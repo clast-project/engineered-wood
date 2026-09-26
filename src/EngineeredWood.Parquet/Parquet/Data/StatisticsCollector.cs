@@ -11,6 +11,12 @@ namespace EngineeredWood.Parquet.Data;
 /// <summary>
 /// Computes column-level statistics (min, max, null_count) from Arrow arrays.
 /// </summary>
+/// <summary>
+/// One page's bounds and NaN count, in the physical type's encoding and untruncated. Both bounds are
+/// null when the page has no bound to give.
+/// </summary>
+internal readonly record struct PageBounds(byte[]? Min, byte[]? Max, long NanCount);
+
 internal static class StatisticsCollector
 {
     /// <summary>
@@ -54,8 +60,8 @@ internal static class StatisticsCollector
         if (isFloatingPoint)
         {
             var (fpMin, fpMax, nanCount) = physicalType == PhysicalType.Float
-                ? ComputeFloatMinMax(array, defLevels, floatingPointTotalOrder)
-                : ComputeDoubleMinMax(array, defLevels, floatingPointTotalOrder);
+                ? ComputeFloatMinMax(array, defLevels, floatingPointTotalOrder, 0, array.Length)
+                : ComputeDoubleMinMax(array, defLevels, floatingPointTotalOrder, 0, array.Length);
 
             var fpStats = new Statistics
             {
@@ -75,12 +81,12 @@ internal static class StatisticsCollector
 
         var (minBytes, maxBytes, minExact, maxExact) = physicalType switch
         {
-            PhysicalType.Boolean => WithExact(ComputeBooleanMinMax(array, defLevels)),
-            PhysicalType.Int32 => WithExact(ComputeMinMax<int>(array, defLevels, Int32Comparison(order))),
-            PhysicalType.Int64 => WithExact(ComputeMinMax<long>(array, defLevels, Int64Comparison(order))),
+            PhysicalType.Boolean => WithExact(ComputeBooleanMinMax(array, defLevels, 0, array.Length)),
+            PhysicalType.Int32 => WithExact(ComputeMinMax<int>(array, defLevels, Int32Comparison(order), 0, array.Length)),
+            PhysicalType.Int64 => WithExact(ComputeMinMax<long>(array, defLevels, Int64Comparison(order), 0, array.Length)),
             PhysicalType.ByteArray => ComputeByteArrayMinMaxTruncated(array, defLevels),
             PhysicalType.FixedLenByteArray
-                => ComputeFlbaMinMaxTruncated(array, defLevels, typeLength, order),
+                => WithExact(ComputeFlbaMinMax(array, defLevels, typeLength, order, 0, array.Length)),
             _ => (null, null, true, true),
         };
 
@@ -99,6 +105,134 @@ internal static class StatisticsCollector
         // Roots it for the duration; see doc/arrow-span-lifetime.md.
         GC.KeepAlive(array);
         return stats;
+    }
+
+    /// <summary>
+    /// The bounds and NaN count of the values in level positions
+    /// <paramref name="start"/> .. <paramref name="start"/> + <paramref name="count"/> — one page's
+    /// worth — for a page index.
+    /// </summary>
+    /// <remarks>
+    /// Runs the same scans <see cref="Compute"/> runs over the whole chunk, so a page's bounds are
+    /// ordered exactly as the chunk's are. Unlike <see cref="Compute"/>, BYTE_ARRAY bounds come back in
+    /// full: a page index truncates by its own rule. Call only for a page with at least one non-null
+    /// value. <see cref="PageBounds.Min"/> is null when there are no bounds to give, which for a
+    /// FLOAT/DOUBLE page under TYPE_ORDER means every value is NaN.
+    /// </remarks>
+    public static PageBounds ComputePageBounds(
+        IArrowArray array,
+        PhysicalType physicalType,
+        int typeLength,
+        int[]? defLevels,
+        int start,
+        int count,
+        bool floatingPointTotalOrder,
+        StatisticsOrder order)
+    {
+        int end = start + count;
+        PageBounds bounds;
+        switch (physicalType)
+        {
+            case PhysicalType.Float:
+            {
+                var (min, max, nanCount) = ComputeFloatMinMax(array, defLevels, floatingPointTotalOrder, start, end);
+                bounds = new PageBounds(min, max, nanCount);
+                break;
+            }
+            case PhysicalType.Double:
+            {
+                var (min, max, nanCount) = ComputeDoubleMinMax(array, defLevels, floatingPointTotalOrder, start, end);
+                bounds = new PageBounds(min, max, nanCount);
+                break;
+            }
+            case PhysicalType.Boolean:
+            {
+                var (min, max) = ComputeBooleanMinMax(array, defLevels, start, end);
+                bounds = new PageBounds(min, max, 0);
+                break;
+            }
+            case PhysicalType.Int32:
+            {
+                var (min, max) = ComputeMinMax<int>(array, defLevels, Int32Comparison(order), start, end);
+                bounds = new PageBounds(min, max, 0);
+                break;
+            }
+            case PhysicalType.Int64:
+            {
+                var (min, max) = ComputeMinMax<long>(array, defLevels, Int64Comparison(order), start, end);
+                bounds = new PageBounds(min, max, 0);
+                break;
+            }
+            case PhysicalType.ByteArray:
+            {
+                var data = array.Data;
+                ReadOnlySpan<int> offsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
+                ReadOnlySpan<byte> rawData = data.Buffers[2].Span;
+                var (minIdx, maxIdx) = FindByteArrayMinMax(array, defLevels, start, end);
+                bounds = minIdx < 0
+                    ? default
+                    : new PageBounds(
+                        rawData.Slice(offsets[minIdx], offsets[minIdx + 1] - offsets[minIdx]).ToArray(),
+                        rawData.Slice(offsets[maxIdx], offsets[maxIdx + 1] - offsets[maxIdx]).ToArray(),
+                        0);
+                break;
+            }
+            case PhysicalType.FixedLenByteArray:
+            {
+                var (min, max) = ComputeFlbaMinMax(array, defLevels, typeLength, order, start, end);
+                bounds = new PageBounds(min, max, 0);
+                break;
+            }
+            default:
+                bounds = default;
+                break;
+        }
+
+        GC.KeepAlive(array);
+        return bounds;
+    }
+
+    /// <summary>
+    /// Orders two encoded values of one column the way the scans here order them: the comparator a
+    /// dictionary-encoded page's bounds and a page index's boundary order are decided with. Both
+    /// values must be non-NaN.
+    /// </summary>
+    public static int CompareValues(
+        ReadOnlySpan<byte> left, ReadOnlySpan<byte> right, PhysicalType physicalType, StatisticsOrder order)
+        => physicalType switch
+        {
+            PhysicalType.Boolean => left[0].CompareTo(right[0]),
+            PhysicalType.Int32 => Int32Comparison(order)(MemoryMarshal.Read<int>(left), MemoryMarshal.Read<int>(right)),
+            PhysicalType.Int64 => Int64Comparison(order)(MemoryMarshal.Read<long>(left), MemoryMarshal.Read<long>(right)),
+            PhysicalType.Float => CompareFloat(MemoryMarshal.Read<float>(left), MemoryMarshal.Read<float>(right)),
+            PhysicalType.Double => CompareDouble(MemoryMarshal.Read<double>(left), MemoryMarshal.Read<double>(right)),
+            PhysicalType.FixedLenByteArray => CompareFlba(left, right, order),
+            _ => left.SequenceCompareTo(right),
+        };
+
+    /// <summary>
+    /// Numeric order with -0 below +0: the rule the FLOAT scans apply when they pick a bound.
+    /// </summary>
+    private static int CompareFloat(float a, float b)
+    {
+        if (a < b) return -1;
+        if (a > b) return 1;
+#if NET8_0_OR_GREATER
+        return a == 0f ? float.IsNegative(b).CompareTo(float.IsNegative(a)) : 0;
+#else
+        return a == 0f ? IsNegativeFloat(b).CompareTo(IsNegativeFloat(a)) : 0;
+#endif
+    }
+
+    private static int CompareDouble(double a, double b)
+    {
+        if (a < b) return -1;
+        if (a > b) return 1;
+#if NET8_0_OR_GREATER
+        return a == 0.0 ? double.IsNegative(b).CompareTo(double.IsNegative(a)) : 0;
+#else
+        return a == 0.0 ? IsNegativeDouble(b).CompareTo(IsNegativeDouble(a)) : 0;
+#endif
     }
 
     /// <summary>
@@ -446,12 +580,12 @@ internal static class StatisticsCollector
 
     // ── Full-scan statistics ──
 
-    private static (byte[]?, byte[]?) ComputeBooleanMinMax(IArrowArray array, int[]? defLevels)
+    private static (byte[]?, byte[]?) ComputeBooleanMinMax(IArrowArray array, int[]? defLevels, int start, int end)
     {
         var boolArray = (BooleanArray)array;
         bool hasTrue = false, hasFalse = false;
 
-        for (int i = 0; i < array.Length; i++)
+        for (int i = start; i < end; i++)
         {
             if (defLevels != null && defLevels[i] == 0) continue;
             if (boolArray.GetValue(i) == true) hasTrue = true;
@@ -465,14 +599,14 @@ internal static class StatisticsCollector
     }
 
     private static (byte[]?, byte[]?) ComputeMinMax<T>(
-        IArrowArray array, int[]? defLevels, Comparison<T> compare)
+        IArrowArray array, int[]? defLevels, Comparison<T> compare, int start, int end)
         where T : unmanaged
     {
         var valueBuffer = MemoryMarshal.Cast<byte, T>(array.Data.Buffers[1].Span);
         bool first = true;
         T min = default, max = default;
 
-        for (int i = 0; i < array.Length; i++)
+        for (int i = start; i < end; i++)
         {
             if (defLevels != null && defLevels[i] == 0) continue;
             T val = valueBuffer[i];
@@ -504,7 +638,7 @@ internal static class StatisticsCollector
     }
 
     private static (byte[]?, byte[]?, long) ComputeFloatMinMax(
-        IArrowArray array, int[]? defLevels, bool totalOrder)
+        IArrowArray array, int[]? defLevels, bool totalOrder, int start, int end)
     {
         var valueBuffer = MemoryMarshal.Cast<byte, float>(array.Data.Buffers[1].Span);
         bool first = true;
@@ -512,7 +646,7 @@ internal static class StatisticsCollector
         long nanCount = 0;
         float firstNaN = 0;
 
-        for (int i = 0; i < array.Length; i++)
+        for (int i = start; i < end; i++)
         {
             if (defLevels != null && defLevels[i] == 0) continue;
             float val = valueBuffer[i];
@@ -556,7 +690,7 @@ internal static class StatisticsCollector
     }
 
     private static (byte[]?, byte[]?, long) ComputeDoubleMinMax(
-        IArrowArray array, int[]? defLevels, bool totalOrder)
+        IArrowArray array, int[]? defLevels, bool totalOrder, int start, int end)
     {
         var valueBuffer = MemoryMarshal.Cast<byte, double>(array.Data.Buffers[1].Span);
         bool first = true;
@@ -564,7 +698,7 @@ internal static class StatisticsCollector
         long nanCount = 0;
         double firstNaN = 0;
 
-        for (int i = 0; i < array.Length; i++)
+        for (int i = start; i < end; i++)
         {
             if (defLevels != null && defLevels[i] == 0) continue;
             double val = valueBuffer[i];
@@ -634,9 +768,25 @@ internal static class StatisticsCollector
         ReadOnlySpan<int> offsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
         ReadOnlySpan<byte> rawData = data.Buffers[2].Span;
 
+        var (minIdx, maxIdx) = FindByteArrayMinMax(array, defLevels, 0, array.Length);
+        if (minIdx < 0) return (null, null, true, true);
+
+        return TruncateBinaryStats(
+            rawData.Slice(offsets[minIdx], offsets[minIdx + 1] - offsets[minIdx]),
+            rawData.Slice(offsets[maxIdx], offsets[maxIdx + 1] - offsets[maxIdx]));
+    }
+
+    /// <summary>Positions of the least and greatest values in the range, or -1 if all are null.</summary>
+    private static (int MinIdx, int MaxIdx) FindByteArrayMinMax(
+        IArrowArray array, int[]? defLevels, int start, int end)
+    {
+        var data = array.Data;
+        ReadOnlySpan<int> offsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
+        ReadOnlySpan<byte> rawData = data.Buffers[2].Span;
+
         int minIdx = -1, maxIdx = -1;
 
-        for (int i = 0; i < array.Length; i++)
+        for (int i = start; i < end; i++)
         {
             if (defLevels != null && defLevels[i] == 0) continue;
 
@@ -654,20 +804,16 @@ internal static class StatisticsCollector
             }
         }
 
-        if (minIdx < 0) return (null, null, true, true);
-
-        return TruncateBinaryStats(
-            rawData.Slice(offsets[minIdx], offsets[minIdx + 1] - offsets[minIdx]),
-            rawData.Slice(offsets[maxIdx], offsets[maxIdx + 1] - offsets[maxIdx]));
+        return (minIdx, maxIdx);
     }
 
-    private static (byte[]?, byte[]?, bool, bool) ComputeFlbaMinMaxTruncated(
-        IArrowArray array, int[]? defLevels, int typeLength, StatisticsOrder order)
+    private static (byte[]?, byte[]?) ComputeFlbaMinMax(
+        IArrowArray array, int[]? defLevels, int typeLength, StatisticsOrder order, int start, int end)
     {
         var valueBuffer = array.Data.Buffers[1].Span;
         int minIdx = -1, maxIdx = -1;
 
-        for (int i = 0; i < array.Length; i++)
+        for (int i = start; i < end; i++)
         {
             if (defLevels != null && defLevels[i] == 0) continue;
 
@@ -685,13 +831,12 @@ internal static class StatisticsCollector
             }
         }
 
-        if (minIdx < 0) return (null, null, true, true);
+        if (minIdx < 0) return (null, null);
 
         // FLBA values are typically short (16/32 bytes for decimals), no truncation needed
         return (
             valueBuffer.Slice(minIdx * typeLength, typeLength).ToArray(),
-            valueBuffer.Slice(maxIdx * typeLength, typeLength).ToArray(),
-            true, true);
+            valueBuffer.Slice(maxIdx * typeLength, typeLength).ToArray());
     }
 
     /// <summary>

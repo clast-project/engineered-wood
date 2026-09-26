@@ -44,6 +44,12 @@ internal static class ColumnChunkWriter
         /// Serialized Bloom filter block (Thrift header + bitset), or null if not enabled.
         /// </summary>
         public byte[]? BloomFilterData { get; init; }
+
+        /// <summary>
+        /// The chunk's page index, with page offsets relative to the chunk, or null when
+        /// <see cref="ParquetWriteOptions.WritePageIndex"/> is off.
+        /// </summary>
+        public ChunkPageIndex? PageIndex { get; init; }
     }
 
     [ThreadStatic]
@@ -186,6 +192,11 @@ internal static class ColumnChunkWriter
         // Read off the Arrow type before the rewrites below replace it with the bytes that reach the file.
         var statisticsOrder = StatisticsOrders.For(ValueType(array), physicalType, extendedTimestamp);
 
+        // Null when page indexes are off, which is what keeps every page loop below free of their cost.
+        var pageIndex = options.WritePageIndex
+            ? NewPageIndexCollector(ValueType(array), physicalType, typeLength, statisticsOrder, pathInSchema, options)
+            : null;
+
         // Only when the values are still timestamps. The buffered writer encodes at accumulation time --
         // its encoders dispatch on the Arrow type, so they have to see the carrier -- and then reaches
         // this method through its dictionary-fallback path with an array that is already twelve-byte.
@@ -221,14 +232,14 @@ internal static class ColumnChunkWriter
         {
             result = WriteDictionaryColumn(
                 dictResult.Value, rowCount, pathInSchema, physicalType,
-                maxDefLevel, maxRepLevel, defLevels, repLevels, options);
+                maxDefLevel, maxRepLevel, defLevels, repLevels, options, pageIndex);
         }
         else
         {
             // Non-dictionary encoding (PLAIN for V1, type-aware for V2)
             result = WriteNonDictionaryColumn(
                 array, rowCount, pathInSchema, physicalType, typeLength,
-                maxDefLevel, maxRepLevel, defLevels, repLevels, valueDefLevels, nonNullCount, options);
+                maxDefLevel, maxRepLevel, defLevels, repLevels, valueDefLevels, nonNullCount, options, pageIndex);
         }
 
         // Statistics OFF leaves the column chunk with no Statistics at all — not merely no bounds — and
@@ -277,6 +288,7 @@ internal static class ColumnChunkWriter
                 Data = result.Data,
                 MetaData = result.MetaData,
                 DictionaryPageSize = result.DictionaryPageSize,
+                PageIndex = result.PageIndex,
                 BloomFilterData = BloomFilterSerializer.Serialize(bfBuilder.ToArray()),
             };
         }
@@ -296,7 +308,7 @@ internal static class ColumnChunkWriter
         PhysicalType physicalType, int typeLength,
         int maxDefLevel, int maxRepLevel, int[]? defLevels, int[]? repLevels,
         int[]? valueDefLevels, int nonNullCount,
-        ParquetWriteOptions options)
+        ParquetWriteOptions options, PageIndexCollector? pageIndex)
     {
         var output = new ColumnChunkOutput(EstimateColumnSize(rowCount, physicalType, typeLength), options);
         var encodings = new HashSet<Encoding>();
@@ -358,18 +370,31 @@ internal static class ColumnChunkWriter
                 : pageValues;
 
             Encoding pageEncoding;
+            EmittedPage page;
 
             if (options.DataPageVersion == DataPageVersion.V2)
             {
-                WriteDataPageV2(output, array, offset, pageValues, pageNonNull,
+                page = WriteDataPageV2(output, array, offset, pageValues, pageNonNull,
                     physicalType, typeLength, maxDefLevel, maxRepLevel, defLevels, repLevels,
                     valueDefLevels, options, defEncoder, repEncoder, fsstColumn, valueIndex, out pageEncoding);
             }
             else
             {
-                WriteDataPageV1(output, array, offset, pageValues, pageNonNull,
+                page = WriteDataPageV1(output, array, offset, pageValues, pageNonNull,
                     physicalType, typeLength, maxDefLevel, maxRepLevel, defLevels, repLevels,
                     valueDefLevels, options, defEncoder, repEncoder, out pageEncoding);
+            }
+
+            if (pageIndex != null)
+            {
+                // The same scans the chunk statistics run, over this page's level positions.
+                var bounds = pageIndex.WritesColumnIndex && pageNonNull > 0
+                    ? StatisticsCollector.ComputePageBounds(
+                        array, physicalType, typeLength, valueDefLevels, offset, pageValues,
+                        pageIndex.FloatingPointTotalOrder, pageIndex.Order)
+                    : default;
+                pageIndex.AddPage(page, PageRows(repLevels, offset, pageValues, maxRepLevel),
+                    pageValues - pageNonNull, pageNonNull, bounds);
             }
 
             encodings.Add(pageEncoding);
@@ -396,8 +421,29 @@ internal static class ColumnChunkWriter
             Data = output.Data,
             MetaData = metadata,
             SymbolTablePageSize = symbolTablePageSize,
+            PageIndex = pageIndex?.Build(),
         };
     }
+
+    /// <summary>
+    /// A collector for one chunk's page index. The ColumnIndex follows the chunk statistics: a column
+    /// without them gets none, and neither does INT96 (its order is undefined) or FLOAT16 (whose
+    /// bounds are not yet ordered correctly). The OffsetIndex is written regardless.
+    /// </summary>
+    private static PageIndexCollector NewPageIndexCollector(
+        Apache.Arrow.Types.IArrowType valueType, PhysicalType physicalType, int typeLength,
+        StatisticsOrder order, IReadOnlyList<string> pathInSchema, ParquetWriteOptions options) =>
+        new(physicalType, typeLength, order,
+            floatingPointTotalOrder: options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder,
+            truncateLength: options.PageIndexTruncateLength,
+            utf8: valueType is StringType or LargeStringType or StringViewType,
+            writeColumnIndex: options.GetWriteStatistics(pathInSchema)
+                && physicalType != PhysicalType.Int96
+                && valueType is not HalfFloatType);
+
+    /// <summary>Rows that start in a page: every level entry for a flat column, rep = 0 for a repeated one.</summary>
+    private static int PageRows(int[]? repLevels, int offset, int pageValues, int maxRepLevel) =>
+        maxRepLevel > 0 ? CountRows(repLevels, offset, pageValues, maxRepLevel) : pageValues;
 
     /// <summary>
     /// Moves a page's end onto a record boundary, so that every page of a repeated leaf begins at
@@ -524,8 +570,15 @@ internal static class ColumnChunkWriter
         int[]? repLevels,
         ParquetWriteOptions options)
     {
+        var statisticsOrder = StatisticsOrders.For(
+            arrowType, physicalType,
+            physicalType == PhysicalType.FixedLenByteArray && options.IsExtendedTimestampColumn(pathInSchema));
+        var pageIndex = options.WritePageIndex
+            ? NewPageIndexCollector(arrowType, physicalType, typeLength, statisticsOrder, pathInSchema, options)
+            : null;
+
         var result = WriteDictionaryColumn(dictResult, rowCount, pathInSchema, physicalType,
-            maxDefLevel, maxRepLevel, defLevels, repLevels, options);
+            maxDefLevel, maxRepLevel, defLevels, repLevels, options, pageIndex);
 
         // See ParquetWriteOptions.WriteStatistics: off means no Statistics at all, not merely no bounds.
         if (!options.GetWriteStatistics(pathInSchema))
@@ -540,10 +593,7 @@ internal static class ColumnChunkWriter
                 options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder)
             : StatisticsCollector.ComputeFromDictEntries(
                 dictResult.DictionaryPageData, dictResult.DictionaryCount,
-                physicalType, typeLength, rowCount - nonNullCount,
-                StatisticsOrders.For(
-                    arrowType, physicalType,
-                    physicalType == PhysicalType.FixedLenByteArray && options.IsExtendedTimestampColumn(pathInSchema)));
+                physicalType, typeLength, rowCount - nonNullCount, statisticsOrder);
 
         result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
         return result;
@@ -558,7 +608,8 @@ internal static class ColumnChunkWriter
         int maxRepLevel,
         int[]? defLevels,
         int[]? repLevels,
-        ParquetWriteOptions options)
+        ParquetWriteOptions options,
+        PageIndexCollector? pageIndex)
     {
         var output = new ColumnChunkOutput(dictResult.DictionaryPageData.Length + rowCount, options);
 
@@ -582,6 +633,10 @@ internal static class ColumnChunkWriter
         // expanding the runs to slice them, is the per-row array the run form exists to avoid.
         var runCursor = dictResult.IndexRuns is { } runs ? new IndexRunCursor(runs) : default;
 
+        var dictionaryBounds = pageIndex is { WritesColumnIndex: true }
+            ? new DictionaryPageBounds(dictResult, pageIndex)
+            : null;
+
         int offset = 0;
         int indexOffset = 0;
         while (offset < rowCount)
@@ -592,6 +647,24 @@ internal static class ColumnChunkWriter
                 ? CountNonNull(defLevels!, offset, pageValues, maxDefLevel)
                 : pageValues;
 
+            // Before the indices are encoded, which advances the run cursor: bounds read a copy of it.
+            PageBounds bounds = default;
+            if (dictionaryBounds != null && pageIndex!.WritesColumnIndex && pageNonNull > 0)
+            {
+                dictionaryBounds.Begin();
+                if (dictResult.IndexRuns is null)
+                {
+                    dictionaryBounds.Add(dictResult.Indices.AsSpan(indexOffset, pageNonNull));
+                }
+                else
+                {
+                    var peek = runCursor;
+                    peek.VisitNext(pageNonNull, dictionaryBounds);
+                }
+
+                bounds = dictionaryBounds.End();
+            }
+
             // Encoded up front rather than inside each page writer: both need the same bytes in the same
             // thread-static buffer, and only here is it known which form the indices arrived in.
             int valuesLen = dictResult.IndexRuns is null
@@ -600,18 +673,22 @@ internal static class ColumnChunkWriter
                 : EncodeDictionaryIndexRunsToBuffer(
                     ref runCursor, pageNonNull, bitWidth, indexEncoder);
 
+            EmittedPage page;
             if (options.DataPageVersion == DataPageVersion.V2)
             {
-                WriteDictDataPageV2(output, valuesLen, offset, pageValues, pageNonNull,
+                page = WriteDictDataPageV2(output, valuesLen, offset, pageValues, pageNonNull,
                     maxDefLevel, maxRepLevel, defLevels, repLevels, options,
                     defEncoder, repEncoder);
             }
             else
             {
-                WriteDictDataPageV1(output, valuesLen, offset, pageValues, pageNonNull,
+                page = WriteDictDataPageV1(output, valuesLen, offset, pageValues, pageNonNull,
                     maxDefLevel, maxRepLevel, defLevels, repLevels, options,
                     defEncoder, repEncoder);
             }
+
+            pageIndex?.AddPage(page, PageRows(repLevels, offset, pageValues, maxRepLevel),
+                pageValues - pageNonNull, pageNonNull, bounds);
 
             offset += pageValues;
             indexOffset += pageNonNull;
@@ -639,6 +716,7 @@ internal static class ColumnChunkWriter
             Data = output.Data,
             MetaData = metadata,
             DictionaryPageSize = dictionaryPageSize,
+            PageIndex = pageIndex?.Build(),
         };
     }
 
@@ -865,6 +943,28 @@ internal static class ColumnChunkWriter
             _lengths = runs.Lengths;
             _run = 0;
             _taken = 0;
+        }
+
+        /// <summary>
+        /// Feeds the next <paramref name="count"/> indices to <paramref name="bounds"/>, a run at a time.
+        /// Advances this cursor, so call it on a copy to leave the original where it was.
+        /// </summary>
+        public void VisitNext(int count, DictionaryPageBounds bounds)
+        {
+            while (count > 0 && _run < _values.Length)
+            {
+                int take = Math.Min(_lengths[_run] - _taken, count);
+                bounds.Add(_values[_run], take);
+
+                _taken += take;
+                count -= take;
+
+                if (_taken == _lengths[_run])
+                {
+                    _run++;
+                    _taken = 0;
+                }
+            }
         }
 
         /// <summary>Feeds the next <paramref name="count"/> indices to <paramref name="encoder"/> as runs.</summary>

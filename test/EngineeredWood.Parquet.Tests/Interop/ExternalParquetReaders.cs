@@ -135,6 +135,50 @@ internal static class ExternalParquetReaders
         return new CountOutcome(Installed: true, Error: null, Count: result.GetProperty("count").GetInt64());
     }
 
+    /// <summary>
+    /// Runs a filtered count in DataFusion under <c>EXPLAIN ANALYZE</c> and reports how many rows its
+    /// page index let through. Null when DataFusion is absent or failed; the error says which.
+    /// </summary>
+    public static (PageIndexMetrics? Metrics, string? Error) DataFusionPageIndexMetrics(string path, string predicate)
+    {
+        var result = Driver.InvokeRaw("page_index_metrics", new { path, predicate });
+        if (!result.GetProperty("ok").GetBoolean())
+            return (null, result.TryGetProperty("error", out var e) ? e.GetString() : "(no message)");
+        if (!result.GetProperty("available").GetBoolean())
+            return (null, result.TryGetProperty("error", out var a) ? a.GetString() : "datafusion is not installed");
+
+        return (new PageIndexMetrics(
+            result.GetProperty("found").GetBoolean(),
+            result.GetProperty("rows_total").GetInt64(),
+            result.GetProperty("rows_matched").GetInt64()), null);
+    }
+
+    /// <summary>pyarrow's view of which column chunks carry a ColumnIndex and an OffsetIndex.</summary>
+    public static (IReadOnlyList<PageIndexPresence>? Chunks, string? Error) PyArrowPageIndexPresence(string path)
+    {
+        var result = Driver.InvokeRaw("page_index_presence", new { path });
+        if (!result.GetProperty("ok").GetBoolean())
+            return (null, result.TryGetProperty("error", out var e) ? e.GetString() : "(no message)");
+        if (!result.GetProperty("available").GetBoolean())
+            return (null, result.TryGetProperty("error", out var a) ? a.GetString() : "pyarrow is not installed");
+
+        var chunks = new List<PageIndexPresence>();
+        foreach (var chunk in result.GetProperty("chunks").EnumerateArray())
+        {
+            chunks.Add(new PageIndexPresence(
+                chunk.GetProperty("row_group").GetInt32(),
+                chunk.GetProperty("path").GetString()!,
+                chunk.GetProperty("column_index").GetBoolean(),
+                chunk.GetProperty("offset_index").GetBoolean()));
+        }
+
+        return (chunks, null);
+    }
+
+    internal sealed record PageIndexMetrics(bool Found, long RowsTotal, long RowsMatched);
+
+    internal sealed record PageIndexPresence(int RowGroup, string Path, bool HasColumnIndex, bool HasOffsetIndex);
+
     internal sealed record ReaderOutcome(bool Installed, string? Error, ReaderResult? Result);
 
     internal sealed record CountOutcome(bool Installed, string? Error, long? Count);

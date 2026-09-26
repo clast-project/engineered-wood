@@ -29,6 +29,7 @@ parquet — which is why the availability probe checks for it too rather than di
 """
 import hashlib
 import json
+import re
 import sys
 import traceback
 
@@ -149,10 +150,76 @@ def cmd_count_where(args):
     return {"available": True, "count": count, "version": getattr(module, "__version__", None)}
 
 
+# "60.00 K total → 12 matched". DataFusion abbreviates large counts with a K/M/B suffix.
+_ROWS_PRUNED = re.compile(
+    r"page_index_rows_pruned=([\d.]+)\s*([KMB]?) total \S+ ([\d.]+)\s*([KMB]?) matched")
+_SUFFIX = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
+
+
+def _count(number, suffix):
+    return int(round(float(number) * _SUFFIX[suffix]))
+
+
+def cmd_page_index_metrics(args):
+    """Runs a filtered count in DataFusion under EXPLAIN ANALYZE and reports what its page index did.
+
+    DataFusion prints `page_index_rows_pruned=<total> total -> <matched> matched` per scan. A
+    matched count below the total is the only evidence that the page index was read and used; a
+    filtered count alone cannot tell pruning from a full scan.
+
+    Rows, not pages: DataFusion 54's `page_index_pages_pruned` reported "0 matched" for string and
+    decimal predicates that nonetheless matched a page's worth of rows, and returned the right count.
+    """
+    module, error = _import("datafusion")
+    if module is None:
+        return {"available": False, "error": error}
+
+    ctx = module.SessionContext()
+    ctx.register_parquet("t", args["path"])
+    plan = "\n".join(
+        str(value)
+        for row in ctx.sql(f"EXPLAIN ANALYZE SELECT count(*) FROM t WHERE {args['predicate']}").to_pylist()
+        for value in row.values())
+
+    total = matched = 0
+    found = False
+    for m in _ROWS_PRUNED.finditer(plan):
+        found = True
+        total += _count(m.group(1), m.group(2))
+        matched += _count(m.group(3), m.group(4))
+
+    return {"available": True, "found": found, "rows_total": total, "rows_matched": matched,
+            "version": getattr(module, "__version__", None)}
+
+
+def cmd_page_index_presence(args):
+    """Reports pyarrow's has_column_index / has_offset_index for every column chunk.
+
+    Structural only: pyarrow's Python API exposes whether a chunk has each index, not what is in it.
+    """
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    metadata = pq.ParquetFile(args["path"]).metadata
+    chunks = []
+    for g in range(metadata.num_row_groups):
+        row_group = metadata.row_group(g)
+        for c in range(row_group.num_columns):
+            column = row_group.column(c)
+            chunks.append({"row_group": g, "path": column.path_in_schema,
+                           "column_index": bool(column.has_column_index),
+                           "offset_index": bool(column.has_offset_index)})
+    return {"available": True, "chunks": chunks}
+
+
 COMMANDS = {
     "probe": cmd_probe,
     "read_digest": cmd_read_digest,
     "count_where": cmd_count_where,
+    "page_index_metrics": cmd_page_index_metrics,
+    "page_index_presence": cmd_page_index_presence,
 }
 
 

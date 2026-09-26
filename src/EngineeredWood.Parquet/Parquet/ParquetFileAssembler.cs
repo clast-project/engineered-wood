@@ -27,6 +27,12 @@ internal sealed class ParquetFileAssembler
     private readonly ParquetWriteOptions _options;
     private readonly List<RowGroup> _rowGroups = new();
 
+    // Page indexes wait for the footer: they are laid out together after the last row group, so that a
+    // reader can fetch every index of a row group in one read. Each is a few bytes per page.
+    private readonly List<PendingPageIndex> _pageIndexes = new();
+
+    private readonly record struct PendingPageIndex(int RowGroup, int Column, long ChunkStart, ChunkPageIndex Index);
+
     public ParquetFileAssembler(ISequentialFile file, ParquetWriteOptions options)
     {
         _file = file;
@@ -101,6 +107,8 @@ internal sealed class ParquetFileAssembler
             };
 
             columnChunks[i] = new ColumnChunk { FileOffset = chunkStart, MetaData = meta };
+            if (result.PageIndex is { } pageIndex)
+                _pageIndexes.Add(new PendingPageIndex(_rowGroups.Count, i, chunkStart, pageIndex));
             totalByteSize += result.MetaData.TotalUncompressedSize;
             totalCompressedSize += result.MetaData.TotalCompressedSize;
         }
@@ -132,9 +140,12 @@ internal sealed class ParquetFileAssembler
         CancellationToken cancellationToken)
     {
         var keyValueMetadata = BuildKeyValueMetadata(arrowSchema);
+        var rowGroups = _pageIndexes.Count == 0
+            ? _rowGroups
+            : await WritePageIndexesAsync(cancellationToken).ConfigureAwait(false);
 
         long totalRows = 0;
-        foreach (var rg in _rowGroups)
+        foreach (var rg in rowGroups)
             totalRows += rg.NumRows;
 
         var fileMetaData = new FileMetaData
@@ -142,7 +153,7 @@ internal sealed class ParquetFileAssembler
             Version = 2,
             Schema = schema,
             NumRows = totalRows,
-            RowGroups = _rowGroups,
+            RowGroups = rowGroups,
             CreatedBy = _options.CreatedBy,
             KeyValueMetadata = keyValueMetadata,
             ColumnOrders = ColumnOrderBuilder.Build(schema, _options.FloatColumnOrder),
@@ -191,5 +202,85 @@ internal sealed class ParquetFileAssembler
             Value = ArrowSchemaMetadata.Encode(arrowSchema),
         });
         return merged;
+    }
+
+    /// <summary>
+    /// Writes every ColumnIndex, then every OffsetIndex, each in row-group and column order (parquet-mr's
+    /// layout), and returns the row groups with ColumnChunk fields 4-7 filled in.
+    /// </summary>
+    private async ValueTask<List<RowGroup>> WritePageIndexesAsync(CancellationToken cancellationToken)
+    {
+        var columnIndexes = new Dictionary<(int, int), (long Offset, int Length)>();
+        foreach (var pending in _pageIndexes)
+        {
+            if (pending.Index.ColumnIndex is not { } columnIndex)
+                continue;
+
+            columnIndexes[(pending.RowGroup, pending.Column)] = await WritePageIndexStructureAsync(
+                MetadataEncoder.EncodeColumnIndex(columnIndex), cancellationToken).ConfigureAwait(false);
+        }
+
+        var offsetIndexes = new Dictionary<(int, int), (long Offset, int Length)>();
+        foreach (var pending in _pageIndexes)
+        {
+            // The encoder recorded page offsets from the start of the chunk; only now is that known.
+            var locations = new PageLocation[pending.Index.PageLocations.Count];
+            for (int p = 0; p < locations.Length; p++)
+            {
+                var location = pending.Index.PageLocations[p];
+                locations[p] = location with { Offset = pending.ChunkStart + location.Offset };
+            }
+
+            offsetIndexes[(pending.RowGroup, pending.Column)] = await WritePageIndexStructureAsync(
+                MetadataEncoder.EncodeOffsetIndex(new OffsetIndex { PageLocations = locations }),
+                cancellationToken).ConfigureAwait(false);
+        }
+
+        var rowGroups = new List<RowGroup>(_rowGroups.Count);
+        for (int g = 0; g < _rowGroups.Count; g++)
+        {
+            var rowGroup = _rowGroups[g];
+            var columns = new ColumnChunk[rowGroup.Columns.Count];
+            for (int c = 0; c < columns.Length; c++)
+            {
+                var chunk = rowGroup.Columns[c];
+                bool hasOffsetIndex = offsetIndexes.TryGetValue((g, c), out var offsetIndex);
+                bool hasColumnIndex = columnIndexes.TryGetValue((g, c), out var columnIndex);
+                columns[c] = new ColumnChunk
+                {
+                    FilePath = chunk.FilePath,
+                    FileOffset = chunk.FileOffset,
+                    MetaData = chunk.MetaData,
+                    OffsetIndexOffset = hasOffsetIndex ? offsetIndex.Offset : null,
+                    OffsetIndexLength = hasOffsetIndex ? offsetIndex.Length : null,
+                    ColumnIndexOffset = hasColumnIndex ? columnIndex.Offset : null,
+                    ColumnIndexLength = hasColumnIndex ? columnIndex.Length : null,
+                };
+            }
+
+            rowGroups.Add(new RowGroup
+            {
+                Columns = columns,
+                TotalByteSize = rowGroup.TotalByteSize,
+                NumRows = rowGroup.NumRows,
+                SortingColumns = rowGroup.SortingColumns,
+                TotalCompressedSize = rowGroup.TotalCompressedSize,
+                Ordinal = rowGroup.Ordinal,
+            });
+        }
+
+        return rowGroups;
+    }
+
+    /// <summary>
+    /// Writes one ColumnIndex or OffsetIndex and returns where it went. Every page-index structure goes
+    /// through here, so that encryption can wrap them (module types 6 and 7) in one place.
+    /// </summary>
+    private async ValueTask<(long Offset, int Length)> WritePageIndexStructureAsync(
+        byte[] bytes, CancellationToken cancellationToken)
+    {
+        long offset = _file.Position;
+        await _file.WriteAsync(bytes, cancellationToken).ConfigureAwait(false);
+        return (offset, bytes.Length);
     }
 }
