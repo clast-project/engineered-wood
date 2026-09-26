@@ -1,13 +1,29 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+#pragma warning disable EWPARQUET0003 // one batched case writes FSST, to tamper with its symbol table
+
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 
 namespace EngineeredWood.Tests.Parquet;
 
-public class PageChecksumTests
+public class PageChecksumTests : IDisposable
 {
+    private readonly string _tempDir;
+
+    public PageChecksumTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), "ew-crc-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(_tempDir);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempDir))
+            Directory.Delete(_tempDir, recursive: true);
+    }
+
     [Fact]
     public async Task RoundTrip_WriteWithCrc_ReadWithValidation()
     {
@@ -267,6 +283,26 @@ public class PageChecksumTests
 
     [Theory]
     [MemberData(nameof(BatchedLayouts))]
+    public async Task Batched_TamperedSymbolTablePage_ThrowsOnValidation(bool writePageIndex, int? batchSize, long? maxBatchBytes)
+    {
+        var values = new Apache.Arrow.StringArray.Builder()
+            .AppendRange(Enumerable.Range(0, Rows).Select(i => "customer-" + (i % 700).ToString("D4")))
+            .Build();
+        string path = await WriteAsync(values, writePageIndex, DataPageVersion.V2, dictionary: false, ByteArrayEncoding.Fsst);
+        var (bytes, chunk) = ReadFirstChunk(path);
+        long symbolTableOffset = Assert.IsType<long>(chunk.SymbolTablePageOffset);
+        EngineeredWood.Parquet.Data.PageHeaderDecoder.Decode(bytes.AsSpan(checked((int)symbolTableOffset)), out int headerSize);
+
+        // Inside the symbol table. Without the check this may decode to wrong strings or fail
+        // some other way, so only the refusal, and its reason, is asserted.
+        bytes[checked((int)symbolTableOffset + headerSize + 4)] ^= 0xFF;
+        File.WriteAllBytes(path, bytes);
+
+        await AssertBatchedReadRefusesAsync(path, batchSize, maxBatchBytes);
+    }
+
+    [Theory]
+    [MemberData(nameof(BatchedLayouts))]
     public async Task Batched_Untampered_ReadsWithValidation(bool writePageIndex, int? batchSize, long? maxBatchBytes)
     {
         foreach (var version in new[] { DataPageVersion.V1, DataPageVersion.V2 })
@@ -277,13 +313,19 @@ public class PageChecksumTests
         }
     }
 
-    private static async Task<string> WriteDoublesAsync(
-        Func<int, double> value, bool dictionary, bool writePageIndex, DataPageVersion version = DataPageVersion.V2)
+    private Task<string> WriteDoublesAsync(
+        Func<int, double> value, bool dictionary, bool writePageIndex, DataPageVersion version = DataPageVersion.V2) =>
+        WriteAsync(
+            new Apache.Arrow.DoubleArray.Builder().AppendRange(Enumerable.Range(0, Rows).Select(value)).Build(),
+            writePageIndex, version, dictionary, ByteArrayEncoding.DeltaLengthByteArray);
+
+    /// <summary>Writes one non-null column <c>x</c>, uncompressed, with page CRCs, into this test's directory.</summary>
+    private async Task<string> WriteAsync(
+        Apache.Arrow.IArrowArray values, bool writePageIndex, DataPageVersion version, bool dictionary, ByteArrayEncoding strings)
     {
-        string path = Path.Combine(Path.GetTempPath(), "ew-crc-" + Guid.NewGuid().ToString("N")[..8] + ".parquet");
-        var values = new Apache.Arrow.DoubleArray.Builder().AppendRange(Enumerable.Range(0, Rows).Select(value)).Build();
+        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N")[..8] + ".parquet");
         var batch = new Apache.Arrow.RecordBatch(
-            new Apache.Arrow.Schema.Builder().Field(new Apache.Arrow.Field("x", Apache.Arrow.Types.DoubleType.Default, false)).Build(),
+            new Apache.Arrow.Schema.Builder().Field(new Apache.Arrow.Field("x", values.Data.DataType, false)).Build(),
             [values], Rows);
 
         await using var file = new LocalSequentialFile(path);
@@ -295,6 +337,7 @@ public class PageChecksumTests
             DataPageVersion = version,
             DataPageSize = 1024,
             WritePageIndex = writePageIndex,
+            ByteArrayEncoding = strings,
         });
         await writer.WriteRowGroupAsync(batch);
         await writer.CloseAsync();
