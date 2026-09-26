@@ -18,7 +18,11 @@ internal sealed class PageHeader
     public required int CompressedPageSize { get; init; }
 
     /// <summary>Optional CRC-32C checksum of the compressed page data (excluding the page header).</summary>
-    public int? Crc { get; init; }
+    /// <remarks>
+    /// Settable because the writer fills it in last: <see cref="ColumnChunkOutput.EmitPage(PageHeader, ReadOnlySpan{byte}, ReadOnlySpan{byte}, ReadOnlySpan{byte})"/>
+    /// computes it over the payload it is about to write.
+    /// </remarks>
+    public int? Crc { get; set; }
 
     /// <summary>Data page header (V1). Null for non-data pages.</summary>
     public DataPageHeader? DataPageHeader { get; init; }

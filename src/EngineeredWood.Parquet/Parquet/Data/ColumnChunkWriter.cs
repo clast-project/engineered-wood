@@ -295,9 +295,7 @@ internal static class ColumnChunkWriter
         int[]? valueDefLevels, int nonNullCount,
         ParquetWriteOptions options)
     {
-        var output = new MemoryStream(EstimateColumnSize(rowCount, physicalType, typeLength));
-        int totalUncompressedSize = 0;
-        int totalCompressedSize = 0;
+        var output = new ColumnChunkOutput(EstimateColumnSize(rowCount, physicalType, typeLength), options);
         var encodings = new HashSet<Encoding>();
 
         if (maxDefLevel > 0 || maxRepLevel > 0)
@@ -338,8 +336,7 @@ internal static class ColumnChunkWriter
 
         if (fsstColumn != null)
         {
-            symbolTablePageSize = WriteSymbolTablePage(
-                output, fsstColumn.Table, options, ref totalUncompressedSize, ref totalCompressedSize);
+            symbolTablePageSize = WriteSymbolTablePage(output, fsstColumn.Table, options);
         }
 
         // Reusable encoder for def/rep levels across pages
@@ -363,15 +360,13 @@ internal static class ColumnChunkWriter
             {
                 WriteDataPageV2(output, array, offset, pageValues, pageNonNull,
                     physicalType, typeLength, maxDefLevel, maxRepLevel, defLevels, repLevels,
-                    valueDefLevels, options, defEncoder, repEncoder, fsstColumn, valueIndex,
-                    ref totalUncompressedSize, ref totalCompressedSize, out pageEncoding);
+                    valueDefLevels, options, defEncoder, repEncoder, fsstColumn, valueIndex, out pageEncoding);
             }
             else
             {
                 WriteDataPageV1(output, array, offset, pageValues, pageNonNull,
                     physicalType, typeLength, maxDefLevel, maxRepLevel, defLevels, repLevels,
-                    valueDefLevels, options, defEncoder, repEncoder,
-                    ref totalUncompressedSize, ref totalCompressedSize, out pageEncoding);
+                    valueDefLevels, options, defEncoder, repEncoder, out pageEncoding);
             }
 
             encodings.Add(pageEncoding);
@@ -386,17 +381,16 @@ internal static class ColumnChunkWriter
             PathInSchema = pathInSchema is string[] arr ? arr : pathInSchema.ToArray(),
             Codec = options.Compression,
             NumValues = rowCount,
-            TotalUncompressedSize = totalUncompressedSize,
-            TotalCompressedSize = totalCompressedSize,
+            TotalUncompressedSize = output.TotalUncompressedSize,
+            TotalCompressedSize = output.TotalCompressedSize,
             DataPageOffset = 0, // set by caller
             SymbolTablePageOffset = symbolTablePageSize > 0 ? 0 : null, // set by caller
             SymbolTablePageLength = symbolTablePageSize > 0 ? symbolTablePageSize : null,
         };
 
-        output.TryGetBuffer(out var buffer);
         return new ColumnChunkResult
         {
-            Data = buffer,
+            Data = output.Data,
             MetaData = metadata,
             SymbolTablePageSize = symbolTablePageSize,
         };
@@ -479,13 +473,11 @@ internal static class ColumnChunkWriter
     }
 
     private static int WriteSymbolTablePage(
-        MemoryStream output,
+        ColumnChunkOutput output,
         FsstSymbolTable table,
-        ParquetWriteOptions options,
-        ref int totalUncompressed, ref int totalCompressed)
+        ParquetWriteOptions options)
     {
         byte[] body = table.Serialize();
-        int uncompressedSize = body.Length;
 
         int compressedLen = CompressTo(body, options);
         bool isCompressed = options.Compression != CompressionCodec.Uncompressed;
@@ -493,11 +485,8 @@ internal static class ColumnChunkWriter
         var pageHeader = new PageHeader
         {
             Type = PageType.SymbolTablePage,
-            UncompressedPageSize = uncompressedSize,
+            UncompressedPageSize = body.Length,
             CompressedPageSize = compressedLen,
-            Crc = options.PageChecksumEnabled
-                ? unchecked((int)ComputeCrc32C(t_compressBuffer.AsSpan(0, compressedLen)))
-                : null,
             SymbolTablePageHeader = new SymbolTablePageHeader
             {
                 Type = table.Type,
@@ -505,20 +494,7 @@ internal static class ColumnChunkWriter
             },
         };
 
-        byte[] headerBytes = MetadataEncoder.EncodePageHeader(pageHeader);
-        int pageSize = headerBytes.Length + compressedLen;
-
-#if NET8_0_OR_GREATER
-        output.Write(headerBytes);
-#else
-        output.Write(headerBytes, 0, headerBytes.Length);
-#endif
-        output.Write(t_compressBuffer!, 0, compressedLen);
-
-        totalUncompressed += headerBytes.Length + uncompressedSize;
-        totalCompressed += pageSize;
-
-        return pageSize;
+        return output.EmitPage(pageHeader, t_compressBuffer.AsSpan(0, compressedLen)).Size;
     }
 
     /// <summary>
@@ -580,15 +556,12 @@ internal static class ColumnChunkWriter
         int[]? repLevels,
         ParquetWriteOptions options)
     {
-        var output = new MemoryStream(dictResult.DictionaryPageData.Length + rowCount);
-        int totalUncompressedSize = 0;
-        int totalCompressedSize = 0;
+        var output = new ColumnChunkOutput(dictResult.DictionaryPageData.Length + rowCount, options);
 
         int bitWidth = DictionaryEncoder.GetIndexBitWidth(dictResult.DictionaryCount);
 
         // 1. Encode dictionary page
-        int dictionaryPageSize = WriteDictionaryPage(output, dictResult, options,
-            ref totalUncompressedSize, ref totalCompressedSize);
+        int dictionaryPageSize = WriteDictionaryPage(output, dictResult, options);
 
         // 2. Encode data pages with RLE dictionary indices
         int bytesPerIndex = Math.Max(1, (bitWidth + 7) / 8);
@@ -627,15 +600,13 @@ internal static class ColumnChunkWriter
             {
                 WriteDictDataPageV2(output, valuesLen, offset, pageValues, pageNonNull,
                     maxDefLevel, maxRepLevel, defLevels, repLevels, options,
-                    defEncoder, repEncoder,
-                    ref totalUncompressedSize, ref totalCompressedSize);
+                    defEncoder, repEncoder);
             }
             else
             {
                 WriteDictDataPageV1(output, valuesLen, offset, pageValues, pageNonNull,
                     maxDefLevel, maxRepLevel, defLevels, repLevels, options,
-                    defEncoder, repEncoder,
-                    ref totalUncompressedSize, ref totalCompressedSize);
+                    defEncoder, repEncoder);
             }
 
             offset += pageValues;
@@ -653,40 +624,34 @@ internal static class ColumnChunkWriter
             PathInSchema = pathInSchema is string[] arr ? arr : pathInSchema.ToArray(),
             Codec = options.Compression,
             NumValues = rowCount,
-            TotalUncompressedSize = totalUncompressedSize,
-            TotalCompressedSize = totalCompressedSize,
+            TotalUncompressedSize = output.TotalUncompressedSize,
+            TotalCompressedSize = output.TotalCompressedSize,
             DataPageOffset = 0, // set by caller
             DictionaryPageOffset = 0, // set by caller
         };
 
-        output.TryGetBuffer(out var buffer);
         return new ColumnChunkResult
         {
-            Data = buffer,
+            Data = output.Data,
             MetaData = metadata,
             DictionaryPageSize = dictionaryPageSize,
         };
     }
 
     private static int WriteDictionaryPage(
-        MemoryStream output,
+        ColumnChunkOutput output,
         DictionaryEncoder.DictionaryResult dictResult,
-        ParquetWriteOptions options,
-        ref int totalUncompressed, ref int totalCompressed)
+        ParquetWriteOptions options)
     {
         byte[] dictData = dictResult.DictionaryPageData;
-        int uncompressedSize = dictData.Length;
 
         int compressedLen = CompressTo(dictData, options);
 
         var pageHeader = new PageHeader
         {
             Type = PageType.DictionaryPage,
-            UncompressedPageSize = uncompressedSize,
+            UncompressedPageSize = dictData.Length,
             CompressedPageSize = compressedLen,
-            Crc = options.PageChecksumEnabled
-                ? unchecked((int)ComputeCrc32C(t_compressBuffer.AsSpan(0, compressedLen)))
-                : null,
             DictionaryPageHeader = new DictionaryPageHeader
             {
                 NumValues = dictResult.DictionaryCount,
@@ -694,33 +659,19 @@ internal static class ColumnChunkWriter
             },
         };
 
-        byte[] headerBytes = MetadataEncoder.EncodePageHeader(pageHeader);
-        int pageSize = headerBytes.Length + compressedLen;
-
-#if NET8_0_OR_GREATER
-        output.Write(headerBytes);
-#else
-        output.Write(headerBytes, 0, headerBytes.Length);
-#endif
-        output.Write(t_compressBuffer!, 0, compressedLen);
-
-        totalUncompressed += headerBytes.Length + uncompressedSize;
-        totalCompressed += pageSize;
-
-        return pageSize;
+        return output.EmitPage(pageHeader, t_compressBuffer.AsSpan(0, compressedLen)).Size;
     }
 
     /// <param name="uncompressedValuesSize">
     /// Bytes of encoded dictionary indices already sitting in the thread-static values buffer — see the
     /// page loop in <see cref="WriteDictionaryColumn"/>, which encodes them.
     /// </param>
-    private static void WriteDictDataPageV2(
-        MemoryStream output,
+    private static EmittedPage WriteDictDataPageV2(
+        ColumnChunkOutput output,
         int uncompressedValuesSize, int rowOffset, int numValues, int nonNullCount,
         int maxDefLevel, int maxRepLevel, int[]? defLevels, int[]? repLevels,
         ParquetWriteOptions options,
-        RleBitPackedEncoder? defEncoder, RleBitPackedEncoder? repEncoder,
-        ref int totalUncompressed, ref int totalCompressed)
+        RleBitPackedEncoder? defEncoder, RleBitPackedEncoder? repEncoder)
     {
         // Encode repetition levels (RLE, no length prefix for V2)
         int repLevelLen = 0;
@@ -746,22 +697,11 @@ internal static class ColumnChunkWriter
 
         int numRows = maxRepLevel > 0 ? CountRows(repLevels, rowOffset, numValues, maxRepLevel) : numValues;
 
-        int? pageCrc = null;
-        if (options.PageChecksumEnabled)
-        {
-            var crc = new System.IO.Hashing.Crc32();
-            if (repLevelLen > 0) crc.Append(repEncoder!.WrittenSpan);
-            if (defLevelLen > 0) crc.Append(defEncoder!.WrittenSpan);
-            crc.Append(t_compressBuffer.AsSpan(0, compressedValuesLen));
-            pageCrc = unchecked((int)CrcFinish(crc));
-        }
-
         var pageHeader = new PageHeader
         {
             Type = PageType.DataPageV2,
             UncompressedPageSize = repLevelLen + defLevelLen + uncompressedValuesSize,
             CompressedPageSize = repLevelLen + defLevelLen + compressedValuesLen,
-            Crc = pageCrc,
             DataPageHeaderV2 = new DataPageHeaderV2
             {
                 NumValues = numValues,
@@ -774,36 +714,23 @@ internal static class ColumnChunkWriter
             },
         };
 
-        byte[] headerBytes = MetadataEncoder.EncodePageHeader(pageHeader);
-
-#if NET8_0_OR_GREATER
-        output.Write(headerBytes);
-        if (repLevelLen > 0) output.Write(repEncoder!.WrittenSpan);
-        if (defLevelLen > 0) output.Write(defEncoder!.WrittenSpan);
-#else
-        output.Write(headerBytes, 0, headerBytes.Length);
-        if (repLevelLen > 0) { var tmp = repEncoder!.WrittenSpan.ToArray(); output.Write(tmp, 0, tmp.Length); }
-        if (defLevelLen > 0) { var tmp = defEncoder!.WrittenSpan.ToArray(); output.Write(tmp, 0, tmp.Length); }
-#endif
-        output.Write(t_compressBuffer!, 0, compressedValuesLen);
-
-        int uncompressedPageSize = headerBytes.Length + repLevelLen + defLevelLen + uncompressedValuesSize;
-        int compressedPageSize = headerBytes.Length + repLevelLen + defLevelLen + compressedValuesLen;
-        totalUncompressed += uncompressedPageSize;
-        totalCompressed += compressedPageSize;
+        return output.EmitPage(
+            pageHeader,
+            repLevelLen > 0 ? repEncoder!.WrittenSpan : default,
+            defLevelLen > 0 ? defEncoder!.WrittenSpan : default,
+            t_compressBuffer.AsSpan(0, compressedValuesLen));
     }
 
     /// <param name="valuesLen">
     /// Bytes of encoded dictionary indices already sitting in the thread-static values buffer — see the
     /// page loop in <see cref="WriteDictionaryColumn"/>, which encodes them.
     /// </param>
-    private static void WriteDictDataPageV1(
-        MemoryStream output,
+    private static EmittedPage WriteDictDataPageV1(
+        ColumnChunkOutput output,
         int valuesLen, int rowOffset, int numValues, int nonNullCount,
         int maxDefLevel, int maxRepLevel, int[]? defLevels, int[]? repLevels,
         ParquetWriteOptions options,
-        RleBitPackedEncoder? defEncoder, RleBitPackedEncoder? repEncoder,
-        ref int totalUncompressed, ref int totalCompressed)
+        RleBitPackedEncoder? defEncoder, RleBitPackedEncoder? repEncoder)
     {
         // Build uncompressed body: rep levels + def levels + values
         // All concatenated and compressed together for V1
@@ -852,9 +779,6 @@ internal static class ColumnChunkWriter
             Type = PageType.DataPage,
             UncompressedPageSize = uncompressedBodySize,
             CompressedPageSize = compressedLen,
-            Crc = options.PageChecksumEnabled
-                ? unchecked((int)ComputeCrc32C(t_compressBuffer.AsSpan(0, compressedLen)))
-                : null,
             DataPageHeader = new DataPageHeader
             {
                 NumValues = numValues,
@@ -864,17 +788,7 @@ internal static class ColumnChunkWriter
             },
         };
 
-        byte[] headerBytes = MetadataEncoder.EncodePageHeader(pageHeader);
-
-#if NET8_0_OR_GREATER
-        output.Write(headerBytes);
-#else
-        output.Write(headerBytes, 0, headerBytes.Length);
-#endif
-        output.Write(t_compressBuffer!, 0, compressedLen);
-
-        totalUncompressed += headerBytes.Length + uncompressedBodySize;
-        totalCompressed += headerBytes.Length + compressedLen;
+        return output.EmitPage(pageHeader, t_compressBuffer.AsSpan(0, compressedLen));
     }
 
     /// <summary>
@@ -991,15 +905,14 @@ internal static class ColumnChunkWriter
         return nonNull;
     }
 
-    private static void WriteDataPageV2(
-        MemoryStream output,
+    private static EmittedPage WriteDataPageV2(
+        ColumnChunkOutput output,
         IArrowArray array, int offset, int numValues, int nonNullCount,
         PhysicalType physicalType, int typeLength, int maxDefLevel, int maxRepLevel,
         int[]? defLevels, int[]? repLevels, int[]? valueDefLevels,
         ParquetWriteOptions options,
         RleBitPackedEncoder? defEncoder, RleBitPackedEncoder? repEncoder,
         FsstCompressedColumn? fsstColumn, int valueIndex,
-        ref int totalUncompressed, ref int totalCompressed,
         out Encoding valueEncoding)
     {
         // Encode repetition levels (RLE, no length prefix for V2)
@@ -1032,23 +945,11 @@ internal static class ColumnChunkWriter
         int numNulls = numValues - nonNullCount;
         int numRows = maxRepLevel > 0 ? CountRows(repLevels, offset, numValues, maxRepLevel) : numValues;
 
-        // CRC-32C covers the entire page payload (rep levels + def levels + compressed values).
-        int? pageCrc = null;
-        if (options.PageChecksumEnabled)
-        {
-            var crc = new System.IO.Hashing.Crc32();
-            if (repLevelLen > 0) crc.Append(repEncoder!.WrittenSpan);
-            if (defLevelLen > 0) crc.Append(defEncoder!.WrittenSpan);
-            crc.Append(t_compressBuffer.AsSpan(0, compressedValuesLen));
-            pageCrc = unchecked((int)CrcFinish(crc));
-        }
-
         var pageHeader = new PageHeader
         {
             Type = PageType.DataPageV2,
             UncompressedPageSize = repLevelLen + defLevelLen + uncompressedValuesSize,
             CompressedPageSize = repLevelLen + defLevelLen + compressedValuesLen,
-            Crc = pageCrc,
             DataPageHeaderV2 = new DataPageHeaderV2
             {
                 NumValues = numValues,
@@ -1061,33 +962,20 @@ internal static class ColumnChunkWriter
             },
         };
 
-        byte[] headerBytes = MetadataEncoder.EncodePageHeader(pageHeader);
-
-#if NET8_0_OR_GREATER
-        output.Write(headerBytes);
-        if (repLevelLen > 0) output.Write(repEncoder!.WrittenSpan);
-        if (defLevelLen > 0) output.Write(defEncoder!.WrittenSpan);
-#else
-        output.Write(headerBytes, 0, headerBytes.Length);
-        if (repLevelLen > 0) { var tmp = repEncoder!.WrittenSpan.ToArray(); output.Write(tmp, 0, tmp.Length); }
-        if (defLevelLen > 0) { var tmp = defEncoder!.WrittenSpan.ToArray(); output.Write(tmp, 0, tmp.Length); }
-#endif
-        output.Write(t_compressBuffer!, 0, compressedValuesLen);
-
-        int uncompressedPageSize = headerBytes.Length + repLevelLen + defLevelLen + uncompressedValuesSize;
-        int compressedPageSize = headerBytes.Length + repLevelLen + defLevelLen + compressedValuesLen;
-        totalUncompressed += uncompressedPageSize;
-        totalCompressed += compressedPageSize;
+        return output.EmitPage(
+            pageHeader,
+            repLevelLen > 0 ? repEncoder!.WrittenSpan : default,
+            defLevelLen > 0 ? defEncoder!.WrittenSpan : default,
+            t_compressBuffer.AsSpan(0, compressedValuesLen));
     }
 
-    private static void WriteDataPageV1(
-        MemoryStream output,
+    private static EmittedPage WriteDataPageV1(
+        ColumnChunkOutput output,
         IArrowArray array, int offset, int numValues, int nonNullCount,
         PhysicalType physicalType, int typeLength, int maxDefLevel, int maxRepLevel,
         int[]? defLevels, int[]? repLevels, int[]? valueDefLevels,
         ParquetWriteOptions options,
         RleBitPackedEncoder? defEncoder, RleBitPackedEncoder? repEncoder,
-        ref int totalUncompressed, ref int totalCompressed,
         out Encoding valueEncoding)
     {
         // Encode levels
@@ -1152,9 +1040,6 @@ internal static class ColumnChunkWriter
             Type = PageType.DataPage,
             UncompressedPageSize = uncompressedBodySize,
             CompressedPageSize = compressedLen,
-            Crc = options.PageChecksumEnabled
-                ? unchecked((int)ComputeCrc32C(t_compressBuffer.AsSpan(0, compressedLen)))
-                : null,
             DataPageHeader = new DataPageHeader
             {
                 NumValues = numValues,
@@ -1164,17 +1049,7 @@ internal static class ColumnChunkWriter
             },
         };
 
-        byte[] headerBytes = MetadataEncoder.EncodePageHeader(pageHeader);
-
-#if NET8_0_OR_GREATER
-        output.Write(headerBytes);
-#else
-        output.Write(headerBytes, 0, headerBytes.Length);
-#endif
-        output.Write(t_compressBuffer!, 0, compressedLen);
-
-        totalUncompressed += headerBytes.Length + uncompressedBodySize;
-        totalCompressed += headerBytes.Length + compressedLen;
+        return output.EmitPage(pageHeader, t_compressBuffer.AsSpan(0, compressedLen));
     }
 
     // ───── Compression ─────
@@ -2046,21 +1921,5 @@ internal static class ColumnChunkWriter
                 rows++;
         }
         return rows;
-    }
-
-    /// <summary>Computes CRC-32C of a contiguous span.</summary>
-    private static uint ComputeCrc32C(ReadOnlySpan<byte> data)
-    {
-        var crc = new System.IO.Hashing.Crc32();
-        crc.Append(data);
-        return CrcFinish(crc);
-    }
-
-    /// <summary>Extracts the uint32 hash value from a Crc32 instance.</summary>
-    private static uint CrcFinish(System.IO.Hashing.Crc32 crc)
-    {
-        Span<byte> hash = stackalloc byte[4];
-        crc.GetHashAndReset(hash);
-        return BinaryPrimitives.ReadUInt32LittleEndian(hash);
     }
 }
