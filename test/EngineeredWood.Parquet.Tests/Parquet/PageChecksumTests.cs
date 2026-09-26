@@ -87,12 +87,16 @@ public class PageChecksumTests
                 await writer.WriteRowGroupAsync(batch);
             }
 
-            // Tamper with a byte that's definitely in compressed page data.
-            // The footer is at the end: [data...][footer][4-byte length][PAR1].
-            // We tamper just before the footer — this is page data for the last column.
+            // Tamper with a byte that's definitely in compressed page data: 5 bytes before the end of the
+            // last column chunk, located through the footer. (Not "just before the footer": page indexes
+            // sit there, and they carry no CRC.)
             var fileBytes = File.ReadAllBytes(path);
             int footerLen = BitConverter.ToInt32(fileBytes, fileBytes.Length - 8);
-            int tamperOffset = fileBytes.Length - 8 - footerLen - 5; // 5 bytes before footer
+            var metadata = EngineeredWood.Parquet.Metadata.MetadataDecoder.DecodeFileMetaData(
+                fileBytes.AsSpan(fileBytes.Length - 8 - footerLen, footerLen));
+            var lastChunk = metadata.RowGroups[^1].Columns[^1].MetaData!;
+            long chunkStart = lastChunk.DictionaryPageOffset ?? lastChunk.DataPageOffset;
+            int tamperOffset = checked((int)(chunkStart + lastChunk.TotalCompressedSize - 5));
             fileBytes[tamperOffset] ^= 0xFF; // flip all bits for maximum disruption
             File.WriteAllBytes(path, fileBytes);
 

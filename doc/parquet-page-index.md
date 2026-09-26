@@ -191,8 +191,8 @@ file; a per-column override can be added later if someone needs it.
   default 64; see W-3).
 - **Decided: page indexes are written by default, provided the memory and duration
   overhead is nominal.** parquet-mr and arrow-rs also default on; pyarrow defaults off.
-  - The writer lands with `WritePageIndex = false` (phase 3). Phase 4 measures the
-    overhead and flips the default in its own PR.
+  - The writer landed with `WritePageIndex = false` (phase 3, #399). Phase 4 measured the
+    overhead and turned the default on (below).
   - The measurement uses the Parquet write benchmarks with and without page indexes:
     wall-clock duration, allocated bytes and peak working set (BenchmarkDotNet's
     `MemoryDiagnoser`), over plain, dictionary, string-heavy and nested schemas, with
@@ -201,6 +201,58 @@ file; a per-column override can be added later if someone needs it.
   - The phase-4 PR records the numbers and the case for calling them nominal. If they are
     not, the default stays off until the cost is brought down, for example by deriving
     chunk statistics from the page statistics instead of computing both (W-2).
+- **Measured (phase 4): nominal, so the default is on.** 500,000 rows, net10.0, i9-12900K. The
+  plain, strings and nested writes were first +6% to +15% slower with the index at the
+  default page size. The cause was the second pass over the values: page bounds, then chunk
+  statistics. So chunk statistics are now folded from the page bounds when a page index is
+  written (`PageIndexCollector.ChunkStatistics`, byte-identical to the scan; see
+  `ChunkStatistics_AreIdenticalWithAndWithoutTheIndex`). With the fold, time is within noise,
+  except for repeated (list/map) columns (below).
+
+  Index cost, as the median of 25 alternating off/on rounds in one process
+  (`dotnet run -c Release -f net10.0 -- pageindex-ab`). Each cell shows three separate runs;
+  even with alternating rounds, one run moves by up to ±10 points on this machine:
+
+  | Schema | 1 MiB pages, V1 | 1 MiB pages, V2 | 8 KiB pages, V1 / V2 | Allocated, 1 MiB |
+  |---|---|---|---|---|
+  | plain | +0.1 / −5.4 / −5.1% | −6.0 / −3.8 / +2.0% | +3% to +13% / −7% to +25% | +0.02% |
+  | dictionary | +2.2 / +0.9 / −2.1% | +4.1 / +1.2 / −1.2% | +1% to +5% / +4% | +0.1% |
+  | strings | −3.2 / −4.3 / +0.2% | −1.9 / +9.1 / −12.1% | +3% to +14% / +6% to +15% | +0.03% |
+  | nested | +0.1 / +4.2 / +4.9% | +2.0 / +4.5 / +6.7% | +2% to +8% / +5% to +7% | +0.01% |
+
+  Before the fold, one run at 1 MiB gave: plain +5.9% / +14.3%, strings +4.6% / +14.4%, and
+  nested +12.8% / +11.1%. Now plain, dictionary and strings center on zero. Allocations are
+  the median over the rounds and barely vary.
+
+  **The nested schema's remaining cost is its repeated column.** Measured one column at a
+  time (`-- pageindex-ab 25 nested nested:list nested:struct nested:id`), from the same data,
+  two runs, 1 MiB pages, V1 / V2:
+
+  | Column | Run 1 | Run 2 | Share of the nested write |
+  |---|---|---|---|
+  | whole `nested` schema | +4.0% / +3.7% | +5.0% / +4.5% | ~98 ms |
+  | `list<int64>` (repeated) | −1.6% / +3.7% | +6.9% / +4.8% | ~100 ms on its own |
+  | `struct{int32, string}` (nested, not repeated) | +0.8% / +1.0% | +1.8% / +2.2% | ~19 ms |
+  | flat `int64` | +5.2% / −3.7% | −1.8% / +1.3% | ~5 ms, too short to resolve |
+
+  So repeated columns keep a small, consistent cost of about +3% to +5%. A non-repeated
+  struct costs about +1% to +2%, like the dictionary schema, and flat columns cost nothing
+  measurable. The cause inside the repeated path is not profiled. The likely suspect is
+  `PageRows`, which counts each page's rows over its repetition levels: a second pass on V2,
+  whose header already counted them, and a new pass on V1. Counting once, in the V2 header,
+  and reusing that count would be the first thing to try.
+  - **File size:** +0.01% at the default page size; +0.4% to +1.7% at 8 KiB.
+  - **Peak working set:** the median of 5 fresh processes per configuration
+    (`-- pageindex-overhead`) moves −15% to +9% in both directions, with no pattern. That is GC
+    heap sizing, which dominates the peak; the index itself holds a few bytes per page until
+    `CloseAsync`. There is no measurable cost within that ±10–20% noise floor.
+  - **BenchmarkDotNet** (`PageIndexWriteBenchmarks`) agrees, but its methods run one after the
+    other, so machine load that changes between them moves the ratio. The alternating run is
+    the one to trust. It has to run in process: the generated child project cannot build
+    through `build/StrongNameUnsignedReferences.targets`.
+  - **Small pages:** 8 KiB pages still cost several percent, with runs up to +15% for strings
+    (and one +25% plain outlier). That is per-page work (bounds, truncation, one index entry)
+    and is not the default.
 - **Encryption:** when encryption lands, these two structures are module types 6/7. Route
   their bytes through one write helper and one read helper so there is one place to encrypt
   them (encryption plan D8).

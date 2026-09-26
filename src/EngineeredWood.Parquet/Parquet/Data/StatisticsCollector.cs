@@ -193,6 +193,62 @@ internal static class StatisticsCollector
     }
 
     /// <summary>
+    /// The chunk statistics <see cref="Compute"/> would return, built from bounds already found
+    /// page by page — so a column whose pages were scanned for a page index is not scanned again.
+    /// </summary>
+    /// <param name="min">The least non-NaN value, untruncated; null if every value is NaN.</param>
+    /// <param name="max">The greatest non-NaN value, untruncated.</param>
+    /// <param name="firstNaN">The first NaN in row order, for an all-NaN chunk under total order.</param>
+    /// <param name="nanCount">NaN values in the chunk, for FLOAT/DOUBLE.</param>
+    /// <remarks>
+    /// Mirrors <see cref="Compute"/> field for field, including the 64-byte BYTE_ARRAY truncation and
+    /// the exactness flags; tests hold the two to byte-identical output. Call only for a chunk with at
+    /// least one non-null value, whose every page's bounds reached the fold.
+    /// </remarks>
+    public static Statistics FromBounds(
+        PhysicalType physicalType,
+        byte[]? min,
+        byte[]? max,
+        byte[]? firstNaN,
+        long nanCount,
+        long nullCount,
+        bool floatingPointTotalOrder)
+    {
+        if (physicalType is PhysicalType.Float or PhysicalType.Double)
+        {
+            if (min is null && floatingPointTotalOrder && nanCount > 0)
+                min = max = firstNaN;
+
+            return new Statistics
+            {
+                NullCount = nullCount,
+                Min = min,
+                Max = max,
+                MinValue = min,
+                MaxValue = max,
+                IsMinValueExact = min != null ? true : (bool?)null,
+                IsMaxValueExact = max != null ? true : (bool?)null,
+                NanCount = nanCount,
+            };
+        }
+
+        var (minBytes, maxBytes, minExact, maxExact) = physicalType == PhysicalType.ByteArray && min is not null
+            ? TruncateBinaryStats(min, max!)
+            : (min, max, true, true);
+
+        return new Statistics
+        {
+            NullCount = nullCount,
+            Min = minBytes,
+            Max = maxBytes,
+            MinValue = minBytes,
+            MaxValue = maxBytes,
+            IsMinValueExact = minBytes != null ? minExact : null,
+            IsMaxValueExact = maxBytes != null ? maxExact : null,
+        };
+    }
+
+    /// <summary>
     /// Orders two encoded values of one column the way the scans here order them: the comparator a
     /// dictionary-encoded page's bounds and a page index's boundary order are decided with. Both
     /// values must be non-NaN.

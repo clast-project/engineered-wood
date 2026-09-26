@@ -255,13 +255,16 @@ internal static class ColumnChunkWriter
             bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
             bool floatingPointTotalOrder =
                 options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder;
+            // A page index already found every page's bounds with the same scans; folding them gives
+            // these statistics exactly, and saves the second pass over the values.
             var stats = dictResult != null && !isFloatingPoint
                 ? StatisticsCollector.ComputeFromDictEntries(
                     dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
                     physicalType, typeLength, rowCount - nonNullCount, statisticsOrder)
-                : StatisticsCollector.Compute(
-                    array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
-                    floatingPointTotalOrder, statisticsOrder);
+                : pageIndex?.ChunkStatistics(nonNullCount, rowCount)
+                    ?? StatisticsCollector.Compute(
+                        array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
+                        floatingPointTotalOrder, statisticsOrder);
             result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array), physicalType);
         }
 
