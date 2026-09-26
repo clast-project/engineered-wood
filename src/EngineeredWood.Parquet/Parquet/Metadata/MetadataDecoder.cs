@@ -521,6 +521,10 @@ internal static class MetadataDecoder
         string? filePath = null;
         long? fileOffset = null;
         ColumnMetaData? metaData = null;
+        long? offsetIndexOffset = null;
+        int? offsetIndexLength = null;
+        long? columnIndexOffset = null;
+        int? columnIndexLength = null;
 
         while (true)
         {
@@ -538,6 +542,18 @@ internal static class MetadataDecoder
                 case 3 when type == ThriftType.Struct: // meta_data: ColumnMetaData
                     metaData = ReadColumnMetaData(ref reader);
                     break;
+                case 4 when type == ThriftType.I64: // offset_index_offset: i64
+                    offsetIndexOffset = reader.ReadZigZagInt64();
+                    break;
+                case 5 when type == ThriftType.I32: // offset_index_length: i32
+                    offsetIndexLength = reader.ReadZigZagInt32();
+                    break;
+                case 6 when type == ThriftType.I64: // column_index_offset: i64
+                    columnIndexOffset = reader.ReadZigZagInt64();
+                    break;
+                case 7 when type == ThriftType.I32: // column_index_length: i32
+                    columnIndexLength = reader.ReadZigZagInt32();
+                    break;
                 default:
                     reader.Skip(type);
                     break;
@@ -551,6 +567,10 @@ internal static class MetadataDecoder
             FilePath = filePath,
             FileOffset = fileOffset ?? throw new ParquetFormatException("ColumnChunk missing required field: file_offset"),
             MetaData = metaData,
+            OffsetIndexOffset = offsetIndexOffset,
+            OffsetIndexLength = offsetIndexLength,
+            ColumnIndexOffset = columnIndexOffset,
+            ColumnIndexLength = columnIndexLength,
         };
     }
 
@@ -831,6 +851,226 @@ internal static class MetadataDecoder
         reader.PopStruct();
 
         return new SortingColumn(columnIndex, descending, nullsFirst);
+    }
+
+    /// <summary>
+    /// Decodes an <see cref="OffsetIndex"/> from the Thrift-encoded bytes that
+    /// <see cref="ColumnChunk.OffsetIndexOffset"/> and <see cref="ColumnChunk.OffsetIndexLength"/> locate.
+    /// </summary>
+    public static OffsetIndex DecodeOffsetIndex(ReadOnlySpan<byte> data)
+    {
+        var reader = new ThriftCompactReader(data);
+        reader.PushStruct();
+
+        PageLocation[]? pageLocations = null;
+        long[]? unencodedByteArrayDataBytes = null;
+
+        while (true)
+        {
+            var (type, fid) = reader.ReadFieldHeader();
+            if (type == ThriftType.Stop) break;
+
+            switch (fid)
+            {
+                case 1 when type == ThriftType.List: // page_locations: list<PageLocation>
+                    pageLocations = ReadPageLocationList(ref reader);
+                    break;
+                case 2 when type == ThriftType.List: // unencoded_byte_array_data_bytes: list<i64>
+                    unencodedByteArrayDataBytes = ReadI64List(ref reader, "unencoded_byte_array_data_bytes");
+                    break;
+                default:
+                    reader.Skip(type);
+                    break;
+            }
+        }
+
+        reader.PopStruct();
+
+        if (pageLocations is null) throw new ParquetFormatException("OffsetIndex missing required field: page_locations");
+        RequirePageCount(unencodedByteArrayDataBytes, pageLocations.Length, "OffsetIndex", "unencoded_byte_array_data_bytes");
+
+        return new OffsetIndex
+        {
+            PageLocations = pageLocations,
+            UnencodedByteArrayDataBytes = unencodedByteArrayDataBytes,
+        };
+    }
+
+    /// <summary>
+    /// Decodes a <see cref="ColumnIndex"/> from the Thrift-encoded bytes that
+    /// <see cref="ColumnChunk.ColumnIndexOffset"/> and <see cref="ColumnChunk.ColumnIndexLength"/> locate.
+    /// </summary>
+    /// <remarks>
+    /// The per-page lists must agree on the page count, since a reader indexes all of them by page.
+    /// The level histograms are exempt: they hold one entry per level per page, and checking them
+    /// needs the column's maximum levels, which only the schema knows.
+    /// </remarks>
+    public static ColumnIndex DecodeColumnIndex(ReadOnlySpan<byte> data)
+    {
+        var reader = new ThriftCompactReader(data);
+        reader.PushStruct();
+
+        bool[]? nullPages = null;
+        byte[][]? minValues = null;
+        byte[][]? maxValues = null;
+        BoundaryOrder? boundaryOrder = null;
+        long[]? nullCounts = null;
+        long[]? repetitionLevelHistograms = null;
+        long[]? definitionLevelHistograms = null;
+        long[]? nanCounts = null;
+
+        while (true)
+        {
+            var (type, fid) = reader.ReadFieldHeader();
+            if (type == ThriftType.Stop) break;
+
+            switch (fid)
+            {
+                case 1 when type == ThriftType.List: // null_pages: list<bool>
+                    nullPages = ReadBoolList(ref reader, "null_pages");
+                    break;
+                case 2 when type == ThriftType.List: // min_values: list<binary>
+                    minValues = ReadBinaryList(ref reader, "min_values");
+                    break;
+                case 3 when type == ThriftType.List: // max_values: list<binary>
+                    maxValues = ReadBinaryList(ref reader, "max_values");
+                    break;
+                case 4 when type == ThriftType.I32: // boundary_order: BoundaryOrder
+                    boundaryOrder = (BoundaryOrder)reader.ReadZigZagInt32();
+                    break;
+                case 5 when type == ThriftType.List: // null_counts: list<i64>
+                    nullCounts = ReadI64List(ref reader, "null_counts");
+                    break;
+                case 6 when type == ThriftType.List: // repetition_level_histograms: list<i64>
+                    repetitionLevelHistograms = ReadI64List(ref reader, "repetition_level_histograms");
+                    break;
+                case 7 when type == ThriftType.List: // definition_level_histograms: list<i64>
+                    definitionLevelHistograms = ReadI64List(ref reader, "definition_level_histograms");
+                    break;
+                case 8 when type == ThriftType.List: // nan_counts: list<i64> (PARQUET-2249)
+                    nanCounts = ReadI64List(ref reader, "nan_counts");
+                    break;
+                default:
+                    reader.Skip(type);
+                    break;
+            }
+        }
+
+        reader.PopStruct();
+
+        if (nullPages is null) throw new ParquetFormatException("ColumnIndex missing required field: null_pages");
+        if (minValues is null) throw new ParquetFormatException("ColumnIndex missing required field: min_values");
+        if (maxValues is null) throw new ParquetFormatException("ColumnIndex missing required field: max_values");
+        int pages = nullPages.Length;
+        RequirePageCount(minValues, pages, "ColumnIndex", "min_values");
+        RequirePageCount(maxValues, pages, "ColumnIndex", "max_values");
+        RequirePageCount(nullCounts, pages, "ColumnIndex", "null_counts");
+        RequirePageCount(nanCounts, pages, "ColumnIndex", "nan_counts");
+
+        return new ColumnIndex
+        {
+            NullPages = nullPages,
+            MinValues = minValues,
+            MaxValues = maxValues,
+            BoundaryOrder = boundaryOrder
+                ?? throw new ParquetFormatException("ColumnIndex missing required field: boundary_order"),
+            NullCounts = nullCounts,
+            RepetitionLevelHistograms = repetitionLevelHistograms,
+            DefinitionLevelHistograms = definitionLevelHistograms,
+            NanCounts = nanCounts,
+        };
+    }
+
+    private static void RequirePageCount<T>(T[]? list, int pages, string structName, string fieldName)
+    {
+        if (list is not null && list.Length != pages)
+        {
+            throw new ParquetFormatException(
+                $"{structName} field {fieldName} has {list.Length} entries for {pages} pages.");
+        }
+    }
+
+    /// <summary>
+    /// Reads the header of a page-index list. Unlike the footer's lists, one with the wrong element
+    /// type cannot be skipped, since every entry is needed. The count is checked against the bytes
+    /// left, because each element occupies at least one byte and the count sizes the allocation.
+    /// </summary>
+    private static int ReadPageIndexListHeader(
+        ref ThriftCompactReader reader, string fieldName, ThriftType expected, ThriftType alsoAccepted)
+    {
+        var (elemType, count) = reader.ReadListHeader();
+        if (elemType != expected && elemType != alsoAccepted)
+            throw new ParquetFormatException($"Page index field {fieldName} has element type {elemType}, expected {expected}.");
+        if (count > reader.Remaining)
+            throw new ParquetFormatException($"Page index field {fieldName} claims {count} entries in {reader.Remaining} bytes.");
+        return count;
+    }
+
+    private static PageLocation[] ReadPageLocationList(ref ThriftCompactReader reader)
+    {
+        int count = ReadPageIndexListHeader(ref reader, "page_locations", ThriftType.Struct, ThriftType.Struct);
+        var array = new PageLocation[count];
+        for (int i = 0; i < count; i++)
+            array[i] = ReadPageLocation(ref reader);
+        return array;
+    }
+
+    private static PageLocation ReadPageLocation(ref ThriftCompactReader reader)
+    {
+        reader.PushStruct();
+
+        long? offset = null;
+        int? compressedPageSize = null;
+        long? firstRowIndex = null;
+
+        while (true)
+        {
+            var (type, fid) = reader.ReadFieldHeader();
+            if (type == ThriftType.Stop) break;
+
+            switch (fid)
+            {
+                case 1 when type == ThriftType.I64: offset = reader.ReadZigZagInt64(); break;
+                case 2 when type == ThriftType.I32: compressedPageSize = reader.ReadZigZagInt32(); break;
+                case 3 when type == ThriftType.I64: firstRowIndex = reader.ReadZigZagInt64(); break;
+                default: reader.Skip(type); break;
+            }
+        }
+
+        reader.PopStruct();
+
+        return new PageLocation(
+            offset ?? throw new ParquetFormatException("PageLocation missing required field: offset"),
+            compressedPageSize ?? throw new ParquetFormatException("PageLocation missing required field: compressed_page_size"),
+            firstRowIndex ?? throw new ParquetFormatException("PageLocation missing required field: first_row_index"));
+    }
+
+    private static bool[] ReadBoolList(ref ThriftCompactReader reader, string fieldName)
+    {
+        // Writers disagree on which of the two compact bool codes names a bool list's element type.
+        int count = ReadPageIndexListHeader(ref reader, fieldName, ThriftType.BooleanTrue, ThriftType.BooleanFalse);
+        var array = new bool[count];
+        for (int i = 0; i < count; i++)
+            array[i] = reader.ReadBool();
+        return array;
+    }
+
+    private static byte[][] ReadBinaryList(ref ThriftCompactReader reader, string fieldName)
+    {
+        int count = ReadPageIndexListHeader(ref reader, fieldName, ThriftType.Binary, ThriftType.Binary);
+        var array = new byte[count][];
+        for (int i = 0; i < count; i++)
+            array[i] = reader.ReadBinary().ToArray();
+        return array;
+    }
+
+    private static long[] ReadI64List(ref ThriftCompactReader reader, string fieldName)
+    {
+        int count = ReadPageIndexListHeader(ref reader, fieldName, ThriftType.I64, ThriftType.I64);
+        var array = new long[count];
+        for (int i = 0; i < count; i++)
+            array[i] = reader.ReadZigZagInt64();
+        return array;
     }
 
     /// <summary>

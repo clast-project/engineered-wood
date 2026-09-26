@@ -40,6 +40,9 @@ internal ref struct ThriftCompactReader
     /// <summary>Current read position within the data span.</summary>
     public int Position => _position;
 
+    /// <summary>Bytes left to read. Every list element occupies at least one, which bounds a list's count.</summary>
+    public int Remaining => _data.Length - _position;
+
     public byte ReadByte()
     {
         if (_position >= _data.Length)
