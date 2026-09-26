@@ -125,6 +125,7 @@ public class PageIndexWriterTests : IDisposable
 
     [Theory]
     [InlineData(DataPageVersion.V1, false)]
+    [InlineData(DataPageVersion.V1, true)]
     [InlineData(DataPageVersion.V2, false)]
     [InlineData(DataPageVersion.V2, true)]
     public async Task SortedColumn_PageBoundsAreItsFirstAndLastValues(DataPageVersion version, bool descending)
