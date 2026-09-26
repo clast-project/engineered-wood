@@ -499,6 +499,14 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         return Data.ArrowArrayFactory.BuildArray(arrayData);
     }
 
+    /// <summary>
+    /// A decimal written as FIXED_LEN_BYTE_ARRAY: big-endian in Parquet, little-endian in Arrow (#400).
+    /// These types derive from <see cref="Apache.Arrow.Types.FixedSizeBinaryType"/>, so they take the
+    /// FIXED_LEN_BYTE_ARRAY arms here unless something reverses their bytes.
+    /// </summary>
+    private static bool IsFlbaDecimal(Apache.Arrow.Types.IArrowType type) =>
+        type is Apache.Arrow.Types.Decimal128Type or Apache.Arrow.Types.Decimal256Type;
+
     private static IArrowArray ReconstructFixedLenByteArray(
         byte[] dictPage, int[] indices, int[]? defLevels, int numRows,
         bool isNullable, int byteWidth, Apache.Arrow.Types.IArrowType arrowType)
@@ -514,6 +522,11 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
             int dictIdx = indices[idx++];
             dictPage.AsSpan(dictIdx * byteWidth, byteWidth).CopyTo(values.AsSpan(row * byteWidth));
+
+            // The page holds a decimal big-endian, as Parquet stores it; the rebuilt array goes back
+            // through ColumnChunkWriter, which expects Arrow's little-endian order and reverses it again.
+            if (IsFlbaDecimal(arrowType))
+                values.AsSpan(row * byteWidth, byteWidth).Reverse();
             if (nullBitmap != null)
                 nullBitmap[row / 8] |= (byte)(1 << (row % 8));
         }
@@ -933,6 +946,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
             bool isByteArray = PhysicalType == PhysicalType.ByteArray ||
                 (ArrowType is Apache.Arrow.Types.StringType or Apache.Arrow.Types.BinaryType);
+            bool bigEndian = IsFlbaDecimal(ArrowType);
 
             var page = new byte[_dictPageSize];
             int pos = 0;
@@ -944,6 +958,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     pos += 4;
                 }
                 entry.CopyTo(page.AsSpan(pos));
+                if (bigEndian)
+                    page.AsSpan(pos, entry.Length).Reverse();
                 pos += entry.Length;
             }
             return page;
