@@ -515,6 +515,54 @@ public sealed record ParquetWriteOptions
     public bool PageChecksumEnabled { get; init; }
 
     /// <summary>
+    /// Whether to write a page index — a ColumnIndex and an OffsetIndex per column chunk — so that
+    /// readers such as DataFusion, Trino and parquet-mr can skip pages inside a row group. Default is
+    /// <see langword="false"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>The OffsetIndex locates every data page and is written for every column. The ColumnIndex
+    /// holds each page's bounds, null count and (for FLOAT/DOUBLE) NaN count, and is written only for
+    /// columns that also get chunk statistics (see <see cref="WriteStatistics"/>). It is omitted for
+    /// FLOAT16 columns, whose bounds are not yet ordered correctly, and, as the format requires, for
+    /// a FLOAT/DOUBLE chunk under <see cref="FloatingPointColumnOrder.TypeDefined"/> in which some
+    /// page holds only NaNs.</para>
+    /// <para>The indexes are written after the last row group, before the footer, and kept in memory
+    /// until <c>CloseAsync</c>: a few bytes per page.</para>
+    /// </remarks>
+    public bool WritePageIndex { get; init; }
+
+    /// <summary>
+    /// The longest BYTE_ARRAY bound, in bytes, that a page index records. Longer bounds are shortened:
+    /// a minimum to a prefix, a maximum to a prefix that is then incremented so it still bounds the
+    /// page. UTF-8 strings are cut and incremented on code-point boundaries, so the result stays valid
+    /// UTF-8. Default is 64, parquet-mr's default. <see langword="null"/> records bounds in full.
+    /// </summary>
+    /// <remarks>
+    /// Only BYTE_ARRAY bounds are shortened. FIXED_LEN_BYTE_ARRAY values (decimals, UUIDs, the
+    /// extended timestamp carrier) are short and are never truncated, since a shortened decimal or
+    /// timestamp would no longer be a value of its type. Chunk statistics are not affected by this
+    /// setting.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The value is zero or negative.</exception>
+    public int? PageIndexTruncateLength
+    {
+        get => _pageIndexTruncateLength;
+        init
+        {
+            if (value is <= 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(PageIndexTruncateLength), value,
+                    "Must be positive, or null to record page-index bounds in full.");
+            }
+
+            _pageIndexTruncateLength = value;
+        }
+    }
+
+    private readonly int? _pageIndexTruncateLength = 64;
+
+    /// <summary>
     /// Column names (dotted paths) for which Bloom filters should be written.
     /// <c>null</c> (the default) disables Bloom filter writing for all columns.
     /// Use a <see cref="HashSet{T}"/> for efficient lookup.

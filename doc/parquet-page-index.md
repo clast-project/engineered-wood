@@ -71,7 +71,9 @@ Rules that bite:
 - **NaN.**
   - Under `TYPE_ORDER`, if any page's non-null values are *all* NaN, the ColumnIndex must
     be **omitted for that chunk**. The OffsetIndex is still written.
-  - Under `IEEE754_TOTAL_ORDER`, such a page's bounds are the smallest and largest NaN.
+  - Under `IEEE754_TOTAL_ORDER`, such a page's bounds are the smallest and largest NaN. EW uses
+    the first NaN in row order for both, as its chunk statistics already do (one comparator), and
+    records the chunk's `boundary_order` as `UNORDERED`.
 - **INT96.** No ColumnIndex unless the column order is `INT96_TIMESTAMP_ORDER`. EW's
   `ColumnOrder` enum has no such member, so EW never writes one for INT96.
 - **Truncated bounds** "must still be valid values within the column's logical type". A
@@ -92,7 +94,7 @@ Rules that bite:
 | Chunk placement + footer | `ParquetFileAssembler`, shared by `ParquetFileWriter` and `BufferedParquetWriter` |
 | Filter | `ParquetReadOptions.Filter` is evaluated per row group by `StatisticsEvaluator.Evaluate<RowGroup>` through `ParquetStatisticsAccessor`. The contract is a **superset**: the caller re-applies the predicate |
 | Page walkers | Three independent loops (`ColumnChunkReader.ReadColumn`, `TryReadFixedListColumn`, `PageMapBuilder.Build`) plus the lazy `*FromEntry` decode |
-| Truncation | None anywhere. Chunk statistics are written full-length |
+| Truncation | Chunk statistics already shorten BYTE_ARRAY bounds to 64 bytes, but on a byte boundary, so a STRING bound can be cut inside a code point. The page index truncates by its own UTF-8-aware rule (W-3) |
 
 The shared refactors in [`encryption-design.md`](encryption-design.md) (Phase 1a: one
 `PageReader`; Phase 1b: `EmitPage` plus de-duplicating the two writers) are prerequisites
@@ -148,7 +150,8 @@ file; a per-column override can be added later if someone needs it.
 - **Never truncate FIXED_LEN_BYTE_ARRAY**: decimals are signed big-endian, and the
   extended-timestamp carrier is signed little-endian (already noted in `known-issues.md`).
   UUID and FLOAT16 are fixed-width and small anyway.
-- Chunk-level `Statistics` stay untruncated, as today. Only the index truncates.
+- Chunk-level `Statistics` keep their existing rule (64 bytes, cut on a byte boundary) and are
+  not affected by `PageIndexTruncateLength`.
 
 ### W-4. The rest of the ColumnIndex
 
@@ -206,7 +209,7 @@ file; a per-column override can be added later if someone needs it.
 
 | Oracle | What it proves |
 |---|---|
-| **DataFusion 54** (arrow-rs, page index on by default), via the existing reader-interop tier (#237) | EW writes a sorted column with many small pages; a filtered `SELECT` in DataFusion must equal the same filter over a full read in DuckDB (which ignores page indexes). EXPLAIN ANALYZE's page-index pruning metrics must show pages actually pruned, or the test proves nothing |
+| **DataFusion 54** (arrow-rs, page index on by default), via the existing reader-interop tier (#237) | EW writes a sorted column with many small pages; a filtered `SELECT` in DataFusion must equal the same filter over a full read in DuckDB (which ignores page indexes). EXPLAIN ANALYZE's page-index pruning metrics must show pages actually pruned, or the test proves nothing. Use `page_index_rows_pruned`: DataFusion 54's `page_index_pages_pruned` reported "0 matched" for string and decimal predicates that matched a page's rows |
 | **Mutation check** | Deliberately write one page's max *below* a value that page really contains. DataFusion must then drop rows, turning the test red. A tier that cannot fail tests nothing |
 | pyarrow `ColumnChunkMetaData.has_column_index` / `has_offset_index` | Structural presence only (pyarrow's Python API does not expose index contents) |
 | EW self-check (after R-1) | Walk the chunk's page headers and assert that each `PageLocation` offset, size and `first_row_index` matches, and that each page's recomputed min/max lies within the index bounds |
@@ -313,7 +316,7 @@ testing the writer.
 | 0 | #389: row-aligned pages | small | – |
 | 1 | Thrift model + codec for §1, ColumnChunk fields 4–7 (both directions) | small | – |
 | 2 | Encryption plan Phase 1b: `EmitPage`, shared writer code | medium | – |
-| 3 | W-2…W-6, landing with `WritePageIndex = false`, + W-7 oracles | medium | 0, 1, 2 |
+| 3 | W-2…W-6, landing with `WritePageIndex = false`, + W-7 oracles | medium | 0, 1, 2, #396 |
 | 4 | Measure memory and duration overhead; default on if nominal (W-6) | small | 3 |
 | 5 | R-1: parse/expose + fixture self-consistency | small | 1 |
 | 6 | Encryption plan Phase 1a: `PageReader` with position-derived ordinals | medium | – |
