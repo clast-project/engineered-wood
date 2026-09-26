@@ -119,11 +119,20 @@ internal sealed class ParquetFileAssembler
     /// Writes the footer, its length and the trailing magic, then flushes. The leading magic must
     /// already have been written.
     /// </summary>
+    /// <param name="schema">The Parquet schema the row groups were encoded against.</param>
+    /// <param name="arrowSchema">
+    /// The Arrow schema as the caller declared it, before any unit rescaling, recorded under
+    /// <c>ARROW:schema</c> when <see cref="ParquetWriteOptions.WriteArrowSchema"/> is set. Null when
+    /// the writer never saw one.
+    /// </param>
+    /// <param name="cancellationToken">Cancels the write.</param>
     public async ValueTask WriteFooterAsync(
         IReadOnlyList<SchemaElement> schema,
-        IReadOnlyList<KeyValue>? keyValueMetadata,
+        Apache.Arrow.Schema? arrowSchema,
         CancellationToken cancellationToken)
     {
+        var keyValueMetadata = BuildKeyValueMetadata(arrowSchema);
+
         long totalRows = 0;
         foreach (var rg in _rowGroups)
             totalRows += rg.NumRows;
@@ -150,5 +159,37 @@ internal sealed class ParquetFileAssembler
 
         await _file.WriteAsync(Par1Magic, cancellationToken).ConfigureAwait(false);
         await _file.FlushAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Adds the <c>ARROW:schema</c> entry to whatever the caller supplied, so that units and zone
+    /// names Parquet cannot express survive a round trip the way they do through PyArrow and Polars.
+    /// A caller who sets the key explicitly keeps their own value.
+    /// </summary>
+    private IReadOnlyList<KeyValue>? BuildKeyValueMetadata(Apache.Arrow.Schema? arrowSchema)
+    {
+        var supplied = _options.KeyValueMetadata;
+        if (!_options.WriteArrowSchema || arrowSchema is null)
+            return supplied;
+
+        if (supplied is not null)
+        {
+            foreach (var entry in supplied)
+            {
+                if (string.Equals(entry.Key, ArrowSchemaMetadata.Key, StringComparison.Ordinal))
+                    return supplied;
+            }
+        }
+
+        var merged = new List<KeyValue>(supplied?.Count + 1 ?? 1);
+        if (supplied is not null)
+            merged.AddRange(supplied);
+
+        merged.Add(new KeyValue
+        {
+            Key = ArrowSchemaMetadata.Key,
+            Value = ArrowSchemaMetadata.Encode(arrowSchema),
+        });
+        return merged;
     }
 }
