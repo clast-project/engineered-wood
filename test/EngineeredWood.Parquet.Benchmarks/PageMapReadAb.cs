@@ -68,7 +68,7 @@ internal static class PageMapReadAb
                         }
 
                         Console.WriteLine(
-                            $"| {schema} | {version} | {label} | {Median(msOff):F1} | {Median(msOn):F1} | {(Median(ratios) - 1) * 100:+0;-0}% " +
+                            $"| {schema} | {version} | {label} | {Median(msOff):F1} | {Median(msOn):F1} | {(Median(ratios) - 1) * 100:+0;-0;0}% " +
                             $"| {ioOff.Requests} | {ioOn.Requests} | {ioOff.Bytes:N0} | {ioOn.Bytes:N0} | {new FileInfo(on).Length:N0} |");
                     }
                 }
