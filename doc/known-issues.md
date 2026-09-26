@@ -30,8 +30,8 @@ For the forward-looking encryption design, see
 ### Missing features
 
 **Modular encryption (PARQUET-1375).** Neither reading nor writing of
-encrypted Parquet files is implemented. Encrypted test files are skipped
-by the test sweeps. See [`encryption-design.md`](encryption-design.md).
+encrypted Parquet files is implemented. The encrypted fixtures are never
+opened by the test sweeps (they do not match the `*.parquet` glob). See [`encryption-design.md`](encryption-design.md).
 
 **Column Index / Offset Index.** Not parsed on read and not produced on
 write. Pushdown granularity is the row group; files we write do not carry
