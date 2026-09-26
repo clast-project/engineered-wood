@@ -1,7 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Operations.Shredding;
 using EngineeredWood.IO;
@@ -15,17 +14,14 @@ namespace EngineeredWood.Parquet;
 /// </summary>
 public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 {
-    private static readonly byte[] Par1Magic = "PAR1"u8.ToArray();
-
     private readonly ISequentialFile _file;
     private readonly bool _ownsFile;
     private readonly ParquetWriteOptions _options;
-    private readonly List<RowGroup> _rowGroups = new();
+    private readonly ParquetFileAssembler _assembler;
     private IReadOnlyList<SchemaElement>? _parquetSchema;
     private Apache.Arrow.Schema? _arrowSchema;
     private Apache.Arrow.Schema? _declaredSchema;
     private Dictionary<string, ShredSchema?>? _variantShredDecisions;
-    private bool _headerWritten;
     private bool _closed;
     private bool _disposed;
 
@@ -40,6 +36,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         _file = file;
         _ownsFile = ownsFile;
         _options = options ?? ParquetWriteOptions.Default;
+        _assembler = new ParquetFileAssembler(file, _options);
     }
 
     /// <summary>
@@ -110,11 +107,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
         // First call: write header. The schema is captured in WriteSingleRowGroupAsync instead, once
         // shredding has been applied, so that what is written and what the footer declares agree.
-        if (!_headerWritten)
-        {
-            await _file.WriteAsync(Par1Magic, cancellationToken).ConfigureAwait(false);
-            _headerWritten = true;
-        }
+        await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
 
         // Auto-split large batches into multiple row groups
         int maxRows = _options.RowGroupMaxRows;
@@ -204,71 +197,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         foreach (var results in perColumnLeaves)
             allLeafResults.AddRange(results);
 
-        // Write column data sequentially (to maintain file offsets)
-        var columnChunks = new ColumnChunk[allLeafResults.Count];
-        long totalByteSize = 0;
-        long totalCompressedSize = 0;
-
-        for (int i = 0; i < allLeafResults.Count; i++)
-        {
-            var result = allLeafResults[i];
-            long chunkStart = _file.Position;
-
-            await _file.WriteAsync(result.Data, cancellationToken).ConfigureAwait(false);
-
-            // Calculate offsets: a dictionary page or an FSST symbol table page comes first if
-            // present. A chunk has at most one of the two — FSST is a non-dictionary encoding.
-            long dataPageOffset = chunkStart + result.DictionaryPageSize + result.SymbolTablePageSize;
-            long? dictionaryPageOffset = result.DictionaryPageSize > 0 ? chunkStart : null;
-            long? symbolTablePageOffset = result.SymbolTablePageSize > 0 ? chunkStart : null;
-
-            // Write Bloom filter block if present.
-            long? bloomFilterOffset = null;
-            int? bloomFilterLength = null;
-            if (result.BloomFilterData != null)
-            {
-                bloomFilterOffset = _file.Position;
-                bloomFilterLength = result.BloomFilterData.Length;
-                await _file.WriteAsync(result.BloomFilterData, cancellationToken).ConfigureAwait(false);
-            }
-
-            // Update metadata with actual file offset
-            var meta = new ColumnMetaData
-            {
-                Type = result.MetaData.Type,
-                Encodings = result.MetaData.Encodings,
-                PathInSchema = result.MetaData.PathInSchema,
-                Codec = result.MetaData.Codec,
-                NumValues = result.MetaData.NumValues,
-                TotalUncompressedSize = result.MetaData.TotalUncompressedSize,
-                TotalCompressedSize = result.MetaData.TotalCompressedSize,
-                DataPageOffset = dataPageOffset,
-                DictionaryPageOffset = dictionaryPageOffset,
-                Statistics = result.MetaData.Statistics,
-                BloomFilterOffset = bloomFilterOffset,
-                BloomFilterLength = bloomFilterLength,
-                SymbolTablePageOffset = symbolTablePageOffset,
-                SymbolTablePageLength = result.MetaData.SymbolTablePageLength,
-            };
-
-            columnChunks[i] = new ColumnChunk
-            {
-                FileOffset = chunkStart,
-                MetaData = meta,
-            };
-
-            totalByteSize += result.MetaData.TotalUncompressedSize;
-            totalCompressedSize += result.MetaData.TotalCompressedSize;
-        }
-
-        _rowGroups.Add(new RowGroup
-        {
-            Columns = columnChunks,
-            TotalByteSize = totalByteSize,
-            NumRows = batch.Length,
-            TotalCompressedSize = totalCompressedSize,
-            Ordinal = checked((short)_rowGroups.Count),
-        });
+        // Written sequentially, since each chunk's offsets depend on the one before it.
+        await _assembler.WriteRowGroupAsync(allLeafResults, batch.Length, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -588,11 +518,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         _closed = true;
 
         // If no row groups were written, still write a valid empty file
-        if (!_headerWritten)
-        {
-            await _file.WriteAsync(Par1Magic, cancellationToken).ConfigureAwait(false);
-            _headerWritten = true;
-        }
+        await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
 
         // The header is written before the first row group but the schema is captured during it, so a
         // row group that throws leaves this null. Falling back here keeps dispose from replacing that
@@ -608,40 +534,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
         _parquetSchema ??= [new SchemaElement { Name = "schema", NumChildren = 0 }];
 
-        // Calculate total rows
-        long totalRows = 0;
-        foreach (var rg in _rowGroups)
-            totalRows += rg.NumRows;
-
-        // Build file metadata
-        var fileMetaData = new FileMetaData
-        {
-            Version = 2,
-            Schema = _parquetSchema!,
-            NumRows = totalRows,
-            RowGroups = _rowGroups,
-            CreatedBy = _options.CreatedBy,
-            KeyValueMetadata = BuildKeyValueMetadata(),
-            ColumnOrders = ColumnOrderBuilder.Build(_parquetSchema!, _options.FloatColumnOrder),
-        };
-
-        // Encode footer to Thrift
-#pragma warning disable EWPARQUET0002 // Honoring the caller's opt-in; the experimental signal lives on the option itself.
-        byte[] footerBytes = MetadataEncoder.EncodeFileMetaData(fileMetaData, writePathInSchema: !_options.OmitPathInSchema);
-#pragma warning restore EWPARQUET0002
-
-        // Write footer
-        await _file.WriteAsync(footerBytes, cancellationToken).ConfigureAwait(false);
-
-        // Write footer length (4 bytes LE)
-        var footerLengthBytes = new byte[4];
-        BinaryPrimitives.WriteInt32LittleEndian(footerLengthBytes, footerBytes.Length);
-        await _file.WriteAsync(footerLengthBytes, cancellationToken).ConfigureAwait(false);
-
-        // Write trailing PAR1 magic
-        await _file.WriteAsync(Par1Magic, cancellationToken).ConfigureAwait(false);
-
-        await _file.FlushAsync(cancellationToken).ConfigureAwait(false);
+        await _assembler.WriteFooterAsync(_parquetSchema, BuildKeyValueMetadata(), cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()

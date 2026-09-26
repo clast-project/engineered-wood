@@ -26,15 +26,12 @@ namespace EngineeredWood.Parquet;
 /// </remarks>
 public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 {
-    private static readonly byte[] Par1Magic = "PAR1"u8.ToArray();
-
     private readonly ISequentialFile _file;
     private readonly bool _ownsFile;
     private readonly ParquetWriteOptions _options;
-    private readonly List<RowGroup> _rowGroups = new();
+    private readonly ParquetFileAssembler _assembler;
     private IReadOnlyList<SchemaElement>? _parquetSchema;
     private Apache.Arrow.Schema? _arrowSchema;
-    private bool _headerWritten;
     private bool _closed;
     private bool _disposed;
 
@@ -50,6 +47,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         _file = file;
         _ownsFile = ownsFile;
         _options = options ?? ParquetWriteOptions.Default;
+        _assembler = new ParquetFileAssembler(file, _options);
     }
 
     /// <summary>Number of rows currently buffered and not yet flushed.</summary>
@@ -76,12 +74,11 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        if (!_headerWritten)
+        if (!_assembler.HeaderWritten)
         {
             _arrowSchema = batch.Schema;
             _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema, _options);
-            await _file.WriteAsync(Par1Magic, cancellationToken).ConfigureAwait(false);
-            _headerWritten = true;
+            await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // Initialize column states on first batch
@@ -193,65 +190,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             }
         });
 
-        // Write column chunks sequentially
-        var columnChunks = new ColumnChunk[columnResults.Length];
-        long totalByteSize = 0;
-        long totalCompressedSize = 0;
-
-        for (int i = 0; i < columnResults.Length; i++)
-        {
-            var result = columnResults[i];
-            long chunkStart = _file.Position;
-
-            await _file.WriteAsync(result.Data, cancellationToken).ConfigureAwait(false);
-
-            // A dictionary page or an FSST symbol table page precedes the data pages; a chunk
-            // has at most one of the two, since FSST is a non-dictionary encoding.
-            long dataPageOffset = chunkStart + result.DictionaryPageSize + result.SymbolTablePageSize;
-            long? dictionaryPageOffset = result.DictionaryPageSize > 0 ? chunkStart : null;
-            long? symbolTablePageOffset = result.SymbolTablePageSize > 0 ? chunkStart : null;
-
-            // Write Bloom filter block if present.
-            long? bloomFilterOffset = null;
-            int? bloomFilterLength = null;
-            if (result.BloomFilterData != null)
-            {
-                bloomFilterOffset = _file.Position;
-                bloomFilterLength = result.BloomFilterData.Length;
-                await _file.WriteAsync(result.BloomFilterData, cancellationToken).ConfigureAwait(false);
-            }
-
-            var meta = new ColumnMetaData
-            {
-                Type = result.MetaData.Type,
-                Encodings = result.MetaData.Encodings,
-                PathInSchema = result.MetaData.PathInSchema,
-                Codec = result.MetaData.Codec,
-                NumValues = result.MetaData.NumValues,
-                TotalUncompressedSize = result.MetaData.TotalUncompressedSize,
-                TotalCompressedSize = result.MetaData.TotalCompressedSize,
-                DataPageOffset = dataPageOffset,
-                DictionaryPageOffset = dictionaryPageOffset,
-                Statistics = result.MetaData.Statistics,
-                BloomFilterOffset = bloomFilterOffset,
-                BloomFilterLength = bloomFilterLength,
-                SymbolTablePageOffset = symbolTablePageOffset,
-                SymbolTablePageLength = result.MetaData.SymbolTablePageLength,
-            };
-
-            columnChunks[i] = new ColumnChunk { FileOffset = chunkStart, MetaData = meta };
-            totalByteSize += result.MetaData.TotalUncompressedSize;
-            totalCompressedSize += result.MetaData.TotalCompressedSize;
-        }
-
-        _rowGroups.Add(new RowGroup
-        {
-            Columns = columnChunks,
-            TotalByteSize = totalByteSize,
-            NumRows = numRows,
-            TotalCompressedSize = totalCompressedSize,
-            Ordinal = checked((short)_rowGroups.Count),
-        });
+        await _assembler.WriteRowGroupAsync(columnResults, numRows, cancellationToken).ConfigureAwait(false);
 
         // Reset buffers for next row group
         ResetBuffers();
@@ -277,39 +216,15 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         if (_bufferedRows > 0)
             await FlushRowGroupAsync(cancellationToken).ConfigureAwait(false);
 
-        if (!_headerWritten)
+        if (!_assembler.HeaderWritten)
         {
-            await _file.WriteAsync(Par1Magic, cancellationToken).ConfigureAwait(false);
-            _headerWritten = true;
+            await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
             _parquetSchema ??= [new SchemaElement { Name = "schema", NumChildren = 0 }];
         }
 
-        long totalRows = 0;
-        foreach (var rg in _rowGroups)
-            totalRows += rg.NumRows;
-
-        var fileMetaData = new FileMetaData
-        {
-            Version = 2,
-            Schema = _parquetSchema!,
-            NumRows = totalRows,
-            RowGroups = _rowGroups,
-            CreatedBy = _options.CreatedBy,
-            KeyValueMetadata = _options.KeyValueMetadata,
-            ColumnOrders = ColumnOrderBuilder.Build(_parquetSchema!, _options.FloatColumnOrder),
-        };
-
-#pragma warning disable EWPARQUET0002 // Honoring the caller's opt-in; the experimental signal lives on the option itself.
-        byte[] footerBytes = MetadataEncoder.EncodeFileMetaData(fileMetaData, writePathInSchema: !_options.OmitPathInSchema);
-#pragma warning restore EWPARQUET0002
-        await _file.WriteAsync(footerBytes, cancellationToken).ConfigureAwait(false);
-
-        var footerLengthBytes = new byte[4];
-        BinaryPrimitives.WriteInt32LittleEndian(footerLengthBytes, footerBytes.Length);
-        await _file.WriteAsync(footerLengthBytes, cancellationToken).ConfigureAwait(false);
-
-        await _file.WriteAsync(Par1Magic, cancellationToken).ConfigureAwait(false);
-        await _file.FlushAsync(cancellationToken).ConfigureAwait(false);
+        // Unlike ParquetFileWriter, this writer does not add ARROW:schema to the caller's metadata (#394).
+        await _assembler.WriteFooterAsync(_parquetSchema!, _options.KeyValueMetadata, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     public async ValueTask DisposeAsync()

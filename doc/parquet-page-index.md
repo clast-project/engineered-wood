@@ -87,9 +87,9 @@ Rules that bite:
 |---|---|
 | Thrift | `MetadataDecoder` skips ColumnChunk fields 4–7 (`MetadataDecoder.cs:520-545`); `MetadataEncoder` never writes them. There is no model for any §1 struct |
 | Chunk stats | `StatisticsCollector.Compute(array, physicalType, typeLength, defLevels, nonNullCount, rowCount, floatingPointTotalOrder, extendedTimestamp)`, plus `ComputeFromDictEntries` / `ComputeFloatingPointFromDictEntries`. Each is called **once per chunk** (`ColumnChunkWriter.cs:248`, `:532`) |
-| Page emission | Six helpers (`WriteSymbolTablePage`, `WriteDictionaryPage`, `WriteDictDataPageV1/V2`, `WriteDataPageV1/V2`), each building its own header |
+| Page emission | Every page goes through `ColumnChunkOutput.EmitPage`, which returns each page's offset in the chunk and its data-page ordinal |
 | Page cut points | `ColumnChunkWriter.cs:350-378` loop, which counts levels, not rows (#389) |
-| Chunk placement + footer | Duplicated in `ParquetFileWriter` (`:205-275`, `:575-642`) and `BufferedParquetWriter` (`:200-253`, `:275-311`) |
+| Chunk placement + footer | `ParquetFileAssembler`, shared by `ParquetFileWriter` and `BufferedParquetWriter` |
 | Filter | `ParquetReadOptions.Filter` is evaluated per row group by `StatisticsEvaluator.Evaluate<RowGroup>` through `ParquetStatisticsAccessor`. The contract is a **superset**: the caller re-applies the predicate |
 | Page walkers | Three independent loops (`ColumnChunkReader.ReadColumn`, `TryReadFixedListColumn`, `PageMapBuilder.Build`) plus the lazy `*FromEntry` decode |
 | Truncation | None anywhere. Chunk statistics are written full-length |
