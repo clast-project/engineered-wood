@@ -113,6 +113,16 @@ internal static class PageIndexWorkload
     /// </summary>
     public static RecordBatch Build(string schema)
     {
+        // "nested:<field>" is one column of the nested schema, from the same data, to attribute its cost.
+        if (schema.StartsWith("nested:", StringComparison.Ordinal))
+        {
+            var nested = Build("nested");
+            string field = schema.Substring("nested:".Length);
+            int index = nested.Schema.GetFieldIndex(field);
+            return new RecordBatch(
+                new Apache.Arrow.Schema([nested.Schema.GetFieldByIndex(index)], null), [nested.Column(index)], Rows);
+        }
+
         var rng = new Random(4);
         var fields = new List<Field>();
         var arrays = new List<IArrowArray>();
@@ -256,7 +266,9 @@ internal static class PageIndexOverhead
     public static async Task<int> RunAsync(string[] args)
     {
         if (args.Length >= 1 && args[0] == "pageindex-ab")
-            return await RunInterleavedAsync(args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 25);
+            return await RunInterleavedAsync(
+                args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 25,
+                args.Length > 2 ? args[2..] : ["plain", "dictionary", "strings", "nested"]);
 
         if (args.Length == 5 && args[0] == "pageindex-child")
             return await RunChildAsync(args[1], Enum.Parse<DataPageVersion>(args[2]), int.Parse(args[3], CultureInfo.InvariantCulture), bool.Parse(args[4]));
@@ -297,12 +309,12 @@ internal static class PageIndexOverhead
     /// load that comes and goes between them skews its ratio; alternating spreads any drift over both.
     /// Reported: the median of the per-round time ratios, and the medians of each side's allocations.
     /// </summary>
-    private static async Task<int> RunInterleavedAsync(int rounds)
+    private static async Task<int> RunInterleavedAsync(int rounds, string[] schemas)
     {
         Console.WriteLine($"Median of {rounds} alternating rounds, after 3 warm-up rounds.");
         Console.WriteLine("| Schema | Pages | Page size | ms off | ms on | Time | Allocated off (MB) | on (MB) | Allocated |");
         Console.WriteLine("|---|---|---|---|---|---|---|---|---|");
-        foreach (string schema in new[] { "plain", "dictionary", "strings", "nested" })
+        foreach (string schema in schemas)
         {
             var batch = PageIndexWorkload.Build(schema);
             foreach (var version in new[] { DataPageVersion.V1, DataPageVersion.V2 })

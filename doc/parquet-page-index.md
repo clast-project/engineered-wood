@@ -207,7 +207,7 @@ file; a per-column override can be added later if someone needs it.
   statistics. So chunk statistics are now folded from the page bounds when a page index is
   written (`PageIndexCollector.ChunkStatistics`, byte-identical to the scan; see
   `ChunkStatistics_AreIdenticalWithAndWithoutTheIndex`). With the fold, time is within noise,
-  except for nested columns (below).
+  except for repeated (list/map) columns (below).
 
   Index cost, as the median of 25 alternating off/on rounds in one process
   (`dotnet run -c Release -f net10.0 -- pageindex-ab`). Each cell shows three separate runs;
@@ -221,10 +221,26 @@ file; a per-column override can be added later if someone needs it.
   | nested | +0.1 / +4.2 / +4.9% | +2.0 / +4.5 / +6.7% | +2% to +8% / +5% to +7% | +0.01% |
 
   Before the fold, one run at 1 MiB gave: plain +5.9% / +14.3%, strings +4.6% / +14.4%, and
-  nested +12.8% / +11.1%. Now plain, dictionary and strings center on zero. **Nested keeps a
-  small, consistent cost of about +3% to +5%.** That is per-page work the fold does not
-  remove: counting each page's rows over the repetition levels, and the dictionary-entry
-  bounds of its string field. Allocations are the median over the rounds and barely vary.
+  nested +12.8% / +11.1%. Now plain, dictionary and strings center on zero. Allocations are
+  the median over the rounds and barely vary.
+
+  **The nested schema's remaining cost is its repeated column.** Measured one column at a
+  time (`-- pageindex-ab 25 nested nested:list nested:struct nested:id`), from the same data,
+  two runs, 1 MiB pages, V1 / V2:
+
+  | Column | Run 1 | Run 2 | Share of the nested write |
+  |---|---|---|---|
+  | whole `nested` schema | +4.0% / +3.7% | +5.0% / +4.5% | ~98 ms |
+  | `list<int64>` (repeated) | −1.6% / +3.7% | +6.9% / +4.8% | ~100 ms on its own |
+  | `struct{int32, string}` (nested, not repeated) | +0.8% / +1.0% | +1.8% / +2.2% | ~19 ms |
+  | flat `int64` | +5.2% / −3.7% | −1.8% / +1.3% | ~5 ms, too short to resolve |
+
+  So repeated columns keep a small, consistent cost of about +3% to +5%. A non-repeated
+  struct costs about +1% to +2%, like the dictionary schema, and flat columns cost nothing
+  measurable. The cause inside the repeated path is not profiled. The likely suspect is
+  `PageRows`, which counts each page's rows over its repetition levels: a second pass on V2,
+  whose header already counted them, and a new pass on V1. Counting once, in the V2 header,
+  and reusing that count would be the first thing to try.
   - **File size:** +0.01% at the default page size; +0.4% to +1.7% at 8 KiB.
   - **Peak working set:** the median of 5 fresh processes per configuration
     (`-- pageindex-overhead`) moves −15% to +9% in both directions, with no pattern. That is GC
