@@ -279,7 +279,8 @@ pages under both float orders, all-null pages, single-page chunks, and **both wr
 ### R-1. Parse and expose
 
 **Done (phase 5).** The model types and decoding landed in phase 1 (#392).
-`ParquetFileReader.ReadPageIndexAsync(rowGroup, columns)` takes leaf indices or column names. It
+`ParquetFileReader.ReadPageIndexAsync(rowGroup, columnNames)` selects columns by name, as
+`ReadRowGroupAsync` does, and refuses a chunk stored in another file (#405). It
 merges the requested ranges across gaps of up to 64 KiB, which on a parquet-mr/EW layout is one
 request of one or two ranges, and decodes each index on first access. All page-index reads go
 through `ReadPageIndexBytesAsync`, the future decryption point. The 27 fixtures read back exactly
