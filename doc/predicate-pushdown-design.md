@@ -1419,10 +1419,13 @@ catch the coarse case; the page index buys granularity *inside* a surviving
 row group. On a randomly distributed column every page's min/max spans the domain,
 nothing is skipped, and the extra metadata read is pure cost.
 
-Note that writing the index is much cheaper work than using it — it is mostly
-serialising per-page statistics the `StatisticsCollector` already computes,
-whereas reading requires a row-range-aware decode path in `ColumnChunkReader`.
-The dependency in the phase table (13 after 11) is not a real one.
+Note that writing the index is much cheaper work than using it, whereas reading
+requires a row-range-aware decode path in `ColumnChunkReader`. The dependency in
+the phase table (13 after 11) is not a real one. (An earlier version of this
+paragraph said writing is "mostly serialising per-page statistics the
+`StatisticsCollector` already computes". That was wrong: the collector runs once
+per column chunk, so per-page statistics are new work. See
+[`parquet-page-index.md`](parquet-page-index.md).)
 
 ### Bloom filters: opt-in everywhere except DuckDB
 
@@ -1501,7 +1504,9 @@ evaluated per-page with the same `StatisticsEvaluator`.
 
 This is a separate body of work — requires parsing column/offset index Thrift
 structures, a page-skipping read path in `ColumnChunkReader`, and writing the
-indexes in `ColumnChunkWriter`.
+indexes in `ColumnChunkWriter`. **The implementation plan is
+[`parquet-page-index.md`](parquet-page-index.md)**, which supersedes phases 11–13
+below.
 
 ## Implementation Phases
 
@@ -1534,9 +1539,9 @@ oversight.
 | — | Bloom auto-mode keyed on dictionary encoding; dictionary-sourced population; FPP default | Parquet | [#56](https://github.com/clast-project/engineered-wood/issues/56) |
 | — | Dictionary-page row-group pruning | Parquet | [#57](https://github.com/clast-project/engineered-wood/issues/57) |
 | **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes. No longer blocked — Phase 9 shipped | DeltaLake.Table | [#102](https://github.com/clast-project/engineered-wood/issues/102) |
-| **Phase 11** | Column/offset index parsing (Parquet read) | Parquet | unfiled |
-| **Phase 12** | Page-level pushdown using column index (needs Phase 11 and a row-range read path) | Parquet | unfiled |
-| **Phase 13** | Column/offset index writing — independent of Phase 11, despite the original ordering | Parquet | unfiled |
+| **Phase 11** | Column/offset index parsing (Parquet read) | Parquet | unfiled; see [`parquet-page-index.md`](parquet-page-index.md) R-1 |
+| **Phase 12** | Page-level pushdown using column index (needs Phase 11 and a row-range read path) | Parquet | unfiled; see [`parquet-page-index.md`](parquet-page-index.md) R-2/R-3 |
+| **Phase 13** | Column/offset index writing — independent of Phase 11, despite the original ordering. Blocked on [#389](https://github.com/clast-project/engineered-wood/issues/389) (row-aligned pages) | Parquet | unfiled; see [`parquet-page-index.md`](parquet-page-index.md) W-1…W-7 |
 | **Phase 14** | ORC stripe pruning | Orc | unfiled |
 
 ### Ordering rationale

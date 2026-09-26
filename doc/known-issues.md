@@ -35,8 +35,9 @@ opened by the test sweeps (they do not match the `*.parquet` glob). See [`encryp
 
 **Column Index / Offset Index.** Not parsed on read and not produced on
 write. Pushdown granularity is the row group; files we write do not carry
-page indexes. Tracked as phases 11–13 in
-[`predicate-pushdown-design.md`](predicate-pushdown-design.md).
+page indexes. Planned in [`parquet-page-index.md`](parquet-page-index.md);
+writing is blocked on [#389](https://github.com/clast-project/engineered-wood/issues/389)
+(rows of repeated columns are split across pages).
 
 *If page indexes are ever added:* bounds for the extended-precision
 timestamp carrier must never be truncated. Truncation assumes
