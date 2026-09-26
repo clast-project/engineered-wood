@@ -16,4 +16,16 @@ public sealed class ColumnChunk
 
     /// <summary>Column metadata. May be null if stored in a separate metadata file.</summary>
     public ColumnMetaData? MetaData { get; init; }
+
+    /// <summary>File offset of the chunk's <see cref="Metadata.OffsetIndex"/>, or null if it has none.</summary>
+    public long? OffsetIndexOffset { get; init; }
+
+    /// <summary>Size in bytes of the chunk's <see cref="Metadata.OffsetIndex"/>.</summary>
+    public int? OffsetIndexLength { get; init; }
+
+    /// <summary>File offset of the chunk's <see cref="Metadata.ColumnIndex"/>, or null if it has none.</summary>
+    public long? ColumnIndexOffset { get; init; }
+
+    /// <summary>Size in bytes of the chunk's <see cref="Metadata.ColumnIndex"/>.</summary>
+    public int? ColumnIndexLength { get; init; }
 }

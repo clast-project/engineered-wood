@@ -153,11 +153,17 @@ public enum PageType
 }
 
 /// <summary>
-/// Sort order for column index boundary values.
+/// Whether a <see cref="Metadata.ColumnIndex"/>'s page bounds are ordered across the pages of a
+/// column chunk.
 /// </summary>
 public enum BoundaryOrder
 {
+    /// <summary>The bounds are in no particular order.</summary>
     Unordered = 0,
+
+    /// <summary>Both the minimums and the maximums are non-decreasing, page by page.</summary>
     Ascending = 1,
+
+    /// <summary>Both the minimums and the maximums are non-increasing, page by page.</summary>
     Descending = 2,
 }

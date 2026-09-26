@@ -416,6 +416,32 @@ internal static class MetadataEncoder
             WriteColumnMetaData(writer, chunk.MetaData, writePathInSchema);
         }
 
+        // Fields 4-7: offset_index_offset, offset_index_length, column_index_offset,
+        // column_index_length (optional; the page index lives outside the footer)
+        if (chunk.OffsetIndexOffset.HasValue)
+        {
+            writer.WriteFieldHeader(ThriftType.I64, 4);
+            writer.WriteZigZagInt64(chunk.OffsetIndexOffset.Value);
+        }
+
+        if (chunk.OffsetIndexLength.HasValue)
+        {
+            writer.WriteFieldHeader(ThriftType.I32, 5);
+            writer.WriteZigZagInt32(chunk.OffsetIndexLength.Value);
+        }
+
+        if (chunk.ColumnIndexOffset.HasValue)
+        {
+            writer.WriteFieldHeader(ThriftType.I64, 6);
+            writer.WriteZigZagInt64(chunk.ColumnIndexOffset.Value);
+        }
+
+        if (chunk.ColumnIndexLength.HasValue)
+        {
+            writer.WriteFieldHeader(ThriftType.I32, 7);
+            writer.WriteZigZagInt32(chunk.ColumnIndexLength.Value);
+        }
+
         writer.WriteStructStop();
         writer.PopStruct();
     }
@@ -637,6 +663,99 @@ internal static class MetadataEncoder
 
         writer.WriteStructStop();
         writer.PopStruct();
+    }
+
+    /// <summary>
+    /// Encodes an <see cref="OffsetIndex"/> to Thrift Compact Protocol bytes, to be written outside
+    /// the footer and located by <see cref="ColumnChunk.OffsetIndexOffset"/>.
+    /// </summary>
+    public static byte[] EncodeOffsetIndex(OffsetIndex index)
+    {
+        var writer = new ThriftCompactWriter(16 + 12 * index.PageLocations.Count);
+        writer.PushStruct();
+
+        // Field 1: page_locations (list<PageLocation>)
+        writer.WriteFieldHeader(ThriftType.List, 1);
+        writer.WriteListHeader(ThriftType.Struct, index.PageLocations.Count);
+        foreach (var location in index.PageLocations)
+        {
+            writer.PushStruct();
+            writer.WriteFieldHeader(ThriftType.I64, 1);
+            writer.WriteZigZagInt64(location.Offset);
+            writer.WriteFieldHeader(ThriftType.I32, 2);
+            writer.WriteZigZagInt32(location.CompressedPageSize);
+            writer.WriteFieldHeader(ThriftType.I64, 3);
+            writer.WriteZigZagInt64(location.FirstRowIndex);
+            writer.WriteStructStop();
+            writer.PopStruct();
+        }
+
+        // Field 2: unencoded_byte_array_data_bytes (optional, list<i64>)
+        if (index.UnencodedByteArrayDataBytes != null)
+            WriteI64ListField(writer, 2, index.UnencodedByteArrayDataBytes);
+
+        writer.WriteStructStop();
+        writer.PopStruct();
+        return writer.ToArray();
+    }
+
+    /// <summary>
+    /// Encodes a <see cref="ColumnIndex"/> to Thrift Compact Protocol bytes, to be written outside
+    /// the footer and located by <see cref="ColumnChunk.ColumnIndexOffset"/>.
+    /// </summary>
+    public static byte[] EncodeColumnIndex(ColumnIndex index)
+    {
+        var writer = new ThriftCompactWriter(64 + 24 * index.NullPages.Count);
+        writer.PushStruct();
+
+        // Field 1: null_pages (list<bool>). A bool list element is one byte, 1 for true and 2 for
+        // false, under the element type 1: the compact bool codes, as parquet-mr and parquet-cpp
+        // write them.
+        writer.WriteFieldHeader(ThriftType.List, 1);
+        writer.WriteListHeader(ThriftType.BooleanTrue, index.NullPages.Count);
+        foreach (bool nullPage in index.NullPages)
+            writer.WriteByte(nullPage ? (byte)ThriftType.BooleanTrue : (byte)ThriftType.BooleanFalse);
+
+        // Field 2: min_values (list<binary>)
+        writer.WriteFieldHeader(ThriftType.List, 2);
+        WriteBinaryList(writer, index.MinValues);
+
+        // Field 3: max_values (list<binary>)
+        writer.WriteFieldHeader(ThriftType.List, 3);
+        WriteBinaryList(writer, index.MaxValues);
+
+        // Field 4: boundary_order (BoundaryOrder as i32)
+        writer.WriteFieldHeader(ThriftType.I32, 4);
+        writer.WriteZigZagInt32((int)index.BoundaryOrder);
+
+        // Fields 5-8: null_counts, repetition/definition level histograms, nan_counts (optional, list<i64>)
+        if (index.NullCounts != null)
+            WriteI64ListField(writer, 5, index.NullCounts);
+        if (index.RepetitionLevelHistograms != null)
+            WriteI64ListField(writer, 6, index.RepetitionLevelHistograms);
+        if (index.DefinitionLevelHistograms != null)
+            WriteI64ListField(writer, 7, index.DefinitionLevelHistograms);
+        if (index.NanCounts != null)
+            WriteI64ListField(writer, 8, index.NanCounts);
+
+        writer.WriteStructStop();
+        writer.PopStruct();
+        return writer.ToArray();
+    }
+
+    private static void WriteBinaryList(ThriftCompactWriter writer, IReadOnlyList<byte[]> values)
+    {
+        writer.WriteListHeader(ThriftType.Binary, values.Count);
+        foreach (byte[] value in values)
+            writer.WriteBinary(value);
+    }
+
+    private static void WriteI64ListField(ThriftCompactWriter writer, short fieldId, IReadOnlyList<long> values)
+    {
+        writer.WriteFieldHeader(ThriftType.List, fieldId);
+        writer.WriteListHeader(ThriftType.I64, values.Count);
+        foreach (long value in values)
+            writer.WriteZigZagInt64(value);
     }
 
     /// <summary>
