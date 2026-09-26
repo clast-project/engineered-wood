@@ -1286,6 +1286,196 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Reads the page index (the ColumnIndex and OffsetIndex) of column chunks in one row group.
+    /// </summary>
+    /// <param name="rowGroupIndex">The row group.</param>
+    /// <param name="columnNames">
+    /// Columns to read, named as for <see cref="ReadRowGroupAsync"/>: a leaf's dotted path, or a
+    /// top-level name, which selects all of that column's leaves. Null reads every leaf column.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>
+    /// One entry per selected leaf column, in the order selected. A chunk the writer gave no index
+    /// reports <see cref="ColumnChunkPageIndex.HasColumnIndex"/> and
+    /// <see cref="ColumnChunkPageIndex.HasOffsetIndex"/> as false.
+    /// </returns>
+    /// <remarks>
+    /// Nothing is read unless this is called: reading a row group never touches its page index. The
+    /// selected indexes are fetched together in as few ranged reads as their layout allows. Writers
+    /// put a row group's ColumnIndexes next to each other and its OffsetIndexes next to each other,
+    /// so that is usually two ranges in one request. Each index is decoded when first accessed.
+    /// An index whose offset or length is missing is treated as absent.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The row group index is out of range.</exception>
+    /// <exception cref="ArgumentException">A column name is not found in the schema.</exception>
+    /// <exception cref="ParquetFormatException">An index lies outside the file.</exception>
+    /// <exception cref="NotSupportedException">
+    /// A selected column chunk is stored in another file (<see cref="ColumnChunk.FilePath"/>).
+    /// </exception>
+    public async ValueTask<IReadOnlyList<ColumnChunkPageIndex>> ReadPageIndexAsync(
+        int rowGroupIndex,
+        IReadOnlyList<string>? columnNames = null,
+        CancellationToken cancellationToken = default)
+    {
+#if NET8_0_OR_GREATER
+        ObjectDisposedException.ThrowIf(_disposed, this);
+#else
+        if (_disposed) throw new ObjectDisposedException(GetType().FullName);
+#endif
+
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        if (rowGroupIndex < 0 || rowGroupIndex >= metadata.RowGroups.Count)
+            throw new ArgumentOutOfRangeException(nameof(rowGroupIndex), rowGroupIndex,
+                $"The file has {metadata.RowGroups.Count} row groups.");
+
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        var (descriptors, chunks) = ResolveColumns(schema, metadata.RowGroups[rowGroupIndex], columnNames);
+
+        // Up to two ranges per column, remembering which entry and which index each one is.
+        var ranges = new List<FileRange>(chunks.Count * 2);
+        var owners = new List<(int Entry, bool IsColumnIndex)>(chunks.Count * 2);
+        var leaves = new int[chunks.Count];
+        for (int entry = 0; entry < chunks.Count; entry++)
+        {
+            var chunk = chunks[entry];
+            leaves[entry] = IndexOf(schema.Columns, descriptors[entry]);
+
+            // The offsets would be into that other file; reading them from this one returns unrelated bytes.
+            if (chunk.FilePath is not null)
+            {
+                throw new NotSupportedException(
+                    $"Column '{descriptors[entry].DottedPath}' is stored in another file ('{chunk.FilePath}'); " +
+                    "reading column chunks from external files is not supported.");
+            }
+
+            if (PageIndexRange(chunk.ColumnIndexOffset, chunk.ColumnIndexLength, "ColumnIndex", descriptors[entry]) is { } ci)
+            {
+                ranges.Add(ci);
+                owners.Add((entry, true));
+            }
+
+            if (PageIndexRange(chunk.OffsetIndexOffset, chunk.OffsetIndexLength, "OffsetIndex", descriptors[entry]) is { } oi)
+            {
+                ranges.Add(oi);
+                owners.Add((entry, false));
+            }
+        }
+
+        var bytes = await ReadPageIndexBytesAsync(ranges, cancellationToken).ConfigureAwait(false);
+
+        var columnIndexes = new byte[]?[chunks.Count];
+        var offsetIndexes = new byte[]?[chunks.Count];
+        for (int i = 0; i < owners.Count; i++)
+        {
+            if (owners[i].IsColumnIndex)
+                columnIndexes[owners[i].Entry] = bytes[i];
+            else
+                offsetIndexes[owners[i].Entry] = bytes[i];
+        }
+
+        var result = new ColumnChunkPageIndex[chunks.Count];
+        for (int entry = 0; entry < chunks.Count; entry++)
+        {
+            result[entry] = new ColumnChunkPageIndex(
+                leaves[entry], descriptors[entry].Path, columnIndexes[entry], offsetIndexes[entry]);
+        }
+
+        return result;
+    }
+
+    private static int IndexOf(IReadOnlyList<ColumnDescriptor> columns, ColumnDescriptor column)
+    {
+        for (int i = 0; i < columns.Count; i++)
+        {
+            if (ReferenceEquals(columns[i], column))
+                return i;
+        }
+
+        throw new InvalidOperationException($"Column '{column.DottedPath}' is not a leaf of this schema.");
+    }
+
+    /// <summary>
+    /// The byte range of one page-index structure, or null when the chunk records none. A range
+    /// with only one of its two fields set is treated as absent: it cannot be read either way.
+    /// </summary>
+    private FileRange? PageIndexRange(long? offset, int? length, string structure, ColumnDescriptor column)
+    {
+        if (offset is not { } o || length is not { } l)
+            return null;
+
+        if (o < 0 || l <= 0 || o > _fileLength - l)
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}''s {structure} lies outside the file: offset {o}, length {l}, file length {_fileLength}.");
+        }
+
+        return new FileRange(o, l);
+    }
+
+    /// <summary>
+    /// Ranges closer than this are read as one. Page-index structures are tens to thousands of
+    /// bytes, so reading a small gap between two costs less than a second request, especially
+    /// against object storage.
+    /// </summary>
+    private const long PageIndexCoalesceGap = 64 * 1024;
+
+    /// <summary>
+    /// Reads page-index structures, merging nearby ranges into as few reads as possible, and returns
+    /// each range's bytes in the order given. Every page-index read goes through here, so that
+    /// encryption (module types 6 and 7) has one place to decrypt them.
+    /// </summary>
+    private async ValueTask<byte[][]> ReadPageIndexBytesAsync(
+        IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken)
+    {
+        var result = new byte[ranges.Count][];
+        if (ranges.Count == 0)
+            return result;
+
+        var order = Enumerable.Range(0, ranges.Count).OrderBy(i => ranges[i].Offset).ToArray();
+        var merged = new List<FileRange>();
+        var mergedOf = new int[ranges.Count];
+        long start = ranges[order[0]].Offset;
+        long end = start + ranges[order[0]].Length;
+        foreach (int i in order)
+        {
+            var range = ranges[i];
+            if (range.Offset > end + PageIndexCoalesceGap)
+            {
+                merged.Add(new FileRange(start, end - start));
+                start = range.Offset;
+                end = range.Offset + range.Length;
+            }
+            else
+            {
+                end = Math.Max(end, range.Offset + range.Length);
+            }
+
+            mergedOf[i] = merged.Count;
+        }
+
+        merged.Add(new FileRange(start, end - start));
+
+        var buffers = await _file.ReadRangesAsync(merged, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            for (int i = 0; i < ranges.Count; i++)
+            {
+                var within = merged[mergedOf[i]];
+                result[i] = buffers[mergedOf[i]].Memory.Span
+                    .Slice(checked((int)(ranges[i].Offset - within.Offset)), checked((int)ranges[i].Length))
+                    .ToArray();
+            }
+        }
+        finally
+        {
+            foreach (var buffer in buffers)
+                buffer.Dispose();
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// Resolves a column name to a leaf column index in the schema.
     /// </summary>
     private static int ResolveLeafColumnIndex(SchemaDescriptor schema, string column)
