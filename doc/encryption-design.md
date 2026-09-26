@@ -420,7 +420,7 @@ Overall order:
 | 0 | Refuse encrypted files clearly | small | independent; ship first |
 | 1a | Reader: one page walker, position-derived ordinals, skip-capable | medium | shared prerequisite (D8) |
 | 1b | Writer: `EmitPage` + de-duplicate the two writers | medium | shared prerequisite (D8) |
-| 2 | Page index: write, then read | medium | **not in this doc**: `predicate-pushdown-design.md` phases 13 then 11 (12 is optional). Recommended, not required (D8) |
+| 2 | Page index: write, then read | medium | **not in this doc**: [`parquet-page-index.md`](parquet-page-index.md) (#390). Recommended, not required (D8) |
 | 3 | Crypto primitives | small–medium | |
 | 4 | Encrypted metadata (footer, column metadata, keys) | medium | |
 | 5 | Encrypted pages, bloom filters, page indexes | medium | |
@@ -468,7 +468,8 @@ No behavior change.
 
 ### Phase 2: page index
 
-Specified in `predicate-pushdown-design.md` (phases 11–13), not here. Its only obligation
+Specified in [`parquet-page-index.md`](parquet-page-index.md), not here. Page-index writing is blocked on
+[#389](https://github.com/clast-project/engineered-wood/issues/389) (row-aligned pages). Its only obligation
 to this plan: route ColumnIndex/OffsetIndex bytes through one read helper and one write
 helper, so that Phase 5 and Phase 6 can wrap them in module types 6/7.
 
