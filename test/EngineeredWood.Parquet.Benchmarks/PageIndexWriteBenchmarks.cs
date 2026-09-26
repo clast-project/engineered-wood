@@ -6,9 +6,6 @@ using System.Globalization;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using BenchmarkDotNet.Attributes;
-using BenchmarkDotNet.Configs;
-using BenchmarkDotNet.Jobs;
-using BenchmarkDotNet.Toolchains.InProcess.Emit;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet;
 using Field = Apache.Arrow.Field;
@@ -29,22 +26,9 @@ namespace EngineeredWood.Benchmarks;
 /// Run with: dotnet run -c Release -f net10.0 -- --filter "*PageIndexWriteBenchmarks*"
 /// </remarks>
 [MemoryDiagnoser]
-[Config(typeof(InProcessConfig))]
+[SimpleJob(warmupCount: 3, iterationCount: 12)]
 public class PageIndexWriteBenchmarks
 {
-    /// <summary>
-    /// In process, because BenchmarkDotNet's generated child project cannot build here: under it,
-    /// build/StrongNameUnsignedReferences.targets joins an already-absolute obj path onto the project
-    /// directory. The comparison is between two methods of one process, so the toolchain is common to both.
-    /// </summary>
-    public sealed class InProcessConfig : ManualConfig
-    {
-        public InProcessConfig() => AddJob(Job.Default
-            .WithWarmupCount(3)
-            .WithIterationCount(12)
-            .WithToolchain(InProcessEmitToolchain.Instance));
-    }
-
     [Params("plain", "dictionary", "strings", "nested")]
     public string Schema { get; set; } = null!;
 

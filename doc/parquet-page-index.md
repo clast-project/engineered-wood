@@ -248,8 +248,8 @@ file; a per-column override can be added later if someone needs it.
     `CloseAsync`. There is no measurable cost within that ±10–20% noise floor.
   - **BenchmarkDotNet** (`PageIndexWriteBenchmarks`) agrees, but its methods run one after the
     other, so machine load that changes between them moves the ratio. The alternating run is
-    the one to trust. It has to run in process: the generated child project cannot build
-    through `build/StrongNameUnsignedReferences.targets`.
+    the one to trust. (It first had to run in process, because the generated child project
+    could not build through `build/StrongNameUnsignedReferences.targets`; fixed in #403.)
   - **Small pages:** 8 KiB pages still cost several percent, with runs up to +15% for strings
     (and one +25% plain outlier). That is per-page work (bounds, truncation, one index entry)
     and is not the default.
