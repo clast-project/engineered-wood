@@ -100,8 +100,13 @@
         would silently bind ITS ParquetSharp (net472 against the net8.0 build, say). Inside
         the target the path is per-TFM, which is what keeps the three builds apart. It also
         keeps the rewritten copies under obj/, where they are already gitignored.
+
+        Combined, not concatenated: IntermediateOutputPath is relative in an ordinary build but
+        absolute when a build redirects obj, as BenchmarkDotNet's generated project does. Joining
+        the two strings then produced <project>/C:/.../obj/... (#403); NormalizeDirectory keeps an
+        absolute second path, as Path.Combine does.
       -->
-      <_SignedReferenceDir>$(MSBuildProjectDirectory)/$(IntermediateOutputPath)signed-refs/</_SignedReferenceDir>
+      <_SignedReferenceDir>$([MSBuild]::NormalizeDirectory($(MSBuildProjectDirectory), $(IntermediateOutputPath), signed-refs))</_SignedReferenceDir>
     </PropertyGroup>
 
     <ItemGroup>
