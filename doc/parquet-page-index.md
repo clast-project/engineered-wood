@@ -131,8 +131,12 @@ runs once per chunk. The work:
 
 ### W-3. Truncation
 
-The default limit is **64 bytes** (parquet-mr's `parquet.columnindex.truncate.length`),
-exposed as a write option.
+**Decided:** the default limit is **64 bytes** (parquet-mr's
+`parquet.columnindex.truncate.length`). Callers can override it with
+`ParquetWriteOptions.PageIndexTruncateLength` (`int?`, default 64). A positive value sets
+the limit, `null` turns truncation off (full-length bounds), and zero or a negative value
+is rejected at option validation. The limit applies to every truncatable column in the
+file; a per-column override can be added later if someone needs it.
 
 - Truncate **only** physical `BYTE_ARRAY` columns whose order is unsigned lexicographic
   (STRING, BINARY, JSON, BSON, ENUM).
@@ -180,11 +184,20 @@ exposed as a write option.
 - ColumnChunk fields 4–7 are written in `MetadataEncoder`.
 - This goes into the **shared** footer writer from encryption Phase 1b, never into both
   writers separately.
-- `ParquetWriteOptions.WritePageIndex` (bool) and `PageIndexTruncateLength` (int, default 64).
-- **Default:** land it **off**. Then measure file-size and write-time overhead on the
-  benchmark corpus, and flip it **on** in a separate PR if the numbers are small. parquet-mr
-  and arrow-rs default on, pyarrow off. The downstream benefit is the reason to build this,
-  so the expected end state is on.
+- `ParquetWriteOptions.WritePageIndex` (bool) and `PageIndexTruncateLength` (`int?`,
+  default 64; see W-3).
+- **Decided: page indexes are written by default, provided the memory and duration
+  overhead is nominal.** parquet-mr and arrow-rs also default on; pyarrow defaults off.
+  - The writer lands with `WritePageIndex = false` (phase 3). Phase 4 measures the
+    overhead and flips the default in its own PR.
+  - The measurement uses the Parquet write benchmarks with and without page indexes:
+    wall-clock duration, allocated bytes and peak working set (BenchmarkDotNet's
+    `MemoryDiagnoser`), over plain, dictionary, string-heavy and nested schemas, with
+    V1 and V2 pages. File-size growth is recorded as well, though it is not one of the
+    conditions.
+  - The phase-4 PR records the numbers and the case for calling them nominal. If they are
+    not, the default stays off until the cost is brought down, for example by deriving
+    chunk statistics from the page statistics instead of computing both (W-2).
 - **Encryption:** when encryption lands, these two structures are module types 6/7. Route
   their bytes through one write helper and one read helper so there is one place to encrypt
   them (encryption plan D8).
@@ -200,7 +213,8 @@ exposed as a write option.
 | Optional: Spark (parquet-mr column-index filtering) | Only if DataFusion leaves doubt; a second, independent consumer lineage |
 
 Test matrix: V1/V2 pages, dictionary and plain, nullable/required, repeated leaves (after
-#389), truncation boundaries (63/64/65 bytes, all-`0xFF`, multibyte UTF-8 at the cut), NaN
+#389), truncation boundaries (63/64/65 bytes, all-`0xFF`, multibyte UTF-8 at the cut), a custom
+`PageIndexTruncateLength`, truncation turned off with `null`, NaN
 pages under both float orders, all-null pages, single-page chunks, and **both writers**.
 
 ---
@@ -299,8 +313,8 @@ testing the writer.
 | 0 | #389: row-aligned pages | small | – |
 | 1 | Thrift model + codec for §1, ColumnChunk fields 4–7 (both directions) | small | – |
 | 2 | Encryption plan Phase 1b: `EmitPage`, shared writer code | medium | – |
-| 3 | W-2…W-6 behind `WritePageIndex = false` + W-7 oracles | medium | 0, 1, 2 |
-| 4 | Measure, then flip the default | small | 3 |
+| 3 | W-2…W-6, landing with `WritePageIndex = false`, + W-7 oracles | medium | 0, 1, 2 |
+| 4 | Measure memory and duration overhead; default on if nominal (W-6) | small | 3 |
 | 5 | R-1: parse/expose + fixture self-consistency | small | 1 |
 | 6 | Encryption plan Phase 1a: `PageReader` with position-derived ordinals | medium | – |
 | 7 | R-2 + R-3: page pruning and row-range decode | large | 5, 6, #55 |
@@ -309,12 +323,16 @@ testing the writer.
 Phases 0–4 deliver the downstream-reader benefit on their own. Phases 5–7 are the EW-reader
 benefit, and whether they are worth it depends on how clustered EW users' data is.
 
-## 6. Open questions
+## 6. Decisions and open questions
 
-1. **Default on (phase 4)?** The recommendation is yes, if the measured overhead is small,
-   since the benefit to downstream readers is the main reason to build this.
-2. **Truncation length:** 64 bytes, matching parquet-mr, or no truncation at all (simpler,
-   and always valid)? The recommendation is 64: without truncation, long-string columns
-   bloat the index, and it is read on every filtered query.
+**Decided:**
+
+1. **Write page indexes by default**, provided the memory and duration overhead is nominal
+   (W-6, phase 4).
+2. **Shorten string bounds to 64 bytes by default**, and let callers override the limit or
+   turn truncation off with `PageIndexTruncateLength` (W-3).
+
+**Open:**
+
 3. **Is R-3 worth building at all**, or do phases 0–5 suffice until a user shows clustered
    data and a filtered-read workload?
