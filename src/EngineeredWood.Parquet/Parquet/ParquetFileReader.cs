@@ -1228,10 +1228,17 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 Advance(rows, dispose: false);
             }
 
-            var copy = Concatenate(pieces);
-            foreach (var run in consumed)
-                run.Dispose();
-            return copy;
+            // The used-up runs are already out of _runs, so Dispose() would no longer reach them:
+            // let go of them here even if the copy throws.
+            try
+            {
+                return Concatenate(pieces);
+            }
+            finally
+            {
+                foreach (var run in consumed)
+                    run.Dispose();
+            }
         }
 
         public void Dispose()
