@@ -148,6 +148,25 @@ floats); UTF-8 / binary / unsigned / decimal-FLBA columns get only
 `min_value`/`max_value` (parquet-mr behavior), so a legacy signed-order
 reader can no longer mis-prune them.
 
+**Files written by EngineeredWood 0.3.0 and earlier can have inverted
+decimal and unsigned-integer statistics.** Until #398 the writer ordered
+chunk min/max by physical type, comparing FIXED_LEN_BYTE_ARRAY decimals
+(every `Decimal128`/`Decimal256` column) as unsigned bytes and
+`UInt32`/`UInt64` as signed. A chunk holding decimals of both signs, or
+unsigned values on both sides of 2^31 (or 2^63), recorded a minimum above its
+maximum. That affects every release to 0.3.0 and builds of `main` up to
+`edabc29`. Their `created_by` does not tell the two apart, since released files
+say just `EngineeredWood` and later builds say `version 0.3.0` either side of
+the fix. The values themselves are correct; only the statistics are wrong.
+
+- *EngineeredWood's own pruning* is safe: `StatisticsEvaluator` treats a
+  minimum above the maximum as unknown, so such a row group is read. This
+  covers every format that uses it.
+- *Other readers are not.* DataFusion, Spark and other engines that trust the
+  bounds skip these row groups and silently return none of their rows (measured
+  with DataFusion 54 while fixing #396). Rewriting an affected file with a
+  current build writes correct statistics.
+
 ### Known runtime issue: concatenated Gzip members on .NET Framework
 
 **Status:** Open — workaround in place, fix requires third-party Gzip

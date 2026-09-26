@@ -914,4 +914,50 @@ public class StatisticsEvaluatorTests
         Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.LessThan("g", Five), allNaN));
         Assert.Equal(FilterResult.AlwaysTrue, Eval(Expressions.GreaterThan("g", Five), allNaN));
     }
+
+    // ── Inverted bounds ──
+    //
+    // A minimum above the maximum describes no value, so every range test would answer
+    // AlwaysFalse and skip the unit. EngineeredWood before #398 wrote exactly that for a chunk of
+    // decimals with both signs, or of unsigned integers either side of 2^31/2^63, so a pair the
+    // wrong way round is not evidence.
+
+    [Fact]
+    public void InvertedBounds_AreUnknown_ForEveryComparison()
+    {
+        // As a pre-#398 file recorded -500..499: min 0 (smallest non-negative), max -1 (largest negative)
+        var stats = new TestStats().With("d", min: 0m, max: -1m, nullCount: 0);
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.Equal("d", -250m), stats));
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.LessThan("d", 0m), stats));
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.GreaterThan("d", 400m), stats));
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.NotEqual("d", 5m), stats));
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.In("d", -250m, 7m), stats));
+
+        // unsigned, recorded as signed: min 2^63 + 500, max 499
+        var unsigned = new TestStats().With("u", min: 9_223_372_036_854_776_308UL, max: 499UL, nullCount: 0);
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.Equal("u", 100UL), unsigned));
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.GreaterThan("u", 9_223_372_036_854_775_808UL), unsigned));
+    }
+
+    [Fact]
+    public void OrderedBounds_StillPrune()
+    {
+        var stats = new TestStats().With("d", min: -500m, max: 499m, nullCount: 0);
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.LessThan("d", -500m), stats));
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.In("d", 600m, 700m), stats));
+
+        // A single-value unit: min equal to max is not inverted.
+        var single = new TestStats().With("d", min: 7m, max: 7m, nullCount: 0);
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Expressions.Equal("d", 8m), single));
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(Expressions.Equal("d", 7m), single));
+    }
+
+    [Fact]
+    public void IncomparableBounds_AreNotTreatedAsInverted()
+    {
+        // A string minimum against a numeric maximum cannot be ordered; that is not evidence of
+        // inversion, and the pair is left to the comparisons that follow, which answer Unknown.
+        var stats = new TestStats().With("x", min: "b", max: 1, nullCount: 0);
+        Assert.Equal(FilterResult.Unknown, Eval(Expressions.Equal("x", 5), stats));
+    }
 }
