@@ -116,6 +116,30 @@ public class OffsetIndexPageMapTests : IDisposable
     }
 
     /// <summary>
+    /// An index whose first page starts a few bytes into the real first data page's header makes
+    /// the prefix before it end inside that header. The prefix cannot be scanned, and that is the
+    /// index's fault, not the file's, so the read falls back to the header scan instead of failing.
+    /// </summary>
+    [Fact]
+    public async Task AnIndexThatCutsTheDictionaryPrefixMidHeader_FallsBackToTheHeaders()
+    {
+        string path = await WriteAsync(DataPageVersion.V2, CompressionCodec.Snappy, true, ByteArrayEncoding.DeltaLengthByteArray, writePageIndex: true);
+        var whole = await ReadAsync(path, new ParquetReadOptions());
+        var (_, metadata) = ReadFooter(path);
+        string dictionaryColumn = metadata.RowGroups[0].Columns
+            .First(c => c.MetaData!.DictionaryPageOffset is > 0).MetaData!.PathInSchema[^1];
+
+        TamperOffsetIndex(path, dictionaryColumn, locations => locations[0] = locations[0] with
+        {
+            Offset = locations[0].Offset + 3,
+            CompressedPageSize = locations[0].CompressedPageSize - 3,
+        });
+
+        foreach (var options in BatchOptions())
+            AssertConcatenationEquals(whole, await ReadAsync(path, options));
+    }
+
+    /// <summary>
     /// An index that is consistent on its own but moves a page boundary disagrees with the page's
     /// header, and that is refused rather than decoded into misaligned rows.
     /// </summary>
@@ -178,6 +202,23 @@ public class OffsetIndexPageMapTests : IDisposable
     public void Fixture_IndexMapDescribesThePagesTheHeadersDo(string fileName)
     {
         AssertIndexMapsAgree(TestData.GetPath(fileName));
+    }
+
+    /// <summary>
+    /// The theory above skips chunks without an OffsetIndex, repeated columns and chunks the scan
+    /// cannot read, so on its own it would pass having compared nothing. When this was written, 22
+    /// of the page-index fixtures had a flat chunk with an OffsetIndex; the other 4 have only
+    /// repeated columns.
+    /// </summary>
+    [Fact]
+    public void Fixtures_IndexMapsAreActuallyCompared()
+    {
+        var compared = PageIndexCodecTests.FixturesWithPageIndexes().Cast<object[]>()
+            .Select(row => (string)row[0])
+            .Where(name => AssertIndexMapsAgree(TestData.GetPath(name)) > 0)
+            .ToList();
+
+        Assert.True(compared.Count >= 22, $"only {compared.Count} fixtures compared an index map: {string.Join(", ", compared)}");
     }
 
     [Theory]

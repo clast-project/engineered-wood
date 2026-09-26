@@ -223,7 +223,20 @@ internal static class PageMapBuilder
         int pos = 0;
         while (pos < prefix.Length)
         {
-            var pageHeader = DecodeHeader(prefix, pos, column, "before the first data page", out int headerSize);
+            // The prefix ends where the index puts the first data page. If that is wrong, it can end
+            // inside a header, which then fails to decode: the index is wrong, not the file. A side
+            // page that decodes but whose data is corrupt still throws below, as the scan would.
+            PageHeader pageHeader;
+            int headerSize;
+            try
+            {
+                pageHeader = PageHeaderDecoder.Decode(prefix.Slice(pos), out headerSize);
+            }
+            catch (ParquetFormatException)
+            {
+                return null;
+            }
+
             int pageDataOffset = pos + headerSize;
             if (pageHeader.CompressedPageSize < 0 || pageHeader.CompressedPageSize > prefix.Length - pageDataOffset)
                 return null;
