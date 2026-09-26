@@ -53,20 +53,38 @@ public class TimestampUnitCoercionTests : IDisposable
         return new Time32Array(new ArrayData(type, 1, 0, 0, [validity.Build(), values.Build()]));
     }
 
-    private async Task WriteAsync(string file, IArrowType type, IArrowArray array)
+    private Task WriteAsync(string file, IArrowType type, IArrowArray array) =>
+        WriteAsync(file, type, array, buffered: false);
+
+    // BufferedParquetWriter once skipped both the rescale and ARROW:schema (#394), so the tests
+    // that pin either one run against both writers.
+    private async Task WriteAsync(
+        string file, IArrowType type, IArrowArray array, bool buffered, ParquetWriteOptions? options = null)
     {
         var schema = new Apache.Arrow.Schema.Builder().Field(new Field("v", type, true)).Build();
+        var batch = new RecordBatch(schema, [array], 1);
         await using var f = new LocalSequentialFile(TempPath(file));
-        await using var writer = new ParquetFileWriter(f, ownsFile: false);
-        await writer.WriteRowGroupAsync(new RecordBatch(schema, [array], 1));
-        await writer.CloseAsync();
+        if (buffered)
+        {
+            await using var writer = new BufferedParquetWriter(f, ownsFile: false, options);
+            await writer.AppendAsync(batch);
+            await writer.CloseAsync();
+        }
+        else
+        {
+            await using var writer = new ParquetFileWriter(f, ownsFile: false, options);
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
     }
 
-    [Fact]
-    public async Task Write_SecondPrecisionTimestamp_RescalesToMillis()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Write_SecondPrecisionTimestamp_RescalesToMillis(bool buffered)
     {
         var type = new TimestampType(TimeUnit.Second, "UTC");
-        await WriteAsync("ts_second.parquet", type, Int64Backed(type, 1_700_000_000L, timestamp: true));
+        await WriteAsync("ts_second.parquet", type, Int64Backed(type, 1_700_000_000L, timestamp: true), buffered);
 
         await using var rf = new LocalRandomAccessFile(TempPath("ts_second.parquet"));
         await using var reader = new ParquetFileReader(rf, ownsFile: false);
@@ -82,11 +100,13 @@ public class TimestampUnitCoercionTests : IDisposable
             ((TimestampArray)batch.Column(0)).GetTimestamp(0)!.Value);
     }
 
-    [Fact]
-    public async Task Write_SecondPrecisionTime32_RescalesToMillis()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Write_SecondPrecisionTime32_RescalesToMillis(bool buffered)
     {
         var type = new Time32Type(TimeUnit.Second);
-        await WriteAsync("time32_second.parquet", type, Int32Backed(type, 3661));
+        await WriteAsync("time32_second.parquet", type, Int32Backed(type, 3661), buffered);
 
         await using var rf = new LocalRandomAccessFile(TempPath("time32_second.parquet"));
         await using var reader = new ParquetFileReader(rf, ownsFile: false);
@@ -94,6 +114,43 @@ public class TimestampUnitCoercionTests : IDisposable
 
         Assert.Equal(TimeUnit.Millisecond, ((Time32Type)batch.Schema.FieldsList[0].DataType).Unit);
         Assert.Equal(3_661_000, ((Time32Array)batch.Column(0)).GetValue(0));
+    }
+
+    [Fact]
+    public async Task BufferedWrite_EveryAppendedBatchIsRescaled()
+    {
+        // The buffered writer captures its schema from the first batch but keeps appending, so a
+        // rescale applied only to that first batch would write later ones a thousand times too small.
+        var type = new TimestampType(TimeUnit.Second, "UTC");
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("v", type, true)).Build();
+        string path = TempPath("ts_second_buffered.parquet");
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new BufferedParquetWriter(file, ownsFile: false))
+        {
+            await writer.AppendAsync(new RecordBatch(
+                schema, [Int64Backed(type, 1_700_000_000L, timestamp: true)], 1));
+            await writer.AppendAsync(new RecordBatch(
+                schema, [Int64Backed(type, 1_700_000_001L, timestamp: true)], 1));
+            await writer.CloseAsync();
+        }
+
+        await using var rf = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(rf, ownsFile: false);
+        var read = new List<DateTimeOffset>();
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            var arr = (TimestampArray)batch.Column(0);
+            for (int i = 0; i < arr.Length; i++)
+                read.Add(arr.GetTimestamp(i)!.Value);
+        }
+
+        Assert.Equal(
+            [
+                new DateTimeOffset(2023, 11, 14, 22, 13, 20, TimeSpan.Zero),
+                new DateTimeOffset(2023, 11, 14, 22, 13, 21, TimeSpan.Zero),
+            ],
+            read);
     }
 
     [Fact]
@@ -134,13 +191,16 @@ public class TimestampUnitCoercionTests : IDisposable
         Assert.Contains("millisecond", error.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    [Fact]
-    public async Task Write_TimestampZoneName_SurvivesThroughArrowSchema()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Write_TimestampZoneName_SurvivesThroughArrowSchema(bool buffered)
     {
         // Parquet stores isAdjustedToUTC and no zone name, so the name only survives in
         // ARROW:schema. Without it this reads back as UTC — which is what DuckDB returns.
         var type = new TimestampType(TimeUnit.Microsecond, "America/New_York");
-        await WriteAsync("ts_zone.parquet", type, Int64Backed(type, 1_700_000_000_000_000L, timestamp: true));
+        await WriteAsync(
+            "ts_zone.parquet", type, Int64Backed(type, 1_700_000_000_000_000L, timestamp: true), buffered);
 
         await using var rf = new LocalRandomAccessFile(TempPath("ts_zone.parquet"));
         await using var reader = new ParquetFileReader(rf, ownsFile: false);
@@ -151,22 +211,17 @@ public class TimestampUnitCoercionTests : IDisposable
             ((TimestampType)batch.Schema.FieldsList[0].DataType).Timezone);
     }
 
-    [Fact]
-    public async Task Write_WithoutArrowSchema_LosesTheZoneName()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Write_WithoutArrowSchema_LosesTheZoneName(bool buffered)
     {
         // The opt-out has to actually opt out: no ARROW:schema entry, and the zone falls back to UTC.
         var type = new TimestampType(TimeUnit.Microsecond, "America/New_York");
-        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("v", type, true)).Build();
         string path = TempPath("ts_no_arrow_schema.parquet");
-
-        await using (var file = new LocalSequentialFile(path))
-        await using (var writer = new ParquetFileWriter(
-            file, ownsFile: false, new ParquetWriteOptions { WriteArrowSchema = false }))
-        {
-            await writer.WriteRowGroupAsync(new RecordBatch(
-                schema, [Int64Backed(type, 1_700_000_000_000_000L, timestamp: true)], 1));
-            await writer.CloseAsync();
-        }
+        await WriteAsync(
+            "ts_no_arrow_schema.parquet", type, Int64Backed(type, 1_700_000_000_000_000L, timestamp: true),
+            buffered, new ParquetWriteOptions { WriteArrowSchema = false });
 
         await using var rf = new LocalRandomAccessFile(path);
         await using var reader = new ParquetFileReader(rf, ownsFile: false);

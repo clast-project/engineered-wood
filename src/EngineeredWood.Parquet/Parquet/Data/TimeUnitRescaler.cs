@@ -136,6 +136,46 @@ internal static class TimeUnitRescaler
     }
 
     /// <summary>
+    /// Rescales every column of <paramref name="batch"/>, at any depth, into the units Parquet can
+    /// express, rebuilding the schema to match. Returns the same batch when there is nothing to
+    /// rescale, which is the usual case.
+    /// </summary>
+    /// <param name="batch">The batch to rescale.</param>
+    internal static RecordBatch ToParquetUnits(RecordBatch batch)
+    {
+        IArrowArray[]? columns = null;
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var original = batch.Column(i);
+            var coerced = ToParquetUnits(original);
+            if (!ReferenceEquals(coerced, original))
+            {
+                if (columns is null)
+                {
+                    columns = new IArrowArray[batch.ColumnCount];
+                    for (int c = 0; c < columns.Length; c++)
+                        columns[c] = batch.Column(c);
+                }
+
+                columns[i] = coerced;
+            }
+        }
+
+        if (columns is null)
+            return batch;
+
+        var fields = new Field[columns.Length];
+        for (int i = 0; i < fields.Length; i++)
+        {
+            var field = batch.Schema.FieldsList[i];
+            fields[i] = new Field(field.Name, columns[i].Data.DataType, field.IsNullable, field.Metadata);
+        }
+
+        return new RecordBatch(
+            new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
+    }
+
+    /// <summary>
     /// The type <see cref="ToDeclaredUnits(IArrowArray, IArrowType)"/> would produce, without the
     /// array. Used for a file with no row groups, whose schema is all there is to restore.
     /// </summary>

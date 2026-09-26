@@ -32,6 +32,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     private readonly ParquetFileAssembler _assembler;
     private IReadOnlyList<SchemaElement>? _parquetSchema;
     private Apache.Arrow.Schema? _arrowSchema;
+    private Apache.Arrow.Schema? _declaredSchema;
     private bool _closed;
     private bool _disposed;
 
@@ -73,6 +74,12 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             throw new InvalidOperationException("Writer has been closed.");
 
         cancellationToken.ThrowIfCancellationRequested();
+
+        // As in ParquetFileWriter: the caller's schema is kept for ARROW:schema, and the batch is
+        // rescaled out of second precision before its schema is captured, so the footer declares
+        // what the encoders write.
+        _declaredSchema ??= batch.Schema;
+        batch = TimeUnitRescaler.ToParquetUnits(batch);
 
         if (!_assembler.HeaderWritten)
         {
@@ -222,8 +229,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             _parquetSchema ??= [new SchemaElement { Name = "schema", NumChildren = 0 }];
         }
 
-        // Unlike ParquetFileWriter, this writer does not add ARROW:schema to the caller's metadata (#394).
-        await _assembler.WriteFooterAsync(_parquetSchema!, _options.KeyValueMetadata, cancellationToken)
+        await _assembler.WriteFooterAsync(_parquetSchema!, _declaredSchema, cancellationToken)
             .ConfigureAwait(false);
     }
 
