@@ -350,95 +350,122 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         //
         // Phase 1: Build each column's page map, from its OffsetIndex where it has one, otherwise by
         //          reading the whole chunk to scan its page headers.
-        // Phase 2: For each batch, compute the file-level byte ranges for only the
-        //          pages that overlap the target row range, read those, decode, yield.
+        // Phase 2: For each batch, read and decode only the pages no earlier batch has decoded, and
+        //          take the batch's rows from what is decoded.
         //
         // An OffsetIndex map estimates each page's uncompressed size, which the implicit budget
         // cannot use: it exists to keep a batch under the Arrow limit, so it reads the headers.
         var pageMaps = await BuildPageMapsAsync(ctx, useOffsetIndex: !implicitBudget, cancellationToken)
             .ConfigureAwait(false);
 
-        // Phase 2: yield batches, reading only the needed pages per batch.
-        int rowsEmitted = 0;
-        while (rowsEmitted < ctx.RowCount)
+        // Pages are not cut where batches are, so a page usually holds rows for more than one batch.
+        // Each column keeps the decoded rows that it has not yet returned, and a page is fetched and
+        // decoded once, by the first batch that reaches it (#408). Re-decoding it for every batch it
+        // overlapped cost 8x on dictionary-encoded data, whose pages hold many rows.
+        var cursors = new DecodedRows[ctx.Count];
+        for (int i = 0; i < ctx.Count; i++)
+            cursors[i] = new DecodedRows();
+
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            int batchStartRow = rowsEmitted;
-            int actualBatchRows = ComputeBatchRowCount(
-                pageMaps, batchStartRow, ctx.RowCount, batchSize, maxBytes);
-            int lastRow = batchStartRow + actualBatchRows - 1;
-
-            // Compute the file-level byte range covering the needed pages for
-            // each column and read only those bytes.
-            var pageRanges = new FileRange[ctx.Count];
-            var pageOffsets = new int[ctx.Count]; // startPage per column
-            var pageEnds = new int[ctx.Count];    // endPage per column
-            var baseOffsets = new long[ctx.Count]; // file offset of first byte read per column
-
-            for (int i = 0; i < ctx.Count; i++)
+            int rowsEmitted = 0;
+            while (rowsEmitted < ctx.RowCount)
             {
-                int startPage = pageMaps[i].FindPageForRow(batchStartRow);
-                int endPage = pageMaps[i].FindPageForRow(lastRow);
-                pageOffsets[i] = startPage;
-                pageEnds[i] = endPage;
+                cancellationToken.ThrowIfCancellationRequested();
 
-                var firstEntry = pageMaps[i].Pages[startPage];
-                var lastEntry = pageMaps[i].Pages[endPage];
-                long rangeStart = ctx.Ranges[i].Offset + firstEntry.Offset;
-                long rangeEnd = ctx.Ranges[i].Offset + lastEntry.Offset + lastEntry.CompressedSize;
-                pageRanges[i] = new FileRange(rangeStart, rangeEnd - rangeStart);
-                baseOffsets[i] = firstEntry.Offset; // offset of startPage within column chunk
-            }
+                int batchStartRow = rowsEmitted;
+                int actualBatchRows = ComputeBatchRowCount(
+                    pageMaps, batchStartRow, ctx.RowCount, batchSize, maxBytes);
+                int batchEndRow = batchStartRow + actualBatchRows;
 
-            var pageBuffers = await _file.ReadRangesAsync(pageRanges, cancellationToken)
-                .ConfigureAwait(false);
-
-            try
-            {
-                var results = new ColumnResult[ctx.Count];
-                ForEachColumn(ctx.Count, i =>
+                // The pages each column still has to decode for this batch, read in one request.
+                var pageRanges = new List<FileRange>(ctx.Count);
+                var readers = new List<int>(ctx.Count);
+                var startPages = new int[ctx.Count];
+                var endPages = new int[ctx.Count];
+                for (int i = 0; i < ctx.Count; i++)
                 {
-                    int startPage = pageOffsets[i];
-                    int endPage = pageEnds[i];
-                    int pageStartRow = pageMaps[i].CumulativeRows[startPage];
-                    long baseOffset = baseOffsets[i];
+                    var cursor = cursors[i];
+                    if (cursor.EndRow >= batchEndRow)
+                        continue;
 
-                    var fullResult = ColumnChunkReader.ReadColumnBatchFromSlice(
-                        pageBuffers[i].Memory.Span,
-                        baseOffset,
-                        ctx.Columns[i],
-                        ctx.Chunks[i].MetaData!,
-                        pageMaps[i],
-                        startPage, endPage,
-                        ctx.LeafArrowFields[i],
-                        ctx.HasNestedColumns,
-                        _options.PageChecksumValidation);
+                    int endPage = pageMaps[i].FindPageForRow(batchEndRow - 1);
+                    endPages[i] = endPage;
 
-                    int skipRows = batchStartRow - pageStartRow;
-                    if (skipRows > 0 || fullResult.Array.Length > actualBatchRows)
+                    // A batch that starts in rows already decoded and ends in pages not yet decoded
+                    // spans two runs, and would be copied. When the batch holds more rows than
+                    // decoding its first page again repeats, decode again from that page instead:
+                    // the batch then lies in one run and is returned without a copy.
+                    int startPage = cursor.NextPage;
+                    if (cursor.EndRow > batchStartRow)
                     {
-                        var slicedData = fullResult.Array.Data.Slice(skipRows, actualBatchRows);
-                        var slicedArray = Data.ArrowArrayFactory.BuildArray(slicedData);
-                        results[i] = new ColumnResult(slicedArray,
-                            fullResult.DefinitionLevels, fullResult.RepetitionLevels);
+                        int batchFirstPage = pageMaps[i].FindPageForRow(batchStartRow);
+                        if (cursor.EndRow - pageMaps[i].CumulativeRows[batchFirstPage] < actualBatchRows)
+                            startPage = batchFirstPage;
                     }
-                    else
+
+                    startPages[i] = startPage;
+                    var firstEntry = pageMaps[i].Pages[startPage];
+                    var lastEntry = pageMaps[i].Pages[endPage];
+                    long rangeStart = ctx.Ranges[i].Offset + firstEntry.Offset;
+                    long rangeEnd = ctx.Ranges[i].Offset + lastEntry.Offset + lastEntry.CompressedSize;
+                    pageRanges.Add(new FileRange(rangeStart, rangeEnd - rangeStart));
+                    readers.Add(i);
+                }
+
+                var pageBuffers = pageRanges.Count > 0
+                    ? await _file.ReadRangesAsync(pageRanges, cancellationToken).ConfigureAwait(false)
+                    : [];
+
+                try
+                {
+                    var buffers = new IMemoryOwner<byte>?[ctx.Count];
+                    for (int k = 0; k < readers.Count; k++)
+                        buffers[readers[k]] = pageBuffers[k];
+
+                    var results = new ColumnResult[ctx.Count];
+                    ForEachColumn(ctx.Count, i =>
                     {
-                        results[i] = fullResult;
-                    }
-                });
+                        var cursor = cursors[i];
+                        if (buffers[i] is { } buffer)
+                        {
+                            int startPage = startPages[i];
+                            var decoded = ColumnChunkReader.ReadColumnBatchFromSlice(
+                                buffer.Memory.Span,
+                                pageMaps[i].Pages[startPage].Offset,
+                                ctx.Columns[i],
+                                ctx.Chunks[i].MetaData!,
+                                pageMaps[i],
+                                startPage, endPages[i],
+                                ctx.LeafArrowFields[i],
+                                ctx.HasNestedColumns,
+                                _options.PageChecksumValidation);
+                            if (startPage < cursor.NextPage)
+                                cursor.Restart(decoded.Array, pageMaps[i].CumulativeRows[startPage], endPages[i] + 1);
+                            else
+                                cursor.Append(decoded.Array, endPages[i] + 1);
+                        }
 
-                yield return AssembleRecordBatch(
-                    ctx with { RowCount = actualBatchRows }, results);
-            }
-            finally
-            {
-                for (int i = 0; i < pageBuffers.Count; i++)
-                    pageBuffers[i].Dispose();
-            }
+                        results[i] = new ColumnResult(cursor.Take(actualBatchRows), null, null);
+                    });
 
-            rowsEmitted += actualBatchRows;
+                    yield return AssembleRecordBatch(
+                        ctx with { RowCount = actualBatchRows }, results);
+                }
+                finally
+                {
+                    for (int i = 0; i < pageBuffers.Count; i++)
+                        pageBuffers[i].Dispose();
+                }
+
+                rowsEmitted += actualBatchRows;
+            }
+        }
+        finally
+        {
+            // Rows decoded but not returned, when the caller stops early.
+            foreach (var cursor in cursors)
+                cursor.Dispose();
         }
     }
 
@@ -1122,6 +1149,166 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             builder.Field(arrowFields[i]);
 
         return new RecordBatch(builder.Build(), arrowArrays, rowCount);
+    }
+
+    /// <summary>
+    /// One column's decoded rows that the batched read has not yet returned, and the next page
+    /// to decode. The rows start at the batch being assembled, so <see cref="EndRow"/> is where
+    /// the decoded rows stop, counted from the start of the row group.
+    /// </summary>
+    /// <remarks>
+    /// A caller may dispose one batch and go on reading the next, so a batch must hold its own
+    /// reference to whatever it uses. Rows within one decoded run are returned as a
+    /// reference-counted slice (<see cref="ArrayData.SliceShared"/>): no copy, and the run's
+    /// buffers are freed when the last batch using them and this cursor have both let go. Only a
+    /// batch that spans two runs is copied, and only its own rows are.
+    /// </remarks>
+    private sealed class DecodedRows : IDisposable
+    {
+        // Decoded runs, in row order, with how many of each run's rows have been returned.
+        private readonly List<(IArrowArray Run, int Taken)> _runs = new();
+        private int _startRow;
+        private int _length;
+
+        /// <summary>The first page not yet decoded.</summary>
+        public int NextPage { get; private set; }
+
+        /// <summary>One past the last decoded row.</summary>
+        public int EndRow => _startRow + _length;
+
+        /// <summary>Adds the rows of the pages up to <paramref name="nextPage"/>, just decoded.</summary>
+        public void Append(IArrowArray decoded, int nextPage)
+        {
+            _runs.Add((decoded, 0));
+            _length += decoded.Length;
+            NextPage = nextPage;
+        }
+
+        /// <summary>
+        /// Replaces the decoded rows with <paramref name="decoded"/>, the pages from the one that
+        /// starts at <paramref name="startRow"/>, which re-decodes rows already held: those before
+        /// the next row to return are skipped.
+        /// </summary>
+        public void Restart(IArrowArray decoded, int startRow, int nextPage)
+        {
+            Dispose();
+            int skip = _startRow - startRow;
+            _runs.Add((decoded, skip));
+            _length = decoded.Length - skip;
+            NextPage = nextPage;
+        }
+
+        /// <summary>Returns the next <paramref name="count"/> rows, as an array the caller owns.</summary>
+        public IArrowArray Take(int count)
+        {
+            _startRow += count;
+            _length -= count;
+
+            var (first, firstTaken) = _runs[0];
+            if (first.Length - firstTaken >= count)
+            {
+                var shared = Data.ArrowArrayFactory.BuildArray(first.Data.SliceShared(firstTaken, count));
+                Advance(count);
+                return shared;
+            }
+
+            // The rows span runs. Copy them, then let go of the runs they used up.
+            var pieces = new List<IArrowArray>(2);
+            var consumed = new List<IArrowArray>(2);
+            int needed = count;
+            while (needed > 0)
+            {
+                var (run, taken) = _runs[0];
+                int rows = Math.Min(run.Length - taken, needed);
+                pieces.Add(Data.ArrowArrayFactory.BuildArray(run.Data.Slice(taken, rows)));
+                needed -= rows;
+                if (taken + rows == run.Length)
+                    consumed.Add(run);
+                Advance(rows, dispose: false);
+            }
+
+            var copy = Concatenate(pieces);
+            foreach (var run in consumed)
+                run.Dispose();
+            return copy;
+        }
+
+        public void Dispose()
+        {
+            foreach (var (run, _) in _runs)
+                run.Dispose();
+            _runs.Clear();
+        }
+
+        /// <summary>Marks <paramref name="rows"/> of the first run returned, dropping it once all are.</summary>
+        private void Advance(int rows, bool dispose = true)
+        {
+            var (run, taken) = _runs[0];
+            if (taken + rows < run.Length)
+            {
+                _runs[0] = (run, taken + rows);
+                return;
+            }
+
+            _runs.RemoveAt(0);
+            if (dispose)
+                run.Dispose();
+        }
+
+        /// <summary>
+        /// Copies <paramref name="pieces"/> into one array with buffers of its own. Arrow's
+        /// concatenator does not do that for every type EW returns, so two are handled here:
+        /// <list type="bullet">
+        /// <item>an extension type (a GUID) it refuses, so its storage is concatenated and wrapped again;</item>
+        /// <item>a view type it concatenates by pointing at the inputs' data buffers without holding
+        /// them, which the runs' disposal would free, so the values are copied one by one.</item>
+        /// </list>
+        /// </summary>
+        private static IArrowArray Concatenate(List<IArrowArray> pieces)
+        {
+            switch (pieces[0].Data.DataType)
+            {
+                case ExtensionType extension:
+                    return extension.CreateArray(Concatenate(pieces.Select(p => ((ExtensionArray)p).Storage).ToList()));
+
+                case Apache.Arrow.Types.StringViewType:
+                {
+                    var builder = new StringViewArray.Builder();
+                    foreach (StringViewArray piece in pieces)
+                    {
+                        for (int i = 0; i < piece.Length; i++)
+                        {
+                            if (piece.IsNull(i))
+                                builder.AppendNull();
+                            else
+                                builder.Append(piece.GetString(i));
+                        }
+                    }
+
+                    return builder.Build();
+                }
+
+                case Apache.Arrow.Types.BinaryViewType:
+                {
+                    var builder = new BinaryViewArray.Builder();
+                    foreach (BinaryViewArray piece in pieces)
+                    {
+                        for (int i = 0; i < piece.Length; i++)
+                        {
+                            if (piece.IsNull(i))
+                                builder.AppendNull();
+                            else
+                                builder.Append(piece.GetBytes(i));
+                        }
+                    }
+
+                    return builder.Build();
+                }
+
+                default:
+                    return ArrowArrayConcatenator.Concatenate(pieces);
+            }
+        }
     }
 
     private sealed record RowGroupContext(
