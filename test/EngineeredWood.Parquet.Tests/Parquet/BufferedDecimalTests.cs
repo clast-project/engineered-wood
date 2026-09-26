@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers.Binary;
+using System.Numerics;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.IO.Local;
@@ -118,7 +119,69 @@ public class BufferedDecimalTests : IDisposable
         Assert.Equal(fromControl.Result!.Columns, fromBuffered.Result!.Columns);
     }
 
+    /// <summary>
+    /// With the page big-endian, the dictionary-entry statistics order the values as signed numbers
+    /// (#396): -123456.78 is the minimum and 2.00 the maximum, where unsigned byte order would put
+    /// every negative value above every positive one.
+    /// </summary>
+    [Theory]
+    [InlineData("decimal128")]
+    [InlineData("decimal256")]
+    public async Task DictionaryStatistics_AreSigned(string type)
+    {
+        string path = await WriteBufferedAsync(Batch(type, dictionaryKept: true, nullable: true, out _));
+
+        var chunk = ReadChunk(path);
+        Assert.NotNull(chunk.DictionaryPageOffset);
+        Assert.Equal(new BigInteger(-12345678), SignedBigEndian(chunk.Statistics!.MinValue!));
+        Assert.Equal(new BigInteger(200), SignedBigEndian(chunk.Statistics.MaxValue!));
+    }
+
+    /// <summary>
+    /// DataFusion prunes row groups on those statistics; with bounds inverted it returned no rows for
+    /// predicates that match. DuckDB is the control.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData("d = -1.00")]
+    [InlineData("d < 0")]
+    [InlineData("d > 1")]
+    [InlineData("d = -123456.78")]
+    public async Task DataFusion_FiltersOnBufferedDecimals(string predicate)
+    {
+        ExternalParquetReaders.Require();
+
+        string path = await WriteBufferedAsync(Batch("decimal128", dictionaryKept: true, nullable: true, out var values));
+        long expected = CountMatching(values, predicate);
+        Assert.True(expected > 0, "the predicate must match something, or a pruning reader cannot get it wrong");
+
+        var dataFusion = ExternalParquetReaders.CountWhere(ExternalParquetReaders.DataFusion, path, predicate);
+        Skip.IfNot(dataFusion.Installed, $"datafusion is not installed: {dataFusion.Error}");
+        Assert.True(dataFusion.Count is not null, $"DataFusion refused '{predicate}': {dataFusion.Error}");
+        Assert.Equal(expected, dataFusion.Count);
+
+        var duckDb = ExternalParquetReaders.CountWhere(ExternalParquetReaders.DuckDb, path, predicate);
+        if (duckDb.Installed)
+            Assert.Equal(expected, duckDb.Count);
+    }
+
     // ───── Helpers ─────
+
+    /// <summary>The true answer, computed from the values written, so the expectations cannot drift.</summary>
+    private static long CountMatching(decimal?[] values, string predicate) => predicate switch
+    {
+        "d = -1.00" => values.Count(v => v == -1.00m),
+        "d < 0" => values.Count(v => v < 0),
+        "d > 1" => values.Count(v => v > 1),
+        "d = -123456.78" => values.Count(v => v == -123456.78m),
+        _ => throw new ArgumentOutOfRangeException(nameof(predicate)),
+    };
+
+    private static BigInteger SignedBigEndian(byte[] bytes)
+    {
+        var littleEndian = (byte[])bytes.Clone();
+        System.Array.Reverse(littleEndian);
+        return new BigInteger(littleEndian);
+    }
 
     private static RecordBatch Batch(string type, bool dictionaryKept, bool nullable, out decimal?[] expected)
     {
