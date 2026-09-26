@@ -1289,25 +1289,32 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// Reads the page index (the ColumnIndex and OffsetIndex) of column chunks in one row group.
     /// </summary>
     /// <param name="rowGroupIndex">The row group.</param>
-    /// <param name="columns">Leaf column indices, or null for every leaf column.</param>
+    /// <param name="columnNames">
+    /// Columns to read, named as for <see cref="ReadRowGroupAsync"/>: a leaf's dotted path, or a
+    /// top-level name, which selects all of that column's leaves. Null reads every leaf column.
+    /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>
-    /// One entry per requested column, in the order requested. A chunk the writer gave no index
+    /// One entry per selected leaf column, in the order selected. A chunk the writer gave no index
     /// reports <see cref="ColumnChunkPageIndex.HasColumnIndex"/> and
     /// <see cref="ColumnChunkPageIndex.HasOffsetIndex"/> as false.
     /// </returns>
     /// <remarks>
     /// Nothing is read unless this is called: reading a row group never touches its page index. The
-    /// requested indexes are fetched together in as few ranged reads as their layout allows. Writers
+    /// selected indexes are fetched together in as few ranged reads as their layout allows. Writers
     /// put a row group's ColumnIndexes next to each other and its OffsetIndexes next to each other,
     /// so that is usually two ranges in one request. Each index is decoded when first accessed.
     /// An index whose offset or length is missing is treated as absent.
     /// </remarks>
-    /// <exception cref="ArgumentOutOfRangeException">A row group or column index is out of range.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The row group index is out of range.</exception>
+    /// <exception cref="ArgumentException">A column name is not found in the schema.</exception>
     /// <exception cref="ParquetFormatException">An index lies outside the file.</exception>
+    /// <exception cref="NotSupportedException">
+    /// A selected column chunk is stored in another file (<see cref="ColumnChunk.FilePath"/>).
+    /// </exception>
     public async ValueTask<IReadOnlyList<ColumnChunkPageIndex>> ReadPageIndexAsync(
         int rowGroupIndex,
-        IReadOnlyList<int>? columns = null,
+        IReadOnlyList<string>? columnNames = null,
         CancellationToken cancellationToken = default)
     {
 #if NET8_0_OR_GREATER
@@ -1321,28 +1328,33 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             throw new ArgumentOutOfRangeException(nameof(rowGroupIndex), rowGroupIndex,
                 $"The file has {metadata.RowGroups.Count} row groups.");
 
-        var chunks = metadata.RowGroups[rowGroupIndex].Columns;
-        IReadOnlyList<int> selected = columns ?? Enumerable.Range(0, chunks.Count).ToArray();
-        foreach (int column in selected)
-        {
-            if (column < 0 || column >= chunks.Count)
-                throw new ArgumentOutOfRangeException(nameof(columns), column,
-                    $"The row group has {chunks.Count} leaf columns.");
-        }
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        var (descriptors, chunks) = ResolveColumns(schema, metadata.RowGroups[rowGroupIndex], columnNames);
 
         // Up to two ranges per column, remembering which entry and which index each one is.
-        var ranges = new List<FileRange>(selected.Count * 2);
-        var owners = new List<(int Entry, bool IsColumnIndex)>(selected.Count * 2);
-        for (int entry = 0; entry < selected.Count; entry++)
+        var ranges = new List<FileRange>(chunks.Count * 2);
+        var owners = new List<(int Entry, bool IsColumnIndex)>(chunks.Count * 2);
+        var leaves = new int[chunks.Count];
+        for (int entry = 0; entry < chunks.Count; entry++)
         {
-            var chunk = chunks[selected[entry]];
-            if (PageIndexRange(chunk.ColumnIndexOffset, chunk.ColumnIndexLength, "ColumnIndex", selected[entry]) is { } ci)
+            var chunk = chunks[entry];
+            leaves[entry] = IndexOf(schema.Columns, descriptors[entry]);
+
+            // The offsets would be into that other file; reading them from this one returns unrelated bytes.
+            if (chunk.FilePath is not null)
+            {
+                throw new NotSupportedException(
+                    $"Column '{descriptors[entry].DottedPath}' is stored in another file ('{chunk.FilePath}'); " +
+                    "reading column chunks from external files is not supported.");
+            }
+
+            if (PageIndexRange(chunk.ColumnIndexOffset, chunk.ColumnIndexLength, "ColumnIndex", descriptors[entry]) is { } ci)
             {
                 ranges.Add(ci);
                 owners.Add((entry, true));
             }
 
-            if (PageIndexRange(chunk.OffsetIndexOffset, chunk.OffsetIndexLength, "OffsetIndex", selected[entry]) is { } oi)
+            if (PageIndexRange(chunk.OffsetIndexOffset, chunk.OffsetIndexLength, "OffsetIndex", descriptors[entry]) is { } oi)
             {
                 ranges.Add(oi);
                 owners.Add((entry, false));
@@ -1351,8 +1363,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         var bytes = await ReadPageIndexBytesAsync(ranges, cancellationToken).ConfigureAwait(false);
 
-        var columnIndexes = new byte[]?[selected.Count];
-        var offsetIndexes = new byte[]?[selected.Count];
+        var columnIndexes = new byte[]?[chunks.Count];
+        var offsetIndexes = new byte[]?[chunks.Count];
         for (int i = 0; i < owners.Count; i++)
         {
             if (owners[i].IsColumnIndex)
@@ -1361,37 +1373,32 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 offsetIndexes[owners[i].Entry] = bytes[i];
         }
 
-        var result = new ColumnChunkPageIndex[selected.Count];
-        for (int entry = 0; entry < selected.Count; entry++)
-            result[entry] = new ColumnChunkPageIndex(selected[entry], columnIndexes[entry], offsetIndexes[entry]);
+        var result = new ColumnChunkPageIndex[chunks.Count];
+        for (int entry = 0; entry < chunks.Count; entry++)
+        {
+            result[entry] = new ColumnChunkPageIndex(
+                leaves[entry], descriptors[entry].Path, columnIndexes[entry], offsetIndexes[entry]);
+        }
+
         return result;
     }
 
-    /// <summary>
-    /// Reads the page index of the named column chunks in one row group.
-    /// </summary>
-    /// <param name="rowGroupIndex">The row group.</param>
-    /// <param name="columns">Column names: a dotted path, or a top-level name for a leaf column.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    /// <exception cref="ArgumentException">A column name is not found.</exception>
-    /// <inheritdoc cref="ReadPageIndexAsync(int, IReadOnlyList{int}?, CancellationToken)" path="/returns"/>
-    public async ValueTask<IReadOnlyList<ColumnChunkPageIndex>> ReadPageIndexAsync(
-        int rowGroupIndex,
-        IReadOnlyList<string> columns,
-        CancellationToken cancellationToken = default)
+    private static int IndexOf(IReadOnlyList<ColumnDescriptor> columns, ColumnDescriptor column)
     {
-        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-        var indices = new int[columns.Count];
         for (int i = 0; i < columns.Count; i++)
-            indices[i] = ResolveLeafColumnIndex(schema, columns[i]);
-        return await ReadPageIndexAsync(rowGroupIndex, indices, cancellationToken).ConfigureAwait(false);
+        {
+            if (ReferenceEquals(columns[i], column))
+                return i;
+        }
+
+        throw new InvalidOperationException($"Column '{column.DottedPath}' is not a leaf of this schema.");
     }
 
     /// <summary>
     /// The byte range of one page-index structure, or null when the chunk records none. A range
     /// with only one of its two fields set is treated as absent: it cannot be read either way.
     /// </summary>
-    private FileRange? PageIndexRange(long? offset, int? length, string structure, int column)
+    private FileRange? PageIndexRange(long? offset, int? length, string structure, ColumnDescriptor column)
     {
         if (offset is not { } o || length is not { } l)
             return null;
@@ -1399,7 +1406,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         if (o < 0 || l <= 0 || o > _fileLength - l)
         {
             throw new ParquetFormatException(
-                $"Column {column}'s {structure} lies outside the file: offset {o}, length {l}, file length {_fileLength}.");
+                $"Column '{column.DottedPath}''s {structure} lies outside the file: offset {o}, length {l}, file length {_fileLength}.");
         }
 
         return new FileRange(o, l);

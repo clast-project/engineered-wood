@@ -6,7 +6,7 @@ using EngineeredWood.Parquet.Metadata;
 namespace EngineeredWood.Parquet;
 
 /// <summary>
-/// One column chunk's page index, as read by <see cref="ParquetFileReader.ReadPageIndexAsync(int, IReadOnlyList{int}?, CancellationToken)"/>.
+/// One column chunk's page index, as read by <see cref="ParquetFileReader.ReadPageIndexAsync"/>.
 /// </summary>
 /// <remarks>
 /// The bytes are fetched up front and decoded on first access, so a caller that needs only the
@@ -18,9 +18,10 @@ public sealed class ColumnChunkPageIndex
     private readonly Lazy<ColumnIndex?> _columnIndex;
     private readonly Lazy<OffsetIndex?> _offsetIndex;
 
-    internal ColumnChunkPageIndex(int column, byte[]? columnIndexBytes, byte[]? offsetIndexBytes)
+    internal ColumnChunkPageIndex(int column, IReadOnlyList<string> path, byte[]? columnIndexBytes, byte[]? offsetIndexBytes)
     {
         Column = column;
+        Path = path;
         HasColumnIndex = columnIndexBytes is not null;
         HasOffsetIndex = offsetIndexBytes is not null;
         _columnIndex = new Lazy<ColumnIndex?>(() =>
@@ -29,8 +30,11 @@ public sealed class ColumnChunkPageIndex
             offsetIndexBytes is null ? null : MetadataDecoder.DecodeOffsetIndex(offsetIndexBytes));
     }
 
-    /// <summary>The leaf column's index in the schema.</summary>
+    /// <summary>The leaf column's index in the schema, and in each row group's column chunks.</summary>
     public int Column { get; }
+
+    /// <summary>The leaf column's path in the schema.</summary>
+    public IReadOnlyList<string> Path { get; }
 
     /// <summary>Whether the chunk has a ColumnIndex (per-page bounds and counts).</summary>
     public bool HasColumnIndex { get; }

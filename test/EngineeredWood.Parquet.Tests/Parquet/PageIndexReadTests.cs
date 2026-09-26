@@ -14,7 +14,7 @@ using EngineeredWood.Tests.Parquet.Metadata;
 namespace EngineeredWood.Tests.Parquet;
 
 /// <summary>
-/// <see cref="ParquetFileReader.ReadPageIndexAsync(int, IReadOnlyList{int}?, CancellationToken)"/>:
+/// <see cref="ParquetFileReader.ReadPageIndexAsync"/>:
 /// reading a row group's page index, from files written by parquet-mr, parquet-cpp, parquet-rs and
 /// EngineeredWood.
 /// </summary>
@@ -157,22 +157,80 @@ public class PageIndexReadTests : IDisposable
     // ───── EW-written files ─────
 
     [Fact]
-    public async Task SelectedColumns_ComeBackInTheOrderAsked_ByIndexAndByName()
+    public async Task SelectedColumns_ComeBackInTheOrderAsked()
     {
         string path = await WriteSortedAsync(rowGroups: 3);
         await using var input = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(input, ownsFile: false);
 
-        var byIndex = await reader.ReadPageIndexAsync(1, [2, 0]);
-        var byName = await reader.ReadPageIndexAsync(1, ["s", "x"]);
+        var all = await reader.ReadPageIndexAsync(1);
+        var some = await reader.ReadPageIndexAsync(1, ["s", "x"]);
 
-        Assert.Equal([2, 0], byIndex.Select(i => i.Column));
-        Assert.Equal([2, 0], byName.Select(i => i.Column));
-        for (int i = 0; i < 2; i++)
+        Assert.Equal([0, 1, 2], all.Select(i => i.Column));
+        Assert.Equal([2, 0], some.Select(i => i.Column));
+        Assert.Equal(["s", "x"], some.Select(i => i.Path.Single()));
+        Assert.Equal(MetadataEncoder.EncodeColumnIndex(all[2].ColumnIndex!), MetadataEncoder.EncodeColumnIndex(some[0].ColumnIndex!));
+        Assert.Equal(MetadataEncoder.EncodeOffsetIndex(all[0].OffsetIndex!), MetadataEncoder.EncodeOffsetIndex(some[1].OffsetIndex!));
+    }
+
+    /// <summary>
+    /// Columns are named as for ReadRowGroupAsync: a top-level group selects all its leaves, and a
+    /// leaf can also be named by its dotted path.
+    /// </summary>
+    [Fact]
+    public async Task GroupName_SelectsItsLeaves()
+    {
+        var a = new Int32Array.Builder();
+        var b = new StringArray.Builder();
+        var id = new Int64Array.Builder();
+        for (int i = 0; i < 100; i++)
         {
-            Assert.Equal(MetadataEncoder.EncodeColumnIndex(byIndex[i].ColumnIndex!), MetadataEncoder.EncodeColumnIndex(byName[i].ColumnIndex!));
-            Assert.Equal(MetadataEncoder.EncodeOffsetIndex(byIndex[i].OffsetIndex!), MetadataEncoder.EncodeOffsetIndex(byName[i].OffsetIndex!));
+            a.Append(i);
+            b.Append("b" + i);
+            id.Append(i);
         }
+
+        var structType = new StructType([new Field("a", Int32Type.Default, false), new Field("b", StringType.Default, false)]);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("st", structType, false))
+            .Build();
+        var batch = new RecordBatch(schema,
+            [id.Build(), new StructArray(structType, 100, [a.Build(), b.Build()], ArrowBuffer.Empty, 0)], 100);
+        string path = Path.Combine(_tempDir, "struct.parquet");
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var input = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(input, ownsFile: false);
+
+        var group = await reader.ReadPageIndexAsync(0, ["st"]);
+        var leaf = await reader.ReadPageIndexAsync(0, ["st.b"]);
+
+        Assert.Equal(["st.a", "st.b"], group.Select(i => string.Join(".", i.Path)));
+        Assert.Equal([1, 2], group.Select(i => i.Column));
+        Assert.Equal(2, leaf.Single().Column);
+        Assert.All(group, i => Assert.True(i.HasColumnIndex && i.HasOffsetIndex));
+    }
+
+    /// <summary>
+    /// Selecting nothing must be callable without a cast. With a second overload on
+    /// IReadOnlyList&lt;int&gt;, <c>null</c>, <c>default</c> and <c>[]</c> were ambiguous.
+    /// </summary>
+    [Fact]
+    public async Task NullDefaultAndEmpty_AreUnambiguous()
+    {
+        string path = await WriteSortedAsync(rowGroups: 1);
+        await using var input = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(input, ownsFile: false);
+
+        Assert.Equal(3, (await reader.ReadPageIndexAsync(0, null)).Count);
+        Assert.Equal(3, (await reader.ReadPageIndexAsync(0, default)).Count);
+        Assert.Empty(await reader.ReadPageIndexAsync(0, []));
     }
 
     /// <summary>
@@ -260,6 +318,28 @@ public class PageIndexReadTests : IDisposable
         Assert.Contains("outside the file", e.Message);
     }
 
+    /// <summary>
+    /// A chunk stored in another file has offsets into that file. Reading them from this one would
+    /// return unrelated bytes, so the chunk is refused instead.
+    /// </summary>
+    [Fact]
+    public async Task ExternalColumnChunk_IsRefused()
+    {
+        string path = await RewriteFooterAsync(c => new ColumnChunk
+        {
+            FilePath = "part-00001.parquet",
+            FileOffset = c.FileOffset,
+            MetaData = c.MetaData,
+            ColumnIndexOffset = c.ColumnIndexOffset,
+            ColumnIndexLength = c.ColumnIndexLength,
+            OffsetIndexOffset = c.OffsetIndexOffset,
+            OffsetIndexLength = c.OffsetIndexLength,
+        });
+
+        var e = await Assert.ThrowsAsync<NotSupportedException>(() => ReadAsync(path, 0).AsTask());
+        Assert.Contains("part-00001.parquet", e.Message);
+    }
+
     [Fact]
     public async Task HalfSpecifiedRange_IsAbsent()
     {
@@ -307,7 +387,6 @@ public class PageIndexReadTests : IDisposable
 
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => reader.ReadPageIndexAsync(1).AsTask());
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => reader.ReadPageIndexAsync(-1).AsTask());
-        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => reader.ReadPageIndexAsync(0, [3]).AsTask());
         await Assert.ThrowsAsync<ArgumentException>(() => reader.ReadPageIndexAsync(0, ["nope"]).AsTask());
     }
 
