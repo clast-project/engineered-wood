@@ -359,9 +359,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             .ConfigureAwait(false);
 
         // Pages are not cut where batches are, so a page usually holds rows for more than one batch.
-        // Each column keeps the decoded rows that it has not yet returned, and a page is fetched and
-        // decoded once, by the first batch that reaches it (#408). Re-decoding it for every batch it
-        // overlapped cost 8x on dictionary-encoded data, whose pages hold many rows.
+        // Each column keeps the decoded rows that it has not yet returned, so a page is fetched and
+        // decoded by the first batch that reaches it, and at most once more (see below), rather
+        // than once for every batch it overlaps (#408). That cost 8x on dictionary-encoded data,
+        // whose pages hold many rows.
         var cursors = new DecodedRows[ctx.Count];
         for (int i = 0; i < ctx.Count; i++)
             cursors[i] = new DecodedRows();
