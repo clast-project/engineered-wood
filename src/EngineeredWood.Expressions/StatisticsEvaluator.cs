@@ -144,7 +144,7 @@ public static class StatisticsEvaluator
                 : FilterResult.AlwaysFalse;
         }
 
-        if (min is null || max is null)
+        if (min is null || max is null || IsInverted(min.Value, max.Value))
             return FilterResult.Unknown;
 
         bool minExact = accessor.IsMinExact(stats, column);
@@ -521,7 +521,7 @@ public static class StatisticsEvaluator
 
         var min = accessor.GetMinValue(stats, column!);
         var max = accessor.GetMaxValue(stats, column!);
-        if (min is null || max is null)
+        if (min is null || max is null || IsInverted(min.Value, max.Value))
             return FilterResult.Unknown;
 
         // A hidden NaN matches nothing but a NaN, so an IN list of ordinary numbers still prunes a
@@ -653,6 +653,37 @@ public static class StatisticsEvaluator
         catch (InvalidOperationException)
         {
             return int.MinValue;
+        }
+    }
+
+    /// <summary>
+    /// Whether a unit's minimum lies above its maximum, so that the pair describes no value at all.
+    /// </summary>
+    /// <remarks>
+    /// Taken at face value, such a pair makes every range test answer AlwaysFalse, and the unit is
+    /// skipped whatever it holds. Correct statistics are never inverted, but statistics ordered in
+    /// the wrong type are, and in exactly the case where they are wrong. EngineeredWood before
+    /// #398 (every release to 0.3.0) ordered FIXED_LEN_BYTE_ARRAY decimals as unsigned bytes and
+    /// unsigned integers as signed. Both orders agree with the true one on either side of a single
+    /// break (zero for the decimals, 2^31 or 2^63 for the integers) and put everything above the
+    /// break first. A chunk with values on both sides therefore recorded a minimum from above the
+    /// break and a maximum from below it, which is inverted. That is the one shape of those files
+    /// whose bounds are wrong, and every query against such a chunk skipped it.
+    /// <para>
+    /// Only an exact comparison declares a pair inverted. A pair that cannot be compared, or only
+    /// lossily, is left to the checks that follow, as before. Refusing a pair costs only pruning, so
+    /// a false positive (bounds in an order this comparison does not share) is safe.
+    /// </para>
+    /// </remarks>
+    private static bool IsInverted(LiteralValue min, LiteralValue max)
+    {
+        try
+        {
+            return min.CompareTo(max, out bool exact) > 0 && exact;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
         }
     }
 
