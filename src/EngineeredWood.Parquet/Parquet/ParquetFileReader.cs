@@ -602,7 +602,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             pageMaps[i] = PageMapBuilder.Build(
                 buffer.Memory.Span,
                 ctx.Columns[i],
-                ctx.Chunks[i].MetaData!);
+                ctx.Chunks[i].MetaData!,
+                _options.PageChecksumValidation);
         }
 
         return pageMaps!;
@@ -690,7 +691,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
                 pageMaps[i] = PageMapBuilder.BuildFromOffsetIndex(
                     prefix, range.Offset, range.Offset + range.Length, index, ctx.RowCount,
-                    ctx.Columns[i], ctx.Chunks[i].MetaData!);
+                    ctx.Columns[i], ctx.Chunks[i].MetaData!, _options.PageChecksumValidation);
             }
         }
         finally

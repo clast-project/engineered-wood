@@ -1,13 +1,29 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+#pragma warning disable EWPARQUET0003 // one batched case writes FSST, to tamper with its symbol table
+
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 
 namespace EngineeredWood.Tests.Parquet;
 
-public class PageChecksumTests
+public class PageChecksumTests : IDisposable
 {
+    private readonly string _tempDir;
+
+    public PageChecksumTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), "ew-crc-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(_tempDir);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempDir))
+            Directory.Delete(_tempDir, recursive: true);
+    }
+
     [Fact]
     public async Task RoundTrip_WriteWithCrc_ReadWithValidation()
     {
@@ -216,4 +232,155 @@ public class PageChecksumTests
             File.Delete(path);
         }
     }
+
+    // ───── Batched reads (#407) ─────
+    //
+    // A row group read in several batches goes through the page map, not ColumnChunkReader.ReadColumn:
+    // side pages are decoded while the map is built, data pages one batch at a time. Both must be
+    // checked, whether the map comes from the page headers or from the OffsetIndex.
+
+    private const int Rows = 5000;
+
+    public static TheoryData<bool, int?, long?> BatchedLayouts() => new()
+    {
+        { false, 10, null },
+        { true, 10, null },
+        { false, null, 2000 },
+        { true, null, 2000 },
+    };
+
+    [Theory]
+    [MemberData(nameof(BatchedLayouts))]
+    public async Task Batched_TamperedDataPage_ThrowsOnValidation(bool writePageIndex, int? batchSize, long? maxBatchBytes)
+    {
+        string path = await WriteDoublesAsync(i => i * 1.0, dictionary: false, writePageIndex);
+        var (bytes, chunk) = ReadFirstChunk(path);
+
+        // Inside the last data page's values: PLAIN doubles, so without the check this reads as data.
+        bytes[checked((int)(chunk.DataPageOffset + chunk.TotalCompressedSize - 5))] ^= 0xFF;
+        File.WriteAllBytes(path, bytes);
+
+        await AssertBatchedReadRefusesAsync(path, batchSize, maxBatchBytes);
+        await AssertBatchedReadSucceedsAsync(path, batchSize, maxBatchBytes, validate: false);
+    }
+
+    [Theory]
+    [MemberData(nameof(BatchedLayouts))]
+    public async Task Batched_TamperedDictionaryPage_ThrowsOnValidation(bool writePageIndex, int? batchSize, long? maxBatchBytes)
+    {
+        string path = await WriteDoublesAsync(i => i % 250, dictionary: true, writePageIndex);
+        var (bytes, chunk) = ReadFirstChunk(path);
+        long dictionaryOffset = Assert.IsType<long>(chunk.DictionaryPageOffset);
+        EngineeredWood.Parquet.Data.PageHeaderDecoder.Decode(bytes.AsSpan(checked((int)dictionaryOffset)), out int headerSize);
+
+        // Inside the dictionary's PLAIN doubles.
+        bytes[checked((int)dictionaryOffset + headerSize + 2)] ^= 0xFF;
+        File.WriteAllBytes(path, bytes);
+
+        await AssertBatchedReadRefusesAsync(path, batchSize, maxBatchBytes);
+        await AssertBatchedReadSucceedsAsync(path, batchSize, maxBatchBytes, validate: false);
+    }
+
+    [Theory]
+    [MemberData(nameof(BatchedLayouts))]
+    public async Task Batched_TamperedSymbolTablePage_ThrowsOnValidation(bool writePageIndex, int? batchSize, long? maxBatchBytes)
+    {
+        var values = new Apache.Arrow.StringArray.Builder()
+            .AppendRange(Enumerable.Range(0, Rows).Select(i => "customer-" + (i % 700).ToString("D4")))
+            .Build();
+        string path = await WriteAsync(values, writePageIndex, DataPageVersion.V2, dictionary: false, ByteArrayEncoding.Fsst);
+        var (bytes, chunk) = ReadFirstChunk(path);
+        long symbolTableOffset = Assert.IsType<long>(chunk.SymbolTablePageOffset);
+        EngineeredWood.Parquet.Data.PageHeaderDecoder.Decode(bytes.AsSpan(checked((int)symbolTableOffset)), out int headerSize);
+
+        // Inside the symbol table. Without the check this may decode to wrong strings or fail
+        // some other way, so only the refusal, and its reason, is asserted.
+        bytes[checked((int)symbolTableOffset + headerSize + 4)] ^= 0xFF;
+        File.WriteAllBytes(path, bytes);
+
+        await AssertBatchedReadRefusesAsync(path, batchSize, maxBatchBytes);
+    }
+
+    [Theory]
+    [MemberData(nameof(BatchedLayouts))]
+    public async Task Batched_Untampered_ReadsWithValidation(bool writePageIndex, int? batchSize, long? maxBatchBytes)
+    {
+        foreach (var version in new[] { DataPageVersion.V1, DataPageVersion.V2 })
+        foreach (bool dictionary in new[] { false, true })
+        {
+            string path = await WriteDoublesAsync(i => i % 250, dictionary, writePageIndex, version);
+            await AssertBatchedReadSucceedsAsync(path, batchSize, maxBatchBytes, validate: true);
+        }
+    }
+
+    private Task<string> WriteDoublesAsync(
+        Func<int, double> value, bool dictionary, bool writePageIndex, DataPageVersion version = DataPageVersion.V2) =>
+        WriteAsync(
+            new Apache.Arrow.DoubleArray.Builder().AppendRange(Enumerable.Range(0, Rows).Select(value)).Build(),
+            writePageIndex, version, dictionary, ByteArrayEncoding.DeltaLengthByteArray);
+
+    /// <summary>Writes one non-null column <c>x</c>, uncompressed, with page CRCs, into this test's directory.</summary>
+    private async Task<string> WriteAsync(
+        Apache.Arrow.IArrowArray values, bool writePageIndex, DataPageVersion version, bool dictionary, ByteArrayEncoding strings)
+    {
+        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N")[..8] + ".parquet");
+        var batch = new Apache.Arrow.RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Apache.Arrow.Field("x", values.Data.DataType, false)).Build(),
+            [values], Rows);
+
+        await using var file = new LocalSequentialFile(path);
+        await using var writer = new ParquetFileWriter(file, ownsFile: false, new ParquetWriteOptions
+        {
+            PageChecksumEnabled = true,
+            DictionaryEnabled = dictionary,
+            Compression = EngineeredWood.Compression.CompressionCodec.Uncompressed,
+            DataPageVersion = version,
+            DataPageSize = 1024,
+            WritePageIndex = writePageIndex,
+            ByteArrayEncoding = strings,
+        });
+        await writer.WriteRowGroupAsync(batch);
+        await writer.CloseAsync();
+        return path;
+    }
+
+    private static (byte[] Bytes, EngineeredWood.Parquet.Metadata.ColumnMetaData Chunk) ReadFirstChunk(string path)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        int footerLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        var metadata = EngineeredWood.Parquet.Metadata.MetadataDecoder.DecodeFileMetaData(
+            bytes.AsSpan(bytes.Length - 8 - footerLength, footerLength));
+        return (bytes, metadata.RowGroups[0].Columns[0].MetaData!);
+    }
+
+    private static async Task<int> ReadBatchedAsync(string path, int? batchSize, long? maxBatchBytes, bool validate)
+    {
+        await using var input = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(input, ownsFile: false, new ParquetReadOptions
+        {
+            PageChecksumValidation = validate,
+            BatchSize = batchSize,
+            MaxBatchByteSize = maxBatchBytes,
+        });
+
+        int batches = 0, rows = 0;
+        await foreach (var batch in reader.ReadRowGroupBatchesAsync(0))
+        {
+            batches++;
+            rows += batch.Length;
+        }
+
+        Assert.Equal(Rows, rows);
+        Assert.True(batches > 1, "the read must take the batched path");
+        return batches;
+    }
+
+    private static async Task AssertBatchedReadRefusesAsync(string path, int? batchSize, long? maxBatchBytes)
+    {
+        var ex = await Assert.ThrowsAsync<ParquetFormatException>(() => ReadBatchedAsync(path, batchSize, maxBatchBytes, validate: true));
+        Assert.Contains("CRC", ex.Message);
+    }
+
+    private static Task AssertBatchedReadSucceedsAsync(string path, int? batchSize, long? maxBatchBytes, bool validate) =>
+        ReadBatchedAsync(path, batchSize, maxBatchBytes, validate);
 }
