@@ -16,6 +16,12 @@ if (args.Length > 0 && args[0] is "pageindex-overhead" or "pageindex-child" or "
     Environment.ExitCode = await PageIndexOverhead.RunAsync(args);
     return;
 }
+
+if (args.Length > 0 && args[0] == "pagemap-ab")
+{
+    Environment.ExitCode = await PageMapReadAb.RunAsync(args);
+    return;
+}
 #endif
 
 BenchmarkSwitcher.FromTypes([
