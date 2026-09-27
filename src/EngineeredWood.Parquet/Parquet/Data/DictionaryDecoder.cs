@@ -38,6 +38,19 @@ internal sealed class DictionaryDecoder
     /// </summary>
     public void Load(ReadOnlySpan<byte> data, int numValues, int typeLength)
     {
+        // The arrays below are sized from the header's count before the data is read, so a tiny
+        // page declaring int.MaxValue entries would allocate gigabytes. Every PLAIN entry takes at
+        // least a bit (BOOLEAN) or MinEntryBytes bytes, which bounds the count by the data.
+        long capacity = _physicalType == PhysicalType.Boolean
+            ? data.Length * 8L
+            : data.Length / Math.Max(1, MinEntryBytes(typeLength));
+        if (numValues < 0 || numValues > capacity)
+        {
+            throw new ParquetFormatException(
+                $"Dictionary page declares {numValues} entries, but its {data.Length} bytes of " +
+                $"{_physicalType} data can hold at most {capacity}.");
+        }
+
         Count = numValues;
         switch (_physicalType)
         {
@@ -87,6 +100,16 @@ internal sealed class DictionaryDecoder
                 throw new NotSupportedException($"Dictionary not supported for physical type '{_physicalType}'.");
         }
     }
+
+    /// <summary>The fewest bytes a PLAIN entry of this type takes (a BYTE_ARRAY's length prefix).</summary>
+    private int MinEntryBytes(int typeLength) => _physicalType switch
+    {
+        PhysicalType.Int32 or PhysicalType.Float or PhysicalType.ByteArray => 4,
+        PhysicalType.Int64 or PhysicalType.Double => 8,
+        PhysicalType.Int96 => 12,
+        PhysicalType.FixedLenByteArray => typeLength,
+        _ => 1,
+    };
 
     /// <summary>Gets an Int32 dictionary value by index.</summary>
     public int GetInt32(int index) => _int32Values![index];

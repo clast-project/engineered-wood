@@ -64,6 +64,9 @@ internal ref struct ThriftCompactReader
             if (_position >= _data.Length)
                 throw new ParquetFormatException("Unexpected end of Thrift data reading a varint.");
             byte b = _data[_position++];
+            // The tenth byte carries only bit 63; more would be shifted out and lost.
+            if (shift == 63 && (b & 0x7E) != 0)
+                throw new ParquetFormatException("Thrift varint overflows 64 bits.");
             result |= (ulong)(b & 0x7F) << shift;
             if ((b & 0x80) == 0)
                 return result;

@@ -136,9 +136,9 @@ internal static class PageHeaderDecoder
     private static DataPageHeader ReadDataPageHeader(ref ThriftCompactReader reader)
     {
         int? numValues = null;
-        Encoding encoding = Encoding.Plain;
-        Encoding defLevelEncoding = Encoding.Plain;
-        Encoding repLevelEncoding = Encoding.Plain;
+        Encoding? encoding = null;
+        Encoding? defLevelEncoding = null;
+        Encoding? repLevelEncoding = null;
 
         reader.PushStruct();
         while (true)
@@ -171,9 +171,9 @@ internal static class PageHeaderDecoder
         return new DataPageHeader
         {
             NumValues = numValues ?? throw Missing("DataPageHeader", "num_values"),
-            Encoding = encoding,
-            DefinitionLevelEncoding = defLevelEncoding,
-            RepetitionLevelEncoding = repLevelEncoding,
+            Encoding = encoding ?? throw Missing("DataPageHeader", "encoding"),
+            DefinitionLevelEncoding = defLevelEncoding ?? throw Missing("DataPageHeader", "definition_level_encoding"),
+            RepetitionLevelEncoding = repLevelEncoding ?? throw Missing("DataPageHeader", "repetition_level_encoding"),
         };
     }
 
@@ -182,7 +182,7 @@ internal static class PageHeaderDecoder
         int? numValues = null;
         int? numNulls = null;
         int? numRows = null;
-        Encoding encoding = Encoding.Plain;
+        Encoding? encoding = null;
         int? defByteLength = null;
         int? repByteLength = null;
         bool isCompressed = true;
@@ -229,7 +229,7 @@ internal static class PageHeaderDecoder
             NumValues = numValues ?? throw Missing("DataPageHeaderV2", "num_values"),
             NumNulls = numNulls ?? throw Missing("DataPageHeaderV2", "num_nulls"),
             NumRows = numRows ?? throw Missing("DataPageHeaderV2", "num_rows"),
-            Encoding = encoding,
+            Encoding = encoding ?? throw Missing("DataPageHeaderV2", "encoding"),
             DefinitionLevelsByteLength = defByteLength ?? throw Missing("DataPageHeaderV2", "definition_levels_byte_length"),
             RepetitionLevelsByteLength = repByteLength ?? throw Missing("DataPageHeaderV2", "repetition_levels_byte_length"),
             IsCompressed = isCompressed,
@@ -239,7 +239,7 @@ internal static class PageHeaderDecoder
     private static DictionaryPageHeader ReadDictionaryPageHeader(ref ThriftCompactReader reader)
     {
         int? numValues = null;
-        Encoding encoding = Encoding.Plain;
+        Encoding? encoding = null;
 
         reader.PushStruct();
         while (true)
@@ -266,7 +266,7 @@ internal static class PageHeaderDecoder
         return new DictionaryPageHeader
         {
             NumValues = numValues ?? throw Missing("DictionaryPageHeader", "num_values"),
-            Encoding = encoding,
+            Encoding = encoding ?? throw Missing("DictionaryPageHeader", "encoding"),
         };
     }
 

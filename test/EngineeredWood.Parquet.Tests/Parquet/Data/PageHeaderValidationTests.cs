@@ -142,12 +142,17 @@ public class PageHeaderValidationTests : IDisposable
     /// </summary>
     [Theory]
     [InlineData("varint cut off by the end of the bytes", new byte[] { 0x15, 0x80 }, "Unexpected end of Thrift data reading a varint")]
-    [InlineData("varint longer than 10 bytes", new byte[] { 0x15, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01 }, "longer than 10 bytes")]
+    [InlineData("varint longer than 10 bytes", new byte[] { 0x15, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x81, 0x01 }, "longer than 10 bytes")]
+    [InlineData("tenth varint byte past bit 63", new byte[] { 0x15, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02, 0x00 }, "overflows 64 bits")]
     [InlineData("i32 out of range", new byte[] { 0x15, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0x00 }, "out of range")]
     [InlineData("no compressed_page_size", new byte[] { 0x15, 0x00, 0x15, 0x02, 0x00 }, "missing required 'compressed_page_size'")]
     [InlineData("no uncompressed_page_size", new byte[] { 0x15, 0x00, 0x25, 0x02, 0x00 }, "missing required 'uncompressed_page_size'")]
     [InlineData("data page with no num_values", new byte[] { 0x15, 0x00, 0x15, 0x00, 0x15, 0x00, 0x2C, 0x25, 0x00, 0x00, 0x00 }, "DataPageHeader is missing required 'num_values'")]
     [InlineData("dictionary page with no num_values", new byte[] { 0x15, 0x04, 0x15, 0x00, 0x15, 0x00, 0x4C, 0x25, 0x00, 0x00, 0x00 }, "DictionaryPageHeader is missing required 'num_values'")]
+    [InlineData("data page with no encoding", new byte[] { 0x15, 0x00, 0x15, 0x00, 0x15, 0x00, 0x2C, 0x15, 0x02, 0x00, 0x00 }, "DataPageHeader is missing required 'encoding'")]
+    [InlineData("data page with no level encodings", new byte[] { 0x15, 0x00, 0x15, 0x00, 0x15, 0x00, 0x2C, 0x15, 0x02, 0x15, 0x00, 0x00, 0x00 }, "DataPageHeader is missing required 'definition_level_encoding'")]
+    [InlineData("V2 data page with no encoding", new byte[] { 0x15, 0x06, 0x15, 0x00, 0x15, 0x00, 0x5C, 0x15, 0x02, 0x15, 0x00, 0x15, 0x02, 0x25, 0x00, 0x15, 0x00, 0x00, 0x00 }, "DataPageHeaderV2 is missing required 'encoding'")]
+    [InlineData("dictionary page with no encoding", new byte[] { 0x15, 0x04, 0x15, 0x00, 0x15, 0x00, 0x4C, 0x15, 0x02, 0x00, 0x00 }, "DictionaryPageHeader is missing required 'encoding'")]
     public void MalformedThrift_IsAFormatError(string label, byte[] bytes, string expected)
     {
         _ = label;
@@ -164,6 +169,29 @@ public class PageHeaderValidationTests : IDisposable
         });
         Assert.Contains("corrupted page header", ex.Message);
         Assert.Contains(expected, ex.InnerException!.Message);
+    }
+
+    /// <summary>
+    /// A dictionary's arrays are sized from its header's count before the data is read, so a small
+    /// page declaring int.MaxValue entries must be refused rather than allocate gigabytes.
+    /// </summary>
+    [Theory]
+    [InlineData(int.MaxValue)]
+    [InlineData(1_000_000)]
+    public async Task ADictionaryDeclaringMoreEntriesThanItsDataHolds_IsRefused(int entries)
+    {
+        var chunk = await FirstChunkAsync(DataPageVersion.V2, dictionary: true, column: "n");
+        byte[] tampered = RewriteFirst(chunk.Bytes, PageType.DictionaryPage, h =>
+            Copy(h, dictionary: new DictionaryPageHeader { NumValues = entries, Encoding = h.DictionaryPageHeader!.Encoding }));
+
+#if NET
+        long before = GC.GetAllocatedBytesForCurrentThread();
+#endif
+        var ex = Assert.Throws<ParquetFormatException>(() => ReadColumn(chunk, tampered));
+        Assert.Contains($"declares {entries} entries", ex.Message);
+#if NET
+        Assert.True(GC.GetAllocatedBytesForCurrentThread() - before < 1_000_000, "the refusal allocated as if the count were real");
+#endif
     }
 
     [Fact]
