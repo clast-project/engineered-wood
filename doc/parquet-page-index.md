@@ -377,7 +377,9 @@ and the caller still post-filters.
   bytes and runs 28–32% faster, and a plain read is 8–11% faster at 64Ki-row batches.
 
 **Sequencing on the read side:** page pruning is only reachable from the table layer after
-#55 (per-read filters). `predicate-pushdown-design.md` already puts #55 and #57 ahead of
+#55 (per-read filters), which is now done. Its Delta scan walks row groups itself and carries
+each batch's file position, so page pruning must keep reporting positions the same way: a
+skipped page range is rows the deletion vector and row ids still count. `predicate-pushdown-design.md` already puts #55 and #57 ahead of
 page-level pushdown, and this plan does not change that. R-1 is independent and useful for
 testing the writer.
 
@@ -394,7 +396,7 @@ testing the writer.
 | 4 | Measure memory and duration overhead; default on if nominal (W-6) | small | 3 |
 | 5 | R-1: parse/expose + fixture self-consistency | small | 1 |
 | 6 | Encryption plan Phase 1a: `PageReader` with position-derived ordinals | medium | – |
-| 7 | R-2 + R-3: page pruning and row-range decode | large | 5, 6, #55 |
+| 7 | R-2 + R-3: page pruning and row-range decode | large | 5, 6, #55 (done) |
 | 8 | R-4 items, on demand | – | 7 |
 
 Phases 0–4 deliver the downstream-reader benefit on their own. Phases 5–7 are the EW-reader

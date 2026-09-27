@@ -209,22 +209,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         for (int i = 0; i < metadata.RowGroups.Count; i++)
         {
-            if (accessor is not null && _options.Filter is not null)
+            if (accessor is not null
+                && !await MightMatchAsync(_options.Filter!, i, metadata, schema!, accessor, cancellationToken)
+                    .ConfigureAwait(false))
             {
-                var result = EngineeredWood.Expressions.StatisticsEvaluator.Evaluate(
-                    _options.Filter, metadata.RowGroups[i], accessor);
-                if (result == EngineeredWood.Expressions.FilterResult.AlwaysFalse)
-                    continue;
-
-                if (_options.FilterUseBloomFilters
-                    && result == EngineeredWood.Expressions.FilterResult.Unknown)
-                {
-                    var bloomResult = await BloomFilterPredicateEvaluator.EvaluateAsync(
-                        _options.Filter, i, metadata, schema!,
-                        _file, _fileLength, _options.ColumnChunkFilePath, cancellationToken).ConfigureAwait(false);
-                    if (bloomResult == EngineeredWood.Expressions.FilterResult.AlwaysFalse)
-                        continue;
-                }
+                continue;
             }
 
             // Always via the batching entry point, even with no batch limit configured: it falls back to
@@ -1624,6 +1613,81 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Returns a <see cref="BitArray"/> indicating which row groups might contain a row matching
+    /// <paramref name="filter"/>: the per-read form of <see cref="ParquetReadOptions.Filter"/>, deciding
+    /// each row group exactly as <see cref="ReadAllAsync"/> does under that option (column statistics,
+    /// then Bloom filters when <see cref="ParquetReadOptions.FilterUseBloomFilters"/> is set) without
+    /// reading any data.
+    /// </summary>
+    /// <remarks>
+    /// Use this rather than <see cref="ParquetReadOptions.Filter"/> when one reader configuration serves
+    /// reads with different intents, or when the caller needs each row's position in the file: read the
+    /// candidates with <see cref="ReadRowGroupBatchesAsync"/> and count the rows of the skipped groups
+    /// from <see cref="RowGroup.NumRows"/>. <see cref="ReadAllAsync"/> under a filter drops row groups
+    /// silently, so a position computed by counting its batches is wrong after the first skipped group.
+    /// <para>References are resolved against the file's leaf columns by dotted path (or bare name for a
+    /// top-level leaf); one that resolves to nothing evaluates Unknown and keeps the row group. The
+    /// result is a superset: rows of a candidate row group are not filtered.</para>
+    /// </remarks>
+    /// <param name="filter">The predicate.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>
+    /// A <see cref="BitArray"/> of length equal to the number of row groups. A <c>false</c> bit means
+    /// the row group provably holds no matching row.
+    /// </returns>
+    public async ValueTask<BitArray> GetCandidateRowGroupsAsync(
+        EngineeredWood.Expressions.Predicate filter,
+        CancellationToken cancellationToken = default)
+    {
+#if NET8_0_OR_GREATER
+        ObjectDisposedException.ThrowIf(_disposed, this);
+#else
+        if (_disposed) throw new ObjectDisposedException(GetType().FullName);
+#endif
+        if (filter is null) throw new ArgumentNullException(nameof(filter));
+
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        var accessor = new ParquetStatisticsAccessor(schema);
+
+        var result = new BitArray(metadata.RowGroups.Count, true);
+        for (int i = 0; i < metadata.RowGroups.Count; i++)
+        {
+            result[i] = await MightMatchAsync(filter, i, metadata, schema, accessor, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// The one row-group verdict behind both <see cref="ParquetReadOptions.Filter"/> and
+    /// <see cref="GetCandidateRowGroupsAsync(EngineeredWood.Expressions.Predicate, CancellationToken)"/>:
+    /// false only when statistics, or a Bloom filter probe of a predicate they left Unknown, prove no row
+    /// of row group <paramref name="rowGroup"/> matches.
+    /// </summary>
+    private async ValueTask<bool> MightMatchAsync(
+        EngineeredWood.Expressions.Predicate filter, int rowGroup, FileMetaData metadata,
+        SchemaDescriptor schema, ParquetStatisticsAccessor accessor, CancellationToken cancellationToken)
+    {
+        var result = EngineeredWood.Expressions.StatisticsEvaluator.Evaluate(
+            filter, metadata.RowGroups[rowGroup], accessor);
+        if (result == EngineeredWood.Expressions.FilterResult.AlwaysFalse)
+            return false;
+
+        if (_options.FilterUseBloomFilters
+            && result == EngineeredWood.Expressions.FilterResult.Unknown)
+        {
+            var bloomResult = await BloomFilterPredicateEvaluator.EvaluateAsync(
+                filter, rowGroup, metadata, schema,
+                _file, _fileLength, _options.ColumnChunkFilePath, cancellationToken).ConfigureAwait(false);
+            if (bloomResult == EngineeredWood.Expressions.FilterResult.AlwaysFalse)
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>

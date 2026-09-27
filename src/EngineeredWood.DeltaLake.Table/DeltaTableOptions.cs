@@ -18,7 +18,11 @@ public sealed record DeltaTableOptions
     /// <summary>Parquet write options for data files.</summary>
     public ParquetWriteOptions ParquetWriteOptions { get; init; } = ParquetWriteOptions.Default;
 
-    /// <summary>Parquet read options for data files.</summary>
+    /// <summary>
+    /// Parquet read options for data files. <see cref="ParquetReadOptions.Filter"/> must be unset (opening
+    /// the table refuses it): these options serve every read of a data file, compaction and DML rewrites
+    /// included, which must see every row. Push a predicate down with <see cref="DeltaReadOptions.Filter"/>.
+    /// </summary>
     public ParquetReadOptions ParquetReadOptions { get; init; } = ParquetReadOptions.Default;
 
     /// <summary>Target size for individual data files in bytes. Default: 128 MB.</summary>

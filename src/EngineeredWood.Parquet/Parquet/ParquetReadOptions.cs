@@ -265,11 +265,21 @@ public sealed record ParquetReadOptions
     /// comparisons, missing stats) are conservatively kept. The reader does not
     /// re-apply the predicate to rows; callers wanting exact row-level
     /// filtering must do that on the returned batches themselves.
+    /// <para>
+    /// This is a property of the reader, so it applies to every
+    /// <see cref="ParquetFileReader.ReadAllAsync"/> made with these options, and
+    /// a skipped row group leaves no trace in the batches. A layer that issues
+    /// reads with different intents, or that counts rows to know their positions
+    /// in the file, should leave it unset and call
+    /// <see cref="ParquetFileReader.GetCandidateRowGroupsAsync(Predicate, System.Threading.CancellationToken)"/>
+    /// per read instead.
+    /// </para>
     /// </remarks>
     public Predicate? Filter { get; init; }
 
     /// <summary>
-    /// When <see langword="true"/> and <see cref="Filter"/> is set, the reader
+    /// When <see langword="true"/>, row-group pruning (by <see cref="Filter"/>, or by
+    /// <see cref="ParquetFileReader.GetCandidateRowGroupsAsync(Predicate, System.Threading.CancellationToken)"/>)
     /// also probes Bloom filters for equality and IN predicates that the
     /// statistics evaluator could not decide. Requires extra I/O per candidate
     /// row group (one read per column with a Bloom filter), so this is opt-in.
