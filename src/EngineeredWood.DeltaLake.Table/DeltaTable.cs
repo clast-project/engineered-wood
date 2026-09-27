@@ -158,6 +158,35 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    private (Schema.StructType Schema, ColumnMappingMode Mode, ParquetWriteOptions Options)? _dataFileWriteOptions;
+
+    /// <summary>
+    /// The write options for a data file of <paramref name="snapshot"/>: the table's
+    /// <see cref="DeltaTableOptions.ParquetWriteOptions"/> with each per-column key translated from the
+    /// logical column it names to the physical leaf the file carries (#416). Only data files: checkpoint
+    /// files have a schema of their own and take the options untranslated. Cached per schema, so the
+    /// translation is redone when a RENAME COLUMN changes the logical names.
+    /// </summary>
+    private ParquetWriteOptions DataFileWriteOptions(Snapshot.Snapshot snapshot) =>
+        DataFileWriteOptions(snapshot.Schema, ColumnMapping.GetMode(snapshot.Metadata.Configuration));
+
+    /// <summary>
+    /// As above, against a schema that need not be committed: a buffered transaction's pending schema
+    /// carries added columns and their fresh physical names, which the committed snapshot does not.
+    /// </summary>
+    private ParquetWriteOptions DataFileWriteOptions(Schema.StructType schema, ColumnMappingMode mode)
+    {
+        if (_dataFileWriteOptions is { } cached
+            && ReferenceEquals(cached.Schema, schema) && cached.Mode == mode)
+        {
+            return cached.Options;
+        }
+
+        var options = ColumnMappingWriteOptions.ToPhysical(_options.ParquetWriteOptions, schema, mode);
+        _dataFileWriteOptions = (schema, mode, options);
+        return options;
+    }
+
     private static ParquetReadOptions WithVariantExtension(ParquetReadOptions options)
     {
         var registry = options.ExtensionRegistry;
@@ -3755,7 +3784,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     var trk = b < deletedRowTracking.Count ? deletedRowTracking[b] : ((Int64Array, Int64Array)?)null;
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
                         _fs, snapshot, deletedRowBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                        addFile.PartitionValues, _options.ParquetWriteOptions,
+                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
                         cancellationToken, trk?.Item1, trk?.Item2, written).ConfigureAwait(false);
                     actions.Add(cdcAction);
                 }
@@ -4062,7 +4091,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 await using var file = await _fs.CreateAsync(
                     newFileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                 await using var writer = new Parquet.ParquetFileWriter(
-                    file, ownsFile: false, _options.ParquetWriteOptions);
+                    file, ownsFile: false, DataFileWriteOptions(snapshot));
 
                 foreach (var batch in writeBatches)
                 {
@@ -4121,7 +4150,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     var trk = b < changeTracking.Count ? changeTracking[b] : default;
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
                         _fs, snapshot, preimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
-                        addFile.PartitionValues, _options.ParquetWriteOptions,
+                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
                         cancellationToken, trk.PreIds, trk.PreVers, written).ConfigureAwait(false);
                     actions.Add(cdcAction);
                 }
@@ -4130,7 +4159,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     var trk = b < changeTracking.Count ? changeTracking[b] : default;
                     var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
                         _fs, snapshot, postimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
-                        addFile.PartitionValues, _options.ParquetWriteOptions,
+                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
                         cancellationToken, trk.PostIds, trk.PostVers, written).ConfigureAwait(false);
                     actions.Add(cdcAction);
                 }
@@ -4402,7 +4431,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return await ChangeDataFeed.CdfWriter.WriteAsync(
             _fs, CurrentSnapshot, rows, changeType,
             partitionValues ?? EmptyPartitionValues,
-            _options.ParquetWriteOptions, cancellationToken,
+            DataFileWriteOptions(CurrentSnapshot), cancellationToken,
             rowIds, rowCommitVersions).ConfigureAwait(false);
     }
 
@@ -5337,7 +5366,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     await using var file = await _fs.CreateAsync(
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
-                        file, ownsFile: false, _options.ParquetWriteOptions);
+                        file, ownsFile: false, DataFileWriteOptions(snapshot));
                     await writer.WriteRowGroupAsync(writeBatch, cancellationToken)
                         .ConfigureAwait(false);
 
@@ -6036,7 +6065,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     await using var file = await _fs.CreateAsync(
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
-                        file, ownsFile: false, _options.ParquetWriteOptions);
+                        file, ownsFile: false, DataFileWriteOptions(writeSchema, mappingMode));
                     await writer.WriteRowGroupAsync(writeBatch, cancellationToken).ConfigureAwait(false);
                     await writer.DisposeAsync().ConfigureAwait(false);
                     fileSize = file.Position;
@@ -6649,7 +6678,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return
             [
                 await ChangeDataFeed.CdfWriter.WriteAsync(
-                    _fs, snapshot, rows, changeType, EmptyPartitionValues, _options.ParquetWriteOptions,
+                    _fs, snapshot, rows, changeType, EmptyPartitionValues, DataFileWriteOptions(snapshot),
                     cancellationToken, rowIds, rowCommitVersions, written).ConfigureAwait(false),
             ];
         }
@@ -6675,7 +6704,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // CdfWriter strips the partition columns itself, but SplitByPartition already removed them; the
             // second removal is a no-op, so the batch arrives shaped exactly like a data file's.
             files.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
-                _fs, snapshot, dataBatch, changeType, keyed, _options.ParquetWriteOptions,
+                _fs, snapshot, dataBatch, changeType, keyed, DataFileWriteOptions(snapshot),
                 cancellationToken,
                 rowIds is not null ? TakeIds(rowIds, sourceRows) : null,
                 rowCommitVersions is not null ? TakeIds(rowCommitVersions, sourceRows) : null,
@@ -7013,7 +7042,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         var batchVers = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
                         var cdc = await ChangeDataFeed.CdfWriter.WriteAsync(
                             _fs, snapshot, TakeRowsFromBatch(batch, delRows), DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                            addFile.PartitionValues, _options.ParquetWriteOptions,
+                            addFile.PartitionValues, DataFileWriteOptions(snapshot),
                             cancellationToken,
                             batchIds is not null ? TakeIds(batchIds, delRows) : null,
                             batchVers is not null ? TakeIds(batchVers, delRows) : null,
@@ -7168,7 +7197,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     var trk = deletedTracking![b];
                     actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
                         _fs, snapshot, deletedBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                        addFile.PartitionValues, _options.ParquetWriteOptions,
+                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
                         cancellationToken, trk.Ids, trk.Vers, written).ConfigureAwait(false));
                 }
             }
@@ -7290,7 +7319,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             await using var file = await _fs.CreateAsync(
                 newFileName, cancellationToken: cancellationToken).ConfigureAwait(false);
             await using var writer = new Parquet.ParquetFileWriter(
-                file, ownsFile: false, _options.ParquetWriteOptions);
+                file, ownsFile: false, DataFileWriteOptions(snapshot));
             foreach (var batch in writeBatches)
                 await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
             await writer.DisposeAsync().ConfigureAwait(false);
@@ -7616,11 +7645,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
                         _fs, snapshot, pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
-                        addFile.PartitionValues, _options.ParquetWriteOptions,
+                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
                         cancellationToken, ids, preVers, written).ConfigureAwait(false));
                     actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
                         _fs, snapshot, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
-                        addFile.PartitionValues, _options.ParquetWriteOptions,
+                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
                         cancellationToken,
                         ids, ids is not null ? ConstInt64(newVersion, ids.Length) : null,
                         written).ConfigureAwait(false));
@@ -8255,7 +8284,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 var plan = await Compaction.CompactionExecutor.ExecuteAsync(
                     _fs, snapshot, options,
-                    _options.ParquetWriteOptions, _dataFileReadOptions,
+                    DataFileWriteOptions(snapshot), _dataFileReadOptions,
                     cancellationToken, _options.DataFileWriter, _options.DataFileReader, written)
                     .ConfigureAwait(false);
                 if (plan is not { } compaction)
