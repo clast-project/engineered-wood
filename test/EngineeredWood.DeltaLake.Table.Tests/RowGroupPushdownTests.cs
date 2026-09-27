@@ -148,6 +148,41 @@ public class RowGroupPushdownTests : IDisposable
         Assert.Equal(Range(20, RowsPerGroup), await ReadIds(table, Ex.GreaterThanOrEqual("id", 25L)));
     }
 
+    /// <summary>
+    /// Dictionary pages (#57) prune through the same per-read path when the table opts in. The three
+    /// row groups span "a".."z" but hold disjoint names, so statistics cannot rule any out.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Dictionaries_ApplyWhenTheTableOptsIn(bool useDictionaries)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("name", StringType.Default, false))
+            .Build();
+        var options = new DeltaTableOptions
+        {
+            ParquetWriteOptions = ParquetWriteOptions.Default with { RowGroupMaxRows = RowsPerGroup },
+            ParquetReadOptions = ParquetReadOptions.Default with { FilterUseDictionaries = useDictionaries },
+        };
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema, options);
+
+        // Each group of ten repeats its two names, so the writer builds a dictionary for it.
+        string[][] groups = [["alpha", "zebra"], ["cherry", "zinnia"], ["avocado", "zucchini"]];
+        var names = new StringArray.Builder();
+        foreach (var group in groups)
+            for (int i = 0; i < RowsPerGroup; i++)
+                names.Append(group[i % 2]);
+        await table.WriteAsync([new RecordBatch(schema, [names.Build()], Rows)]);
+        Assert.Single(table.CurrentSnapshot.ActiveFiles);
+
+        int rows = 0;
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Filter = Ex.Equal("name", "cherry") }))
+            rows += batch.Length;
+
+        Assert.Equal(useDictionaries ? RowsPerGroup : Rows, rows);
+    }
+
     [Fact]
     public async Task BloomFilters_ApplyWhenTheTableOptsIn()
     {

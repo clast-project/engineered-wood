@@ -288,6 +288,23 @@ public sealed record ParquetReadOptions
     public bool FilterUseBloomFilters { get; init; }
 
     /// <summary>
+    /// When <see langword="true"/>, row-group pruning (by <see cref="Filter"/>, or by
+    /// <see cref="ParquetFileReader.GetCandidateRowGroupsAsync(Predicate, System.Threading.CancellationToken)"/>)
+    /// also reads the dictionary page of each column an equality or IN predicate names, when the
+    /// statistics evaluator could not decide, and rules the row group out when no value is in it.
+    /// Unlike a Bloom filter the answer is exact, and it needs nothing from the writer beyond the
+    /// dictionary encoding most writers use by default.
+    /// </summary>
+    /// <remarks>
+    /// <para>A chunk is only asked when its <c>encoding_stats</c> prove every data page is
+    /// dictionary-encoded: a chunk that fell back to PLAIN holds values its dictionary does not, and its
+    /// encoding list alone cannot show that it did. A chunk without those stats is read as usual.</para>
+    /// <para>Costs one ranged read per named column, only in row groups statistics left undecided. Off
+    /// by default until that cost is measured. Default: <see langword="false"/>.</para>
+    /// </remarks>
+    public bool FilterUseDictionaries { get; init; }
+
+    /// <summary>
     /// Whether to validate CRC-32C checksums when present in page headers.
     /// When enabled and a page header contains a <c>crc</c> field, the compressed
     /// page data is verified before decompression. Mismatches throw

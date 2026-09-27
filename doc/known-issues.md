@@ -1052,10 +1052,13 @@ contain non-matching rows. `ArrowRowEvaluator` exists and is used by Delta
 predicate DELETE/UPDATE and by `LanceTable.ReadAsync`, but not by either
 reader.
 
-**Dictionary pages are used only to decode.** No dictionary-based row-group
-pruning, and the dictionary never reaches Arrow (dictionary-encoded columns are
-always materialised), so it cannot accelerate row-level filtering either.
-Tracked as [#57](https://github.com/clast-project/engineered-wood/issues/57).
+**Dictionary-page pruning is off by default.** `ParquetReadOptions.FilterUseDictionaries`
+rules a row group out when an equality or IN value is absent from a chunk's dictionary
+(#57), but it is opt-in until its read cost is measured. It only answers for a chunk whose
+`encoding_stats` prove every data page is dictionary-encoded, so files from writers that
+omit those stats (no arrow-rs file in parquet-testing carries them) are not pruned. The
+dictionary also never reaches Arrow (dictionary-encoded columns are always materialised),
+so it cannot accelerate row-level filtering.
 
 ### Correctness / interop issues
 
