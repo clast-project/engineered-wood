@@ -589,6 +589,7 @@ internal static class MetadataDecoder
         long? indexPageOffset = null;
         long? dictionaryPageOffset = null;
         Statistics? statistics = null;
+        IReadOnlyList<PageEncodingStats>? encodingStats = null;
         long? bloomFilterOffset = null;
         int? bloomFilterLength = null;
         long? symbolTablePageOffset = null;
@@ -637,8 +638,8 @@ internal static class MetadataDecoder
                 case 12 when type == ThriftType.Struct: // statistics: Statistics
                     statistics = ReadStatistics(ref reader);
                     break;
-                case 13: // encoding_stats: list<PageEncodingStats> (skip)
-                    reader.Skip(type);
+                case 13 when type == ThriftType.List: // encoding_stats: list<PageEncodingStats>
+                    encodingStats = ReadPageEncodingStatsList(ref reader);
                     break;
                 case 14 when type == ThriftType.I64: // bloom_filter_offset: i64
                     bloomFilterOffset = reader.ReadZigZagInt64();
@@ -676,6 +677,7 @@ internal static class MetadataDecoder
             IndexPageOffset = indexPageOffset,
             DictionaryPageOffset = dictionaryPageOffset,
             Statistics = statistics,
+            EncodingStats = encodingStats,
             BloomFilterOffset = bloomFilterOffset,
             BloomFilterLength = bloomFilterLength,
             SymbolTablePageOffset = symbolTablePageOffset,
@@ -760,6 +762,62 @@ internal static class MetadataDecoder
         for (int i = 0; i < count; i++)
             array[i] = (Encoding)reader.ReadZigZagInt32();
         return array;
+    }
+
+    /// <summary>
+    /// Reads <c>encoding_stats</c>, or returns null when any entry is malformed. The list is optional, and a
+    /// consumer may conclude from it that a chunk has NO page of some kind (every data page
+    /// dictionary-encoded), so a list with an entry dropped would be worse than no list at all.
+    /// </summary>
+    private static PageEncodingStats[]? ReadPageEncodingStatsList(ref ThriftCompactReader reader)
+    {
+        var (elemType, count) = reader.ReadListHeader();
+        if (elemType != ThriftType.Struct)
+        {
+            for (int i = 0; i < count; i++)
+                reader.Skip(elemType);
+            return null;
+        }
+
+        var array = new PageEncodingStats[count];
+        bool complete = true;
+        for (int i = 0; i < count; i++)
+        {
+            if (ReadPageEncodingStats(ref reader) is { } stats)
+                array[i] = stats;
+            else
+                complete = false;
+        }
+        return complete ? array : null;
+    }
+
+    private static PageEncodingStats? ReadPageEncodingStats(ref ThriftCompactReader reader)
+    {
+        reader.PushStruct();
+
+        int? pageType = null;
+        int? encoding = null;
+        int? count = null;
+
+        while (true)
+        {
+            var (type, fid) = reader.ReadFieldHeader();
+            if (type == ThriftType.Stop) break;
+
+            switch (fid)
+            {
+                case 1 when type == ThriftType.I32: pageType = reader.ReadZigZagInt32(); break;
+                case 2 when type == ThriftType.I32: encoding = reader.ReadZigZagInt32(); break;
+                case 3 when type == ThriftType.I32: count = reader.ReadZigZagInt32(); break;
+                default: reader.Skip(type); break;
+            }
+        }
+
+        reader.PopStruct();
+
+        return pageType is { } p && encoding is { } e && count is { } c
+            ? new PageEncodingStats((PageType)p, (Encoding)e, c)
+            : null;
     }
 
     private static string[] ReadStringList(ref ThriftCompactReader reader)

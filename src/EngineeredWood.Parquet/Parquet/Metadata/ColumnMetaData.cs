@@ -49,8 +49,15 @@ public sealed class ColumnMetaData
     /// <summary>Column chunk statistics.</summary>
     public Statistics? Statistics { get; set; }
 
-    /// <summary>Encoding statistics per page type.</summary>
+    /// <summary>Application-defined key-value metadata for the column chunk.</summary>
     public IReadOnlyList<KeyValue>? KeyValueMetadata { get; init; }
+
+    /// <summary>
+    /// The number of pages of each type and encoding in this chunk (dictionary page included), or
+    /// <see langword="null"/> when the writer did not record them. See <see cref="PageEncodingStats"/>
+    /// for why this, and not <see cref="Encodings"/>, is what shows a chunk never left its dictionary.
+    /// </summary>
+    public IReadOnlyList<PageEncodingStats>? EncodingStats { get; init; }
 
     /// <summary>Byte offset of the Bloom filter block in the file, if present.</summary>
     public long? BloomFilterOffset { get; init; }

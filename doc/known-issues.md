@@ -116,7 +116,6 @@ and `ListViewType`.
 
 **Metadata fields not produced on write:**
 
-- `ColumnMetaData.encoding_stats` (field 13) is never populated.
 - `ColumnMetaData.key_value_metadata` (field 8, per-column) is neither
   read nor written.
 - `RowGroup.SortingColumns` can be encoded and decoded but

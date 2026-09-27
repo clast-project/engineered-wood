@@ -33,6 +33,7 @@ internal sealed class ColumnChunkOutput
     private readonly MemoryStream _stream;
     private readonly bool _pageChecksumEnabled;
     private int _dataPageCount;
+    private readonly List<PageEncodingStats> _encodingStats = new(2);
 
     public ColumnChunkOutput(int initialCapacity, ParquetWriteOptions options)
     {
@@ -45,6 +46,13 @@ internal sealed class ColumnChunkOutput
 
     /// <summary>Header plus payload as written, summed over every page written.</summary>
     public int TotalCompressedSize { get; private set; }
+
+    /// <summary>
+    /// Pages written so far, by type and encoding, in order of first appearance: the chunk's
+    /// <c>encoding_stats</c>. The FSST symbol table page is not counted: its page type is part of an
+    /// unratified proposal, and a reader that does not know it may refuse the whole list.
+    /// </summary>
+    public IReadOnlyList<PageEncodingStats> EncodingStats => _encodingStats;
 
     /// <summary>The chunk's bytes so far.</summary>
     public ArraySegment<byte> Data
@@ -105,8 +113,34 @@ internal sealed class ColumnChunkOutput
         TotalUncompressedSize += headerBytes.Length + header.UncompressedPageSize;
         TotalCompressedSize += headerBytes.Length + payloadLength;
 
+        CountEncoding(header);
+
         int? ordinal = header.Type is PageType.DataPage or PageType.DataPageV2 ? _dataPageCount++ : null;
         return new EmittedPage(offset, headerBytes.Length + payloadLength, ordinal);
+    }
+
+    private void CountEncoding(PageHeader header)
+    {
+        Encoding? encoding = header.Type switch
+        {
+            PageType.DataPage => header.DataPageHeader?.Encoding,
+            PageType.DataPageV2 => header.DataPageHeaderV2?.Encoding,
+            PageType.DictionaryPage => header.DictionaryPageHeader?.Encoding,
+            _ => null,
+        };
+        if (encoding is not { } e)
+            return;
+
+        for (int i = 0; i < _encodingStats.Count; i++)
+        {
+            var entry = _encodingStats[i];
+            if (entry.PageType == header.Type && entry.Encoding == e)
+            {
+                _encodingStats[i] = entry with { Count = entry.Count + 1 };
+                return;
+            }
+        }
+        _encodingStats.Add(new PageEncodingStats(header.Type, e, 1));
     }
 
     private void Write(ReadOnlySpan<byte> bytes)

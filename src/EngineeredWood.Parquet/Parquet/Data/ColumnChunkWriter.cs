@@ -414,6 +414,7 @@ internal static class ColumnChunkWriter
             NumValues = rowCount,
             TotalUncompressedSize = output.TotalUncompressedSize,
             TotalCompressedSize = output.TotalCompressedSize,
+            EncodingStats = output.EncodingStats.ToArray(),
             DataPageOffset = 0, // set by caller
             SymbolTablePageOffset = symbolTablePageSize > 0 ? 0 : null, // set by caller
             SymbolTablePageLength = symbolTablePageSize > 0 ? symbolTablePageSize : null,
@@ -710,6 +711,7 @@ internal static class ColumnChunkWriter
             NumValues = rowCount,
             TotalUncompressedSize = output.TotalUncompressedSize,
             TotalCompressedSize = output.TotalCompressedSize,
+            EncodingStats = output.EncodingStats.ToArray(),
             DataPageOffset = 0, // set by caller
             DictionaryPageOffset = 0, // set by caller
         };
