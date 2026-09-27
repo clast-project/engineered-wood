@@ -201,16 +201,18 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         ParquetStatisticsAccessor? accessor = null;
         SchemaDescriptor? schema = null;
+        DictionaryPrefetch? prefetch = null;
         if (_options.Filter is not null)
         {
             schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
             accessor = new ParquetStatisticsAccessor(schema);
+            prefetch = CreateDictionaryPrefetch(_options.Filter, metadata, schema, accessor);
         }
 
         for (int i = 0; i < metadata.RowGroups.Count; i++)
         {
             if (accessor is not null
-                && !await MightMatchAsync(_options.Filter!, i, metadata, schema!, accessor, cancellationToken)
+                && !await MightMatchAsync(_options.Filter!, i, metadata, schema!, accessor, prefetch, cancellationToken)
                     .ConfigureAwait(false))
             {
                 continue;
@@ -1666,14 +1668,30 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
         var accessor = new ParquetStatisticsAccessor(schema);
 
+        var prefetch = CreateDictionaryPrefetch(filter, metadata, schema, accessor);
+
         var result = new BitArray(metadata.RowGroups.Count, true);
         for (int i = 0; i < metadata.RowGroups.Count; i++)
         {
-            result[i] = await MightMatchAsync(filter, i, metadata, schema, accessor, cancellationToken)
+            result[i] = await MightMatchAsync(filter, i, metadata, schema, accessor, prefetch, cancellationToken)
                 .ConfigureAwait(false);
         }
         return result;
     }
+
+    /// <summary>
+    /// How many bytes of dictionary pages one prefetch request may ask for. Tests lower it to make a
+    /// file span several windows.
+    /// </summary>
+    internal long DictionaryPrefetchBudgetBytes { get; set; } = DictionaryPrefetch.DefaultBudgetBytes;
+
+    private DictionaryPrefetch? CreateDictionaryPrefetch(
+        EngineeredWood.Expressions.Predicate filter, FileMetaData metadata, SchemaDescriptor schema,
+        ParquetStatisticsAccessor accessor) =>
+        _options.FilterUseDictionaries
+            ? new DictionaryPrefetch(filter, metadata, schema, accessor, _file, _fileLength,
+                _options.ColumnChunkFilePath, _options.PageChecksumValidation, DictionaryPrefetchBudgetBytes)
+            : null;
 
     /// <summary>
     /// The one row-group verdict behind both <see cref="ParquetReadOptions.Filter"/> and
@@ -1685,7 +1703,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </summary>
     private async ValueTask<bool> MightMatchAsync(
         EngineeredWood.Expressions.Predicate filter, int rowGroup, FileMetaData metadata,
-        SchemaDescriptor schema, ParquetStatisticsAccessor accessor, CancellationToken cancellationToken)
+        SchemaDescriptor schema, ParquetStatisticsAccessor accessor, DictionaryPrefetch? prefetch,
+        CancellationToken cancellationToken)
     {
         var result = EngineeredWood.Expressions.StatisticsEvaluator.Evaluate(
             filter, metadata.RowGroups[rowGroup], accessor);
@@ -1695,24 +1714,30 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         if (result != EngineeredWood.Expressions.FilterResult.Unknown)
             return true;
 
-        if (_options.FilterUseDictionaries
-            && await MembershipRulesOutAsync(MembershipSource.Dictionary).ConfigureAwait(false))
+        if (_options.FilterUseDictionaries)
         {
-            return false;
+            // Read ahead for this group and the undecided groups after it, in one request, rather than
+            // one request per group: on object storage the request, not the bytes, is the cost.
+            var dictionaries = prefetch is null
+                ? null
+                : await prefetch.ForRowGroupAsync(rowGroup, cancellationToken).ConfigureAwait(false);
+            if (await MembershipRulesOutAsync(MembershipSource.Dictionary, dictionaries).ConfigureAwait(false))
+                return false;
         }
 
         if (_options.FilterUseBloomFilters
-            && await MembershipRulesOutAsync(MembershipSource.BloomFilter).ConfigureAwait(false))
+            && await MembershipRulesOutAsync(MembershipSource.BloomFilter, null).ConfigureAwait(false))
         {
             return false;
         }
 
         return true;
 
-        async ValueTask<bool> MembershipRulesOutAsync(MembershipSource source) =>
+        async ValueTask<bool> MembershipRulesOutAsync(
+            MembershipSource source, IReadOnlyDictionary<int, HashSet<byte[]>?>? dictionaries) =>
             await MembershipPredicateEvaluator.EvaluateAsync(
                 filter, source, rowGroup, metadata, schema, _file, _fileLength,
-                _options.ColumnChunkFilePath, _options.PageChecksumValidation, cancellationToken)
+                _options.ColumnChunkFilePath, _options.PageChecksumValidation, cancellationToken, dictionaries)
                 .ConfigureAwait(false) == EngineeredWood.Expressions.FilterResult.AlwaysFalse;
     }
 

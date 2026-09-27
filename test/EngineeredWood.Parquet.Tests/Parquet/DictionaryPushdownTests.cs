@@ -224,6 +224,151 @@ public class DictionaryPushdownTests : IDisposable
         Assert.True(candidates[1]);
     }
 
+    // ───── Requests: dictionaries are read a window at a time ─────
+
+    private const int PrefetchGroups = 8;
+
+    /// <summary>
+    /// <see cref="PrefetchGroups"/> row groups of a dictionary-encoded key. Groups 0-5 hold the extremes
+    /// "a-min" and "z-max", so statistics leave an equality on a middle value undecided; groups 6-7 hold
+    /// only "y" values, so statistics rule out any value below "y" and those groups never need a
+    /// dictionary. "common" is in groups 0-5; "k3" only in group 3.
+    /// </summary>
+    private async Task<string> WritePrefetchFile(string name)
+    {
+        string path = Path.Combine(_tempDir, name + ".parquet");
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("key", StringType.Default, false))
+            .Build();
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false,
+            new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed }))
+        {
+            for (int g = 0; g < PrefetchGroups; g++)
+            {
+                string[] values = g < 6 ? ["a-min", "z-max", "common", $"k{g}"] : ["y1", "y2"];
+                var builder = new StringArray.Builder();
+                for (int r = 0; r < Repeats; r++)
+                    foreach (var v in values)
+                        builder.Append(v);
+                await writer.WriteRowGroupAsync(new RecordBatch(schema, [builder.Build()], values.Length * Repeats));
+            }
+            await writer.CloseAsync();
+        }
+        return path;
+    }
+
+    /// <summary>The requests a candidate evaluation issues, with the number of ranges in each.</summary>
+    private static async Task<(bool[] Candidates, List<int> RangesPerRequest)> CandidatesCounted(
+        string path, Predicate filter, bool dictionaries, long? budget = null)
+    {
+        await using var input = new CountingFile(new LocalRandomAccessFile(path));
+        await using var reader = new ParquetFileReader(input, ownsFile: false,
+            new ParquetReadOptions { FilterUseDictionaries = dictionaries });
+        if (budget is { } b)
+            reader.DictionaryPrefetchBudgetBytes = b;
+
+        await reader.ReadMetadataAsync(); // footer requests are not the subject
+        input.Requests.Clear();
+
+        var bits = await reader.GetCandidateRowGroupsAsync(filter);
+        return (Enumerable.Range(0, bits.Length).Select(i => bits[i]).ToArray(), input.Requests.ToList());
+    }
+
+    [Fact]
+    public async Task EveryUndecidedGroup_IsAskedInOneRequest()
+    {
+        string path = await WritePrefetchFile("one_request");
+
+        var (candidates, requests) = await CandidatesCounted(path, Ex.Equal("key", "k3"), dictionaries: true);
+
+        Assert.Equal(new[] { false, false, false, true, false, false, false, false }, candidates);
+        // Six undecided groups (0-5), six dictionary pages, one request; groups 6-7 are ruled out by
+        // statistics and never read.
+        Assert.Equal(new[] { 6 }, requests);
+    }
+
+    [Fact]
+    public async Task AValueInEveryUndecidedGroup_CostsOneRequest()
+    {
+        string path = await WritePrefetchFile("worst_case");
+
+        var (candidates, requests) = await CandidatesCounted(path, Ex.Equal("key", "common"), dictionaries: true);
+
+        Assert.Equal(new[] { true, true, true, true, true, true, false, false }, candidates);
+        Assert.Equal(new[] { 6 }, requests);
+    }
+
+    [Fact]
+    public async Task ASmallBudget_SplitsTheReadIntoWindows_WithTheSameAnswers()
+    {
+        string path = await WritePrefetchFile("windows");
+        var (expected, _) = await CandidatesCounted(path, Ex.Equal("key", "k3"), dictionaries: true);
+
+        // A budget below one page: every group is its own window, and a window always holds its first group.
+        var (candidates, requests) = await CandidatesCounted(path, Ex.Equal("key", "k3"), dictionaries: true, budget: 1);
+
+        Assert.Equal(expected, candidates);
+        Assert.Equal(Enumerable.Repeat(1, 6), requests);
+    }
+
+    [Fact]
+    public async Task ThePrefetch_IsOnlyForTheColumnsTheEqualitiesName()
+    {
+        string path = await WritePrefetchFile("no_equality");
+
+        // A range predicate never asks a dictionary, so nothing is read ahead for it.
+        var (_, requests) = await CandidatesCounted(path, Ex.GreaterThan("key", "b"), dictionaries: true);
+
+        Assert.Empty(requests);
+    }
+
+    [Fact]
+    public async Task ReadAll_ReadsTheDictionariesOnceAndOnlyTheKeptGroupsData()
+    {
+        string path = await WritePrefetchFile("read_all");
+        await using var input = new CountingFile(new LocalRandomAccessFile(path));
+        await using var reader = new ParquetFileReader(input, ownsFile: false,
+            new ParquetReadOptions { Filter = Ex.Equal("key", "k3"), FilterUseDictionaries = true });
+        await reader.ReadMetadataAsync();
+        input.Requests.Clear();
+
+        int rows = 0;
+        await foreach (var batch in reader.ReadAllAsync())
+            rows += batch.Length;
+
+        Assert.Equal(4 * Repeats, rows);
+        Assert.Equal(2, input.Requests.Count); // the dictionary window, then group 3's data
+    }
+
+    /// <summary>Records the number of ranges in each request.</summary>
+    private sealed class CountingFile(EngineeredWood.IO.IRandomAccessFile inner) : EngineeredWood.IO.IRandomAccessFile
+    {
+        public List<int> Requests { get; } = new();
+
+        public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default) =>
+            inner.GetLengthAsync(cancellationToken);
+
+        public ValueTask<System.Buffers.IMemoryOwner<byte>> ReadAsync(
+            EngineeredWood.IO.FileRange range, CancellationToken cancellationToken = default)
+        {
+            lock (Requests) Requests.Add(1);
+            return inner.ReadAsync(range, cancellationToken);
+        }
+
+        public ValueTask<IReadOnlyList<System.Buffers.IMemoryOwner<byte>>> ReadRangesAsync(
+            IReadOnlyList<EngineeredWood.IO.FileRange> ranges, CancellationToken cancellationToken = default)
+        {
+            lock (Requests) Requests.Add(ranges.Count);
+            return inner.ReadRangesAsync(ranges, cancellationToken);
+        }
+
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
+
+        public void Dispose() => inner.Dispose();
+    }
+
     // ───── Floating point and the stored representation ─────
 
     private static readonly double OtherNaN = BitConverter.Int64BitsToDouble(0x7FF8_0000_0000_0001);

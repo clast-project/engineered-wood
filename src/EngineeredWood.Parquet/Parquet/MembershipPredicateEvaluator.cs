@@ -64,10 +64,64 @@ internal static class MembershipPredicateEvaluator
         long fileLength,
         ColumnChunkFilePathKind filePath,
         bool validateChecksums,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyDictionary<int, HashSet<byte[]>?>? dictionaries = null)
     {
         var ctx = new Context(source, rowGroupIndex, metadata, schema, file, fileLength, filePath, validateChecksums);
+        if (dictionaries is not null)
+        {
+            // Read ahead by a DictionaryPrefetch: a column present here is never read again, including a
+            // null entry, which is a chunk already found unable to answer.
+            foreach (var entry in dictionaries)
+                ctx.Dictionaries[entry.Key] = entry.Value;
+        }
         return await EvaluateAsync(predicate, ctx, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The columns whose dictionaries <paramref name="predicate"/> can ask: those named by an equality
+    /// or IN leaf against literals, anywhere in the tree (a NOT still asks its child), resolved as a
+    /// probe resolves them.
+    /// </summary>
+    internal static List<(int Index, ColumnDescriptor Descriptor)> DictionaryColumns(
+        Predicate predicate, SchemaDescriptor schema)
+    {
+        var names = new HashSet<string>(StringComparer.Ordinal);
+        Collect(predicate);
+
+        var columns = new List<(int, ColumnDescriptor)>();
+        var seen = new HashSet<int>();
+        foreach (string name in names)
+        {
+            if (FindColumn(schema, name, out int index, out var descriptor) && seen.Add(index))
+                columns.Add((index, descriptor!));
+        }
+        return columns;
+
+        void Collect(Predicate p)
+        {
+            switch (p)
+            {
+                case AndPredicate and:
+                    foreach (var child in and.Children) Collect(child);
+                    break;
+                case OrPredicate or:
+                    foreach (var child in or.Children) Collect(child);
+                    break;
+                case NotPredicate not:
+                    Collect(not.Child);
+                    break;
+                case ComparisonPredicate cmp when IsEquality(cmp.Op):
+                    if (TryGetColumnAndLiteral(cmp.Left, cmp.Right, out string? column, out _)
+                        || TryGetColumnAndLiteral(cmp.Right, cmp.Left, out column, out _))
+                        names.Add(column!);
+                    break;
+                case SetPredicate set when set.Op == SetOperator.In:
+                    if (TryGetColumnName(set.Operand, out string? operand))
+                        names.Add(operand!);
+                    break;
+            }
+        }
     }
 
     private static async ValueTask<FilterResult> EvaluateAsync(
@@ -284,27 +338,56 @@ internal static class MembershipPredicateEvaluator
     private static async ValueTask<HashSet<byte[]>?> ReadDictionaryAsync(
         ColumnChunk chunk, ColumnDescriptor descriptor, Context ctx, CancellationToken ct)
     {
+        if (!TryGetDictionaryRange(chunk, descriptor, ctx.FileLength, ctx.FilePath, out var range))
+            return null;
+
+        using var buffer = (await ctx.File.ReadRangesAsync(new[] { range }, ct).ConfigureAwait(false))[0];
+        return DecodeDictionary(buffer.Memory.Span, chunk.MetaData!.Codec, descriptor, ctx.ValidateChecksums);
+    }
+
+    /// <summary>
+    /// Where the chunk's dictionary page is, when the chunk can be answered from it at all: every data
+    /// page dictionary-encoded, a physical type with a PLAIN layout a literal can meet, a stored
+    /// extent within bounds, and the chunk in this file. Shared by the single read above and by
+    /// <see cref="DictionaryPrefetch"/>, so the two cannot disagree about which chunks are asked.
+    /// </summary>
+    internal static bool TryGetDictionaryRange(
+        ColumnChunk chunk, ColumnDescriptor descriptor, long fileLength, ColumnChunkFilePathKind filePath,
+        out FileRange range)
+    {
+        range = default;
         var meta = chunk.MetaData;
         if (meta is null || !IsWhollyDictionaryEncoded(meta))
-            return null;
+            return false;
+
+        // A chunk stored in another file has its dictionary there (#405).
+        if (chunk.FilePath is not null && filePath == ColumnChunkFilePathKind.Refuse)
+            return false;
 
         // A BOOLEAN dictionary would be bit-packed, and an INT96 value has no literal to meet it.
         if (descriptor.PhysicalType is PhysicalType.Boolean or PhysicalType.Int96)
-            return null;
+            return false;
 
         // The dictionary page opens the chunk and ends where the first data page begins.
         if (meta.DictionaryPageOffset is not long start || start <= 0 || start >= meta.DataPageOffset)
-            return null;
+            return false;
         long length = meta.DataPageOffset - start;
-        if (length > MaxDictionaryPageBytes || start + length > ctx.FileLength)
-            return null;
+        if (length > MaxDictionaryPageBytes || start > fileLength - length)
+            return false;
 
-        using var buffer = (await ctx.File.ReadRangesAsync(
-            new[] { new FileRange(start, length) }, ct).ConfigureAwait(false))[0];
+        range = new FileRange(start, length);
+        return true;
+    }
 
+    /// <summary>
+    /// Decodes a dictionary page read from <see cref="TryGetDictionaryRange"/>'s extent, or returns null.
+    /// </summary>
+    internal static HashSet<byte[]>? DecodeDictionary(
+        ReadOnlySpan<byte> page, CompressionCodec codec, ColumnDescriptor descriptor, bool validateChecksums)
+    {
         try
         {
-            return DecodeDictionaryPage(buffer.Memory.Span, meta.Codec, descriptor, ctx.ValidateChecksums);
+            return DecodeDictionaryPage(page, codec, descriptor, validateChecksums);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -650,22 +733,27 @@ internal static class MembershipPredicateEvaluator
         public long FileLength { get; }
         public ColumnChunkFilePathKind FilePath { get; }
 
-        public bool TryFindColumn(string name, out int index, out ColumnDescriptor? descriptor)
+        public bool TryFindColumn(string name, out int index, out ColumnDescriptor? descriptor) =>
+            FindColumn(Schema, name, out index, out descriptor);
+    }
+
+    /// <summary>A leaf by dotted path, or by bare name for a top-level leaf.</summary>
+    internal static bool FindColumn(
+        SchemaDescriptor schema, string name, out int index, out ColumnDescriptor? descriptor)
+    {
+        for (int i = 0; i < schema.Columns.Count; i++)
         {
-            for (int i = 0; i < Schema.Columns.Count; i++)
+            if (schema.Columns[i].DottedPath == name
+                || (schema.Columns[i].Path.Count == 1
+                    && schema.Columns[i].Path[0] == name))
             {
-                if (Schema.Columns[i].DottedPath == name
-                    || (Schema.Columns[i].Path.Count == 1
-                        && Schema.Columns[i].Path[0] == name))
-                {
-                    index = i;
-                    descriptor = Schema.Columns[i];
-                    return true;
-                }
+                index = i;
+                descriptor = schema.Columns[i];
+                return true;
             }
-            index = -1;
-            descriptor = null;
-            return false;
         }
+        index = -1;
+        descriptor = null;
+        return false;
     }
 }
