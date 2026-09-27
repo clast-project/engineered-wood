@@ -284,10 +284,16 @@ public sealed record ParquetReadOptions
     /// When <see langword="true"/>, row-group pruning (by <see cref="Filter"/>, or by
     /// <see cref="ParquetFileReader.GetCandidateRowGroupsAsync(Predicate, System.Threading.CancellationToken)"/>)
     /// also probes Bloom filters for equality and IN predicates that the
-    /// statistics evaluator could not decide. Requires extra I/O per candidate
-    /// row group (one read per column with a Bloom filter), so this is opt-in.
-    /// Default: <see langword="false"/>.
+    /// statistics evaluator and dictionary pages could not decide.
     /// </summary>
+    /// <remarks>
+    /// Reads the filters of the named columns, only in row groups statistics left undecided, many row
+    /// groups to a call, as <see cref="FilterUseDictionaries"/> does. Measured on 32 row groups through
+    /// the cloud readers' coalescer with 20 ms per GET: +3% time and one more GET per group when no
+    /// group can be ruled out, -85% when all but one can. Opt-in, since few writers produce Bloom
+    /// filters by default and a filter that cannot rule a value out still costs its GET. A filter that
+    /// cannot be parsed is declined, not thrown. Default: <see langword="false"/>.
+    /// </remarks>
     public bool FilterUseBloomFilters { get; init; }
 
     /// <summary>

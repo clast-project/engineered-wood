@@ -268,11 +268,11 @@ public class DictionaryPushdownTests : IDisposable
     private static async Task<(bool[] Candidates, List<int> RangesPerRequest)> CandidatesCounted(
         string path, Predicate filter, bool dictionaries, long? budget = null)
     {
-        await using var input = new CountingFile(new LocalRandomAccessFile(path));
+        await using var input = new RequestCountingFile(new LocalRandomAccessFile(path));
         await using var reader = new ParquetFileReader(input, ownsFile: false,
             new ParquetReadOptions { FilterUseDictionaries = dictionaries });
         if (budget is { } b)
-            reader.DictionaryPrefetchBudgetBytes = b;
+            reader.MembershipPrefetchBudgetBytes = b;
 
         await reader.ReadMetadataAsync(); // footer requests are not the subject
         input.Requests.Clear();
@@ -362,14 +362,14 @@ public class DictionaryPushdownTests : IDisposable
         var (candidates, requests) = await CandidatesCounted(path, Ex.Equal("key", "k3"), dictionaries: true);
 
         Assert.Equal(Enumerable.Range(0, 72).Select(g => g == 3), candidates);
-        Assert.Equal(new[] { DictionaryPrefetch.MaxRangesPerWindow, 70 - DictionaryPrefetch.MaxRangesPerWindow }, requests);
+        Assert.Equal(new[] { MembershipPrefetch.MaxRangesPerWindow, 70 - MembershipPrefetch.MaxRangesPerWindow }, requests);
     }
 
     [Fact]
     public async Task ReadAll_ReadsTheDictionariesOnceAndOnlyTheKeptGroupsData()
     {
         string path = await WritePrefetchFile("read_all");
-        await using var input = new CountingFile(new LocalRandomAccessFile(path));
+        await using var input = new RequestCountingFile(new LocalRandomAccessFile(path));
         await using var reader = new ParquetFileReader(input, ownsFile: false,
             new ParquetReadOptions { Filter = Ex.Equal("key", "k3"), FilterUseDictionaries = true });
         await reader.ReadMetadataAsync();
@@ -381,33 +381,6 @@ public class DictionaryPushdownTests : IDisposable
 
         Assert.Equal(4 * Repeats, rows);
         Assert.Equal(2, input.Requests.Count); // the dictionary window, then group 3's data
-    }
-
-    /// <summary>Records the number of ranges in each request.</summary>
-    private sealed class CountingFile(EngineeredWood.IO.IRandomAccessFile inner) : EngineeredWood.IO.IRandomAccessFile
-    {
-        public List<int> Requests { get; } = new();
-
-        public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default) =>
-            inner.GetLengthAsync(cancellationToken);
-
-        public ValueTask<System.Buffers.IMemoryOwner<byte>> ReadAsync(
-            EngineeredWood.IO.FileRange range, CancellationToken cancellationToken = default)
-        {
-            lock (Requests) Requests.Add(1);
-            return inner.ReadAsync(range, cancellationToken);
-        }
-
-        public ValueTask<IReadOnlyList<System.Buffers.IMemoryOwner<byte>>> ReadRangesAsync(
-            IReadOnlyList<EngineeredWood.IO.FileRange> ranges, CancellationToken cancellationToken = default)
-        {
-            lock (Requests) Requests.Add(ranges.Count);
-            return inner.ReadRangesAsync(ranges, cancellationToken);
-        }
-
-        public ValueTask DisposeAsync() => inner.DisposeAsync();
-
-        public void Dispose() => inner.Dispose();
     }
 
     // ───── Floating point and the stored representation ─────

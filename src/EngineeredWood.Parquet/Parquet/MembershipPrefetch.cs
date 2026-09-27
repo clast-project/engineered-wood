@@ -10,8 +10,8 @@ using EngineeredWood.Parquet.Schema;
 namespace EngineeredWood.Parquet;
 
 /// <summary>
-/// Reads the dictionary pages that row-group pruning will ask for ahead of time, many row groups to a
-/// request, instead of one request per row group.
+/// Reads ahead what row-group pruning will ask of one membership source (dictionary pages or Bloom
+/// filters): many row groups to a request, instead of one request per row group.
 /// </summary>
 /// <remarks>
 /// <para>Measured by <c>dictpruning-ab</c> with 20 ms added per request, asking each row group's dictionary
@@ -26,26 +26,31 @@ namespace EngineeredWood.Parquet;
 /// issued concurrently. So on S3, Azure or GCS a window costs about one GET per page but only one round
 /// trip of waiting, where asking group by group cost a round trip per group.</para>
 /// <para>Only the columns an equality or IN leaf names are read, and only chunks
-/// <see cref="MembershipPredicateEvaluator.TryGetDictionaryRange"/> accepts, the same test the single
-/// read applies. A group this has no entry for is left to the evaluator, which reads what it needs
-/// itself, so a gap here costs a request and never a wrong answer.</para>
+/// <see cref="MembershipPredicateEvaluator.TryGetRange"/> accepts, the same test the single read
+/// applies. A group this has no entry for is left to the evaluator, which reads what it needs itself, so
+/// a gap here costs a request and never a wrong answer.</para>
+/// <para>Each source has its own prefetch, and so its own windows. The Bloom step only runs for a group
+/// the dictionary step left undecided, but a Bloom window is chosen by statistics alone, so with both
+/// sources on it may also read the filters of groups a dictionary then rules out: bytes, not round
+/// trips, since they arrive in the same window.</para>
 /// </remarks>
-internal sealed class DictionaryPrefetch
+internal sealed class MembershipPrefetch
 {
     /// <summary>
-    /// The bytes of dictionary pages one window may ask for. Well above a default dictionary page
+    /// The bytes one window may ask for. Well above a default dictionary page or Bloom filter
     /// (~1 MiB), so a window usually spans many row groups, and small enough to hold in memory.
     /// </summary>
     internal const long DefaultBudgetBytes = 32L * 1024 * 1024;
 
     /// <summary>
-    /// The most dictionary pages one window asks for. On object storage a window is not one HTTP
-    /// request: <see cref="CoalescingFileReader"/> merges only ranges under a small gap apart, and
-    /// dictionary pages sit between data chunks, so it issues about one GET per page, all at once.
+    /// The most ranges (pages or filters) one window asks for. On object storage a window is not one
+    /// HTTP request: <see cref="CoalescingFileReader"/> merges only ranges under a small gap apart, and
+    /// these sit between data chunks, so it issues about one GET per range, all at once.
     /// The window saves round trips because those GETs run concurrently; this bounds how many.
     /// </summary>
     internal const int MaxRangesPerWindow = 64;
 
+    private readonly MembershipSource _source;
     private readonly Predicate _filter;
     private readonly FileMetaData _metadata;
     private readonly ParquetStatisticsAccessor _accessor;
@@ -56,17 +61,19 @@ internal sealed class DictionaryPrefetch
     private readonly long _budgetBytes;
     private readonly List<(int Index, ColumnDescriptor Descriptor)> _columns;
 
-    /// <summary>The current window: each covered row group's dictionaries by column index.</summary>
-    private readonly Dictionary<int, Dictionary<int, HashSet<byte[]>?>> _window = new();
+    /// <summary>The current window: each covered row group's value sets by column index.</summary>
+    private readonly Dictionary<int, Dictionary<int, MembershipPredicateEvaluator.IValueSet?>> _window = new();
 
     /// <summary>The first row group after the current window.</summary>
     private int _windowEnd;
 
-    public DictionaryPrefetch(
+    public MembershipPrefetch(
+        MembershipSource source,
         Predicate filter, FileMetaData metadata, SchemaDescriptor schema, ParquetStatisticsAccessor accessor,
         IRandomAccessFile file, long fileLength, ColumnChunkFilePathKind filePath, bool validateChecksums,
         long budgetBytes)
     {
+        _source = source;
         _filter = filter;
         _metadata = metadata;
         _accessor = accessor;
@@ -75,15 +82,15 @@ internal sealed class DictionaryPrefetch
         _filePath = filePath;
         _validateChecksums = validateChecksums;
         _budgetBytes = budgetBytes;
-        _columns = MembershipPredicateEvaluator.DictionaryColumns(filter, schema);
+        _columns = MembershipPredicateEvaluator.MembershipColumns(filter, schema);
     }
 
     /// <summary>
-    /// The dictionaries of <paramref name="rowGroup"/>'s predicate columns (null for a chunk that cannot
+    /// The value sets of <paramref name="rowGroup"/>'s predicate columns (null for a chunk that cannot
     /// answer), loading the window that starts at it when it is past the current one. Call in ascending
     /// row-group order, and only for a group statistics left undecided.
     /// </summary>
-    public async ValueTask<IReadOnlyDictionary<int, HashSet<byte[]>?>?> ForRowGroupAsync(
+    public async ValueTask<IReadOnlyDictionary<int, MembershipPredicateEvaluator.IValueSet?>?> ForRowGroupAsync(
         int rowGroup, CancellationToken cancellationToken)
     {
         if (_columns.Count == 0)
@@ -92,7 +99,7 @@ internal sealed class DictionaryPrefetch
         if (rowGroup >= _windowEnd)
             await LoadWindowAsync(rowGroup, cancellationToken).ConfigureAwait(false);
 
-        return _window.TryGetValue(rowGroup, out var dictionaries) ? dictionaries : null;
+        return _window.TryGetValue(rowGroup, out var sets) ? sets : null;
     }
 
     private async ValueTask LoadWindowAsync(int first, CancellationToken cancellationToken)
@@ -107,26 +114,26 @@ internal sealed class DictionaryPrefetch
         {
             var rowGroup = _metadata.RowGroups[group];
 
-            // Groups statistics decide never reach the dictionary step, so they cost nothing here. The
+            // Groups statistics decide never reach a membership step, so they cost nothing here. The
             // caller has already found the first group undecided.
             if (group != first && StatisticsEvaluator.Evaluate(_filter, rowGroup, _accessor) != FilterResult.Unknown)
                 continue;
 
-            var dictionaries = new Dictionary<int, HashSet<byte[]>?>();
+            var sets = new Dictionary<int, MembershipPredicateEvaluator.IValueSet?>();
             var groupRanges = new List<(int Column, ColumnDescriptor Descriptor, CompressionCodec Codec, FileRange Range)>();
             long groupBytes = 0;
             foreach (var (index, descriptor) in _columns)
             {
                 var chunk = rowGroup.Columns[index];
-                if (MembershipPredicateEvaluator.TryGetDictionaryRange(
-                        chunk, descriptor, _fileLength, _filePath, out var range))
+                if (MembershipPredicateEvaluator.TryGetRange(
+                        _source, chunk, descriptor, _fileLength, _filePath, out var range))
                 {
                     groupRanges.Add((index, descriptor, chunk.MetaData!.Codec, range));
                     groupBytes += range.Length;
                 }
                 else
                 {
-                    dictionaries[index] = null; // cannot answer: never read
+                    sets[index] = null; // cannot answer: never read
                 }
             }
 
@@ -142,7 +149,7 @@ internal sealed class DictionaryPrefetch
                 ranges.Add(range);
                 owners.Add((group, column, descriptor, codec));
             }
-            _window[group] = dictionaries;
+            _window[group] = sets;
         }
         _windowEnd = group;
 
@@ -155,8 +162,8 @@ internal sealed class DictionaryPrefetch
             for (int i = 0; i < owners.Count; i++)
             {
                 var (rowGroup, column, descriptor, codec) = owners[i];
-                _window[rowGroup][column] = MembershipPredicateEvaluator.DecodeDictionary(
-                    buffers[i].Memory.Span, codec, descriptor, _validateChecksums);
+                _window[rowGroup][column] = MembershipPredicateEvaluator.Decode(
+                    _source, buffers[i].Memory.Span, codec, descriptor, _validateChecksums);
             }
         }
         finally

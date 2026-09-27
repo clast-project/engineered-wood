@@ -201,12 +201,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         ParquetStatisticsAccessor? accessor = null;
         SchemaDescriptor? schema = null;
-        DictionaryPrefetch? prefetch = null;
+        Prefetches prefetch = default;
         if (_options.Filter is not null)
         {
             schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
             accessor = new ParquetStatisticsAccessor(schema);
-            prefetch = CreateDictionaryPrefetch(_options.Filter, metadata, schema, accessor);
+            prefetch = CreatePrefetches(_options.Filter, metadata, schema, accessor);
         }
 
         for (int i = 0; i < metadata.RowGroups.Count; i++)
@@ -1577,18 +1577,17 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         for (int rg = 0; rg < numRowGroups; rg++)
         {
-            var colMeta = metadata.RowGroups[rg].Columns[columnIndex].MetaData;
-            if (IsStoredElsewhere(metadata.RowGroups[rg].Columns[columnIndex]))
+            var chunk = metadata.RowGroups[rg].Columns[columnIndex];
+            if (IsStoredElsewhere(chunk))
                 continue; // its filter is in the other file: stay a candidate, and let the read refuse
-            if (colMeta?.BloomFilterOffset is long offset and > 0)
+
+            // The same test pruning applies (bounds, a missing length, the size cap), so this probe and
+            // the predicate path agree on which filters are read at all.
+            if (MembershipPredicateEvaluator.TryGetBloomFilterRange(
+                    chunk, _fileLength, _options.ColumnChunkFilePath, out var range))
             {
                 rangeIndices.Add(rg);
-
-                // If bloom_filter_length is present, use it directly.
-                // Otherwise, read a generous chunk — the Thrift header tells us the actual size.
-                // Clamp to file length to avoid reading past end of file.
-                long length = colMeta.BloomFilterLength ?? Math.Min(4096, _fileLength - offset);
-                ranges.Add(new FileRange(offset, length));
+                ranges.Add(range);
             }
         }
 
@@ -1603,8 +1602,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             for (int i = 0; i < rangeIndices.Count; i++)
             {
                 int rg = rangeIndices[i];
-                var span = buffers[i].Memory.Span;
-                var filter = BloomFilter.BloomFilterReader.Parse(span);
+
+                // A filter that cannot be parsed is declined, as pruning declines it: the group stays a
+                // candidate, and the read that follows is left to report what is wrong with the file.
+                var filter = MembershipPredicateEvaluator.Decode(
+                    MembershipSource.BloomFilter, buffers[i].Memory.Span,
+                    metadata.RowGroups[rg].Columns[columnIndex].MetaData!.Codec, schema.Columns[columnIndex],
+                    validateChecksums: false);
+                if (filter is null)
+                    continue;
 
                 bool anyMatch = false;
                 for (int v = 0; v < encodedValues.Length; v++)
@@ -1668,7 +1674,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
         var accessor = new ParquetStatisticsAccessor(schema);
 
-        var prefetch = CreateDictionaryPrefetch(filter, metadata, schema, accessor);
+        var prefetch = CreatePrefetches(filter, metadata, schema, accessor);
 
         var result = new BitArray(metadata.RowGroups.Count, true);
         for (int i = 0; i < metadata.RowGroups.Count; i++)
@@ -1680,18 +1686,26 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// How many bytes of dictionary pages one prefetch request may ask for. Tests lower it to make a
+    /// How many bytes one prefetch request may ask for, per membership source. Tests lower it to make a
     /// file span several windows.
     /// </summary>
-    internal long DictionaryPrefetchBudgetBytes { get; set; } = DictionaryPrefetch.DefaultBudgetBytes;
+    internal long MembershipPrefetchBudgetBytes { get; set; } = MembershipPrefetch.DefaultBudgetBytes;
 
-    private DictionaryPrefetch? CreateDictionaryPrefetch(
+    /// <summary>The read-ahead for each membership source the options turn on.</summary>
+    private readonly record struct Prefetches(MembershipPrefetch? Dictionary, MembershipPrefetch? BloomFilter);
+
+    private Prefetches CreatePrefetches(
         EngineeredWood.Expressions.Predicate filter, FileMetaData metadata, SchemaDescriptor schema,
-        ParquetStatisticsAccessor accessor) =>
-        _options.FilterUseDictionaries
-            ? new DictionaryPrefetch(filter, metadata, schema, accessor, _file, _fileLength,
-                _options.ColumnChunkFilePath, _options.PageChecksumValidation, DictionaryPrefetchBudgetBytes)
-            : null;
+        ParquetStatisticsAccessor accessor)
+    {
+        return new Prefetches(
+            _options.FilterUseDictionaries ? Create(MembershipSource.Dictionary) : null,
+            _options.FilterUseBloomFilters ? Create(MembershipSource.BloomFilter) : null);
+
+        MembershipPrefetch Create(MembershipSource source) =>
+            new(source, filter, metadata, schema, accessor, _file, _fileLength,
+                _options.ColumnChunkFilePath, _options.PageChecksumValidation, MembershipPrefetchBudgetBytes);
+    }
 
     /// <summary>
     /// The one row-group verdict behind both <see cref="ParquetReadOptions.Filter"/> and
@@ -1703,7 +1717,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </summary>
     private async ValueTask<bool> MightMatchAsync(
         EngineeredWood.Expressions.Predicate filter, int rowGroup, FileMetaData metadata,
-        SchemaDescriptor schema, ParquetStatisticsAccessor accessor, DictionaryPrefetch? prefetch,
+        SchemaDescriptor schema, ParquetStatisticsAccessor accessor, Prefetches prefetch,
         CancellationToken cancellationToken)
     {
         var result = EngineeredWood.Expressions.StatisticsEvaluator.Evaluate(
@@ -1714,31 +1728,32 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         if (result != EngineeredWood.Expressions.FilterResult.Unknown)
             return true;
 
-        if (_options.FilterUseDictionaries)
+        // Each source reads ahead for this group and the undecided groups after it, in one request, rather
+        // than one request per group: on object storage the round trip, not the bytes, is the cost.
+        if (_options.FilterUseDictionaries
+            && await MembershipRulesOutAsync(MembershipSource.Dictionary, prefetch.Dictionary).ConfigureAwait(false))
         {
-            // Read ahead for this group and the undecided groups after it, in one request, rather than
-            // one request per group: on object storage the request, not the bytes, is the cost.
-            var dictionaries = prefetch is null
-                ? null
-                : await prefetch.ForRowGroupAsync(rowGroup, cancellationToken).ConfigureAwait(false);
-            if (await MembershipRulesOutAsync(MembershipSource.Dictionary, dictionaries).ConfigureAwait(false))
-                return false;
+            return false;
         }
 
         if (_options.FilterUseBloomFilters
-            && await MembershipRulesOutAsync(MembershipSource.BloomFilter, null).ConfigureAwait(false))
+            && await MembershipRulesOutAsync(MembershipSource.BloomFilter, prefetch.BloomFilter).ConfigureAwait(false))
         {
             return false;
         }
 
         return true;
 
-        async ValueTask<bool> MembershipRulesOutAsync(
-            MembershipSource source, IReadOnlyDictionary<int, HashSet<byte[]>?>? dictionaries) =>
-            await MembershipPredicateEvaluator.EvaluateAsync(
-                filter, source, rowGroup, metadata, schema, _file, _fileLength,
-                _options.ColumnChunkFilePath, _options.PageChecksumValidation, cancellationToken, dictionaries)
+        async ValueTask<bool> MembershipRulesOutAsync(MembershipSource source, MembershipPrefetch? readAhead)
+        {
+            var sets = readAhead is null
+                ? null
+                : await readAhead.ForRowGroupAsync(rowGroup, cancellationToken).ConfigureAwait(false);
+            return await MembershipPredicateEvaluator.EvaluateAsync(
+                    filter, source, rowGroup, metadata, schema, _file, _fileLength,
+                    _options.ColumnChunkFilePath, _options.PageChecksumValidation, cancellationToken, sets)
                 .ConfigureAwait(false) == EngineeredWood.Expressions.FilterResult.AlwaysFalse;
+        }
     }
 
     /// <summary>
