@@ -1491,8 +1491,10 @@ from the writer (dictionary pages are in nearly every real file), and it is exac
 rather than probabilistic. The trap is that a chunk which fell back to PLAIN holds
 values absent from its dictionary.
 
-**Built for #57, off by default** (`ParquetReadOptions.FilterUseDictionaries`) until
-its read cost is measured. It is one more source for the same tree walk as the Bloom
+**Built for #57, on by default** (`ParquetReadOptions.FilterUseDictionaries`) since
+its cost was measured (#420: dictionary pages are read a window of row groups at a
+time; at 20 ms per GET, +3% time when nothing is ruled out, -89% when all but one
+row group is). It is one more source for the same tree walk as the Bloom
 probe (`MembershipPredicateEvaluator`), asked after statistics and before Bloom
 filters, as parquet-mr does. Three things the plan above did not know:
 
@@ -1595,7 +1597,7 @@ unreachable from the table layer, so #55 came before all of it — more pruning
 that nothing can invoke adds nothing. With #55 done, #57 (dictionary pruning) was
 plausibly the best value of the remaining work, because unlike bloom filters and
 page indexes it needs no cooperation from whoever wrote the file, and it is exact
-rather than probabilistic. It is now built, off by default until measured. Page-level pushdown (11-12) is the largest of these by
+rather than probabilistic. It is now built and on by default. Page-level pushdown (11-12) is the largest of these by
 some margin, since it needs a row-range-aware decode path and not just metadata
 parsing; index *writing* (13) is much cheaper and has interop value on its own.
 

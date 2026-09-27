@@ -149,13 +149,15 @@ public class RowGroupPushdownTests : IDisposable
     }
 
     /// <summary>
-    /// Dictionary pages (#57) prune through the same per-read path when the table opts in. The three
-    /// row groups span "a".."z" but hold disjoint names, so statistics cannot rule any out.
+    /// Dictionary pages (#57) prune through the same per-read path, by default, unless the table turns
+    /// them off. The three row groups span "a".."z" but hold disjoint names, so statistics cannot rule
+    /// any out. Null leaves the table's read options at their default.
     /// </summary>
     [Theory]
+    [InlineData(null)]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task Dictionaries_ApplyWhenTheTableOptsIn(bool useDictionaries)
+    public async Task Dictionaries_ApplyUnlessTheTableOptsOut(bool? useDictionaries)
     {
         var schema = new Apache.Arrow.Schema.Builder()
             .Field(new Field("name", StringType.Default, false))
@@ -163,7 +165,9 @@ public class RowGroupPushdownTests : IDisposable
         var options = new DeltaTableOptions
         {
             ParquetWriteOptions = ParquetWriteOptions.Default with { RowGroupMaxRows = RowsPerGroup },
-            ParquetReadOptions = ParquetReadOptions.Default with { FilterUseDictionaries = useDictionaries },
+            ParquetReadOptions = useDictionaries is { } use
+                ? ParquetReadOptions.Default with { FilterUseDictionaries = use }
+                : ParquetReadOptions.Default,
         };
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema, options);
 
@@ -180,7 +184,7 @@ public class RowGroupPushdownTests : IDisposable
         await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Filter = Ex.Equal("name", "cherry") }))
             rows += batch.Length;
 
-        Assert.Equal(useDictionaries ? RowsPerGroup : Rows, rows);
+        Assert.Equal(useDictionaries != false ? RowsPerGroup : Rows, rows);
     }
 
     [Fact]
