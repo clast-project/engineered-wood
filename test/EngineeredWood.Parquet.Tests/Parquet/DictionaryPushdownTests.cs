@@ -102,11 +102,16 @@ public class DictionaryPushdownTests : IDisposable
     }
 
     [Fact]
-    public async Task IsOffByDefault()
+    public async Task IsOnByDefault_AndCanBeTurnedOff()
     {
-        string path = await WriteThreeRowGroups("off");
+        string path = await WriteThreeRowGroups("default");
 
-        Assert.Equal(new[] { true, true, true }, await Candidates(path, Ex.Equal("name", "banana"), new ParquetReadOptions()));
+        Assert.Equal(new[] { false, false, false },
+            await Candidates(path, Ex.Equal("name", "banana"), new ParquetReadOptions()));
+        Assert.Equal(new[] { false, false, false },
+            await Candidates(path, Ex.Equal("name", "banana"), ParquetReadOptions.Default));
+        Assert.Equal(new[] { true, true, true },
+            await Candidates(path, Ex.Equal("name", "banana"), new ParquetReadOptions { FilterUseDictionaries = false }));
     }
 
     [Fact]

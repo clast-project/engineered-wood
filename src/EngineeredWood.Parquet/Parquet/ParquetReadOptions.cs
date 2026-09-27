@@ -304,9 +304,10 @@ public sealed record ParquetReadOptions
     /// pages go out as concurrent GETs, one per page, so what this saves is round trips, not GETs.
     /// Measured on 32 row groups through the cloud readers' coalescer with 20 ms per GET: +3% time and
     /// 32 more GETs when no group can be ruled out, and -89% time with the same GET count when all but
-    /// one can. Default: <see langword="false"/>.</para>
+    /// one can. Default: <see langword="true"/>, as parquet-mr's <c>parquet.filter.dictionary.enabled</c>.
+    /// Set it false when extra GETs cost more than round trips, for instance under a request quota.</para>
     /// </remarks>
-    public bool FilterUseDictionaries { get; init; }
+    public bool FilterUseDictionaries { get; init; } = true;
 
     /// <summary>
     /// Whether to validate CRC-32C checksums when present in page headers.
