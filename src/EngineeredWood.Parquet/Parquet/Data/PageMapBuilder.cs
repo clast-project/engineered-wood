@@ -159,6 +159,11 @@ internal static class PageMapBuilder
                 case PageType.DataPage:
                 case PageType.DataPageV2:
                 {
+                    // As ColumnChunkReader.ReadColumn does: the map sizes the batch buffers, so a
+                    // page may not claim more values than the chunk's metadata has left.
+                    if (page.NumValues > columnMeta.NumValues - valuesRead)
+                        throw ColumnChunkReader.TooManyValues(column, page, columnMeta.NumValues - valuesRead);
+
                     var entry = EntryFromHeader(
                         pageHeader, page.PayloadOffset, pageData, page.Ordinal, column, columnMeta);
                     pages.Add(entry);
@@ -171,6 +176,9 @@ internal static class PageMapBuilder
                     break;
             }
         }
+
+        if (valuesRead < columnMeta.NumValues)
+            throw ColumnChunkReader.TooFewValues(column, columnMeta.NumValues, valuesRead);
 
         var pagesArray = pages.ToArray();
         var cumulativeRows = new int[pagesArray.Length + 1];

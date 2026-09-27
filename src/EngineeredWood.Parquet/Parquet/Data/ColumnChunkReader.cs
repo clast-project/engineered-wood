@@ -118,12 +118,7 @@ internal static class ColumnChunkReader
         }
 
         if (valuesRead < columnMeta.NumValues)
-        {
-            throw new ParquetFormatException(
-                $"Column '{string.Join(".", column.Path)}': expected {columnMeta.NumValues} " +
-                $"values but only read {valuesRead}. The column data may be corrupted or " +
-                $"truncated. To skip this column, pass a columnNames list excluding it.");
-        }
+            throw TooFewValues(column, columnMeta.NumValues, valuesRead);
 
         int[]? defLevels = null;
         if ((preserveDefLevels || isRepeated) && column.MaxDefinitionLevel > 0)
@@ -184,9 +179,13 @@ internal static class ColumnChunkReader
             "carry one entry per row.");
     }
 
-    private static ParquetFormatException TooManyValues(ColumnDescriptor column, Page page, long remaining) => new(
+    internal static ParquetFormatException TooManyValues(ColumnDescriptor column, Page page, long remaining) => new(
         $"Column '{column.DottedPath}': data page {page.Ordinal} at byte offset {page.Offset} holds " +
         $"{page.NumValues} values, but the chunk's metadata leaves room for only {remaining} more.");
+
+    internal static ParquetFormatException TooFewValues(ColumnDescriptor column, long expected, long read) => new(
+        $"Column '{column.DottedPath}': expected {expected} values but only read {read}. The column data " +
+        "may be corrupted or truncated. To skip this column, pass a columnNames list excluding it.");
 
     /// <summary>
     /// Whether a column is even eligible for the fixed-length list fast path: exactly one level of

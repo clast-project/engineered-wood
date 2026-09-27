@@ -21,8 +21,8 @@ internal static class PageHeaderDecoder
         var reader = new ThriftCompactReader(data);
 
         PageType? type = null;
-        int uncompressedPageSize = 0;
-        int compressedPageSize = 0;
+        int? uncompressedPageSize = null;
+        int? compressedPageSize = null;
         int? crc = null;
         DataPageHeader? dataPageHeader = null;
         DictionaryPageHeader? dictionaryPageHeader = null;
@@ -76,12 +76,17 @@ internal static class PageHeaderDecoder
 
         if (!type.HasValue)
             throw new ParquetFormatException("PageHeader is missing required 'type' field.");
+        // A missing size would read as 0 and misalign every page after this one.
+        if (uncompressedPageSize is not { } uncompressed)
+            throw new ParquetFormatException("PageHeader is missing required 'uncompressed_page_size' field.");
+        if (compressedPageSize is not { } compressed)
+            throw new ParquetFormatException("PageHeader is missing required 'compressed_page_size' field.");
 
         return new PageHeader
         {
             Type = type.Value,
-            UncompressedPageSize = uncompressedPageSize,
-            CompressedPageSize = compressedPageSize,
+            UncompressedPageSize = uncompressed,
+            CompressedPageSize = compressed,
             Crc = crc,
             DataPageHeader = dataPageHeader,
             DictionaryPageHeader = dictionaryPageHeader,
@@ -130,7 +135,7 @@ internal static class PageHeaderDecoder
 
     private static DataPageHeader ReadDataPageHeader(ref ThriftCompactReader reader)
     {
-        int numValues = 0;
+        int? numValues = null;
         Encoding encoding = Encoding.Plain;
         Encoding defLevelEncoding = Encoding.Plain;
         Encoding repLevelEncoding = Encoding.Plain;
@@ -165,7 +170,7 @@ internal static class PageHeaderDecoder
 
         return new DataPageHeader
         {
-            NumValues = numValues,
+            NumValues = numValues ?? throw Missing("DataPageHeader", "num_values"),
             Encoding = encoding,
             DefinitionLevelEncoding = defLevelEncoding,
             RepetitionLevelEncoding = repLevelEncoding,
@@ -174,12 +179,12 @@ internal static class PageHeaderDecoder
 
     private static DataPageHeaderV2 ReadDataPageHeaderV2(ref ThriftCompactReader reader)
     {
-        int numValues = 0;
-        int numNulls = 0;
-        int numRows = 0;
+        int? numValues = null;
+        int? numNulls = null;
+        int? numRows = null;
         Encoding encoding = Encoding.Plain;
-        int defByteLength = 0;
-        int repByteLength = 0;
+        int? defByteLength = null;
+        int? repByteLength = null;
         bool isCompressed = true;
 
         reader.PushStruct();
@@ -221,19 +226,19 @@ internal static class PageHeaderDecoder
 
         return new DataPageHeaderV2
         {
-            NumValues = numValues,
-            NumNulls = numNulls,
-            NumRows = numRows,
+            NumValues = numValues ?? throw Missing("DataPageHeaderV2", "num_values"),
+            NumNulls = numNulls ?? throw Missing("DataPageHeaderV2", "num_nulls"),
+            NumRows = numRows ?? throw Missing("DataPageHeaderV2", "num_rows"),
             Encoding = encoding,
-            DefinitionLevelsByteLength = defByteLength,
-            RepetitionLevelsByteLength = repByteLength,
+            DefinitionLevelsByteLength = defByteLength ?? throw Missing("DataPageHeaderV2", "definition_levels_byte_length"),
+            RepetitionLevelsByteLength = repByteLength ?? throw Missing("DataPageHeaderV2", "repetition_levels_byte_length"),
             IsCompressed = isCompressed,
         };
     }
 
     private static DictionaryPageHeader ReadDictionaryPageHeader(ref ThriftCompactReader reader)
     {
-        int numValues = 0;
+        int? numValues = null;
         Encoding encoding = Encoding.Plain;
 
         reader.PushStruct();
@@ -260,8 +265,11 @@ internal static class PageHeaderDecoder
 
         return new DictionaryPageHeader
         {
-            NumValues = numValues,
+            NumValues = numValues ?? throw Missing("DictionaryPageHeader", "num_values"),
             Encoding = encoding,
         };
     }
+
+    private static ParquetFormatException Missing(string structName, string field) =>
+        new($"{structName} is missing required '{field}' field.");
 }

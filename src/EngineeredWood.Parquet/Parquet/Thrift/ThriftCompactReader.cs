@@ -51,28 +51,47 @@ internal ref struct ThriftCompactReader
     }
 
     /// <summary>Reads an unsigned variable-length integer (ULEB128).</summary>
+    /// <remarks>
+    /// Bounded here rather than through <see cref="Varint.ReadUnsigned"/>, which checks nothing: a
+    /// varint whose last byte still has its continuation bit set would otherwise run off the end of
+    /// the span as an <see cref="IndexOutOfRangeException"/>.
+    /// </remarks>
     public ulong ReadVarint()
     {
-        if (_position >= _data.Length)
-            throw new ParquetFormatException("Unexpected end of Thrift data.");
-        return unchecked((ulong)Varint.ReadUnsigned(_data, ref _position));
+        ulong result = 0;
+        for (int shift = 0; shift < 64; shift += 7)
+        {
+            if (_position >= _data.Length)
+                throw new ParquetFormatException("Unexpected end of Thrift data reading a varint.");
+            byte b = _data[_position++];
+            result |= (ulong)(b & 0x7F) << shift;
+            if ((b & 0x80) == 0)
+                return result;
+        }
+
+        throw new ParquetFormatException("Thrift varint is longer than 10 bytes.");
+    }
+
+    /// <summary>Reads a varint that must fit a non-negative <see cref="int"/>: a length or a count.</summary>
+    private int ReadVarintInt32()
+    {
+        ulong value = ReadVarint();
+        if (value > int.MaxValue)
+            throw new ParquetFormatException($"Thrift length or count {value} is out of range.");
+        return (int)value;
     }
 
     /// <summary>Reads a zigzag-encoded 32-bit integer.</summary>
     public int ReadZigZagInt32()
     {
-        if (_position >= _data.Length)
-            throw new ParquetFormatException("Unexpected end of Thrift data.");
-        return checked((int)Varint.ReadSigned(_data, ref _position));
+        long value = ReadZigZagInt64();
+        if (value is < int.MinValue or > int.MaxValue)
+            throw new ParquetFormatException($"Thrift i32 value {value} is out of range.");
+        return (int)value;
     }
 
     /// <summary>Reads a zigzag-encoded 64-bit integer.</summary>
-    public long ReadZigZagInt64()
-    {
-        if (_position >= _data.Length)
-            throw new ParquetFormatException("Unexpected end of Thrift data.");
-        return Varint.ReadSigned(_data, ref _position);
-    }
+    public long ReadZigZagInt64() => Varint.ZigzagDecode(unchecked((long)ReadVarint()));
 
     /// <summary>Reads a 16-bit integer (zigzag encoded in compact protocol).</summary>
     public short ReadI16()
@@ -97,8 +116,8 @@ internal ref struct ThriftCompactReader
     /// <summary>Reads a binary field (length-prefixed byte sequence).</summary>
     public ReadOnlySpan<byte> ReadBinary()
     {
-        int length = checked((int)ReadVarint());
-        if (length < 0 || _position + length > _data.Length)
+        int length = ReadVarintInt32();
+        if (length > _data.Length - _position)
             throw new ParquetFormatException("Invalid binary length in Thrift data.");
         var span = _data.Slice(_position, length);
         _position += length;
@@ -179,7 +198,7 @@ internal ref struct ThriftCompactReader
         if (count == 15)
         {
             // Large list: count follows as varint.
-            count = checked((int)ReadVarint());
+            count = ReadVarintInt32();
             elementType = (ThriftType)(header & 0x0F);
         }
         else
@@ -193,7 +212,7 @@ internal ref struct ThriftCompactReader
     /// <summary>Reads a map header, returning key type, value type, and count.</summary>
     public (ThriftType KeyType, ThriftType ValueType, int Count) ReadMapHeader()
     {
-        int count = checked((int)ReadVarint());
+        int count = ReadVarintInt32();
         if (count == 0)
             return (ThriftType.Stop, ThriftType.Stop, 0);
 

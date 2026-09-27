@@ -102,6 +102,70 @@ public class PageHeaderValidationTests : IDisposable
         Assert.Contains($"holds {rows + 1} values, but the chunk's metadata leaves room for only {rows} more", ex.Message);
     }
 
+    /// <summary>
+    /// The batched read's header-scanned page map sizes its buffers from the pages, so it must refuse
+    /// the same over-full page the whole read does. It used to pass it on to the level decoder.
+    /// </summary>
+    [Theory]
+    [InlineData(DataPageVersion.V1)]
+    [InlineData(DataPageVersion.V2)]
+    public async Task ALaterPageWithMoreValuesThanTheChunk_IsRefusedByThePageMapToo(DataPageVersion version)
+    {
+        var chunk = await FirstChunkAsync(version, dictionary: false, column: "n");
+        byte[] tampered = RewriteDataPage(chunk.Bytes, ordinal: 3, h => h.Type == PageType.DataPage
+            ? Copy(h, v1: Copy(h.DataPageHeader!, numValues: h.DataPageHeader!.NumValues + chunk.RowCount))
+            : Copy(h, v2: Copy(h.DataPageHeaderV2!, numValues: h.DataPageHeaderV2!.NumValues + chunk.RowCount,
+                numRows: h.DataPageHeaderV2.NumRows + chunk.RowCount)));
+
+        var whole = Assert.Throws<ParquetFormatException>(() => ReadColumn(chunk, tampered));
+        var mapped = Assert.Throws<ParquetFormatException>(() => PageMapBuilder.Build(tampered, chunk.Column, chunk.Meta));
+        Assert.Contains("data page 3", mapped.Message);
+        Assert.Contains("leaves room for only", mapped.Message);
+        Assert.Equal(whole.Message, mapped.Message);
+    }
+
+    /// <summary>A chunk whose pages hold fewer values than its metadata is refused by the map as by the whole read.</summary>
+    [Fact]
+    public async Task AChunkMissingItsLastPage_IsRefusedByThePageMap()
+    {
+        var chunk = await FirstChunkAsync(DataPageVersion.V2, dictionary: false, column: "n");
+        var header = PageHeaderDecoder.Decode(chunk.Bytes, out int headerSize);
+        byte[] firstPageOnly = chunk.Bytes.AsSpan(0, headerSize + header.CompressedPageSize).ToArray();
+
+        var ex = Assert.Throws<ParquetFormatException>(() => PageMapBuilder.Build(firstPageOnly, chunk.Column, chunk.Meta));
+        Assert.Contains($"expected {chunk.Meta.NumValues} values but only read {header.DataPageHeaderV2!.NumValues}", ex.Message);
+    }
+
+    /// <summary>
+    /// Thrift a header cannot be. Each used to escape the decoder as something other than a
+    /// <see cref="ParquetFormatException"/>, or to read as a zero that misaligned every later page.
+    /// </summary>
+    [Theory]
+    [InlineData("varint cut off by the end of the bytes", new byte[] { 0x15, 0x80 }, "Unexpected end of Thrift data reading a varint")]
+    [InlineData("varint longer than 10 bytes", new byte[] { 0x15, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01 }, "longer than 10 bytes")]
+    [InlineData("i32 out of range", new byte[] { 0x15, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F, 0x00 }, "out of range")]
+    [InlineData("no compressed_page_size", new byte[] { 0x15, 0x00, 0x15, 0x02, 0x00 }, "missing required 'compressed_page_size'")]
+    [InlineData("no uncompressed_page_size", new byte[] { 0x15, 0x00, 0x25, 0x02, 0x00 }, "missing required 'uncompressed_page_size'")]
+    [InlineData("data page with no num_values", new byte[] { 0x15, 0x00, 0x15, 0x00, 0x15, 0x00, 0x2C, 0x25, 0x00, 0x00, 0x00 }, "DataPageHeader is missing required 'num_values'")]
+    [InlineData("dictionary page with no num_values", new byte[] { 0x15, 0x04, 0x15, 0x00, 0x15, 0x00, 0x4C, 0x25, 0x00, 0x00, 0x00 }, "DictionaryPageHeader is missing required 'num_values'")]
+    public void MalformedThrift_IsAFormatError(string label, byte[] bytes, string expected)
+    {
+        _ = label;
+        var column = new SchemaDescriptor(
+        [
+            new SchemaElement { Name = "schema", NumChildren = 1 },
+            new SchemaElement { Name = "n", Type = PhysicalType.Int32, RepetitionType = FieldRepetitionType.Optional },
+        ]).Columns[0];
+
+        var ex = Assert.Throws<ParquetFormatException>(() =>
+        {
+            var reader = new PageReader(bytes, column);
+            reader.TryRead(out _);
+        });
+        Assert.Contains("corrupted page header", ex.Message);
+        Assert.Contains(expected, ex.InnerException!.Message);
+    }
+
     [Fact]
     public async Task UntamperedChunks_Read()
     {
@@ -156,6 +220,23 @@ public class PageHeaderValidationTests : IDisposable
 
         _ => throw new ArgumentOutOfRangeException(nameof(defect), defect, null),
     });
+
+    /// <summary>Re-encodes the header of data page <paramref name="ordinal"/> in <paramref name="chunk"/>.</summary>
+    private static byte[] RewriteDataPage(byte[] chunk, int ordinal, Func<PageHeader, PageHeader> rewrite)
+    {
+        int position = 0, seen = 0;
+        while (true)
+        {
+            var header = PageHeaderDecoder.Decode(chunk.AsSpan(position), out int headerSize);
+            if (header.Type is PageType.DataPage or PageType.DataPageV2 && seen++ == ordinal)
+            {
+                byte[] encoded = MetadataEncoder.EncodePageHeader(rewrite(header));
+                return [.. chunk.AsSpan(0, position), .. encoded, .. chunk.AsSpan(position + headerSize)];
+            }
+
+            position += headerSize + header.CompressedPageSize;
+        }
+    }
 
     /// <summary>
     /// Re-encodes the header of the first page of <paramref name="type"/> in <paramref name="chunk"/>.
