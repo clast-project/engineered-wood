@@ -10,8 +10,8 @@ using EngineeredWood.Parquet.Schema;
 namespace EngineeredWood.Parquet;
 
 /// <summary>
-/// Reads what row-group pruning will ask one membership source for (dictionary pages, or Bloom
-/// filters) ahead of time, many row groups to a request, instead of one request per row group.
+/// Reads ahead what row-group pruning will ask of one membership source (dictionary pages or Bloom
+/// filters): many row groups to a request, instead of one request per row group.
 /// </summary>
 /// <remarks>
 /// <para>Measured by <c>dictpruning-ab</c> with 20 ms added per request, asking each row group's dictionary

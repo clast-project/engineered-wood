@@ -1577,18 +1577,17 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         for (int rg = 0; rg < numRowGroups; rg++)
         {
-            var colMeta = metadata.RowGroups[rg].Columns[columnIndex].MetaData;
-            if (IsStoredElsewhere(metadata.RowGroups[rg].Columns[columnIndex]))
+            var chunk = metadata.RowGroups[rg].Columns[columnIndex];
+            if (IsStoredElsewhere(chunk))
                 continue; // its filter is in the other file: stay a candidate, and let the read refuse
-            if (colMeta?.BloomFilterOffset is long offset and > 0)
+
+            // The same test pruning applies (bounds, a missing length, the size cap), so this probe and
+            // the predicate path agree on which filters are read at all.
+            if (MembershipPredicateEvaluator.TryGetBloomFilterRange(
+                    chunk, _fileLength, _options.ColumnChunkFilePath, out var range))
             {
                 rangeIndices.Add(rg);
-
-                // If bloom_filter_length is present, use it directly.
-                // Otherwise, read a generous chunk — the Thrift header tells us the actual size.
-                // Clamp to file length to avoid reading past end of file.
-                long length = colMeta.BloomFilterLength ?? Math.Min(4096, _fileLength - offset);
-                ranges.Add(new FileRange(offset, length));
+                ranges.Add(range);
             }
         }
 
@@ -1603,8 +1602,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             for (int i = 0; i < rangeIndices.Count; i++)
             {
                 int rg = rangeIndices[i];
-                var span = buffers[i].Memory.Span;
-                var filter = BloomFilter.BloomFilterReader.Parse(span);
+
+                // A filter that cannot be parsed is declined, as pruning declines it: the group stays a
+                // candidate, and the read that follows is left to report what is wrong with the file.
+                var filter = MembershipPredicateEvaluator.Decode(
+                    MembershipSource.BloomFilter, buffers[i].Memory.Span,
+                    metadata.RowGroups[rg].Columns[columnIndex].MetaData!.Codec, schema.Columns[columnIndex],
+                    validateChecksums: false);
+                if (filter is null)
+                    continue;
 
                 bool anyMatch = false;
                 for (int v = 0; v < encodedValues.Length; v++)

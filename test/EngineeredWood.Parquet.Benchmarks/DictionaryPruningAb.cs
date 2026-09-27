@@ -62,7 +62,7 @@ internal static class DictionaryPruningAb
             // The source under test present in one file and absent from the other.
             string dictionaryFile = Path.Combine(dir, "with-source.parquet");
             string plainFile = Path.Combine(dir, "without-source.parquet");
-            await WriteAsync(batch, dictionaryFile, dictionary: true, bloom);
+            await WriteAsync(batch, dictionaryFile, dictionary: true, bloomFilter: bloom);
             await WriteAsync(batch, plainFile, dictionary: bloom, bloomFilter: false);
 
             Console.WriteLine(

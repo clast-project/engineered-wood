@@ -200,6 +200,56 @@ public class BloomFilterPushdownTests : IDisposable
         Assert.True(candidates[3]);
     }
 
+    /// <summary>
+    /// The by-value probe applies the same guards: a filter that cannot be parsed leaves its group a
+    /// candidate instead of failing the call.
+    /// </summary>
+    [Fact]
+    public async Task CandidateRowGroups_ByValue_DeclineACorruptFilter()
+    {
+        string path = await WriteBloomPrefetchFile("by_value_corrupt");
+        byte[] file = File.ReadAllBytes(path);
+        EngineeredWood.Parquet.Metadata.FileMetaData metadata;
+        await using (var input = new LocalRandomAccessFile(path))
+        using (var reader = new ParquetFileReader(input, ownsFile: false))
+            metadata = await reader.ReadMetadataAsync();
+
+        var meta = metadata.RowGroups[1].Columns[0].MetaData!;
+        file.AsSpan(checked((int)meta.BloomFilterOffset!.Value), meta.BloomFilterLength!.Value).Fill(0xFF);
+        File.WriteAllBytes(path, file);
+
+        await using var corrupt = new LocalRandomAccessFile(path);
+        await using var probe = new ParquetFileReader(corrupt, ownsFile: false);
+        var candidates = await probe.GetCandidateRowGroupsAsync("key", "k3");
+
+        Assert.True(candidates[1]);
+        Assert.True(candidates[3]);
+    }
+
+    [Fact]
+    public void AFilterOverTheSizeCap_IsNotRead()
+    {
+        var chunk = new EngineeredWood.Parquet.Metadata.ColumnChunk
+        {
+            FileOffset = 4,
+            MetaData = new EngineeredWood.Parquet.Metadata.ColumnMetaData
+            {
+                Type = PhysicalType.ByteArray,
+                Encodings = [EngineeredWood.Parquet.Encoding.Plain],
+                Codec = CompressionCodec.Uncompressed,
+                NumValues = 1,
+                TotalUncompressedSize = 1,
+                TotalCompressedSize = 1,
+                DataPageOffset = 4,
+                BloomFilterOffset = 100,
+                BloomFilterLength = MembershipPredicateEvaluator.MaxBloomFilterBytes + 1,
+            },
+        };
+
+        Assert.False(MembershipPredicateEvaluator.TryGetBloomFilterRange(
+            chunk, fileLength: long.MaxValue, ColumnChunkFilePathKind.Refuse, out _));
+    }
+
     // ── Floating point: SQL equality is not bit equality ──
 
     /// <summary>A NaN whose payload differs from <see cref="double.NaN"/>'s.</summary>
