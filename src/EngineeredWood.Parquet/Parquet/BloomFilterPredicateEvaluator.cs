@@ -164,10 +164,13 @@ internal static class BloomFilterPredicateEvaluator
 
         foreach (var v in values)
         {
-            if (!TryEncodeForBloom(v, descriptor!, out byte[] bytes))
+            if (!TryEncodeForBloom(v, descriptor!, out var encodings))
                 return FilterResult.Unknown; // can't encode → can't decide
-            if (filter.MightContain(bytes))
-                return FilterResult.Unknown; // maybe present
+            foreach (byte[] bytes in encodings)
+            {
+                if (filter.MightContain(bytes))
+                    return FilterResult.Unknown; // maybe present
+            }
         }
 
         return FilterResult.AlwaysFalse;
@@ -200,24 +203,26 @@ internal static class BloomFilterPredicateEvaluator
     }
 
     /// <summary>
-    /// Encodes a typed <see cref="LiteralValue"/> into the byte representation
-    /// the Bloom filter was built from. Mirrors
-    /// <see cref="BloomFilterValueEncoder"/> but operates on the typed value
-    /// instead of <c>object</c>.
+    /// Encodes a typed <see cref="LiteralValue"/> into every byte representation a value EQUAL to it
+    /// could have been hashed from (see <see cref="BloomFilterValueEncoder.TryEncodeEquivalents"/>, which
+    /// holds the floating-point rule), or returns false when the filter cannot be asked.
     /// </summary>
     private static bool TryEncodeForBloom(
-        LiteralValue value, ColumnDescriptor descriptor, out byte[] bytes)
+        LiteralValue value, ColumnDescriptor descriptor, out byte[][] encodings)
     {
         try
         {
             object? boxed = ToObjectForColumn(value, descriptor);
-            if (boxed is null) { bytes = []; return false; }
-            bytes = BloomFilterValueEncoder.Encode(boxed, descriptor.PhysicalType);
-            return true;
+            if (boxed is null)
+            {
+                encodings = [];
+                return false;
+            }
+            return BloomFilterValueEncoder.TryEncodeEquivalents(boxed, descriptor.PhysicalType, out encodings);
         }
         catch (ArgumentException)
         {
-            bytes = [];
+            encodings = [];
             return false;
         }
     }

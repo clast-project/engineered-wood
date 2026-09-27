@@ -34,6 +34,42 @@ internal static class BloomFilterValueEncoder
         };
     }
 
+    /// <summary>
+    /// Encodes <paramref name="value"/> into every byte representation that a value EQUAL to it could
+    /// have been hashed from, for probing a filter on the value's behalf. Returns false when no finite
+    /// set covers them, so the filter cannot be asked.
+    /// </summary>
+    /// <remarks>
+    /// Usually that is one encoding. Floating point is the exception, because equality is not bit
+    /// equality: <c>0.0 = -0.0</c> is true, and Spark treats every NaN as equal to every other NaN. A
+    /// filter hashes bits, so probing a zero with only its own bits would call a row group holding the
+    /// other zero "absent" and drop rows that match. A zero is therefore both zeros, and a NaN, whose
+    /// payload bits a writer may have spelled any of 2^52 ways, returns false.
+    /// </remarks>
+    /// <exception cref="ArgumentException">The value type is incompatible with the column's physical type.</exception>
+    public static bool TryEncodeEquivalents(object value, PhysicalType physicalType, out byte[][] encodings)
+    {
+        if (physicalType is PhysicalType.Float or PhysicalType.Double)
+        {
+            switch (value)
+            {
+                case float f when float.IsNaN(f):
+                case double d when double.IsNaN(d):
+                    encodings = [];
+                    return false;
+                case float f when f == 0f:
+                    encodings = [Encode(0f, physicalType), Encode(-0f, physicalType)];
+                    return true;
+                case double d when d == 0d:
+                    encodings = [Encode(0d, physicalType), Encode(-0d, physicalType)];
+                    return true;
+            }
+        }
+
+        encodings = [Encode(value, physicalType)];
+        return true;
+    }
+
     private static byte[] EncodeBoolean(object value)
     {
         if (value is bool b) return [b ? (byte)1 : (byte)0];
