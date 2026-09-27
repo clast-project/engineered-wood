@@ -463,17 +463,20 @@ internal static class MembershipPredicateEvaluator
     private static HashSet<byte[]>? DecodeDictionaryPage(
         ReadOnlySpan<byte> page, CompressionCodec codec, ColumnDescriptor descriptor, bool validateChecksums)
     {
-        var header = PageHeaderDecoder.Decode(page, out int headerLength);
+        // A payload that overruns the extent throws here, which DecodeDictionary turns into null.
+        var reader = new PageReader(page, descriptor);
+        if (!reader.TryRead(out var read))
+            return null;
+        var header = read.Header;
         if (header.Type != PageType.DictionaryPage || header.DictionaryPageHeader is not { } dictionaryHeader)
             return null;
         if (dictionaryHeader.Encoding is not (Encoding.Plain or Encoding.PlainDictionary))
             return null;
-        if (header.CompressedPageSize < 0 || header.CompressedPageSize > page.Length - headerLength
-            || header.UncompressedPageSize < 0 || header.UncompressedPageSize > MaxDictionaryPageBytes
+        if (header.UncompressedPageSize < 0 || header.UncompressedPageSize > MaxDictionaryPageBytes
             || dictionaryHeader.NumValues < 0)
             return null;
 
-        var payload = page.Slice(headerLength, header.CompressedPageSize);
+        var payload = read.Payload;
         if (validateChecksums)
             ColumnChunkReader.ValidateCrc(header.Crc, payload, descriptor);
 

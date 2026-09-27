@@ -11,6 +11,7 @@ namespace EngineeredWood.Parquet.Data;
 /// <summary>
 /// Describes a single data page within a column chunk.
 /// </summary>
+/// <param name="Ordinal">The page's position among the chunk's data pages (<see cref="Page.Ordinal"/>).</param>
 internal readonly record struct PageMapEntry(
     int Offset,
     int CompressedSize,
@@ -25,6 +26,7 @@ internal readonly record struct PageMapEntry(
     int RepetitionLevelsByteLength,
     int DefinitionLevelsByteLength,
     bool IsCompressed,
+    int Ordinal,
     int? Crc = null);
 
 /// <summary>
@@ -132,24 +134,20 @@ internal static class PageMapBuilder
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
 
-        int pos = 0;
+        var reader = new PageReader(data, column);
         long valuesRead = 0;
 
-        while (valuesRead < columnMeta.NumValues && pos < data.Length)
+        while (valuesRead < columnMeta.NumValues && reader.TryRead(out var page))
         {
-            var pageHeader = DecodeHeader(
-                data, pos, column, $"{valuesRead}/{columnMeta.NumValues} values read", out int headerSize);
-
-            int pageDataOffset = pos + headerSize;
-            var pageData = data.Slice(pageDataOffset, pageHeader.CompressedPageSize);
-            pos = pageDataOffset + pageHeader.CompressedPageSize;
+            var pageHeader = page.Header;
+            var pageData = page.Payload;
 
             switch (pageHeader.Type)
             {
                 case PageType.DictionaryPage:
                     if (validateCrc)
                         ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                    dictionary = DecodeDictionaryPage(pageHeader, pageData, column, columnMeta);
+                    dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
                     break;
 
                 case PageType.SymbolTablePage:
@@ -161,7 +159,8 @@ internal static class PageMapBuilder
                 case PageType.DataPage:
                 case PageType.DataPageV2:
                 {
-                    var entry = EntryFromHeader(pageHeader, pageDataOffset, pageData, column, columnMeta);
+                    var entry = EntryFromHeader(
+                        pageHeader, page.PayloadOffset, pageData, page.Ordinal, column, columnMeta);
                     pages.Add(entry);
                     valuesRead += entry.NumValues;
                     break;
@@ -232,36 +231,32 @@ internal static class PageMapBuilder
 
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
-        int pos = 0;
-        while (pos < prefix.Length)
+        var reader = new PageReader(prefix, column);
+        while (true)
         {
             // The prefix ends where the index puts the first data page. If that is wrong, it can end
-            // inside a header, which then fails to decode: the index is wrong, not the file. A side
-            // page that decodes but whose data is corrupt still throws below, as the scan would.
-            PageHeader pageHeader;
-            int headerSize;
+            // inside a header or a page, which then fails to read: the index is wrong, not the file.
+            // A side page that reads but whose data is corrupt still throws below, as the scan would.
+            Page page;
             try
             {
-                pageHeader = PageHeaderDecoder.Decode(prefix.Slice(pos), out headerSize);
+                if (!reader.TryRead(out page))
+                    break;
             }
             catch (ParquetFormatException)
             {
                 return null;
             }
 
-            int pageDataOffset = pos + headerSize;
-            if (pageHeader.CompressedPageSize < 0 || pageHeader.CompressedPageSize > prefix.Length - pageDataOffset)
-                return null;
-
-            var pageData = prefix.Slice(pageDataOffset, pageHeader.CompressedPageSize);
-            pos = pageDataOffset + pageHeader.CompressedPageSize;
+            var pageHeader = page.Header;
+            var pageData = page.Payload;
 
             switch (pageHeader.Type)
             {
                 case PageType.DictionaryPage:
                     if (validateCrc)
                         ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                    dictionary = DecodeDictionaryPage(pageHeader, pageData, column, columnMeta);
+                    dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
                     break;
                 case PageType.SymbolTablePage:
                     if (validateCrc)
@@ -305,7 +300,8 @@ internal static class PageMapBuilder
                 DefinitionLevelEncoding: Encoding.Rle,
                 RepetitionLevelsByteLength: 0,
                 DefinitionLevelsByteLength: 0,
-                IsCompressed: true);
+                IsCompressed: true,
+                Ordinal: i);
         }
         cumulativeRows[pages.Length] = rowCount;
 
@@ -378,18 +374,28 @@ internal static class PageMapBuilder
             return located;
         }
 
-        var header = DecodeHeader(pageBytes, 0, column, $"OffsetIndex page {page}", out headerSize);
-        if (header.Type is not (PageType.DataPage or PageType.DataPageV2)
-            || headerSize + (long)header.CompressedPageSize != located.CompressedSize)
+        // The index located the page, so the reader starts there and knows its ordinal.
+        var reader = new PageReader(pageBytes, column, located.Ordinal);
+        Page read;
+        try
         {
-            throw new ParquetFormatException(
-                $"Column '{column.DottedPath}': OffsetIndex page {page} ({located.CompressedSize} bytes at chunk " +
-                $"offset {located.Offset}) does not match the page there, a {header.Type} of {headerSize} + " +
-                $"{header.CompressedPageSize} bytes.");
+            if (!reader.TryRead(out read))
+                throw Mismatch("The page is empty.");
+        }
+        catch (ParquetFormatException ex)
+        {
+            throw Mismatch(ex.Message, ex);
         }
 
+        if (!read.IsDataPage || reader.Position != pageBytes.Length)
+        {
+            throw Mismatch(
+                $"The page there is a {read.Header.Type} of {read.HeaderSize} + {read.Header.CompressedPageSize} bytes.");
+        }
+
+        headerSize = read.HeaderSize;
         var entry = EntryFromHeader(
-            header, located.Offset + headerSize, pageBytes.Slice(headerSize), column, columnMeta);
+            read.Header, located.Offset + headerSize, read.Payload, read.Ordinal, column, columnMeta);
         if (entry.NumRows != located.NumRows)
         {
             throw new ParquetFormatException(
@@ -398,21 +404,13 @@ internal static class PageMapBuilder
         }
 
         return entry;
-    }
 
-    private static PageHeader DecodeHeader(
-        ReadOnlySpan<byte> data, int pos, ColumnDescriptor column, string where, out int headerSize)
-    {
-        try
+        ParquetFormatException Mismatch(string detail, Exception? inner = null)
         {
-            return PageHeaderDecoder.Decode(data.Slice(pos), out headerSize);
-        }
-        catch (ParquetFormatException ex)
-        {
-            throw new ParquetFormatException(
-                $"Column '{string.Join(".", column.Path)}': corrupted page header " +
-                $"at byte offset {pos} ({where}).",
-                ex);
+            string message =
+                $"Column '{column.DottedPath}': OffsetIndex page {page} ({located.CompressedSize} bytes at chunk " +
+                $"offset {located.Offset}) does not match the page there. {detail}";
+            return inner is null ? new ParquetFormatException(message) : new ParquetFormatException(message, inner);
         }
     }
 
@@ -424,6 +422,7 @@ internal static class PageMapBuilder
         PageHeader pageHeader,
         int pageDataOffset,
         ReadOnlySpan<byte> pageData,
+        int ordinal,
         ColumnDescriptor column,
         ColumnMetaData columnMeta)
     {
@@ -444,6 +443,7 @@ internal static class PageMapBuilder
                 RepetitionLevelsByteLength: 0,
                 DefinitionLevelsByteLength: 0,
                 IsCompressed: true,
+                Ordinal: ordinal,
                 Crc: pageHeader.Crc);
         }
 
@@ -462,6 +462,7 @@ internal static class PageMapBuilder
             RepetitionLevelsByteLength: v2h.RepetitionLevelsByteLength,
             DefinitionLevelsByteLength: v2h.DefinitionLevelsByteLength,
             IsCompressed: v2h.IsCompressed,
+            Ordinal: ordinal,
             Crc: pageHeader.Crc);
     }
 
@@ -520,43 +521,6 @@ internal static class PageMapBuilder
             {
                 ArrayPool<byte>.Shared.Return(repLevels);
             }
-        }
-        finally
-        {
-            if (decompressedBuffer != null)
-                ArrayPool<byte>.Shared.Return(decompressedBuffer);
-        }
-    }
-
-    private static DictionaryDecoder DecodeDictionaryPage(
-        PageHeader header,
-        ReadOnlySpan<byte> compressedData,
-        ColumnDescriptor column,
-        ColumnMetaData columnMeta)
-    {
-        var dictHeader = header.DictionaryPageHeader
-            ?? throw new ParquetFormatException("Dictionary page missing DictionaryPageHeader.");
-
-        ReadOnlySpan<byte> plainData;
-        byte[]? decompressedBuffer = null;
-
-        if (columnMeta.Codec == CompressionCodec.Uncompressed)
-        {
-            plainData = compressedData;
-        }
-        else
-        {
-            int size = header.UncompressedPageSize;
-            decompressedBuffer = ArrayPool<byte>.Shared.Rent(size);
-            Decompressor.Decompress(columnMeta.Codec, compressedData, decompressedBuffer);
-            plainData = decompressedBuffer.AsSpan(0, size);
-        }
-
-        try
-        {
-            var decoder = new DictionaryDecoder(column.PhysicalType);
-            decoder.Load(plainData, dictHeader.NumValues, column.TypeLength ?? 0);
-            return decoder;
         }
         finally
         {
