@@ -234,7 +234,7 @@ public class DictionaryPushdownTests : IDisposable
     /// only "y" values, so statistics rule out any value below "y" and those groups never need a
     /// dictionary. "common" is in groups 0-5; "k3" only in group 3.
     /// </summary>
-    private async Task<string> WritePrefetchFile(string name)
+    private async Task<string> WritePrefetchFile(string name, int groups = PrefetchGroups)
     {
         string path = Path.Combine(_tempDir, name + ".parquet");
         var schema = new Apache.Arrow.Schema.Builder()
@@ -245,9 +245,9 @@ public class DictionaryPushdownTests : IDisposable
         await using (var writer = new ParquetFileWriter(file, ownsFile: false,
             new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed }))
         {
-            for (int g = 0; g < PrefetchGroups; g++)
+            for (int g = 0; g < groups; g++)
             {
-                string[] values = g < 6 ? ["a-min", "z-max", "common", $"k{g}"] : ["y1", "y2"];
+                string[] values = g < groups - 2 ? ["a-min", "z-max", "common", $"k{g}"] : ["y1", "y2"];
                 var builder = new StringArray.Builder();
                 for (int r = 0; r < Repeats; r++)
                     foreach (var v in values)
@@ -322,6 +322,42 @@ public class DictionaryPushdownTests : IDisposable
         var (_, requests) = await CandidatesCounted(path, Ex.GreaterThan("key", "b"), dictionaries: true);
 
         Assert.Empty(requests);
+    }
+
+    /// <summary>
+    /// Leaves the probe declines before reading must not make the prefetch read either: an IN list
+    /// holding a column reference, a NULL literal, and a literal the column cannot hold.
+    /// </summary>
+    [Fact]
+    public async Task ThePrefetch_SkipsLeavesTheProbeWouldDecline()
+    {
+        string path = await WritePrefetchFile("declined_leaves");
+
+        var nonLiteralIn = new SetPredicate(
+            new UnboundReference("key"), [new LiteralExpression(LiteralValue.Of("k3")), new UnboundReference("other")],
+            SetOperator.In);
+        var nullLiteral = new ComparisonPredicate(
+            new UnboundReference("key"), ComparisonOperator.Equal, new LiteralExpression(LiteralValue.Null));
+        var wrongType = Ex.Equal("key", 5);
+
+        foreach (var filter in new Predicate[] { nonLiteralIn, nullLiteral, wrongType })
+        {
+            var (_, requests) = await CandidatesCounted(path, filter, dictionaries: true);
+            Assert.Empty(requests);
+        }
+    }
+
+    [Fact]
+    public async Task AWindow_AsksForAtMost64Pages()
+    {
+        // 70 undecided groups (plus 2 statistics rule out) and a budget they all fit: the page cap splits
+        // them, since on object storage each page of a window is its own concurrent GET.
+        string path = await WritePrefetchFile("page_cap", groups: 72);
+
+        var (candidates, requests) = await CandidatesCounted(path, Ex.Equal("key", "k3"), dictionaries: true);
+
+        Assert.Equal(Enumerable.Range(0, 72).Select(g => g == 3), candidates);
+        Assert.Equal(new[] { DictionaryPrefetch.MaxRangesPerWindow, 70 - DictionaryPrefetch.MaxRangesPerWindow }, requests);
     }
 
     [Fact]

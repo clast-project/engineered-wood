@@ -21,6 +21,10 @@ namespace EngineeredWood.Parquet;
 /// its own and those of the groups after it that statistics leave undecided, up to a byte budget, in
 /// one <see cref="IRandomAccessFile.ReadRangesAsync"/>. The next group outside the window loads the next.
 /// Memory holds one window at a time.</para>
+/// <para>What that saves is ROUND TRIPS, not requests. Object stores have no multi-range GET, and the
+/// cloud readers' <see cref="CoalescingFileReader"/> sends the window's distant ranges as separate GETs
+/// issued concurrently. So on S3, Azure or GCS a window costs about one GET per page but only one round
+/// trip of waiting, where asking group by group cost a round trip per group.</para>
 /// <para>Only the columns an equality or IN leaf names are read, and only chunks
 /// <see cref="MembershipPredicateEvaluator.TryGetDictionaryRange"/> accepts, the same test the single
 /// read applies. A group this has no entry for is left to the evaluator, which reads what it needs
@@ -33,6 +37,14 @@ internal sealed class DictionaryPrefetch
     /// (~1 MiB), so a window usually spans many row groups, and small enough to hold in memory.
     /// </summary>
     internal const long DefaultBudgetBytes = 32L * 1024 * 1024;
+
+    /// <summary>
+    /// The most dictionary pages one window asks for. On object storage a window is not one HTTP
+    /// request: <see cref="CoalescingFileReader"/> merges only ranges under a small gap apart, and
+    /// dictionary pages sit between data chunks, so it issues about one GET per page, all at once.
+    /// The window saves round trips because those GETs run concurrently; this bounds how many.
+    /// </summary>
+    internal const int MaxRangesPerWindow = 64;
 
     private readonly Predicate _filter;
     private readonly FileMetaData _metadata;
@@ -119,8 +131,9 @@ internal sealed class DictionaryPrefetch
             }
 
             // The first group is always loaded, whatever it costs; a later one that would overrun the
-            // budget starts the next window instead.
-            if (group != first && bytes + groupBytes > _budgetBytes)
+            // budget, or the cap on concurrent pages, starts the next window instead.
+            if (group != first
+                && (bytes + groupBytes > _budgetBytes || ranges.Count + groupRanges.Count > MaxRangesPerWindow))
                 break;
 
             bytes += groupBytes;

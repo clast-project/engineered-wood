@@ -79,23 +79,18 @@ internal static class MembershipPredicateEvaluator
     }
 
     /// <summary>
-    /// The columns whose dictionaries <paramref name="predicate"/> can ask: those named by an equality
-    /// or IN leaf against literals, anywhere in the tree (a NOT still asks its child), resolved as a
-    /// probe resolves them.
+    /// The columns whose dictionaries <paramref name="predicate"/> will actually ask, anywhere in the
+    /// tree (a NOT still asks its child): those with an equality or IN leaf the probe would not decline
+    /// before reading. That is the probe's own test, so a prefetch never reads a page no leaf can use: a
+    /// NULL literal, an IN list holding a non-literal (<c>x IN (a, b)</c>), and a literal that cannot
+    /// be encoded for the column (an integer against a DECIMAL stored as INT32) are all declined.
     /// </summary>
     internal static List<(int Index, ColumnDescriptor Descriptor)> DictionaryColumns(
         Predicate predicate, SchemaDescriptor schema)
     {
-        var names = new HashSet<string>(StringComparer.Ordinal);
-        Collect(predicate);
-
         var columns = new List<(int, ColumnDescriptor)>();
         var seen = new HashSet<int>();
-        foreach (string name in names)
-        {
-            if (FindColumn(schema, name, out int index, out var descriptor) && seen.Add(index))
-                columns.Add((index, descriptor!));
-        }
+        Collect(predicate);
         return columns;
 
         void Collect(Predicate p)
@@ -112,15 +107,31 @@ internal static class MembershipPredicateEvaluator
                     Collect(not.Child);
                     break;
                 case ComparisonPredicate cmp when IsEquality(cmp.Op):
-                    if (TryGetColumnAndLiteral(cmp.Left, cmp.Right, out string? column, out _)
-                        || TryGetColumnAndLiteral(cmp.Right, cmp.Left, out column, out _))
-                        names.Add(column!);
+                    if ((TryGetColumnAndLiteral(cmp.Left, cmp.Right, out string? column, out var value)
+                         || TryGetColumnAndLiteral(cmp.Right, cmp.Left, out column, out value))
+                        && !value.IsNull)
+                        Add(column!, [value]);
                     break;
                 case SetPredicate set when set.Op == SetOperator.In:
-                    if (TryGetColumnName(set.Operand, out string? operand))
-                        names.Add(operand!);
+                    if (TryGetColumnName(set.Operand, out string? operand)
+                        && set.Values.Count > 0
+                        && set.TryGetLiteralValues(out var values))
+                        Add(operand!, values);
                     break;
             }
+        }
+
+        void Add(string name, IReadOnlyList<LiteralValue> values)
+        {
+            if (!FindColumn(schema, name, out int index, out var descriptor) || seen.Contains(index))
+                return;
+            foreach (var value in values)
+            {
+                if (!TryEncodeForProbe(value, descriptor!, out _))
+                    return;
+            }
+            seen.Add(index);
+            columns.Add((index, descriptor!));
         }
     }
 

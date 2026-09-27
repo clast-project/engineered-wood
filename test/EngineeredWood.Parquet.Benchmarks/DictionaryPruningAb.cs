@@ -33,7 +33,10 @@ namespace EngineeredWood.Benchmarks;
 /// <para>Local disk hides what matters most on object storage: each asked row group costs one more
 /// request, issued before that group's data read. <c>latencyMs</c> delays every request by that much
 /// to model a store's time to first byte.</para>
-/// Run with: dotnet run -c Release -f net10.0 -- dictpruning-ab [rounds] [latencyMs]
+/// <para><c>cloud</c> reads through <see cref="CoalescingFileReader"/>, as the S3, Azure and GCS readers
+/// do, and delays each GET it issues rather than each call: that reader merges only nearby ranges and
+/// sends the rest as concurrent GETs. The table then reports both calls and GETs.</para>
+/// Run with: dotnet run -c Release -f net10.0 -- dictpruning-ab [rounds] [latencyMs] [direct|cloud]
 /// </remarks>
 internal static class DictionaryPruningAb
 {
@@ -45,6 +48,7 @@ internal static class DictionaryPruningAb
     {
         int rounds = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 15;
         int latencyMs = args.Length > 2 ? int.Parse(args[2], CultureInfo.InvariantCulture) : 0;
+        bool cloud = args.Length > 3 && args[3] == "cloud";
         string dir = Path.Combine(Path.GetTempPath(), "ew-dictpruning-ab-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(dir);
 
@@ -58,10 +62,11 @@ internal static class DictionaryPruningAb
 
             Console.WriteLine(
                 $"{RowGroups} row groups x {RowsPerGroup:N0} rows, key + 2 plain payload columns; " +
-                $"median of {rounds} alternating rounds after 3 warm-up rounds; {latencyMs} ms added per request.");
+                $"median of {rounds} alternating rounds after 3 warm-up rounds; {latencyMs} ms added per " +
+                (cloud ? "GET, through CoalescingFileReader." : "request."));
             Console.WriteLine($"Files: dictionary key {new FileInfo(dictionaryFile).Length:N0} bytes, plain key {new FileInfo(plainFile).Length:N0} bytes.");
-            Console.WriteLine("| Case | ms off | ms on | Time | Requests off | on | Bytes off | on | Row groups read off | on |");
-            Console.WriteLine("|---|---|---|---|---|---|---|---|---|---|");
+            Console.WriteLine("| Case | ms off | ms on | Time | Calls off | on | GETs off | on | Bytes off | on | Row groups read off | on |");
+            Console.WriteLine("|---|---|---|---|---|---|---|---|---|---|---|---|");
 
             var cases = new[]
             {
@@ -79,8 +84,8 @@ internal static class DictionaryPruningAb
                 foreach (var (_, path, key) in cases)
                 {
                     var filter = Ex.Equal("key", key);
-                    await ReadAsync(path, new ParquetReadOptions { Filter = filter }, latencyMs: 0);
-                    await ReadAsync(path, new ParquetReadOptions { Filter = filter, FilterUseDictionaries = true }, latencyMs: 0);
+                    await ReadAsync(path, new ParquetReadOptions { Filter = filter }, latencyMs: 0, cloud);
+                    await ReadAsync(path, new ParquetReadOptions { Filter = filter, FilterUseDictionaries = true }, latencyMs: 0, cloud);
                 }
             }
 
@@ -98,10 +103,10 @@ internal static class DictionaryPruningAb
                 {
                     bool offFirst = round % 2 == 0;
                     if (offFirst)
-                        a = await ReadAsync(path, off, latencyMs);
-                    b = await ReadAsync(path, on, latencyMs);
+                        a = await ReadAsync(path, off, latencyMs, cloud);
+                    b = await ReadAsync(path, on, latencyMs, cloud);
                     if (!offFirst)
-                        a = await ReadAsync(path, off, latencyMs);
+                        a = await ReadAsync(path, off, latencyMs, cloud);
 
                     if (round < 0)
                         continue;
@@ -112,7 +117,7 @@ internal static class DictionaryPruningAb
 
                 Console.WriteLine(
                     $"| {label} | {Median(msOff):F1} | {Median(msOn):F1} | {(Median(ratios) - 1) * 100:+0;-0;0}% " +
-                    $"| {a.Requests} | {b.Requests} | {a.Bytes:N0} | {b.Bytes:N0} | {a.RowGroups} | {b.RowGroups} |");
+                    $"| {a.Calls} | {b.Calls} | {a.Gets} | {b.Gets} | {a.Bytes:N0} | {b.Bytes:N0} | {a.RowGroups} | {b.RowGroups} |");
             }
         }
         finally
@@ -173,11 +178,15 @@ internal static class DictionaryPruningAb
         await writer.CloseAsync();
     }
 
-    private readonly record struct Result(double Ms, int Requests, long Bytes, int RowGroups);
+    private readonly record struct Result(double Ms, int Calls, int Gets, long Bytes, int RowGroups);
 
-    private static async Task<Result> ReadAsync(string path, ParquetReadOptions options, int latencyMs)
+    private static async Task<Result> ReadAsync(string path, ParquetReadOptions options, int latencyMs, bool cloud)
     {
-        await using var file = new CountingFile(new LocalRandomAccessFile(path), latencyMs);
+        // Direct: every call is one request and pays the delay. Cloud: calls go through the coalescer,
+        // and each GET it sends to the transport pays the delay.
+        await using var transport = new CountingFile(new LocalRandomAccessFile(path), latencyMs);
+        await using var calls = cloud ? new CountingFile(new CoalescingFileReader(transport), 0) : null;
+        IRandomAccessFile file = calls ?? transport;
         var clock = Stopwatch.StartNew();
         int batches = 0;
         using (var reader = new ParquetFileReader(file, ownsFile: false, options))
@@ -189,7 +198,8 @@ internal static class DictionaryPruningAb
             }
         }
 
-        return new Result(clock.Elapsed.TotalMilliseconds, file.Requests, file.Bytes, batches);
+        return new Result(clock.Elapsed.TotalMilliseconds, (calls ?? transport).Requests, transport.Requests,
+            transport.Bytes, batches);
     }
 
     private static double Median(List<double> values)
