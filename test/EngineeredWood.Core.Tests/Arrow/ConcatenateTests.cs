@@ -110,6 +110,46 @@ public class ConcatenateTests
         Assert.Equal(all, Enumerable.Range(0, 3).Select(i => items.GetGuid(i)!.Value));
     }
 
+    /// <summary>An extension over another extension: both layers must come off before Arrow sees it.</summary>
+    [Fact]
+    public void StackedExtension_KeepsBothLayers()
+    {
+        var money = new MoneyType();
+        var outer = new TakeExtensionTests.WrappedType(money);
+        IArrowArray Build(long[] values) => outer.CreateArray(money.CreateArray(RawArrays.Fixed(Int64Type.Default, values)));
+
+        var result = Assert.IsType<TakeExtensionTests.WrappedArray>(ArrowCompute.Concatenate([Build([1, 2]), Build([3])]));
+
+        Assert.Same(outer, result.Data.DataType);
+        var inner = Assert.IsType<MoneyArray>(result.Storage);
+        Assert.Equal(new long?[] { 1, 2, 3 }, Enumerable.Range(0, 3).Select(inner.GetAmount));
+    }
+
+    /// <summary>
+    /// Two extension types over the same storage are different types. The storage would concatenate,
+    /// and relabelling would silently give the second input the first one's type.
+    /// </summary>
+    [Fact]
+    public void DifferentExtensionTypes_AreRefused()
+    {
+        var money = new MoneyType().CreateArray(RawArrays.Fixed(Int64Type.Default, new[] { 1L }));
+        var wrapped = new TakeExtensionTests.WrappedType(Int64Type.Default).CreateArray(RawArrays.Fixed(Int64Type.Default, new[] { 2L }));
+
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([money, wrapped]));
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([wrapped, money]));
+    }
+
+    /// <summary>Separate instances of one extension type are the same type.</summary>
+    [Fact]
+    public void SameExtensionType_FromSeparateInstances_Concatenates()
+    {
+        var a = new MoneyType().CreateArray(RawArrays.Fixed(Int64Type.Default, new[] { 1L }));
+        var b = new MoneyType().CreateArray(RawArrays.Fixed(Int64Type.Default, new[] { 2L }));
+
+        var result = Assert.IsType<MoneyArray>(ArrowCompute.Concatenate([a, b]));
+        Assert.Equal(new long?[] { 1, 2 }, Enumerable.Range(0, 2).Select(result.GetAmount));
+    }
+
     [Fact]
     public void NullArrays_AreCounted()
     {

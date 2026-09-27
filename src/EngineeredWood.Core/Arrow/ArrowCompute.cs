@@ -210,6 +210,18 @@ public static class ArrowCompute
         if (!HasExtensionType(type))
             return ArrowArrayConcatenator.Concatenate(inputs);
 
+        // Arrow checks that the inputs' storage agrees, which is all it will see. The extension types
+        // are ours to check: relabelling gives every input the first one's.
+        for (int i = 1; i < inputs.Count; i++)
+        {
+            if (!SameExtensionTypes(type, inputs[i].Data.DataType))
+            {
+                throw new ArgumentException(
+                    $"Cannot concatenate {inputs[i].Data.DataType.Name} onto {type.Name}: their extension types differ.",
+                    nameof(arrays));
+            }
+        }
+
         var storage = new List<ArrayData>(inputs.Count);
         foreach (var array in inputs)
             storage.Add(AsStorage(array.Data));
@@ -224,11 +236,48 @@ public static class ArrowCompute
         _ => false,
     };
 
-    /// <summary><paramref name="data"/> with every extension type in it replaced by its storage type.</summary>
-    private static ArrayData AsStorage(ArrayData data) => new(
-        data.DataType is ExtensionType extension ? extension.StorageType : data.DataType,
-        data.Length, data.NullCount, data.Offset, data.Buffers,
-        data.Children?.Select(AsStorage).ToArray(), data.Dictionary);
+    /// <summary>
+    /// Whether two types carry the same extension types in the same places: same name and metadata,
+    /// over storage that does too. Anything that is not an extension is left to Arrow's own check.
+    /// </summary>
+    private static bool SameExtensionTypes(IArrowType a, IArrowType b)
+    {
+        if (a is ExtensionType || b is ExtensionType)
+        {
+            return a is ExtensionType x && b is ExtensionType y
+                && x.Name == y.Name
+                && x.ExtensionMetadata == y.ExtensionMetadata
+                && SameExtensionTypes(x.StorageType, y.StorageType);
+        }
+
+        if (a is NestedType na && b is NestedType nb)
+        {
+            if (na.Fields.Count != nb.Fields.Count)
+                return false;
+            for (int i = 0; i < na.Fields.Count; i++)
+            {
+                if (!SameExtensionTypes(na.Fields[i].DataType, nb.Fields[i].DataType))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// <paramref name="data"/> with every extension type in it replaced by its storage type, all the
+    /// way down when one extension is stored as another.
+    /// </summary>
+    private static ArrayData AsStorage(ArrayData data)
+    {
+        var type = data.DataType;
+        while (type is ExtensionType extension)
+            type = extension.StorageType;
+
+        return new ArrayData(
+            type, data.Length, data.NullCount, data.Offset, data.Buffers,
+            data.Children?.Select(AsStorage).ToArray(), data.Dictionary);
+    }
 
     /// <summary>
     /// <paramref name="data"/>, laid out as <paramref name="template"/> is, with the template's type at
