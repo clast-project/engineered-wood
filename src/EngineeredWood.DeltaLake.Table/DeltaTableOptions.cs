@@ -22,7 +22,8 @@ public sealed record DeltaTableOptions
     /// dotted path, as the table's schema spells it; under column mapping each write translates them to
     /// the physical leaves the file carries. A list element is <c>name.list.element</c> and a map's key
     /// and value are <c>name.key_value.key</c> / <c>name.key_value.value</c>, as in the Parquet layout. A name
-    /// that matches no column is ignored.
+    /// that matches no logical column is passed through unchanged: a physical <c>col-&lt;uuid&gt;</c> path
+    /// still applies, and anything else matches nothing.
     /// </summary>
     public ParquetWriteOptions ParquetWriteOptions { get; init; } = ParquetWriteOptions.Default;
 

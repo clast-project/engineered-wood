@@ -183,6 +183,34 @@ public class ColumnMappingWriteOptionsTests : IDisposable
         Assert.Equal(0, rows);
     }
 
+    /// <summary>
+    /// A buffered transaction writes under its PENDING schema, whose added column has a physical name the
+    /// committed snapshot does not know yet; an option naming that column must still reach it.
+    /// </summary>
+    [Fact]
+    public async Task AStagedAddColumn_IsTranslatedAgainstThePendingSchema()
+    {
+        var options = new DeltaTableOptions
+        {
+            ParquetWriteOptions = ParquetWriteOptions.Default with { BloomFilterColumns = new HashSet<string> { "extra" } },
+        };
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdSchema, options, columnMappingMode: ColumnMappingMode.Name);
+
+        var change = table.ComputeAddColumn(new Field("extra", Int32Type.Default, true));
+        var widened = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("extra", Int32Type.Default, true))
+            .Build();
+        await table.WriteDataFilesAsync(
+            [new RecordBatch(widened, [Ids(3).Column(0), new Int32Array.Builder().Append(1).Append(2).Append(3).Build()], 3)],
+            schemaOverride: change.NewSchema);
+
+        var chunks = await Chunks();
+        Assert.Equal(2, chunks.Count);
+        Assert.Single(chunks, c => c.Meta.BloomFilterOffset is not null);
+    }
+
     // ───── The translator ─────
 
     private static StructField Field(string name, DeltaDataType type, string physical) => new()
@@ -210,6 +238,9 @@ public class ColumnMappingWriteOptionsTests : IDisposable
             Field("m", new Schema.MapType { KeyType = Long, ValueType = Long, ValueContainsNull = true }, "col-m"),
             Field("amb", new Schema.StructType { Fields = [Field("c", Long, "col-amb-c")] }, "col-amb"),
             Field("amb.c", Long, "col-amb-dotted"),
+            Field("p", Long, "col-p"),
+            Field("p.q", Long, "col-pq"),
+            Field("v", new PrimitiveType { TypeName = "variant" }, "col-v"),
         ],
     };
 
@@ -225,6 +256,9 @@ public class ColumnMappingWriteOptionsTests : IDisposable
     [InlineData("s.nope", "s.nope")]
     [InlineData("tags.element", "tags.element")] // not the Parquet list layout
     [InlineData("amb.c", "amb.c")] // a struct leaf and a dotted field both spell it: ambiguous
+    [InlineData("p.q", "col-pq")] // a primitive p cannot hold q, so the dotted field is the only reading
+    [InlineData("p.extra", "p.extra")] // nothing follows a non-variant primitive
+    [InlineData("v.value", "col-v.value")] // a variant's own children pass through
     public void Translate(string logical, string physical)
     {
         Assert.Equal(physical, ColumnMappingWriteOptions.Translate(logical, Mapped, ColumnMappingMode.Name));

@@ -66,9 +66,11 @@ internal static class ColumnMappingWriteOptions
     /// <remarks>
     /// Walks the path a segment at a time. A struct field becomes its physical name. A list's
     /// <c>list.&lt;element&gt;</c> and a map's <c>key_value.key</c>/<c>key_value.value</c> are Parquet's own
-    /// nodes and pass through. Below a primitive (a variant's <c>metadata</c>/<c>value</c>) the rest passes
-    /// through too. A field whose own name contains a dot is matched by trying the longest run of
-    /// segments first; a path two fields could both spell is left unresolved.
+    /// nodes and pass through. Below a variant (its <c>metadata</c>/<c>value</c>) the rest passes through
+    /// too; below any other primitive nothing can follow. A field whose own name contains a dot is
+    /// matched by trying every run of segments, and a run counts only when its field could hold what is
+    /// left of the path: a primitive <c>a</c> beside a dotted <c>a.b</c> leaves <c>a.b</c> meaning the
+    /// dotted field. A path two fields could still both spell is left unresolved.
     /// </remarks>
     internal static string Translate(string key, StructType schema, ColumnMappingMode mode)
     {
@@ -90,6 +92,8 @@ internal static class ColumnMappingWriteOptions
                         var field = st.Fields.FirstOrDefault(f => string.Equals(f.Name, name, StringComparison.Ordinal));
                         if (field is null)
                             continue;
+                        if (take < segments.Length - i && !CanHoldChildren(field.Type))
+                            continue; // a leaf cannot be the start of a longer path
                         if (match is not null)
                             return key; // two readings of the same path: ambiguous
                         match = field;
@@ -119,14 +123,24 @@ internal static class ColumnMappingWriteOptions
                     type = segments[i + 1] == "key" ? map.KeyType : map.ValueType;
                     i += 2;
                     break;
-                default:
+                case PrimitiveType primitive when IsVariant(primitive):
                     for (; i < segments.Length; i++)
                         output.Add(segments[i]);
                     break;
+                default:
+                    return key; // a leaf with more path after it
             }
         }
         return string.Join(".", output);
     }
+
+    /// <summary>Whether a path can continue below a field of this type in the Parquet layout.</summary>
+    private static bool CanHoldChildren(DeltaDataType type) =>
+        type is StructType or ArrayType or MapType || (type is PrimitiveType p && IsVariant(p));
+
+    /// <summary>A variant is primitive to Delta but a group (metadata, value) in the file.</summary>
+    private static bool IsVariant(PrimitiveType type) =>
+        string.Equals(type.TypeName, "variant", StringComparison.Ordinal);
 
     private static IReadOnlyCollection<string>? Keys(IReadOnlyCollection<string>? keys, Func<string, string> translate) =>
         keys is null ? null : new HashSet<string>(keys.Select(translate), StringComparer.Ordinal);

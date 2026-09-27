@@ -167,17 +167,23 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// files have a schema of their own and take the options untranslated. Cached per schema, so the
     /// translation is redone when a RENAME COLUMN changes the logical names.
     /// </summary>
-    private ParquetWriteOptions DataFileWriteOptions(Snapshot.Snapshot snapshot)
+    private ParquetWriteOptions DataFileWriteOptions(Snapshot.Snapshot snapshot) =>
+        DataFileWriteOptions(snapshot.Schema, ColumnMapping.GetMode(snapshot.Metadata.Configuration));
+
+    /// <summary>
+    /// As above, against a schema that need not be committed: a buffered transaction's pending schema
+    /// carries added columns and their fresh physical names, which the committed snapshot does not.
+    /// </summary>
+    private ParquetWriteOptions DataFileWriteOptions(Schema.StructType schema, ColumnMappingMode mode)
     {
-        var mode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         if (_dataFileWriteOptions is { } cached
-            && ReferenceEquals(cached.Schema, snapshot.Schema) && cached.Mode == mode)
+            && ReferenceEquals(cached.Schema, schema) && cached.Mode == mode)
         {
             return cached.Options;
         }
 
-        var options = ColumnMappingWriteOptions.ToPhysical(_options.ParquetWriteOptions, snapshot.Schema, mode);
-        _dataFileWriteOptions = (snapshot.Schema, mode, options);
+        var options = ColumnMappingWriteOptions.ToPhysical(_options.ParquetWriteOptions, schema, mode);
+        _dataFileWriteOptions = (schema, mode, options);
         return options;
     }
 
@@ -6059,7 +6065,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     await using var file = await _fs.CreateAsync(
                         fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
                     await using var writer = new ParquetFileWriter(
-                        file, ownsFile: false, DataFileWriteOptions(snapshot));
+                        file, ownsFile: false, DataFileWriteOptions(writeSchema, mappingMode));
                     await writer.WriteRowGroupAsync(writeBatch, cancellationToken).ConfigureAwait(false);
                     await writer.DisposeAsync().ConfigureAwait(false);
                     fileSize = file.Position;
