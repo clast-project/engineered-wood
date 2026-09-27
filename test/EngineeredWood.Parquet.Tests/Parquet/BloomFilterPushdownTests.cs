@@ -92,6 +92,114 @@ public class BloomFilterPushdownTests : IDisposable
         Assert.Empty(batches);
     }
 
+    // ── Requests: filters are read a window of row groups at a time ──
+
+    /// <summary>
+    /// Eight row groups of a key with a Bloom filter. Groups 0-5 hold the extremes "a-min" and "z-max",
+    /// so statistics leave an equality on a middle value undecided; groups 6-7 hold only "y" values, so
+    /// statistics rule out any value below "y". "k3" is only in group 3. Each group repeats its values,
+    /// so the key is also dictionary-encoded.
+    /// </summary>
+    private async Task<string> WriteBloomPrefetchFile(string name)
+    {
+        string path = Path.Combine(_tempDir, name + ".parquet");
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("key", StringType.Default, false))
+            .Build();
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            BloomFilterColumns = new HashSet<string> { "key" },
+        };
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            for (int g = 0; g < 8; g++)
+            {
+                string[] values = g < 6 ? ["a-min", "z-max", "common", $"k{g}"] : ["y1", "y2"];
+                var builder = new StringArray.Builder();
+                for (int r = 0; r < 10; r++)
+                    foreach (var v in values)
+                        builder.Append(v);
+                await writer.WriteRowGroupAsync(new RecordBatch(schema, [builder.Build()], values.Length * 10));
+            }
+            await writer.CloseAsync();
+        }
+        return path;
+    }
+
+    private static async Task<(bool[] Candidates, List<int> Requests)> CandidatesCounted(
+        string path, EngineeredWood.Expressions.Predicate filter, ParquetReadOptions options)
+    {
+        await using var input = new RequestCountingFile(new LocalRandomAccessFile(path));
+        await using var reader = new ParquetFileReader(input, ownsFile: false, options);
+        await reader.ReadMetadataAsync(); // footer requests are not the subject
+        input.Requests.Clear();
+
+        var bits = await reader.GetCandidateRowGroupsAsync(filter);
+        return (Enumerable.Range(0, bits.Length).Select(i => bits[i]).ToArray(), input.Requests.ToList());
+    }
+
+    private static readonly ParquetReadOptions BloomOnly =
+        new() { FilterUseBloomFilters = true, FilterUseDictionaries = false };
+
+    [Fact]
+    public async Task BloomFilters_ForEveryUndecidedGroup_AreReadInOneRequest()
+    {
+        string path = await WriteBloomPrefetchFile("bloom_one_request");
+
+        var (candidates, requests) = await CandidatesCounted(path, Ex.Equal("key", "k3"), BloomOnly);
+
+        Assert.True(candidates[3]);
+        Assert.False(candidates[6]); // statistics
+        Assert.False(candidates[7]);
+        // Six undecided groups, six filters, one request; groups 6-7 are never read.
+        Assert.Equal(new[] { 6 }, requests);
+    }
+
+    /// <summary>
+    /// With both sources on, each reads ahead once. The dictionary rules out every group but 3, so the
+    /// Bloom step first runs at group 3, and its window covers the undecided groups from there on.
+    /// </summary>
+    [Fact]
+    public async Task BothSources_ReadAheadOnceEach()
+    {
+        string path = await WriteBloomPrefetchFile("both_sources");
+
+        var (candidates, requests) = await CandidatesCounted(path, Ex.Equal("key", "k3"),
+            new ParquetReadOptions { FilterUseBloomFilters = true, FilterUseDictionaries = true });
+
+        Assert.Equal(new[] { false, false, false, true, false, false, false, false }, candidates);
+        Assert.Equal(new[] { 6, 3 }, requests);
+    }
+
+    /// <summary>
+    /// A filter that cannot be parsed is declined, not trusted and not thrown: pruning must never be
+    /// what fails a read. It used to throw out of the probe.
+    /// </summary>
+    [Fact]
+    public async Task ACorruptBloomFilter_IsDeclinedNotThrown()
+    {
+        string path = await WriteBloomPrefetchFile("bloom_corrupt");
+        byte[] file = File.ReadAllBytes(path);
+        EngineeredWood.Parquet.Metadata.FileMetaData metadata;
+        await using (var input = new LocalRandomAccessFile(path))
+        using (var reader = new ParquetFileReader(input, ownsFile: false))
+            metadata = await reader.ReadMetadataAsync();
+
+        // Overwrite group 1's whole filter block (header and bitset).
+        var meta = metadata.RowGroups[1].Columns[0].MetaData!;
+        int offset = checked((int)meta.BloomFilterOffset!.Value);
+        file.AsSpan(offset, meta.BloomFilterLength!.Value).Fill(0xFF);
+        File.WriteAllBytes(path, file);
+
+        var (candidates, _) = await CandidatesCounted(path, Ex.Equal("key", "k3"), BloomOnly);
+
+        Assert.True(candidates[1]);
+        Assert.True(candidates[3]);
+    }
+
     // ── Floating point: SQL equality is not bit equality ──
 
     /// <summary>A NaN whose payload differs from <see cref="double.NaN"/>'s.</summary>

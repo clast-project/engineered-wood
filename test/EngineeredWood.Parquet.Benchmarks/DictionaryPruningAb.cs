@@ -36,7 +36,10 @@ namespace EngineeredWood.Benchmarks;
 /// <para><c>cloud</c> reads through <see cref="CoalescingFileReader"/>, as the S3, Azure and GCS readers
 /// do, and delays each GET it issues rather than each call: that reader merges only nearby ranges and
 /// sends the rest as concurrent GETs. The table then reports both calls and GETs.</para>
-/// Run with: dotnet run -c Release -f net10.0 -- dictpruning-ab [rounds] [latencyMs] [direct|cloud]
+/// <para><c>bloom</c> measures <see cref="ParquetReadOptions.FilterUseBloomFilters"/> the same way instead:
+/// the key carries a Bloom filter, and dictionary pruning is off on both sides so that only the Bloom
+/// step differs. The third case is then a key with no Bloom filter.</para>
+/// Run with: dotnet run -c Release -f net10.0 -- dictpruning-ab [rounds] [latencyMs] [direct|cloud] [dictionary|bloom]
 /// </remarks>
 internal static class DictionaryPruningAb
 {
@@ -49,22 +52,25 @@ internal static class DictionaryPruningAb
         int rounds = args.Length > 1 ? int.Parse(args[1], CultureInfo.InvariantCulture) : 15;
         int latencyMs = args.Length > 2 ? int.Parse(args[2], CultureInfo.InvariantCulture) : 0;
         bool cloud = args.Length > 3 && args[3] == "cloud";
+        bool bloom = args.Length > 4 && args[4] == "bloom";
         string dir = Path.Combine(Path.GetTempPath(), "ew-dictpruning-ab-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(dir);
 
         try
         {
             var batch = Build();
-            string dictionaryFile = Path.Combine(dir, "dictionary.parquet");
-            string plainFile = Path.Combine(dir, "plain.parquet");
-            await WriteAsync(batch, dictionaryFile, dictionary: true);
-            await WriteAsync(batch, plainFile, dictionary: false);
+            // The source under test present in one file and absent from the other.
+            string dictionaryFile = Path.Combine(dir, "with-source.parquet");
+            string plainFile = Path.Combine(dir, "without-source.parquet");
+            await WriteAsync(batch, dictionaryFile, dictionary: true, bloom);
+            await WriteAsync(batch, plainFile, dictionary: bloom, bloomFilter: false);
 
             Console.WriteLine(
                 $"{RowGroups} row groups x {RowsPerGroup:N0} rows, key + 2 plain payload columns; " +
                 $"median of {rounds} alternating rounds after 3 warm-up rounds; {latencyMs} ms added per " +
-                (cloud ? "GET, through CoalescingFileReader." : "request."));
-            Console.WriteLine($"Files: dictionary key {new FileInfo(dictionaryFile).Length:N0} bytes, plain key {new FileInfo(plainFile).Length:N0} bytes.");
+                (cloud ? "GET, through CoalescingFileReader" : "request") + "; measuring " +
+                (bloom ? "Bloom filters (dictionaries off both sides)." : "dictionaries."));
+            Console.WriteLine($"Files: with the source {new FileInfo(dictionaryFile).Length:N0} bytes, without {new FileInfo(plainFile).Length:N0} bytes.");
             Console.WriteLine("| Case | ms off | ms on | Time | Calls off | on | GETs off | on | Bytes off | on | Row groups read off | on |");
             Console.WriteLine("|---|---|---|---|---|---|---|---|---|---|---|---|");
 
@@ -72,7 +78,7 @@ internal static class DictionaryPruningAb
             {
                 ("in every group", dictionaryFile, "common"),
                 ("in one group", dictionaryFile, Key(7, 3)),
-                ("plain key, in one group", plainFile, Key(7, 3)),
+                (bloom ? "no Bloom filter, in one group" : "plain key, in one group", plainFile, Key(7, 3)),
             };
 
             // Unmeasured passes over every case first. Without them the first case measured read about
@@ -84,17 +90,16 @@ internal static class DictionaryPruningAb
                 foreach (var (_, path, key) in cases)
                 {
                     var filter = Ex.Equal("key", key);
-                    await ReadAsync(path, new ParquetReadOptions { Filter = filter, FilterUseDictionaries = false }, latencyMs: 0, cloud);
-                    await ReadAsync(path, new ParquetReadOptions { Filter = filter, FilterUseDictionaries = true }, latencyMs: 0, cloud);
+                    await ReadAsync(path, Options(filter, bloom, on: false), latencyMs: 0, cloud);
+                    await ReadAsync(path, Options(filter, bloom, on: true), latencyMs: 0, cloud);
                 }
             }
 
             foreach (var (label, path, key) in cases)
             {
                 var filter = Ex.Equal("key", key);
-                // Explicit both ways: the option defaults to on, so leaving it out would measure on against on.
-                var off = new ParquetReadOptions { Filter = filter, FilterUseDictionaries = false };
-                var on = new ParquetReadOptions { Filter = filter, FilterUseDictionaries = true };
+                var off = Options(filter, bloom, on: false);
+                var on = Options(filter, bloom, on: true);
 
                 var msOff = new List<double>();
                 var msOn = new List<double>();
@@ -165,13 +170,23 @@ internal static class DictionaryPruningAb
         return new RecordBatch(schema, [keys.Build(), longs.Build(), doubles.Build()], RowGroups * RowsPerGroup);
     }
 
-    private static async Task WriteAsync(RecordBatch batch, string path, bool dictionary)
+    /// <summary>
+    /// The read options for one side. Every option is explicit: dictionary pruning defaults to on, so
+    /// leaving it out would measure on against on.
+    /// </summary>
+    private static ParquetReadOptions Options(EngineeredWood.Expressions.Predicate filter, bool bloom, bool on) =>
+        bloom
+            ? new ParquetReadOptions { Filter = filter, FilterUseDictionaries = false, FilterUseBloomFilters = on }
+            : new ParquetReadOptions { Filter = filter, FilterUseDictionaries = on, FilterUseBloomFilters = false };
+
+    private static async Task WriteAsync(RecordBatch batch, string path, bool dictionary, bool bloomFilter)
     {
         var options = new ParquetWriteOptions
         {
             RowGroupMaxRows = RowsPerGroup,
             // The payload columns never dictionary-encode (random values); only the key's setting varies.
             ColumnDictionaryEnabled = new Dictionary<string, bool> { ["key"] = dictionary },
+            BloomFilterColumns = bloomFilter ? new HashSet<string> { "key" } : null,
         };
         await using var file = new LocalSequentialFile(path);
         await using var writer = new ParquetFileWriter(file, ownsFile: false, options);

@@ -65,27 +65,27 @@ internal static class MembershipPredicateEvaluator
         ColumnChunkFilePathKind filePath,
         bool validateChecksums,
         CancellationToken ct,
-        IReadOnlyDictionary<int, HashSet<byte[]>?>? dictionaries = null)
+        IReadOnlyDictionary<int, IValueSet?>? prefetched = null)
     {
         var ctx = new Context(source, rowGroupIndex, metadata, schema, file, fileLength, filePath, validateChecksums);
-        if (dictionaries is not null)
+        if (prefetched is not null)
         {
-            // Read ahead by a DictionaryPrefetch: a column present here is never read again, including a
-            // null entry, which is a chunk already found unable to answer.
-            foreach (var entry in dictionaries)
-                ctx.Dictionaries[entry.Key] = entry.Value;
+            // Read ahead by a MembershipPrefetch for this source: a column present here is never read
+            // again, including a null entry, which is a chunk already found unable to answer.
+            foreach (var entry in prefetched)
+                ctx.Sets[entry.Key] = entry.Value;
         }
         return await EvaluateAsync(predicate, ctx, ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// The columns whose dictionaries <paramref name="predicate"/> will actually ask, anywhere in the
+    /// The columns whose dictionaries or Bloom filters <paramref name="predicate"/> will actually ask, anywhere in the
     /// tree (a NOT still asks its child): those with an equality or IN leaf the probe would not decline
     /// before reading. That is the probe's own test, so a prefetch never reads a page no leaf can use: a
     /// NULL literal, an IN list holding a non-literal (<c>x IN (a, b)</c>), and a literal that cannot
     /// be encoded for the column (an integer against a DECIMAL stored as INT32) are all declined.
     /// </summary>
-    internal static List<(int Index, ColumnDescriptor Descriptor)> DictionaryColumns(
+    internal static List<(int Index, ColumnDescriptor Descriptor)> MembershipColumns(
         Predicate predicate, SchemaDescriptor schema)
     {
         var columns = new List<(int, ColumnDescriptor)>();
@@ -246,56 +246,126 @@ internal static class MembershipPredicateEvaluator
             encoded.AddRange(encodings);
         }
 
-        return ctx.Source == MembershipSource.BloomFilter
-            ? await ProbeBloomFilterAsync(chunk, encoded, ctx, ct).ConfigureAwait(false)
-            : await ProbeDictionaryAsync(columnIndex, chunk, descriptor!, encoded, ctx, ct).ConfigureAwait(false);
-    }
-
-    private static async ValueTask<FilterResult> ProbeBloomFilterAsync(
-        ColumnChunk chunk, List<byte[]> encoded, Context ctx, CancellationToken ct)
-    {
-        var colMeta = chunk.MetaData;
-        if (colMeta?.BloomFilterOffset is not long offset || offset <= 0)
-            return FilterResult.Unknown;
-
-        long length = colMeta.BloomFilterLength
-            ?? Math.Min(4096, ctx.FileLength - offset);
-
-        using var buffer = (await ctx.File.ReadRangesAsync(
-            new[] { new FileRange(offset, length) }, ct).ConfigureAwait(false))[0];
-
-        var filter = BloomFilterReader.Parse(buffer.Memory.Span);
-
-        foreach (byte[] bytes in encoded)
-        {
-            if (filter.MightContain(bytes))
-                return FilterResult.Unknown; // maybe present
-        }
-
-        return FilterResult.AlwaysFalse;
-    }
-
-    private static async ValueTask<FilterResult> ProbeDictionaryAsync(
-        int columnIndex, ColumnChunk chunk, ColumnDescriptor descriptor, List<byte[]> encoded,
-        Context ctx, CancellationToken ct)
-    {
         // One read per column per row group, however many leaves of the predicate name the column.
-        if (!ctx.Dictionaries.TryGetValue(columnIndex, out var dictionary))
+        if (!ctx.Sets.TryGetValue(columnIndex, out var set))
         {
-            dictionary = await ReadDictionaryAsync(chunk, descriptor, ctx, ct).ConfigureAwait(false);
-            ctx.Dictionaries[columnIndex] = dictionary;
+            set = await ReadSetAsync(ctx.Source, chunk, descriptor!, ctx, ct).ConfigureAwait(false);
+            ctx.Sets[columnIndex] = set;
         }
 
-        if (dictionary is null)
+        if (set is null)
             return FilterResult.Unknown;
 
         foreach (byte[] bytes in encoded)
         {
-            if (dictionary.Contains(bytes))
-                return FilterResult.Unknown; // present
+            if (set.MightContain(bytes))
+                return FilterResult.Unknown; // (maybe) present
         }
 
         return FilterResult.AlwaysFalse;
+    }
+
+    /// <summary>A column chunk's answer to "might this value, in its plain encoding, be present?"</summary>
+    internal interface IValueSet
+    {
+        bool MightContain(byte[] value);
+    }
+
+    /// <summary>A dictionary page: exact, since only a wholly dictionary-encoded chunk is asked.</summary>
+    private sealed class DictionaryValues : IValueSet
+    {
+        private readonly HashSet<byte[]> _values;
+
+        public DictionaryValues(HashSet<byte[]> values) => _values = values;
+
+        public bool MightContain(byte[] value) => _values.Contains(value);
+    }
+
+    /// <summary>A Bloom filter: a hit proves nothing, a miss proves absence.</summary>
+    private sealed class BloomFilterValues : IValueSet
+    {
+        private readonly Clast.BloomFilter.SplitBlockBloomFilter _filter;
+
+        public BloomFilterValues(Clast.BloomFilter.SplitBlockBloomFilter filter) => _filter = filter;
+
+        public bool MightContain(byte[] value) => _filter.MightContain(value);
+    }
+
+    private static async ValueTask<IValueSet?> ReadSetAsync(
+        MembershipSource source, ColumnChunk chunk, ColumnDescriptor descriptor, Context ctx, CancellationToken ct)
+    {
+        if (!TryGetRange(source, chunk, descriptor, ctx.FileLength, ctx.FilePath, out var range))
+            return null;
+
+        using var buffer = (await ctx.File.ReadRangesAsync(new[] { range }, ct).ConfigureAwait(false))[0];
+        return Decode(source, buffer.Memory.Span, chunk.MetaData!.Codec, descriptor, ctx.ValidateChecksums);
+    }
+
+    /// <summary>
+    /// Where the chunk's <paramref name="source"/> is stored, when the chunk can be answered from it at
+    /// all. Shared by the single read above and by <see cref="MembershipPrefetch"/>, so the two cannot
+    /// disagree about which chunks are asked.
+    /// </summary>
+    internal static bool TryGetRange(
+        MembershipSource source, ColumnChunk chunk, ColumnDescriptor descriptor, long fileLength,
+        ColumnChunkFilePathKind filePath, out FileRange range) =>
+        source == MembershipSource.Dictionary
+            ? TryGetDictionaryRange(chunk, descriptor, fileLength, filePath, out range)
+            : TryGetBloomFilterRange(chunk, fileLength, filePath, out range);
+
+    /// <summary>
+    /// Decodes what <see cref="TryGetRange"/> located, or returns null when it cannot be trusted: pruning
+    /// declines on a page or filter it cannot read, and the ordinary read of the row group reports it.
+    /// </summary>
+    internal static IValueSet? Decode(
+        MembershipSource source, ReadOnlySpan<byte> bytes, CompressionCodec codec, ColumnDescriptor descriptor,
+        bool validateChecksums)
+    {
+        if (source == MembershipSource.Dictionary)
+        {
+            return DecodeDictionary(bytes, codec, descriptor, validateChecksums) is { } values
+                ? new DictionaryValues(values)
+                : null;
+        }
+
+        try
+        {
+            return new BloomFilterValues(BloomFilterReader.Parse(bytes));
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// A Bloom filter larger than this is not read for pruning: well past any filter a writer sizes by
+    /// default, and reading it would cost more than the scan it might save.
+    /// </summary>
+    internal const int MaxBloomFilterBytes = 16 * 1024 * 1024;
+
+    /// <summary>
+    /// Where the chunk's Bloom filter is, when it has one in this file. Without a recorded length the
+    /// first 4 KiB are read, as before this was shared: the header gives the filter's size.
+    /// </summary>
+    internal static bool TryGetBloomFilterRange(
+        ColumnChunk chunk, long fileLength, ColumnChunkFilePathKind filePath, out FileRange range)
+    {
+        range = default;
+        var meta = chunk.MetaData;
+        if (meta?.BloomFilterOffset is not long offset || offset <= 0 || offset >= fileLength)
+            return false;
+
+        // A chunk stored in another file has its filter there (#405).
+        if (chunk.FilePath is not null && filePath == ColumnChunkFilePathKind.Refuse)
+            return false;
+
+        long length = meta.BloomFilterLength ?? Math.Min(4096, fileLength - offset);
+        if (length <= 0 || length > MaxBloomFilterBytes || offset > fileLength - length)
+            return false;
+
+        range = new FileRange(offset, length);
+        return true;
     }
 
     /// <summary>
@@ -338,29 +408,9 @@ internal static class MembershipPredicateEvaluator
     }
 
     /// <summary>
-    /// Reads the chunk's dictionary page into the set of its values' plain encodings (a BYTE_ARRAY value
-    /// without its length prefix, the form <see cref="BloomFilterValueEncoder"/> produces), or returns
-    /// null when the chunk cannot be answered from its dictionary.
-    /// </summary>
-    /// <remarks>
-    /// Every failure is a null, never a throw: pruning may only DECLINE on a page it cannot trust, and a
-    /// malformed or corrupt page is then met by the ordinary read of the row group, which reports it.
-    /// </remarks>
-    private static async ValueTask<HashSet<byte[]>?> ReadDictionaryAsync(
-        ColumnChunk chunk, ColumnDescriptor descriptor, Context ctx, CancellationToken ct)
-    {
-        if (!TryGetDictionaryRange(chunk, descriptor, ctx.FileLength, ctx.FilePath, out var range))
-            return null;
-
-        using var buffer = (await ctx.File.ReadRangesAsync(new[] { range }, ct).ConfigureAwait(false))[0];
-        return DecodeDictionary(buffer.Memory.Span, chunk.MetaData!.Codec, descriptor, ctx.ValidateChecksums);
-    }
-
-    /// <summary>
     /// Where the chunk's dictionary page is, when the chunk can be answered from it at all: every data
     /// page dictionary-encoded, a physical type with a PLAIN layout a literal can meet, a stored
-    /// extent within bounds, and the chunk in this file. Shared by the single read above and by
-    /// <see cref="DictionaryPrefetch"/>, so the two cannot disagree about which chunks are asked.
+    /// extent within bounds, and the chunk in this file.
     /// </summary>
     internal static bool TryGetDictionaryRange(
         ColumnChunk chunk, ColumnDescriptor descriptor, long fileLength, ColumnChunkFilePathKind filePath,
@@ -734,8 +784,8 @@ internal static class MembershipPredicateEvaluator
         public MembershipSource Source { get; }
         public bool ValidateChecksums { get; }
 
-        /// <summary>Each column's dictionary values once read, or null when it cannot answer.</summary>
-        public Dictionary<int, HashSet<byte[]>?> Dictionaries { get; } = new();
+        /// <summary>Each column's values from this source once read, or null when it cannot answer.</summary>
+        public Dictionary<int, IValueSet?> Sets { get; } = new();
 
         public int RowGroupIndex { get; }
         public FileMetaData Metadata { get; }
