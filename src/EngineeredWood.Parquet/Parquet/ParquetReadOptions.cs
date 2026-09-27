@@ -300,9 +300,11 @@ public sealed record ParquetReadOptions
     /// dictionary-encoded: a chunk that fell back to PLAIN holds values its dictionary does not, and its
     /// encoding list alone cannot show that it did. A chunk without those stats is read as usual.</para>
     /// <para>Reads the dictionary pages of the named columns, only in row groups statistics left
-    /// undecided, many row groups to a request (up to 32 MiB of pages each). Measured on 32 row groups
-    /// with 20 ms added per request: one extra request (+3%) when no group can be ruled out, and 4
-    /// requests instead of 34 (-88%) when all but one can. Default: <see langword="false"/>.</para>
+    /// undecided, many row groups to a call (up to 32 MiB or 64 pages each). On object storage a call's
+    /// pages go out as concurrent GETs, one per page, so what this saves is round trips, not GETs.
+    /// Measured on 32 row groups through the cloud readers' coalescer with 20 ms per GET: +3% time and
+    /// 32 more GETs when no group can be ruled out, and -89% time with the same GET count when all but
+    /// one can. Default: <see langword="false"/>.</para>
     /// </remarks>
     public bool FilterUseDictionaries { get; init; }
 
