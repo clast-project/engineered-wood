@@ -22,6 +22,12 @@ if (args.Length > 0 && args[0] == "pagemap-ab")
     Environment.ExitCode = await PageMapReadAb.RunAsync(args);
     return;
 }
+
+if (args.Length > 0 && args[0] == "dictpruning-ab")
+{
+    Environment.ExitCode = await DictionaryPruningAb.RunAsync(args);
+    return;
+}
 #endif
 
 BenchmarkSwitcher.FromTypes([
