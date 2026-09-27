@@ -76,30 +76,13 @@ internal static class ColumnChunkReader
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
 
-        int pos = 0;
+        var pages = new PageReader(data, column);
         long valuesRead = 0;
 
-        while (valuesRead < columnMeta.NumValues && pos < data.Length)
+        while (valuesRead < columnMeta.NumValues && pages.TryRead(out var page))
         {
-            PageHeader pageHeader;
-            int headerSize;
-
-            try
-            {
-                pageHeader = PageHeaderDecoder.Decode(data.Slice(pos), out headerSize);
-            }
-            catch (ParquetFormatException ex)
-            {
-                throw new ParquetFormatException(
-                    $"Column '{string.Join(".", column.Path)}': corrupted page header " +
-                    $"at byte offset {pos} ({valuesRead}/{columnMeta.NumValues} values read).",
-                    ex);
-            }
-
-            pos += headerSize;
-
-            var pageData = data.Slice(pos, pageHeader.CompressedPageSize);
-            pos += pageHeader.CompressedPageSize;
+            var pageHeader = page.Header;
+            var pageData = page.Payload;
 
             if (validateCrc)
                 ValidateCrc(pageHeader.Crc, pageData, column);
@@ -244,25 +227,24 @@ internal static class ColumnChunkReader
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
         int listLength = 0;
-        int pos = 0;
+        var pages = new PageReader(data, column);
         long valuesRead = 0;
 
-        while (valuesRead < columnMeta.NumValues && pos < data.Length)
+        while (valuesRead < columnMeta.NumValues)
         {
-            PageHeader pageHeader;
-            int headerSize;
+            Page page;
             try
             {
-                pageHeader = PageHeaderDecoder.Decode(data.Slice(pos), out headerSize);
+                if (!pages.TryRead(out page))
+                    break;
             }
             catch (ParquetFormatException)
             {
                 return null; // let the general path produce the diagnostic
             }
 
-            pos += headerSize;
-            var pageData = data.Slice(pos, pageHeader.CompressedPageSize);
-            pos += pageHeader.CompressedPageSize;
+            var pageHeader = page.Header;
+            var pageData = page.Payload;
 
             if (validateCrc && pageHeader.Crc.HasValue)
             {
@@ -698,7 +680,7 @@ internal static class ColumnChunkReader
         }
     }
 
-    private static DictionaryDecoder ReadDictionaryPage(
+    internal static DictionaryDecoder ReadDictionaryPage(
         PageHeader header,
         ReadOnlySpan<byte> compressedData,
         ColumnDescriptor column,

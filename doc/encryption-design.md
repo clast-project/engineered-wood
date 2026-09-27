@@ -443,7 +443,15 @@ Small, and useful on its own.
 
 ### Phase 1a: reader page-walker unification
 
-No behavior change.
+**Done**, as page-index phase 6 (`Data/PageReader.cs`). Every reader of page headers goes
+through `PageReader`: both `ColumnChunkReader` loops, `PageMapBuilder.Build`, its OffsetIndex
+prefix scan and `ResolveEntry`, and the pruning dictionary decode in
+`MembershipPredicateEvaluator`. A walk takes the ordinal of its first data page, and
+`PageMapEntry.Ordinal` records each page's. One change in behavior: a page whose declared size
+overruns the chunk is now a `ParquetFormatException`, where the loops threw an
+`ArgumentOutOfRangeException` from `Slice`.
+
+The plan as written:
 
 - One internal `PageReader` that yields `(PageHeader, ReadOnlySpan<byte> payload,
   pageOrdinal)`. It replaces the loops in `ColumnChunkReader.ReadColumn`,

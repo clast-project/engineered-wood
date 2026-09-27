@@ -335,7 +335,9 @@ and the caller still post-filters.
 
 - Build on encryption Phase 1a's `PageReader`, whose page ordinal is **position-derived**
   so that page *k* can be decoded without walking pages 0 to *k*−1. That property is also
-  what encryption's AAD needs, so it is designed once.
+  what encryption's AAD needs, so it is designed once. **Done (phase 6):** start a
+  `PageReader` at `page_locations[k]` with `firstOrdinal: k`. The fixtures confirm that a
+  walk from page 0 puts data page *k* at index entry *k*, repeated columns included.
 - Per selected column:
   1. Map the row ranges through the OffsetIndex to the pages that overlap them.
   2. Fetch those pages plus the dictionary or symbol-table page, coalescing adjacent byte
