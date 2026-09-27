@@ -202,7 +202,10 @@ public enum ColumnChunkFilePathKind
 /// </remarks>
 public sealed record ParquetReadOptions
 {
-    /// <summary>Default options: all features disabled, producing standard Arrow types.</summary>
+    /// <summary>
+    /// Default options, producing standard Arrow types. Each option documents its own default; most
+    /// optional behaviour is off, but <see cref="FilterUseDictionaries"/> is on.
+    /// </summary>
     public static readonly ParquetReadOptions Default = new();
 
     /// <summary>

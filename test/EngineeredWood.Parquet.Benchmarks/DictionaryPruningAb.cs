@@ -84,7 +84,7 @@ internal static class DictionaryPruningAb
                 foreach (var (_, path, key) in cases)
                 {
                     var filter = Ex.Equal("key", key);
-                    await ReadAsync(path, new ParquetReadOptions { Filter = filter }, latencyMs: 0, cloud);
+                    await ReadAsync(path, new ParquetReadOptions { Filter = filter, FilterUseDictionaries = false }, latencyMs: 0, cloud);
                     await ReadAsync(path, new ParquetReadOptions { Filter = filter, FilterUseDictionaries = true }, latencyMs: 0, cloud);
                 }
             }
@@ -92,7 +92,8 @@ internal static class DictionaryPruningAb
             foreach (var (label, path, key) in cases)
             {
                 var filter = Ex.Equal("key", key);
-                var off = new ParquetReadOptions { Filter = filter };
+                // Explicit both ways: the option defaults to on, so leaving it out would measure on against on.
+                var off = new ParquetReadOptions { Filter = filter, FilterUseDictionaries = false };
                 var on = new ParquetReadOptions { Filter = filter, FilterUseDictionaries = true };
 
                 var msOff = new List<double>();
