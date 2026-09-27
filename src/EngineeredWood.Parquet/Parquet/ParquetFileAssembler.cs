@@ -100,6 +100,7 @@ internal sealed class ParquetFileAssembler
                 DataPageOffset = dataPageOffset,
                 DictionaryPageOffset = dictionaryPageOffset,
                 Statistics = result.MetaData.Statistics,
+                EncodingStats = result.MetaData.EncodingStats,
                 BloomFilterOffset = bloomFilterOffset,
                 BloomFilterLength = bloomFilterLength,
                 SymbolTablePageOffset = symbolTablePageOffset,

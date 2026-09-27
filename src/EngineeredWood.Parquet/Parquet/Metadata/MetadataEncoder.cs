@@ -509,6 +509,13 @@ internal static class MetadataEncoder
             WriteStatistics(writer, meta.Statistics);
         }
 
+        // Field 13: encoding_stats (optional, list<PageEncodingStats>)
+        if (meta.EncodingStats != null)
+        {
+            writer.WriteFieldHeader(ThriftType.List, 13);
+            WritePageEncodingStatsList(writer, meta.EncodingStats);
+        }
+
         // Field 14: bloom_filter_offset (optional, i64)
         if (meta.BloomFilterOffset.HasValue)
         {
@@ -611,6 +618,24 @@ internal static class MetadataEncoder
         writer.WriteListHeader(ThriftType.I32, encodings.Count);
         for (int i = 0; i < encodings.Count; i++)
             writer.WriteZigZagInt32((int)encodings[i]);
+    }
+
+    private static void WritePageEncodingStatsList(
+        ThriftCompactWriter writer, IReadOnlyList<PageEncodingStats> stats)
+    {
+        writer.WriteListHeader(ThriftType.Struct, stats.Count);
+        for (int i = 0; i < stats.Count; i++)
+        {
+            writer.PushStruct();
+            writer.WriteFieldHeader(ThriftType.I32, 1);
+            writer.WriteZigZagInt32((int)stats[i].PageType);
+            writer.WriteFieldHeader(ThriftType.I32, 2);
+            writer.WriteZigZagInt32((int)stats[i].Encoding);
+            writer.WriteFieldHeader(ThriftType.I32, 3);
+            writer.WriteZigZagInt32(stats[i].Count);
+            writer.WriteStructStop();
+            writer.PopStruct();
+        }
     }
 
     private static void WriteStringList(ThriftCompactWriter writer, IReadOnlyList<string> strings)
