@@ -164,10 +164,13 @@ internal static class BloomFilterPredicateEvaluator
 
         foreach (var v in values)
         {
-            if (!TryEncodeForBloom(v, descriptor!, out byte[] bytes))
+            if (!TryEncodeForBloom(v, descriptor!, out var encodings))
                 return FilterResult.Unknown; // can't encode → can't decide
-            if (filter.MightContain(bytes))
-                return FilterResult.Unknown; // maybe present
+            foreach (byte[] bytes in encodings)
+            {
+                if (filter.MightContain(bytes))
+                    return FilterResult.Unknown; // maybe present
+            }
         }
 
         return FilterResult.AlwaysFalse;
@@ -200,26 +203,48 @@ internal static class BloomFilterPredicateEvaluator
     }
 
     /// <summary>
-    /// Encodes a typed <see cref="LiteralValue"/> into the byte representation
-    /// the Bloom filter was built from. Mirrors
-    /// <see cref="BloomFilterValueEncoder"/> but operates on the typed value
-    /// instead of <c>object</c>.
+    /// Encodes a typed <see cref="LiteralValue"/> into every byte representation a value EQUAL to it
+    /// could have been hashed from. Mirrors <see cref="BloomFilterValueEncoder"/> but operates on the
+    /// typed value instead of <c>object</c>.
     /// </summary>
+    /// <remarks>
+    /// Usually that is one encoding. Floating point is the exception, because SQL equality is not bit
+    /// equality: <c>0.0 = -0.0</c> is true, and Spark treats every NaN as equal to every other NaN. A
+    /// filter hashes bits, so probing a zero with only its own bits would call a row group holding the
+    /// other zero "absent" and drop rows that match. A zero is therefore probed as both zeros, and a NaN,
+    /// whose payload bits the writer may have spelled any of 2^52 ways, is not probed at all.
+    /// </remarks>
     private static bool TryEncodeForBloom(
-        LiteralValue value, ColumnDescriptor descriptor, out byte[] bytes)
+        LiteralValue value, ColumnDescriptor descriptor, out byte[][] encodings)
     {
         try
         {
             object? boxed = ToObjectForColumn(value, descriptor);
-            if (boxed is null) { bytes = []; return false; }
-            bytes = BloomFilterValueEncoder.Encode(boxed, descriptor.PhysicalType);
-            return true;
+            switch (boxed)
+            {
+                case null:
+                case float f when float.IsNaN(f):
+                case double d when double.IsNaN(d):
+                    encodings = [];
+                    return false;
+                case float f when f == 0f:
+                    encodings = [Encode(0f), Encode(-0f)];
+                    return true;
+                case double d when d == 0d:
+                    encodings = [Encode(0d), Encode(-0d)];
+                    return true;
+                default:
+                    encodings = [Encode(boxed)];
+                    return true;
+            }
         }
         catch (ArgumentException)
         {
-            bytes = [];
+            encodings = [];
             return false;
         }
+
+        byte[] Encode(object boxed) => BloomFilterValueEncoder.Encode(boxed, descriptor.PhysicalType);
     }
 
     /// <summary>

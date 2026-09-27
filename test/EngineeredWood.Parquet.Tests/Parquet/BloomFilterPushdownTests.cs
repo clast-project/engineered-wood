@@ -92,6 +92,96 @@ public class BloomFilterPushdownTests : IDisposable
         Assert.Empty(batches);
     }
 
+    // ── Floating point: SQL equality is not bit equality ──
+
+    /// <summary>A NaN whose payload differs from <see cref="double.NaN"/>'s.</summary>
+    private static readonly double OtherNaN = BitConverter.Int64BitsToDouble(0x7FF8_0000_0000_0001);
+
+    /// <summary>
+    /// One row group of <c>{stored, 5, -3}</c>: statistics span the literal, so only the Bloom filter can
+    /// rule the group out, and it must not when a stored value is EQUAL to the literal in SQL.
+    /// </summary>
+    private async Task<int> RowsReadWithBloom(string name, double stored, double literal)
+    {
+        string path = Path.Combine(_tempDir, name + ".parquet");
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", DoubleType.Default, false))
+            .Build();
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            BloomFilterColumns = new HashSet<string> { "x" },
+        };
+        var values = new DoubleArray.Builder().Append(stored).Append(5.0).Append(-3.0).Build();
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(new RecordBatch(schema, [values], 3));
+            await writer.CloseAsync();
+        }
+
+        await using var input = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(input, ownsFile: false,
+            new ParquetReadOptions { Filter = Ex.Equal("x", literal), FilterUseBloomFilters = true });
+        int rows = 0;
+        await foreach (var batch in reader.ReadAllAsync())
+            rows += batch.Length;
+        return rows;
+    }
+
+    [Theory]
+    [InlineData("neg_zero_stored", -0.0, 0.0)]
+    [InlineData("pos_zero_stored", 0.0, -0.0)]
+    public async Task BloomFilter_ZeroMatchesTheOtherZero(string name, double stored, double literal)
+    {
+        Assert.Equal(3, await RowsReadWithBloom(name, stored, literal));
+    }
+
+    [Fact]
+    public async Task BloomFilter_NaNMatchesAnyNaN()
+    {
+        Assert.Equal(3, await RowsReadWithBloom("nan", OtherNaN, double.NaN));
+    }
+
+    [Fact]
+    public async Task BloomFilter_FloatZeroMatchesTheOtherZero()
+    {
+        string path = Path.Combine(_tempDir, "float_zero.parquet");
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", FloatType.Default, false))
+            .Build();
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            BloomFilterColumns = new HashSet<string> { "x" },
+        };
+        var values = new FloatArray.Builder().Append(-0f).Append(5f).Append(-3f).Build();
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(new RecordBatch(schema, [values], 3));
+            await writer.CloseAsync();
+        }
+
+        await using var input = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(input, ownsFile: false,
+            new ParquetReadOptions { Filter = Ex.Equal("x", 0f), FilterUseBloomFilters = true });
+        int rows = 0;
+        await foreach (var batch in reader.ReadAllAsync())
+            rows += batch.Length;
+        Assert.Equal(3, rows);
+    }
+
+    [Theory]
+    [InlineData("zero_absent", 1.0, 0.0)] // neither zero stored: both probes miss
+    [InlineData("value_absent", 0.0, 1.0)]
+    public async Task BloomFilter_StillPrunesAnAbsentValue(string name, double stored, double literal)
+    {
+        Assert.Equal(0, await RowsReadWithBloom(name, stored, literal));
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
