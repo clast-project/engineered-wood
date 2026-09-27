@@ -190,6 +190,40 @@ public class DictionaryPushdownTests : IDisposable
         Assert.True((await Candidates(path, Ex.Equal("name", "cherry"), options))[1]);
     }
 
+    /// <summary>
+    /// A compressed dictionary page that its codec cannot decompress is declined, whatever the codec
+    /// throws: ZstdSharp signals corruption with its own exception type, not an InvalidDataException, and
+    /// pruning must never be what fails a read. No checksum here, so the codec is the first to see it.
+    /// </summary>
+    [Theory]
+    [InlineData(CompressionCodec.Zstd)]
+    [InlineData(CompressionCodec.Snappy)]
+    [InlineData(CompressionCodec.Gzip)]
+    [InlineData(CompressionCodec.Brotli)]
+    [InlineData(CompressionCodec.Lz4)]
+    public async Task AnUndecompressableDictionary_IsDeclinedNotThrown(CompressionCodec codec)
+    {
+        string path = await WriteThreeRowGroups("codec_" + codec, new ParquetWriteOptions { Compression = codec });
+
+        byte[] file = File.ReadAllBytes(path);
+        FileMetaData metadata;
+        await using (var input = new LocalRandomAccessFile(path))
+        using (var reader = new ParquetFileReader(input, ownsFile: false))
+            metadata = await reader.ReadMetadataAsync();
+
+        // Overwrite the whole compressed payload of row group 1's dictionary page, after its header.
+        var meta = metadata.RowGroups[1].Columns[0].MetaData!;
+        int start = checked((int)meta.DictionaryPageOffset!.Value);
+        var header = PageHeaderDecoder.Decode(file.AsSpan(start), out int headerLength);
+        Assert.Equal(PageType.DictionaryPage, header.Type);
+        file.AsSpan(start + headerLength, header.CompressedPageSize).Fill(0xFF);
+        File.WriteAllBytes(path, file);
+
+        var candidates = await Candidates(path, Ex.Equal("name", "banana"), WithDictionaries);
+
+        Assert.True(candidates[1]);
+    }
+
     // ───── Floating point and the stored representation ─────
 
     private static readonly double OtherNaN = BitConverter.Int64BitsToDouble(0x7FF8_0000_0000_0001);

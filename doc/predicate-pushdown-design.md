@@ -639,7 +639,7 @@ public async IAsyncEnumerable<RecordBatch> ReadAllAsync(
             if (_options.FilterUseBloomFilters
                 && result == FilterResult.Unknown)
             {
-                var bloomResult = await BloomFilterPredicateEvaluator.EvaluateAsync(
+                var bloomResult = await MembershipPredicateEvaluator.EvaluateAsync(
                     _options.Filter, _file, metadata.RowGroups[i], _schema, ct)
                     .ConfigureAwait(false);
                 if (bloomResult == FilterResult.AlwaysFalse)
@@ -656,8 +656,8 @@ public async IAsyncEnumerable<RecordBatch> ReadAllAsync(
 ### Bloom filter integration
 
 `ParquetFileReader.GetCandidateRowGroupsAsync` already probes bloom filters for
-a column + value list. The new `BloomFilterPredicateEvaluator` (since #57,
-`MembershipPredicateEvaluator`, which also asks dictionary pages) walks an
+a column + value list. `MembershipPredicateEvaluator` (which also asks dictionary
+pages, since #57) walks an
 `Expression` tree to find `Equal`/`In` predicates and probes them per row
 group:
 

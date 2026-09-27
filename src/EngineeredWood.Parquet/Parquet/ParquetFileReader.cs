@@ -1631,8 +1631,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// Returns a <see cref="BitArray"/> indicating which row groups might contain a row matching
     /// <paramref name="filter"/>: the per-read form of <see cref="ParquetReadOptions.Filter"/>, deciding
     /// each row group exactly as <see cref="ReadAllAsync"/> does under that option (column statistics,
-    /// then Bloom filters when <see cref="ParquetReadOptions.FilterUseBloomFilters"/> is set) without
-    /// reading any data.
+    /// then dictionary pages when <see cref="ParquetReadOptions.FilterUseDictionaries"/> is set, then
+    /// Bloom filters when <see cref="ParquetReadOptions.FilterUseBloomFilters"/> is set) without reading
+    /// any data pages.
     /// </summary>
     /// <remarks>
     /// Use this rather than <see cref="ParquetReadOptions.Filter"/> when one reader configuration serves

@@ -306,9 +306,12 @@ internal static class MembershipPredicateEvaluator
         {
             return DecodeDictionaryPage(buffer.Memory.Span, meta.Codec, descriptor, ctx.ValidateChecksums);
         }
-        catch (Exception ex) when (ex is ParquetFormatException or InvalidDataException
-            or ArgumentException or NotSupportedException or IndexOutOfRangeException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            // Whatever the page or its codec throws: ZstdSharp and Snappier signal corrupt input with
+            // their own exception types (ZstdException, InvalidOperationException), so no list of
+            // expected types is complete. Only the DECODE is guarded; a failure to read the file itself
+            // surfaces above, as it would from the read this pruning stands in front of.
             return null;
         }
     }
@@ -321,7 +324,7 @@ internal static class MembershipPredicateEvaluator
             return null;
         if (dictionaryHeader.Encoding is not (Encoding.Plain or Encoding.PlainDictionary))
             return null;
-        if (header.CompressedPageSize < 0 || headerLength + header.CompressedPageSize > page.Length
+        if (header.CompressedPageSize < 0 || header.CompressedPageSize > page.Length - headerLength
             || header.UncompressedPageSize < 0 || header.UncompressedPageSize > MaxDictionaryPageBytes
             || dictionaryHeader.NumValues < 0)
             return null;
