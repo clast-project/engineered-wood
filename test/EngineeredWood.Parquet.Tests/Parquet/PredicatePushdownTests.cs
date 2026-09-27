@@ -76,6 +76,62 @@ public class PredicatePushdownTests : IDisposable
         return batches;
     }
 
+    // ── Per-read candidates (#55) ──
+
+    public static TheoryData<string> CandidateCases => ["none", "one", "upper", "lower", "in", "unknown"];
+
+    private static EngineeredWood.Expressions.Predicate CandidateCase(string name) => name switch
+    {
+        "none" => Ex.Equal("id", 999),
+        "one" => Ex.Equal("id", 150),
+        "upper" => Ex.GreaterThan("id", 199),
+        "lower" => Ex.LessThan("id", 100),
+        "in" => Ex.In("id", 50, 250),
+        _ => Ex.Equal("nonexistent", 5),
+    };
+
+    /// <summary>
+    /// The per-read verdict is the one <see cref="ParquetReadOptions.Filter"/> reads under: a row group is
+    /// a candidate exactly when the filtered <c>ReadAllAsync</c> returns its rows.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(CandidateCases))]
+    public async Task CandidateRowGroups_AgreeWithTheFilteredRead(string name)
+    {
+        var filter = CandidateCase(name);
+        string path = await WriteThreeRangedRowGroups($"candidates_{name}.parquet");
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var candidates = await reader.GetCandidateRowGroupsAsync(filter);
+
+        await using var filteredFile = new LocalRandomAccessFile(path);
+        await using var filtered = new ParquetFileReader(filteredFile, ownsFile: false,
+            new ParquetReadOptions { Filter = filter });
+        var readGroups = new HashSet<int>();
+        await foreach (var batch in filtered.ReadAllAsync())
+            readGroups.Add(((Int32Array)batch.Column(0)).GetValue(0)!.Value / 100);
+
+        Assert.Equal(3, candidates.Length);
+        for (int rg = 0; rg < 3; rg++)
+            Assert.Equal(readGroups.Contains(rg), candidates[rg]);
+    }
+
+    [Fact]
+    public async Task CandidateRowGroups_DoNotDependOnTheReadersFilter()
+    {
+        string path = await WriteThreeRangedRowGroups("candidates_own.parquet");
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false,
+            new ParquetReadOptions { Filter = Ex.Equal("id", 999) });
+
+        var candidates = await reader.GetCandidateRowGroupsAsync(Ex.LessThan("id", 100));
+
+        Assert.True(candidates[0]);
+        Assert.False(candidates[1]);
+        Assert.False(candidates[2]);
+    }
+
     // ── Basic pruning ──
 
     [Fact]

@@ -19,9 +19,15 @@ public sealed record DeltaReadOptions
     public IReadOnlyList<string>? Columns { get; init; }
 
     /// <summary>
-    /// Superset-safe file pruning by partition values and column statistics: a file is skipped only when its
-    /// statistics PROVE no row can match. The reader does NOT re-apply this per row, so surviving batches
-    /// still contain non-matching rows — filter them yourself.
+    /// Superset-safe pruning by partition values and column statistics: a file is skipped only when its
+    /// statistics in the log PROVE no row can match, and within a surviving file so is a Parquet row group
+    /// whose footer statistics prove the same (and whose Bloom filter does, when
+    /// <see cref="Parquet.ParquetReadOptions.FilterUseBloomFilters"/> is set on the table's
+    /// <see cref="DeltaTableOptions.ParquetReadOptions"/>). Row groups are pruned only by the built-in reader:
+    /// a <see cref="DeltaTableOptions.DataFileReader"/> gets file pruning alone, because the codec seam hides
+    /// the footer. The reader does NOT re-apply this per row, so
+    /// surviving batches still contain non-matching rows — filter them yourself. Metadata columns are
+    /// unaffected: a row keeps its file position and row id however many row groups before it were skipped.
     /// </summary>
     public Expressions.Predicate? Filter { get; init; }
 

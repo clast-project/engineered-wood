@@ -92,6 +92,23 @@ public class BloomFilterPushdownTests : IDisposable
         Assert.Empty(batches);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task CandidateRowGroups_ProbeBloomFilters_OnlyWhenOptedIn(bool useBloom)
+    {
+        string path = await WriteThreeRowGroupsWithBloom($"candidates_bloom_{useBloom}.parquet");
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false,
+            new ParquetReadOptions { FilterUseBloomFilters = useBloom });
+
+        var candidates = await reader.GetCandidateRowGroupsAsync(Ex.Equal("name", "definitely_not_present"));
+
+        for (int rg = 0; rg < candidates.Length; rg++)
+            Assert.Equal(!useBloom, candidates[rg]);
+    }
+
     [Fact]
     public async Task BloomFilter_PresentValue_KeepsContainingRowGroup()
     {

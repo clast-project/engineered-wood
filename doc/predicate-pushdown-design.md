@@ -39,16 +39,20 @@ Phases 10–14 (Delta CHECK/generated-column wiring, Parquet column/offset index
 ORC stripe pruning) are not built. See the phase table at the bottom for scope;
 the issue tracker, not this document, is authoritative for what is in flight.
 
-**The wiring gap, which matters more than any unbuilt phase.** Nothing in `src/`
-sets `ParquetReadOptions.Filter`. Row-group pruning and bloom probing are built
-and tested, and unreachable from any table layer: `DeltaReadOptions.Filter`
-prunes files and stops, Iceberg has no data-file read path at all. The cause is
-that `Filter` is fixed when the `ParquetFileReader` is constructed, and Delta
-holds one options record shared by the scan, CDF, DML and compaction paths — so
-setting it there would prune row groups during OPTIMIZE's rewrite, which is data
-loss. Tracked as
-[#55](https://github.com/clast-project/engineered-wood/issues/55), and it blocks
-the payoff of most of the rest of this document.
+**The wiring gap, closed by
+[#55](https://github.com/clast-project/engineered-wood/issues/55).** Row-group
+pruning and bloom probing used to be unreachable from any table layer, because
+`ParquetReadOptions.Filter` is fixed when the `ParquetFileReader` is constructed
+and Delta shares one options record between the scan, CDF, DML and compaction
+paths. Setting it there would have pruned row groups during OPTIMIZE's rewrite,
+which is data loss. Now `ParquetFileReader.GetCandidateRowGroupsAsync(Predicate)`
+gives the verdict per read, and Delta's scan walks the row groups itself with it.
+It counts skipped groups' rows so that deletion vectors, row ids and the locator
+column keep their file positions, which a filtered `ReadAllAsync` would have
+shifted. Delta refuses `ParquetReadOptions.Filter` outright. References are
+translated per file from logical names to the file's leaves (by field id in id
+mode), and a column that is widened, ambiguous, repeated, or missing from the file
+is left Unknown. Iceberg still has no data-file read path at all.
 
 **Reading this document.** It was written before any of it existed, and the body
 still describes the destination rather than the current tree — the code samples
@@ -1535,7 +1539,6 @@ oversight.
 
 | Phase | Scope | Project | Tracked as |
 |---|---|---|---|
-| — | Per-read filter on the Parquet reader; Delta forwarding, with logical→physical rewriting under column mapping | Parquet + DeltaLake.Table | [#55](https://github.com/clast-project/engineered-wood/issues/55) |
 | — | Bloom auto-mode keyed on dictionary encoding; dictionary-sourced population; FPP default | Parquet | [#56](https://github.com/clast-project/engineered-wood/issues/56) |
 | — | Dictionary-page row-group pruning | Parquet | [#57](https://github.com/clast-project/engineered-wood/issues/57) |
 | **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes. No longer blocked — Phase 9 shipped | DeltaLake.Table | [#102](https://github.com/clast-project/engineered-wood/issues/102) |
@@ -1571,8 +1574,8 @@ reproduce another engine's semantics.
 
 **What the original ordering got wrong.** It assumed the next win was more
 pruning machinery. It is not: every mechanism phases 5-7 built is already
-unreachable from the table layer, so #55 comes before all of it — more pruning
-that nothing can invoke adds nothing. After that, #57 (dictionary pruning) is
+unreachable from the table layer, so #55 came before all of it — more pruning
+that nothing can invoke adds nothing. With #55 done, #57 (dictionary pruning) is
 plausibly the best value of the remaining work, because unlike bloom filters and
 page indexes it needs no cooperation from whoever wrote the file, and it is exact
 rather than probabilistic. Page-level pushdown (11-12) is the largest of these by

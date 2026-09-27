@@ -37,7 +37,7 @@ opened by the test sweeps (they do not match the `*.parquet` glob). See [`encryp
 by default (#402), and `ParquetFileReader.ReadPageIndexAsync` reads them (#404).
 The batched read builds its page map from the OffsetIndex (#409). Filtering
 still prunes whole row groups, not pages: phases 6-7 of
-[`parquet-page-index.md`](parquet-page-index.md) are waiting on #55.
+[`parquet-page-index.md`](parquet-page-index.md) are not built.
 
 **Column chunks stored in another file (`file_path`).** A chunk's
 `file_path` says its pages are in another file, as in the `_metadata`
@@ -1046,15 +1046,6 @@ rather than producing a wrong answer:
   `current_date` / `current_timestamp` are deliberately absent because
   they are non-deterministic — which Delta forbids in a constraint or
   generated column anyway.
-
-**No table layer can push a predicate into the Parquet reader.** Row-group
-pruning and bloom probing are implemented and tested, but nothing in `src/` sets
-`ParquetReadOptions.Filter`: it is fixed when the `ParquetFileReader` is
-constructed, and Delta holds one options record shared by the scan, CDF, DML and
-compaction paths, so setting it there would prune row groups during OPTIMIZE's
-rewrite. `DeltaReadOptions.Filter` therefore prunes whole files and stops.
-Tracked as [#55](https://github.com/clast-project/engineered-wood/issues/55);
-see [`predicate-pushdown-design.md`](predicate-pushdown-design.md).
 
 **No row-level post-filter on the Parquet or Delta read paths.** Both filters
 are superset-safe by design and documented as such — surviving batches still

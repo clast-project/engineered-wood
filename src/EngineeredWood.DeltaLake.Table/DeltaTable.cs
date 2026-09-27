@@ -65,6 +65,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         DeltaTableOptions options,
         Snapshot.Snapshot? snapshot)
     {
+        // Backstop only: the create path validates before it writes a commit, which this is too late for.
+        ValidateOptions(options);
+
         _fs = fileSystem;
         _options = options;
         _dataFileReadOptions = WithVariantExtension(options.ParquetReadOptions);
@@ -135,6 +138,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>Applies to data files only; log and checkpoint parquet never contains variant.</para>
     /// </summary>
     private readonly ParquetReadOptions _dataFileReadOptions;
+
+    /// <summary>
+    /// Refuses options no table can honour. The create path calls this before it writes anything, so a
+    /// refusal leaves no table behind.
+    /// </summary>
+    private static void ValidateOptions(DeltaTableOptions options)
+    {
+        // A reader-level filter would apply to EVERY read of a data file (compaction, CDF and the DML
+        // rewrites included, where dropping a row group silently loses its rows) and would shift the file
+        // positions that deletion vectors and row ids are keyed by. Scans push DeltaReadOptions.Filter down
+        // per read instead (see ReadFileAsync).
+        if (options.ParquetReadOptions.Filter is not null)
+        {
+            throw new ArgumentException(
+                "DeltaTableOptions.ParquetReadOptions.Filter is not supported: it would apply to every read "
+                + "of a data file, including compaction and DML rewrites. Set DeltaReadOptions.Filter on the "
+                + "read instead, which prunes files and row groups.", nameof(options));
+        }
+    }
 
     private static ParquetReadOptions WithVariantExtension(ParquetReadOptions options)
     {
@@ -315,6 +337,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Schema.StructType? preAssignedSchema)
     {
         options ??= DeltaTableOptions.Default;
+        ValidateOptions(options);
         var log = new TransactionLog(fileSystem);
 
         // Liquid clustering and partitioning are mutually exclusive (Spark's CLUSTER BY REPLACES
@@ -4642,10 +4665,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
 
             int bi = -1;
+            // The scan is the ONE read that forwards its predicate to the row-group level: it promises only
+            // a superset of the matching rows. Compaction, CDF and the DML rewrites must see every row of a
+            // file they read, and never pass one.
             await foreach (var batch in ReadFileAsync(
                                addFile, options.Columns, snapshot, cancellationToken,
                                strippedRowIdsOut: idsOut, strippedVersionsOut: versOut,
-                               strippedAbsPositionsOut: absOut).ConfigureAwait(false))
+                               strippedAbsPositionsOut: absOut,
+                               rowGroupFilter: options.Filter).ConfigureAwait(false))
             {
                 bi++;
                 if (metadataFields.Count == 0)
@@ -8403,8 +8430,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         [EnumeratorCancellation] CancellationToken cancellationToken,
         List<Int64Array?>? strippedRowIdsOut = null,
         List<Int64Array?>? strippedVersionsOut = null,
-        List<Int64Array?>? strippedAbsPositionsOut = null)
+        List<Int64Array?>? strippedAbsPositionsOut = null,
+        Expressions.Predicate? rowGroupFilter = null)
     {
+        // rowGroupFilter: a LOGICAL-name predicate; row groups whose statistics prove no row matches are
+        // skipped. Only a read that promises a superset of the matching rows may pass one. The pluggable
+        // codec path ignores it (the seam hides the footer).
+        //
         // strippedRowIdsOut/strippedVersionsOut: when non-null, each EMITTED batch appends its per-row RESOLVED
         // row id / commit version (materialized value where present, else add.baseRowId + absolute position /
         // add.defaultRowCommitVersion; null when underivable). A copy-on-write rewrite (UPDATE) uses these so a
@@ -8474,8 +8506,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (seamColumns is not null && MaterializedRowTrackingColumnNames(snapshot).Count > 0)
                 seamColumns = null;
 
-            var seamBatches = dataFileReader.ReadAsync(
-                EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), seamColumns, cancellationToken);
+            var seamBatches = InFileOrder(dataFileReader.ReadAsync(
+                EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), seamColumns, cancellationToken),
+                cancellationToken);
             await foreach (var processed in ProcessFileBatchesAsync(
                 seamBatches, addFile, snapshot, columns, mappingMode, isIdMode, physicalToLogical,
                 logicalToPhysical, fieldIdToLogical, parquetSchema: null, deletedRows, partitionColumns,
@@ -8596,8 +8629,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 fileColumns = fileColumns.Where(filePresent.Contains).ToList();
         }
 
-        var builtinBatches = reader.ReadAllAsync(
-            columnNames: fileColumns, cancellationToken: cancellationToken);
+        System.Collections.BitArray? candidates = null;
+        if (rowGroupFilter is not null)
+        {
+            parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+            var filePredicate = RowGroupPushdown.ToFileColumns(
+                rowGroupFilter, snapshot.Schema, mappingMode, parquetSchema);
+            candidates = await reader.GetCandidateRowGroupsAsync(filePredicate, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        var builtinBatches = ReadRowGroupsAsync(reader, fileColumns, candidates, cancellationToken);
         await foreach (var processed in ProcessFileBatchesAsync(
             builtinBatches, addFile, snapshot, columns, mappingMode, isIdMode, physicalToLogical,
             logicalToPhysical, fieldIdToLogical, parquetSchema, deletedRows, partitionColumns,
@@ -8617,7 +8659,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// file order, which is part of the <see cref="IDataFileReader"/> contract.
     /// </summary>
     private async IAsyncEnumerable<RecordBatch> ProcessFileBatchesAsync(
-        IAsyncEnumerable<RecordBatch> source,
+        IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> source,
         AddFile addFile,
         Snapshot.Snapshot snapshot,
         IReadOnlyList<string>? columns,
@@ -8635,8 +8677,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         List<Int64Array?>? strippedVersionsOut = null,
         List<Int64Array?>? strippedAbsPositionsOut = null)
     {
-        long batchStartRow = 0;
-
         // Hidden materialized row-tracking columns (a copy-on-write rewrite wrote each moved row's original id +
         // commit version under these declared physical names). Stripped from every emitted batch so a reader
         // never sees them; their values feed the rowid out-params when a caller (UPDATE) requests them.
@@ -8646,9 +8686,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool wantRowIds = strippedRowIdsOut is not null || strippedVersionsOut is not null
             || strippedAbsPositionsOut is not null;
 
-        await foreach (var batch in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+        await foreach (var (batch, firstRow) in source.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
-            long thisBatchStart = batchStartRow; // absolute file position of this raw batch's first row
+            // Absolute file position of this raw batch's first row, from the SOURCE rather than a running
+            // count of batch lengths: a pruned read skips row groups, and every position after the first
+            // skipped one would be off by its row count.
+            long thisBatchStart = firstRow;
 
             // Rename columns back to logical names (flat, top level), then recursively for nested struct
             // children (the flat renames leave them under their physical names).
@@ -8689,15 +8732,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // Apply deletion vector filtering
             if (deletedRows is not null)
             {
-                result = DeletionVectorFilter.Filter(result, deletedRows, batchStartRow);
-                batchStartRow += batch.Length;
+                result = DeletionVectorFilter.Filter(result, deletedRows, thisBatchStart);
 
                 if (result.Length == 0)
                     continue; // All rows in this batch were deleted (no surviving ids to emit either)
-            }
-            else
-            {
-                batchStartRow += batch.Length; // track absolute position for the rowid out-params
             }
 
             // Apply type widening — convert narrow types from old files to current schema types
@@ -8768,6 +8806,52 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
 
             yield return cleanResult;
+        }
+    }
+
+    /// <summary>
+    /// Pairs each batch of a source that yields EVERY row of a file, in file order, with the file position
+    /// of its first row. The <see cref="IDataFileReader"/> contract makes that a running count.
+    /// </summary>
+    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(
+        IAsyncEnumerable<RecordBatch> source,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        long next = 0;
+        await foreach (var batch in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            yield return (batch, next);
+            next += batch.Length;
+        }
+    }
+
+    /// <summary>
+    /// Reads the row groups <paramref name="candidates"/> marks (all of them when null), pairing each batch
+    /// with the file position of its first row. A skipped row group still advances the position by its
+    /// row count, which is why this walks the row groups itself rather than reading through a filtered
+    /// <see cref="ParquetFileReader.ReadAllAsync"/>.
+    /// </summary>
+    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> ReadRowGroupsAsync(
+        ParquetFileReader reader,
+        IReadOnlyList<string>? columns,
+        System.Collections.BitArray? candidates,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var metadata = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        long groupStart = 0;
+        for (int i = 0; i < metadata.RowGroups.Count; i++)
+        {
+            if (candidates is null || candidates[i])
+            {
+                long next = groupStart;
+                await foreach (var batch in reader.ReadRowGroupBatchesAsync(i, columns, cancellationToken)
+                    .ConfigureAwait(false))
+                {
+                    yield return (batch, next);
+                    next += batch.Length;
+                }
+            }
+            groupStart += metadata.RowGroups[i].NumRows;
         }
     }
 
