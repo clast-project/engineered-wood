@@ -146,6 +146,44 @@ public class BatchedPageReuseTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// 3000 rows of pyarrow's null type, written by pyarrow 24.0.0:
+    /// <c>pq.write_table(pa.table({'nothing': pa.nulls(3000, pa.null())}), p, compression='none', write_statistics=False)</c>.
+    /// EngineeredWood cannot write the null logical type, so the file is embedded.
+    /// </summary>
+    private const string NullColumnFile =
+        "UEFSMRUEFQAVAEwVABUAEgAAFQAVEBUQLBXwLhUQFQYVBhwAAAADAAAA8C4AABUEGSw1ABgGc2NoZW1hFQIAFQIlAhgHbm90aGluZ2y8AAAAFvAuGRwZHCYAHBUCGTUABhAZGAdub3RoaW5nFQAW8C4WVBZUJiQmCCksFQQVABUCABUAFRAVAgA8KQYZJvAuAAAAABZUFvAuJggWVAAZHBgMQVJST1c6c2NoZW1hGKABLy8vLy8zQUFBQUFRQUFBQUFBQUtBQXdBQmdBRkFBZ0FDZ0FBQUFBQkJBQU1BQUFBQ0FBSUFBQUFCQUFJQUFBQUJBQUFBQUVBQUFBVUFBQUFFQUFVQUFnQUJnQUhBQXdBQUFBUUFCQUFBQUFBQUFFQkVBQUFBQndBQUFBRUFBQUFBQUFBQUFjQUFBQnViM1JvYVc1bkFBUUFCQUFFQUFBQQAYIHBhcnF1ZXQtY3BwLWFycm93IHZlcnNpb24gMjQuMC4wGRwcAAAATAEAAFBBUjE=";
+
+    /// <summary>
+    /// A column of the null type reads in batches. The batched read slices every leaf through
+    /// EngineeredWood's array factory, which had no case for the null type, so such a column could
+    /// be read whole but threw <c>Cannot construct Arrow array for type 'null'</c> in batches.
+    /// </summary>
+    [Theory]
+    [InlineData(1000)]
+    [InlineData(7)]
+    public async Task NullColumn_ReadsInBatches(int batchSize)
+    {
+        string path = Path.Combine(_tempDir, "null-column.parquet");
+        File.WriteAllBytes(path, Convert.FromBase64String(NullColumnFile));
+
+        await using var input = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(input, ownsFile: false, new ParquetReadOptions { BatchSize = batchSize });
+        int rows = 0, batches = 0;
+        await foreach (var batch in reader.ReadRowGroupBatchesAsync(0))
+        {
+            using (batch)
+            {
+                Assert.IsType<NullArray>(batch.Column(0));
+                rows += batch.Length;
+                batches++;
+            }
+        }
+
+        Assert.Equal(3000, rows);
+        Assert.Equal((3000 + batchSize - 1) / batchSize, batches);
+    }
+
     private async Task<string> WriteAllTypesAsync(DataPageVersion version, bool dictionary)
     {
         var fields = new List<Field>();

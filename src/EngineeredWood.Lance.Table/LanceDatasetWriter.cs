@@ -954,7 +954,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         for (int i = 0; i < perColumnSlices.Length; i++)
             newFragArrays[i] = perColumnSlices[i].Count == 1
                 ? perColumnSlices[i][0]
-                : ArrowArrayConcatenator.Concatenate(perColumnSlices[i]);
+                : ArrowCompute.Concatenate(perColumnSlices[i]);
 
         Directory.CreateDirectory(Path.Combine(datasetPath, "data"));
         Directory.CreateDirectory(Path.Combine(datasetPath, "_deletions"));
@@ -1194,7 +1194,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             for (int i = 0; i < perColumnSlices.Length; i++)
                 newFragArrays[i] = perColumnSlices[i].Count == 1
                     ? perColumnSlices[i][0]
-                    : ArrowArrayConcatenator.Concatenate(perColumnSlices[i]);
+                    : ArrowCompute.Concatenate(perColumnSlices[i]);
 
             string newDataFileName = Guid.NewGuid().ToString("N") + ".lance";
             string newDataFilePath = Path.Combine(datasetPath, "data", newDataFileName);

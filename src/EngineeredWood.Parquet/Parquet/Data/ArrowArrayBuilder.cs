@@ -1900,6 +1900,9 @@ internal static class ArrowArrayFactory
             Decimal128Type => new Decimal128Array(data),
             Decimal256Type => new Decimal256Array(data),
             FixedSizeBinaryType => new FixedSizeBinaryArray(data),
+            // A column of the null logical type (pyarrow's pa.null()). The batched read slices every
+            // leaf through here, so without this case such a column could be read whole but not in batches.
+            NullType => new NullArray(data),
             // ExtensionType: rebuild the storage array with the inner storage
             // type, then wrap via CreateArray. This covers GuidType today and
             // any future extension whose storage type we already know how to

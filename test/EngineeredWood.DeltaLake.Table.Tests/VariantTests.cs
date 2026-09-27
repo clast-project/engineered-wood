@@ -398,4 +398,66 @@ public class VariantTests : IDisposable
         await Assert.ThrowsAnyAsync<NotSupportedException>(
             async () => await table.WriteAsync([batch]));
     }
+
+    /// <summary>
+    /// A locator-keyed update of a VARIANT column. The update concatenates the stored column with the
+    /// new values and takes from the result, and Arrow's concatenator refuses an extension array
+    /// (apache/arrow-dotnet#443), so this threw for any VARIANT column.
+    /// </summary>
+    [Fact]
+    public async Task UpdateRowsAsync_SetsAVariantColumn()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema());
+        await table.WriteAsync([VariantBatch(True, False, null)]);
+
+        // Locate the row with id 2, and give it the variant 42.
+        string pathName = DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.FilePathSuffix;
+        string indexName = DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIndexSuffix;
+        string? path = null;
+        long position = -1;
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
+        {
+            var ids = (Int64Array)batch.Column("id");
+            for (int i = 0; i < batch.Length; i++)
+            {
+                if (ids.GetValue(i) == 2)
+                {
+                    path = ((StringArray)batch.Column(pathName)).GetString(i);
+                    position = ((Int64Array)batch.Column(indexName)).GetValue(i)!.Value;
+                }
+            }
+        }
+
+        Assert.NotNull(path);
+        var variant = new VariantArray.Builder();
+        variant.Append(EmptyMetadata, Int8Val);
+        var updates = new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field(pathName, StringType.Default, false))
+                .Field(new Field(indexName, Int64Type.Default, false))
+                .Field(new Field("v", VariantType.Default, true))
+                .Build(),
+            [
+                new StringArray.Builder().Append(path).Build(),
+                new Int64Array.Builder().Append(position).Build(),
+                variant.Build(allocator: null),
+            ],
+            1);
+
+        await table.UpdateRowsAsync(updates);
+
+        var byId = new Dictionary<long, byte[]?>();
+        foreach (var batch in await ReadAllAsync(table))
+        {
+            var ids = (Int64Array)batch.Column("id");
+            var v = Assert.IsType<VariantArray>(batch.Column("v"));
+            for (int i = 0; i < batch.Length; i++)
+                byId[ids.GetValue(i)!.Value] = v.IsNull(i) ? null : v.GetValueBytes(i).ToArray();
+        }
+
+        Assert.Equal(True, byId[1]);
+        Assert.Equal(Int8Val, byId[2]);
+        Assert.Null(byId[3]);
+    }
 }
