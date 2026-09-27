@@ -65,17 +65,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         DeltaTableOptions options,
         Snapshot.Snapshot? snapshot)
     {
-        // A reader-level filter would apply to EVERY read of a data file (compaction, CDF and the DML
-        // rewrites included, where dropping a row group silently loses its rows) and would shift the file
-        // positions that deletion vectors and row ids are keyed by. Scans push DeltaReadOptions.Filter down
-        // per read instead (see ReadFileAsync).
-        if (options.ParquetReadOptions.Filter is not null)
-        {
-            throw new ArgumentException(
-                "DeltaTableOptions.ParquetReadOptions.Filter is not supported: it would apply to every read "
-                + "of a data file, including compaction and DML rewrites. Set DeltaReadOptions.Filter on the "
-                + "read instead, which prunes files and row groups.", nameof(options));
-        }
+        // Backstop only: the create path validates before it writes a commit, which this is too late for.
+        ValidateOptions(options);
 
         _fs = fileSystem;
         _options = options;
@@ -147,6 +138,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>Applies to data files only; log and checkpoint parquet never contains variant.</para>
     /// </summary>
     private readonly ParquetReadOptions _dataFileReadOptions;
+
+    /// <summary>
+    /// Refuses options no table can honour. The create path calls this before it writes anything, so a
+    /// refusal leaves no table behind.
+    /// </summary>
+    private static void ValidateOptions(DeltaTableOptions options)
+    {
+        // A reader-level filter would apply to EVERY read of a data file (compaction, CDF and the DML
+        // rewrites included, where dropping a row group silently loses its rows) and would shift the file
+        // positions that deletion vectors and row ids are keyed by. Scans push DeltaReadOptions.Filter down
+        // per read instead (see ReadFileAsync).
+        if (options.ParquetReadOptions.Filter is not null)
+        {
+            throw new ArgumentException(
+                "DeltaTableOptions.ParquetReadOptions.Filter is not supported: it would apply to every read "
+                + "of a data file, including compaction and DML rewrites. Set DeltaReadOptions.Filter on the "
+                + "read instead, which prunes files and row groups.", nameof(options));
+        }
+    }
 
     private static ParquetReadOptions WithVariantExtension(ParquetReadOptions options)
     {
@@ -327,6 +337,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Schema.StructType? preAssignedSchema)
     {
         options ??= DeltaTableOptions.Default;
+        ValidateOptions(options);
         var log = new TransactionLog(fileSystem);
 
         // Liquid clustering and partitioning are mutually exclusive (Spark's CLUSTER BY REPLACES

@@ -19,6 +19,10 @@ namespace EngineeredWood.DeltaLake.Table;
 /// directions (which is what makes copy-on-write rewrites and compaction preserve codec-specific column
 /// representations the built-in reader is blind to, e.g. the parquet VARIANT logical-type annotation).
 ///
+/// <para>A read's <see cref="DeltaReadOptions.Filter"/> still prunes FILES through this seam, but not row groups:
+/// the seam hides the footer, so the table cannot see row-group statistics, and it never passes the predicate on.
+/// Every row of every surviving file is requested.</para>
+///
 /// <para><b>Experimental</b> (shares diagnostic <c>EWDELTA0001</c> with <see cref="IDataFileWriter"/>): the
 /// codec seam has no in-tree implementation and an unsettled contract, and may change or be removed. See
 /// <c>doc/codec-seam-investigation.md</c>.</para>

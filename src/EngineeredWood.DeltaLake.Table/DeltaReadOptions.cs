@@ -23,7 +23,9 @@ public sealed record DeltaReadOptions
     /// statistics in the log PROVE no row can match, and within a surviving file so is a Parquet row group
     /// whose footer statistics prove the same (and whose Bloom filter does, when
     /// <see cref="Parquet.ParquetReadOptions.FilterUseBloomFilters"/> is set on the table's
-    /// <see cref="DeltaTableOptions.ParquetReadOptions"/>). The reader does NOT re-apply this per row, so
+    /// <see cref="DeltaTableOptions.ParquetReadOptions"/>). Row groups are pruned only by the built-in reader:
+    /// a <see cref="DeltaTableOptions.DataFileReader"/> gets file pruning alone, because the codec seam hides
+    /// the footer. The reader does NOT re-apply this per row, so
     /// surviving batches still contain non-matching rows — filter them yourself. Metadata columns are
     /// unaffected: a row keeps its file position and row id however many row groups before it were skipped.
     /// </summary>

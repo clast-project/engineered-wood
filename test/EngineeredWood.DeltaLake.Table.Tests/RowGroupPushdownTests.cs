@@ -178,6 +178,10 @@ public class RowGroupPushdownTests : IDisposable
         var ex = await Assert.ThrowsAsync<ArgumentException>(async () =>
             await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdSchema, options));
         Assert.Contains("DeltaReadOptions.Filter", ex.Message);
+
+        // Refused BEFORE commit 0: a refusal must not leave a table behind.
+        Assert.False(Directory.Exists(Path.Combine(_tempDir, "_delta_log"))
+            && Directory.EnumerateFiles(Path.Combine(_tempDir, "_delta_log")).Any());
     }
 
     // ── The logical-to-file name map ──
