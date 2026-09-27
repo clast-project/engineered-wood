@@ -101,18 +101,38 @@ public class BloomFilterPushdownTests : IDisposable
     /// One row group of <c>{stored, 5, -3}</c>: statistics span the literal, so only the Bloom filter can
     /// rule the group out, and it must not when a stored value is EQUAL to the literal in SQL.
     /// </summary>
-    private async Task<int> RowsReadWithBloom(string name, double stored, double literal)
+    private Task<int> RowsReadWithBloom(string name, double stored, double literal) =>
+        RowsReadWithBloom(name, stored, Ex.Equal("x", literal));
+
+    private async Task<int> RowsReadWithBloom(
+        string name, double stored, EngineeredWood.Expressions.Predicate filter, bool asFloat = false)
+    {
+        string path = await WriteFloatingColumn(name, stored, asFloat);
+
+        await using var input = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(input, ownsFile: false,
+            new ParquetReadOptions { Filter = filter, FilterUseBloomFilters = true });
+        int rows = 0;
+        await foreach (var batch in reader.ReadAllAsync())
+            rows += batch.Length;
+        return rows;
+    }
+
+    /// <summary>One row group of <c>{stored, 5, -3}</c> in column "x", with a Bloom filter.</summary>
+    private async Task<string> WriteFloatingColumn(string name, double stored, bool asFloat = false)
     {
         string path = Path.Combine(_tempDir, name + ".parquet");
         var schema = new Apache.Arrow.Schema.Builder()
-            .Field(new Field("x", DoubleType.Default, false))
+            .Field(new Field("x", asFloat ? FloatType.Default : DoubleType.Default, false))
             .Build();
         var options = new ParquetWriteOptions
         {
             Compression = CompressionCodec.Uncompressed,
             BloomFilterColumns = new HashSet<string> { "x" },
         };
-        var values = new DoubleArray.Builder().Append(stored).Append(5.0).Append(-3.0).Build();
+        IArrowArray values = asFloat
+            ? new FloatArray.Builder().Append((float)stored).Append(5f).Append(-3f).Build()
+            : new DoubleArray.Builder().Append(stored).Append(5.0).Append(-3.0).Build();
 
         await using (var file = new LocalSequentialFile(path))
         await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
@@ -120,15 +140,11 @@ public class BloomFilterPushdownTests : IDisposable
             await writer.WriteRowGroupAsync(new RecordBatch(schema, [values], 3));
             await writer.CloseAsync();
         }
-
-        await using var input = new LocalRandomAccessFile(path);
-        await using var reader = new ParquetFileReader(input, ownsFile: false,
-            new ParquetReadOptions { Filter = Ex.Equal("x", literal), FilterUseBloomFilters = true });
-        int rows = 0;
-        await foreach (var batch in reader.ReadAllAsync())
-            rows += batch.Length;
-        return rows;
+        return path;
     }
+
+    /// <summary>A float NaN whose payload differs from <see cref="float.NaN"/>'s.</summary>
+    private static readonly float OtherFloatNaN = BitConverter.ToSingle(BitConverter.GetBytes(0x7FC0_0001), 0);
 
     [Theory]
     [InlineData("neg_zero_stored", -0.0, 0.0)]
@@ -147,31 +163,77 @@ public class BloomFilterPushdownTests : IDisposable
     [Fact]
     public async Task BloomFilter_FloatZeroMatchesTheOtherZero()
     {
-        string path = Path.Combine(_tempDir, "float_zero.parquet");
-        var schema = new Apache.Arrow.Schema.Builder()
-            .Field(new Field("x", FloatType.Default, false))
-            .Build();
-        var options = new ParquetWriteOptions
-        {
-            Compression = CompressionCodec.Uncompressed,
-            BloomFilterColumns = new HashSet<string> { "x" },
-        };
-        var values = new FloatArray.Builder().Append(-0f).Append(5f).Append(-3f).Build();
+        Assert.Equal(3, await RowsReadWithBloom("float_zero", -0.0, Ex.Equal("x", 0f), asFloat: true));
+    }
 
-        await using (var file = new LocalSequentialFile(path))
-        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
-        {
-            await writer.WriteRowGroupAsync(new RecordBatch(schema, [values], 3));
-            await writer.CloseAsync();
-        }
+    [Fact]
+    public async Task BloomFilter_FloatNaNMatchesAnyNaN()
+    {
+        Assert.Equal(3, await RowsReadWithBloom("float_nan", OtherFloatNaN, Ex.Equal("x", float.NaN), asFloat: true));
+    }
 
+    /// <summary>
+    /// An IN list is kept when ANY member might match. A NaN member cannot be ruled out, and a zero member
+    /// must be probed as both zeros, even beside members that are absent.
+    /// </summary>
+    [Theory]
+    [InlineData("in_nan", double.NaN)]
+    [InlineData("in_zero", 0.0)]
+    public async Task BloomFilter_InList_KeepsTheGroupForAnEqualMember(string name, double member)
+    {
+        double stored = double.IsNaN(member) ? OtherNaN : -0.0;
+        var filter = new EngineeredWood.Expressions.SetPredicate(
+            new EngineeredWood.Expressions.UnboundReference("x"),
+            [EngineeredWood.Expressions.LiteralValue.Of(1.0), EngineeredWood.Expressions.LiteralValue.Of(member)],
+            EngineeredWood.Expressions.SetOperator.In);
+
+        Assert.Equal(3, await RowsReadWithBloom(name, stored, filter));
+    }
+
+    // The public value probe answers the same question without a predicate, and must answer it the same way.
+
+    [Theory]
+    [InlineData("api_neg_zero", -0.0, 0.0)]
+    [InlineData("api_pos_zero", 0.0, -0.0)]
+    public async Task CandidateRowGroups_ByValue_ZeroMatchesTheOtherZero(string name, double stored, double value)
+    {
+        string path = await WriteFloatingColumn(name, stored);
         await using var input = new LocalRandomAccessFile(path);
-        await using var reader = new ParquetFileReader(input, ownsFile: false,
-            new ParquetReadOptions { Filter = Ex.Equal("x", 0f), FilterUseBloomFilters = true });
-        int rows = 0;
-        await foreach (var batch in reader.ReadAllAsync())
-            rows += batch.Length;
-        Assert.Equal(3, rows);
+        await using var reader = new ParquetFileReader(input, ownsFile: false);
+
+        Assert.True((await reader.GetCandidateRowGroupsAsync("x", value))[0]);
+    }
+
+    [Fact]
+    public async Task CandidateRowGroups_ByValue_NaNMatchesAnyNaN()
+    {
+        string path = await WriteFloatingColumn("api_nan", OtherNaN);
+        await using var input = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(input, ownsFile: false);
+
+        Assert.True((await reader.GetCandidateRowGroupsAsync("x", double.NaN))[0]);
+        Assert.True((await reader.GetCandidateRowGroupsAsync("x", new object[] { 1.0, double.NaN }))[0]);
+    }
+
+    [Fact]
+    public async Task CandidateRowGroups_ByValue_StillRefusesAnIncompatibleValueAfterANaN()
+    {
+        string path = await WriteFloatingColumn("api_nan_then_bad", 1.0);
+        await using var input = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(input, ownsFile: false);
+
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await reader.GetCandidateRowGroupsAsync("x", new object[] { double.NaN, "not a double" }));
+    }
+
+    [Fact]
+    public async Task CandidateRowGroups_ByValue_StillRulesOutAnAbsentZero()
+    {
+        string path = await WriteFloatingColumn("api_zero_absent", 1.0);
+        await using var input = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(input, ownsFile: false);
+
+        Assert.False((await reader.GetCandidateRowGroupsAsync("x", 0.0))[0]);
     }
 
     [Theory]

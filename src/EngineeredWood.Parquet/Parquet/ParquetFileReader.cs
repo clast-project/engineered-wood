@@ -1549,13 +1549,25 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         int columnIndex = ResolveLeafColumnIndex(schema, column);
         var physicalType = schema.Columns[columnIndex].PhysicalType;
 
-        // Pre-encode all values.
-        var encodedValues = new byte[values.Count][];
-        for (int i = 0; i < values.Count; i++)
-            encodedValues[i] = BloomFilter.BloomFilterValueEncoder.Encode(values[i], physicalType);
-
         int numRowGroups = metadata.RowGroups.Count;
         var result = new BitArray(numRowGroups, true); // default to candidate
+
+        // Pre-encode all values, each as every encoding an EQUAL value could have been hashed from (both
+        // zeros for a zero). A NaN matches NaNs of any payload, which no probe covers: every row group
+        // stays a candidate. Every value is encoded before that is decided, so an incompatible value is
+        // refused whatever precedes it.
+        var encoded = new List<byte[]>(values.Count);
+        bool unprobeable = false;
+        for (int i = 0; i < values.Count; i++)
+        {
+            if (BloomFilter.BloomFilterValueEncoder.TryEncodeEquivalents(values[i], physicalType, out var equivalents))
+                encoded.AddRange(equivalents);
+            else
+                unprobeable = true;
+        }
+        if (unprobeable)
+            return result;
+        var encodedValues = encoded.ToArray();
 
         // Collect bloom filter file ranges for all row groups that have one.
         var rangeIndices = new List<int>(); // row group indices that have bloom filter data
