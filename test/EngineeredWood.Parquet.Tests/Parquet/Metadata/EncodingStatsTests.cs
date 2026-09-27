@@ -195,6 +195,44 @@ public class EncodingStatsTests : IDisposable
         Assert.Null(decoded.RowGroups[0].Columns[0].MetaData!.EncodingStats);
     }
 
+    [Fact]
+    public void ANegativeCount_DropsTheWholeList()
+    {
+        var stats = new[]
+        {
+            new PageEncodingStats(PageType.DictionaryPage, Encoding.Plain, 1),
+            new PageEncodingStats(PageType.DataPage, Encoding.Plain, -1),
+        };
+
+        var decoded = MetadataDecoder.DecodeFileMetaData(MetadataEncoder.EncodeFileMetaData(OneChunk(stats)));
+
+        Assert.Null(decoded.RowGroups[0].Columns[0].MetaData!.EncodingStats);
+    }
+
+    /// <summary>
+    /// Entries a reference writer would never produce, spliced into an otherwise valid footer in place of
+    /// a one-entry list: each must drop the list rather than yield a guess.
+    /// </summary>
+    [Theory]
+    // page_type twice (DataPage, then DictionaryPage via a long-form header: delta 0, zigzag id 1 = 0x02).
+    [InlineData(new byte[] { 0x15, 0x00, 0x05, 0x02, 0x04, 0x15, 0x00, 0x15, 0x02, 0x00 })]
+    // count as an i64 (type 6) rather than an i32.
+    [InlineData(new byte[] { 0x15, 0x00, 0x15, 0x00, 0x16, 0x02, 0x00 })]
+    // page_type as an i64, then encoding and count as i32s.
+    [InlineData(new byte[] { 0x16, 0x00, 0x15, 0x00, 0x15, 0x02, 0x00 })]
+    public void AMalformedEntry_DropsTheWholeList(byte[] entry)
+    {
+        var valid = new[] { new PageEncodingStats(PageType.DataPage, Encoding.Plain, 1) };
+        byte[] footer = MetadataEncoder.EncodeFileMetaData(OneChunk(valid));
+
+        byte[] list = new byte[] { 0x1C }.Concat(entry).ToArray(); // one struct element
+        var decoded = MetadataDecoder.DecodeFileMetaData(Replace(footer, ReferenceEncodeList(valid), list));
+
+        var metadata = decoded.RowGroups[0].Columns[0].MetaData!;
+        Assert.Null(metadata.EncodingStats);
+        Assert.Equal(4, metadata.DataPageOffset); // the rest of the chunk still decodes
+    }
+
     // ───── EW's writer ─────
 
     public static TheoryData<bool, DataPageVersion, bool, bool> WriterCases()

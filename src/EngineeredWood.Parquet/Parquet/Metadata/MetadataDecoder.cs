@@ -765,7 +765,8 @@ internal static class MetadataDecoder
     }
 
     /// <summary>
-    /// Reads <c>encoding_stats</c>, or returns null when any entry is malformed. The list is optional, and a
+    /// Reads <c>encoding_stats</c>, or returns null when any entry is malformed (a required field missing,
+    /// repeated or of the wrong type, or a negative count). The list is optional, and a
     /// consumer may conclude from it that a chunk has NO page of some kind (every data page
     /// dictionary-encoded), so a list with an entry dropped would be worse than no list at all.
     /// </summary>
@@ -798,24 +799,36 @@ internal static class MetadataDecoder
         int? pageType = null;
         int? encoding = null;
         int? count = null;
+        // A required field sent twice, or with the wrong type, makes the entry ambiguous rather than merely
+        // incomplete: which page type did the writer mean? Refuse it, and with it the list.
+        bool malformed = false;
 
         while (true)
         {
             var (type, fid) = reader.ReadFieldHeader();
             if (type == ThriftType.Stop) break;
 
+            if (fid is >= 1 and <= 3
+                && (type != ThriftType.I32 || (fid == 1 ? pageType : fid == 2 ? encoding : count) is not null))
+            {
+                malformed = true;
+                reader.Skip(type);
+                continue;
+            }
+
             switch (fid)
             {
-                case 1 when type == ThriftType.I32: pageType = reader.ReadZigZagInt32(); break;
-                case 2 when type == ThriftType.I32: encoding = reader.ReadZigZagInt32(); break;
-                case 3 when type == ThriftType.I32: count = reader.ReadZigZagInt32(); break;
+                case 1: pageType = reader.ReadZigZagInt32(); break;
+                case 2: encoding = reader.ReadZigZagInt32(); break;
+                case 3: count = reader.ReadZigZagInt32(); break;
                 default: reader.Skip(type); break;
             }
         }
 
         reader.PopStruct();
 
-        return pageType is { } p && encoding is { } e && count is { } c
+        // A page count below zero is not a count; a consumer summing or testing counts would be misled.
+        return !malformed && pageType is { } p && encoding is { } e && count is >= 0 and var c
             ? new PageEncodingStats((PageType)p, (Encoding)e, c)
             : null;
     }
