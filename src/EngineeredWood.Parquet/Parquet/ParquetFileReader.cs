@@ -1631,8 +1631,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// Returns a <see cref="BitArray"/> indicating which row groups might contain a row matching
     /// <paramref name="filter"/>: the per-read form of <see cref="ParquetReadOptions.Filter"/>, deciding
     /// each row group exactly as <see cref="ReadAllAsync"/> does under that option (column statistics,
-    /// then Bloom filters when <see cref="ParquetReadOptions.FilterUseBloomFilters"/> is set) without
-    /// reading any data.
+    /// then dictionary pages when <see cref="ParquetReadOptions.FilterUseDictionaries"/> is set, then
+    /// Bloom filters when <see cref="ParquetReadOptions.FilterUseBloomFilters"/> is set) without reading
+    /// any data pages.
     /// </summary>
     /// <remarks>
     /// Use this rather than <see cref="ParquetReadOptions.Filter"/> when one reader configuration serves
@@ -1677,8 +1678,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <summary>
     /// The one row-group verdict behind both <see cref="ParquetReadOptions.Filter"/> and
     /// <see cref="GetCandidateRowGroupsAsync(EngineeredWood.Expressions.Predicate, CancellationToken)"/>:
-    /// false only when statistics, or a Bloom filter probe of a predicate they left Unknown, prove no row
-    /// of row group <paramref name="rowGroup"/> matches.
+    /// false only when statistics, or a dictionary page or Bloom filter asked about a predicate they left
+    /// Unknown, prove no row of row group <paramref name="rowGroup"/> matches. The dictionary goes first,
+    /// as in parquet-mr: its answer is exact, so it never leaves a row group the filter could still rule
+    /// out, and a chunk that has one is usually small enough to read whole.
     /// </summary>
     private async ValueTask<bool> MightMatchAsync(
         EngineeredWood.Expressions.Predicate filter, int rowGroup, FileMetaData metadata,
@@ -1689,17 +1692,28 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         if (result == EngineeredWood.Expressions.FilterResult.AlwaysFalse)
             return false;
 
-        if (_options.FilterUseBloomFilters
-            && result == EngineeredWood.Expressions.FilterResult.Unknown)
+        if (result != EngineeredWood.Expressions.FilterResult.Unknown)
+            return true;
+
+        if (_options.FilterUseDictionaries
+            && await MembershipRulesOutAsync(MembershipSource.Dictionary).ConfigureAwait(false))
         {
-            var bloomResult = await BloomFilterPredicateEvaluator.EvaluateAsync(
-                filter, rowGroup, metadata, schema,
-                _file, _fileLength, _options.ColumnChunkFilePath, cancellationToken).ConfigureAwait(false);
-            if (bloomResult == EngineeredWood.Expressions.FilterResult.AlwaysFalse)
-                return false;
+            return false;
+        }
+
+        if (_options.FilterUseBloomFilters
+            && await MembershipRulesOutAsync(MembershipSource.BloomFilter).ConfigureAwait(false))
+        {
+            return false;
         }
 
         return true;
+
+        async ValueTask<bool> MembershipRulesOutAsync(MembershipSource source) =>
+            await MembershipPredicateEvaluator.EvaluateAsync(
+                filter, source, rowGroup, metadata, schema, _file, _fileLength,
+                _options.ColumnChunkFilePath, _options.PageChecksumValidation, cancellationToken)
+                .ConfigureAwait(false) == EngineeredWood.Expressions.FilterResult.AlwaysFalse;
     }
 
     /// <summary>
