@@ -63,7 +63,7 @@ internal static class ChunkedArrayDecoder
             // or only empty ones: either way the result is a typed empty array.
             0 => ArrowCompute.MakeNullArray(expectedType, 0),
             1 => chunks[0],
-            _ => ArrowArrayConcatenator.Concatenate(chunks),
+            _ => ArrowCompute.Concatenate(chunks),
         };
     }
 }

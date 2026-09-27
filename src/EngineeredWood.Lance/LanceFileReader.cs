@@ -5,6 +5,7 @@ using System.Buffers;
 using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Lance.Encodings;
@@ -1308,7 +1309,7 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         for (int p = 0; p < cm.Pages.Count; p++)
             perPage[p] = await DecodeV21PageAsync(cm.Pages[p], targetType, cancellationToken)
                 .ConfigureAwait(false);
-        return ArrowArrayConcatenator.Concatenate(perPage);
+        return ArrowCompute.Concatenate(perPage);
     }
 
     private async Task<IArrowArray> DecodeV21PageAsync(
@@ -1594,7 +1595,7 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         for (int p = 0; p < cm.Pages.Count; p++)
             perPage[p] = await DecodeV20PageAsync(cm.Pages[p], targetType, cancellationToken)
                 .ConfigureAwait(false);
-        return ArrowArrayConcatenator.Concatenate(perPage);
+        return ArrowCompute.Concatenate(perPage);
     }
 
     private async Task<IArrowArray> DecodeV20PageAsync(

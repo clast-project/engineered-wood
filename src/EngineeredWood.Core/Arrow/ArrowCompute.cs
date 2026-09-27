@@ -164,6 +164,140 @@ public static class ArrowCompute
 #endif
 
     /// <summary>
+    /// Joins arrays of one type end to end. Use this in place of Apache.Arrow's
+    /// <see cref="ArrowArrayConcatenator"/>, which refuses types EngineeredWood reads every day.
+    /// </summary>
+    /// <remarks>
+    /// Arrow 23's concatenator throws for:
+    /// <list type="bullet">
+    /// <item>an extension type, at any depth. That includes VARIANT, even inside a struct, and GUID.
+    /// Here, extension types are relabelled as their storage types throughout the tree, which copies
+    /// nothing. The storage is concatenated and relabelled back.</item>
+    /// <item>the null type, which has no concatenation at all. Here, the null arrays are counted.</item>
+    /// <item>a zero-length string or binary view array that still carries data buffers, which
+    /// makes it overrun its buffer list. Here, empty inputs are dropped: they contribute no rows
+    /// (apache/arrow-dotnet#443).</item>
+    /// </list>
+    /// <para>One gap is not closed here. For a view type the result refers to the inputs' data
+    /// buffers without holding them (also #443), so it stays valid only while the inputs do. That is
+    /// only a problem for a caller that disposes the inputs before the result.</para>
+    /// <para>As with Arrow's, a single input (after the empty ones are dropped) is returned as it is,
+    /// not copied.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentException"><paramref name="arrays"/> is empty.</exception>
+    public static IArrowArray Concatenate(IReadOnlyList<IArrowArray> arrays)
+    {
+        if (arrays is null)
+            throw new ArgumentNullException(nameof(arrays));
+        if (arrays.Count == 0)
+            throw new ArgumentException("There is nothing to concatenate.", nameof(arrays));
+
+        var inputs = new List<IArrowArray>(arrays.Count);
+        foreach (var array in arrays)
+        {
+            if (array.Length > 0)
+                inputs.Add(array);
+        }
+
+        if (inputs.Count == 0)
+            return arrays[0];
+        if (inputs.Count == 1)
+            return inputs[0];
+
+        var type = inputs[0].Data.DataType;
+        if (type is NullType)
+            return new NullArray(inputs.Sum(a => a.Length));
+        if (!HasExtensionType(type))
+            return ArrowArrayConcatenator.Concatenate(inputs);
+
+        // Arrow checks that the inputs' storage agrees, which is all it will see. The extension types
+        // are ours to check: relabelling gives every input the first one's.
+        for (int i = 1; i < inputs.Count; i++)
+        {
+            if (!SameExtensionTypes(type, inputs[i].Data.DataType))
+            {
+                throw new ArgumentException(
+                    $"Cannot concatenate {inputs[i].Data.DataType.Name} onto {type.Name}: their extension types differ.",
+                    nameof(arrays));
+            }
+        }
+
+        var storage = new List<ArrayData>(inputs.Count);
+        foreach (var array in inputs)
+            storage.Add(AsStorage(array.Data));
+        var joined = ArrayDataConcatenator.Concatenate(storage);
+        return ArrowArrayFactory.BuildArray(Relabel(joined, inputs[0].Data));
+    }
+
+    private static bool HasExtensionType(IArrowType type) => type switch
+    {
+        ExtensionType => true,
+        NestedType nested => nested.Fields.Any(f => HasExtensionType(f.DataType)),
+        _ => false,
+    };
+
+    /// <summary>
+    /// Whether two types carry the same extension types in the same places: same name and metadata,
+    /// over storage that does too. Anything that is not an extension is left to Arrow's own check.
+    /// </summary>
+    private static bool SameExtensionTypes(IArrowType a, IArrowType b)
+    {
+        if (a is ExtensionType || b is ExtensionType)
+        {
+            return a is ExtensionType x && b is ExtensionType y
+                && x.Name == y.Name
+                && x.ExtensionMetadata == y.ExtensionMetadata
+                && SameExtensionTypes(x.StorageType, y.StorageType);
+        }
+
+        if (a is NestedType na && b is NestedType nb)
+        {
+            if (na.Fields.Count != nb.Fields.Count)
+                return false;
+            for (int i = 0; i < na.Fields.Count; i++)
+            {
+                if (!SameExtensionTypes(na.Fields[i].DataType, nb.Fields[i].DataType))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// <paramref name="data"/> with every extension type in it replaced by its storage type, all the
+    /// way down when one extension is stored as another.
+    /// </summary>
+    private static ArrayData AsStorage(ArrayData data)
+    {
+        var type = data.DataType;
+        while (type is ExtensionType extension)
+            type = extension.StorageType;
+
+        return new ArrayData(
+            type, data.Length, data.NullCount, data.Offset, data.Buffers,
+            data.Children?.Select(AsStorage).ToArray(), data.Dictionary);
+    }
+
+    /// <summary>
+    /// <paramref name="data"/>, laid out as <paramref name="template"/> is, with the template's type at
+    /// every node. Concatenation keeps the tree's shape, so the two match node for node.
+    /// </summary>
+    private static ArrayData Relabel(ArrayData data, ArrayData template)
+    {
+        ArrayData[]? children = null;
+        if (data.Children is not null)
+        {
+            children = new ArrayData[data.Children.Length];
+            for (int i = 0; i < children.Length; i++)
+                children[i] = Relabel(data.Children[i], template.Children![i]);
+        }
+
+        return new ArrayData(
+            template.DataType, data.Length, data.NullCount, data.Offset, data.Buffers, children, data.Dictionary);
+    }
+
+    /// <summary>
     /// Places <paramref name="values"/> — one per entry of <paramref name="targetRows"/>, in order — into an
     /// array of <paramref name="length"/> rows, leaving every row no entry names NULL. The inverse of
     /// <see cref="Take(IArrowArray, ReadOnlySpan{int})"/>: <c>Scatter(Take(a, rows), rows, a.Length)</c> is

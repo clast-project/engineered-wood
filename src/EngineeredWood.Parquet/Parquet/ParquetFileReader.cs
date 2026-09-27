@@ -1264,21 +1264,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         }
 
         /// <summary>
-        /// Copies <paramref name="pieces"/> into one array with buffers of its own. Arrow's
-        /// concatenator does not do that for every type EW returns, so two are handled here:
-        /// <list type="bullet">
-        /// <item>an extension type (a GUID) it refuses, so its storage is concatenated and wrapped again;</item>
-        /// <item>a view type it concatenates by pointing at the inputs' data buffers without holding
-        /// them, which the runs' disposal would free, so the values are copied one by one.</item>
-        /// </list>
+        /// Copies <paramref name="pieces"/> into one array with buffers of its own. That is
+        /// <see cref="EngineeredWood.Arrow.ArrowCompute.Concatenate"/>, except for a view type: its result points at the
+        /// inputs' data buffers without holding them (apache/arrow-dotnet#443), and the runs are
+        /// disposed right after, so view values are copied one by one.
         /// </summary>
         private static IArrowArray Concatenate(List<IArrowArray> pieces)
         {
             switch (pieces[0].Data.DataType)
             {
-                case ExtensionType extension:
-                    return extension.CreateArray(Concatenate(pieces.Select(p => ((ExtensionArray)p).Storage).ToList()));
-
                 case Apache.Arrow.Types.StringViewType:
                 {
                     var builder = new StringViewArray.Builder();
@@ -1314,7 +1308,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 }
 
                 default:
-                    return ArrowArrayConcatenator.Concatenate(pieces);
+                    return EngineeredWood.Arrow.ArrowCompute.Concatenate(pieces);
             }
         }
     }

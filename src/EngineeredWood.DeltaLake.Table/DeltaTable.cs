@@ -7426,7 +7426,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     columns[c] = src.Column(c); // not a SET column — unchanged
                     continue;
                 }
-                var combined = ArrowArrayConcatenator.Concatenate(new[] { src.Column(c), setCol.Values });
+                var combined = ArrowCompute.Concatenate([src.Column(c), setCol.Values]);
                 columns[c] = ArrowCompute.Take(combined, take);
             }
             result.Add(new RecordBatch(src.Schema, columns, src.Length));

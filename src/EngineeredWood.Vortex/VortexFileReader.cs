@@ -326,7 +326,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     /// Apache Arrow array, materialising every chunk that backs the
     /// column. For multi-chunk columns each chunk is read in order and
     /// the results are concatenated via
-    /// <see cref="Apache.Arrow.ArrowArrayConcatenator"/>.
+    /// <see cref="EngineeredWood.Arrow.ArrowCompute.Concatenate"/>.
     ///
     /// <para>Use this when you only need one column from a multi-column
     /// file — it avoids the per-batch cost of decoding every column on
@@ -353,7 +353,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
         var pieces = new Apache.Arrow.IArrowArray[plan.ChunkCount];
         for (int i = 0; i < plan.ChunkCount; i++)
             pieces[i] = await ReadPlanChunkAsync(plan, i, cancellationToken).ConfigureAwait(false);
-        return Apache.Arrow.ArrowArrayConcatenator.Concatenate(pieces);
+        return EngineeredWood.Arrow.ArrowCompute.Concatenate(pieces);
     }
 
     /// <summary>
