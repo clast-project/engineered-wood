@@ -112,7 +112,7 @@ internal static class PlainDecoder
         // Lengths array avoids re-reading each 4-byte header in a second pass.
         // Cap stack buffer at 256 ints (1 KB); rent from the pool for larger batches.
         int[]? rentedLengths = null;
-        Span<int> lengths = count <= 256
+        Span<int> lengths = (uint)count <= 256
             ? stackalloc int[count]
             : (rentedLengths = ArrayPool<int>.Shared.Rent(count)).AsSpan(0, count);
         try

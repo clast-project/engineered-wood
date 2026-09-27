@@ -35,6 +35,14 @@ internal readonly ref struct Page
     /// <summary>Whether this is a V1 or V2 data page.</summary>
     public bool IsDataPage => Header.Type is PageType.DataPage or PageType.DataPageV2;
 
+    /// <summary>The values, nulls included, that a data page holds; 0 for any other page.</summary>
+    public int NumValues => Header.Type switch
+    {
+        PageType.DataPage => Header.DataPageHeader!.NumValues,
+        PageType.DataPageV2 => Header.DataPageHeaderV2!.NumValues,
+        _ => 0,
+    };
+
     public Page(PageHeader header, ReadOnlySpan<byte> payload, int offset, int headerSize, int ordinal)
     {
         Header = header;
@@ -87,7 +95,8 @@ internal ref struct PageReader
     /// </summary>
     /// <returns>False when no bytes remain.</returns>
     /// <exception cref="ParquetFormatException">
-    /// The header does not decode, or declares more data than the walked bytes hold.
+    /// The header does not decode, declares more data than the walked bytes hold, or holds a count
+    /// or size no page can have (<see cref="Validate"/>).
     /// </exception>
     public bool TryRead(out Page page)
     {
@@ -120,10 +129,78 @@ internal ref struct PageReader
                 "The column data may be truncated.");
         }
 
+        if (Validate(header) is { } problem)
+        {
+            throw new ParquetFormatException(
+                $"Column '{_column.DottedPath}': the {header.Type} at byte offset {_position} is malformed: {problem}");
+        }
+
         int ordinal = header.Type is PageType.DataPage or PageType.DataPageV2 ? _nextOrdinal++ : -1;
         page = new Page(
             header, _data.Slice(payloadOffset, header.CompressedPageSize), _position, headerSize, ordinal);
         _position = payloadOffset + header.CompressedPageSize;
         return true;
+    }
+
+    /// <summary>
+    /// Checks the counts and sizes a page's decoder trusts. A header that decodes as Thrift can
+    /// still hold values no page can have, and the decoders size buffers and slices from them: a
+    /// negative value count reached a <c>stackalloc</c> and overflowed the stack, which no caller
+    /// can catch. Only what the header alone can prove is checked here; that the data agrees
+    /// with it is the decoders' business.
+    /// </summary>
+    /// <returns>What is wrong, or null.</returns>
+    private static string? Validate(PageHeader header)
+    {
+        if (header.UncompressedPageSize < 0)
+            return $"its uncompressed size is {header.UncompressedPageSize}.";
+
+        switch (header.Type)
+        {
+            case PageType.DataPage:
+                if (header.DataPageHeader is not { } v1)
+                    return "it has no data_page_header.";
+                if (v1.NumValues < 0)
+                    return $"it holds {v1.NumValues} values.";
+                break;
+
+            case PageType.DataPageV2:
+                if (header.DataPageHeaderV2 is not { } v2)
+                    return "it has no data_page_header_v2.";
+                if (v2.NumValues < 0)
+                    return $"it holds {v2.NumValues} values.";
+                if (v2.NumNulls < 0 || v2.NumNulls > v2.NumValues)
+                    return $"it holds {v2.NumNulls} nulls among {v2.NumValues} values.";
+                // Every row contributes at least one level, so at least one value slot.
+                if (v2.NumRows < 0 || v2.NumRows > v2.NumValues)
+                    return $"it holds {v2.NumRows} rows in {v2.NumValues} values.";
+                if (v2.RepetitionLevelsByteLength < 0 || v2.DefinitionLevelsByteLength < 0)
+                {
+                    return $"its level lengths are {v2.RepetitionLevelsByteLength} (repetition) and " +
+                        $"{v2.DefinitionLevelsByteLength} (definition) bytes.";
+                }
+                // The levels are stored uncompressed ahead of the values, so both sizes include them.
+                long levels = (long)v2.RepetitionLevelsByteLength + v2.DefinitionLevelsByteLength;
+                if (levels > header.CompressedPageSize || levels > header.UncompressedPageSize)
+                {
+                    return $"its levels take {levels} bytes, more than its size ({header.CompressedPageSize} " +
+                        $"compressed, {header.UncompressedPageSize} uncompressed).";
+                }
+                break;
+
+            case PageType.DictionaryPage:
+                if (header.DictionaryPageHeader is not { } dictionary)
+                    return "it has no dictionary_page_header.";
+                if (dictionary.NumValues < 0)
+                    return $"it holds {dictionary.NumValues} entries.";
+                break;
+
+            case PageType.SymbolTablePage:
+                if (header.SymbolTablePageHeader is null)
+                    return "it has no symbol_table_page_header.";
+                break;
+        }
+
+        return null;
     }
 }
