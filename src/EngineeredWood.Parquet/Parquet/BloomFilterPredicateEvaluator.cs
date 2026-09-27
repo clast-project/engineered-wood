@@ -40,9 +40,10 @@ internal static class BloomFilterPredicateEvaluator
         SchemaDescriptor schema,
         IRandomAccessFile file,
         long fileLength,
+        ColumnChunkFilePathKind filePath,
         CancellationToken ct)
     {
-        var ctx = new Context(rowGroupIndex, metadata, schema, file, fileLength);
+        var ctx = new Context(rowGroupIndex, metadata, schema, file, fileLength, filePath);
         return await EvaluateAsync(predicate, ctx, ct).ConfigureAwait(false);
     }
 
@@ -143,8 +144,13 @@ internal static class BloomFilterPredicateEvaluator
         if (!ctx.TryFindColumn(column, out int columnIndex, out var descriptor))
             return FilterResult.Unknown;
 
-        var colMeta = ctx.Metadata.RowGroups[ctx.RowGroupIndex]
-            .Columns[columnIndex].MetaData;
+        var chunk = ctx.Metadata.RowGroups[ctx.RowGroupIndex].Columns[columnIndex];
+        // A chunk stored in another file has its filter there too (#405); reading this file at that
+        // offset could rule the row group out, so it would never reach the read that refuses it.
+        if (chunk.FilePath is not null && ctx.FilePath == ColumnChunkFilePathKind.Refuse)
+            return FilterResult.Unknown;
+
+        var colMeta = chunk.MetaData;
         if (colMeta?.BloomFilterOffset is not long offset || offset <= 0)
             return FilterResult.Unknown;
 
@@ -354,13 +360,14 @@ internal static class BloomFilterPredicateEvaluator
     private sealed class Context
     {
         public Context(int rgIndex, FileMetaData metadata, SchemaDescriptor schema,
-            IRandomAccessFile file, long fileLength)
+            IRandomAccessFile file, long fileLength, ColumnChunkFilePathKind filePath)
         {
             RowGroupIndex = rgIndex;
             Metadata = metadata;
             Schema = schema;
             File = file;
             FileLength = fileLength;
+            FilePath = filePath;
         }
 
         public int RowGroupIndex { get; }
@@ -368,6 +375,7 @@ internal static class BloomFilterPredicateEvaluator
         public SchemaDescriptor Schema { get; }
         public IRandomAccessFile File { get; }
         public long FileLength { get; }
+        public ColumnChunkFilePathKind FilePath { get; }
 
         public bool TryFindColumn(string name, out int index, out ColumnDescriptor? descriptor)
         {

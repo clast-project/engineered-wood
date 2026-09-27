@@ -33,11 +33,21 @@ For the forward-looking encryption design, see
 encrypted Parquet files is implemented. The encrypted fixtures are never
 opened by the test sweeps (they do not match the `*.parquet` glob). See [`encryption-design.md`](encryption-design.md).
 
-**Column Index / Offset Index.** Not parsed on read and not produced on
-write. Pushdown granularity is the row group; files we write do not carry
-page indexes. Planned in [`parquet-page-index.md`](parquet-page-index.md);
-writing is blocked on [#389](https://github.com/clast-project/engineered-wood/issues/389)
-(rows of repeated columns are split across pages).
+**Page-level pruning with the Column Index / Offset Index.** Both are written
+by default (#402), and `ParquetFileReader.ReadPageIndexAsync` reads them (#404).
+The batched read builds its page map from the OffsetIndex (#409). Filtering
+still prunes whole row groups, not pages: phases 6-7 of
+[`parquet-page-index.md`](parquet-page-index.md) are waiting on #55.
+
+**Column chunks stored in another file (`file_path`).** A chunk's
+`file_path` says its pages are in another file, as in the `_metadata`
+summary files Hive, Spark and pyarrow write. EngineeredWood does not open other
+files, so it does not follow the path. By default such a chunk is refused with a
+`NotSupportedException` wherever its offsets would be read: data, page index,
+Bloom filter. The footer and every other column stay readable.
+`ParquetReadOptions.ColumnChunkFilePath = Ignore` reads the chunk from the file
+at hand instead, as pyarrow, arrow-rs and Spark do. That is right only when the
+data really is local (#405).
 
 *If page indexes are ever added:* bounds for the extended-precision
 timestamp carrier must never be truncated. Truncation assumes

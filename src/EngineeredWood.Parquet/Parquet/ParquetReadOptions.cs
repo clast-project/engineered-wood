@@ -160,6 +160,37 @@ public enum ExtendedTimestampOutputKind
 }
 
 /// <summary>
+/// What to do with a column chunk whose <c>file_path</c> says it is stored in another file.
+/// </summary>
+/// <remarks>
+/// <para>A chunk's <c>file_path</c> names the file its pages are in, and its offsets are offsets into
+/// that file. Parquet's own summary files (<c>_metadata</c>, written by Hive, Spark and pyarrow's
+/// <c>write_metadata</c>) set it on every chunk: they hold only a footer, indexing the data files
+/// beside them. Reading such a chunk from the file at hand reads unrelated bytes, which is a decode
+/// error at best and wrong values at worst. EngineeredWood does not open other files, so it cannot
+/// follow the path.</para>
+/// <para>Readers differ. DuckDB refuses these files. pyarrow, arrow-rs (DataFusion) and Spark ignore the
+/// field and read their own bytes, which is right only for a file whose data really is local. None of
+/// the 245 files in the parquet-testing corpus sets the field.</para>
+/// </remarks>
+public enum ColumnChunkFilePathKind
+{
+    /// <summary>
+    /// Default: refuse to read a chunk that has a <c>file_path</c>, empty or not, with a
+    /// <see cref="NotSupportedException"/>. The footer can still be read, and so can every chunk
+    /// without one. A Bloom filter that such a chunk points to is not used for pruning either,
+    /// so it cannot rule out a row group whose data would have been refused.
+    /// </summary>
+    Refuse,
+
+    /// <summary>
+    /// Ignore <c>file_path</c> and read the chunk from this file at its offsets, as pyarrow, arrow-rs
+    /// and Spark do. Use this only for files known to hold their own data despite the field.
+    /// </summary>
+    Ignore,
+}
+
+/// <summary>
 /// Options that control how Parquet data is read and mapped to Apache Arrow types.
 /// </summary>
 /// <remarks>
@@ -253,6 +284,12 @@ public sealed record ParquetReadOptions
     /// <see cref="ParquetFormatException"/>. Default is <see langword="false"/>.
     /// </summary>
     public bool PageChecksumValidation { get; init; }
+
+    /// <summary>
+    /// What to do with a column chunk whose <c>file_path</c> says it is stored in another file.
+    /// Defaults to <see cref="ColumnChunkFilePathKind.Refuse"/>.
+    /// </summary>
+    public ColumnChunkFilePathKind ColumnChunkFilePath { get; init; } = ColumnChunkFilePathKind.Refuse;
 
     /// <summary>
     /// When <see langword="true"/>, the reader probes the encoded definition and repetition level

@@ -221,7 +221,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 {
                     var bloomResult = await BloomFilterPredicateEvaluator.EvaluateAsync(
                         _options.Filter, i, metadata, schema!,
-                        _file, _fileLength, cancellationToken).ConfigureAwait(false);
+                        _file, _fileLength, _options.ColumnChunkFilePath, cancellationToken).ConfigureAwait(false);
                     if (bloomResult == EngineeredWood.Expressions.FilterResult.AlwaysFalse)
                         continue;
                 }
@@ -657,8 +657,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         {
             var chunk = ctx.Chunks[i];
 
-            // Offsets into another file (#405); and a map must not be built for a repeated column.
-            if (chunk.FilePath is not null || ctx.Columns[i].MaxRepetitionLevel > 0)
+            // A map must not be built for a repeated column. (A chunk stored elsewhere never gets
+            // here: PrepareRowGroupAsync refused it, unless the caller chose to ignore file_path.)
+            if (ctx.Columns[i].MaxRepetitionLevel > 0)
                 continue;
             if (chunk.OffsetIndexOffset is not { } offset || chunk.OffsetIndexLength is not { } length
                 || offset < 0 || length <= 0 || offset > _fileLength - length)
@@ -873,6 +874,29 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Whether <paramref name="chunk"/> is to be treated as stored in another file: it has a
+    /// <c>file_path</c> (empty or not) and the caller has not chosen to ignore it.
+    /// </summary>
+    private bool IsStoredElsewhere(ColumnChunk chunk) =>
+        chunk.FilePath is not null && _options.ColumnChunkFilePath == ColumnChunkFilePathKind.Refuse;
+
+    /// <summary>
+    /// Refuses a chunk stored in another file (#405). Its offsets are into that file, so reading
+    /// them from this one returns unrelated bytes.
+    /// </summary>
+    private void ThrowIfStoredElsewhere(ColumnChunk chunk, ColumnDescriptor column)
+    {
+        if (!IsStoredElsewhere(chunk))
+            return;
+
+        throw new NotSupportedException(
+            $"Column '{column.DottedPath}' is stored in another file ('{chunk.FilePath}'), which this reader does not " +
+            "open; this file may be a summary (_metadata) file. If the data is in fact in this file, set " +
+            $"{nameof(ParquetReadOptions)}.{nameof(ParquetReadOptions.ColumnChunkFilePath)} to " +
+            $"{nameof(ColumnChunkFilePathKind)}.{nameof(ColumnChunkFilePathKind.Ignore)}.");
+    }
+
+    /// <summary>
     /// Reads and decodes columns in parallel with bounded concurrency.
     /// Each iteration reads its I/O buffer, decodes, and releases the buffer immediately.
     /// </summary>
@@ -955,6 +979,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         for (int i = 0; i < selectedChunks.Count; i++)
         {
+            ThrowIfStoredElsewhere(selectedChunks[i], selectedColumns[i]);
+
             var colMeta = selectedChunks[i].MetaData
                 ?? throw new ParquetFormatException(
                     $"Column chunk {i} has no inline metadata.");
@@ -1549,6 +1575,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         for (int rg = 0; rg < numRowGroups; rg++)
         {
             var colMeta = metadata.RowGroups[rg].Columns[columnIndex].MetaData;
+            if (IsStoredElsewhere(metadata.RowGroups[rg].Columns[columnIndex]))
+                continue; // its filter is in the other file: stay a candidate, and let the read refuse
             if (colMeta?.BloomFilterOffset is long offset and > 0)
             {
                 rangeIndices.Add(rg);
@@ -1653,13 +1681,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             var chunk = chunks[entry];
             leaves[entry] = IndexOf(schema.Columns, descriptors[entry]);
 
-            // The offsets would be into that other file; reading them from this one returns unrelated bytes.
-            if (chunk.FilePath is not null)
-            {
-                throw new NotSupportedException(
-                    $"Column '{descriptors[entry].DottedPath}' is stored in another file ('{chunk.FilePath}'); " +
-                    "reading column chunks from external files is not supported.");
-            }
+            ThrowIfStoredElsewhere(chunk, descriptors[entry]);
 
             if (PageIndexRange(chunk.ColumnIndexOffset, chunk.ColumnIndexLength, "ColumnIndex", descriptors[entry]) is { } ci)
             {
