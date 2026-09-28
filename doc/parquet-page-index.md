@@ -387,6 +387,37 @@ and the caller still post-filters.
   - the 26 fixtures with random predicates on their indexed columns;
   - a pages-actually-skipped assertion, via a read counter on a test `IRandomAccessFile`.
 
+**Done, off by default**, as `ParquetFileReader.ReadRowRangesAsync(rowGroup, ranges, columns)` and
+`ParquetReadOptions.FilterUsePageIndex`, under which a filtered `ReadAllAsync` narrows each kept
+row group with `GetCandidateRowRangesAsync` and reads only those rows. A row group whose pages rule
+everything out is skipped.
+
+- **One loop, not two.** `ReadRowGroupBatchesAsync`'s flat batched loop now walks a list of
+  row ranges, the whole row group being one. Each column's `DecodedRows` cursor can skip to a
+  row, dropping the rows in the gap. A batch that begins past the decoded rows starts at its own
+  page, via the OffsetIndex, and leaves the pages between unread. Decoded pages that do not
+  continue the held rows replace them with a skip. So an ordinary read behaves as before, and
+  the existing batched-read tests guard the refactor.
+- **Batches never cross a gap.** A range longer than `BatchSize` or `MaxBatchByteSize` allows is
+  split as a row group is. So counting rows across the ranges in order locates each batch in the
+  file, which the Delta scan needs for deletion vectors and row ids. Wiring Delta onto it is a
+  follow-up.
+- **What is not narrowed yet.** A column without a usable OffsetIndex scans its headers and reads
+  whole, and every column of a row group with a nested column is decoded whole and sliced. The rows
+  are the same; only the saving is lost. Trimming repeated columns by `rep = 0` remains R-4 work.
+- **Found on the way: #431.** The nested path's slices took no reference on the decoded buffers,
+  so a caller that disposed one batch freed the next. That affects any batched read of a nested
+  row group, so it was fixed on its own first (#432).
+
+Oracles: the rows a range read returns equal a full read's rows at those positions, value for
+value (`ArrowValues` renders any Arrow value). This holds across page versions, dictionary on and
+off, row and byte batch limits, single rows, page-aligned and page-crossing ranges, many small
+ranges, no page index, nested columns, and every fixture with a page index. No batch may cross a
+range. A one-page read fetches about 6% of a whole row group's bytes. Deliberately introduced
+cursor bugs are caught: a no-op skip fails 30 tests, never jumping to the batch's page fails 2
+(the byte counts), and always appending fails 44. Whether to turn the option on by default is
+for measurement, as for the page index itself.
+
 ### R-4. Later
 
 - ~~`nan_counts`-driven `IsNaN` / `IsNotNaN` page pruning (the row-group logic exists in

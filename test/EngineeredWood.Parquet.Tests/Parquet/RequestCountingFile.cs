@@ -14,12 +14,18 @@ internal sealed class RequestCountingFile(IRandomAccessFile inner) : IRandomAcce
 {
     public List<int> Requests { get; } = new();
 
+    /// <summary>The bytes all requests asked for.</summary>
+    public long Bytes => Interlocked.Read(ref _bytes);
+
+    private long _bytes;
+
     public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default) =>
         inner.GetLengthAsync(cancellationToken);
 
     public ValueTask<IMemoryOwner<byte>> ReadAsync(FileRange range, CancellationToken cancellationToken = default)
     {
         lock (Requests) Requests.Add(1);
+        Interlocked.Add(ref _bytes, range.Length);
         return inner.ReadAsync(range, cancellationToken);
     }
 
@@ -27,6 +33,8 @@ internal sealed class RequestCountingFile(IRandomAccessFile inner) : IRandomAcce
         IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
     {
         lock (Requests) Requests.Add(ranges.Count);
+        foreach (var range in ranges)
+            Interlocked.Add(ref _bytes, range.Length);
         return inner.ReadRangesAsync(ranges, cancellationToken);
     }
 

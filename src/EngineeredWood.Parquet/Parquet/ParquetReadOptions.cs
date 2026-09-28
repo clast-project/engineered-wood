@@ -297,6 +297,25 @@ public sealed record ParquetReadOptions
     public bool FilterUseBloomFilters { get; init; }
 
     /// <summary>
+    /// When <see langword="true"/>, <see cref="ParquetFileReader.ReadAllAsync"/> under a
+    /// <see cref="Filter"/> also prunes within each row group it keeps: it reads the page index of the
+    /// columns the filter names, and decodes only the rows whose pages might match, as
+    /// <see cref="ParquetFileReader.GetCandidateRowRangesAsync"/> selects them and
+    /// <see cref="ParquetFileReader.ReadRowRangesAsync"/> reads them.
+    /// </summary>
+    /// <remarks>
+    /// <para>The result is still a superset: the rows of a page that might match are all returned. A
+    /// batch never spans rows the index ruled out, so a row group can come back as more, shorter
+    /// batches, and the rows between them leave no trace. As with <see cref="Filter"/> itself, a
+    /// layer that counts rows to know their positions in the file should call the two methods above
+    /// instead.</para>
+    /// <para>It costs one more request per row group kept, for the index, and saves the pages it rules
+    /// out. Columns without a usable index are read whole and cut to the same rows, and so are the
+    /// columns of a row group with any nested column. Default: <see langword="false"/>.</para>
+    /// </remarks>
+    public bool FilterUsePageIndex { get; init; }
+
+    /// <summary>
     /// When <see langword="true"/>, row-group pruning (by <see cref="Filter"/>, or by
     /// <see cref="ParquetFileReader.GetCandidateRowGroupsAsync(Predicate, System.Threading.CancellationToken)"/>)
     /// also reads the dictionary page of each column an equality or IN predicate names, when the
