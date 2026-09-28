@@ -423,11 +423,44 @@ public class PageIndexPruningTests : IDisposable
         var index = await reader.ReadPageIndexAsync(0, ["x"]);
         var columnIndex = index[0].ColumnIndex!;
 
-        byte[] lowered = BitConverter.GetBytes(240);
-        var tampered = new TamperedIndex(index[0], columnIndex, page: 2, max: lowered);
-        var ranges = PageIndexPruner.SelectRows(Ex.Equal("x", LiteralValue.Of(250)), metadata.RowGroups[0], schema, [tampered.Index]);
+        var maxValues = columnIndex.MaxValues.ToArray();
+        maxValues[2] = BitConverter.GetBytes(240);
+        var tampered = Tamper(index[0], ci => FooterRewrite.With(ci, nameof(ColumnIndex.MaxValues), maxValues));
+        var ranges = PageIndexPruner.SelectRows(Ex.Equal("x", LiteralValue.Of(250)), metadata.RowGroups[0], schema, [tampered]);
 
         Assert.Empty(ranges);
+    }
+
+    /// <summary>
+    /// A NaN count that cannot be true discredits the whole index, as an impossible null count does:
+    /// the rows come back whole rather than narrowed by bounds from the same index. Rows 0-49 and the
+    /// page [200, 300) are null; without tampering, <c>d = 350</c> keeps only [300, 400).
+    /// </summary>
+    [Theory]
+    [InlineData(1, 101)] // more NaNs than the page's 100 rows
+    [InlineData(0, 60)]  // 50 nulls and 60 NaNs in 100 rows
+    [InlineData(2, 1)]   // a NaN in a null page
+    public async Task ImpossibleNanCounts_TheIndexIsIgnored(int page, long nans)
+    {
+        var values = new DoubleArray.Builder();
+        for (int i = 0; i < 400; i++)
+        {
+            if (i < 50 || i is >= 200 and < 300) values.AppendNull(); else values.Append(i);
+        }
+
+        string path = await WriteAsync(Batch("d", values.Build(), nullable: true), RowCapped(100) with { DictionaryEnabled = false });
+        using var reader = Open(path);
+        var metadata = await reader.ReadMetadataAsync();
+        var schema = new EngineeredWood.Parquet.Schema.SchemaDescriptor(metadata.Schema);
+        var index = (await reader.ReadPageIndexAsync(0, ["d"]))[0];
+        var filter = Ex.Equal("d", LiteralValue.Of(350.0));
+        Assert.Equal([new RowRange(300, 400)], PageIndexPruner.SelectRows(filter, metadata.RowGroups[0], schema, [index]));
+
+        var nanCounts = index.ColumnIndex!.NanCounts!.ToArray();
+        nanCounts[page] = nans;
+        var tampered = Tamper(index, ci => FooterRewrite.With(ci, nameof(ColumnIndex.NanCounts), nanCounts));
+
+        Assert.Equal([new RowRange(0, 400)], PageIndexPruner.SelectRows(filter, metadata.RowGroups[0], schema, [tampered]));
     }
 
     // ───── DataFusion ─────
@@ -599,27 +632,11 @@ public class PageIndexPruningTests : IDisposable
         _ => null,
     };
 
-    /// <summary>A page index whose ColumnIndex has one page's maximum replaced.</summary>
-    private sealed class TamperedIndex
-    {
-        public TamperedIndex(ColumnChunkPageIndex original, ColumnIndex columnIndex, int page, byte[] max)
-        {
-            var maxValues = columnIndex.MaxValues.ToArray();
-            maxValues[page] = max;
-            var tampered = new ColumnIndex
-            {
-                NullPages = columnIndex.NullPages,
-                MinValues = columnIndex.MinValues,
-                MaxValues = maxValues,
-                BoundaryOrder = columnIndex.BoundaryOrder,
-                NullCounts = columnIndex.NullCounts,
-            };
-            Index = new ColumnChunkPageIndex(
-                original.Column, original.Path,
-                MetadataEncoder.EncodeColumnIndex(tampered),
-                MetadataEncoder.EncodeOffsetIndex(original.OffsetIndex!));
-        }
-
-        public ColumnChunkPageIndex Index { get; }
-    }
+    /// <summary>
+    /// A page index with its ColumnIndex edited, re-encoded so that it decodes as a file's would.
+    /// </summary>
+    private static ColumnChunkPageIndex Tamper(ColumnChunkPageIndex original, Func<ColumnIndex, ColumnIndex> edit) =>
+        new(original.Column, original.Path,
+            MetadataEncoder.EncodeColumnIndex(edit(original.ColumnIndex!)),
+            MetadataEncoder.EncodeOffsetIndex(original.OffsetIndex!));
 }

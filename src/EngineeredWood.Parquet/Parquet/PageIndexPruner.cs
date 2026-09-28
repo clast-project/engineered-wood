@@ -122,8 +122,8 @@ internal static class PageIndexPruner
     /// <summary>
     /// Whether a column's page index can be trusted to describe the row group: both indexes decode,
     /// the pages start at row 0 and ascend strictly within the row group, every per-page list of the
-    /// ColumnIndex has one entry per page, and no count is impossible (negative, more nulls than rows,
-    /// a null page in a required column or with fewer nulls than rows).
+    /// ColumnIndex has one entry per page, and no count is impossible (negative, more nulls and NaNs
+    /// together than rows, a null page in a required column, with fewer nulls than rows, or with a NaN).
     /// </summary>
     private static bool Usable(
         ColumnChunkPageIndex index, bool required, long rows, out OffsetIndex? offsetIndex, out ColumnIndex? columnIndex)
@@ -165,14 +165,18 @@ internal static class PageIndexPruner
 
         // Counts that cannot be true. parquet-mr 1.13 wrote the datapage_v1-*-checksum fixtures with
         // every page marked null, null counts of -1 and empty bounds, for required columns full of
-        // values: a placeholder index, trusted, drops every row of `a IS NOT NULL`.
+        // values: a placeholder index, trusted, drops every row of `a IS NOT NULL`. An impossible NaN
+        // count could only keep rows, but it says the same thing about the index as an impossible null
+        // count does, and the index's bounds are what drop them. In a flat column each row is one
+        // value, null or not, and a NaN is a non-null value, so a page's nulls and NaNs share its rows.
         for (int p = 0; p < count; p++)
         {
             long pageRows = (p + 1 < count ? pages[p + 1].FirstRowIndex : rows) - pages[p].FirstRowIndex;
             long? nulls = columnIndex.NullCounts?[p];
-            if (nulls is < 0 || nulls > pageRows || columnIndex.NanCounts?[p] is < 0)
+            long? nans = columnIndex.NanCounts?[p];
+            if (nulls is < 0 || nulls > pageRows || nans is < 0 || nans > pageRows || nulls + nans > pageRows)
                 return false;
-            if (columnIndex.NullPages[p] && (required || nulls is { } n && n != pageRows))
+            if (columnIndex.NullPages[p] && (required || nulls is { } n && n != pageRows || nans > 0))
                 return false;
         }
 

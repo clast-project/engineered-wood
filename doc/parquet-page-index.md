@@ -344,7 +344,9 @@ page bound decodes as a chunk bound does. Three details the outline above did no
   fail (NaN is the top of SQL's order), and `IsNaN` / `IsNotNaN` prune pages, an R-4 item.
 - **An index is checked before it is trusted, and ignored if it fails.** It must decode,
   tile the row group from row 0, and have one entry per page in every list. No count may be
-  impossible. parquet-mr 1.13 wrote the `datapage_v1-*-checksum` fixtures with every page
+  impossible: none negative, a page's nulls and NaNs together no more than its rows, and a
+  null page neither in a required column nor with a NaN. An impossible NaN count could only keep
+  rows, but it discredits the index's bounds, which drop them. parquet-mr 1.13 wrote the `datapage_v1-*-checksum` fixtures with every page
   marked null, null counts of −1 and empty bounds, for required columns full of values.
   Trusted, that index drops every row of `a IS NOT NULL`. DataFusion answers those correctly.
 
