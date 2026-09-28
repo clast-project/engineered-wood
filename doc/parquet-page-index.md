@@ -430,7 +430,7 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    |---|---|---|---|---|
    | arrow-rs | 50 / 49 / 49 | 2.0%, 10.5% | 2.0%, 11.3% | 88% / 86% |
    | pyarrow | 51 / 50 / 50 | 2.0%, 10.9% | 2.0%, 11.2% | 87% / 86% |
-   | **EW** | **8 / 2 / 1** | 13.1%, 19.4% | 52.4%, 56.3% | 77% / 49% |
+   | **EW, no page row cap** (the default before #429) | **8 / 2 / 1** | 13.1%, 19.4% | 52.4%, 56.3% | 77% / 49% |
 
    - **The win is large where it applies.** Today EW reads the surviving 1M-row group whole:
      21 ms for an EW file and 36 ms for the others, locally. For a point or 0.1% range on a
@@ -441,13 +441,13 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
      `note` payload's pages drive most of those bytes, since they do not align with `id`'s.
    - **Unclustered predicates prune nothing**, as expected. What they pay is the index read, one
      request per surviving row group.
-   - **EW's own files halve the benefit.** `EstimateValuesPerPage` cuts a page at
+   - **EW's own files halved the benefit**, until the row cap below. `EstimateValuesPerPage` cuts a page at
      `DataPageSize` ÷ *plain* value width, so at the default 1 MiB an int64 page holds 131,072
      rows. A dictionary page is cut at `DataPageSize` ÷ index bytes, so a dictionary column with
      ≤ 256 distinct values is **one page per row group** and can never prune. parquet-mr and
      pyarrow 25's parquet-cpp cap a page at 20,000 rows; arrow-rs checks the same limit only
-     between 1,024-row write batches, so its pages hold 20,480. Spark-written Delta tables therefore get the full effect;
-     EW-written ones do not. That includes DataFusion reading EW's files, which saves 49% on
+     between 1,024-row write batches, so its pages hold 20,480. Spark-written Delta tables therefore got the full effect;
+     EW-written ones did not. That included DataFusion reading EW's files, which saved 49% on
      `user` where it saves 86% on the others. The cap is a writer change that phases 0–4
      should have had.
    - The kept-rows proxy is re-encoded by EW, which decodes faster than the other two writers'
@@ -458,16 +458,17 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    off then flipped after measuring file size and write time, as phase 4 did; (b) R-2 as
    selected row ranges, testable on its own; (c) R-3.
 
-   **(a) landed, off by default.** `ParquetWriteOptions.DataPageRowCountLimit` caps rows per data
+   **(a) landed off by default in #428, and became the default in #429 (below).**
+   `ParquetWriteOptions.DataPageRowCountLimit` caps rows per data
    page in both page loops of `ColumnChunkWriter`, which both writers share. A repeated leaf is
    cut where the first record past the limit begins. EW's cut is exact, so with the cap every
    column of a row group starts a page at the same rows. That makes EW's own files prune better
    than the other writers', whose payload pages are cut by size first:
 
-   | `pageindex-worth`, EW with a 20,000-row cap | Pages (id / user / category) | id point: rows, bytes kept | user point: rows, bytes kept | DataFusion saving (id / user) |
+   | `pageindex-worth`, EW page row cap | Pages (id / user / category) | id point: rows, bytes kept | user point: rows, bytes kept | DataFusion saving (id / user) |
    |---|---|---|---|---|
-   | no cap (today's default) | 8 / 2 / 1 | 13.1%, 19.4% | 52.4%, 56.3% | 80% / 51% |
-   | 20,000 | 50 / 50 / 50 | 2.0%, 2.05% | 2.0%, 2.06% | 93% / 94% |
+   | none (the default before #429) | 8 / 2 / 1 | 13.1%, 19.4% | 52.4%, 56.3% | 80% / 51% |
+   | 20,000 (the default since #429) | 50 / 50 / 50 | 2.0%, 2.05% | 2.0%, 2.06% | 93% / 94% |
 
    Cost, from `-- rowcap-ab` (500k rows, the phase-4 workloads, medians of alternating rounds):
    files grow 0.1–0.3%, and write time does not change beyond noise. A full read does not change

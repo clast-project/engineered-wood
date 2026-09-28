@@ -32,7 +32,7 @@ internal static class RowCountLimitAb
         Directory.CreateDirectory(dir);
 
         Console.WriteLine(
-            $"{PageIndexWorkload.Rows:N0} rows, one row group, default options; limit {limit:N0} rows; " +
+            $"{PageIndexWorkload.Rows:N0} rows, one row group, default options with no limit vs a limit of {limit:N0} rows; " +
             $"median of {rounds} alternating rounds.");
         Console.WriteLine("| Schema | Pages off | on | Bytes off | on | Size | Write ms off | on | Write | Read ms off | on | Read |");
         Console.WriteLine("|---|---|---|---|---|---|---|---|---|---|---|---|");
@@ -41,7 +41,8 @@ internal static class RowCountLimitAb
             foreach (string schema in schemas)
             {
                 var batch = PageIndexWorkload.Build(schema);
-                var off = ParquetWriteOptions.Default;
+                // Both sides explicit: the limit defaults to 20,000 since #429, so Default is the capped side.
+                var off = ParquetWriteOptions.Default with { DataPageRowCountLimit = null };
                 var on = off with { DataPageRowCountLimit = limit };
                 string offPath = Path.Combine(dir, schema + "-off.parquet");
                 string onPath = Path.Combine(dir, schema + "-on.parquet");
