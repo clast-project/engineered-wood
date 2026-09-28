@@ -2065,7 +2065,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// The OffsetIndexes a read of <paramref name="projection"/> builds its page maps from: every
-    /// projected column's that a map can use (flat, and wholly inside the file). None when the projection
+    /// projected column's that a map can use (flat, in this file under <see cref="ParquetReadOptions.ColumnChunkFilePath"/>,
+    /// and wholly inside it). None when the projection
     /// has a nested column, since such a row group is decoded whole and builds no page maps. The narrowing
     /// and the read-ahead both ask this, so that the read-ahead holds exactly what the narrowing wants.
     /// </summary>
@@ -2078,7 +2079,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         foreach (var chunk in chunks)
         {
-            if (chunk.OffsetIndexOffset is { } offset && chunk.OffsetIndexLength is { } length
+            // A chunk stored in another file has offsets into that file (#405); under Refuse the read then
+            // refuses it, so its index is not this file's to read.
+            if (!IsStoredElsewhere(chunk)
+                && chunk.OffsetIndexOffset is { } offset && chunk.OffsetIndexLength is { } length
                 && offset >= 0 && length > 0 && offset <= _fileLength - length)
             {
                 yield return new FileRange(offset, length);

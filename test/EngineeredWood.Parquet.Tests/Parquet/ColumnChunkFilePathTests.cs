@@ -149,6 +149,44 @@ public class ColumnChunkFilePathTests : IDisposable
         Assert.Equal([new RowRange(0, Rows)], await RangesAsync(ColumnChunkFilePathKind.Refuse));
     }
 
+    /// <summary>
+    /// A filtered read with <see cref="ParquetReadOptions.FilterUsePageIndex"/> reads the OffsetIndexes of
+    /// the columns it projects ahead of their data. Under Refuse, b's is another file's, so it is not
+    /// read: the read refuses b as any read does, without first fetching bytes b's offsets point at.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(FilePaths))]
+    public async Task FilterUsePageIndex_UnderRefuse_DoesNotReadAStoredElsewhereIndex(string filePath)
+    {
+        string path = await WriteAsync(filePath);
+        long bIndex;
+        int bIndexLength;
+        await using (var probe = new LocalRandomAccessFile(path))
+        using (var reader = new ParquetFileReader(probe, ownsFile: false))
+        {
+            var b = (await reader.ReadMetadataAsync()).RowGroups[0].Columns[1];
+            bIndex = b.OffsetIndexOffset!.Value;
+            bIndexLength = b.OffsetIndexLength!.Value;
+        }
+
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using (var reader = new ParquetFileReader(counting, ownsFile: true, new ParquetReadOptions
+        {
+            Filter = Ex.Equal("a", LiteralValue.Of(500L)),
+            FilterUsePageIndex = true,
+        }))
+        {
+            await Assert.ThrowsAsync<NotSupportedException>(async () =>
+            {
+                await foreach (var batch in reader.ReadAllAsync())
+                    batch.Dispose();
+            });
+        }
+
+        Assert.DoesNotContain(counting.RequestRanges.SelectMany(r => r),
+            r => r.Offset < bIndex + bIndexLength && bIndex < r.Offset + r.Length);
+    }
+
     // ───── Helpers ─────
 
     /// <summary>
