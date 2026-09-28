@@ -418,6 +418,44 @@ cursor bugs are caught: a no-op skip fails 30 tests, never jumping to the batch'
 (the byte counts), and always appending fails 44. Whether to turn the option on by default is
 for measurement, as for the page index itself.
 
+**Measured, and three round trips cut.** `-- pageindex-read-ab` reads 4 row groups × 500k rows
+(default options, so 25 pages per column per row group) under five filters, alternating the option
+off and on. Latency and a transfer rate are charged per GET, through `CoalescingFileReader`.
+Latency alone makes the saved bytes free and understates the index. As R-3 first landed, the option
+cost three sequential requests per kept row group before any data:
+
+1. the predicate's ColumnIndexes;
+2. every projected column's OffsetIndex, for the page maps;
+3. the dictionary pages.
+
+So at 20 ms per request it lost everywhere but on slow links: at 400 MB/s, point lookups were 37%
+slower and unclustered filters 31% slower. Now:
+
+- **One index request per row group.** The ColumnIndex and OffsetIndex of each column the filter
+  prunes by, and the OffsetIndex of each column the read projects, come in one request. The
+  OffsetIndexes go on to the page maps.
+- **Dictionary pages come with the first data pages.** A page map built from an OffsetIndex waits
+  for its dictionary or symbol-table page (`ColumnPageMap.PendingPrefixLength`), and the first data
+  request for the column fetches it too. This applies to every batched read, not only filtered ones.
+  It happens only where the OffsetIndex and `DataPageOffset` agree on the first data page. Otherwise
+  the side pages are read first, as before, so an index they contradict can still be set aside
+  for a header scan.
+- **Indexes are read a window of row groups at a time.** That is up to 64 row groups or 8 MiB, and
+  only groups that statistics leave undecided. A filter the index cannot narrow then costs one
+  request per window, not per row group.
+
+| Filter (20 ms per request) | Local | 100 MB/s | 400 MB/s |
+|---|---|---|---|
+| id point | −93% | −55% | −8% |
+| id 1% | −89% | −47% | −11% |
+| id 10% | −51% | −34% | +5% |
+| category (unclustered) | +2% | +4% | +6% |
+| id 1% AND category | −88% | −44% | −7% |
+
+A selective filter now costs one request more than without the index, and one the index cannot
+narrow costs one more per window. Tests pin both counts, and that a dictionary page never travels
+alone. What remains at 400 MB/s is that one request, against the bytes it saves.
+
 ### R-4. Later
 
 - ~~`nan_counts`-driven `IsNaN` / `IsNotNaN` page pruning (the row-group logic exists in

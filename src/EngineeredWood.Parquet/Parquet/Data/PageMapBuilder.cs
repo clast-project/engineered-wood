@@ -36,10 +36,17 @@ internal readonly record struct PageMapEntry(
 internal sealed class ColumnPageMap
 {
     /// <summary>Decoded dictionary, or null if the column is not dictionary-encoded.</summary>
-    public DictionaryDecoder? Dictionary { get; }
+    public DictionaryDecoder? Dictionary { get; private set; }
 
     /// <summary>Decoded FSST symbol table, or null if the column is not FSST-encoded.</summary>
-    public FsstSymbolTable? SymbolTable { get; }
+    public FsstSymbolTable? SymbolTable { get; private set; }
+
+    /// <summary>
+    /// The length of the chunk's bytes before its first data page (its dictionary or symbol-table
+    /// page) when the map was built without reading them, so that they can be fetched with the first
+    /// data pages; zero once <see cref="CompleteSidePages"/> has them, or when there are none.
+    /// </summary>
+    public int PendingPrefixLength { get; private set; }
 
     /// <summary>Data pages in file order (dictionary page excluded).</summary>
     public PageMapEntry[] Pages { get; }
@@ -76,7 +83,8 @@ internal sealed class ColumnPageMap
         int[] cumulativeRows,
         int[] cumulativeValues,
         int totalRows,
-        bool headersResolved = true)
+        bool headersResolved = true,
+        int pendingPrefixLength = 0)
     {
         Dictionary = dictionary;
         SymbolTable = symbolTable;
@@ -85,6 +93,31 @@ internal sealed class ColumnPageMap
         CumulativeValues = cumulativeValues;
         TotalRows = totalRows;
         HeadersResolved = headersResolved;
+        PendingPrefixLength = pendingPrefixLength;
+    }
+
+    /// <summary>
+    /// Reads the side pages in <paramref name="prefix"/>, the <see cref="PendingPrefixLength"/> bytes
+    /// before the first data page, into <see cref="Dictionary"/> and <see cref="SymbolTable"/>.
+    /// </summary>
+    /// <exception cref="ParquetFormatException">
+    /// The bytes do not hold only side pages. The map was built on the OffsetIndex and the column
+    /// metadata agreeing where the first data page starts, so both are wrong.
+    /// </exception>
+    public void CompleteSidePages(ReadOnlySpan<byte> prefix, ColumnDescriptor column, ColumnMetaData columnMeta, bool validateCrc)
+    {
+        if (prefix.Length != PendingPrefixLength)
+            throw new ArgumentException($"Expected {PendingPrefixLength} bytes, got {prefix.Length}.", nameof(prefix));
+        if (!PageMapBuilder.TryReadSidePages(prefix, column, columnMeta, validateCrc, out var dictionary, out var symbolTable))
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}': the bytes before the first data page, where its OffsetIndex and " +
+                "its metadata both put it, are not only a dictionary or symbol-table page.");
+        }
+
+        Dictionary = dictionary;
+        SymbolTable = symbolTable;
+        PendingPrefixLength = 0;
     }
 
     /// <summary>
@@ -233,50 +266,36 @@ internal static class PageMapBuilder
         if (column.MaxRepetitionLevel > 0)
             throw new ArgumentException($"Column '{column.DottedPath}' is repeated.", nameof(column));
 
-        var locations = index.PageLocations;
-        if (!Tiles(locations, chunkStart + prefix.Length, chunkEnd, rowCount))
+        var layout = BuildLayoutFromOffsetIndex(prefix.Length, chunkStart, chunkEnd, index, rowCount, column, columnMeta);
+        if (layout is null || !TryReadSidePages(prefix, column, columnMeta, validateCrc, out var dictionary, out var symbolTable))
             return null;
 
-        DictionaryDecoder? dictionary = null;
-        FsstSymbolTable? symbolTable = null;
-        var reader = new PageReader(prefix, column);
-        while (true)
-        {
-            // The prefix ends where the index puts the first data page. If that is wrong, it can end
-            // inside a header or a page, which then fails to read: the index is wrong, not the file.
-            // A side page that reads but whose data is corrupt still throws below, as the scan would.
-            Page page;
-            try
-            {
-                if (!reader.TryRead(out page))
-                    break;
-            }
-            catch (ParquetFormatException)
-            {
-                return null;
-            }
+        return new ColumnPageMap(
+            dictionary, symbolTable, layout.Pages, layout.CumulativeRows, layout.CumulativeValues, layout.TotalRows,
+            headersResolved: false);
+    }
 
-            var pageHeader = page.Header;
-            var pageData = page.Payload;
+    /// <summary>
+    /// <see cref="BuildFromOffsetIndex"/> without the side pages: the map's layout, from the OffsetIndex
+    /// and the length of the bytes before the first data page alone. Its <see cref="ColumnPageMap.Dictionary"/>
+    /// and <see cref="ColumnPageMap.SymbolTable"/> are unset, for <see cref="ColumnPageMap.CompleteSidePages"/>
+    /// to fill once those bytes are read. Null when the index cannot describe the chunk.
+    /// </summary>
+    public static ColumnPageMap? BuildLayoutFromOffsetIndex(
+        int prefixLength,
+        long chunkStart,
+        long chunkEnd,
+        OffsetIndex index,
+        int rowCount,
+        ColumnDescriptor column,
+        ColumnMetaData columnMeta)
+    {
+        if (column.MaxRepetitionLevel > 0)
+            throw new ArgumentException($"Column '{column.DottedPath}' is repeated.", nameof(column));
 
-            switch (pageHeader.Type)
-            {
-                case PageType.DictionaryPage:
-                    if (validateCrc)
-                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                    dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
-                    break;
-                case PageType.SymbolTablePage:
-                    if (validateCrc)
-                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                    symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
-                    break;
-                case PageType.DataPage:
-                case PageType.DataPageV2:
-                    // A data page the index does not list, whose rows the map would lose.
-                    return null;
-            }
-        }
+        var locations = index.PageLocations;
+        if (!Tiles(locations, chunkStart + prefixLength, chunkEnd, rowCount))
+            return null;
 
         // Only ComputeBatchRowCount's byte budget reads UncompressedSize, and that budget is
         // documented as approximate. Scale by the chunk's own ratio: both totals count page headers,
@@ -314,8 +333,61 @@ internal static class PageMapBuilder
         cumulativeRows[pages.Length] = rowCount;
 
         return new ColumnPageMap(
-            dictionary, symbolTable, pages, cumulativeRows, cumulativeRows, rowCount,
-            headersResolved: false);
+            null, null, pages, cumulativeRows, cumulativeRows, rowCount,
+            headersResolved: false, pendingPrefixLength: prefixLength);
+    }
+
+    /// <summary>
+    /// Reads the dictionary and FSST symbol-table pages in <paramref name="prefix"/>, the bytes before a
+    /// chunk's first data page. False when they are not only such pages: the prefix then ends inside a
+    /// header or a page, or holds a data page the index does not list.
+    /// </summary>
+    internal static bool TryReadSidePages(
+        ReadOnlySpan<byte> prefix, ColumnDescriptor column, ColumnMetaData columnMeta, bool validateCrc,
+        out DictionaryDecoder? dictionary, out FsstSymbolTable? symbolTable)
+    {
+        dictionary = null;
+        symbolTable = null;
+        var reader = new PageReader(prefix, column);
+        while (true)
+        {
+            // The prefix ends where the index puts the first data page. If that is wrong, it can end
+            // inside a header or a page, which then fails to read: the index is wrong, not the file.
+            // A side page that reads but whose data is corrupt still throws below, as the scan would.
+            Page page;
+            try
+            {
+                if (!reader.TryRead(out page))
+                    break;
+            }
+            catch (ParquetFormatException)
+            {
+                return false;
+            }
+
+            var pageHeader = page.Header;
+            var pageData = page.Payload;
+
+            switch (pageHeader.Type)
+            {
+                case PageType.DictionaryPage:
+                    if (validateCrc)
+                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
+                    dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+                    break;
+                case PageType.SymbolTablePage:
+                    if (validateCrc)
+                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
+                    symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                    break;
+                case PageType.DataPage:
+                case PageType.DataPageV2:
+                    // A data page the index does not list, whose rows the map would lose.
+                    return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>

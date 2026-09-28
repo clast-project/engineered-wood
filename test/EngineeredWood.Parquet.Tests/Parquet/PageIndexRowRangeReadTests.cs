@@ -4,6 +4,7 @@
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Expressions;
+using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 using EngineeredWood.Tests.Parquet.Metadata;
@@ -228,6 +229,102 @@ public class PageIndexRowRangeReadTests : IDisposable
         Assert.Equal(expected.Take(250).Concat(expected.Skip(4500).Take(250)), on);
     }
 
+    // ───── Requests: round trips, not only bytes, decide object storage ─────
+
+    /// <summary>
+    /// A selective filter costs one request more than without the index: the index of the row group it
+    /// keeps, which also carries the OffsetIndexes its page maps need, and whose dictionary pages come
+    /// with its data pages.
+    /// </summary>
+    [Fact]
+    public async Task FilterUsePageIndex_SelectiveFilter_CostsOneRequest()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            DataPageRowCountLimit = 250,
+            RowGroupMaxRows = 1000,
+        });
+        var filter = Ex.Equal("sorted", LiteralValue.Of(2100L));
+
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true });
+
+        Assert.Equal(off + 1, on);
+    }
+
+    /// <summary>
+    /// A filter the index cannot narrow costs one request more per window of row groups, not per row
+    /// group: 132 row groups are three windows of at most 64.
+    /// </summary>
+    [Theory]
+    [InlineData(1000, 1)]  // 5 row groups
+    [InlineData(38, 3)]    // 132 row groups
+    public async Task FilterUsePageIndex_FilterItCannotNarrow_OneRequestPerWindow(int rowsPerGroup, int windows)
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            DataPageRowCountLimit = 250,
+            RowGroupMaxRows = rowsPerGroup,
+        });
+
+        // Random ints: every row group and every page holds values on both sides of the median.
+        var filter = Ex.LessThan("ints", LiteralValue.Of(int.MaxValue / 2));
+
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true });
+
+        Assert.Equal(off + windows, on);
+        Assert.Equal(
+            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter }),
+            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true }));
+    }
+
+    /// <summary>
+    /// A batched read finds a column's pages from its OffsetIndex; its dictionary page is fetched in the
+    /// same request as its first data pages, not in a request of its own.
+    /// </summary>
+    [Fact]
+    public async Task BatchedRead_FetchesTheDictionaryWithTheFirstPages()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true, new ParquetReadOptions { BatchSize = 97 });
+        var metadata = await reader.ReadMetadataAsync();
+        var low = metadata.RowGroups[0].Columns[2].MetaData!;
+        Assert.Equal("low", low.PathInSchema![0]);
+        long dictionary = low.DictionaryPageOffset!.Value;
+        var dictionaryRange = new FileRange(dictionary, low.DataPageOffset - dictionary);
+
+        await foreach (var batch in reader.ReadRowGroupBatchesAsync(0))
+            batch.Dispose();
+
+        var carrying = Assert.Single(counting.RequestRanges, ranges => ranges.Contains(dictionaryRange));
+        Assert.True(carrying.Count > 1, "the dictionary page was read on its own");
+    }
+
+    /// <summary>
+    /// Where the OffsetIndex and the metadata agree the first data page starts, what lies before it must
+    /// be a dictionary page. Bytes that are not one are refused, rather than decoded as a dictionary.
+    /// </summary>
+    [Fact]
+    public async Task BatchedRead_CorruptDictionaryPage_IsRefused()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+        long dictionary;
+        using (var probe = Open(path))
+            dictionary = (await probe.ReadMetadataAsync()).RowGroups[0].Columns[2].MetaData!.DictionaryPageOffset!.Value;
+        byte[] bytes = File.ReadAllBytes(path);
+        bytes.AsSpan(checked((int)dictionary), 16).Fill(0xFF);
+        File.WriteAllBytes(path, bytes);
+
+        using var reader = new ParquetFileReader(new LocalRandomAccessFile(path), ownsFile: true, new ParquetReadOptions { BatchSize = 97 });
+        await Assert.ThrowsAsync<ParquetFormatException>(async () =>
+        {
+            await foreach (var batch in reader.ReadRowGroupBatchesAsync(0, ["low"]))
+                batch.Dispose();
+        });
+    }
+
     // ───── Arguments ─────
 
     [Theory]
@@ -362,6 +459,16 @@ public class PageIndexRowRangeReadTests : IDisposable
         }
 
         return rows;
+    }
+
+    /// <summary>The requests a whole filtered read makes, footer included.</summary>
+    private static async Task<int> RequestsAsync(string path, ParquetReadOptions options)
+    {
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true, options);
+        await foreach (var batch in reader.ReadAllAsync())
+            batch.Dispose();
+        return counting.Requests.Count;
     }
 
     /// <summary>The bytes a read asks for, footer and index included.</summary>
