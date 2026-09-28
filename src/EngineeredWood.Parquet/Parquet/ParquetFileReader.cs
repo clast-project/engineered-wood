@@ -508,34 +508,43 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 buffers[i].Dispose();
         }
 
-        int rowsEmitted = 0;
-        while (rowsEmitted < ctx.RowCount)
+        // Each batch holds its own reference to the decoded buffers; this one is let go at the end, or
+        // when the caller stops early, so they are freed once the last batch is disposed.
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            int rowsEmitted = 0;
+            while (rowsEmitted < ctx.RowCount)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
 
-            int actualBatchRows = ComputeBatchRowCount(
-                pageMaps, rowsEmitted, ctx.RowCount, batchSize, maxBytes);
+                int actualBatchRows = ComputeBatchRowCount(
+                    pageMaps, rowsEmitted, ctx.RowCount, batchSize, maxBytes);
 
-            yield return SliceRecordBatch(full, rowsEmitted, actualBatchRows);
-            rowsEmitted += actualBatchRows;
+                yield return SliceRecordBatch(full, rowsEmitted, actualBatchRows);
+                rowsEmitted += actualBatchRows;
+            }
+        }
+        finally
+        {
+            full.Dispose();
         }
     }
 
     /// <summary>
     /// Returns a row-range view of <paramref name="batch"/> covering
-    /// <c>[offset, offset + length)</c>. Each column is sliced via <see cref="ArrayData.Slice"/>,
-    /// which is zero-copy and offset-correct for nested (list/struct/map) arrays.
+    /// <c>[offset, offset + length)</c>, zero-copy and offset-correct for nested (list/struct/map)
+    /// arrays. Each column is sliced with <see cref="ArrayData.SliceShared"/>, which takes a reference
+    /// on the buffers: the view stays valid after <paramref name="batch"/> and every other view are
+    /// disposed. <see cref="ArrayData.Slice"/> takes none, so disposing one batch freed the buffers
+    /// under the next.
     /// </summary>
     private static RecordBatch SliceRecordBatch(RecordBatch batch, int offset, int length)
     {
-        if (offset == 0 && length == batch.Length)
-            return batch;
-
         // Apache.Arrow's factory (not EW's leaf-only Data.ArrowArrayFactory) reconstructs every
         // type, including struct/list/map, from sliced ArrayData.
         var columns = new IArrowArray[batch.ColumnCount];
         for (int i = 0; i < batch.ColumnCount; i++)
-            columns[i] = Apache.Arrow.ArrowArrayFactory.BuildArray(batch.Column(i).Data.Slice(offset, length));
+            columns[i] = Apache.Arrow.ArrowArrayFactory.BuildArray(batch.Column(i).Data.SliceShared(offset, length));
 
         return new RecordBatch(batch.Schema, columns, length);
     }
