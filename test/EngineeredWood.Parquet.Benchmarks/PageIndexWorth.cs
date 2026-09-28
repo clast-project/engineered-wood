@@ -21,9 +21,11 @@ namespace EngineeredWood.Benchmarks;
 /// what page pruning (R-2) would keep, and bounds what R-3 could save, without building either.
 /// </summary>
 /// <remarks>
-/// <para><c>write &lt;dir&gt;</c> writes <c>ew-default.parquet</c>, and <c>ew-rowcap20k.parquet</c> with a 20,000-row page cap: 4 row groups x 1M rows of a sorted id,
+/// <para><c>write &lt;dir&gt;</c> writes the same rows twice: <c>ew-uncapped.parquet</c>, with no page
+/// row-count limit (the default before #429), and <c>ew-rowcap20k.parquet</c>, with a 20,000-row cap
+/// (the default since). Both are set explicitly. The rows are 4 row groups x 1M rows of a sorted id,
 /// a sorted timestamp, a clustered user string, and unclustered category/amount/note columns. Re-write
-/// it with other writers into the same directory (see the doc) before analysing.</para>
+/// the uncapped file with other writers into the same directory (see the doc) before analysing.</para>
 /// <para><c>analyze &lt;dir&gt; [rounds]</c>, per file and predicate: row groups surviving chunk
 /// statistics; pages per predicate column; the rows and bytes page pruning keeps, from a prototype of
 /// R-2 (elementary row intervals evaluated by the unchanged <see cref="StatisticsEvaluator"/>); the
@@ -46,7 +48,8 @@ internal static class PageIndexWorth
         {
             Directory.CreateDirectory(dir);
             var batch = Build();
-            await WriteAsync(batch, Path.Combine(dir, "ew-default.parquet"));
+            await WriteAsync(batch, Path.Combine(dir, "ew-uncapped.parquet"),
+                ParquetWriteOptions.Default with { DataPageRowCountLimit = null });
             await WriteAsync(batch, Path.Combine(dir, "ew-rowcap20k.parquet"),
                 ParquetWriteOptions.Default with { DataPageRowCountLimit = 20_000 });
             return 0;

@@ -89,12 +89,15 @@ public class WriterByteIdentityCorpus
 
     // Every option a default change could move is pinned, so that a manifest stays comparable across
     // one: when WritePageIndex became the default, a corpus that followed Default stopped being able
-    // to show "unchanged with the index off". The page index has variants of its own below.
+    // to show "unchanged with the index off". The page index has variants of its own below, and so
+    // does the page row-count limit, whose 20,000-row default could not cut the corpus's 5,000 rows
+    // anyway.
     private static readonly ParquetWriteOptions Base = ParquetWriteOptions.Default with
     {
         CreatedBy = CreatedBy,
         DataPageSize = 2048,
         WritePageIndex = false,
+        DataPageRowCountLimit = null,
     };
 
     private static IEnumerable<(string Name, ParquetWriteOptions Options)> FileWriterVariants()
@@ -170,6 +173,18 @@ public class WriterByteIdentityCorpus
             PageIndexTruncateLength = null,
             FloatingPointOrder = FloatingPointColumnOrder.Ieee754TotalOrder,
         });
+
+        // The row-count limit, with pages large enough that only it cuts: both page loops (dictionary
+        // on and off), both page versions, and the list, whose pages it cuts on record boundaries.
+        yield return ("rowcap-v2", Base with { DataPageSize = 1024 * 1024, DataPageRowCountLimit = 700 });
+        yield return ("rowcap-v1-plain-crc", Base with
+        {
+            DataPageSize = 1024 * 1024,
+            DataPageRowCountLimit = 700,
+            DataPageVersion = DataPageVersion.V1,
+            DictionaryEnabled = false,
+            PageChecksumEnabled = true,
+        });
     }
 
     private static IEnumerable<(string Name, ParquetWriteOptions Options)> BufferedWriterVariants()
@@ -190,6 +205,7 @@ public class WriterByteIdentityCorpus
 
         yield return ("bloom", Base with { BloomFilterColumns = ["i32", "str_hi"], RowGroupMaxRows = 2500 });
         yield return ("pageindex", Base with { WritePageIndex = true, RowGroupMaxRows = 2500 });
+        yield return ("rowcap", Base with { DataPageSize = 1024 * 1024, DataPageRowCountLimit = 700, RowGroupMaxRows = 2500 });
         yield return ("footer-inputs", Base with
         {
             KeyValueMetadata = [new EngineeredWood.Parquet.Metadata.KeyValue { Key = "k", Value = "v" }],

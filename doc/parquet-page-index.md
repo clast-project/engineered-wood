@@ -418,7 +418,9 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
 3. **Is R-3 worth building at all**, or do phases 0–5 suffice until a user shows clustered
    data and a filtered-read workload?
 
-   **Measured (2026-09-27); recommendation: build it, but first cap EW's page row count.**
+   **Measured (2026-09-27); recommendation: build it, but first cap EW's page row count.** The cap
+   is done (#428, and the default since #429); R-2 and R-3 are next. The first table and its
+   bullets measure EW's files as they were written before the cap.
    `-- pageindex-worth` writes 4 row groups × 1M rows (sorted `id` and `ts`, a clustered
    dictionary-encoded `user`, and unclustered `category`, `amount` and `note`). pyarrow 25 and
    DataFusion 54 (arrow-rs) rewrote the same rows with their defaults. The harness prototypes R-2
@@ -430,24 +432,26 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    |---|---|---|---|---|
    | arrow-rs | 50 / 49 / 49 | 2.0%, 10.5% | 2.0%, 11.3% | 88% / 86% |
    | pyarrow | 51 / 50 / 50 | 2.0%, 10.9% | 2.0%, 11.2% | 87% / 86% |
-   | **EW** | **8 / 2 / 1** | 13.1%, 19.4% | 52.4%, 56.3% | 77% / 49% |
+   | **EW, no page row cap** (the default before #429) | **8 / 2 / 1** | 13.1%, 19.4% | 52.4%, 56.3% | 77% / 49% |
 
-   - **The win is large where it applies.** Today EW reads the surviving 1M-row group whole:
-     21 ms for an EW file and 36 ms for the others, locally. For a point or 0.1% range on a
-     sorted column, page pruning keeps 2–13% of those rows and 10–19% of the bytes. The
-     kept-rows-only EW read takes 3.3 ms against 21 ms, an upper bound of 85% saved.
+   - **The win is large where it applies.** EW's reader, which has no page pruning until R-3,
+     reads the surviving 1M-row group whole: 21 ms for the uncapped EW file and 36 ms for the
+     others, locally. For a point or 0.1% range on a sorted column, page pruning keeps 2–13% of
+     those rows and 10–19% of the bytes (2% of both on a capped EW file; second table below).
+     The kept-rows-only read of the uncapped EW file takes 3.3 ms against 21 ms, an upper bound
+     of 85% saved; on the capped file it is 0.7–0.8 ms, 96%.
      DataFusion's mature equivalent saves 77–88%. The bytes column is what matters on object
      storage: 3–7 MB fetched instead of 26–43 MB, for one extra request for the index. The
      `note` payload's pages drive most of those bytes, since they do not align with `id`'s.
    - **Unclustered predicates prune nothing**, as expected. What they pay is the index read, one
      request per surviving row group.
-   - **EW's own files halve the benefit.** `EstimateValuesPerPage` cuts a page at
+   - **EW's own files halved the benefit**, until the row cap below. `EstimateValuesPerPage` cuts a page at
      `DataPageSize` ÷ *plain* value width, so at the default 1 MiB an int64 page holds 131,072
      rows. A dictionary page is cut at `DataPageSize` ÷ index bytes, so a dictionary column with
      ≤ 256 distinct values is **one page per row group** and can never prune. parquet-mr and
      pyarrow 25's parquet-cpp cap a page at 20,000 rows; arrow-rs checks the same limit only
-     between 1,024-row write batches, so its pages hold 20,480. Spark-written Delta tables therefore get the full effect;
-     EW-written ones do not. That includes DataFusion reading EW's files, which saves 49% on
+     between 1,024-row write batches, so its pages hold 20,480. Spark-written Delta tables therefore got the full effect;
+     EW-written ones did not. That included DataFusion reading EW's files, which saved 49% on
      `user` where it saves 86% on the others. The cap is a writer change that phases 0–4
      should have had.
    - The kept-rows proxy is re-encoded by EW, which decodes faster than the other two writers'
@@ -458,16 +462,17 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    off then flipped after measuring file size and write time, as phase 4 did; (b) R-2 as
    selected row ranges, testable on its own; (c) R-3.
 
-   **(a) landed, off by default.** `ParquetWriteOptions.DataPageRowCountLimit` caps rows per data
+   **(a) landed off by default in #428, and became the default in #429 (below).**
+   `ParquetWriteOptions.DataPageRowCountLimit` caps rows per data
    page in both page loops of `ColumnChunkWriter`, which both writers share. A repeated leaf is
    cut where the first record past the limit begins. EW's cut is exact, so with the cap every
    column of a row group starts a page at the same rows. That makes EW's own files prune better
    than the other writers', whose payload pages are cut by size first:
 
-   | `pageindex-worth`, EW with a 20,000-row cap | Pages (id / user / category) | id point: rows, bytes kept | user point: rows, bytes kept | DataFusion saving (id / user) |
+   | `pageindex-worth`, EW page row cap | Pages (id / user / category) | id point: rows, bytes kept | user point: rows, bytes kept | DataFusion saving (id / user) |
    |---|---|---|---|---|
-   | no cap (today's default) | 8 / 2 / 1 | 13.1%, 19.4% | 52.4%, 56.3% | 80% / 51% |
-   | 20,000 | 50 / 50 / 50 | 2.0%, 2.05% | 2.0%, 2.06% | 93% / 94% |
+   | none (the default before #429) | 8 / 2 / 1 | 13.1%, 19.4% | 52.4%, 56.3% | 80% / 51% |
+   | 20,000 (the default since #429) | 50 / 50 / 50 | 2.0%, 2.05% | 2.0%, 2.06% | 93% / 94% |
 
    Cost, from `-- rowcap-ab` (500k rows, the phase-4 workloads, medians of alternating rounds):
    files grow 0.1–0.3%, and write time does not change beyond noise. A full read does not change
@@ -477,3 +482,10 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    with `DOTNET_TieredPGO=0` the capped and uncapped reads of that column time the same. The
    one-column dictionary read is about 1.3 ms, so the absolute cost is tenths of a millisecond per
    500k rows. **Recommendation: default it to 20,000**, in its own change, like phase 4.
+   (Carried out by #429.)
+
+   **Done in #429: the default is 20,000.** The byte-identity corpus pins the limit off in its baseline and
+   carries capped variants of its own; its 5,000 rows are below the default anyway. A probe that
+   threw wherever the default cap shortened a page found only two pre-existing tests that write
+   row groups larger than 20,000 rows, both round trips, and no Delta test. Both now write five
+   pages per column where one of them, named for multiple pages, used to write one.
