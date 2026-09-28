@@ -2017,19 +2017,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         if (readProjection)
         {
-            var (_, chunks) = ResolveColumns(schema, rowGroup, projection);
-            foreach (var chunk in chunks)
+            foreach (var range in ProjectedOffsetIndexRanges(schema, rowGroup, projection))
             {
-                // The same test the page maps apply; anything else they read, or scan, themselves.
-                if (chunk.OffsetIndexOffset is not { } offset || chunk.OffsetIndexLength is not { } length
-                    || offset < 0 || length <= 0 || offset > _fileLength - length
-                    || offsetIndexRanges.ContainsKey(offset))
-                {
+                if (offsetIndexRanges.ContainsKey(range.Offset))
                     continue;
-                }
-
-                offsetIndexRanges[offset] = ranges.Count;
-                ranges.Add(new FileRange(offset, length));
+                offsetIndexRanges[range.Offset] = ranges.Count;
+                ranges.Add(range);
             }
         }
 
@@ -2068,6 +2061,29 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         }
 
         return (PageIndexPruner.SelectRows(filter, rowGroup, schema, indexes), offsetIndexes);
+    }
+
+    /// <summary>
+    /// The OffsetIndexes a read of <paramref name="projection"/> builds its page maps from: every
+    /// projected column's that a map can use (flat, and wholly inside the file). None when the projection
+    /// has a nested column, since such a row group is decoded whole and builds no page maps. The narrowing
+    /// and the read-ahead both ask this, so that the read-ahead holds exactly what the narrowing wants.
+    /// </summary>
+    private IEnumerable<FileRange> ProjectedOffsetIndexRanges(
+        SchemaDescriptor schema, RowGroup rowGroup, IReadOnlyList<string>? projection)
+    {
+        var (descriptors, chunks) = ResolveColumns(schema, rowGroup, projection);
+        if (descriptors.Any(d => d.Path.Count > 1 || d.MaxRepetitionLevel > 0))
+            yield break;
+
+        foreach (var chunk in chunks)
+        {
+            if (chunk.OffsetIndexOffset is { } offset && chunk.OffsetIndexLength is { } length
+                && offset >= 0 && length > 0 && offset <= _fileLength - length)
+            {
+                yield return new FileRange(offset, length);
+            }
+        }
     }
 
     /// <summary>At most this many row groups' page indexes are read ahead in one request.</summary>
@@ -2130,12 +2146,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 Add(chunk.OffsetIndexOffset, chunk.OffsetIndexLength);
             }
 
-            var (descriptors, chunks) = ResolveColumns(schema, rowGroup, projection);
-            for (int c = 0; c < chunks.Count; c++)
-            {
-                if (descriptors[c].MaxRepetitionLevel == 0)
-                    Add(chunks[c].OffsetIndexOffset, chunks[c].OffsetIndexLength);
-            }
+            foreach (var range in ProjectedOffsetIndexRanges(schema, rowGroup, projection))
+                Add(range.Offset, (int)range.Length);
         }
 
         if (ranges.Count > 0)

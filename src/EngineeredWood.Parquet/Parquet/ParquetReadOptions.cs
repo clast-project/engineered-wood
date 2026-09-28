@@ -309,10 +309,13 @@ public sealed record ParquetReadOptions
     /// batches, and the rows between them leave no trace. As with <see cref="Filter"/> itself, a
     /// layer that counts rows to know their positions in the file should call the two methods above
     /// instead.</para>
-    /// <para>It costs one more request per window of up to 64 row groups statistics leave undecided,
-    /// for their indexes, and saves the pages it rules out; the indexes also carry the OffsetIndexes
-    /// the read's page maps need, and a column's dictionary page comes with its first data pages.
-    /// Measured with 20 ms per request (<c>-- pageindex-read-ab</c>), on a sorted column: a point or 1%
+    /// <para>It costs one more read call (one more round trip) per window of up to 64 row groups
+    /// statistics leave undecided, for their indexes, and saves the pages it rules out; the indexes
+    /// also carry the OffsetIndexes the read's page maps need, and a column's dictionary page comes with
+    /// its first data pages. Through the object-storage readers' coalescer a call whose ranges lie far
+    /// apart becomes several GETs, sent concurrently, so the GET count can rise by more than the call
+    /// count while the round trips do not.
+    /// Measured with 20 ms per GET (<c>-- pageindex-read-ab</c>), on a sorted column: a point or 1%
     /// range reads 47–55% faster at 100 MB/s and 8–11% faster at 400 MB/s, and a 10% range 34% faster
     /// and 5% slower; a filter no page can narrow reads 4–6% slower. Columns without a usable index are read whole and cut to the same
     /// rows, and so are the columns of a row group with any nested column.

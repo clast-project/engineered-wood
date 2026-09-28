@@ -280,6 +280,52 @@ public class PageIndexRowRangeReadTests : IDisposable
     }
 
     /// <summary>
+    /// A projection with a nested column is decoded whole, so it builds no page maps and needs no
+    /// OffsetIndexes: the selective filter still costs one request, not one more for the projection's
+    /// indexes (which the read-ahead and the narrowing once disagreed about).
+    /// </summary>
+    [Fact]
+    public async Task FilterUsePageIndex_NestedProjection_CostsOneRequest()
+    {
+        string path = await WriteAsync(WithNested(Flat(Rows)), ParquetWriteOptions.Default with
+        {
+            DataPageRowCountLimit = 250,
+            RowGroupMaxRows = 1000,
+        });
+        var filter = Ex.Equal("sorted", LiteralValue.Of(2100L));
+
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true });
+
+        Assert.Equal(off + 1, on);
+    }
+
+    /// <summary>
+    /// A footer with a ColumnIndex offset but no length has no ColumnIndex, as for
+    /// <see cref="ParquetFileReader.ReadPageIndexAsync"/>: the rows are not narrowed, and nothing throws.
+    /// </summary>
+    [Fact]
+    public async Task HalfSpecifiedColumnIndex_IsNoIndex()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+        FooterRewrite.Rewrite(path, metadata =>
+        {
+            var rowGroup = metadata.RowGroups[0];
+            var columns = rowGroup.Columns.ToArray();
+            columns[0] = FooterRewrite.With(columns[0], nameof(EngineeredWood.Parquet.Metadata.ColumnChunk.ColumnIndexLength), (int?)null);
+            return FooterRewrite.With(metadata, nameof(EngineeredWood.Parquet.Metadata.FileMetaData.RowGroups),
+                new[] { FooterRewrite.With(rowGroup, nameof(EngineeredWood.Parquet.Metadata.RowGroup.Columns), columns) });
+        });
+        var filter = Ex.Equal("sorted", LiteralValue.Of(2100L));
+
+        using (var reader = Open(path))
+            Assert.Equal([new RowRange(0, Rows)], await reader.GetCandidateRowRangesAsync(0, filter));
+        Assert.Equal(
+            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter }),
+            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true }));
+    }
+
+    /// <summary>
     /// A batched read finds a column's pages from its OffsetIndex; its dictionary page is fetched in the
     /// same request as its first data pages, not in a request of its own.
     /// </summary>

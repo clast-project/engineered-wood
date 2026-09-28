@@ -444,7 +444,7 @@ slower and unclustered filters 31% slower. Now:
   only groups that statistics leave undecided. A filter the index cannot narrow then costs one
   request per window, not per row group.
 
-| Filter (20 ms per request) | Local | 100 MB/s | 400 MB/s |
+| Filter (20 ms per GET) | Local | 100 MB/s | 400 MB/s |
 |---|---|---|---|
 | id point | −93% | −55% | −8% |
 | id 1% | −89% | −47% | −11% |
@@ -452,9 +452,12 @@ slower and unclustered filters 31% slower. Now:
 | category (unclustered) | +2% | +4% | +6% |
 | id 1% AND category | −88% | −44% | −7% |
 
-A selective filter now costs one request more than without the index, and one the index cannot
+A selective filter now costs one read call more than without the index, and one the index cannot
 narrow costs one more per window. Tests pin both counts, and that a dictionary page never travels
-alone. What remains at 400 MB/s is that one request, against the bytes it saves.
+alone. A call is a round trip. Through `CoalescingFileReader` it can be several GETs, sent
+concurrently when its ranges lie far apart: a point lookup makes 4 calls but 6 GETs, against 3
+and 3 without the index. So the latency paid is per call, and a store that bills per request sees
+the GETs. What remains at 400 MB/s is that one call, against the bytes it saves.
 
 ### R-4. Later
 
