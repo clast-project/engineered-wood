@@ -71,6 +71,7 @@ internal static class ArrowValues
         UInt8Array a => a.GetValue(row)!.Value,
         UInt16Array a => a.GetValue(row)!.Value,
         UInt32Array a => checked((int)a.GetValue(row)!.Value),
+        UInt64Array a => checked((int)a.GetValue(row)!.Value),
         _ => throw new NotSupportedException(indices.Data.DataType.Name),
     };
 }
