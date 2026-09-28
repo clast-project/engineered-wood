@@ -124,6 +124,31 @@ public class ColumnChunkFilePathTests : IDisposable
         Assert.True(index.HasOffsetIndex);
     }
 
+    /// <summary>
+    /// Page pruning follows the policy the rest of the reader does: under Ignore, b's page index is this
+    /// file's and narrows the rows; under Refuse, b's chunk is someone else's and the whole row group
+    /// comes back rather than an error.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(FilePaths))]
+    public async Task CandidateRowRanges_UseAStoredElsewhereIndexOnlyUnderIgnore(string filePath)
+    {
+        string path = await WriteAsync(filePath);
+        var filter = Ex.Equal("b", LiteralValue.Of(BOffset + 500));
+
+        async Task<IReadOnlyList<RowRange>> RangesAsync(ColumnChunkFilePathKind kind)
+        {
+            await using var input = new LocalRandomAccessFile(path);
+            using var reader = new ParquetFileReader(input, ownsFile: false, new ParquetReadOptions { ColumnChunkFilePath = kind });
+            return await reader.GetCandidateRowRangesAsync(0, filter);
+        }
+
+        var ignored = Assert.Single(await RangesAsync(ColumnChunkFilePathKind.Ignore));
+        Assert.True(ignored.Start <= 500 && 500 < ignored.End && ignored.Length < Rows, $"{ignored}");
+
+        Assert.Equal([new RowRange(0, Rows)], await RangesAsync(ColumnChunkFilePathKind.Refuse));
+    }
+
     // ───── Helpers ─────
 
     /// <summary>

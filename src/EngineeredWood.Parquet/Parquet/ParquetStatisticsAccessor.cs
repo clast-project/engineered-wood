@@ -88,7 +88,11 @@ public sealed class ParquetStatisticsAccessor
         return true;
     }
 
-    private static Dictionary<string, int> BuildNameIndex(SchemaDescriptor schema)
+    /// <summary>
+    /// Maps a predicate's column names to leaf indexes: every leaf by dotted path, and a top-level leaf
+    /// by bare name too. The page-index pruner resolves names with this, so that both agree.
+    /// </summary>
+    internal static Dictionary<string, int> BuildNameIndex(SchemaDescriptor schema)
     {
         var map = new Dictionary<string, int>(StringComparer.Ordinal);
         for (int i = 0; i < schema.Columns.Count; i++)
@@ -104,9 +108,14 @@ public sealed class ParquetStatisticsAccessor
 
     // ── Decoding ──
 
-    private static LiteralValue? DecodeMin(ColumnDescriptor desc, Statistics stats)
+    private static LiteralValue? DecodeMin(ColumnDescriptor desc, Statistics stats) =>
+        DecodeLowerBound(desc, stats.MinValue ?? FallbackBytes(desc, stats.Min), stats.MaxValue ?? FallbackBytes(desc, stats.Max));
+
+    /// <summary>
+    /// Decodes a minimum, given the maximum beside it. Chunk statistics and page-index bounds share it.
+    /// </summary>
+    internal static LiteralValue? DecodeLowerBound(ColumnDescriptor desc, byte[]? bytes, byte[]? maxBytes)
     {
-        var bytes = stats.MinValue ?? FallbackBytes(desc, stats.Min);
         if (bytes is null)
             return null;
 
@@ -115,17 +124,18 @@ public sealed class ParquetStatisticsAccessor
         // agree on exactly this shape. A NaN min beside a FINITE max is the signature of a writer
         // using .NET's order, where the pair reads min > max; treating it as a real lower bound
         // would prune `col < 5.0` away from a file whose values genuinely are below 5.0.
-        if (IsNaNBound(desc, bytes) && !IsNaNBound(desc, stats.MaxValue ?? FallbackBytes(desc, stats.Max)))
+        if (IsNaNBound(desc, bytes) && !IsNaNBound(desc, maxBytes))
             return null;
 
         return Decode(desc, bytes, isMax: false);
     }
 
-    private static LiteralValue? DecodeMax(ColumnDescriptor desc, Statistics stats)
-    {
-        var bytes = stats.MaxValue ?? FallbackBytes(desc, stats.Max);
-        return bytes is null ? null : Decode(desc, bytes, isMax: true);
-    }
+    /// <summary>Decodes a maximum. Chunk statistics and page-index bounds share it.</summary>
+    internal static LiteralValue? DecodeUpperBound(ColumnDescriptor desc, byte[]? bytes) =>
+        bytes is null ? null : Decode(desc, bytes, isMax: true);
+
+    private static LiteralValue? DecodeMax(ColumnDescriptor desc, Statistics stats) =>
+        DecodeUpperBound(desc, stats.MaxValue ?? FallbackBytes(desc, stats.Max));
 
     /// <summary>Whether a raw FLOAT/DOUBLE bound holds a NaN.</summary>
     private static bool IsNaNBound(ColumnDescriptor desc, byte[]? bytes) =>
