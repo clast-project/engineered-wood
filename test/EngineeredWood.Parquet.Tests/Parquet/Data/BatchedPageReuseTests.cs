@@ -184,6 +184,86 @@ public class BatchedPageReuseTests : IDisposable
         Assert.Equal((3000 + batchSize - 1) / batchSize, batches);
     }
 
+    /// <summary>
+    /// A row group with a nested column is batched by decoding it once and slicing. The slices took no
+    /// reference on the decoded buffers, so a caller that disposed each batch before reading the next
+    /// freed the rows under every later batch: the second batch threw a NullReferenceException, and
+    /// with pooled memory could have read freed memory instead. Each batch now holds its own reference.
+    /// </summary>
+    [Theory]
+    [InlineData(97, null)]
+    [InlineData(null, 4096L)]
+    public async Task NestedRowGroup_BatchesSurviveDisposingEarlierOnes(int? batchSize, long? maxBytes)
+    {
+        var list = new ListArray.Builder(Int32Type.Default);
+        var elements = (Int32Array.Builder)list.ValueBuilder;
+        var structA = new Int64Array.Builder();
+        var structB = new StringArray.Builder();
+        var flat = new Int64Array.Builder();
+        for (int i = 0; i < Rows; i++)
+        {
+            if (i % 11 == 0)
+            {
+                list.AppendNull();
+            }
+            else
+            {
+                list.Append();
+                for (int j = 0; j < i % 4; j++)
+                    elements.Append(i * 10 + j);
+            }
+
+            structA.Append(-i);
+            structB.Append("s" + i);
+            flat.Append(i);
+        }
+
+        var listArray = list.Build();
+        var structType = new StructType([new Field("a", Int64Type.Default, false), new Field("b", StringType.Default, false)]);
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field("list", listArray.Data.DataType, true))
+                .Field(new Field("struct", structType, false))
+                .Field(new Field("flat", Int64Type.Default, false))
+                .Build(),
+            [listArray, new StructArray(structType, Rows, [structA.Build(), structB.Build()], ArrowBuffer.Empty, 0), flat.Build()],
+            Rows);
+
+        string path = Path.Combine(_tempDir, "nested.parquet");
+        await using (var file = new LocalSequentialFile(path))
+        // Pages of 1,000 rows, so that the byte budget has page boundaries to cut at.
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false,
+            ParquetWriteOptions.Default with { DataPageRowCountLimit = 1000 }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        List<string> expected;
+        using (var whole = new ParquetFileReader(new LocalRandomAccessFile(path), ownsFile: true))
+        using (var all = await whole.ReadRowGroupAsync(0))
+            expected = Enumerable.Range(0, all.Length).Select(r => ArrowValues.RenderRow(all, r)).ToList();
+
+        var actual = new List<string>();
+        int batches = 0;
+        using (var reader = new ParquetFileReader(new LocalRandomAccessFile(path), ownsFile: true,
+            new ParquetReadOptions { BatchSize = batchSize, MaxBatchByteSize = maxBytes }))
+        {
+            await foreach (var b in reader.ReadRowGroupBatchesAsync(0))
+            {
+                using (b)
+                {
+                    batches++;
+                    for (int r = 0; r < b.Length; r++)
+                        actual.Add(ArrowValues.RenderRow(b, r));
+                }
+            }
+        }
+
+        Assert.True(batches > 2, $"{batches} batches; the test needs several");
+        Assert.Equal(expected, actual);
+    }
+
     private async Task<string> WriteAllTypesAsync(DataPageVersion version, bool dictionary)
     {
         var fields = new List<Field>();
