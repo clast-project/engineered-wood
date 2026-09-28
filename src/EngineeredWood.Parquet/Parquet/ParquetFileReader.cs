@@ -1686,6 +1686,67 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// The rows of one row group that might match <paramref name="filter"/>, narrowed by the page index:
+    /// the row-level companion to <see cref="GetCandidateRowGroupsAsync(EngineeredWood.Expressions.Predicate, CancellationToken)"/>. Reads no data pages.
+    /// </summary>
+    /// <remarks>
+    /// <para>The row group is judged first exactly as <see cref="GetCandidateRowGroupsAsync(EngineeredWood.Expressions.Predicate, CancellationToken)"/> judges it;
+    /// one ruled out returns no ranges. Otherwise each column the predicate references that is not
+    /// repeated, and has a ColumnIndex and OffsetIndex, contributes its pages' bounds and counts, one
+    /// ranged read for all of them. Rows in a page whose bounds rule the predicate out are dropped.</para>
+    /// <para>The result is a superset, like the row-group one: rows inside a range are not filtered.
+    /// With no usable index, or a predicate the bounds cannot decide, the whole row group is one range.
+    /// A page index that fails to decode or cannot describe the row group is ignored, not refused.</para>
+    /// </remarks>
+    /// <param name="rowGroupIndex">Zero-based index of the row group.</param>
+    /// <param name="filter">The predicate.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>Ascending, disjoint, non-empty ranges of rows within the row group.</returns>
+    public async ValueTask<IReadOnlyList<RowRange>> GetCandidateRowRangesAsync(
+        int rowGroupIndex,
+        EngineeredWood.Expressions.Predicate filter,
+        CancellationToken cancellationToken = default)
+    {
+#if NET8_0_OR_GREATER
+        ObjectDisposedException.ThrowIf(_disposed, this);
+#else
+        if (_disposed) throw new ObjectDisposedException(GetType().FullName);
+#endif
+        if (filter is null) throw new ArgumentNullException(nameof(filter));
+
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        if (rowGroupIndex < 0 || rowGroupIndex >= metadata.RowGroups.Count)
+            throw new ArgumentOutOfRangeException(nameof(rowGroupIndex), rowGroupIndex,
+                $"The file has {metadata.RowGroups.Count} row groups.");
+
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        var accessor = new ParquetStatisticsAccessor(schema);
+        var rowGroup = metadata.RowGroups[rowGroupIndex];
+        if (rowGroup.NumRows <= 0
+            || !await MightMatchAsync(filter, rowGroupIndex, metadata, schema, accessor, default, cancellationToken)
+                .ConfigureAwait(false))
+        {
+            return [];
+        }
+
+        var whole = new[] { new RowRange(0, rowGroup.NumRows) };
+        if (EngineeredWood.Expressions.StatisticsEvaluator.Evaluate(filter, rowGroup, accessor)
+            == EngineeredWood.Expressions.FilterResult.AlwaysTrue)
+        {
+            return whole;
+        }
+
+        var leaves = PageIndexPruner.PrunableColumns(filter, rowGroup, schema);
+        if (leaves.Count == 0)
+            return whole;
+
+        var indexes = await ReadPageIndexAsync(
+                rowGroupIndex, leaves.ConvertAll(leaf => schema.Columns[leaf].DottedPath), cancellationToken)
+            .ConfigureAwait(false);
+        return PageIndexPruner.SelectRows(filter, rowGroup, schema, indexes);
+    }
+
+    /// <summary>
     /// How many bytes one prefetch request may ask for, per membership source. Tests lower it to make a
     /// file span several windows.
     /// </summary>

@@ -51,6 +51,7 @@
     <ProjectReference Include="..\..\src\EngineeredWood.Gcs\EngineeredWood.Gcs.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Aws\EngineeredWood.Aws.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
+    <ProjectReference Include="..\..\src\EngineeredWood.Expressions.Arrow\EngineeredWood.Expressions.Arrow.csproj" />
   </ItemGroup>
 
 </Project>

@@ -328,6 +328,33 @@ referenced columns.
   A predicate on a repeated column yields Unknown for it, as it effectively does at row
   group level today.
 
+**Done**, as `ParquetFileReader.GetCandidateRowRangesAsync(rowGroup, filter)`: the row-level
+companion to `GetCandidateRowGroupsAsync`, returning ascending, disjoint `RowRange`s. It judges
+the row group first as that method does (statistics, then dictionaries or Bloom filters), then
+reads the ColumnIndex and OffsetIndex of the predicate's flat columns in one ranged read. The
+accessor (`PageIndexPruner`) shares its bound decoding with `ParquetStatisticsAccessor`, so a
+page bound decodes as a chunk bound does. Three details the outline above did not settle:
+
+- **Null counts are per page, and an interval can be part of a page.** The accessor reports a
+  count only when it holds for any part: all rows for a null page, zero for a page with no
+  nulls. Otherwise the count is unknown. Passing the page's count through would let a page
+  with 50 nulls call a 50-row half of itself all null, and drop that half's values.
+- **NaN counts come for free.** The accessor implements `INanCountAccessor` from the
+  ColumnIndex's `nan_counts`, so a page holding a NaN keeps comparisons it would otherwise
+  fail (NaN is the top of SQL's order), and `IsNaN` / `IsNotNaN` prune pages, an R-4 item.
+- **An index is checked before it is trusted, and ignored if it fails.** It must decode,
+  tile the row group from row 0, and have one entry per page in every list. No count may be
+  impossible. parquet-mr 1.13 wrote the `datapage_v1-*-checksum` fixtures with every page
+  marked null, null counts of −1 and empty bounds, for required columns full of values.
+  Trusted, that index drops every row of `a IS NOT NULL`. DataFusion answers those correctly.
+
+Oracles: every fixture with a page index, with predicates built from values each column holds,
+evaluated row by row (`ArrowRowEvaluator`), where every matching row must lie in a range; exact
+ranges on EW-written files; and the kept row count equal to DataFusion's for four predicates.
+Deliberately introducing bugs checked the tests catch real mistakes: a page cursor lagging one
+interval fails 10 tests, NaN counts forced to zero fail 2, and a page null count used as an
+interval's fails 1.
+
 ### R-3. Row-range decode (the large part)
 
 The `Filter` contract stays a **superset**: pruning drops rows that provably don't match,
@@ -360,8 +387,8 @@ and the caller still post-filters.
 
 ### R-4. Later
 
-- `nan_counts`-driven `IsNaN` / `IsNotNaN` page pruning (the row-group logic exists in
-  `StatisticsEvaluator.EvaluateNaN`).
+- ~~`nan_counts`-driven `IsNaN` / `IsNotNaN` page pruning (the row-group logic exists in
+  `StatisticsEvaluator.EvaluateNaN`).~~ Done with R-2.
 - Repeated-column pruning.
 - Level histograms.
 - ~~Using the OffsetIndex to build `PageMapBuilder`'s map without scanning headers.~~ Done,
@@ -412,11 +439,9 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    (W-6, phase 4).
 2. **Shorten string bounds to 64 bytes by default**, and let callers override the limit or
    turn truncation off with `PageIndexTruncateLength` (W-3).
-
-**Open:**
-
-3. **Is R-3 worth building at all**, or do phases 0–5 suffice until a user shows clustered
-   data and a filtered-read workload?
+3. **Build R-2 and R-3** (was open: is R-3 worth building at all, or do phases 0–5 suffice
+   until a user shows clustered data and a filtered-read workload?). Decided on the
+   measurements below, after capping EW's page row count first.
 
    **Measured (2026-09-27); recommendation: build it, but first cap EW's page row count.** The cap
    is done (#428, and the default since #429); R-2 and R-3 are next. The first table and its
