@@ -200,8 +200,8 @@ internal static class DictionaryPruningAb
     {
         // Direct: every call is one request and pays the delay. Cloud: calls go through the coalescer,
         // and each GET it sends to the transport pays the delay.
-        await using var transport = new CountingFile(new LocalRandomAccessFile(path), latencyMs);
-        await using var calls = cloud ? new CountingFile(new CoalescingFileReader(transport), 0) : null;
+        await using var transport = new LatencyCountingFile(new LocalRandomAccessFile(path), latencyMs);
+        await using var calls = cloud ? new LatencyCountingFile(new CoalescingFileReader(transport), 0) : null;
         IRandomAccessFile file = calls ?? transport;
         var clock = Stopwatch.StartNew();
         int batches = 0;
@@ -222,47 +222,6 @@ internal static class DictionaryPruningAb
     {
         var sorted = values.OrderBy(v => v).ToList();
         return sorted[sorted.Count / 2];
-    }
-
-    /// <summary>
-    /// Counts requests (a ReadRangesAsync is one) and the bytes they ask for, and delays each by
-    /// <paramref name="latencyMs"/>.
-    /// </summary>
-    private sealed class CountingFile(IRandomAccessFile inner, int latencyMs) : IRandomAccessFile
-    {
-        private int _requests;
-        private long _bytes;
-
-        public int Requests => _requests;
-
-        public long Bytes => Interlocked.Read(ref _bytes);
-
-        public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default) =>
-            inner.GetLengthAsync(cancellationToken);
-
-        public async ValueTask<IMemoryOwner<byte>> ReadAsync(FileRange range, CancellationToken cancellationToken = default)
-        {
-            Interlocked.Increment(ref _requests);
-            Interlocked.Add(ref _bytes, range.Length);
-            if (latencyMs > 0)
-                await Task.Delay(latencyMs, cancellationToken);
-            return await inner.ReadAsync(range, cancellationToken);
-        }
-
-        public async ValueTask<IReadOnlyList<IMemoryOwner<byte>>> ReadRangesAsync(
-            IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
-        {
-            Interlocked.Increment(ref _requests);
-            foreach (var range in ranges)
-                Interlocked.Add(ref _bytes, range.Length);
-            if (latencyMs > 0)
-                await Task.Delay(latencyMs, cancellationToken);
-            return await inner.ReadRangesAsync(ranges, cancellationToken);
-        }
-
-        public ValueTask DisposeAsync() => inner.DisposeAsync();
-
-        public void Dispose() => inner.Dispose();
     }
 }
 #endif

@@ -29,6 +29,12 @@ if (args.Length > 0 && args[0] == "pageindex-worth")
     return;
 }
 
+if (args.Length > 0 && args[0] == "pageindex-read-ab")
+{
+    Environment.ExitCode = await PageIndexReadAb.RunAsync(args);
+    return;
+}
+
 if (args.Length > 0 && args[0] == "rowcap-ab")
 {
     Environment.ExitCode = await RowCountLimitAb.RunAsync(args);
