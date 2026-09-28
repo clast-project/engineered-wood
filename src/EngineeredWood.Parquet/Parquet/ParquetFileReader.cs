@@ -209,6 +209,13 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             prefetch = CreatePrefetches(_options.Filter, metadata, schema, accessor);
         }
 
+        // Page indexes are read a window of row groups at a time: one request, where one per row group
+        // would pay a round trip each, and most for a group the index cannot narrow.
+        var indexReadAhead = accessor is not null && _options.FilterUsePageIndex
+            ? new Dictionary<long, byte[]>()
+            : null;
+        int readAheadEnd = 0;
+
         for (int i = 0; i < metadata.RowGroups.Count; i++)
         {
             if (accessor is not null
@@ -220,11 +227,21 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
             // Within a kept row group, the page index can narrow the rows further. Null means the whole
             // row group; the read below takes it as such.
+            // The OffsetIndexes read with the ColumnIndexes serve the read's page maps.
             IReadOnlyList<RowRange>? ranges = null;
-            if (accessor is not null && _options.FilterUsePageIndex)
+            Dictionary<long, byte[]>? offsetIndexes = null;
+            if (indexReadAhead is not null)
             {
-                ranges = await NarrowByPageIndexAsync(
-                        _options.Filter!, i, metadata.RowGroups[i], schema!, accessor, cancellationToken)
+                if (i >= readAheadEnd)
+                {
+                    readAheadEnd = await ReadPageIndexesAheadAsync(
+                            _options.Filter!, i, metadata, schema!, accessor!, columnNames, indexReadAhead, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
+                (ranges, offsetIndexes) = await NarrowByPageIndexAsync(
+                        _options.Filter!, i, metadata.RowGroups[i], schema!, accessor!,
+                        readProjection: true, projection: columnNames, indexReadAhead, cancellationToken)
                     .ConfigureAwait(false);
                 if (ranges.Count == 0)
                     continue;
@@ -234,7 +251,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             // the single-batch read itself when there is nothing to split, and it is where the implicit
             // cap for an over-sized chunk is decided. Routing around it here would put that decision in
             // two places and leave ReadAllAsync unable to read a file ReadRowGroupBatchesAsync can.
-            await foreach (var batch in ReadBatchesAsync(i, columnNames, ranges, cancellationToken)
+            await foreach (var batch in ReadBatchesAsync(i, columnNames, ranges, offsetIndexes, cancellationToken)
                 .ConfigureAwait(false))
             {
                 yield return batch;
@@ -258,7 +275,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         int rowGroupIndex,
         IReadOnlyList<string>? columnNames = null,
         CancellationToken cancellationToken = default) =>
-        ReadBatchesAsync(rowGroupIndex, columnNames, ranges: null, cancellationToken);
+        ReadBatchesAsync(rowGroupIndex, columnNames, ranges: null, offsetIndexes: null, cancellationToken);
 
     /// <summary>
     /// Streams only the rows of a row group that lie in <paramref name="ranges"/>, as
@@ -311,7 +328,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         if (ranges.Count == 0)
             yield break;
 
-        await foreach (var batch in ReadBatchesAsync(rowGroupIndex, columnNames, ranges, cancellationToken)
+        await foreach (var batch in ReadBatchesAsync(rowGroupIndex, columnNames, ranges, offsetIndexes: null, cancellationToken)
             .ConfigureAwait(false))
         {
             yield return batch;
@@ -321,11 +338,13 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <summary>
     /// The batched read behind <see cref="ReadRowGroupBatchesAsync"/> and <see cref="ReadRowRangesAsync"/>:
     /// the rows in <paramref name="ranges"/>, or the whole row group when that is null.
+    /// <paramref name="offsetIndexes"/> holds OffsetIndex bytes already read, by file offset.
     /// </summary>
     private async IAsyncEnumerable<RecordBatch> ReadBatchesAsync(
         int rowGroupIndex,
         IReadOnlyList<string>? columnNames,
         IReadOnlyList<RowRange>? ranges,
+        IReadOnlyDictionary<long, byte[]>? offsetIndexes,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
         CancellationToken cancellationToken)
     {
@@ -435,7 +454,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         //
         // An OffsetIndex map estimates each page's uncompressed size, which the implicit budget
         // cannot use: it exists to keep a batch under the Arrow limit, so it reads the headers.
-        var pageMaps = await BuildPageMapsAsync(ctx, useOffsetIndex: !implicitBudget, cancellationToken)
+        var pageMaps = await BuildPageMapsAsync(ctx, useOffsetIndex: !implicitBudget, offsetIndexes, cancellationToken)
             .ConfigureAwait(false);
 
         // Pages are not cut where batches are, so a page usually holds rows for more than one batch.
@@ -467,7 +486,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
                     // The pages each column still has to decode for this batch, read in one request.
                     var pageRanges = new List<FileRange>(ctx.Count);
-                    var readers = new List<int>(ctx.Count);
+                    // Each column's data range, and its side pages when the map still waits for them,
+                    // as positions in pageRanges; -1 for none.
+                    var dataSlots = new int[ctx.Count];
+                    var prefixSlots = new int[ctx.Count];
+                    dataSlots.AsSpan().Fill(-1);
+                    prefixSlots.AsSpan().Fill(-1);
                     var startPages = new int[ctx.Count];
                     var endPages = new int[ctx.Count];
                     for (int i = 0; i < ctx.Count; i++)
@@ -503,8 +527,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                         var lastEntry = pageMaps[i].Pages[endPage];
                         long rangeStart = ctx.Ranges[i].Offset + firstEntry.Offset;
                         long rangeEnd = ctx.Ranges[i].Offset + lastEntry.Offset + lastEntry.CompressedSize;
+                        dataSlots[i] = pageRanges.Count;
                         pageRanges.Add(new FileRange(rangeStart, rangeEnd - rangeStart));
-                        readers.Add(i);
+
+                        // Side pages the map waits for come in the same request as its first pages.
+                        if (pageMaps[i].PendingPrefixLength > 0)
+                        {
+                            prefixSlots[i] = pageRanges.Count;
+                            pageRanges.Add(new FileRange(ctx.Ranges[i].Offset, pageMaps[i].PendingPrefixLength));
+                        }
                     }
 
                     var pageBuffers = pageRanges.Count > 0
@@ -513,16 +544,20 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
                     try
                     {
-                        var buffers = new IMemoryOwner<byte>?[ctx.Count];
-                        for (int k = 0; k < readers.Count; k++)
-                            buffers[readers[k]] = pageBuffers[k];
-
                         var results = new ColumnResult[ctx.Count];
                         ForEachColumn(ctx.Count, i =>
                         {
                             var cursor = cursors[i];
-                            if (buffers[i] is { } buffer)
+                            if (dataSlots[i] >= 0)
                             {
+                                if (prefixSlots[i] >= 0)
+                                {
+                                    pageMaps[i].CompleteSidePages(
+                                        pageBuffers[prefixSlots[i]].Memory.Span, ctx.Columns[i],
+                                        ctx.Chunks[i].MetaData!, _options.PageChecksumValidation);
+                                }
+
+                                var buffer = pageBuffers[dataSlots[i]];
                                 int startPage = startPages[i];
                                 var decoded = ColumnChunkReader.ReadColumnBatchFromSlice(
                                     buffer.Memory.Span,
@@ -720,15 +755,20 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <summary>
     /// Builds the page map of each of a flat row group's columns. Where
     /// <paramref name="useOffsetIndex"/> is set and a chunk has a usable OffsetIndex, the map comes
-    /// from that and the bytes before the first data page, so the data pages are not read. Every
-    /// other chunk is read whole to scan its page headers.
+    /// from that, so the data pages are not read to find them. Every other chunk is read whole to
+    /// scan its page headers.
     /// </summary>
+    /// <param name="offsetIndexes">
+    /// OffsetIndex bytes already read, by the index's file offset, as the page-index filter reads them
+    /// with the ColumnIndexes it prunes by; the rest are read here.
+    /// </param>
     private async ValueTask<ColumnPageMap[]> BuildPageMapsAsync(
-        RowGroupContext ctx, bool useOffsetIndex, CancellationToken cancellationToken)
+        RowGroupContext ctx, bool useOffsetIndex, IReadOnlyDictionary<long, byte[]>? offsetIndexes,
+        CancellationToken cancellationToken)
     {
         var pageMaps = new ColumnPageMap?[ctx.Count];
         if (useOffsetIndex)
-            await BuildPageMapsFromOffsetIndexesAsync(ctx, pageMaps, cancellationToken).ConfigureAwait(false);
+            await BuildPageMapsFromOffsetIndexesAsync(ctx, pageMaps, offsetIndexes, cancellationToken).ConfigureAwait(false);
 
         for (int i = 0; i < ctx.Count; i++)
         {
@@ -749,17 +789,22 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Fills in <paramref name="pageMaps"/> for each chunk whose OffsetIndex can describe its pages,
-    /// leaving null those without one, or with one that is unreadable or cannot be right. That
-    /// takes two reads in all: the indexes, then each chunk's bytes before its first data page (its
-    /// dictionary or FSST symbol table).
+    /// leaving null those without one, or with one that is unreadable or cannot be right.
     /// </summary>
     /// <remarks>
-    /// The first data page is where the index puts it, not <see cref="ColumnMetaData.DataPageOffset"/>:
+    /// <para>The first data page is where the index puts it, not <see cref="ColumnMetaData.DataPageOffset"/>:
     /// some writers leave <see cref="ColumnMetaData.DictionaryPageOffset"/> unset and point
-    /// <see cref="ColumnMetaData.DataPageOffset"/> at the dictionary page (alltypes_tiny_pages.parquet).
+    /// <see cref="ColumnMetaData.DataPageOffset"/> at the dictionary page (alltypes_tiny_pages.parquet).</para>
+    /// <para>The bytes before it (a dictionary or FSST symbol-table page) are not read here when the index
+    /// and <see cref="ColumnMetaData.DataPageOffset"/> agree where the first data page is: the map then
+    /// waits for them (<see cref="ColumnPageMap.PendingPrefixLength"/>), and the first data read fetches
+    /// them in the same request, saving a round trip. When the two disagree they are read now, one
+    /// request for every such chunk, so that an index they contradict can still be set aside for a
+    /// header scan.</para>
     /// </remarks>
     private async ValueTask BuildPageMapsFromOffsetIndexesAsync(
-        RowGroupContext ctx, ColumnPageMap?[] pageMaps, CancellationToken cancellationToken)
+        RowGroupContext ctx, ColumnPageMap?[] pageMaps, IReadOnlyDictionary<long, byte[]>? prefetched,
+        CancellationToken cancellationToken)
     {
         var columns = new List<int>(ctx.Count);
         var indexRanges = new List<FileRange>(ctx.Count);
@@ -784,13 +829,30 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         if (columns.Count == 0)
             return;
 
-        var indexBytes = await ReadPageIndexBytesAsync(indexRanges, cancellationToken).ConfigureAwait(false);
+        // Only the indexes not already read.
+        var toRead = new List<FileRange>(columns.Count);
+        foreach (var range in indexRanges)
+        {
+            if (prefetched is null || !prefetched.ContainsKey(range.Offset))
+                toRead.Add(range);
+        }
+
+        var read = await ReadPageIndexBytesAsync(toRead, cancellationToken).ConfigureAwait(false);
+        var indexBytes = new byte[columns.Count][];
+        for (int k = 0, next = 0; k < columns.Count; k++)
+        {
+            indexBytes[k] = prefetched is not null && prefetched.TryGetValue(indexRanges[k].Offset, out var bytes)
+                ? bytes
+                : read[next++];
+        }
 
         var indexes = new OffsetIndex?[columns.Count];
         var prefixRanges = new List<FileRange>(columns.Count);
+        var readNow = new bool[columns.Count];
         for (int k = 0; k < columns.Count; k++)
         {
-            var range = ctx.Ranges[columns[k]];
+            int i = columns[k];
+            var range = ctx.Ranges[i];
             try
             {
                 indexes[k] = MetadataDecoder.DecodeOffsetIndex(indexBytes[k]);
@@ -807,8 +869,21 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 continue;
             }
 
-            if (first.Offset > range.Offset)
-                prefixRanges.Add(new FileRange(range.Offset, first.Offset - range.Offset));
+            if (first.Offset == range.Offset)
+                continue; // no side pages
+
+            if (first.Offset == ctx.Chunks[i].MetaData!.DataPageOffset)
+            {
+                // The index and the metadata agree: the side pages come with the first data read.
+                pageMaps[i] = PageMapBuilder.BuildLayoutFromOffsetIndex(
+                    checked((int)(first.Offset - range.Offset)), range.Offset, range.Offset + range.Length,
+                    indexes[k]!, ctx.RowCount, ctx.Columns[i], ctx.Chunks[i].MetaData!);
+                indexes[k] = null;
+                continue;
+            }
+
+            prefixRanges.Add(new FileRange(range.Offset, first.Offset - range.Offset));
+            readNow[k] = true;
         }
 
         var prefixes = prefixRanges.Count > 0
@@ -824,7 +899,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
                 int i = columns[k];
                 var range = ctx.Ranges[i];
-                var prefix = index.PageLocations[0].Offset > range.Offset
+                var prefix = readNow[k]
                     ? prefixes[nextPrefix++].Memory.Span
                     : ReadOnlySpan<byte>.Empty;
 
@@ -1882,45 +1957,232 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             return [];
         }
 
-        return await NarrowByPageIndexAsync(filter, rowGroupIndex, rowGroup, schema, accessor, cancellationToken)
+        var (ranges, _) = await NarrowByPageIndexAsync(
+                filter, rowGroupIndex, rowGroup, schema, accessor, readProjection: false, projection: null,
+                readAhead: null, cancellationToken)
             .ConfigureAwait(false);
+        return ranges;
     }
 
     /// <summary>
     /// The page-index half of <see cref="GetCandidateRowRangesAsync"/>, for a row group already judged a
     /// candidate: the rows its pages cannot rule out, the whole row group when nothing can narrow it.
+    /// With <paramref name="readProjection"/>, the same request reads the OffsetIndex of each column in
+    /// <paramref name="projection"/> (null: all), returned by file offset for the read's page maps.
     /// </summary>
-    private async ValueTask<IReadOnlyList<RowRange>> NarrowByPageIndexAsync(
+    private async ValueTask<(IReadOnlyList<RowRange> Ranges, Dictionary<long, byte[]>? OffsetIndexes)> NarrowByPageIndexAsync(
         EngineeredWood.Expressions.Predicate filter, int rowGroupIndex, RowGroup rowGroup,
-        SchemaDescriptor schema, ParquetStatisticsAccessor accessor, CancellationToken cancellationToken)
+        SchemaDescriptor schema, ParquetStatisticsAccessor accessor,
+        bool readProjection, IReadOnlyList<string>? projection, IReadOnlyDictionary<long, byte[]>? readAhead,
+        CancellationToken cancellationToken)
     {
         var whole = new[] { new RowRange(0, rowGroup.NumRows) };
         if (EngineeredWood.Expressions.StatisticsEvaluator.Evaluate(filter, rowGroup, accessor)
             == EngineeredWood.Expressions.FilterResult.AlwaysTrue)
         {
-            return whole;
+            return (whole, null);
         }
 
         var leaves = PageIndexPruner.PrunableColumns(filter, rowGroup, schema, _options.ColumnChunkFilePath);
         if (leaves.Count == 0)
-            return whole;
+            return (whole, null);
 
-        IReadOnlyList<ColumnChunkPageIndex> indexes;
+        // One request: the ColumnIndex and OffsetIndex of each column pruned by, and, for a read that
+        // follows, the OffsetIndex of each column it projects, which its page maps need. Reading those
+        // separately afterwards cost a round trip per row group.
+        var ranges = new List<FileRange>();
+        var columnIndexOf = new Dictionary<int, int>();
+        var offsetIndexOf = new Dictionary<int, int>();
+        var offsetIndexRanges = new Dictionary<long, int>();
         try
         {
-            indexes = await ReadPageIndexAsync(
-                    rowGroupIndex, leaves.ConvertAll(leaf => schema.Columns[leaf].DottedPath), cancellationToken)
-                .ConfigureAwait(false);
+            foreach (int leaf in leaves)
+            {
+                var chunk = rowGroup.Columns[leaf];
+                var column = schema.Columns[leaf];
+                columnIndexOf[leaf] = ranges.Count;
+                ranges.Add(PageIndexRange(chunk.ColumnIndexOffset, chunk.ColumnIndexLength, "ColumnIndex", column)!.Value);
+                var offsetIndex = PageIndexRange(chunk.OffsetIndexOffset, chunk.OffsetIndexLength, "OffsetIndex", column)!.Value;
+                offsetIndexOf[leaf] = offsetIndexRanges[offsetIndex.Offset] = ranges.Count;
+                ranges.Add(offsetIndex);
+            }
         }
         catch (ParquetFormatException)
         {
             // A footer that places an index outside the file. As with an index that fails to decode,
             // the rows are not narrowed rather than the call failing: a read that never consults the
             // index would not fail on it either.
-            return whole;
+            return (whole, null);
         }
 
-        return PageIndexPruner.SelectRows(filter, rowGroup, schema, indexes);
+        if (readProjection)
+        {
+            foreach (var range in ProjectedOffsetIndexRanges(schema, rowGroup, projection))
+            {
+                if (offsetIndexRanges.ContainsKey(range.Offset))
+                    continue;
+                offsetIndexRanges[range.Offset] = ranges.Count;
+                ranges.Add(range);
+            }
+        }
+
+        // What the read-ahead holds is taken from it; the rest is read now.
+        var bytes = new byte[ranges.Count][];
+        var missing = new List<int>();
+        for (int k = 0; k < ranges.Count; k++)
+        {
+            if (readAhead is not null && readAhead.TryGetValue(ranges[k].Offset, out var held) && held.Length == ranges[k].Length)
+                bytes[k] = held;
+            else
+                missing.Add(k);
+        }
+
+        if (missing.Count > 0)
+        {
+            var read = await ReadPageIndexBytesAsync(missing.ConvertAll(k => ranges[k]), cancellationToken).ConfigureAwait(false);
+            for (int m = 0; m < missing.Count; m++)
+                bytes[missing[m]] = read[m];
+        }
+
+        var indexes = new ColumnChunkPageIndex[leaves.Count];
+        for (int k = 0; k < leaves.Count; k++)
+        {
+            int leaf = leaves[k];
+            indexes[k] = new ColumnChunkPageIndex(
+                leaf, schema.Columns[leaf].Path, bytes[columnIndexOf[leaf]], bytes[offsetIndexOf[leaf]]);
+        }
+
+        Dictionary<long, byte[]>? offsetIndexes = null;
+        if (readProjection)
+        {
+            offsetIndexes = new Dictionary<long, byte[]>(offsetIndexRanges.Count);
+            foreach (var entry in offsetIndexRanges)
+                offsetIndexes[entry.Key] = bytes[entry.Value];
+        }
+
+        return (PageIndexPruner.SelectRows(filter, rowGroup, schema, indexes), offsetIndexes);
+    }
+
+    /// <summary>
+    /// The OffsetIndexes a read of <paramref name="projection"/> builds its page maps from: every
+    /// projected column's that a map can use (flat, in this file under <see cref="ParquetReadOptions.ColumnChunkFilePath"/>,
+    /// and wholly inside it). None when the projection
+    /// has a nested column, since such a row group is decoded whole and builds no page maps. The narrowing
+    /// and the read-ahead both ask this, so that the read-ahead holds exactly what the narrowing wants.
+    /// </summary>
+    private IEnumerable<FileRange> ProjectedOffsetIndexRanges(
+        SchemaDescriptor schema, RowGroup rowGroup, IReadOnlyList<string>? projection)
+    {
+        var (descriptors, chunks) = ResolveColumns(schema, rowGroup, projection);
+        if (descriptors.Any(d => d.Path.Count > 1 || d.MaxRepetitionLevel > 0))
+            yield break;
+
+        foreach (var chunk in chunks)
+        {
+            // A chunk stored in another file has offsets into that file (#405); under Refuse the read then
+            // refuses it, so its index is not this file's to read.
+            if (!IsStoredElsewhere(chunk)
+                && chunk.OffsetIndexOffset is { } offset && chunk.OffsetIndexLength is { } length
+                && offset >= 0 && length > 0 && offset <= _fileLength - length)
+            {
+                yield return new FileRange(offset, length);
+            }
+        }
+    }
+
+    /// <summary>At most this many row groups' page indexes are read ahead in one request.</summary>
+    private const int PageIndexReadAheadRowGroups = 64;
+
+    /// <summary>
+    /// ...and at most this many bytes of them, unless the first row group's alone are more, which are read
+    /// anyway. Tests lower it to make a file span several windows.
+    /// </summary>
+    internal long PageIndexReadAheadBudgetBytes { get; set; } = 8L * 1024 * 1024;
+
+    /// <summary>
+    /// Replaces <paramref name="readAhead"/>'s contents with the page-index bytes that
+    /// <see cref="NarrowByPageIndexAsync"/> will want for row group <paramref name="first"/> and the row
+    /// groups after it, read in one request, and returns the row group after the last one covered.
+    /// </summary>
+    /// <remarks>
+    /// Only row groups statistics leave undecided are covered: one they rule out, or wholly in, never
+    /// consults its index. A later group that dictionaries or Bloom filters then rule out wasted its
+    /// share, which is small. An index this cannot place is left out, for the narrowing to read and
+    /// refuse itself.
+    /// </remarks>
+    private async ValueTask<int> ReadPageIndexesAheadAsync(
+        EngineeredWood.Expressions.Predicate filter, int first, FileMetaData metadata, SchemaDescriptor schema,
+        ParquetStatisticsAccessor accessor, IReadOnlyList<string>? projection, Dictionary<long, byte[]> readAhead,
+        CancellationToken cancellationToken)
+    {
+        readAhead.Clear();
+        var ranges = new List<FileRange>();
+        var seen = new HashSet<long>();
+        long bytes = 0;
+
+        // One row group's ranges, gathered before they are committed so that the budget can be checked
+        // with them counted.
+        var group = new List<FileRange>();
+        long groupBytes = 0;
+        void Add(long? offset, int? length)
+        {
+            if (offset is { } o && length is { } l && o >= 0 && l > 0 && o <= _fileLength - l
+                && !seen.Contains(o) && !group.Exists(r => r.Offset == o))
+            {
+                group.Add(new FileRange(o, l));
+                groupBytes += l;
+            }
+        }
+
+        int end = first;
+        for (; end < metadata.RowGroups.Count && end - first < PageIndexReadAheadRowGroups; end++)
+        {
+            group.Clear();
+            groupBytes = 0;
+
+            var rowGroup = metadata.RowGroups[end];
+            if (rowGroup.NumRows <= 0)
+                continue;
+            var verdict = EngineeredWood.Expressions.StatisticsEvaluator.Evaluate(filter, rowGroup, accessor);
+            if (verdict != EngineeredWood.Expressions.FilterResult.Unknown)
+                continue;
+
+            var leaves = PageIndexPruner.PrunableColumns(filter, rowGroup, schema, _options.ColumnChunkFilePath);
+            if (leaves.Count == 0)
+                continue;
+
+            foreach (int leaf in leaves)
+            {
+                var chunk = rowGroup.Columns[leaf];
+                Add(chunk.ColumnIndexOffset, chunk.ColumnIndexLength);
+                Add(chunk.OffsetIndexOffset, chunk.OffsetIndexLength);
+            }
+
+            foreach (var range in ProjectedOffsetIndexRanges(schema, rowGroup, projection))
+                Add(range.Offset, (int)range.Length);
+
+            // A group that would take the window past its budget starts the next window instead. The
+            // first group is read whatever its size: the narrowing would read its index anyway.
+            if (end > first && bytes + groupBytes > PageIndexReadAheadBudgetBytes)
+                break;
+
+            foreach (var range in group)
+            {
+                seen.Add(range.Offset);
+                ranges.Add(range);
+            }
+
+            bytes += groupBytes;
+        }
+
+        if (ranges.Count > 0)
+        {
+            var read = await ReadPageIndexBytesAsync(ranges, cancellationToken).ConfigureAwait(false);
+            for (int k = 0; k < ranges.Count; k++)
+                readAhead[ranges[k].Offset] = read[k];
+        }
+
+        return Math.Max(end, first + 1);
     }
 
     /// <summary>

@@ -26,7 +26,8 @@ internal static class PageIndexPruner
 {
     /// <summary>
     /// The leaves of <paramref name="filter"/> whose page index can narrow it in
-    /// <paramref name="rowGroup"/>: flat, with both indexes, and not stored in another file. A chunk
+    /// <paramref name="rowGroup"/>: flat, with both indexes (offset and length each; a footer with only
+    /// one of the two has no index), and not stored in another file. A chunk
     /// with a <c>file_path</c> counts as stored here under <see cref="ColumnChunkFilePathKind.Ignore"/>,
     /// as it does for every other read (#405). In schema order.
     /// </summary>
@@ -45,8 +46,8 @@ internal static class PageIndexPruner
             var chunk = rowGroup.Columns[leaf];
             if (schema.Columns[leaf].MaxRepetitionLevel == 0
                 && (chunk.FilePath is null || filePath == ColumnChunkFilePathKind.Ignore)
-                && chunk.ColumnIndexOffset is not null
-                && chunk.OffsetIndexOffset is not null)
+                && chunk.ColumnIndexOffset is not null && chunk.ColumnIndexLength is not null
+                && chunk.OffsetIndexOffset is not null && chunk.OffsetIndexLength is not null)
             {
                 leaves.Add(leaf);
             }

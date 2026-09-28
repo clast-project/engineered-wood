@@ -4,6 +4,7 @@
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Expressions;
+using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 using EngineeredWood.Tests.Parquet.Metadata;
@@ -228,6 +229,207 @@ public class PageIndexRowRangeReadTests : IDisposable
         Assert.Equal(expected.Take(250).Concat(expected.Skip(4500).Take(250)), on);
     }
 
+    // ───── Requests: round trips, not only bytes, decide object storage ─────
+
+    /// <summary>
+    /// A selective filter costs one request more than without the index: the index of the row group it
+    /// keeps, which also carries the OffsetIndexes its page maps need, and whose dictionary pages come
+    /// with its data pages.
+    /// </summary>
+    [Fact]
+    public async Task FilterUsePageIndex_SelectiveFilter_CostsOneRequest()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            DataPageRowCountLimit = 250,
+            RowGroupMaxRows = 1000,
+        });
+        var filter = Ex.Equal("sorted", LiteralValue.Of(2100L));
+
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true });
+
+        Assert.Equal(off + 1, on);
+    }
+
+    /// <summary>
+    /// A filter the index cannot narrow costs one request more per window of row groups, not per row
+    /// group: 132 row groups are three windows of at most 64.
+    /// </summary>
+    [Theory]
+    [InlineData(1000, 1)]  // 5 row groups
+    [InlineData(38, 3)]    // 132 row groups
+    public async Task FilterUsePageIndex_FilterItCannotNarrow_OneRequestPerWindow(int rowsPerGroup, int windows)
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            DataPageRowCountLimit = 250,
+            RowGroupMaxRows = rowsPerGroup,
+        });
+
+        // Random ints: every row group and every page holds values on both sides of the median.
+        var filter = Ex.LessThan("ints", LiteralValue.Of(int.MaxValue / 2));
+
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true });
+
+        Assert.Equal(off + windows, on);
+        Assert.Equal(
+            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter }),
+            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true }));
+    }
+
+    /// <summary>
+    /// The read-ahead stops before a row group that would take it past its byte budget, rather than
+    /// after: with a budget of 2.5 row groups' indexes, 20 row groups are 10 windows of 2, not 7 of 3.
+    /// </summary>
+    [Fact]
+    public async Task FilterUsePageIndex_ReadAheadStaysWithinItsBudget()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            DataPageRowCountLimit = 50,
+            RowGroupMaxRows = 250,
+        });
+        var filter = Ex.LessThan("ints", LiteralValue.Of(int.MaxValue / 2));
+
+        // What the read-ahead asks for per row group: the filter column's ColumnIndex, and every
+        // column's OffsetIndex (all columns are flat, and all are read).
+        long largest;
+        using (var probe = Open(path))
+        {
+            var metadata = await probe.ReadMetadataAsync();
+            Assert.Equal(20, metadata.RowGroups.Count);
+            largest = metadata.RowGroups.Max(rg =>
+                rg.Columns[1].ColumnIndexLength!.Value + rg.Columns.Sum(c => (long)c.OffsetIndexLength!.Value));
+        }
+
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using (var reader = new ParquetFileReader(counting, ownsFile: true,
+            new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true }))
+        {
+            reader.PageIndexReadAheadBudgetBytes = largest * 5 / 2;
+            await foreach (var batch in reader.ReadAllAsync())
+                batch.Dispose();
+        }
+
+        Assert.Equal(off + 10, counting.Requests.Count);
+    }
+
+    /// <summary>
+    /// Where statistics already decide a row group (here every row matches), the index is never read, so
+    /// the option costs nothing: a batched read makes exactly the requests it makes without it, page maps'
+    /// OffsetIndexes included.
+    /// </summary>
+    [Fact]
+    public async Task FilterUsePageIndex_RowGroupsStatisticsDecide_CostNothing()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            DataPageRowCountLimit = 250,
+            RowGroupMaxRows = 1000,
+        });
+        var filter = Ex.GreaterThanOrEqual("sorted", LiteralValue.Of(0L));
+
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, BatchSize = 97 });
+        int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, BatchSize = 97, FilterUsePageIndex = true });
+
+        Assert.Equal(off, on);
+    }
+
+    /// <summary>
+    /// A projection with a nested column is decoded whole, so it builds no page maps and needs no
+    /// OffsetIndexes: the selective filter still costs one request, not one more for the projection's
+    /// indexes (which the read-ahead and the narrowing once disagreed about).
+    /// </summary>
+    [Fact]
+    public async Task FilterUsePageIndex_NestedProjection_CostsOneRequest()
+    {
+        string path = await WriteAsync(WithNested(Flat(Rows)), ParquetWriteOptions.Default with
+        {
+            DataPageRowCountLimit = 250,
+            RowGroupMaxRows = 1000,
+        });
+        var filter = Ex.Equal("sorted", LiteralValue.Of(2100L));
+
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true });
+
+        Assert.Equal(off + 1, on);
+    }
+
+    /// <summary>
+    /// A footer with a ColumnIndex offset but no length has no ColumnIndex, as for
+    /// <see cref="ParquetFileReader.ReadPageIndexAsync"/>: the rows are not narrowed, and nothing throws.
+    /// </summary>
+    [Fact]
+    public async Task HalfSpecifiedColumnIndex_IsNoIndex()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+        FooterRewrite.Rewrite(path, metadata =>
+        {
+            var rowGroup = metadata.RowGroups[0];
+            var columns = rowGroup.Columns.ToArray();
+            columns[0] = FooterRewrite.With(columns[0], nameof(EngineeredWood.Parquet.Metadata.ColumnChunk.ColumnIndexLength), (int?)null);
+            return FooterRewrite.With(metadata, nameof(EngineeredWood.Parquet.Metadata.FileMetaData.RowGroups),
+                new[] { FooterRewrite.With(rowGroup, nameof(EngineeredWood.Parquet.Metadata.RowGroup.Columns), columns) });
+        });
+        var filter = Ex.Equal("sorted", LiteralValue.Of(2100L));
+
+        using (var reader = Open(path))
+            Assert.Equal([new RowRange(0, Rows)], await reader.GetCandidateRowRangesAsync(0, filter));
+        Assert.Equal(
+            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter }),
+            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true }));
+    }
+
+    /// <summary>
+    /// A batched read finds a column's pages from its OffsetIndex; its dictionary page is fetched in the
+    /// same request as its first data pages, not in a request of its own.
+    /// </summary>
+    [Fact]
+    public async Task BatchedRead_FetchesTheDictionaryWithTheFirstPages()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true, new ParquetReadOptions { BatchSize = 97 });
+        var metadata = await reader.ReadMetadataAsync();
+        var low = metadata.RowGroups[0].Columns[2].MetaData!;
+        Assert.Equal("low", low.PathInSchema![0]);
+        long dictionary = low.DictionaryPageOffset!.Value;
+        var dictionaryRange = new FileRange(dictionary, low.DataPageOffset - dictionary);
+
+        await foreach (var batch in reader.ReadRowGroupBatchesAsync(0))
+            batch.Dispose();
+
+        var carrying = Assert.Single(counting.RequestRanges, ranges => ranges.Contains(dictionaryRange));
+        Assert.True(carrying.Count > 1, "the dictionary page was read on its own");
+    }
+
+    /// <summary>
+    /// Where the OffsetIndex and the metadata agree the first data page starts, what lies before it must
+    /// be a dictionary page. Bytes that are not one are refused, rather than decoded as a dictionary.
+    /// </summary>
+    [Fact]
+    public async Task BatchedRead_CorruptDictionaryPage_IsRefused()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+        long dictionary;
+        using (var probe = Open(path))
+            dictionary = (await probe.ReadMetadataAsync()).RowGroups[0].Columns[2].MetaData!.DictionaryPageOffset!.Value;
+        byte[] bytes = File.ReadAllBytes(path);
+        bytes.AsSpan(checked((int)dictionary), 16).Fill(0xFF);
+        File.WriteAllBytes(path, bytes);
+
+        using var reader = new ParquetFileReader(new LocalRandomAccessFile(path), ownsFile: true, new ParquetReadOptions { BatchSize = 97 });
+        await Assert.ThrowsAsync<ParquetFormatException>(async () =>
+        {
+            await foreach (var batch in reader.ReadRowGroupBatchesAsync(0, ["low"]))
+                batch.Dispose();
+        });
+    }
+
     // ───── Arguments ─────
 
     [Theory]
@@ -362,6 +564,16 @@ public class PageIndexRowRangeReadTests : IDisposable
         }
 
         return rows;
+    }
+
+    /// <summary>The requests a whole filtered read makes, footer included.</summary>
+    private static async Task<int> RequestsAsync(string path, ParquetReadOptions options)
+    {
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true, options);
+        await foreach (var batch in reader.ReadAllAsync())
+            batch.Dispose();
+        return counting.Requests.Count;
     }
 
     /// <summary>The bytes a read asks for, footer and index included.</summary>
