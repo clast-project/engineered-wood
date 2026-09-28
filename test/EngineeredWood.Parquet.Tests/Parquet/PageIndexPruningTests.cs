@@ -367,6 +367,29 @@ public class PageIndexPruningTests : IDisposable
     }
 
     /// <summary>
+    /// A footer that places the ColumnIndex outside the file fails <see cref="ParquetFileReader.ReadPageIndexAsync"/>
+    /// with a format error; candidate ranges treat it like any other unusable index.
+    /// </summary>
+    [Fact]
+    public async Task ColumnIndexOutsideTheFile_IsIgnored()
+    {
+        string path = await WriteAsync(Sorted(1000), RowCapped(100));
+        long length = new FileInfo(path).Length;
+        FooterRewrite.Rewrite(path, metadata =>
+        {
+            var rowGroup = metadata.RowGroups[0];
+            var x = FooterRewrite.With(rowGroup.Columns[0], nameof(ColumnChunk.ColumnIndexOffset), (long?)(length * 2));
+            var columns = new[] { x, rowGroup.Columns[1] };
+            return FooterRewrite.With(metadata, nameof(FileMetaData.RowGroups),
+                new[] { FooterRewrite.With(rowGroup, nameof(RowGroup.Columns), columns) });
+        });
+
+        using var reader = Open(path);
+        await Assert.ThrowsAsync<ParquetFormatException>(async () => await reader.ReadPageIndexAsync(0, ["x"]));
+        Assert.Equal([new RowRange(0, 1000)], await reader.GetCandidateRowRangesAsync(0, Ex.Equal("x", LiteralValue.Of(250))));
+    }
+
+    /// <summary>
     /// parquet-mr 1.13 wrote these fixtures' ColumnIndex as a placeholder: every page null, null counts
     /// of -1, empty bounds, on required columns full of values. Trusted, it drops every row of
     /// <c>a IS NOT NULL</c>; it must be ignored instead.

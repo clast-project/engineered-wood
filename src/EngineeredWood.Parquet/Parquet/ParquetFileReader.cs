@@ -1736,13 +1736,25 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             return whole;
         }
 
-        var leaves = PageIndexPruner.PrunableColumns(filter, rowGroup, schema);
+        var leaves = PageIndexPruner.PrunableColumns(filter, rowGroup, schema, _options.ColumnChunkFilePath);
         if (leaves.Count == 0)
             return whole;
 
-        var indexes = await ReadPageIndexAsync(
-                rowGroupIndex, leaves.ConvertAll(leaf => schema.Columns[leaf].DottedPath), cancellationToken)
-            .ConfigureAwait(false);
+        IReadOnlyList<ColumnChunkPageIndex> indexes;
+        try
+        {
+            indexes = await ReadPageIndexAsync(
+                    rowGroupIndex, leaves.ConvertAll(leaf => schema.Columns[leaf].DottedPath), cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (ParquetFormatException)
+        {
+            // A footer that places an index outside the file. As with an index that fails to decode,
+            // the rows are not narrowed rather than the call failing: a read that never consults the
+            // index would not fail on it either.
+            return whole;
+        }
+
         return PageIndexPruner.SelectRows(filter, rowGroup, schema, indexes);
     }
 
