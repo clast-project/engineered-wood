@@ -2089,8 +2089,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <summary>At most this many row groups' page indexes are read ahead in one request.</summary>
     private const int PageIndexReadAheadRowGroups = 64;
 
-    /// <summary>...and at most this many bytes of them.</summary>
-    private const long PageIndexReadAheadBytes = 8L * 1024 * 1024;
+    /// <summary>
+    /// ...and at most this many bytes of them, unless the first row group's alone are more, which are read
+    /// anyway. Tests lower it to make a file span several windows.
+    /// </summary>
+    internal long PageIndexReadAheadBudgetBytes { get; set; } = 8L * 1024 * 1024;
 
     /// <summary>
     /// Replaces <paramref name="readAhead"/>'s contents with the page-index bytes that
@@ -2113,20 +2116,25 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var seen = new HashSet<long>();
         long bytes = 0;
 
+        // One row group's ranges, gathered before they are committed so that the budget can be checked
+        // with them counted.
+        var group = new List<FileRange>();
+        long groupBytes = 0;
         void Add(long? offset, int? length)
         {
-            if (offset is { } o && length is { } l && o >= 0 && l > 0 && o <= _fileLength - l && seen.Add(o))
+            if (offset is { } o && length is { } l && o >= 0 && l > 0 && o <= _fileLength - l
+                && !seen.Contains(o) && !group.Exists(r => r.Offset == o))
             {
-                ranges.Add(new FileRange(o, l));
-                bytes += l;
+                group.Add(new FileRange(o, l));
+                groupBytes += l;
             }
         }
 
         int end = first;
         for (; end < metadata.RowGroups.Count && end - first < PageIndexReadAheadRowGroups; end++)
         {
-            if (end > first && bytes >= PageIndexReadAheadBytes)
-                break;
+            group.Clear();
+            groupBytes = 0;
 
             var rowGroup = metadata.RowGroups[end];
             if (rowGroup.NumRows <= 0)
@@ -2148,6 +2156,19 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
             foreach (var range in ProjectedOffsetIndexRanges(schema, rowGroup, projection))
                 Add(range.Offset, (int)range.Length);
+
+            // A group that would take the window past its budget starts the next window instead. The
+            // first group is read whatever its size: the narrowing would read its index anyway.
+            if (end > first && bytes + groupBytes > PageIndexReadAheadBudgetBytes)
+                break;
+
+            foreach (var range in group)
+            {
+                seen.Add(range.Offset);
+                ranges.Add(range);
+            }
+
+            bytes += groupBytes;
         }
 
         if (ranges.Count > 0)

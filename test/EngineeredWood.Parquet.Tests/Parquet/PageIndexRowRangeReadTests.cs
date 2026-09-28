@@ -280,6 +280,44 @@ public class PageIndexRowRangeReadTests : IDisposable
     }
 
     /// <summary>
+    /// The read-ahead stops before a row group that would take it past its byte budget, rather than
+    /// after: with a budget of 2.5 row groups' indexes, 20 row groups are 10 windows of 2, not 7 of 3.
+    /// </summary>
+    [Fact]
+    public async Task FilterUsePageIndex_ReadAheadStaysWithinItsBudget()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            DataPageRowCountLimit = 50,
+            RowGroupMaxRows = 250,
+        });
+        var filter = Ex.LessThan("ints", LiteralValue.Of(int.MaxValue / 2));
+
+        // What the read-ahead asks for per row group: the filter column's ColumnIndex, and every
+        // column's OffsetIndex (all columns are flat, and all are read).
+        long largest;
+        using (var probe = Open(path))
+        {
+            var metadata = await probe.ReadMetadataAsync();
+            Assert.Equal(20, metadata.RowGroups.Count);
+            largest = metadata.RowGroups.Max(rg =>
+                rg.Columns[1].ColumnIndexLength!.Value + rg.Columns.Sum(c => (long)c.OffsetIndexLength!.Value));
+        }
+
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using (var reader = new ParquetFileReader(counting, ownsFile: true,
+            new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true }))
+        {
+            reader.PageIndexReadAheadBudgetBytes = largest * 5 / 2;
+            await foreach (var batch in reader.ReadAllAsync())
+                batch.Dispose();
+        }
+
+        Assert.Equal(off + 10, counting.Requests.Count);
+    }
+
+    /// <summary>
     /// A projection with a nested column is decoded whole, so it builds no page maps and needs no
     /// OffsetIndexes: the selective filter still costs one request, not one more for the projection's
     /// indexes (which the read-ahead and the narrowing once disagreed about).
