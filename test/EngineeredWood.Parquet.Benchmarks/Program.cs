@@ -23,6 +23,18 @@ if (args.Length > 0 && args[0] == "pagemap-ab")
     return;
 }
 
+if (args.Length > 0 && args[0] == "pageindex-worth")
+{
+    Environment.ExitCode = await PageIndexWorth.RunAsync(args);
+    return;
+}
+
+if (args.Length > 0 && args[0] == "rowcap-ab")
+{
+    Environment.ExitCode = await RowCountLimitAb.RunAsync(args);
+    return;
+}
+
 if (args.Length > 0 && args[0] == "dictpruning-ab")
 {
     Environment.ExitCode = await DictionaryPruningAb.RunAsync(args);

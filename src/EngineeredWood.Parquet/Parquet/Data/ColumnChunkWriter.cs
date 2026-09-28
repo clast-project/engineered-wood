@@ -367,7 +367,9 @@ internal static class ColumnChunkWriter
         while (offset < rowCount)
         {
             int pageValues = RecordAlignedPageLength(
-                repLevels, offset, Math.Min(valuesPerPage, rowCount - offset), rowCount);
+                repLevels, offset,
+                PageTargetLength(repLevels, offset, valuesPerPage, rowCount, options.DataPageRowCountLimit),
+                rowCount);
             int pageNonNull = maxDefLevel > 0
                 ? CountNonNull(defLevels!, offset, pageValues, maxDefLevel)
                 : pageValues;
@@ -448,6 +450,30 @@ internal static class ColumnChunkWriter
     /// <summary>Rows that start in a page: every level entry for a flat column, rep = 0 for a repeated one.</summary>
     private static int PageRows(int[]? repLevels, int offset, int pageValues, int maxRepLevel) =>
         maxRepLevel > 0 ? CountRows(repLevels, offset, pageValues, maxRepLevel) : pageValues;
+
+    /// <summary>
+    /// A page's length in level entries before record alignment: what <paramref name="valuesPerPage"/>
+    /// allows, shortened to <paramref name="rowLimit"/> rows. For a repeated leaf the row cut falls
+    /// where the first record past the limit begins, which is already a record boundary.
+    /// </summary>
+    /// <param name="levelCount">Level entries in the whole chunk.</param>
+    private static int PageTargetLength(int[]? repLevels, int offset, int valuesPerPage, int levelCount, int? rowLimit)
+    {
+        int target = Math.Min(valuesPerPage, levelCount - offset);
+        if (rowLimit is not int limit)
+            return target;
+        if (repLevels is null)
+            return Math.Min(target, limit);
+
+        int rows = 0;
+        for (int i = offset; i < offset + target; i++)
+        {
+            if (repLevels[i] == 0 && ++rows > limit)
+                return i - offset;
+        }
+
+        return target;
+    }
 
     /// <summary>
     /// Moves a page's end onto a record boundary, so that every page of a repeated leaf begins at
@@ -646,7 +672,9 @@ internal static class ColumnChunkWriter
         while (offset < rowCount)
         {
             int pageValues = RecordAlignedPageLength(
-                repLevels, offset, Math.Min(valuesPerPage, rowCount - offset), rowCount);
+                repLevels, offset,
+                PageTargetLength(repLevels, offset, valuesPerPage, rowCount, options.DataPageRowCountLimit),
+                rowCount);
             int pageNonNull = maxDefLevel > 0
                 ? CountNonNull(defLevels!, offset, pageValues, maxDefLevel)
                 : pageValues;

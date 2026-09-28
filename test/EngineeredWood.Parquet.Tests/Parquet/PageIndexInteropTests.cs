@@ -82,6 +82,30 @@ public class PageIndexInteropTests : IDisposable
         await AssertAgreesAndPrunes(path, "u >= 3000059000", 1000);
     }
 
+    /// <summary>
+    /// The same checks on pages cut by <see cref="ParquetWriteOptions.DataPageRowCountLimit"/> rather
+    /// than by size: every column starts a page every 1,000 rows, and the default page size never cuts.
+    /// </summary>
+    [SkippableTheory]
+    [MemberData(nameof(Layouts))]
+    public async Task DataFusion_RowCountLimitedPages(DataPageVersion version, bool dictionary)
+    {
+        ExternalParquetReaders.Require();
+
+        string path = await WriteAsync(SortedBatch(), ParquetWriteOptions.Default with
+        {
+            DataPageVersion = version,
+            DictionaryEnabled = dictionary,
+            DataPageRowCountLimit = 1000,
+        });
+
+        await AssertAgreesAndPrunes(path, "x BETWEEN 30000 AND 30150", 151);
+        await AssertAgreesAndPrunes(path, "k = 250", 100);
+        await AssertAgreesAndPrunes(path, $"s = '{LongString(41_000)}'", 1);
+        await AssertAgreesAndPrunes(path, "d > 580.00", 999);
+        await AssertAgreesAndPrunes(path, "u >= 3000059000", 1000);
+    }
+
     [SkippableFact]
     public async Task DataFusion_BufferedWriter()
     {
