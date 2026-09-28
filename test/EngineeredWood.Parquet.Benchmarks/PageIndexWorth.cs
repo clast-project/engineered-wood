@@ -98,7 +98,7 @@ internal static class PageIndexWorth
         for (long i = 0; i < (long)RowGroups * RowsPerGroup; i++)
         {
             ids.Append(i);
-            ts.Append(Ts(i) + random.Next(1000)); // sorted, neighbours overlap slightly
+            ts.Append(Ts(i) + random.Next(250)); // jitter below the 250-unit step, so ts stays sorted
             users.Append(User(i));
             categories.Append("cat-" + random.Next(50).ToString("D2", CultureInfo.InvariantCulture));
             amounts.Append(random.NextDouble());
@@ -303,22 +303,33 @@ internal static class PageIndexWorth
     {
         if (ranges.Count == 0)
             return;
+        var rowGroups = new List<RecordBatch>();
         var slices = new List<RecordBatch>();
-        using (var reader = new ParquetFileReader(new LocalRandomAccessFile(path), ownsFile: true))
+        try
         {
-            foreach (var group in ranges.GroupBy(r => r.RowGroup))
+            using (var reader = new ParquetFileReader(new LocalRandomAccessFile(path), ownsFile: true))
             {
-                var batch = await reader.ReadRowGroupAsync(group.Key);
-                foreach (var r in group)
-                    slices.Add(batch.Slice((int)r.Start, (int)(r.End - r.Start)));
+                foreach (var group in ranges.GroupBy(r => r.RowGroup))
+                {
+                    var batch = await reader.ReadRowGroupAsync(group.Key);
+                    rowGroups.Add(batch);
+                    foreach (var r in group)
+                        slices.Add(batch.Slice((int)r.Start, (int)(r.End - r.Start)));
+                }
             }
-        }
 
-        var schema = slices[0].Schema;
-        var arrays = Enumerable.Range(0, schema.FieldsList.Count)
-            .Select(c => ArrowCompute.Concatenate(slices.Select(s => s.Column(c)).ToList()))
-            .ToArray();
-        await WriteAsync(new RecordBatch(schema, arrays, arrays[0].Length), keptPath);
+            var schema = slices[0].Schema;
+            var arrays = Enumerable.Range(0, schema.FieldsList.Count)
+                .Select(c => ArrowCompute.Concatenate(slices.Select(s => s.Column(c)).ToList()))
+                .ToArray();
+            using var kept = new RecordBatch(schema, arrays, arrays[0].Length);
+            await WriteAsync(kept, keptPath);
+        }
+        finally
+        {
+            foreach (var batch in rowGroups)
+                batch.Dispose();
+        }
     }
 
     private static async Task<double> TimeReadAsync(string path, ParquetReadOptions options)

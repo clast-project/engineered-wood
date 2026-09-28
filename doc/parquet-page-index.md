@@ -429,8 +429,8 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    | Writer | Pages per row group (id / user / category) | id point: rows, bytes kept | user point: rows, bytes kept | DataFusion saving, index on vs off (id / user) |
    |---|---|---|---|---|
    | arrow-rs | 50 / 49 / 49 | 2.0%, 10.5% | 2.0%, 11.3% | 88% / 86% |
-   | pyarrow | 51 / 50 / 50 | 2.0%, 11.1% | 2.0%, 11.2% | 87% / 86% |
-   | **EW** | **8 / 2 / 1** | 13.1%, 19.3% | 52.4%, 56.3% | 77% / 49% |
+   | pyarrow | 51 / 50 / 50 | 2.0%, 10.9% | 2.0%, 11.2% | 87% / 86% |
+   | **EW** | **8 / 2 / 1** | 13.1%, 19.4% | 52.4%, 56.3% | 77% / 49% |
 
    - **The win is large where it applies.** Today EW reads the surviving 1M-row group whole:
      21 ms for an EW file and 36 ms for the others, locally. For a point or 0.1% range on a
@@ -465,7 +465,7 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
 
    | `pageindex-worth`, EW with a 20,000-row cap | Pages (id / user / category) | id point: rows, bytes kept | user point: rows, bytes kept | DataFusion saving (id / user) |
    |---|---|---|---|---|
-   | no cap (today's default) | 8 / 2 / 1 | 13.1%, 19.3% | 52.4%, 56.3% | 80% / 51% |
+   | no cap (today's default) | 8 / 2 / 1 | 13.1%, 19.4% | 52.4%, 56.3% | 80% / 51% |
    | 20,000 | 50 / 50 / 50 | 2.0%, 2.05% | 2.0%, 2.06% | 93% / 94% |
 
    Cost, from `-- rowcap-ab` (500k rows, the phase-4 workloads, medians of alternating rounds):
