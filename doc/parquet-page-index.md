@@ -442,10 +442,11 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    - **Unclustered predicates prune nothing**, as expected. What they pay is the index read, one
      request per surviving row group.
    - **EW's own files halve the benefit.** `EstimateValuesPerPage` cuts a page at
-     `DataPageSize` ÷ *plain* value width, so an int64 page holds 131,072 rows. A dictionary page
-     is cut at `DataPageSize` ÷ index bytes, so a dictionary column with ≤ 256 distinct values
-     is **one page per row group** and can never prune. arrow-rs, parquet-mr and pyarrow 25's parquet-cpp all
-     also cap a page at 20,000 rows. Spark-written Delta tables therefore get the full effect;
+     `DataPageSize` ÷ *plain* value width, so at the default 1 MiB an int64 page holds 131,072
+     rows. A dictionary page is cut at `DataPageSize` ÷ index bytes, so a dictionary column with
+     ≤ 256 distinct values is **one page per row group** and can never prune. parquet-mr and
+     pyarrow 25's parquet-cpp cap a page at 20,000 rows; arrow-rs checks the same limit only
+     between 1,024-row write batches, so its pages hold 20,480. Spark-written Delta tables therefore get the full effect;
      EW-written ones do not. That includes DataFusion reading EW's files, which saves 49% on
      `user` where it saves 86% on the others. The cap is a writer change that phases 0–4
      should have had.
