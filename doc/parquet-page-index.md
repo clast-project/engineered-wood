@@ -418,7 +418,9 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
 3. **Is R-3 worth building at all**, or do phases 0–5 suffice until a user shows clustered
    data and a filtered-read workload?
 
-   **Measured (2026-09-27); recommendation: build it, but first cap EW's page row count.**
+   **Measured (2026-09-27); recommendation: build it, but first cap EW's page row count.** The cap
+   is done (#428, and the default since #429); R-2 and R-3 are next. The first table and its
+   bullets measure EW's files as they were written before the cap.
    `-- pageindex-worth` writes 4 row groups × 1M rows (sorted `id` and `ts`, a clustered
    dictionary-encoded `user`, and unclustered `category`, `amount` and `note`). pyarrow 25 and
    DataFusion 54 (arrow-rs) rewrote the same rows with their defaults. The harness prototypes R-2
@@ -432,10 +434,12 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    | pyarrow | 51 / 50 / 50 | 2.0%, 10.9% | 2.0%, 11.2% | 87% / 86% |
    | **EW, no page row cap** (the default before #429) | **8 / 2 / 1** | 13.1%, 19.4% | 52.4%, 56.3% | 77% / 49% |
 
-   - **The win is large where it applies.** Today EW reads the surviving 1M-row group whole:
-     21 ms for an EW file and 36 ms for the others, locally. For a point or 0.1% range on a
-     sorted column, page pruning keeps 2–13% of those rows and 10–19% of the bytes. The
-     kept-rows-only EW read takes 3.3 ms against 21 ms, an upper bound of 85% saved.
+   - **The win is large where it applies.** EW's reader, which has no page pruning until R-3,
+     reads the surviving 1M-row group whole: 21 ms for the uncapped EW file and 36 ms for the
+     others, locally. For a point or 0.1% range on a sorted column, page pruning keeps 2–13% of
+     those rows and 10–19% of the bytes (2% of both on a capped EW file; second table below).
+     The kept-rows-only read of the uncapped EW file takes 3.3 ms against 21 ms, an upper bound
+     of 85% saved; on the capped file it is 0.7–0.8 ms, 96%.
      DataFusion's mature equivalent saves 77–88%. The bytes column is what matters on object
      storage: 3–7 MB fetched instead of 26–43 MB, for one extra request for the index. The
      `note` payload's pages drive most of those bytes, since they do not align with `id`'s.
@@ -478,8 +482,9 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    with `DOTNET_TieredPGO=0` the capped and uncapped reads of that column time the same. The
    one-column dictionary read is about 1.3 ms, so the absolute cost is tenths of a millisecond per
    500k rows. **Recommendation: default it to 20,000**, in its own change, like phase 4.
+   (Carried out by #429.)
 
-   **Done: the default is 20,000.** The byte-identity corpus pins the limit off in its baseline and
+   **Done in #429: the default is 20,000.** The byte-identity corpus pins the limit off in its baseline and
    carries capped variants of its own; its 5,000 rows are below the default anyway. A probe that
    threw wherever the default cap shortened a page found only two pre-existing tests that write
    row groups larger than 20,000 rows, both round trips, and no Delta test. Both now write five
