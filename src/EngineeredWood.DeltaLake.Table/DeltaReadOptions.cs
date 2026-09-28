@@ -23,12 +23,14 @@ public sealed record DeltaReadOptions
     /// statistics in the log PROVE no row can match, and within a surviving file so is a Parquet row group
     /// whose footer statistics prove the same, or whose dictionary pages do (unless
     /// <see cref="Parquet.ParquetReadOptions.FilterUseDictionaries"/> is turned off), or whose Bloom filter
-    /// does (when <see cref="Parquet.ParquetReadOptions.FilterUseBloomFilters"/> is set), all on the table's
-    /// <see cref="DeltaTableOptions.ParquetReadOptions"/>. Row groups are pruned only by the built-in reader:
-    /// a <see cref="DeltaTableOptions.DataFileReader"/> gets file pruning alone, because the codec seam hides
-    /// the footer. The reader does NOT re-apply this per row, so
+    /// does (when <see cref="Parquet.ParquetReadOptions.FilterUseBloomFilters"/> is set), and within a
+    /// surviving row group so are the pages whose page-index bounds prove it (when
+    /// <see cref="Parquet.ParquetReadOptions.FilterUsePageIndex"/> is set), all on the table's
+    /// <see cref="DeltaTableOptions.ParquetReadOptions"/>. Row groups and pages are pruned only by the built-in
+    /// reader: a <see cref="DeltaTableOptions.DataFileReader"/> gets file pruning alone, because the codec seam
+    /// hides the footer. The reader does NOT re-apply this per row, so
     /// surviving batches still contain non-matching rows — filter them yourself. Metadata columns are
-    /// unaffected: a row keeps its file position and row id however many row groups before it were skipped.
+    /// unaffected: a row keeps its file position and row id however many rows before it were skipped.
     /// </summary>
     public Expressions.Predicate? Filter { get; init; }
 

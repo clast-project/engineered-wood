@@ -400,8 +400,11 @@ everything out is skipped.
   the existing batched-read tests guard the refactor.
 - **Batches never cross a gap.** A range longer than `BatchSize` or `MaxBatchByteSize` allows is
   split as a row group is. So counting rows across the ranges in order locates each batch in the
-  file, which the Delta scan needs for deletion vectors and row ids. Wiring Delta onto it is a
-  follow-up.
+  file, which the Delta scan needs for deletion vectors and row ids. `ReadWithPositionsAsync`
+  does that count for it: it is `ReadAllAsync`'s loop, with the filter passed in rather than set on
+  the options (which a table's many reads share) and each batch paired with its first row's file
+  position. The Delta scan reads through it, so `FilterUsePageIndex` on a table's
+  `ParquetReadOptions` narrows its scans with the same index read-ahead and one request per window.
 - **What is not narrowed yet.** A column without a usable OffsetIndex scans its headers and reads
   whole, and every column of a row group with a nested column is decoded whole and sliced. The rows
   are the same; only the saving is lost. Trimming repeated columns by `rep = 0` remains R-4 work.

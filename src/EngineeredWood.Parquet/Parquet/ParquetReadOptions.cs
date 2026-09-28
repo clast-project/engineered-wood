@@ -307,8 +307,9 @@ public sealed record ParquetReadOptions
     /// <para>The result is still a superset: the rows of a page that might match are all returned. A
     /// batch never spans rows the index ruled out, so a row group can come back as more, shorter
     /// batches, and the rows between them leave no trace. As with <see cref="Filter"/> itself, a
-    /// layer that counts rows to know their positions in the file should call the two methods above
-    /// instead.</para>
+    /// layer that counts rows to know their positions in the file should read through
+    /// <see cref="ParquetFileReader.ReadWithPositionsAsync"/> instead, which this option governs
+    /// too.</para>
     /// <para>It costs one more read call (one more round trip) per window of up to 64 row groups
     /// statistics leave undecided, for their indexes, and saves the pages it rules out; the indexes
     /// also carry the OffsetIndexes the read's page maps need, and a column's dictionary page comes with
