@@ -670,7 +670,9 @@ internal static class ColumnChunkReader
 
         var valuesCompressed = rawData.Slice(offset);
 
-        if (nonNullCount == 0 || valuesCompressed.IsEmpty)
+        // Only an all-null page may have no values. Returning early for an empty section of a page
+        // with values left the value buffer unwritten, and it was read back as garbage.
+        if (nonNullCount == 0)
             return;
 
         ReadOnlySpan<byte> valueData;
@@ -865,8 +867,9 @@ internal static class ColumnChunkReader
         // V2: only values portion is compressed (if is_compressed, default true)
         var valuesCompressed = rawData.Slice(offset);
 
-        // All values may be null — nothing to decompress or decode
-        if (nonNullCount == 0 || valuesCompressed.IsEmpty)
+        // All values may be null — nothing to decompress or decode. An empty section with values
+        // left would leave the value buffer unwritten, so it goes on to the decoder, which refuses it.
+        if (nonNullCount == 0)
             return numValues;
 
         ReadOnlySpan<byte> valueData;

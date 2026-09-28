@@ -212,6 +212,18 @@ internal ref struct ThriftCompactReader
         return (elementType, count);
     }
 
+    /// <summary>
+    /// Reads a list header whose count is about to size an allocation or a loop. Every element, a
+    /// bool included, takes at least a byte, so a count larger than the bytes left cannot be real.
+    /// </summary>
+    public (ThriftType ElementType, int Count) ReadBoundedListHeader()
+    {
+        var (elementType, count) = ReadListHeader();
+        if (count > Remaining)
+            throw new ParquetFormatException($"Thrift list claims {count} elements in {Remaining} bytes.");
+        return (elementType, count);
+    }
+
     /// <summary>Reads a map header, returning key type, value type, and count.</summary>
     public (ThriftType KeyType, ThriftType ValueType, int Count) ReadMapHeader()
     {
@@ -259,7 +271,7 @@ internal ref struct ThriftCompactReader
                 break;
 
             case ThriftType.Byte:
-                _position++;
+                ReadByte();
                 break;
 
             case ThriftType.I16:
@@ -272,6 +284,8 @@ internal ref struct ThriftCompactReader
                 break;
 
             case ThriftType.Double:
+                if (Remaining < 8)
+                    throw new ParquetFormatException("Unexpected end of Thrift data skipping a double.");
                 _position += 8;
                 break;
 
@@ -281,17 +295,20 @@ internal ref struct ThriftCompactReader
 
             case ThriftType.List:
             case ThriftType.Set:
-                var (elemType, count) = ReadListHeader();
+                var (elemType, count) = ReadBoundedListHeader();
                 for (int i = 0; i < count; i++)
-                    Skip(elemType);
+                    SkipElement(elemType);
                 break;
 
             case ThriftType.Map:
                 var (keyType, valueType, mapCount) = ReadMapHeader();
+                // A key and a value take at least a byte each; a larger count would spin, not read.
+                if (mapCount > Remaining / 2)
+                    throw new ParquetFormatException($"Thrift map claims {mapCount} entries in {Remaining} bytes.");
                 for (int i = 0; i < mapCount; i++)
                 {
-                    Skip(keyType);
-                    Skip(valueType);
+                    SkipElement(keyType);
+                    SkipElement(valueType);
                 }
                 break;
 
@@ -310,6 +327,18 @@ internal ref struct ThriftCompactReader
             default:
                 throw new ParquetFormatException($"Cannot skip unknown Thrift type {type}.");
         }
+    }
+
+    /// <summary>
+    /// Skips one element of a list, set or map. A bool there is a byte of its own, unlike a bool
+    /// field, whose value is in the field header that <see cref="Skip"/> assumes.
+    /// </summary>
+    private void SkipElement(ThriftType type)
+    {
+        if (type is ThriftType.BooleanTrue or ThriftType.BooleanFalse)
+            ReadByte();
+        else
+            Skip(type);
     }
 
     private readonly short GetStack(int index) => index switch

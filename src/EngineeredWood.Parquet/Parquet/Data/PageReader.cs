@@ -186,6 +186,12 @@ internal ref struct PageReader
                     return $"its levels take {levels} bytes, more than its size ({header.CompressedPageSize} " +
                         $"compressed, {header.UncompressedPageSize} uncompressed).";
                 }
+                // Every non-null value takes at least one byte in every encoding.
+                if (v2.NumNulls < v2.NumValues
+                    && (levels == header.CompressedPageSize || levels == header.UncompressedPageSize))
+                {
+                    return $"it holds {v2.NumValues - v2.NumNulls} non-null values but no value bytes.";
+                }
                 break;
 
             case PageType.DictionaryPage:

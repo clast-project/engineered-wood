@@ -89,7 +89,7 @@ internal static class MetadataDecoder
 
     private static ColumnOrder[] ReadColumnOrderList(ref ThriftCompactReader reader)
     {
-        var (elemType, count) = reader.ReadListHeader();
+        var (elemType, count) = reader.ReadBoundedListHeader();
         var array = new ColumnOrder[count];
         for (int i = 0; i < count; i++)
         {
@@ -136,7 +136,7 @@ internal static class MetadataDecoder
 
     private static SchemaElement[] ReadSchemaList(ref ThriftCompactReader reader)
     {
-        var (elemType, count) = reader.ReadListHeader();
+        var (elemType, count) = reader.ReadBoundedListHeader();
         var array = new SchemaElement[count];
         for (int i = 0; i < count; i++)
         {
@@ -430,7 +430,7 @@ internal static class MetadataDecoder
 
     private static RowGroup[] ReadRowGroupList(ref ThriftCompactReader reader)
     {
-        var (elemType, count) = reader.ReadListHeader();
+        var (elemType, count) = reader.ReadBoundedListHeader();
         var array = new RowGroup[count];
         for (int i = 0; i < count; i++)
         {
@@ -502,7 +502,7 @@ internal static class MetadataDecoder
 
     private static ColumnChunk[] ReadColumnChunkList(ref ThriftCompactReader reader)
     {
-        var (elemType, count) = reader.ReadListHeader();
+        var (elemType, count) = reader.ReadBoundedListHeader();
         var array = new ColumnChunk[count];
         for (int i = 0; i < count; i++)
         {
@@ -757,7 +757,7 @@ internal static class MetadataDecoder
 
     private static Encoding[] ReadEncodingList(ref ThriftCompactReader reader)
     {
-        var (_, count) = reader.ReadListHeader();
+        var (_, count) = reader.ReadBoundedListHeader();
         var array = new Encoding[count];
         for (int i = 0; i < count; i++)
             array[i] = (Encoding)reader.ReadZigZagInt32();
@@ -772,7 +772,7 @@ internal static class MetadataDecoder
     /// </summary>
     private static PageEncodingStats[]? ReadPageEncodingStatsList(ref ThriftCompactReader reader)
     {
-        var (elemType, count) = reader.ReadListHeader();
+        var (elemType, count) = reader.ReadBoundedListHeader();
         if (elemType != ThriftType.Struct)
         {
             for (int i = 0; i < count; i++)
@@ -835,7 +835,7 @@ internal static class MetadataDecoder
 
     private static string[] ReadStringList(ref ThriftCompactReader reader)
     {
-        var (_, count) = reader.ReadListHeader();
+        var (_, count) = reader.ReadBoundedListHeader();
         var array = new string[count];
         for (int i = 0; i < count; i++)
             array[i] = reader.ReadString();
@@ -844,7 +844,7 @@ internal static class MetadataDecoder
 
     private static KeyValue[] ReadKeyValueList(ref ThriftCompactReader reader)
     {
-        var (elemType, count) = reader.ReadListHeader();
+        var (elemType, count) = reader.ReadBoundedListHeader();
         var array = new KeyValue[count];
         for (int i = 0; i < count; i++)
         {
@@ -885,7 +885,7 @@ internal static class MetadataDecoder
 
     private static SortingColumn[] ReadSortingColumnList(ref ThriftCompactReader reader)
     {
-        var (elemType, count) = reader.ReadListHeader();
+        var (elemType, count) = reader.ReadBoundedListHeader();
         var array = new SortingColumn[count];
         for (int i = 0; i < count; i++)
         {

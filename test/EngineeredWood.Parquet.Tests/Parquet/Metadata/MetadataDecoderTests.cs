@@ -233,4 +233,34 @@ public class MetadataDecoderTests
         Assert.True(failures.Count == 0,
             $"Failed to parse {failures.Count} file(s):\n" + string.Join("\n", failures));
     }
+
+    /// <summary>
+    /// The footer's lists size an array from their count before reading an element, so a count the
+    /// footer's bytes cannot hold must be refused rather than allocate: here, int.MaxValue row
+    /// groups in a 7-byte footer, and likewise for each list in <see cref="FooterListFields"/>.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(FooterListFields))]
+    public void AFooterListClaimingMoreEntriesThanItsBytes_IsRefusedBeforeAllocating(string field, byte[] bytes)
+    {
+        _ = field;
+#if NET
+        long before = GC.GetAllocatedBytesForCurrentThread();
+#endif
+        var ex = Assert.Throws<ParquetFormatException>(() => MetadataDecoder.DecodeFileMetaData(bytes));
+        Assert.Contains("claims 2147483647 elements", ex.Message);
+#if NET
+        Assert.True(GC.GetAllocatedBytesForCurrentThread() - before < 1_000_000, "the refusal allocated as if the count were real");
+#endif
+    }
+
+    // A FileMetaData field in short form (delta, LIST), then a large-list header of STRUCT (0xFC)
+    // or BINARY (0xF8) claiming int.MaxValue elements, and nothing after it.
+    public static TheoryData<string, byte[]> FooterListFields() => new()
+    {
+        { "schema", [0x29, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x07] },
+        { "row_groups", [0x49, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x07] },
+        { "key_value_metadata", [0x59, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x07] },
+        { "column_orders", [0x79, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x07] },
+    };
 }

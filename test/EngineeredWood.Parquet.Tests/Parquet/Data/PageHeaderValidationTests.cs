@@ -42,6 +42,7 @@ public class PageHeaderValidationTests : IDisposable
     {
         "negative values", "negative nulls", "more nulls than values", "negative rows", "more rows than values",
         "negative repetition length", "negative definition length", "levels longer than the page",
+        "non-null values but no value bytes",
         "no data_page_header_v2",
     };
 
@@ -149,6 +150,9 @@ public class PageHeaderValidationTests : IDisposable
     [InlineData("no uncompressed_page_size", new byte[] { 0x15, 0x00, 0x25, 0x02, 0x00 }, "missing required 'uncompressed_page_size'")]
     [InlineData("data page with no num_values", new byte[] { 0x15, 0x00, 0x15, 0x00, 0x15, 0x00, 0x2C, 0x25, 0x00, 0x00, 0x00 }, "DataPageHeader is missing required 'num_values'")]
     [InlineData("dictionary page with no num_values", new byte[] { 0x15, 0x04, 0x15, 0x00, 0x15, 0x00, 0x4C, 0x25, 0x00, 0x00, 0x00 }, "DictionaryPageHeader is missing required 'num_values'")]
+    [InlineData("list claiming more elements than bytes", new byte[] { 0x15, 0x00, 0x15, 0x02, 0x15, 0x02, 0x09, 0x28, 0xF1, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x00 }, "Thrift list claims 2147483647 elements")]
+    [InlineData("map claiming more entries than bytes", new byte[] { 0x15, 0x00, 0x15, 0x02, 0x15, 0x02, 0x0B, 0x28, 0xFF, 0xFF, 0xFF, 0xFF, 0x07, 0x55, 0x00 }, "Thrift map claims 2147483647 entries")]
+    [InlineData("double cut off by the end of the bytes", new byte[] { 0x15, 0x00, 0x15, 0x02, 0x15, 0x02, 0x07, 0x28, 0x00, 0x00 }, "skipping a double")]
     [InlineData("data page with no encoding", new byte[] { 0x15, 0x00, 0x15, 0x00, 0x15, 0x00, 0x2C, 0x15, 0x02, 0x00, 0x00 }, "DataPageHeader is missing required 'encoding'")]
     [InlineData("data page with no level encodings", new byte[] { 0x15, 0x00, 0x15, 0x00, 0x15, 0x00, 0x2C, 0x15, 0x02, 0x15, 0x00, 0x00, 0x00 }, "DataPageHeader is missing required 'definition_level_encoding'")]
     [InlineData("V2 data page with no encoding", new byte[] { 0x15, 0x06, 0x15, 0x00, 0x15, 0x00, 0x5C, 0x15, 0x02, 0x15, 0x00, 0x15, 0x02, 0x25, 0x00, 0x15, 0x00, 0x00, 0x00 }, "DataPageHeaderV2 is missing required 'encoding'")]
@@ -192,6 +196,40 @@ public class PageHeaderValidationTests : IDisposable
 #if NET
         Assert.True(GC.GetAllocatedBytesForCurrentThread() - before < 1_000_000, "the refusal allocated as if the count were real");
 #endif
+    }
+
+    /// <summary>
+    /// An unknown field is skipped. A bool inside a list is a byte of its own, unlike a bool field,
+    /// so skipping a <c>list&lt;bool&gt;</c> must consume one byte per element or the fields after
+    /// it are misread.
+    /// </summary>
+    [Fact]
+    public void AnUnknownListOfBools_IsSkippedWithoutMisaligningTheHeader()
+    {
+        byte[] bytes =
+        [
+            0x15, 0x00,                         // 1: type = DATA_PAGE
+            0x15, 0x02,                         // 2: uncompressed_page_size = 1
+            0x09, 0x28, 0x31, 0x01, 0x02, 0x01, // 20: list<bool> [true, false, true], unknown to the reader
+            0x05, 0x06, 0x02,                   // 3: compressed_page_size = 1 (long-form field header)
+            0x0C, 0x0A,                         // 5: data_page_header (long-form field header)
+            0x15, 0x02, 0x15, 0x00, 0x15, 0x00, 0x15, 0x00, 0x00, // num_values = 1, three encodings = PLAIN
+            0x00,                               // stop
+            0x2A,                               // the page's one byte
+        ];
+
+        var column = new SchemaDescriptor(
+        [
+            new SchemaElement { Name = "schema", NumChildren = 1 },
+            new SchemaElement { Name = "n", Type = PhysicalType.Int32, RepetitionType = FieldRepetitionType.Optional },
+        ]).Columns[0];
+        var reader = new PageReader(bytes, column);
+        Assert.True(reader.TryRead(out var page));
+        Assert.Equal(PageType.DataPage, page.Header.Type);
+        Assert.Equal(1, page.Header.CompressedPageSize);
+        Assert.Equal(1, page.NumValues);
+        Assert.Equal(new byte[] { 0x2A }, page.Payload.ToArray());
+        Assert.False(reader.TryRead(out _));
     }
 
     [Fact]
@@ -241,6 +279,9 @@ public class PageHeaderValidationTests : IDisposable
         "negative repetition length" => Copy(h, v2: Copy(h.DataPageHeaderV2!, repetitionLength: -1)),
         "negative definition length" => Copy(h, v2: Copy(h.DataPageHeaderV2!, definitionLength: -1)),
         "levels longer than the page" => Copy(h, v2: Copy(h.DataPageHeaderV2!, definitionLength: h.CompressedPageSize + 1)),
+        // The definition levels now claim the whole page; RLE stops at its own count, so the levels
+        // still decode, and before the check the page read as garbage values from an unwritten buffer.
+        "non-null values but no value bytes" => Copy(h, v2: Copy(h.DataPageHeaderV2!, definitionLength: h.CompressedPageSize)),
         "no data_page_header_v2" => Copy(h, dropSubHeader: true),
 
         "negative entries" => Copy(h, dictionary: new DictionaryPageHeader { NumValues = -1, Encoding = h.DictionaryPageHeader!.Encoding }),
