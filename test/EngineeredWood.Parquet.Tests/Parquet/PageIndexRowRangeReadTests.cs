@@ -318,6 +318,27 @@ public class PageIndexRowRangeReadTests : IDisposable
     }
 
     /// <summary>
+    /// Where statistics already decide a row group (here every row matches), the index is never read, so
+    /// the option costs nothing: a batched read makes exactly the requests it makes without it, page maps'
+    /// OffsetIndexes included.
+    /// </summary>
+    [Fact]
+    public async Task FilterUsePageIndex_RowGroupsStatisticsDecide_CostNothing()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            DataPageRowCountLimit = 250,
+            RowGroupMaxRows = 1000,
+        });
+        var filter = Ex.GreaterThanOrEqual("sorted", LiteralValue.Of(0L));
+
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, BatchSize = 97 });
+        int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, BatchSize = 97, FilterUsePageIndex = true });
+
+        Assert.Equal(off, on);
+    }
+
+    /// <summary>
     /// A projection with a nested column is decoded whole, so it builds no page maps and needs no
     /// OffsetIndexes: the selective filter still costs one request, not one more for the projection's
     /// indexes (which the read-ahead and the narrowing once disagreed about).
