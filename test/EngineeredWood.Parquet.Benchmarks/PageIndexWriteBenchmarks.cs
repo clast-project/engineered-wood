@@ -97,14 +97,13 @@ internal static class PageIndexWorkload
     /// </summary>
     public static RecordBatch Build(string schema)
     {
-        // "nested:<field>" is one column of the nested schema, from the same data, to attribute its cost.
-        if (schema.StartsWith("nested:", StringComparison.Ordinal))
+        // "<schema>:<field>" is one column of a schema, from the same data, to attribute its cost.
+        if (schema.IndexOf(':') is var colon and > 0)
         {
-            var nested = Build("nested");
-            string field = schema.Substring("nested:".Length);
-            int index = nested.Schema.GetFieldIndex(field);
+            var whole = Build(schema.Substring(0, colon));
+            int index = whole.Schema.GetFieldIndex(schema.Substring(colon + 1));
             return new RecordBatch(
-                new Apache.Arrow.Schema([nested.Schema.GetFieldByIndex(index)], null), [nested.Column(index)], Rows);
+                new Apache.Arrow.Schema([whole.Schema.GetFieldByIndex(index)], null), [whole.Column(index)], Rows);
         }
 
         var rng = new Random(4);

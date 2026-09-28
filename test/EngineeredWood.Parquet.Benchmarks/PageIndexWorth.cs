@@ -21,7 +21,7 @@ namespace EngineeredWood.Benchmarks;
 /// what page pruning (R-2) would keep, and bounds what R-3 could save, without building either.
 /// </summary>
 /// <remarks>
-/// <para><c>write &lt;dir&gt;</c> writes <c>ew-default.parquet</c>: 4 row groups x 1M rows of a sorted id,
+/// <para><c>write &lt;dir&gt;</c> writes <c>ew-default.parquet</c>, and <c>ew-rowcap20k.parquet</c> with a 20,000-row page cap: 4 row groups x 1M rows of a sorted id,
 /// a sorted timestamp, a clustered user string, and unclustered category/amount/note columns. Re-write
 /// it with other writers into the same directory (see the doc) before analysing.</para>
 /// <para><c>analyze &lt;dir&gt; [rounds]</c>, per file and predicate: row groups surviving chunk
@@ -45,7 +45,10 @@ internal static class PageIndexWorth
         if (mode == "write")
         {
             Directory.CreateDirectory(dir);
-            await WriteAsync(Build(), Path.Combine(dir, "ew-default.parquet"));
+            var batch = Build();
+            await WriteAsync(batch, Path.Combine(dir, "ew-default.parquet"));
+            await WriteAsync(batch, Path.Combine(dir, "ew-rowcap20k.parquet"),
+                ParquetWriteOptions.Default with { DataPageRowCountLimit = 20_000 });
             return 0;
         }
 
@@ -116,10 +119,10 @@ internal static class PageIndexWorth
             RowGroups * RowsPerGroup);
     }
 
-    private static async Task WriteAsync(RecordBatch batch, string path)
+    private static async Task WriteAsync(RecordBatch batch, string path, ParquetWriteOptions? options = null)
     {
         await using var file = new LocalSequentialFile(path);
-        await using var writer = new ParquetFileWriter(file, ownsFile: false, ParquetWriteOptions.Default);
+        await using var writer = new ParquetFileWriter(file, ownsFile: false, options ?? ParquetWriteOptions.Default);
         await writer.WriteRowGroupAsync(batch);
         await writer.CloseAsync();
     }

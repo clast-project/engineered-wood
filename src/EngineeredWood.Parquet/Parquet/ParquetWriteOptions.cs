@@ -239,6 +239,37 @@ public sealed record ParquetWriteOptions
     public int DataPageSize { get; init; } = 1024 * 1024;
 
     /// <summary>
+    /// The most rows a data page holds, whatever its size. <see langword="null"/>, the default, cuts
+    /// pages by <see cref="DataPageSize"/> alone.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="DataPageSize"/> is measured before encoding, at a value's plain width, so a column
+    /// that encodes small still gets few pages: an INT64 page holds 131,072 rows, and a dictionary
+    /// column with 256 or fewer distinct values fits a 1M-row row group in one page. A reader can skip
+    /// data only a page at a time, using the page index, so those columns can never be pruned below
+    /// the row group. parquet-mr, arrow-rs and parquet-cpp cap a page at 20,000 rows. A page of a
+    /// repeated column ends on a row boundary and holds at most this many rows too.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">The value is zero or negative.</exception>
+    public int? DataPageRowCountLimit
+    {
+        get => _dataPageRowCountLimit;
+        init
+        {
+            if (value is <= 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(DataPageRowCountLimit), value,
+                    "Must be positive, or null to cut pages by size alone.");
+            }
+
+            _dataPageRowCountLimit = value;
+        }
+    }
+
+    private readonly int? _dataPageRowCountLimit;
+
+    /// <summary>
     /// Maximum byte size of a dictionary page before dictionary encoding is abandoned
     /// for that column. Default is 1 MB.
     /// </summary>

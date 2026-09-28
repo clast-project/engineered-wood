@@ -134,6 +134,91 @@ public class PageIndexWriterTests : IDisposable
         Assert.Equal(2 * 10, AssertIndexesAgreeWithFile(path, expectColumnIndexOnEveryChunk: true));
     }
 
+    // ───── Page row-count limit ─────
+
+    [Fact]
+    public void RowCountLimit_IsOffByDefault() =>
+        Assert.Null(ParquetWriteOptions.Default.DataPageRowCountLimit);
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void RowCountLimit_MustBePositive(int limit) =>
+        Assert.Throws<ArgumentOutOfRangeException>(() => ParquetWriteOptions.Default with { DataPageRowCountLimit = limit });
+
+    /// <summary>
+    /// With pages far larger than the data, only the row limit cuts them: every column, the list's
+    /// element and the struct's field included, starts a page exactly every <c>limit</c> rows.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Matrix))]
+    public async Task RowCountLimit_CutsEveryColumnEveryNRows(DataPageVersion version, bool dictionary, bool nullable)
+    {
+        const int limit = 250;
+        var batch = MixedBatch(7000, nullable, nested: true);
+        var options = ParquetWriteOptions.Default with
+        {
+            DataPageVersion = version,
+            DictionaryEnabled = dictionary,
+            PageIndexTruncateLength = null,
+            RowGroupMaxRows = 3000,
+            DataPageRowCountLimit = limit,
+        };
+        string path = await WriteAsync(batch, options);
+
+        Assert.Equal(3 * 12, AssertIndexesAgreeWithFile(path, expectColumnIndexOnEveryChunk: true));
+        foreach (var (_, rows, chunk, offsetIndex, _) in Chunks(path))
+        {
+            var expected = Enumerable.Range(0, (int)((rows + limit - 1) / limit)).Select(k => (long)k * limit);
+            Assert.Equal(expected, offsetIndex!.PageLocations.Select(p => p.FirstRowIndex));
+        }
+
+        await AssertReadsBackAsync(batch, path);
+    }
+
+    /// <summary>The limit only ever shortens a page: where the size cuts first, it still does.</summary>
+    [Fact]
+    public async Task RowCountLimit_LeavesSmallerSizeCutsAlone()
+    {
+        var batch = MixedBatch(7000, nullable: false, nested: true);
+        string path = await WriteAsync(batch, Indexed with { DictionaryEnabled = false, DataPageRowCountLimit = 250 });
+
+        foreach (var (_, rows, chunk, offsetIndex, _) in Chunks(path))
+        {
+            var starts = offsetIndex!.PageLocations.Select(p => p.FirstRowIndex).Append(rows).ToList();
+            Assert.All(starts.Zip(starts.Skip(1), (a, b) => b - a), span => Assert.InRange(span, 1, 250));
+            if (chunk.MetaData!.PathInSchema![0] == "i64")
+                Assert.Equal(1024 / 8, starts[1]); // DataPageSize over the plain width
+        }
+
+        await AssertReadsBackAsync(batch, path);
+    }
+
+    [Fact]
+    public async Task RowCountLimit_BufferedWriter()
+    {
+        const int limit = 300;
+        var batch = MixedBatch(7000, nullable: true, nested: false);
+        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N")[..8] + ".parquet");
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new BufferedParquetWriter(file, ownsFile: false,
+            ParquetWriteOptions.Default with { RowGroupMaxRows = 3000, DataPageRowCountLimit = limit }))
+        {
+            await writer.AppendAsync(Slice(batch, 0, 3500));
+            await writer.AppendAsync(Slice(batch, 3500, 3500));
+            await writer.CloseAsync();
+        }
+
+        Assert.Equal(2 * 10, AssertIndexesAgreeWithFile(path, expectColumnIndexOnEveryChunk: true));
+        foreach (var (_, rows, _, offsetIndex, _) in Chunks(path))
+        {
+            var expected = Enumerable.Range(0, (int)((rows + limit - 1) / limit)).Select(k => (long)k * limit);
+            Assert.Equal(expected, offsetIndex!.PageLocations.Select(p => p.FirstRowIndex));
+        }
+
+        await AssertReadsBackAsync(batch, path);
+    }
+
     // ───── Chunk statistics from page bounds ─────
 
     public static TheoryData<DataPageVersion, bool, bool> StatisticsCases()
@@ -779,6 +864,42 @@ public class PageIndexWriterTests : IDisposable
         await writer.CloseAsync();
         return path;
     }
+
+    /// <summary>Reads the file back and compares every value, row group by row group.</summary>
+    private static async Task AssertReadsBackAsync(RecordBatch expected, string path)
+    {
+        using var reader = new ParquetFileReader(new LocalRandomAccessFile(path), ownsFile: true);
+        int row = 0;
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            using (batch)
+            {
+                for (int c = 0; c < expected.ColumnCount; c++)
+                {
+                    for (int i = 0; i < batch.Length; i++)
+                        Assert.Equal(Render(expected.Column(c), row + i), Render(batch.Column(c), i));
+                }
+
+                row += batch.Length;
+            }
+        }
+
+        Assert.Equal(expected.Length, row);
+    }
+
+    private static string Render(IArrowArray array, int i) => array.IsNull(i) ? "null" : array switch
+    {
+        StringArray s => s.GetString(i),
+        BooleanArray b => b.GetValue(i).ToString(),
+        ListArray l => "[" + string.Join(",", Enumerable.Range(l.ValueOffsets[i], l.GetValueLength(i)).Select(j => Render(l.Values, j))) + "]",
+        StructArray s => "{" + string.Join(",", s.Fields.Select(f => Render(f, i))) + "}",
+        PrimitiveArray<int> x => x.GetValue(i).ToString()!,
+        PrimitiveArray<long> x => x.GetValue(i).ToString()!,
+        PrimitiveArray<uint> x => x.GetValue(i).ToString()!,
+        PrimitiveArray<double> x => x.GetValue(i)!.Value.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+        PrimitiveArray<float> x => x.GetValue(i)!.Value.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+        _ => throw new NotSupportedException(array.GetType().Name),
+    };
 
     private static RecordBatch Batch(string name, IArrowArray column, bool nullable) =>
         new(new Apache.Arrow.Schema.Builder().Field(new Field(name, column.Data.DataType, nullable)).Build(),

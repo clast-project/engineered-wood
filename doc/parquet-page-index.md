@@ -456,3 +456,23 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    **Proposed order:** (a) a `DataPageRowCountLimit` writer option defaulting to 20,000, landed
    off then flipped after measuring file size and write time, as phase 4 did; (b) R-2 as
    selected row ranges, testable on its own; (c) R-3.
+
+   **(a) landed, off by default.** `ParquetWriteOptions.DataPageRowCountLimit` caps rows per data
+   page in both page loops of `ColumnChunkWriter`, which both writers share. A repeated leaf is
+   cut where the first record past the limit begins. EW's cut is exact, so with the cap every
+   column of a row group starts a page at the same rows. That makes EW's own files prune better
+   than the other writers', whose payload pages are cut by size first:
+
+   | `pageindex-worth`, EW with a 20,000-row cap | Pages (id / user / category) | id point: rows, bytes kept | user point: rows, bytes kept | DataFusion saving (id / user) |
+   |---|---|---|---|---|
+   | no cap (today's default) | 8 / 2 / 1 | 13.1%, 19.3% | 52.4%, 56.3% | 80% / 51% |
+   | 20,000 | 50 / 50 / 50 | 2.0%, 2.05% | 2.0%, 2.06% | 93% / 94% |
+
+   Cost, from `-- rowcap-ab` (500k rows, the phase-4 workloads, medians of alternating rounds):
+   files grow 0.1–0.3%, and write time does not change beyond noise. A full read does not change
+   for plain, strings or nested. It is slower for the dictionary workload: +12% at 20,000 rows,
+   reproducible. That cost falls on dictionary columns with narrow indexes (6 and 7 bits here;
+   the 8- and 10-bit columns show none), about 2–10 µs per extra page. Much of it is dynamic PGO:
+   with `DOTNET_TieredPGO=0` the capped and uncapped reads of that column time the same. The
+   one-column dictionary read is about 1.3 ms, so the absolute cost is tenths of a millisecond per
+   500k rows. **Recommendation: default it to 20,000**, in its own change, like phase 4.
