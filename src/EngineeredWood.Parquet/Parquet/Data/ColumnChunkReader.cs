@@ -87,6 +87,10 @@ internal static class ColumnChunkReader
             if (validateCrc)
                 ValidateCrc(pageHeader.Crc, pageData, column);
 
+            // The level and value buffers are sized from the chunk's metadata, not from the pages.
+            if (page.NumValues > capacity - valuesRead)
+                throw TooManyValues(column, page, capacity - valuesRead);
+
             switch (pageHeader.Type)
             {
                 case PageType.DictionaryPage:
@@ -114,12 +118,7 @@ internal static class ColumnChunkReader
         }
 
         if (valuesRead < columnMeta.NumValues)
-        {
-            throw new ParquetFormatException(
-                $"Column '{string.Join(".", column.Path)}': expected {columnMeta.NumValues} " +
-                $"values but only read {valuesRead}. The column data may be corrupted or " +
-                $"truncated. To skip this column, pass a columnNames list excluding it.");
-        }
+            throw TooFewValues(column, columnMeta.NumValues, valuesRead);
 
         int[]? defLevels = null;
         if ((preserveDefLevels || isRepeated) && column.MaxDefinitionLevel > 0)
@@ -179,6 +178,14 @@ internal static class ColumnChunkReader
             $"value(s) but the row group declares {rowCount} row(s). A non-repeated column must " +
             "carry one entry per row.");
     }
+
+    internal static ParquetFormatException TooManyValues(ColumnDescriptor column, Page page, long remaining) => new(
+        $"Column '{column.DottedPath}': data page {page.Ordinal} at byte offset {page.Offset} holds " +
+        $"{page.NumValues} values, but the chunk's metadata leaves room for only {remaining} more.");
+
+    internal static ParquetFormatException TooFewValues(ColumnDescriptor column, long expected, long read) => new(
+        $"Column '{column.DottedPath}': expected {expected} values but only read {read}. The column data " +
+        "may be corrupted or truncated. To skip this column, pass a columnNames list excluding it.");
 
     /// <summary>
     /// Whether a column is even eligible for the fixed-length list fast path: exactly one level of
@@ -245,6 +252,9 @@ internal static class ColumnChunkReader
 
             var pageHeader = page.Header;
             var pageData = page.Payload;
+
+            if (page.NumValues > numValues - valuesRead)
+                return null;
 
             if (validateCrc && pageHeader.Crc.HasValue)
             {
@@ -482,12 +492,22 @@ internal static class ColumnChunkReader
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
             byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
 
+        int valuesLeft = capacity;
         for (int p = startPage; p <= endPage; p++)
         {
             var located = pageMap.Pages[p];
             var pageBytes = data.Slice((int)(located.Offset - dataBaseOffset), located.CompressedSize);
             var entry = PageMapBuilder.ResolveEntry(pageMap, p, pageBytes, column, columnMeta, out int headerSize);
             var pageData = pageBytes.Slice(headerSize);
+
+            // The buffers were sized from the map, which for an OffsetIndex map counts the index's rows.
+            if (entry.NumValues > valuesLeft)
+            {
+                throw new ParquetFormatException(
+                    $"Column '{column.DottedPath}': data page {entry.Ordinal} holds {entry.NumValues} values, " +
+                    $"but only {valuesLeft} remain in the pages read.");
+            }
+            valuesLeft -= entry.NumValues;
             if (validateCrc)
                 ValidateCrc(entry.Crc, pageData, column);
 
@@ -621,7 +641,7 @@ internal static class ColumnChunkReader
         else if (entry.RepetitionLevelsByteLength > 0)
         {
             byte[]? rentedRep = null;
-            Span<byte> tempRep = numValues <= 1024
+            Span<byte> tempRep = (uint)numValues <= 1024
                 ? stackalloc byte[numValues]
                 : (rentedRep = ArrayPool<byte>.Shared.Rent(numValues)).AsSpan(0, numValues);
             try
@@ -650,7 +670,9 @@ internal static class ColumnChunkReader
 
         var valuesCompressed = rawData.Slice(offset);
 
-        if (nonNullCount == 0 || valuesCompressed.IsEmpty)
+        // Only an all-null page may have no values. Returning early for an empty section of a page
+        // with values left the value buffer unwritten, and it was read back as garbage.
+        if (nonNullCount == 0)
             return;
 
         ReadOnlySpan<byte> valueData;
@@ -813,7 +835,7 @@ internal static class ColumnChunkReader
         else if (v2Header.RepetitionLevelsByteLength > 0)
         {
             byte[]? rentedRep = null;
-            Span<byte> tempRep = numValues <= 1024
+            Span<byte> tempRep = (uint)numValues <= 1024
                 ? stackalloc byte[numValues]
                 : (rentedRep = ArrayPool<byte>.Shared.Rent(numValues)).AsSpan(0, numValues);
             try
@@ -845,8 +867,9 @@ internal static class ColumnChunkReader
         // V2: only values portion is compressed (if is_compressed, default true)
         var valuesCompressed = rawData.Slice(offset);
 
-        // All values may be null — nothing to decompress or decode
-        if (nonNullCount == 0 || valuesCompressed.IsEmpty)
+        // All values may be null — nothing to decompress or decode. An empty section with values
+        // left would leave the value buffer unwritten, so it goes on to the decoder, which refuses it.
+        if (nonNullCount == 0)
             return numValues;
 
         ReadOnlySpan<byte> valueData;
@@ -965,7 +988,7 @@ internal static class ColumnChunkReader
         {
             case PhysicalType.Boolean:
             {
-                Span<bool> values = count <= 1024 ? stackalloc bool[count] : new bool[count];
+                Span<bool> values = (uint)count <= 1024 ? stackalloc bool[count] : new bool[count];
                 PlainDecoder.DecodeBooleans(data, values, count);
                 state.AddBoolValues(values.Slice(0, count));
                 break;
@@ -1212,7 +1235,7 @@ internal static class ColumnChunkReader
         {
             decoder.ReadBatch(ints.AsSpan(0, count));
 
-            Span<bool> values = count <= 1024 ? stackalloc bool[count] : new bool[count];
+            Span<bool> values = (uint)count <= 1024 ? stackalloc bool[count] : new bool[count];
             for (int i = 0; i < count; i++)
                 values[i] = ints[i] != 0;
 
@@ -1249,7 +1272,7 @@ internal static class ColumnChunkReader
             {
                 case PhysicalType.Boolean:
                 {
-                    Span<bool> values = count <= 1024 ? stackalloc bool[count] : new bool[count];
+                    Span<bool> values = (uint)count <= 1024 ? stackalloc bool[count] : new bool[count];
                     for (int i = 0; i < count; i++)
                         values[i] = dictionary.GetBoolean(indices[i]);
                     state.AddBoolValues(values.Slice(0, count));

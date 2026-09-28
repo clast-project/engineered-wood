@@ -159,6 +159,11 @@ internal static class PageMapBuilder
                 case PageType.DataPage:
                 case PageType.DataPageV2:
                 {
+                    // As ColumnChunkReader.ReadColumn does: the map sizes the batch buffers, so a
+                    // page may not claim more values than the chunk's metadata has left.
+                    if (page.NumValues > columnMeta.NumValues - valuesRead)
+                        throw ColumnChunkReader.TooManyValues(column, page, columnMeta.NumValues - valuesRead);
+
                     var entry = EntryFromHeader(
                         pageHeader, page.PayloadOffset, pageData, page.Ordinal, column, columnMeta);
                     pages.Add(entry);
@@ -171,6 +176,9 @@ internal static class PageMapBuilder
                     break;
             }
         }
+
+        if (valuesRead < columnMeta.NumValues)
+            throw ColumnChunkReader.TooFewValues(column, columnMeta.NumValues, valuesRead);
 
         var pagesArray = pages.ToArray();
         var cumulativeRows = new int[pagesArray.Length + 1];
@@ -454,7 +462,10 @@ internal static class PageMapBuilder
             UncompressedSize: pageHeader.UncompressedPageSize,
             NumValues: v2h.NumValues,
             NumNulls: v2h.NumNulls,
-            NumRows: v2h.NumRows,
+            // A flat column has a value slot per row, as for V1 (DeriveRowCountV1). Its num_rows is
+            // redundant, and other readers ignore a wrong one; trusting it made the batched read
+            // refuse a page the whole-chunk read decodes correctly.
+            NumRows: column.MaxRepetitionLevel == 0 ? v2h.NumValues : v2h.NumRows,
             Type: PageType.DataPageV2,
             Encoding: v2h.Encoding,
             RepetitionLevelEncoding: Encoding.Rle,

@@ -51,28 +51,50 @@ internal ref struct ThriftCompactReader
     }
 
     /// <summary>Reads an unsigned variable-length integer (ULEB128).</summary>
+    /// <remarks>
+    /// Bounded here rather than through <see cref="Varint.ReadUnsigned"/>, which checks nothing: a
+    /// varint whose last byte still has its continuation bit set would otherwise run off the end of
+    /// the span as an <see cref="IndexOutOfRangeException"/>.
+    /// </remarks>
     public ulong ReadVarint()
     {
-        if (_position >= _data.Length)
-            throw new ParquetFormatException("Unexpected end of Thrift data.");
-        return unchecked((ulong)Varint.ReadUnsigned(_data, ref _position));
+        ulong result = 0;
+        for (int shift = 0; shift < 64; shift += 7)
+        {
+            if (_position >= _data.Length)
+                throw new ParquetFormatException("Unexpected end of Thrift data reading a varint.");
+            byte b = _data[_position++];
+            // The tenth byte carries only bit 63; more would be shifted out and lost.
+            if (shift == 63 && (b & 0x7E) != 0)
+                throw new ParquetFormatException("Thrift varint overflows 64 bits.");
+            result |= (ulong)(b & 0x7F) << shift;
+            if ((b & 0x80) == 0)
+                return result;
+        }
+
+        throw new ParquetFormatException("Thrift varint is longer than 10 bytes.");
+    }
+
+    /// <summary>Reads a varint that must fit a non-negative <see cref="int"/>: a length or a count.</summary>
+    private int ReadVarintInt32()
+    {
+        ulong value = ReadVarint();
+        if (value > int.MaxValue)
+            throw new ParquetFormatException($"Thrift length or count {value} is out of range.");
+        return (int)value;
     }
 
     /// <summary>Reads a zigzag-encoded 32-bit integer.</summary>
     public int ReadZigZagInt32()
     {
-        if (_position >= _data.Length)
-            throw new ParquetFormatException("Unexpected end of Thrift data.");
-        return checked((int)Varint.ReadSigned(_data, ref _position));
+        long value = ReadZigZagInt64();
+        if (value is < int.MinValue or > int.MaxValue)
+            throw new ParquetFormatException($"Thrift i32 value {value} is out of range.");
+        return (int)value;
     }
 
     /// <summary>Reads a zigzag-encoded 64-bit integer.</summary>
-    public long ReadZigZagInt64()
-    {
-        if (_position >= _data.Length)
-            throw new ParquetFormatException("Unexpected end of Thrift data.");
-        return Varint.ReadSigned(_data, ref _position);
-    }
+    public long ReadZigZagInt64() => Varint.ZigzagDecode(unchecked((long)ReadVarint()));
 
     /// <summary>Reads a 16-bit integer (zigzag encoded in compact protocol).</summary>
     public short ReadI16()
@@ -97,8 +119,8 @@ internal ref struct ThriftCompactReader
     /// <summary>Reads a binary field (length-prefixed byte sequence).</summary>
     public ReadOnlySpan<byte> ReadBinary()
     {
-        int length = checked((int)ReadVarint());
-        if (length < 0 || _position + length > _data.Length)
+        int length = ReadVarintInt32();
+        if (length > _data.Length - _position)
             throw new ParquetFormatException("Invalid binary length in Thrift data.");
         var span = _data.Slice(_position, length);
         _position += length;
@@ -179,7 +201,7 @@ internal ref struct ThriftCompactReader
         if (count == 15)
         {
             // Large list: count follows as varint.
-            count = checked((int)ReadVarint());
+            count = ReadVarintInt32();
             elementType = (ThriftType)(header & 0x0F);
         }
         else
@@ -190,10 +212,22 @@ internal ref struct ThriftCompactReader
         return (elementType, count);
     }
 
+    /// <summary>
+    /// Reads a list header whose count is about to size an allocation or a loop. Every element, a
+    /// bool included, takes at least a byte, so a count larger than the bytes left cannot be real.
+    /// </summary>
+    public (ThriftType ElementType, int Count) ReadBoundedListHeader()
+    {
+        var (elementType, count) = ReadListHeader();
+        if (count > Remaining)
+            throw new ParquetFormatException($"Thrift list claims {count} elements in {Remaining} bytes.");
+        return (elementType, count);
+    }
+
     /// <summary>Reads a map header, returning key type, value type, and count.</summary>
     public (ThriftType KeyType, ThriftType ValueType, int Count) ReadMapHeader()
     {
-        int count = checked((int)ReadVarint());
+        int count = ReadVarintInt32();
         if (count == 0)
             return (ThriftType.Stop, ThriftType.Stop, 0);
 
@@ -237,7 +271,7 @@ internal ref struct ThriftCompactReader
                 break;
 
             case ThriftType.Byte:
-                _position++;
+                ReadByte();
                 break;
 
             case ThriftType.I16:
@@ -250,6 +284,8 @@ internal ref struct ThriftCompactReader
                 break;
 
             case ThriftType.Double:
+                if (Remaining < 8)
+                    throw new ParquetFormatException("Unexpected end of Thrift data skipping a double.");
                 _position += 8;
                 break;
 
@@ -259,17 +295,20 @@ internal ref struct ThriftCompactReader
 
             case ThriftType.List:
             case ThriftType.Set:
-                var (elemType, count) = ReadListHeader();
+                var (elemType, count) = ReadBoundedListHeader();
                 for (int i = 0; i < count; i++)
-                    Skip(elemType);
+                    SkipElement(elemType);
                 break;
 
             case ThriftType.Map:
                 var (keyType, valueType, mapCount) = ReadMapHeader();
+                // A key and a value take at least a byte each; a larger count would spin, not read.
+                if (mapCount > Remaining / 2)
+                    throw new ParquetFormatException($"Thrift map claims {mapCount} entries in {Remaining} bytes.");
                 for (int i = 0; i < mapCount; i++)
                 {
-                    Skip(keyType);
-                    Skip(valueType);
+                    SkipElement(keyType);
+                    SkipElement(valueType);
                 }
                 break;
 
@@ -288,6 +327,18 @@ internal ref struct ThriftCompactReader
             default:
                 throw new ParquetFormatException($"Cannot skip unknown Thrift type {type}.");
         }
+    }
+
+    /// <summary>
+    /// Skips one element of a list, set or map. A bool there is a byte of its own, unlike a bool
+    /// field, whose value is in the field header that <see cref="Skip"/> assumes.
+    /// </summary>
+    public void SkipElement(ThriftType type)
+    {
+        if (type is ThriftType.BooleanTrue or ThriftType.BooleanFalse)
+            ReadByte();
+        else
+            Skip(type);
     }
 
     private readonly short GetStack(int index) => index switch
