@@ -218,11 +218,23 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 continue;
             }
 
+            // Within a kept row group, the page index can narrow the rows further. Null means the whole
+            // row group; the read below takes it as such.
+            IReadOnlyList<RowRange>? ranges = null;
+            if (accessor is not null && _options.FilterUsePageIndex)
+            {
+                ranges = await NarrowByPageIndexAsync(
+                        _options.Filter!, i, metadata.RowGroups[i], schema!, accessor, cancellationToken)
+                    .ConfigureAwait(false);
+                if (ranges.Count == 0)
+                    continue;
+            }
+
             // Always via the batching entry point, even with no batch limit configured: it falls back to
             // the single-batch read itself when there is nothing to split, and it is where the implicit
             // cap for an over-sized chunk is decided. Routing around it here would put that decision in
             // two places and leave ReadAllAsync unable to read a file ReadRowGroupBatchesAsync can.
-            await foreach (var batch in ReadRowGroupBatchesAsync(i, columnNames, cancellationToken)
+            await foreach (var batch in ReadBatchesAsync(i, columnNames, ranges, cancellationToken)
                 .ConfigureAwait(false))
             {
                 yield return batch;
@@ -242,17 +254,93 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>An async enumerable of RecordBatches.</returns>
-    public async IAsyncEnumerable<RecordBatch> ReadRowGroupBatchesAsync(
+    public IAsyncEnumerable<RecordBatch> ReadRowGroupBatchesAsync(
         int rowGroupIndex,
+        IReadOnlyList<string>? columnNames = null,
+        CancellationToken cancellationToken = default) =>
+        ReadBatchesAsync(rowGroupIndex, columnNames, ranges: null, cancellationToken);
+
+    /// <summary>
+    /// Streams only the rows of a row group that lie in <paramref name="ranges"/>, as
+    /// <see cref="GetCandidateRowRangesAsync"/> returns them, reading and decoding only the pages
+    /// those rows are in wherever a column has an OffsetIndex.
+    /// </summary>
+    /// <remarks>
+    /// <para>Batches follow the ranges in order, and a batch never spans the gap between two ranges;
+    /// a range longer than <see cref="ParquetReadOptions.BatchSize"/> or
+    /// <see cref="ParquetReadOptions.MaxBatchByteSize"/> allows is split as
+    /// <see cref="ReadRowGroupBatchesAsync"/> splits a row group. So the rows so far, counted across
+    /// the ranges in order, locate each batch's first row in the file.</para>
+    /// <para>A column without a usable OffsetIndex is read whole and cut to the ranges, and so is
+    /// every column of a row group with a nested column: the rows are the same, only the saving is
+    /// lost.</para>
+    /// </remarks>
+    /// <param name="rowGroupIndex">Zero-based index of the row group to read.</param>
+    /// <param name="ranges">Ascending, disjoint, non-empty ranges of rows within the row group.</param>
+    /// <param name="columnNames">Optional list of column names to read. If null, reads all columns.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="ArgumentException">A range is empty, outside the row group, or out of order.</exception>
+    public async IAsyncEnumerable<RecordBatch> ReadRowRangesAsync(
+        int rowGroupIndex,
+        IReadOnlyList<RowRange> ranges,
         IReadOnlyList<string>? columnNames = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
         CancellationToken cancellationToken = default)
+    {
+        if (ranges is null) throw new ArgumentNullException(nameof(ranges));
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        if (rowGroupIndex < 0 || rowGroupIndex >= metadata.RowGroups.Count)
+            throw new ArgumentOutOfRangeException(nameof(rowGroupIndex), rowGroupIndex,
+                $"The file has {metadata.RowGroups.Count} row groups.");
+
+        long rows = metadata.RowGroups[rowGroupIndex].NumRows;
+        long previousEnd = 0;
+        for (int i = 0; i < ranges.Count; i++)
+        {
+            var range = ranges[i];
+            if (range.Start < previousEnd || range.Start >= range.End || range.End > rows)
+            {
+                throw new ArgumentException(
+                    $"Range {i} ({range.Start}, {range.End}) is empty, overlaps or precedes the one before it, "
+                    + $"or ends past the row group's {rows} rows.", nameof(ranges));
+            }
+
+            previousEnd = range.End;
+        }
+
+        if (ranges.Count == 0)
+            yield break;
+
+        await foreach (var batch in ReadBatchesAsync(rowGroupIndex, columnNames, ranges, cancellationToken)
+            .ConfigureAwait(false))
+        {
+            yield return batch;
+        }
+    }
+
+    /// <summary>
+    /// The batched read behind <see cref="ReadRowGroupBatchesAsync"/> and <see cref="ReadRowRangesAsync"/>:
+    /// the rows in <paramref name="ranges"/>, or the whole row group when that is null.
+    /// </summary>
+    private async IAsyncEnumerable<RecordBatch> ReadBatchesAsync(
+        int rowGroupIndex,
+        IReadOnlyList<string>? columnNames,
+        IReadOnlyList<RowRange>? ranges,
+        [System.Runtime.CompilerServices.EnumeratorCancellation]
+        CancellationToken cancellationToken)
     {
         int? batchSize = _options.BatchSize;
         long? maxBytes = _options.MaxBatchByteSize;
 
         var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
             .ConfigureAwait(false);
+
+        // The rows to return, as int spans: the whole row group unless ranges narrow it.
+        bool whole = ranges is null
+            || (ranges.Count == 1 && ranges[0].Start == 0 && ranges[0].End == ctx.RowCount);
+        (int Start, int End)[] spans = whole
+            ? [(0, ctx.RowCount)]
+            : ranges!.Select(r => (checked((int)r.Start), checked((int)r.End))).ToArray();
 
         // A BYTE_ARRAY chunk holding more bytes than one Arrow array can address cannot be returned as a
         // single batch at all. Splitting it is the only way to read it, so a caller who asked for no
@@ -278,7 +366,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // PrepareRowGroupAsync a second time for the row group already prepared above, and since
         // ReadAllAsync now always comes through here that is every row group of every ordinary read. With
         // no limit set nothing below narrows the batch, so the single-pass branch handles it unchanged.
-        bool fitsInOneBatch = true;
+        // Only a read of the whole row group can take the single-pass path: it has no way to skip rows.
+        bool fitsInOneBatch = whole;
         if (batchSize is > 0 && ctx.RowCount > batchSize.Value)
             fitsInOneBatch = false;
         if (maxBytes is > 0)
@@ -330,7 +419,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             // offsets and validity correctly for nested types. The trade-off is that the full row
             // group is decoded up front; true per-page subsetting for nested columns is future work.
             await foreach (var b in ReadNestedRowGroupInBatchesAsync(
-                ctx, batchSize, maxBytes, cancellationToken).ConfigureAwait(false))
+                ctx, spans, batchSize, maxBytes, cancellationToken).ConfigureAwait(false))
             {
                 yield return b;
             }
@@ -360,97 +449,113 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         try
         {
-            int rowsEmitted = 0;
-            while (rowsEmitted < ctx.RowCount)
+            foreach (var (spanStart, spanEnd) in spans)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                int batchStartRow = rowsEmitted;
-                int actualBatchRows = ComputeBatchRowCount(
-                    pageMaps, batchStartRow, ctx.RowCount, batchSize, maxBytes);
-                int batchEndRow = batchStartRow + actualBatchRows;
-
-                // The pages each column still has to decode for this batch, read in one request.
-                var pageRanges = new List<FileRange>(ctx.Count);
-                var readers = new List<int>(ctx.Count);
-                var startPages = new int[ctx.Count];
-                var endPages = new int[ctx.Count];
-                for (int i = 0; i < ctx.Count; i++)
+                int rowsEmitted = spanStart;
+                while (rowsEmitted < spanEnd)
                 {
-                    var cursor = cursors[i];
-                    if (cursor.EndRow >= batchEndRow)
-                        continue;
+                    cancellationToken.ThrowIfCancellationRequested();
 
-                    int endPage = pageMaps[i].FindPageForRow(batchEndRow - 1);
-                    endPages[i] = endPage;
+                    int batchStartRow = rowsEmitted;
+                    int actualBatchRows = ComputeBatchRowCount(
+                        pageMaps, batchStartRow, spanEnd, batchSize, maxBytes);
+                    int batchEndRow = batchStartRow + actualBatchRows;
 
-                    // A batch that starts in rows already decoded and ends in pages not yet decoded
-                    // spans two runs, and would be copied. When the batch holds more rows than
-                    // decoding its first page again repeats, decode again from that page instead:
-                    // the batch then lies in one run and is returned without a copy.
-                    int startPage = cursor.NextPage;
-                    if (cursor.EndRow > batchStartRow)
-                    {
-                        int batchFirstPage = pageMaps[i].FindPageForRow(batchStartRow);
-                        if (cursor.EndRow - pageMaps[i].CumulativeRows[batchFirstPage] < actualBatchRows)
-                            startPage = batchFirstPage;
-                    }
+                    // Rows before this batch that no batch returns: the gap since the last range.
+                    foreach (var cursor in cursors)
+                        cursor.SkipTo(batchStartRow);
 
-                    startPages[i] = startPage;
-                    var firstEntry = pageMaps[i].Pages[startPage];
-                    var lastEntry = pageMaps[i].Pages[endPage];
-                    long rangeStart = ctx.Ranges[i].Offset + firstEntry.Offset;
-                    long rangeEnd = ctx.Ranges[i].Offset + lastEntry.Offset + lastEntry.CompressedSize;
-                    pageRanges.Add(new FileRange(rangeStart, rangeEnd - rangeStart));
-                    readers.Add(i);
-                }
-
-                var pageBuffers = pageRanges.Count > 0
-                    ? await _file.ReadRangesAsync(pageRanges, cancellationToken).ConfigureAwait(false)
-                    : [];
-
-                try
-                {
-                    var buffers = new IMemoryOwner<byte>?[ctx.Count];
-                    for (int k = 0; k < readers.Count; k++)
-                        buffers[readers[k]] = pageBuffers[k];
-
-                    var results = new ColumnResult[ctx.Count];
-                    ForEachColumn(ctx.Count, i =>
+                    // The pages each column still has to decode for this batch, read in one request.
+                    var pageRanges = new List<FileRange>(ctx.Count);
+                    var readers = new List<int>(ctx.Count);
+                    var startPages = new int[ctx.Count];
+                    var endPages = new int[ctx.Count];
+                    for (int i = 0; i < ctx.Count; i++)
                     {
                         var cursor = cursors[i];
-                        if (buffers[i] is { } buffer)
+                        if (cursor.EndRow >= batchEndRow)
+                            continue;
+
+                        int endPage = pageMaps[i].FindPageForRow(batchEndRow - 1);
+                        endPages[i] = endPage;
+
+                        // A batch that starts in rows already decoded and ends in pages not yet decoded
+                        // spans two runs, and would be copied. When the batch holds more rows than
+                        // decoding its first page again repeats, decode again from that page instead:
+                        // the batch then lies in one run and is returned without a copy.
+                        int startPage = cursor.NextPage;
+                        if (cursor.EndRow > batchStartRow)
                         {
-                            int startPage = startPages[i];
-                            var decoded = ColumnChunkReader.ReadColumnBatchFromSlice(
-                                buffer.Memory.Span,
-                                pageMaps[i].Pages[startPage].Offset,
-                                ctx.Columns[i],
-                                ctx.Chunks[i].MetaData!,
-                                pageMaps[i],
-                                startPage, endPages[i],
-                                ctx.LeafArrowFields[i],
-                                ctx.HasNestedColumns,
-                                _options.PageChecksumValidation);
-                            if (startPage < cursor.NextPage)
-                                cursor.Restart(decoded.Array, pageMaps[i].CumulativeRows[startPage], endPages[i] + 1);
-                            else
-                                cursor.Append(decoded.Array, endPages[i] + 1);
+                            int batchFirstPage = pageMaps[i].FindPageForRow(batchStartRow);
+                            if (cursor.EndRow - pageMaps[i].CumulativeRows[batchFirstPage] < actualBatchRows)
+                                startPage = batchFirstPage;
+                        }
+                        else if (startPage >= pageMaps[i].Pages.Length
+                            || pageMaps[i].CumulativeRows[startPage] != batchStartRow)
+                        {
+                            // The batch begins past the rows decoded so far, after a gap between
+                            // ranges: go straight to its page, leaving the pages between unread.
+                            startPage = pageMaps[i].FindPageForRow(batchStartRow);
                         }
 
-                        results[i] = new ColumnResult(cursor.Take(actualBatchRows), null, null);
-                    });
+                        startPages[i] = startPage;
+                        var firstEntry = pageMaps[i].Pages[startPage];
+                        var lastEntry = pageMaps[i].Pages[endPage];
+                        long rangeStart = ctx.Ranges[i].Offset + firstEntry.Offset;
+                        long rangeEnd = ctx.Ranges[i].Offset + lastEntry.Offset + lastEntry.CompressedSize;
+                        pageRanges.Add(new FileRange(rangeStart, rangeEnd - rangeStart));
+                        readers.Add(i);
+                    }
 
-                    yield return AssembleRecordBatch(
-                        ctx with { RowCount = actualBatchRows }, results);
-                }
-                finally
-                {
-                    for (int i = 0; i < pageBuffers.Count; i++)
-                        pageBuffers[i].Dispose();
-                }
+                    var pageBuffers = pageRanges.Count > 0
+                        ? await _file.ReadRangesAsync(pageRanges, cancellationToken).ConfigureAwait(false)
+                        : [];
 
-                rowsEmitted += actualBatchRows;
+                    try
+                    {
+                        var buffers = new IMemoryOwner<byte>?[ctx.Count];
+                        for (int k = 0; k < readers.Count; k++)
+                            buffers[readers[k]] = pageBuffers[k];
+
+                        var results = new ColumnResult[ctx.Count];
+                        ForEachColumn(ctx.Count, i =>
+                        {
+                            var cursor = cursors[i];
+                            if (buffers[i] is { } buffer)
+                            {
+                                int startPage = startPages[i];
+                                var decoded = ColumnChunkReader.ReadColumnBatchFromSlice(
+                                    buffer.Memory.Span,
+                                    pageMaps[i].Pages[startPage].Offset,
+                                    ctx.Columns[i],
+                                    ctx.Chunks[i].MetaData!,
+                                    pageMaps[i],
+                                    startPage, endPages[i],
+                                    ctx.LeafArrowFields[i],
+                                    ctx.HasNestedColumns,
+                                    _options.PageChecksumValidation);
+                                // Decoded rows that continue the held ones are appended; otherwise the
+                                // pages start at or before the next row to return, and replace them.
+                                if (pageMaps[i].CumulativeRows[startPage] == cursor.EndRow)
+                                    cursor.Append(decoded.Array, endPages[i] + 1);
+                                else
+                                    cursor.Restart(decoded.Array, pageMaps[i].CumulativeRows[startPage], endPages[i] + 1);
+                            }
+
+                            results[i] = new ColumnResult(cursor.Take(actualBatchRows), null, null);
+                        });
+
+                        yield return AssembleRecordBatch(
+                            ctx with { RowCount = actualBatchRows }, results);
+                    }
+                    finally
+                    {
+                        for (int i = 0; i < pageBuffers.Count; i++)
+                            pageBuffers[i].Dispose();
+                    }
+
+                    rowsEmitted += actualBatchRows;
+                }
             }
         }
         finally
@@ -464,10 +569,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <summary>
     /// Batches a row group that contains nested columns by decoding it once and yielding row-sliced
     /// views. Batch sizing honours <paramref name="batchSize"/> and <paramref name="maxBytes"/> the
-    /// same way the flat path does; only the decode strategy differs (whole chunk vs per-page).
+    /// same way the flat path does; only the decode strategy differs (whole chunk vs per-page). Only
+    /// the rows in <paramref name="spans"/> are yielded, a batch never spanning two of them.
     /// </summary>
     private async IAsyncEnumerable<RecordBatch> ReadNestedRowGroupInBatchesAsync(
         RowGroupContext ctx,
+        (int Start, int End)[] spans,
         int? batchSize,
         long? maxBytes,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
@@ -512,16 +619,19 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // when the caller stops early, so they are freed once the last batch is disposed.
         try
         {
-            int rowsEmitted = 0;
-            while (rowsEmitted < ctx.RowCount)
+            foreach (var (start, end) in spans)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                int rowsEmitted = start;
+                while (rowsEmitted < end)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
 
-                int actualBatchRows = ComputeBatchRowCount(
-                    pageMaps, rowsEmitted, ctx.RowCount, batchSize, maxBytes);
+                    int actualBatchRows = ComputeBatchRowCount(
+                        pageMaps, rowsEmitted, end, batchSize, maxBytes);
 
-                yield return SliceRecordBatch(full, rowsEmitted, actualBatchRows);
-                rowsEmitted += actualBatchRows;
+                    yield return SliceRecordBatch(full, rowsEmitted, actualBatchRows);
+                    rowsEmitted += actualBatchRows;
+                }
             }
         }
         finally
@@ -744,6 +854,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         long? maxBytes)
     {
         int remaining = totalRows - batchStartRow;
+
+        // No limit: a range read with neither set, which returns each range as one batch.
+        if (batchSize is not > 0 && maxBytes is not > 0)
+            return remaining;
 
         // Row-count limit only.
         if (maxBytes is not > 0)
@@ -1223,6 +1337,36 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             _runs.Add((decoded, skip));
             _length = decoded.Length - skip;
             NextPage = nextPage;
+        }
+
+        /// <summary>
+        /// Drops the rows before <paramref name="row"/>, which no batch returns: the gap before a range.
+        /// Past the decoded rows, drops them all and waits at <paramref name="row"/> for pages that start
+        /// at or before it.
+        /// </summary>
+        public void SkipTo(int row)
+        {
+            if (row <= _startRow)
+                return;
+
+            if (row >= EndRow)
+            {
+                Dispose();
+                _startRow = row;
+                _length = 0;
+                return;
+            }
+
+            int skip = row - _startRow;
+            _startRow = row;
+            _length -= skip;
+            while (skip > 0)
+            {
+                var (run, taken) = _runs[0];
+                int rows = Math.Min(run.Length - taken, skip);
+                Advance(rows);
+                skip -= rows;
+            }
         }
 
         /// <summary>Returns the next <paramref name="count"/> rows, as an array the caller owns.</summary>
@@ -1738,6 +1882,18 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             return [];
         }
 
+        return await NarrowByPageIndexAsync(filter, rowGroupIndex, rowGroup, schema, accessor, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The page-index half of <see cref="GetCandidateRowRangesAsync"/>, for a row group already judged a
+    /// candidate: the rows its pages cannot rule out, the whole row group when nothing can narrow it.
+    /// </summary>
+    private async ValueTask<IReadOnlyList<RowRange>> NarrowByPageIndexAsync(
+        EngineeredWood.Expressions.Predicate filter, int rowGroupIndex, RowGroup rowGroup,
+        SchemaDescriptor schema, ParquetStatisticsAccessor accessor, CancellationToken cancellationToken)
+    {
         var whole = new[] { new RowRange(0, rowGroup.NumRows) };
         if (EngineeredWood.Expressions.StatisticsEvaluator.Evaluate(filter, rowGroup, accessor)
             == EngineeredWood.Expressions.FilterResult.AlwaysTrue)
