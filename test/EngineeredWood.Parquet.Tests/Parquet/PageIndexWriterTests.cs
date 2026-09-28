@@ -137,8 +137,29 @@ public class PageIndexWriterTests : IDisposable
     // ───── Page row-count limit ─────
 
     [Fact]
-    public void RowCountLimit_IsOffByDefault() =>
-        Assert.Null(ParquetWriteOptions.Default.DataPageRowCountLimit);
+    public void RowCountLimit_DefaultsTo20000() =>
+        Assert.Equal(20_000, ParquetWriteOptions.Default.DataPageRowCountLimit);
+
+    /// <summary>
+    /// The default reaches the page loops: a small dictionary column, which the size cut alone left as
+    /// one page per row group, gets a page every 20,000 rows; with the limit turned off it is one page.
+    /// </summary>
+    [Fact]
+    public async Task RowCountLimit_DefaultCutsASmallDictionaryColumn()
+    {
+        const int rows = 50_000;
+        var values = new Int32Array.Builder();
+        for (int i = 0; i < rows; i++)
+            values.Append(i % 7);
+        var batch = Batch("k", values.Build(), nullable: false);
+
+        string capped = await WriteAsync(batch, ParquetWriteOptions.Default);
+        string uncapped = await WriteAsync(batch, ParquetWriteOptions.Default with { DataPageRowCountLimit = null });
+
+        Assert.Equal([0L, 20_000, 40_000], Chunks(capped).Single().OffsetIndex!.PageLocations.Select(p => p.FirstRowIndex));
+        Assert.Single(Chunks(uncapped).Single().OffsetIndex!.PageLocations);
+        await AssertReadsBackAsync(batch, capped);
+    }
 
     [Theory]
     [InlineData(0)]

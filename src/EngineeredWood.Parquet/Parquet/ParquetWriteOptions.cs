@@ -239,17 +239,21 @@ public sealed record ParquetWriteOptions
     public int DataPageSize { get; init; } = 1024 * 1024;
 
     /// <summary>
-    /// The most rows a data page holds, whatever its size. <see langword="null"/>, the default, cuts
-    /// pages by <see cref="DataPageSize"/> alone.
+    /// The most rows a data page holds, whatever its size. Default is 20,000. <see langword="null"/>
+    /// cuts pages by <see cref="DataPageSize"/> alone.
     /// </summary>
     /// <remarks>
-    /// <see cref="DataPageSize"/> is measured before encoding, at a value's plain width, so a column
-    /// that encodes small still gets few pages. At the default 1 MiB, an INT64 page holds 131,072 rows,
-    /// and a dictionary column with 256 or fewer distinct values fits a 1M-row row group in one page.
-    /// A reader can skip data only a page at a time, using the page index, so those columns can never
-    /// be pruned below the row group. parquet-mr and parquet-cpp cap a page at 20,000 rows; arrow-rs
-    /// checks the same limit only between its 1,024-row write batches, so its pages hold 20,480. A page of a
-    /// repeated column ends on a row boundary and holds at most this many rows too.
+    /// <see cref="DataPageSize"/> is measured before encoding, at a value's plain width, so without
+    /// this limit a column that encodes small gets few pages. At the default 1 MiB, an INT64 page would
+    /// hold 131,072 rows, and a dictionary column with 256 or fewer distinct values would fit a 1M-row
+    /// row group in one page. A reader can skip data only a page at a time, using the page index, so
+    /// those columns could never be pruned below the row group. parquet-mr and parquet-cpp cap a page
+    /// at 20,000 rows; arrow-rs checks the same limit only between its 1,024-row write batches, so its
+    /// pages hold 20,480. A page of a repeated column ends on a row boundary and holds at most this
+    /// many rows too.
+    /// <para>The cost of the default, measured on 500k rows: files 0.1–0.3% larger, writes unchanged,
+    /// and reads unchanged except for dictionary columns with narrow indexes, which read up to about
+    /// 12% slower (doc/parquet-page-index.md, open question 3).</para>
     /// </remarks>
     /// <exception cref="ArgumentOutOfRangeException">The value is zero or negative.</exception>
     public int? DataPageRowCountLimit
@@ -268,7 +272,7 @@ public sealed record ParquetWriteOptions
         }
     }
 
-    private readonly int? _dataPageRowCountLimit;
+    private readonly int? _dataPageRowCountLimit = 20_000;
 
     /// <summary>
     /// Maximum byte size of a dictionary page before dictionary encoding is abandoned

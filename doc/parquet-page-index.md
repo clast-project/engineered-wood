@@ -477,3 +477,9 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
    with `DOTNET_TieredPGO=0` the capped and uncapped reads of that column time the same. The
    one-column dictionary read is about 1.3 ms, so the absolute cost is tenths of a millisecond per
    500k rows. **Recommendation: default it to 20,000**, in its own change, like phase 4.
+
+   **Done: the default is 20,000.** The byte-identity corpus pins the limit off in its baseline and
+   carries capped variants of its own; its 5,000 rows are below the default anyway. A probe that
+   threw wherever the default cap shortened a page found only two pre-existing tests that write
+   row groups larger than 20,000 rows, both round trips, and no Delta test. Both now write five
+   pages per column where one of them, named for multiple pages, used to write one.
