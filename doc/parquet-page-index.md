@@ -417,3 +417,42 @@ benefit, and whether they are worth it depends on how clustered EW users' data i
 
 3. **Is R-3 worth building at all**, or do phases 0–5 suffice until a user shows clustered
    data and a filtered-read workload?
+
+   **Measured (2026-09-27); recommendation: build it, but first cap EW's page row count.**
+   `-- pageindex-worth` writes 4 row groups × 1M rows (sorted `id` and `ts`, a clustered
+   dictionary-encoded `user`, and unclustered `category`, `amount` and `note`). pyarrow 25 and
+   DataFusion 54 (arrow-rs) rewrote the same rows with their defaults. The harness prototypes R-2
+   as above, reusing `ParquetStatisticsAccessor` and `StatisticsEvaluator` unchanged, then times
+   a read of a file holding only the kept rows. That time is a lower bound on any R-3 read.
+   Every selective predicate below leaves exactly one row group after chunk statistics.
+
+   | Writer | Pages per row group (id / user / category) | id point: rows, bytes kept | user point: rows, bytes kept | DataFusion saving, index on vs off (id / user) |
+   |---|---|---|---|---|
+   | arrow-rs | 50 / 49 / 49 | 2.0%, 10.5% | 2.0%, 11.3% | 88% / 86% |
+   | pyarrow | 51 / 50 / 50 | 2.0%, 11.1% | 2.0%, 11.2% | 87% / 86% |
+   | **EW** | **8 / 2 / 1** | 13.1%, 19.3% | 52.4%, 56.3% | 77% / 49% |
+
+   - **The win is large where it applies.** Today EW reads the surviving 1M-row group whole:
+     21 ms for an EW file and 36 ms for the others, locally. For a point or 0.1% range on a
+     sorted column, page pruning keeps 2–13% of those rows and 10–19% of the bytes. The
+     kept-rows-only EW read takes 3.3 ms against 21 ms, an upper bound of 85% saved.
+     DataFusion's mature equivalent saves 77–88%. The bytes column is what matters on object
+     storage: 3–7 MB fetched instead of 26–43 MB, for one extra request for the index. The
+     `note` payload's pages drive most of those bytes, since they do not align with `id`'s.
+   - **Unclustered predicates prune nothing**, as expected. What they pay is the index read, one
+     request per surviving row group.
+   - **EW's own files halve the benefit.** `EstimateValuesPerPage` cuts a page at
+     `DataPageSize` ÷ *plain* value width, so an int64 page holds 131,072 rows. A dictionary page
+     is cut at `DataPageSize` ÷ index bytes, so a dictionary column with ≤ 256 distinct values
+     is **one page per row group** and can never prune. arrow-rs, parquet-mr and pyarrow 25's parquet-cpp all
+     also cap a page at 20,000 rows. Spark-written Delta tables therefore get the full effect;
+     EW-written ones do not. That includes DataFusion reading EW's files, which saves 49% on
+     `user` where it saves 86% on the others. The cap is a writer change that phases 0–4
+     should have had.
+   - The kept-rows proxy is re-encoded by EW, which decodes faster than the other two writers'
+     encodings (unclustered: 86 ms against 141–150 ms). Its savings for the foreign files are
+     therefore inflated; use their bytes-kept column instead.
+
+   **Proposed order:** (a) a `DataPageRowCountLimit` writer option defaulting to 20,000, landed
+   off then flipped after measuring file size and write time, as phase 4 did; (b) R-2 as
+   selected row ranges, testable on its own; (c) R-3.
