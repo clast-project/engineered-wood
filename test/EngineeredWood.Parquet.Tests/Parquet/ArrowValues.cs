@@ -33,7 +33,11 @@ internal static class ArrowValues
                 return Convert.ToBase64String(b.GetBytes(row).ToArray());
             case FixedSizeBinaryArray b:
                 return Convert.ToBase64String(b.GetBytes(row).ToArray());
-            case ListArray l: // MapArray too
+            case MapArray m:
+                // Explicitly the key-value entries. MapArray hides ListArray.Values with the values
+                // alone, so rendering a map through that member would drop its keys.
+                return "[" + string.Join(",", Enumerable.Range(m.ValueOffsets[row], m.GetValueLength(row)).Select(j => Render(m.KeyValues, j))) + "]";
+            case ListArray l:
                 return "[" + string.Join(",", Enumerable.Range(l.ValueOffsets[row], l.GetValueLength(row)).Select(j => Render(l.Values, j))) + "]";
             case LargeListArray l:
                 return "[" + string.Join(",", Enumerable.Range((int)l.ValueOffsets[row], l.GetValueLength(row)).Select(j => Render(l.Values, j))) + "]";
