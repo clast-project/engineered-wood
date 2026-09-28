@@ -129,7 +129,7 @@ internal ref struct PageReader
                 "The column data may be truncated.");
         }
 
-        if (Validate(header) is { } problem)
+        if (Validate(header, repeated: _column.MaxRepetitionLevel > 0) is { } problem)
         {
             throw new ParquetFormatException(
                 $"Column '{_column.DottedPath}': the {header.Type} at byte offset {_position} is malformed: {problem}");
@@ -150,7 +150,7 @@ internal ref struct PageReader
     /// with it is the decoders' business.
     /// </summary>
     /// <returns>What is wrong, or null.</returns>
-    private static string? Validate(PageHeader header)
+    private static string? Validate(PageHeader header, bool repeated)
     {
         if (header.UncompressedPageSize < 0)
             return $"its uncompressed size is {header.UncompressedPageSize}.";
@@ -171,8 +171,11 @@ internal ref struct PageReader
                     return $"it holds {v2.NumValues} values.";
                 if (v2.NumNulls < 0 || v2.NumNulls > v2.NumValues)
                     return $"it holds {v2.NumNulls} nulls among {v2.NumValues} values.";
-                // Every row contributes at least one level, so at least one value slot.
-                if (v2.NumRows < 0 || v2.NumRows > v2.NumValues)
+                // Every row contributes at least one level, so at least one value slot. A flat column's
+                // rows are its values, and its num_rows is not read (PageMapBuilder), so it is not
+                // checked either: pyarrow, DuckDB and DataFusion all read a flat page whose num_rows is
+                // wrong, and so does EW's whole-chunk read.
+                if (repeated && (v2.NumRows < 0 || v2.NumRows > v2.NumValues))
                     return $"it holds {v2.NumRows} rows in {v2.NumValues} values.";
                 if (v2.RepetitionLevelsByteLength < 0 || v2.DefinitionLevelsByteLength < 0)
                 {

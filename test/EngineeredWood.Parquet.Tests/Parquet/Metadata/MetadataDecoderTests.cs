@@ -263,4 +263,34 @@ public class MetadataDecoderTests
         { "key_value_metadata", [0x59, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x07] },
         { "column_orders", [0x79, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x07] },
     };
+
+    /// <summary>
+    /// A footer list of an unexpected element type is skipped element by element. A bool element is
+    /// a byte of its own, unlike a bool field, so the skip must consume it or the fields after the
+    /// list are misread. (Two bools 0x01 0x02 would happen to re-parse as a harmless field header,
+    /// hiding the bug; three 0x01 bytes do not.)
+    /// </summary>
+    [Fact]
+    public void AFooterListOfUnexpectedBools_IsSkippedWithoutMisaligningTheFooter()
+    {
+        byte[] bytes =
+        [
+            0x15, 0x02,                         // 1: version = 1
+            0x19, 0x1C, 0x48, 0x01, 0x73, 0x00, // 2: schema = [{ name = "s" }]
+            0x16, 0x00,                         // 3: num_rows = 0
+            0x19, 0x0C,                         // 4: row_groups = []
+            0x39, 0x31, 0x01, 0x01, 0x01,       // 7: column_orders as list<bool> [true, true, true], not structs
+            0x08, 0x0C, 0x02, 0x61, 0x62,       // 6: created_by = "ab" (long-form field header)
+            0x00,
+        ];
+
+        var metadata = MetadataDecoder.DecodeFileMetaData(bytes);
+
+        Assert.Equal(1, metadata.Version);
+        Assert.Equal(0, metadata.NumRows);
+        Assert.Equal("s", Assert.Single(metadata.Schema).Name);
+        Assert.Empty(metadata.RowGroups);
+        Assert.Equal(3, metadata.ColumnOrders!.Count);
+        Assert.Equal("ab", metadata.CreatedBy);
+    }
 }

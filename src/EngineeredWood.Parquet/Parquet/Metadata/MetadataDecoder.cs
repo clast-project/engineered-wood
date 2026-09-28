@@ -99,7 +99,7 @@ internal static class MetadataDecoder
             }
             else
             {
-                reader.Skip(elemType);
+                reader.SkipElement(elemType);
                 array[i] = ColumnOrder.Undefined;
             }
         }
@@ -143,7 +143,7 @@ internal static class MetadataDecoder
             if (elemType == ThriftType.Struct)
                 array[i] = ReadSchemaElement(ref reader);
             else
-                reader.Skip(elemType);
+                reader.SkipElement(elemType);
         }
         return array;
     }
@@ -437,7 +437,7 @@ internal static class MetadataDecoder
             if (elemType == ThriftType.Struct)
                 array[i] = ReadRowGroup(ref reader);
             else
-                reader.Skip(elemType);
+                reader.SkipElement(elemType);
         }
         return array;
     }
@@ -509,7 +509,7 @@ internal static class MetadataDecoder
             if (elemType == ThriftType.Struct)
                 array[i] = ReadColumnChunk(ref reader);
             else
-                reader.Skip(elemType);
+                reader.SkipElement(elemType);
         }
         return array;
     }
@@ -776,7 +776,7 @@ internal static class MetadataDecoder
         if (elemType != ThriftType.Struct)
         {
             for (int i = 0; i < count; i++)
-                reader.Skip(elemType);
+                reader.SkipElement(elemType);
             return null;
         }
 
@@ -851,7 +851,7 @@ internal static class MetadataDecoder
             if (elemType == ThriftType.Struct)
                 array[i] = ReadKeyValue(ref reader);
             else
-                reader.Skip(elemType);
+                reader.SkipElement(elemType);
         }
         return array;
     }
@@ -892,7 +892,7 @@ internal static class MetadataDecoder
             if (elemType == ThriftType.Struct)
                 array[i] = ReadSortingColumn(ref reader);
             else
-                reader.Skip(elemType);
+                reader.SkipElement(elemType);
         }
         return array;
     }

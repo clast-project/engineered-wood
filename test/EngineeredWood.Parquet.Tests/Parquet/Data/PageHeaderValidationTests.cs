@@ -40,11 +40,14 @@ public class PageHeaderValidationTests : IDisposable
 
     public static TheoryData<string> V2Cases() => new()
     {
-        "negative values", "negative nulls", "more nulls than values", "negative rows", "more rows than values",
+        "negative values", "negative nulls", "more nulls than values",
         "negative repetition length", "negative definition length", "levels longer than the page",
         "non-null values but no value bytes",
         "no data_page_header_v2",
     };
+
+    /// <summary>Row counts are checked only where they are read: in a repeated column's pages.</summary>
+    public static TheoryData<string> V2RepeatedCases() => new() { "negative rows", "more rows than values" };
 
     public static TheoryData<string> DictionaryCases() => new() { "negative entries", "no dictionary_page_header" };
 
@@ -62,6 +65,39 @@ public class PageHeaderValidationTests : IDisposable
     {
         var chunk = await FirstChunkAsync(DataPageVersion.V2, dictionary: false, column: "n");
         AssertRefused(chunk, Tamper(chunk, PageType.DataPageV2, defect));
+    }
+
+    [Theory]
+    [MemberData(nameof(V2RepeatedCases))]
+    public async Task V2DataPageOfARepeatedColumn(string defect)
+    {
+        var chunk = await FirstChunkAsync(DataPageVersion.V2, dictionary: false, column: "xs");
+        AssertRefused(chunk, Tamper(chunk, PageType.DataPageV2, defect));
+    }
+
+    /// <summary>
+    /// A flat column has a value slot per row, so a V2 page's num_rows is redundant there. pyarrow,
+    /// DuckDB and DataFusion all read a flat page whose num_rows is wrong, and so did EW's whole-chunk
+    /// read; its batched read refused it. Both now take the rows from the values.
+    /// </summary>
+    [Theory]
+    [InlineData(-10)]
+    [InlineData(10)]
+    public async Task AFlatV2PageWithAWrongRowCount_ReadsItsValues(int delta)
+    {
+        var chunk = await FirstChunkAsync(DataPageVersion.V2, dictionary: false, column: "n");
+        byte[] tampered = RewriteDataPage(chunk.Bytes, ordinal: 2, h =>
+            Copy(h, v2: Copy(h.DataPageHeaderV2!, numRows: h.DataPageHeaderV2!.NumRows + delta)));
+
+        var expected = (Int32Array)ReadColumn(chunk, chunk.Bytes).Array;
+        var whole = (Int32Array)ReadColumn(chunk, tampered).Array;
+        Assert.Equal(Values(expected), Values(whole));
+
+        var map = PageMapBuilder.Build(tampered, chunk.Column, chunk.Meta);
+        Assert.Equal(chunk.RowCount, map.TotalRows);
+        Assert.Equal(map.CumulativeValues, map.CumulativeRows);
+
+        static List<int?> Values(Int32Array a) => Enumerable.Range(0, a.Length).Select(i => a.IsNull(i) ? null : a.GetValue(i)).ToList();
     }
 
     [Theory]
@@ -254,7 +290,7 @@ public class PageHeaderValidationTests : IDisposable
             var reader = new PageReader(tampered, chunk.Column);
             while (reader.TryRead(out _)) { }
         });
-        Assert.Contains("Column 'n': the ", ex.Message);
+        Assert.Contains($"Column '{chunk.Column.DottedPath}': the ", ex.Message);
         Assert.Contains("is malformed", ex.Message);
 
         // And through a whole-column read, the path that used to crash or throw from a decoder.
@@ -263,7 +299,7 @@ public class PageHeaderValidationTests : IDisposable
 
     private static ColumnResult ReadColumn(Chunk chunk, byte[] bytes) =>
         ColumnChunkReader.ReadColumn(
-            bytes, chunk.Column, chunk.Meta, chunk.RowCount, new Field("n", Int32Type.Default, nullable: true));
+            bytes, chunk.Column, chunk.Meta, chunk.RowCount, new Field(chunk.Column.Path[^1], Int32Type.Default, nullable: true));
 
     private static byte[] Tamper(Chunk chunk, PageType type, string defect) => RewriteFirst(chunk.Bytes, type, h => defect switch
     {
@@ -377,15 +413,21 @@ public class PageHeaderValidationTests : IDisposable
         const int rows = 2_000;
         var id = new Int64Array.Builder();
         var n = new Int32Array.Builder();
+        var xs = new ListArray.Builder(Int32Type.Default);
+        var elements = (Int32Array.Builder)xs.ValueBuilder;
         for (int r = 0; r < rows; r++)
         {
             id.Append(r);
             if (r % 7 == 0) n.AppendNull(); else n.Append(r % 13);
+            xs.Append();
+            for (int e = 0; e < r % 3; e++)
+                elements.Append(r + e);
         }
 
         var schema = new Apache.Arrow.Schema.Builder()
             .Field(new Field("id", Int64Type.Default, false))
             .Field(new Field("n", Int32Type.Default, true))
+            .Field(new Field("xs", new ListType(Int32Type.Default), true))
             .Build();
 
         string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N")[..8] + ".parquet");
@@ -398,7 +440,7 @@ public class PageHeaderValidationTests : IDisposable
             DataPageSize = 1024,
         }))
         {
-            await writer.WriteRowGroupAsync(new RecordBatch(schema, [id.Build(), n.Build()], rows));
+            await writer.WriteRowGroupAsync(new RecordBatch(schema, [id.Build(), n.Build(), xs.Build()], rows));
             await writer.CloseAsync();
         }
 
@@ -406,7 +448,7 @@ public class PageHeaderValidationTests : IDisposable
         int length = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(bytes.Length - 8, 4));
         var metadata = MetadataDecoder.DecodeFileMetaData(bytes.AsSpan(bytes.Length - 8 - length, length));
         var descriptors = new SchemaDescriptor(metadata.Schema);
-        int c = descriptors.Columns.ToList().FindIndex(d => d.DottedPath == column);
+        int c = descriptors.Columns.ToList().FindIndex(d => d.Path[0] == column);
         var meta = metadata.RowGroups[0].Columns[c].MetaData!;
         long start = meta.DictionaryPageOffset is > 0 and long dpo ? dpo : meta.DataPageOffset;
         byte[] chunk = bytes.AsSpan(checked((int)start), checked((int)meta.TotalCompressedSize)).ToArray();

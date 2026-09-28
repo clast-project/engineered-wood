@@ -462,7 +462,10 @@ internal static class PageMapBuilder
             UncompressedSize: pageHeader.UncompressedPageSize,
             NumValues: v2h.NumValues,
             NumNulls: v2h.NumNulls,
-            NumRows: v2h.NumRows,
+            // A flat column has a value slot per row, as for V1 (DeriveRowCountV1). Its num_rows is
+            // redundant, and other readers ignore a wrong one; trusting it made the batched read
+            // refuse a page the whole-chunk read decodes correctly.
+            NumRows: column.MaxRepetitionLevel == 0 ? v2h.NumValues : v2h.NumRows,
             Type: PageType.DataPageV2,
             Encoding: v2h.Encoding,
             RepetitionLevelEncoding: Encoding.Rle,

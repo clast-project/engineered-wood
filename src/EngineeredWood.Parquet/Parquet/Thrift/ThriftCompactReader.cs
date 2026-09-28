@@ -333,7 +333,7 @@ internal ref struct ThriftCompactReader
     /// Skips one element of a list, set or map. A bool there is a byte of its own, unlike a bool
     /// field, whose value is in the field header that <see cref="Skip"/> assumes.
     /// </summary>
-    private void SkipElement(ThriftType type)
+    public void SkipElement(ThriftType type)
     {
         if (type is ThriftType.BooleanTrue or ThriftType.BooleanFalse)
             ReadByte();
