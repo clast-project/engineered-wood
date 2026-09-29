@@ -229,6 +229,88 @@ public class PageIndexRowRangeReadTests : IDisposable
         Assert.Equal(expected.Take(250).Concat(expected.Skip(4500).Take(250)), on);
     }
 
+    // ───── ReadWithPositionsAsync: each batch's first row in the file ─────
+
+    public static TheoryData<bool, int?, bool> PositionLayouts()
+    {
+        var data = new TheoryData<bool, int?, bool>();
+        foreach (bool pageIndex in new[] { true, false })
+        foreach (int? batchSize in new int?[] { null, 97 })
+        foreach (bool nested in new[] { false, true })
+            data.Add(pageIndex, batchSize, nested);
+        return data;
+    }
+
+    /// <summary>
+    /// <c>sorted</c> holds each row's file position, so every row of every batch must sit at the batch's
+    /// FirstRow plus its index: after a skipped row group, after a skipped page range within one, and
+    /// across a range split into several batches.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(PositionLayouts))]
+    public async Task ReadWithPositions_EveryRowIsAtItsFilePosition(bool pageIndex, int? batchSize, bool nested)
+    {
+        var rows = Flat(Rows);
+        string path = await WriteAsync(nested ? WithNested(rows) : rows, ParquetWriteOptions.Default with
+        {
+            DataPageRowCountLimit = 250,
+            RowGroupMaxRows = 2000,
+        });
+        var options = new ParquetReadOptions { FilterUsePageIndex = pageIndex, BatchSize = batchSize };
+
+        // Row group 0 keeps two page ranges, [0, 250) and [1500, 1750), row group 1 is ruled out, and
+        // row group 2 keeps [4500, 4750); without the index, groups 0 and 2 whole.
+        var filter = Ex.Or(
+            Ex.Or(Ex.Equal("sorted", LiteralValue.Of(10L)), Ex.Equal("sorted", LiteralValue.Of(1600L))),
+            Ex.Equal("sorted", LiteralValue.Of(4600L)));
+        long[] expected = pageIndex
+            ? [.. Positions(0, 250), .. Positions(1500, 250), .. Positions(4500, 250)]
+            : [.. Positions(0, 2000), .. Positions(4000, 1000)];
+
+        Assert.Equal(expected, await PositionsReadAsync(path, options, filter));
+
+        // No filter: every row, at its own position.
+        Assert.Equal(Positions(0, Rows), await PositionsReadAsync(path, options, filter: null));
+
+        static IEnumerable<long> Positions(long start, int count) => Enumerable.Range(0, count).Select(i => start + i);
+    }
+
+    /// <summary>A null filter reads under the options' filter, as ReadAllAsync does.</summary>
+    [Fact]
+    public async Task ReadWithPositions_NullFilter_TakesTheOptionsFilter()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+        var options = new ParquetReadOptions
+        {
+            Filter = Ex.Equal("sorted", LiteralValue.Of(1300L)),
+            FilterUsePageIndex = true,
+        };
+
+        Assert.Equal(Enumerable.Range(1250, 250).Select(i => (long)i), await PositionsReadAsync(path, options, filter: null));
+    }
+
+    /// <summary>
+    /// The positions read, row by row, from <c>sorted</c>, after checking each row against its batch's
+    /// FirstRow.
+    /// </summary>
+    private static async Task<List<long>> PositionsReadAsync(string path, ParquetReadOptions options, Predicate? filter)
+    {
+        using var reader = new ParquetFileReader(new LocalRandomAccessFile(path), ownsFile: true, options);
+        var positions = new List<long>();
+        await foreach (var positioned in reader.ReadWithPositionsAsync(filter))
+        {
+            using var batch = positioned.Batch;
+            var sorted = (Int64Array)batch.Column("sorted");
+            for (int i = 0; i < batch.Length; i++)
+            {
+                Assert.Equal(positioned.FirstRow + i, sorted.GetValue(i));
+                positions.Add(sorted.GetValue(i)!.Value);
+            }
+        }
+
+        return positions;
+    }
+
     // ───── Requests: round trips, not only bytes, decide object storage ─────
 
     /// <summary>

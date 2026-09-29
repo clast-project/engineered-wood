@@ -8658,17 +8658,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 fileColumns = fileColumns.Where(filePresent.Contains).ToList();
         }
 
-        System.Collections.BitArray? candidates = null;
+        Expressions.Predicate? filePredicate = null;
         if (rowGroupFilter is not null)
         {
             parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-            var filePredicate = RowGroupPushdown.ToFileColumns(
+            filePredicate = RowGroupPushdown.ToFileColumns(
                 rowGroupFilter, snapshot.Schema, mappingMode, parquetSchema);
-            candidates = await reader.GetCandidateRowGroupsAsync(filePredicate, cancellationToken)
-                .ConfigureAwait(false);
         }
 
-        var builtinBatches = ReadRowGroupsAsync(reader, fileColumns, candidates, cancellationToken);
+        var builtinBatches = ReadPositionedAsync(reader, filePredicate, fileColumns, cancellationToken);
         await foreach (var processed in ProcessFileBatchesAsync(
             builtinBatches, addFile, snapshot, columns, mappingMode, isIdMode, physicalToLogical,
             logicalToPhysical, fieldIdToLogical, parquetSchema, deletedRows, partitionColumns,
@@ -8855,32 +8853,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Reads the row groups <paramref name="candidates"/> marks (all of them when null), pairing each batch
-    /// with the file position of its first row. A skipped row group still advances the position by its
-    /// row count, which is why this walks the row groups itself rather than reading through a filtered
+    /// Reads the rows <paramref name="filter"/> might match (every row when null), pairing each batch with
+    /// the file position of its first row. Rows pruned before a batch, whole row groups or, under
+    /// <see cref="ParquetReadOptions.FilterUsePageIndex"/>, pages within one, still count towards its
+    /// position, which the deletion vector and row ids are keyed by; that is why this is not a filtered
     /// <see cref="ParquetFileReader.ReadAllAsync"/>.
     /// </summary>
-    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> ReadRowGroupsAsync(
+    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> ReadPositionedAsync(
         ParquetFileReader reader,
+        Expressions.Predicate? filter,
         IReadOnlyList<string>? columns,
-        System.Collections.BitArray? candidates,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var metadata = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
-        long groupStart = 0;
-        for (int i = 0; i < metadata.RowGroups.Count; i++)
+        await foreach (var positioned in reader.ReadWithPositionsAsync(filter, columns, cancellationToken)
+            .ConfigureAwait(false))
         {
-            if (candidates is null || candidates[i])
-            {
-                long next = groupStart;
-                await foreach (var batch in reader.ReadRowGroupBatchesAsync(i, columns, cancellationToken)
-                    .ConfigureAwait(false))
-                {
-                    yield return (batch, next);
-                    next += batch.Length;
-                }
-            }
-            groupStart += metadata.RowGroups[i].NumRows;
+            yield return (positioned.Batch, positioned.FirstRow);
         }
     }
 

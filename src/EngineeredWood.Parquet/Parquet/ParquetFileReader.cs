@@ -197,16 +197,53 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         [System.Runtime.CompilerServices.EnumeratorCancellation]
         CancellationToken cancellationToken = default)
     {
+        await foreach (var positioned in ReadPositionedAsync(_options.Filter, columnNames, cancellationToken)
+            .ConfigureAwait(false))
+        {
+            yield return positioned.Batch;
+        }
+    }
+
+    /// <summary>
+    /// Streams the rows <paramref name="filter"/> might match, pruned as <see cref="ReadAllAsync"/> prunes
+    /// under <see cref="ParquetReadOptions.Filter"/>, pairing each batch with the file position of its
+    /// first row: for a layer that keys rows by position (deletion vectors, row ids, positional deletes)
+    /// and so cannot count them itself once rows are skipped.
+    /// </summary>
+    /// <remarks>
+    /// <para>Row groups are pruned by statistics, then by dictionary pages and Bloom filters as
+    /// <see cref="ParquetReadOptions.FilterUseDictionaries"/> and
+    /// <see cref="ParquetReadOptions.FilterUseBloomFilters"/> say; with
+    /// <see cref="ParquetReadOptions.FilterUsePageIndex"/>, rows within a kept row group are pruned by
+    /// the page index too. The result is a superset: rows are not filtered. Batches come in file order
+    /// and never span skipped rows.</para>
+    /// </remarks>
+    /// <param name="filter">The predicate; null reads every row under
+    /// <see cref="ParquetReadOptions.Filter"/> instead, as <see cref="ReadAllAsync"/> does.</param>
+    /// <param name="columnNames">Optional list of column names to read. If null, reads all columns.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public IAsyncEnumerable<PositionedRecordBatch> ReadWithPositionsAsync(
+        EngineeredWood.Expressions.Predicate? filter,
+        IReadOnlyList<string>? columnNames = null,
+        CancellationToken cancellationToken = default) =>
+        ReadPositionedAsync(filter ?? _options.Filter, columnNames, cancellationToken);
+
+    private async IAsyncEnumerable<PositionedRecordBatch> ReadPositionedAsync(
+        EngineeredWood.Expressions.Predicate? filter,
+        IReadOnlyList<string>? columnNames,
+        [System.Runtime.CompilerServices.EnumeratorCancellation]
+        CancellationToken cancellationToken)
+    {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
 
         ParquetStatisticsAccessor? accessor = null;
         SchemaDescriptor? schema = null;
         Prefetches prefetch = default;
-        if (_options.Filter is not null)
+        if (filter is not null)
         {
             schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
             accessor = new ParquetStatisticsAccessor(schema);
-            prefetch = CreatePrefetches(_options.Filter, metadata, schema, accessor);
+            prefetch = CreatePrefetches(filter, metadata, schema, accessor);
         }
 
         // Page indexes are read a window of row groups at a time: one request, where one per row group
@@ -216,10 +253,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             : null;
         int readAheadEnd = 0;
 
+        long nextGroupStart = 0;
         for (int i = 0; i < metadata.RowGroups.Count; i++)
         {
+            // A skipped row group's rows still count towards the positions after it.
+            long groupStart = nextGroupStart;
+            nextGroupStart += metadata.RowGroups[i].NumRows;
+
             if (accessor is not null
-                && !await MightMatchAsync(_options.Filter!, i, metadata, schema!, accessor, prefetch, cancellationToken)
+                && !await MightMatchAsync(filter!, i, metadata, schema!, accessor, prefetch, cancellationToken)
                     .ConfigureAwait(false))
             {
                 continue;
@@ -235,17 +277,23 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 if (i >= readAheadEnd)
                 {
                     readAheadEnd = await ReadPageIndexesAheadAsync(
-                            _options.Filter!, i, metadata, schema!, accessor!, columnNames, indexReadAhead, cancellationToken)
+                            filter!, i, metadata, schema!, accessor!, columnNames, indexReadAhead, cancellationToken)
                         .ConfigureAwait(false);
                 }
 
                 (ranges, offsetIndexes) = await NarrowByPageIndexAsync(
-                        _options.Filter!, i, metadata.RowGroups[i], schema!, accessor!,
+                        filter!, i, metadata.RowGroups[i], schema!, accessor!,
                         readProjection: true, projection: columnNames, indexReadAhead, cancellationToken)
                     .ConfigureAwait(false);
                 if (ranges.Count == 0)
                     continue;
             }
+
+            // Batches follow the ranges in order and never span the gap between two, so a cursor over
+            // the ranges places each one: its first row is the cursor, and the cursor moves on to the
+            // next range once a range's rows have all been returned.
+            int range = 0;
+            long cursor = ranges is null ? 0 : ranges[0].Start;
 
             // Always via the batching entry point, even with no batch limit configured: it falls back to
             // the single-batch read itself when there is nothing to split, and it is where the implicit
@@ -254,7 +302,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             await foreach (var batch in ReadBatchesAsync(i, columnNames, ranges, offsetIndexes, cancellationToken)
                 .ConfigureAwait(false))
             {
-                yield return batch;
+                yield return new PositionedRecordBatch(batch, groupStart + cursor);
+                cursor += batch.Length;
+                if (ranges is not null && cursor == ranges[range].End && range + 1 < ranges.Count)
+                    cursor = ranges[++range].Start;
             }
         }
     }
