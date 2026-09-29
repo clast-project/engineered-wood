@@ -22,6 +22,7 @@ return args[0] switch
 {
     "create_test_file" => await CreateTestFile(args.Skip(1).ToArray()),
     "read_test_file" => await ReadTestFile(args.Skip(1).ToArray()),
+    "analyze_settings" => await EngineeredWood.Parquet.TestTool.SettingsAnalyzer.Run(args.Skip(1).ToArray()),
     "strip_path_in_schema" => StripPathInSchema(args.Skip(1).ToArray()),
     "create_fsst_test_file" => await EngineeredWood.Parquet.TestTool.FsstTestData.Create(args.Skip(1).ToArray()),
     _ => PrintUsage(),
@@ -41,6 +42,12 @@ static int PrintUsage()
           ew-test-tool read_test_file <path> [--batch-rows <n>] [--batch-bytes <n>] [--validate]
             Reads the file one RecordBatch at a time and reports peak memory.
             --validate checks every encoding-exercise column for correct values.
+
+          ew-test-tool analyze_settings <file|directory|glob> [...]
+            Inspects one or more existing Parquet files and estimates the writer's
+            page, dictionary, row-group, and file-size settings. Directories are
+            searched recursively for *.parquet files. Reported candidates distinguish
+            exact observations from settings that Parquet does not persist.
 
           ew-test-tool create_fsst_test_file <path> [--compression <codec>]
             Creates a small Parquet file exercising the FSST encoding's corner cases,
