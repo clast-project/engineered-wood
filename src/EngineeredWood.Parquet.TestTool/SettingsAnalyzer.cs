@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet.Data;
 using EngineeredWood.Parquet.Metadata;
@@ -56,7 +57,16 @@ internal static class SettingsAnalyzer
 
     private static IReadOnlyList<string> ExpandPaths(IEnumerable<string> inputs)
     {
-        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        StringComparer pathComparer =
+#if NET5_0_OR_GREATER
+            OperatingSystem.IsWindows()
+#else
+            System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                System.Runtime.InteropServices.OSPlatform.Windows)
+#endif
+                ? StringComparer.OrdinalIgnoreCase
+                : StringComparer.Ordinal;
+        var paths = new HashSet<string>(pathComparer);
         foreach (string input in inputs)
         {
             string fullPath = Path.GetFullPath(input);
@@ -86,7 +96,7 @@ internal static class SettingsAnalyzer
         }
 
         var result = paths.ToList();
-        result.Sort(StringComparer.OrdinalIgnoreCase);
+        result.Sort(pathComparer);
         return result;
     }
 
@@ -114,20 +124,24 @@ internal static class SettingsAnalyzer
                     continue;
                 }
 
-                long start = FirstPageOffset(column);
-                long end = checked(start + column.TotalCompressedSize);
+                FileRange range = ParquetFileReader.GetColumnChunkRange(
+                    column,
+                    info.Length,
+                    ParquetFileReader.HasParquet816Bug(metadata.CreatedBy));
+                long position = range.Offset;
+                long valuesRead = 0;
                 string columnName = column.PathInSchema is { Count: > 0 }
                     ? string.Join(".", column.PathInSchema)
                     : $"column[{columnIndex}]";
 
-                while (start < end)
+                while (position < range.End && valuesRead < column.NumValues)
                 {
-                    stream.Position = start;
-                    long remaining = end - start;
+                    stream.Position = position;
+                    long remaining = range.End - position;
                     int requested = (int)Math.Min(headerBuffer.Length, remaining);
                     int read = ReadAtMost(stream, headerBuffer, requested);
                     if (read == 0)
-                        throw new EndOfStreamException($"Unexpected end of file at offset {start}.");
+                        throw new EndOfStreamException($"Unexpected end of file at offset {position}.");
 
                     PageHeader header;
                     int headerSize;
@@ -138,7 +152,7 @@ internal static class SettingsAnalyzer
                     catch (Exception ex) when (ex is ParquetFormatException or IndexOutOfRangeException)
                     {
                         throw new ParquetFormatException(
-                            $"Column '{columnName}' in row group {rowGroupIndex} has an unreadable page header at offset {start}.",
+                            $"Column '{columnName}' in row group {rowGroupIndex} has an unreadable page header at offset {position}.",
                             ex);
                     }
 
@@ -146,7 +160,7 @@ internal static class SettingsAnalyzer
                     if (header.CompressedPageSize < 0 || pageSize > remaining)
                     {
                         throw new ParquetFormatException(
-                            $"Column '{columnName}' in row group {rowGroupIndex} has a page at offset {start} " +
+                            $"Column '{columnName}' in row group {rowGroupIndex} has a page at offset {position} " +
                             $"whose {pageSize:N0} bytes exceed the column chunk boundary.");
                     }
 
@@ -175,22 +189,14 @@ internal static class SettingsAnalyzer
                         rowCount,
                         encoding,
                         header.Crc.HasValue));
-                    start += pageSize;
+                    if (header.Type is PageType.DataPage or PageType.DataPageV2)
+                        valuesRead = checked(valuesRead + valueCount!.Value);
+                    position += pageSize;
                 }
             }
         }
 
         return new FileObservation(path, info.Length, metadata, pages, externalChunks);
-    }
-
-    private static long FirstPageOffset(ColumnMetaData column)
-    {
-        long offset = column.DataPageOffset;
-        if (column.DictionaryPageOffset is { } dictionaryOffset)
-            offset = Math.Min(offset, dictionaryOffset);
-        if (column.SymbolTablePageOffset is { } symbolTableOffset)
-            offset = Math.Min(offset, symbolTableOffset);
-        return offset;
     }
 
     private static int ReadAtMost(FileStream stream, byte[] buffer, int count)

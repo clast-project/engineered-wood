@@ -1225,28 +1225,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 ?? throw new ParquetFormatException(
                     $"Column chunk {i} has no inline metadata.");
 
-            // The chunk starts at whichever side-table page precedes the data pages — a
-            // dictionary page, or an FSST symbol table page. Starting at DataPageOffset would
-            // read past a symbol table the data pages cannot be decoded without.
-            long start = colMeta.DictionaryPageOffset is > 0 and long dpo
-                ? dpo
-                : colMeta.SymbolTablePageOffset is > 0 and long stpo
-                    ? stpo
-                    : colMeta.DataPageOffset;
-            long length = colMeta.TotalCompressedSize;
-
-            // PARQUET-816 workaround: old parquet-mr writers (<= 1.2.8) exclude the
-            // dictionary page header from TotalCompressedSize. Add padding to cover
-            // the potentially missing header bytes. Extra trailing bytes are harmless
-            // — ColumnChunkReader stops after consuming all values.
-            if (start < colMeta.DataPageOffset || hasParquet816Bug)
-            {
-                long bytesRemaining = _fileLength - (start + length);
-                if (bytesRemaining > 0)
-                    length += Math.Min(MaxDictHeaderPadding, bytesRemaining);
-            }
-
-            ranges[i] = new FileRange(start, length);
+            ranges[i] = GetColumnChunkRange(colMeta, _fileLength, hasParquet816Bug);
 
             leafArrowFields[i] = ArrowSchemaConverter.ToArrowField(selectedColumns[i], _options);
         }
@@ -1743,7 +1722,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// where TotalCompressedSize excludes the dictionary page header.
     /// The fix was in parquet-mr 1.2.9.
     /// </summary>
-    private static bool HasParquet816Bug(string? createdBy)
+    internal static bool HasParquet816Bug(string? createdBy)
     {
         if (createdBy == null)
             return false;
@@ -1763,6 +1742,35 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         // Bug was fixed in 1.2.9
         return major < 1 || (major == 1 && (minor < 2 || (minor == 2 && patch < 9)));
+    }
+
+    internal static FileRange GetColumnChunkRange(
+        ColumnMetaData column,
+        long fileLength,
+        bool hasParquet816Bug)
+    {
+        // The chunk starts at whichever side-table page precedes the data pages — a
+        // dictionary page, or an FSST symbol table page. Starting at DataPageOffset would
+        // read past a symbol table the data pages cannot be decoded without.
+        long start = column.DictionaryPageOffset is > 0 and long dpo
+            ? dpo
+            : column.SymbolTablePageOffset is > 0 and long stpo
+                ? stpo
+                : column.DataPageOffset;
+        long length = column.TotalCompressedSize;
+
+        // PARQUET-816 workaround: old parquet-mr writers (<= 1.2.8) exclude the
+        // dictionary page header from TotalCompressedSize. Add padding to cover
+        // the potentially missing header bytes. Extra trailing bytes are harmless
+        // when the caller stops after consuming all values.
+        if (start < column.DataPageOffset || hasParquet816Bug)
+        {
+            long bytesRemaining = fileLength - (start + length);
+            if (bytesRemaining > 0)
+                length += Math.Min(MaxDictHeaderPadding, bytesRemaining);
+        }
+
+        return new FileRange(start, length);
     }
 
     /// <summary>
