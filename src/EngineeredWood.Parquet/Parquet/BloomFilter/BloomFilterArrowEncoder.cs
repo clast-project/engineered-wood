@@ -53,6 +53,51 @@ internal static class BloomFilterArrowEncoder
         GC.KeepAlive(array);
     }
 
+    /// <summary>
+    /// Adds every entry of a PLAIN-encoded dictionary page to the bloom filter builder.
+    /// </summary>
+    /// <remarks>
+    /// A Bloom filter is a SET, and the dictionary is exactly the chunk's set of distinct non-null
+    /// values, already in the PLAIN bytes the filter hashes. So this builds the same filter as
+    /// <see cref="AddArrowValues"/> over the column, hashing each distinct value once rather than once
+    /// per row. Reading the page rather than the Arrow array also means the filter hashes precisely
+    /// the bytes that reached the file, after every rewrite the writer made on the way there.
+    /// </remarks>
+    public static void AddDictionaryValues(
+        SplitBlockBloomFilterBuilder builder,
+        ReadOnlySpan<byte> dictionaryPage,
+        int dictionaryCount,
+        PhysicalType physicalType,
+        int typeLength)
+    {
+        if (physicalType == PhysicalType.ByteArray)
+        {
+            // Each entry is a 4-byte little-endian length and then the value; the filter hashes the value.
+            int pos = 0;
+            for (int i = 0; i < dictionaryCount; i++)
+            {
+                int length = BinaryPrimitives.ReadInt32LittleEndian(dictionaryPage.Slice(pos));
+                builder.Add(dictionaryPage.Slice(pos + 4, length));
+                pos += 4 + length;
+            }
+
+            return;
+        }
+
+        int width = physicalType switch
+        {
+            PhysicalType.Int32 or PhysicalType.Float => 4,
+            PhysicalType.Int64 or PhysicalType.Double => 8,
+            PhysicalType.FixedLenByteArray => typeLength,
+            // BOOLEAN and INT96 are never dictionary-encoded by this writer.
+            _ => throw new ArgumentOutOfRangeException(
+                nameof(physicalType), physicalType, "No dictionary page is written for this physical type."),
+        };
+
+        for (int i = 0; i < dictionaryCount; i++)
+            builder.Add(dictionaryPage.Slice(i * width, width));
+    }
+
     private static void AddBooleanValues(SplitBlockBloomFilterBuilder builder, BooleanArray array)
     {
         Span<byte> buf = stackalloc byte[1];

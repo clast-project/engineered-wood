@@ -268,28 +268,24 @@ internal static class ColumnChunkWriter
             result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array), physicalType);
         }
 
-        // Build Bloom filter if enabled for this column.
         if (options.HasBloomFilter(pathInSchema))
         {
-            int ndv = dictResult?.DictionaryCount ?? nonNullCount;
-            int filterBytes = SplitBlockBloomFilterBuilder.OptimalNumBytes(
-                ndv, options.BloomFilterFpp, options.BloomFilterMaxBytes);
+            // A column the dictionary took is filled from its entries — O(distinct) rather than O(rows).
+            // That also covers every run-end encoded column that reaches here, since one the dictionary
+            // declined was expanded above. The rest hash every row, and size the filter from the row
+            // count because they have no better estimate of the distinct values.
+            SplitBlockBloomFilterBuilder bloomFilter;
+            if (dictResult is { } dictionary)
+            {
+                bloomFilter = DictionaryBloomFilter(dictionary, physicalType, typeLength, options);
+            }
+            else
+            {
+                bloomFilter = NewBloomFilterBuilder(nonNullCount, options);
+                BloomFilterArrowEncoder.AddArrowValues(bloomFilter, array, physicalType, typeLength);
+            }
 
-            var bfBuilder = new SplitBlockBloomFilterBuilder(filterBytes);
-
-            // A Bloom filter is a SET: a run contributes its value once, and the rows after the first add
-            // nothing a membership test could observe. So a run-end encoded column is reduced to one value
-            // per run rather than expanded — same filter, O(runs) to build.
-            BloomFilterArrowEncoder.AddArrowValues(
-                bfBuilder,
-                array is RunEndEncodedArray reeBloom ? RunValues(reeBloom) : array,
-                physicalType,
-                typeLength);
-
-            // A `with` rather than a field-by-field copy: the copy this replaced left out
-            // SymbolTablePageSize, which cost an FSST chunk with a Bloom filter its
-            // symbol_table_page_offset (#393).
-            result = result with { BloomFilterData = BloomFilterSerializer.Serialize(bfBuilder.ToArray()) };
+            result = WithBloomFilter(result, bloomFilter);
         }
 
         // Roots the caller's array across the whole column encode. Both WriteColumn overloads land here,
@@ -1971,15 +1967,32 @@ internal static class ColumnChunkWriter
             ? new RunEndEncodedArray(ree.RunEnds, transform(ree.Values))
             : transform(array);
 
-    /// <summary>One value per run, in run order — the distinct-ish values of a run-end encoded column.</summary>
-    private static IArrowArray RunValues(RunEndEncodedArray array)
-    {
-        var physical = new List<int>();
-        foreach (var run in RunEndEncoding.EnumerateRuns(array))
-            physical.Add(run.PhysicalIndex);
+    /// <summary>A filter sized for <paramref name="distinctValues"/> under the options' FPP and size cap.</summary>
+    private static SplitBlockBloomFilterBuilder NewBloomFilterBuilder(int distinctValues, ParquetWriteOptions options) =>
+        new(SplitBlockBloomFilterBuilder.OptimalNumBytes(
+            distinctValues, options.BloomFilterFpp, options.BloomFilterMaxBytes));
 
-        return ArrowCompute.Take(array.Values, physical);
+    /// <summary>
+    /// The Bloom filter of a dictionary-encoded chunk, sized exactly (the dictionary holds the distinct
+    /// count) and filled by hashing each dictionary entry once.
+    /// </summary>
+    private static SplitBlockBloomFilterBuilder DictionaryBloomFilter(
+        in DictionaryEncoder.DictionaryResult dictResult, PhysicalType physicalType, int typeLength,
+        ParquetWriteOptions options)
+    {
+        var builder = NewBloomFilterBuilder(dictResult.DictionaryCount, options);
+        BloomFilterArrowEncoder.AddDictionaryValues(
+            builder, dictResult.DictionaryPageData, dictResult.DictionaryCount, physicalType, typeLength);
+        return builder;
     }
+
+    /// <remarks>
+    /// A <c>with</c> rather than a field-by-field copy: the copy this replaced left out
+    /// <see cref="ColumnChunkResult.SymbolTablePageSize"/>, which cost an FSST chunk with a Bloom filter
+    /// its symbol_table_page_offset.
+    /// </remarks>
+    private static ColumnChunkResult WithBloomFilter(ColumnChunkResult result, SplitBlockBloomFilterBuilder bloomFilter) =>
+        result with { BloomFilterData = BloomFilterSerializer.Serialize(bloomFilter.ToArray()) };
 
     /// <summary>
     /// For nested columns (maxDefLevel &gt; 1), normalizes def levels to 0/1
