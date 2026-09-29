@@ -395,6 +395,59 @@ public class BufferedParquetWriterTests : IDisposable
             File.ReadAllBytes(buffered).AsSpan((int)b.BloomFilterOffset!.Value, b.BloomFilterLength!.Value).ToArray());
     }
 
+#if NET8_0_OR_GREATER // HalfFloatArray does not exist on .NET Framework.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HalfFloat_RoundTrips(bool highCardinality)
+    {
+        // HalfFloat shares the narrow integers' 2-byte encoder but is FIXED_LEN_BYTE_ARRAY(2), so its
+        // dictionary entries must stay two bytes. The high-cardinality fallback had no HalfFloat arm and threw.
+        // Built from bit patterns, so the values need no System.Half.
+        const int rows = 600;
+        ushort? Bits(int i) => i % 11 == 4 ? null
+            : (ushort)(0x3C00 + (highCardinality ? i : i % 5));
+
+        var values = new byte[rows * 2];
+        var validity = new ArrowBuffer.BitmapBuilder();
+        int nulls = 0;
+        for (int i = 0; i < rows; i++)
+        {
+            validity.Append(Bits(i) is not null);
+            if (Bits(i) is ushort bits) System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(values.AsSpan(i * 2), bits);
+            else nulls++;
+        }
+
+        var array = new HalfFloatArray(new ArrayData(
+            HalfFloatType.Default, rows, nulls, 0, [validity.Build(), new ArrowBuffer(values)]));
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("h", HalfFloatType.Default, nullable: true)).Build(), [array], rows);
+
+        string path = TempPath("half.parquet");
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new BufferedParquetWriter(file, ownsFile: false,
+            new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed }))
+        {
+            await writer.AppendAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        Assert.Equal(!highCardinality,
+            (await reader.ReadMetadataAsync()).RowGroups[0].Columns[0].MetaData!.Encodings.Contains(Encoding.RleDictionary));
+
+        var read = (await reader.ReadRowGroupAsync(0)).Column(0);
+        var readValues = read.Data.Buffers[1].Span;
+        for (int i = 0; i < rows; i++)
+        {
+            ushort? actual = read.IsNull(i) ? null
+                : System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(readValues.Slice((read.Data.Offset + i) * 2));
+            Assert.Equal(Bits(i), actual);
+        }
+    }
+#endif
+
     private static RecordBatch MakeMixedBatch(int rowCount, int seed = 42)
     {
         var rng = new Random(seed);

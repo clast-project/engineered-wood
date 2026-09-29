@@ -380,6 +380,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 => ReconstructByteArray(dictPage, dictCount, indices, defLevels, numRows, state.IsNullable, isString: false),
             Apache.Arrow.Types.FixedSizeBinaryType fsb
                 => ReconstructFixedLenByteArray(dictPage, indices, defLevels, numRows, state.IsNullable, fsb.ByteWidth, state.ArrowType),
+            // FIXED_LEN_BYTE_ARRAY(2), and its entries keep Arrow's two bytes (see EncodeFixed).
+            Apache.Arrow.Types.HalfFloatType
+                => ReconstructFixedLenByteArray(dictPage, indices, defLevels, numRows, state.IsNullable, 2, state.ArrowType),
             _ => throw new NotSupportedException($"Cannot reconstruct array of type {state.ArrowType}"),
         };
     }
