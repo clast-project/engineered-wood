@@ -371,7 +371,7 @@ public class DictionaryPushdownTests : IDisposable
         string path = await WritePrefetchFile("read_all");
         await using var input = new RequestCountingFile(new LocalRandomAccessFile(path));
         await using var reader = new ParquetFileReader(input, ownsFile: false,
-            new ParquetReadOptions { Filter = Ex.Equal("key", "k3"), FilterUseDictionaries = true });
+            new ParquetReadOptions { Filter = Ex.Equal("key", "k3"), FilterUseDictionaries = true, FilterUsePageIndex = false });
         await reader.ReadMetadataAsync();
         input.Requests.Clear();
 

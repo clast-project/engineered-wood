@@ -1562,7 +1562,7 @@ oversight.
 | — | Dictionary-page row-group pruning | Parquet | [#57](https://github.com/clast-project/engineered-wood/issues/57) |
 | **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes. No longer blocked — Phase 9 shipped | DeltaLake.Table | [#102](https://github.com/clast-project/engineered-wood/issues/102) |
 | **Phase 11** | Column/offset index parsing (Parquet read) | Parquet | **Done** (#392, #404); see [`parquet-page-index.md`](parquet-page-index.md) R-1 |
-| **Phase 12** | Page-level pushdown using column index (needs Phase 11 and a row-range read path) | Parquet | R-2 (page pruning, `GetCandidateRowRangesAsync`) and R-3 (`ReadRowRangesAsync`, `FilterUsePageIndex`, off by default) done; see [`parquet-page-index.md`](parquet-page-index.md) R-2/R-3 |
+| **Phase 12** | Page-level pushdown using column index (needs Phase 11 and a row-range read path) | Parquet | R-2 (page pruning, `GetCandidateRowRangesAsync`) and R-3 (`ReadRowRangesAsync`, `FilterUsePageIndex`, on by default since #435) done; see [`parquet-page-index.md`](parquet-page-index.md) R-2/R-3 |
 | **Phase 13** | Column/offset index writing — independent of Phase 11, despite the original ordering. Was blocked on [#389](https://github.com/clast-project/engineered-wood/issues/389) (row-aligned pages) | Parquet | **Done**, on by default (#391, #399, #402), with pages capped at 20,000 rows (#428, #429); see [`parquet-page-index.md`](parquet-page-index.md) W-1…W-7 |
 | **Phase 14** | ORC stripe pruning | Orc | unfiled |
 

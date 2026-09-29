@@ -176,7 +176,7 @@ public class PageIndexRowRangeReadTests : IDisposable
             Ex.LessThan("sorted", LiteralValue.Of(1300L)));
 
         var on = await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true });
-        var off = await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter });
+        var off = await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = false });
         var expected = await FullRowsAsync(path, 0);
 
         // The pages [1000, 1250) and [1250, 1500).
@@ -185,9 +185,22 @@ public class PageIndexRowRangeReadTests : IDisposable
 
         long onBytes = await BytesReadAsync(path, reader => reader.ReadAllAsync(),
             new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true });
-        long offBytes = await BytesReadAsync(path, reader => reader.ReadAllAsync(), new ParquetReadOptions { Filter = filter });
+        long offBytes = await BytesReadAsync(path, reader => reader.ReadAllAsync(), new ParquetReadOptions { Filter = filter, FilterUsePageIndex = false });
         _output.WriteLine($"on {onBytes:N0} bytes, off {offBytes:N0}");
         Assert.True(onBytes < offBytes / 4, $"read {onBytes:N0} of {offBytes:N0} bytes");
+    }
+
+    /// <summary>On by default (#435): a filter alone narrows by the page index.</summary>
+    [Fact]
+    public async Task FilterUsePageIndex_IsOnByDefault()
+    {
+        Assert.True(ParquetReadOptions.Default.FilterUsePageIndex);
+
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+        var filter = Ex.Equal("sorted", LiteralValue.Of(1300L));
+        var expected = await FullRowsAsync(path, 0);
+
+        Assert.Equal(expected.Skip(1250).Take(250), await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter }));
     }
 
     /// <summary>
@@ -203,7 +216,7 @@ public class PageIndexRowRangeReadTests : IDisposable
             Ex.GreaterThan("sorted", LiteralValue.Of(4900L)));
 
         Assert.Empty(await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true }));
-        Assert.Equal(Rows, (await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter })).Count);
+        Assert.Equal(Rows, (await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = false })).Count);
     }
 
     /// <summary>With several row groups, each is narrowed on its own, and ruled-out ones are skipped.</summary>
@@ -328,7 +341,7 @@ public class PageIndexRowRangeReadTests : IDisposable
         });
         var filter = Ex.Equal("sorted", LiteralValue.Of(2100L));
 
-        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = false });
         int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true });
 
         Assert.Equal(off + 1, on);
@@ -352,12 +365,12 @@ public class PageIndexRowRangeReadTests : IDisposable
         // Random ints: every row group and every page holds values on both sides of the median.
         var filter = Ex.LessThan("ints", LiteralValue.Of(int.MaxValue / 2));
 
-        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = false });
         int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true });
 
         Assert.Equal(off + windows, on);
         Assert.Equal(
-            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter }),
+            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = false }),
             await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true }));
     }
 
@@ -386,7 +399,7 @@ public class PageIndexRowRangeReadTests : IDisposable
                 rg.Columns[1].ColumnIndexLength!.Value + rg.Columns.Sum(c => (long)c.OffsetIndexLength!.Value));
         }
 
-        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = false });
         var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
         using (var reader = new ParquetFileReader(counting, ownsFile: true,
             new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true }))
@@ -414,7 +427,7 @@ public class PageIndexRowRangeReadTests : IDisposable
         });
         var filter = Ex.GreaterThanOrEqual("sorted", LiteralValue.Of(0L));
 
-        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, BatchSize = 97 });
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, BatchSize = 97, FilterUsePageIndex = false });
         int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, BatchSize = 97, FilterUsePageIndex = true });
 
         Assert.Equal(off, on);
@@ -435,7 +448,7 @@ public class PageIndexRowRangeReadTests : IDisposable
         });
         var filter = Ex.Equal("sorted", LiteralValue.Of(2100L));
 
-        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter });
+        int off = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = false });
         int on = await RequestsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true });
 
         Assert.Equal(off + 1, on);
@@ -462,7 +475,7 @@ public class PageIndexRowRangeReadTests : IDisposable
         using (var reader = Open(path))
             Assert.Equal([new RowRange(0, Rows)], await reader.GetCandidateRowRangesAsync(0, filter));
         Assert.Equal(
-            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter }),
+            await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = false }),
             await ReadAllRowsAsync(path, new ParquetReadOptions { Filter = filter, FilterUsePageIndex = true }));
     }
 
