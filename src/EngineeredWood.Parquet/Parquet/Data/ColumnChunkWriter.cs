@@ -603,21 +603,27 @@ internal static class ColumnChunkWriter
             maxDefLevel, maxRepLevel, defLevels, repLevels, options, pageIndex);
 
         // See ParquetWriteOptions.WriteStatistics: off means no Statistics at all, not merely no bounds.
-        if (!options.GetWriteStatistics(pathInSchema))
-            return result;
+        if (options.GetWriteStatistics(pathInSchema))
+        {
+            // FLOAT/DOUBLE take the index-aware overload: the bounds come from the dictionary entries
+            // either way, but nan_count counts VALUES, so it has to see the indices. WriteColumn
+            // full-scans the Arrow array for the same reason; here there is no array left to scan.
+            var stats = physicalType is PhysicalType.Float or PhysicalType.Double
+                ? StatisticsCollector.ComputeFloatingPointFromDictEntries(
+                    dictResult, physicalType, rowCount - nonNullCount,
+                    options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder)
+                : StatisticsCollector.ComputeFromDictEntries(
+                    dictResult.DictionaryPageData, dictResult.DictionaryCount,
+                    physicalType, typeLength, rowCount - nonNullCount, statisticsOrder);
 
-        // FLOAT/DOUBLE take the index-aware overload: the bounds come from the dictionary entries either
-        // way, but nan_count counts VALUES, so it has to see the indices. WriteColumn full-scans the Arrow
-        // array for the same reason; here there is no array left to scan.
-        var stats = physicalType is PhysicalType.Float or PhysicalType.Double
-            ? StatisticsCollector.ComputeFloatingPointFromDictEntries(
-                dictResult, physicalType, rowCount - nonNullCount,
-                options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder)
-            : StatisticsCollector.ComputeFromDictEntries(
-                dictResult.DictionaryPageData, dictResult.DictionaryCount,
-                physicalType, typeLength, rowCount - nonNullCount, statisticsOrder);
+            result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
+        }
 
-        result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
+        // With no array left to scan, the dictionary is the only way to build this filter, so until it
+        // was filled from one this path wrote none at all.
+        if (options.HasBloomFilter(pathInSchema))
+            result = WithBloomFilter(result, DictionaryBloomFilter(dictResult, physicalType, typeLength, options));
+
         return result;
     }
 
