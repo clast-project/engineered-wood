@@ -286,14 +286,10 @@ internal static class ColumnChunkWriter
                 physicalType,
                 typeLength);
 
-            result = new ColumnChunkResult
-            {
-                Data = result.Data,
-                MetaData = result.MetaData,
-                DictionaryPageSize = result.DictionaryPageSize,
-                PageIndex = result.PageIndex,
-                BloomFilterData = BloomFilterSerializer.Serialize(bfBuilder.ToArray()),
-            };
+            // A `with` rather than a field-by-field copy: the copy this replaced left out
+            // SymbolTablePageSize, which cost an FSST chunk with a Bloom filter its
+            // symbol_table_page_offset (#393).
+            result = result with { BloomFilterData = BloomFilterSerializer.Serialize(bfBuilder.ToArray()) };
         }
 
         // Roots the caller's array across the whole column encode. Both WriteColumn overloads land here,
