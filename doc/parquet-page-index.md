@@ -418,8 +418,8 @@ off, row and byte batch limits, single rows, page-aligned and page-crossing rang
 ranges, no page index, nested columns, and every fixture with a page index. No batch may cross a
 range. A one-page read fetches about 6% of a whole row group's bytes. Deliberately introduced
 cursor bugs are caught: a no-op skip fails 30 tests, never jumping to the batch's page fails 2
-(the byte counts), and always appending fails 44. Whether to turn the option on by default is
-for measurement, as for the page index itself.
+(the byte counts), and always appending fails 44. Whether to turn the option on by default was
+left to measurement, as for the page index itself; it is now on (see below).
 
 **Measured, and three round trips cut.** `-- pageindex-read-ab` reads 4 row groups × 500k rows
 (default options, so 25 pages per column per row group) under five filters, alternating the option
@@ -463,8 +463,11 @@ and 3 without the index. So the latency paid is per call, and a store that bills
 the GETs. What remains at 400 MB/s is that one call, against the bytes it saves.
 
 **On by default (#435).** Typical filters are on sorted or clustered columns (time, ids,
-Z-ordered keys), EW's writer cuts pages at 20,000 rows (#429) so its own files prune, and the loss
-is bounded: +2–6% for a filter no page can narrow. The Delta scan reads through the same path
+Z-ordered keys), and EW's writer cuts pages at 20,000 rows (#429) so its own files prune. The
+loss measured for a filter no page can narrow was +2–6%, on the flat-column benchmark above at
+its three transfer settings. That is an observation, not a bound: columns without an OffsetIndex
+and row groups with a nested column pay the index read and save nothing, and a store that bills
+per request sees the extra GETs. The Delta scan reads through the same path
 (#436), so a table's scans narrow by the index unless its `ParquetReadOptions` turn it off.
 
 ### R-4. Later
