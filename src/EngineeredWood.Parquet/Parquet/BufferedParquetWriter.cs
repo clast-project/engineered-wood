@@ -352,10 +352,15 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         return state.ArrowType switch
         {
-            Apache.Arrow.Types.Int8Type => ReconstructFixed<sbyte>(dictPage, indices, defLevels, numRows, state.IsNullable),
-            Apache.Arrow.Types.UInt8Type => ReconstructFixed<byte>(dictPage, indices, defLevels, numRows, state.IsNullable),
-            Apache.Arrow.Types.Int16Type => ReconstructFixed<short>(dictPage, indices, defLevels, numRows, state.IsNullable),
-            Apache.Arrow.Types.UInt16Type => ReconstructFixed<ushort>(dictPage, indices, defLevels, numRows, state.IsNullable),
+            // The narrow integers' entries are INT32 (see EncodeFixed), so they are read back at that width.
+            Apache.Arrow.Types.Int8Type => ReconstructFixed(
+                NarrowEntries(dictPage, v => unchecked((sbyte)v)), indices, defLevels, numRows, state.IsNullable),
+            Apache.Arrow.Types.UInt8Type => ReconstructFixed(
+                NarrowEntries(dictPage, v => unchecked((byte)v)), indices, defLevels, numRows, state.IsNullable),
+            Apache.Arrow.Types.Int16Type => ReconstructFixed(
+                NarrowEntries(dictPage, v => unchecked((short)v)), indices, defLevels, numRows, state.IsNullable),
+            Apache.Arrow.Types.UInt16Type => ReconstructFixed(
+                NarrowEntries(dictPage, v => unchecked((ushort)v)), indices, defLevels, numRows, state.IsNullable),
             Apache.Arrow.Types.Int32Type or Apache.Arrow.Types.Date32Type or Apache.Arrow.Types.Time32Type
                 => ReconstructFixed<int>(dictPage, indices, defLevels, numRows, state.IsNullable),
             Apache.Arrow.Types.UInt32Type
@@ -379,11 +384,25 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         };
     }
 
+    /// <summary>An INT32 dictionary page's entries, each narrowed back to the column's Arrow type.</summary>
+    private static T[] NarrowEntries<T>(byte[] dictPage, Func<int, T> narrow)
+    {
+        var entries = MemoryMarshal.Cast<byte, int>(dictPage.AsSpan());
+        var narrowed = new T[entries.Length];
+        for (int i = 0; i < entries.Length; i++)
+            narrowed[i] = narrow(entries[i]);
+        return narrowed;
+    }
+
     private static IArrowArray ReconstructFixed<T>(
         byte[] dictPage, int[] indices, int[]? defLevels, int numRows,
+        bool isNullable) where T : unmanaged =>
+        ReconstructFixed<T>(MemoryMarshal.Cast<byte, T>(dictPage.AsSpan()), indices, defLevels, numRows, isNullable);
+
+    private static IArrowArray ReconstructFixed<T>(
+        ReadOnlySpan<T> dictValues, int[] indices, int[]? defLevels, int numRows,
         bool isNullable) where T : unmanaged
     {
-        var dictValues = MemoryMarshal.Cast<byte, T>(dictPage.AsSpan());
         var values = new T[numRows];
         var nullBitmap = isNullable ? new byte[(numRows + 7) / 8] : null;
 
@@ -766,35 +785,65 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             GC.KeepAlive(array);
         }
 
-        // Generic fixed-width encoding via int key (handles Int8/16 widening to int)
+        /// <summary>
+        /// Dictionary-encodes a 1- or 2-byte column: Int8/UInt8/Int16/UInt16, and HalfFloat.
+        /// </summary>
+        /// <remarks>
+        /// The integers are written as the INT32 physical type, whose PLAIN dictionary entries are four bytes,
+        /// so each entry is widened here — sign- or zero-extended as the source type says. Keeping the Arrow
+        /// width made the page one or two bytes per entry, which the statistics read past and the reader
+        /// refused (#441). HalfFloat is FIXED_LEN_BYTE_ARRAY(2), so its entries keep their two bytes.
+        /// </remarks>
         private void EncodeFixed<T>(ReadOnlySpan<T> valueBuffer, int srcOffset, int rowCount)
             where T : unmanaged, IEquatable<T>
         {
             _fixedDict ??= new Dictionary<int, int>();
             _dictEntries ??= new List<byte[]>();
-            int elementSize = Marshal.SizeOf<T>();
+            bool asInt32 = PhysicalType == PhysicalType.Int32;
+            int entrySize = asInt32 ? 4 : Marshal.SizeOf<T>();
 
             for (int i = 0; i < rowCount; i++)
             {
                 if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
                 T val = valueBuffer[srcOffset + i];
-                int key = Widen(val);
+                // For the integers the key IS the INT32 value, so it is also what the entry holds.
+                int key = asInt32 ? Int32Value(val) : Widen(val);
                 if (!_fixedDict.TryGetValue(key, out int idx))
                 {
                     idx = DictionaryCount++;
                     _fixedDict[key] = idx;
-                    var bytes = new byte[elementSize];
+                    var bytes = new byte[entrySize];
 
+                    if (asInt32)
+                        BinaryPrimitives.WriteInt32LittleEndian(bytes, key);
+                    else
 #if NET8_0_OR_GREATER
-                    MemoryMarshal.Write(bytes, in val);
+                        MemoryMarshal.Write(bytes, in val);
 #else
-                    MemoryMarshal.Write(bytes, ref val);
+                        MemoryMarshal.Write(bytes, ref val);
 #endif
                     _dictEntries.Add(bytes);
-                    _dictPageSize += elementSize;
+                    _dictPageSize += entrySize;
                 }
                 Indices!.Add(idx);
             }
+        }
+
+        /// <summary>
+        /// A narrow integer's value as INT32. <see cref="Widen{T}"/> cannot say: it extends by the C# type of
+        /// the slot, and Int8 is read as <c>byte</c> and UInt16 as <c>short</c>, so it gets both wrong.
+        /// </summary>
+        private int Int32Value<T>(T val) where T : unmanaged
+        {
+            int slot = Widen(val);
+            return ArrowType switch
+            {
+                Apache.Arrow.Types.Int8Type => unchecked((sbyte)slot),
+                Apache.Arrow.Types.UInt8Type => unchecked((byte)slot),
+                Apache.Arrow.Types.Int16Type => unchecked((short)slot),
+                Apache.Arrow.Types.UInt16Type => unchecked((ushort)slot),
+                _ => throw new InvalidOperationException($"{ArrowType} is not a narrow integer type."),
+            };
         }
 
         private void EncodeFixedInt(ReadOnlySpan<int> valueBuffer, int srcOffset, int rowCount)
