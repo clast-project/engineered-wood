@@ -285,6 +285,169 @@ public class BufferedParquetWriterTests : IDisposable
         Assert.False((await reader.GetCandidateRowGroupsAsync("id", 12345))[0]);
     }
 
+    public static TheoryData<string, bool, bool> NarrowIntegerCases()
+    {
+        var data = new TheoryData<string, bool, bool>();
+        foreach (var type in new[] { "int8", "uint8", "int16", "uint16" })
+        foreach (bool highCardinality in new[] { false, true })
+        foreach (bool writeStatistics in new[] { true, false })
+            data.Add(type, highCardinality, writeStatistics);
+        return data;
+    }
+
+    [Theory]
+    [MemberData(nameof(NarrowIntegerCases))]
+    public async Task NarrowIntegers_RoundTripAndMatchTheFileWriter(string type, bool highCardinality, bool writeStatistics)
+    {
+        // These types are written as INT32, whose PLAIN dictionary entries are four bytes. The buffered writer
+        // kept each entry at its Arrow width, so the dictionary page was one or two bytes per entry: with
+        // statistics on the write threw, and with them off the reader refused the file (#441). Low cardinality
+        // keeps the dictionary; high cardinality falls back to rebuilding the column from it.
+        const int rows = 600;
+        long[] extremes = type switch
+        {
+            "int8" => [sbyte.MinValue, -1, 0, 1, sbyte.MaxValue],
+            "uint8" => [0, 1, 128, 200, byte.MaxValue],
+            "int16" => [short.MinValue, -1, 0, 1, short.MaxValue],
+            _ => [0, 1, 32768, 60000, ushort.MaxValue],
+        };
+        long min = extremes[0], span = extremes[extremes.Length - 1] - min + 1;
+        long? Value(int i) => i % 11 == 4 ? null
+            : highCardinality ? min + (i * 7919L % span) : extremes[i % extremes.Length];
+
+        IArrowArray array;
+        IArrowType arrowType;
+        switch (type)
+        {
+            case "int8":
+                var i8 = new Int8Array.Builder();
+                for (int i = 0; i < rows; i++) { if (Value(i) is long v) i8.Append((sbyte)v); else i8.AppendNull(); }
+                (array, arrowType) = (i8.Build(), Int8Type.Default);
+                break;
+            case "uint8":
+                var u8 = new UInt8Array.Builder();
+                for (int i = 0; i < rows; i++) { if (Value(i) is long v) u8.Append((byte)v); else u8.AppendNull(); }
+                (array, arrowType) = (u8.Build(), UInt8Type.Default);
+                break;
+            case "int16":
+                var i16 = new Int16Array.Builder();
+                for (int i = 0; i < rows; i++) { if (Value(i) is long v) i16.Append((short)v); else i16.AppendNull(); }
+                (array, arrowType) = (i16.Build(), Int16Type.Default);
+                break;
+            default:
+                var u16 = new UInt16Array.Builder();
+                for (int i = 0; i < rows; i++) { if (Value(i) is long v) u16.Append((ushort)v); else u16.AppendNull(); }
+                (array, arrowType) = (u16.Build(), UInt16Type.Default);
+                break;
+        }
+
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("n", arrowType, nullable: true)).Build(), [array], rows);
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            BloomFilterColumns = ["n"],
+            WriteStatistics = writeStatistics,
+        };
+
+        string buffered = TempPath("narrow_buffered.parquet");
+        await using (var file = new LocalSequentialFile(buffered))
+        await using (var writer = new BufferedParquetWriter(file, ownsFile: false, options))
+        {
+            await writer.AppendAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        string direct = TempPath("narrow_direct.parquet");
+        await using (var file = new LocalSequentialFile(direct))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+        }
+
+        await using var bufferedFile = new LocalRandomAccessFile(buffered);
+        await using var reader = new ParquetFileReader(bufferedFile, ownsFile: false);
+        var read = (await reader.ReadRowGroupAsync(0)).Column(0);
+        for (int i = 0; i < rows; i++)
+        {
+            long? actual = read.IsNull(i) ? null : read switch
+            {
+                Int8Array a => a.GetValue(i),
+                UInt8Array a => a.GetValue(i),
+                Int16Array a => a.GetValue(i),
+                UInt16Array a => (long?)a.GetValue(i),
+                _ => throw new InvalidOperationException(read.GetType().Name),
+            };
+            Assert.Equal(Value(i), actual);
+        }
+
+        await using var directFile = new LocalRandomAccessFile(direct);
+        await using var directReader = new ParquetFileReader(directFile, ownsFile: false);
+        var b = (await reader.ReadMetadataAsync()).RowGroups[0].Columns[0].MetaData!;
+        var d = (await directReader.ReadMetadataAsync()).RowGroups[0].Columns[0].MetaData!;
+
+        Assert.Equal(!highCardinality, b.Encodings.Contains(Encoding.RleDictionary));
+        Assert.Equal(d.Statistics?.MinValue, b.Statistics?.MinValue);
+        Assert.Equal(d.Statistics?.MaxValue, b.Statistics?.MaxValue);
+        Assert.Equal(d.Statistics?.NullCount, b.Statistics?.NullCount);
+        Assert.Equal(
+            File.ReadAllBytes(direct).AsSpan((int)d.BloomFilterOffset!.Value, d.BloomFilterLength!.Value).ToArray(),
+            File.ReadAllBytes(buffered).AsSpan((int)b.BloomFilterOffset!.Value, b.BloomFilterLength!.Value).ToArray());
+    }
+
+#if NET8_0_OR_GREATER // HalfFloatArray does not exist on .NET Framework.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task HalfFloat_RoundTrips(bool highCardinality)
+    {
+        // HalfFloat shares the narrow integers' 2-byte encoder but is FIXED_LEN_BYTE_ARRAY(2), so its
+        // dictionary entries must stay two bytes. The high-cardinality fallback had no HalfFloat arm and threw.
+        // Built from bit patterns, so the values need no System.Half.
+        const int rows = 600;
+        ushort? Bits(int i) => i % 11 == 4 ? null
+            : (ushort)(0x3C00 + (highCardinality ? i : i % 5));
+
+        var values = new byte[rows * 2];
+        var validity = new ArrowBuffer.BitmapBuilder();
+        int nulls = 0;
+        for (int i = 0; i < rows; i++)
+        {
+            validity.Append(Bits(i) is not null);
+            if (Bits(i) is ushort bits) System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(values.AsSpan(i * 2), bits);
+            else nulls++;
+        }
+
+        var array = new HalfFloatArray(new ArrayData(
+            HalfFloatType.Default, rows, nulls, 0, [validity.Build(), new ArrowBuffer(values)]));
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("h", HalfFloatType.Default, nullable: true)).Build(), [array], rows);
+
+        string path = TempPath("half.parquet");
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new BufferedParquetWriter(file, ownsFile: false,
+            new ParquetWriteOptions { Compression = CompressionCodec.Uncompressed }))
+        {
+            await writer.AppendAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        Assert.Equal(!highCardinality,
+            (await reader.ReadMetadataAsync()).RowGroups[0].Columns[0].MetaData!.Encodings.Contains(Encoding.RleDictionary));
+
+        var read = (await reader.ReadRowGroupAsync(0)).Column(0);
+        var readValues = read.Data.Buffers[1].Span;
+        for (int i = 0; i < rows; i++)
+        {
+            ushort? actual = read.IsNull(i) ? null
+                : System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(readValues.Slice((read.Data.Offset + i) * 2));
+            Assert.Equal(Bits(i), actual);
+        }
+    }
+#endif
+
     private static RecordBatch MakeMixedBatch(int rowCount, int seed = 42)
     {
         var rng = new Random(seed);
