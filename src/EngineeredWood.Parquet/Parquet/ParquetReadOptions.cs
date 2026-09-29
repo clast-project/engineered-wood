@@ -320,9 +320,11 @@ public sealed record ParquetReadOptions
     /// range reads 47–55% faster at 100 MB/s and 8–11% faster at 400 MB/s, and a 10% range 34% faster
     /// and 5% slower; a filter no page can narrow reads 4–6% slower. Columns without a usable index are read whole and cut to the same
     /// rows, and so are the columns of a row group with any nested column.
-    /// Default: <see langword="false"/>.</para>
+    /// Default: <see langword="true"/> (#435), as in DataFusion, which reads the page index by default.
+    /// Set it false for filters on unclustered columns over a fast link, where the index read is
+    /// all cost, or when extra GETs cost more than round trips.</para>
     /// </remarks>
-    public bool FilterUsePageIndex { get; init; }
+    public bool FilterUsePageIndex { get; init; } = true;
 
     /// <summary>
     /// When <see langword="true"/>, row-group pruning (by <see cref="Filter"/>, or by
