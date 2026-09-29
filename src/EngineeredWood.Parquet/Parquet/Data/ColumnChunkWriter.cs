@@ -268,32 +268,24 @@ internal static class ColumnChunkWriter
             result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array), physicalType);
         }
 
-        // Build Bloom filter if enabled for this column.
         if (options.HasBloomFilter(pathInSchema))
         {
-            int ndv = dictResult?.DictionaryCount ?? nonNullCount;
-            int filterBytes = SplitBlockBloomFilterBuilder.OptimalNumBytes(
-                ndv, options.BloomFilterFpp, options.BloomFilterMaxBytes);
-
-            var bfBuilder = new SplitBlockBloomFilterBuilder(filterBytes);
-
-            // A Bloom filter is a SET: a run contributes its value once, and the rows after the first add
-            // nothing a membership test could observe. So a run-end encoded column is reduced to one value
-            // per run rather than expanded — same filter, O(runs) to build.
-            BloomFilterArrowEncoder.AddArrowValues(
-                bfBuilder,
-                array is RunEndEncodedArray reeBloom ? RunValues(reeBloom) : array,
-                physicalType,
-                typeLength);
-
-            result = new ColumnChunkResult
+            // A column the dictionary took is filled from its entries — O(distinct) rather than O(rows).
+            // That also covers every run-end encoded column that reaches here, since one the dictionary
+            // declined was expanded above. The rest hash every row, and size the filter from the row
+            // count because they have no better estimate of the distinct values.
+            SplitBlockBloomFilterBuilder bloomFilter;
+            if (dictResult is { } dictionary)
             {
-                Data = result.Data,
-                MetaData = result.MetaData,
-                DictionaryPageSize = result.DictionaryPageSize,
-                PageIndex = result.PageIndex,
-                BloomFilterData = BloomFilterSerializer.Serialize(bfBuilder.ToArray()),
-            };
+                bloomFilter = DictionaryBloomFilter(dictionary, physicalType, typeLength, options);
+            }
+            else
+            {
+                bloomFilter = NewBloomFilterBuilder(nonNullCount, options);
+                BloomFilterArrowEncoder.AddArrowValues(bloomFilter, array, physicalType, typeLength);
+            }
+
+            result = WithBloomFilter(result, bloomFilter);
         }
 
         // Roots the caller's array across the whole column encode. Both WriteColumn overloads land here,
@@ -611,21 +603,27 @@ internal static class ColumnChunkWriter
             maxDefLevel, maxRepLevel, defLevels, repLevels, options, pageIndex);
 
         // See ParquetWriteOptions.WriteStatistics: off means no Statistics at all, not merely no bounds.
-        if (!options.GetWriteStatistics(pathInSchema))
-            return result;
+        if (options.GetWriteStatistics(pathInSchema))
+        {
+            // FLOAT/DOUBLE take the index-aware overload: the bounds come from the dictionary entries
+            // either way, but nan_count counts VALUES, so it has to see the indices. WriteColumn
+            // full-scans the Arrow array for the same reason; here there is no array left to scan.
+            var stats = physicalType is PhysicalType.Float or PhysicalType.Double
+                ? StatisticsCollector.ComputeFloatingPointFromDictEntries(
+                    dictResult, physicalType, rowCount - nonNullCount,
+                    options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder)
+                : StatisticsCollector.ComputeFromDictEntries(
+                    dictResult.DictionaryPageData, dictResult.DictionaryCount,
+                    physicalType, typeLength, rowCount - nonNullCount, statisticsOrder);
 
-        // FLOAT/DOUBLE take the index-aware overload: the bounds come from the dictionary entries either
-        // way, but nan_count counts VALUES, so it has to see the indices. WriteColumn full-scans the Arrow
-        // array for the same reason; here there is no array left to scan.
-        var stats = physicalType is PhysicalType.Float or PhysicalType.Double
-            ? StatisticsCollector.ComputeFloatingPointFromDictEntries(
-                dictResult, physicalType, rowCount - nonNullCount,
-                options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder)
-            : StatisticsCollector.ComputeFromDictEntries(
-                dictResult.DictionaryPageData, dictResult.DictionaryCount,
-                physicalType, typeLength, rowCount - nonNullCount, statisticsOrder);
+            result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
+        }
 
-        result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
+        // With no array left to scan, the dictionary is the only way to build this filter, so until it
+        // was filled from one this path wrote none at all.
+        if (options.HasBloomFilter(pathInSchema))
+            result = WithBloomFilter(result, DictionaryBloomFilter(dictResult, physicalType, typeLength, options));
+
         return result;
     }
 
@@ -1975,15 +1973,32 @@ internal static class ColumnChunkWriter
             ? new RunEndEncodedArray(ree.RunEnds, transform(ree.Values))
             : transform(array);
 
-    /// <summary>One value per run, in run order — the distinct-ish values of a run-end encoded column.</summary>
-    private static IArrowArray RunValues(RunEndEncodedArray array)
-    {
-        var physical = new List<int>();
-        foreach (var run in RunEndEncoding.EnumerateRuns(array))
-            physical.Add(run.PhysicalIndex);
+    /// <summary>A filter sized for <paramref name="distinctValues"/> under the options' FPP and size cap.</summary>
+    private static SplitBlockBloomFilterBuilder NewBloomFilterBuilder(int distinctValues, ParquetWriteOptions options) =>
+        new(SplitBlockBloomFilterBuilder.OptimalNumBytes(
+            distinctValues, options.BloomFilterFpp, options.BloomFilterMaxBytes));
 
-        return ArrowCompute.Take(array.Values, physical);
+    /// <summary>
+    /// The Bloom filter of a dictionary-encoded chunk, sized exactly (the dictionary holds the distinct
+    /// count) and filled by hashing each dictionary entry once.
+    /// </summary>
+    private static SplitBlockBloomFilterBuilder DictionaryBloomFilter(
+        in DictionaryEncoder.DictionaryResult dictResult, PhysicalType physicalType, int typeLength,
+        ParquetWriteOptions options)
+    {
+        var builder = NewBloomFilterBuilder(dictResult.DictionaryCount, options);
+        BloomFilterArrowEncoder.AddDictionaryValues(
+            builder, dictResult.DictionaryPageData, dictResult.DictionaryCount, physicalType, typeLength);
+        return builder;
     }
+
+    /// <remarks>
+    /// A <c>with</c> rather than a field-by-field copy: the copy this replaced left out
+    /// <see cref="ColumnChunkResult.SymbolTablePageSize"/>, which cost an FSST chunk with a Bloom filter
+    /// its symbol_table_page_offset.
+    /// </remarks>
+    private static ColumnChunkResult WithBloomFilter(ColumnChunkResult result, SplitBlockBloomFilterBuilder bloomFilter) =>
+        result with { BloomFilterData = BloomFilterSerializer.Serialize(bloomFilter.ToArray()) };
 
     /// <summary>
     /// For nested columns (maxDefLevel &gt; 1), normalizes def levels to 0/1

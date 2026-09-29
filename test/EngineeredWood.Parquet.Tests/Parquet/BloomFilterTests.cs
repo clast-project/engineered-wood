@@ -192,6 +192,95 @@ public class BloomFilterTests
         }
     }
 
+    public static TheoryData<string> DictionaryFillColumns() =>
+        ["int32", "int64", "float", "double", "string", "binary", "flba"];
+
+    [Theory]
+    [MemberData(nameof(DictionaryFillColumns))]
+    public void DictionaryFill_BuildsTheSameFilterAsTheRows(string column)
+    {
+        // Filling from the dictionary is only a cheaper route to the same set: hashing each distinct
+        // value once has to set exactly the bits that hashing every row did.
+        const int rows = 2000;
+        var (array, physicalType, typeLength) = column switch
+        {
+            "int32" => (Build(new Apache.Arrow.Int32Array.Builder(), rows,
+                (b, i) => b.Append(i % 37 - 18), b => b.AppendNull(), b => b.Build()), PhysicalType.Int32, 0),
+            "int64" => (Build(new Apache.Arrow.Int64Array.Builder(), rows,
+                (b, i) => b.Append((i % 41) * 1_000_000_007L), b => b.AppendNull(), b => b.Build()), PhysicalType.Int64, 0),
+            // Both zeros and two NaN payloads: a dictionary keyed on bits keeps all four apart, as the
+            // per-row hashing does.
+            "float" => (Build(new Apache.Arrow.FloatArray.Builder(), rows, (b, i) => b.Append((i % 5) switch
+                {
+                    0 => 0.0f, 1 => -0.0f, 2 => float.NaN,
+                    3 => BitConverter.ToSingle(BitConverter.GetBytes(0x7FC00001), 0), _ => i % 23,
+                }), b => b.AppendNull(), b => b.Build()), PhysicalType.Float, 0),
+            "double" => (Build(new Apache.Arrow.DoubleArray.Builder(), rows, (b, i) => b.Append((i % 5) switch
+                {
+                    0 => 0.0, 1 => -0.0, 2 => double.NaN,
+                    3 => BitConverter.Int64BitsToDouble(0x7FF8000000000001), _ => i % 29 / 7.0,
+                }), b => b.AppendNull(), b => b.Build()), PhysicalType.Double, 0),
+            // The empty string is a value, and must be in both.
+            "string" => (Build(new Apache.Arrow.StringArray.Builder(), rows,
+                (b, i) => b.Append(i % 19 == 0 ? "" : $"v{i % 31}"), b => b.AppendNull(), b => b.Build()),
+                PhysicalType.ByteArray, 0),
+            "binary" => (Build(new Apache.Arrow.BinaryArray.Builder(), rows,
+                (b, i) => b.Append(new[] { (byte)(i % 13), (byte)(i % 3) }.AsSpan()), b => b.AppendNull(), b => b.Build()),
+                PhysicalType.ByteArray, 0),
+            _ => (FixedSizeBinaryColumn(rows, 6, i => [1, 2, 3, (byte)(i % 11), 5, 6]), PhysicalType.FixedLenByteArray, 6),
+        };
+
+        var validity = Enumerable.Range(0, rows).Select(i => array.IsNull(i) ? 0 : 1).ToArray();
+        int nonNull = validity.Sum();
+        var dictionary = EngineeredWood.Parquet.Data.DictionaryEncoder.TryEncode(
+            array, physicalType, typeLength, validity, nonNull, ParquetWriteOptions.Default);
+        Assert.NotNull(dictionary);
+
+        int bytes = SplitBlockBloomFilterBuilder.OptimalNumBytes(dictionary!.Value.DictionaryCount, 0.01, 1024 * 1024);
+        var fromRows = new SplitBlockBloomFilterBuilder(bytes);
+        BloomFilterArrowEncoder.AddArrowValues(fromRows, array, physicalType, typeLength);
+        var fromDictionary = new SplitBlockBloomFilterBuilder(bytes);
+        BloomFilterArrowEncoder.AddDictionaryValues(
+            fromDictionary, dictionary.Value.DictionaryPageData, dictionary.Value.DictionaryCount, physicalType, typeLength);
+
+        Assert.Equal(fromRows.ToArray(), fromDictionary.ToArray());
+    }
+
+    private static bool IsNullRow(int i) => i % 7 == 3;
+
+    /// <summary>A column with <see cref="IsNullRow"/> rows null and the rest from <paramref name="append"/>.</summary>
+    private static Apache.Arrow.IArrowArray Build<TBuilder>(
+        TBuilder builder, int rows, Action<TBuilder, int> append, Action<TBuilder> appendNull,
+        Func<TBuilder, Apache.Arrow.IArrowArray> build)
+    {
+        for (int i = 0; i < rows; i++)
+        {
+            if (IsNullRow(i)) appendNull(builder);
+            else append(builder, i);
+        }
+
+        return build(builder);
+    }
+
+    /// <summary>The fixed-size twin of <see cref="Build"/>; Arrow has no builder for this type.</summary>
+    private static Apache.Arrow.IArrowArray FixedSizeBinaryColumn(int rows, int width, Func<int, byte[]> value)
+    {
+        var values = new byte[rows * width];
+        var validity = new Apache.Arrow.ArrowBuffer.BitmapBuilder();
+        int nulls = 0;
+        for (int i = 0; i < rows; i++)
+        {
+            bool isNull = IsNullRow(i);
+            validity.Append(!isNull);
+            if (isNull) nulls++;
+            else value(i).CopyTo(values, i * width);
+        }
+
+        return new Apache.Arrow.Arrays.FixedSizeBinaryArray(new Apache.Arrow.ArrayData(
+            new Apache.Arrow.Types.FixedSizeBinaryType(width), rows, nulls, 0,
+            [validity.Build(), new Apache.Arrow.ArrowBuffer(values)]));
+    }
+
     [Fact]
     public async Task GetCandidateRowGroups_InvalidColumn_Throws()
     {

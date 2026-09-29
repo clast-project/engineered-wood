@@ -227,6 +227,64 @@ public class BufferedParquetWriterTests : IDisposable
         Assert.Equal(expectedNulls, actualNulls);
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task BloomFilter_DictionaryColumns_MatchTheFileWriter(bool writeStatistics)
+    {
+        // The buffered writer's dictionary path wrote no Bloom filter at all, whatever
+        // BloomFilterColumns said. Statistics off is its own case: that path used to return early.
+        var batch = MakeMixedBatch(1000);
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            BloomFilterColumns = ["id", "name"],
+            WriteStatistics = writeStatistics,
+        };
+
+        string buffered = TempPath("bloom_buffered.parquet");
+        await using (var file = new LocalSequentialFile(buffered))
+        await using (var writer = new BufferedParquetWriter(file, ownsFile: false, options))
+        {
+            await writer.AppendAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        string direct = TempPath("bloom_direct.parquet");
+        await using (var file = new LocalSequentialFile(direct))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+        }
+
+        await using var bufferedFile = new LocalRandomAccessFile(buffered);
+        await using var reader = new ParquetFileReader(bufferedFile, ownsFile: false);
+        var bufferedMeta = await reader.ReadMetadataAsync();
+
+        await using var directFile = new LocalRandomAccessFile(direct);
+        await using var directReader = new ParquetFileReader(directFile, ownsFile: false);
+        var directMeta = await directReader.ReadMetadataAsync();
+
+        byte[] bufferedBytes = File.ReadAllBytes(buffered);
+        byte[] directBytes = File.ReadAllBytes(direct);
+        for (int c = 0; c < 2; c++)
+        {
+            var b = bufferedMeta.RowGroups[0].Columns[c].MetaData!;
+            var d = directMeta.RowGroups[0].Columns[c].MetaData!;
+            Assert.Contains(Encoding.RleDictionary, b.Encodings);
+            Assert.NotNull(b.BloomFilterOffset);
+
+            // A filter is a set, so the two writers' different dictionary orders build the same bytes.
+            Assert.Equal(
+                directBytes.AsSpan((int)d.BloomFilterOffset!.Value, d.BloomFilterLength!.Value).ToArray(),
+                bufferedBytes.AsSpan((int)b.BloomFilterOffset.Value, b.BloomFilterLength!.Value).ToArray());
+        }
+
+        Assert.True((await reader.GetCandidateRowGroupsAsync("name", "gamma"))[0]);
+        Assert.False((await reader.GetCandidateRowGroupsAsync("name", "zzz_absent"))[0]);
+        Assert.False((await reader.GetCandidateRowGroupsAsync("id", 12345))[0]);
+    }
+
     private static RecordBatch MakeMixedBatch(int rowCount, int seed = 42)
     {
         var rng = new Random(seed);

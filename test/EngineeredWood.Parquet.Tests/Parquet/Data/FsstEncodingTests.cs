@@ -475,6 +475,33 @@ public class FsstEncodingTests : IDisposable
     }
 
     [Fact]
+    public async Task File_FsstWithBloomFilter_KeepsTheSymbolTableOffset()
+    {
+        // Attaching the Bloom filter rebuilt the chunk result field by field and left out the symbol
+        // table's size, so the footer lost symbol_table_page_offset and pointed data_page_offset at the
+        // symbol table page instead of the first data page.
+        var values = UrlValues(4000);
+        string path = await WriteAsync(
+            "urls-bloom.parquet", StringBatch(values, nullable: false),
+            FsstOptions() with { BloomFilterColumns = ["s"] });
+
+        await using var rf = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(rf, ownsFile: false);
+
+        var meta = await reader.ReadMetadataAsync();
+        var colMeta = meta.RowGroups[0].Columns[0].MetaData!;
+        Assert.Contains(Encoding.Fsst, colMeta.Encodings);
+        Assert.NotNull(colMeta.BloomFilterOffset);
+        Assert.NotNull(colMeta.SymbolTablePageOffset);
+        Assert.Equal(colMeta.SymbolTablePageOffset + colMeta.SymbolTablePageLength, colMeta.DataPageOffset);
+
+        var read = await reader.ReadRowGroupAsync(0);
+        var arr = (StringArray)read.Column(0);
+        for (int i = 0; i < values.Length; i++)
+            Assert.Equal(values[i], arr.GetString(i));
+    }
+
+    [Fact]
     public async Task File_FsstIsSmallerThanTheUncompressedAlternative()
     {
         var values = UrlValues(4000);
