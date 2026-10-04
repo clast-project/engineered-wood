@@ -399,7 +399,80 @@ public class PhysicalNameResolutionTests : IDisposable
         Assert.False(pruner.ShouldInclude(add, Ex.Equal("p", LiteralValue.Of("B"))));
     }
 
+    // A logical-keyed map whose names COLLIDE with physical ones: on an upgraded table, p1 renamed to x (physical
+    // p1) and p2 renamed to p1 (physical p2), then an older engineered-wood writes {x: A, p1: B}. Looked up key by
+    // key, x found "its" physical key p1 in the map and read B. The map's spelling is decided once, from every
+    // partition column: it lacks the physical key p2, so it is logical-keyed throughout.
+    private static DeltaStructType CollidingPartitionSchema() => new()
+    {
+        Fields = [Mapped("x", Str, 1, "p1"), Mapped("p1", Str, 2, "p2"), Mapped("v", Long, 3, "v")],
+    };
+
+    private static readonly Dictionary<string, string> LegacyCollidingValues = new() { ["x"] = "A", ["p1"] = "B" };
+    private static readonly Dictionary<string, string> SpecValues = new() { ["p1"] = "A", ["p2"] = "B" };
+
+    [Fact]
+    public void Pruner_LogicalKeyedPartitionValues_CollidingWithPhysicalNames_ResolveAsLogical()
+    {
+        var pruner = new DeltaFilePruner(CollidingPartitionSchema(), ["x", "p1"]);
+        foreach (var values in new[] { LegacyCollidingValues, SpecValues })
+        {
+            var add = MakeAdd(null, values);
+            Assert.True(pruner.ShouldInclude(add, Ex.Equal("x", LiteralValue.Of("A"))));
+            Assert.False(pruner.ShouldInclude(add, Ex.Equal("x", LiteralValue.Of("B"))));
+            Assert.True(pruner.ShouldInclude(add, Ex.Equal("p1", LiteralValue.Of("B"))));
+        }
+    }
+
+    [Fact]
+    public void AddPartitionColumns_LogicalKeyedValues_CollidingWithPhysicalNames_ResolveAsLogical()
+    {
+        var full = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", StringType.Default, true))
+            .Field(new Field("p1", StringType.Default, true))
+            .Field(new Field("v", Int64Type.Default, true))
+            .Build();
+        var data = LongRow(LongSchema("v"), 1);
+        var map = ColumnMapping.BuildLogicalToPhysicalMap(CollidingPartitionSchema(), ColumnMappingMode.Name);
+
+        foreach (var values in new[] { LegacyCollidingValues, SpecValues })
+        {
+            var batch = Partitioning.PartitionUtils.AddPartitionColumns(data, full, values, ["x", "p1"], map);
+            Assert.Equal("A", ((StringArray)batch.Column("x")).GetString(0));
+            Assert.Equal("B", ((StringArray)batch.Column("p1")).GetString(0));
+        }
+    }
+
+    [Fact]
+    public void CanonicalPartitionKey_SpellingsOfOnePartitionAgree_AndDistinctPartitionsDiffer()
+    {
+        var map = ColumnMapping.BuildLogicalToPhysicalMap(CollidingPartitionSchema(), ColumnMappingMode.Name);
+        string[] partitionColumns = ["x", "p1"];
+
+        Assert.Equal(
+            DeltaTable.CanonicalPartitionKey(SpecValues, partitionColumns, map),
+            DeltaTable.CanonicalPartitionKey(LegacyCollidingValues, partitionColumns, map));
+        Assert.NotEqual(
+            DeltaTable.CanonicalPartitionKey(SpecValues, partitionColumns, map),
+            DeltaTable.CanonicalPartitionKey(
+                new Dictionary<string, string> { ["p1"] = "B", ["p2"] = "A" }, partitionColumns, map));
+    }
+
     // ── #452: a dropped column's values do not come back under a re-added name ───────────────────────
+
+    // The public ToLogical still accepts input that is already logical, as it documents: only the file-read
+    // paths drop fields of dropped columns. A logical name that is no physical name is not stale there.
+    [Fact]
+    public void ToLogical_AlreadyLogicalInput_PassesThrough()
+    {
+        var schema = new DeltaStructType { Fields = [Mapped("x", Long, 1, "a"), Mapped("y", Long, 2, "b")] };
+        var logical = LongRow(LongSchema("x", "y"), 1, 2);
+
+        var result = ColumnMappingRecursive.ToLogical(logical, schema, ColumnMappingMode.Name);
+
+        Assert.Equal(["x", "y"], result.Schema.FieldsList.Select(f => f.Name).ToArray());
+        Assert.Equal(2L, ((Int64Array)result.Column("y")).GetValue(0));
+    }
 
     private static Apache.Arrow.Schema IdAmountStructSchema(bool withStruct)
     {

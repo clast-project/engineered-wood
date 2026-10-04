@@ -1,55 +1,63 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using System.Runtime.CompilerServices;
-
 namespace EngineeredWood.DeltaLake;
 
 /// <summary>
 /// Resolves the keys of an <c>add.partitionValues</c> map under column mapping. The Delta spec (and Spark) key
-/// it by the PHYSICAL column name; engineered-wood commits before 2026-07 keyed it by the logical name. Every
-/// lookup is PHYSICAL FIRST: on a table upgraded to name mode the original names stay as physical names, so
-/// after renaming <c>p1</c> to <c>x</c> and then <c>p2</c> to <c>p1</c>, the logical name <c>p1</c> is the
-/// physical key of <c>x</c>. Trying the logical name first bound the wrong column. A spec-keyed file carries
-/// every partition column's physical key, so the logical fallback is only reached for a logical-keyed one.
+/// it by the PHYSICAL column name; engineered-wood commits before 2026-07 keyed it by the logical name.
+///
+/// <para>A map's spelling is decided ONCE, from every partition column, never key by key: a spec-keyed map
+/// carries every partition column's physical key, and a map that does not is logical-keyed throughout. Key by
+/// key goes wrong either way on a table upgraded to name mode, whose original names stay as physical names.
+/// After renaming <c>p1</c> to <c>x</c> and then <c>p2</c> to <c>p1</c>, the logical name <c>p1</c> is the
+/// physical key of <c>x</c>, so logical-first bound the wrong column in a spec-keyed map; and in a
+/// logical-keyed map <c>{x, p1}</c>, physical-first found <c>x</c>'s physical key <c>p1</c> and read the other
+/// column's value.</para>
 /// </summary>
 internal static class PartitionValueKeys
 {
     /// <summary>
-    /// Looks up the value of the partition column whose LOGICAL name is <paramref name="column"/>.
-    /// <paramref name="logicalToPhysical"/> may be null, or omit a column whose physical name is its logical one.
+    /// True when <paramref name="values"/> is keyed by physical name: it carries every partition column's
+    /// physical key. With no column mapping the two spellings are the same and this is true whenever the map is
+    /// complete.
     /// </summary>
-    public static bool TryGet<TValue>(
-        IReadOnlyDictionary<string, TValue> values, string column,
-        IReadOnlyDictionary<string, string>? logicalToPhysical, out TValue value)
+    public static bool IsPhysicallyKeyed<TValue>(
+        IReadOnlyDictionary<string, TValue> values, IEnumerable<string> partitionColumns,
+        IReadOnlyDictionary<string, string>? logicalToPhysical)
     {
-        if (logicalToPhysical is not null
-            && logicalToPhysical.TryGetValue(column, out var physical)
-            && values.TryGetValue(physical, out value!))
+        foreach (var column in partitionColumns)
         {
-            return true;
+            if (!values.ContainsKey(Physical(column, logicalToPhysical)))
+                return false;
         }
-        return values.TryGetValue(column, out value!);
+        return true;
     }
 
     /// <summary>
-    /// The physical spelling of one key of a file's partitionValues: the key itself when it is already some
-    /// column's physical name, else the physical name of the column it is the logical name of.
+    /// Looks up the value of the partition column whose LOGICAL name is <paramref name="column"/>, in the map's
+    /// own spelling. <paramref name="logicalToPhysical"/> may be null, or omit a column whose physical name is
+    /// its logical one.
     /// </summary>
-    public static string ToPhysical(string key, IReadOnlyDictionary<string, string>? logicalToPhysical)
+    public static bool TryGet<TValue>(
+        IReadOnlyDictionary<string, TValue> values, string column, IEnumerable<string> partitionColumns,
+        IReadOnlyDictionary<string, string>? logicalToPhysical, out TValue value)
     {
-        if (logicalToPhysical is null || logicalToPhysical.Count == 0)
-            return key;
-        if (PhysicalNames.GetValue(logicalToPhysical, static m => new HashSet<string>(m.Values, StringComparer.Ordinal))
-            .Contains(key))
-        {
-            return key;
-        }
-        return logicalToPhysical.TryGetValue(key, out var physical) ? physical : key;
+        string key = IsPhysicallyKeyed(values, partitionColumns, logicalToPhysical)
+            ? Physical(column, logicalToPhysical)
+            : column;
+        return values.TryGetValue(key, out value!);
     }
 
-    // The physical names of one map, built once per map instance: a caller canonicalizes every file's keys
-    // against the same map.
-    private static readonly ConditionalWeakTable<IReadOnlyDictionary<string, string>, HashSet<string>>
-        PhysicalNames = new();
+    /// <summary>
+    /// The physical spelling of one key of a map whose spelling <see cref="IsPhysicallyKeyed"/> decided.
+    /// </summary>
+    public static string ToPhysical(
+        string key, bool physicallyKeyed, IReadOnlyDictionary<string, string>? logicalToPhysical) =>
+        physicallyKeyed ? key : Physical(key, logicalToPhysical);
+
+    private static string Physical(string logical, IReadOnlyDictionary<string, string>? logicalToPhysical) =>
+        logicalToPhysical is not null && logicalToPhysical.TryGetValue(logical, out var physical)
+            ? physical
+            : logical;
 }

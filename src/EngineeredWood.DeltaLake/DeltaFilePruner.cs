@@ -183,10 +183,10 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
             ? typed
             : null;
 
-    // A file's partition value: physical key first, then the logical key of an older engineered-wood commit
-    // (see PartitionValueKeys for why the order matters).
+    // A file's partition value, in its map's own spelling: physical keys (the spec), or the logical keys of an
+    // older engineered-wood commit. The spelling is decided per map, not per key (see PartitionValueKeys).
     private bool TryGetPartitionValue(AddFile addFile, string column, out string value) =>
-        PartitionValueKeys.TryGet(addFile.PartitionValues, column, _logicalToPhysical, out value);
+        PartitionValueKeys.TryGet(addFile.PartitionValues, column, _partitionColumns, _logicalToPhysical, out value);
 
     // A file's statistic for a column: under the column's PHYSICAL name ONLY when it has one distinct from its
     // logical name, as the spec and Spark key them. There is no logical fallback, unlike partition values. A

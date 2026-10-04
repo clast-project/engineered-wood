@@ -4249,18 +4249,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // The canonical identity of ONE partition (for dynamic partition overwrite set membership and compaction
     // grouping): the sorted "key=value" pairs joined with U+0001, with every key spelled PHYSICALLY when the
     // table has column mapping — so a physical-keyed entry (the spec convention) and a logical-keyed one
-    // (older engineered-wood commits) canonicalize identically. A key that is already a physical name stays
-    // as it is (see PartitionValueKeys): translating it as if it were logical merged two partitions of a table
-    // whose renamed partition column's logical name is another's physical name. A null value (Delta's "row is
-    // null in this partition column") is marked distinctly from an empty string.
+    // (older engineered-wood commits) canonicalize identically. The map's spelling is decided once, from every
+    // partition column (see PartitionValueKeys): translating keys that were already physical as if they were
+    // logical merged two partitions of a table whose renamed partition column's logical name is another's
+    // physical name. A null value (Delta's "row is null in this partition column") is marked distinctly from an
+    // empty string.
     internal static string CanonicalPartitionKey(
         IReadOnlyDictionary<string, string> values,
+        IReadOnlyList<string> partitionColumns,
         IReadOnlyDictionary<string, string>? logicalToPhysical)
     {
+        bool physicallyKeyed = PartitionValueKeys.IsPhysicallyKeyed(values, partitionColumns, logicalToPhysical);
         var parts = new List<string>(values.Count);
         foreach (var kv in values)
         {
-            string key = PartitionValueKeys.ToPhysical(kv.Key, logicalToPhysical);
+            string key = PartitionValueKeys.ToPhysical(kv.Key, physicallyKeyed, logicalToPhysical);
             parts.Add(key + "=" + (kv.Value is null ? "\u0000<null>" : kv.Value));
         }
         parts.Sort(StringComparer.Ordinal);
@@ -4272,14 +4275,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // stored as strings). Keys are validated to be partition columns before this is called. `filter` keys are the
     // user-facing LOGICAL names; under column mapping a file's partitionValues are keyed by the PHYSICAL name
     // (the Delta-spec convention — physical keys survive a partition-column rename), while files written before
-    // that convention are logical-keyed — so each filter key is tried under BOTH names, physical first.
+    // that convention are logical-keyed — so each filter key is looked up in the map's own spelling, decided from
+    // every partition column (see PartitionValueKeys).
     private static bool PartitionValuesMatch(
         IReadOnlyDictionary<string, string> fileValues, IReadOnlyDictionary<string, string> filter,
-        IReadOnlyDictionary<string, string>? logicalToPhysical = null)
+        IReadOnlyList<string> partitionColumns, IReadOnlyDictionary<string, string>? logicalToPhysical = null)
     {
         foreach (var kv in filter)
         {
-            if (!PartitionValueKeys.TryGet(fileValues, kv.Key, logicalToPhysical, out var v))
+            if (!PartitionValueKeys.TryGet(fileValues, kv.Key, partitionColumns, logicalToPhysical, out var v))
                 return false;
             if (!string.Equals(v, kv.Value, StringComparison.Ordinal))
             {
@@ -5258,7 +5262,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             foreach (var existingFile in snapshot.ActiveFiles.Values)
             {
                 if (overwritePartitions is { Count: > 0 } &&
-                    !PartitionValuesMatch(existingFile.PartitionValues, overwritePartitions, logicalToPhysical))
+                    !PartitionValuesMatch(
+                        existingFile.PartitionValues, overwritePartitions, snapshot.Metadata.PartitionColumns,
+                        logicalToPhysical))
                 {
                     continue; // keep files outside the target partition(s)
                 }
@@ -5321,7 +5327,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 // Partition overwrite: the input must fall within the target partition(s) — otherwise we'd ADD
                 // files in partitions we didn't clear, silently mixing overwrite + append semantics.
-                if (overwritePartitions is { Count: > 0 } && !PartitionValuesMatch(partValues, overwritePartitions))
+                if (overwritePartitions is { Count: > 0 }
+                    && !PartitionValuesMatch(partValues, overwritePartitions, partitionColumns))
                 {
                     throw new DeltaFormatException(
                         DeltaTableErrorCodes.DataOutsideTargetPartitions,
@@ -5371,7 +5378,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     }
                 }
 
-                touchedPartitions?.Add(CanonicalPartitionKey(trackedPartValues, logicalToPhysical));
+                touchedPartitions?.Add(CanonicalPartitionKey(trackedPartValues, partitionColumns, logicalToPhysical));
 
                 // Build file path: partition subdirectory + UUID filename
                 string partDir = BuildPartitionPath(trackedPartValues);
@@ -5449,7 +5456,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             long removeNow = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             foreach (var existingFile in snapshot.ActiveFiles.Values)
             {
-                if (!touchedPartitions.Contains(CanonicalPartitionKey(existingFile.PartitionValues, logicalToPhysical)))
+                if (!touchedPartitions.Contains(CanonicalPartitionKey(
+                        existingFile.PartitionValues, snapshot.Metadata.PartitionColumns, logicalToPhysical)))
                     continue;
                 actions.Add(new RemoveFile
                 {
@@ -6372,11 +6380,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 foreach (var f in files)
                 {
                     if (f.PartitionValues is { Count: > 0 } pv)
-                        touched.Add(CanonicalPartitionKey(pv, logicalToPhysical));
+                        touched.Add(CanonicalPartitionKey(pv, snapshot.Metadata.PartitionColumns, logicalToPhysical));
                 }
                 foreach (var existingFile in snapshot.ActiveFiles.Values)
                 {
-                    if (!touched.Contains(CanonicalPartitionKey(existingFile.PartitionValues, logicalToPhysical)))
+                    if (!touched.Contains(CanonicalPartitionKey(
+                        existingFile.PartitionValues, snapshot.Metadata.PartitionColumns, logicalToPhysical)))
                         continue;
                     actions.Add(new RemoveFile
                     {
@@ -8900,10 +8909,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     private static RecordBatch ToLogicalBatch(
         RecordBatch batch, Schema.StructType schema, ColumnMappingMode mappingMode,
         Dictionary<string, string> physicalToLogical)
-        => mappingMode == ColumnMappingMode.Id || ColumnMappingRecursive.HasNestedFields(schema)
+    {
+        batch = ColumnMappingRecursive.DropStaleFields(batch, schema, mappingMode);
+        return mappingMode == ColumnMappingMode.Id || ColumnMappingRecursive.HasNestedFields(schema)
             ? ColumnMappingRecursive.ToLogical(batch, schema, mappingMode)
-            : ColumnMapping.RenameColumns(
-                ColumnMappingRecursive.DropStaleFields(batch, schema, mappingMode), physicalToLogical);
+            : ColumnMapping.RenameColumns(batch, physicalToLogical);
+    }
 
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(
         IAsyncEnumerable<RecordBatch> source,

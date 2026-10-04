@@ -58,10 +58,14 @@ public static class ColumnMappingRecursive
     /// </remarks>
     public static RecordBatch ToLogical(RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode)
     {
-        // A field of a DROPPED column is removed BEFORE any name is looked at. Passed through, it would keep its
-        // physical name, and a later name-based step (the logical fallback here, or the backfill) could bind it
-        // to a column re-added under that name.
-        batch = DropStaleFields(batch, deltaSchema, mode);
+        // Id mode: a field whose id the schema no longer has (a dropped column) is removed BEFORE any name is
+        // looked at. Passed through, it would keep its physical name, and once its id is stripped a later
+        // name-based step (backfill) could bind it to a column re-added under that name. Ids identify a FILE's
+        // columns, so this cannot misread logical input. Name mode's counterpart can (a logical name that is no
+        // physical name is exactly what it removes), so a caller reading a data file applies DropStaleFields
+        // itself, first.
+        if (mode == ColumnMappingMode.Id)
+            batch = DropStaleFields(batch, deltaSchema, mode);
         return Transform(batch, deltaSchema, mode, toPhysical: false, preferPhysical: true);
     }
 
@@ -77,7 +81,9 @@ public static class ColumnMappingRecursive
     /// reads the re-added column as NULL.</item>
     /// </list>
     /// A field matching neither rule is kept: hidden columns such as the materialized row-tracking ones are no
-    /// table column at all.
+    /// table column at all. Pass a batch exactly as read from a data file: in name mode an already-LOGICAL field
+    /// whose name is no physical name would be taken for a dropped column's. <see cref="ToLogical"/> applies the
+    /// id-mode rule itself but not the name-mode one, since it accepts already-logical input.
     /// </summary>
     public static RecordBatch DropStaleFields(RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode)
     {
