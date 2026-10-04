@@ -128,6 +128,36 @@ public class StatsCorrectnessTests : IDisposable
         Assert.Equal(2, NullCountAt(stats, "s", "t", "x"));
     }
 
+    // Offsets at EVERY level: the leaf, the middle struct and the batch are each a slice. Arrow applies a struct's
+    // offset on top of its child's own (struct slot j is the child's logical element struct.offset + j, and the
+    // child's accessors add its own offset), so both are honoured and neither is subtracted.
+    //
+    // Batch row r is s[1 + r] (s is sliced at 1), which is t's logical element 1 + r, which is tFull[2 + r] (t is
+    // sliced at 1), whose x is x's logical element 2 + r (tFull has no offset), which is xFull[3 + r] (x is sliced at
+    // 1). Subtracting each child's own offset instead would read tFull[1 + r] and xFull[1 + r]; each case is built
+    // so that gives a different count.
+    [Theory]
+    [InlineData(false, 2)] // nulls at the leaf: xFull[3], xFull[4] are null; xFull[1], xFull[2] are not
+    [InlineData(true, 2)]  // nulls at the middle struct: tFull[2], tFull[3] are null; tFull[1] is not
+    public void NestedNullCount_WithAnOffsetAtEveryLevel_ReadsTheRightRows(bool nullsInTheStruct, long expected)
+    {
+        var xb = new Int64Array.Builder().Append(1).Append(2).Append(3);
+        var xFull = nullsInTheStruct ? xb.Append(4).Append(5).Build() : xb.AppendNull().AppendNull().Build();
+        var x = (Int64Array)xFull.Slice(1, 4);
+        var tType = new ArrowStructType([new Apache.Arrow.Field("x", Int64Type.Default, true)]);
+        var tFull = nullsInTheStruct
+            ? new StructArray(tType, 4, [x], Validity(true, true, false, false), 2)
+            : new StructArray(tType, 4, [x], ArrowBuffer.Empty);
+        var t = (StructArray)tFull.Slice(1, 3);
+        var sType = new ArrowStructType([new Apache.Arrow.Field("t", tType, true)]);
+        var s = (StructArray)new StructArray(sType, 3, [t], ArrowBuffer.Empty).Slice(1, 2);
+        var batch = new RecordBatch(new Apache.Arrow.Schema.Builder()
+            .Field(new Apache.Arrow.Field("s", sType, true)).Build(), [s], 2);
+
+        string stats = Stats.StatsCollector.Collect(batch)!;
+        Assert.Equal(expected, NullCountAt(stats, "s", "t", "x"));
+    }
+
     [Fact]
     public async Task IsNull_OnADeepLeafUnderANullGrandparent_KeepsTheFile()
     {
