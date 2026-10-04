@@ -8975,16 +8975,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return builder.Build();
     }
 
-    private static bool HasTypeChanges(EngineeredWood.DeltaLake.Schema.StructType schema)
+    // At EVERY depth: Spark records a nested widening on the struct child itself, or on the nearest struct field
+    // with a fieldPath for a list element or map key/value. A table can turn delta.enableTypeWidening off after
+    // widening; its old files must still be read widened.
+    private static bool HasTypeChanges(Schema.DeltaDataType type) => type switch
     {
-        foreach (var field in schema.Fields)
-        {
-            if (field.Metadata is not null &&
-                field.Metadata.ContainsKey(EngineeredWood.DeltaLake.Schema.TypeWidening.TypeChangesKey))
-                return true;
-        }
-        return false;
-    }
+        Schema.StructType st => st.Fields.Any(f =>
+            (f.Metadata is not null && f.Metadata.ContainsKey(Schema.TypeWidening.TypeChangesKey))
+            || HasTypeChanges(f.Type)),
+        Schema.ArrayType at => HasTypeChanges(at.ElementType),
+        Schema.MapType mt => HasTypeChanges(mt.KeyType) || HasTypeChanges(mt.ValueType),
+        _ => false,
+    };
 
     private static string? CollectStats(RecordBatch batch) =>
         Stats.StatsCollector.Collect(batch);

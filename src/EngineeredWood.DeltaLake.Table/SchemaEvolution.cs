@@ -95,8 +95,52 @@ internal static class SchemaEvolution
     // through unchanged (reference-equal). Struct children are NOT sliced with the parent, so backfilled
     // child arrays are sized to the PHYSICAL child length (parent offset + length; see the TakeRows
     // convention) and the parent's offset/validity are preserved on the rebuilt array.
+    //
+    // Lists and maps are recursed through too: a struct INSIDE a list element or a map key/value evolves the same
+    // way (Spark: ALTER TABLE ADD COLUMNS (l.element.b ...)), and an old file's element structs must come back in
+    // the table's shape. Only the child is rebuilt; the container keeps its offsets, validity and offset.
     private static IArrowArray ReconcileColumn(IArrowArray column, IArrowType expectedType, int logicalLength)
     {
+        switch (expectedType, column.Data.DataType)
+        {
+            // MapType derives from ListType, so it has to be matched first.
+            case (MapType em, MapType am):
+            {
+                var entries = column.Data.Children[0];
+                var key = ReconcileChild(entries.Children[0], em.KeyField.DataType);
+                var value = ReconcileChild(entries.Children[1], em.ValueField.DataType);
+                if (ReferenceEquals(key, entries.Children[0]) && ReferenceEquals(value, entries.Children[1]))
+                    return column;
+                var mapType = new MapType(
+                    WithType(em.KeyField, key.DataType), WithType(em.ValueField, value.DataType), am.KeySorted);
+                var newEntries = new ArrayData(mapType.KeyValueType, entries.Length, entries.NullCount,
+                    entries.Offset, entries.Buffers, [key, value]);
+                return ArrowArrayFactory.BuildArray(new ArrayData(mapType, column.Data.Length,
+                    column.Data.NullCount, column.Data.Offset, column.Data.Buffers, [newEntries]));
+            }
+            case (MapType, _):
+            case (_, MapType):
+                return column;
+            case (ListType el, ListType):
+            {
+                var values = ReconcileChild(column.Data.Children[0], el.ValueDataType);
+                return ReferenceEquals(values, column.Data.Children[0])
+                    ? column
+                    : ArrowArrayFactory.BuildArray(new ArrayData(
+                        new ListType(WithType(el.ValueField, values.DataType)), column.Data.Length,
+                        column.Data.NullCount, column.Data.Offset, column.Data.Buffers, [values]));
+            }
+            case (LargeListType el, LargeListType):
+            {
+                var values = ReconcileChild(column.Data.Children[0], el.ValueDataType);
+                return ReferenceEquals(values, column.Data.Children[0])
+                    ? column
+                    : ArrowArrayFactory.BuildArray(new ArrayData(
+                        new LargeListType(WithType(el.ValueField, values.DataType)), column.Data.Length,
+                        column.Data.NullCount, column.Data.Offset, column.Data.Buffers, [values]));
+            }
+        }
+
         if (expectedType is not Apache.Arrow.Types.StructType expectedStruct || column is not StructArray sa)
             return column;
 
@@ -137,5 +181,20 @@ internal static class SchemaEvolution
         return new StructArray(
             expectedStruct, sa.Length, children, sa.NullBitmapBuffer, sa.NullCount, sa.Data.Offset);
     }
+
+    // A container's child (list values, map keys or values) reconciled against its expected type; `data` itself
+    // when nothing changed.
+    private static ArrayData ReconcileChild(ArrayData data, IArrowType expectedType)
+    {
+        var child = ArrowArrayFactory.BuildArray(data);
+        var reconciled = ReconcileColumn(child, expectedType, child.Length);
+        return ReferenceEquals(reconciled, child) ? data : reconciled.Data;
+    }
+
+    // The expected field's name, nullability and metadata, with the type the reconciled child actually has.
+    private static Field WithType(Field expected, IArrowType type) =>
+        ReferenceEquals(expected.DataType, type)
+            ? expected
+            : new Field(expected.Name, type, expected.IsNullable, expected.Metadata);
 
 }
