@@ -95,7 +95,7 @@ public class ColumnMappingNameReuseTests : IDisposable
     }
 
     // Each row as "name=value" pairs in schema order, struct children as "s.child"; a null renders empty.
-    private static List<string> Render(IEnumerable<RecordBatch> batches)
+    internal static List<string> Render(IEnumerable<RecordBatch> batches)
     {
         static string Value(IArrowArray array, int i) => array.IsNull(i) ? "" : array switch
         {
@@ -133,7 +133,7 @@ public class ColumnMappingNameReuseTests : IDisposable
         return rows;
     }
 
-    private static async Task<List<string>> ReadAsync(DeltaTable table)
+    internal static async Task<List<string>> ReadAsync(DeltaTable table)
     {
         var batches = new List<RecordBatch>();
         await foreach (var b in table.ReadAllAsync())

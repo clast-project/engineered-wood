@@ -56,7 +56,131 @@ public static class ColumnMappingRecursive
     /// names need not be the ones the table schema records. A field without an id falls back to name matching.
     /// </remarks>
     public static RecordBatch ToLogical(RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode)
-        => Transform(batch, deltaSchema, mode, toPhysical: false, preferPhysical: true);
+    {
+        // Id mode: a field whose id the schema no longer has (a dropped column) is removed BEFORE any name is
+        // looked at. Passed through, it would keep its physical name, and once its id is stripped a later
+        // name-based step (backfill) could bind it to a column re-added under that name.
+        if (mode == ColumnMappingMode.Id)
+            batch = DropFieldsWithUnknownIds(batch, deltaSchema);
+        return Transform(batch, deltaSchema, mode, toPhysical: false, preferPhysical: true);
+    }
+
+    // Removes, at every depth, each struct field (and the top-level column) that carries a PARQUET:field_id the
+    // Delta schema at that level does not have. A field without an id is kept (hidden columns such as the
+    // materialized row-tracking ones carry none). Returns the same instance when nothing is removed.
+    private static RecordBatch DropFieldsWithUnknownIds(RecordBatch batch, StructType deltaSchema)
+    {
+        List<Field>? fields = null;
+        List<IArrowArray>? arrays = null;
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var field = batch.Schema.FieldsList[i];
+            var delta = FindField(deltaSchema, field, byId: true, preferPhysical: true);
+            if (delta is null && ColumnMapping.GetParquetFieldId(field) is not null)
+            {
+                fields ??= [.. batch.Schema.FieldsList.Take(i)];
+                arrays ??= [.. batch.Arrays.Take(i)];
+                continue;
+            }
+
+            var column = batch.Column(i);
+            var (type, data) = delta is null
+                ? (field.DataType, column.Data)
+                : DropUnknownIdsInType(field.DataType, column.Data, delta.Type);
+            if (ReferenceEquals(data, column.Data) && fields is null)
+                continue;
+
+            fields ??= [.. batch.Schema.FieldsList.Take(i)];
+            arrays ??= [.. batch.Arrays.Take(i)];
+            fields.Add(ReferenceEquals(type, field.DataType)
+                ? field
+                : new Field(field.Name, type, field.IsNullable, field.Metadata));
+            arrays.Add(ReferenceEquals(data, column.Data) ? column : ArrowArrayFactory.BuildArray(data));
+        }
+
+        return fields is null
+            ? batch
+            : new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), arrays!, batch.Length);
+    }
+
+    private static (Apache.Arrow.Types.IArrowType Type, ArrayData Data) DropUnknownIdsInType(
+        Apache.Arrow.Types.IArrowType type, ArrayData data, DeltaDataType delta)
+    {
+        switch (type)
+        {
+            case Apache.Arrow.Types.StructType st when delta is StructType ds:
+            {
+                var keptFields = new List<Field>(st.Fields.Count);
+                var keptChildren = new List<ArrayData>(st.Fields.Count);
+                bool changed = false;
+                for (int k = 0; k < st.Fields.Count; k++)
+                {
+                    var child = st.Fields[k];
+                    var childDelta = FindField(ds, child, byId: true, preferPhysical: true);
+                    if (childDelta is null && ColumnMapping.GetParquetFieldId(child) is not null)
+                    {
+                        changed = true;
+                        continue;
+                    }
+                    var (childType, childData) = childDelta is null
+                        ? (child.DataType, data.Children[k])
+                        : DropUnknownIdsInType(child.DataType, data.Children[k], childDelta.Type);
+                    changed |= !ReferenceEquals(childData, data.Children[k]);
+                    keptFields.Add(ReferenceEquals(childType, child.DataType)
+                        ? child
+                        : new Field(child.Name, childType, child.IsNullable, child.Metadata));
+                    keptChildren.Add(childData);
+                }
+                if (!changed)
+                    return (type, data);
+                var newType = new Apache.Arrow.Types.StructType(keptFields);
+                return (newType, new ArrayData(newType, data.Length, data.NullCount, data.Offset, data.Buffers,
+                    keptChildren, data.Dictionary));
+            }
+            // MapType derives from ListType, so it has to be matched first.
+            case Apache.Arrow.Types.MapType mt when delta is MapType dm:
+            {
+                var entries = data.Children[0];
+                var (keyType, keyData) = DropUnknownIdsInType(mt.KeyField.DataType, entries.Children[0], dm.KeyType);
+                var (valueType, valueData) =
+                    DropUnknownIdsInType(mt.ValueField.DataType, entries.Children[1], dm.ValueType);
+                if (ReferenceEquals(keyData, entries.Children[0]) && ReferenceEquals(valueData, entries.Children[1]))
+                    return (type, data);
+                var keyField = new Field(mt.KeyField.Name, keyType, mt.KeyField.IsNullable, mt.KeyField.Metadata);
+                var valueField = new Field(
+                    mt.ValueField.Name, valueType, mt.ValueField.IsNullable, mt.ValueField.Metadata);
+                var newMap = new Apache.Arrow.Types.MapType(keyField, valueField, mt.KeySorted);
+                var entriesType = new Apache.Arrow.Types.StructType([keyField, valueField]);
+                var newEntries = new ArrayData(entriesType, entries.Length, entries.NullCount, entries.Offset,
+                    entries.Buffers, [keyData, valueData], entries.Dictionary);
+                return (newMap, new ArrayData(newMap, data.Length, data.NullCount, data.Offset, data.Buffers,
+                    [newEntries], data.Dictionary));
+            }
+            case Apache.Arrow.Types.ListType lt when delta is ArrayType da:
+            {
+                var (elemType, elemData) = DropUnknownIdsInType(lt.ValueField.DataType, data.Children[0], da.ElementType);
+                if (ReferenceEquals(elemData, data.Children[0]))
+                    return (type, data);
+                var newList = new Apache.Arrow.Types.ListType(
+                    new Field(lt.ValueField.Name, elemType, lt.ValueField.IsNullable, lt.ValueField.Metadata));
+                return (newList, new ArrayData(newList, data.Length, data.NullCount, data.Offset, data.Buffers,
+                    [elemData], data.Dictionary));
+            }
+            case Apache.Arrow.Types.LargeListType llt when delta is ArrayType da:
+            {
+                var (elemType, elemData) =
+                    DropUnknownIdsInType(llt.ValueField.DataType, data.Children[0], da.ElementType);
+                if (ReferenceEquals(elemData, data.Children[0]))
+                    return (type, data);
+                var newList = new Apache.Arrow.Types.LargeListType(
+                    new Field(llt.ValueField.Name, elemType, llt.ValueField.IsNullable, llt.ValueField.Metadata));
+                return (newList, new ArrayData(newList, data.Length, data.NullCount, data.Offset, data.Buffers,
+                    [elemData], data.Dictionary));
+            }
+            default:
+                return (type, data);
+        }
+    }
 
     /// <summary>
     /// Returns <paramref name="batch"/> with every <c>PARQUET:field_id</c> removed from its field metadata, at

@@ -256,6 +256,16 @@ internal static class CompactionExecutor
 
                 // The source file's own PARQUET:field_id metadata must not ride into the compacted file: a
                 // mapped table re-stamps every id from the schema below, and an unmapped one has none to write.
+                // Id mode resolves a file's columns by field id, and its physical names need not be the schema's
+                // (a converted table keeps each file's names from when it was written). Everything below matches
+                // by NAME, so first map the batch to the schema's own physical names by id: logical by id (which
+                // also drops columns whose id the table no longer has), then back to canonical physical.
+                if (mappingMode == ColumnMappingMode.Id)
+                {
+                    userBatch = ColumnMappingRecursive.ToPhysical(
+                        ColumnMappingRecursive.ToLogical(userBatch, snapshot.Schema, mappingMode),
+                        snapshot.Schema, mappingMode);
+                }
                 var liveBatch = ColumnMappingRecursive.StripParquetFieldIds(userBatch);
                 if (deletedRows is not null)
                 {

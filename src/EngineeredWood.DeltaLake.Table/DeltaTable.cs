@@ -3674,10 +3674,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             await foreach (var batch in reader.ReadAllAsync(
                 cancellationToken: cancellationToken).ConfigureAwait(false))
             {
-                // As in the read path: the recursive transform takes the batch as read, never a flat-renamed one.
-                var logicalBatch = ColumnMappingRecursive.HasNestedFields(snapshot.Schema)
-                    ? ColumnMappingRecursive.ToLogical(batch, snapshot.Schema, mappingMode)
-                    : ColumnMapping.RenameColumns(batch, physicalToLogical);
+                // Resolved exactly as the read path resolves it: the predicate must see what a scan sees.
+                var logicalBatch = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
                 // The deleted rows go on to the change file; the source file's ids must not go with them.
                 logicalBatch = ColumnMappingRecursive.StripParquetFieldIds(logicalBatch);
 
@@ -8489,10 +8487,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot.Schema, mappingMode);
         var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
             snapshot.Schema, mappingMode);
-        var fieldIdToLogical = isIdMode
-            ? ColumnMapping.BuildFieldIdToLogicalMap(snapshot.Schema)
-            : null;
-
         // Load the deletion vector first — it is independent of the byte source.
         HashSet<long>? deletedRows = null;
         if (addFile.DeletionVector is not null)
@@ -8506,8 +8500,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // Pluggable codec read: raw physical batches in file order (DV rows included). Projection resolves
             // by PHYSICAL NAME in every mode — id-mode field-id resolution needs the parquet footer, which the
             // seam deliberately hides; Delta-spec files carry physicalName in BOTH modes, so name resolution is
-            // exact for spec-written files. parquetSchema stays null, so the logical rename in the pipeline
-            // falls to the (equivalent for spec files) name-based path.
+            // exact for spec-written files. The logical rename in the pipeline resolves by the PARQUET:field_id
+            // the host's batches carry, if any, and otherwise by physical name.
             IReadOnlyList<string>? seamColumns = null;
             if (columns is not null)
             {
@@ -8542,8 +8536,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), seamColumns, cancellationToken),
                 cancellationToken);
             await foreach (var processed in ProcessFileBatchesAsync(
-                seamBatches, addFile, snapshot, columns, mappingMode, isIdMode, physicalToLogical,
-                logicalToPhysical, fieldIdToLogical, parquetSchema: null, deletedRows, partitionColumns,
+                seamBatches, addFile, snapshot, columns, mappingMode, physicalToLogical,
+                logicalToPhysical, deletedRows, partitionColumns,
                 hasPartitions, cancellationToken, strippedRowIdsOut, strippedVersionsOut,
                 strippedAbsPositionsOut).ConfigureAwait(false))
             {
@@ -8612,12 +8606,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        if (parquetSchema is null && isIdMode)
-        {
-            parquetSchema = await reader.GetSchemaAsync(cancellationToken)
-                .ConfigureAwait(false);
-        }
-
         // Row tracking: same omission as the seam branch above — the hidden materialized columns are not schema
         // fields, so a PROJECTED read (either mapping mode) and an UNPROJECTED read of a PARTITIONED table both
         // build a file-level column list without them, and every id then falls back to baseRowId + position.
@@ -8671,8 +8659,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var builtinBatches = ReadPositionedAsync(reader, filePredicate, fileColumns, cancellationToken);
         await foreach (var processed in ProcessFileBatchesAsync(
-            builtinBatches, addFile, snapshot, columns, mappingMode, isIdMode, physicalToLogical,
-            logicalToPhysical, fieldIdToLogical, parquetSchema, deletedRows, partitionColumns,
+            builtinBatches, addFile, snapshot, columns, mappingMode, physicalToLogical,
+            logicalToPhysical, deletedRows, partitionColumns,
             hasPartitions, cancellationToken, strippedRowIdsOut, strippedVersionsOut,
             strippedAbsPositionsOut).ConfigureAwait(false))
         {
@@ -8694,11 +8682,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Snapshot.Snapshot snapshot,
         IReadOnlyList<string>? columns,
         ColumnMappingMode mappingMode,
-        bool isIdMode,
         Dictionary<string, string> physicalToLogical,
         Dictionary<string, string> logicalToPhysical,
-        Dictionary<int, string>? fieldIdToLogical,
-        Parquet.Schema.SchemaDescriptor? parquetSchema,
         HashSet<long>? deletedRows,
         IReadOnlyList<string> partitionColumns,
         bool hasPartitions,
@@ -8723,28 +8708,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // skipped one would be off by its row count.
             long thisBatchStart = firstRow;
 
-            // Rename columns back to logical names (flat, top level), then recursively for nested struct
-            // children (the flat renames leave them under their physical names).
-            // Rename columns back to logical names. With nested fields the recursive transform does every level
-            // from the batch AS READ — renaming the top level first would hand it logical names it matches
-            // physical-first, and after a rename one column's logical name can be another's physical name.
-            // Otherwise the flat renames: id mode resolves by field id wherever one is known, from the footer or
-            // from the PARQUET:field_id the batch's own fields carry (the native reader always supplies it; a
-            // codec-seam host may).
-            RecordBatch result;
-            if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
-            {
-                result = ColumnMappingRecursive.ToLogical(batch, snapshot.Schema, mappingMode);
-            }
-            else if (isIdMode && fieldIdToLogical is not null
-                && (parquetSchema is not null || HasTopLevelParquetFieldId(batch)))
-            {
-                result = ColumnMapping.RenameByFieldId(batch, fieldIdToLogical, parquetSchema);
-            }
-            else
-            {
-                result = ColumnMapping.RenameColumns(batch, physicalToLogical);
-            }
+            // Rename columns back to logical names.
+            var result = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
 
             // The file's field ids have done their job (resolving columns above); a caller never sees them.
             result = ColumnMappingRecursive.StripParquetFieldIds(result);
@@ -8853,15 +8818,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Pairs each batch of a source that yields EVERY row of a file, in file order, with the file position
     /// of its first row. The <see cref="IDataFileReader"/> contract makes that a running count.
     /// </summary>
-    private static bool HasTopLevelParquetFieldId(RecordBatch batch)
-    {
-        foreach (var field in batch.Schema.FieldsList)
-        {
-            if (ColumnMapping.GetParquetFieldId(field) is not null)
-                return true;
-        }
-        return false;
-    }
+    /// <summary>
+    /// Renames a data file's batch, as read, to the table's logical names. Every path that reads a data file
+    /// resolves its columns through this one rule, so a DELETE predicate sees what a scan sees.
+    /// <list type="bullet">
+    /// <item>Id mode resolves by the <c>PARQUET:field_id</c> the reader puts on every field, at every depth,
+    /// and drops fields whose id the table no longer has. A file's physical names need not be the schema's.</item>
+    /// <item>With nested fields, the recursive transform renames every level from the batch AS READ. Renaming the
+    /// top level first would hand it logical names it matches physical-first, and after a rename one column's
+    /// logical name can be another's physical name.</item>
+    /// <item>Otherwise the flat physical-to-logical rename.</item>
+    /// </list>
+    /// </summary>
+    private static RecordBatch ToLogicalBatch(
+        RecordBatch batch, Schema.StructType schema, ColumnMappingMode mappingMode,
+        Dictionary<string, string> physicalToLogical)
+        => mappingMode == ColumnMappingMode.Id || ColumnMappingRecursive.HasNestedFields(schema)
+            ? ColumnMappingRecursive.ToLogical(batch, schema, mappingMode)
+            : ColumnMapping.RenameColumns(batch, physicalToLogical);
 
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(
         IAsyncEnumerable<RecordBatch> source,
