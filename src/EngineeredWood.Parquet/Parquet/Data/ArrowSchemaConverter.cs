@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Globalization;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Parquet.Metadata;
@@ -14,6 +15,24 @@ namespace EngineeredWood.Parquet.Data;
 internal static class ArrowSchemaConverter
 {
     /// <summary>
+    /// The Arrow field-metadata key that carries a Parquet <c>field_id</c>: the key PyArrow and arrow-rs use on
+    /// read, and the first one <see cref="ArrowToSchemaConverter"/> looks for on write, so an id survives a
+    /// Parquet -> Arrow -> Parquet round trip.
+    /// </summary>
+    internal const string FieldIdKey = "PARQUET:field_id";
+
+    /// <summary>
+    /// The metadata for an Arrow field read from <paramref name="element"/>: its <c>field_id</c> under
+    /// <see cref="FieldIdKey"/>, or null when the element has none. Only nodes that become an Arrow field carry
+    /// one across — the repeated <c>list</c> and <c>key_value</c> groups between a LIST or MAP and its element
+    /// have no Arrow field to hold an id, and the writer never gives them one.
+    /// </summary>
+    internal static Dictionary<string, string>? FieldIdMetadata(SchemaElement element) =>
+        element.FieldId is { } id
+            ? new Dictionary<string, string> { [FieldIdKey] = id.ToString(CultureInfo.InvariantCulture) }
+            : null;
+
+    /// <summary>
     /// Converts a Parquet <see cref="ColumnDescriptor"/> to an Arrow <see cref="Apache.Arrow.Field"/>.
     /// </summary>
     public static Apache.Arrow.Field ToArrowField(ColumnDescriptor column, ParquetReadOptions? options = null)
@@ -21,7 +40,7 @@ internal static class ArrowSchemaConverter
         bool nullable = column.MaxDefinitionLevel > 0;
         var arrowType = ToArrowType(column, options);
         arrowType = ApplyOutputKind(arrowType, options?.ByteArrayOutput ?? ByteArrayOutputKind.Default);
-        return new Apache.Arrow.Field(column.DottedPath, arrowType, nullable);
+        return new Apache.Arrow.Field(column.DottedPath, arrowType, nullable, FieldIdMetadata(column.SchemaElement));
     }
 
     /// <summary>
@@ -69,11 +88,14 @@ internal static class ArrowSchemaConverter
             {
                 var elementType = LeafToArrowType(node, options);
                 var elementField = new Apache.Arrow.Field("element", elementType, nullable: false);
-                return new Apache.Arrow.Field(node.Name, new ListType(elementField), nullable: false);
+                // One node stands for both the list and its element; its id names the column, so it goes on
+                // the list — the field a writer turns back into the node's place in the schema.
+                return new Apache.Arrow.Field(
+                    node.Name, new ListType(elementField), nullable: false, FieldIdMetadata(node.Element));
             }
 
             var arrowType = LeafToArrowType(node, options);
-            return new Apache.Arrow.Field(node.Name, arrowType, nullable);
+            return new Apache.Arrow.Field(node.Name, arrowType, nullable, FieldIdMetadata(node.Element));
         }
 
         if (IsListNode(node))
@@ -88,7 +110,7 @@ internal static class ArrowSchemaConverter
 
         var structType = new StructType(childFields);
         IArrowType groupType = MaybeWrapAsExtensionStruct(structType, node.Element.LogicalType, options);
-        return new Apache.Arrow.Field(node.Name, groupType, nullable);
+        return new Apache.Arrow.Field(node.Name, groupType, nullable, FieldIdMetadata(node.Element));
     }
 
     /// <summary>
@@ -181,7 +203,8 @@ internal static class ArrowSchemaConverter
         {
             // 2-level: repeated leaf is the element
             var elementType = LeafToArrowType(repeatedChild, options);
-            elementField = new Apache.Arrow.Field(repeatedChild.Name, elementType, nullable: false);
+            elementField = new Apache.Arrow.Field(
+                repeatedChild.Name, elementType, nullable: false, FieldIdMetadata(repeatedChild.Element));
         }
         else if (repeatedChild.Children.Count == 1)
         {
@@ -195,10 +218,11 @@ internal static class ArrowSchemaConverter
             for (int i = 0; i < repeatedChild.Children.Count; i++)
                 childFields[i] = NodeToArrowField(repeatedChild.Children[i], options);
             var structType = new StructType(childFields);
-            elementField = new Apache.Arrow.Field(repeatedChild.Name, structType, nullable: false);
+            elementField = new Apache.Arrow.Field(
+                repeatedChild.Name, structType, nullable: false, FieldIdMetadata(repeatedChild.Element));
         }
 
-        return new Apache.Arrow.Field(node.Name, new ListType(elementField), nullable);
+        return new Apache.Arrow.Field(node.Name, new ListType(elementField), nullable, FieldIdMetadata(node.Element));
     }
 
     private static Apache.Arrow.Field BuildMapField(SchemaNode node, ParquetReadOptions? options = null)
@@ -209,14 +233,14 @@ internal static class ArrowSchemaConverter
         var keyValueGroup = node.Children[0];
         var keyField = NodeToArrowField(keyValueGroup.Children[0], options);
         // Key field must be non-nullable per Arrow spec
-        keyField = new Apache.Arrow.Field(keyField.Name, keyField.DataType, nullable: false);
+        keyField = new Apache.Arrow.Field(keyField.Name, keyField.DataType, nullable: false, keyField.Metadata);
 
         // IsMapNode has already established that key_value carries exactly a key and a value; a group that
         // does not is classified as a list and never arrives here.
         var valueField = NodeToArrowField(keyValueGroup.Children[1], options);
 
         var mapType = new MapType(keyField, valueField);
-        return new Apache.Arrow.Field(node.Name, mapType, nullable);
+        return new Apache.Arrow.Field(node.Name, mapType, nullable, FieldIdMetadata(node.Element));
     }
 
     private static IArrowType LeafToArrowType(SchemaNode node, ParquetReadOptions? options = null)

@@ -386,7 +386,8 @@ internal static class CdfReader
         IReadOnlyDictionary<string, string>? partitionValues,
         CdfSchemaContext ctx)
     {
-        var logical = ColumnMappingRecursive.ToLogical(physicalData, ctx.DeltaSchema, ctx.MappingMode);
+        var logical = ColumnMappingRecursive.StripParquetFieldIds(
+            ColumnMappingRecursive.ToLogical(physicalData, ctx.DeltaSchema, ctx.MappingMode));
         if (ctx.PartitionColumns.Count == 0)
             return logical;
         return PartitionUtils.AddPartitionColumns(

@@ -80,7 +80,7 @@ internal static class VariantNestedWrapper
         var fields = new Field[structType.Fields.Count];
         for (int i = 0; i < fields.Length; i++)
             fields[i] = new Field(structType.Fields[i].Name, children[i].Data.DataType,
-                                  structType.Fields[i].IsNullable);
+                                  structType.Fields[i].IsNullable, structType.Fields[i].Metadata);
 
         var data = new ArrayData(new StructType(fields), array.Length, array.NullCount, array.Offset,
                                  array.Data.Buffers, children.Select(c => c.Data).ToArray());
@@ -94,7 +94,7 @@ internal static class VariantNestedWrapper
             return array;
 
         var valueField = new Field(listType.ValueField.Name, wrappedValues.Data.DataType,
-                                   listType.ValueField.IsNullable);
+                                   listType.ValueField.IsNullable, listType.ValueField.Metadata);
         var data = new ArrayData(new ListType(valueField), array.Length, array.NullCount, array.Offset,
                                  array.Data.Buffers, new[] { wrappedValues.Data });
         return new ListArray(data);
@@ -113,8 +113,10 @@ internal static class VariantNestedWrapper
             return array;
         }
 
-        var keyField = new Field(mapType.KeyField.Name, wrappedKey.Data.DataType, mapType.KeyField.IsNullable);
-        var valueField = new Field(mapType.ValueField.Name, wrappedValue.Data.DataType, mapType.ValueField.IsNullable);
+        var keyField = new Field(mapType.KeyField.Name, wrappedKey.Data.DataType, mapType.KeyField.IsNullable,
+                                 mapType.KeyField.Metadata);
+        var valueField = new Field(mapType.ValueField.Name, wrappedValue.Data.DataType, mapType.ValueField.IsNullable,
+                                   mapType.ValueField.Metadata);
         var entriesData = new ArrayData(
             new StructType(new[] { keyField, valueField }), entries.Length, entries.NullCount,
             entries.Offset, entries.Data.Buffers, new[] { wrappedKey.Data, wrappedValue.Data });

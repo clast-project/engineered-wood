@@ -371,9 +371,11 @@ internal static class TimeUnitRescaler
 
                 var source = (MapType)ma.Data.DataType;
                 var keyField = new Field(
-                    source.KeyField.Name, key.Data.DataType, source.KeyField.IsNullable);
+                    source.KeyField.Name, key.Data.DataType, source.KeyField.IsNullable,
+                    source.KeyField.Metadata);
                 var valueField = new Field(
-                    source.ValueField.Name, value.Data.DataType, source.ValueField.IsNullable);
+                    source.ValueField.Name, value.Data.DataType, source.ValueField.IsNullable,
+                    source.ValueField.Metadata);
                 var entriesData = new ArrayData(
                     new StructType([keyField, valueField]), entries.Length, entries.NullCount,
                     entries.Offset, entries.Data.Buffers, [key.Data, value.Data]);
@@ -475,6 +477,6 @@ internal static class TimeUnitRescaler
         var type = RewriteType(field.DataType, leaf);
         return ReferenceEquals(type, field.DataType)
             ? null
-            : new Field(field.Name, type, field.IsNullable);
+            : new Field(field.Name, type, field.IsNullable, field.Metadata);
     }
 }

@@ -3674,9 +3674,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             await foreach (var batch in reader.ReadAllAsync(
                 cancellationToken: cancellationToken).ConfigureAwait(false))
             {
-                var logicalBatch = ColumnMapping.RenameColumns(batch, physicalToLogical);
-                if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
-                    logicalBatch = ColumnMappingRecursive.ToLogical(logicalBatch, snapshot.Schema, mappingMode);
+                // As in the read path: the recursive transform takes the batch as read, never a flat-renamed one.
+                var logicalBatch = ColumnMappingRecursive.HasNestedFields(snapshot.Schema)
+                    ? ColumnMappingRecursive.ToLogical(batch, snapshot.Schema, mappingMode)
+                    : ColumnMapping.RenameColumns(batch, physicalToLogical);
+                // The deleted rows go on to the change file; the source file's ids must not go with them.
+                logicalBatch = ColumnMappingRecursive.StripParquetFieldIds(logicalBatch);
 
                 // This path reads the file's raw columns rather than going through ReadFileAsync, so the hidden
                 // materialized row-tracking columns (present on any file a rewrite produced) are still attached.
@@ -5815,7 +5818,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Refuses a batch carrying a top-level column the write schema does not declare. Every write path drops
-    /// through <see cref="ColumnMappingRecursive.ToPhysical"/>, which passes an unmatched column through
+    /// through <see cref="ColumnMappingRecursive.ToPhysical(Apache.Arrow.RecordBatch, Schema.StructType, ColumnMappingMode)"/>, which passes an unmatched column through
     /// untouched, and the parquet writer then writes whatever columns the batch has — so an undeclared column
     /// becomes a real column of the data file. A Delta reader projects by the table schema and never surfaces
     /// it, which is what makes this worth refusing: it costs bytes in every file written, forever, with
@@ -8722,8 +8725,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             // Rename columns back to logical names (flat, top level), then recursively for nested struct
             // children (the flat renames leave them under their physical names).
+            // Rename columns back to logical names. With nested fields the recursive transform does every level
+            // from the batch AS READ — renaming the top level first would hand it logical names it matches
+            // physical-first, and after a rename one column's logical name can be another's physical name.
+            // Otherwise the flat renames: id mode resolves by field id wherever one is known, from the footer or
+            // from the PARQUET:field_id the batch's own fields carry (the native reader always supplies it; a
+            // codec-seam host may).
             RecordBatch result;
-            if (isIdMode && fieldIdToLogical is not null && parquetSchema is not null)
+            if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
+            {
+                result = ColumnMappingRecursive.ToLogical(batch, snapshot.Schema, mappingMode);
+            }
+            else if (isIdMode && fieldIdToLogical is not null
+                && (parquetSchema is not null || HasTopLevelParquetFieldId(batch)))
             {
                 result = ColumnMapping.RenameByFieldId(batch, fieldIdToLogical, parquetSchema);
             }
@@ -8731,10 +8745,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 result = ColumnMapping.RenameColumns(batch, physicalToLogical);
             }
-            if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
-            {
-                result = ColumnMappingRecursive.ToLogical(result, snapshot.Schema, mappingMode);
-            }
+
+            // The file's field ids have done their job (resolving columns above); a caller never sees them.
+            result = ColumnMappingRecursive.StripParquetFieldIds(result);
 
             // Strip the hidden materialized row-tracking columns UP FRONT (before DV filter / widening /
             // partition re-add / backfill), so the rest of the pipeline operates on exactly the user columns
@@ -8840,6 +8853,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Pairs each batch of a source that yields EVERY row of a file, in file order, with the file position
     /// of its first row. The <see cref="IDataFileReader"/> contract makes that a running count.
     /// </summary>
+    private static bool HasTopLevelParquetFieldId(RecordBatch batch)
+    {
+        foreach (var field in batch.Schema.FieldsList)
+        {
+            if (ColumnMapping.GetParquetFieldId(field) is not null)
+                return true;
+        }
+        return false;
+    }
+
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(
         IAsyncEnumerable<RecordBatch> source,
         [EnumeratorCancellation] CancellationToken cancellationToken)

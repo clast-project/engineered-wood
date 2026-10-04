@@ -97,31 +97,23 @@ internal static class CompactionExecutor
         // Delta layout, data files do not carry them (values live in add.partitionValues; readers re-add
         // them). Backfilling them as all-NULL columns wrote junk columns into the compacted file and
         // misaligned the batches against the file's real column set.
-        var targetSchema = SchemaConverter.ToArrowSchema(
-            DeltaSchemaSerializer.Parse(snapshot.Metadata.SchemaString));
+        var tableSchema = DeltaSchemaSerializer.Parse(snapshot.Metadata.SchemaString);
         if (snapshot.Metadata.PartitionColumns.Count > 0)
         {
             var partSet = new HashSet<string>(snapshot.Metadata.PartitionColumns, StringComparer.Ordinal);
-            targetSchema = new Apache.Arrow.Schema(
-                targetSchema.FieldsList.Where(f => !partSet.Contains(f.Name)).ToList(), null);
+            tableSchema = new EngineeredWood.DeltaLake.Schema.StructType
+            {
+                Fields = tableSchema.Fields.Where(f => !partSet.Contains(f.Name)).ToList(),
+            };
         }
 
-        // Column mapping: the data files store PHYSICAL column names (both name and id mode), and the compacted
-        // file must keep them + re-stamp each column's parquet field_id — readers resolve by
-        // physicalName/field_id, so a compacted file without them reads as all-NULL. Widening therefore has to
-        // match on the physical-renamed target schema (the logical-named one matches nothing on disk, which
-        // silently skipped widening under mapping).
-        if (mappingMode != ColumnMappingMode.None)
-        {
-            var physFields = new List<Field>(targetSchema.FieldsList.Count);
-            foreach (var f in targetSchema.FieldsList)
-            {
-                physFields.Add(logicalToPhysical!.TryGetValue(f.Name, out var p) && p != f.Name
-                    ? new Field(p, f.DataType, f.IsNullable)
-                    : f);
-            }
-            targetSchema = new Apache.Arrow.Schema(physFields, null);
-        }
+        // Column mapping: the data files store PHYSICAL column names (both name and id mode) at EVERY depth, and
+        // the compacted file must keep them + re-stamp each column's parquet field_id — readers resolve by
+        // physicalName/field_id, so a compacted file without them reads as all-NULL. Widening and backfill
+        // therefore match on a target schema that is physical all the way down: one physical only at the top
+        // level matched no struct child on disk, so a file whose struct lacked a field ADDed later was
+        // "reconciled" to all-NULL children and every nested value in the compacted file was lost.
+        var targetSchema = SchemaConverter.ToArrowSchema(ColumnMapping.ToPhysicalSchema(tableSchema, mappingMode));
 
         var dvReader = new DeletionVectors.DeletionVectorReader(fs);
         var actions = new List<DeltaAction>();
@@ -262,7 +254,9 @@ internal static class CompactionExecutor
                     survivorVers = vrb.Build();
                 }
 
-                var liveBatch = userBatch;
+                // The source file's own PARQUET:field_id metadata must not ride into the compacted file: a
+                // mapped table re-stamps every id from the schema below, and an unmapped one has none to write.
+                var liveBatch = ColumnMappingRecursive.StripParquetFieldIds(userBatch);
                 if (deletedRows is not null)
                 {
                     liveBatch = DeletionVectors.DeletionVectorFilter.Filter(
@@ -286,8 +280,9 @@ internal static class CompactionExecutor
                 {
                     // Rebuild with a CLEAN schema (drop the reader-carried field metadata, e.g. the file's own
                     // PARQUET:field_id) before re-stamping, then apply the mapping recursively so nested struct
-                    // children keep their physical names + ids too. The batch is already physical-named, so the
-                    // tolerant matching renames nothing — it only stamps the ids.
+                    // children keep their physical names + ids too. The batch is already physical-named, so it is
+                    // matched physical-first (a renamed column's old name may be a newer column's logical name) and
+                    // renames nothing — it only stamps the ids.
                     var cleanFields = new List<Field>(outBatch.Schema.FieldsList.Count);
                     foreach (var f in outBatch.Schema.FieldsList)
                         cleanFields.Add(CleanField(f));
@@ -296,7 +291,8 @@ internal static class CompactionExecutor
                         cleanArrays.Add(outBatch.Column(c));
                     outBatch = new RecordBatch(
                         new Apache.Arrow.Schema(cleanFields, null), cleanArrays, outBatch.Length);
-                    outBatch = ColumnMappingRecursive.ToPhysical(outBatch, snapshot.Schema, mappingMode);
+                    outBatch = ColumnMappingRecursive.ToPhysical(
+                        outBatch, snapshot.Schema, mappingMode, inputIsPhysical: true);
                 }
                 allBatches.Add(outBatch);
                 if (materialize)
