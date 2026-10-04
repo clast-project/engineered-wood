@@ -193,6 +193,29 @@ public class FieldMetadataKindTests : IDisposable
         Assert.Equal(JsonValueKind.Array, md.GetProperty(SchemaTypeWidening.TypeChangesKey).ValueKind);
     }
 
+    // IcebergCompatV2's nested ids are a JSON object (PROTOCOL.md). One that reaches the serializer as text -- for
+    // example after an Arrow round trip -- is written back as an object; an unrelated key with the same text is not.
+    [Fact]
+    public void NestedIdsMapAsText_IsWrittenAsObject()
+    {
+        const string ids = "{\"col-1.element\":7,\"col-1.element.key\":8}";
+        var field = new StructField
+        {
+            Name = "m", Type = new PrimitiveType { TypeName = "long" }, Nullable = true,
+            Metadata = new Dictionary<string, string>
+            {
+                ["delta.columnMapping.nested.ids"] = ids,
+                ["parquet.field.nested.ids"] = ids,
+            },
+        };
+
+        var md = FieldMetadataOf(DeltaSchemaSerializer.Serialize(new DeltaStructType { Fields = [field] }), "m");
+        var nested = md.GetProperty("delta.columnMapping.nested.ids");
+        Assert.Equal(JsonValueKind.Object, nested.ValueKind);
+        Assert.Equal(7, nested.GetProperty("col-1.element").GetInt64());
+        Assert.Equal(ids, md.GetProperty("parquet.field.nested.ids").GetString());
+    }
+
     // A spec-typed key whose text is not that kind stays a string rather than being dropped or thrown on.
     [Fact]
     public void SpecKeyWithMalformedText_StaysString()

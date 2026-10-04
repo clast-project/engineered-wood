@@ -173,7 +173,8 @@ internal static class DeltaSchemaSerializer
             or IdentityColumn.HighWaterMarkKey => JsonValueKind.Number,
         IdentityColumn.AllowExplicitInsertKey => JsonValueKind.True,
         TypeWidening.TypeChangesKey => JsonValueKind.Array,
-        IcebergCompat.NestedFieldIdsKey or "delta.columnMapping.nested.ids" => JsonValueKind.Object,
+        // PROTOCOL.md, "Writer Requirements for IcebergCompatV2": a Map[String, Long] of array/map field ids.
+        "delta.columnMapping.nested.ids" => JsonValueKind.Object,
         _ => null,
     };
 
