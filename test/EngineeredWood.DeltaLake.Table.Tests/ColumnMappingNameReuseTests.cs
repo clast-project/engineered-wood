@@ -180,21 +180,29 @@ public class ColumnMappingNameReuseTests : IDisposable
     [Fact]
     public async Task ChangeFeed_ChainedNestedRenames_EachChildKeepsItsOwnData()
     {
-        // The feed for an insert reads the data file itself, through its own name resolution.
+        // The feed for an insert reads the data file itself, through its own name resolution. Under column
+        // mapping the feed takes the END version's schema (#447), so a read through the renames reports the
+        // new names and a read of the insert alone the names it was written under; the values must follow
+        // their column either way.
         await using var table = await CreateAsync(
             new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" });
         long inserted = await table.WriteAsync([Row(1, 10, "p")]);
         await table.RenameFieldAsync(["s", "x"], "y");
-        await table.RenameFieldAsync(["s", "a"], "x");
+        long renamed = await table.RenameFieldAsync(["s", "a"], "x");
 
-        var batches = new List<RecordBatch>();
-        await foreach (var b in table.ReadChangesAsync(
-            new DeltaChangeReadOptions { StartVersion = inserted, EndVersion = inserted }))
+        async Task<List<string>> FeedAsync(long end)
         {
-            batches.Add(b);
+            var batches = new List<RecordBatch>();
+            await foreach (var b in table.ReadChangesAsync(
+                new DeltaChangeReadOptions { StartVersion = inserted, EndVersion = end }))
+            {
+                batches.Add(b);
+            }
+            return Render(batches);
         }
 
-        Assert.Equal(["amount=1 s.x=10 s.y=p"], Render(batches));
+        Assert.Equal(["amount=1 s.x=10 s.y=p"], await FeedAsync(renamed));
+        Assert.Equal(["amount=1 s.a=10 s.x=p"], await FeedAsync(inserted));
     }
 
     [Fact]

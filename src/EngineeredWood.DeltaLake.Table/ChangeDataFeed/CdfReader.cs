@@ -10,10 +10,8 @@ using EngineeredWood.DeltaLake.ChangeDataFeed;
 using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Schema;
-using EngineeredWood.DeltaLake.Table.Partitioning;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet;
-using DeltaStructType = EngineeredWood.DeltaLake.Schema.StructType;
 
 namespace EngineeredWood.DeltaLake.Table.ChangeDataFeed;
 
@@ -24,18 +22,15 @@ namespace EngineeredWood.DeltaLake.Table.ChangeDataFeed;
 /// </summary>
 internal static class CdfReader
 {
-    // The schema view the feed is resolved against — the table's LOGICAL schema (with column-mapping metadata
-    // and partition columns). Both _change_data files and inferred-from-data-file rows are stored in the
-    // PHYSICAL layout (physical names + field ids, partition columns absent — the data-file convention), so the
-    // reader maps them back to logical names and re-materializes the partition columns from the action's
-    // partitionValues. A single schema is used for the whole range (column mapping keeps field ids stable across
-    // a rename, so this is correct unless the schema's SHAPE changes mid-range — the same simplification the
-    // rest of the read path makes).
+    // The schema view the feed is resolved against: the LOGICAL schema (with column-mapping metadata and
+    // partition columns) of the snapshot the caller picked. Both _change_data files and inferred-from-data-file
+    // rows are stored in the PHYSICAL layout (physical names + field ids, partition columns absent — the
+    // data-file convention), so the reader maps them back to logical names and then reconciles them exactly as
+    // a scan does: partition columns from the action's partitionValues, columns the file predates as NULL,
+    // widened types widened. One schema serves the whole range, so every batch of one feed has the same shape.
     private sealed record CdfSchemaContext(
-        Apache.Arrow.Schema LogicalArrowSchema,
-        DeltaStructType DeltaSchema,
+        Snapshot.Snapshot SchemaSnapshot,
         ColumnMappingMode MappingMode,
-        IReadOnlyList<string> PartitionColumns,
         IReadOnlyDictionary<string, string> LogicalToPhysical,
         string? MaterializedRowIdName,
         string? MaterializedRowVersionName,
@@ -57,6 +52,8 @@ internal static class CdfReader
     /// from every batch — a change file and a data file both store them inline, and they are not part of the
     /// feed a caller asked for. With <paramref name="emitRowTracking"/> they come back as the spec's two
     /// GENERATED columns instead, resolved per row; see <see cref="ResolveRowTracking"/>.</para>
+    /// <para>Every batch is reconciled to <paramref name="schemaSnapshot"/>'s schema; which snapshot that is
+    /// (Spark's rule depends on column mapping) is the caller's decision.</para>
     /// </summary>
     public static async IAsyncEnumerable<RecordBatch> ReadChangesAsync(
         ITableFileSystem fs,
@@ -64,10 +61,7 @@ internal static class CdfReader
         long startVersion,
         long endVersion,
         ParquetReadOptions? readOptions,
-        Apache.Arrow.Schema logicalArrowSchema,
-        DeltaStructType deltaSchema,
-        ColumnMappingMode mappingMode,
-        IReadOnlyList<string> partitionColumns,
+        Snapshot.Snapshot schemaSnapshot,
         string? materializedRowIdName = null,
         string? materializedRowVersionName = null,
         bool emitRowTracking = false,
@@ -75,11 +69,12 @@ internal static class CdfReader
         string? emittedRowVersionName = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        var mappingMode = ColumnMapping.GetMode(schemaSnapshot.Metadata.Configuration);
         var ctx = new CdfSchemaContext(
-            logicalArrowSchema, deltaSchema, mappingMode, partitionColumns,
+            schemaSnapshot, mappingMode,
             mappingMode == ColumnMappingMode.None
                 ? new Dictionary<string, string>()
-                : ColumnMapping.BuildLogicalToPhysicalMap(deltaSchema, mappingMode),
+                : ColumnMapping.BuildLogicalToPhysicalMap(schemaSnapshot.Schema, mappingMode),
             materializedRowIdName, materializedRowVersionName, emitRowTracking,
             emittedRowIdName ?? DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName,
             emittedRowVersionName
@@ -198,7 +193,7 @@ internal static class CdfReader
                     physicalData, ctx.MaterializedRowIdName, ctx.MaterializedRowVersionName);
             }
 
-            var logical = MapToLogicalWithPartitions(
+            var logical = ToTableShape(
                 cleanPhysical, (IReadOnlyDictionary<string, string>?)cdcFile.PartitionValues, ctx);
             var withChangeType = changeType is null
                 ? logical
@@ -288,9 +283,9 @@ internal static class CdfReader
             }
 
             // Strip a _change_type column if the data file happens to carry one (defensive), map physical → logical
-            // + re-materialize partition columns, then add the constant _change_type for this add/remove.
+            // + reconcile to the feed's schema, then add the constant _change_type for this add/remove.
             var cleanBatch = StripChangeTypeColumn(batch);
-            var logical = MapToLogicalWithPartitions(cleanBatch, partitionValues, ctx);
+            var logical = ToTableShape(cleanBatch, partitionValues, ctx);
             var withChangeType = CdfWriter.AddChangeTypeColumn(logical, changeType);
             var withMetadata = AddMetadataColumns(withChangeType, commitVersion, commitTimestamp);
 
@@ -378,25 +373,23 @@ internal static class CdfReader
             emittedRowIdName, emittedRowVersionName, nullable: true);
     }
 
-    // Maps a PHYSICAL-layout data batch (physical names, partition columns absent) to the LOGICAL schema and
-    // interleaves the partition columns from the action's partitionValues. A no-op for a plain, unpartitioned
-    // table (logical == physical, no partitions), so the common path is byte-identical to before.
-    private static RecordBatch MapToLogicalWithPartitions(
+    // Maps a PHYSICAL-layout data batch (physical names, partition columns absent) to the LOGICAL schema, then
+    // brings it to the shape a scan of the schema snapshot returns: partition columns interleaved from the
+    // action's partitionValues, a column the file predates backfilled as NULL, a dropped one removed, widened
+    // types widened. Without the reconcile, a range spanning an ADD COLUMN gave batches of two schemas.
+    private static RecordBatch ToTableShape(
         RecordBatch physicalData,
         IReadOnlyDictionary<string, string>? partitionValues,
         CdfSchemaContext ctx)
     {
+        var snapshot = ctx.SchemaSnapshot;
         var logical = ColumnMappingRecursive.StripParquetFieldIds(
-            ColumnMappingRecursive.ToLogical(physicalData, ctx.DeltaSchema, ctx.MappingMode));
-        if (ctx.PartitionColumns.Count == 0)
-            return logical;
-        return PartitionUtils.AddPartitionColumns(
-            logical, ctx.LogicalArrowSchema, partitionValues ?? EmptyPartitionValues,
-            ctx.PartitionColumns, ctx.LogicalToPhysical);
+            ColumnMappingRecursive.ToLogical(physicalData, snapshot.Schema, ctx.MappingMode));
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        return DeltaTable.ReconcileToTableShape(
+            logical, snapshot, partitionValues, columns: null, partitionColumns, partitionColumns.Count > 0,
+            ctx.LogicalToPhysical);
     }
-
-    private static readonly IReadOnlyDictionary<string, string> EmptyPartitionValues =
-        new Dictionary<string, string>();
 
     private static RecordBatch AddMetadataColumns(
         RecordBatch batch, long commitVersion, long? commitTimestamp)
