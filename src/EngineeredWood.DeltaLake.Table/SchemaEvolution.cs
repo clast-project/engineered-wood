@@ -73,7 +73,9 @@ internal static class SchemaEvolution
                 else
                 {
                     changed = true;
-                    schemaBuilder.Field(f); // rebuilt to the expected structure, so the expected label is right
+                    // Rebuilt to the expected STRUCTURE, but a child the rebuild passed through keeps its own
+                    // type, so the label is the rebuilt array's type under the expected field's name.
+                    schemaBuilder.Field(WithType(f, reconciled.Data.DataType));
                 }
             }
             else
@@ -178,8 +180,15 @@ internal static class SchemaEvolution
         if (!changed)
             return column;
 
+        // The expected children's names and order, each with the type its array actually has: a child passed
+        // through unchanged may carry a type the reconcile does not convert (an old file's millisecond timestamp
+        // under a microsecond schema), and declaring the expected one would contradict the buffers.
+        var fields = new List<Field>(children.Count);
+        for (int i = 0; i < children.Count; i++)
+            fields.Add(WithType(expectedStruct.Fields[i], children[i].Data.DataType));
         return new StructArray(
-            expectedStruct, sa.Length, children, sa.NullBitmapBuffer, sa.NullCount, sa.Data.Offset);
+            new Apache.Arrow.Types.StructType(fields), sa.Length, children, sa.NullBitmapBuffer, sa.NullCount,
+            sa.Data.Offset);
     }
 
     // A container's child (list values, map keys or values) reconciled against its expected type; `data` itself

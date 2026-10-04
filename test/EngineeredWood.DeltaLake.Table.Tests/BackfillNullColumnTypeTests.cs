@@ -167,6 +167,108 @@ public class BackfillNullColumnTypeTests
         AssertAllNull(reconciled.Column(1), 2);
     }
 
+    // The same contract one level down: when a container is rebuilt because a child was ADDed, the children it
+    // passes through keep their own types. An old file's millisecond timestamp stays millisecond (the reconcile
+    // converts no units) and must not be declared as the expected microsecond type, neither in the rebuilt
+    // array's type nor in the batch's schema.
+
+    private static readonly TimestampType Millis = new(TimeUnit.Millisecond, "UTC");
+    private static readonly TimestampType Micros = new(TimeUnit.Microsecond, "UTC");
+
+    private static TimestampArray MillisArray(int length)
+    {
+        var b = new TimestampArray.Builder(Millis);
+        for (int i = 0; i < length; i++)
+            b.Append(DateTimeOffset.FromUnixTimeMilliseconds(1000 + i));
+        return b.Build();
+    }
+
+    private static ArrowBuffer Offsets(params int[] offsets)
+    {
+        var b = new ArrowBuffer.Builder<int>();
+        foreach (var o in offsets)
+            b.Append(o);
+        return b.Build();
+    }
+
+    // Every timestamp type reachable from `type`, in a fixed walk order.
+    private static IEnumerable<TimestampType> Timestamps(IArrowType type) => type switch
+    {
+        TimestampType ts => [ts],
+        NestedType n => n.Fields.SelectMany(f => Timestamps(f.DataType)),
+        _ => [],
+    };
+
+    // The batch's schema, the column array's own type, and its leaf arrays must all agree.
+    private static void AssertLabelsMatchArrays(RecordBatch batch, int column)
+    {
+        var declared = Timestamps(batch.Schema.FieldsList[column].DataType).ToList();
+        var actual = Timestamps(batch.Column(column).Data.DataType).ToList();
+        Assert.NotEmpty(declared);
+        Assert.Equal(actual.Select(t => t.Unit), declared.Select(t => t.Unit));
+        Assert.All(actual, t => Assert.Equal(TimeUnit.Millisecond, t.Unit));
+    }
+
+    [Fact]
+    public void StructRebuiltForAnAddedChild_KeepsAPassThroughChildsOwnType()
+    {
+        var st = new Apache.Arrow.Types.StructType([new Field("ts", Millis, true)]);
+        var batch = new RecordBatch(new Apache.Arrow.Schema.Builder().Field(new Field("s", st, true)).Build(),
+            [new StructArray(st, 2, [MillisArray(2)], ArrowBuffer.Empty)], 2);
+
+        var expected = new Apache.Arrow.Types.StructType(
+            [new Field("ts", Micros, true), new Field("b", StringType.Default, true)]);
+        var reconciled = SchemaEvolution.BackfillMissingColumns(batch, [new Field("s", expected, true)]);
+
+        var s = (StructArray)reconciled.Column(0);
+        Assert.Equal(2, s.Fields.Count);
+        Assert.Equal(TimeUnit.Millisecond, ((TimestampType)s.Fields[0].Data.DataType).Unit);
+        AssertLabelsMatchArrays(reconciled, 0);
+    }
+
+    [Fact]
+    public void ListOfStructRebuiltForAnAddedChild_KeepsAPassThroughChildsOwnType()
+    {
+        var elem = new Apache.Arrow.Types.StructType([new Field("ts", Millis, true)]);
+        var lt = new ListType(new Field("element", elem, true));
+        var list = new ListArray(lt, 2, Offsets(0, 1, 3),
+            new StructArray(elem, 3, [MillisArray(3)], ArrowBuffer.Empty), ArrowBuffer.Empty, 0);
+        var batch = new RecordBatch(new Apache.Arrow.Schema.Builder().Field(new Field("l", lt, true)).Build(),
+            [list], 2);
+
+        var expectedElem = new Apache.Arrow.Types.StructType(
+            [new Field("ts", Micros, true), new Field("b", StringType.Default, true)]);
+        var reconciled = SchemaEvolution.BackfillMissingColumns(batch,
+            [new Field("l", new ListType(new Field("element", expectedElem, true)), true)]);
+
+        var values = (StructArray)((ListArray)reconciled.Column(0)).Values;
+        Assert.Equal(2, values.Fields.Count);
+        AssertLabelsMatchArrays(reconciled, 0);
+    }
+
+    [Fact]
+    public void MapRebuiltForAnAddedValueChild_KeepsAPassThroughKeysOwnType()
+    {
+        var valueType = new Apache.Arrow.Types.StructType([new Field("a", Int64Type.Default, true)]);
+        var mt = new Apache.Arrow.Types.MapType(new Field("key", Millis, false), new Field("value", valueType, true));
+        var entries = new StructArray(mt.KeyValueType, 2,
+        [
+            MillisArray(2),
+            new StructArray(valueType, 2, [new Int64Array.Builder().Append(1).Append(2).Build()], ArrowBuffer.Empty),
+        ], ArrowBuffer.Empty);
+        var batch = new RecordBatch(new Apache.Arrow.Schema.Builder().Field(new Field("m", mt, true)).Build(),
+            [new MapArray(mt, 1, Offsets(0, 2), entries, ArrowBuffer.Empty, 0)], 1);
+
+        var expectedValue = new Apache.Arrow.Types.StructType(
+            [new Field("a", Int64Type.Default, true), new Field("b", StringType.Default, true)]);
+        var expectedMap = new Apache.Arrow.Types.MapType(
+            new Field("key", Micros, false), new Field("value", expectedValue, true));
+        var reconciled = SchemaEvolution.BackfillMissingColumns(batch, [new Field("m", expectedMap, true)]);
+
+        Assert.Equal(2, ((StructArray)((MapArray)reconciled.Column(0)).Values).Fields.Count);
+        AssertLabelsMatchArrays(reconciled, 0);
+    }
+
     [Fact]
     public void MissingBooleanColumn_BackfillsAsBoolean()
     {
