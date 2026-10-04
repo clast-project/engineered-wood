@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Buffers;
 using System.Globalization;
 using System.Numerics;
 using System.Text.Json;
@@ -141,42 +142,54 @@ internal static class StatsCollector
         Dictionary<string, object?> maxValues,
         Dictionary<string, object> nullCounts)
     {
-        // The rows this struct makes null, on top of its ancestors'.
+        // The rows this struct makes null, on top of its ancestors'. The mask is rented: statistics are collected on
+        // every write, and a fresh row-sized array per nullable struct level was a megabyte per level per million
+        // rows. A rented array may be longer than rowCount; only its first rowCount entries are read.
+        bool[]? rented = null;
         bool[]? rowNull = ancestorNull;
         if (st.NullCount != 0)
         {
-            rowNull = new bool[rowCount];
+            rented = ArrayPool<bool>.Shared.Rent(rowCount);
+            rowNull = rented;
             for (int r = 0; r < rowCount; r++)
                 rowNull[r] = (ancestorNull is not null && ancestorNull[r]) || st.IsNull(firstElement + r);
         }
 
-        // Children are NOT sliced with their struct: element i of the struct is slot (offset + i) of each child.
-        int childFirst = st.Data.Offset + firstElement;
-        var structType = (Apache.Arrow.Types.StructType)st.Data.DataType;
-        for (int c = 0; c < st.Data.Children.Length && c < structType.Fields.Count; c++)
+        try
         {
-            string childName = structType.Fields[c].Name;
-            var child = ArrowArrayFactory.BuildArray(st.Data.Children[c]);
+            // Children are NOT sliced with their struct: element i of the struct is slot (offset + i) of each child.
+            int childFirst = st.Data.Offset + firstElement;
+            var structType = (Apache.Arrow.Types.StructType)st.Data.DataType;
+            for (int c = 0; c < st.Data.Children.Length && c < structType.Fields.Count; c++)
+            {
+                string childName = structType.Fields[c].Name;
+                var child = ArrowArrayFactory.BuildArray(st.Data.Children[c]);
 
-            if (child is StructArray nestedStruct)
-            {
-                var nMin = GetOrAddNested(minValues, childName);
-                var nMax = GetOrAddNested(maxValues, childName);
-                var nNull = GetOrAddNestedCounts(nullCounts, childName);
-                CollectStruct(nestedStruct, childFirst, rowCount, rowNull, nMin, nMax, nNull);
-            }
-            else
-            {
-                long nulls = 0;
-                for (int r = 0; r < rowCount; r++)
+                if (child is StructArray nestedStruct)
                 {
-                    if ((rowNull is not null && rowNull[r]) || child.IsNull(childFirst + r))
-                        nulls++;
+                    var nMin = GetOrAddNested(minValues, childName);
+                    var nMax = GetOrAddNested(maxValues, childName);
+                    var nNull = GetOrAddNestedCounts(nullCounts, childName);
+                    CollectStruct(nestedStruct, childFirst, rowCount, rowNull, nMin, nMax, nNull);
                 }
-                long existing = nullCounts.TryGetValue(childName, out var ex) && ex is long l ? l : 0;
-                nullCounts[childName] = existing + nulls;
-                CollectMinMax(childName, child, minValues, maxValues);
+                else
+                {
+                    long nulls = 0;
+                    for (int r = 0; r < rowCount; r++)
+                    {
+                        if ((rowNull is not null && rowNull[r]) || child.IsNull(childFirst + r))
+                            nulls++;
+                    }
+                    long existing = nullCounts.TryGetValue(childName, out var ex) && ex is long l ? l : 0;
+                    nullCounts[childName] = existing + nulls;
+                    CollectMinMax(childName, child, minValues, maxValues);
+                }
             }
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<bool>.Shared.Return(rented);
         }
     }
 
