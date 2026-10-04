@@ -40,7 +40,8 @@ public sealed class DeltaFilePruner
         var collided = new HashSet<string>(StringComparer.Ordinal);
         // Struct leaves register under their dotted path ("s.a") — matching the flattened stats keys —
         // so a nested reference resolves with the same flat lookup as a top-level column.
-        AddFields(schema, logicalPrefix: "", physicalPrefix: "", typeMap, logicalToPhysical, collided);
+        var noBounds = new HashSet<string>(StringComparer.Ordinal);
+        AddFields(schema, logicalPrefix: "", physicalPrefix: "", typeMap, logicalToPhysical, collided, noBounds);
         // A literal dotted column name colliding with a struct leaf path is ambiguous — drop the key
         // (an unresolvable reference evaluates Unknown => the file is kept; pruning must never guess).
         foreach (var key in collided)
@@ -62,13 +63,33 @@ public sealed class DeltaFilePruner
 
         var partitionSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
         _accessor = new DeltaFileStatsAccessor(
-            typeMap, partitionSet, logicalToPhysical, preferTypedStats, unattributable);
+            typeMap, partitionSet, logicalToPhysical, preferTypedStats, unattributable, noBounds);
+    }
+
+    // A column widened from float (to double) has old files whose bounds are a float's shortest text: "0.1"
+    // decodes to the double 0.1, while the widened value is (double)0.1f = 0.10000000149..., outside the bound,
+    // and the file was pruned. Decoding the text as a float instead would be wrong for files written after the
+    // widening, whose bounds ARE doubles, and nothing says which a file is. So its bounds are not used; its null
+    // counts are exact whatever the type was. Integer, decimal and date bounds decode exactly at the wider type.
+    // Malformed type-change metadata is treated the same way, which only costs pruning.
+    private static bool WidenedFromFloat(StructField field)
+    {
+        try
+        {
+            return Schema.TypeWidening.GetTypeChanges(field)
+                .Any(c => c.FieldPath is null && c.FromType == "float");
+        }
+        catch (Exception e) when (e is System.Text.Json.JsonException or InvalidOperationException
+            or KeyNotFoundException)
+        {
+            return true;
+        }
     }
 
     private static void AddFields(
         StructType schema, string logicalPrefix, string physicalPrefix,
         Dictionary<string, string> typeMap, Dictionary<string, string> logicalToPhysical,
-        HashSet<string> collided)
+        HashSet<string> collided, HashSet<string> noBounds)
     {
         foreach (var field in schema.Fields)
         {
@@ -96,11 +117,13 @@ public sealed class DeltaFilePruner
                     typeMap[logical] = pt.TypeName;
                     if (physical != logical)
                         logicalToPhysical[logical] = physical;
+                    if (WidenedFromFloat(field))
+                        noBounds.Add(logical);
                 }
             }
             else if (field.Type is StructType st)
             {
-                AddFields(st, logical, physical, typeMap, logicalToPhysical, collided);
+                AddFields(st, logical, physical, typeMap, logicalToPhysical, collided, noBounds);
             }
             // list/map: stats only cover struct leaves — nothing to register.
         }
@@ -172,19 +195,22 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     private readonly IReadOnlyDictionary<string, string> _logicalToPhysical;
     private readonly bool _preferTypedStats;
     private readonly HashSet<string> _unattributable;
+    private readonly HashSet<string> _noBounds;
 
     public DeltaFileStatsAccessor(
         IReadOnlyDictionary<string, string> columnTypes,
         HashSet<string> partitionColumns,
         IReadOnlyDictionary<string, string>? logicalToPhysical = null,
         bool preferTypedStats = true,
-        HashSet<string>? unattributableStatsColumns = null)
+        HashSet<string>? unattributableStatsColumns = null,
+        HashSet<string>? noBoundsColumns = null)
     {
         _columnTypes = columnTypes;
         _partitionColumns = partitionColumns;
         _logicalToPhysical = logicalToPhysical ?? new Dictionary<string, string>();
         _preferTypedStats = preferTypedStats;
         _unattributable = unattributableStatsColumns ?? new HashSet<string>(StringComparer.Ordinal);
+        _noBounds = noBoundsColumns ?? new HashSet<string>(StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -297,14 +323,40 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
             return DeltaLiteralDecoder.FromPartitionString(partVal, typeName);
         }
 
-        if (TypedFor(stats.AddFile) is { } typed
-            && TryResolveTyped(typed, column, typed.View.HasBound, out string resolved))
-            return typed.View.GetBound(resolved, typed.Row, isMin, typeName);
-
-        var bounds = isMin ? stats.ColumnStats?.MinValues : stats.ColumnStats?.MaxValues;
-        if (!TryGetStat(bounds, column, out var element))
+        if (_noBounds.Contains(column))
             return null;
 
-        return DeltaLiteralDecoder.FromJson(element, typeName);
+        LiteralValue? bound;
+        if (TypedFor(stats.AddFile) is { } typed
+            && TryResolveTyped(typed, column, typed.View.HasBound, out string resolved))
+        {
+            bound = typed.View.GetBound(resolved, typed.Row, isMin, typeName);
+        }
+        else
+        {
+            var bounds = isMin ? stats.ColumnStats?.MinValues : stats.ColumnStats?.MaxValues;
+            if (!TryGetStat(bounds, column, out var element))
+                return null;
+            bound = DeltaLiteralDecoder.FromJson(element, typeName);
+        }
+
+        return isMin ? bound : WidenTimestampMax(bound, typeName);
+    }
+
+    // Spark writes timestamp bounds TRUNCATED to the millisecond, so a file's true maximum can lie up to 999
+    // microseconds above its recorded one; delta-spark and delta-kernel add 1 ms to every timestamp max they read
+    // for the same reason. The min, truncated downwards, is already a valid lower bound. A max this engine wrote
+    // at full precision only gets looser by the same millisecond.
+    private static LiteralValue? WidenTimestampMax(LiteralValue? bound, string typeName)
+    {
+        if (bound is not { Type: LiteralValue.Kind.DateTimeOffset } max
+            || typeName is not ("timestamp" or "timestamp_ntz"))
+        {
+            return bound;
+        }
+        var value = max.AsDateTimeOffset;
+        return value <= DateTimeOffset.MaxValue.AddMilliseconds(-1)
+            ? (LiteralValue?)LiteralValue.Of(value.AddMilliseconds(1))
+            : null;
     }
 }
