@@ -1,10 +1,12 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Buffers;
 using System.Globalization;
 using System.Numerics;
 using System.Text.Json;
 using Apache.Arrow;
+using EngineeredWood.Expressions;
 
 namespace EngineeredWood.DeltaLake.Table.Stats;
 
@@ -53,7 +55,7 @@ internal static class StatsCollector
                     var nMin = GetOrAddNested(minValues, field.Name);
                     var nMax = GetOrAddNested(maxValues, field.Name);
                     var nNull = GetOrAddNestedCounts(nullCounts, field.Name);
-                    CollectStruct(structCol, allParentValid: structCol.NullCount == 0, nMin, nMax, nNull);
+                    CollectStruct(structCol, firstElement: 0, structCol.Length, ancestorNull: null, nMin, nMax, nNull);
                 }
                 else
                 {
@@ -125,47 +127,69 @@ internal static class StatsCollector
     }
 
     /// <summary>
-    /// Recursive stats for a struct column's leaves. nullCount is EXACT (a row counts as null when the
-    /// parent row is null OR the child slot is null — exactness matters, IS NULL pruning relies on it).
-    /// min/max reuse the flat collectors over the child arrays; when the parent has nulls the child slot
-    /// of a parent-null row may hold an arbitrary value, which can only WIDEN the bounds — a superset
-    /// bound never wrongly skips a file, so it is prune-safe (same argument as deletion-vector stats).
+    /// Recursive stats for a struct column's leaves, over <paramref name="rowCount"/> of the batch's rows, which
+    /// are <paramref name="st"/>'s elements from <paramref name="firstElement"/> on. nullCount is EXACT: a row
+    /// counts as null for a leaf when ANY struct above it is null on that row, not just its direct parent, or
+    /// the leaf slot is (exactness matters, IS NULL pruning relies on it). <paramref name="ancestorNull"/> carries
+    /// the rows some enclosing struct already made null, or is null when none did. min/max reuse the flat
+    /// collectors over the child arrays; a child slot under a null ancestor, or outside the batch's rows, may hold
+    /// an arbitrary value, which can only WIDEN the bounds — a superset bound never wrongly skips a file, so it is
+    /// prune-safe (same argument as deletion-vector stats).
     /// </summary>
     private static void CollectStruct(
-        StructArray st, bool allParentValid,
+        StructArray st, int firstElement, int rowCount, bool[]? ancestorNull,
         Dictionary<string, object?> minValues,
         Dictionary<string, object?> maxValues,
         Dictionary<string, object> nullCounts)
     {
-        var structType = (Apache.Arrow.Types.StructType)st.Data.DataType;
-        int offset = st.Data.Offset;
-        for (int c = 0; c < st.Data.Children.Length && c < structType.Fields.Count; c++)
+        // The rows this struct makes null, on top of its ancestors'. The mask is rented: statistics are collected on
+        // every write, and a fresh row-sized array per nullable struct level was a megabyte per level per million
+        // rows. A rented array may be longer than rowCount; only its first rowCount entries are read.
+        bool[]? rented = null;
+        bool[]? rowNull = ancestorNull;
+        if (st.NullCount != 0)
         {
-            string childName = structType.Fields[c].Name;
-            var child = ArrowArrayFactory.BuildArray(st.Data.Children[c]);
+            rented = ArrayPool<bool>.Shared.Rent(rowCount);
+            rowNull = rented;
+            for (int r = 0; r < rowCount; r++)
+                rowNull[r] = (ancestorNull is not null && ancestorNull[r]) || st.IsNull(firstElement + r);
+        }
 
-            // Exact per-row null count over the parent's logical rows (children do NOT incorporate the
-            // parent's offset — index at offset + r).
-            long nulls = 0;
-            for (int r = 0; r < st.Length; r++)
+        try
+        {
+            // Children are NOT sliced with their struct: element i of the struct is slot (offset + i) of each child.
+            int childFirst = st.Data.Offset + firstElement;
+            var structType = (Apache.Arrow.Types.StructType)st.Data.DataType;
+            for (int c = 0; c < st.Data.Children.Length && c < structType.Fields.Count; c++)
             {
-                if ((!allParentValid && st.IsNull(r)) || child.IsNull(offset + r))
-                    nulls++;
-            }
+                string childName = structType.Fields[c].Name;
+                var child = ArrowArrayFactory.BuildArray(st.Data.Children[c]);
 
-            if (child is StructArray nestedStruct)
-            {
-                var nMin = GetOrAddNested(minValues, childName);
-                var nMax = GetOrAddNested(maxValues, childName);
-                var nNull = GetOrAddNestedCounts(nullCounts, childName);
-                CollectStruct(nestedStruct, allParentValid && nestedStruct.NullCount == 0, nMin, nMax, nNull);
+                if (child is StructArray nestedStruct)
+                {
+                    var nMin = GetOrAddNested(minValues, childName);
+                    var nMax = GetOrAddNested(maxValues, childName);
+                    var nNull = GetOrAddNestedCounts(nullCounts, childName);
+                    CollectStruct(nestedStruct, childFirst, rowCount, rowNull, nMin, nMax, nNull);
+                }
+                else
+                {
+                    long nulls = 0;
+                    for (int r = 0; r < rowCount; r++)
+                    {
+                        if ((rowNull is not null && rowNull[r]) || child.IsNull(childFirst + r))
+                            nulls++;
+                    }
+                    long existing = nullCounts.TryGetValue(childName, out var ex) && ex is long l ? l : 0;
+                    nullCounts[childName] = existing + nulls;
+                    CollectMinMax(childName, child, minValues, maxValues);
+                }
             }
-            else
-            {
-                long existing = nullCounts.TryGetValue(childName, out var ex) && ex is long l ? l : 0;
-                nullCounts[childName] = existing + nulls;
-                CollectMinMax(childName, child, minValues, maxValues);
-            }
+        }
+        finally
+        {
+            if (rented is not null)
+                ArrayPool<bool>.Shared.Return(rented);
         }
     }
 
@@ -414,8 +438,8 @@ internal static class StatsCollector
             if (array.IsNull(i)) continue;
             string val = array.GetString(i);
 
-            if (min is null || string.Compare(val, min, StringComparison.Ordinal) < 0) min = val;
-            if (max is null || string.Compare(val, max, StringComparison.Ordinal) > 0) max = val;
+            if (min is null || CompareStrings(val, min) < 0) min = val;
+            if (max is null || CompareStrings(val, max) > 0) max = val;
         }
 
         MergeStringMinMax(name, min, max, minValues, maxValues);
@@ -434,12 +458,19 @@ internal static class StatsCollector
             if (array.IsNull(i)) continue;
             string val = array.GetString(i);
 
-            if (min is null || string.Compare(val, min, StringComparison.Ordinal) < 0) min = val;
-            if (max is null || string.Compare(val, max, StringComparison.Ordinal) > 0) max = val;
+            if (min is null || CompareStrings(val, min) < 0) min = val;
+            if (max is null || CompareStrings(val, max) > 0) max = val;
         }
 
         MergeStringMinMax(name, min, max, minValues, maxValues);
     }
+
+    // String bounds are ordered in CODE POINT order (UTF-8 byte order), as Delta specifies and as the pruner
+    // compares them: through LiteralValue, whose string comparison is the one StatisticsEvaluator evaluates
+    // bounds with. StringComparison.Ordinal is UTF-16 code-unit order, which puts a supplementary character (a
+    // surrogate pair) BELOW U+E000..U+FFFF; a max taken that way could be lower than a value in the file without
+    // looking inverted, and the file was pruned.
+    private static int CompareStrings(string a, string b) => LiteralValue.Of(a).CompareTo(LiteralValue.Of(b));
 
     private static void MergeStringMinMax(
         string name, string? min, string? max,
@@ -449,13 +480,13 @@ internal static class StatsCollector
         if (min is not null)
         {
             if (minValues.TryGetValue(name, out var em) && em is string es)
-                min = string.Compare(min, es, StringComparison.Ordinal) < 0 ? min : es;
+                min = CompareStrings(min, es) < 0 ? min : es;
             minValues[name] = min;
         }
         if (max is not null)
         {
             if (maxValues.TryGetValue(name, out var ex) && ex is string xs)
-                max = string.Compare(max, xs, StringComparison.Ordinal) > 0 ? max : xs;
+                max = CompareStrings(max, xs) > 0 ? max : xs;
             maxValues[name] = max;
         }
     }
