@@ -14,6 +14,9 @@ namespace EngineeredWood.DeltaLake;
 /// physical key of <c>x</c>, so logical-first bound the wrong column in a spec-keyed map; and in a
 /// logical-keyed map <c>{x, p1}</c>, physical-first found <c>x</c>'s physical key <c>p1</c> and read the other
 /// column's value.</para>
+///
+/// <para>Renames can also PERMUTE names, leaving a map complete in both spellings (<see cref="IsAmbiguous"/>).
+/// Nothing in the map decides it; a read follows the spec, and the pruner declines.</para>
 /// </summary>
 internal static class PartitionValueKeys
 {
@@ -32,6 +35,26 @@ internal static class PartitionValueKeys
                 return false;
         }
         return true;
+    }
+
+    /// <summary>
+    /// True when <paramref name="values"/> is complete in BOTH spellings and they differ: renames that permute
+    /// names (logical <c>p1</c> physical <c>p2</c>, logical <c>p2</c> physical <c>p1</c>) leave a map whose keys
+    /// say nothing about which column each belongs to. <see cref="TryGet"/> then follows the spec (physical), as a
+    /// read must produce some value; a consumer that may decline, such as the pruner, should.
+    /// </summary>
+    public static bool IsAmbiguous<TValue>(
+        IReadOnlyDictionary<string, TValue> values, IEnumerable<string> partitionColumns,
+        IReadOnlyDictionary<string, string>? logicalToPhysical)
+    {
+        bool spellingsDiffer = false;
+        foreach (var column in partitionColumns)
+        {
+            if (!values.ContainsKey(column))
+                return false;
+            spellingsDiffer |= !string.Equals(Physical(column, logicalToPhysical), column, StringComparison.Ordinal);
+        }
+        return spellingsDiffer && IsPhysicallyKeyed(values, partitionColumns, logicalToPhysical);
     }
 
     /// <summary>

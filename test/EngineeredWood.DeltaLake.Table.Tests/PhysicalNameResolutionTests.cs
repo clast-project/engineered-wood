@@ -458,6 +458,84 @@ public class PhysicalNameResolutionTests : IDisposable
                 new Dictionary<string, string> { ["p1"] = "B", ["p2"] = "A" }, partitionColumns, map));
     }
 
+    // ── Spellings that cannot be told apart ──────────────────────────────────────────────────────────
+
+    // Renames that PERMUTE names: logical p1 is physical p2 and logical p2 is physical p1. A map keyed {p1, p2} is
+    // complete in BOTH spellings, so nothing in it says which column a key belongs to. Logical-keyed statistics
+    // are real: UPDATE and copy-on-write rewrites wrote them until #451.
+    private static DeltaStructType PermutedSchema(DeltaDataType type) => new()
+    {
+        Fields = [Mapped("p1", type, 1, "p2"), Mapped("p2", type, 2, "p1")],
+    };
+
+    private const string PermutedStats =
+        """{"numRecords":1,"minValues":{"p1":1,"p2":100},"maxValues":{"p1":1,"p2":100},"nullCount":{"p1":0,"p2":0}}""";
+
+    // Physical-keyed, the row is p1 = 100; logical-keyed, it is p1 = 1. Neither may be pruned.
+    [Fact]
+    public void Pruner_StatsKeyedByAPermutedName_PruneNothing()
+    {
+        var pruner = new DeltaFilePruner(PermutedSchema(Long), []);
+        var add = MakeAdd(PermutedStats);
+        foreach (long v in new[] { 1L, 100L })
+        {
+            Assert.True(pruner.ShouldInclude(add, Ex.Equal("p1", LiteralValue.Of(v))));
+            Assert.True(pruner.ShouldInclude(add, Ex.Equal("p2", LiteralValue.Of(v))));
+        }
+    }
+
+    [Fact]
+    public async Task CheckpointStatsParsed_KeyedByAPermutedName_PruneNothing()
+    {
+        string schemaJson = MappedSchemaJson(("p1", "p2", 1), ("p2", "p1", 2));
+        var add = await CheckpointedAddAsync(schemaJson, PermutedStats);
+        Assert.NotNull(add.TypedStats);
+
+        var pruner = new DeltaFilePruner(DeltaSchemaSerializer.Parse(schemaJson), []);
+        var typedOnly = add with { Stats = null };
+        foreach (long v in new[] { 1L, 100L })
+            Assert.True(pruner.ShouldInclude(typedOnly, Ex.Equal("p1", LiteralValue.Of(v))));
+    }
+
+    // A column whose physical name is no other column's logical name is still pruned on.
+    [Fact]
+    public void Pruner_OnlyTheCollidingColumnsLosePruning()
+    {
+        // x is physical a, a is physical b: the key "a" is x's or (logical-keyed) a's; the key "b" is only a's.
+        var schema = new DeltaStructType { Fields = [Mapped("x", Long, 1, "a"), Mapped("a", Long, 2, "b")] };
+        var add = MakeAdd("""{"numRecords":1,"minValues":{"a":1,"b":100},"maxValues":{"a":1,"b":100},"nullCount":{"a":0,"b":0}}""");
+        var pruner = new DeltaFilePruner(schema, []);
+
+        Assert.False(pruner.ShouldInclude(add, Ex.Equal("a", LiteralValue.Of(1L))));
+        Assert.True(pruner.ShouldInclude(add, Ex.Equal("x", LiteralValue.Of(5L))));
+    }
+
+    // Partition values must be READ, so an ambiguous map follows the spec (physical); the pruner, which may
+    // decline, keeps the file whichever value is asked for.
+    [Fact]
+    public void PartitionValues_KeyedByPermutedNames_ReadAsPhysical_AndPruneNothing()
+    {
+        var schema = new DeltaStructType
+        {
+            Fields = [Mapped("p1", Str, 1, "p2"), Mapped("p2", Str, 2, "p1"), Mapped("v", Long, 3, "v")],
+        };
+        var values = new Dictionary<string, string> { ["p1"] = "A", ["p2"] = "B" };
+
+        var pruner = new DeltaFilePruner(schema, ["p1", "p2"]);
+        foreach (string v in new[] { "A", "B" })
+            Assert.True(pruner.ShouldInclude(MakeAdd(null, values), Ex.Equal("p1", LiteralValue.Of(v))));
+
+        var full = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("p1", StringType.Default, true))
+            .Field(new Field("p2", StringType.Default, true))
+            .Field(new Field("v", Int64Type.Default, true))
+            .Build();
+        var map = ColumnMapping.BuildLogicalToPhysicalMap(schema, ColumnMappingMode.Name);
+        var batch = Partitioning.PartitionUtils.AddPartitionColumns(
+            LongRow(LongSchema("v"), 1), full, values, ["p1", "p2"], map);
+        Assert.Equal("B", ((StringArray)batch.Column("p1")).GetString(0));
+    }
+
     // ── #452: a dropped column's values do not come back under a re-added name ───────────────────────
 
     // The public ToLogical still accepts input that is already logical, as it documents: only the file-read

@@ -49,9 +49,20 @@ public sealed class DeltaFilePruner
             logicalToPhysical.Remove(key);
         }
 
+        // A column whose PHYSICAL name is another column's LOGICAL name has statistics no reader can attribute:
+        // the key is its own in a spec-keyed map and the other column's in a logical-keyed one (UPDATE and
+        // copy-on-write rewrites wrote those until #451), and renames that permute names leave nothing in the map
+        // to tell them apart. Its statistics are not used; every other column keeps pruning.
+        var unattributable = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var kv in logicalToPhysical)
+        {
+            if (typeMap.ContainsKey(kv.Value))
+                unattributable.Add(kv.Key);
+        }
+
         var partitionSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
         _accessor = new DeltaFileStatsAccessor(
-            typeMap, partitionSet, logicalToPhysical, preferTypedStats);
+            typeMap, partitionSet, logicalToPhysical, preferTypedStats, unattributable);
     }
 
     private static void AddFields(
@@ -160,17 +171,20 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     private readonly HashSet<string> _partitionColumns;
     private readonly IReadOnlyDictionary<string, string> _logicalToPhysical;
     private readonly bool _preferTypedStats;
+    private readonly HashSet<string> _unattributable;
 
     public DeltaFileStatsAccessor(
         IReadOnlyDictionary<string, string> columnTypes,
         HashSet<string> partitionColumns,
         IReadOnlyDictionary<string, string>? logicalToPhysical = null,
-        bool preferTypedStats = true)
+        bool preferTypedStats = true,
+        HashSet<string>? unattributableStatsColumns = null)
     {
         _columnTypes = columnTypes;
         _partitionColumns = partitionColumns;
         _logicalToPhysical = logicalToPhysical ?? new Dictionary<string, string>();
         _preferTypedStats = preferTypedStats;
+        _unattributable = unattributableStatsColumns ?? new HashSet<string>(StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -184,9 +198,19 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
             : null;
 
     // A file's partition value, in its map's own spelling: physical keys (the spec), or the logical keys of an
-    // older engineered-wood commit. The spelling is decided per map, not per key (see PartitionValueKeys).
-    private bool TryGetPartitionValue(AddFile addFile, string column, out string value) =>
-        PartitionValueKeys.TryGet(addFile.PartitionValues, column, _partitionColumns, _logicalToPhysical, out value);
+    // older engineered-wood commit. The spelling is decided per map, not per key (see PartitionValueKeys). A map
+    // complete in BOTH spellings that disagree (renames that permute names) gives the pruner nothing: a read has
+    // to pick the spec's reading, but pruning can decline to guess.
+    private bool TryGetPartitionValue(AddFile addFile, string column, out string value)
+    {
+        if (PartitionValueKeys.IsAmbiguous(addFile.PartitionValues, _partitionColumns, _logicalToPhysical))
+        {
+            value = default!;
+            return false;
+        }
+        return PartitionValueKeys.TryGet(
+            addFile.PartitionValues, column, _partitionColumns, _logicalToPhysical, out value);
+    }
 
     // A file's statistic for a column: under the column's PHYSICAL name ONLY when it has one distinct from its
     // logical name, as the spec and Spark key them. There is no logical fallback, unlike partition values. A
@@ -194,11 +218,13 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     // from one that simply has no statistics for the column, while the logical name can be a DIFFERENT column's
     // key: a dropped column's physical name after a column was re-added under it, or another column's physical
     // name after chained renames on an upgraded table. Those bounds pruned files holding matching rows. A
-    // logical-keyed file loses pruning for mapped columns instead, which only costs reads.
+    // logical-keyed file loses pruning for mapped columns instead, which only costs reads. Nor is the physical
+    // key read for a column whose physical name is another column's logical name (see the constructor): in a
+    // logical-keyed map that key is the other column's.
     private bool TryGetStat<TValue>(IReadOnlyDictionary<string, TValue>? dict, string column, out TValue value)
     {
         value = default!;
-        if (dict is null)
+        if (dict is null || _unattributable.Contains(column))
             return false;
         return dict.TryGetValue(
             _logicalToPhysical.TryGetValue(column, out var physical) ? physical : column, out value!);
@@ -248,14 +274,15 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     /// True when the checkpoint's typed statistics cover this column under the name its statistics are keyed
     /// by — the physical one, as <see cref="TryGetStat"/> and for the same reason. False sends the lookup to the
     /// JSON copy, which may carry bounds stats_parsed omits (a checkpoint an older engineered-wood wrote under
-    /// logical names, for one).
+    /// logical names, for one). A column whose statistics cannot be attributed is not covered: the checkpoint
+    /// writer laid each JSON key out under the physical column of that name, whichever column wrote it.
     /// </summary>
     private bool TryResolveTyped(
         Checkpoint.ParsedStatsRef typed, string column,
         Func<string, bool> covers, out string resolved)
     {
         resolved = _logicalToPhysical.TryGetValue(column, out var physical) ? physical : column;
-        return covers(resolved);
+        return !_unattributable.Contains(column) && covers(resolved);
     }
 
     private LiteralValue? GetBound(DeltaFileStats stats, string column, bool isMin)
