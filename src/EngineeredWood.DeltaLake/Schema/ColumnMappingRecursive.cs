@@ -60,24 +60,43 @@ public static class ColumnMappingRecursive
     {
         // Id mode: a field whose id the schema no longer has (a dropped column) is removed BEFORE any name is
         // looked at. Passed through, it would keep its physical name, and once its id is stripped a later
-        // name-based step (backfill) could bind it to a column re-added under that name.
+        // name-based step (backfill) could bind it to a column re-added under that name. Ids identify a FILE's
+        // columns, so this cannot misread logical input. Name mode's counterpart can (a logical name that is no
+        // physical name is exactly what it removes), so a caller reading a data file applies DropStaleFields
+        // itself, first.
         if (mode == ColumnMappingMode.Id)
-            batch = DropFieldsWithUnknownIds(batch, deltaSchema);
+            batch = DropStaleFields(batch, deltaSchema, mode);
         return Transform(batch, deltaSchema, mode, toPhysical: false, preferPhysical: true);
     }
 
-    // Removes, at every depth, each struct field (and the top-level column) that carries a PARQUET:field_id the
-    // Delta schema at that level does not have. A field without an id is kept (hidden columns such as the
-    // materialized row-tracking ones carry none). Returns the same instance when nothing is removed.
-    private static RecordBatch DropFieldsWithUnknownIds(RecordBatch batch, StructType deltaSchema)
+    /// <summary>
+    /// Removes, at every depth, each field of a data file's batch (as read, physical-named) that belongs to a
+    /// column the schema no longer has. Returns the same instance when nothing is removed.
+    /// <list type="bullet">
+    /// <item>Id mode: a field carrying a <c>PARQUET:field_id</c> the schema at that level does not have.</item>
+    /// <item>Name mode: a field whose name is no field's physical name but IS the logical name of a field mapped
+    /// to a different physical name. Data files hold physical names only, so that name can only be a dropped
+    /// column's physical name: a table upgraded to name mode keeps its original names as physical names, and a
+    /// column re-added under a dropped one's name gets a fresh one. Spark resolves by physical name alone and
+    /// reads the re-added column as NULL.</item>
+    /// </list>
+    /// A field matching neither rule is kept: hidden columns such as the materialized row-tracking ones are no
+    /// table column at all. Pass a batch exactly as read from a data file: in name mode an already-LOGICAL field
+    /// whose name is no physical name would be taken for a dropped column's. <see cref="ToLogical"/> applies the
+    /// id-mode rule itself but not the name-mode one, since it accepts already-logical input.
+    /// </summary>
+    public static RecordBatch DropStaleFields(RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode)
     {
+        if (mode == ColumnMappingMode.None)
+            return batch;
+
         List<Field>? fields = null;
         List<IArrowArray>? arrays = null;
         for (int i = 0; i < batch.ColumnCount; i++)
         {
             var field = batch.Schema.FieldsList[i];
-            var delta = FindField(deltaSchema, field, byId: true, preferPhysical: true);
-            if (delta is null && ColumnMapping.GetParquetFieldId(field) is not null)
+            var delta = ResolveStored(deltaSchema, field, mode, out bool stale);
+            if (stale)
             {
                 fields ??= [.. batch.Schema.FieldsList.Take(i)];
                 arrays ??= [.. batch.Arrays.Take(i)];
@@ -87,7 +106,7 @@ public static class ColumnMappingRecursive
             var column = batch.Column(i);
             var (type, data) = delta is null
                 ? (field.DataType, column.Data)
-                : DropUnknownIdsInType(field.DataType, column.Data, delta.Type);
+                : DropStaleInType(field.DataType, column.Data, delta.Type, mode);
             if (ReferenceEquals(data, column.Data) && fields is null)
                 continue;
 
@@ -104,8 +123,29 @@ public static class ColumnMappingRecursive
             : new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), arrays!, batch.Length);
     }
 
-    private static (Apache.Arrow.Types.IArrowType Type, ArrayData Data) DropUnknownIdsInType(
-        Apache.Arrow.Types.IArrowType type, ArrayData data, DeltaDataType delta)
+    // The Delta field a data file's field belongs to, and whether it is a dropped column's (see DropStaleFields).
+    private static StructField? ResolveStored(StructType schema, Field arrow, ColumnMappingMode mode, out bool stale)
+    {
+        if (mode == ColumnMappingMode.Id)
+        {
+            var byId = FindField(schema, arrow, byId: true, preferPhysical: true);
+            stale = byId is null && ColumnMapping.GetParquetFieldId(arrow) is not null;
+            return byId;
+        }
+
+        var index = Indexes.GetValue(schema, static s => new FieldIndex(s));
+        if (index.ByPhysical.TryGetValue(arrow.Name, out var field))
+        {
+            stale = false;
+            return field;
+        }
+        stale = index.ByLogical.TryGetValue(arrow.Name, out var logical)
+            && logical.Metadata is { } md && md.ContainsKey(ColumnMapping.PhysicalNameKey);
+        return null;
+    }
+
+    private static (Apache.Arrow.Types.IArrowType Type, ArrayData Data) DropStaleInType(
+        Apache.Arrow.Types.IArrowType type, ArrayData data, DeltaDataType delta, ColumnMappingMode mode)
     {
         switch (type)
         {
@@ -117,15 +157,15 @@ public static class ColumnMappingRecursive
                 for (int k = 0; k < st.Fields.Count; k++)
                 {
                     var child = st.Fields[k];
-                    var childDelta = FindField(ds, child, byId: true, preferPhysical: true);
-                    if (childDelta is null && ColumnMapping.GetParquetFieldId(child) is not null)
+                    var childDelta = ResolveStored(ds, child, mode, out bool stale);
+                    if (stale)
                     {
                         changed = true;
                         continue;
                     }
                     var (childType, childData) = childDelta is null
                         ? (child.DataType, data.Children[k])
-                        : DropUnknownIdsInType(child.DataType, data.Children[k], childDelta.Type);
+                        : DropStaleInType(child.DataType, data.Children[k], childDelta.Type, mode);
                     changed |= !ReferenceEquals(childData, data.Children[k]);
                     keptFields.Add(ReferenceEquals(childType, child.DataType)
                         ? child
@@ -142,9 +182,10 @@ public static class ColumnMappingRecursive
             case Apache.Arrow.Types.MapType mt when delta is MapType dm:
             {
                 var entries = data.Children[0];
-                var (keyType, keyData) = DropUnknownIdsInType(mt.KeyField.DataType, entries.Children[0], dm.KeyType);
+                var (keyType, keyData) =
+                    DropStaleInType(mt.KeyField.DataType, entries.Children[0], dm.KeyType, mode);
                 var (valueType, valueData) =
-                    DropUnknownIdsInType(mt.ValueField.DataType, entries.Children[1], dm.ValueType);
+                    DropStaleInType(mt.ValueField.DataType, entries.Children[1], dm.ValueType, mode);
                 if (ReferenceEquals(keyData, entries.Children[0]) && ReferenceEquals(valueData, entries.Children[1]))
                     return (type, data);
                 var keyField = new Field(mt.KeyField.Name, keyType, mt.KeyField.IsNullable, mt.KeyField.Metadata);
@@ -159,7 +200,8 @@ public static class ColumnMappingRecursive
             }
             case Apache.Arrow.Types.ListType lt when delta is ArrayType da:
             {
-                var (elemType, elemData) = DropUnknownIdsInType(lt.ValueField.DataType, data.Children[0], da.ElementType);
+                var (elemType, elemData) =
+                    DropStaleInType(lt.ValueField.DataType, data.Children[0], da.ElementType, mode);
                 if (ReferenceEquals(elemData, data.Children[0]))
                     return (type, data);
                 var newList = new Apache.Arrow.Types.ListType(
@@ -170,7 +212,7 @@ public static class ColumnMappingRecursive
             case Apache.Arrow.Types.LargeListType llt when delta is ArrayType da:
             {
                 var (elemType, elemData) =
-                    DropUnknownIdsInType(llt.ValueField.DataType, data.Children[0], da.ElementType);
+                    DropStaleInType(llt.ValueField.DataType, data.Children[0], da.ElementType, mode);
                 if (ReferenceEquals(elemData, data.Children[0]))
                     return (type, data);
                 var newList = new Apache.Arrow.Types.LargeListType(

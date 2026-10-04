@@ -383,8 +383,13 @@ internal static class CdfReader
         CdfSchemaContext ctx)
     {
         var snapshot = ctx.SchemaSnapshot;
+        // As read from a change or data file, so in name mode a dropped column's field is removed before the names
+        // are mapped (in id mode ToLogical drops by id itself).
+        var physical = ctx.MappingMode == ColumnMappingMode.Name
+            ? ColumnMappingRecursive.DropStaleFields(physicalData, snapshot.Schema, ctx.MappingMode)
+            : physicalData;
         var logical = ColumnMappingRecursive.StripParquetFieldIds(
-            ColumnMappingRecursive.ToLogical(physicalData, snapshot.Schema, ctx.MappingMode));
+            ColumnMappingRecursive.ToLogical(physical, snapshot.Schema, ctx.MappingMode));
         var partitionColumns = snapshot.Metadata.PartitionColumns;
         return DeltaTable.ReconcileToTableShape(
             logical, snapshot, partitionValues, columns: null, partitionColumns, partitionColumns.Count > 0,

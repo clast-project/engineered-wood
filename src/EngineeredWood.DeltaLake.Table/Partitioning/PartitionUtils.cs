@@ -129,8 +129,8 @@ internal static class PartitionUtils
     /// The partition columns are appended at the positions matching the full table schema.
     /// Under column mapping a file's <paramref name="partitionValues"/> are keyed by the PHYSICAL column name
     /// (the Delta-spec convention Spark follows — physical keys survive a partition-column rename), while files
-    /// written before that convention are logical-keyed — so each value is looked up under BOTH names via the
-    /// optional <paramref name="logicalToPhysical"/> map.
+    /// written before that convention are logical-keyed — so each map's spelling is decided from the optional
+    /// <paramref name="logicalToPhysical"/> map and every partition column (see PartitionValueKeys).
     /// </summary>
     public static RecordBatch AddPartitionColumns(
         RecordBatch dataBatch,
@@ -153,14 +153,11 @@ internal static class PartitionUtils
 
             if (partColSet.Contains(field.Name))
             {
-                // Build a constant array from the partition value (logical key, else the physical key).
+                // Build a constant array from the partition value, in the map's own spelling (PartitionValueKeys).
                 // A missing key means the writer omitted it — treated as null, like a JSON-null value.
-                if (!partitionValues.TryGetValue(field.Name, out var v)
-                    && (logicalToPhysical is null || !logicalToPhysical.TryGetValue(field.Name, out var phys)
-                        || !partitionValues.TryGetValue(phys, out v)))
-                {
+                if (!PartitionValueKeys.TryGet(
+                        partitionValues, field.Name, partitionColumns, logicalToPhysical, out var v))
                     v = null;
-                }
                 columns.Add(BuildConstantArray(field.DataType, v, dataBatch.Length));
                 fields.Add(field);
             }
