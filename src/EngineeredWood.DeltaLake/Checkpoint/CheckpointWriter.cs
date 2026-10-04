@@ -187,8 +187,14 @@ public sealed class CheckpointWriter
         // Which copies of the statistics this table asks for. stats_parsed is dropped when the schema
         // yields no bounds at all, so the mode alone does not decide the shape.
         var statsMode = CheckpointStatsMode.FromConfiguration(snapshot.Metadata.Configuration);
+        // stats_parsed is laid out under PHYSICAL names at every depth, like the JSON statistics it is parsed
+        // from (and as Spark writes it). Laid out under logical names, every bound of a column whose physical
+        // name differs came out null, and where a logical name is another column's physical name the typed
+        // column held that other column's bounds.
+        var statsSchema = Schema.ColumnMapping.ToPhysicalSchema(
+            snapshot.Schema, Schema.ColumnMapping.GetMode(snapshot.Metadata.Configuration));
         var statsParsedType = statsMode.WriteStruct
-            ? StatsParsedBuilder.BuildStatsType(snapshot.Schema)
+            ? StatsParsedBuilder.BuildStatsType(statsSchema)
             : null;
 
         // Build the struct-based checkpoint schema
@@ -199,7 +205,7 @@ public sealed class CheckpointWriter
         {
             BuildProtocolColumn(allActions, count),
             BuildMetadataColumn(allActions, count),
-            BuildAddColumn(allActions, count, statsMode, snapshot.Schema, statsParsedType),
+            BuildAddColumn(allActions, count, statsMode, statsSchema, statsParsedType),
             BuildRemoveColumn(allActions, count),
             BuildTxnColumn(allActions, count),
             BuildDomainMetadataColumn(allActions, count),

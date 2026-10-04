@@ -153,14 +153,10 @@ internal static class PartitionUtils
 
             if (partColSet.Contains(field.Name))
             {
-                // Build a constant array from the partition value (logical key, else the physical key).
+                // Build a constant array from the partition value (physical key, else the logical key).
                 // A missing key means the writer omitted it — treated as null, like a JSON-null value.
-                if (!partitionValues.TryGetValue(field.Name, out var v)
-                    && (logicalToPhysical is null || !logicalToPhysical.TryGetValue(field.Name, out var phys)
-                        || !partitionValues.TryGetValue(phys, out v)))
-                {
+                if (!PartitionValueKeys.TryGet(partitionValues, field.Name, logicalToPhysical, out var v))
                     v = null;
-                }
                 columns.Add(BuildConstantArray(field.DataType, v, dataBatch.Length));
                 fields.Add(field);
             }

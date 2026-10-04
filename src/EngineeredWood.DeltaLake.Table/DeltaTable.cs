@@ -4074,12 +4074,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // row's ORIGINAL values. Prepared up front so both the built-in and pluggable writers see the same
             // batches.
             var writeBatches = new List<RecordBatch>(dataBatches.Count);
+            var statsBatches = new List<RecordBatch>(dataBatches.Count);
             for (int k = 0; k < dataBatches.Count; k++)
             {
                 var physicalBatch = ColumnMappingRecursive.ToPhysical(
                     dataBatches[k], snapshot.Schema, mappingMode);
+                // Statistics are keyed by PHYSICAL name, as the append path keys them; collected from the
+                // logical rows, they were keyed by names that can belong to another column after a rename or
+                // to a dropped one after a re-add, and the pruner skipped files holding matching rows.
+                statsBatches.Add(physicalBatch);
                 // Drop the VARIANT annotation for a Spark 4.0.x-compatible table (bytes unchanged; the
-                // read path recovers the type from the schema). Stats use dataBatches, not these.
+                // read path recovers the type from the schema). Stats use statsBatches, not these.
                 if (!_options.EmitVariantLogicalType)
                     physicalBatch = VariantColumnCoercion.StripAnnotation(physicalBatch);
                 if (materializeIds && outTracking![k] is { } trk)
@@ -4112,7 +4117,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 fileSize = file.Position;
             }
 
-            string? stats = Stats.StatsCollector.Collect(dataBatches);
+            string? stats = Stats.StatsCollector.Collect(statsBatches);
 
             // Remove old, add new
             actions.Add(new RemoveFile
@@ -4241,11 +4246,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         DeltaPath.BuildPartitionPath(
             partitionValues, _options.PartitionPathSpelling, _fs.PathConstraints);
 
-    // The canonical identity of ONE partition (for dynamic partition overwrite set membership): the
-    // sorted "key=value" pairs joined with U+0001, with every key translated to its PHYSICAL name when the
+    // The canonical identity of ONE partition (for dynamic partition overwrite set membership and compaction
+    // grouping): the sorted "key=value" pairs joined with U+0001, with every key spelled PHYSICALLY when the
     // table has column mapping — so a physical-keyed entry (the spec convention) and a logical-keyed one
-    // (older engineered-wood commits) canonicalize identically. A null value (Delta's "row is null in this
-    // partition column") is marked distinctly from an empty string.
+    // (older engineered-wood commits) canonicalize identically. A key that is already a physical name stays
+    // as it is (see PartitionValueKeys): translating it as if it were logical merged two partitions of a table
+    // whose renamed partition column's logical name is another's physical name. A null value (Delta's "row is
+    // null in this partition column") is marked distinctly from an empty string.
     internal static string CanonicalPartitionKey(
         IReadOnlyDictionary<string, string> values,
         IReadOnlyDictionary<string, string>? logicalToPhysical)
@@ -4253,8 +4260,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var parts = new List<string>(values.Count);
         foreach (var kv in values)
         {
-            string key = logicalToPhysical is not null && logicalToPhysical.TryGetValue(kv.Key, out var phys)
-                ? phys : kv.Key;
+            string key = PartitionValueKeys.ToPhysical(kv.Key, logicalToPhysical);
             parts.Add(key + "=" + (kv.Value is null ? "\u0000<null>" : kv.Value));
         }
         parts.Sort(StringComparer.Ordinal);
@@ -4266,19 +4272,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // stored as strings). Keys are validated to be partition columns before this is called. `filter` keys are the
     // user-facing LOGICAL names; under column mapping a file's partitionValues are keyed by the PHYSICAL name
     // (the Delta-spec convention — physical keys survive a partition-column rename), while files written before
-    // that convention are logical-keyed — so each filter key is tried under BOTH names.
+    // that convention are logical-keyed — so each filter key is tried under BOTH names, physical first.
     private static bool PartitionValuesMatch(
         IReadOnlyDictionary<string, string> fileValues, IReadOnlyDictionary<string, string> filter,
         IReadOnlyDictionary<string, string>? logicalToPhysical = null)
     {
         foreach (var kv in filter)
         {
-            if (!fileValues.TryGetValue(kv.Key, out var v)
-                && (logicalToPhysical is null || !logicalToPhysical.TryGetValue(kv.Key, out var phys)
-                    || !fileValues.TryGetValue(phys, out v)))
-            {
+            if (!PartitionValueKeys.TryGet(fileValues, kv.Key, logicalToPhysical, out var v))
                 return false;
-            }
             if (!string.Equals(v, kv.Value, StringComparison.Ordinal))
             {
                 return false;
@@ -7333,9 +7335,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         var writeBatches = new List<RecordBatch>(dataBatches.Count);
+        var statsBatches = new List<RecordBatch>(dataBatches.Count);
         for (int k = 0; k < dataBatches.Count; k++)
         {
             var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatches[k], snapshot.Schema, mappingMode);
+            // Statistics are keyed by PHYSICAL name, as the append path keys them (see the UPDATE rewrite).
+            statsBatches.Add(physicalBatch);
             if (!_options.EmitVariantLogicalType)
                 physicalBatch = VariantColumnCoercion.StripAnnotation(physicalBatch);
             if (materializeIds && outTracking is not null && outTracking[k] is { } trk)
@@ -7371,7 +7376,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             Size = fileSize,
             ModificationTime = now,
             DataChange = true,
-            Stats = Stats.StatsCollector.Collect(dataBatches),
+            Stats = Stats.StatsCollector.Collect(statsBatches),
             BaseRowId = rowTrackingEnabled ? baseRowId : null,
             DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
         };
@@ -8889,13 +8894,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// logical name can be another's physical name.</item>
     /// <item>Otherwise the flat physical-to-logical rename.</item>
     /// </list>
+    /// Either way a dropped column's field is removed first (<see cref="ColumnMappingRecursive.DropStaleFields"/>),
+    /// so its values cannot come back under a column re-added with its name.
     /// </summary>
     private static RecordBatch ToLogicalBatch(
         RecordBatch batch, Schema.StructType schema, ColumnMappingMode mappingMode,
         Dictionary<string, string> physicalToLogical)
         => mappingMode == ColumnMappingMode.Id || ColumnMappingRecursive.HasNestedFields(schema)
             ? ColumnMappingRecursive.ToLogical(batch, schema, mappingMode)
-            : ColumnMapping.RenameColumns(batch, physicalToLogical);
+            : ColumnMapping.RenameColumns(
+                ColumnMappingRecursive.DropStaleFields(batch, schema, mappingMode), physicalToLogical);
 
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(
         IAsyncEnumerable<RecordBatch> source,

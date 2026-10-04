@@ -63,8 +63,8 @@ public sealed class DeltaFilePruner
         {
             string logical = logicalPrefix.Length == 0 ? field.Name : logicalPrefix + "." + field.Name;
             // Column mapping: partitionValues + stats in the log are keyed by the PHYSICAL column name at
-            // EVERY level (older engineered-wood commits used logical keys) — the accessor looks values up
-            // under both, so track the dotted physical path alongside the logical one.
+            // EVERY level, so track the dotted physical path alongside the logical one. (Older engineered-wood
+            // commits used logical keys; the accessor still reads their partition values, not their stats.)
             string physName = field.Name;
             if (field.Metadata is not null
                 && field.Metadata.TryGetValue(ColumnMapping.PhysicalNameKey, out var phys)
@@ -183,17 +183,25 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
             ? typed
             : null;
 
-    // Looks up a per-file dictionary keyed by column name under the LOGICAL name first, then the PHYSICAL name
-    // (column mapping: partitionValues/stats keys are physical per the Delta spec; older engineered-wood
-    // commits used logical keys — both must resolve).
-    private bool TryGet<TValue>(IReadOnlyDictionary<string, TValue>? dict, string column, out TValue value)
+    // A file's partition value: physical key first, then the logical key of an older engineered-wood commit
+    // (see PartitionValueKeys for why the order matters).
+    private bool TryGetPartitionValue(AddFile addFile, string column, out string value) =>
+        PartitionValueKeys.TryGet(addFile.PartitionValues, column, _logicalToPhysical, out value);
+
+    // A file's statistic for a column: under the column's PHYSICAL name ONLY when it has one distinct from its
+    // logical name, as the spec and Spark key them. There is no logical fallback, unlike partition values. A
+    // statistics map need not cover every column, so a missing physical key cannot tell a logical-keyed file
+    // from one that simply has no statistics for the column, while the logical name can be a DIFFERENT column's
+    // key: a dropped column's physical name after a column was re-added under it, or another column's physical
+    // name after chained renames on an upgraded table. Those bounds pruned files holding matching rows. A
+    // logical-keyed file loses pruning for mapped columns instead, which only costs reads.
+    private bool TryGetStat<TValue>(IReadOnlyDictionary<string, TValue>? dict, string column, out TValue value)
     {
         value = default!;
         if (dict is null)
             return false;
-        if (dict.TryGetValue(column, out value!))
-            return true;
-        return _logicalToPhysical.TryGetValue(column, out var phys) && dict.TryGetValue(phys, out value!);
+        return dict.TryGetValue(
+            _logicalToPhysical.TryGetValue(column, out var physical) ? physical : column, out value!);
     }
 
     public LiteralValue? GetMinValue(DeltaFileStats stats, string column) =>
@@ -209,7 +217,7 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
             // Partition value is constant per file. If the stored value is
             // null (the dictionary holds a null string), every row is null;
             // otherwise no row is null in this column.
-            if (TryGet(stats.AddFile.PartitionValues, column, out var v))
+            if (TryGetPartitionValue(stats.AddFile, column, out var v))
                 return v is null ? stats.AddFile.PartitionValues.Count > 0 ? GetValueCount(stats, column) : null : 0;
             return null;
         }
@@ -218,7 +226,7 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
             && TryResolveTyped(typed, column, typed.View.HasNullCount, out string resolved))
             return typed.View.GetNullCount(resolved, typed.Row);
 
-        return TryGet(stats.ColumnStats?.NullCount, column, out long n) ? (long?)n : null;
+        return TryGetStat(stats.ColumnStats?.NullCount, column, out long n) ? (long?)n : null;
     }
 
     public long? GetValueCount(DeltaFileStats stats, string column)
@@ -237,25 +245,17 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     public bool IsMaxExact(DeltaFileStats stats, string column) => true;
 
     /// <summary>
-    /// True when the checkpoint's typed statistics cover this column, under its logical or physical
-    /// name. False sends the lookup to the JSON copy, which may carry bounds stats_parsed omits.
+    /// True when the checkpoint's typed statistics cover this column under the name its statistics are keyed
+    /// by — the physical one, as <see cref="TryGetStat"/> and for the same reason. False sends the lookup to the
+    /// JSON copy, which may carry bounds stats_parsed omits (a checkpoint an older engineered-wood wrote under
+    /// logical names, for one).
     /// </summary>
     private bool TryResolveTyped(
         Checkpoint.ParsedStatsRef typed, string column,
         Func<string, bool> covers, out string resolved)
     {
-        if (covers(column))
-        {
-            resolved = column;
-            return true;
-        }
-        if (_logicalToPhysical.TryGetValue(column, out var physical) && covers(physical))
-        {
-            resolved = physical;
-            return true;
-        }
-        resolved = column;
-        return false;
+        resolved = _logicalToPhysical.TryGetValue(column, out var physical) ? physical : column;
+        return covers(resolved);
     }
 
     private LiteralValue? GetBound(DeltaFileStats stats, string column, bool isMin)
@@ -265,7 +265,7 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
 
         if (_partitionColumns.Contains(column))
         {
-            if (!TryGet(stats.AddFile.PartitionValues, column, out var partVal))
+            if (!TryGetPartitionValue(stats.AddFile, column, out var partVal))
                 return null;
             return DeltaLiteralDecoder.FromPartitionString(partVal, typeName);
         }
@@ -275,7 +275,7 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
             return typed.View.GetBound(resolved, typed.Row, isMin, typeName);
 
         var bounds = isMin ? stats.ColumnStats?.MinValues : stats.ColumnStats?.MaxValues;
-        if (!TryGet(bounds, column, out var element))
+        if (!TryGetStat(bounds, column, out var element))
             return null;
 
         return DeltaLiteralDecoder.FromJson(element, typeName);
