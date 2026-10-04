@@ -8910,7 +8910,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         RecordBatch batch, Schema.StructType schema, ColumnMappingMode mappingMode,
         Dictionary<string, string> physicalToLogical)
     {
-        batch = ColumnMappingRecursive.DropStaleFields(batch, schema, mappingMode);
+        // Name mode only: in id mode ToLogical drops by id itself.
+        if (mappingMode == ColumnMappingMode.Name)
+            batch = ColumnMappingRecursive.DropStaleFields(batch, schema, mappingMode);
         return mappingMode == ColumnMappingMode.Id || ColumnMappingRecursive.HasNestedFields(schema)
             ? ColumnMappingRecursive.ToLogical(batch, schema, mappingMode)
             : ColumnMapping.RenameColumns(batch, physicalToLogical);

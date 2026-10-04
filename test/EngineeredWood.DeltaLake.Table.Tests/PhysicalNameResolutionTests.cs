@@ -630,6 +630,52 @@ public class PhysicalNameResolutionTests : IDisposable
         Assert.Equal("p", ((StringArray)s.Fields[st.GetFieldIndex("x")]).GetString(0));
     }
 
+    // OPTIMIZE does not resurrect it either, at any depth. Compaction reconciles each batch to the table's
+    // PHYSICAL schema before stamping the mapping, and a dropped column's physical name is no current one (a
+    // re-added column gets a fresh name), so the dropped field is removed before ToPhysical's logical fallback
+    // could see it.
+    [Fact]
+    public async Task DropThenReAdd_Nested_CompactionKeepsTheNewFieldNull()
+    {
+        await using var table = await CreateUpgradedAmountAsync(withStruct: true);
+        await table.DropFieldAsync(["s", "a"]);
+        await table.AddFieldAsync(["s"], new Field("a", Int64Type.Default, true));
+        await table.DropColumnAsync("amount");
+        await table.AddColumnAsync(new Field("amount", Int64Type.Default, true));
+        var s2 = new Apache.Arrow.Types.StructType(
+            [new Field("x", StringType.Default, true), new Field("a", Int64Type.Default, true)]);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("s", s2, true))
+            .Field(new Field("amount", Int64Type.Default, true))
+            .Build();
+        await table.WriteAsync([new RecordBatch(schema,
+            [
+                new Int64Array.Builder().Append(2).Build(),
+                new StructArray(s2, 1,
+                    [new StringArray.Builder().Append("q").Build(), new Int64Array.Builder().Append(7).Build()],
+                    ArrowBuffer.Empty),
+                new Int64Array.Builder().Append(8).Build(),
+            ], 1)]);
+
+        await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+
+        Assert.Single(table.CurrentSnapshot.ActiveFiles);
+        var rows = new List<string>();
+        foreach (var b in await CollectAsync(table))
+        {
+            var s = (StructArray)b.Column("s");
+            var a = (Int64Array)s.Fields[((ArrowStructType)s.Data.DataType).GetFieldIndex("a")];
+            for (int i = 0; i < b.Length; i++)
+            {
+                rows.Add($"id={((Int64Array)b.Column("id")).GetValue(i)} s.a={a.GetValue(i)} "
+                    + $"amount={((Int64Array)b.Column("amount")).GetValue(i)}");
+            }
+        }
+        rows.Sort(StringComparer.Ordinal);
+        Assert.Equal(["id=1 s.a= amount=", "id=2 s.a=7 amount=8"], rows);
+    }
+
     [Fact]
     public async Task DropThenReAdd_DeletePredicate_SeesTheNewColumn()
     {
