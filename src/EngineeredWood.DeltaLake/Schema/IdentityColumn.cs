@@ -102,12 +102,9 @@ public static class IdentityColumn
     /// </summary>
     public static StructField UpdateHighWaterMark(StructField field, long highWaterMark)
     {
-        var metadata = new Dictionary<string, string>();
-        if (field.Metadata is not null)
-            foreach (var kvp in field.Metadata)
-                metadata[kvp.Key] = kvp.Value;
-
-        metadata[HighWaterMarkKey] = highWaterMark.ToString();
+        // FieldMetadata.With keeps the JSON kinds of the other keys (Spark's numeric start/step, say).
+        var metadata = FieldMetadata.With(
+            field.Metadata, (HighWaterMarkKey, highWaterMark.ToString(System.Globalization.CultureInfo.InvariantCulture)));
 
         return new StructField
         {

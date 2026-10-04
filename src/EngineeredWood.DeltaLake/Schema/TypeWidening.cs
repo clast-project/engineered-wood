@@ -173,11 +173,8 @@ public static class TypeWidening
             FieldPath = fieldPath,
         });
 
-        var metadata = new Dictionary<string, string>();
-        if (field.Metadata is not null)
-            foreach (var kvp in field.Metadata)
-                metadata[kvp.Key] = kvp.Value;
-        metadata[TypeChangesKey] = SerializeTypeChanges(existing);
+        // FieldMetadata.With keeps the JSON kinds of the other keys; the serializer writes this one as an array.
+        var metadata = FieldMetadata.With(field.Metadata, (TypeChangesKey, SerializeTypeChanges(existing)));
 
         return new StructField
         {
