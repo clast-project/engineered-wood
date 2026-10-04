@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Runtime.CompilerServices;
 using Apache.Arrow;
 
 namespace EngineeredWood.DeltaLake.Schema;
@@ -13,28 +14,269 @@ namespace EngineeredWood.DeltaLake.Schema;
 /// pair breaks on nested structs — a substituted struct column would be written with logical child names and
 /// no ids, silently unreadable for spec readers (Spark, delta-kernel).
 /// Matching tolerates EITHER name at every level (an already-physical child read from a data file passes
-/// through with just the field id stamped). Arrays are rebuilt by re-wrapping <see cref="ArrayData"/> with
+/// through with just the field id stamped), but tries the kind of name the input is expected to carry FIRST,
+/// across every field, before the other: a table upgraded to name mode keeps each column's original name as
+/// its physical name, so after a rename one column's physical name can be another column's logical name, and
+/// a single pass that accepts either name binds whichever of the two fields comes first. Arrays are rebuilt by re-wrapping <see cref="ArrayData"/> with
 /// the renamed type tree — buffers are shared, no data is copied. Structs recurse to any depth; lists
 /// recurse into a struct element; maps recurse into key/value. (List/map INNER elements have structural
 /// parquet names — only struct fields carry a physicalName/id to map.)
 /// </summary>
 public static class ColumnMappingRecursive
 {
+    private const string ParquetFieldIdKey = ColumnMapping.ParquetFieldIdKey;
+
     /// <summary>
     /// Returns <paramref name="batch"/> with physical names + parquet field ids applied at every level.
     /// No-op when <paramref name="mode"/> is <see cref="ColumnMappingMode.None"/>.
     /// </summary>
     public static RecordBatch ToPhysical(RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode)
-        => Transform(batch, deltaSchema, mode, toPhysical: true);
+        => Transform(batch, deltaSchema, mode, toPhysical: true, preferPhysical: false);
+
+    /// <summary>
+    /// <see cref="ToPhysical(RecordBatch, StructType, ColumnMappingMode)"/> for a batch whose names are
+    /// <paramref name="inputIsPhysical"/> already — one read back from a data file, as compaction rewrites — so
+    /// each field is matched by physical name before logical name. A logical-named batch (anything a caller
+    /// wrote) passes false.
+    /// </summary>
+    public static RecordBatch ToPhysical(
+        RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode, bool inputIsPhysical)
+        => Transform(batch, deltaSchema, mode, toPhysical: true, preferPhysical: inputIsPhysical);
 
     /// <summary>
     /// The READ direction: renames a physical-named batch (as stored in data files) back to the LOGICAL
-    /// schema at every level. The flat <see cref="ColumnMapping.RenameColumns"/>/<c>RenameByFieldId</c>
-    /// handle the top level only — nested struct children stay under their physical <c>col-&lt;guid&gt;</c>
-    /// names without this. Tolerant matching: an already-logical level passes through unchanged.
+    /// schema at every level, the top level included — pass the batch as read, NOT after a flat
+    /// <see cref="ColumnMapping.RenameColumns"/>/<c>RenameByFieldId</c>, since names are matched physical-first
+    /// and a top level that is already logical could match another column's physical name. A field that
+    /// matches no physical name falls back to its logical name, so an already-logical level still passes.
     /// </summary>
+    /// <remarks>
+    /// In <see cref="ColumnMappingMode.Id"/> mode a field that carries a <c>PARQUET:field_id</c> (the Parquet
+    /// reader puts one on every field whose schema node has an id) is matched to the Delta field with that id,
+    /// at every level, and only by it: id mode resolves a data file's columns by field id, and a file's physical
+    /// names need not be the ones the table schema records. A field without an id falls back to name matching.
+    /// </remarks>
     public static RecordBatch ToLogical(RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode)
-        => Transform(batch, deltaSchema, mode, toPhysical: false);
+    {
+        // Id mode: a field whose id the schema no longer has (a dropped column) is removed BEFORE any name is
+        // looked at. Passed through, it would keep its physical name, and once its id is stripped a later
+        // name-based step (backfill) could bind it to a column re-added under that name.
+        if (mode == ColumnMappingMode.Id)
+            batch = DropFieldsWithUnknownIds(batch, deltaSchema);
+        return Transform(batch, deltaSchema, mode, toPhysical: false, preferPhysical: true);
+    }
+
+    // Removes, at every depth, each struct field (and the top-level column) that carries a PARQUET:field_id the
+    // Delta schema at that level does not have. A field without an id is kept (hidden columns such as the
+    // materialized row-tracking ones carry none). Returns the same instance when nothing is removed.
+    private static RecordBatch DropFieldsWithUnknownIds(RecordBatch batch, StructType deltaSchema)
+    {
+        List<Field>? fields = null;
+        List<IArrowArray>? arrays = null;
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var field = batch.Schema.FieldsList[i];
+            var delta = FindField(deltaSchema, field, byId: true, preferPhysical: true);
+            if (delta is null && ColumnMapping.GetParquetFieldId(field) is not null)
+            {
+                fields ??= [.. batch.Schema.FieldsList.Take(i)];
+                arrays ??= [.. batch.Arrays.Take(i)];
+                continue;
+            }
+
+            var column = batch.Column(i);
+            var (type, data) = delta is null
+                ? (field.DataType, column.Data)
+                : DropUnknownIdsInType(field.DataType, column.Data, delta.Type);
+            if (ReferenceEquals(data, column.Data) && fields is null)
+                continue;
+
+            fields ??= [.. batch.Schema.FieldsList.Take(i)];
+            arrays ??= [.. batch.Arrays.Take(i)];
+            fields.Add(ReferenceEquals(type, field.DataType)
+                ? field
+                : new Field(field.Name, type, field.IsNullable, field.Metadata));
+            arrays.Add(ReferenceEquals(data, column.Data) ? column : ArrowArrayFactory.BuildArray(data));
+        }
+
+        return fields is null
+            ? batch
+            : new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), arrays!, batch.Length);
+    }
+
+    private static (Apache.Arrow.Types.IArrowType Type, ArrayData Data) DropUnknownIdsInType(
+        Apache.Arrow.Types.IArrowType type, ArrayData data, DeltaDataType delta)
+    {
+        switch (type)
+        {
+            case Apache.Arrow.Types.StructType st when delta is StructType ds:
+            {
+                var keptFields = new List<Field>(st.Fields.Count);
+                var keptChildren = new List<ArrayData>(st.Fields.Count);
+                bool changed = false;
+                for (int k = 0; k < st.Fields.Count; k++)
+                {
+                    var child = st.Fields[k];
+                    var childDelta = FindField(ds, child, byId: true, preferPhysical: true);
+                    if (childDelta is null && ColumnMapping.GetParquetFieldId(child) is not null)
+                    {
+                        changed = true;
+                        continue;
+                    }
+                    var (childType, childData) = childDelta is null
+                        ? (child.DataType, data.Children[k])
+                        : DropUnknownIdsInType(child.DataType, data.Children[k], childDelta.Type);
+                    changed |= !ReferenceEquals(childData, data.Children[k]);
+                    keptFields.Add(ReferenceEquals(childType, child.DataType)
+                        ? child
+                        : new Field(child.Name, childType, child.IsNullable, child.Metadata));
+                    keptChildren.Add(childData);
+                }
+                if (!changed)
+                    return (type, data);
+                var newType = new Apache.Arrow.Types.StructType(keptFields);
+                return (newType, new ArrayData(newType, data.Length, data.NullCount, data.Offset, data.Buffers,
+                    keptChildren, data.Dictionary));
+            }
+            // MapType derives from ListType, so it has to be matched first.
+            case Apache.Arrow.Types.MapType mt when delta is MapType dm:
+            {
+                var entries = data.Children[0];
+                var (keyType, keyData) = DropUnknownIdsInType(mt.KeyField.DataType, entries.Children[0], dm.KeyType);
+                var (valueType, valueData) =
+                    DropUnknownIdsInType(mt.ValueField.DataType, entries.Children[1], dm.ValueType);
+                if (ReferenceEquals(keyData, entries.Children[0]) && ReferenceEquals(valueData, entries.Children[1]))
+                    return (type, data);
+                var keyField = new Field(mt.KeyField.Name, keyType, mt.KeyField.IsNullable, mt.KeyField.Metadata);
+                var valueField = new Field(
+                    mt.ValueField.Name, valueType, mt.ValueField.IsNullable, mt.ValueField.Metadata);
+                var newMap = new Apache.Arrow.Types.MapType(keyField, valueField, mt.KeySorted);
+                var entriesType = new Apache.Arrow.Types.StructType([keyField, valueField]);
+                var newEntries = new ArrayData(entriesType, entries.Length, entries.NullCount, entries.Offset,
+                    entries.Buffers, [keyData, valueData], entries.Dictionary);
+                return (newMap, new ArrayData(newMap, data.Length, data.NullCount, data.Offset, data.Buffers,
+                    [newEntries], data.Dictionary));
+            }
+            case Apache.Arrow.Types.ListType lt when delta is ArrayType da:
+            {
+                var (elemType, elemData) = DropUnknownIdsInType(lt.ValueField.DataType, data.Children[0], da.ElementType);
+                if (ReferenceEquals(elemData, data.Children[0]))
+                    return (type, data);
+                var newList = new Apache.Arrow.Types.ListType(
+                    new Field(lt.ValueField.Name, elemType, lt.ValueField.IsNullable, lt.ValueField.Metadata));
+                return (newList, new ArrayData(newList, data.Length, data.NullCount, data.Offset, data.Buffers,
+                    [elemData], data.Dictionary));
+            }
+            case Apache.Arrow.Types.LargeListType llt when delta is ArrayType da:
+            {
+                var (elemType, elemData) =
+                    DropUnknownIdsInType(llt.ValueField.DataType, data.Children[0], da.ElementType);
+                if (ReferenceEquals(elemData, data.Children[0]))
+                    return (type, data);
+                var newList = new Apache.Arrow.Types.LargeListType(
+                    new Field(llt.ValueField.Name, elemType, llt.ValueField.IsNullable, llt.ValueField.Metadata));
+                return (newList, new ArrayData(newList, data.Length, data.NullCount, data.Offset, data.Buffers,
+                    [elemData], data.Dictionary));
+            }
+            default:
+                return (type, data);
+        }
+    }
+
+    /// <summary>
+    /// Returns <paramref name="batch"/> with every <c>PARQUET:field_id</c> removed from its field metadata, at
+    /// every level. The Parquet reader carries a file's ids into Arrow; they identify PHYSICAL columns of that
+    /// one file, so once a read has used them to resolve columns they must not reach a caller (where files
+    /// with and without ids would hand back batches with different schemas) or a writer (where they would
+    /// leak into new files). Returns the same instance when there is nothing to remove. Buffers are shared;
+    /// only a type tree that carried an id is rebuilt.
+    /// </summary>
+    public static RecordBatch StripParquetFieldIds(RecordBatch batch)
+    {
+        Field[]? fields = null;
+        IArrowArray[]? arrays = null;
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var field = batch.Schema.FieldsList[i];
+            var stripped = StripField(field);
+            if (ReferenceEquals(stripped, field))
+                continue;
+
+            fields ??= [.. batch.Schema.FieldsList];
+            arrays ??= [.. batch.Arrays];
+            fields[i] = stripped;
+            // As in Transform: a field whose type tree is untouched keeps the reader's array verbatim.
+            if (!ReferenceEquals(stripped.DataType, field.DataType))
+                arrays[i] = Rebuild(batch.Column(i).Data, stripped.DataType);
+        }
+
+        return fields is null
+            ? batch
+            : new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), arrays!, batch.Length);
+    }
+
+    // Returns the SAME instance when neither the field nor its type tree carries an id.
+    private static Field StripField(Field field)
+    {
+        var type = StripType(field.DataType);
+        bool hasId = field.Metadata is { } md && md.ContainsKey(ParquetFieldIdKey);
+        if (!hasId && ReferenceEquals(type, field.DataType))
+            return field;
+
+        Dictionary<string, string>? meta = null;
+        if (field.Metadata is { } src)
+        {
+            foreach (var kvp in src)
+            {
+                if (kvp.Key != ParquetFieldIdKey)
+                    (meta ??= new Dictionary<string, string>())[kvp.Key] = kvp.Value;
+            }
+        }
+        return new Field(field.Name, type, field.IsNullable, meta);
+    }
+
+    private static Apache.Arrow.Types.IArrowType StripType(Apache.Arrow.Types.IArrowType type)
+    {
+        switch (type)
+        {
+            case Apache.Arrow.Types.StructType st:
+            {
+                Field[]? children = null;
+                for (int i = 0; i < st.Fields.Count; i++)
+                {
+                    var stripped = StripField(st.Fields[i]);
+                    if (!ReferenceEquals(stripped, st.Fields[i]))
+                    {
+                        children ??= [.. st.Fields];
+                        children[i] = stripped;
+                    }
+                }
+                return children is null ? type : new Apache.Arrow.Types.StructType(children);
+            }
+            // MapType derives from ListType, so it has to be matched first.
+            case Apache.Arrow.Types.MapType mt:
+            {
+                var key = StripField(mt.KeyField);
+                var value = StripField(mt.ValueField);
+                return ReferenceEquals(key, mt.KeyField) && ReferenceEquals(value, mt.ValueField)
+                    ? type
+                    : new Apache.Arrow.Types.MapType(key, value, mt.KeySorted);
+            }
+            case Apache.Arrow.Types.ListType lt:
+            {
+                var value = StripField(lt.ValueField);
+                return ReferenceEquals(value, lt.ValueField) ? type : new Apache.Arrow.Types.ListType(value);
+            }
+            case Apache.Arrow.Types.LargeListType llt:
+            {
+                var value = StripField(llt.ValueField);
+                return ReferenceEquals(value, llt.ValueField) ? type : new Apache.Arrow.Types.LargeListType(value);
+            }
+            default:
+                // A leaf, or a shape RebuildData does not walk (an extension type's storage is left alone).
+                return type;
+        }
+    }
 
     /// <summary>True when the schema has any nested (struct-carrying) mapped field — the cheap gate for the
     /// recursive transform (top-level-only tables are fully handled by the flat renames).</summary>
@@ -57,18 +299,21 @@ public static class ColumnMappingRecursive
     };
 
     private static RecordBatch Transform(
-        RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode, bool toPhysical)
+        RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode, bool toPhysical, bool preferPhysical)
     {
         if (mode == ColumnMappingMode.None)
             return batch;
 
+        // Only the read direction resolves by id: a write batch's ids, if any, are the ones being replaced.
+        bool byId = !toPhysical && mode == ColumnMappingMode.Id;
         var fields = new List<Field>(batch.Schema.FieldsList.Count);
         var arrays = new List<IArrowArray>(batch.ColumnCount);
         bool changed = false;
         for (int i = 0; i < batch.ColumnCount; i++)
         {
             var f = batch.Schema.FieldsList[i];
-            var renamed = RenameField(f, FindField(deltaSchema, f.Name), toPhysical);
+            var renamed = RenameField(
+                f, FindField(deltaSchema, f, byId, preferPhysical), toPhysical, byId, preferPhysical);
             if (ReferenceEquals(renamed, f))
             {
                 fields.Add(f);
@@ -97,26 +342,58 @@ public static class ColumnMappingRecursive
         return new RecordBatch(builder.Build(), arrays, batch.Length);
     }
 
-    // Finds the Delta field an Arrow name refers to: the logical name OR the physicalName (tolerant —
-    // the source may be a logical-named substitution or a physical-named column read back from a data file).
-    private static StructField? FindField(StructType schema, string arrowName)
+    // Finds the Delta field an Arrow field refers to. By id (read direction, id mode) when the Arrow field carries a
+    // PARQUET:field_id: the field with that id, or none — a name must not rebind a column whose id the table no
+    // longer has. Otherwise by name: the preferred kind (physical or logical) across EVERY field first, then the
+    // other kind (tolerant — the source may be a logical-named substitution or a physical-named column read back
+    // from a data file). Never both kinds in one pass: with a reused name, that binds whichever field is first.
+    private static StructField? FindField(StructType schema, Field arrow, bool byId, bool preferPhysical)
     {
-        foreach (var f in schema.Fields)
+        var index = Indexes.GetValue(schema, static s => new FieldIndex(s));
+        if (byId && ColumnMapping.GetParquetFieldId(arrow) is { } id)
+            return index.ById.TryGetValue(id, out var byIdField) ? byIdField : null;
+
+        var first = preferPhysical ? index.ByPhysical : index.ByLogical;
+        var second = preferPhysical ? index.ByLogical : index.ByPhysical;
+        return first.TryGetValue(arrow.Name, out var field) || second.TryGetValue(arrow.Name, out field)
+            ? field
+            : null;
+    }
+
+    // Every batch of a scan binds each of its fields against the same schema levels, so each level is indexed
+    // once, by id, physical name and logical name; scanning the level per field made binding a wide table
+    // quadratic in its column count, per batch. Keyed weakly on the StructType instance: a snapshot's schema
+    // objects are reused across batches and dropped with the snapshot. A key's FIRST field wins, as the linear
+    // scan's did.
+    private static readonly ConditionalWeakTable<StructType, FieldIndex> Indexes = new();
+
+    private sealed class FieldIndex
+    {
+        public readonly Dictionary<int, StructField> ById = new();
+        public readonly Dictionary<string, StructField> ByPhysical = new(StringComparer.Ordinal);
+        public readonly Dictionary<string, StructField> ByLogical = new(StringComparer.Ordinal);
+
+        public FieldIndex(StructType schema)
         {
-            if (string.Equals(f.Name, arrowName, StringComparison.Ordinal))
-                return f;
-            if (f.Metadata is { } md
-                && md.TryGetValue(ColumnMapping.PhysicalNameKey, out var phys)
-                && string.Equals(phys, arrowName, StringComparison.Ordinal))
+            foreach (var f in schema.Fields)
             {
-                return f;
+                if (ColumnMapping.GetFieldId(f) is { } id && !ById.ContainsKey(id))
+                    ById[id] = f;
+                if (f.Metadata is { } md
+                    && md.TryGetValue(ColumnMapping.PhysicalNameKey, out var phys)
+                    && !ByPhysical.ContainsKey(phys))
+                {
+                    ByPhysical[phys] = f;
+                }
+                if (!ByLogical.ContainsKey(f.Name))
+                    ByLogical[f.Name] = f;
             }
         }
-        return null;
     }
 
     // Returns the SAME instance when nothing changes (the no-op signal used to avoid rebuilding arrays).
-    private static Field RenameField(Field arrow, StructField? delta, bool toPhysical)
+    private static Field RenameField(
+        Field arrow, StructField? delta, bool toPhysical, bool byId, bool preferPhysical)
     {
         if (delta is null)
             return arrow; // not a table column (e.g. a transient metadata column) — pass through
@@ -127,7 +404,7 @@ public static class ColumnMappingRecursive
             && !string.IsNullOrEmpty(phys)
                 ? phys
                 : delta.Name;
-        var type = RenameType(arrow.DataType, delta.Type, toPhysical);
+        var type = RenameType(arrow.DataType, delta.Type, toPhysical, byId, preferPhysical);
         // field ids are stamped on the WRITE direction only (the read direction leaves metadata untouched).
         int? fieldId = toPhysical ? ColumnMapping.GetFieldId(delta) : null;
 
@@ -155,7 +432,7 @@ public static class ColumnMappingRecursive
     }
 
     private static Apache.Arrow.Types.IArrowType RenameType(
-        Apache.Arrow.Types.IArrowType arrow, DeltaDataType delta, bool toPhysical)
+        Apache.Arrow.Types.IArrowType arrow, DeltaDataType delta, bool toPhysical, bool byId, bool preferPhysical)
     {
         switch (arrow)
         {
@@ -165,7 +442,8 @@ public static class ColumnMappingRecursive
                 bool changed = false;
                 foreach (var child in st.Fields)
                 {
-                    var renamed = RenameField(child, FindField(ds, child.Name), toPhysical);
+                    var renamed = RenameField(
+                        child, FindField(ds, child, byId, preferPhysical), toPhysical, byId, preferPhysical);
                     changed |= !ReferenceEquals(renamed, child);
                     children.Add(renamed);
                 }
@@ -173,7 +451,7 @@ public static class ColumnMappingRecursive
             }
             case Apache.Arrow.Types.ListType lt when delta is ArrayType da:
             {
-                var elemType = RenameType(lt.ValueField.DataType, da.ElementType, toPhysical);
+                var elemType = RenameType(lt.ValueField.DataType, da.ElementType, toPhysical, byId, preferPhysical);
                 return ReferenceEquals(elemType, lt.ValueField.DataType)
                     ? arrow
                     : new Apache.Arrow.Types.ListType(
@@ -181,7 +459,7 @@ public static class ColumnMappingRecursive
             }
             case Apache.Arrow.Types.LargeListType llt when delta is ArrayType da:
             {
-                var elemType = RenameType(llt.ValueField.DataType, da.ElementType, toPhysical);
+                var elemType = RenameType(llt.ValueField.DataType, da.ElementType, toPhysical, byId, preferPhysical);
                 return ReferenceEquals(elemType, llt.ValueField.DataType)
                     ? arrow
                     : new Apache.Arrow.Types.LargeListType(
@@ -189,8 +467,8 @@ public static class ColumnMappingRecursive
             }
             case Apache.Arrow.Types.MapType mt when delta is MapType dm:
             {
-                var keyType = RenameType(mt.KeyField.DataType, dm.KeyType, toPhysical);
-                var valType = RenameType(mt.ValueField.DataType, dm.ValueType, toPhysical);
+                var keyType = RenameType(mt.KeyField.DataType, dm.KeyType, toPhysical, byId, preferPhysical);
+                var valType = RenameType(mt.ValueField.DataType, dm.ValueType, toPhysical, byId, preferPhysical);
                 if (ReferenceEquals(keyType, mt.KeyField.DataType)
                     && ReferenceEquals(valType, mt.ValueField.DataType))
                 {

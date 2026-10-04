@@ -89,6 +89,68 @@ public static class ColumnMapping
     }
 
     /// <summary>
+    /// Returns <paramref name="schema"/> with every struct field, at every depth, renamed to its physical name —
+    /// the shape a data file's columns have. Fields keep their type, nullability and metadata. Unchanged when
+    /// <paramref name="mode"/> is <see cref="ColumnMappingMode.None"/>.
+    /// </summary>
+    public static StructType ToPhysicalSchema(StructType schema, ColumnMappingMode mode)
+    {
+        if (mode == ColumnMappingMode.None)
+            return schema;
+        return PhysicalStruct(schema, mode);
+    }
+
+    private static StructType PhysicalStruct(StructType schema, ColumnMappingMode mode) => new()
+    {
+        Fields = schema.Fields.Select(f => new StructField
+        {
+            Name = GetPhysicalName(f, mode),
+            Type = PhysicalType(f.Type, mode),
+            Nullable = f.Nullable,
+            Metadata = f.Metadata,
+        }).ToList(),
+    };
+
+    private static DeltaDataType PhysicalType(DeltaDataType type, ColumnMappingMode mode) => type switch
+    {
+        StructType st => PhysicalStruct(st, mode),
+        ArrayType at => new ArrayType
+        {
+            ElementType = PhysicalType(at.ElementType, mode),
+            ContainsNull = at.ContainsNull,
+        },
+        MapType mt => new MapType
+        {
+            KeyType = PhysicalType(mt.KeyType, mode),
+            ValueType = PhysicalType(mt.ValueType, mode),
+            ValueContainsNull = mt.ValueContainsNull,
+        },
+        _ => type,
+    };
+
+    /// <summary>
+    /// The Arrow field-metadata key that carries a Parquet <c>field_id</c>, both into the Parquet writer and
+    /// out of the Parquet reader.
+    /// </summary>
+    public const string ParquetFieldIdKey = "PARQUET:field_id";
+
+    /// <summary>
+    /// Gets the Parquet <c>field_id</c> an Arrow field carries under <see cref="ParquetFieldIdKey"/>, or null.
+    /// </summary>
+    public static int? GetParquetFieldId(Apache.Arrow.Field field)
+    {
+        if (field.Metadata is not null &&
+            field.Metadata.TryGetValue(ParquetFieldIdKey, out string? idStr) &&
+            int.TryParse(idStr, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out int id))
+        {
+            return id;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Assigns column mapping metadata (IDs and physical names) to a schema
     /// that doesn't have them yet. Used when creating a new column-mapped table.
     /// Returns the updated schema and the maximum assigned column ID.
@@ -335,21 +397,25 @@ public static class ColumnMapping
     }
 
     /// <summary>
-    /// Renames a RecordBatch using a field_id → logical name map.
-    /// Matches batch columns by their Parquet field_id (from Arrow metadata
-    /// or from a pre-resolved name map).
+    /// Renames a RecordBatch's top-level columns using a field_id → logical name map.
+    /// A column's field_id is the <c>PARQUET:field_id</c> in its Arrow metadata (which the Parquet reader
+    /// supplies), or else the id <paramref name="parquetSchema"/> gives the column of that name — for a batch
+    /// from a source that does not carry ids into Arrow. A column with neither is left as it is.
     /// </summary>
     public static Apache.Arrow.RecordBatch RenameByFieldId(
         Apache.Arrow.RecordBatch batch,
         Dictionary<int, string> fieldIdToLogical,
-        EngineeredWood.Parquet.Schema.SchemaDescriptor parquetSchema)
+        EngineeredWood.Parquet.Schema.SchemaDescriptor? parquetSchema)
     {
-        // Build a map from Parquet column name → field_id using the Parquet schema
-        var nameToFieldId = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var child in parquetSchema.Root.Children)
+        Dictionary<string, int>? nameToFieldId = null;
+        if (parquetSchema is not null)
         {
-            if (child.Element.FieldId.HasValue)
-                nameToFieldId[child.Name] = child.Element.FieldId.Value;
+            nameToFieldId = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var child in parquetSchema.Root.Children)
+            {
+                if (child.Element.FieldId.HasValue)
+                    nameToFieldId[child.Name] = child.Element.FieldId.Value;
+            }
         }
 
         var fields = new List<Apache.Arrow.Field>();
@@ -359,8 +425,12 @@ public static class ColumnMapping
         {
             var field = batch.Schema.FieldsList[i];
 
-            if (nameToFieldId.TryGetValue(field.Name, out int fieldId) &&
-                fieldIdToLogical.TryGetValue(fieldId, out string? logicalName) &&
+            int? fieldId = GetParquetFieldId(field);
+            if (fieldId is null && nameToFieldId is not null && nameToFieldId.TryGetValue(field.Name, out int byName))
+                fieldId = byName;
+
+            if (fieldId is { } id &&
+                fieldIdToLogical.TryGetValue(id, out string? logicalName) &&
                 logicalName != field.Name)
             {
                 fields.Add(new Apache.Arrow.Field(logicalName, field.DataType, field.IsNullable));

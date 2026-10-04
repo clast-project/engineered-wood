@@ -3670,13 +3670,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
             var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
                 snapshot.Schema, mappingMode);
+            var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+            var partitionColumns = snapshot.Metadata.PartitionColumns;
 
             await foreach (var batch in reader.ReadAllAsync(
                 cancellationToken: cancellationToken).ConfigureAwait(false))
             {
-                var logicalBatch = ColumnMapping.RenameColumns(batch, physicalToLogical);
-                if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
-                    logicalBatch = ColumnMappingRecursive.ToLogical(logicalBatch, snapshot.Schema, mappingMode);
+                // Resolved exactly as the read path resolves it: the predicate must see what a scan sees.
+                var logicalBatch = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
+                // The deleted rows go on to the change file; the source file's ids must not go with them.
+                logicalBatch = ColumnMappingRecursive.StripParquetFieldIds(logicalBatch);
 
                 // This path reads the file's raw columns rather than going through ReadFileAsync, so the hidden
                 // materialized row-tracking columns (present on any file a rewrite produced) are still attached.
@@ -3688,6 +3691,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     (logicalBatch, rawMatIds, rawMatVers) = RowTracking.RowTrackingWriter
                         .StripMaterializedColumns(logicalBatch, matRowIdName, matRowVerName);
                 }
+
+                // The predicate sees each row as a scan returns it: current schema, columns added since this
+                // file was written as NULL, partition columns re-materialized, widened types widened.
+                logicalBatch = ReconcileToTableShape(
+                    logicalBatch, snapshot, addFile, columns: null, partitionColumns, partitionColumns.Count > 0,
+                    logicalToPhysical);
 
                 var mask = predicate(logicalBatch);
                 var matchRows = new List<int>();
@@ -5815,7 +5824,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Refuses a batch carrying a top-level column the write schema does not declare. Every write path drops
-    /// through <see cref="ColumnMappingRecursive.ToPhysical"/>, which passes an unmatched column through
+    /// through <see cref="ColumnMappingRecursive.ToPhysical(Apache.Arrow.RecordBatch, Schema.StructType, ColumnMappingMode)"/>, which passes an unmatched column through
     /// untouched, and the parquet writer then writes whatever columns the batch has — so an undeclared column
     /// becomes a real column of the data file. A Delta reader projects by the table schema and never surfaces
     /// it, which is what makes this worth refusing: it costs bytes in every file written, forever, with
@@ -8486,10 +8495,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot.Schema, mappingMode);
         var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
             snapshot.Schema, mappingMode);
-        var fieldIdToLogical = isIdMode
-            ? ColumnMapping.BuildFieldIdToLogicalMap(snapshot.Schema)
-            : null;
-
         // Load the deletion vector first — it is independent of the byte source.
         HashSet<long>? deletedRows = null;
         if (addFile.DeletionVector is not null)
@@ -8503,8 +8508,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // Pluggable codec read: raw physical batches in file order (DV rows included). Projection resolves
             // by PHYSICAL NAME in every mode — id-mode field-id resolution needs the parquet footer, which the
             // seam deliberately hides; Delta-spec files carry physicalName in BOTH modes, so name resolution is
-            // exact for spec-written files. parquetSchema stays null, so the logical rename in the pipeline
-            // falls to the (equivalent for spec files) name-based path.
+            // exact for spec-written files. The logical rename in the pipeline resolves by the PARQUET:field_id
+            // the host's batches carry, if any, and otherwise by physical name.
             IReadOnlyList<string>? seamColumns = null;
             if (columns is not null)
             {
@@ -8539,8 +8544,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), seamColumns, cancellationToken),
                 cancellationToken);
             await foreach (var processed in ProcessFileBatchesAsync(
-                seamBatches, addFile, snapshot, columns, mappingMode, isIdMode, physicalToLogical,
-                logicalToPhysical, fieldIdToLogical, parquetSchema: null, deletedRows, partitionColumns,
+                seamBatches, addFile, snapshot, columns, mappingMode, physicalToLogical,
+                logicalToPhysical, deletedRows, partitionColumns,
                 hasPartitions, cancellationToken, strippedRowIdsOut, strippedVersionsOut,
                 strippedAbsPositionsOut).ConfigureAwait(false))
             {
@@ -8609,12 +8614,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        if (parquetSchema is null && isIdMode)
-        {
-            parquetSchema = await reader.GetSchemaAsync(cancellationToken)
-                .ConfigureAwait(false);
-        }
-
         // Row tracking: same omission as the seam branch above — the hidden materialized columns are not schema
         // fields, so a PROJECTED read (either mapping mode) and an UNPROJECTED read of a PARTITIONED table both
         // build a file-level column list without them, and every id then falls back to baseRowId + position.
@@ -8668,8 +8667,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var builtinBatches = ReadPositionedAsync(reader, filePredicate, fileColumns, cancellationToken);
         await foreach (var processed in ProcessFileBatchesAsync(
-            builtinBatches, addFile, snapshot, columns, mappingMode, isIdMode, physicalToLogical,
-            logicalToPhysical, fieldIdToLogical, parquetSchema, deletedRows, partitionColumns,
+            builtinBatches, addFile, snapshot, columns, mappingMode, physicalToLogical,
+            logicalToPhysical, deletedRows, partitionColumns,
             hasPartitions, cancellationToken, strippedRowIdsOut, strippedVersionsOut,
             strippedAbsPositionsOut).ConfigureAwait(false))
         {
@@ -8691,11 +8690,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Snapshot.Snapshot snapshot,
         IReadOnlyList<string>? columns,
         ColumnMappingMode mappingMode,
-        bool isIdMode,
         Dictionary<string, string> physicalToLogical,
         Dictionary<string, string> logicalToPhysical,
-        Dictionary<int, string>? fieldIdToLogical,
-        Parquet.Schema.SchemaDescriptor? parquetSchema,
         HashSet<long>? deletedRows,
         IReadOnlyList<string> partitionColumns,
         bool hasPartitions,
@@ -8720,21 +8716,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // skipped one would be off by its row count.
             long thisBatchStart = firstRow;
 
-            // Rename columns back to logical names (flat, top level), then recursively for nested struct
-            // children (the flat renames leave them under their physical names).
-            RecordBatch result;
-            if (isIdMode && fieldIdToLogical is not null && parquetSchema is not null)
-            {
-                result = ColumnMapping.RenameByFieldId(batch, fieldIdToLogical, parquetSchema);
-            }
-            else
-            {
-                result = ColumnMapping.RenameColumns(batch, physicalToLogical);
-            }
-            if (ColumnMappingRecursive.HasNestedFields(snapshot.Schema))
-            {
-                result = ColumnMappingRecursive.ToLogical(result, snapshot.Schema, mappingMode);
-            }
+            // Rename columns back to logical names.
+            var result = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
+
+            // The file's field ids have done their job (resolving columns above); a caller never sees them.
+            result = ColumnMappingRecursive.StripParquetFieldIds(result);
 
             // Strip the hidden materialized row-tracking columns UP FRONT (before DV filter / widening /
             // partition re-add / backfill), so the rest of the pipeline operates on exactly the user columns
@@ -8765,47 +8751,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     continue; // All rows in this batch were deleted (no surviving ids to emit either)
             }
 
-            // Apply type widening — convert narrow types from old files to current schema types
-            if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
-                HasTypeChanges(snapshot.Schema))
-            {
-                var targetSchema = columns is not null
-                    ? BuildProjectedSchema(snapshot.ArrowSchema, columns,
-                        hasPartitions ? partitionColumns : null)
-                    : BuildNonPartitionSchema(snapshot.ArrowSchema, partitionColumns);
-
-                result = TypeWidening.ValueWidener.WidenBatch(result, targetSchema);
-            }
-
-            if (hasPartitions)
-            {
-                // Re-add partition columns as constant arrays
-                var fullSchema = columns is not null
-                    ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
-                    : snapshot.ArrowSchema;
-
-                // partitionValues are keyed by the PHYSICAL column name under mapping (the spec convention),
-                // while files written before that convention are logical-keyed — the map resolves both.
-                result = Partitioning.PartitionUtils.AddPartitionColumns(
-                    result, fullSchema, addFile.PartitionValues, partitionColumns, logicalToPhysical);
-            }
-
             // The materialized row-tracking columns were already stripped up front (above).
-            var cleanResult = result;
-
-            // Schema evolution: ADD/DROP COLUMN are metadata-only commits, so a file written before an ADD
-            // lacks the column and one written before a DROP still carries it — reconcile every emitted batch
-            // to the current schema's expected output columns (absent ones backfilled as typed all-NULL).
-            var expectedSchema = columns is not null
-                ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
-                : snapshot.ArrowSchema;
-            cleanResult = SchemaEvolution.BackfillMissingColumns(cleanResult, expectedSchema.FieldsList);
-
-            // Present variant columns per the Delta SCHEMA, not the parquet annotation: an unannotated
-            // file (Spark 4.0.x, a spec-minimal writer, or our own output under
-            // EmitVariantLogicalType=false) yields a bare struct-of-binary that the parquet reader did
-            // not wrap. Without this the column would silently read as a struct rather than a variant.
-            cleanResult = VariantColumnCoercion.Coerce(cleanResult, expectedSchema);
+            var cleanResult = ReconcileToTableShape(
+                result, snapshot, addFile, columns, partitionColumns, hasPartitions, logicalToPhysical);
 
             // Surface each surviving row's RESOLVED id + commit version (row-aligned with cleanResult): the
             // materialized value where present, else add.baseRowId + absolute position / defaultRowCommitVersion
@@ -8840,6 +8788,75 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Pairs each batch of a source that yields EVERY row of a file, in file order, with the file position
     /// of its first row. The <see cref="IDataFileReader"/> contract makes that a running count.
     /// </summary>
+    /// <summary>
+    /// Brings a logical-named batch read from <paramref name="addFile"/> to the shape a scan returns: the
+    /// current schema (or the <paramref name="columns"/> projection of it), whatever schema the file was
+    /// written under. Every path that hands a data file's rows onward uses it, so a DELETE predicate sees what
+    /// a scan sees.
+    /// </summary>
+    private static RecordBatch ReconcileToTableShape(
+        RecordBatch result, Snapshot.Snapshot snapshot, AddFile addFile, IReadOnlyList<string>? columns,
+        IReadOnlyList<string> partitionColumns, bool hasPartitions, Dictionary<string, string> logicalToPhysical)
+    {
+        // Apply type widening — convert narrow types from old files to current schema types
+        if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
+            HasTypeChanges(snapshot.Schema))
+        {
+            var targetSchema = columns is not null
+                ? BuildProjectedSchema(snapshot.ArrowSchema, columns,
+                    hasPartitions ? partitionColumns : null)
+                : BuildNonPartitionSchema(snapshot.ArrowSchema, partitionColumns);
+
+            result = TypeWidening.ValueWidener.WidenBatch(result, targetSchema);
+        }
+
+        if (hasPartitions)
+        {
+            // Re-add partition columns as constant arrays
+            var fullSchema = columns is not null
+                ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
+                : snapshot.ArrowSchema;
+
+            // partitionValues are keyed by the PHYSICAL column name under mapping (the spec convention),
+            // while files written before that convention are logical-keyed — the map resolves both.
+            result = Partitioning.PartitionUtils.AddPartitionColumns(
+                result, fullSchema, addFile.PartitionValues, partitionColumns, logicalToPhysical);
+        }
+
+        // Schema evolution: ADD/DROP COLUMN are metadata-only commits, so a file written before an ADD
+        // lacks the column and one written before a DROP still carries it — reconcile every emitted batch
+        // to the current schema's expected output columns (absent ones backfilled as typed all-NULL).
+        var expectedSchema = columns is not null
+            ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
+            : snapshot.ArrowSchema;
+        result = SchemaEvolution.BackfillMissingColumns(result, expectedSchema.FieldsList);
+
+        // Present variant columns per the Delta SCHEMA, not the parquet annotation: an unannotated
+        // file (Spark 4.0.x, a spec-minimal writer, or our own output under
+        // EmitVariantLogicalType=false) yields a bare struct-of-binary that the parquet reader did
+        // not wrap. Without this the column would silently read as a struct rather than a variant.
+        return VariantColumnCoercion.Coerce(result, expectedSchema);
+    }
+
+    /// <summary>
+    /// Renames a data file's batch, as read, to the table's logical names. Every path that reads a data file
+    /// resolves its columns through this one rule, so a DELETE predicate sees what a scan sees.
+    /// <list type="bullet">
+    /// <item>Id mode resolves by the <c>PARQUET:field_id</c> the reader puts on every field, at every depth,
+    /// and drops fields whose id the table no longer has. A file's physical names need not be the schema's.</item>
+    /// <item>With nested fields, the recursive transform renames every level from the batch AS READ. Renaming the
+    /// top level first would hand it logical names it matches physical-first, and after a rename one column's
+    /// logical name can be another's physical name.</item>
+    /// <item>Otherwise the flat physical-to-logical rename.</item>
+    /// </list>
+    /// </summary>
+    private static RecordBatch ToLogicalBatch(
+        RecordBatch batch, Schema.StructType schema, ColumnMappingMode mappingMode,
+        Dictionary<string, string> physicalToLogical)
+        => mappingMode == ColumnMappingMode.Id || ColumnMappingRecursive.HasNestedFields(schema)
+            ? ColumnMappingRecursive.ToLogical(batch, schema, mappingMode)
+            : ColumnMapping.RenameColumns(batch, physicalToLogical);
+
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(
         IAsyncEnumerable<RecordBatch> source,
         [EnumeratorCancellation] CancellationToken cancellationToken)

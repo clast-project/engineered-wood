@@ -1927,7 +1927,7 @@ public class SparkInteropTests : IDisposable
     /// materialized columns need a parquet <c>field_id</c>. In <c>id</c> mode a conformant reader resolves
     /// data-file columns by field id, but the two materialized row-tracking columns are NOT in the table
     /// schema, so no id exists for them: EW appends them after
-    /// <see cref="ColumnMappingRecursive.ToPhysical"/> has stamped every mapped field, and the
+    /// <see cref="ColumnMappingRecursive.ToPhysical(Apache.Arrow.RecordBatch, Schema.StructType, ColumnMappingMode)"/> has stamped every mapped field, and the
     /// <c>_change_data</c> files inherit that shape. Whether that leaves them unresolvable was open.</para>
     ///
     /// <para>MEASURED against Spark 4.0.1 / delta-spark 4.0.0 — both halves of the answer:</para>

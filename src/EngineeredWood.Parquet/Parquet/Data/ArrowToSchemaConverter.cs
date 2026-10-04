@@ -229,7 +229,8 @@ internal static class ArrowToSchemaConverter
         });
 
         // Key field (always required)
-        var keyField = new Field(mapType.KeyField.Name, mapType.KeyField.DataType, nullable: false);
+        var keyField = new Field(
+            mapType.KeyField.Name, mapType.KeyField.DataType, nullable: false, mapType.KeyField.Metadata);
         AddField(elements, keyField, path + ".key_value", options);
 
         // Value field

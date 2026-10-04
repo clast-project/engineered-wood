@@ -274,7 +274,9 @@ internal static class NestedAssembler
             // 2-level: repeated leaf is the element
             elementArray = leafArrays[leafIndex++];
             var elementType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(repeatedChild), options).DataType;
-            elementField = new Apache.Arrow.Field(repeatedChild.Name, elementType, nullable: false);
+            elementField = new Apache.Arrow.Field(
+                repeatedChild.Name, elementType, nullable: false,
+                ArrowSchemaConverter.FieldIdMetadata(repeatedChild.Element));
         }
         else if (ArrowSchemaConverter.IsListNode(repeatedChild))
         {
@@ -319,7 +321,9 @@ internal static class NestedAssembler
             var structChildFields = BuildChildFields(repeatedChild, options);
             var structType = new StructType(structChildFields);
             elementArray = new StructArray(structType, elementCount, structChildArrays, ArrowBuffer.Empty, nullCount: 0);
-            elementField = new Apache.Arrow.Field(repeatedChild.Name, structType, nullable: false);
+            elementField = new Apache.Arrow.Field(
+                repeatedChild.Name, structType, nullable: false,
+                ArrowSchemaConverter.FieldIdMetadata(repeatedChild.Element));
         }
 
         // Filter out phantom entries (null/empty list markers) from the element array
@@ -384,7 +388,7 @@ internal static class NestedAssembler
 
         // Build the key_value struct array
         var keyField = NodeToField(keyNode, options);
-        keyField = new Apache.Arrow.Field(keyField.Name, keyField.DataType, nullable: false); // keys are non-nullable
+        keyField = new Apache.Arrow.Field(keyField.Name, keyField.DataType, nullable: false, keyField.Metadata); // keys are non-nullable
 
         var valueField = NodeToField(valueNode, options);
         IArrowArray[] structChildren = [keyArray, valueArray];
@@ -533,7 +537,8 @@ internal static class NestedAssembler
             // ToArrowField, not ToArrowType: only the former applies ByteArrayOutput, and a wrapper
             // that skips it declares `utf8` over a LargeStringArray the leaf builder already made.
             var arrowType = ArrowSchemaConverter.ToArrowField(BuildTempDescriptor(node), options).DataType;
-            return new Apache.Arrow.Field(node.Name, arrowType, nullable);
+            return new Apache.Arrow.Field(
+                node.Name, arrowType, nullable, ArrowSchemaConverter.FieldIdMetadata(node.Element));
         }
 
         // Delegate to the ArrowSchemaConverter for full recursive handling. A list node needs no
