@@ -7,6 +7,8 @@ using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Schema;
+using MapType = Apache.Arrow.Types.MapType;
+using StructType = Apache.Arrow.Types.StructType;
 
 namespace EngineeredWood.DeltaLake.Table.TypeWidening;
 
@@ -62,12 +64,13 @@ internal static class ValueWidener
             {
                 var widened = WidenArray(source, targetType);
                 columns[i] = widened;
-                // Take the target's TYPE only when the array was actually converted: WidenArray returns the
-                // source unchanged for a pair it does not support, and relabeling untouched data with a type
-                // it does not have is the same lie the positional pairing told. The name is the batch's own.
+                // Label the field with the type the array now HAS, never the target's: WidenArray returns the
+                // source unchanged for a pair it does not support, and a nested array keeps its own child set
+                // (reconciling that is BackfillMissingColumns' job), so the target type can describe it wrongly.
+                // Relabeling data with a type it does not have is the same lie the positional pairing told.
                 fields.Add(ReferenceEquals(widened, source)
                     ? f
-                    : new Field(f.Name, targetType, f.IsNullable, f.Metadata));
+                    : new Field(f.Name, widened.Data.DataType, f.IsNullable, f.Metadata));
             }
             else
             {
@@ -118,9 +121,108 @@ internal static class ValueWidener
             (Int32Array a, Decimal128Type dt) => WidenIntToDecimal(a, dt, v => (long)v),
             (Int64Array a, Decimal128Type dt) => WidenLongToDecimal(a, dt),
 
+            // A field widened INSIDE a struct, list element or map key/value (PROTOCOL.md records those on the
+            // struct child, or with fieldPath element/key/value). Without these arms an old file's nested
+            // values came back narrow under a wide schema, and compaction wrote them into the wide column.
+            (StructArray or ListArray or LargeListArray, NestedType) => WidenNested(source, targetType),
+
             _ => source, // No widening needed or unsupported
         };
     }
+
+    #region Nested Widening
+
+    private static IArrowArray WidenNested(IArrowArray source, IArrowType targetType)
+    {
+        var widened = WidenData(source.Data, targetType);
+        return ReferenceEquals(widened, source.Data) ? source : ArrowArrayFactory.BuildArray(widened);
+    }
+
+    // Widens every leaf under `data` whose type the target puts at the same place, returning `data` itself when
+    // nothing changes. Struct children are matched BY NAME, as the top level is: a file's struct may lack a child
+    // added since, or still carry one dropped, and that set is reconciled afterwards. Only the CHILDREN are
+    // rebuilt; each container keeps its own length, offset, validity and offsets buffers. A widened child comes
+    // back with offset 0 and the same length as before, so element i is unchanged and the parent's indexing into
+    // it still holds.
+    private static ArrayData WidenData(ArrayData data, IArrowType target)
+    {
+        switch (data.DataType, target)
+        {
+            // MapType derives from ListType, so it has to be matched first.
+            case (MapType sm, MapType tm):
+            {
+                var entries = data.Children[0];
+                var key = WidenData(entries.Children[0], tm.KeyField.DataType);
+                var value = WidenData(entries.Children[1], tm.ValueField.DataType);
+                if (ReferenceEquals(key, entries.Children[0]) && ReferenceEquals(value, entries.Children[1]))
+                    return data;
+                var mapType = new MapType(
+                    WithType(sm.KeyField, key.DataType), WithType(sm.ValueField, value.DataType), sm.KeySorted);
+                var newEntries = new ArrayData(mapType.KeyValueType, entries.Length, entries.NullCount,
+                    entries.Offset, entries.Buffers, [key, value]);
+                return new ArrayData(mapType, data.Length, data.NullCount, data.Offset, data.Buffers, [newEntries]);
+            }
+            case (MapType, _):
+            case (_, MapType):
+                return data;
+            case (ListType sl, ListType tl):
+            {
+                var values = WidenData(data.Children[0], tl.ValueDataType);
+                return ReferenceEquals(values, data.Children[0])
+                    ? data
+                    : new ArrayData(new ListType(WithType(sl.ValueField, values.DataType)), data.Length,
+                        data.NullCount, data.Offset, data.Buffers, [values]);
+            }
+            case (LargeListType sl, LargeListType tl):
+            {
+                var values = WidenData(data.Children[0], tl.ValueDataType);
+                return ReferenceEquals(values, data.Children[0])
+                    ? data
+                    : new ArrayData(new LargeListType(WithType(sl.ValueField, values.DataType)), data.Length,
+                        data.NullCount, data.Offset, data.Buffers, [values]);
+            }
+            case (StructType ss, StructType ts):
+            {
+                ArrayData[]? children = null;
+                for (int i = 0; i < ss.Fields.Count; i++)
+                {
+                    int t = ts.GetFieldIndex(ss.Fields[i].Name, StringComparer.Ordinal);
+                    if (t < 0)
+                        continue;
+                    var child = WidenData(data.Children[i], ts.Fields[t].DataType);
+                    if (ReferenceEquals(child, data.Children[i]))
+                        continue;
+                    children ??= (ArrayData[])data.Children.Clone();
+                    children[i] = child;
+                }
+                if (children is null)
+                    return data;
+                var fields = new List<Field>(ss.Fields.Count);
+                for (int i = 0; i < ss.Fields.Count; i++)
+                    fields.Add(WithType(ss.Fields[i], children[i].DataType));
+                return new ArrayData(new StructType(fields), data.Length, data.NullCount, data.Offset,
+                    data.Buffers, children);
+            }
+            case (NestedType, _):
+            case (_, NestedType):
+                return data;
+            default:
+            {
+                if (TypesMatch(data.DataType, target))
+                    return data;
+                var leaf = ArrowArrayFactory.BuildArray(data);
+                var widened = WidenArray(leaf, target);
+                return ReferenceEquals(widened, leaf) ? data : widened.Data;
+            }
+        }
+    }
+
+    private static Field WithType(Field field, IArrowType type) =>
+        ReferenceEquals(field.DataType, type)
+            ? field
+            : new Field(field.Name, type, field.IsNullable, field.Metadata);
+
+    #endregion
 
     #region Decimal Widening
 
@@ -297,8 +399,27 @@ internal static class ValueWidener
                 da.Precision == db.Precision && da.Scale == db.Scale,
             (TimestampType ta, TimestampType tb) =>
                 ta.Unit == tb.Unit && ta.Timezone == tb.Timezone,
+            // Containers match when everything they share matches; a struct child present on one side only is
+            // a column-set difference, which is BackfillMissingColumns' to reconcile, not a widening.
+            (MapType ma, MapType mb) =>
+                TypesMatch(ma.KeyField.DataType, mb.KeyField.DataType)
+                && TypesMatch(ma.ValueField.DataType, mb.ValueField.DataType),
+            (ListType la, ListType lb) => TypesMatch(la.ValueDataType, lb.ValueDataType),
+            (LargeListType la, LargeListType lb) => TypesMatch(la.ValueDataType, lb.ValueDataType),
+            (StructType sa, StructType sb) => StructChildrenMatch(sa, sb),
             _ => true,
         };
+    }
+
+    private static bool StructChildrenMatch(StructType a, StructType b)
+    {
+        foreach (var child in a.Fields)
+        {
+            int i = b.GetFieldIndex(child.Name, StringComparer.Ordinal);
+            if (i >= 0 && !TypesMatch(child.DataType, b.Fields[i].DataType))
+                return false;
+        }
+        return true;
     }
 
     #endregion
