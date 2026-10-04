@@ -217,4 +217,30 @@ public class CdfSchemaEvolutionTests : IDisposable
         Assert.Equal("emea", ((StringArray)b.Column(1)).GetString(0));
         Assert.True(b.Column(2).IsNull(0));
     }
+
+    [Theory]
+    [InlineData(ColumnMappingMode.Name)]
+    [InlineData(ColumnMappingMode.Id)]
+    public async Task PartitionedTable_RangeSpanningDropColumn_RetainedColumnKeepsItsValue(ColumnMappingMode mode)
+    {
+        // The file predates the DROP, so it still carries `a`. Partition columns are interleaved BY POSITION;
+        // with `a` still in the batch it took `b`'s slot, and `b` came out NULL (in name mode, where ToLogical
+        // keeps a field the schema no longer has).
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("a", Int64Type.Default, true))
+            .Field(new Field("b", Int64Type.Default, true))
+            .Field(new Field("p", StringType.Default, true))
+            .Build();
+        await using var table = await CreateAsync(mode, schema, partitionColumns: ["p"]);
+        long v1 = await table.WriteAsync([new RecordBatch(schema,
+            [new Int64Array.Builder().Append(1).Build(), new Int64Array.Builder().Append(2).Build(),
+             new StringArray.Builder().Append("x").Build()], 1)]);
+        long v2 = await table.DropColumnAsync("a");
+
+        var b = Assert.Single(await ReadChangesAsync(table, v1, v2));
+
+        Assert.Equal(["b", "p", .. FeedColumns], Names(b));
+        Assert.Equal(2L, ((Int64Array)b.Column(0)).GetValue(0));
+        Assert.Equal("x", ((StringArray)b.Column(1)).GetString(0));
+    }
 }

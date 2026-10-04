@@ -8848,6 +8848,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
                 : snapshot.ArrowSchema;
 
+            // The insert below fills the non-partition slots BY POSITION, so the data columns must first be
+            // exactly the schema's, in its order. A file written before a DROP COLUMN still carries the dropped
+            // column; left in place it would take the next column's slot, and that column would come out NULL.
+            var dataSchema = columns is not null
+                ? BuildProjectedSchema(snapshot.ArrowSchema, columns, partitionColumns)
+                : BuildNonPartitionSchema(snapshot.ArrowSchema, partitionColumns);
+            result = SchemaEvolution.BackfillMissingColumns(result, dataSchema.FieldsList);
+
             // partitionValues are keyed by the PHYSICAL column name under mapping (the spec convention),
             // while files written before that convention are logical-keyed — the map resolves both.
             result = Partitioning.PartitionUtils.AddPartitionColumns(
