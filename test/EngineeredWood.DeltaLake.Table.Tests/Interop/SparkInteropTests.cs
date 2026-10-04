@@ -1850,6 +1850,75 @@ public class SparkInteropTests : IDisposable
     }
 
     /// <summary>
+    /// Issue #447: a change feed over a range that spans an ADD COLUMN has ONE schema, and which one depends on
+    /// column mapping. EW builds the issue's table (v1 inserts id = 1, v2 adds <c>extra</c>, v3 inserts
+    /// (2, 20)) and both engines read the same range; the columns and rows must agree. Spark takes the LATEST
+    /// schema without mapping, so an old-version-only read still shows <c>extra</c> as NULL, and the END
+    /// version's schema under mapping, so the same read in name mode has no <c>extra</c>. Before the fix EW
+    /// returned a batch without <c>extra</c> for the v1 row in every case.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(ColumnMappingMode.None, false)]
+    [InlineData(ColumnMappingMode.None, true)]
+    [InlineData(ColumnMappingMode.Name, false)]
+    [InlineData(ColumnMappingMode.Name, true)]
+    public async Task EwWritten_ChangeDataFeedAcrossAddColumn_EwAndSparkAgreeOnTheSchema(
+        ColumnMappingMode mode, bool throughLatest)
+    {
+        Spark.Require();
+
+        var idOnly = new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, false)).Build();
+        var idExtra = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("extra", Int64Type.Default, true))
+            .Build();
+
+        long v1, v3;
+        var ewColumns = new List<List<string>>();
+        var ewRows = new List<(long Id, long? Extra)>();
+        await using (var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), idOnly, columnMappingMode: mode,
+            configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" }))
+        {
+            v1 = await table.WriteAsync([new RecordBatch(idOnly, [new Int64Array.Builder().Append(1).Build()], 1)]);
+            await table.AddColumnAsync(new Field("extra", Int64Type.Default, true));
+            v3 = await table.WriteAsync([new RecordBatch(idExtra,
+                [new Int64Array.Builder().Append(2).Build(), new Int64Array.Builder().Append(20).Build()], 1)]);
+
+            await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions
+                { StartVersion = v1, EndVersion = throughLatest ? v3 : v1 }))
+            {
+                ewColumns.Add(b.Schema.FieldsList.Select(f => f.Name).ToList());
+                var id = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
+                int extraIdx = b.Schema.GetFieldIndex("extra");
+                for (int i = 0; i < b.Length; i++)
+                    ewRows.Add((id.GetValue(i)!.Value,
+                        extraIdx < 0 ? null : ((Int64Array)b.Column(extraIdx)).GetValue(i)));
+            }
+        }
+
+        var result = Spark.Invoke("read_changes",
+            new { path = _tempDir, start = v1, end = throughLatest ? v3 : v1 });
+
+        var sparkColumns = result.GetProperty("columns").EnumerateArray().Select(e => e.GetString()!).ToList();
+        bool sparkHasExtra = sparkColumns.Contains("extra");
+        var sparkRows = result.GetProperty("rows").EnumerateArray()
+            .Select(r => (
+                Id: r.GetProperty("id").GetInt64(),
+                Extra: sparkHasExtra && r.GetProperty("extra").ValueKind != JsonValueKind.Null
+                    ? r.GetProperty("extra").GetInt64() : (long?)null))
+            .OrderBy(t => t.Id).ToList();
+
+        // The measured table of the issue: only the name-mode old-version read leaves `extra` out.
+        Assert.Equal(mode == ColumnMappingMode.None || throughLatest, sparkHasExtra);
+
+        // One schema for the whole feed, and it is Spark's.
+        Assert.NotEmpty(ewColumns);
+        Assert.All(ewColumns, c => Assert.Equal(sparkColumns, c));
+        Assert.Equal(sparkRows, ewRows.OrderBy(t => t.Id).ToList());
+    }
+
+    /// <summary>
     /// EW writes a ROW TRACKING + CDF table and Spark reads the feed. The claim is that the two hidden
     /// materialized columns EW now puts in every <c>_change_data</c> file — which is how a change row carries
     /// any identity at all, a <c>cdc</c> action having no <c>baseRowId</c> — do not disturb a conformant

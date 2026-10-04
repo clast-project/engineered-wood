@@ -3695,7 +3695,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // The predicate sees each row as a scan returns it: current schema, columns added since this
                 // file was written as NULL, partition columns re-materialized, widened types widened.
                 logicalBatch = ReconcileToTableShape(
-                    logicalBatch, snapshot, addFile, columns: null, partitionColumns, partitionColumns.Count > 0,
+                    logicalBatch, snapshot, addFile.PartitionValues, columns: null, partitionColumns, partitionColumns.Count > 0,
                     logicalToPhysical);
 
                 var mask = predicate(logicalBatch);
@@ -4298,6 +4298,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>_commit_version</c> and <c>_commit_timestamp</c>. For versions with CDC files those are used
     /// directly; for versions without, changes are inferred from add/remove actions.
     ///
+    /// <para>Every batch of one feed has the same schema, as Spark's does: the table's LATEST schema, or, on
+    /// a column-mapping table, its schema at <see cref="DeltaChangeReadOptions.EndVersion"/>. A column the
+    /// changed file predates reads as NULL, as it does in a scan.</para>
+    ///
     /// <para>With <see cref="DeltaRowMetadata.RowTracking"/> each change row also carries its STABLE
     /// identity, which is what lets a consumer JOIN a change to the row it happened to: an
     /// <c>update_preimage</c> and its <c>update_postimage</c> report the SAME id, and that id is the one
@@ -4338,8 +4342,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     // The materialized column names are fixed at enablement and never change, so the CURRENT snapshot's
-    // metadata names them correctly for every version in the range — the same simplification the feed already
-    // makes for the schema itself.
+    // metadata names them correctly for every version in the range. The schema is a different matter; see
+    // GetChangeFeedSchemaSnapshotAsync.
     private async IAsyncEnumerable<RecordBatch> ReadChangesCoreAsync(
         Snapshot.Snapshot snapshot, DeltaChangeReadOptions options, bool emitRowTracking,
         [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -4347,11 +4351,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
 
+        var schemaSnapshot = await GetChangeFeedSchemaSnapshotAsync(snapshot, options.EndVersion, cancellationToken)
+            .ConfigureAwait(false);
+
         var emitted = ChangeDataFeed.CdfReader.ReadChangesAsync(
             _fs, _log, options.StartVersion, options.EndVersion, _dataFileReadOptions,
-            snapshot.ArrowSchema, snapshot.Schema,
-            ColumnMapping.GetMode(snapshot.Metadata.Configuration),
-            snapshot.Metadata.PartitionColumns,
+            schemaSnapshot,
             matRowIdName, matRowVerName, emitRowTracking,
             options.MetadataPrefix + DeltaMetadataColumns.RowIdSuffix,
             options.MetadataPrefix + DeltaMetadataColumns.RowCommitVersionSuffix,
@@ -4377,6 +4382,30 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         await foreach (var batch in emitted.ConfigureAwait(false))
             yield return keep is null ? batch : ProjectBatch(batch, keep);
+    }
+
+    /// <summary>
+    /// The snapshot whose schema every batch of a change feed is reconciled to, chosen as Spark chooses it
+    /// (delta-spark 4.0, <c>CDCReaderImpl.getCDCRelation</c>): the END version's schema when the table uses
+    /// column mapping, the LATEST schema when it does not. Without mapping a column can only be added, so the
+    /// latest schema is a superset of every file in the range. Under mapping it may have been renamed or
+    /// dropped since, and the end version names the columns as they were when the range closed.
+    ///
+    /// <para>Spark also takes the end version's schema when mapping was on at the start or end version but
+    /// is off now. Mapping is only turned off by rewriting every file, and telling that case apart would take
+    /// two more snapshot builds on every read of an unmapped table, so it is decided by the latest snapshot
+    /// alone.</para>
+    /// </summary>
+    private async ValueTask<Snapshot.Snapshot> GetChangeFeedSchemaSnapshotAsync(
+        Snapshot.Snapshot latest, long endVersion, CancellationToken cancellationToken)
+    {
+        if (endVersion >= latest.Version
+            || ColumnMapping.GetMode(latest.Metadata.Configuration) == ColumnMappingMode.None)
+        {
+            return latest;
+        }
+        return await SnapshotBuilder.BuildAsync(_log, _checkpointReader, atVersion: endVersion, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     /// <summary>Drops the columns not in <paramref name="keep"/>, preserving order. A post-read projection:
@@ -8753,7 +8782,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             // The materialized row-tracking columns were already stripped up front (above).
             var cleanResult = ReconcileToTableShape(
-                result, snapshot, addFile, columns, partitionColumns, hasPartitions, logicalToPhysical);
+                result, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions, logicalToPhysical);
 
             // Surface each surviving row's RESOLVED id + commit version (row-aligned with cleanResult): the
             // materialized value where present, else add.baseRowId + absolute position / defaultRowCommitVersion
@@ -8789,14 +8818,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// of its first row. The <see cref="IDataFileReader"/> contract makes that a running count.
     /// </summary>
     /// <summary>
-    /// Brings a logical-named batch read from <paramref name="addFile"/> to the shape a scan returns: the
-    /// current schema (or the <paramref name="columns"/> projection of it), whatever schema the file was
-    /// written under. Every path that hands a data file's rows onward uses it, so a DELETE predicate sees what
-    /// a scan sees.
+    /// Brings a logical-named batch read from a data or change file to the shape a scan returns:
+    /// <paramref name="snapshot"/>'s schema (or the <paramref name="columns"/> projection of it), whatever
+    /// schema the file was written under. <paramref name="partitionValues"/> are the file's action's. Every
+    /// path that hands a file's rows onward uses it, so a DELETE predicate and the change feed see what a scan
+    /// sees.
     /// </summary>
-    private static RecordBatch ReconcileToTableShape(
-        RecordBatch result, Snapshot.Snapshot snapshot, AddFile addFile, IReadOnlyList<string>? columns,
-        IReadOnlyList<string> partitionColumns, bool hasPartitions, Dictionary<string, string> logicalToPhysical)
+    internal static RecordBatch ReconcileToTableShape(
+        RecordBatch result, Snapshot.Snapshot snapshot, IReadOnlyDictionary<string, string>? partitionValues,
+        IReadOnlyList<string>? columns, IReadOnlyList<string> partitionColumns, bool hasPartitions,
+        IReadOnlyDictionary<string, string> logicalToPhysical)
     {
         // Apply type widening — convert narrow types from old files to current schema types
         if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
@@ -8817,10 +8848,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
                 : snapshot.ArrowSchema;
 
+            // The insert below fills the non-partition slots BY POSITION, so the data columns must first be
+            // exactly the schema's, in its order. A file written before a DROP COLUMN still carries the dropped
+            // column; left in place it would take the next column's slot, and that column would come out NULL.
+            var dataSchema = columns is not null
+                ? BuildProjectedSchema(snapshot.ArrowSchema, columns, partitionColumns)
+                : BuildNonPartitionSchema(snapshot.ArrowSchema, partitionColumns);
+            result = SchemaEvolution.BackfillMissingColumns(result, dataSchema.FieldsList);
+
             // partitionValues are keyed by the PHYSICAL column name under mapping (the spec convention),
             // while files written before that convention are logical-keyed — the map resolves both.
             result = Partitioning.PartitionUtils.AddPartitionColumns(
-                result, fullSchema, addFile.PartitionValues, partitionColumns, logicalToPhysical);
+                result, fullSchema, partitionValues ?? EmptyPartitionValues, partitionColumns,
+                logicalToPhysical);
         }
 
         // Schema evolution: ADD/DROP COLUMN are metadata-only commits, so a file written before an ADD
