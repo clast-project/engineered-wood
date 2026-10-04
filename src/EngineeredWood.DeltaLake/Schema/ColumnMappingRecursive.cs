@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Runtime.CompilerServices;
 using Apache.Arrow;
 
 namespace EngineeredWood.DeltaLake.Schema;
@@ -348,31 +349,46 @@ public static class ColumnMappingRecursive
     // from a data file). Never both kinds in one pass: with a reused name, that binds whichever field is first.
     private static StructField? FindField(StructType schema, Field arrow, bool byId, bool preferPhysical)
     {
+        var index = Indexes.GetValue(schema, static s => new FieldIndex(s));
         if (byId && ColumnMapping.GetParquetFieldId(arrow) is { } id)
+            return index.ById.TryGetValue(id, out var byIdField) ? byIdField : null;
+
+        var first = preferPhysical ? index.ByPhysical : index.ByLogical;
+        var second = preferPhysical ? index.ByLogical : index.ByPhysical;
+        return first.TryGetValue(arrow.Name, out var field) || second.TryGetValue(arrow.Name, out field)
+            ? field
+            : null;
+    }
+
+    // Every batch of a scan binds each of its fields against the same schema levels, so each level is indexed
+    // once, by id, physical name and logical name; scanning the level per field made binding a wide table
+    // quadratic in its column count, per batch. Keyed weakly on the StructType instance: a snapshot's schema
+    // objects are reused across batches and dropped with the snapshot. A key's FIRST field wins, as the linear
+    // scan's did.
+    private static readonly ConditionalWeakTable<StructType, FieldIndex> Indexes = new();
+
+    private sealed class FieldIndex
+    {
+        public readonly Dictionary<int, StructField> ById = new();
+        public readonly Dictionary<string, StructField> ByPhysical = new(StringComparer.Ordinal);
+        public readonly Dictionary<string, StructField> ByLogical = new(StringComparer.Ordinal);
+
+        public FieldIndex(StructType schema)
         {
             foreach (var f in schema.Fields)
             {
-                if (ColumnMapping.GetFieldId(f) == id)
-                    return f;
+                if (ColumnMapping.GetFieldId(f) is { } id && !ById.ContainsKey(id))
+                    ById[id] = f;
+                if (f.Metadata is { } md
+                    && md.TryGetValue(ColumnMapping.PhysicalNameKey, out var phys)
+                    && !ByPhysical.ContainsKey(phys))
+                {
+                    ByPhysical[phys] = f;
+                }
+                if (!ByLogical.ContainsKey(f.Name))
+                    ByLogical[f.Name] = f;
             }
-            return null;
         }
-
-        return FindByName(schema, arrow.Name, physical: preferPhysical)
-            ?? FindByName(schema, arrow.Name, physical: !preferPhysical);
-    }
-
-    private static StructField? FindByName(StructType schema, string arrowName, bool physical)
-    {
-        foreach (var f in schema.Fields)
-        {
-            string? candidate = physical
-                ? f.Metadata is { } md && md.TryGetValue(ColumnMapping.PhysicalNameKey, out var phys) ? phys : null
-                : f.Name;
-            if (string.Equals(candidate, arrowName, StringComparison.Ordinal))
-                return f;
-        }
-        return null;
     }
 
     // Returns the SAME instance when nothing changes (the no-op signal used to avoid rebuilding arrays).

@@ -152,7 +152,8 @@ public class ColumnMappingIdResolutionTests : IDisposable
         };
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(
-            fs, arrow, columnMappingMode: ColumnMappingMode.Id, preAssignedSchema: preAssigned);
+            fs, arrow, columnMappingMode: ColumnMappingMode.Id, enableDeletionVectors: true,
+            preAssignedSchema: preAssigned);
         await table.WriteAsync([new RecordBatch(arrow,
             [
                 new Int64Array.Builder().Append(1).Build(),
@@ -185,5 +186,10 @@ public class ColumnMappingIdResolutionTests : IDisposable
         Assert.NotNull(await table.CompactAsync(
             new CompactionOptions { MinFileSize = long.MaxValue, TargetFileSize = long.MaxValue }));
         Assert.Equal(expected, await ReadAsync(table));
+
+        // DELETE sees the same rows: the old row's re-added "amount" is NULL, not its dropped value.
+        var (deleted, _) = await table.DeleteAsync(EngineeredWood.Expressions.Expressions.IsNull("amount"));
+        Assert.Equal(1, deleted);
+        Assert.Equal(["s.x=q s.a=200 amount=2000"], await ReadAsync(table));
     }
 }

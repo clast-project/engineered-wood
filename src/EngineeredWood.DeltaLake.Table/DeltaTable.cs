@@ -3670,6 +3670,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
             var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
                 snapshot.Schema, mappingMode);
+            var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+            var partitionColumns = snapshot.Metadata.PartitionColumns;
 
             await foreach (var batch in reader.ReadAllAsync(
                 cancellationToken: cancellationToken).ConfigureAwait(false))
@@ -3689,6 +3691,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     (logicalBatch, rawMatIds, rawMatVers) = RowTracking.RowTrackingWriter
                         .StripMaterializedColumns(logicalBatch, matRowIdName, matRowVerName);
                 }
+
+                // The predicate sees each row as a scan returns it: current schema, columns added since this
+                // file was written as NULL, partition columns re-materialized, widened types widened.
+                logicalBatch = ReconcileToTableShape(
+                    logicalBatch, snapshot, addFile, columns: null, partitionColumns, partitionColumns.Count > 0,
+                    logicalToPhysical);
 
                 var mask = predicate(logicalBatch);
                 var matchRows = new List<int>();
@@ -8743,47 +8751,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     continue; // All rows in this batch were deleted (no surviving ids to emit either)
             }
 
-            // Apply type widening — convert narrow types from old files to current schema types
-            if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
-                HasTypeChanges(snapshot.Schema))
-            {
-                var targetSchema = columns is not null
-                    ? BuildProjectedSchema(snapshot.ArrowSchema, columns,
-                        hasPartitions ? partitionColumns : null)
-                    : BuildNonPartitionSchema(snapshot.ArrowSchema, partitionColumns);
-
-                result = TypeWidening.ValueWidener.WidenBatch(result, targetSchema);
-            }
-
-            if (hasPartitions)
-            {
-                // Re-add partition columns as constant arrays
-                var fullSchema = columns is not null
-                    ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
-                    : snapshot.ArrowSchema;
-
-                // partitionValues are keyed by the PHYSICAL column name under mapping (the spec convention),
-                // while files written before that convention are logical-keyed — the map resolves both.
-                result = Partitioning.PartitionUtils.AddPartitionColumns(
-                    result, fullSchema, addFile.PartitionValues, partitionColumns, logicalToPhysical);
-            }
-
             // The materialized row-tracking columns were already stripped up front (above).
-            var cleanResult = result;
-
-            // Schema evolution: ADD/DROP COLUMN are metadata-only commits, so a file written before an ADD
-            // lacks the column and one written before a DROP still carries it — reconcile every emitted batch
-            // to the current schema's expected output columns (absent ones backfilled as typed all-NULL).
-            var expectedSchema = columns is not null
-                ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
-                : snapshot.ArrowSchema;
-            cleanResult = SchemaEvolution.BackfillMissingColumns(cleanResult, expectedSchema.FieldsList);
-
-            // Present variant columns per the Delta SCHEMA, not the parquet annotation: an unannotated
-            // file (Spark 4.0.x, a spec-minimal writer, or our own output under
-            // EmitVariantLogicalType=false) yields a bare struct-of-binary that the parquet reader did
-            // not wrap. Without this the column would silently read as a struct rather than a variant.
-            cleanResult = VariantColumnCoercion.Coerce(cleanResult, expectedSchema);
+            var cleanResult = ReconcileToTableShape(
+                result, snapshot, addFile, columns, partitionColumns, hasPartitions, logicalToPhysical);
 
             // Surface each surviving row's RESOLVED id + commit version (row-aligned with cleanResult): the
             // materialized value where present, else add.baseRowId + absolute position / defaultRowCommitVersion
@@ -8818,6 +8788,56 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Pairs each batch of a source that yields EVERY row of a file, in file order, with the file position
     /// of its first row. The <see cref="IDataFileReader"/> contract makes that a running count.
     /// </summary>
+    /// <summary>
+    /// Brings a logical-named batch read from <paramref name="addFile"/> to the shape a scan returns: the
+    /// current schema (or the <paramref name="columns"/> projection of it), whatever schema the file was
+    /// written under. Every path that hands a data file's rows onward uses it, so a DELETE predicate sees what
+    /// a scan sees.
+    /// </summary>
+    private static RecordBatch ReconcileToTableShape(
+        RecordBatch result, Snapshot.Snapshot snapshot, AddFile addFile, IReadOnlyList<string>? columns,
+        IReadOnlyList<string> partitionColumns, bool hasPartitions, Dictionary<string, string> logicalToPhysical)
+    {
+        // Apply type widening — convert narrow types from old files to current schema types
+        if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
+            HasTypeChanges(snapshot.Schema))
+        {
+            var targetSchema = columns is not null
+                ? BuildProjectedSchema(snapshot.ArrowSchema, columns,
+                    hasPartitions ? partitionColumns : null)
+                : BuildNonPartitionSchema(snapshot.ArrowSchema, partitionColumns);
+
+            result = TypeWidening.ValueWidener.WidenBatch(result, targetSchema);
+        }
+
+        if (hasPartitions)
+        {
+            // Re-add partition columns as constant arrays
+            var fullSchema = columns is not null
+                ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
+                : snapshot.ArrowSchema;
+
+            // partitionValues are keyed by the PHYSICAL column name under mapping (the spec convention),
+            // while files written before that convention are logical-keyed — the map resolves both.
+            result = Partitioning.PartitionUtils.AddPartitionColumns(
+                result, fullSchema, addFile.PartitionValues, partitionColumns, logicalToPhysical);
+        }
+
+        // Schema evolution: ADD/DROP COLUMN are metadata-only commits, so a file written before an ADD
+        // lacks the column and one written before a DROP still carries it — reconcile every emitted batch
+        // to the current schema's expected output columns (absent ones backfilled as typed all-NULL).
+        var expectedSchema = columns is not null
+            ? BuildProjectedSchema(snapshot.ArrowSchema, columns)
+            : snapshot.ArrowSchema;
+        result = SchemaEvolution.BackfillMissingColumns(result, expectedSchema.FieldsList);
+
+        // Present variant columns per the Delta SCHEMA, not the parquet annotation: an unannotated
+        // file (Spark 4.0.x, a spec-minimal writer, or our own output under
+        // EmitVariantLogicalType=false) yields a bare struct-of-binary that the parquet reader did
+        // not wrap. Without this the column would silently read as a struct rather than a variant.
+        return VariantColumnCoercion.Coerce(result, expectedSchema);
+    }
+
     /// <summary>
     /// Renames a data file's batch, as read, to the table's logical names. Every path that reads a data file
     /// resolves its columns through this one rule, so a DELETE predicate sees what a scan sees.
