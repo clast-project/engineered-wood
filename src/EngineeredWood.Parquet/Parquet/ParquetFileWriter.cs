@@ -70,6 +70,10 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     /// If the batch exceeds <see cref="ParquetWriteOptions.RowGroupMaxRows"/>, it is automatically
     /// split into multiple row groups.
     /// </summary>
+    /// <exception cref="ArgumentException">
+    /// A batch after the first differs from it in column names, order or types at any depth, or holds nulls in a
+    /// column the first batch made required. Field metadata and list/map child names may differ.
+    /// </exception>
     public async ValueTask WriteRowGroupAsync(
         RecordBatch batch,
         CancellationToken cancellationToken = default)
@@ -139,6 +143,12 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         {
             _arrowSchema = batch.Schema;
             _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema, _options);
+        }
+        else
+        {
+            // Every later row group is encoded against the captured schema, so one of another shape would be
+            // written as silently wrong data. Checked before anything of this row group is written.
+            RowGroupSchemaCheck.EnsureMatches(_arrowSchema, batch);
         }
 
         // Decompose all Arrow columns into leaf columns (flat columns produce 1 leaf each,
