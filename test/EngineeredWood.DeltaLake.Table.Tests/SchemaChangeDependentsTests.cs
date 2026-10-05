@@ -335,6 +335,69 @@ public class SchemaChangeDependentsTests : IDisposable
             async () => await table.SetSchemaAsync(LongSchema("id", "name", "extra")));
     }
 
+    /// <summary>Appends a commit that sets the clustering domain to <paramref name="columnsJson"/> verbatim,
+    /// the way another writer could, and returns a fresh handle on the result.</summary>
+    private DeltaTable WithClusteringDomain(long version, string columnsJson)
+    {
+        string configuration = $"{{\"clusteringColumns\":{columnsJson},\"domainName\":\"delta.clustering\"}}";
+        File.WriteAllText(
+            Path.Combine(_tempDir, "_delta_log", $"{version + 1:D20}.json"),
+            "{\"domainMetadata\":{\"domain\":\"delta.clustering\",\"configuration\":"
+            + System.Text.Json.JsonSerializer.Serialize(configuration) + ",\"removed\":false}}\n");
+        var table = OpenSecondHandle();
+        Assert.Equal(version + 1, table.CurrentSnapshot.Version);
+        return table;
+    }
+
+    [Fact]
+    public async Task DropColumn_WhenTheClusteringDomainNamesAColumnTheSchemaLacks_IsRefused()
+    {
+        long version;
+        await using (var created = await CreateAsync(LongSchema("id", "name", "other"), clusteringColumns: ["id"]))
+            version = created.CurrentSnapshot.Version;
+
+        await using var table = WithClusteringDomain(version, "[[\"nosuch\"]]");
+        await RefusedAsync(DeltaTableErrorCodes.UnsupportedDropClusteringColumn,
+            async () => await table.DropColumnAsync("other"));
+    }
+
+    [Fact]
+    public async Task DropColumn_WhenTheClusteringDomainUsesItsLogicalName_IsRefused()
+    {
+        // Under mapping the spec must hold PHYSICAL names; one holding the logical name cannot be matched
+        // to the drop by physical name, so without failing closed this drop would go through.
+        long version;
+        await using (var created = await CreateAsync(LongSchema("id", "name"), clusteringColumns: ["id"]))
+            version = created.CurrentSnapshot.Version;
+
+        await using var table = WithClusteringDomain(version, "[[\"name\"]]");
+        Assert.NotEqual("name", ColumnMapping.GetPhysicalName(
+            table.CurrentSnapshot.Schema.Fields[1], ColumnMappingMode.Name));
+        await RefusedAsync(DeltaTableErrorCodes.UnsupportedDropClusteringColumn,
+            async () => await table.DropColumnAsync("name"));
+    }
+
+    [Fact]
+    public async Task DropColumn_MatchesThePhysicalNameOfExactlyTheDroppedColumn()
+    {
+        // `x` and `X` differ only in case; the clustering spec names `X`'s physical column. A
+        // case-insensitive lookup of the dropped `x` used to find `X` first and refuse the wrong drop,
+        // and would have let the clustered one through.
+        long version;
+        string xUpperPhysical;
+        await using (var created = await CreateAsync(LongSchema("X", "x", "id"), clusteringColumns: ["id"]))
+        {
+            version = created.CurrentSnapshot.Version;
+            xUpperPhysical = ColumnMapping.GetPhysicalName(
+                created.CurrentSnapshot.Schema.Fields[0], ColumnMappingMode.Name);
+        }
+
+        await using var table = WithClusteringDomain(version, $"[[\"{xUpperPhysical}\"]]");
+        await table.DropColumnAsync("x");
+        await RefusedAsync(DeltaTableErrorCodes.UnsupportedDropClusteringColumn,
+            async () => await table.DropColumnAsync("X"));
+    }
+
     [Fact]
     public async Task SetSchema_OnAStaleHandle_AbortsWhenClusteringMovedOntoADroppedColumn()
     {

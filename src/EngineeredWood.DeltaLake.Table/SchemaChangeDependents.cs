@@ -85,6 +85,17 @@ internal static class SchemaChangeDependents
             var physical = PhysicalPath(schema, path, mode);
             foreach (var column in clustering)
             {
+                // A spec path the schema cannot resolve might be anything — a stale name, or another
+                // writer's logical one — including the column being dropped, so it fails closed.
+                if (TranslatePath(schema, column, f => ColumnMapping.GetPhysicalName(f, mode), f => f.Name) is null)
+                {
+                    throw new DeltaFormatException(
+                        DeltaTableErrorCodes.UnsupportedDropClusteringColumn,
+                        $"Cannot drop column '{target}': the {ClusteringDomain} domain names "
+                        + $"'{string.Join(".", column)}', which is not a column of the table, so whether "
+                        + "the drop affects clustering cannot be told. Re-declare the clustering columns first.");
+                }
+
                 if (IsPrefix(physical, column))
                 {
                     throw new DeltaFormatException(
@@ -228,14 +239,14 @@ internal static class SchemaChangeDependents
     /// </summary>
     public static IReadOnlyList<string>? TranslatePath(
         StructType schema, IReadOnlyList<string> path,
-        Func<StructField, string> from, Func<StructField, string> to)
+        Func<StructField, string> from, Func<StructField, string> to,
+        StringComparison comparison = StringComparison.OrdinalIgnoreCase)
     {
         var result = new List<string>(path.Count);
         IReadOnlyList<StructField>? fields = schema.Fields;
         foreach (var segment in path)
         {
-            var field = fields?.FirstOrDefault(
-                f => string.Equals(from(f), segment, StringComparison.OrdinalIgnoreCase));
+            var field = fields?.FirstOrDefault(f => string.Equals(from(f), segment, comparison));
             if (field is null)
                 return null;
             result.Add(to(field));
@@ -244,9 +255,12 @@ internal static class SchemaChangeDependents
         return result;
     }
 
+    // The callers have already found the field by its exact name, so this matches exactly too: a
+    // case-insensitive match could pick a sibling differing only in case, and its physical name.
     private static IReadOnlyList<string> PhysicalPath(
         StructType schema, IReadOnlyList<string> path, ColumnMappingMode mode) =>
-        TranslatePath(schema, path, f => f.Name, f => ColumnMapping.GetPhysicalName(f, mode)) ?? path;
+        TranslatePath(schema, path, f => f.Name, f => ColumnMapping.GetPhysicalName(f, mode), StringComparison.Ordinal)
+        ?? throw new InvalidOperationException($"Column '{string.Join(".", path)}' does not exist.");
 
     private static bool IsPrefix(IReadOnlyList<string> prefix, IReadOnlyList<string> path)
     {
