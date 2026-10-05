@@ -81,6 +81,9 @@ public sealed record ConflictResult(ConflictType Type, long ConflictingVersion, 
 /// <see cref="WholeTable"/> is the "read everything" shortcut: every concurrent remove and every
 /// concurrent add matches. A blind append (<see cref="Blind"/>) reads nothing, so only metadata,
 /// protocol, and delete/delete conflicts can touch it.</para>
+///
+/// <para><see cref="Domains"/> is about table state rather than data: the <c>domainMetadata</c> domains
+/// a decision rested on.</para>
 /// </summary>
 public sealed record ReadSet
 {
@@ -92,6 +95,20 @@ public sealed record ReadSet
 
     /// <summary>The transaction read the entire table — every concurrent add and remove is relevant.</summary>
     public bool WholeTable { get; init; }
+
+    /// <summary>
+    /// <c>domainMetadata</c> domains whose state the transaction's decision rested on; a concurrent
+    /// <c>domainMetadata</c> action naming one conflicts (domainMetadata), exactly as if this transaction
+    /// wrote it.
+    /// </summary>
+    /// <remarks>
+    /// A transaction that only READ a domain is otherwise invisible to that rule, which considers the
+    /// domains a transaction writes. A DROP COLUMN reads <c>delta.clustering</c> to refuse dropping a
+    /// clustering column, and a concurrent domain-only re-key onto that column would otherwise rebase
+    /// past it and leave the spec naming a column the schema no longer has. Includes a domain that was
+    /// ABSENT when read: its creation is just as much a change to what was decided on.
+    /// </remarks>
+    public ISet<string> Domains { get; init; } = new HashSet<string>();
 
     /// <summary>
     /// A transaction with no read dependency (an INSERT with no predicate).
@@ -153,7 +170,8 @@ public sealed record ReadSet
 /// itself change the metadata — see <see cref="ExamineConcurrentAdds"/> for the third term, which is the
 /// one that judges us rather than the winning commit.</item>
 /// <item>domainMetadata — the concurrent commit wrote a <c>domainMetadata</c> action for a domain this
-/// transaction also writes. See <see cref="WrittenDomains"/> for the row-tracking exemption.</item>
+/// transaction also writes, or declared it read (<see cref="ReadSet.Domains"/>). See
+/// <see cref="WrittenDomains"/> for the row-tracking exemption, which applies to writes only.</item>
 /// </list>
 /// </summary>
 public static class ConflictChecker
@@ -203,12 +221,16 @@ public static class ConflictChecker
                 if (action is ProtocolAction)
                     return new ConflictResult(ConflictType.ProtocolChanged, version,
                         $"Concurrent commit {version} changed the protocol.");
-                if (action is DomainMetadata concurrentDomain
-                    && writtenDomains?.Contains(concurrentDomain.Domain) == true)
+                if (action is DomainMetadata concurrentDomain)
                 {
-                    return new ConflictResult(ConflictType.DomainMetadataChanged, version,
-                        $"Concurrent commit {version} wrote the metadata domain "
-                        + $"'{concurrentDomain.Domain}', which this transaction also writes.");
+                    if (writtenDomains?.Contains(concurrentDomain.Domain) == true)
+                        return new ConflictResult(ConflictType.DomainMetadataChanged, version,
+                            $"Concurrent commit {version} wrote the metadata domain "
+                            + $"'{concurrentDomain.Domain}', which this transaction also writes.");
+                    if (reads.Domains.Contains(concurrentDomain.Domain))
+                        return new ConflictResult(ConflictType.DomainMetadataChanged, version,
+                            $"Concurrent commit {version} wrote the metadata domain "
+                            + $"'{concurrentDomain.Domain}', which this transaction read.");
                 }
             }
 

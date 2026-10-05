@@ -134,6 +134,34 @@ public static class DeltaTableErrorCodes
     /// </remarks>
     public const string GeneratedColumnMismatch = "DELTA_GENERATED_COLUMN_MISMATCH";
 
+    // ── Schema changes ──
+
+    /// <summary>
+    /// A RENAME or DROP would change a column that a CHECK constraint reads, or a schema replacement
+    /// would remove one.
+    /// </summary>
+    /// <remarks>
+    /// <para>delta-spark: <c>DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE</c>. Constraints bind by NAME,
+    /// so letting the change through either leaves the table unwritable (the name is gone) or, after
+    /// a rename and a re-add, moves the constraint onto a different column.</para>
+    /// <para>Drop the constraint first, then change the column.</para>
+    /// </remarks>
+    public const string ConstraintDependentColumnChange = "DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE";
+
+    /// <summary>
+    /// A RENAME or DROP would change a column that a generated column's expression reads.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_GENERATED_COLUMNS_DEPENDENT_COLUMN_CHANGE</c>. Same reasoning as
+    /// <see cref="ConstraintDependentColumnChange"/>: the expression binds by name.</remarks>
+    public const string GeneratedColumnsDependentColumnChange =
+        "DELTA_GENERATED_COLUMNS_DEPENDENT_COLUMN_CHANGE";
+
+    /// <summary>A DROP would remove one of the table's clustering columns.</summary>
+    /// <remarks>delta-spark: <c>DELTA_UNSUPPORTED_DROP_CLUSTERING_COLUMN</c>. The
+    /// <c>delta.clustering</c> domain would go on naming the dropped physical column, which Spark's
+    /// <c>ClusteringColumnInfo</c> crashes on. Change the clustering columns first.</remarks>
+    public const string UnsupportedDropClusteringColumn = "DELTA_UNSUPPORTED_DROP_CLUSTERING_COLUMN";
+
     // ── Write modes ──
 
     /// <summary>

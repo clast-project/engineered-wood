@@ -87,6 +87,10 @@ public class StagedCommitParityTests : IDisposable
         ["constraintsEnforcedByCaller"] = new(
             typeof(DeltaTransaction), nameof(DeltaTransaction.StageDataFilesAsync),
             "constraintsEnforcedByCaller"),
+        // Domains a fused schema change was validated against. Staged, they ride in on the change itself
+        // (DeferredSchemaChange.ReadDomains), which StageSchemaChange declares read.
+        ["readDomains"] = new(
+            typeof(DeltaTransaction), nameof(DeltaTransaction.StageSchemaChange), "change"),
     };
 
     /// <summary>
