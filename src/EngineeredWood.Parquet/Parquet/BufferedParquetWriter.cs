@@ -60,6 +60,10 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     /// If the accumulated rows reach <see cref="ParquetWriteOptions.RowGroupMaxRows"/>, the
     /// buffer is automatically flushed as a row group.
     /// </summary>
+    /// <exception cref="ArgumentException">
+    /// A batch after the first differs from it in column names, order or types, or holds nulls in a column the
+    /// first batch made required. Field metadata may differ.
+    /// </exception>
     public async ValueTask AppendAsync(
         RecordBatch batch,
         CancellationToken cancellationToken = default)
@@ -86,6 +90,11 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             _arrowSchema = batch.Schema;
             _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema, _options);
             await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            // As in ParquetFileWriter: later batches are encoded against the first one's schema.
+            RowGroupSchemaCheck.EnsureMatches(_arrowSchema!, batch);
         }
 
         // Initialize column states on first batch
