@@ -58,16 +58,17 @@ internal static class DeltaSchemaSerializer
 
         foreach (var fieldElement in fieldsElement.EnumerateArray())
         {
-            Dictionary<string, string>? metadata = null;
+            FieldMetadata? metadata = null;
             if (fieldElement.TryGetProperty("metadata", out var metaElement) &&
                 metaElement.ValueKind == JsonValueKind.Object)
             {
-                metadata = new Dictionary<string, string>();
+                metadata = new FieldMetadata();
                 foreach (var prop in metaElement.EnumerateObject())
                 {
-                    metadata[prop.Name] = prop.Value.ValueKind == JsonValueKind.String
-                        ? prop.Value.GetString()!
-                        : prop.Value.GetRawText();
+                    if (prop.Value.ValueKind == JsonValueKind.String)
+                        metadata.AddString(prop.Name, prop.Value.GetString()!);
+                    else
+                        metadata.AddJson(prop.Name, prop.Value.GetRawText());
                 }
                 if (metadata.Count == 0)
                     metadata = null;
@@ -125,15 +126,7 @@ internal static class DeltaSchemaSerializer
                     {
                         writer.WriteStartObject();
                         foreach (var kvp in field.Metadata)
-                        {
-                            // delta.columnMapping.id is a NUMERIC field-id in the Delta spec — a strict reader
-                            // (Spark: Metadata.getLong) fails if it's serialized as a string. Emit it as a JSON
-                            // number; every other metadata value (physicalName, comments, …) stays a string.
-                            if (kvp.Key == ColumnMapping.FieldIdKey && long.TryParse(kvp.Value, out var fieldId))
-                                writer.WriteNumber(kvp.Key, fieldId);
-                            else
-                                writer.WriteString(kvp.Key, kvp.Value);
-                        }
+                            WriteMetadataValue(writer, field.Metadata, kvp.Key, kvp.Value);
                         writer.WriteEndObject();
                     }
                     else
@@ -167,5 +160,72 @@ internal static class DeltaSchemaSerializer
                 writer.WriteEndObject();
                 break;
         }
+    }
+
+    // The JSON kind PROTOCOL.md gives a metadata key, for the keys it types. Strict readers depend on it: Spark
+    // reads the identity keys with Metadata.getLong/getBoolean and delta.typeChanges with getMetadataArray, all of
+    // which throw on a JSON string. JsonValueKind.True stands for "boolean".
+    private static JsonValueKind? SpecKind(string key) => key switch
+    {
+        ColumnMapping.FieldIdKey
+            or IdentityColumn.StartKey
+            or IdentityColumn.StepKey
+            or IdentityColumn.HighWaterMarkKey => JsonValueKind.Number,
+        IdentityColumn.AllowExplicitInsertKey => JsonValueKind.True,
+        TypeWidening.TypeChangesKey => JsonValueKind.Array,
+        // PROTOCOL.md, "Writer Requirements for IcebergCompatV2": a Map[String, Long] of array/map field ids.
+        "delta.columnMapping.nested.ids" => JsonValueKind.Object,
+        _ => null,
+    };
+
+    // A value parsed as non-string JSON goes back out as that JSON. Otherwise a key the spec types is written with
+    // its spec kind when the text is one, which also repairs the strings older EW versions wrote for them; anything
+    // else is a string. The text alone never decides: "42" or a delta.invariants object is a legitimate string.
+    private static void WriteMetadataValue(
+        Utf8JsonWriter writer, IReadOnlyDictionary<string, string> metadata, string key, string value)
+    {
+        if (metadata is FieldMetadata kinds && kinds.IsJson(key))
+        {
+            writer.WritePropertyName(key);
+            writer.WriteRawValue(value);
+            return;
+        }
+
+        var kind = SpecKind(key);
+        switch (kind)
+        {
+            case JsonValueKind.Number when long.TryParse(
+                value, System.Globalization.NumberStyles.AllowLeadingSign,
+                System.Globalization.CultureInfo.InvariantCulture, out long number):
+                writer.WriteNumber(key, number);
+                return;
+            case JsonValueKind.True when bool.TryParse(value, out bool flag):
+                writer.WriteBoolean(key, flag);
+                return;
+            case JsonValueKind.Array or JsonValueKind.Object when TryParseJson(value, kind.Value) is { } json:
+                using (json)
+                {
+                    writer.WritePropertyName(key);
+                    json.RootElement.WriteTo(writer);
+                }
+                return;
+        }
+
+        writer.WriteString(key, value);
+    }
+
+    private static JsonDocument? TryParseJson(string value, JsonValueKind kind)
+    {
+        try
+        {
+            var doc = JsonDocument.Parse(value);
+            if (doc.RootElement.ValueKind == kind)
+                return doc;
+            doc.Dispose();
+        }
+        catch (JsonException)
+        {
+        }
+        return null;
     }
 }

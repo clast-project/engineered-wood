@@ -238,9 +238,10 @@ public static class ColumnMapping
             }
         }
 
-        var metadata = CopyMetadata(field.Metadata);
-        metadata[FieldIdKey] = fieldId.ToString();
-        metadata[PhysicalNameKey] = physicalName;
+        var metadata = FieldMetadata.With(
+            field.Metadata,
+            (FieldIdKey, fieldId.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            (PhysicalNameKey, physicalName));
 
         return (new StructField
         {
