@@ -80,6 +80,8 @@ public static class SchemaConverter
         {
             int precision = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
             int scale = int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
+            if (precision > MaxDecimalPrecision)
+                throw new DeltaLake.DeltaFormatException(DecimalPrecisionMessage(precision, scale));
             return new Decimal128Type(precision, scale);
         }
 
@@ -199,6 +201,17 @@ public static class SchemaConverter
         }
     }
 
+    /// <summary>The largest decimal precision Delta allows (PROTOCOL.md, Primitive Types).</summary>
+    private const int MaxDecimalPrecision = 38;
+
+    private static string DecimalPrecisionMessage(int precision, int scale) =>
+        $"decimal({precision},{scale}) exceeds Delta's maximum decimal precision of {MaxDecimalPrecision}.";
+
+    private static PrimitiveType Decimal(int precision, int scale) =>
+        precision <= MaxDecimalPrecision
+            ? new PrimitiveType { TypeName = $"decimal({precision},{scale})" }
+            : throw new DeltaLake.DeltaFormatException(DecimalPrecisionMessage(precision, scale));
+
     private static DeltaDataType FromArrowType(IArrowType arrowType) => arrowType switch
     {
         // MUST precede the struct arm: VariantType is an ExtensionType (not a StructType), so it
@@ -219,13 +232,22 @@ public static class SchemaConverter
         FloatType => new PrimitiveType { TypeName = "float" },
         DoubleType => new PrimitiveType { TypeName = "double" },
         BooleanType => new PrimitiveType { TypeName = "boolean" },
-        Decimal128Type d => new PrimitiveType
-            { TypeName = $"decimal({d.Precision},{d.Scale})" },
-        Decimal256Type d => new PrimitiveType
-            { TypeName = $"decimal({d.Precision},{d.Scale})" },
-        BinaryType or LargeBinaryType or BinaryViewType or FixedSizeBinaryType =>
+        Decimal128Type d => Decimal(d.Precision, d.Scale),
+        Decimal256Type d => Decimal(d.Precision, d.Scale),
+        BinaryType or LargeBinaryType or BinaryViewType =>
             new PrimitiveType { TypeName = "binary" },
-        Date32Type or Date64Type => new PrimitiveType { TypeName = "date" },
+        Date32Type => new PrimitiveType { TypeName = "date" },
+
+        // Accepted before, and wrong both ways. A FixedSizeBinary column was written as a Parquet
+        // FIXED_LEN_BYTE_ARRAY and read back FixedSizeBinary, contradicting the declared Delta binary;
+        // Date64 passed here and then failed at WRITE. Like the timestamp units below, neither is
+        // converted silently: Date64 can carry sub-day milliseconds a Delta date would drop.
+        FixedSizeBinaryType => throw new DeltaLake.DeltaFormatException(
+            "Arrow FixedSizeBinary has no Delta equivalent: Delta 'binary' is variable-length. Cast the "
+            + "column to Binary first."),
+        Date64Type => throw new DeltaLake.DeltaFormatException(
+            "Arrow Date64 has no Delta equivalent: Delta 'date' is a day count (Arrow Date32). Cast the "
+            + "column to Date32 first."),
 
         // MUST precede the timestamp arms below. Nothing downstream narrows the Arrow unit, so a unit
         // Delta or Parquet cannot represent would be written as-is under a microsecond annotation.

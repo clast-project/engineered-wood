@@ -84,7 +84,11 @@ public static class TypeWidening
             _ => -1,
         };
 
-        return basePrecision >= 0 && toPrecision >= basePrecision && toScale >= 0;
+        // decimal(base + k1, k2) with k1 >= k2 >= 0: every added fractional digit needs an added
+        // precision digit too, or the integer's own digits no longer fit (int -> decimal(10,5) holds
+        // at most 99999.99999).
+        int addedPrecision = toPrecision - basePrecision;
+        return basePrecision >= 0 && addedPrecision >= toScale && toScale >= 0;
     }
 
     /// <summary>

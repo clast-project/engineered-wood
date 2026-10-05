@@ -137,6 +137,13 @@ public static class DeltaTableErrorCodes
     // ── Schema changes ──
 
     /// <summary>
+    /// A schema being committed has two fields in one struct whose names differ only in case.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_DUPLICATE_COLUMNS_FOUND</c>. Delta column names are
+    /// case-insensitive, and Spark cannot read a table whose schema has such a pair.</remarks>
+    public const string DuplicateColumnsFound = "DELTA_DUPLICATE_COLUMNS_FOUND";
+
+    /// <summary>
     /// A RENAME or DROP would change a column that a CHECK constraint reads, or a schema replacement
     /// would remove one.
     /// </summary>

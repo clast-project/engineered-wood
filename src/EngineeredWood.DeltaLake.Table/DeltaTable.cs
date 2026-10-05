@@ -400,6 +400,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Convert Arrow schema to Delta schema — unless the caller assigned one ALREADY (see the parameter
         // doc: a CTAS whose data files were written before commit 0 exists).
         var deltaSchema = preAssignedSchema ?? SchemaConverter.FromArrowSchema(schema);
+        DuplicateColumnNames.EnsureNone(deltaSchema);
 
         // Set protocol versions based on column mapping mode
         int minReaderVersion = 1;
@@ -978,27 +979,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 + $"than the existing table's maxColumnId ({previousMaxId}).");
         }
 
-        switch (field.Type)
+        ValidateReplacementColumnMappingIds(field.Type, previousMaxId);
+    }
+
+    // Every depth: array<array<struct>> and map<k, array<struct>> carry ids as surely as array<struct> does.
+    private static void ValidateReplacementColumnMappingIds(DeltaDataType type, int previousMaxId)
+    {
+        switch (type)
         {
             case StructType structure:
                 foreach (StructField child in structure.Fields)
                     ValidateReplacementColumnMappingIds(child, previousMaxId);
                 break;
-            case ArrayType array when array.ElementType is StructType element:
-                foreach (StructField child in element.Fields)
-                    ValidateReplacementColumnMappingIds(child, previousMaxId);
+            case ArrayType array:
+                ValidateReplacementColumnMappingIds(array.ElementType, previousMaxId);
                 break;
             case MapType map:
-                if (map.KeyType is StructType key)
-                {
-                    foreach (StructField child in key.Fields)
-                        ValidateReplacementColumnMappingIds(child, previousMaxId);
-                }
-                if (map.ValueType is StructType value)
-                {
-                    foreach (StructField child in value.Fields)
-                        ValidateReplacementColumnMappingIds(child, previousMaxId);
-                }
+                ValidateReplacementColumnMappingIds(map.KeyType, previousMaxId);
+                ValidateReplacementColumnMappingIds(map.ValueType, previousMaxId);
                 break;
         }
     }
@@ -1087,61 +1085,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     public async ValueTask<long> AddColumnAsync(
         StructField newColumn, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-
-        if (!newColumn.Nullable)
-            throw new InvalidOperationException(
-                $"ADD COLUMN '{newColumn.Name}' must be nullable — existing rows have no value for a new column.");
-
         var snapshot = CurrentSnapshot;
-        var config = snapshot.Metadata.Configuration;
-        var mappingMode = ColumnMapping.GetMode(config);
-
-        foreach (var f in snapshot.Schema.Fields)
-        {
-            if (string.Equals(f.Name, newColumn.Name, StringComparison.Ordinal))
-                throw new InvalidOperationException($"Column '{newColumn.Name}' already exists.");
-        }
-
-        var newDeltaField = newColumn;
-
-        string newSchemaString;
-        var newConfig = config;
-        if (mappingMode == ColumnMappingMode.None)
-        {
-            // Plain table: append the field; old files backfill NULL on read.
-            var fields = new List<StructField>(snapshot.Schema.Fields) { newDeltaField };
-            newSchemaString = DeltaSchemaSerializer.Serialize(new StructType { Fields = fields });
-        }
-        else
-        {
-            // Column-mapping table: assign the new field a fresh column id + physical name RECURSIVELY (the
-            // create-time assigner), so a struct/array/map-typed column arrives with ids on every descendant —
-            // a top-level-only assignment would commit spec-violating metadata that strict readers reject.
-            // Existing fields keep their id/physicalName; maxColumnId advances past the last assigned id.
-            var (mappedField, lastId) = AssignMappedField(snapshot.Schema, config, newDeltaField);
-            var fields = new List<StructField>(snapshot.Schema.Fields) { mappedField };
-            newSchemaString = DeltaSchemaSerializer.Serialize(new StructType { Fields = fields });
-            var cfg = config is null
-                ? new Dictionary<string, string>()
-                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
-            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
-            newConfig = cfg;
-        }
-
-        // Adding a column whose type requires a schema-driven table feature (timestampNtz) to a table whose
-        // protocol lacks it needs a protocol upgrade in the SAME commit — otherwise the committed schema
-        // declares a type the protocol doesn't advertise, and strict readers reject the table.
-        var protocolUpgrade =
-            UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
-
+        var change = ComputeAddColumn(newColumn);
         return await CommitMetadataOnlyAsync(
-            snapshot,
-            snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig },
-            "ADD COLUMNS",
-            cancellationToken,
-            protocolUpgrade).ConfigureAwait(false);
+            snapshot, change.Metadata, "ADD COLUMNS", cancellationToken,
+            change.ProtocolUpgrade).ConfigureAwait(false);
     }
 
     // ── Buffered-transaction schema seam ───────────────────────────────────────────────────────────────
@@ -1228,6 +1176,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             newConfig = cfg;
         }
 
+        DuplicateColumnNames.EnsureNone(newSchema);
         var protocolUpgrade = UpgradeProtocolForFeatures(
             baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
 
@@ -1286,6 +1235,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 : f);
         }
         var newSchema = new StructType { Fields = newFields };
+        DuplicateColumnNames.EnsureNone(newSchema);
 
         var newPartitionColumns = baseMeta.PartitionColumns;
         if (newPartitionColumns.Contains(oldName))
@@ -1404,6 +1354,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return new List<StructField>(fields) { addedField };
         });
 
+        DuplicateColumnNames.EnsureNone(newSchema);
         var protocolUpgrade = UpgradeProtocolForFeatures(
             baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
 
@@ -1469,6 +1420,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         });
         SchemaChangeDependents.EnsureChangeable(
             baseSchema, baseMeta, snapshot.DomainMetadata, fieldPath, isDrop: false);
+        DuplicateColumnNames.EnsureNone(newSchema);
 
         var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
         return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
@@ -1553,6 +1505,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var mappingMode = ColumnMapping.GetMode(config);
 
         var newDeltaSchema = SchemaConverter.FromArrowSchema(newSchema);
+        DuplicateColumnNames.EnsureNone(newDeltaSchema);
         var newConfig = config;
         if (mappingMode != ColumnMappingMode.None)
         {
@@ -1695,59 +1648,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     public async ValueTask<long> AddFieldAsync(
         IReadOnlyList<string> containerPath, Field newField, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        if (containerPath.Count == 0)
-            throw new ArgumentException(
-                "containerPath must name the containing struct column.", nameof(containerPath));
-        if (!newField.IsNullable)
-            throw new InvalidOperationException(
-                $"ADD COLUMN '{PathText(containerPath)}.{newField.Name}' must be nullable — existing rows have "
-                + "no value for a new field.");
-
         var snapshot = CurrentSnapshot;
-        var config = snapshot.Metadata.Configuration;
-        var mappingMode = ColumnMapping.GetMode(config);
-
-        var newDeltaField = SchemaConverter.FromArrowSchema(
-            new Apache.Arrow.Schema([newField], null)).Fields[0];
-
-        var newConfig = config;
-        if (mappingMode != ColumnMappingMode.None)
-        {
-            // Recursive id + physical-name assignment (the create-time assigner) — a struct/array/map-typed
-            // field gets ids on every descendant, exactly like at create; maxColumnId advances past them.
-            var (mappedField, lastId) = AssignMappedField(snapshot.Schema, config, newDeltaField);
-            newDeltaField = mappedField;
-            var cfg = config is null
-                ? new Dictionary<string, string>()
-                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
-            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
-            newConfig = cfg;
-        }
-
-        var addedField = newDeltaField;
-        var newSchema = TransformStructAt(snapshot.Schema, containerPath, 0, fields =>
-        {
-            foreach (var f in fields)
-            {
-                if (string.Equals(f.Name, addedField.Name, StringComparison.Ordinal))
-                    throw new InvalidOperationException(
-                        $"Field '{PathText(containerPath)}.{addedField.Name}' already exists.");
-            }
-            return new List<StructField>(fields) { addedField };
-        });
-        string newSchemaString = DeltaSchemaSerializer.Serialize(newSchema);
-
-        var protocolUpgrade =
-            UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
-
+        var change = ComputeAddField(containerPath, newField);
         return await CommitMetadataOnlyAsync(
-            snapshot,
-            snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig },
-            "ADD COLUMNS",
-            cancellationToken,
-            protocolUpgrade).ConfigureAwait(false);
+            snapshot, change.Metadata, "ADD COLUMNS", cancellationToken,
+            change.ProtocolUpgrade).ConfigureAwait(false);
     }
 
     /// <summary>

@@ -470,19 +470,27 @@ public static class ColumnMapping
         return maxId;
     }
 
-    private static int GetMaxColumnIdRecursive(StructField field)
-    {
-        int maxId = GetFieldId(field) ?? 0;
+    private static int GetMaxColumnIdRecursive(StructField field) =>
+        Math.Max(GetFieldId(field) ?? 0, GetMaxColumnIdRecursive(field.Type));
 
-        switch (field.Type)
+    // Through array elements and map keys/values too: a struct nested in either carries ids of its own,
+    // and a maxColumnId below them lets the next ADD COLUMN reuse one.
+    private static int GetMaxColumnIdRecursive(DeltaDataType type)
+    {
+        switch (type)
         {
             case StructType st:
+                int maxId = 0;
                 foreach (var child in st.Fields)
                     maxId = Math.Max(maxId, GetMaxColumnIdRecursive(child));
-                break;
+                return maxId;
+            case ArrayType at:
+                return GetMaxColumnIdRecursive(at.ElementType);
+            case MapType mt:
+                return Math.Max(GetMaxColumnIdRecursive(mt.KeyType), GetMaxColumnIdRecursive(mt.ValueType));
+            default:
+                return 0;
         }
-
-        return maxId;
     }
 
     /// <summary>
