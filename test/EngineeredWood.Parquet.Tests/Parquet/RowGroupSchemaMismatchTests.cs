@@ -49,7 +49,7 @@ public class RowGroupSchemaMismatchTests : IDisposable
 
     private static ArrowBuffer[] ValueBuffers(IArrowType type, int length) => type switch
     {
-        StructType => [],
+        StructType or FixedSizeListType => [],
         ListType or MapType => [new ArrowBuffer(new byte[(length + 1) * 4])],
         StringType or BinaryType => [new ArrowBuffer(new byte[(length + 1) * 4]), ArrowBuffer.Empty],
         FixedWidthType fw => [new ArrowBuffer(new byte[Math.Max(1, (fw.BitWidth * length + 7) / 8)])],
@@ -60,6 +60,7 @@ public class RowGroupSchemaMismatchTests : IDisposable
     {
         StructType st => st.Fields.Select(f => ArrayOfNulls(f.DataType, length).Data).ToArray(),
         ListType lt => [ArrayOfNulls(lt.ValueDataType, 0).Data],
+        FixedSizeListType ft => [ArrayOfNulls(ft.ValueDataType, length * ft.ListSize).Data],
         MapType mt => [ArrayOfNulls(new StructType([mt.KeyField, mt.ValueField]), 0).Data],
         _ => null,
     };
@@ -292,6 +293,121 @@ public class RowGroupSchemaMismatchTests : IDisposable
             SchemaOf(new Field("t", new TimestampType(TimeUnit.Microsecond, ""), true)));
 
         Assert.Contains("'t'", ex.Message);
+    }
+
+    private static ArrowBuffer Validity(params bool[] valid)
+    {
+        var b = new ArrowBuffer.BitmapBuilder();
+        foreach (bool v in valid)
+            b.Append(v);
+        return b.Build();
+    }
+
+    private static ArrowBuffer Offsets(params int[] offsets)
+    {
+        var b = new ArrowBuffer.Builder<int>();
+        foreach (int o in offsets)
+            b.Append(o);
+        return b.Build();
+    }
+
+    private static Int32Array Ints(params int?[] values)
+    {
+        var b = new Int32Array.Builder();
+        foreach (var v in values)
+        {
+            if (v is null)
+                b.AppendNull();
+            else
+                b.Append(v.Value);
+        }
+        return b.Build();
+    }
+
+    private static ArrowSchema StructOfX(bool xNullable) =>
+        SchemaOf(new Field("s", new StructType([new Field("x", Int32Type.Default, xNullable)]), true));
+
+    private static ArrowSchema ListOfInts(bool elementNullable) =>
+        SchemaOf(new Field("l", new ListType(new Field("element", Int32Type.Default, elementNullable)), true));
+
+    private static RecordBatch ListBatch(bool elementNullable, bool[] valid, int[] offsets, Int32Array values)
+    {
+        var schema = ListOfInts(elementNullable);
+        var list = new ListArray(schema.FieldsList[0].DataType, valid.Length, Offsets(offsets), values,
+            Validity(valid), valid.Count(v => !v));
+        return new RecordBatch(schema, [list], valid.Length);
+    }
+
+    // Review of #464: Parquet map keys are always required (ArrowToSchemaConverter, NestedLevelWriter), whatever
+    // the Arrow key field says, so a null key is refused even when the first batch declared keys nullable.
+    [Fact]
+    public async Task NullMapKey_IsRefused_EvenWhenTheFileDeclaredKeysNullable()
+    {
+        var mapType = new MapType(new Field("key", Int32Type.Default, true), new Field("value", Int32Type.Default, true));
+        var schema = SchemaOf(new Field("m", mapType, true));
+        var entries = new StructArray(new StructType([mapType.KeyField, mapType.ValueField]), 2,
+            [Ints(1, null), Ints(10, 20)], ArrowBuffer.Empty, nullCount: 0);
+        var map = new MapArray(mapType, 1, Offsets(0, 2), entries, Validity(true), nullCount: 0);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => WriteAsync(Writer.File,
+            Path.Combine(_tempDir, "map-key.parquet"), BatchOf(schema), new RecordBatch(schema, [map], 1)));
+
+        Assert.Contains("'m.key'", ex.Message);
+    }
+
+    // Review of #464: a struct child's slot under a null struct row is never written (NestedLevelWriter maps it
+    // to -1), so a null there is fine even when the file made the child required.
+    [Fact]
+    public async Task NullChildUnderANullStruct_IsAccepted()
+    {
+        var second = StructOfX(xNullable: true);
+        var structArray = new StructArray(second.FieldsList[0].DataType, 2, [Ints(2, null)],
+            Validity(true, false), nullCount: 1);
+        string path = Path.Combine(_tempDir, "struct-null-parent.parquet");
+
+        await WriteAsync(Writer.File, path, BatchOf(StructOfX(xNullable: false)),
+            new RecordBatch(second, [structArray], 2));
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var read = (StructArray)(await reader.ReadRowGroupAsync(1)).Column(0);
+        Assert.Equal(2, ((Int32Array)read.Fields[0]).GetValue(0));
+        Assert.True(read.IsNull(1));
+    }
+
+    // The same for a list: an element under a null list slot is never written.
+    [Fact]
+    public async Task NullElementUnderANullListSlot_IsAccepted()
+    {
+        await WriteAsync(Writer.File, Path.Combine(_tempDir, "list-null-slot.parquet"),
+            BatchOf(ListOfInts(elementNullable: false)),
+            ListBatch(elementNullable: true, valid: [true, false], offsets: [0, 1, 2], Ints(1, null)));
+    }
+
+    // ...but one in a present slot is written, and is refused.
+    [Fact]
+    public async Task NullElementInAPresentListSlot_IsRefused()
+    {
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => WriteAsync(Writer.File,
+            Path.Combine(_tempDir, "list-null-element.parquet"),
+            BatchOf(ListOfInts(elementNullable: false)),
+            ListBatch(elementNullable: true, valid: [true, true], offsets: [0, 1, 2], Ints(1, null))));
+
+        Assert.Contains("'l.element'", ex.Message);
+    }
+
+    // A fixed-size list writes no elements for a null slot either.
+    [Fact]
+    public async Task NullElementsUnderANullFixedSizeListSlot_AreAccepted()
+    {
+        static ArrowSchema Of(bool elementNullable) => SchemaOf(new Field("f",
+            new FixedSizeListType(new Field("element", Int32Type.Default, elementNullable), 2), true));
+        var second = Of(elementNullable: true);
+        var fixedList = new FixedSizeListArray(second.FieldsList[0].DataType, 2, Ints(1, 2, null, null),
+            Validity(true, false), nullCount: 1);
+
+        await WriteAsync(Writer.File, Path.Combine(_tempDir, "fsl-null-slot.parquet"),
+            BatchOf(Of(elementNullable: false)), new RecordBatch(second, [fixedList], 2));
     }
 
     private static async Task<int[]> ReadColumnAsync(string path, string column)
