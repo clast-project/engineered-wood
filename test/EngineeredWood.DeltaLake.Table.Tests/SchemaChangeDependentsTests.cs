@@ -269,6 +269,59 @@ public class SchemaChangeDependentsTests : IDisposable
         Assert.Equal(domain, table.GetDomainMetadata("delta.clustering"));
     }
 
+    private DeltaTable OpenSecondHandle() =>
+        DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir)).AsTask().GetAwaiter().GetResult();
+
+    [Fact]
+    public async Task DropColumn_OnAStaleHandle_AbortsWhenClusteringMovedOntoIt()
+    {
+        // The other handle re-keys clustering onto `name` with a domain-only commit (no metaData, no
+        // protocol), so only declaring delta.clustering READ stops the stale DROP from rebasing past it.
+        await using var stale = await CreateAsync(LongSchema("id", "name"), clusteringColumns: ["id"]);
+        await using (var other = OpenSecondHandle())
+            await other.SetClusteringColumnsAsync(["name"]);
+
+        var ex = await Assert.ThrowsAsync<DeltaConflictException>(
+            async () => await stale.DropColumnAsync("name"));
+        Assert.Equal(DeltaErrorCodes.DomainMetadataConflict, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task StagedDropColumn_AbortsWhenClusteringMovedOntoIt()
+    {
+        await using var table = await CreateAsync(LongSchema("id", "name"), clusteringColumns: ["id"]);
+        var txn = table.StartTransaction();
+        txn.StageSchemaChange(table.ComputeDropColumn("name"));
+
+        await using (var other = OpenSecondHandle())
+            await other.SetClusteringColumnsAsync(["name"]);
+
+        await Assert.ThrowsAsync<DeltaConflictException>(async () => await txn.CommitAsync());
+    }
+
+    [Fact]
+    public async Task SetSchema_OnAStaleHandle_AbortsWhenClusteringMovedOntoADroppedColumn()
+    {
+        await using var stale = await CreateAsync(
+            LongSchema("id", "name"), clusteringColumns: ["id"], mode: ColumnMappingMode.None);
+        await using (var other = OpenSecondHandle())
+            await other.SetClusteringColumnsAsync(["name"]);
+
+        await Assert.ThrowsAsync<DeltaConflictException>(
+            async () => await stale.SetSchemaAsync(LongSchema("id", "extra")));
+    }
+
+    [Fact]
+    public async Task RenameColumn_OnAStaleHandle_StillRebasesPastAClusteringChange()
+    {
+        // A rename keeps the physical name, so it does not depend on the clustering spec.
+        await using var stale = await CreateAsync(LongSchema("id", "name"), clusteringColumns: ["id"]);
+        await using (var other = OpenSecondHandle())
+            await other.SetClusteringColumnsAsync(["name"]);
+
+        await stale.RenameColumnAsync("name", "label");
+    }
+
     [Fact]
     public async Task DropColumn_AfterClusteringWasRemoved_IsAllowed()
     {
@@ -334,6 +387,59 @@ public class SchemaChangeDependentsTests : IDisposable
             async () => await table.SetSchemaAsync(LongSchema("b")));
 
         await table.SetSchemaAsync(LongSchema("ID", "c"));
+    }
+
+    [Fact]
+    public async Task SetSchema_TurningAQuotedDottedColumnIntoAStruct_IsRefused()
+    {
+        // `a.b` names the top-level column "a.b". The parser's dotted text cannot tell it from field b of a
+        // struct a, so the replacement must keep the binding the OLD schema gave it.
+        await using var table = await CreateAsync(
+            LongSchema("id", "a.b"), "`a.b` > 0", mode: ColumnMappingMode.None);
+
+        var structured = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("a", new ArrowStructType([new Field("b", Int64Type.Default, true)]), true))
+            .Build();
+        await RefusedAsync(DeltaTableErrorCodes.ConstraintDependentColumnChange,
+            async () => await table.SetSchemaAsync(structured));
+
+        await table.SetSchemaAsync(LongSchema("a.b", "c"));
+    }
+
+    [Fact]
+    public async Task SetSchema_KeepingAGeneratedColumnButNotItsSource_IsRefused()
+    {
+        await using var table = await CreateAsync(GeneratedSchema(), mode: ColumnMappingMode.None);
+
+        var withoutA = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("b", Int64Type.Default, true))
+            .Field(GeneratedSchema().FieldsList[2])
+            .Build();
+        await RefusedAsync(DeltaTableErrorCodes.GeneratedColumnsDependentColumnChange,
+            async () => await table.SetSchemaAsync(withoutA));
+
+        // Dropping both is fine, and so is a NEW generated column over a new column.
+        var replaced = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("b", Int64Type.Default, true))
+            .Field(new Field("h", Int64Type.Default, true,
+                new Dictionary<string, string> { ["delta.generationExpression"] = "b + 1" }))
+            .Build();
+        await table.SetSchemaAsync(replaced);
+    }
+
+    [Fact]
+    public async Task SetSchema_WithAGenerationExpressionThatCannotBeParsed_IsRefused()
+    {
+        await using var table = await CreateAsync(LongSchema("a"), mode: ColumnMappingMode.None);
+
+        var bad = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("a", Int64Type.Default, true))
+            .Field(new Field("g", Int64Type.Default, true,
+                new Dictionary<string, string> { ["delta.generationExpression"] = "a >>> 1" }))
+            .Build();
+        await RefusedAsync(DeltaTableErrorCodes.UnevaluableTableExpression,
+            async () => await table.SetSchemaAsync(bad));
     }
 
     [Fact]

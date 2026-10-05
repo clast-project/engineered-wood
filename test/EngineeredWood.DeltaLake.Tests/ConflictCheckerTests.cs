@@ -612,6 +612,25 @@ public class ConflictCheckerTests
     }
 
     /// <summary>
+    /// A domain declared READ conflicts like one written: a DROP COLUMN validated against
+    /// <c>delta.clustering</c> must not rebase past a concurrent re-key onto the dropped column (#465).
+    /// </summary>
+    [Fact]
+    public void ConcurrentWriteOfADomainThisTransactionRead_Conflicts()
+    {
+        var reads = new ReadSet { Domains = new HashSet<string> { "delta.clustering" } };
+
+        var result = CheckCommitting(
+            [], reads, IsolationLevel.WriteSerializable,
+            Commit(4, Domain("delta.clustering", "{\"clusteringColumns\":[[\"name\"]]}")));
+        Assert.Equal(ConflictType.DomainMetadataChanged, result.Type);
+        Assert.Contains("read", result.Message);
+
+        Assert.False(CheckCommitting(
+            [], reads, IsolationLevel.WriteSerializable, Commit(4, Domain("acme.lineage"))).HasConflict);
+    }
+
+    /// <summary>
     /// A transaction that writes NO domain metadata is untouched by one that does — the rule is symmetric
     /// intersection, not "a concurrent domainMetadata is dangerous".
     /// </summary>

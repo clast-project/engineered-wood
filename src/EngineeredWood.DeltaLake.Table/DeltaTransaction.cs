@@ -64,6 +64,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
     // They become the transaction's ReadSet.Predicates so a concurrent add matching one is a
     // concurrentAppend conflict. Left empty by the functional-predicate and append-only paths.
     private readonly List<Expressions.Predicate> _readPredicates = [];
+    private readonly HashSet<string> _readDomains = new(StringComparer.Ordinal);
     // Per-file row-level edits from staged DELETEs (the rows each removed, by absolute position). They let
     // the commit loop rebase this delete's deletion vectors onto a concurrent DV-delete of the same file
     // (row-level concurrency) instead of aborting. Only DELETEs contribute; appends and updates do not.
@@ -136,6 +137,10 @@ public sealed class DeltaTransaction : IAsyncDisposable
     internal ISet<string> RemovedPaths => _removedPaths;
 
     internal IReadOnlyList<Expressions.Predicate> ReadPredicates => _readPredicates;
+
+    /// <summary>The <c>domainMetadata</c> domains staged schema changes were validated against; see
+    /// <see cref="Concurrency.ReadSet.Domains"/>.</summary>
+    internal IReadOnlyCollection<string> ReadDomains => _readDomains;
 
     internal IReadOnlyList<DeltaTable.DeleteDvEdit> DvEdits => _dvEdits;
 
@@ -550,6 +555,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
     {
         EnsureOpen();
         StageInternal(change.Actions);
+        foreach (var domain in change.ReadDomains ?? [])
+            _readDomains.Add(domain);
         _operations.Add("ALTER");
     }
 

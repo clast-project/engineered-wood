@@ -97,22 +97,52 @@ internal static class SchemaChangeDependents
     }
 
     /// <summary>
-    /// Throws if a CHECK constraint in <paramref name="metadata"/> reads a column that
-    /// <paramref name="newSchema"/> does not have — the schema-replacement form of
+    /// Throws if a schema replacement leaves an expression reading a column that
+    /// <paramref name="newSchema"/> does not have: a CHECK constraint in <paramref name="metadata"/>
+    /// (which the replacement keeps), or a generation expression declared in
+    /// <paramref name="newSchema"/> itself. The schema-replacement form of
     /// <see cref="EnsureChangeable"/>.
     /// </summary>
-    public static void EnsureConstraintsResolve(MetadataAction metadata, StructType newSchema)
+    /// <remarks>
+    /// A reference must keep the binding it had in <paramref name="oldSchema"/>. The parser's dotted
+    /// text cannot say whether <c>`a.b`</c> was one quoted column or <c>a</c>'s field <c>b</c>, so
+    /// accepting any split that resolves would let a replacement swap the one for the other, and the
+    /// write path, which binds the old way, would then fail. A reference the old schema cannot bind
+    /// (a new generated column's, say) only has to resolve somehow.
+    /// </remarks>
+    public static void EnsureReplacementResolves(
+        MetadataAction metadata, StructType oldSchema, StructType newSchema)
     {
         foreach (var (key, sql) in Constraints(metadata))
         {
             foreach (var reference in References($"CHECK constraint '{key}'", sql))
             {
-                if (!Resolves(newSchema.Fields, reference))
+                if (!StillResolves(oldSchema, newSchema, reference))
                 {
                     throw new DeltaFormatException(
                         DeltaTableErrorCodes.ConstraintDependentColumnChange,
                         $"The new schema has no column '{reference}', which CHECK constraint '{key}' "
                         + $"({sql}) reads. Drop the constraint first.");
+                }
+            }
+        }
+
+        foreach (var field in newSchema.Fields)
+        {
+            if (field.Metadata is null
+                || !field.Metadata.TryGetValue(GenerationExpressionKey, out var sql))
+            {
+                continue;
+            }
+
+            foreach (var reference in References($"generated column '{field.Name}'", sql))
+            {
+                if (!StillResolves(oldSchema, newSchema, reference))
+                {
+                    throw new DeltaFormatException(
+                        DeltaTableErrorCodes.GeneratedColumnsDependentColumnChange,
+                        $"The new schema has no column '{reference}', which generated column "
+                        + $"'{field.Name}' is computed from ({sql}).");
                 }
             }
         }
@@ -238,24 +268,31 @@ internal static class SchemaChangeDependents
             && reference[target.Length] == '.'
             && reference.StartsWith(target, StringComparison.OrdinalIgnoreCase));
 
-    /// <summary>Whether a dotted reference names a field of <paramref name="fields"/>, trying every
+    private static bool StillResolves(StructType oldSchema, StructType newSchema, string reference)
+    {
+        var bound = Bindings(oldSchema.Fields, reference).ToList();
+        return bound.Count == 0
+            ? Bindings(newSchema.Fields, reference).Any()
+            : bound.All(path => TranslatePath(newSchema, path, f => f.Name, f => f.Name) is not null);
+    }
+
+    /// <summary>Every field path a dotted reference can name in <paramref name="fields"/>, trying every
     /// split, since a quoted name may itself contain a dot.</summary>
-    private static bool Resolves(IReadOnlyList<StructField> fields, string reference)
+    private static IEnumerable<IReadOnlyList<string>> Bindings(IReadOnlyList<StructField> fields, string reference)
     {
         foreach (var field in fields)
         {
             if (reference.Equals(field.Name, StringComparison.OrdinalIgnoreCase))
-                return true;
+                yield return [field.Name];
             if (field.Type is StructType st
                 && reference.Length > field.Name.Length
                 && reference[field.Name.Length] == '.'
-                && reference.StartsWith(field.Name, StringComparison.OrdinalIgnoreCase)
-                && Resolves(st.Fields, reference.Substring(field.Name.Length + 1)))
+                && reference.StartsWith(field.Name, StringComparison.OrdinalIgnoreCase))
             {
-                return true;
+                foreach (var rest in Bindings(st.Fields, reference.Substring(field.Name.Length + 1)))
+                    yield return [field.Name, .. rest];
             }
         }
-        return false;
     }
 
     /// <summary>The column names an expression reads.</summary>

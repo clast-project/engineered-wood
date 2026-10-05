@@ -1156,12 +1156,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="Actions"/> = the optional protocol upgrade + the new <c>metaData</c> action, to be fused into
     /// ONE commit via <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>; <see cref="Metadata"/> /
     /// <see cref="ProtocolUpgrade"/> are the pending base for a CHAINED next change; <see cref="NewSchema"/> is
-    /// the parsed new Delta schema (drives the caller's read overlays and schema-overridden writes).</summary>
+    /// the parsed new Delta schema (drives the caller's read overlays and schema-overridden writes);
+    /// <see cref="ReadDomains"/> are the <c>domainMetadata</c> domains the change was validated against (a DROP
+    /// reads <c>delta.clustering</c>), which <see cref="DeltaTransaction.StageSchemaChange"/> declares read so a
+    /// concurrent change to one aborts the commit.</summary>
     public readonly record struct DeferredSchemaChange(
         IReadOnlyList<DeltaAction> Actions,
         MetadataAction Metadata,
         ProtocolAction? ProtocolUpgrade,
-        StructType NewSchema);
+        StructType NewSchema,
+        IReadOnlyList<string>? ReadDomains = null);
 
     /// <summary>
     /// The compute-only counterpart of <see cref="AddColumnAsync(StructField, CancellationToken)"/>: builds the metaData (+ protocol upgrade)
@@ -1338,7 +1342,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var newSchema = new StructType { Fields = newFields };
 
         var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
-        return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
+        return new DeferredSchemaChange(
+            new List<DeltaAction> { metadata }, metadata, null, newSchema, [ClusteringDomain]);
     }
 
     /// <summary>The compute-only counterpart of <see cref="AddFieldAsync"/> (nested ADD) — for a buffered
@@ -1514,7 +1519,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             baseSchema, baseMeta, snapshot.DomainMetadata, fieldPath, isDrop: true);
 
         var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
-        return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
+        return new DeferredSchemaChange(
+            new List<DeltaAction> { metadata }, metadata, null, newSchema, [ClusteringDomain]);
     }
 
     /// <summary>Reconciles a logically-named batch to <paramref name="expectedFields"/> — the public form of the
@@ -1532,8 +1538,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// old-schema files). On a column-mapping table fresh field ids are assigned (continuing past the current
     /// maxColumnId so ids are never reused across history), and a clustering spec is re-keyed to the new physical
     /// names. Throws if the new schema lacks a partition column, a clustering column, or a column a CHECK
-    /// constraint reads. Returns the new version; a no-op (returns the current version) if the schema is already
-    /// logically identical.
+    /// constraint or a generation expression reads. Returns the new version; a no-op (returns the current
+    /// version) if the schema is already logically identical.
     /// </summary>
     public async ValueTask<long> SetSchemaAsync(
         Apache.Arrow.Schema newSchema, CancellationToken cancellationToken = default)
@@ -1582,8 +1588,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         // What the old schema's columns carried that the metadata keeps: partitionColumns must name schema
-        // columns (PROTOCOL.md), CHECK constraints read theirs by name, and the clustering spec names physical
-        // columns this replacement may have just renamed.
+        // columns (PROTOCOL.md), CHECK constraints and generation expressions read theirs by name, and the
+        // clustering spec names physical columns this replacement may have just renamed.
         foreach (var partitionColumn in snapshot.Metadata.PartitionColumns)
         {
             if (!newDeltaSchema.Fields.Any(f => string.Equals(f.Name, partitionColumn, StringComparison.Ordinal)))
@@ -1593,7 +1599,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     $"The new schema has no partition column '{partitionColumn}'.");
             }
         }
-        SchemaChangeDependents.EnsureConstraintsResolve(snapshot.Metadata, newDeltaSchema);
+        SchemaChangeDependents.EnsureReplacementResolves(snapshot.Metadata, snapshot.Schema, newDeltaSchema);
         var clustering = RekeyClusteringDomain(snapshot, newDeltaSchema, mappingMode);
 
         var protocolUpgrade = UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaSchema));
@@ -1604,7 +1610,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             "CHANGE COLUMNS",
             cancellationToken,
             protocolUpgrade,
-            clustering).ConfigureAwait(false);
+            clustering,
+            readDomains: [ClusteringDomain]).ConfigureAwait(false);
     }
 
     // The schema's LOGICAL signature — field names + types + nullability, with column-mapping metadata (ids /
@@ -1670,7 +1677,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var snapshot = CurrentSnapshot;
         var change = ComputeDropColumn(name);
         return await CommitMetadataOnlyAsync(
-            snapshot, change.Metadata, "DROP COLUMNS", cancellationToken).ConfigureAwait(false);
+            snapshot, change.Metadata, "DROP COLUMNS", cancellationToken,
+            readDomains: change.ReadDomains).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1770,7 +1778,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var snapshot = CurrentSnapshot;
         var change = ComputeDropField(fieldPath);
         return await CommitMetadataOnlyAsync(
-            snapshot, change.Metadata, "DROP COLUMNS", cancellationToken).ConfigureAwait(false);
+            snapshot, change.Metadata, "DROP COLUMNS", cancellationToken,
+            readDomains: change.ReadDomains).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1786,8 +1795,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// derived metadata is unchanged by construction.</para>
     ///
     /// <para><b>Why <see cref="ReadSet.Blind"/> is the right read set and not a shrug.</b> A schema change
-    /// reads the SCHEMA, which is not a thing <see cref="ReadSet"/> can name — its two facets are files
-    /// and predicates — and the rule that protects that read needs no declaration to fire. Naming files or
+    /// reads the SCHEMA, which is not a thing <see cref="ReadSet"/> can name — its data facets are files
+    /// and predicates — and the rule that protects that read needs no declaration to fire. The exception
+    /// is a change validated against a <c>domainMetadata</c> domain (a DROP checks <c>delta.clustering</c>):
+    /// a domain-only commit changes no metadata, so <paramref name="readDomains"/> declares it. Naming files or
     /// claiming <see cref="ReadSet.WholeTable"/> would not add protection; it would invent a dependency on
     /// DATA that an ALTER TABLE does not have, and make it conflict with every concurrent append and
     /// delete. Delta's own ALTER TABLE registers no read files and no read predicates either.
@@ -1800,7 +1811,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         string operation,
         CancellationToken cancellationToken,
         ProtocolAction? protocolUpgrade = null,
-        DomainMetadata? domain = null)
+        DomainMetadata? domain = null,
+        IReadOnlyList<string>? readDomains = null)
     {
         var actionList = new List<DeltaAction>();
         if (protocolUpgrade is not null)
@@ -1809,8 +1821,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (domain is not null)
             actionList.Add(domain);
 
+        var reads = readDomains is null
+            ? ReadSet.Blind
+            : new ReadSet { Domains = new HashSet<string>(readDomains, StringComparer.Ordinal) };
         return CommitOccAsync(
-            snapshot, actionList, ReadSet.Blind, IsolationLevel.WriteSerializable, operation,
+            snapshot, actionList, reads, IsolationLevel.WriteSerializable, operation,
             rebaseSafe: true, cancellationToken, isBlindAppend: false);
     }
 
@@ -2543,6 +2558,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // saw the scan. Honoured at both isolation levels; see the method's own remarks for the proposal
             // that would narrow it and why it is not implemented.
             WholeTable = transaction.DeclaredWholeTableRead,
+            // Domains a staged schema change was validated against (StageSchemaChange).
+            Domains = new HashSet<string>(transaction.ReadDomains, StringComparer.Ordinal),
         };
 
         // The row-tracking high-water mark is emitted ONCE for the whole transaction, from the counter each
