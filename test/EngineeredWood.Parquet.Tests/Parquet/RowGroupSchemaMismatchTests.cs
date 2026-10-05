@@ -241,6 +241,59 @@ public class RowGroupSchemaMismatchTests : IDisposable
         Assert.Contains("'s.x'", ex.Message);
     }
 
+    private static RunEndEncodedArray Ree(IArrowArray values)
+    {
+        var ends = new Int32Array.Builder();
+        for (int i = 1; i <= values.Length; i++)
+            ends.Append(i * 2);
+        return new RunEndEncodedArray(ends.Build(), values);
+    }
+
+    private static RecordBatch ReeBatch(RunEndEncodedArray ree, bool nullable) => new(
+        SchemaOf(new Field("r", ree.Data.DataType, nullable)), [ree], ree.Length);
+
+    // Review of #464: two run-end encoded columns share a TypeId whatever their values are, so the values type
+    // must be compared, or REE<Int64> is narrowed into the file's REE<Int32> column.
+    // ParquetFileWriter only: BufferedParquetWriter refuses run-end encoded columns outright.
+    [Fact]
+    public async Task RunEndEncodedValuesType_IsCompared()
+    {
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => WriteAsync(Writer.File,
+            Path.Combine(_tempDir, "ree-type.parquet"),
+            ReeBatch(Ree(new Int32Array.Builder().Append(1).Build()), nullable: true),
+            ReeBatch(Ree(new Int64Array.Builder().Append(5_000_000_000L).Build()), nullable: true)));
+
+        Assert.Contains("'r'", ex.Message);
+        Assert.Contains("int64", ex.Message);
+    }
+
+    // Review of #464: a run-end encoded array has no validity bitmap; its nulls are null runs in Values.
+    // ParquetFileWriter only: BufferedParquetWriter refuses run-end encoded columns outright.
+    [Fact]
+    public async Task NullRunsInAColumnTheFileMadeRequired_AreRefused()
+    {
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => WriteAsync(Writer.File,
+            Path.Combine(_tempDir, "ree-nulls.parquet"),
+            ReeBatch(Ree(new Int32Array.Builder().Append(1).Build()), nullable: false),
+            ReeBatch(Ree(new Int32Array.Builder().Append(2).AppendNull().Build()), nullable: true)));
+
+        Assert.Contains("required", ex.Message);
+    }
+
+    // Review of #464: an empty zone is still a zone to ArrowToSchemaConverter (isAdjustedToUTC = Timezone != null),
+    // so it does not match a file whose timestamps have none.
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task EmptyTimezoneAgainstNone_IsRefused(Writer kind)
+    {
+        var ex = await RefusedAsync(kind,
+            SchemaOf(new Field("t", new TimestampType(TimeUnit.Microsecond, (string?)null), true)),
+            SchemaOf(new Field("t", new TimestampType(TimeUnit.Microsecond, ""), true)));
+
+        Assert.Contains("'t'", ex.Message);
+    }
+
     private static async Task<int[]> ReadColumnAsync(string path, string column)
     {
         await using var file = new LocalRandomAccessFile(path);

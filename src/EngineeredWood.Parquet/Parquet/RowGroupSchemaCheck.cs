@@ -14,8 +14,8 @@ namespace EngineeredWood.Parquet;
 /// <remarks>
 /// Compared at every depth: column count, names and order; struct child names and order; types, including their
 /// parameters (decimal precision and scale, time units, byte widths, list sizes). Not compared: field metadata, the
-/// names Arrow gives list and map children (Parquet writes its own), and a timestamp's time zone beyond whether it
-/// has one (Parquet records only that). A nullable field where the file's is required is refused only when it
+/// names Arrow gives list and map children (Parquet writes its own), a run-end encoded column's run-end type, and a
+/// timestamp's time zone beyond whether it is null (Parquet records only that, as isAdjustedToUTC). A nullable field where the file's is required is refused only when it
 /// holds nulls, since the file cannot represent them and the writers would encode each one as a value.
 /// </remarks>
 internal static class RowGroupSchemaCheck
@@ -50,7 +50,7 @@ internal static class RowGroupSchemaCheck
 
     private static void CheckField(Field expected, Field actual, IArrowArray? array, string path)
     {
-        if (!expected.IsNullable && actual.IsNullable && array is { NullCount: > 0 })
+        if (!expected.IsNullable && actual.IsNullable && HasNulls(array))
             throw Mismatch(path, "the file's column is required, and the row group has nulls in it");
 
         CheckType(expected.DataType, actual.DataType, array, path);
@@ -99,6 +99,13 @@ internal static class RowGroupSchemaCheck
                 CheckField(ef.ValueField, af.ValueField, (array as FixedSizeListArray)?.Values, path + ".element");
                 return;
 
+            // The run ends only say where each run stops, and Parquet never sees them; the values are what is
+            // encoded, so they are what must match.
+            case RunEndEncodedType er:
+                CheckType(er.ValuesDataType, ((RunEndEncodedType)actual).ValuesDataType,
+                    (array as RunEndEncodedArray)?.Values, path);
+                return;
+
             case DictionaryType ed:
                 var ad = (DictionaryType)actual;
                 CheckType(ed.IndexType, ad.IndexType, null, path);
@@ -110,12 +117,22 @@ internal static class RowGroupSchemaCheck
             throw TypeMismatch(path, expected, actual);
     }
 
+    // A run-end encoded array has no validity bitmap of its own: its nulls are null runs in Values, which is
+    // where ColumnChunkWriter's def levels come from too.
+    private static bool HasNulls(IArrowArray? array) => array switch
+    {
+        null => false,
+        RunEndEncodedArray ree => ree.Values.NullCount > 0,
+        _ => array.NullCount > 0,
+    };
+
     // Leaf types whose TypeId leaves parameters open.
     private static bool SameParameters(IArrowType expected, IArrowType actual) => (expected, actual) switch
     {
         _ when Decimal(expected) is { } ed => ed == Decimal(actual),
         (TimestampType et, TimestampType at) =>
-            et.Unit == at.Unit && string.IsNullOrEmpty(et.Timezone) == string.IsNullOrEmpty(at.Timezone),
+            // Null, not empty, is "no zone": ArrowToSchemaConverter sets isAdjustedToUTC from Timezone != null.
+            et.Unit == at.Unit && (et.Timezone is null) == (at.Timezone is null),
         (Time32Type et, Time32Type at) => et.Unit == at.Unit,
         (Time64Type et, Time64Type at) => et.Unit == at.Unit,
         (DurationType ed, DurationType ad) => ed.Unit == ad.Unit,
@@ -146,7 +163,7 @@ internal static class RowGroupSchemaCheck
     private static string Describe(IArrowType type) => type switch
     {
         _ when Decimal(type) is var (p, sc) => $"{type.Name}({p}, {sc})",
-        TimestampType t => $"timestamp[{t.Unit}{(string.IsNullOrEmpty(t.Timezone) ? "" : ", " + t.Timezone)}]",
+        TimestampType t => $"timestamp[{t.Unit}{(t.Timezone is null ? "" : $", \"{t.Timezone}\"")}]",
         Time32Type t => $"time32[{t.Unit}]",
         Time64Type t => $"time64[{t.Unit}]",
         DurationType d => $"duration[{d.Unit}]",
