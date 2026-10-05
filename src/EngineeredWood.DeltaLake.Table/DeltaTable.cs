@@ -1159,7 +1159,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// the parsed new Delta schema (drives the caller's read overlays and schema-overridden writes);
     /// <see cref="ReadDomains"/> are the <c>domainMetadata</c> domains the change was validated against (a DROP
     /// reads <c>delta.clustering</c>), which <see cref="DeltaTransaction.StageSchemaChange"/> declares read so a
-    /// concurrent change to one aborts the commit.</summary>
+    /// concurrent change to one aborts the commit. A caller fusing <see cref="Actions"/> through
+    /// <see cref="CommitDataFilesAsync"/> instead passes them as its <c>readDomains</c>.</summary>
     public readonly record struct DeferredSchemaChange(
         IReadOnlyList<DeltaAction> Actions,
         MetadataAction Metadata,
@@ -6154,6 +6155,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <param name="deletedPositionsByFileIndex">Rows of a not-yet-committed file (by index into
     /// <paramref name="files"/>) that a buffered transaction deleted AFTER inserting them (same-transaction DML):
     /// the add is born with an inline deletion vector, so the rows never appear in any committed version.</param>
+    /// <param name="readDomains"><c>domainMetadata</c> domains the fused <paramref name="extraActions"/> were
+    /// validated against — pass a fused <see cref="DeferredSchemaChange"/>'s <see cref="DeferredSchemaChange.ReadDomains"/>
+    /// here. A concurrent commit writing one then aborts this one rather than being rebased past: a DROP
+    /// COLUMN checked against <c>delta.clustering</c> must not land after a domain-only re-key onto that
+    /// column.</param>
     public async ValueTask<long> CommitDataFilesAsync(
         IReadOnlyList<WrittenDataFile> files,
         DeltaWriteMode mode = DeltaWriteMode.Append,
@@ -6167,7 +6173,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool dataChange = true,
         string? clusteringProvider = null,
         bool? isBlindAppend = null,
-        bool constraintsEnforcedByCaller = false)
+        bool constraintsEnforcedByCaller = false,
+        IReadOnlyCollection<string>? readDomains = null)
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
@@ -6252,9 +6259,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // through this while another process edits table properties will now see conflicts it did
                 // not before — the fix is a public opt-out on the request rather than a quiet revert here.
                 // That reopens a real hole, so it should be asked for rather than offered.
-                Reads = ReadSet.Blind,
+                //
+                // The one thing it can be told: domains a fused schema change was validated against.
+                Reads = readDomains is { Count: > 0 }
+                    ? new ReadSet { Domains = new HashSet<string>(readDomains, StringComparer.Ordinal) }
+                    : ReadSet.Blind,
                 // The caller's own claim about what it read, passed through verbatim. ⚠ NOT derived from
-                // Reads above: that is hardcoded Blind here because this method has no way to know, which
+                // Reads above: that is Blind here (bar declared domains) because this method cannot see a scan, which
                 // is precisely why the claim has to come from the caller. See LogCommitRequest.IsBlindAppend.
                 IsBlindAppend = isBlindAppend,
             },

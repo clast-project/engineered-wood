@@ -152,6 +152,11 @@ internal static class SchemaChangeDependents
     /// The clustering spec's column paths (PHYSICAL names), or null when the table is not
     /// clustered.
     /// </summary>
+    /// <exception cref="DeltaFormatException">
+    /// An active domain is not of the expected shape — including one with no
+    /// <c>clusteringColumns</c> at all. Null would read as "not clustered" and let a DROP or a
+    /// replacement skip the check, so a domain that cannot be read fails closed.
+    /// </exception>
     public static IReadOnlyList<IReadOnlyList<string>>? ClusteringPaths(
         IReadOnlyDictionary<string, DomainMetadata> domains)
     {
@@ -161,8 +166,11 @@ internal static class SchemaChangeDependents
         try
         {
             using var document = JsonDocument.Parse(domain.Configuration);
-            if (!document.RootElement.TryGetProperty("clusteringColumns", out var columns))
-                return null;
+            if (document.RootElement.ValueKind != JsonValueKind.Object
+                || !document.RootElement.TryGetProperty("clusteringColumns", out var columns))
+            {
+                throw new FormatException("no clusteringColumns property");
+            }
 
             var paths = new List<IReadOnlyList<string>>();
             foreach (var column in columns.EnumerateArray())
@@ -177,7 +185,7 @@ internal static class SchemaChangeDependents
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or FormatException)
         {
             throw new DeltaFormatException(
-                DeltaTableErrorCodes.UnsupportedDropClusteringColumn,
+                DeltaErrorCodes.InvalidLogJson,
                 $"The {ClusteringDomain} domain is not of the form "
                 + $"{{\"clusteringColumns\":[[\"…\"],…]}}, so its columns cannot be checked: "
                 + domain.Configuration,

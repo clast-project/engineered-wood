@@ -300,6 +300,42 @@ public class SchemaChangeDependentsTests : IDisposable
     }
 
     [Fact]
+    public async Task DropFusedThroughCommitDataFiles_AbortsWhenClusteringMovedOntoIt()
+    {
+        // The other documented home of a Compute* change: fused into a buffered flush.
+        await using var stale = await CreateAsync(LongSchema("id", "name"), clusteringColumns: ["id"]);
+        var change = stale.ComputeDropColumn("name");
+
+        await using (var other = OpenSecondHandle())
+            await other.SetClusteringColumnsAsync(["name"]);
+
+        await Assert.ThrowsAsync<DeltaConflictException>(async () =>
+            await stale.CommitDataFilesAsync(
+                [], extraActions: change.Actions, operation: "DROP COLUMNS", readDomains: change.ReadDomains));
+    }
+
+    [Fact]
+    public async Task DropAndSetSchema_WithAClusteringDomainMissingItsColumns_AreRefused()
+    {
+        // An ACTIVE delta.clustering domain that names no columns cannot be read as "not clustered".
+        long version;
+        await using (var created = await CreateAsync(LongSchema("id", "name"), clusteringColumns: ["id"]))
+            version = created.CurrentSnapshot.Version;
+        File.WriteAllText(
+            Path.Combine(_tempDir, "_delta_log", $"{version + 1:D20}.json"),
+            "{\"domainMetadata\":{\"domain\":\"delta.clustering\","
+            + "\"configuration\":\"{\\\"domainName\\\":\\\"delta.clustering\\\"}\",\"removed\":false}}\n");
+
+        await using var table = OpenSecondHandle();
+        Assert.Equal(version + 1, table.CurrentSnapshot.Version);
+
+        await RefusedAsync(DeltaErrorCodes.InvalidLogJson,
+            async () => await table.DropColumnAsync("name"));
+        await RefusedAsync(DeltaErrorCodes.InvalidLogJson,
+            async () => await table.SetSchemaAsync(LongSchema("id", "name", "extra")));
+    }
+
+    [Fact]
     public async Task SetSchema_OnAStaleHandle_AbortsWhenClusteringMovedOntoADroppedColumn()
     {
         await using var stale = await CreateAsync(
