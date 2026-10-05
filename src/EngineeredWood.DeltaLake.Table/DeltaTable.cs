@@ -4975,10 +4975,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long? rowIdStart = null,
         WrittenFileLedger? written = null)
     {
-        // Nanosecond and second Arrow timestamps have no faithful Delta/Parquet encoding, and FixedSizeBinary
-        // / Date64 none at all. Creation and schema evolution reject them via SchemaConverter, but a write into
-        // an EXISTING table converts no schema, so check the incoming batches here — the shared chokepoint for
-        // both the auto-committing path and a transaction's append.
+        // The shared chokepoint for both the auto-committing path and a transaction's append. First convert
+        // the Arrow types a Delta type accepts but does not read back as (FixedSizeBinary, Date64,
+        // Decimal32/64) to the ones it does, so every file of a column has one physical form. Then refuse
+        // what has no faithful encoding at all — nanosecond and second timestamps: creation and schema
+        // evolution reject those via SchemaConverter, but a write into an EXISTING table converts no schema.
+        batches = batches.Select(WriteTypeNormalization.Normalize).ToList();
         foreach (var b in batches)
             SchemaConverter.ThrowIfUnwritableType(b.Schema);
 
@@ -5811,7 +5813,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        // Same unwritable-type rule as the committing write path; this entry point bypasses it.
+        // Same normalization and unwritable-type rule as the committing write path; this entry point bypasses it.
+        batches = batches.Select(WriteTypeNormalization.Normalize).ToList();
         foreach (var b in batches)
             SchemaConverter.ThrowIfUnwritableType(b.Schema);
         if (IsIcebergCompat)

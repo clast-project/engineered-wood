@@ -169,6 +169,14 @@ public static class DeltaTableErrorCodes
     /// <c>ClusteringColumnInfo</c> crashes on. Change the clustering columns first.</remarks>
     public const string UnsupportedDropClusteringColumn = "DELTA_UNSUPPORTED_DROP_CLUSTERING_COLUMN";
 
+    /// <summary>
+    /// A value in a batch being written cannot be stored in its column's Delta type without guessing —
+    /// a Date64 that is not a whole number of days, which the Arrow format forbids.
+    /// </summary>
+    /// <remarks>No delta-spark equivalent: Spark never receives Arrow data in this form. Nothing is
+    /// written; fix the data or cast the column.</remarks>
+    public const string UnwritableValue = "DELTA_UNWRITABLE_VALUE";
+
     // ── Write modes ──
 
     /// <summary>

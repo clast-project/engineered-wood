@@ -287,7 +287,7 @@ public class SchemaValidationTests : IDisposable
         });
     }
 
-    // ── Arrow types with no Delta equivalent ──────────────────────────────────────────────────────────
+    // ── Decimal precision ─────────────────────────────────────────────────────────────────────────────────
 
     [Theory]
     [InlineData(39)]
@@ -379,115 +379,199 @@ public class SchemaValidationTests : IDisposable
         Assert.Single(reopened.CurrentSnapshot.Schema.Fields);
     }
 
-    [Fact]
-    public async Task Create_FixedSizeBinary_IsRefused()
+    // ── Arrow types that convert to the Delta type's canonical form on write ────────────────────────
+    //
+    // Several Arrow types map onto one Delta type. EW accepts them, and a write converts each to the form
+    // the table reads back as (Binary, Date32, Decimal128), so the files of a column agree.
+
+    private static async Task<List<RecordBatch>> ReadAllAsync(DeltaTable table)
     {
-        var ex = await RefusedAsync(null, async () =>
-        {
-            await using var t = await DeltaTable.CreateAsync(
-                Fs, Schema(new Field("b", new FixedSizeBinaryType(4), true)));
-        });
-        Assert.Contains("Binary", ex.Message);
+        var batches = new List<RecordBatch>();
+        await foreach (var b in table.ReadAllAsync())
+            batches.Add(b);
+        return batches;
+    }
+
+    private static FixedSizeBinaryArray FixedSizeBinary(int width, int length, byte[] bytes, byte[]? validity = null)
+    {
+        int nulls = validity is null
+            ? 0
+            : Enumerable.Range(0, length).Count(i => (validity[i / 8] & (1 << (i % 8))) == 0);
+        return new(new ArrayData(new FixedSizeBinaryType(width), length, nulls, 0,
+            [validity is null ? ArrowBuffer.Empty : new ArrowBuffer(validity), new ArrowBuffer(bytes)]));
     }
 
     [Fact]
-    public async Task Create_Date64_IsRefused()
+    public async Task Create_FixedSizeBinary_IsDeclaredBinary()
     {
-        var ex = await RefusedAsync(null, async () =>
-        {
-            await using var t = await DeltaTable.CreateAsync(Fs, Schema(new Field("d", Date64Type.Default, true)));
-        });
-        Assert.Contains("Date32", ex.Message);
+        await using var t = await DeltaTable.CreateAsync(Fs, Schema(new Field("b", new FixedSizeBinaryType(4), true)));
+
+        Assert.Equal("binary", ((PrimitiveType)t.CurrentSnapshot.Schema.Fields[0].Type).TypeName);
+        Assert.IsType<BinaryType>(t.ArrowSchema.FieldsList[0].DataType);
     }
 
     [Fact]
-    public async Task AddColumn_FixedSizeBinaryInsideAStruct_IsRefused()
-    {
-        await using var table = await DeltaTable.CreateAsync(Fs, Schema(Long("id")));
-
-        await RefusedAsync(null, async () => await table.AddColumnAsync(
-            Struct("s", new Field("b", new FixedSizeBinaryType(16), true))));
-    }
-
-    // A write into an EXISTING column converts no schema, so the same types are refused on the batch.
-
-    private static FixedSizeBinaryArray FixedSizeBinary(int width, params byte[] bytes) =>
-        new(new ArrayData(new FixedSizeBinaryType(width), bytes.Length / width, 0, 0,
-            [ArrowBuffer.Empty, new ArrowBuffer(bytes)]));
-
-    [Fact]
-    public async Task Write_FixedSizeBinaryIntoABinaryColumn_IsRefusedOnEveryEntryPoint()
+    public async Task Write_FixedSizeBinary_ReadsBackAsBinaryOnEveryEntryPoint()
     {
         await using var table = await DeltaTable.CreateAsync(Fs, Schema(new Field("b", BinaryType.Default, true)));
+
+        // [1,2,3,4], null, [9,10,11,12]; the later writes are SLICES, so the conversion must honour the offset.
+        var array = FixedSizeBinary(4, 3, [1, 2, 3, 4, 0, 0, 0, 0, 9, 10, 11, 12], validity: [0b101]);
+        var batch = new RecordBatch(Schema(new Field("b", new FixedSizeBinaryType(4), true)), [array], 3);
+        await table.WriteAsync([batch]);
+        await table.WriteAsync([batch.Slice(1, 2)]);
+        await table.CommitDataFilesAsync(await table.WriteDataFilesAsync([batch.Slice(2, 1)]));
+
+        var rows = new List<string>();
+        foreach (var b in await ReadAllAsync(table))
+        {
+            var col = Assert.IsType<BinaryArray>(b.Column(0));
+            for (int i = 0; i < col.Length; i++)
+                rows.Add(col.IsNull(i) ? "null" : string.Join(",", col.GetBytes(i).ToArray()));
+        }
+        rows.Sort(StringComparer.Ordinal);
+        Assert.Equal(["1,2,3,4", "9,10,11,12", "9,10,11,12", "9,10,11,12", "null", "null"], rows);
+    }
+
+    [Fact]
+    public async Task Write_FixedSizeBinaryNestedInAStructAndList_ReadsBackAsBinary()
+    {
+        var structType = new ArrowStructType([new Field("b", new FixedSizeBinaryType(2), true)]);
+        var listType = new ListType(new Field("element", new FixedSizeBinaryType(2), true));
+        var schema = Schema(new Field("s", structType, true), new Field("l", listType, true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema);
+
+        var list = new ListArray(listType, 1,
+            new ArrowBuffer(new byte[] { 0, 0, 0, 0, 2, 0, 0, 0 }), FixedSizeBinary(2, 2, [5, 6, 7, 8]), ArrowBuffer.Empty);
+        await table.WriteAsync([new RecordBatch(schema,
+            [new StructArray(structType, 1, [FixedSizeBinary(2, 1, [7, 8])], ArrowBuffer.Empty), list], 1)]);
+
+        var batch = Assert.Single(await ReadAllAsync(table));
+        var child = Assert.IsType<BinaryArray>(((StructArray)batch.Column(0)).Fields[0]);
+        Assert.Equal(new byte[] { 7, 8 }, child.GetBytes(0).ToArray());
+        var elements = Assert.IsType<BinaryArray>(((ListArray)batch.Column(1)).Values);
+        Assert.Equal(new byte[] { 5, 6 }, elements.GetBytes(0).ToArray());
+        Assert.Equal(new byte[] { 7, 8 }, elements.GetBytes(1).ToArray());
+    }
+
+    [Fact]
+    public async Task Write_Date64_ReadsBackAsDate32()
+    {
+        var schema = Schema(new Field("d", Date64Type.Default, true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema);
+        Assert.Equal("date", ((PrimitiveType)table.CurrentSnapshot.Schema.Fields[0].Type).TypeName);
+
+        var array = new Date64Array.Builder()
+            .Append(new DateTime(2024, 3, 1)).AppendNull().Append(new DateTime(1969, 12, 31)).Build();
+        await table.WriteAsync([new RecordBatch(schema, [array], 3)]);
+
+        var col = Assert.IsType<Date32Array>(Assert.Single(await ReadAllAsync(table)).Column(0));
+        Assert.Equal(new DateTime(2024, 3, 1), col.GetDateTime(0));
+        Assert.True(col.IsNull(1));
+        Assert.Equal(new DateTime(1969, 12, 31), col.GetDateTime(2));
+    }
+
+    [Fact]
+    public async Task Write_Date64ThatIsNotAWholeDay_IsRefusedAndNothingIsWritten()
+    {
+        // The Arrow format requires Date64 values to be evenly divisible by 86400000. One that is not has
+        // no single day it means, so it is refused rather than truncated.
+        var schema = Schema(new Field("d", Date64Type.Default, true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema);
         long version = table.CurrentSnapshot.Version;
 
-        var schema = Schema(new Field("b", new FixedSizeBinaryType(4), true));
-        var batch = new RecordBatch(schema, [FixedSizeBinary(4, 1, 2, 3, 4)], 1);
-
-        var ex = await RefusedAsync(null, async () => await table.WriteAsync([batch]));
-        Assert.Contains("Binary", ex.Message);
-        await RefusedAsync(null, async () => await table.WriteDataFilesAsync([batch]));
-        await RefusedAsync(null, async () =>
-        {
-            var txn = table.StartTransaction();
-            await txn.WriteAsync([batch]);
-        });
+        var data = new ArrayData(Date64Type.Default, 1, 0, 0,
+            [ArrowBuffer.Empty, new ArrowBuffer(BitConverter.GetBytes(86_400_000L + 1))]);
+        var ex = await RefusedAsync(DeltaTableErrorCodes.UnwritableValue, async () =>
+            await table.WriteAsync([new RecordBatch(schema, [new Date64Array(data)], 1)]));
+        Assert.Contains("86400000", ex.Message);
 
         Assert.Equal(version, table.CurrentSnapshot.Version);
         Assert.Empty(Directory.EnumerateFiles(_tempDir, "*.parquet", SearchOption.AllDirectories));
     }
 
     [Fact]
-    public async Task Write_FixedSizeBinaryNestedInAStruct_IsRefused()
+    public async Task Create_Decimal32And64_AreDeclaredDecimal()
     {
-        await using var table = await DeltaTable.CreateAsync(
-            Fs, Schema(Struct("s", new Field("b", BinaryType.Default, true))));
+        await using var t = await DeltaTable.CreateAsync(Fs, Schema(
+            new Field("a", new Decimal32Type(5, 2), true), new Field("b", new Decimal64Type(15, 3), true)));
 
-        var structType = new ArrowStructType([new Field("b", new FixedSizeBinaryType(2), true)]);
-        var batch = new RecordBatch(Schema(new Field("s", structType, true)),
-            [new StructArray(structType, 1, [FixedSizeBinary(2, 7, 8)], ArrowBuffer.Empty)], 1);
+        Assert.Equal("decimal(5,2)", ((PrimitiveType)t.CurrentSnapshot.Schema.Fields[0].Type).TypeName);
+        Assert.Equal("decimal(15,3)", ((PrimitiveType)t.CurrentSnapshot.Schema.Fields[1].Type).TypeName);
+    }
 
-        var ex = await RefusedAsync(null, async () => await table.WriteAsync([batch]));
-        Assert.Contains("'s.b'", ex.Message);
+    private static decimal? DecimalAt(IArrowArray array, int i) => array switch
+    {
+        Decimal32Array a => a.GetValue(i),
+        Decimal64Array a => a.GetValue(i),
+        Decimal128Array a => a.GetValue(i),
+        _ => throw new InvalidOperationException(array.GetType().Name),
+    };
+
+    private static ArrowBuffer Int32s(params int[] values) =>
+        new(values.SelectMany(BitConverter.GetBytes).ToArray());
+
+    [Fact]
+    public void Normalize_WidensNarrowDecimalsToDecimal128_KeepingValuesAndSlices()
+    {
+        // So every file EW writes for a decimal column has one physical form (FIXED_LEN_BYTE_ARRAY(16)),
+        // whichever Arrow width the caller handed in.
+        var d64 = new Decimal64Type(15, 3);
+        var array = new Decimal64Array(new ArrayData(d64, 3, 0, 0,
+            [ArrowBuffer.Empty, new ArrowBuffer(new long[] { -1, 5_000, long.MaxValue / 1_000 }.SelectMany(BitConverter.GetBytes).ToArray())]));
+        var batch = new RecordBatch(Schema(new Field("d", d64, true)), [array], 3).Slice(1, 2);
+
+        var normalized = WriteTypeNormalization.Normalize(batch);
+
+        var wide = Assert.IsType<Decimal128Array>(normalized.Column(0));
+        Assert.Equal(new Decimal128Type(15, 3), (Decimal128Type)wide.Data.DataType, new DecimalTypeComparer());
+        Assert.Equal(5m, wide.GetValue(0));
+        Assert.Equal((long.MaxValue / 1_000) / 1000m, wide.GetValue(1));
+    }
+
+    private sealed class DecimalTypeComparer : IEqualityComparer<Decimal128Type>
+    {
+        public bool Equals(Decimal128Type? x, Decimal128Type? y) => x!.Precision == y!.Precision && x.Scale == y.Scale;
+        public int GetHashCode(Decimal128Type obj) => obj.Precision;
+    }
+
+    [Fact]
+    public async Task Write_NarrowAndWideDecimals_KeepTheirValues()
+    {
+        // The read TYPE is #469's business, so only the values are asserted here.
+        var d32 = new Decimal32Type(9, 2);
+        var d128 = new Decimal128Type(9, 2);
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(new Field("d", d128, true)));
+
+        var narrow = new Decimal32Array(new ArrayData(d32, 3, 0, 0, [ArrowBuffer.Empty, Int32s(-125, 0, 99_999_999)]));
+        var wide = new Decimal128Array.Builder(d128).Append(12.34m).Build();
+        await table.WriteAsync([
+            new RecordBatch(Schema(new Field("d", d32, true)), [narrow], 3),
+            new RecordBatch(Schema(new Field("d", d128, true)), [wide], 1),
+        ]);
+
+        var values = new List<decimal?>();
+        foreach (var b in await ReadAllAsync(table))
+        {
+            for (int i = 0; i < b.Length; i++)
+                values.Add(DecimalAt(b.Column(0), i));
+        }
+        values.Sort();
+        Assert.Equal([-1.25m, 0m, 12.34m, 999_999.99m], values);
     }
 
     [Fact]
     public async Task Write_Decimal_IsNotMistakenForFixedSizeBinary()
     {
-        // Every Arrow decimal type derives from FixedSizeBinaryType, so the refusal must match the type
-        // exactly. A bare type pattern refused every decimal write.
+        // Every Arrow decimal type derives from FixedSizeBinaryType, so the FixedSizeBinary handling must
+        // match the type exactly.
         var type = new Decimal128Type(10, 2);
         await using var table = await DeltaTable.CreateAsync(Fs, Schema(new Field("d", type, true)));
+        Assert.Equal("decimal(10,2)", ((PrimitiveType)table.CurrentSnapshot.Schema.Fields[0].Type).TypeName);
 
-        var batch = new RecordBatch(table.ArrowSchema,
-            [new Decimal128Array.Builder(type).Append(12.34m).Build()], 1);
-        await table.WriteAsync([batch]);
-        await table.WriteDataFilesAsync([batch]);
-    }
-
-    [Fact]
-    public async Task Create_Decimal32_IsRefusedRatherThanDeclaredBinary()
-    {
-        // Decimal32 also derives from FixedSizeBinaryType and used to fall into its arm, declaring a
-        // decimal column as Delta 'binary'. It has no arm of its own, so it is refused.
-        var ex = await RefusedAsync(null, async () =>
-        {
-            await using var t = await DeltaTable.CreateAsync(Fs, Schema(new Field("d", new Decimal32Type(5, 2), true)));
-        });
-        Assert.DoesNotContain("FixedSizeBinary", ex.Message);
-    }
-
-    [Fact]
-    public async Task Write_Date64IntoADateColumn_IsRefusedWithACastMessage()
-    {
-        // Used to reach the Parquet writer and fail there with a NotSupportedException.
-        await using var table = await DeltaTable.CreateAsync(Fs, Schema(new Field("d", Date32Type.Default, true)));
-
-        var schema = Schema(new Field("d", Date64Type.Default, true));
-        var batch = new RecordBatch(schema, [new Date64Array.Builder().Append(new DateTime(2024, 3, 1)).Build()], 1);
-
-        var ex = await RefusedAsync(null, async () => await table.WriteAsync([batch]));
-        Assert.Contains("Date32", ex.Message);
+        await table.WriteAsync([new RecordBatch(table.ArrowSchema,
+            [new Decimal128Array.Builder(type).Append(12.34m).Build()], 1)]);
+        Assert.Equal(12.34m, DecimalAt(Assert.Single(await ReadAllAsync(table)).Column(0), 0));
     }
 
     // ── Integer to decimal widening ───────────────────────────────────────────────────────────────────
