@@ -317,6 +317,67 @@ public class SchemaValidationTests : IDisposable
             () => SchemaConverter.ToArrowType(new PrimitiveType { TypeName = "decimal(40,2)" }));
     }
 
+    // A Delta-typed schema never passes through the Arrow-to-Delta conversion that refuses these types on
+    // the way in. Before the pre-commit check, the refusal came from building the NEXT snapshot — after
+    // the commit had landed, leaving a table that could no longer be opened.
+
+    private static StructField DeltaDecimal(string name, int precision) => new()
+    {
+        Name = name,
+        Type = new PrimitiveType { TypeName = $"decimal({precision},2)" },
+        Nullable = true,
+    };
+
+    [Fact]
+    public async Task Create_PreAssignedDecimalAbove38_IsRefusedBeforeAnythingIsCommitted()
+    {
+        var arrow = Schema(new Field("d", new Decimal256Type(38, 2), true));
+        var pre = new DeltaStructType { Fields = [DeltaDecimal("d", 40)] };
+
+        await RefusedAsync(null, async () =>
+        {
+            await using var t = await DeltaTable.CreateAsync(Fs, arrow, preAssignedSchema: pre);
+        });
+
+        var log = Path.Combine(_tempDir, "_delta_log");
+        Assert.False(Directory.Exists(log) && Directory.EnumerateFiles(log, "*.json").Any());
+    }
+
+    [Fact]
+    public async Task AddColumn_DeltaTypedDecimalAbove38_IsRefusedAndTheTableStillOpens()
+    {
+        long version;
+        await using (var table = await DeltaTable.CreateAsync(Fs, Schema(Long("id"))))
+        {
+            version = table.CurrentSnapshot.Version;
+
+            await RefusedAsync(null, async () => await table.AddColumnAsync(DeltaDecimal("d", 40)));
+            await RefusedAsync(null, () =>
+            {
+                table.ComputeAddColumn(DeltaDecimal("d", 39));
+                return Task.CompletedTask;
+            });
+        }
+
+        await using var reopened = await DeltaTable.OpenAsync(Fs);
+        Assert.Equal(version, reopened.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task AddColumn_DeltaTypedUnknownPrimitive_IsRefusedAndTheTableStillOpens()
+    {
+        await using (var table = await DeltaTable.CreateAsync(Fs, Schema(Long("id"))))
+        {
+            await RefusedAsync(null, async () => await table.AddColumnAsync(new StructField
+            {
+                Name = "u", Type = new PrimitiveType { TypeName = "no_such_type" }, Nullable = true,
+            }));
+        }
+
+        await using var reopened = await DeltaTable.OpenAsync(Fs);
+        Assert.Single(reopened.CurrentSnapshot.Schema.Fields);
+    }
+
     [Fact]
     public async Task Create_FixedSizeBinary_IsRefused()
     {

@@ -400,7 +400,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Convert Arrow schema to Delta schema — unless the caller assigned one ALREADY (see the parameter
         // doc: a CTAS whose data files were written before commit 0 exists).
         var deltaSchema = preAssignedSchema ?? SchemaConverter.FromArrowSchema(schema);
-        DuplicateColumnNames.EnsureNone(deltaSchema);
+        CommitSchemaValidation.EnsureValid(deltaSchema);
 
         // Set protocol versions based on column mapping mode
         int minReaderVersion = 1;
@@ -1176,7 +1176,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             newConfig = cfg;
         }
 
-        DuplicateColumnNames.EnsureNone(newSchema);
+        CommitSchemaValidation.EnsureValid(newSchema);
         var protocolUpgrade = UpgradeProtocolForFeatures(
             baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
 
@@ -1235,7 +1235,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 : f);
         }
         var newSchema = new StructType { Fields = newFields };
-        DuplicateColumnNames.EnsureNone(newSchema);
+        CommitSchemaValidation.EnsureValid(newSchema);
 
         var newPartitionColumns = baseMeta.PartitionColumns;
         if (newPartitionColumns.Contains(oldName))
@@ -1354,7 +1354,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return new List<StructField>(fields) { addedField };
         });
 
-        DuplicateColumnNames.EnsureNone(newSchema);
+        CommitSchemaValidation.EnsureValid(newSchema);
         var protocolUpgrade = UpgradeProtocolForFeatures(
             baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
 
@@ -1420,7 +1420,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         });
         SchemaChangeDependents.EnsureChangeable(
             baseSchema, baseMeta, snapshot.DomainMetadata, fieldPath, isDrop: false);
-        DuplicateColumnNames.EnsureNone(newSchema);
+        CommitSchemaValidation.EnsureValid(newSchema);
 
         var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
         return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
@@ -1505,7 +1505,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var mappingMode = ColumnMapping.GetMode(config);
 
         var newDeltaSchema = SchemaConverter.FromArrowSchema(newSchema);
-        DuplicateColumnNames.EnsureNone(newDeltaSchema);
+        CommitSchemaValidation.EnsureValid(newDeltaSchema);
         var newConfig = config;
         if (mappingMode != ColumnMappingMode.None)
         {
