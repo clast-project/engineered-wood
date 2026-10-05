@@ -1270,6 +1270,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
         if (target is null)
             throw new InvalidOperationException($"Column '{oldName}' does not exist.");
+        SchemaChangeDependents.EnsureChangeable(
+            baseSchema, baseMeta, snapshot.DomainMetadata, [oldName], isDrop: false);
 
         var newFields = new List<StructField>(baseSchema.Fields.Count);
         foreach (var f in baseSchema.Fields)
@@ -1331,6 +1333,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             throw new InvalidOperationException($"Column '{name}' does not exist.");
         if (newFields.Count == 0)
             throw new InvalidOperationException("Cannot drop the table's only column.");
+        SchemaChangeDependents.EnsureChangeable(
+            baseSchema, baseMeta, snapshot.DomainMetadata, [name], isDrop: true);
         var newSchema = new StructType { Fields = newFields };
 
         var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
@@ -1457,6 +1461,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
             return result;
         });
+        SchemaChangeDependents.EnsureChangeable(
+            baseSchema, baseMeta, snapshot.DomainMetadata, fieldPath, isDrop: false);
 
         var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
         return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
@@ -1504,6 +1510,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     $"Cannot drop the only field of struct '{PathText(containerPath)}'.");
             return result;
         });
+        SchemaChangeDependents.EnsureChangeable(
+            baseSchema, baseMeta, snapshot.DomainMetadata, fieldPath, isDrop: true);
 
         var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
         return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
@@ -1522,8 +1530,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// drop, or retype columns — the "schema overwrite" primitive a CREATE OR REPLACE uses (adopt exactly the
     /// incoming schema). Callers align the data (typically a paired <c>Overwrite</c> write that removes the
     /// old-schema files). On a column-mapping table fresh field ids are assigned (continuing past the current
-    /// maxColumnId so ids are never reused across history). Returns the new version; a no-op (returns the current
-    /// version) if the schema is already logically identical.
+    /// maxColumnId so ids are never reused across history), and a clustering spec is re-keyed to the new physical
+    /// names. Throws if the new schema lacks a partition column, a clustering column, or a column a CHECK
+    /// constraint reads. Returns the new version; a no-op (returns the current version) if the schema is already
+    /// logically identical.
     /// </summary>
     public async ValueTask<long> SetSchemaAsync(
         Apache.Arrow.Schema newSchema, CancellationToken cancellationToken = default)
@@ -1571,6 +1581,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return snapshot.Version; // identical schema — nothing to commit
         }
 
+        // What the old schema's columns carried that the metadata keeps: partitionColumns must name schema
+        // columns (PROTOCOL.md), CHECK constraints read theirs by name, and the clustering spec names physical
+        // columns this replacement may have just renamed.
+        foreach (var partitionColumn in snapshot.Metadata.PartitionColumns)
+        {
+            if (!newDeltaSchema.Fields.Any(f => string.Equals(f.Name, partitionColumn, StringComparison.Ordinal)))
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.ColumnNotFound,
+                    $"The new schema has no partition column '{partitionColumn}'.");
+            }
+        }
+        SchemaChangeDependents.EnsureConstraintsResolve(snapshot.Metadata, newDeltaSchema);
+        var clustering = RekeyClusteringDomain(snapshot, newDeltaSchema, mappingMode);
+
         var protocolUpgrade = UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaSchema));
 
         return await CommitMetadataOnlyAsync(
@@ -1578,7 +1603,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig },
             "CHANGE COLUMNS",
             cancellationToken,
-            protocolUpgrade).ConfigureAwait(false);
+            protocolUpgrade,
+            clustering).ConfigureAwait(false);
     }
 
     // The schema's LOGICAL signature — field names + types + nullability, with column-mapping metadata (ids /
@@ -1616,66 +1642,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// keeps its <c>delta.columnMapping.id</c> + <c>physicalName</c>, so existing data files (stored under the
     /// physical name, or matched by field id in id mode) are read unchanged under the new logical name. A
     /// non-mapping table would have to rewrite every file (the logical name IS the physical parquet name), so
-    /// it is rejected. Throws if <paramref name="oldName"/> is absent or <paramref name="newName"/> exists.
+    /// it is rejected. Throws if <paramref name="oldName"/> is absent or <paramref name="newName"/> exists, and
+    /// (as Spark does) when a CHECK constraint or a generation expression reads the column — both bind by name.
     /// Returns the new version.
     /// </summary>
     public async ValueTask<long> RenameColumnAsync(
         string oldName, string newName, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-
         var snapshot = CurrentSnapshot;
-        if (ColumnMapping.GetMode(snapshot.Metadata.Configuration) == ColumnMappingMode.None)
-        {
-            throw new InvalidOperationException(
-                "RENAME COLUMN requires column mapping (enable it at table creation) — a plain table would need "
-                + "to rewrite every data file since the logical name is the physical parquet column name.");
-        }
-
-        var schema = snapshot.Schema;
-        StructField? target = null;
-        foreach (var f in schema.Fields)
-        {
-            if (string.Equals(f.Name, newName, StringComparison.Ordinal))
-                throw new InvalidOperationException($"Column '{newName}' already exists.");
-            if (string.Equals(f.Name, oldName, StringComparison.Ordinal))
-                target = f;
-        }
-        if (target is null)
-            throw new InvalidOperationException($"Column '{oldName}' does not exist.");
-
-        var newFields = new List<StructField>(schema.Fields.Count);
-        foreach (var f in schema.Fields)
-        {
-            newFields.Add(ReferenceEquals(f, target)
-                ? new StructField
-                {
-                    Name = newName, Type = f.Type, Nullable = f.Nullable, Metadata = f.Metadata,
-                }
-                : f);
-        }
-        string newSchemaString = DeltaSchemaSerializer.Serialize(new StructType { Fields = newFields });
-
-        // metaData.partitionColumns holds LOGICAL names (Spark convention) — renaming a partition column must
-        // update it too, else the reader/writer treat the renamed column as an ordinary data column.
-        var newPartitionColumns = snapshot.Metadata.PartitionColumns;
-        if (newPartitionColumns.Contains(oldName))
-        {
-            newPartitionColumns = newPartitionColumns
-                .Select(pc => string.Equals(pc, oldName, StringComparison.Ordinal) ? newName : pc)
-                .ToList();
-        }
-
+        var change = ComputeRenameColumn(oldName, newName);
         return await CommitMetadataOnlyAsync(
-            snapshot,
-            snapshot.Metadata with
-            {
-                SchemaString = newSchemaString,
-                PartitionColumns = newPartitionColumns,
-            },
-            "RENAME COLUMN",
-            cancellationToken).ConfigureAwait(false);
+            snapshot, change.Metadata, "RENAME COLUMN", cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1684,46 +1661,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// the current schema). ONLY supported on a <b>column-mapping</b> table: without mapping, dropping a column
     /// would require rewriting every data file, and the name could not be safely reused. The dropped field's
     /// column id is retired (maxColumnId is NOT decremented), so a later ADD COLUMN never reuses it. Throws if
-    /// the column is absent, is a partition column, or is the table's only column. Returns the new version.
+    /// the column is absent, is a partition column, is the table's only column, is a clustering column, or is
+    /// read by a CHECK constraint or a generation expression. Returns the new version.
     /// </summary>
     public async ValueTask<long> DropColumnAsync(
         string name, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-
         var snapshot = CurrentSnapshot;
-        if (ColumnMapping.GetMode(snapshot.Metadata.Configuration) == ColumnMappingMode.None)
-        {
-            throw new InvalidOperationException(
-                "DROP COLUMN requires column mapping (enable it at table creation) — a plain table would need "
-                + "to rewrite every data file since the logical name is the physical parquet column name.");
-        }
-        foreach (var pc in snapshot.Metadata.PartitionColumns)
-        {
-            if (string.Equals(pc, name, StringComparison.Ordinal))
-                throw new InvalidOperationException($"Cannot drop partition column '{name}'.");
-        }
-
-        var newFields = new List<StructField>(snapshot.Schema.Fields.Count);
-        bool found = false;
-        foreach (var f in snapshot.Schema.Fields)
-        {
-            if (string.Equals(f.Name, name, StringComparison.Ordinal)) { found = true; continue; }
-            newFields.Add(f);
-        }
-        if (!found)
-            throw new InvalidOperationException($"Column '{name}' does not exist.");
-        if (newFields.Count == 0)
-            throw new InvalidOperationException("Cannot drop the table's only column.");
-
-        string newSchemaString = DeltaSchemaSerializer.Serialize(new StructType { Fields = newFields });
-
+        var change = ComputeDropColumn(name);
         return await CommitMetadataOnlyAsync(
-            snapshot,
-            snapshot.Metadata with { SchemaString = newSchemaString },
-            "DROP COLUMNS",
-            cancellationToken).ConfigureAwait(false);
+            snapshot, change.Metadata, "DROP COLUMNS", cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1804,51 +1751,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     public async ValueTask<long> RenameFieldAsync(
         IReadOnlyList<string> fieldPath, string newName, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        if (fieldPath.Count < 2)
-            throw new ArgumentException(
-                "fieldPath must name a NESTED field (use RenameColumnAsync for top-level columns).");
-
         var snapshot = CurrentSnapshot;
-        if (ColumnMapping.GetMode(snapshot.Metadata.Configuration) == ColumnMappingMode.None)
-        {
-            throw new InvalidOperationException(
-                "RENAME of a nested field requires column mapping (enable it at table creation) — a plain table "
-                + "would need to rewrite every data file since the logical name is the physical parquet name.");
-        }
-
-        string oldName = fieldPath[fieldPath.Count - 1];
-        var containerPath = fieldPath.Take(fieldPath.Count - 1).ToList();
-        var newSchema = TransformStructAt(snapshot.Schema, containerPath, 0, fields =>
-        {
-            StructField? target = null;
-            foreach (var f in fields)
-            {
-                if (string.Equals(f.Name, newName, StringComparison.Ordinal))
-                    throw new InvalidOperationException(
-                        $"Field '{PathText(containerPath)}.{newName}' already exists.");
-                if (string.Equals(f.Name, oldName, StringComparison.Ordinal))
-                    target = f;
-            }
-            if (target is null)
-                throw new InvalidOperationException($"Field '{PathText(fieldPath)}' does not exist.");
-            var result = new List<StructField>(fields.Count);
-            foreach (var f in fields)
-            {
-                result.Add(ReferenceEquals(f, target)
-                    ? new StructField { Name = newName, Type = f.Type, Nullable = f.Nullable, Metadata = f.Metadata }
-                    : f);
-            }
-            return result;
-        });
-        string newSchemaString = DeltaSchemaSerializer.Serialize(newSchema);
-
+        var change = ComputeRenameField(fieldPath, newName);
         return await CommitMetadataOnlyAsync(
-            snapshot,
-            snapshot.Metadata with { SchemaString = newSchemaString },
-            "RENAME COLUMN",
-            cancellationToken).ConfigureAwait(false);
+            snapshot, change.Metadata, "RENAME COLUMN", cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1861,45 +1767,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     public async ValueTask<long> DropFieldAsync(
         IReadOnlyList<string> fieldPath, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        if (fieldPath.Count < 2)
-            throw new ArgumentException(
-                "fieldPath must name a NESTED field (use DropColumnAsync for top-level columns).");
-
         var snapshot = CurrentSnapshot;
-        if (ColumnMapping.GetMode(snapshot.Metadata.Configuration) == ColumnMappingMode.None)
-        {
-            throw new InvalidOperationException(
-                "DROP of a nested field requires column mapping (enable it at table creation) — a plain table "
-                + "would need to rewrite every data file since the logical name is the physical parquet name.");
-        }
-
-        string name = fieldPath[fieldPath.Count - 1];
-        var containerPath = fieldPath.Take(fieldPath.Count - 1).ToList();
-        var newSchema = TransformStructAt(snapshot.Schema, containerPath, 0, fields =>
-        {
-            var result = new List<StructField>(fields.Count);
-            bool found = false;
-            foreach (var f in fields)
-            {
-                if (string.Equals(f.Name, name, StringComparison.Ordinal)) { found = true; continue; }
-                result.Add(f);
-            }
-            if (!found)
-                throw new InvalidOperationException($"Field '{PathText(fieldPath)}' does not exist.");
-            if (result.Count == 0)
-                throw new InvalidOperationException(
-                    $"Cannot drop the only field of struct '{PathText(containerPath)}'.");
-            return result;
-        });
-        string newSchemaString = DeltaSchemaSerializer.Serialize(newSchema);
-
+        var change = ComputeDropField(fieldPath);
         return await CommitMetadataOnlyAsync(
-            snapshot,
-            snapshot.Metadata with { SchemaString = newSchemaString },
-            "DROP COLUMNS",
-            cancellationToken).ConfigureAwait(false);
+            snapshot, change.Metadata, "DROP COLUMNS", cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -1928,12 +1799,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         MetadataAction newMetadata,
         string operation,
         CancellationToken cancellationToken,
-        ProtocolAction? protocolUpgrade = null)
+        ProtocolAction? protocolUpgrade = null,
+        DomainMetadata? domain = null)
     {
         var actionList = new List<DeltaAction>();
         if (protocolUpgrade is not null)
             actionList.Add(protocolUpgrade);
         actionList.Add(newMetadata);
+        if (domain is not null)
+            actionList.Add(domain);
 
         return CommitOccAsync(
             snapshot, actionList, ReadSet.Blind, IsolationLevel.WriteSerializable, operation,
@@ -2013,7 +1887,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>The Delta system domain carrying a table's liquid-clustering column spec.</summary>
-    private const string ClusteringDomain = "delta.clustering";
+    private const string ClusteringDomain = SchemaChangeDependents.ClusteringDomain;
 
     // The clustering-columns spec, byte-shaped like Spark's own (each column a PATH array — these are
     // top-level names — plus the redundant domainName field Spark includes):
@@ -2025,30 +1899,59 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     private static DomainMetadata BuildClusteringDomain(
         Schema.StructType deltaSchema, IReadOnlyList<string> clusteringColumns, ColumnMappingMode mode)
     {
-        var sb = new System.Text.StringBuilder("{\"clusteringColumns\":[");
-        for (int i = 0; i < clusteringColumns.Count; i++)
+        var paths = new List<IReadOnlyList<string>>(clusteringColumns.Count);
+        foreach (var column in clusteringColumns)
         {
             var field = deltaSchema.Fields.FirstOrDefault(
-                f => string.Equals(f.Name, clusteringColumns[i], StringComparison.OrdinalIgnoreCase));
+                f => string.Equals(f.Name, column, StringComparison.OrdinalIgnoreCase));
             if (field is null)
             {
                 throw new DeltaFormatException(
                     DeltaTableErrorCodes.ColumnNotFound,
-                    $"Clustering column '{clusteringColumns[i]}' is not a column of the table.");
+                    $"Clustering column '{column}' is not a column of the table.");
             }
-            string physical = ColumnMapping.GetPhysicalName(field, mode);
-            if (i > 0)
-                sb.Append(',');
-            sb.Append("[\"").Append(physical.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append("\"]");
+            paths.Add([ColumnMapping.GetPhysicalName(field, mode)]);
         }
-        sb.Append("],\"domainName\":\"").Append(ClusteringDomain).Append("\"}");
+        return SchemaChangeDependents.ClusteringDomainFor(paths);
+    }
 
-        return new DomainMetadata
+    /// <summary>
+    /// The clustering domain <see cref="SetSchemaAsync"/> must carry for <paramref name="newSchema"/>,
+    /// or null when it needs none. The spec stores PHYSICAL names, and a replacement on a mapped
+    /// table assigns fresh ones, so a surviving clustering column is re-keyed through its logical
+    /// name; one the new schema lacks refuses the replacement, as Spark's REPLACE does.
+    /// </summary>
+    private static DomainMetadata? RekeyClusteringDomain(
+        Snapshot.Snapshot snapshot, StructType newSchema, ColumnMappingMode mode)
+    {
+        var paths = SchemaChangeDependents.ClusteringPaths(snapshot.DomainMetadata);
+        if (paths is null)
+            return null;
+
+        var rekeyed = new List<IReadOnlyList<string>>(paths.Count);
+        foreach (var physical in paths)
         {
-            Domain = ClusteringDomain,
-            Configuration = sb.ToString(),
-            Removed = false,
-        };
+            var logical = SchemaChangeDependents.TranslatePath(
+                snapshot.Schema, physical, f => ColumnMapping.GetPhysicalName(f, mode), f => f.Name);
+            var replacement = logical is null
+                ? null
+                : SchemaChangeDependents.TranslatePath(
+                    newSchema, logical, f => f.Name, f => ColumnMapping.GetPhysicalName(f, mode));
+            if (replacement is null)
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.ColumnNotFound,
+                    $"The new schema has no clustering column '{string.Join(".", logical ?? physical)}'. "
+                    + "Change the clustering columns first.");
+            }
+            rekeyed.Add(replacement);
+        }
+
+        var domain = SchemaChangeDependents.ClusteringDomainFor(rekeyed);
+        return string.Equals(
+            domain.Configuration, snapshot.DomainMetadata[ClusteringDomain].Configuration, StringComparison.Ordinal)
+            ? null
+            : domain;
     }
 
     /// <summary>
