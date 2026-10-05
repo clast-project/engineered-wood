@@ -164,20 +164,29 @@ public static class SchemaConverter
         _ => $"Arrow timestamp unit {unit} cannot be written to a Delta table.",
     };
 
+    internal const string FixedSizeBinaryMessage =
+        "Arrow FixedSizeBinary has no Delta equivalent: Delta 'binary' is variable-length. Cast the "
+        + "column to Binary first.";
+
+    internal const string Date64Message =
+        "Arrow Date64 has no Delta equivalent: Delta 'date' is a day count (Arrow Date32). Cast the "
+        + "column to Date32 first.";
+
     /// <summary>
-    /// Throws if any field of <paramref name="schema"/>, at any nesting depth, is a nanosecond Arrow
-    /// timestamp. <see cref="FromArrowSchema"/> already rejects those when a schema is converted, which
-    /// covers table creation and schema evolution — but a write into an EXISTING table converts nothing,
-    /// so the same rule has to be enforced against the incoming batches directly. Without this a
-    /// nanosecond column reaches Parquet under a schema advertising microseconds.
+    /// Throws if any field of <paramref name="schema"/>, at any nesting depth, has an Arrow type that
+    /// <see cref="FromArrowSchema"/> refuses: an unsupported timestamp unit, FixedSizeBinary, or Date64.
+    /// That conversion covers table creation and schema evolution — but a write into an EXISTING table
+    /// converts nothing, so the same rule has to be enforced against the incoming batches directly.
+    /// Without this a nanosecond column reaches Parquet under a schema advertising microseconds, and a
+    /// FixedSizeBinary one is written as FIXED_LEN_BYTE_ARRAY under a schema declaring binary.
     /// </summary>
-    internal static void ThrowIfUnsupportedTimestampUnit(Apache.Arrow.Schema schema)
+    internal static void ThrowIfUnwritableType(Apache.Arrow.Schema schema)
     {
         foreach (var field in schema.FieldsList)
-            ThrowIfUnsupportedTimestampUnit(field.DataType, field.Name);
+            ThrowIfUnwritableType(field.DataType, field.Name);
     }
 
-    private static void ThrowIfUnsupportedTimestampUnit(IArrowType type, string path)
+    private static void ThrowIfUnwritableType(IArrowType type, string path)
     {
         switch (type)
         {
@@ -185,18 +194,25 @@ public static class SchemaConverter
                 throw new DeltaLake.DeltaFormatException(
                     $"Column '{path}': {UnsupportedTimestampUnitMessage(ts.Unit)}");
 
+            // By TypeId: every Arrow decimal type DERIVES from FixedSizeBinaryType.
+            case FixedSizeBinaryType when type.TypeId == ArrowTypeId.FixedSizedBinary:
+                throw new DeltaLake.DeltaFormatException($"Column '{path}': {FixedSizeBinaryMessage}");
+
+            case Date64Type:
+                throw new DeltaLake.DeltaFormatException($"Column '{path}': {Date64Message}");
+
             case ArrowStructType s:
                 foreach (var f in s.Fields)
-                    ThrowIfUnsupportedTimestampUnit(f.DataType, path + "." + f.Name);
+                    ThrowIfUnwritableType(f.DataType, path + "." + f.Name);
                 break;
 
             case ListType l:
-                ThrowIfUnsupportedTimestampUnit(l.ValueDataType, path + ".element");
+                ThrowIfUnwritableType(l.ValueDataType, path + ".element");
                 break;
 
             case ArrowMapType m:
-                ThrowIfUnsupportedTimestampUnit(m.KeyField.DataType, path + ".key");
-                ThrowIfUnsupportedTimestampUnit(m.ValueField.DataType, path + ".value");
+                ThrowIfUnwritableType(m.KeyField.DataType, path + ".key");
+                ThrowIfUnwritableType(m.ValueField.DataType, path + ".value");
                 break;
         }
     }
@@ -242,12 +258,11 @@ public static class SchemaConverter
         // FIXED_LEN_BYTE_ARRAY and read back FixedSizeBinary, contradicting the declared Delta binary;
         // Date64 passed here and then failed at WRITE. Like the timestamp units below, neither is
         // converted silently: Date64 can carry sub-day milliseconds a Delta date would drop.
-        FixedSizeBinaryType => throw new DeltaLake.DeltaFormatException(
-            "Arrow FixedSizeBinary has no Delta equivalent: Delta 'binary' is variable-length. Cast the "
-            + "column to Binary first."),
-        Date64Type => throw new DeltaLake.DeltaFormatException(
-            "Arrow Date64 has no Delta equivalent: Delta 'date' is a day count (Arrow Date32). Cast the "
-            + "column to Date32 first."),
+        // By TypeId: every Arrow decimal type (Decimal32/64/128/256) DERIVES from FixedSizeBinaryType, so
+        // a bare type pattern would claim the decimals this switch has no arm for.
+        FixedSizeBinaryType when arrowType.TypeId == ArrowTypeId.FixedSizedBinary =>
+            throw new DeltaLake.DeltaFormatException(FixedSizeBinaryMessage),
+        Date64Type => throw new DeltaLake.DeltaFormatException(Date64Message),
 
         // MUST precede the timestamp arms below. Nothing downstream narrows the Arrow unit, so a unit
         // Delta or Parquet cannot represent would be written as-is under a microsecond annotation.

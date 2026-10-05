@@ -4975,12 +4975,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long? rowIdStart = null,
         WrittenFileLedger? written = null)
     {
-        // Nanosecond and second Arrow timestamps have no faithful Delta/Parquet encoding. Creation and
-        // schema evolution reject them via SchemaConverter, but a write into an EXISTING table converts no
-        // schema, so check the incoming batches here — the shared chokepoint for both the auto-committing
-        // path and a transaction's append.
+        // Nanosecond and second Arrow timestamps have no faithful Delta/Parquet encoding, and FixedSizeBinary
+        // / Date64 none at all. Creation and schema evolution reject them via SchemaConverter, but a write into
+        // an EXISTING table converts no schema, so check the incoming batches here — the shared chokepoint for
+        // both the auto-committing path and a transaction's append.
         foreach (var b in batches)
-            SchemaConverter.ThrowIfUnsupportedTimestampUnit(b.Schema);
+            SchemaConverter.ThrowIfUnwritableType(b.Schema);
 
         // Same chokepoint, same reason: this path converts no schema either, so a column the table does not
         // declare would ride into the data file unnoticed. (No write here evolves the schema — the write
@@ -5811,9 +5811,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        // Same timestamp-unit rule as the committing write path; this entry point bypasses it.
+        // Same unwritable-type rule as the committing write path; this entry point bypasses it.
         foreach (var b in batches)
-            SchemaConverter.ThrowIfUnsupportedTimestampUnit(b.Schema);
+            SchemaConverter.ThrowIfUnwritableType(b.Schema);
         if (IsIcebergCompat)
             throw new NotSupportedException(
                 "WriteDataFilesAsync: IcebergCompat tables require the committing write path.");

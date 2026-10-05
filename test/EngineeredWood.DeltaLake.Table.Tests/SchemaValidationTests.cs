@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.IO.Local;
@@ -406,6 +407,87 @@ public class SchemaValidationTests : IDisposable
 
         await RefusedAsync(null, async () => await table.AddColumnAsync(
             Struct("s", new Field("b", new FixedSizeBinaryType(16), true))));
+    }
+
+    // A write into an EXISTING column converts no schema, so the same types are refused on the batch.
+
+    private static FixedSizeBinaryArray FixedSizeBinary(int width, params byte[] bytes) =>
+        new(new ArrayData(new FixedSizeBinaryType(width), bytes.Length / width, 0, 0,
+            [ArrowBuffer.Empty, new ArrowBuffer(bytes)]));
+
+    [Fact]
+    public async Task Write_FixedSizeBinaryIntoABinaryColumn_IsRefusedOnEveryEntryPoint()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(new Field("b", BinaryType.Default, true)));
+        long version = table.CurrentSnapshot.Version;
+
+        var schema = Schema(new Field("b", new FixedSizeBinaryType(4), true));
+        var batch = new RecordBatch(schema, [FixedSizeBinary(4, 1, 2, 3, 4)], 1);
+
+        var ex = await RefusedAsync(null, async () => await table.WriteAsync([batch]));
+        Assert.Contains("Binary", ex.Message);
+        await RefusedAsync(null, async () => await table.WriteDataFilesAsync([batch]));
+        await RefusedAsync(null, async () =>
+        {
+            var txn = table.StartTransaction();
+            await txn.WriteAsync([batch]);
+        });
+
+        Assert.Equal(version, table.CurrentSnapshot.Version);
+        Assert.Empty(Directory.EnumerateFiles(_tempDir, "*.parquet", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task Write_FixedSizeBinaryNestedInAStruct_IsRefused()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, Schema(Struct("s", new Field("b", BinaryType.Default, true))));
+
+        var structType = new ArrowStructType([new Field("b", new FixedSizeBinaryType(2), true)]);
+        var batch = new RecordBatch(Schema(new Field("s", structType, true)),
+            [new StructArray(structType, 1, [FixedSizeBinary(2, 7, 8)], ArrowBuffer.Empty)], 1);
+
+        var ex = await RefusedAsync(null, async () => await table.WriteAsync([batch]));
+        Assert.Contains("'s.b'", ex.Message);
+    }
+
+    [Fact]
+    public async Task Write_Decimal_IsNotMistakenForFixedSizeBinary()
+    {
+        // Every Arrow decimal type derives from FixedSizeBinaryType, so the refusal must match the type
+        // exactly. A bare type pattern refused every decimal write.
+        var type = new Decimal128Type(10, 2);
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(new Field("d", type, true)));
+
+        var batch = new RecordBatch(table.ArrowSchema,
+            [new Decimal128Array.Builder(type).Append(12.34m).Build()], 1);
+        await table.WriteAsync([batch]);
+        await table.WriteDataFilesAsync([batch]);
+    }
+
+    [Fact]
+    public async Task Create_Decimal32_IsRefusedRatherThanDeclaredBinary()
+    {
+        // Decimal32 also derives from FixedSizeBinaryType and used to fall into its arm, declaring a
+        // decimal column as Delta 'binary'. It has no arm of its own, so it is refused.
+        var ex = await RefusedAsync(null, async () =>
+        {
+            await using var t = await DeltaTable.CreateAsync(Fs, Schema(new Field("d", new Decimal32Type(5, 2), true)));
+        });
+        Assert.DoesNotContain("FixedSizeBinary", ex.Message);
+    }
+
+    [Fact]
+    public async Task Write_Date64IntoADateColumn_IsRefusedWithACastMessage()
+    {
+        // Used to reach the Parquet writer and fail there with a NotSupportedException.
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(new Field("d", Date32Type.Default, true)));
+
+        var schema = Schema(new Field("d", Date64Type.Default, true));
+        var batch = new RecordBatch(schema, [new Date64Array.Builder().Append(new DateTime(2024, 3, 1)).Build()], 1);
+
+        var ex = await RefusedAsync(null, async () => await table.WriteAsync([batch]));
+        Assert.Contains("Date32", ex.Message);
     }
 
     // ── Integer to decimal widening ───────────────────────────────────────────────────────────────────

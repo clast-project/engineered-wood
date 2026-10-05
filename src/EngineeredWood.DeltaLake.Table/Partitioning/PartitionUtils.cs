@@ -456,7 +456,7 @@ internal static class PartitionUtils
         var tsType = (TimestampType)ts.Data.DataType;
 
         // Reached only from partition splitting of a batch being WRITTEN, and the write path already
-        // refuses the units with no faithful encoding (SchemaConverter.ThrowIfUnsupportedTimestampUnit).
+        // refuses the units with no faithful encoding (SchemaConverter.ThrowIfUnwritableType).
         // Throw rather than convert if one arrives anyway: a partition value is an exact identity, not a
         // bound, so rounding it produces a value that will not round-trip — and the nanosecond arm used to
         // do exactly that silently. Same rule as GetStringValue's unsupported-type arm above.
