@@ -410,6 +410,42 @@ public class RowGroupSchemaMismatchTests : IDisposable
             BatchOf(Of(elementNullable: false)), new RecordBatch(second, [fixedList], 2));
     }
 
+    // Review of #464: ArrayData.NullCount may be -1 ("not computed"), but the check reads IArrowArray.NullCount,
+    // which computes it. These pin that: an unknown count must neither hide a null nor invent one.
+    private static Int32Array WithUnknownNullCount(Int32Array array) =>
+        new(new ArrayData(Int32Type.Default, array.Length, -1, 0, array.Data.Buffers));
+
+    [Fact]
+    public async Task UnknownNullCount_InRunEndEncodedValues_StillFindsTheNullRun()
+    {
+        var values = WithUnknownNullCount(Ints(2, null));
+        Assert.Equal(-1, values.Data.NullCount);
+
+        var ex = await Assert.ThrowsAsync<ArgumentException>(() => WriteAsync(Writer.File,
+            Path.Combine(_tempDir, "ree-unknown.parquet"),
+            ReeBatch(Ree(Ints(1)), nullable: false),
+            ReeBatch(Ree(values), nullable: true)));
+
+        Assert.Contains("required", ex.Message);
+    }
+
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task UnknownNullCount_WithNoNulls_IsAccepted(Writer kind)
+    {
+        var schema = SchemaOf(new Field("a", Int32Type.Default, false));
+        var values = WithUnknownNullCount(Ints(3, 4));
+        Assert.Equal(-1, values.Data.NullCount);
+        string path = Path.Combine(_tempDir, "unknown-none.parquet");
+
+        await WriteAsync(kind, path,
+            new RecordBatch(schema, [Ints(1, 2)], 2), new RecordBatch(schema, [values], 2));
+
+        int[] read = await ReadColumnAsync(path, "a");
+        Assert.Equal(new[] { 1, 2, 3, 4 }, read);
+    }
+
     private static async Task<int[]> ReadColumnAsync(string path, string column)
     {
         await using var file = new LocalRandomAccessFile(path);
