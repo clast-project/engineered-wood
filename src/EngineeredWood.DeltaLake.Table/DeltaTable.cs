@@ -3822,6 +3822,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     var matchBatch = TakeRowsFromBatch(batch, matchRows);
                     var updatedBatch = updater(matchBatch);
+                    ThrowIfUpdaterChangedTypes(matchBatch, updatedBatch, snapshot.Schema);
 
                     // Only the post-image. Rows the predicate did not match are copied through
                     // untouched: they were already in the table, so re-checking them would refuse
@@ -6555,7 +6556,62 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         var normalized = WriteTypeNormalization.Normalize(rows);
         SchemaConverter.ThrowIfUnwritableType(normalized.Schema);
+        // CdfWriter writes every column the batch has, so an undeclared one would ride into the change file
+        // exactly as it would into a data file.
+        ThrowIfUndeclaredColumns([normalized], snapshot.Schema, entryPoint);
         ThrowIfMistypedColumns([normalized], snapshot.Schema, entryPoint);
+    }
+
+    /// <summary>
+    /// The write-boundary checks, applied to what an UPDATE's updater returned. Only the columns it CHANGED
+    /// are type-checked: those whose type differs from the batch it was handed, or that it added. A column
+    /// passed through keeps whatever form the reader produced — which need not be the declared one (an
+    /// INT96 timestamp reads as a naive <c>timestamp[us]</c>, a decimal(9,2) as Decimal32, #469) — and was
+    /// written back in that form before these checks existed, so refusing it would break an identity UPDATE
+    /// over data another engine wrote.
+    /// </summary>
+    private void ThrowIfUpdaterChangedTypes(
+        RecordBatch input, RecordBatch output, Schema.StructType schema)
+    {
+        const string entryPoint = "UPDATE";
+        ThrowIfUndeclaredColumns([output], schema, entryPoint);
+
+        var changedFields = new List<Field>();
+        var changedColumns = new List<IArrowArray>();
+        for (int i = 0; i < output.ColumnCount; i++)
+        {
+            var field = output.Schema.FieldsList[i];
+            int source = input.Schema.GetFieldIndex(field.Name);
+            if (source >= 0 && SameDeltaType(input.Schema.FieldsList[source].DataType, field.DataType))
+                continue;
+            changedFields.Add(field);
+            changedColumns.Add(output.Column(i));
+        }
+        if (changedFields.Count == 0)
+            return;
+
+        var changed = new RecordBatch(new Apache.Arrow.Schema(changedFields, null), changedColumns, output.Length);
+        var normalized = HostOwnsBytes ? changed : WriteTypeNormalization.Normalize(changed);
+        SchemaConverter.ThrowIfUnwritableType(normalized.Schema, convertibleTypesAllowed: HostOwnsBytes);
+        if (!HostOwnsBytes)
+            ThrowIfMistypedColumns([normalized], schema, entryPoint);
+    }
+
+    /// <summary>Whether two Arrow types are the same object, or map onto the same Delta type.</summary>
+    private static bool SameDeltaType(Apache.Arrow.Types.IArrowType a, Apache.Arrow.Types.IArrowType b)
+    {
+        if (ReferenceEquals(a, b))
+            return true;
+        try
+        {
+            var da = SchemaConverter.FromArrowSchema(new Apache.Arrow.Schema([new Field("x", a, true)], null)).Fields[0].Type;
+            var db = SchemaConverter.FromArrowSchema(new Apache.Arrow.Schema([new Field("x", b, true)], null)).Fields[0].Type;
+            return Mismatch(db, da, "x") is null && Mismatch(da, db, "x") is null;
+        }
+        catch (DeltaFormatException)
+        {
+            return false; // a type with no Delta mapping is checked, and refused, as changed
+        }
     }
 
     /// <summary>

@@ -891,6 +891,100 @@ public class SchemaValidationTests : IDisposable
         await MistypedAsync(async () => await table.WriteChangeDataFileAsync(rows, "delete"));
     }
 
+    // ── What an UPDATE's updater returns ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Update_UpdaterReturningAMistypedColumn_IsRefusedAndNothingIsCommitted()
+    {
+        var schema = Schema(Long("id"), new Field("s", StringType.Default, true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema);
+        await table.WriteAsync([new RecordBatch(schema,
+            [new Int64Array.Builder().Append(1).Build(), new StringArray.Builder().Append("a").Build()], 1)]);
+        long version = table.CurrentSnapshot.Version;
+
+        var ex = await MistypedAsync(async () => await table.UpdateAsync(
+            b => new BooleanArray.Builder().AppendRange(Enumerable.Repeat(true, b.Length)).Build(),
+            b => new RecordBatch(
+                Schema(b.Schema.FieldsList[0], new Field("s", Int32Type.Default, true)),
+                [b.Column(0), new Int32Array.Builder().AppendRange(Enumerable.Repeat(7, b.Length)).Build()],
+                b.Length)));
+        Assert.Contains("'s' is declared string", ex.Message);
+        Assert.Equal(version, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task Update_PassingThroughAColumnTheReaderNarrowed_IsNotRefused()
+    {
+        // A Spark INT96 timestamp reads back as a NAIVE timestamp[us] under a declared (zoned) `timestamp`.
+        // Simulated with a file holding a naive timestamp, committed as another writer would. An UPDATE that
+        // changes only `id` passes `t` through in the form it was read, as it always has, so `t` is not
+        // re-checked against its declaration.
+        var zoned = new TimestampType(TimeUnit.Microsecond, "UTC");
+        var naive = new TimestampType(TimeUnit.Microsecond, (string?)null);
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(Long("id"), new Field("t", zoned, true)));
+
+        var fileSchema = Schema(Long("id"), new Field("t", naive, true));
+        var when = new DateTimeOffset(2024, 3, 1, 12, 0, 0, TimeSpan.Zero);
+        string path = Path.Combine(_tempDir, "foreign.parquet");
+        await using (var file = new LocalSequentialFile(path))
+        {
+            await using var writer = new Parquet.ParquetFileWriter(file, ownsFile: false);
+            await writer.WriteRowGroupAsync(new RecordBatch(fileSchema,
+                [new Int64Array.Builder().Append(1).Build(), new TimestampArray.Builder(naive).Append(when).Build()], 1));
+        }
+        await table.CommitDataFilesAsync([new WrittenDataFile("foreign.parquet", new FileInfo(path).Length, 1, null, null)]);
+
+        var naiveRead = (await ReadAllAsync(table)).Single().Schema.GetFieldByName("t").DataType;
+        Assert.Null(((TimestampType)naiveRead).Timezone); // the premise: the reader hands back the naive form
+
+        await table.UpdateAsync(
+            b => new BooleanArray.Builder().AppendRange(Enumerable.Repeat(true, b.Length)).Build(),
+            b => new RecordBatch(b.Schema,
+                [new Int64Array.Builder().AppendRange(Enumerable.Repeat(2L, b.Length)).Build(), b.Column(1)], b.Length));
+
+        var batch = (await ReadAllAsync(table)).Single();
+        Assert.Equal(2L, ((Int64Array)batch.Column(0)).GetValue(0));
+    }
+
+    [Fact]
+    public async Task ChangeData_UndeclaredColumn_IsRefused()
+    {
+        await using var table = await CreateCdfTableAsync(Schema(new Field("s", StringType.Default, true)));
+
+        var rows = new RecordBatch(Schema(new Field("s", StringType.Default, true), Long("extra")),
+            [new StringArray.Builder().Append("a").Build(), new Int64Array.Builder().Append(1).Build()], 1);
+        var ex = await MistypedAsync(async () => await table.WriteChangeDataFileAsync(rows, "delete"));
+        Assert.Contains("'extra'", ex.Message);
+        await MistypedAsync(async () => await table.StartTransaction().StageChangeDataAsync(rows, "delete"));
+    }
+
+    // ── Maps stay maps ────────────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Write_MapWithAConvertibleValue_StaysAMap()
+    {
+        // In Arrow 23 MapType derives from NestedType, not ListType, so the normalizer's map arm is the one
+        // that matches. Pinned so a future Arrow where the hierarchy changes fails here, not in a data file.
+        var mapType = new Apache.Arrow.Types.MapType(
+            new Field("key", StringType.Default, false), new Field("value", Date64Type.Default, true));
+        var schema = Schema(new Field("m", mapType, true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema);
+
+        var builder = new MapArray.Builder(mapType);
+        builder.Append();
+        ((StringArray.Builder)builder.KeyBuilder).Append("k");
+        ((Date64Array.Builder)builder.ValueBuilder).Append(new DateTime(2024, 3, 1));
+        var map = builder.Build();
+
+        var normalized = WriteTypeNormalization.Normalize(new RecordBatch(schema, [map], 1));
+        var normalizedType = Assert.IsType<Apache.Arrow.Types.MapType>(normalized.Column(0).Data.DataType);
+        Assert.IsType<Date32Type>(normalizedType.ValueField.DataType);
+
+        await table.WriteAsync([new RecordBatch(schema, [map], 1)]);
+        var read = Assert.IsType<MapArray>(Assert.Single(await ReadAllAsync(table)).Column(0));
+        Assert.Equal(new DateTime(2024, 3, 1), ((Date32Array)read.Values).GetDateTime(0));
+    }
+
     // ── Integer to decimal widening ───────────────────────────────────────────────────────────────────
 
     [Theory]
