@@ -35,10 +35,13 @@ namespace EngineeredWood.DeltaLake.Table;
 /// not fit). Refusing it would refuse a batch for bytes nobody can see.
 /// </para>
 /// <para>
-/// Works on <see cref="ArrayData"/> so a sliced array keeps its offset: each converted buffer is laid
-/// out over the same slot positions as the original, and untouched buffers (validity bitmaps, list
-/// offsets, FixedSizeBinary's value bytes) are shared rather than copied. Struct children are not
-/// sliced with their parent: parent slot <c>i</c> is child slot <c>parent.Offset + i</c>.
+/// Works on <see cref="ArrayData"/>, and every array it converts comes out ZERO-OFFSET, sized to its
+/// own length: a one-row slice of a large batch costs one row, not the prefix before it. Buffers that
+/// need no conversion are shared where they can be (FixedSizeBinary's value bytes, as a slice of the
+/// original; a byte-aligned validity bitmap). A sliced struct is rebased by slicing its children —
+/// struct children are not sliced with their parent in Arrow C#, so parent slot <c>i</c> is child slot
+/// <c>parent.Offset + i</c>. A list keeps its offsets: rebasing them would leave values no row
+/// references, which the Parquet writer cannot yet write (#470), and a sliced list writes as it is.
 /// </para>
 /// </remarks>
 internal static class WriteTypeNormalization
@@ -67,6 +70,30 @@ internal static class WriteTypeNormalization
 
         return new RecordBatch(
             new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
+    }
+
+    /// <summary>
+    /// <see cref="Normalize(RecordBatch)"/> over a list: the caller's OWN list when no batch needed
+    /// converting — the common case on the write hot path — so nothing is allocated until a batch
+    /// actually changes.
+    /// </summary>
+    public static IReadOnlyList<RecordBatch> NormalizeAll(IReadOnlyList<RecordBatch> batches)
+    {
+        List<RecordBatch>? converted = null;
+        for (int i = 0; i < batches.Count; i++)
+        {
+            var batch = Normalize(batches[i]);
+            if (converted is null && ReferenceEquals(batch, batches[i]))
+                continue;
+            if (converted is null)
+            {
+                converted = new List<RecordBatch>(batches.Count);
+                for (int j = 0; j < i; j++)
+                    converted.Add(batches[j]);
+            }
+            converted.Add(batch);
+        }
+        return converted ?? batches;
     }
 
     private static bool Needs(IArrowType type) => type switch
@@ -108,6 +135,8 @@ internal static class WriteTypeNormalization
 
             case ArrowStructType st:
             {
+                if (data.Offset != 0)
+                    data = RebaseStruct(data);
                 var childVisible = StructChildVisibility(data, visible);
                 var children = new ArrayData[data.Children.Length];
                 var fields = new List<Field>(st.Fields.Count);
@@ -186,36 +215,67 @@ internal static class WriteTypeNormalization
 
     // ── Conversions ───────────────────────────────────────────────────────────────────────────────────
 
-    /// <summary>Binary over the SAME value bytes: slot <c>j</c> of a FixedSizeBinary array lives at
-    /// <c>j * width</c>, so only an offsets buffer saying so is new.</summary>
+    /// <summary>A zero-offset struct over the same rows: each child sliced to the struct's slots.</summary>
+    private static ArrayData RebaseStruct(ArrayData data)
+    {
+        var children = new ArrayData[data.Children.Length];
+        for (int i = 0; i < children.Length; i++)
+            children[i] = data.Children[i].Slice(data.Offset, data.Length);
+        return new ArrayData(
+            data.DataType, data.Length, data.NullCount, 0,
+            [RebaseBitmap(data.Buffers[0], data.Offset, data.Length)], children);
+    }
+
+    /// <summary>The validity bits of slots <c>offset .. offset + length</c>, starting at bit 0. Shared when
+    /// the slice starts on a byte boundary; copied otherwise.</summary>
+    private static ArrowBuffer RebaseBitmap(ArrowBuffer bitmap, int offset, int length)
+    {
+        if (bitmap.IsEmpty || offset == 0)
+            return bitmap;
+        int bytes = (length + 7) / 8;
+        if (offset % 8 == 0)
+            return new ArrowBuffer(bitmap.Memory.Slice(offset / 8, bytes));
+
+        var rebased = new byte[bytes];
+        var source = bitmap.Span;
+        for (int i = 0; i < length; i++)
+        {
+            int bit = offset + i;
+            if ((source[bit >> 3] & (1 << (bit & 7))) != 0)
+                rebased[i >> 3] |= (byte)(1 << (i & 7));
+        }
+        return new ArrowBuffer(rebased);
+    }
+
+    /// <summary>Binary over the same value bytes: the slice's bytes are shared, and only an offsets
+    /// buffer saying where each value starts is new.</summary>
     private static ArrayData FixedSizeBinaryToBinary(ArrayData data, int width)
     {
-        int slots = data.Offset + data.Length;
-        if ((long)slots * width > int.MaxValue)
+        if ((long)data.Length * width > int.MaxValue)
         {
             throw new DeltaFormatException(
                 DeltaTableErrorCodes.UnwritableValue,
-                $"A FixedSizeBinary column of {slots} values of {width} bytes is too large to write as "
+                $"A FixedSizeBinary column of {data.Length} values of {width} bytes is too large to write as "
                 + "Delta binary in one batch; split the batch.");
         }
 
-        var offsets = new byte[(slots + 1) * sizeof(int)];
-        for (int j = 0; j <= slots; j++)
+        var offsets = new byte[(data.Length + 1) * sizeof(int)];
+        for (int j = 0; j <= data.Length; j++)
             BinaryPrimitives.WriteInt32LittleEndian(offsets.AsSpan(j * sizeof(int)), j * width);
 
+        var values = data.Buffers[1].Memory.Slice(data.Offset * width, data.Length * width);
         return new ArrayData(
-            BinaryType.Default, data.Length, data.NullCount, data.Offset,
-            [data.Buffers[0], new ArrowBuffer(offsets), data.Buffers[1]]);
+            BinaryType.Default, data.Length, data.NullCount, 0,
+            [RebaseBitmap(data.Buffers[0], data.Offset, data.Length), new ArrowBuffer(offsets), new ArrowBuffer(values)]);
     }
 
     private static ArrayData Date64ToDate32(ArrayData data, string path, bool[]? visible)
     {
-        var days = new byte[(data.Offset + data.Length) * sizeof(int)];
+        var days = new byte[data.Length * sizeof(int)];
         var millis = data.Buffers[1].Span;
         for (int i = 0; i < data.Length; i++)
         {
-            int slot = data.Offset + i;
-            long ms = BinaryPrimitives.ReadInt64LittleEndian(millis.Slice(slot * sizeof(long)));
+            long ms = BinaryPrimitives.ReadInt64LittleEndian(millis.Slice((data.Offset + i) * sizeof(long)));
             long day = ms / MillisecondsPerDay;
             bool fits = ms % MillisecondsPerDay == 0 && day is >= int.MinValue and <= int.MaxValue;
             if (!fits)
@@ -228,33 +288,34 @@ internal static class WriteTypeNormalization
                     + "Arrow format requires Date64 values to be evenly divisible by 86400000), so it cannot "
                     + "be written as a Delta date without guessing which day was meant.");
             }
-            BinaryPrimitives.WriteInt32LittleEndian(days.AsSpan(slot * sizeof(int)), (int)day);
+            BinaryPrimitives.WriteInt32LittleEndian(days.AsSpan(i * sizeof(int)), (int)day);
         }
 
         return new ArrayData(
-            Date32Type.Default, data.Length, data.NullCount, data.Offset,
-            [data.Buffers[0], new ArrowBuffer(days)]);
+            Date32Type.Default, data.Length, data.NullCount, 0,
+            [RebaseBitmap(data.Buffers[0], data.Offset, data.Length), new ArrowBuffer(days)]);
     }
 
     /// <summary>Sign-extends each 4- or 8-byte unscaled value to Decimal128's 16 bytes; precision and
     /// scale are unchanged, so the values are too.</summary>
     private static ArrayData WidenDecimal(ArrayData data, Decimal128Type target, int sourceWidth)
     {
-        int slots = data.Offset + data.Length;
-        var wide = new byte[slots * 16];
+        var wide = new byte[data.Length * 16];
         var narrow = data.Buffers[1].Span;
-        for (int j = data.Offset; j < slots; j++)
+        for (int i = 0; i < data.Length; i++)
         {
+            int j = data.Offset + i;
             long value = sourceWidth == 4
                 ? BinaryPrimitives.ReadInt32LittleEndian(narrow.Slice(j * 4))
                 : BinaryPrimitives.ReadInt64LittleEndian(narrow.Slice(j * 8));
-            var dest = wide.AsSpan(j * 16);
+            var dest = wide.AsSpan(i * 16);
             BinaryPrimitives.WriteInt64LittleEndian(dest, value);
             BinaryPrimitives.WriteInt64LittleEndian(dest.Slice(8), value < 0 ? -1L : 0L);
         }
 
         return new ArrayData(
-            target, data.Length, data.NullCount, data.Offset, [data.Buffers[0], new ArrowBuffer(wide)]);
+            target, data.Length, data.NullCount, 0,
+            [RebaseBitmap(data.Buffers[0], data.Offset, data.Length), new ArrowBuffer(wide)]);
     }
 
     /// <summary>Keeps the low 16 bytes of each 32-byte value. Schema conversion admits Decimal256 only
@@ -270,12 +331,11 @@ internal static class WriteTypeNormalization
                 + "precision of 38.");
         }
 
-        var narrow = new byte[(data.Offset + data.Length) * 16];
+        var narrow = new byte[data.Length * 16];
         var wide = data.Buffers[1].Span;
         for (int i = 0; i < data.Length; i++)
         {
-            int slot = data.Offset + i;
-            var value = wide.Slice(slot * 32, 32);
+            var value = wide.Slice((data.Offset + i) * 32, 32);
             long sign = (sbyte)value[15] < 0 ? -1L : 0L;
             bool fits = BinaryPrimitives.ReadInt64LittleEndian(value.Slice(16)) == sign
                 && BinaryPrimitives.ReadInt64LittleEndian(value.Slice(24)) == sign;
@@ -288,10 +348,11 @@ internal static class WriteTypeNormalization
                     $"Column '{path}': the Decimal256 value at position {i} does not fit the column's "
                     + $"decimal({target.Precision},{target.Scale}).");
             }
-            value.Slice(0, 16).CopyTo(narrow.AsSpan(slot * 16));
+            value.Slice(0, 16).CopyTo(narrow.AsSpan(i * 16));
         }
 
         return new ArrayData(
-            target, data.Length, data.NullCount, data.Offset, [data.Buffers[0], new ArrowBuffer(narrow)]);
+            target, data.Length, data.NullCount, 0,
+            [RebaseBitmap(data.Buffers[0], data.Offset, data.Length), new ArrowBuffer(narrow)]);
     }
 }

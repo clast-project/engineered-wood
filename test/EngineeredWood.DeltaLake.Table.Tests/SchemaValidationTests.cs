@@ -985,6 +985,99 @@ public class SchemaValidationTests : IDisposable
         Assert.Equal(new DateTime(2024, 3, 1), ((Date32Array)read.Values).GetDateTime(0));
     }
 
+    // ── Allocation stays proportional to the slice ────────────────────────────────────────────────────
+
+    private const int Big = 100_000;
+
+    private static RecordBatch LastRowOf(Field field, IArrowArray array) =>
+        new RecordBatch(Schema(field), [array], array.Length).Slice(array.Length - 1, 1);
+
+    [Fact]
+    public void Normalize_ASliceAtTheEndOfALargeArray_AllocatesForTheSliceOnly()
+    {
+        // Each converted array comes out zero-offset and sized to its own length, so a one-row slice of a
+        // 100k-row column costs one row, not the 99,999 before it.
+        var fsbBytes = new byte[Big * 4];
+        fsbBytes[^1] = 9;
+        var fsb = WriteTypeNormalization.Normalize(LastRowOf(
+            new Field("b", new FixedSizeBinaryType(4), true), FixedSizeBinary(4, Big, fsbBytes))).Column(0).Data;
+        Assert.Equal((0, 1), (fsb.Offset, fsb.Length));
+        Assert.Equal(2 * sizeof(int), fsb.Buffers[1].Length); // offsets
+        Assert.Equal(4, fsb.Buffers[2].Length);                // the slice's bytes, shared
+        Assert.Equal(new byte[] { 0, 0, 0, 9 }, ((BinaryArray)ArrowArrayFactory.BuildArray(fsb)).GetBytes(0).ToArray());
+
+        var date = WriteTypeNormalization.Normalize(LastRowOf(
+            new Field("d", Date64Type.Default, true), Date64s(Enumerable.Repeat(2 * Day, Big).ToArray()))).Column(0).Data;
+        Assert.Equal((0, 1, sizeof(int)), (date.Offset, date.Length, date.Buffers[1].Length));
+
+        var d32 = new Decimal32Type(9, 2);
+        var dec = WriteTypeNormalization.Normalize(LastRowOf(new Field("d", d32, true),
+            new Decimal32Array(new ArrayData(d32, Big, 0, 0, [ArrowBuffer.Empty, Int32s(new int[Big])])))).Column(0).Data;
+        Assert.Equal((0, 1, 16), (dec.Offset, dec.Length, dec.Buffers[1].Length));
+
+        var d256 = new Decimal256Type(20, 2);
+        var wide = WriteTypeNormalization.Normalize(LastRowOf(new Field("d", d256, true),
+            new Decimal256Array(new ArrayData(d256, Big, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(new byte[Big * 32])])))).Column(0).Data;
+        Assert.Equal((0, 1, 16), (wide.Offset, wide.Length, wide.Buffers[1].Length));
+    }
+
+    [Fact]
+    public void Normalize_ASlicedStruct_IsRebasedSoItsChildrenAreSlicedToo()
+    {
+        var structType = new ArrowStructType([new Field("d", Date64Type.Default, true)]);
+        var structs = new StructArray(structType, Big, [Date64s(Enumerable.Repeat(3 * Day, Big).ToArray())], ArrowBuffer.Empty);
+
+        var data = WriteTypeNormalization.Normalize(LastRowOf(new Field("s", structType, true), structs)).Column(0).Data;
+
+        Assert.Equal((0, 1), (data.Offset, data.Length));
+        var child = data.Children[0];
+        Assert.Equal((0, 1, sizeof(int)), (child.Offset, child.Length, child.Buffers[1].Length));
+        Assert.Equal(new DateTime(1970, 1, 4), ((Date32Array)ArrowArrayFactory.BuildArray(child)).GetDateTime(0));
+    }
+
+    [Theory]
+    [InlineData(3)]  // not byte-aligned: the bits are copied
+    [InlineData(8)]  // byte-aligned: the bitmap bytes are shared
+    public void Normalize_ASliceWithNulls_KeepsEachRowsNullness(int offset)
+    {
+        // Every third row is valid: a period that does not divide 8, so each bitmap byte differs from the
+        // next and a slice taken from the wrong byte shows.
+        const int length = 20;
+        var validity = new byte[(length + 7) / 8];
+        for (int i = 0; i < length; i += 3)
+            validity[i / 8] |= (byte)(1 << (i % 8));
+        var array = Date64s(Enumerable.Range(0, length).Select(i => i * Day).ToArray(), validity);
+        var batch = new RecordBatch(Schema(new Field("d", Date64Type.Default, true)), [array], length).Slice(offset, 6);
+
+        var normalized = (Date32Array)WriteTypeNormalization.Normalize(batch).Column(0);
+
+        for (int i = 0; i < 6; i++)
+        {
+            bool valid = (offset + i) % 3 == 0;
+            Assert.Equal(!valid, normalized.IsNull(i));
+            if (valid)
+                Assert.Equal(new DateTime(1970, 1, 1).AddDays(offset + i), normalized.GetDateTime(i));
+        }
+    }
+
+    [Fact]
+    public void NormalizeAll_WithNothingToConvert_ReturnsTheCallersOwnList()
+    {
+        // The write hot path: nothing to convert must allocate nothing, not even a new list.
+        var batches = new List<RecordBatch> { new(Schema(Long("id")), [new Int64Array.Builder().Append(1).Build()], 1) };
+        Assert.Same(batches, WriteTypeNormalization.NormalizeAll(batches));
+
+        var mixed = new List<RecordBatch>
+        {
+            batches[0],
+            new(Schema(new Field("d", Date64Type.Default, true)), [Date64s([Day])], 1),
+        };
+        var result = WriteTypeNormalization.NormalizeAll(mixed);
+        Assert.NotSame(mixed, result);
+        Assert.Same(batches[0], result[0]);
+        Assert.IsType<Date32Array>(result[1].Column(0));
+    }
+
     // ── Integer to decimal widening ───────────────────────────────────────────────────────────────────
 
     [Theory]

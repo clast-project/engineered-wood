@@ -5767,7 +5767,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     private bool HostOwnsBytes => _options.DataFileWriter is not null;
 
     private IReadOnlyList<RecordBatch> NormalizeUnlessHostOwnsBytes(IReadOnlyList<RecordBatch> batches) =>
-        HostOwnsBytes ? batches : batches.Select(WriteTypeNormalization.Normalize).ToList();
+        HostOwnsBytes ? batches : WriteTypeNormalization.NormalizeAll(batches);
 
     private RecordBatch NormalizeUnlessHostOwnsBytes(RecordBatch batch) =>
         HostOwnsBytes ? batch : WriteTypeNormalization.Normalize(batch);
