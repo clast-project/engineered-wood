@@ -558,12 +558,50 @@ delete produces a new DV file rather than packing multiple DVs into a
 single file with distinct offsets, so `offset`/`sizeInBytes` are
 effectively unused on write.
 
-**Table-property honoring.** The following properties are accepted in
-table metadata but not acted on by the runtime: `delta.logRetentionDuration`,
-`delta.enableExpiredLogCleanup`,
-`delta.randomizeFilePrefixes`, `delta.checkpointInterval` (as a table
-property; the .NET option `DeltaTableOptions.CheckpointInterval` does
-work), `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStatsColumns`.
+**Table properties.** Audited 2026-10-05 against delta-spark 4.4.0. The list covers every key
+`DeltaConfigs` defines, plus `delta.constraints.*`, `delta.feature.*`, the row-tracking column names
+and the symlink-manifest flag. To repeat the audit, run `javap` over `DeltaConfigsBase` in the
+delta-spark jar and collect the first argument of each `buildConfig` call.
+
+*Honoured:* `delta.appendOnly`; `delta.checkpointInterval` (the property wins unless
+`DeltaTableOptions.CheckpointInterval` is 0 or less); `delta.checkpointPolicy`;
+`delta.checkpoint.writeStatsAsJson` / `writeStatsAsStruct`; `delta.columnMapping.mode` /
+`maxColumnId`; `delta.constraints.*`; `delta.deletedFileRetentionDuration` (checkpoint tombstones and
+VACUUM); `delta.enableChangeDataFeed`; `delta.enableDeletionVectors`; `delta.enableExpiredLogCleanup`
+and `delta.logRetentionDuration` (`LogCleanup`); `delta.enableIcebergCompatV1` / `V2`;
+`delta.enableInCommitTimestamps`; `delta.enableRowTracking` and its two materialized-column names;
+`delta.enableTypeWidening`.
+
+*Not read, with consequences for a table EW writes to:*
+
+| Property | What EW does instead |
+|---|---|
+| `delta.isolationLevel` | DML commits at `WriteSerializable` whatever the table demands, so on a `Serializable` table it can commit past a concurrent blind append that Spark would abort on. #472 |
+| `delta.universalFormat.enabledFormats` (with `…iceberg.atomicConversion.supported`, `delta.universalformat.config.*`) | Writes to a UniForm table without generating Iceberg metadata, so Iceberg readers see stale data. Nothing refuses the write: UniForm rides on `icebergCompatV2`, which EW supports. #473 |
+| `delta.dataSkippingStatsColumns` | Not kept in step with RENAME/DROP. Spark rewrites or removes entries there, and validates the property on **every** metadata update, so a stale entry breaks Spark's next ALTER. Also not used to choose stats columns. #471 |
+| `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStringPrefixLength` | Statistics for every eligible column, with a fixed string-prefix length. Never wrong, but larger on wide tables. #471 |
+| `delta.compatibility.symlinkFormatManifest.enabled` | Symlink manifests (for Presto/Athena-style readers) are not regenerated. |
+| `delta.setTransactionRetentionDuration` | Expired `txn` (idempotent-write) identifiers are never dropped from checkpoints. |
+| `delta.feature.*`, `delta.minReaderVersion`, `delta.minWriterVersion` passed as CREATE `configuration` | Spark treats these as requests to enable features or set protocol versions; EW does not act on them. Use the `CreateAsync` parameters instead. |
+| `delta.rowTrackingSuspended` | Not read. What Spark expects of a writer while suspended is not yet verified. |
+| `delta.inCommitTimestampEnablementVersion` / `…Timestamp` | Not read. EW sets them only implicitly (in-commit timestamps enabled at creation need neither). Unverified for a table that enabled them mid-life, where timestamp time travel across the boundary depends on them. |
+| `delta.enableChangeDataCapture` | Not read. Spark defines it as a key separate from `enableChangeDataFeed`; how Spark uses it is not yet verified. |
+| `delta.randomizeFilePrefixes`, `delta.randomPrefixLength` | Data files are not given random prefixes (layout only). |
+| `delta.checkpointRetentionDuration` | Not read; log cleanup goes by `delta.logRetentionDuration`. |
+
+*Moot because EW refuses the table:* each of these belongs to a table feature missing from
+`ProtocolVersions.SupportedWriterFeatures`, so EW will not write the table at all:
+`delta.coordinatedCommits.*-preview`, `delta.redirectReaderWriter-preview`,
+`delta.redirectWriterOnly-preview`, `delta.enableIcebergCompatV3`, `delta.enableVariantShredding`,
+`delta.enableMaterializePartitionColumnsFeature` / `delta.writePartitionColumnsToParquet`, and
+`delta.requireCheckpointProtectionBeforeVersion`.
+
+*Not relevant to EW:* `delta.autoOptimize*` (Databricks write tuning), `delta.castIcebergTimeType` and
+`delta.ignoreIcebergBucketPartition` (Iceberg conversion), `delta.ignoreProtocolDefaults`,
+`delta.sampleRetentionDuration`, `delta.dropFeatureTruncateHistory.retentionDuration` and
+`delta.enableFullRetentionRollback` (DROP FEATURE, which EW does not implement),
+`delta.parquet.format.version`, and Spark's own bookkeeping keys `delta.lastCommitTimestamp` /
+`delta.lastUpdateVersion`.
 
 **Timestamp units are refused rather than converted.** `SchemaConverter`
 rejects two Arrow timestamp units at write, and the incoming batches are
@@ -636,7 +674,7 @@ therefore reads back as an ordinary list, which is what DuckDB also returns.
   wide statistics regardless: it only skips on the two `nullCount` states (0 and
   `== numRecords`) that the spec preserves when bounds go wide.
 - `delta.dataSkippingNumIndexedCols` / `delta.dataSkippingStatsColumns`
-  are ignored; every eligible column gets stats.
+  are ignored; every eligible column gets stats (see **Table properties** above, #471).
 
 (String-stat truncation and nested-struct recursion are both implemented —
 `StatsCollector.TruncateMaxString` and `CollectStruct`. Nested stats are
