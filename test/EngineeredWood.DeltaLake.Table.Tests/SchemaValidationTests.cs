@@ -737,6 +737,160 @@ public class SchemaValidationTests : IDisposable
         Assert.Contains("'s.d'", ex.Message);
     }
 
+    // ── Batch types against the declared types ────────────────────────────────────────────────────────
+
+    private static Task<ArgumentException> MistypedAsync(Func<Task> write) =>
+        Assert.ThrowsAsync<ArgumentException>(write);
+
+    [Fact]
+    public async Task Write_Int32IntoAStringColumn_IsRefusedOnEveryEntryPoint()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(new Field("s", StringType.Default, true)));
+        long version = table.CurrentSnapshot.Version;
+        var batch = new RecordBatch(Schema(new Field("s", Int32Type.Default, true)),
+            [new Int32Array.Builder().Append(1).Build()], 1);
+
+        var ex = await MistypedAsync(async () => await table.WriteAsync([batch]));
+        Assert.Contains("'s' is declared string", ex.Message);
+        await MistypedAsync(async () => await table.WriteDataFilesAsync([batch]));
+        await MistypedAsync(async () => await table.StartTransaction().WriteAsync([batch]));
+
+        Assert.Equal(version, table.CurrentSnapshot.Version);
+        Assert.Empty(Directory.EnumerateFiles(_tempDir, "*.parquet", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task Write_ConvertibleTypeForTheWrongDeclaredType_IsRefusedRatherThanConverted()
+    {
+        // Normalization would happily turn these into Binary / Decimal128; the declared type decides
+        // whether that is what the column holds.
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(
+            new Field("d", new Decimal128Type(9, 2), true), new Field("b", BinaryType.Default, true)));
+
+        var fsbForDecimal = new RecordBatch(Schema(new Field("d", new FixedSizeBinaryType(16), true)),
+            [FixedSizeBinary(16, 1, new byte[16])], 1);
+        await MistypedAsync(async () => await table.WriteAsync([fsbForDecimal]));
+
+        var d32 = new Decimal32Type(9, 2);
+        var decimalForBinary = new RecordBatch(Schema(new Field("b", d32, true)),
+            [new Decimal32Array(new ArrayData(d32, 1, 0, 0, [ArrowBuffer.Empty, Int32s(1)]))], 1);
+        await MistypedAsync(async () => await table.WriteAsync([decimalForBinary]));
+    }
+
+    [Fact]
+    public async Task Write_DecimalOfAnotherPrecisionOrScale_IsRefused()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(new Field("d", new Decimal128Type(12, 2), true)));
+
+        var type = new Decimal128Type(10, 2);
+        var ex = await MistypedAsync(async () => await table.WriteAsync([new RecordBatch(
+            Schema(new Field("d", type, true)), [new Decimal128Array.Builder(type).Append(1m).Build()], 1)]));
+        Assert.Contains("decimal(12,2)", ex.Message);
+        Assert.Contains("decimal(10,2)", ex.Message);
+    }
+
+    [Fact]
+    public async Task Write_NestedMismatch_NamesItsPath()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(Struct("s", Long("a"), Long("b"))));
+
+        var structType = new ArrowStructType([new Field("a", Int32Type.Default, true)]);
+        var batch = new RecordBatch(Schema(new Field("s", structType, true)),
+            [new StructArray(structType, 1, [new Int32Array.Builder().Append(1).Build()], ArrowBuffer.Empty)], 1);
+
+        var ex = await MistypedAsync(async () => await table.WriteAsync([batch]));
+        Assert.Contains("'s.a' is declared long", ex.Message);
+    }
+
+    [Fact]
+    public async Task Write_EveryArrowFormOfTheDeclaredType_IsAccepted()
+    {
+        // The comparison is on Delta types, so the Arrow forms that map onto the declared one all pass, and
+        // a struct may omit declared children (they read as null).
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(
+            new Field("s", StringType.Default, true), new Field("d", new Decimal128Type(9, 2), true),
+            Struct("t", Long("a"), Long("b"))));
+
+        var d32 = new Decimal32Type(9, 2);
+        var partial = new ArrowStructType([Long("b")]);
+        await table.WriteAsync([new RecordBatch(Schema(
+                new Field("s", LargeStringType.Default, true), new Field("d", d32, true), new Field("t", partial, true)),
+            [
+                new LargeStringArray.Builder().Append("x").Build(),
+                new Decimal32Array(new ArrayData(d32, 1, 0, 0, [ArrowBuffer.Empty, Int32s(125)])),
+                new StructArray(partial, 1, [new Int64Array.Builder().Append(7).Build()], ArrowBuffer.Empty),
+            ], 1)]);
+
+        Assert.Single(await ReadAllAsync(table));
+    }
+
+    // ── The codec seam stays value-blind ──────────────────────────────────────────────────────────────
+
+    private sealed class CapturingWriter : IDataFileWriter
+    {
+        public List<RecordBatch> Received { get; } = [];
+
+        public async ValueTask<long> WriteAsync(
+            IAsyncEnumerable<RecordBatch> batches, string relativePath, CancellationToken cancellationToken)
+        {
+            await foreach (var b in batches.WithCancellation(cancellationToken))
+                Received.Add(b);
+            return 1;
+        }
+    }
+
+    [Fact]
+    public async Task Write_UnderAHostWriter_ReachesItVerbatim()
+    {
+        // A host that owns the bytes may present its own representation for a declared column
+        // (CodecSeamValueBlindnessTests), so neither the conversion nor the type check applies.
+        var writer = new CapturingWriter();
+#pragma warning disable EWDELTA0001 // codec seam is experimental
+        var options = DeltaTableOptions.Default with { DataFileWriter = writer };
+#pragma warning restore EWDELTA0001
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, Schema(new Field("b", BinaryType.Default, true)), options);
+
+        var batch = new RecordBatch(Schema(new Field("b", new FixedSizeBinaryType(4), true)),
+            [FixedSizeBinary(4, 1, [1, 2, 3, 4])], 1);
+        await table.WriteDataFilesAsync([batch]);
+
+        Assert.IsType<FixedSizeBinaryArray>(Assert.Single(writer.Received).Column(0));
+    }
+
+    // ── Caller-supplied change rows get the same checks ───────────────────────────────────────────────
+
+    private async Task<DeltaTable> CreateCdfTableAsync(Apache.Arrow.Schema schema) =>
+        await DeltaTable.CreateAsync(Fs, schema,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" });
+
+    [Fact]
+    public async Task ChangeData_NanosecondTimestampNestedInAStruct_IsRefusedOnBothEntryPoints()
+    {
+        var micros = new TimestampType(TimeUnit.Microsecond, "UTC");
+        await using var table = await CreateCdfTableAsync(Schema(Struct("s", new Field("t", micros, true))));
+
+        var nanos = new TimestampType(TimeUnit.Nanosecond, "UTC");
+        var structType = new ArrowStructType([new Field("t", nanos, true)]);
+        var rows = new RecordBatch(Schema(new Field("s", structType, true)),
+            [new StructArray(structType, 1, [new TimestampArray.Builder(nanos).Append(new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero)).Build()], ArrowBuffer.Empty)], 1);
+
+        await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.WriteChangeDataFileAsync(rows, "delete"));
+        await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await table.StartTransaction().StageChangeDataAsync(rows, "delete"));
+        Assert.Empty(Directory.EnumerateFiles(_tempDir, "*.parquet", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task ChangeData_MistypedColumn_IsRefused()
+    {
+        await using var table = await CreateCdfTableAsync(Schema(new Field("s", StringType.Default, true)));
+
+        var rows = new RecordBatch(Schema(new Field("s", Int32Type.Default, true)),
+            [new Int32Array.Builder().Append(1).Build()], 1);
+        await MistypedAsync(async () => await table.WriteChangeDataFileAsync(rows, "delete"));
+    }
+
     // ── Integer to decimal widening ───────────────────────────────────────────────────────────────────
 
     [Theory]

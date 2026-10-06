@@ -3906,7 +3906,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // Canonical Arrow forms (WriteTypeNormalization): rows read back from a file arrive in whatever
                 // form its reader produced — Decimal32 from an INT32 decimal, FixedSizeBinary from a foreign
                 // FLBA binary — and a rewrite must not carry that into the file it writes.
-                var physicalBatch = WriteTypeNormalization.Normalize(ColumnMappingRecursive.ToPhysical(
+                var physicalBatch = NormalizeUnlessHostOwnsBytes(ColumnMappingRecursive.ToPhysical(
                     dataBatches[k], snapshot.Schema, mappingMode));
                 // Statistics are keyed by PHYSICAL name, as the append path keys them; collected from the
                 // logical rows, they were keyed by names that can belong to another column after a rename or
@@ -4300,6 +4300,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (rows is null)
             throw new ArgumentNullException(nameof(rows));
         ValidateChangeDataStageable(CurrentSnapshot, changeType);
+        ValidateChangeDataRows(CurrentSnapshot, rows, nameof(WriteChangeDataFileAsync));
 
         return await ChangeDataFeed.CdfWriter.WriteAsync(
             _fs, CurrentSnapshot, rows, changeType,
@@ -4983,14 +4984,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Decimal32/64) to the ones it does, so every file of a column has one physical form. Then refuse
         // what has no faithful encoding at all — nanosecond and second timestamps: creation and schema
         // evolution reject those via SchemaConverter, but a write into an EXISTING table converts no schema.
-        batches = batches.Select(WriteTypeNormalization.Normalize).ToList();
+        batches = NormalizeUnlessHostOwnsBytes(batches);
         foreach (var b in batches)
-            SchemaConverter.ThrowIfUnwritableType(b.Schema);
+            SchemaConverter.ThrowIfUnwritableType(b.Schema, convertibleTypesAllowed: HostOwnsBytes);
 
         // Same chokepoint, same reason: this path converts no schema either, so a column the table does not
         // declare would ride into the data file unnoticed. (No write here evolves the schema — the write
         // schema is always the snapshot's — so an unknown column is a mistake, never an addition.)
         ThrowIfUndeclaredColumns(batches, snapshot.Schema, "Write");
+        if (!HostOwnsBytes)
+            ThrowIfMistypedColumns(batches, snapshot.Schema, "Write");
 
         // Generated columns first, because a CHECK constraint may reference one: validating before
         // the column exists would read a null the table never stores.
@@ -5740,6 +5743,149 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    /// <summary>
+    /// Refuses a batch column whose Arrow type does not map onto the Delta type the table declares for it.
+    /// <see cref="ThrowIfUndeclaredColumns"/> checks names only, and nothing downstream compares types: the
+    /// parquet writer writes whatever the batch holds, so an Int32 column under a declared <c>string</c>, or
+    /// a FixedSizeBinary under a declared <c>decimal</c>, became a data file contradicting its own table.
+    /// </summary>
+    /// <remarks>
+    /// The comparison is on DELTA types, through the same <see cref="SchemaConverter"/> mapping CREATE uses,
+    /// so every Arrow type Delta accepts for a column passes (String / LargeString / StringView all map to
+    /// <c>string</c>, Decimal32 to Decimal256 of one precision and scale to that decimal, and so on).
+    /// Nullability is not compared, and a struct may omit declared children (they read as null), matching
+    /// what the write paths already tolerate. Runs after <see cref="SchemaConverter.ThrowIfUnwritableType"/>,
+    /// which refuses the types with no mapping at all.
+    /// </remarks>
+    /// <summary>
+    /// True when a host's <see cref="IDataFileWriter"/> writes the data files. The codec seam is VALUE-BLIND
+    /// (pinned by <c>CodecSeamValueBlindnessTests</c>): a host that owns the bytes may present its own physical
+    /// representation for a declared column, so the library neither converts batches to its canonical Arrow
+    /// forms nor checks them against the declared types on that path.
+    /// </summary>
+    private bool HostOwnsBytes => _options.DataFileWriter is not null;
+
+    private IReadOnlyList<RecordBatch> NormalizeUnlessHostOwnsBytes(IReadOnlyList<RecordBatch> batches) =>
+        HostOwnsBytes ? batches : batches.Select(WriteTypeNormalization.Normalize).ToList();
+
+    private RecordBatch NormalizeUnlessHostOwnsBytes(RecordBatch batch) =>
+        HostOwnsBytes ? batch : WriteTypeNormalization.Normalize(batch);
+
+    internal static void ThrowIfMistypedColumns(
+        IReadOnlyList<RecordBatch> batches, Schema.StructType writeSchema, string entryPoint)
+    {
+        foreach (var batch in batches)
+        {
+            foreach (var field in batch.Schema.FieldsList)
+            {
+                var declared = FindDeclared(writeSchema.Fields, field.Name);
+                if (declared is null)
+                    continue; // ThrowIfUndeclaredColumns' business
+
+                var supplied = SchemaConverter.FromArrowSchema(new Apache.Arrow.Schema([field], null)).Fields[0].Type;
+                if (Mismatch(supplied, declared.Type, field.Name) is { } path)
+                {
+                    throw new ArgumentException(
+                        $"{entryPoint}: column '{path}' is declared {Describe(DeclaredAt(declared.Type, path, field.Name))} "
+                        + $"but the batch supplies Arrow {TypeAt(field.DataType, path, field.Name)}, which is Delta "
+                        + $"{Describe(DeclaredAt(supplied, path, field.Name))}. The data file would contradict the "
+                        + "table schema; cast the column to the declared type first.",
+                        nameof(batches));
+                }
+            }
+        }
+    }
+
+    private static StructField? FindDeclared(IReadOnlyList<StructField> fields, string arrowName)
+    {
+        foreach (var f in fields)
+        {
+            if (string.Equals(f.Name, arrowName, StringComparison.Ordinal))
+                return f;
+            if (f.Metadata is { } md
+                && md.TryGetValue(ColumnMapping.PhysicalNameKey, out var physical)
+                && string.Equals(physical, arrowName, StringComparison.Ordinal))
+            {
+                return f;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>The dotted path of the first place <paramref name="supplied"/> disagrees with
+    /// <paramref name="declared"/>, or null when it maps onto it.</summary>
+    private static string? Mismatch(DeltaDataType supplied, DeltaDataType declared, string path)
+    {
+        switch (supplied, declared)
+        {
+            case (PrimitiveType s, PrimitiveType d):
+                return string.Equals(s.TypeName, d.TypeName, StringComparison.Ordinal) ? null : path;
+            case (StructType s, StructType d):
+                foreach (var child in s.Fields)
+                {
+                    var match = FindDeclared(d.Fields, child.Name);
+                    if (match is null)
+                        continue; // an undeclared nested field is not a TYPE question
+                    if (Mismatch(child.Type, match.Type, path + "." + child.Name) is { } inner)
+                        return inner;
+                }
+                return null;
+            case (ArrayType s, ArrayType d):
+                return Mismatch(s.ElementType, d.ElementType, path + ".element");
+            case (MapType s, MapType d):
+                return Mismatch(s.KeyType, d.KeyType, path + ".key")
+                    ?? Mismatch(s.ValueType, d.ValueType, path + ".value");
+            default:
+                return path;
+        }
+    }
+
+    private static string[] SegmentsBelow(string path, string root) =>
+        path.Length > root.Length ? path.Substring(root.Length + 1).Split('.') : [];
+
+    // For the message: the Delta / Arrow type found at a dotted path (the root segment is the column).
+    private static DeltaDataType DeclaredAt(DeltaDataType type, string path, string root)
+    {
+        foreach (var segment in SegmentsBelow(path, root))
+        {
+            type = (type, segment) switch
+            {
+                (StructType st, _) => FindDeclared(st.Fields, segment)?.Type ?? type,
+                (ArrayType at, "element") => at.ElementType,
+                (MapType mt, "key") => mt.KeyType,
+                (MapType mt, "value") => mt.ValueType,
+                _ => type,
+            };
+        }
+        return type;
+    }
+
+    private static string TypeAt(Apache.Arrow.Types.IArrowType type, string path, string root)
+    {
+        foreach (var segment in SegmentsBelow(path, root))
+        {
+            type = (type, segment) switch
+            {
+                (Apache.Arrow.Types.StructType st, _) =>
+                    st.Fields.FirstOrDefault(f => f.Name == segment)?.DataType ?? type,
+                (Apache.Arrow.Types.ListType lt, "element") => lt.ValueDataType,
+                (Apache.Arrow.Types.MapType mt, "key") => mt.KeyField.DataType,
+                (Apache.Arrow.Types.MapType mt, "value") => mt.ValueField.DataType,
+                _ => type,
+            };
+        }
+        return type.ToString() ?? type.Name;
+    }
+
+    private static string Describe(DeltaDataType type) => type switch
+    {
+        PrimitiveType p => p.TypeName,
+        StructType => "struct",
+        ArrayType => "array",
+        MapType => "map",
+        _ => type.GetType().Name,
+    };
+
     /// <summary>True when <paramref name="arrowName"/> names a top-level field of <paramref name="schema"/>,
     /// by its logical name or by its column-mapping physical name — the same either-name rule
     /// <c>ColumnMappingRecursive.FindField</c> applies when renaming.</summary>
@@ -5817,9 +5963,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
         // Same normalization and unwritable-type rule as the committing write path; this entry point bypasses it.
-        batches = batches.Select(WriteTypeNormalization.Normalize).ToList();
+        batches = NormalizeUnlessHostOwnsBytes(batches);
         foreach (var b in batches)
-            SchemaConverter.ThrowIfUnwritableType(b.Schema);
+            SchemaConverter.ThrowIfUnwritableType(b.Schema, convertibleTypesAllowed: HostOwnsBytes);
         if (IsIcebergCompat)
             throw new NotSupportedException(
                 "WriteDataFilesAsync: IcebergCompat tables require the committing write path.");
@@ -5831,6 +5977,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var snapshot = CurrentSnapshot;
         var writeSchema = schemaOverride ?? snapshot.Schema;
         ThrowIfUndeclaredColumns(batches, writeSchema, nameof(WriteDataFilesAsync));
+        if (!HostOwnsBytes)
+            ThrowIfMistypedColumns(batches, writeSchema, nameof(WriteDataFilesAsync));
         var partitionColumns = snapshot.Metadata.PartitionColumns;
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(writeSchema, mappingMode);
@@ -6396,6 +6544,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 "Change Data Feed is not enabled on this table — a _change_data file would never be read. "
                 + "Create the table with the 'delta.enableChangeDataFeed' property set to 'true'.");
         }
+    }
+
+    /// <summary>
+    /// The row checks a caller-supplied change batch needs, as a data batch gets them at the write
+    /// boundary: no Arrow type without a faithful Delta encoding (a second- or nanosecond-unit timestamp
+    /// would read back at the wrong scale), and every column of the type the table declares.
+    /// </summary>
+    internal static void ValidateChangeDataRows(Snapshot.Snapshot snapshot, RecordBatch rows, string entryPoint)
+    {
+        var normalized = WriteTypeNormalization.Normalize(rows);
+        SchemaConverter.ThrowIfUnwritableType(normalized.Schema);
+        ThrowIfMistypedColumns([normalized], snapshot.Schema, entryPoint);
     }
 
     /// <summary>
@@ -7190,7 +7350,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         for (int k = 0; k < dataBatches.Count; k++)
         {
             // Canonical Arrow forms, as in the UPDATE rewrite: these rows were read back from a file.
-            var physicalBatch = WriteTypeNormalization.Normalize(
+            var physicalBatch = NormalizeUnlessHostOwnsBytes(
                 ColumnMappingRecursive.ToPhysical(dataBatches[k], snapshot.Schema, mappingMode));
             // Statistics are keyed by PHYSICAL name, as the append path keys them (see the UPDATE rewrite).
             statsBatches.Add(physicalBatch);

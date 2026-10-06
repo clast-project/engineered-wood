@@ -182,13 +182,16 @@ public static class SchemaConverter
     /// or Date64 still here sits in a container the normalizer does not convert, and would otherwise be
     /// written in a form the table does not declare.
     /// </summary>
-    internal static void ThrowIfUnwritableType(Apache.Arrow.Schema schema)
+    /// <param name="convertibleTypesAllowed">True on the codec seam, where a host writer owns the bytes and
+    /// nothing was converted: FixedSizeBinary and Date64 are the host's to represent, and only the timestamp
+    /// units, which no writer can store faithfully under a Delta timestamp, are refused.</param>
+    internal static void ThrowIfUnwritableType(Apache.Arrow.Schema schema, bool convertibleTypesAllowed = false)
     {
         foreach (var field in schema.FieldsList)
-            ThrowIfUnwritableType(field.DataType, field.Name);
+            ThrowIfUnwritableType(field.DataType, field.Name, convertibleTypesAllowed);
     }
 
-    private static void ThrowIfUnwritableType(IArrowType type, string path)
+    private static void ThrowIfUnwritableType(IArrowType type, string path, bool convertibleTypesAllowed)
     {
         switch (type)
         {
@@ -197,24 +200,24 @@ public static class SchemaConverter
                     $"Column '{path}': {UnsupportedTimestampUnitMessage(ts.Unit)}");
 
             // By TypeId: every Arrow decimal type DERIVES from FixedSizeBinaryType.
-            case FixedSizeBinaryType when type.TypeId == ArrowTypeId.FixedSizedBinary:
+            case FixedSizeBinaryType when type.TypeId == ArrowTypeId.FixedSizedBinary && !convertibleTypesAllowed:
                 throw new DeltaLake.DeltaFormatException($"Column '{path}': {FixedSizeBinaryMessage}");
 
-            case Date64Type:
+            case Date64Type when !convertibleTypesAllowed:
                 throw new DeltaLake.DeltaFormatException($"Column '{path}': {Date64Message}");
 
             case ArrowStructType s:
                 foreach (var f in s.Fields)
-                    ThrowIfUnwritableType(f.DataType, path + "." + f.Name);
+                    ThrowIfUnwritableType(f.DataType, path + "." + f.Name, convertibleTypesAllowed);
                 break;
 
             case ListType l:
-                ThrowIfUnwritableType(l.ValueDataType, path + ".element");
+                ThrowIfUnwritableType(l.ValueDataType, path + ".element", convertibleTypesAllowed);
                 break;
 
             case ArrowMapType m:
-                ThrowIfUnwritableType(m.KeyField.DataType, path + ".key");
-                ThrowIfUnwritableType(m.ValueField.DataType, path + ".value");
+                ThrowIfUnwritableType(m.KeyField.DataType, path + ".key", convertibleTypesAllowed);
+                ThrowIfUnwritableType(m.ValueField.DataType, path + ".value", convertibleTypesAllowed);
                 break;
         }
     }
