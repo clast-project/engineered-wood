@@ -574,6 +574,169 @@ public class SchemaValidationTests : IDisposable
         Assert.Equal(12.34m, DecimalAt(Assert.Single(await ReadAllAsync(table)).Column(0), 0));
     }
 
+    // ── Rewrites keep the canonical form ──────────────────────────────────────────────────────────────
+
+    private static async Task<(Parquet.PhysicalType? Type, int? Length)> PhysicalTypeOf(string file, string column)
+    {
+        await using var raf = new LocalRandomAccessFile(file);
+        await using var reader = new Parquet.ParquetFileReader(raf, ownsFile: false);
+        var element = (await reader.ReadMetadataAsync()).Schema.First(s => s.Name == column);
+        return (element.Type, element.TypeLength);
+    }
+
+    private static BooleanArray Where(RecordBatch batch, Func<decimal?, bool> test)
+    {
+        var builder = new BooleanArray.Builder();
+        var column = batch.Column(batch.Schema.GetFieldIndex("d"));
+        for (int i = 0; i < batch.Length; i++)
+            builder.Append(test(DecimalAt(column, i)));
+        return builder.Build();
+    }
+
+    [Fact]
+    public async Task Rewrites_AndChangeFiles_WriteDecimalsInTheCanonicalForm()
+    {
+        // Reads hand back Decimal32 for a decimal(9,2) column (#469), so every rewrite starts from a
+        // non-canonical batch. UPDATE, a copy-on-write DELETE, OPTIMIZE and the change files they emit must
+        // all still write the canonical FIXED_LEN_BYTE_ARRAY(16), not INT32.
+        var type = new Decimal128Type(9, 2);
+        var schema = Schema(new Field("d", type, true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" });
+        await table.WriteAsync([new RecordBatch(schema, [new Decimal128Array.Builder(type).Append(1m).Append(2m).Build()], 2)]);
+        string first = table.CurrentSnapshot.ActiveFiles.Values.Single().Path;
+        await table.WriteAsync([new RecordBatch(schema, [new Decimal128Array.Builder(type).Append(3m).Build()], 1)]);
+
+        await table.DeleteRowsAsync(
+            RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>> { [first] = [1L] }),
+            RowDeleteMode.CopyOnWrite);
+        await table.UpdateAsync(b => Where(b, d => d == 1m), b => b);
+        await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+
+        var files = Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories);
+        Assert.Contains(files, f => f.Contains("_change_data"));
+        foreach (var file in files)
+            Assert.Equal((Parquet.PhysicalType.FixedLenByteArray, 16), await PhysicalTypeOf(file, "d"));
+
+        var values = new List<decimal?>();
+        foreach (var b in await ReadAllAsync(table))
+        {
+            for (int i = 0; i < b.Length; i++)
+                values.Add(DecimalAt(b.Column(0), i));
+        }
+        values.Sort();
+        Assert.Equal([1m, 3m], values);
+    }
+
+    // ── Decimal256 ────────────────────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public void Normalize_NarrowsDecimal256ToDecimal128_KeepingValuesAndSlices()
+    {
+        var d256 = new Decimal256Type(20, 2);
+        var array = new Decimal256Array.Builder(d256).Append(-12.34m).Append(5m).Append(99_999_999_999_999_999.99m).Build();
+        var batch = new RecordBatch(Schema(new Field("d", d256, true)), [array], 3).Slice(1, 2);
+
+        var wide = Assert.IsType<Decimal128Array>(WriteTypeNormalization.Normalize(batch).Column(0));
+        Assert.Equal(20, ((Decimal128Type)wide.Data.DataType).Precision);
+        Assert.Equal(5m, wide.GetValue(0));
+        Assert.Equal(99_999_999_999_999_999.99m, wide.GetValue(1));
+
+        var negative = Assert.IsType<Decimal128Array>(WriteTypeNormalization.Normalize(
+            new RecordBatch(Schema(new Field("d", d256, true)), [array], 3)).Column(0));
+        Assert.Equal(-12.34m, negative.GetValue(0));
+    }
+
+    [Fact]
+    public async Task Write_Decimal256ValueTooLargeForItsPrecision_IsRefused()
+    {
+        // decimal(20,2) promises the value fits Decimal128; a high half that is not the low half's sign
+        // extension breaks that promise.
+        var d256 = new Decimal256Type(20, 2);
+        var schema = Schema(new Field("d", d256, true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema);
+
+        var bytes = new byte[32];
+        bytes[16] = 1; // 2^128: no Decimal128 holds it
+        var array = new Decimal256Array(new ArrayData(d256, 1, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(bytes)]));
+        await RefusedAsync(DeltaTableErrorCodes.UnwritableValue, async () =>
+            await table.WriteAsync([new RecordBatch(schema, [array], 1)]));
+    }
+
+    // ── Values nobody can see are not checked ─────────────────────────────────────────────────────────
+
+    private static Date64Array Date64s(long[] millis, byte[]? validity = null)
+    {
+        int nulls = validity is null
+            ? 0
+            : Enumerable.Range(0, millis.Length).Count(i => (validity[i / 8] & (1 << (i % 8))) == 0);
+        return new(new ArrayData(Date64Type.Default, millis.Length, nulls, 0,
+            [validity is null ? ArrowBuffer.Empty : new ArrowBuffer(validity),
+             new ArrowBuffer(millis.SelectMany(BitConverter.GetBytes).ToArray())]));
+    }
+
+    private const long Day = 86_400_000;
+
+    [Fact]
+    public async Task Write_Date64UnderANullStruct_IsNotChecked()
+    {
+        // Row 1's struct is NULL, so its child slot is never written, whatever it holds.
+        var structType = new ArrowStructType([new Field("d", Date64Type.Default, true)]);
+        var schema = Schema(new Field("s", structType, true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema);
+
+        var structs = new StructArray(structType, 2, [Date64s([3 * Day, 3 * Day + 1])],
+            new ArrowBuffer(new byte[] { 0b01 }), nullCount: 1);
+        await table.WriteAsync([new RecordBatch(schema, [structs], 2)]);
+
+        var batch = Assert.Single(await ReadAllAsync(table));
+        var read = (StructArray)batch.Column(0);
+        Assert.True(read.IsNull(1));
+        Assert.Equal(new DateTime(1970, 1, 4), ((Date32Array)read.Fields[0]).GetDateTime(0));
+    }
+
+    [Fact]
+    public void Normalize_Date64ListElementsNoVisibleRowReferences_AreNotChecked()
+    {
+        // Values [2 days, 5 ms, 7 ms, 9 ms]: row 0 references element 0, row 1 is NULL over elements 1..2,
+        // and element 3 is referenced by nothing. Only element 0 is ever written. (Called directly: the
+        // Parquet writer itself cannot yet write an unreferenced element, #470.)
+        var listType = new ListType(new Field("element", Date64Type.Default, true));
+        var list = new ListArray(listType, 2,
+            new ArrowBuffer(new byte[] { 0, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0 }),
+            Date64s([2 * Day, 5, 7, 9]), new ArrowBuffer(new byte[] { 0b01 }), nullCount: 1);
+
+        var normalized = WriteTypeNormalization.Normalize(new RecordBatch(Schema(new Field("l", listType, true)), [list], 2));
+
+        var elements = Assert.IsType<Date32Array>(((ListArray)normalized.Column(0)).Values);
+        Assert.Equal(new DateTime(1970, 1, 3), elements.GetDateTime(0));
+    }
+
+    [Fact]
+    public void Normalize_Date64ListElementAVisibleRowReferences_IsStillChecked()
+    {
+        var listType = new ListType(new Field("element", Date64Type.Default, true));
+        var list = new ListArray(listType, 1,
+            new ArrowBuffer(new byte[] { 0, 0, 0, 0, 2, 0, 0, 0 }), Date64s([2 * Day, 5]), ArrowBuffer.Empty);
+
+        var ex = Assert.Throws<DeltaFormatException>(() =>
+            WriteTypeNormalization.Normalize(new RecordBatch(Schema(new Field("l", listType, true)), [list], 1)));
+        Assert.Contains("'l.element'", ex.Message);
+    }
+
+    [Fact]
+    public async Task Write_Date64VisibleThroughAStruct_IsStillChecked()
+    {
+        var structType = new ArrowStructType([new Field("d", Date64Type.Default, true)]);
+        var schema = Schema(new Field("s", structType, true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema);
+
+        var structs = new StructArray(structType, 1, [Date64s([Day + 1])], ArrowBuffer.Empty);
+        var ex = await RefusedAsync(DeltaTableErrorCodes.UnwritableValue, async () =>
+            await table.WriteAsync([new RecordBatch(schema, [structs], 1)]));
+        Assert.Contains("'s.d'", ex.Message);
+    }
+
     // ── Integer to decimal widening ───────────────────────────────────────────────────────────────────
 
     [Theory]

@@ -3903,8 +3903,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var statsBatches = new List<RecordBatch>(dataBatches.Count);
             for (int k = 0; k < dataBatches.Count; k++)
             {
-                var physicalBatch = ColumnMappingRecursive.ToPhysical(
-                    dataBatches[k], snapshot.Schema, mappingMode);
+                // Canonical Arrow forms (WriteTypeNormalization): rows read back from a file arrive in whatever
+                // form its reader produced — Decimal32 from an INT32 decimal, FixedSizeBinary from a foreign
+                // FLBA binary — and a rewrite must not carry that into the file it writes.
+                var physicalBatch = WriteTypeNormalization.Normalize(ColumnMappingRecursive.ToPhysical(
+                    dataBatches[k], snapshot.Schema, mappingMode));
                 // Statistics are keyed by PHYSICAL name, as the append path keys them; collected from the
                 // logical rows, they were keyed by names that can belong to another column after a rename or
                 // to a dropped one after a re-add, and the pruner skipped files holding matching rows.
@@ -7186,7 +7189,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var statsBatches = new List<RecordBatch>(dataBatches.Count);
         for (int k = 0; k < dataBatches.Count; k++)
         {
-            var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatches[k], snapshot.Schema, mappingMode);
+            // Canonical Arrow forms, as in the UPDATE rewrite: these rows were read back from a file.
+            var physicalBatch = WriteTypeNormalization.Normalize(
+                ColumnMappingRecursive.ToPhysical(dataBatches[k], snapshot.Schema, mappingMode));
             // Statistics are keyed by PHYSICAL name, as the append path keys them (see the UPDATE rewrite).
             statsBatches.Add(physicalBatch);
             if (!_options.EmitVariantLogicalType)

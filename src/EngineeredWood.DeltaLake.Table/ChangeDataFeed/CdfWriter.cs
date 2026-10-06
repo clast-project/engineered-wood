@@ -52,6 +52,8 @@ internal static class CdfWriter
         // reader would both duplicate the partition column and shift every column after it out of the feed.
         rows = Partitioning.PartitionUtils.RemovePartitionColumns(rows, snapshot.Metadata.PartitionColumns);
 
+        // Canonical Arrow forms, as for data files: change rows are often read back from a data file.
+        rows = WriteTypeNormalization.Normalize(rows);
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         if (mappingMode != ColumnMappingMode.None)
             rows = ColumnMappingRecursive.ToPhysical(rows, snapshot.Schema, mappingMode);
