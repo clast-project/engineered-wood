@@ -17,11 +17,14 @@ namespace EngineeredWood.DeltaLake.Table;
 /// every later ALTER on the table fail there. Spark therefore removes the entries a DROP takes away and rewrites
 /// the ones a RENAME moves, and this does the same.</para>
 /// <para>Both follow delta-spark 4.4.0 (read from its bytecode): a change at path <c>p</c> touches every entry
-/// that <c>p</c> is a prefix of, comparing parts case-sensitively. Dropping every entry leaves the property
-/// <c>""</c>, not absent. Two deliberate differences: entries are always re-written with Spark's RENAME
-/// quoting (<c>quoteIfNeeded</c> on each part), where Spark's DROP path writes names with spaces unquoted and
-/// corrupts them; and a value this cannot parse is left alone rather than read up to the junk, as Spark's
-/// prefix parse does.</para>
+/// that <c>p</c> is a prefix of. Dropping every entry leaves the property <c>""</c>, not absent. Three deliberate
+/// differences. Parts are compared case-insensitively, where Spark compares them case-sensitively: its
+/// validation resolves an entry case-insensitively, so it accepts <c>ID</c> for a column <c>id</c>, and a
+/// case-sensitive DROP then leaves <c>ID</c> behind to fail the next ALTER. That cannot hit the wrong column,
+/// since a schema never holds two names that differ only in case (<see cref="CommitSchemaValidation"/>).
+/// Entries are always re-written with Spark's RENAME quoting (<c>quoteIfNeeded</c> on each part), where Spark's
+/// DROP path writes names with spaces unquoted and corrupts them. And a value this cannot parse is left alone
+/// rather than read up to the junk, as Spark's prefix parse does.</para>
 /// </remarks>
 internal static class DataSkippingStatsColumns
 {
@@ -258,7 +261,7 @@ internal static class DataSkippingStatsColumns
         }
         for (int i = 0; i < prefix.Count; i++)
         {
-            if (!string.Equals(entry[i], prefix[i], StringComparison.Ordinal))
+            if (!string.Equals(entry[i], prefix[i], StringComparison.OrdinalIgnoreCase))
             {
                 return false;
             }

@@ -143,6 +143,30 @@ public class DataSkippingStatsColumnsTests : IDisposable
         Assert.Equal(" id , s.x ", Property(table));
     }
 
+    // CREATE resolves an entry case-insensitively, as Spark does, so a wrongly cased entry is a valid one; leaving
+    // it behind would fail Spark's next ALTER just as a correctly cased one would.
+    [Fact]
+    public async Task DropColumn_RemovesAWronglyCasedEntry()
+    {
+        await using var table = await CreateAsync("ID,S.X,payload");
+
+        await table.DropColumnAsync("id");
+        await table.DropFieldAsync(["s", "x"]);
+
+        Assert.Equal("payload", Property(table));
+    }
+
+    [Fact]
+    public async Task RenameColumn_RewritesAWronglyCasedEntry_InTheNewName()
+    {
+        await using var table = await CreateAsync("S.X,PAYLOAD");
+
+        await table.RenameColumnAsync("payload", "body");
+        await table.RenameFieldAsync(["s", "x"], "z");
+
+        Assert.Equal("s.z,body", Property(table));
+    }
+
     [Fact]
     public async Task DropField_RemovesTheFieldsEntry_NotItsParents()
     {
