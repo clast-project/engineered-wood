@@ -114,7 +114,9 @@ internal static class DataSkippingStatsColumns
         return bare.All(char.IsDigit) ? null : bare;
     }
 
-    // Whitespace and SQL comments separate tokens, as in Spark's grammar.
+    // Whitespace and SQL comments separate tokens, as in Spark's lexer (measured against Spark 4.1's parser): a
+    // bracketed comment nests, and one left open runs to the end of the value, which Spark accepts because it
+    // parses only a prefix. "/*+" opens a hint, not a comment, so it is left for ReadPart to refuse.
     private static void SkipBlank(string value, ref int i)
     {
         while (i < value.Length)
@@ -123,10 +125,27 @@ internal static class DataSkippingStatsColumns
             {
                 i++;
             }
-            else if (i + 1 < value.Length && value[i] == '/' && value[i + 1] == '*')
+            else if (OpensComment(value, i))
             {
-                int end = value.IndexOf("*/", i + 2, StringComparison.Ordinal);
-                i = end < 0 ? value.Length : end + 2;
+                int depth = 1;
+                i += 2;
+                while (i < value.Length && depth > 0)
+                {
+                    if (OpensComment(value, i))
+                    {
+                        depth++;
+                        i += 2;
+                    }
+                    else if (value[i] == '*' && i + 1 < value.Length && value[i + 1] == '/')
+                    {
+                        depth--;
+                        i += 2;
+                    }
+                    else
+                    {
+                        i++;
+                    }
+                }
             }
             else if (i + 1 < value.Length && value[i] == '-' && value[i + 1] == '-')
             {
@@ -139,6 +158,10 @@ internal static class DataSkippingStatsColumns
             }
         }
     }
+
+    private static bool OpensComment(string value, int i) =>
+        i + 1 < value.Length && value[i] == '/' && value[i + 1] == '*'
+        && !(i + 2 < value.Length && value[i + 2] == '+');
 
     /// <summary>Writes <paramref name="entries"/> back as Spark's RENAME does: <c>quoteIfNeeded</c> on each part,
     /// parts joined by <c>.</c> and entries by <c>,</c>.</summary>
@@ -189,15 +212,25 @@ internal static class DataSkippingStatsColumns
         });
 
     /// <summary>
-    /// The configuration after a schema replacement: entries that no longer name a column of
-    /// <paramref name="schema"/> removed, so the property Spark validates on its next ALTER still holds.
-    /// Returns <paramref name="configuration"/> itself when the property is absent, unparseable or untouched.
+    /// The configuration after a schema replacement: entries the property would no longer be valid with removed,
+    /// whether one names a column <paramref name="schema"/> lacks, a top-level column retyped to a type with no
+    /// statistics, or a column an earlier entry already covers. So the property Spark validates on its next ALTER
+    /// still holds. Returns <paramref name="configuration"/> itself when the property is absent, unparseable or
+    /// untouched.
     /// </summary>
     internal static IReadOnlyDictionary<string, string>? AfterReplace(
-        IReadOnlyDictionary<string, string>? configuration, StructType schema) =>
+        IReadOnlyDictionary<string, string>? configuration, StructType schema,
+        IReadOnlyList<string>? partitionColumns) =>
         Rewrite(configuration, entries =>
         {
-            var kept = entries.Where(e => Resolve(schema, e, out _, out _) is null).ToList();
+            var kept = new List<IReadOnlyList<string>>(entries.Count);
+            foreach (var entry in entries)
+            {
+                if (Problem(schema, partitionColumns, [.. kept, entry]) is null)
+                {
+                    kept.Add(entry);
+                }
+            }
             return kept.Count == entries.Count ? null : kept;
         });
 
@@ -256,6 +289,16 @@ internal static class DataSkippingStatsColumns
             $"{Key} must be a comma-separated list of column names, a part in backquotes when it is not a plain "
             + $"identifier; '{value}' is not.");
 
+        if (Problem(schema, partitionColumns, entries) is { } problem)
+        {
+            throw problem;
+        }
+    }
+
+    // The first reason `entries` is not a valid value for `schema`, or null.
+    private static DeltaFormatException? Problem(
+        StructType schema, IReadOnlyList<string>? partitionColumns, IReadOnlyList<IReadOnlyList<string>> entries)
+    {
         var partitions = new HashSet<string>(partitionColumns ?? [], StringComparer.OrdinalIgnoreCase);
         var leaves = new HashSet<string>(StringComparer.Ordinal);
         foreach (var entry in entries)
@@ -263,20 +306,20 @@ internal static class DataSkippingStatsColumns
             string name = Format([entry]);
             if (entry.Count == 1 && partitions.Contains(entry[0]))
             {
-                throw new DeltaFormatException(
+                return new DeltaFormatException(
                     DeltaTableErrorCodes.DataSkippingPartitionColumn,
                     $"Data skipping is not supported for partition column '{name}' ({Key}).");
             }
 
             if (Resolve(schema, entry, out var type, out var resolved) is { } missing)
             {
-                throw new DeltaFormatException(
+                return new DeltaFormatException(
                     DeltaTableErrorCodes.ColumnNotFound, $"{Key} names '{name}', but {missing}.");
             }
 
             if (entry.Count == 1 && type is not StructType && !IsEligible(type))
             {
-                throw new DeltaFormatException(
+                return new DeltaFormatException(
                     DeltaTableErrorCodes.DataSkippingUnsupportedType,
                     $"Data skipping is not supported for column '{name}' of type {Describe(type)} ({Key}).");
             }
@@ -285,12 +328,13 @@ internal static class DataSkippingStatsColumns
             {
                 if (!leaves.Add(leaf))
                 {
-                    throw new DeltaFormatException(
+                    return new DeltaFormatException(
                         DeltaTableErrorCodes.DuplicateDataSkippingColumns,
                         $"{Key} names column '{leaf}' more than once.");
                 }
             }
         }
+        return null;
     }
 
     // Walks `path` through `schema`: struct fields by name, case-insensitively (Delta names are); an array's

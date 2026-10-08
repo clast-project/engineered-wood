@@ -48,6 +48,13 @@ public class DataSkippingStatsColumnsTests : IDisposable
     [InlineData("1a", "1a")]
     [InlineData("a.`b c`", "a.[b c]")]
     [InlineData("a/*c*/,b", "a|b")]
+    // Comments, as Spark 4.1's parser measured: they nest, and an open one runs to the end of the value.
+    [InlineData("a/* /* n */ */,b", "a|b")]
+    [InlineData("a/* /* n */,b", "a")]
+    [InlineData("id/*", "id")]
+    [InlineData("a/**/,b", "a|b")]
+    [InlineData("a/*/,b", "a")]
+    [InlineData("a -- c\n,b", "a|b")]
     [InlineData("", "")]
     [InlineData("  ", "")]
     public void Parse_FollowsSparksGrammar(string value, string expected)
@@ -69,6 +76,7 @@ public class DataSkippingStatsColumnsTests : IDisposable
     [InlineData("`a")]
     [InlineData("a b")]
     [InlineData("a.")]
+    [InlineData("a/*+ h */,b")] // a hint, not a comment: Spark stops reading there
     public void Parse_RefusesWhatIsNotAList(string value) => Assert.Null(DataSkippingStatsColumns.Parse(value));
 
     [Fact]
@@ -229,6 +237,21 @@ public class DataSkippingStatsColumnsTests : IDisposable
             .Build());
 
         // Resolved as Spark does, case-insensitively.
+        Assert.Equal("id,s.x", Property(table));
+    }
+
+    [Fact]
+    public async Task SetSchema_RemovesEntriesRetypedToATypeWithNoStatistics()
+    {
+        await using var table = await CreateAsync("id,payload,s.x");
+
+        await table.SetSchemaAsync(new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("payload", BooleanType.Default, true))
+            .Field(new Field("s", new ArrowStructType([new Field("x", BooleanType.Default, true)]), true))
+            .Build());
+
+        // A nested field of such a type is accepted, as in Spark (which only warns).
         Assert.Equal("id,s.x", Property(table));
     }
 

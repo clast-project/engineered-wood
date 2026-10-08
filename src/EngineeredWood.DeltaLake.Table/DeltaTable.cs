@@ -1596,9 +1596,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot.Metadata with
             {
                 SchemaString = newSchemaString,
-                // Entries naming a column the replacement removed would fail Spark's validation of the property
-                // on its next ALTER, as a DROP's would.
-                Configuration = DataSkippingStatsColumns.AfterReplace(newConfig, newDeltaSchema),
+                // Entries naming a column the replacement removed, or retyped to one with no statistics, would
+                // fail Spark's validation of the property on its next ALTER, as a DROP's would.
+                Configuration = DataSkippingStatsColumns.AfterReplace(
+                    newConfig, newDeltaSchema, snapshot.Metadata.PartitionColumns),
             },
             "CHANGE COLUMNS",
             cancellationToken,
