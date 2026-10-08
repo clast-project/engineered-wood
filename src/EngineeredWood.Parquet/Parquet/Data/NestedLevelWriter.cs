@@ -293,8 +293,14 @@ internal static class NestedLevelWriter
         return ArrowCompute.Scatter(gathered, levels, expandedLength);
     }
 
-    private static bool[] RunNulls(RunEndEncodedArray array)
+    /// <summary>
+    /// Which logical rows of a run-end encoded array are null, or null when none is (the common case, which then
+    /// allocates nothing). One flag per row: the levels built beside it already hold an int per row.
+    /// </summary>
+    internal static bool[]? RunNulls(RunEndEncodedArray array)
     {
+        if (array.Values.NullCount == 0)
+            return null;
         var nulls = new bool[array.Length];
         int row = 0;
         foreach (var run in RunEndEncoding.EnumerateRuns(array))

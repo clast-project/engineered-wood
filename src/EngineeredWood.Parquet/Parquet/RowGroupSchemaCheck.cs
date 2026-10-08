@@ -164,9 +164,19 @@ internal static class RowGroupSchemaCheck
             case null:
                 return false;
             // A run-end encoded array has no validity bitmap of its own: its nulls are null runs in Values, which
-            // is where ColumnChunkWriter's def levels come from too. Counted whole, since REE is written flat.
+            // is where the def levels come from too. Read per row, since under a list only some rows are written.
             case RunEndEncodedArray ree:
-                return ree.Values.NullCount > 0;
+                if (Data.NestedLevelWriter.RunNulls(ree) is not { } runNulls)
+                    return false;
+                var writtenRuns = slots();
+                if (writtenRuns is null)
+                    return System.Array.IndexOf(runNulls, true) >= 0;
+                foreach (int slot in writtenRuns)
+                {
+                    if (runNulls[slot])
+                        return true;
+                }
+                return false;
         }
 
         if (array.NullCount == 0)
@@ -185,16 +195,15 @@ internal static class RowGroupSchemaCheck
     private static IEnumerable<int> Slots(IArrowArray parent, WrittenSlots slots) =>
         slots() ?? Enumerable.Range(0, parent.Length);
 
-    // The child mappings follow NestedLevelWriter. A struct's children are NOT sliced with it, so slot i's child
-    // is at the struct's offset + i; a null struct slot writes no child value.
+    // The child mappings follow NestedLevelWriter. StructArray.Fields, which CheckType reads, IS sliced with the
+    // struct (Arrow 23; only Data.Children is not), so slot i's child is at i; a null struct slot writes no child.
     private static WrittenSlots StructChildSlots(StructArray parent, WrittenSlots slots) => () =>
     {
         var result = new List<int>();
-        int offset = parent.Data.Offset;
         foreach (int slot in Slots(parent, slots))
         {
             if (!parent.IsNull(slot))
-                result.Add(offset + slot);
+                result.Add(slot);
         }
         return result;
     };
