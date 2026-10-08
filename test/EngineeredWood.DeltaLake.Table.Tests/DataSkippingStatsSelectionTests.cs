@@ -252,6 +252,41 @@ public class DataSkippingStatsSelectionTests : IDisposable
         Assert.Equal("a", string.Join(",", Leaves(StatsOf(table), "nullCount")));
     }
 
+    // Review of #478: the staged write and a copy-on-write DELETE collect with the same selection as an append.
+    [Fact]
+    public async Task WriteDataFiles_HonoursTheSelection()
+    {
+        await using var table = await CreatePabAsync([], NumIndexedCols, "2");
+
+        var written = await table.WriteDataFilesAsync([PabRow()]);
+
+        var stats = JsonDocument.Parse(Assert.Single(written).StatsJson!).RootElement;
+        Assert.Equal("p,a", string.Join(",", Leaves(stats, "nullCount")));
+    }
+
+    [Fact]
+    public async Task CopyOnWriteDelete_HonoursTheSelection()
+    {
+        var schema = PabSchema;
+        await using var table = await DeltaTable.CreateAsync(Fs, schema,
+            configuration: new Dictionary<string, string> { [StatsColumns] = "b" });
+        // Two rows, so the rewrite keeps one (a file's only row would leave nothing to rewrite).
+        await table.WriteAsync([new RecordBatch(schema,
+        [
+            new StringArray.Builder().Append("x").Append("y").Build(),
+            new Int32Array.Builder().Append(1).Append(2).Build(),
+            new Int32Array.Builder().Append(3).Append(4).Build(),
+        ], 2)]);
+        string path = table.CurrentSnapshot.ActiveFiles.Values.Single().Path;
+
+        await table.DeleteRowsAsync(
+            RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>> { [path] = [0L] }),
+            RowDeleteMode.CopyOnWrite);
+
+        Assert.NotEqual(path, table.CurrentSnapshot.ActiveFiles.Values.Single().Path);
+        Assert.Equal("b", string.Join(",", Leaves(StatsOf(table), "nullCount")));
+    }
+
     // ── Repartitioning overwrite ────────────────────────────────────────────────────────────────────
 
     private static Apache.Arrow.Schema PabSchema { get; } = new Apache.Arrow.Schema.Builder()

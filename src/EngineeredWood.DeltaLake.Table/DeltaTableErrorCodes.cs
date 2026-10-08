@@ -195,7 +195,7 @@ public static class DeltaTableErrorCodes
     public const string DuplicateDataSkippingColumns = "DELTA_DUPLICATE_DATA_SKIPPING_COLUMNS";
 
     /// <summary><c>delta.dataSkippingNumIndexedCols</c> is not an integer of at least -1, or
-    /// <c>delta.dataSkippingStringPrefixLength</c> not one of at least 0.</summary>
+    /// <c>delta.dataSkippingStringPrefixLength</c> is not an integer of at least 0.</summary>
     /// <remarks>No delta-spark error class: Spark refuses either with a bare <c>IllegalArgumentException</c>
     /// ("requirement failed") when the property is set.</remarks>
     public const string InvalidDataSkippingProperty = "DELTA_INVALID_DATA_SKIPPING_PROPERTY";
