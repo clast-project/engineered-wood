@@ -416,6 +416,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Spark validates the property at CREATE TABLE and on every later metadata update, so a value it would
         // refuse makes the table one Spark can no longer ALTER.
         DataSkippingStatsColumns.Validate(deltaSchema, partitionColumns, configuration);
+        Stats.StatsColumnSelection.Validate(configuration);
 
         // Set protocol versions based on column mapping mode
         int minReaderVersion = 1;
@@ -3990,7 +3991,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 fileSize = file.Position;
             }
 
-            string? stats = Stats.StatsCollector.Collect(statsBatches);
+            string? stats = Stats.StatsCollector.Collect(
+                statsBatches, Stats.StatsColumnSelection.For(snapshot.Schema, snapshot.Metadata));
 
             // Remove old, add new
             actions.Add(new RemoveFile
@@ -5312,7 +5314,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (_options.CollectStats ||
                     Schema.IcebergCompat.RequiresNumRecords(icebergVersion))
                     // Stats keys are PHYSICAL at every level under mapping (nested struct leaves included).
-                    stats = CollectStats(ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode));
+                    stats = CollectStats(
+                        ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode),
+                        Stats.StatsColumnSelection.For(snapshot.Schema, snapshot.Metadata));
 
                 actions.Add(new AddFile
                 {
@@ -6196,7 +6200,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 // Stats keyed PHYSICAL at every level, matching the streaming writer + spec readers.
                 string? stats = _options.CollectStats
-                    ? CollectStats(ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode))
+                    ? CollectStats(
+                        ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode),
+                        Stats.StatsColumnSelection.For(writeSchema, snapshot.Metadata))
                     : null;
 
                 files.Add(new WrittenDataFile(
@@ -7543,7 +7549,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             Size = fileSize,
             ModificationTime = now,
             DataChange = true,
-            Stats = Stats.StatsCollector.Collect(statsBatches),
+            Stats = Stats.StatsCollector.Collect(
+                statsBatches, Stats.StatsColumnSelection.For(snapshot.Schema, snapshot.Metadata)),
             BaseRowId = rowTrackingEnabled ? baseRowId : null,
             DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
         };
@@ -9167,8 +9174,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _ => false,
     };
 
-    private static string? CollectStats(RecordBatch batch) =>
-        Stats.StatsCollector.Collect(batch);
+    private static string? CollectStats(RecordBatch batch, Stats.StatsColumnSelection selection) =>
+        Stats.StatsCollector.Collect(batch, selection);
 
     private void ThrowIfDisposed()
     {

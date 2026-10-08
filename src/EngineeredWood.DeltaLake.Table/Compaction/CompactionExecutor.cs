@@ -436,7 +436,8 @@ internal static class CompactionExecutor
                 if (rowTrackingEnabled)
                     nextRowId += currentRowCount;
 
-                string? stats = Stats.StatsCollector.Collect(currentBatches);
+                string? stats = Stats.StatsCollector.Collect(
+                    currentBatches, Stats.StatsColumnSelection.For(snapshot.Schema, snapshot.Metadata));
 
                 actions.Add(new AddFile
                 {

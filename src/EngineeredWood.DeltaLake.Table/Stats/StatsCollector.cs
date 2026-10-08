@@ -20,16 +20,19 @@ internal static class StatsCollector
     /// Collects column statistics from a RecordBatch and returns
     /// a JSON-encoded stats string.
     /// </summary>
-    public static string? Collect(RecordBatch batch) =>
-        Collect([batch]);
+    public static string? Collect(RecordBatch batch, StatsColumnSelection? selection = null) =>
+        Collect([batch], selection);
 
     /// <summary>
     /// Collects column statistics aggregated across multiple RecordBatches
     /// and returns a JSON-encoded stats string. Used by compaction when
-    /// combining multiple batches into a single output file.
+    /// combining multiple batches into a single output file. <paramref name="selection"/> says which columns get
+    /// statistics and how long a string bound may be (the table's data-skipping properties); null selects every
+    /// column with the default string length.
     /// </summary>
-    public static string? Collect(IReadOnlyList<RecordBatch> batches)
+    public static string? Collect(IReadOnlyList<RecordBatch> batches, StatsColumnSelection? selection = null)
     {
+        selection ??= StatsColumnSelection.All;
         long totalRows = 0;
         var minValues = new Dictionary<string, object?>();
         var maxValues = new Dictionary<string, object?>();
@@ -48,6 +51,10 @@ internal static class StatsCollector
             {
                 var field = batch.Schema.FieldsList[col];
                 var array = batch.Column(col);
+                if (!selection.Includes(field.Name, out var selected))
+                {
+                    continue;
+                }
 
                 if (array is StructArray structCol)
                 {
@@ -55,7 +62,8 @@ internal static class StatsCollector
                     var nMin = GetOrAddNested(minValues, field.Name);
                     var nMax = GetOrAddNested(maxValues, field.Name);
                     var nNull = GetOrAddNestedCounts(nullCounts, field.Name);
-                    CollectStruct(structCol, firstElement: 0, structCol.Length, ancestorNull: null, nMin, nMax, nNull);
+                    CollectStruct(
+                        structCol, firstElement: 0, structCol.Length, ancestorNull: null, selected, nMin, nMax, nNull);
                 }
                 else
                 {
@@ -72,14 +80,15 @@ internal static class StatsCollector
         if (totalRows == 0)
             return null;
 
-        return SerializeStats(totalRows, minValues, maxValues, nullCounts);
+        return SerializeStats(totalRows, minValues, maxValues, nullCounts, selection.StringPrefixLength);
     }
 
     private static string SerializeStats(
         long numRecords,
         Dictionary<string, object?> minValues,
         Dictionary<string, object?> maxValues,
-        Dictionary<string, object> nullCounts)
+        Dictionary<string, object> nullCounts,
+        int stringPrefixLength)
     {
         using var stream = new MemoryStream();
         using var writer = new Utf8JsonWriter(stream);
@@ -88,13 +97,13 @@ internal static class StatsCollector
         writer.WriteNumber("numRecords", numRecords);
 
         // minValues / maxValues nest objects for struct subtrees. Long strings are truncated to a
-        // 32-char prefix on the min side; a truncated max gets its last incrementable char bumped so it
+        // stringPrefixLength-char prefix on the min side; a truncated max gets its last incrementable char bumped so it
         // stays an UPPER bound (omitted when impossible) — Spark parity, applied at every nesting level.
         writer.WritePropertyName("minValues");
-        WriteBoundsObject(writer, minValues, isMax: false);
+        WriteBoundsObject(writer, minValues, isMax: false, stringPrefixLength);
 
         writer.WritePropertyName("maxValues");
-        WriteBoundsObject(writer, maxValues, isMax: true);
+        WriteBoundsObject(writer, maxValues, isMax: true, stringPrefixLength);
 
         // Write nullCount (nested objects for struct subtrees)
         writer.WritePropertyName("nullCount");
@@ -137,7 +146,7 @@ internal static class StatsCollector
     /// prune-safe (same argument as deletion-vector stats).
     /// </summary>
     private static void CollectStruct(
-        StructArray st, int firstElement, int rowCount, bool[]? ancestorNull,
+        StructArray st, int firstElement, int rowCount, bool[]? ancestorNull, StatsColumnSelection.Node? selected,
         Dictionary<string, object?> minValues,
         Dictionary<string, object?> maxValues,
         Dictionary<string, object> nullCounts)
@@ -163,6 +172,11 @@ internal static class StatsCollector
             for (int c = 0; c < st.Data.Children.Length && c < structType.Fields.Count; c++)
             {
                 string childName = structType.Fields[c].Name;
+                StatsColumnSelection.Node? below = null;
+                if (selected is not null && !selected.Includes(childName, out below))
+                {
+                    continue;
+                }
                 var child = ArrowArrayFactory.BuildArray(st.Data.Children[c]);
 
                 if (child is StructArray nestedStruct)
@@ -170,7 +184,7 @@ internal static class StatsCollector
                     var nMin = GetOrAddNested(minValues, childName);
                     var nMax = GetOrAddNested(maxValues, childName);
                     var nNull = GetOrAddNestedCounts(nullCounts, childName);
-                    CollectStruct(nestedStruct, childFirst, rowCount, rowNull, nMin, nMax, nNull);
+                    CollectStruct(nestedStruct, childFirst, rowCount, rowNull, below, nMin, nMax, nNull);
                 }
                 else
                 {
@@ -194,7 +208,7 @@ internal static class StatsCollector
     }
 
     private static void WriteBoundsObject(
-        Utf8JsonWriter writer, Dictionary<string, object?> values, bool isMax)
+        Utf8JsonWriter writer, Dictionary<string, object?> values, bool isMax, int stringPrefixLength)
     {
         writer.WriteStartObject();
         foreach (var kvp in values)
@@ -205,7 +219,7 @@ internal static class StatsCollector
                 if (nested.Count == 0)
                     continue;
                 writer.WritePropertyName(kvp.Key);
-                WriteBoundsObject(writer, nested, isMax);
+                WriteBoundsObject(writer, nested, isMax, stringPrefixLength);
                 continue;
             }
             if (value is DateStat date)
@@ -225,9 +239,11 @@ internal static class StatsCollector
                 writer.WriteRawValue(dec.ToNumberString());
                 continue;
             }
-            if (value is string str && str.Length > StringStatMaxLength)
+            if (value is string str && str.Length > stringPrefixLength)
             {
-                value = isMax ? (object?)TruncateMaxString(str) : TruncateMinString(str);
+                value = isMax
+                    ? (object?)TruncateMaxString(str, stringPrefixLength)
+                    : TruncateMinString(str, stringPrefixLength);
             }
             if (value is not null)
             {
@@ -258,33 +274,32 @@ internal static class StatsCollector
         writer.WriteEndObject();
     }
 
-    private const int StringStatMaxLength = 32;
-
     /// <summary>
-    /// Truncates a min-side string stat to a lower bound of at most <see cref="StringStatMaxLength"/>
-    /// characters. A prefix always sorts at or below the full string, so the only requirement is that
+    /// Truncates a min-side string stat to a lower bound of at most <paramref name="maxLength"/> UTF-16
+    /// code units (the table's <c>delta.dataSkippingStringPrefixLength</c>; Spark counts code points, which keeps
+    /// more of a string with supplementary characters, and either prefix is a lower bound). A prefix always sorts at or below the full string, so the only requirement is that
     /// the cut land on a code point boundary: splitting a surrogate pair orphans its high half, and
     /// <see cref="Utf8JsonWriter"/> silently rewrites a lone surrogate to U+FFFD — which sorts ABOVE
     /// the supplementary character it replaced, turning the bound into one GREATER than a value in the
     /// file. Backing off by one char keeps a valid (merely looser) lower bound.
     /// </summary>
-    private static string TruncateMinString(string value)
+    private static string TruncateMinString(string value, int maxLength)
     {
-        int length = StringStatMaxLength;
-        if (char.IsHighSurrogate(value[length - 1]))
+        int length = maxLength;
+        if (length > 0 && char.IsHighSurrogate(value[length - 1]))
             length--;
         return value.Substring(0, length);
     }
 
     /// <summary>
-    /// Truncates a max-side string stat to an upper bound of at most <see cref="StringStatMaxLength"/>
-    /// characters: the prefix with its last incrementable char bumped by one (skipping chars whose
+    /// Truncates a max-side string stat to an upper bound of at most <paramref name="maxLength"/>
+    /// UTF-16 code units: the prefix with its last incrementable char bumped by one (skipping chars whose
     /// increment would create a lone surrogate). Returns null when no char can be incremented — the
-    /// caller omits the stat (always safe).
+    /// caller omits the stat (always safe), as it does for a length of 0, where Spark omits it too.
     /// </summary>
-    private static string? TruncateMaxString(string value)
+    private static string? TruncateMaxString(string value, int maxLength)
     {
-        for (int i = StringStatMaxLength - 1; i >= 0; i--)
+        for (int i = maxLength - 1; i >= 0; i--)
         {
             char c = value[i];
             if (c == char.MaxValue)
