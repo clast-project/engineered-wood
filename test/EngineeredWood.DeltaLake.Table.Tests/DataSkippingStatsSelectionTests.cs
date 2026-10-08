@@ -252,6 +252,66 @@ public class DataSkippingStatsSelectionTests : IDisposable
         Assert.Equal("a", string.Join(",", Leaves(StatsOf(table), "nullCount")));
     }
 
+    // ── Repartitioning overwrite ────────────────────────────────────────────────────────────────────
+
+    private static Apache.Arrow.Schema PabSchema { get; } = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("p", StringType.Default, true))
+        .Field(new Field("a", Int32Type.Default, true))
+        .Field(new Field("b", Int32Type.Default, true))
+        .Build();
+
+    private static RecordBatch PabRow() => new(PabSchema,
+    [
+        new StringArray.Builder().Append("x").Build(),
+        new Int32Array.Builder().Append(1).Build(),
+        new Int32Array.Builder().Append(2).Build(),
+    ], 1);
+
+    private async Task<DeltaTable> CreatePabAsync(IReadOnlyList<string> partitionColumns, string key, string value)
+    {
+        var table = await DeltaTable.CreateAsync(Fs, PabSchema, partitionColumns: partitionColumns,
+            configuration: new Dictionary<string, string> { [key] = value });
+        await table.WriteAsync([PabRow()]);
+        return table;
+    }
+
+    // Review of #478: the files are split by the NEW partition columns, so those are what the selection skips.
+    [Fact]
+    public async Task Repartitioning_ToNone_IndexesTheFormerPartitionColumn()
+    {
+        await using var table = await CreatePabAsync(["p"], NumIndexedCols, "1");
+
+        await table.WriteAsync([PabRow()], DeltaWriteMode.Overwrite, repartitionTo: []);
+
+        Assert.Equal("p", string.Join(",", Leaves(StatsOf(table), "nullCount")));
+    }
+
+    [Fact]
+    public async Task Repartitioning_ToAColumn_GivesItNoSlot()
+    {
+        await using var table = await CreatePabAsync([], NumIndexedCols, "2");
+
+        await table.WriteAsync([PabRow()], DeltaWriteMode.Overwrite, repartitionTo: ["a"]);
+
+        Assert.Equal("p,b", string.Join(",", Leaves(StatsOf(table), "nullCount")));
+    }
+
+    // Spark validates the property against the metaData the repartition commits, and refuses a partition column.
+    [Fact]
+    public async Task Repartitioning_ToAListedColumn_IsRefused_WritingNothing()
+    {
+        await using var table = await CreatePabAsync([], StatsColumns, "a,b");
+        long version = table.CurrentSnapshot.Version;
+        int files = Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories).Length;
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await table.WriteAsync([PabRow()], DeltaWriteMode.Overwrite, repartitionTo: ["a"]));
+
+        Assert.Equal(DeltaTableErrorCodes.DataSkippingPartitionColumn, ex.ErrorCode);
+        Assert.Equal(version, table.CurrentSnapshot.Version);
+        Assert.Equal(files, Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories).Length);
+    }
+
     [Theory]
     [InlineData(NumIndexedCols, "-2")]
     [InlineData(NumIndexedCols, "abc")]
