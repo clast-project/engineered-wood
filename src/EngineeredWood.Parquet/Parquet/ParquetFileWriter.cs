@@ -71,8 +71,9 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     /// split into multiple row groups.
     /// </summary>
     /// <exception cref="ArgumentException">
-    /// A batch after the first differs from it in column names, order or types at any depth, or holds nulls in a
-    /// column the first batch made required. Field metadata and list/map child names may differ.
+    /// The batch holds a null, at any depth, in a column that is required: a non-nullable field or a map key in the
+    /// first batch, or a column the first batch made required in a later one. Or a batch after the first differs
+    /// from it in column names, order or types at any depth; field metadata and list/map child names may differ.
     /// </exception>
     public async ValueTask WriteRowGroupAsync(
         RecordBatch batch,
@@ -100,7 +101,9 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         // Checked before the declared schema and the shredding layout are captured, so a refused first batch
         // leaves the writer as it was.
         if (_arrowSchema is null)
+        {
             RowGroupSchemaCheck.EnsureWritable(batch);
+        }
 
         // Parquet has no second-precision unit, so such a column is rescaled to milliseconds here —
         // before the schema is captured, so what the footer declares and what the encoders write are

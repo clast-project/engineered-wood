@@ -78,7 +78,9 @@ internal static class RowGroupSchemaCheck
         if ((alwaysRequired || !expected.IsNullable) && HasWrittenNull(array, slots))
         {
             if (firstBatch)
+            {
                 throw NullInRequired(path, alwaysRequired);
+            }
             throw Mismatch(path, "the file's column is required, and the row group has nulls in it");
         }
 
@@ -278,10 +280,10 @@ internal static class RowGroupSchemaCheck
             "batch");
 
     private static ArgumentException NullInRequired(string path, bool mapKey) =>
-        new($"The batch has nulls in column '{path}', which "
-            + (mapKey ? "is a map key, and Parquet map keys are always required"
-                : "its schema declares non-nullable, so Parquet writes it as required")
-            + "; a required column cannot hold a null, and the writers would encode each one as a value. "
+        new($"The batch has nulls in column '{path}'. "
+            + (mapKey ? "It is a map key, and Parquet map keys are always required."
+                : "The column is declared non-nullable, so Parquet writes it as required.")
+            + " A required column cannot hold a null; the writers would encode each one as a value. "
             + (mapKey ? "Remove the null keys." : "Declare the field nullable, or remove the nulls."),
             "batch");
 

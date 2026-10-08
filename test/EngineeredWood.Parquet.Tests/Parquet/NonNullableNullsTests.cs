@@ -28,7 +28,9 @@ public class NonNullableNullsTests : IDisposable
     public void Dispose()
     {
         if (Directory.Exists(_tempDir))
+        {
             Directory.Delete(_tempDir, recursive: true);
+        }
     }
 
     public enum Writer { File, Buffered }
@@ -42,14 +44,18 @@ public class NonNullableNullsTests : IDisposable
         {
             await using var w = new ParquetFileWriter(file, ownsFile: false);
             foreach (var b in batches)
+            {
                 await w.WriteRowGroupAsync(b);
+            }
             await w.CloseAsync();
         }
         else
         {
             await using var w = new BufferedParquetWriter(file, ownsFile: false);
             foreach (var b in batches)
+            {
                 await w.AppendAsync(b);
+            }
             await w.CloseAsync();
         }
     }
@@ -71,7 +77,9 @@ public class NonNullableNullsTests : IDisposable
     {
         var b = new ArrowBuffer.BitmapBuilder();
         foreach (bool v in valid)
+        {
             b.Append(v);
+        }
         return b.Build();
     }
 
@@ -79,7 +87,9 @@ public class NonNullableNullsTests : IDisposable
     {
         var b = new ArrowBuffer.Builder<int>();
         foreach (int o in offsets)
+        {
             b.Append(o);
+        }
         return b.Build();
     }
 
@@ -89,9 +99,13 @@ public class NonNullableNullsTests : IDisposable
         foreach (var v in values)
         {
             if (v is null)
+            {
                 b.AppendNull();
+            }
             else
+            {
                 b.Append(v.Value);
+            }
         }
         return b.Build();
     }

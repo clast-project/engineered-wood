@@ -61,8 +61,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     /// buffer is automatically flushed as a row group.
     /// </summary>
     /// <exception cref="ArgumentException">
-    /// A batch after the first differs from it in column names, order or types, or holds nulls in a column the
-    /// first batch made required. Field metadata may differ.
+    /// The batch holds a null in a column that is required: a non-nullable field or a map key in the first batch,
+    /// or a column the first batch made required in a later one. Or a batch after the first differs from it in
+    /// column names, order or types; field metadata may differ.
     /// </exception>
     public async ValueTask AppendAsync(
         RecordBatch batch,
