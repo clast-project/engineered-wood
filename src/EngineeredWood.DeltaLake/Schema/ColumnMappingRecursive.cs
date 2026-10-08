@@ -20,7 +20,9 @@ namespace EngineeredWood.DeltaLake.Schema;
 /// a single pass that accepts either name binds whichever of the two fields comes first. Arrays are rebuilt by re-wrapping <see cref="ArrayData"/> with
 /// the renamed type tree — buffers are shared, no data is copied. Structs recurse to any depth; lists
 /// recurse into a struct element; maps recurse into key/value. (List/map INNER elements have structural
-/// parquet names — only struct fields carry a physicalName/id to map.)
+/// parquet names — only struct fields carry a physicalName to map. Under IcebergCompatV2 they do carry an id,
+/// recorded on the ancestor field, which the write direction stamps on them too; see
+/// <see cref="ColumnMapping.AssignNestedIds"/>.)
 /// </summary>
 public static class ColumnMappingRecursive
 {
@@ -446,9 +448,12 @@ public static class ColumnMappingRecursive
             && !string.IsNullOrEmpty(phys)
                 ? phys
                 : delta.Name;
-        var type = RenameType(arrow.DataType, delta.Type, toPhysical, byId, preferPhysical);
         // field ids are stamped on the WRITE direction only (the read direction leaves metadata untouched).
         int? fieldId = toPhysical ? ColumnMapping.GetFieldId(delta) : null;
+        var nested = toPhysical ? NestedIds(delta) : null;
+        var type = RenameType(
+            arrow.DataType, delta.Type, toPhysical, byId, preferPhysical,
+            nested, ColumnMapping.GetPhysicalName(delta, ColumnMappingMode.Name));
 
         bool sameName = string.Equals(name, arrow.Name, StringComparison.Ordinal);
         bool sameId = fieldId is null
@@ -473,8 +478,47 @@ public static class ColumnMappingRecursive
         return new Field(name, type, arrow.IsNullable, meta);
     }
 
+    // IcebergCompatV2's ids for the array elements and map keys/values below `delta`, by path; null when it
+    // records none. See ColumnMapping.AssignNestedIds.
+    private static Dictionary<string, int>? NestedIds(StructField delta)
+    {
+        var ids = ColumnMapping.GetNestedIds(delta);
+        if (ids.Count == 0)
+            return null;
+        var map = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var entry in ids)
+            map[entry.Key] = entry.Value;
+        return map;
+    }
+
+    // A list element or map key/value, renamed below and carrying its nested id as its PARQUET:field_id when the
+    // ancestor field records one, which is where Iceberg looks for it. The same instance when neither changes.
+    private static Field NestedField(Field arrow, Apache.Arrow.Types.IArrowType type, Dictionary<string, int>? nested, string path)
+    {
+        string? id = nested is not null && nested.TryGetValue(path, out int value)
+            ? value.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            : null;
+        bool sameId = id is null
+            || (arrow.Metadata is { } am
+                && am.TryGetValue(ParquetFieldIdKey, out var existing)
+                && string.Equals(existing, id, StringComparison.Ordinal));
+        if (sameId && ReferenceEquals(type, arrow.DataType))
+            return arrow;
+
+        var meta = new Dictionary<string, string>();
+        if (arrow.Metadata is { } src)
+        {
+            foreach (var kvp in src)
+                meta[kvp.Key] = kvp.Value;
+        }
+        if (id is not null)
+            meta[ParquetFieldIdKey] = id;
+        return new Field(arrow.Name, type, arrow.IsNullable, meta.Count == 0 ? null : meta);
+    }
+
     private static Apache.Arrow.Types.IArrowType RenameType(
-        Apache.Arrow.Types.IArrowType arrow, DeltaDataType delta, bool toPhysical, bool byId, bool preferPhysical)
+        Apache.Arrow.Types.IArrowType arrow, DeltaDataType delta, bool toPhysical, bool byId, bool preferPhysical,
+        Dictionary<string, int>? nested = null, string path = "")
     {
         switch (arrow)
         {
@@ -493,33 +537,35 @@ public static class ColumnMappingRecursive
             }
             case Apache.Arrow.Types.ListType lt when delta is ArrayType da:
             {
-                var elemType = RenameType(lt.ValueField.DataType, da.ElementType, toPhysical, byId, preferPhysical);
-                return ReferenceEquals(elemType, lt.ValueField.DataType)
-                    ? arrow
-                    : new Apache.Arrow.Types.ListType(
-                        new Field(lt.ValueField.Name, elemType, lt.ValueField.IsNullable, lt.ValueField.Metadata));
+                string elementPath = path + ".element";
+                var elemType = RenameType(
+                    lt.ValueField.DataType, da.ElementType, toPhysical, byId, preferPhysical, nested, elementPath);
+                var element = NestedField(lt.ValueField, elemType, nested, elementPath);
+                return ReferenceEquals(element, lt.ValueField) ? arrow : new Apache.Arrow.Types.ListType(element);
             }
             case Apache.Arrow.Types.LargeListType llt when delta is ArrayType da:
             {
-                var elemType = RenameType(llt.ValueField.DataType, da.ElementType, toPhysical, byId, preferPhysical);
-                return ReferenceEquals(elemType, llt.ValueField.DataType)
+                string elementPath = path + ".element";
+                var elemType = RenameType(
+                    llt.ValueField.DataType, da.ElementType, toPhysical, byId, preferPhysical, nested, elementPath);
+                var element = NestedField(llt.ValueField, elemType, nested, elementPath);
+                return ReferenceEquals(element, llt.ValueField)
                     ? arrow
-                    : new Apache.Arrow.Types.LargeListType(
-                        new Field(llt.ValueField.Name, elemType, llt.ValueField.IsNullable, llt.ValueField.Metadata));
+                    : new Apache.Arrow.Types.LargeListType(element);
             }
             case Apache.Arrow.Types.MapType mt when delta is MapType dm:
             {
-                var keyType = RenameType(mt.KeyField.DataType, dm.KeyType, toPhysical, byId, preferPhysical);
-                var valType = RenameType(mt.ValueField.DataType, dm.ValueType, toPhysical, byId, preferPhysical);
-                if (ReferenceEquals(keyType, mt.KeyField.DataType)
-                    && ReferenceEquals(valType, mt.ValueField.DataType))
-                {
+                string keyPath = path + ".key";
+                string valuePath = path + ".value";
+                var keyType = RenameType(
+                    mt.KeyField.DataType, dm.KeyType, toPhysical, byId, preferPhysical, nested, keyPath);
+                var valType = RenameType(
+                    mt.ValueField.DataType, dm.ValueType, toPhysical, byId, preferPhysical, nested, valuePath);
+                var key = NestedField(mt.KeyField, keyType, nested, keyPath);
+                var value = NestedField(mt.ValueField, valType, nested, valuePath);
+                if (ReferenceEquals(key, mt.KeyField) && ReferenceEquals(value, mt.ValueField))
                     return arrow;
-                }
-                return new Apache.Arrow.Types.MapType(
-                    new Field(mt.KeyField.Name, keyType, mt.KeyField.IsNullable, mt.KeyField.Metadata),
-                    new Field(mt.ValueField.Name, valType, mt.ValueField.IsNullable, mt.ValueField.Metadata),
-                    mt.KeySorted);
+                return new Apache.Arrow.Types.MapType(key, value, mt.KeySorted);
             }
             default:
                 return arrow; // primitive (or a shape the Delta type doesn't mirror) — unchanged
