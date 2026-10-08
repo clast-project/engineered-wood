@@ -169,6 +169,31 @@ public static class DeltaTableErrorCodes
     /// <c>ClusteringColumnInfo</c> crashes on. Change the clustering columns first.</remarks>
     public const string UnsupportedDropClusteringColumn = "DELTA_UNSUPPORTED_DROP_CLUSTERING_COLUMN";
 
+    // ── Data-skipping properties ──
+
+    /// <summary>A <c>delta.dataSkippingStatsColumns</c> value is not a list of column names.</summary>
+    /// <remarks>No delta-spark error class: Spark refuses such a value with a bare
+    /// <c>IllegalArgumentException</c> ("requirement failed") when the property is set. Entries are separated by
+    /// commas; a part that is not a plain identifier goes in backquotes.</remarks>
+    public const string InvalidDataSkippingStatsColumns = "DELTA_INVALID_DATA_SKIPPING_STATS_COLUMNS";
+
+    /// <summary><c>delta.dataSkippingStatsColumns</c> names a partition column.</summary>
+    /// <remarks>delta-spark: <c>DELTA_COLUMN_DATA_SKIPPING_NOT_SUPPORTED_PARTITIONED_COLUMN</c>. A partition value
+    /// is constant per file, so it has no statistics to skip on.</remarks>
+    public const string DataSkippingPartitionColumn =
+        "DELTA_COLUMN_DATA_SKIPPING_NOT_SUPPORTED_PARTITIONED_COLUMN";
+
+    /// <summary><c>delta.dataSkippingStatsColumns</c> names a top-level column of a type with no statistics
+    /// (boolean, binary, array, map).</summary>
+    /// <remarks>delta-spark: <c>DELTA_COLUMN_DATA_SKIPPING_NOT_SUPPORTED_TYPE</c>. Spark only warns for a nested
+    /// column of such a type, and so does this, by accepting it.</remarks>
+    public const string DataSkippingUnsupportedType = "DELTA_COLUMN_DATA_SKIPPING_NOT_SUPPORTED_TYPE";
+
+    /// <summary><c>delta.dataSkippingStatsColumns</c> names one column twice, directly or through a struct that
+    /// contains it.</summary>
+    /// <remarks>delta-spark: <c>DELTA_DUPLICATE_DATA_SKIPPING_COLUMNS</c>.</remarks>
+    public const string DuplicateDataSkippingColumns = "DELTA_DUPLICATE_DATA_SKIPPING_COLUMNS";
+
     /// <summary>
     /// A value in a batch being written cannot be stored in its column's Delta type without guessing —
     /// a Date64 that is not a whole number of days, which the Arrow format forbids.

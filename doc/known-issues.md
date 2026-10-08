@@ -578,7 +578,7 @@ and `delta.logRetentionDuration` (`LogCleanup`); `delta.enableIcebergCompatV1` /
 |---|---|
 | `delta.isolationLevel` | DML commits at `WriteSerializable` whatever the table demands, so on a `Serializable` table it can commit past a concurrent blind append that Spark would abort on. #472 |
 | `delta.universalFormat.enabledFormats` (with `…iceberg.atomicConversion.supported`, `delta.universalformat.config.*`) | Writes to a UniForm table without generating Iceberg metadata, so Iceberg readers see stale data. Nothing refuses the write: UniForm rides on `icebergCompatV2`, which EW supports. #473 |
-| `delta.dataSkippingStatsColumns` | Not kept in step with RENAME/DROP. Spark rewrites or removes entries there, and validates the property on **every** metadata update, so a stale entry breaks Spark's next ALTER. Also not used to choose stats columns. #471 |
+| `delta.dataSkippingStatsColumns` | Kept in step with RENAME/DROP/SetSchema and validated at CREATE, as Spark does, but not yet used to choose stats columns: every eligible column gets stats. #471 |
 | `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStringPrefixLength` | Statistics for every eligible column, with a fixed string-prefix length. Never wrong, but larger on wide tables. #471 |
 | `delta.compatibility.symlinkFormatManifest.enabled` | Symlink manifests (for Presto/Athena-style readers) are not regenerated. |
 | `delta.setTransactionRetentionDuration` | Expired `txn` (idempotent-write) identifiers are never dropped from checkpoints. |

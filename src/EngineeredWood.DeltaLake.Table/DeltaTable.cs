@@ -413,6 +413,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // doc: a CTAS whose data files were written before commit 0 exists).
         var deltaSchema = preAssignedSchema ?? SchemaConverter.FromArrowSchema(schema);
         CommitSchemaValidation.EnsureValid(deltaSchema);
+        // Spark validates the property at CREATE TABLE and on every later metadata update, so a value it would
+        // refuse makes the table one Spark can no longer ALTER.
+        DataSkippingStatsColumns.Validate(deltaSchema, partitionColumns, configuration);
 
         // Set protocol versions based on column mapping mode
         int minReaderVersion = 1;
@@ -1261,6 +1264,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
             PartitionColumns = newPartitionColumns,
+            Configuration = DataSkippingStatsColumns.AfterRename(baseMeta.Configuration, [oldName], [newName]),
         };
         return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
     }
@@ -1307,7 +1311,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // and passes, while any other drop on such a table would commit the invalid schema again.
         CommitSchemaValidation.EnsureValid(newSchema);
 
-        var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
+        var metadata = baseMeta with
+        {
+            SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
+            Configuration = DataSkippingStatsColumns.AfterDrop(baseMeta.Configuration, [name]),
+        };
         return new DeferredSchemaChange(
             new List<DeltaAction> { metadata }, metadata, null, newSchema, [ClusteringDomain]);
     }
@@ -1437,7 +1445,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             baseSchema, baseMeta, snapshot.DomainMetadata, fieldPath, isDrop: false);
         CommitSchemaValidation.EnsureValid(newSchema);
 
-        var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
+        var metadata = baseMeta with
+        {
+            SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
+            Configuration = DataSkippingStatsColumns.AfterRename(
+                baseMeta.Configuration, fieldPath, [.. containerPath, newName]),
+        };
         return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
     }
 
@@ -1487,7 +1500,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             baseSchema, baseMeta, snapshot.DomainMetadata, fieldPath, isDrop: true);
         CommitSchemaValidation.EnsureValid(newSchema); // see ComputeDropColumn
 
-        var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
+        var metadata = baseMeta with
+        {
+            SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
+            Configuration = DataSkippingStatsColumns.AfterDrop(baseMeta.Configuration, fieldPath),
+        };
         return new DeferredSchemaChange(
             new List<DeltaAction> { metadata }, metadata, null, newSchema, [ClusteringDomain]);
     }
@@ -1576,7 +1593,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         return await CommitMetadataOnlyAsync(
             snapshot,
-            snapshot.Metadata with { SchemaString = newSchemaString, Configuration = newConfig },
+            snapshot.Metadata with
+            {
+                SchemaString = newSchemaString,
+                // Entries naming a column the replacement removed would fail Spark's validation of the property
+                // on its next ALTER, as a DROP's would.
+                Configuration = DataSkippingStatsColumns.AfterReplace(newConfig, newDeltaSchema),
+            },
             "CHANGE COLUMNS",
             cancellationToken,
             protocolUpgrade,
