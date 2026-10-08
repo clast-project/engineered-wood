@@ -1,0 +1,319 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+
+using Apache.Arrow;
+using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
+using EngineeredWood.IO.Local;
+using EngineeredWood.Parquet;
+using ArrowSchema = Apache.Arrow.Schema;
+
+namespace EngineeredWood.Tests.Parquet;
+
+/// <summary>
+/// #470: a list's values array may hold elements that no row's offsets reference (offsets need not start at 0 or
+/// end at the values' length). Arrays from another library's filter or take, or from FFI, look like this. The
+/// writer threw IndexOutOfRangeException on them; it must write only the referenced elements.
+/// </summary>
+public class UnreferencedListValuesTests : IDisposable
+{
+    private readonly string _tempDir;
+
+    public UnreferencedListValuesTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), "ew-unref-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(_tempDir);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempDir))
+        {
+            Directory.Delete(_tempDir, recursive: true);
+        }
+    }
+
+    private static ArrowBuffer Offsets(params int[] offsets)
+    {
+        var b = new ArrowBuffer.Builder<int>();
+        foreach (int o in offsets)
+        {
+            b.Append(o);
+        }
+        return b.Build();
+    }
+
+    private static ArrowBuffer Validity(params bool[] valid)
+    {
+        var b = new ArrowBuffer.BitmapBuilder();
+        foreach (bool v in valid)
+        {
+            b.Append(v);
+        }
+        return b.Build();
+    }
+
+    private static Int64Array Longs(params long[] values) => new Int64Array.Builder().AppendRange(values).Build();
+
+    private static readonly ListType LongList = new(new Field("element", Int64Type.Default, true));
+
+    private async Task<List<long[]?>> RoundTripAsync(IArrowArray column)
+    {
+        var schema = new ArrowSchema.Builder().Field(new Field("l", column.Data.DataType, true)).Build();
+        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N") + ".parquet");
+        await using (var file = new LocalSequentialFile(path))
+        {
+            await using var writer = new ParquetFileWriter(file, ownsFile: false);
+            await writer.WriteRowGroupAsync(new RecordBatch(schema, [column], column.Length));
+            await writer.CloseAsync();
+        }
+
+        await using var input = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(input, ownsFile: false);
+        var read = (ListArray)(await reader.ReadRowGroupAsync(0)).Column(0);
+        return Enumerable.Range(0, read.Length)
+            .Select(i => read.IsNull(i) ? null : ((Int64Array)read.GetSlicedValues(i)).Values.ToArray())
+            .ToList();
+    }
+
+    // The issue's probes: one row, values [1, 2, 3].
+    [Theory]
+    [InlineData(new[] { 0, 1 }, new long[] { 1 })] // trailing elements unreferenced
+    [InlineData(new[] { 2, 3 }, new long[] { 3 })] // leading elements unreferenced
+    [InlineData(new[] { 1, 2 }, new long[] { 2 })] // both
+    [InlineData(new[] { 0, 3 }, new long[] { 1, 2, 3 })] // control: all referenced
+    public async Task AListWithUnreferencedValues_WritesOnlyTheReferencedOnes(int[] offsets, long[] expected)
+    {
+        var list = new ListArray(LongList, 1, Offsets(offsets), Longs(1, 2, 3), ArrowBuffer.Empty, nullCount: 0);
+
+        var rows = await RoundTripAsync(list);
+
+        Assert.Equal(expected, Assert.Single(rows));
+    }
+
+    [Fact]
+    public async Task ValuesUnderANullRow_AndTrailingOnes_AreNotWritten()
+    {
+        // Row 0 = [10]; row 1 is null, and its offsets span 11 and 12, which must not be written; row 2 = [];
+        // row 3 = [14]; the trailing 15 is referenced by nothing. (Offsets are one monotonic run, so the values a
+        // row cannot reach are the leading ones, the trailing ones, and those under a null row.)
+        var list = new ListArray(LongList, 4, Offsets(0, 1, 3, 3, 4), Longs(10, 11, 12, 14, 15),
+            Validity(true, false, true, true), nullCount: 1);
+
+        var rows = await RoundTripAsync(list);
+
+        Assert.Equal(4, rows.Count);
+        Assert.Equal([10L], rows[0]);
+        Assert.Null(rows[1]);
+        Assert.Empty(rows[2]!);
+        Assert.Equal([14L], rows[3]);
+    }
+
+    // The same walk serves a list's element that is itself nested.
+    [Fact]
+    public async Task AListOfStructsWithUnreferencedValues_WritesOnlyTheReferencedOnes()
+    {
+        var elementType = new StructType([new Field("x", Int64Type.Default, true)]);
+        var listType = new ListType(new Field("element", elementType, true));
+        var elements = new StructArray(elementType, 4, [Longs(1, 2, 3, 4)], ArrowBuffer.Empty, nullCount: 0);
+        var list = new ListArray(listType, 2, Offsets(1, 2, 3), elements, ArrowBuffer.Empty, nullCount: 0);
+
+        var read = await ReadBackAsync(list);
+
+        var readList = (ListArray)read;
+        var x = (Int64Array)((StructArray)readList.Values).Fields[0];
+        Assert.Equal([2L, 3L], Enumerable.Range(0, 2).Select(i => x.GetValue(readList.ValueOffsets[i])!.Value));
+        Assert.Equal(2, readList.Values.Length);
+    }
+
+    [Fact]
+    public async Task AListOfListsWithUnreferencedValues_WritesOnlyTheReferencedOnes()
+    {
+        // Inner lists [1, 2] and [0, 3], with a trailing 9 that neither references; the one outer row holds inner
+        // list 1 only, so inner list 0 is unreferenced too.
+        var inner = new ListArray(LongList, 2, Offsets(0, 2, 4), Longs(1, 2, 0, 3, 9), ArrowBuffer.Empty, nullCount: 0);
+        var outerType = new ListType(new Field("element", LongList, true));
+        var outer = new ListArray(outerType, 1, Offsets(1, 2), inner, ArrowBuffer.Empty, nullCount: 0);
+
+        var read = (ListArray)await ReadBackAsync(outer);
+
+        var innerRead = (ListArray)read.Values;
+        Assert.Equal(1, innerRead.Length);
+        Assert.Equal([0L, 3L], ((Int64Array)innerRead.GetSlicedValues(0)).Values.ToArray());
+    }
+
+    [Fact]
+    public async Task AMapWithUnreferencedEntries_WritesOnlyTheReferencedOnes()
+    {
+        var mapType = new MapType(new Field("key", StringType.Default, false), new Field("value", Int64Type.Default, true));
+        var entries = new StructArray(new StructType([mapType.KeyField, mapType.ValueField]), 4,
+            [new StringArray.Builder().Append("a").Append("b").Append("c").Append("d").Build(), Longs(1, 2, 3, 4)],
+            ArrowBuffer.Empty, nullCount: 0);
+        // Row 0 = {b: 2}, row 1 = {c: 3}; the leading a and the trailing d are referenced by nothing.
+        var map = new MapArray(mapType, 2, Offsets(1, 2, 3), entries, ArrowBuffer.Empty, nullCount: 0);
+
+        var read = (MapArray)await ReadBackAsync(map);
+
+        Assert.Equal(["b", "c"], Enumerable.Range(0, read.Keys.Length).Select(i => ((StringArray)read.Keys).GetString(i)));
+        Assert.Equal([2L, 3L], Enumerable.Range(0, 2).Select(i => ((Int64Array)read.Values).GetValue(i)!.Value));
+    }
+
+    // A map whose entries struct is itself sliced: keys and values are not sliced with it.
+    [Fact]
+    public async Task AMapOverSlicedEntries_ReadsTheEntriesRows()
+    {
+        var mapType = new MapType(new Field("key", StringType.Default, false), new Field("value", Int64Type.Default, true));
+        var entryType = new StructType([mapType.KeyField, mapType.ValueField]);
+        var allEntries = new StructArray(entryType, 3,
+            [new StringArray.Builder().Append("a").Append("b").Append("c").Build(), Longs(1, 2, 3)],
+            ArrowBuffer.Empty, nullCount: 0);
+        var entries = (StructArray)allEntries.Slice(1, 2);
+        var map = new MapArray(mapType, 1, Offsets(0, 2), entries, ArrowBuffer.Empty, nullCount: 0);
+
+        var read = (MapArray)await ReadBackAsync(map);
+
+        Assert.Equal(["b", "c"], Enumerable.Range(0, 2).Select(i => ((StringArray)read.Keys).GetString(i)));
+        Assert.Equal([2L, 3L], Enumerable.Range(0, 2).Select(i => ((Int64Array)read.Values).GetValue(i)!.Value));
+    }
+
+    private async Task<IArrowArray> ReadBackAsync(IArrowArray column, bool nullable = true)
+    {
+        var schema = new ArrowSchema.Builder().Field(new Field("c", column.Data.DataType, nullable)).Build();
+        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N") + ".parquet");
+        await using (var file = new LocalSequentialFile(path))
+        {
+            await using var writer = new ParquetFileWriter(file, ownsFile: false);
+            await writer.WriteRowGroupAsync(new RecordBatch(schema, [column], column.Length));
+            await writer.CloseAsync();
+        }
+
+        await using var input = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(input, ownsFile: false);
+        return (await reader.ReadRowGroupAsync(0)).Column(0);
+    }
+
+    // Review of #480: rebuilding a leaf in level order used hand-written copies for a few types, so any other
+    // layout threw once a rebuild was needed, and those copies read a sliced child's buffers from slot 0. Each
+    // case: row 0 = [v0], row 1 = null over v1, and v2 trailing, referenced by nothing. Large string/binary and
+    // view leaves are left out: a list of them is written wrong on main even when no rebuild happens (and a flat
+    // view column is refused), which is the column writer's gap, not this one.
+    public static TheoryData<string> LeafLayouts() => new() { "decimal32", "int8", "uint16", "date32" };
+
+    private static IArrowArray Leaf(string layout) => layout switch
+    {
+        "large_string" => new LargeStringArray.Builder().Append("a").Append("b").Append("c").Build(),
+        "string_view" => new StringViewArray.Builder().Append("a").Append("b").Append("c").Build(),
+        "large_binary" => new LargeBinaryArray.Builder().Append([1]).Append([2]).Append([3]).Build(),
+        "decimal32" => new Decimal32Array.Builder(new Decimal32Type(5, 2)).Append(1.25m).Append(2.5m).Append(3.75m).Build(),
+        "int8" => new Int8Array.Builder().Append(1).Append(2).Append(3).Build(),
+        "uint16" => new UInt16Array.Builder().Append(1).Append(2).Append(3).Build(),
+        "date32" => new Date32Array.Builder().Append(new DateTime(2026, 1, 1)).Append(new DateTime(2026, 1, 2))
+            .Append(new DateTime(2026, 1, 3)).Build(),
+        _ => throw new ArgumentOutOfRangeException(nameof(layout)),
+    };
+
+    private static string Render(IArrowArray array, int i) => array switch
+    {
+        StringArray a => a.GetString(i),
+        LargeStringArray a => a.GetString(i),
+        StringViewArray a => a.GetString(i),
+        BinaryArray a => string.Join(",", a.GetBytes(i).ToArray()),
+        LargeBinaryArray a => string.Join(",", a.GetBytes(i).ToArray()),
+        BinaryViewArray a => string.Join(",", a.GetBytes(i).ToArray()),
+        Decimal32Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        Decimal64Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        Decimal128Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        Int8Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        UInt16Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        Date32Array a => a.GetDateTime(i)!.Value.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+        _ => throw new NotSupportedException(array.GetType().Name),
+    };
+
+    [Theory]
+    [MemberData(nameof(LeafLayouts))]
+    public async Task EveryLeafLayout_IsRebuiltInLevelOrder(string layout)
+    {
+        var values = Leaf(layout);
+        var expected = Render(values, 0);
+        var listType = new ListType(new Field("element", values.Data.DataType, true));
+        var list = new ListArray(listType, 2, Offsets(0, 1, 2), values, Validity(true, false), nullCount: 1);
+
+        var read = (ListArray)await ReadBackAsync(list);
+
+        Assert.Equal(2, read.Length);
+        Assert.Equal(1, read.GetValueLength(0));
+        Assert.Equal(expected, Render(read.Values, read.ValueOffsets[0]));
+        Assert.True(read.IsNull(1));
+    }
+
+    [Fact]
+    public async Task AListOverASlicedValuesArray_ReadsTheValuesAtTheirOffset()
+    {
+        // The values array starts at element 2 of its buffers. Row 0 = [12], row 1 = null over 13.
+        var values = (Int64Array)Longs(10, 11, 12, 13, 14).Slice(2, 3);
+        var list = new ListArray(LongList, 2, Offsets(0, 1, 2), values, Validity(true, false), nullCount: 1);
+
+        var rows = await RoundTripAsync(list);
+
+        Assert.Equal([12L], rows[0]);
+        Assert.Null(rows[1]);
+    }
+
+    [Fact]
+    public async Task AListOfRunEndEncodedValuesUnderANullRow_IsWritten()
+    {
+        // Review of #480: a null row needs a phantom level, and nulls can't be scattered into a run-end encoded
+        // array (it has no validity bitmap). Row 0 = [7, 7], row 1 = null, row 2 = [9]; values = runs 7x2, 9x1.
+        var values = new RunEndEncodedArray(
+            new Int32Array.Builder().Append(2).Append(3).Build(), Longs(7, 9));
+        var listType = new ListType(new Field("element", values.Data.DataType, true));
+        var list = new ListArray(listType, 3, Offsets(0, 2, 2, 3), values, Validity(true, false, true), nullCount: 1);
+
+        var read = (ListArray)await ReadBackAsync(list);
+
+        Assert.Equal(3, read.Length);
+        Assert.True(read.IsNull(1));
+        var leaf = read.Values is RunEndEncodedArray ree ? RunEndEncoding.Expand(ree) : read.Values;
+        Assert.Equal([7L, 7L, 9L], Enumerable.Range(0, 3).Select(i => ((Int64Array)leaf).GetValue(i)!.Value));
+        Assert.Equal([0, 2, 2, 3], read.ValueOffsets.ToArray());
+    }
+
+    [Fact]
+    public async Task AListOfRunEndEncodedValues_KeepsANullRun()
+    {
+        // Review of #480: a run-end encoded array carries its nulls in its values, not in a validity bitmap, so its
+        // own IsNull is false everywhere; a nested leaf's definition levels must come from the runs. Row 0 = [7,
+        // null], row 1 = [null]; values = runs 7x1, null x2.
+        var values = new RunEndEncodedArray(
+            new Int32Array.Builder().Append(1).Append(3).Build(),
+            new Int64Array.Builder().Append(7).AppendNull().Build());
+        var listType = new ListType(new Field("element", values.Data.DataType, true));
+        var list = new ListArray(listType, 2, Offsets(0, 2, 3), values, ArrowBuffer.Empty, nullCount: 0);
+
+        var read = (ListArray)await ReadBackAsync(list);
+
+        var leaf = read.Values is RunEndEncodedArray ree ? RunEndEncoding.Expand(ree) : read.Values;
+        Assert.Equal([0, 2, 3], read.ValueOffsets.ToArray());
+        Assert.Equal(7L, ((Int64Array)leaf).GetValue(0));
+        Assert.True(leaf.IsNull(1));
+        Assert.True(leaf.IsNull(2));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ARequiredStructsFieldThatIsASliceOrLonger_WritesTheStructsRows(bool sliced)
+    {
+        // Review of #480: a required top-level struct gives its children no definition levels, so they took the
+        // flat path, which encoded the child's buffers from slot 0 and for as many values as it held. Struct rows
+        // = 2; the child is [10, 11, 12] sliced from 1 (rows 11, 12), or the whole of it (rows 10, 11).
+        var child = sliced ? Longs(10, 11, 12).Slice(1, 2) : Longs(10, 11, 12);
+        var structType = new StructType([new Field("x", Int64Type.Default, false)]);
+        var column = new StructArray(structType, 2, [child], ArrowBuffer.Empty, nullCount: 0);
+
+        var read = (StructArray)await ReadBackAsync(column, nullable: false);
+
+        var x = (Int64Array)read.Fields[0];
+        Assert.Equal(sliced ? [11L, 12L] : [10L, 11L], Enumerable.Range(0, 2).Select(i => x.GetValue(i)!.Value));
+    }
+}

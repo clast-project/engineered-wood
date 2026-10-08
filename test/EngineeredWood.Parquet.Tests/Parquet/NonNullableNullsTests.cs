@@ -347,4 +347,73 @@ public class NonNullableNullsTests : IDisposable
 
         Assert.Contains("'r'", ex.Message);
     }
+
+    // Review of #480: the run-end encoded check counted every null run, so one that no row references (here, under
+    // a null list row) refused a column that writes no null. Runs: 1 x1, null x1; row 0 = [1], row 1 = null over it.
+    private static ListArray ListOfRuns(bool[] valid, int[] offsets)
+    {
+        var ree = new RunEndEncodedArray(Ints(1, 2), Ints(1, null));
+        var type = new ListType(new Field("element", ree.Data.DataType, false));
+        return new ListArray(type, valid.Length, Offsets(offsets), ree, Validity(valid), valid.Count(v => !v));
+    }
+
+    [Fact]
+    public async Task NullRunUnderANullListSlot_IsAccepted()
+    {
+        var list = ListOfRuns([true, false], [0, 1, 2]);
+        string path = NewPath();
+
+        await WriteAsync(Writer.File, path, Single(new Field("l", list.Data.DataType, true), list));
+
+        var read = (ListArray)(await ReadAsync(path)).Column(0);
+        Assert.Equal(1, read.GetValueLength(0));
+        Assert.True(read.IsNull(1));
+    }
+
+    [Fact]
+    public async Task NullRunInANonNullableListElement_IsRefused()
+    {
+        var list = ListOfRuns([true, true], [0, 1, 2]);
+
+        var ex = await RefusedAsync(Writer.File, Single(new Field("l", list.Data.DataType, true), list));
+
+        Assert.Contains("'l.element'", ex.Message);
+    }
+
+    // Review of #480: a struct's Fields are sliced with it (Arrow 23), so the check must not add the struct's offset
+    // again. A list over a sliced struct: x = [5, 6, 7, null] and the struct is rows 1..3, so its x is [6, 7, null].
+    private static ListArray ListOfSlicedStructs(int?[] x, int sliceAt, int sliceLength, bool[] valid, int[] offsets)
+    {
+        var structType = StructOfX(xNullable: false);
+        var all = new StructArray(structType, x.Length, [Ints(x)], ArrowBuffer.Empty, nullCount: 0);
+        var type = new ListType(new Field("element", structType, false));
+        return new ListArray(type, valid.Length, Offsets(offsets), all.Slice(sliceAt, sliceLength), Validity(valid),
+            valid.Count(v => !v));
+    }
+
+    [Fact]
+    public async Task NullStructChildPastTheWrittenSlots_OfASlicedStruct_IsAccepted()
+    {
+        // Row 0 = null (over struct row 0), row 1 = [struct row 1]: x = 7 is written, the null is not.
+        var list = ListOfSlicedStructs([5, 6, 7, null], 1, 3, [false, true], [0, 1, 2]);
+        string path = NewPath();
+
+        await WriteAsync(Writer.File, path, Single(new Field("l", list.Data.DataType, true), list));
+
+        var read = (ListArray)(await ReadAsync(path)).Column(0);
+        Assert.True(read.IsNull(0));
+        var row1 = (StructArray)read.GetSlicedValues(1);
+        Assert.Equal(7, ((Int32Array)row1.Fields[0]).GetValue(0));
+    }
+
+    [Fact]
+    public async Task NullStructChildInAWrittenSlot_OfASlicedStruct_IsRefused()
+    {
+        // x = [5, null, 7], the struct is rows 1..2 (x = [null, 7]), and row 0 = [struct row 0] writes the null.
+        var list = ListOfSlicedStructs([5, null, 7], 1, 2, [true], [0, 1]);
+
+        var ex = await RefusedAsync(Writer.File, Single(new Field("l", list.Data.DataType, true), list));
+
+        Assert.Contains("'l.element.x'", ex.Message);
+    }
 }
