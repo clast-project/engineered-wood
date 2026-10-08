@@ -5000,7 +5000,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Then convert the Arrow types a Delta type accepts but does not read back as (FixedSizeBinary,
         // Date64, the other decimal widths) to the ones it does, so every file of a column has one physical
         // form, and refuse what has no faithful encoding at all — nanosecond and second timestamps.
-        batches = NormalizeUnlessHostOwnsBytes(batches, snapshot.Metadata.PartitionColumns);
+        // Under a host writer only the partition columns are converted — and a repartitioning overwrite
+        // splits by the NEW ones, so those are the ones whose values get formatted.
+        batches = NormalizeUnlessHostOwnsBytes(batches, repartitionTo ?? snapshot.Metadata.PartitionColumns);
         foreach (var b in batches)
             SchemaConverter.ThrowIfUnwritableType(b.Schema, convertibleTypesAllowed: HostOwnsBytes);
 

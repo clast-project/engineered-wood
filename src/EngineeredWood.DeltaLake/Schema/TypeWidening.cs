@@ -55,6 +55,9 @@ public static class TypeWidening
         ("date", "timestamp_ntz"),
     };
 
+    /// <summary>The largest decimal precision Delta allows (PROTOCOL.md, Primitive Types).</summary>
+    private const int MaxDecimalPrecision = 38;
+
     /// <summary>
     /// Returns true if widening from <paramref name="fromType"/> to
     /// <paramref name="toType"/> is a decimal widening.
@@ -67,6 +70,11 @@ public static class TypeWidening
             return false;
 
         var (toPrecision, toScale) = ParseDecimal(toType);
+
+        // Delta decimals stop at precision 38 (PROTOCOL.md, Primitive Types), and SchemaConverter refuses
+        // anything wider, so no widening may target one: the table could not hold the type it records.
+        if (toPrecision > MaxDecimalPrecision)
+            return false;
 
         if (fromType.StartsWith("decimal(", StringComparison.Ordinal))
         {

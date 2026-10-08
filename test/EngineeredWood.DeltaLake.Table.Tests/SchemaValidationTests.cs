@@ -1350,6 +1350,27 @@ public class SchemaValidationTests : IDisposable
         Assert.DoesNotContain("Arrow " + BinaryType.Default, ex.Message);
     }
 
+    [Fact]
+    public async Task Repartition_UnderAHostWriter_ConvertsTheNewPartitionColumn()
+    {
+        // A repartitioning overwrite splits by the NEW partition columns, so those are the values to format.
+        var writer = new CapturingWriter();
+#pragma warning disable EWDELTA0001 // codec seam is experimental
+        var options = DeltaTableOptions.Default with { DataFileWriter = writer };
+#pragma warning restore EWDELTA0001
+        await using var table = await DeltaTable.CreateAsync(Fs,
+            Schema(new Field("p", Date32Type.Default, true), Long("v")), options);
+
+        var batch = new RecordBatch(Schema(new Field("p", Date64Type.Default, true), Long("v")),
+            [new Date64Array.Builder().Append(new DateTime(2024, 3, 1)).Build(), new Int64Array.Builder().Append(1).Build()], 1);
+        await table.WriteAsync([batch], DeltaWriteMode.Overwrite, repartitionTo: ["p"]);
+
+        Assert.Equal(["p"], table.CurrentSnapshot.Metadata.PartitionColumns);
+        string log = File.ReadAllText(Directory.GetFiles(Path.Combine(_tempDir, "_delta_log"), "*.json")
+            .OrderBy(f => f, StringComparer.Ordinal).Last());
+        Assert.Contains("\"p\":\"2024-03-01\"", log);
+    }
+
     // ── Integer to decimal widening ───────────────────────────────────────────────────────────────────
 
     [Theory]
@@ -1361,6 +1382,11 @@ public class SchemaValidationTests : IDisposable
     [InlineData("long", "decimal(25,5)", true)]
     [InlineData("long", "decimal(22,5)", false)]
     [InlineData("long", "decimal(19,0)", false)]
+    [InlineData("integer", "decimal(39,0)", false)]   // above Delta's precision 38
+    [InlineData("integer", "decimal(40,30)", false)]
+    [InlineData("long", "decimal(38,18)", true)]      // exactly 38 is fine
+    [InlineData("decimal(30,2)", "decimal(38,2)", true)]
+    [InlineData("decimal(30,2)", "decimal(39,2)", false)]
     public void IntegerToDecimalWidening_RequiresAPrecisionDigitPerScaleDigit(string from, string to, bool ok)
     {
         Assert.Equal(ok, EngineeredWood.DeltaLake.Schema.TypeWidening.IsDecimalWidening(from, to));
