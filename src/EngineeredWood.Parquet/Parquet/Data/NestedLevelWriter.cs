@@ -151,6 +151,10 @@ internal static class NestedLevelWriter
         int[]? repLevels;
         int nonNullCount;
         IArrowArray leafArray = array;
+        // A run-end encoded array keeps its nulls in its values, so its own IsNull is false everywhere (#480
+        // review); read the runs instead.
+        bool[]? runNulls = array is RunEndEncodedArray runs ? RunNulls(runs) : null;
+        bool IsNullAt(int index) => runNulls?[index] ?? array.IsNull(index);
 
         if (parentDefLevels == null && parentRepLevels == null)
         {
@@ -162,7 +166,7 @@ internal static class NestedLevelWriter
 
             for (int i = 0; i < levelCount; i++)
             {
-                if (!field.IsNullable || !array.IsNull(i))
+                if (!field.IsNullable || !IsNullAt(i))
                 {
                     defLevels[i] = maxDefLevel;
                     nonNullCount++;
@@ -171,6 +175,17 @@ internal static class NestedLevelWriter
                 {
                     defLevels[i] = maxDefLevel - 1;
                 }
+            }
+
+            // A required struct's fields come here too (it gives them no levels), and a field may be a slice of
+            // its own or hold more values than the struct has rows; the encoders read raw buffers from slot 0,
+            // for the array's whole length.
+            if (levelCount != array.Length || array.Data.Offset != 0)
+            {
+                var identity = new int[levelCount];
+                for (int i = 0; i < levelCount; i++)
+                    identity[i] = i;
+                leafArray = ExpandArray(array, identity, levelCount);
             }
         }
         else
@@ -209,7 +224,7 @@ internal static class NestedLevelWriter
                     valueMap[i] = idx;
                     if (idx != i)
                         identityMap = false;
-                    if (!field.IsNullable || !array.IsNull(idx))
+                    if (!field.IsNullable || !IsNullAt(idx))
                     {
                         defLevels[i] = maxDefLevel;
                         nonNullCount++;
@@ -276,6 +291,20 @@ internal static class NestedLevelWriter
         if (gathered is RunEndEncodedArray runs)
             gathered = RunEndEncoding.Expand(runs);
         return ArrowCompute.Scatter(gathered, levels, expandedLength);
+    }
+
+    private static bool[] RunNulls(RunEndEncodedArray array)
+    {
+        var nulls = new bool[array.Length];
+        int row = 0;
+        foreach (var run in RunEndEncoding.EnumerateRuns(array))
+        {
+            if (array.Values.IsNull(run.PhysicalIndex))
+                nulls.AsSpan(row, run.Length).Fill(true);
+            row += run.Length;
+        }
+
+        return nulls;
     }
 
     private static void DecomposeStruct(

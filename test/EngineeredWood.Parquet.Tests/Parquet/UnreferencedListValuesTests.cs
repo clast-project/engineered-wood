@@ -176,9 +176,9 @@ public class UnreferencedListValuesTests : IDisposable
         Assert.Equal([2L, 3L], Enumerable.Range(0, 2).Select(i => ((Int64Array)read.Values).GetValue(i)!.Value));
     }
 
-    private async Task<IArrowArray> ReadBackAsync(IArrowArray column)
+    private async Task<IArrowArray> ReadBackAsync(IArrowArray column, bool nullable = true)
     {
-        var schema = new ArrowSchema.Builder().Field(new Field("c", column.Data.DataType, true)).Build();
+        var schema = new ArrowSchema.Builder().Field(new Field("c", column.Data.DataType, nullable)).Build();
         string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N") + ".parquet");
         await using (var file = new LocalSequentialFile(path))
         {
@@ -276,5 +276,44 @@ public class UnreferencedListValuesTests : IDisposable
         var leaf = read.Values is RunEndEncodedArray ree ? RunEndEncoding.Expand(ree) : read.Values;
         Assert.Equal([7L, 7L, 9L], Enumerable.Range(0, 3).Select(i => ((Int64Array)leaf).GetValue(i)!.Value));
         Assert.Equal([0, 2, 2, 3], read.ValueOffsets.ToArray());
+    }
+
+    [Fact]
+    public async Task AListOfRunEndEncodedValues_KeepsANullRun()
+    {
+        // Review of #480: a run-end encoded array carries its nulls in its values, not in a validity bitmap, so its
+        // own IsNull is false everywhere; a nested leaf's definition levels must come from the runs. Row 0 = [7,
+        // null], row 1 = [null]; values = runs 7x1, null x2.
+        var values = new RunEndEncodedArray(
+            new Int32Array.Builder().Append(1).Append(3).Build(),
+            new Int64Array.Builder().Append(7).AppendNull().Build());
+        var listType = new ListType(new Field("element", values.Data.DataType, true));
+        var list = new ListArray(listType, 2, Offsets(0, 2, 3), values, ArrowBuffer.Empty, nullCount: 0);
+
+        var read = (ListArray)await ReadBackAsync(list);
+
+        var leaf = read.Values is RunEndEncodedArray ree ? RunEndEncoding.Expand(ree) : read.Values;
+        Assert.Equal([0, 2, 3], read.ValueOffsets.ToArray());
+        Assert.Equal(7L, ((Int64Array)leaf).GetValue(0));
+        Assert.True(leaf.IsNull(1));
+        Assert.True(leaf.IsNull(2));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ARequiredStructsFieldThatIsASliceOrLonger_WritesTheStructsRows(bool sliced)
+    {
+        // Review of #480: a required top-level struct gives its children no definition levels, so they took the
+        // flat path, which encoded the child's buffers from slot 0 and for as many values as it held. Struct rows
+        // = 2; the child is [10, 11, 12] sliced from 1 (rows 11, 12), or the whole of it (rows 10, 11).
+        var child = sliced ? Longs(10, 11, 12).Slice(1, 2) : Longs(10, 11, 12);
+        var structType = new StructType([new Field("x", Int64Type.Default, false)]);
+        var column = new StructArray(structType, 2, [child], ArrowBuffer.Empty, nullCount: 0);
+
+        var read = (StructArray)await ReadBackAsync(column, nullable: false);
+
+        var x = (Int64Array)read.Fields[0];
+        Assert.Equal(sliced ? [11L, 12L] : [10L, 11L], Enumerable.Range(0, 2).Select(i => x.GetValue(i)!.Value));
     }
 }
