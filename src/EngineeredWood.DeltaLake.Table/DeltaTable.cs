@@ -4988,7 +4988,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Decimal32/64) to the ones it does, so every file of a column has one physical form. Then refuse
         // what has no faithful encoding at all — nanosecond and second timestamps: creation and schema
         // evolution reject those via SchemaConverter, but a write into an EXISTING table converts no schema.
-        batches = NormalizeUnlessHostOwnsBytes(batches);
+        batches = NormalizeUnlessHostOwnsBytes(batches, snapshot.Metadata.PartitionColumns);
         foreach (var b in batches)
             SchemaConverter.ThrowIfUnwritableType(b.Schema, convertibleTypesAllowed: HostOwnsBytes);
 
@@ -5715,8 +5715,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     ///
     /// <para>Accepts a PHYSICAL name wherever the logical one would do, matching
     /// <c>ColumnMappingRecursive</c>'s own tolerance — a batch read out of a data file and handed straight
-    /// back is legal input, and the guard must never refuse what the rename would have accepted. Top level
-    /// only: a stray nested field is a narrower mistake and not the one measured here.</para>
+    /// back is legal input, and the guard must never refuse what the rename would have accepted.</para>
+    ///
+    /// <para>Nested fields are checked too, wherever the DECLARED type is a struct, array or map:
+    /// <c>ColumnMappingRecursive</c> passes an unmatched nested field through just as it does a top-level one,
+    /// so it would be written all the same. A column declared as a primitive is not walked, so a host's own
+    /// struct representation of one (a variant as metadata/value binaries) is not mistaken for extra
+    /// fields.</para>
     /// </summary>
     private static void ThrowIfUndeclaredColumns(
         IReadOnlyList<RecordBatch> batches, Schema.StructType writeSchema, string entryPoint)
@@ -5726,7 +5731,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             foreach (var field in batch.Schema.FieldsList)
             {
                 if (DeclaresColumn(writeSchema, field.Name))
+                {
+                    ThrowIfUndeclaredNested(field.DataType, FindDeclared(writeSchema.Fields, field.Name)!.Type,
+                        field.Name, entryPoint);
                     continue;
+                }
 
                 bool looksLikeReadMetadata =
                     field.Name.StartsWith(DeltaMetadataColumns.DefaultPrefix, StringComparison.Ordinal)
@@ -5769,8 +5778,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     private bool HostOwnsBytes => _options.DataFileWriter is not null;
 
-    private IReadOnlyList<RecordBatch> NormalizeUnlessHostOwnsBytes(IReadOnlyList<RecordBatch> batches) =>
-        HostOwnsBytes ? batches : WriteTypeNormalization.NormalizeAll(batches);
+    /// <summary>The write entry points' conversion. Under a host writer the data columns stay as given, but
+    /// the partition columns are still converted: their values become log metadata the library formats,
+    /// not bytes the host writes.</summary>
+    private IReadOnlyList<RecordBatch> NormalizeUnlessHostOwnsBytes(
+        IReadOnlyList<RecordBatch> batches, IReadOnlyList<string> partitionColumns)
+    {
+        if (!HostOwnsBytes)
+            return WriteTypeNormalization.NormalizeAll(batches);
+        if (partitionColumns.Count == 0)
+            return batches;
+        return batches.Select(b => WriteTypeNormalization.NormalizeColumns(b, partitionColumns)).ToList();
+    }
 
     private RecordBatch NormalizeUnlessHostOwnsBytes(RecordBatch batch) =>
         HostOwnsBytes ? batch : WriteTypeNormalization.Normalize(batch);
@@ -5890,6 +5909,34 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _ => type.GetType().Name,
     };
 
+    private static void ThrowIfUndeclaredNested(
+        Apache.Arrow.Types.IArrowType supplied, DeltaDataType declared, string path, string entryPoint)
+    {
+        switch (supplied, declared)
+        {
+            case (Apache.Arrow.Types.StructType st, StructType d):
+                foreach (var child in st.Fields)
+                {
+                    var match = FindDeclared(d.Fields, child.Name)
+                        ?? throw new ArgumentException(
+                            $"{entryPoint}: the batch has a nested field '{path}.{child.Name}' that the table does "
+                            + "not declare. It would be written into the data file, where a Delta reader would never "
+                            + "show it. Drop it from the batch, or ALTER the table to declare it. "
+                            + $"'{path}' declares: " + string.Join(", ", d.Fields.Select(f => "'" + f.Name + "'")) + ".",
+                            "batches");
+                    ThrowIfUndeclaredNested(child.DataType, match.Type, path + "." + child.Name, entryPoint);
+                }
+                break;
+            case (Apache.Arrow.Types.ListType lt, ArrayType a):
+                ThrowIfUndeclaredNested(lt.ValueDataType, a.ElementType, path + ".element", entryPoint);
+                break;
+            case (Apache.Arrow.Types.MapType mt, MapType m):
+                ThrowIfUndeclaredNested(mt.KeyField.DataType, m.KeyType, path + ".key", entryPoint);
+                ThrowIfUndeclaredNested(mt.ValueField.DataType, m.ValueType, path + ".value", entryPoint);
+                break;
+        }
+    }
+
     /// <summary>True when <paramref name="arrowName"/> names a top-level field of <paramref name="schema"/>,
     /// by its logical name or by its column-mapping physical name — the same either-name rule
     /// <c>ColumnMappingRecursive.FindField</c> applies when renaming.</summary>
@@ -5967,7 +6014,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
         // Same normalization and unwritable-type rule as the committing write path; this entry point bypasses it.
-        batches = NormalizeUnlessHostOwnsBytes(batches);
+        batches = NormalizeUnlessHostOwnsBytes(batches, CurrentSnapshot.Metadata.PartitionColumns);
         foreach (var b in batches)
             SchemaConverter.ThrowIfUnwritableType(b.Schema, convertibleTypesAllowed: HostOwnsBytes);
         if (IsIcebergCompat)

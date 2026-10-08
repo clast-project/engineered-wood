@@ -54,6 +54,10 @@ internal static class CdfWriter
 
         // Canonical Arrow forms, as for data files: change rows are often read back from a data file.
         rows = WriteTypeNormalization.Normalize(rows);
+        // Every change file is written here, including those built from rows a DML path read back: a
+        // foreign TIMESTAMP(NANOS) reads as a nanosecond column, which cannot be stored under a Delta
+        // timestamp. The reader produces no other unwritable type, so this refuses only that.
+        SchemaConverter.ThrowIfUnwritableType(rows.Schema);
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         if (mappingMode != ColumnMappingMode.None)
             rows = ColumnMappingRecursive.ToPhysical(rows, snapshot.Schema, mappingMode);

@@ -96,6 +96,40 @@ internal static class WriteTypeNormalization
         return converted ?? batches;
     }
 
+    /// <summary>
+    /// <see cref="Normalize(RecordBatch)"/> restricted to the columns named — for a host writer, which owns
+    /// the data bytes and is handed batches unconverted, but whose PARTITION values are the library's to
+    /// format: the split has no form for Date64 or the narrow decimals.
+    /// </summary>
+    public static RecordBatch NormalizeColumns(RecordBatch batch, IReadOnlyCollection<string> names)
+    {
+        if (names.Count == 0)
+            return batch;
+
+        bool any = false;
+        foreach (var field in batch.Schema.FieldsList)
+            any |= names.Contains(field.Name) && Needs(field.DataType);
+        if (!any)
+            return batch;
+
+        var fields = new List<Field>(batch.ColumnCount);
+        var columns = new List<IArrowArray>(batch.ColumnCount);
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var field = batch.Schema.FieldsList[i];
+            if (!names.Contains(field.Name))
+            {
+                fields.Add(field);
+                columns.Add(batch.Column(i));
+                continue;
+            }
+            var data = Normalize(batch.Column(i).Data, field.Name, visible: null);
+            fields.Add(WithType(field, data.DataType));
+            columns.Add(ArrowArrayFactory.BuildArray(data));
+        }
+        return new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
+    }
+
     private static bool Needs(IArrowType type) => type switch
     {
         // By TypeId: every Arrow decimal type derives from FixedSizeBinaryType.

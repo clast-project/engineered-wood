@@ -1147,6 +1147,122 @@ public class SchemaValidationTests : IDisposable
         Assert.Contains("\"p\":\"2024-03-01\"", log);
     }
 
+    // ── Change files built from rows read back ────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task DeletionVectorDelete_WritingChangeRowsWithAForeignNanosecondTimestamp_IsRefused()
+    {
+        // A deletion-vector DELETE rewrites no data file, but with the change feed on it writes the deleted
+        // rows, read back from the file, into _change_data.
+        var zoned = new TimestampType(TimeUnit.Microsecond, "UTC");
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(Long("id"), new Field("t", zoned, true)),
+            enableDeletionVectors: true,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" });
+        await CommitForeignNanosecondFileAsync(table, "foreign.parquet", 1);
+        long version = table.CurrentSnapshot.Version;
+
+        await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.DeleteAsync(
+            b => new BooleanArray.Builder().AppendRange(
+                Enumerable.Range(0, b.Length).Select(i => ((Int64Array)b.Column(b.Schema.GetFieldIndex("id"))).GetValue(i) == 1)).Build()));
+
+        Assert.Equal(version, table.CurrentSnapshot.Version);
+        Assert.DoesNotContain(Directory.EnumerateFiles(_tempDir, "*.parquet", SearchOption.AllDirectories),
+            f => f.Contains("_change_data"));
+    }
+
+    // ── Undeclared nested fields ──────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Write_UndeclaredNestedStructField_IsRefused()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(Struct("s", Long("a"))));
+
+        var structType = new ArrowStructType([Long("a"), new Field("extra", Int32Type.Default, true)]);
+        var batch = new RecordBatch(Schema(new Field("s", structType, true)),
+            [new StructArray(structType, 1,
+                [new Int64Array.Builder().Append(1).Build(), new Int32Array.Builder().Append(2).Build()],
+                ArrowBuffer.Empty)], 1);
+
+        var ex = await MistypedAsync(async () => await table.WriteAsync([batch]));
+        Assert.Contains("'s.extra'", ex.Message);
+        await MistypedAsync(async () => await table.WriteDataFilesAsync([batch]));
+        Assert.Empty(Directory.EnumerateFiles(_tempDir, "*.parquet", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task Write_UndeclaredFieldInAListOfStructs_IsRefused()
+    {
+        var declaredElement = new ArrowStructType([Long("a")]);
+        await using var table = await DeltaTable.CreateAsync(Fs,
+            Schema(new Field("l", new ListType(new Field("element", declaredElement, true)), true)));
+
+        var element = new ArrowStructType([Long("a"), Long("extra")]);
+        var listType = new ListType(new Field("element", element, true));
+        var values = new StructArray(element, 1,
+            [new Int64Array.Builder().Append(1).Build(), new Int64Array.Builder().Append(2).Build()], ArrowBuffer.Empty);
+        var batch = new RecordBatch(Schema(new Field("l", listType, true)),
+            [new ListArray(listType, 1, new ArrowBuffer(new byte[] { 0, 0, 0, 0, 1, 0, 0, 0 }), values, ArrowBuffer.Empty)], 1);
+
+        var ex = await MistypedAsync(async () => await table.WriteAsync([batch]));
+        Assert.Contains("'l.element.extra'", ex.Message);
+    }
+
+    [Fact]
+    public async Task Update_PostImageWithAnUndeclaredNestedField_IsRefused()
+    {
+        var schema = Schema(Struct("s", Long("a")));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema);
+        var declaredType = (ArrowStructType)schema.FieldsList[0].DataType;
+        await table.WriteAsync([new RecordBatch(schema,
+            [new StructArray(declaredType, 1, [new Int64Array.Builder().Append(1).Build()], ArrowBuffer.Empty)], 1)]);
+
+        var widened = new ArrowStructType([Long("a"), Long("extra")]);
+        await MistypedAsync(async () => await table.UpdateAsync(
+            b => new BooleanArray.Builder().AppendRange(Enumerable.Repeat(true, b.Length)).Build(),
+            b => new RecordBatch(Schema(new Field("s", widened, true)),
+                [new StructArray(widened, b.Length,
+                    [((StructArray)b.Column(0)).Fields[0], new Int64Array.Builder().AppendRange(Enumerable.Repeat(9L, b.Length)).Build()],
+                    ArrowBuffer.Empty)], b.Length)));
+    }
+
+    [Fact]
+    public async Task Write_OmittingADeclaredNestedField_IsStillAllowed()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(Struct("s", Long("a"), Long("b"))));
+
+        var partial = new ArrowStructType([Long("b")]);
+        await table.WriteAsync([new RecordBatch(Schema(new Field("s", partial, true)),
+            [new StructArray(partial, 1, [new Int64Array.Builder().Append(1).Build()], ArrowBuffer.Empty)], 1)]);
+    }
+
+    // ── A host writer's partition values ──────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Write_UnderAHostWriter_ConvertsPartitionColumnsButNotData()
+    {
+        // The host owns the data bytes, so `b` reaches it as FixedSizeBinary. The partition VALUE is log
+        // metadata the library formats, and the split has no form for Date64, so `p` is still converted.
+        var writer = new CapturingWriter();
+#pragma warning disable EWDELTA0001 // codec seam is experimental
+        var options = DeltaTableOptions.Default with { DataFileWriter = writer };
+#pragma warning restore EWDELTA0001
+        await using var table = await DeltaTable.CreateAsync(Fs,
+            Schema(new Field("p", Date32Type.Default, true), new Field("b", BinaryType.Default, true)),
+            options, partitionColumns: ["p"]);
+
+        var batch = new RecordBatch(
+            Schema(new Field("p", Date64Type.Default, true), new Field("b", new FixedSizeBinaryType(4), true)),
+            [new Date64Array.Builder().Append(new DateTime(2024, 3, 1)).Build(), FixedSizeBinary(4, 1, [1, 2, 3, 4])], 1);
+
+        var files = await table.WriteDataFilesAsync([batch]);
+        Assert.Equal("2024-03-01", Assert.Single(files).PartitionValues!["p"]);
+        var handed = Assert.Single(writer.Received);
+        Assert.IsType<FixedSizeBinaryArray>(handed.Column(handed.Schema.GetFieldIndex("b")));
+
+        await table.WriteAsync([batch]);
+        Assert.Equal(2, writer.Received.Count);
+    }
+
     // ── Integer to decimal widening ───────────────────────────────────────────────────────────────────
 
     [Theory]
