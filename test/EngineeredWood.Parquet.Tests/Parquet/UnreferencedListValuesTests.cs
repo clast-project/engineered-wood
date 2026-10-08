@@ -190,4 +190,71 @@ public class UnreferencedListValuesTests : IDisposable
         await using var reader = new ParquetFileReader(input, ownsFile: false);
         return (await reader.ReadRowGroupAsync(0)).Column(0);
     }
+
+    // Review of #480: rebuilding a leaf in level order used hand-written copies for a few types, so any other
+    // layout threw once a rebuild was needed, and those copies read a sliced child's buffers from slot 0. Each
+    // case: row 0 = [v0], row 1 = null over v1, and v2 trailing, referenced by nothing. Large string/binary and
+    // view leaves are left out: a list of them is written wrong on main even when no rebuild happens (and a flat
+    // view column is refused), which is the column writer's gap, not this one.
+    public static TheoryData<string> LeafLayouts() => new() { "decimal32", "int8", "uint16", "date32" };
+
+    private static IArrowArray Leaf(string layout) => layout switch
+    {
+        "large_string" => new LargeStringArray.Builder().Append("a").Append("b").Append("c").Build(),
+        "string_view" => new StringViewArray.Builder().Append("a").Append("b").Append("c").Build(),
+        "large_binary" => new LargeBinaryArray.Builder().Append([1]).Append([2]).Append([3]).Build(),
+        "decimal32" => new Decimal32Array.Builder(new Decimal32Type(5, 2)).Append(1.25m).Append(2.5m).Append(3.75m).Build(),
+        "int8" => new Int8Array.Builder().Append(1).Append(2).Append(3).Build(),
+        "uint16" => new UInt16Array.Builder().Append(1).Append(2).Append(3).Build(),
+        "date32" => new Date32Array.Builder().Append(new DateTime(2026, 1, 1)).Append(new DateTime(2026, 1, 2))
+            .Append(new DateTime(2026, 1, 3)).Build(),
+        _ => throw new ArgumentOutOfRangeException(nameof(layout)),
+    };
+
+    private static string Render(IArrowArray array, int i) => array switch
+    {
+        StringArray a => a.GetString(i),
+        LargeStringArray a => a.GetString(i),
+        StringViewArray a => a.GetString(i),
+        BinaryArray a => string.Join(",", a.GetBytes(i).ToArray()),
+        LargeBinaryArray a => string.Join(",", a.GetBytes(i).ToArray()),
+        BinaryViewArray a => string.Join(",", a.GetBytes(i).ToArray()),
+        Decimal32Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        Decimal64Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        Decimal128Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        Int8Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        UInt16Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        Date32Array a => a.GetDateTime(i)!.Value.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture),
+        _ => throw new NotSupportedException(array.GetType().Name),
+    };
+
+    [Theory]
+    [MemberData(nameof(LeafLayouts))]
+    public async Task EveryLeafLayout_IsRebuiltInLevelOrder(string layout)
+    {
+        var values = Leaf(layout);
+        var expected = Render(values, 0);
+        var listType = new ListType(new Field("element", values.Data.DataType, true));
+        var list = new ListArray(listType, 2, Offsets(0, 1, 2), values, Validity(true, false), nullCount: 1);
+
+        var read = (ListArray)await ReadBackAsync(list);
+
+        Assert.Equal(2, read.Length);
+        Assert.Equal(1, read.GetValueLength(0));
+        Assert.Equal(expected, Render(read.Values, read.ValueOffsets[0]));
+        Assert.True(read.IsNull(1));
+    }
+
+    [Fact]
+    public async Task AListOverASlicedValuesArray_ReadsTheValuesAtTheirOffset()
+    {
+        // The values array starts at element 2 of its buffers. Row 0 = [12], row 1 = null over 13.
+        var values = (Int64Array)Longs(10, 11, 12, 13, 14).Slice(2, 3);
+        var list = new ListArray(LongList, 2, Offsets(0, 1, 2), values, Validity(true, false), nullCount: 1);
+
+        var rows = await RoundTripAsync(list);
+
+        Assert.Equal([12L], rows[0]);
+        Assert.Null(rows[1]);
+    }
 }

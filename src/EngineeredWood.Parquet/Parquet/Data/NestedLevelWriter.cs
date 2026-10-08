@@ -1,10 +1,10 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.Parquet.Metadata;
 
 namespace EngineeredWood.Parquet.Data;
@@ -221,10 +221,11 @@ internal static class NestedLevelWriter
                 }
             }
 
-            // Value encoding indexes the array BY LEVEL POSITION — whenever the level->value mapping is not the
-            // identity (phantoms, or a non-trivial struct/list mapping), or the array holds values past the last level
-            // (a list's unreferenced trailing elements, #470), rebuild the array in level order.
-            if (!identityMap || levelCount != array.Length)
+            // Value encoding indexes the array's raw buffers BY LEVEL POSITION from slot 0. So rebuild it in level
+            // order whenever the level->value mapping is not the identity (phantoms, or a non-trivial struct/list
+            // mapping), the array holds values past the last level (a list's unreferenced trailing elements, #470),
+            // or the array is a slice, as a struct's fields are when the struct is.
+            if (!identityMap || levelCount != array.Length || array.Data.Offset != 0)
                 leafArray = ExpandArray(array, valueMap, levelCount);
         }
 
@@ -244,177 +245,34 @@ internal static class NestedLevelWriter
     }
 
     /// <summary>
-    /// Expands a dense array to match level count by inserting placeholder values
-    /// at phantom positions (where valueMap[i] == -1).
+    /// The leaf array in level order: level <c>i</c> holds <paramref name="source"/>'s element
+    /// <c>valueMap[i]</c>, or null where that is -1 (a phantom level, under an absent ancestor).
     /// </summary>
-    private static IArrowArray ExpandArray(IArrowArray denseArray, int[] valueMap, int expandedLength)
+    /// <remarks>
+    /// Built from <see cref="ArrowCompute.Take(IArrowArray, List{int})"/>, which gathers every layout the writer
+    /// accepts and reads logical positions (so a sliced child is read at its own offset), and
+    /// <see cref="ArrowCompute.Scatter(IArrowArray, List{int}, int)"/> for the phantoms. Encoders and statistics
+    /// skip a phantom by its definition level; the null keeps <c>IsNull</c> truthful for anything that asks.
+    /// Without phantoms the gather alone is the answer, which also keeps run-end encoded leaves, which have no
+    /// bitmap to scatter nulls into, writable whenever no phantom needs one (#480 review).
+    /// </remarks>
+    private static IArrowArray ExpandArray(IArrowArray source, int[] valueMap, int expandedLength)
     {
-        switch (denseArray)
-        {
-            case Int32Array:
-                return ExpandFixedWidth<int>(denseArray, valueMap, expandedLength, denseArray.Data.DataType);
-            case Int64Array:
-                return ExpandFixedWidth<long>(denseArray, valueMap, expandedLength, denseArray.Data.DataType);
-            case FloatArray:
-                return ExpandFixedWidth<float>(denseArray, valueMap, expandedLength, denseArray.Data.DataType);
-            case DoubleArray:
-                return ExpandFixedWidth<double>(denseArray, valueMap, expandedLength, denseArray.Data.DataType);
-            case StringArray or BinaryArray:
-                return ExpandVarBinary(denseArray, valueMap, expandedLength, denseArray.Data.DataType);
-            case BooleanArray:
-                return ExpandBoolean((BooleanArray)denseArray, valueMap, expandedLength);
-            case FixedSizeBinaryArray fsb:
-                return ExpandFixedBytes(denseArray, valueMap, expandedLength,
-                    ((FixedSizeBinaryType)fsb.Data.DataType).ByteWidth);
-            default:
-            {
-                // Every other fixed-width type expands by its ACTUAL byte width (the old generic <long> path
-                // read 8-byte strides over narrower buffers — corrupting Int8/Int16/Date32/Time32/... once an
-                // expansion triggered). A genuinely unsupported type throws rather than corrupt.
-                int byteWidth = denseArray.Data.DataType switch
-                {
-                    Int8Type or UInt8Type => 1,
-                    Int16Type or UInt16Type or HalfFloatType => 2,
-                    UInt32Type or Date32Type or Time32Type => 4,
-                    UInt64Type or Date64Type or Time64Type or TimestampType or DurationType => 8,
-                    _ => throw new NotSupportedException(
-                        $"NestedLevelWriter.ExpandArray: unsupported leaf type {denseArray.Data.DataType.TypeId}"),
-                };
-                return ExpandFixedBytes(denseArray, valueMap, expandedLength, byteWidth);
-            }
-        }
-    }
-
-    private static IArrowArray ExpandFixedWidth<T>(
-        IArrowArray source, int[] valueMap, int expandedLength, IArrowType arrowType)
-        where T : struct
-    {
-        int elementSize = System.Runtime.CompilerServices.Unsafe.SizeOf<T>();
-        var srcSpan = source.Data.Buffers[1].Span;
-        var values = new byte[expandedLength * elementSize];
-        var bitmap = new byte[(expandedLength + 7) / 8];
-        int nullCount = 0;
-
+        var sourceRows = new List<int>(expandedLength);
+        var levels = new List<int>(expandedLength);
         for (int i = 0; i < expandedLength; i++)
         {
-            int srcIdx = valueMap[i];
-            if (srcIdx >= 0 && !source.IsNull(srcIdx))
+            if (valueMap[i] >= 0)
             {
-                srcSpan.Slice(srcIdx * elementSize, elementSize).CopyTo(values.AsSpan(i * elementSize));
-                bitmap[i >> 3] |= (byte)(1 << (i & 7));
-            }
-            else
-            {
-                nullCount++;
+                sourceRows.Add(valueMap[i]);
+                levels.Add(i);
             }
         }
 
-        var buffers = new[] { new ArrowBuffer(bitmap), new ArrowBuffer(values) };
-        var data = new ArrayData(arrowType, expandedLength, nullCount, 0, buffers);
-        return ArrowArrayFactory.BuildArray(data);
-    }
-
-    private static IArrowArray ExpandVarBinary(
-        IArrowArray source, int[] valueMap, int expandedLength, IArrowType arrowType)
-    {
-        var srcOffsets = MemoryMarshal.Cast<byte, int>(source.Data.Buffers[1].Span);
-        var srcData = source.Data.Buffers[2].Span;
-        var bitmap = new byte[(expandedLength + 7) / 8];
-        int nullCount = 0;
-
-        // First pass: compute new offsets and total data size
-        var newOffsets = new int[expandedLength + 1];
-        int totalLen = 0;
-        for (int i = 0; i < expandedLength; i++)
-        {
-            newOffsets[i] = totalLen;
-            int srcIdx = valueMap[i];
-            if (srcIdx >= 0 && !source.IsNull(srcIdx))
-            {
-                int len = srcOffsets[srcIdx + 1] - srcOffsets[srcIdx];
-                totalLen += len;
-                bitmap[i >> 3] |= (byte)(1 << (i & 7));
-            }
-            else
-            {
-                nullCount++;
-            }
-        }
-        newOffsets[expandedLength] = totalLen;
-
-        // Second pass: copy data
-        var newData = new byte[totalLen];
-        int pos = 0;
-        for (int i = 0; i < expandedLength; i++)
-        {
-            int srcIdx = valueMap[i];
-            if (srcIdx >= 0 && !source.IsNull(srcIdx))
-            {
-                int start = srcOffsets[srcIdx];
-                int len = srcOffsets[srcIdx + 1] - start;
-                srcData.Slice(start, len).CopyTo(newData.AsSpan(pos));
-                pos += len;
-            }
-        }
-
-        var offsetBytes = new byte[newOffsets.Length * sizeof(int)];
-        MemoryMarshal.AsBytes(newOffsets.AsSpan()).CopyTo(offsetBytes);
-
-        var buffers = new[] { new ArrowBuffer(bitmap), new ArrowBuffer(offsetBytes), new ArrowBuffer(newData) };
-        var data = new ArrayData(arrowType, expandedLength, nullCount, 0, buffers);
-        return ArrowArrayFactory.BuildArray(data);
-    }
-
-    private static IArrowArray ExpandBoolean(BooleanArray source, int[] valueMap, int expandedLength)
-    {
-        var valueBits = new byte[(expandedLength + 7) / 8];
-        var bitmap = new byte[(expandedLength + 7) / 8];
-        int nullCount = 0;
-
-        for (int i = 0; i < expandedLength; i++)
-        {
-            int srcIdx = valueMap[i];
-            if (srcIdx >= 0 && !source.IsNull(srcIdx))
-            {
-                if (source.GetValue(srcIdx) == true)
-                    valueBits[i >> 3] |= (byte)(1 << (i & 7));
-                bitmap[i >> 3] |= (byte)(1 << (i & 7));
-            }
-            else
-            {
-                nullCount++;
-            }
-        }
-
-        var buffers = new[] { new ArrowBuffer(bitmap), new ArrowBuffer(valueBits) };
-        return new BooleanArray(new ArrayData(BooleanType.Default, expandedLength, nullCount, 0, buffers));
-    }
-
-    private static IArrowArray ExpandFixedBytes(
-        IArrowArray source, int[] valueMap, int expandedLength, int byteWidth)
-    {
-        var srcSpan = source.Data.Buffers[1].Span;
-        var values = new byte[expandedLength * byteWidth];
-        var bitmap = new byte[(expandedLength + 7) / 8];
-        int nullCount = 0;
-
-        for (int i = 0; i < expandedLength; i++)
-        {
-            int srcIdx = valueMap[i];
-            if (srcIdx >= 0 && !source.IsNull(srcIdx))
-            {
-                srcSpan.Slice(srcIdx * byteWidth, byteWidth).CopyTo(values.AsSpan(i * byteWidth));
-                bitmap[i >> 3] |= (byte)(1 << (i & 7));
-            }
-            else
-            {
-                nullCount++;
-            }
-        }
-
-        var buffers = new[] { new ArrowBuffer(bitmap), new ArrowBuffer(values) };
-        var data = new ArrayData(source.Data.DataType, expandedLength, nullCount, 0, buffers);
-        return ArrowArrayFactory.BuildArray(data);
+        var gathered = ArrowCompute.Take(source, sourceRows);
+        return levels.Count == expandedLength
+            ? gathered
+            : ArrowCompute.Scatter(gathered, levels, expandedLength);
     }
 
     private static void DecomposeStruct(
@@ -443,10 +301,10 @@ internal static class NestedLevelWriter
             myDefLevels = new int[levelCount];
             childValueMap = new int[levelCount];
             int valueIdx = 0;
-            // A SLICED struct's children are NOT sliced with it (StructArray.Fields wraps Data.Children
-            // directly), so the child index = the struct's logical index + the struct's own offset. The struct's
-            // own IsNull applies its offset internally, so it takes the un-shifted index.
-            int childOffset = structArray.Data.Offset;
+            // StructArray.Fields slices each child with the struct (Arrow 23, probed: a struct sliced to start at
+            // row 1 hands out children with offset 1), so a child's logical index is the struct's own, and the
+            // leaf reads it through ArrowCompute.Take, which takes logical positions. (Data.Children is NOT sliced;
+            // only Fields is, which is what this reads.)
 
             for (int i = 0; i < levelCount; i++)
             {
@@ -461,7 +319,7 @@ internal static class NestedLevelWriter
                 }
 
                 int idx = parentValueMap?[i] ?? valueIdx++;
-                childValueMap[i] = childOffset + idx;
+                childValueMap[i] = idx;
                 myDefLevels[i] = field.IsNullable && structArray.IsNull(idx) ? myDefLevel - 1 : myDefLevel;
             }
         }
@@ -678,12 +536,11 @@ internal static class NestedLevelWriter
         var offsets = mapArray.ValueOffsets;
 
         // Build def/rep levels and the child value map (same structure as list, and for the same reason: the
-        // entries need not be consumed in order from 0, #470). Keys and values are the entries struct's children,
-        // which are not sliced with it, so an entry index is shifted by the entries' own offset.
+        // entries need not be consumed in order from 0, #470). Keys and Values are sliced with the entries struct,
+        // as every StructArray field is, so an entry index needs no shift.
         var defList = new List<int>();
         var repList = new List<int>();
         var childMap = new List<int>();
-        int entriesOffset = mapArray.KeyValues.Data.Offset;
         int inputCount = parentDefLevels?.Length ?? parentCount;
 
         int slotIdx = 0; // a STRUCT parent supplies the mapping (a null struct row still occupies a map slot)
@@ -725,7 +582,7 @@ internal static class NestedLevelWriter
                     {
                         defList.Add(repeatedDefLevel);
                         repList.Add(j == 0 ? pRep : repeatedRepLevel);
-                        childMap.Add(entriesOffset + start + j);
+                        childMap.Add(start + j);
                     }
                 }
             }
