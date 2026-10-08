@@ -570,7 +570,9 @@ delta-spark jar and collect the first argument of each `buildConfig` call.
 VACUUM); `delta.enableChangeDataFeed`; `delta.enableDeletionVectors`; `delta.enableExpiredLogCleanup`
 and `delta.logRetentionDuration` (`LogCleanup`); `delta.enableIcebergCompatV1` / `V2`;
 `delta.enableInCommitTimestamps`; `delta.enableRowTracking` and its two materialized-column names;
-`delta.enableTypeWidening`; `delta.dataSkippingStatsColumns` (kept in step with RENAME/DROP/SetSchema,
+`delta.enableTypeWidening`; `delta.isolationLevel` (DML, appends and transactions started without a level run at
+the table's level; asking for a weaker one is refused, and a value naming no level refuses data-changing commits
+with `DELTA_INVALID_ISOLATION_LEVEL`, #472); `delta.dataSkippingStatsColumns` (kept in step with RENAME/DROP/SetSchema,
 validated at CREATE) and `delta.dataSkippingNumIndexedCols`, which choose the columns that get statistics as
 Spark does; `delta.dataSkippingStringPrefixLength`, though EW's string bounds are not Spark's: it counts UTF-16
 code units where Spark counts code points for the min, and it bumps the last kept character of a max where Spark
@@ -591,7 +593,6 @@ read; they matter only to a converter. #473
 
 | Property | What EW does instead |
 |---|---|
-| `delta.isolationLevel` | DML commits at `WriteSerializable` whatever the table demands, so on a `Serializable` table it can commit past a concurrent blind append that Spark would abort on. #472 |
 | `delta.compatibility.symlinkFormatManifest.enabled` | Symlink manifests (for Presto/Athena-style readers) are not regenerated. |
 | `delta.setTransactionRetentionDuration` | Expired `txn` (idempotent-write) identifiers are never dropped from checkpoints. |
 | `delta.feature.*`, `delta.minReaderVersion`, `delta.minWriterVersion` passed as CREATE `configuration` | Spark treats these as requests to enable a feature or raise the protocol; EW does not act on them. EW derives the protocol from the features a table uses. A feature is enabled through its `CreateAsync` parameter (`columnMappingMode`, `clusteringColumns`, `enableDeletionVectors`, `enableRowTracking`), a property in `configuration` (`delta.enableDeletionVectors`, `delta.enableRowTracking`, `delta.enableInCommitTimestamps`, `delta.enableChangeDataFeed`, `delta.enableIcebergCompatV1` / `V2`, `delta.checkpointPolicy`), or the schema (`timestamp_ntz`, `variant`). There is **no** way to request a protocol version directly, or a feature that has none of these. |

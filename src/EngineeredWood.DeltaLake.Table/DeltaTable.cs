@@ -2538,11 +2538,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// wins. Use this when a write depends on a read that a concurrent writer could invalidate; the
     /// auto-committing <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> / write methods are the single-shot equivalent.</para>
     /// </summary>
-    public DeltaTransaction StartTransaction(
-        IsolationLevel isolationLevel = IsolationLevel.WriteSerializable)
+    /// <param name="isolationLevel">Null — the default — runs at the level the table demands
+    /// (<c>delta.isolationLevel</c>; <see cref="IsolationLevel.WriteSerializable"/> when unset). A stronger level
+    /// may be asked for; a weaker one is refused, since the table's level is a demand on every writer.</param>
+    /// <exception cref="ArgumentException"><paramref name="isolationLevel"/> is weaker than the table's.</exception>
+    /// <exception cref="DeltaFormatException">The table's <c>delta.isolationLevel</c> names no level
+    /// (<see cref="DeltaErrorCodes.InvalidIsolationLevel"/>).</exception>
+    public DeltaTransaction StartTransaction(IsolationLevel? isolationLevel = null)
     {
         ThrowIfDisposed();
-        return new DeltaTransaction(this, CurrentSnapshot, isolationLevel);
+        var snapshot = CurrentSnapshot;
+        return new DeltaTransaction(this, snapshot, ResolveIsolation(snapshot, isolationLevel));
     }
 
     /// <summary>
@@ -2550,19 +2556,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// positions and scan decisions were captured against — rather than on whatever is current now.
     ///
     /// <para><b>Why this exists.</b> For a transaction spanning several of the host's own statements,
-    /// <see cref="StartTransaction(IsolationLevel)"/> makes the commit loop's validation VACUOUS: it asks "what
+    /// <see cref="StartTransaction(IsolationLevel?)"/> makes the commit loop's validation VACUOUS: it asks "what
     /// landed since the latest version?", and the answer is nothing. Basing on the version the work was actually
     /// planned against is what makes the check mean something — a concurrent commit between the host's first
     /// statement and its commit is then seen and adjudicated instead of silently ignored.</para>
     ///
     /// <para>A version number is what a host that cannot keep the table open between statements can carry
-    /// across its own statement boundary; <see cref="StartTransaction(Snapshot.Snapshot, IsolationLevel)"/> is
+    /// across its own statement boundary; <see cref="StartTransaction(Snapshot.Snapshot, IsolationLevel?)"/> is
     /// for a caller already holding the snapshot itself.</para>
     /// </summary>
     /// <param name="baseVersion">The pinned version. Must exist, and must not be ahead of the current one.</param>
     public async ValueTask<DeltaTransaction> StartTransactionAsync(
         long baseVersion,
-        IsolationLevel isolationLevel = IsolationLevel.WriteSerializable,
+        IsolationLevel? isolationLevel = null,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
@@ -2577,7 +2583,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var baseSnapshot = baseVersion == CurrentSnapshot.Version
             ? CurrentSnapshot
             : await GetSnapshotAtVersionAsync(baseVersion, cancellationToken).ConfigureAwait(false);
-        return new DeltaTransaction(this, baseSnapshot, isolationLevel);
+        return new DeltaTransaction(this, baseSnapshot, ResolveIsolation(baseSnapshot, isolationLevel));
     }
 
     /// <summary>
@@ -2590,7 +2596,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// ahead of the current version.</param>
     public DeltaTransaction StartTransaction(
         Snapshot.Snapshot baseSnapshot,
-        IsolationLevel isolationLevel = IsolationLevel.WriteSerializable)
+        IsolationLevel? isolationLevel = null)
     {
         ThrowIfDisposed();
         if (baseSnapshot is null)
@@ -2603,8 +2609,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 $"Cannot base a transaction on version {baseSnapshot.Version}: the table is at "
                 + $"{CurrentSnapshot.Version}, so that version does not exist yet.");
         }
-        return new DeltaTransaction(this, baseSnapshot, isolationLevel);
+        return new DeltaTransaction(this, baseSnapshot, ResolveIsolation(baseSnapshot, isolationLevel));
     }
+
+    /// <summary>
+    /// The level a data-changing commit based on <paramref name="snapshot"/> runs at: the table's
+    /// <c>delta.isolationLevel</c> unless the caller asked for a stronger one. Read off the BASE snapshot — a
+    /// concurrent change to the property is a metadata change, which conflicts at every level, so the base and
+    /// the version the commit lands on cannot disagree about it.
+    /// </summary>
+    /// <remarks>
+    /// <para>Every DML and append entry point resolves through here, and the metadata-only commits
+    /// (properties, domains, clustering) and OPTIMIZE do not. That is Delta's split: a commit that changes no
+    /// data drops to snapshot isolation, and the metadata commits record no reads, so no level would change
+    /// their verdict. So a table with an unparseable value still takes those commits, where every data-changing
+    /// one is refused as Spark refuses it.</para>
+    /// </remarks>
+    private static IsolationLevel ResolveIsolation(
+        Snapshot.Snapshot snapshot, IsolationLevel? requested = null, string paramName = "isolationLevel") =>
+        IsolationLevelProperty.Resolve(snapshot.Metadata.Configuration, requested, paramName);
 
     /// <summary>
     /// The check every write entry point makes before it writes anything: the protocol must be one this library
@@ -3927,7 +3950,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             long committed = await CommitOccAsync(
                 snapshot, plan.Actions,
                 new ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
-                IsolationLevel.WriteSerializable, "UPDATE",
+                ResolveIsolation(snapshot), "UPDATE",
                 rebaseSafe: true, cancellationToken, written: written,
                 isBlindAppend: false).ConfigureAwait(false);
 
@@ -5667,7 +5690,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // so claiming WholeTable would be inventing detail we do not have.
             committedVersion = await CommitOccAsync(
                 snapshot, actions, ReadSet.Blind,
-                IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: isBlindAppend != false,
+                ResolveIsolation(snapshot), "WRITE", rebaseSafe: isBlindAppend != false,
                 cancellationToken, written: written, isBlindAppend: isBlindAppend).ConfigureAwait(false);
         }
         else
@@ -7486,7 +7509,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long version = await CommitOccAsync(
             snapshot, actions,
             new ReadSet { Files = removedPaths },
-            IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: true, cancellationToken,
+            ResolveIsolation(snapshot), "DELETE", rebaseSafe: true, cancellationToken,
             rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written,
             isBlindAppend: false).ConfigureAwait(false);
         return (totalDeleted, version);
@@ -7643,7 +7666,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long version = await CommitOccAsync(
             snapshot, actions,
             new ReadSet { Files = removedPaths },
-            IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: false, cancellationToken,
+            ResolveIsolation(snapshot), "DELETE", rebaseSafe: false, cancellationToken,
             written: written, isBlindAppend: false)
             .ConfigureAwait(false);
         return (totalDeleted, version);
@@ -8100,7 +8123,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return await CommitOccAsync(
             snapshot, actions,
             new ReadSet { Files = removedPaths },
-            IsolationLevel.WriteSerializable, "UPDATE", rebaseSafe: false, cancellationToken,
+            ResolveIsolation(snapshot), "UPDATE", rebaseSafe: false, cancellationToken,
             written: written, isBlindAppend: false)
             .ConfigureAwait(false);
     }
@@ -8470,16 +8493,33 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <paramref name="rowLevelDml"/> — row-level mode replaces them with the row-granular validation the rebase
     /// already performed (same-row overlap conflicts there; under WriteSerializable reads are not serialized).
     /// </summary>
+    /// <param name="serializable">Null — the default — checks at the level the table demands
+    /// (<c>delta.isolationLevel</c>). <c>true</c> asks for <see cref="IsolationLevel.Serializable"/>; <c>false</c>
+    /// for <see cref="IsolationLevel.WriteSerializable"/>, which is refused on a table that demands
+    /// Serializable.</param>
+    /// <exception cref="ArgumentException"><paramref name="serializable"/> is <c>false</c> on a table whose
+    /// <c>delta.isolationLevel</c> is Serializable.</exception>
     public async ValueTask CheckLogicalRebaseAsync(
         Snapshot.Snapshot baseSnapshot,
         IReadOnlyList<DeltaAction> plannedActions,
         IReadOnlyList<Expressions.Predicate>? readPredicates = null,
         bool readWholeTable = false,
-        bool serializable = false,
+        bool? serializable = null,
         bool rowLevelDml = false,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        // Before the early return, so a weaker level than the table demands is refused whether or not anything
+        // landed concurrently — a check that only objected under contention would read as intermittent.
+        var isolation = ResolveIsolation(
+            baseSnapshot,
+            serializable switch
+            {
+                null => null,
+                true => IsolationLevel.Serializable,
+                false => IsolationLevel.WriteSerializable,
+            },
+            nameof(serializable));
         var latest = CurrentSnapshot;
         if (latest.Version == baseSnapshot.Version)
         {
@@ -8574,7 +8614,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // which is how the divergence above became live — one call site learning something the other
             // did not. ExamineConcurrentAdds is the whole decision, third term included.
             bool examineAdds = Concurrency.ConflictChecker.ExamineConcurrentAdds(
-                serializable ? IsolationLevel.Serializable : IsolationLevel.WriteSerializable,
+                isolation,
                 Concurrency.ConflictChecker.IsBlindAppend(commitActions),
                 currentChangesMetadata);
             foreach (var a in commitActions)

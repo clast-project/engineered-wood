@@ -169,7 +169,10 @@ its own data plane can commit with real optimistic concurrency without taking th
   append exempt under WriteSerializable). Modeled on Spark's `ConflictChecker`.
 - `IsolationLevel.cs` — public enum, `WriteSerializable` (default) / `Serializable`. The two differ in
   exactly two places: whether a concurrent blind append matching read predicates conflicts, and the
-  row-level reconciliation narrowing above.
+  row-level reconciliation narrowing above. The table's `delta.isolationLevel` (`IsolationLevelProperty.cs`)
+  sets the level for every DML and append commit and for a transaction started without one; a caller may
+  ask for a stronger level, never a weaker. Metadata-only commits and OPTIMIZE do not consult it, which
+  is Delta's snapshot-isolation downgrade for commits that change no data.
 - `Log/LogCommitter.cs` — the loop itself. Protocol gate, attempt, read `readVersion+1..latest` on a
   collision, rebase hook, conflict verdict, retry, post-commit snapshot refresh, checkpoint on
   interval. It never inspects the actions beyond handing them to the log.

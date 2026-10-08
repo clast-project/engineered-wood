@@ -259,4 +259,14 @@ public static class DeltaErrorCodes
     /// <see cref="Log.LogCommitRequest.RebaseSafe"/> is how a caller says they are not portable.
     /// </remarks>
     public const string RebaseUnsafe = "DELTA_REBASE_UNSAFE";
+
+    /// <summary>
+    /// The table's <c>delta.isolationLevel</c> names no isolation level, so the level a data-changing commit
+    /// must run at is unknown. Nothing is written.
+    /// </summary>
+    /// <remarks>delta-spark raises this code, with the same meaning, from <c>IsolationLevel.fromString</c> on
+    /// every commit to such a table. Here only data-changing commits are refused; the metadata-only ones and
+    /// OPTIMIZE, which never consult the level, still land.
+    /// </remarks>
+    public const string InvalidIsolationLevel = "DELTA_INVALID_ISOLATION_LEVEL";
 }
