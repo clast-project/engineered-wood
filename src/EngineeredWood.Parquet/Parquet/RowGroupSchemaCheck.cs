@@ -26,7 +26,18 @@ internal static class RowGroupSchemaCheck
     {
         var expected = fileSchema.FieldsList;
         var actual = batch.Schema.FieldsList;
-        CheckChildren(expected, actual, i => batch.Column(i), prefix: null, AllSlots);
+        CheckChildren(expected, actual, i => batch.Column(i), prefix: null, AllSlots, firstBatch: false);
+    }
+
+    /// <summary>
+    /// Refuses a first batch with a null in a column its own schema makes required (a non-nullable field, or a map
+    /// key). Arrow does not enforce the nullable flag, and the writers encode a required column without definition
+    /// levels, so each such null would be written as a value (an Int32 null reads back as 0).
+    /// </summary>
+    public static void EnsureWritable(RecordBatch batch)
+    {
+        var fields = batch.Schema.FieldsList;
+        CheckChildren(fields, fields, i => batch.Column(i), prefix: null, AllSlots, firstBatch: true);
     }
 
     // The positions of an array that the writers actually encode, in the array's own index space (what IsNull
@@ -38,7 +49,7 @@ internal static class RowGroupSchemaCheck
 
     private static void CheckChildren(
         IReadOnlyList<Field> expected, IReadOnlyList<Field> actual, Func<int, IArrowArray?> arrayAt, string? prefix,
-        WrittenSlots slots)
+        WrittenSlots slots, bool firstBatch)
     {
         int common = Math.Min(expected.Count, actual.Count);
         for (int i = 0; i < common; i++)
@@ -49,7 +60,7 @@ internal static class RowGroupSchemaCheck
                 throw Mismatch(path,
                     $"the file has column '{Join(prefix, expected[i].Name)}' in this position");
             }
-            CheckField(expected[i], actual[i], arrayAt(i), path, slots);
+            CheckField(expected[i], actual[i], arrayAt(i), path, slots, firstBatch);
         }
 
         if (actual.Count > common)
@@ -61,16 +72,22 @@ internal static class RowGroupSchemaCheck
     // alwaysRequired: map keys, which ArrowToSchemaConverter and NestedLevelWriter write as required whatever the
     // Arrow key field says.
     private static void CheckField(
-        Field expected, Field actual, IArrowArray? array, string path, WrittenSlots slots, bool alwaysRequired = false)
+        Field expected, Field actual, IArrowArray? array, string path, WrittenSlots slots, bool firstBatch,
+        bool alwaysRequired = false)
     {
         if ((alwaysRequired || !expected.IsNullable) && HasWrittenNull(array, slots))
+        {
+            if (firstBatch)
+                throw NullInRequired(path, alwaysRequired);
             throw Mismatch(path, "the file's column is required, and the row group has nulls in it");
+        }
 
-        CheckType(expected.DataType, actual.DataType, array, path, slots);
+        CheckType(expected.DataType, actual.DataType, array, path, slots, firstBatch);
     }
 
     private static void CheckType(
-        IArrowType expected, IArrowType actual, IArrowArray? array, string path, WrittenSlots slots)
+        IArrowType expected, IArrowType actual, IArrowArray? array, string path, WrittenSlots slots,
+        bool firstBatch)
     {
         if (expected.TypeId != actual.TypeId)
             throw TypeMismatch(path, expected, actual);
@@ -81,33 +98,34 @@ internal static class RowGroupSchemaCheck
                 var ae = (ExtensionType)actual;
                 if (!string.Equals(ee.Name, ae.Name, StringComparison.Ordinal))
                     throw TypeMismatch(path, expected, actual);
-                CheckType(ee.StorageType, ae.StorageType, (array as ExtensionArray)?.Storage, path, slots);
+                CheckType(ee.StorageType, ae.StorageType, (array as ExtensionArray)?.Storage, path, slots, firstBatch);
                 return;
 
             case StructType es:
                 var sa = array as StructArray;
                 CheckChildren(es.Fields, ((StructType)actual).Fields, i => sa?.Fields[i], path,
-                    sa is null ? AllSlots : StructChildSlots(sa, slots));
+                    sa is null ? AllSlots : StructChildSlots(sa, slots), firstBatch);
                 return;
 
             case MapType em:
                 var am = (MapType)actual;
                 var ma = array as MapArray;
                 var entries = ma is null ? AllSlots : ListChildSlots(ma, slots);
-                CheckField(em.KeyField, am.KeyField, ma?.Keys, path + ".key", entries, alwaysRequired: true);
-                CheckField(em.ValueField, am.ValueField, ma?.Values, path + ".value", entries);
+                CheckField(em.KeyField, am.KeyField, ma?.Keys, path + ".key", entries, firstBatch,
+                    alwaysRequired: true);
+                CheckField(em.ValueField, am.ValueField, ma?.Values, path + ".value", entries, firstBatch);
                 return;
 
             case ListType el:
                 var la = array as ListArray;
                 CheckField(el.ValueField, ((ListType)actual).ValueField, la?.Values, path + ".element",
-                    la is null ? AllSlots : ListChildSlots(la, slots));
+                    la is null ? AllSlots : ListChildSlots(la, slots), firstBatch);
                 return;
 
             case LargeListType ell:
                 var lla = array as LargeListArray;
                 CheckField(ell.ValueField, ((LargeListType)actual).ValueField, lla?.Values, path + ".element",
-                    lla is null ? AllSlots : LargeListChildSlots(lla, slots));
+                    lla is null ? AllSlots : LargeListChildSlots(lla, slots), firstBatch);
                 return;
 
             case FixedSizeListType ef:
@@ -116,20 +134,20 @@ internal static class RowGroupSchemaCheck
                     throw TypeMismatch(path, expected, actual);
                 var fa = array as FixedSizeListArray;
                 CheckField(ef.ValueField, af.ValueField, fa?.Values, path + ".element",
-                    fa is null ? AllSlots : FixedSizeListChildSlots(fa, ef.ListSize, slots));
+                    fa is null ? AllSlots : FixedSizeListChildSlots(fa, ef.ListSize, slots), firstBatch);
                 return;
 
             // The run ends only say where each run stops, and Parquet never sees them; the values are what is
             // encoded, so they are what must match.
             case RunEndEncodedType er:
                 CheckType(er.ValuesDataType, ((RunEndEncodedType)actual).ValuesDataType,
-                    (array as RunEndEncodedArray)?.Values, path, AllSlots);
+                    (array as RunEndEncodedArray)?.Values, path, AllSlots, firstBatch);
                 return;
 
             case DictionaryType ed:
                 var ad = (DictionaryType)actual;
-                CheckType(ed.IndexType, ad.IndexType, null, path, AllSlots);
-                CheckType(ed.ValueType, ad.ValueType, null, path, AllSlots);
+                CheckType(ed.IndexType, ad.IndexType, null, path, AllSlots, firstBatch);
+                CheckType(ed.ValueType, ad.ValueType, null, path, AllSlots, firstBatch);
                 return;
         }
 
@@ -257,6 +275,14 @@ internal static class RowGroupSchemaCheck
     private static ArgumentException Mismatch(string path, string detail) =>
         new($"The row group does not match the file's schema at column '{path}': {detail}. A Parquet file has "
             + "one schema, fixed by the first batch written; write a batch of a different shape to a new file.",
+            "batch");
+
+    private static ArgumentException NullInRequired(string path, bool mapKey) =>
+        new($"The batch has nulls in column '{path}', which "
+            + (mapKey ? "is a map key, and Parquet map keys are always required"
+                : "its schema declares non-nullable, so Parquet writes it as required")
+            + "; a required column cannot hold a null, and the writers would encode each one as a value. "
+            + (mapKey ? "Remove the null keys." : "Declare the field nullable, or remove the nulls."),
             "batch");
 
     private static string Describe(IArrowType type) => type switch

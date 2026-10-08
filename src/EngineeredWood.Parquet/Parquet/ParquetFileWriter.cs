@@ -95,6 +95,13 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         // rows. Only paid when a column actually carries an offset.
         batch = CompactSlicedColumns(batch);
 
+        // Nothing below enforces the nullable flag: a required column is encoded without definition levels, so a
+        // null in it would be written as a value. Later batches get this from RowGroupSchemaCheck.EnsureMatches.
+        // Checked before the declared schema and the shredding layout are captured, so a refused first batch
+        // leaves the writer as it was.
+        if (_arrowSchema is null)
+            RowGroupSchemaCheck.EnsureWritable(batch);
+
         // Parquet has no second-precision unit, so such a column is rescaled to milliseconds here —
         // before the schema is captured, so what the footer declares and what the encoders write are
         // the same thing. The caller's original units are preserved separately, in ARROW:schema, and
