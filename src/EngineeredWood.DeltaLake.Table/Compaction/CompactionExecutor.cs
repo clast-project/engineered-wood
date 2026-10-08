@@ -78,6 +78,8 @@ internal static class CompactionExecutor
         // column of every other row. Unpartitioned tables form a single group (behaviour unchanged).
         // Canonical keys tolerate mixed logical/physical partitionValues vintages under column mapping.
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        // One table, one selection: built once for every file this operation writes.
+        var statsSelection = Stats.StatsColumnSelection.For(snapshot.Schema, snapshot.Metadata);
         var logicalToPhysical = mappingMode != ColumnMappingMode.None
             ? ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode)
             : null;
@@ -137,7 +139,7 @@ internal static class CompactionExecutor
             (bool compacted, nextRowId) = await CompactGroupAsync(
                 fs, snapshot, options, parquetOptions, parquetReadOptions, group, targetSchema, mappingMode,
                 dvReader, actions, now, rowTrackingEnabled, nextRowId, materialize, matRowIdName, matRowVerName,
-                dataFileWriter, dataFileReader, cancellationToken, written).ConfigureAwait(false);
+                dataFileWriter, dataFileReader, cancellationToken, written, statsSelection).ConfigureAwait(false);
             anyAdds |= compacted;
         }
 
@@ -181,7 +183,8 @@ internal static class CompactionExecutor
         IDataFileWriter? dataFileWriter,
         IDataFileReader? dataFileReader,
         CancellationToken cancellationToken,
-        WrittenFileLedger? written)
+        WrittenFileLedger? written,
+        Stats.StatsColumnSelection statsSelection)
     {
         // Read all LIVE data from the group's files, widening types if needed. A candidate may carry a
         // deletion vector (DELETE marks rows rather than rewriting), and those rows MUST be excluded —
@@ -436,7 +439,7 @@ internal static class CompactionExecutor
                 if (rowTrackingEnabled)
                     nextRowId += currentRowCount;
 
-                string? stats = Stats.StatsCollector.Collect(currentBatches);
+                string? stats = Stats.StatsCollector.Collect(currentBatches, statsSelection);
 
                 actions.Add(new AddFile
                 {

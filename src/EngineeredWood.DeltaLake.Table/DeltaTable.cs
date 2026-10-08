@@ -199,6 +199,30 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     private static ParquetReadOptions DataFileReadOptions(ParquetReadOptions options) =>
         WithVariantExtension(options) with { DecimalOutput = DecimalOutputKind.Decimal128 };
 
+    private sealed record StatsSelectionEntry(
+        Schema.StructType Schema, MetadataAction Metadata, Stats.StatsColumnSelection Selection);
+
+    private StatsSelectionEntry? _statsSelection;
+
+    /// <summary>
+    /// Which columns of a data file get statistics (the table's data-skipping properties), for
+    /// <paramref name="schema"/> under <paramref name="metadata"/>. Cached per pair, as the write options are: a
+    /// write produces a file per partition, and the selection is the same for all of them. The entry is one
+    /// reference, so a concurrent reader sees a whole pair or the previous one.
+    /// </summary>
+    private Stats.StatsColumnSelection StatsSelection(Schema.StructType schema, MetadataAction metadata)
+    {
+        if (_statsSelection is { } cached
+            && ReferenceEquals(cached.Schema, schema) && ReferenceEquals(cached.Metadata, metadata))
+        {
+            return cached.Selection;
+        }
+
+        var selection = Stats.StatsColumnSelection.For(schema, metadata);
+        _statsSelection = new StatsSelectionEntry(schema, metadata, selection);
+        return selection;
+    }
+
     private static ParquetReadOptions WithVariantExtension(ParquetReadOptions options)
     {
         var registry = options.ExtensionRegistry;
@@ -416,6 +440,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // Spark validates the property at CREATE TABLE and on every later metadata update, so a value it would
         // refuse makes the table one Spark can no longer ALTER.
         DataSkippingStatsColumns.Validate(deltaSchema, partitionColumns, configuration);
+        Stats.StatsColumnSelection.Validate(configuration);
 
         // Set protocol versions based on column mapping mode
         int minReaderVersion = 1;
@@ -3990,7 +4015,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 fileSize = file.Position;
             }
 
-            string? stats = Stats.StatsCollector.Collect(statsBatches);
+            string? stats = Stats.StatsCollector.Collect(
+                statsBatches, StatsSelection(snapshot.Schema, snapshot.Metadata));
 
             // Remove old, add new
             actions.Add(new RemoveFile
@@ -5088,6 +5114,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 }
             }
             repartitioned = !repartitionTo.SequenceEqual(snapshot.Metadata.PartitionColumns);
+            if (repartitioned)
+            {
+                // The metaData this commits carries the new partition columns, and Spark validates
+                // delta.dataSkippingStatsColumns against them on that same update: an entry naming a column
+                // that becomes a partition column is refused there, and so here, before anything is written.
+                DataSkippingStatsColumns.Validate(
+                    snapshot.Schema, repartitionTo, snapshot.Metadata.Configuration);
+            }
         }
 
         if (dynamicPartitionOverwrite && snapshot.Metadata.PartitionColumns.Count == 0)
@@ -5126,6 +5160,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // which are keyed by the PHYSICAL column name under mapping — the Delta-spec convention).
         // A repartitioning overwrite splits by the NEW columns (the metaData swap is emitted below).
         var partitionColumns = repartitioned ? repartitionTo! : snapshot.Metadata.PartitionColumns;
+        // Under the partition columns the files are split by: a repartition's new ones are not in the files, and
+        // its old ones are.
+        var statsSelection = repartitioned
+            ? Stats.StatsColumnSelection.For(
+                snapshot.Schema, snapshot.Metadata with { PartitionColumns = partitionColumns })
+            : StatsSelection(snapshot.Schema, snapshot.Metadata);
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
             snapshot.Schema, mappingMode);
@@ -5312,7 +5352,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (_options.CollectStats ||
                     Schema.IcebergCompat.RequiresNumRecords(icebergVersion))
                     // Stats keys are PHYSICAL at every level under mapping (nested struct leaves included).
-                    stats = CollectStats(ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode));
+                    stats = CollectStats(
+                        ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode), statsSelection);
 
                 actions.Add(new AddFile
                 {
@@ -6077,6 +6118,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var partitionColumns = snapshot.Metadata.PartitionColumns;
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(writeSchema, mappingMode);
+        // The committed properties: a pending schema change's rewrite of delta.dataSkippingStatsColumns is not
+        // visible here, so a column renamed in the same transaction may go without statistics until the next
+        // write, which is never wrong.
+        var statsSelection = StatsSelection(writeSchema, snapshot.Metadata);
         var files = new List<WrittenDataFile>();
 
         string? matRowIdName = null;
@@ -6196,7 +6241,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 // Stats keyed PHYSICAL at every level, matching the streaming writer + spec readers.
                 string? stats = _options.CollectStats
-                    ? CollectStats(ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode))
+                    ? CollectStats(
+                        ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode), statsSelection)
                     : null;
 
                 files.Add(new WrittenDataFile(
@@ -7543,7 +7589,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             Size = fileSize,
             ModificationTime = now,
             DataChange = true,
-            Stats = Stats.StatsCollector.Collect(statsBatches),
+            Stats = Stats.StatsCollector.Collect(
+                statsBatches, StatsSelection(snapshot.Schema, snapshot.Metadata)),
             BaseRowId = rowTrackingEnabled ? baseRowId : null,
             DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
         };
@@ -9167,8 +9214,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _ => false,
     };
 
-    private static string? CollectStats(RecordBatch batch) =>
-        Stats.StatsCollector.Collect(batch);
+    private static string? CollectStats(RecordBatch batch, Stats.StatsColumnSelection selection) =>
+        Stats.StatsCollector.Collect(batch, selection);
 
     private void ThrowIfDisposed()
     {

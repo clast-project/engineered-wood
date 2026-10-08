@@ -570,7 +570,11 @@ delta-spark jar and collect the first argument of each `buildConfig` call.
 VACUUM); `delta.enableChangeDataFeed`; `delta.enableDeletionVectors`; `delta.enableExpiredLogCleanup`
 and `delta.logRetentionDuration` (`LogCleanup`); `delta.enableIcebergCompatV1` / `V2`;
 `delta.enableInCommitTimestamps`; `delta.enableRowTracking` and its two materialized-column names;
-`delta.enableTypeWidening`.
+`delta.enableTypeWidening`; `delta.dataSkippingStatsColumns` (kept in step with RENAME/DROP/SetSchema,
+validated at CREATE) and `delta.dataSkippingNumIndexedCols`, which choose the columns that get statistics as
+Spark does; `delta.dataSkippingStringPrefixLength`, though EW's string bounds are not Spark's: it counts UTF-16
+code units where Spark counts code points for the min, and it bumps the last kept character of a max where Spark
+appends U+007F or U+10FFFF. Both are valid bounds.
 
 *Not read, with consequences for a table EW writes to:*
 
@@ -578,8 +582,6 @@ and `delta.logRetentionDuration` (`LogCleanup`); `delta.enableIcebergCompatV1` /
 |---|---|
 | `delta.isolationLevel` | DML commits at `WriteSerializable` whatever the table demands, so on a `Serializable` table it can commit past a concurrent blind append that Spark would abort on. #472 |
 | `delta.universalFormat.enabledFormats` (with `…iceberg.atomicConversion.supported`, `delta.universalformat.config.*`) | Writes to a UniForm table without generating Iceberg metadata, so Iceberg readers see stale data. Nothing refuses the write: UniForm rides on `icebergCompatV2`, which EW supports. #473 |
-| `delta.dataSkippingStatsColumns` | Kept in step with RENAME/DROP/SetSchema and validated at CREATE, as Spark does, but not yet used to choose stats columns: every eligible column gets stats. #471 |
-| `delta.dataSkippingNumIndexedCols`, `delta.dataSkippingStringPrefixLength` | Statistics for every eligible column, with a fixed string-prefix length. Never wrong, but larger on wide tables. #471 |
 | `delta.compatibility.symlinkFormatManifest.enabled` | Symlink manifests (for Presto/Athena-style readers) are not regenerated. |
 | `delta.setTransactionRetentionDuration` | Expired `txn` (idempotent-write) identifiers are never dropped from checkpoints. |
 | `delta.feature.*`, `delta.minReaderVersion`, `delta.minWriterVersion` passed as CREATE `configuration` | Spark treats these as requests to enable a feature or raise the protocol; EW does not act on them. EW derives the protocol from the features a table uses. A feature is enabled through its `CreateAsync` parameter (`columnMappingMode`, `clusteringColumns`, `enableDeletionVectors`, `enableRowTracking`), a property in `configuration` (`delta.enableDeletionVectors`, `delta.enableRowTracking`, `delta.enableInCommitTimestamps`, `delta.enableChangeDataFeed`, `delta.enableIcebergCompatV1` / `V2`, `delta.checkpointPolicy`), or the schema (`timestamp_ntz`, `variant`). There is **no** way to request a protocol version directly, or a feature that has none of these. |
@@ -673,8 +675,6 @@ therefore reads back as an ordinary list, which is what DuckDB also returns.
   written for other engines' benefit, not our own. EW's pruner is safe against
   wide statistics regardless: it only skips on the two `nullCount` states (0 and
   `== numRecords`) that the spec preserves when bounds go wide.
-- `delta.dataSkippingNumIndexedCols` / `delta.dataSkippingStatsColumns`
-  are ignored; every eligible column gets stats (see **Table properties** above, #471).
 
 (String-stat truncation and nested-struct recursion are both implemented —
 `StatsCollector.TruncateMaxString` and `CollectStruct`. Nested stats are

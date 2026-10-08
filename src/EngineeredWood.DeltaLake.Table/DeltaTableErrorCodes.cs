@@ -194,6 +194,12 @@ public static class DeltaTableErrorCodes
     /// <remarks>delta-spark: <c>DELTA_DUPLICATE_DATA_SKIPPING_COLUMNS</c>.</remarks>
     public const string DuplicateDataSkippingColumns = "DELTA_DUPLICATE_DATA_SKIPPING_COLUMNS";
 
+    /// <summary><c>delta.dataSkippingNumIndexedCols</c> is not an integer of at least -1, or
+    /// <c>delta.dataSkippingStringPrefixLength</c> is not an integer of at least 0.</summary>
+    /// <remarks>No delta-spark error class: Spark refuses either with a bare <c>IllegalArgumentException</c>
+    /// ("requirement failed") when the property is set.</remarks>
+    public const string InvalidDataSkippingProperty = "DELTA_INVALID_DATA_SKIPPING_PROPERTY";
+
     /// <summary>
     /// A value in a batch being written cannot be stored in its column's Delta type without guessing —
     /// a Date64 that is not a whole number of days, which the Arrow format forbids.
