@@ -572,7 +572,9 @@ and `delta.logRetentionDuration` (`LogCleanup`); `delta.enableIcebergCompatV1` /
 `delta.enableInCommitTimestamps`; `delta.enableRowTracking` and its two materialized-column names;
 `delta.enableTypeWidening`; `delta.isolationLevel` (DML, appends and transactions started without a level run at
 the table's level; asking for a weaker one is refused, and a value naming no level refuses data-changing commits
-with `DELTA_INVALID_ISOLATION_LEVEL`, #472); `delta.dataSkippingStatsColumns` (kept in step with RENAME/DROP/SetSchema,
+with `DELTA_INVALID_ISOLATION_LEVEL`, #472). An ABSENT property reads as `WriteSerializable`, which is Databricks'
+default; OSS delta-spark falls back to `Serializable`, so on a table neither engine configured, a DML commit
+EW lets past a matching concurrent blind append is one OSS Spark would abort; `delta.dataSkippingStatsColumns` (kept in step with RENAME/DROP/SetSchema,
 validated at CREATE) and `delta.dataSkippingNumIndexedCols`, which choose the columns that get statistics as
 Spark does; `delta.dataSkippingStringPrefixLength`, though EW's string bounds are not Spark's: it counts UTF-16
 code units where Spark counts code points for the min, and it bumps the last kept character of a max where Spark

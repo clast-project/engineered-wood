@@ -106,6 +106,18 @@ public class IsolationLevelPropertyTests : IDisposable
         Assert.Equal(IsolationLevel.WriteSerializable, table.StartTransaction().IsolationLevel);
     }
 
+    /// <summary>An undefined value would compare as stronger than Serializable and then run as
+    /// WriteSerializable wherever the checker asks <c>== Serializable</c>.</summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("Serializable")]
+    public async Task UndefinedLevel_IsRefused(string? tableLevel)
+    {
+        await using var table = await CreateAsync(tableLevel);
+        var ex = Assert.Throws<ArgumentOutOfRangeException>(() => table.StartTransaction((IsolationLevel)2));
+        Assert.Equal("isolationLevel", ex.ParamName);
+    }
+
     // ── What the level changes ──
 
     /// <summary>
@@ -201,6 +213,17 @@ public class IsolationLevelPropertyTests : IDisposable
         var append = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
             await reopened.WriteAsync([Batch([3], ["us"])]));
         Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, append.ErrorCode);
+
+        // The overwrite family makes one direct attempt instead of going through the commit loop, and is
+        // refused all the same.
+        var overwrite = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await reopened.WriteAsync([Batch([3], ["us"])], DeltaWriteMode.Overwrite));
+        Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, overwrite.ErrorCode);
+
+        // So is a commit of files written elsewhere.
+        var external = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await reopened.CommitDataFilesAsync([new WrittenDataFile("elsewhere.parquet", 100, 1, null, null)]));
+        Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, external.ErrorCode);
 
         // A commit that changes no data never consults the level, so it still lands.
         await reopened.SetDomainMetadataAsync("app.isolation-test", "{}");

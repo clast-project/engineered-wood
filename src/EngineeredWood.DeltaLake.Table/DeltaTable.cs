@@ -5205,6 +5205,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot,
             isAppend: mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite,
             handling: WriteTimeExpressionHandling.ValidatedHere);
+        // Every mode changes data, so every mode answers to the table's level — resolved here, before any
+        // parquet is written, so an unparseable delta.isolationLevel refuses the overwrite family too and not
+        // only the append that passes the level to the commit loop.
+        ResolveIsolation(snapshot);
 
         // No transaction here for a host to abort, so the cleanup is the operation's own: a commit that
         // conflicts — which for the overwrite family is any collision at all, it makes ONE attempt — takes
@@ -6595,6 +6599,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 ? WriteTimeExpressionHandling.AssertedByCaller
                 : WriteTimeExpressionHandling.Refuse);
 
+        // The table's level when this commit changes data; a compaction (dataChange=false) or a metadata-only
+        // fused flush does not consult it, as no other no-data-change commit does. The read set below is blind
+        // or domains-only, so today the level cannot change the verdict — but resolving it is what refuses an
+        // unparseable delta.isolationLevel here as everywhere else, and the request then says what it ran at.
+        bool changesData = dataChange
+            && (files.Count > 0 || extraActions?.Any(static a =>
+                a is AddFile { DataChange: true } or RemoveFile { DataChange: true }) == true);
+        var isolation = changesData ? ResolveIsolation(CurrentSnapshot) : IsolationLevel.WriteSerializable;
+
         if (dynamicPartitionOverwrite)
         {
             if (mode != DeltaWriteMode.Append)
@@ -6639,6 +6652,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 BaseSnapshot = baseSnapshot,
                 Actions = await BuildActionsAsync(baseSnapshot, cancellationToken).ConfigureAwait(false),
                 Operation = operation,
+                Isolation = isolation,
                 // The actions are a FUNCTION of the snapshot — an Overwrite's removes name its active set,
                 // and a row-tracking baseRowId is drawn from its high-water mark — so a collision re-derives
                 // them against the version that landed instead of re-committing a stale set. The data files
@@ -8492,6 +8506,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// or <paramref name="readWholeTable"/>, isolation-scoped by <paramref name="serializable"/>) run unless
     /// <paramref name="rowLevelDml"/> — row-level mode replaces them with the row-granular validation the rebase
     /// already performed (same-row overlap conflicts there; under WriteSerializable reads are not serialized).
+    /// Under Serializable, row-level mode instead refuses any concurrent data change to a file the transaction
+    /// modifies, however disjoint the rows, and the read checks still run.
     /// </summary>
     /// <param name="serializable">Null — the default — checks at the level the table demands
     /// (<c>delta.isolationLevel</c>). <c>true</c> asks for <see cref="IsolationLevel.Serializable"/>; <c>false</c>
@@ -8564,13 +8580,67 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        // Read-set checks (skipped when the caller recorded no reads — pure delete/delete mode). ROW-LEVEL mode
-        // (rowLevelDml, WriteSerializable only): the read checks are REPLACED by the row-level write validation
-        // the rebase performed.
+        // ROW-LEVEL mode is a WriteSerializable behaviour (IsolationLevel): the rebase reconciled concurrent changes
+        // to the files this transaction modifies at ROW granularity — a deletion-vector union, or a remap onto a
+        // copy-on-write rewrite — which is what let the delete/delete check above pass. Under Serializable that
+        // reconciliation may stand only past a change that preserved data (a compaction), as
+        // KeepOnlyDataPreservingResolutions narrows it on the OCC path; and the read checks then run as for any
+        // other transaction instead of being replaced.
+        bool rowLevelReconciles = rowLevelDml && isolation != IsolationLevel.Serializable;
         bool hasReads = readWholeTable || readPredicates is { Count: > 0 };
-        if (!hasReads || rowLevelDml)
+        bool checkRowLevelUnderSerializable = rowLevelDml && !rowLevelReconciles;
+        if (!checkRowLevelUnderSerializable && (!hasReads || rowLevelReconciles))
         {
             return;
+        }
+
+        // Each concurrent commit is read once, whichever checks below consume it.
+        var concurrent = new List<(long Version, IReadOnlyList<DeltaAction> Actions)>(
+            (int)(latest.Version - baseSnapshot.Version));
+        for (long v = baseSnapshot.Version + 1; v <= latest.Version; v++)
+        {
+            concurrent.Add((v, await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false)));
+        }
+
+        if (checkRowLevelUnderSerializable)
+        {
+            // After the rebase, the files this transaction modifies are the paths its removes name: the original
+            // file when a DV union re-targeted it, the rewrite's output when a remap moved the rows. A concurrent
+            // DATA-CHANGING action on either is the reconciliation this level forbids — a DV delete removes and
+            // re-adds the same path, a copy-on-write UPDATE adds the path the remap landed on. A compaction's
+            // dataChange=false actions are exempt, as they are from every read check.
+            var modified = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var action in plannedActions)
+            {
+                if (action is RemoveFile remove)
+                {
+                    modified.Add(remove.Path);
+                }
+            }
+            foreach (var (v, commitActions) in concurrent)
+            {
+                foreach (var a in commitActions)
+                {
+                    string? path = a switch
+                    {
+                        AddFile { DataChange: true } add => add.Path,
+                        RemoveFile { DataChange: true } remove => remove.Path,
+                        _ => null,
+                    };
+                    if (path is not null && modified.Contains(path))
+                    {
+                        throw new DeltaConflictException(
+                            DeltaErrorCodes.ConcurrentDeleteDelete,
+                            $"concurrent commit v{v} changed the data of file '{path}', which this transaction "
+                            + "modifies; under Serializable isolation that conflicts at file granularity, however "
+                            + "disjoint the rows — cannot rebase the transaction");
+                    }
+                }
+            }
+            if (!hasReads)
+            {
+                return;
+            }
         }
         var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
@@ -8596,10 +8666,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
         // A property of THIS transaction, so it is computed once rather than per concurrent commit.
         bool currentChangesMetadata = Concurrency.ConflictChecker.ChangesMetadata(plannedActions);
-        for (long v = baseSnapshot.Version + 1; v <= latest.Version; v++)
+        foreach (var (v, commitActions) in concurrent)
         {
-            var commitActions = await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false);
-
             // ONE rule, shared with ConflictChecker. This used to be a second copy — starting `true` and
             // clearing on remove/metaData/protocol — which differed from the checker's in requiring no
             // add, so an add-less commit was blind here and not there. That disagreement was inert while

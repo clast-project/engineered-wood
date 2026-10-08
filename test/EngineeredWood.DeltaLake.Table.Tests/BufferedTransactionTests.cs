@@ -268,13 +268,117 @@ public class BufferedTransactionTests : IDisposable
     // rewrite conflict because there are no stable ids to follow.
 
 
-    private async Task<DeltaTable> CreateRowTrackedTableAsync(params (long Start, int Count)[] files)
+    private Task<DeltaTable> CreateRowTrackedTableAsync(params (long Start, int Count)[] files) =>
+        CreateRowTrackedTableAsync(configuration: null, files);
+
+    private async Task<DeltaTable> CreateRowTrackedTableAsync(
+        IReadOnlyDictionary<string, string>? configuration, params (long Start, int Count)[] files)
     {
         var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), BuildSchema(),
-            enableDeletionVectors: true, enableRowTracking: true);
+            enableDeletionVectors: true, enableRowTracking: true, configuration: configuration);
         foreach (var (start, count) in files)
             await table.WriteAsync([BuildBatch(start, count)]);
         return table;
+    }
+
+    private static readonly IReadOnlyDictionary<string, string> SerializableTable =
+        new Dictionary<string, string> { ["delta.isolationLevel"] = "Serializable" };
+
+    // -- Row-level mode under a Serializable table (#472) --
+    //
+    // The DV union and the remap are WriteSerializable behaviours. On a table demanding Serializable the check
+    // refuses a concurrent DATA change to a file the transaction modifies, however disjoint the rows, while a
+    // compaction (dataChange=false) still remaps: the same split the OCC path makes.
+
+    /// <summary>Two buffered deletes of different rows in one file compose by default
+    /// (<see cref="BufferedFlow_ComputeThenRebaseThenCommit_ComposesWithConcurrentDelete"/>) but conflict on a
+    /// Serializable table.</summary>
+    [Fact]
+    public async Task SerializableTable_BufferedDisjointDvDeletes_Conflict()
+    {
+        await using var table = await CreateRowTrackedTableAsync(SerializableTable, (1, 10));
+        var pinned = table.CurrentSnapshot;
+        var at = await LocateRowsAsync(table);
+        var positions = new Dictionary<int, IReadOnlyCollection<long>>
+        {
+            [at[2].Ordinal] = new[] { at[2].Position },
+        };
+        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(positions, resolveAgainst: pinned);
+
+        await using (var racer = await OpenAsync())
+        {
+            await racer.DeleteAsync(IdEquals(7));
+        }
+
+        await using var committer = await OpenAsync();
+        var rebased = await committer.RebaseDvDmlActionsAsync(
+            dvActions, positions, pinned, committer.CurrentSnapshot);
+        var conflict = await Assert.ThrowsAsync<DeltaConflictException>(async () =>
+            await committer.CheckLogicalRebaseAsync(pinned, rebased, rowLevelDml: true));
+        Assert.Equal(DeltaErrorCodes.ConcurrentDeleteDelete, conflict.ErrorCode);
+    }
+
+    /// <summary>A compaction preserves data, so the remap across it stands at Serializable too.</summary>
+    [Fact]
+    public async Task SerializableTable_BufferedRemapAcrossCompaction_StillLands()
+    {
+        await using var table = await CreateRowTrackedTableAsync(SerializableTable, (1, 10));
+        var pinned = table.CurrentSnapshot;
+        var at = await LocateRowsAsync(table);
+        var positions = new Dictionary<int, IReadOnlyCollection<long>>
+        {
+            [at[2].Ordinal] = new[] { at[2].Position },
+        };
+        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(positions, resolveAgainst: pinned);
+
+        await using (var racer = await OpenAsync())
+        {
+            await racer.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+        }
+
+        await using var committer = await OpenAsync();
+        var rebased = await committer.RebaseDvDmlActionsAsync(
+            dvActions, positions, pinned, committer.CurrentSnapshot);
+        await committer.CheckLogicalRebaseAsync(pinned, rebased, rowLevelDml: true);
+        await committer.CommitDataFilesAsync(
+            System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Append,
+            extraActions: rebased, expectedVersion: committer.CurrentSnapshot.Version, operation: "DELETE");
+
+        Assert.Equal(new long[] { 1, 3, 4, 5, 6, 7, 8, 9, 10 }, await ReadIdsFreshAsync());
+    }
+
+    /// <summary>A copy-on-write UPDATE changes data, so the remap onto its output is refused at Serializable.
+    /// The default-level twin is <see cref="BufferedFlow_DvDml_RemapsAcrossConcurrentCopyOnWriteUpdate"/>.</summary>
+    [Fact]
+    public async Task SerializableTable_BufferedRemapAcrossCopyOnWriteUpdate_Conflicts()
+    {
+        await using var table = await CreateRowTrackedTableAsync(SerializableTable, (1, 10));
+        var pinned = table.CurrentSnapshot;
+        var at = await LocateRowsAsync(table);
+        var positions = new Dictionary<int, IReadOnlyCollection<long>>
+        {
+            [at[2].Ordinal] = new[] { at[2].Position },
+        };
+        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(positions, resolveAgainst: pinned);
+
+        await using (var racer = await OpenAsync())
+        {
+            await racer.UpdateAsync(IdEquals(9), batch =>
+            {
+                var ids = (Int64Array)batch.Column("id");
+                var vals = new StringArray.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                    vals.Append("updated" + ids.GetValue(i)!.Value);
+                return new RecordBatch(BuildSchema(), [ids, vals.Build()], batch.Length);
+            });
+        }
+
+        await using var committer = await OpenAsync();
+        var rebased = await committer.RebaseDvDmlActionsAsync(
+            dvActions, positions, pinned, committer.CurrentSnapshot);
+        var conflict = await Assert.ThrowsAsync<DeltaConflictException>(async () =>
+            await committer.CheckLogicalRebaseAsync(pinned, rebased, rowLevelDml: true));
+        Assert.Equal(DeltaErrorCodes.ConcurrentDeleteDelete, conflict.ErrorCode);
     }
 
     /// <summary>
