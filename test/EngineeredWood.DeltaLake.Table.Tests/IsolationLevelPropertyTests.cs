@@ -225,7 +225,20 @@ public class IsolationLevelPropertyTests : IDisposable
             await reopened.CommitDataFilesAsync([new WrittenDataFile("elsewhere.parquet", 100, 1, null, null)]));
         Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, external.ErrorCode);
 
-        // A commit that changes no data never consults the level, so it still lands.
+        // A file-less overwrite still removes every file, so it changes data and is refused too.
+        var emptyOverwrite = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await reopened.CommitDataFilesAsync(System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Overwrite));
+        Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, emptyOverwrite.ErrorCode);
+
+        // A commit that changes no data never consults the level, so it still lands...
         await reopened.SetDomainMetadataAsync("app.isolation-test", "{}");
+
+        // ...and an append of no rows or an UPDATE matching nothing commits nothing, so neither is refused.
+        long version = reopened.CurrentSnapshot.Version;
+        Assert.Equal(version, await reopened.WriteAsync([Batch([], [])]));
+        var (updated, updateVersion) = await reopened.UpdateAsync(
+            Ex.Equal("region", "nowhere"), batch => batch);
+        Assert.Equal(0, updated);
+        Assert.Equal(version, updateVersion);
     }
 }

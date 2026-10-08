@@ -322,7 +322,8 @@ public class BufferedTransactionTests : IDisposable
     [Fact]
     public async Task SerializableTable_BufferedRemapAcrossCompaction_StillLands()
     {
-        await using var table = await CreateRowTrackedTableAsync(SerializableTable, (1, 10));
+        // Two files, so the compaction really rewrites the one this transaction deletes from.
+        await using var table = await CreateRowTrackedTableAsync(SerializableTable, (1, 10), (11, 2));
         var pinned = table.CurrentSnapshot;
         var at = await LocateRowsAsync(table);
         var positions = new Dictionary<int, IReadOnlyCollection<long>>
@@ -337,6 +338,7 @@ public class BufferedTransactionTests : IDisposable
         }
 
         await using var committer = await OpenAsync();
+        Assert.Single(committer.CurrentSnapshot.ActiveFiles);
         var rebased = await committer.RebaseDvDmlActionsAsync(
             dvActions, positions, pinned, committer.CurrentSnapshot);
         await committer.CheckLogicalRebaseAsync(pinned, rebased, rowLevelDml: true);
@@ -344,7 +346,50 @@ public class BufferedTransactionTests : IDisposable
             System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Append,
             extraActions: rebased, expectedVersion: committer.CurrentSnapshot.Version, operation: "DELETE");
 
-        Assert.Equal(new long[] { 1, 3, 4, 5, 6, 7, 8, 9, 10 }, await ReadIdsFreshAsync());
+        Assert.Equal(new long[] { 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, await ReadIdsFreshAsync());
+    }
+
+    /// <summary>
+    /// The data change is hidden behind a later compaction: a copy-on-write UPDATE rewrites the file, then a
+    /// compaction rewrites the UPDATE's output. The rebased actions name only the compacted file, whose own
+    /// history is a dataChange=false add, so the check must trace the lineage back through the compaction to
+    /// find the UPDATE.
+    /// </summary>
+    [Fact]
+    public async Task SerializableTable_BufferedRemapAcrossUpdateThenCompaction_Conflicts()
+    {
+        // Two files, so the compaction really merges the UPDATE's output with another file into a new one.
+        await using var table = await CreateRowTrackedTableAsync(SerializableTable, (1, 10), (11, 2));
+        var pinned = table.CurrentSnapshot;
+        var at = await LocateRowsAsync(table);
+        var positions = new Dictionary<int, IReadOnlyCollection<long>>
+        {
+            [at[2].Ordinal] = new[] { at[2].Position },
+        };
+        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(positions, resolveAgainst: pinned);
+
+        await using (var racer = await OpenAsync())
+        {
+            await racer.UpdateAsync(IdEquals(9), batch =>
+            {
+                var ids = (Int64Array)batch.Column("id");
+                var vals = new StringArray.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                    vals.Append("updated" + ids.GetValue(i)!.Value);
+                return new RecordBatch(BuildSchema(), [ids, vals.Build()], batch.Length);
+            });
+            await racer.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+        }
+
+        await using var committer = await OpenAsync();
+        // The precondition the test exists for: the compaction's output, not the UPDATE's, is the file the
+        // rows end in, so only the lineage connects them.
+        Assert.Single(committer.CurrentSnapshot.ActiveFiles);
+        var rebased = await committer.RebaseDvDmlActionsAsync(
+            dvActions, positions, pinned, committer.CurrentSnapshot);
+        var conflict = await Assert.ThrowsAsync<DeltaConflictException>(async () =>
+            await committer.CheckLogicalRebaseAsync(pinned, rebased, rowLevelDml: true));
+        Assert.Equal(DeltaErrorCodes.ConcurrentDeleteDelete, conflict.ErrorCode);
     }
 
     /// <summary>A copy-on-write UPDATE changes data, so the remap onto its output is refused at Serializable.
