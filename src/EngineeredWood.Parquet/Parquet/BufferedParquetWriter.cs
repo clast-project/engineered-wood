@@ -61,8 +61,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     /// buffer is automatically flushed as a row group.
     /// </summary>
     /// <exception cref="ArgumentException">
-    /// A batch after the first differs from it in column names, order or types, or holds nulls in a column the
-    /// first batch made required. Field metadata may differ.
+    /// The batch holds a null in a column that is required: a non-nullable field or a map key in the first batch,
+    /// or a column the first batch made required in a later one. Or a batch after the first differs from it in
+    /// column names, order or types; field metadata may differ.
     /// </exception>
     public async ValueTask AppendAsync(
         RecordBatch batch,
@@ -82,11 +83,15 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         // As in ParquetFileWriter: the caller's schema is kept for ARROW:schema, and the batch is
         // rescaled out of second precision before its schema is captured, so the footer declares
         // what the encoders write.
-        _declaredSchema ??= batch.Schema;
+        var declared = batch.Schema;
         batch = TimeUnitRescaler.ToParquetUnits(batch);
 
         if (!_assembler.HeaderWritten)
         {
+            // As in ParquetFileWriter: a null in a required column would be written as a value. Checked before
+            // anything is captured or written, so a refused first batch leaves the writer as it was.
+            RowGroupSchemaCheck.EnsureWritable(batch);
+            _declaredSchema ??= declared;
             _arrowSchema = batch.Schema;
             _parquetSchema = ArrowToSchemaConverter.Convert(_arrowSchema, _options);
             await _assembler.WriteHeaderAsync(cancellationToken).ConfigureAwait(false);
