@@ -85,6 +85,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         // what the encoders write.
         var declared = batch.Schema;
         batch = TimeUnitRescaler.ToParquetUnits(batch);
+        batch = ByteArrayLayoutNormalizer.ToOffsetLayout(batch);
 
         if (!_assembler.HeaderWritten)
         {

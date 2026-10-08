@@ -111,6 +111,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         // that is what lets the reader hand them back.
         _declaredSchema ??= batch.Schema;
         batch = Data.TimeUnitRescaler.ToParquetUnits(batch);
+        // Likewise large and view byte arrays become string and binary, the one layout the encoders read (#481).
+        batch = Data.ByteArrayLayoutNormalizer.ToOffsetLayout(batch);
 
         // Variant shredding, if enabled, changes each shredded column's storage TYPE — so the layout
         // has to be decided before the schema is captured, and from the same batch. Decided once and
