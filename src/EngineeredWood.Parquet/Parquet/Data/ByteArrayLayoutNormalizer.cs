@@ -133,8 +133,8 @@ internal static class ByteArrayLayoutNormalizer
             // An extension is written as its storage, so its storage needs the same conversion. Apache.Arrow has no
             // general way to re-create an extension type over a different storage type, so a converted one is
             // unwrapped to that storage. That loses nothing for an extension the writer writes as bare storage:
-            // the Parquet schema is the same, and the caller's declared type still reaches ARROW:schema. One the
-            // writer annotates (UUID, VARIANT) would lose its annotation, so it is refused instead.
+            // the Parquet schema is the same, and the caller's declared type still reaches ARROW:schema. An extension
+            // the writer annotates (UUID, VARIANT) would lose its annotation, so it is refused instead.
             case ExtensionType extensionType:
             {
                 var storage = new ArrayData(extensionType.StorageType, data.Length, data.NullCount, data.Offset,

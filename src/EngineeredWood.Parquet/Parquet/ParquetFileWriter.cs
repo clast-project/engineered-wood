@@ -109,10 +109,13 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         // before the schema is captured, so what the footer declares and what the encoders write are
         // the same thing. The caller's original units are preserved separately, in ARROW:schema, and
         // that is what lets the reader hand them back.
-        _declaredSchema ??= batch.Schema;
+        var declared = batch.Schema;
         batch = Data.TimeUnitRescaler.ToParquetUnits(batch);
         // Likewise large and view byte arrays become string and binary, the one layout the encoders read (#481).
+        // It can refuse a batch, so the declared schema is kept only once it has succeeded: a refused first batch
+        // must not leave its schema behind for the footer's ARROW:schema.
         batch = Data.ByteArrayLayoutNormalizer.ToOffsetLayout(batch);
+        _declaredSchema ??= declared;
 
         // Variant shredding, if enabled, changes each shredded column's storage TYPE — so the layout
         // has to be decided before the schema is captured, and from the same batch. Decided once and

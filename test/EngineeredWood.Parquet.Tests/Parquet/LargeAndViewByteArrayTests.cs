@@ -260,9 +260,9 @@ public class LargeAndViewByteArrayTests : IDisposable
 
     // Review of #482: an extension type is written as its storage, so one over a large or view layout reached the
     // encoders unconverted.
-    private sealed class TagType(IArrowType storage) : ExtensionType(storage)
+    private sealed class TagType(IArrowType storage, string name = "ew.test.tag") : ExtensionType(storage)
     {
-        public override string Name => "ew.test.tag";
+        public override string Name => name;
 
         public override string ExtensionMetadata => "";
 
@@ -270,6 +270,54 @@ public class LargeAndViewByteArrayTests : IDisposable
     }
 
     private sealed class TagArray(ExtensionType type, IArrowArray storage) : ExtensionArray(type, storage);
+
+    // An extension the writer annotates can't be unwrapped without losing the annotation, so it is refused. The
+    // refusal comes after ParquetFileWriter has looked at the batch's schema; it must not keep it (#482 review).
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task AnAnnotatedExtensionOverALargeLayout_IsRefused_AndLeavesTheWriterUsable(Writer kind)
+    {
+        var storage = Build("large_string", Values);
+        var bad = new RecordBatch(
+            new ArrowSchema.Builder().Field(new Field("c", new TagType(storage.Data.DataType, "arrow.uuid"), true)).Build(),
+            [new TagType(storage.Data.DataType, "arrow.uuid").CreateArray(storage)], storage.Length);
+        var good = new RecordBatch(
+            new ArrowSchema.Builder().Field(new Field("d", Int64Type.Default, false)).Build(),
+            [new Int64Array.Builder().Append(7).Build()], 1);
+        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N") + ".parquet");
+        await using (var file = new LocalSequentialFile(path))
+        {
+            if (kind == Writer.File)
+            {
+                await using var w = new ParquetFileWriter(file, ownsFile: false);
+                await Assert.ThrowsAsync<NotSupportedException>(() => w.WriteRowGroupAsync(bad).AsTask());
+                await w.WriteRowGroupAsync(good);
+                await w.CloseAsync();
+            }
+            else
+            {
+                await using var w = new BufferedParquetWriter(file, ownsFile: false);
+                await Assert.ThrowsAsync<NotSupportedException>(() => w.AppendAsync(bad).AsTask());
+                await w.AppendAsync(good);
+                await w.CloseAsync();
+            }
+        }
+
+        await using var input = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(input, ownsFile: false);
+        var read = await reader.ReadRowGroupAsync(0);
+        var field = Assert.Single(read.Schema.FieldsList);
+        Assert.Equal("d", field.Name);
+        Assert.False(field.IsNullable);
+        Assert.Equal(7L, ((Int64Array)read.Column(0)).GetValue(0));
+
+        // And the footer's ARROW:schema describes the batch that was written, not the refused one.
+        var declared = EngineeredWood.Parquet.Data.ArrowSchemaMetadata.Decode(
+            (await reader.ReadMetadataAsync()).KeyValueMetadata);
+        Assert.NotNull(declared);
+        Assert.Equal("d", Assert.Single(declared.FieldsList).Name);
+    }
 
     [Theory]
     [MemberData(nameof(NestedLayouts))]
