@@ -291,18 +291,8 @@ internal static class TimeUnitRescaler
             case StructArray sa when Structural(target, sa.Fields.Count) is StructType or null:
             {
                 var declared = target as StructType;
-                IArrowArray[]? children = null;
-                for (int i = 0; i < sa.Fields.Count; i++)
-                {
-                    var original = sa.Fields[i];
-                    var rewritten = rewrite(original, declared?.Fields[i].DataType);
-                    if (!ReferenceEquals(rewritten, original))
-                    {
-                        children ??= [.. sa.Fields];
-                        children[i] = rewritten;
-                    }
-                }
-
+                var children = RewriteChildren(
+                    sa.Data, i => declared?.Fields[i].DataType, rewrite);
                 if (children is null)
                     return array;
 
@@ -311,13 +301,13 @@ internal static class TimeUnitRescaler
                 for (int i = 0; i < fields.Length; i++)
                 {
                     fields[i] = new Field(
-                        source.Fields[i].Name, children[i].Data.DataType,
+                        source.Fields[i].Name, children[i].DataType,
                         source.Fields[i].IsNullable, source.Fields[i].Metadata);
                 }
 
                 return new StructArray(new ArrayData(
                     new StructType(fields), sa.Length, sa.NullCount, sa.Offset,
-                    sa.Data.Buffers, [.. children.Select(child => child.Data)]));
+                    sa.Data.Buffers, children));
             }
 
             // MapArray derives from ListArray, so it has to be excluded here or a map would be
@@ -364,21 +354,23 @@ internal static class TimeUnitRescaler
             {
                 var declared = target as MapType;
                 var entries = ma.KeyValues;
-                var key = rewrite(entries.Fields[0], declared?.KeyField.DataType);
-                var value = rewrite(entries.Fields[1], declared?.ValueField.DataType);
-                if (ReferenceEquals(key, entries.Fields[0]) && ReferenceEquals(value, entries.Fields[1]))
+                var children = RewriteChildren(
+                    entries.Data,
+                    i => i == 0 ? declared?.KeyField.DataType : declared?.ValueField.DataType,
+                    rewrite);
+                if (children is null)
                     return array;
 
                 var source = (MapType)ma.Data.DataType;
                 var keyField = new Field(
-                    source.KeyField.Name, key.Data.DataType, source.KeyField.IsNullable,
+                    source.KeyField.Name, children[0].DataType, source.KeyField.IsNullable,
                     source.KeyField.Metadata);
                 var valueField = new Field(
-                    source.ValueField.Name, value.Data.DataType, source.ValueField.IsNullable,
+                    source.ValueField.Name, children[1].DataType, source.ValueField.IsNullable,
                     source.ValueField.Metadata);
                 var entriesData = new ArrayData(
                     new StructType([keyField, valueField]), entries.Length, entries.NullCount,
-                    entries.Offset, entries.Data.Buffers, [key.Data, value.Data]);
+                    entries.Offset, entries.Data.Buffers, children);
                 return new MapArray(new ArrayData(
                     new MapType(keyField, valueField, source.KeySorted), ma.Length, ma.NullCount,
                     ma.Offset, ma.Data.Buffers, [entriesData]));
@@ -387,6 +379,36 @@ internal static class TimeUnitRescaler
             default:
                 return array;
         }
+    }
+
+    /// <summary>
+    /// Rewrites the children of a struct-shaped <paramref name="parent"/>, returning
+    /// <see langword="null"/> when none changed.
+    /// </summary>
+    /// <remarks>
+    /// This works on <see cref="ArrayData.Children"/>, which are unsliced, rather than on
+    /// <see cref="StructArray.Fields"/>, which Arrow already slices by the parent's offset. The
+    /// rebuilt parent keeps that offset, so rebuilding over the sliced fields would apply it twice and
+    /// shift every row of a struct sliced below a list or map (#486).
+    /// </remarks>
+    private static ArrayData[]? RewriteChildren(
+        ArrayData parent,
+        Func<int, IArrowType?> declared,
+        Func<IArrowArray, IArrowType?, IArrowArray> rewrite)
+    {
+        ArrayData[]? children = null;
+        for (int i = 0; i < parent.Children.Length; i++)
+        {
+            var original = Apache.Arrow.ArrowArrayFactory.BuildArray(parent.Children[i]);
+            var rewritten = rewrite(original, declared(i));
+            if (!ReferenceEquals(rewritten, original))
+            {
+                children ??= [.. parent.Children];
+                children[i] = rewritten.Data;
+            }
+        }
+
+        return children;
     }
 
     /// <summary>

@@ -62,7 +62,7 @@ public class TimestampUnitCoercionTests : IDisposable
         string file, IArrowType type, IArrowArray array, bool buffered, ParquetWriteOptions? options = null)
     {
         var schema = new Apache.Arrow.Schema.Builder().Field(new Field("v", type, true)).Build();
-        var batch = new RecordBatch(schema, [array], 1);
+        var batch = new RecordBatch(schema, [array], array.Length);
         await using var f = new LocalSequentialFile(TempPath(file));
         if (buffered)
         {
@@ -317,5 +317,132 @@ public class TimestampUnitCoercionTests : IDisposable
         // The coerced column keeps its id, and so does the one that was never touched.
         Assert.Equal(7, elements.Single(element => element.Name == "at").FieldId);
         Assert.Equal(9, elements.Single(element => element.Name == "id").FieldId);
+    }
+
+    // A struct sliced below a list once read back shifted by its own offset: the rescale rebuilt it
+    // over StructArray.Fields, which Arrow already slices, and then applied the struct's offset a
+    // second time (#486). Only a rescaled column takes that path, so the millisecond case is the
+    // control.
+    [Theory]
+    [InlineData(TimeUnit.Second, false, false)]
+    [InlineData(TimeUnit.Second, false, true)]
+    [InlineData(TimeUnit.Second, true, false)]
+    [InlineData(TimeUnit.Second, true, true)]
+    [InlineData(TimeUnit.Millisecond, false, false)]
+    [InlineData(TimeUnit.Millisecond, true, false)]
+    public async Task Write_SlicedStructUnderList_KeepsItsRows(TimeUnit unit, bool time32, bool buffered)
+    {
+        IArrowType temporal = time32 ? new Time32Type(unit) : new TimestampType(unit, "UTC");
+        var structType = new StructType(
+            [new Field("ts", temporal, true), new Field("n", Int64Type.Default, true)]);
+
+        IArrowArray ts = time32
+            ? new Time32Array.Builder((Time32Type)temporal).AppendRange([100, 200, 300, 400]).Build()
+            : Int64Column(temporal, [100, 200, 300, 400]);
+        var n = new Int64Array.Builder().AppendRange([1, 2, 3, 4]).Build();
+        var full = new StructArray(structType, 4, [ts, n], ArrowBuffer.Empty, nullCount: 0);
+        var sliced = (StructArray)full.Slice(1, 3);
+
+        var listType = new ListType(new Field("item", structType, true));
+        var offsets = new ArrowBuffer.Builder<int>().AppendRange([0, 2, 3]).Build();
+        var list = new ListArray(listType, 2, offsets, sliced, ArrowBuffer.Empty, nullCount: 0);
+
+        string file = $"sliced_struct_{unit}_{time32}_{buffered}.parquet";
+        await WriteAsync(file, listType, list, buffered);
+
+        await using var rf = new LocalRandomAccessFile(TempPath(file));
+        await using var reader = new ParquetFileReader(rf, ownsFile: false);
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        var readList = (ListArray)batch.Column(0);
+        var values = (StructArray)readList.Values;
+        int first = readList.ValueOffsets[0];
+        long scale = unit == TimeUnit.Second ? 1000 : 1;
+        var read = new List<(long Ts, long N)>();
+        for (int i = first; i < readList.ValueOffsets[readList.Length]; i++)
+        {
+            long t = values.Fields[0] is Time32Array t32
+                ? t32.GetValue(i)!.Value
+                : ((TimestampArray)values.Fields[0]).GetValue(i)!.Value;
+            read.Add((t, ((Int64Array)values.Fields[1]).GetValue(i)!.Value));
+        }
+
+        Assert.Equal([(200 * scale, 2L), (300 * scale, 3L), (400 * scale, 4L)], read);
+    }
+
+    // The map arm rebuilds its entries struct the same way, so an entries struct with an offset of
+    // its own has to survive too.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Write_MapWithSlicedEntries_KeepsItsRows(bool buffered)
+    {
+        var second = new TimestampType(TimeUnit.Second, "UTC");
+        var keyField = new Field("key", second, false);
+        var valueField = new Field("value", Int64Type.Default, true);
+        var mapType = new MapType(keyField, valueField);
+
+        var keys = Int64Column(second, [100, 200, 300, 400]);
+        var values = new Int64Array.Builder().AppendRange([1, 2, 3, 4]).Build();
+        var entries = new StructArray(
+            new StructType([keyField, valueField]), 4, [keys, values], ArrowBuffer.Empty, nullCount: 0);
+        var sliced = (StructArray)entries.Slice(1, 3);
+
+        var offsets = new ArrowBuffer.Builder<int>().AppendRange([0, 2, 3]).Build();
+        var map = new MapArray(mapType, 2, offsets, sliced, ArrowBuffer.Empty, nullCount: 0);
+
+        string file = $"sliced_map_{buffered}.parquet";
+        await WriteAsync(file, mapType, map, buffered);
+
+        await using var rf = new LocalRandomAccessFile(TempPath(file));
+        await using var reader = new ParquetFileReader(rf, ownsFile: false);
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        var readMap = (MapArray)batch.Column(0);
+        var readKeys = (TimestampArray)readMap.Keys;
+        var readValues = (Int64Array)readMap.Values;
+        var read = new List<(long Key, long Value)>();
+        for (int i = readMap.ValueOffsets[0]; i < readMap.ValueOffsets[readMap.Length]; i++)
+            read.Add((readKeys.GetValue(i)!.Value, readValues.GetValue(i)!.Value));
+
+        Assert.Equal([(200_000L, 2L), (300_000L, 3L), (400_000L, 4L)], read);
+    }
+
+    // The read side shares the same rebuild to restore zones. The reader's own arrays are unsliced,
+    // but a sliced one must not shift either.
+    [Fact]
+    public void ToDeclaredUnits_SlicedStructUnderList_KeepsItsRows()
+    {
+        var derived = new TimestampType(TimeUnit.Millisecond, (string?)null);
+        var structType = new StructType(
+            [new Field("ts", derived, true), new Field("n", Int64Type.Default, true)]);
+        var full = new StructArray(
+            structType, 4,
+            [Int64Column(derived, [100, 200, 300, 400]),
+             new Int64Array.Builder().AppendRange([1, 2, 3, 4]).Build()],
+            ArrowBuffer.Empty, nullCount: 0);
+        var sliced = (StructArray)full.Slice(1, 3);
+        var offsets = new ArrowBuffer.Builder<int>().AppendRange([0, 2, 3]).Build();
+        var list = new ListArray(
+            new ListType(new Field("item", structType, true)), 2, offsets, sliced,
+            ArrowBuffer.Empty, nullCount: 0);
+
+        var declared = new ListType(new Field("item", new StructType(
+            [new Field("ts", new TimestampType(TimeUnit.Millisecond, "UTC"), true),
+             new Field("n", Int64Type.Default, true)]), true));
+        var restored = (ListArray)EngineeredWood.Parquet.Data.TimeUnitRescaler.ToDeclaredUnits(list, declared);
+
+        var values = (StructArray)restored.Values;
+        Assert.Equal("UTC", ((TimestampType)values.Fields[0].Data.DataType).Timezone);
+        var ts = (TimestampArray)values.Fields[0];
+        var n = (Int64Array)values.Fields[1];
+        Assert.Equal([200L, 300L, 400L], Enumerable.Range(0, 3).Select(i => ts.GetValue(i)!.Value));
+        Assert.Equal([2L, 3L, 4L], Enumerable.Range(0, 3).Select(i => n.GetValue(i)!.Value));
+    }
+
+    private static TimestampArray Int64Column(IArrowType type, long[] raw)
+    {
+        var values = new ArrowBuffer.Builder<long>().AppendRange(raw).Build();
+        return new TimestampArray(new ArrayData(type, raw.Length, 0, 0, [ArrowBuffer.Empty, values]));
     }
 }
