@@ -253,8 +253,9 @@ internal static class NestedLevelWriter
     /// accepts and reads logical positions (so a sliced child is read at its own offset), and
     /// <see cref="ArrowCompute.Scatter(IArrowArray, List{int}, int)"/> for the phantoms. Encoders and statistics
     /// skip a phantom by its definition level; the null keeps <c>IsNull</c> truthful for anything that asks.
-    /// Without phantoms the gather alone is the answer, which also keeps run-end encoded leaves, which have no
-    /// bitmap to scatter nulls into, writable whenever no phantom needs one (#480 review).
+    /// Without phantoms the gather alone is the answer, and a run-end encoded leaf keeps its runs. A run-end
+    /// encoded array has no validity bitmap to scatter nulls into, so with phantoms it is expanded to its plain
+    /// values first; the column writer takes either form (#480 review).
     /// </remarks>
     private static IArrowArray ExpandArray(IArrowArray source, int[] valueMap, int expandedLength)
     {
@@ -270,9 +271,11 @@ internal static class NestedLevelWriter
         }
 
         var gathered = ArrowCompute.Take(source, sourceRows);
-        return levels.Count == expandedLength
-            ? gathered
-            : ArrowCompute.Scatter(gathered, levels, expandedLength);
+        if (levels.Count == expandedLength)
+            return gathered;
+        if (gathered is RunEndEncodedArray runs)
+            gathered = RunEndEncoding.Expand(runs);
+        return ArrowCompute.Scatter(gathered, levels, expandedLength);
     }
 
     private static void DecomposeStruct(

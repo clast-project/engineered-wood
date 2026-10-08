@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 using ArrowSchema = Apache.Arrow.Schema;
@@ -256,5 +257,24 @@ public class UnreferencedListValuesTests : IDisposable
 
         Assert.Equal([12L], rows[0]);
         Assert.Null(rows[1]);
+    }
+
+    [Fact]
+    public async Task AListOfRunEndEncodedValuesUnderANullRow_IsWritten()
+    {
+        // Review of #480: a null row needs a phantom level, and nulls can't be scattered into a run-end encoded
+        // array (it has no validity bitmap). Row 0 = [7, 7], row 1 = null, row 2 = [9]; values = runs 7x2, 9x1.
+        var values = new RunEndEncodedArray(
+            new Int32Array.Builder().Append(2).Append(3).Build(), Longs(7, 9));
+        var listType = new ListType(new Field("element", values.Data.DataType, true));
+        var list = new ListArray(listType, 3, Offsets(0, 2, 2, 3), values, Validity(true, false, true), nullCount: 1);
+
+        var read = (ListArray)await ReadBackAsync(list);
+
+        Assert.Equal(3, read.Length);
+        Assert.True(read.IsNull(1));
+        var leaf = read.Values is RunEndEncodedArray ree ? RunEndEncoding.Expand(ree) : read.Values;
+        Assert.Equal([7L, 7L, 9L], Enumerable.Range(0, 3).Select(i => ((Int64Array)leaf).GetValue(i)!.Value));
+        Assert.Equal([0, 2, 2, 3], read.ValueOffsets.ToArray());
     }
 }
