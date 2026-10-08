@@ -137,6 +137,13 @@ public static class DeltaTableErrorCodes
     // ── Schema changes ──
 
     /// <summary>
+    /// A schema being committed has two fields in one struct whose names differ only in case.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_DUPLICATE_COLUMNS_FOUND</c>. Delta column names are
+    /// case-insensitive, and Spark cannot read a table whose schema has such a pair.</remarks>
+    public const string DuplicateColumnsFound = "DELTA_DUPLICATE_COLUMNS_FOUND";
+
+    /// <summary>
     /// A RENAME or DROP would change a column that a CHECK constraint reads, or a schema replacement
     /// would remove one.
     /// </summary>
@@ -161,6 +168,14 @@ public static class DeltaTableErrorCodes
     /// <c>delta.clustering</c> domain would go on naming the dropped physical column, which Spark's
     /// <c>ClusteringColumnInfo</c> crashes on. Change the clustering columns first.</remarks>
     public const string UnsupportedDropClusteringColumn = "DELTA_UNSUPPORTED_DROP_CLUSTERING_COLUMN";
+
+    /// <summary>
+    /// A value in a batch being written cannot be stored in its column's Delta type without guessing —
+    /// a Date64 that is not a whole number of days, which the Arrow format forbids.
+    /// </summary>
+    /// <remarks>No delta-spark equivalent: Spark never receives Arrow data in this form. Nothing is
+    /// written; fix the data or cast the column.</remarks>
+    public const string UnwritableValue = "DELTA_UNWRITABLE_VALUE";
 
     // ── Write modes ──
 

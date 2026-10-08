@@ -80,6 +80,8 @@ public static class SchemaConverter
         {
             int precision = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
             int scale = int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
+            if (precision > MaxDecimalPrecision)
+                throw new DeltaLake.DeltaFormatException(DecimalPrecisionMessage(precision, scale));
             return new Decimal128Type(precision, scale);
         }
 
@@ -162,20 +164,34 @@ public static class SchemaConverter
         _ => $"Arrow timestamp unit {unit} cannot be written to a Delta table.",
     };
 
+    private const string FixedSizeBinaryMessage =
+        "Arrow FixedSizeBinary could not be converted to Delta binary in this position. Cast the column "
+        + "to Binary first.";
+
+    private const string Date64Message =
+        "Arrow Date64 could not be converted to Delta date in this position. Cast the column to Date32 first.";
+
     /// <summary>
-    /// Throws if any field of <paramref name="schema"/>, at any nesting depth, is a nanosecond Arrow
-    /// timestamp. <see cref="FromArrowSchema"/> already rejects those when a schema is converted, which
-    /// covers table creation and schema evolution — but a write into an EXISTING table converts nothing,
-    /// so the same rule has to be enforced against the incoming batches directly. Without this a
-    /// nanosecond column reaches Parquet under a schema advertising microseconds.
+    /// Throws if any field of <paramref name="schema"/>, at any nesting depth, has an Arrow type that
+    /// cannot be written as-is. <see cref="FromArrowSchema"/> refuses the timestamp units when a schema
+    /// is converted, which covers table creation and schema evolution — but a write into an EXISTING
+    /// table converts nothing, so the same rule has to be enforced against the incoming batches
+    /// directly. Without this a nanosecond column reaches Parquet under a schema advertising
+    /// microseconds. The table's write path runs it AFTER converting FixedSizeBinary, Date64 and Decimal32/64 to
+    /// their canonical forms (<c>WriteTypeNormalization</c>), so a FixedSizeBinary
+    /// or Date64 still here sits in a container the normalizer does not convert, and would otherwise be
+    /// written in a form the table does not declare.
     /// </summary>
-    internal static void ThrowIfUnsupportedTimestampUnit(Apache.Arrow.Schema schema)
+    /// <param name="convertibleTypesAllowed">True on the codec seam, where a host writer owns the bytes and
+    /// nothing was converted: FixedSizeBinary and Date64 are the host's to represent, and only the timestamp
+    /// units, which no writer can store faithfully under a Delta timestamp, are refused.</param>
+    internal static void ThrowIfUnwritableType(Apache.Arrow.Schema schema, bool convertibleTypesAllowed = false)
     {
         foreach (var field in schema.FieldsList)
-            ThrowIfUnsupportedTimestampUnit(field.DataType, field.Name);
+            ThrowIfUnwritableType(field.DataType, field.Name, convertibleTypesAllowed);
     }
 
-    private static void ThrowIfUnsupportedTimestampUnit(IArrowType type, string path)
+    private static void ThrowIfUnwritableType(IArrowType type, string path, bool convertibleTypesAllowed)
     {
         switch (type)
         {
@@ -183,21 +199,39 @@ public static class SchemaConverter
                 throw new DeltaLake.DeltaFormatException(
                     $"Column '{path}': {UnsupportedTimestampUnitMessage(ts.Unit)}");
 
+            // By TypeId: every Arrow decimal type DERIVES from FixedSizeBinaryType.
+            case FixedSizeBinaryType when type.TypeId == ArrowTypeId.FixedSizedBinary && !convertibleTypesAllowed:
+                throw new DeltaLake.DeltaFormatException($"Column '{path}': {FixedSizeBinaryMessage}");
+
+            case Date64Type when !convertibleTypesAllowed:
+                throw new DeltaLake.DeltaFormatException($"Column '{path}': {Date64Message}");
+
             case ArrowStructType s:
                 foreach (var f in s.Fields)
-                    ThrowIfUnsupportedTimestampUnit(f.DataType, path + "." + f.Name);
+                    ThrowIfUnwritableType(f.DataType, path + "." + f.Name, convertibleTypesAllowed);
                 break;
 
             case ListType l:
-                ThrowIfUnsupportedTimestampUnit(l.ValueDataType, path + ".element");
+                ThrowIfUnwritableType(l.ValueDataType, path + ".element", convertibleTypesAllowed);
                 break;
 
             case ArrowMapType m:
-                ThrowIfUnsupportedTimestampUnit(m.KeyField.DataType, path + ".key");
-                ThrowIfUnsupportedTimestampUnit(m.ValueField.DataType, path + ".value");
+                ThrowIfUnwritableType(m.KeyField.DataType, path + ".key", convertibleTypesAllowed);
+                ThrowIfUnwritableType(m.ValueField.DataType, path + ".value", convertibleTypesAllowed);
                 break;
         }
     }
+
+    /// <summary>The largest decimal precision Delta allows (PROTOCOL.md, Primitive Types).</summary>
+    private const int MaxDecimalPrecision = 38;
+
+    private static string DecimalPrecisionMessage(int precision, int scale) =>
+        $"decimal({precision},{scale}) exceeds Delta's maximum decimal precision of {MaxDecimalPrecision}.";
+
+    private static PrimitiveType Decimal(int precision, int scale) =>
+        precision <= MaxDecimalPrecision
+            ? new PrimitiveType { TypeName = $"decimal({precision},{scale})" }
+            : throw new DeltaLake.DeltaFormatException(DecimalPrecisionMessage(precision, scale));
 
     private static DeltaDataType FromArrowType(IArrowType arrowType) => arrowType switch
     {
@@ -219,13 +253,22 @@ public static class SchemaConverter
         FloatType => new PrimitiveType { TypeName = "float" },
         DoubleType => new PrimitiveType { TypeName = "double" },
         BooleanType => new PrimitiveType { TypeName = "boolean" },
-        Decimal128Type d => new PrimitiveType
-            { TypeName = $"decimal({d.Precision},{d.Scale})" },
-        Decimal256Type d => new PrimitiveType
-            { TypeName = $"decimal({d.Precision},{d.Scale})" },
-        BinaryType or LargeBinaryType or BinaryViewType or FixedSizeBinaryType =>
+        // Delta has ONE decimal type; every Arrow width maps to it. A write normalizes the narrow ones
+        // to Decimal128 (the table layer's WriteTypeNormalization) so the files of one column agree.
+        Decimal32Type d => Decimal(d.Precision, d.Scale),
+        Decimal64Type d => Decimal(d.Precision, d.Scale),
+        Decimal128Type d => Decimal(d.Precision, d.Scale),
+        Decimal256Type d => Decimal(d.Precision, d.Scale),
+        BinaryType or LargeBinaryType or BinaryViewType =>
             new PrimitiveType { TypeName = "binary" },
+        // By TypeId: every Arrow decimal type DERIVES from FixedSizeBinaryType. A write converts it to
+        // Binary (WriteTypeNormalization) — lossless — so the column reads back as declared.
+        FixedSizeBinaryType when arrowType.TypeId == ArrowTypeId.FixedSizedBinary =>
+            new PrimitiveType { TypeName = "binary" },
+        // Date64 is milliseconds the Arrow format requires to be whole days, so it converts to Date32
+        // exactly on write; a value that is not a whole day is refused there.
         Date32Type or Date64Type => new PrimitiveType { TypeName = "date" },
+
 
         // MUST precede the timestamp arms below. Nothing downstream narrows the Arrow unit, so a unit
         // Delta or Parquet cannot represent would be written as-is under a microsecond annotation.

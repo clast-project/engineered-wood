@@ -380,7 +380,16 @@ internal static class CompactionExecutor
 
         while (batchIdx < allBatches.Count)
         {
-            var addBatch = allBatches[batchIdx];
+            // Canonical Arrow forms (WriteTypeNormalization). The rows come from several files, each read in
+            // whatever form its own reader produced, and one output file cannot mix them: the Parquet writer
+            // refuses a row group whose column type differs from the file's. Not under a host writer: the
+            // codec seam is value-blind, and the host owns the physical representation.
+            var addBatch = dataFileWriter is null
+                ? WriteTypeNormalization.Normalize(allBatches[batchIdx])
+                : allBatches[batchIdx];
+            // The append path's guard: a foreign TIMESTAMP(NANOS) reads back as a nanosecond column, which no
+            // writer can store under a microsecond Delta timestamp — refused under a host writer too.
+            SchemaConverter.ThrowIfUnwritableType(addBatch.Schema, convertibleTypesAllowed: dataFileWriter is not null);
             currentBatches.Add(addBatch);
             // When materializing, append the ORIGINAL id + commit-version columns to the WRITTEN batch (the
             // internal columns must not appear in Delta stats, which cover the user columns only).

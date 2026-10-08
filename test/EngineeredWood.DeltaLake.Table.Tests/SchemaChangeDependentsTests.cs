@@ -380,19 +380,35 @@ public class SchemaChangeDependentsTests : IDisposable
     [Fact]
     public async Task DropColumn_MatchesThePhysicalNameOfExactlyTheDroppedColumn()
     {
-        // `x` and `X` differ only in case; the clustering spec names `X`'s physical column. A
-        // case-insensitive lookup of the dropped `x` used to find `X` first and refuse the wrong drop,
-        // and would have let the clustered one through.
+        // `x` and `X` differ only in case, and the clustering spec names `X`'s physical column. EW refuses
+        // to commit such a schema (#456), so it is written here the way another writer could: v0 has `X`
+        // and `y`, and v1 renames `y` to `x` in the schema string. A case-insensitive lookup of the dropped
+        // `x` used to find `X` first, refusing the wrong drop and letting the clustered one through.
         long version;
         string xUpperPhysical;
-        await using (var created = await CreateAsync(LongSchema("X", "x", "id"), clusteringColumns: ["id"]))
+        await using (var created = await CreateAsync(LongSchema("X", "y", "id"), clusteringColumns: ["id"]))
         {
             version = created.CurrentSnapshot.Version;
             xUpperPhysical = ColumnMapping.GetPhysicalName(
                 created.CurrentSnapshot.Schema.Fields[0], ColumnMappingMode.Name);
         }
 
-        await using var table = WithClusteringDomain(version, $"[[\"{xUpperPhysical}\"]]");
+        var metadata = System.Text.Json.Nodes.JsonNode.Parse(
+            File.ReadAllLines(Path.Combine(_tempDir, "_delta_log", $"{version:D20}.json"))
+                .Single(line => line.StartsWith("{\"metaData\"", StringComparison.Ordinal)))!;
+        var schema = System.Text.Json.Nodes.JsonNode.Parse((string)metadata["metaData"]!["schemaString"]!)!;
+        foreach (var field in schema["fields"]!.AsArray())
+        {
+            if ((string)field!["name"]! == "y")
+                field["name"] = "x";
+        }
+        metadata["metaData"]!["schemaString"] = schema.ToJsonString();
+        File.WriteAllText(
+            Path.Combine(_tempDir, "_delta_log", $"{version + 1:D20}.json"),
+            metadata.ToJsonString() + "\n");
+
+        await using var table = WithClusteringDomain(version + 1, $"[[\"{xUpperPhysical}\"]]");
+        Assert.Equal(["X", "x", "id"], table.CurrentSnapshot.Schema.Fields.Select(f => f.Name));
         await table.DropColumnAsync("x");
         await RefusedAsync(DeltaTableErrorCodes.UnsupportedDropClusteringColumn,
             async () => await table.DropColumnAsync("X"));

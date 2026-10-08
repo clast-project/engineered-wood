@@ -589,6 +589,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         if (rows.Length == 0)
             return;
         _table.ValidateChangeDataStageable(_baseSnapshot, changeType);
+        DeltaTable.ValidateChangeDataRows(_baseSnapshot, rows, nameof(StageChangeDataAsync));
 
         var files = await _table.WriteChangeDataFilesForAsync(
             _baseSnapshot, rows, changeType, cancellationToken, rowIds, rowCommitVersions, written: _written)
