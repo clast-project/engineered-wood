@@ -15,7 +15,10 @@ namespace EngineeredWood.DeltaLake;
 /// <para><b>Absent is NOT Spark's default here.</b> delta-spark builds the config with default value
 /// <c>Serializable</c> and <c>fromMap</c> falls back to it, so OSS delta-spark runs every data-changing commit at
 /// Serializable whether or not the property is set; <c>WriteSerializable</c> is Databricks' default. This
-/// library reads absence as <see cref="IsolationLevel.WriteSerializable"/>, its long-standing default.</para>
+/// library reads absence as <see cref="IsolationLevel.WriteSerializable"/>, its long-standing default, and that is a
+/// decision rather than an oversight: Serializable by default would also switch off row-level concurrency (the
+/// deletion-vector union) for every table that never asked for it. A table wanting Spark's behaviour sets the
+/// property.</para>
 /// <para><c>SnapshotIsolation</c> as a TABLE's level is read as <see cref="IsolationLevel.WriteSerializable"/>.
 /// Spark's setter refuses it, so only another engine could have written it, and running stricter than it asks
 /// costs conflicts, never correctness; adding a third public level for a value the reference implementation
