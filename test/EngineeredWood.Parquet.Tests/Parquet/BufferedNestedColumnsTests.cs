@@ -213,6 +213,28 @@ public class BufferedNestedColumnsTests : IDisposable
         return new StructArray(type, count, [a.Build()], ArrowBuffer.Empty, nullCount: 0);
     }
 
+    // fixed_size_list<int32, 3>: the list null when r % 5 == 2, element j null when (r + j) % 4 == 3.
+    private static IArrowArray FixedSizeListOfInts(int start, int count)
+    {
+        var values = new Int32Array.Builder();
+        var valid = new List<bool>();
+        for (int r = start; r < start + count; r++)
+        {
+            valid.Add(r % 5 != 2);
+            for (int j = 0; j < 3; j++)
+            {
+                if ((r + j) % 4 == 3) values.AppendNull(); else values.Append(r * 3 + j);
+            }
+        }
+        var type = new FixedSizeListType(new Field("element", Int32Type.Default, true), 3);
+        return new FixedSizeListArray(type, count, values.Build(), Validity(valid), valid.Count(v => !v));
+    }
+
+    // The same, as a slice starting two rows into a longer array: a fixed-size list's values are not sliced with it,
+    // so the leaf's first element is at (offset + row) * 3.
+    private static IArrowArray SlicedFixedSizeListOfInts(int start, int count) =>
+        ArrowArrayFactory.Slice(FixedSizeListOfInts(start - 2, count + 3), 2, count);
+
     private static IArrowArray FlatInts(int start, int count)
     {
         var b = new Int32Array.Builder();
@@ -233,6 +255,8 @@ public class BufferedNestedColumnsTests : IDisposable
         ["list_of_unique_strings"] = (ListOfUniqueStrings, true),
         ["struct_of_all_null_int"] = (StructOfAllNullInt, true),
         ["required_struct"] = (RequiredStruct, false),
+        ["fixed_size_list_of_ints"] = (FixedSizeListOfInts, true),
+        ["sliced_fixed_size_list_of_ints"] = (SlicedFixedSizeListOfInts, true),
         ["flat_ints"] = (FlatInts, true),
     };
 
