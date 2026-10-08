@@ -147,6 +147,64 @@ public class UniversalFormatWriteTests : IDisposable
         Assert.Equal(DeltaTableErrorCodes.UniversalFormatNotMaintained, error.ErrorCode);
     }
 
+    [Theory]
+    [InlineData("clustering extraActions", false)]
+    [InlineData("commit data files extraActions", false)]
+    [InlineData("staged action", false)]
+    [InlineData("clustering extraActions", true)]
+    [InlineData("commit data files extraActions", true)]
+    [InlineData("staged action", true)]
+    public async Task ACallerMetadataThatEnablesUniForm_IsRefused(string seam, bool optIn)
+    {
+        // The table is not UniForm yet; the caller's own metaData turns it on. That commit would already be one no
+        // converter saw, so it is refused like a commit to a table that already is.
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, Schema, optIn ? OptIn : null,
+            columnMappingMode: ColumnMappingMode.Name,
+            configuration: new Dictionary<string, string> { [IcebergCompat.EnableV2Key] = "true" });
+        var current = table.CurrentSnapshot.Metadata;
+        var enabling = current with
+        {
+            Configuration = current.Configuration!
+                .Append(new KeyValuePair<string, string>(UniversalFormat.EnabledFormatsKey, "iceberg"))
+                .ToDictionary(kv => kv.Key, kv => kv.Value),
+        };
+        long version = table.CurrentSnapshot.Version;
+
+        async Task Commit()
+        {
+            switch (seam)
+            {
+                case "clustering extraActions":
+                    await table.SetClusteringColumnsAsync(null, extraActions: [enabling]);
+                    break;
+                case "commit data files extraActions":
+                    await table.CommitDataFilesAsync([], extraActions: [enabling], operation: "SET TBLPROPERTIES");
+                    break;
+                case "staged action":
+                {
+                    await using var txn = table.StartTransaction();
+                    txn.StageActions([enabling]);
+                    await txn.CommitAsync();
+                    break;
+                }
+            }
+        }
+
+        if (optIn)
+        {
+            await Commit();
+            Assert.Equal(["iceberg"],
+                UniversalFormat.GetEnabledFormats(table.CurrentSnapshot.Metadata.Configuration));
+            return;
+        }
+
+        var error = await Assert.ThrowsAsync<DeltaFormatException>(Commit);
+        Assert.Equal(DeltaTableErrorCodes.UniversalFormatNotMaintained, error.ErrorCode);
+        await using var reopened = await DeltaTable.OpenAsync(fs);
+        Assert.Equal(version, reopened.CurrentSnapshot.Version);
+    }
+
     [Fact]
     public async Task ReadsCheckpointsAndVacuum_AreNotRefused()
     {
