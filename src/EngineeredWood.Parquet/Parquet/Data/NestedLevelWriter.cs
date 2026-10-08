@@ -222,8 +222,9 @@ internal static class NestedLevelWriter
             }
 
             // Value encoding indexes the array BY LEVEL POSITION — whenever the level->value mapping is not the
-            // identity (phantoms, or a non-trivial struct/list mapping), rebuild the array in level order.
-            if (!identityMap || levelCount > array.Length)
+            // identity (phantoms, or a non-trivial struct/list mapping), or the array holds values past the last level
+            // (a list's unreferenced trailing elements, #470), rebuild the array in level order.
+            if (!identityMap || levelCount != array.Length)
                 leafArray = ExpandArray(array, valueMap, levelCount);
         }
 
@@ -499,9 +500,14 @@ internal static class NestedLevelWriter
         var elementArray = listArray.Values;
         var offsets = listArray.ValueOffsets;
 
-        // Build def/rep levels
+        // Build def/rep levels, and the CHILD VALUE MAP: each element level's index into the values array. The
+        // values need not be consumed in order from 0 — offsets may start past 0, stop short of the end, leave gaps
+        // between rows, or span values under a null row (all valid Arrow, and what another library's filter/take
+        // leaves behind), and none of those values is written (#470). So the element index is mapped explicitly,
+        // as DecomposeFixedList does.
         var defList = new List<int>();
         var repList = new List<int>();
+        var childMap = new List<int>();
         int inputCount = parentDefLevels?.Length ?? parentCount;
 
         int slotIdx = 0; // index into listArray slots (a STRUCT parent supplies the mapping explicitly —
@@ -516,6 +522,7 @@ internal static class NestedLevelWriter
                 // Ancestor is null — emit phantom entry
                 defList.Add(pDef);
                 repList.Add(pRep);
+                childMap.Add(-1);
                 continue;
             }
 
@@ -525,10 +532,11 @@ internal static class NestedLevelWriter
                 // List itself is null
                 defList.Add(listDefLevel - 1);
                 repList.Add(pRep);
+                childMap.Add(-1);
             }
             else
             {
-                // List is present
+                // List is present. ValueOffsets already applies the list's own slice offset.
                 int start = offsets[slot];
                 int end = offsets[slot + 1];
                 int length = end - start;
@@ -538,6 +546,7 @@ internal static class NestedLevelWriter
                     // Empty list
                     defList.Add(listDefLevel);
                     repList.Add(pRep);
+                    childMap.Add(-1);
                 }
                 else
                 {
@@ -545,6 +554,7 @@ internal static class NestedLevelWriter
                     {
                         defList.Add(repeatedDefLevel); // placeholder — child will add more
                         repList.Add(j == 0 ? pRep : repeatedRepLevel);
+                        childMap.Add(start + j);
                     }
                 }
             }
@@ -557,7 +567,7 @@ internal static class NestedLevelWriter
         path.Add("list");
         path.Add(elementField.Name);
         DecomposeRecursive(elementArray, elementField, path, leaves,
-            repeatedDefLevel, repeatedRepLevel, myDefLevels, myRepLevels, parentCount);
+            repeatedDefLevel, repeatedRepLevel, myDefLevels, myRepLevels, parentCount, childMap.ToArray());
         path.RemoveAt(path.Count - 1);
         path.RemoveAt(path.Count - 1);
     }
@@ -667,9 +677,13 @@ internal static class NestedLevelWriter
         var valueArray = mapArray.Values;
         var offsets = mapArray.ValueOffsets;
 
-        // Build def/rep levels (same structure as list)
+        // Build def/rep levels and the child value map (same structure as list, and for the same reason: the
+        // entries need not be consumed in order from 0, #470). Keys and values are the entries struct's children,
+        // which are not sliced with it, so an entry index is shifted by the entries' own offset.
         var defList = new List<int>();
         var repList = new List<int>();
+        var childMap = new List<int>();
+        int entriesOffset = mapArray.KeyValues.Data.Offset;
         int inputCount = parentDefLevels?.Length ?? parentCount;
 
         int slotIdx = 0; // a STRUCT parent supplies the mapping (a null struct row still occupies a map slot)
@@ -682,6 +696,7 @@ internal static class NestedLevelWriter
             {
                 defList.Add(pDef);
                 repList.Add(pRep);
+                childMap.Add(-1);
                 continue;
             }
 
@@ -690,6 +705,7 @@ internal static class NestedLevelWriter
             {
                 defList.Add(mapDefLevel - 1);
                 repList.Add(pRep);
+                childMap.Add(-1);
             }
             else
             {
@@ -701,6 +717,7 @@ internal static class NestedLevelWriter
                 {
                     defList.Add(mapDefLevel);
                     repList.Add(pRep);
+                    childMap.Add(-1);
                 }
                 else
                 {
@@ -708,6 +725,7 @@ internal static class NestedLevelWriter
                     {
                         defList.Add(repeatedDefLevel);
                         repList.Add(j == 0 ? pRep : repeatedRepLevel);
+                        childMap.Add(entriesOffset + start + j);
                     }
                 }
             }
@@ -719,14 +737,15 @@ internal static class NestedLevelWriter
         // Recurse into key and value
         path.Add("key_value");
 
+        var entryMap = childMap.ToArray();
         path.Add(keyField.Name);
         DecomposeRecursive(keyArray, keyField, path, leaves,
-            repeatedDefLevel, repeatedRepLevel, myDefLevels, myRepLevels, parentCount);
+            repeatedDefLevel, repeatedRepLevel, myDefLevels, myRepLevels, parentCount, entryMap);
         path.RemoveAt(path.Count - 1);
 
         path.Add(valueField.Name);
         DecomposeRecursive(valueArray, valueField, path, leaves,
-            repeatedDefLevel, repeatedRepLevel, myDefLevels, myRepLevels, parentCount);
+            repeatedDefLevel, repeatedRepLevel, myDefLevels, myRepLevels, parentCount, entryMap);
         path.RemoveAt(path.Count - 1);
 
         path.RemoveAt(path.Count - 1);
