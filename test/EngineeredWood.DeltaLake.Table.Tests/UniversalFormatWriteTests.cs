@@ -267,6 +267,9 @@ public class UniversalFormatWriteTests : IDisposable
     [InlineData("iceberg", new[] { "iceberg" })]
     [InlineData("iceberg,hudi", new[] { "iceberg", "hudi" })]
     [InlineData("iceberg, hudi", new[] { "iceberg", " hudi" })] // Spark does not trim (and would refuse this)
+    [InlineData("iceberg,", new[] { "iceberg" })] // Java's split drops trailing empty entries...
+    [InlineData(",", new string[0])] // ...so this is no format at all
+    [InlineData(",iceberg", new[] { "", "iceberg" })] // ...but keeps leading ones
     public void GetEnabledFormats_ParsesAsSparkDoes(string? value, string[] expected)
     {
         var configuration = value is null
@@ -276,11 +279,13 @@ public class UniversalFormatWriteTests : IDisposable
         Assert.Equal(expected, UniversalFormat.GetEnabledFormats(configuration));
     }
 
-    [Fact]
-    public async Task AnEmptyValue_IsNotUniForm()
+    [Theory]
+    [InlineData("")]
+    [InlineData(",")] // Spark parses this as no format too
+    public async Task AValueEnablingNoFormat_IsNotUniForm(string formats)
     {
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), Schema,
-            columnMappingMode: ColumnMappingMode.Name, configuration: UniForm(formats: ""));
+            columnMappingMode: ColumnMappingMode.Name, configuration: UniForm(formats));
 
         await table.WriteAsync([Rows(1)]);
     }

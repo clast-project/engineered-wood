@@ -23,7 +23,8 @@ public static class UniversalFormat
     /// </summary>
     /// <remarks>
     /// Parsed as delta-spark parses it (<c>DeltaConfigs.UNIVERSAL_FORMAT_ENABLED_FORMATS</c>, read from the jar): an
-    /// empty value is none, anything else is split on commas. Spark then accepts only distinct entries from
+    /// empty value is none, anything else is split on commas the way Java splits, dropping trailing empty entries
+    /// (so <c>","</c> is none too). Spark then accepts only distinct entries from
     /// <c>iceberg</c> and <c>hudi</c>, with no trimming and in that case. This method does not validate: an entry
     /// Spark would refuse is still returned, because the table still claims something no one here maintains.
     /// </remarks>
@@ -36,6 +37,12 @@ public static class UniversalFormat
             return [];
         }
 
-        return value.Split(',');
+        // Java's String.split, which Spark calls, drops TRAILING empty strings (and only those): "iceberg," is
+        // [iceberg], and "," is no format at all. .NET's Split keeps them.
+        string[] parts = value.Split(',');
+        int count = parts.Length;
+        while (count > 0 && parts[count - 1].Length == 0)
+            count--;
+        return count == parts.Length ? parts : parts.Take(count).ToArray();
     }
 }
