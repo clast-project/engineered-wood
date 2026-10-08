@@ -403,6 +403,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         options ??= DeltaTableOptions.Default;
         ValidateOptions(options);
+        EnsureUniversalFormatMaintained(configuration, options);
         var log = new TransactionLog(fileSystem);
 
         // Liquid clustering and partitioning are mutually exclusive (Spark's CLUSTER BY REPLACES
@@ -431,6 +432,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 log, new CheckpointReader(fileSystem), latestVersion, cancellationToken)
                 .ConfigureAwait(false);
             ProtocolVersions.ValidateWriteSupport(previousSnapshot.Protocol);
+            // A REPLACE is a commit to the UniForm table too, whatever the new configuration says: one that
+            // drops the property would freeze that metadata for good, and the caller may not know it was there.
+            EnsureUniversalFormatMaintained(previousSnapshot.Metadata.Configuration, options);
         }
 
         // Convert Arrow schema to Delta schema — unless the caller assigned one ALREADY (see the parameter
@@ -1244,7 +1248,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         StructField newColumn, MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
 
         if (!newColumn.Nullable)
             throw new InvalidOperationException(
@@ -1310,7 +1314,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         string oldName, string newName, MetadataAction? baseMetadata = null)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
 
         var snapshot = CurrentSnapshot;
         var baseMeta = baseMetadata ?? snapshot.Metadata;
@@ -1372,7 +1376,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     public DeferredSchemaChange ComputeDropColumn(string name, MetadataAction? baseMetadata = null)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
 
         var snapshot = CurrentSnapshot;
         var baseMeta = baseMetadata ?? snapshot.Metadata;
@@ -1432,7 +1436,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
         if (containerPath.Count == 0)
             throw new ArgumentException(
                 "containerPath must name the containing struct column.", nameof(containerPath));
@@ -1506,7 +1510,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string> fieldPath, string newName, MetadataAction? baseMetadata = null)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
         if (fieldPath.Count < 2)
             throw new ArgumentException(
                 "fieldPath must name a NESTED field (use ComputeRenameColumn for top-level columns).");
@@ -1569,7 +1573,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string> fieldPath, MetadataAction? baseMetadata = null)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
         if (fieldPath.Count < 2)
             throw new ArgumentException(
                 "fieldPath must name a NESTED field (use ComputeDropColumn for top-level columns).");
@@ -1642,7 +1646,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Apache.Arrow.Schema newSchema, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
 
         var snapshot = CurrentSnapshot;
         var config = snapshot.Metadata.Configuration;
@@ -1910,7 +1914,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
 
         var snapshot = CurrentSnapshot;
         var actions = new List<DeltaAction>();
@@ -2343,7 +2347,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // from and the snapshot the commit is based on must be the same one, or the upgrade could be
         // computed against a protocol the commit is not actually starting from.
         var snapshot = CurrentSnapshot;
-        ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
+        ValidateWriteSupport(snapshot);
         DomainMetadataValidation.ValidateUserModification(domain);
 
         var actions = new List<DeltaAction>();
@@ -2375,7 +2379,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // One read, for the same reason as SetDomainMetadataAsync: the existence check, the protocol the
         // declaration is derived from, and the commit's base must all be the same snapshot.
         var snapshot = CurrentSnapshot;
-        ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
+        ValidateWriteSupport(snapshot);
         DomainMetadataValidation.ValidateUserModification(domain);
 
         if (!snapshot.DomainMetadata.ContainsKey(domain))
@@ -2600,6 +2604,37 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// The check every write entry point makes before it writes anything: the protocol must be one this library
+    /// can write, and the table must not promise UniForm metadata this library does not maintain (#473).
+    /// </summary>
+    private void ValidateWriteSupport(Snapshot.Snapshot snapshot)
+    {
+        ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
+        EnsureUniversalFormatMaintained(snapshot.Metadata.Configuration, _options);
+    }
+
+    // A UniForm table's Iceberg/Hudi metadata is regenerated by its writer after each commit, and this library
+    // has no converter: a commit here would leave readers of that format on an older version with nothing to say
+    // so. Refused unless the caller has said it converts, or accepts the lag.
+    private static void EnsureUniversalFormatMaintained(
+        IReadOnlyDictionary<string, string>? configuration, DeltaTableOptions options)
+    {
+        if (options.AllowWritesWithoutUniversalFormatConversion)
+            return;
+        var formats = Schema.UniversalFormat.GetEnabledFormats(configuration);
+        if (formats.Count == 0)
+            return;
+
+        throw new DeltaFormatException(
+            DeltaTableErrorCodes.UniversalFormatNotMaintained,
+            $"The table enables UniForm ({Schema.UniversalFormat.EnabledFormatsKey} = "
+            + $"'{string.Join(",", formats)}'), and this library does not generate that metadata: a write would "
+            + "leave readers of it on an older version of the table. Set "
+            + $"{nameof(DeltaTableOptions)}.{nameof(DeltaTableOptions.AllowWritesWithoutUniversalFormatConversion)} "
+            + "if the conversion is run separately, or the lag is acceptable.");
+    }
+
+    /// <summary>
     /// Rejects a snapshot that belongs to a different table. The Delta table id is in every version's
     /// <c>metaData</c> and never changes, so this is exact — and the failure it prevents is silent: another
     /// table's snapshot has its own active set, so every file ordinal, path and row-id range computed from it
@@ -2630,6 +2665,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
 
         var baseSnapshot = transaction.BaseSnapshot;
+        // StageActions takes raw actions with no entry check of its own, so the transaction is gated here too.
+        EnsureUniversalFormatMaintained(baseSnapshot.Metadata.Configuration, _options);
 
         // Every transactional operation is now rebase-safe under row tracking: a DELETE only edits deletion
         // vectors on EXISTING files (its re-add keeps that file's own baseRowId), or — when a file was
@@ -4954,7 +4991,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool isAppend,
         WriteTimeExpressionHandling handling = WriteTimeExpressionHandling.Refuse)
     {
-        ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
+        ValidateWriteSupport(snapshot);
         // Appends to a row-tracking table are spec-conformant (baseRowId + position). A copy-on-write rewrite
         // (UPDATE / OVERWRITE / DELETE) now materializes each surviving row's ORIGINAL id + commit version into
         // the declared hidden columns — but only when those column names are present in the metadata. A
@@ -6216,7 +6253,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<long?>? materializedRowIds = null)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
         if (IsIcebergCompat)
             throw new NotSupportedException(
                 "WriteDataFilesAsync: IcebergCompat tables require the committing write path.");
@@ -6497,7 +6534,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyCollection<string>? readDomains = null)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
         // extraActions (a buffered transaction's deletion-vector remove/add pairs) likewise make this a
         // non-append. A dataChange=false rewrite (compaction) is append-LEGAL: appendOnly forbids removing
@@ -6789,7 +6826,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     internal void ValidateChangeDataStageable(Snapshot.Snapshot snapshot, string changeType)
     {
-        ProtocolVersions.ValidateWriteSupport(snapshot.Protocol);
+        ValidateWriteSupport(snapshot);
         if (changeType is not (DeltaLake.ChangeDataFeed.CdfConfig.Insert
             or DeltaLake.ChangeDataFeed.CdfConfig.Delete
             or DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage
@@ -7318,7 +7355,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         WrittenFileLedger written,
         CancellationToken cancellationToken)
     {
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
 
         var snapshot = CurrentSnapshot;
         if (selection.IsEmpty)
@@ -7447,7 +7484,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         WrittenFileLedger written,
         CancellationToken cancellationToken)
     {
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
 
         var snapshot = CurrentSnapshot;
         if (selection.IsEmpty)
@@ -7880,7 +7917,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         WrittenFileLedger written,
         CancellationToken cancellationToken = default)
     {
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
 
         var snapshot = CurrentSnapshot;
         if (selection.IsEmpty)
@@ -8650,7 +8687,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
+        ValidateWriteSupport(CurrentSnapshot);
         RejectRowTrackingWrite(CurrentSnapshot); // refused only if a row-tracking table lacks materialized names
 
         options ??= CompactionOptions.Default;

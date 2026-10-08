@@ -576,12 +576,22 @@ Spark does; `delta.dataSkippingStringPrefixLength`, though EW's string bounds ar
 code units where Spark counts code points for the min, and it bumps the last kept character of a max where Spark
 appends U+007F or U+10FFFF. Both are valid bounds.
 
+*Refused unless the caller opts in:* `delta.universalFormat.enabledFormats` (UniForm). EW generates no Iceberg or
+Hudi metadata, so a commit would leave readers of that format on an older version with nothing to say so. UniForm is
+no writer feature (it rides on `icebergCompatV2`, which EW supports), so the protocol alone never stopped such a write.
+EW now refuses every commit to a table whose `enabledFormats` is non-empty: data writes, DML, schema changes, OPTIMIZE,
+transactions, and a REPLACE of it even when the replacement drops the property. Creating one is refused as well. The
+error code is `DELTA_UNIVERSAL_FORMAT_NOT_MAINTAINED`. Reads, checkpoints and VACUUM are unaffected. A host that runs
+the conversion itself, or accepts the lag until another engine's next commit, sets
+`DeltaTableOptions.AllowWritesWithoutUniversalFormatConversion`. Generating the metadata is a possible later feature.
+Its companions `delta.universalFormat.iceberg.atomicConversion.supported` and `delta.universalformat.config.*` are not
+read; they matter only to a converter. #473
+
 *Not read, with consequences for a table EW writes to:*
 
 | Property | What EW does instead |
 |---|---|
 | `delta.isolationLevel` | DML commits at `WriteSerializable` whatever the table demands, so on a `Serializable` table it can commit past a concurrent blind append that Spark would abort on. #472 |
-| `delta.universalFormat.enabledFormats` (with `…iceberg.atomicConversion.supported`, `delta.universalformat.config.*`) | Writes to a UniForm table without generating Iceberg metadata, so Iceberg readers see stale data. Nothing refuses the write: UniForm rides on `icebergCompatV2`, which EW supports. #473 |
 | `delta.compatibility.symlinkFormatManifest.enabled` | Symlink manifests (for Presto/Athena-style readers) are not regenerated. |
 | `delta.setTransactionRetentionDuration` | Expired `txn` (idempotent-write) identifiers are never dropped from checkpoints. |
 | `delta.feature.*`, `delta.minReaderVersion`, `delta.minWriterVersion` passed as CREATE `configuration` | Spark treats these as requests to enable a feature or raise the protocol; EW does not act on them. EW derives the protocol from the features a table uses. A feature is enabled through its `CreateAsync` parameter (`columnMappingMode`, `clusteringColumns`, `enableDeletionVectors`, `enableRowTracking`), a property in `configuration` (`delta.enableDeletionVectors`, `delta.enableRowTracking`, `delta.enableInCommitTimestamps`, `delta.enableChangeDataFeed`, `delta.enableIcebergCompatV1` / `V2`, `delta.checkpointPolicy`), or the schema (`timestamp_ntz`, `variant`). There is **no** way to request a protocol version directly, or a feature that has none of these. |

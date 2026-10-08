@@ -271,4 +271,20 @@ public static class DeltaTableErrorCodes
     /// this one does not, so sharing a code would erase exactly the difference a caller needs.
     /// </remarks>
     public const string StaleTransactionSnapshot = "DELTA_STALE_TRANSACTION_SNAPSHOT";
+
+    // ── UniForm ──
+
+    /// <summary>
+    /// The table enables UniForm (<c>delta.universalFormat.enabledFormats</c>), whose Iceberg or Hudi metadata this
+    /// library does not generate. A commit would leave that metadata describing an older version, so readers of
+    /// the other format would see stale data with nothing to tell them. Nothing is written.
+    /// </summary>
+    /// <remarks>
+    /// Opt out with <see cref="DeltaTableOptions.AllowWritesWithoutUniversalFormatConversion"/> when the host
+    /// runs the conversion itself, or accepts the lag. delta-spark's nearest codes are not reused:
+    /// <c>DELTA_UNIVERSAL_FORMAT_CONVERSION_FAILED</c> reports a conversion that ran and failed, and
+    /// <c>DELTA_UNIVERSAL_FORMAT_VIOLATION</c> a table whose settings break UniForm's own rules. Neither is the
+    /// case here: the table is valid, and no conversion runs at all.
+    /// </remarks>
+    public const string UniversalFormatNotMaintained = "DELTA_UNIVERSAL_FORMAT_NOT_MAINTAINED";
 }

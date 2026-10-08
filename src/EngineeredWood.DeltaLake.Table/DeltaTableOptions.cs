@@ -124,6 +124,22 @@ public sealed record DeltaTableOptions
     /// </remarks>
     public bool HideIcebergMetadataDirectory { get; init; } = true;
 
+    /// <summary>
+    /// Whether to write to a UniForm table (<c>delta.universalFormat.enabledFormats</c>) even though this library
+    /// does not generate its Iceberg or Hudi metadata. Default: false, which refuses every commit to such a table,
+    /// and its creation, with <see cref="DeltaTableErrorCodes.UniversalFormatNotMaintained"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>A UniForm table promises readers of the other format metadata that tracks the Delta table; a Delta
+    /// writer keeps the promise by converting after each commit. Without a converter, a commit leaves that metadata
+    /// at an older version and those readers see stale data, with no error anywhere. So the default refuses, as
+    /// this library does for a writer feature it cannot honour.</para>
+    ///
+    /// <para>Set true when the host runs the conversion itself after each commit, or when a lag until another
+    /// engine's next commit is acceptable. Reads, checkpoints and VACUUM are never refused.</para>
+    /// </remarks>
+    public bool AllowWritesWithoutUniversalFormatConversion { get; init; }
+
     /// <summary>Whether to collect per-column statistics on write. Default: true.</summary>
     public bool CollectStats { get; init; } = true;
 
