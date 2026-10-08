@@ -3909,6 +3909,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // FLBA binary — and a rewrite must not carry that into the file it writes.
                 var physicalBatch = NormalizeUnlessHostOwnsBytes(ColumnMappingRecursive.ToPhysical(
                     dataBatches[k], snapshot.Schema, mappingMode));
+                // The append path's guard, for the same reason: a foreign file's TIMESTAMP(NANOS) reads back
+                // as a nanosecond column, and rewriting it would emit it under a microsecond Delta timestamp.
+                SchemaConverter.ThrowIfUnwritableType(physicalBatch.Schema, convertibleTypesAllowed: HostOwnsBytes);
                 // Statistics are keyed by PHYSICAL name, as the append path keys them; collected from the
                 // logical rows, they were keyed by names that can belong to another column after a rename or
                 // to a dropped one after a re-add, and the pruner skipped files holding matching rows.
@@ -6779,6 +6782,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Int64Array? rowIds = null, Int64Array? rowCommitVersions = null,
         WrittenFileLedger? written = null)
     {
+        // Canonical forms BEFORE the partition split, as the data write path does: the split formats each
+        // row's partition values, and has no form for Date64 or the narrow decimals.
+        rows = WriteTypeNormalization.Normalize(rows);
         var partitionColumns = snapshot.Metadata.PartitionColumns;
         if (partitionColumns is not { Count: > 0 })
         {
@@ -7408,6 +7414,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // Canonical Arrow forms, as in the UPDATE rewrite: these rows were read back from a file.
             var physicalBatch = NormalizeUnlessHostOwnsBytes(
                 ColumnMappingRecursive.ToPhysical(dataBatches[k], snapshot.Schema, mappingMode));
+            SchemaConverter.ThrowIfUnwritableType(physicalBatch.Schema, convertibleTypesAllowed: HostOwnsBytes);
             // Statistics are keyed by PHYSICAL name, as the append path keys them (see the UPDATE rewrite).
             statsBatches.Add(physicalBatch);
             if (!_options.EmitVariantLogicalType)

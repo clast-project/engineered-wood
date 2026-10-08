@@ -387,6 +387,9 @@ internal static class CompactionExecutor
             var addBatch = dataFileWriter is null
                 ? WriteTypeNormalization.Normalize(allBatches[batchIdx])
                 : allBatches[batchIdx];
+            // The append path's guard: a foreign TIMESTAMP(NANOS) reads back as a nanosecond column, which no
+            // writer can store under a microsecond Delta timestamp — refused under a host writer too.
+            SchemaConverter.ThrowIfUnwritableType(addBatch.Schema, convertibleTypesAllowed: dataFileWriter is not null);
             currentBatches.Add(addBatch);
             // When materializing, append the ORIGINAL id + commit-version columns to the WRITTEN batch (the
             // internal columns must not appear in Delta stats, which cover the user columns only).

@@ -1078,6 +1078,75 @@ public class SchemaValidationTests : IDisposable
         Assert.IsType<Date32Array>(result[1].Column(0));
     }
 
+    // ── Rewrites refuse what no writer can store ──────────────────────────────────────────────────────
+
+    /// <summary>Commits a two-row file holding a nanosecond timestamp under a declared (microsecond)
+    /// `timestamp`, as a non-conforming writer could, and returns its path.</summary>
+    private async Task<string> CommitForeignNanosecondFileAsync(DeltaTable table, string name, long id)
+    {
+        var nanos = new TimestampType(TimeUnit.Nanosecond, "UTC");
+        var fileSchema = Schema(Long("id"), new Field("t", nanos, true));
+        string path = Path.Combine(_tempDir, name);
+        await using (var file = new LocalSequentialFile(path))
+        {
+            await using var writer = new Parquet.ParquetFileWriter(file, ownsFile: false);
+            await writer.WriteRowGroupAsync(new RecordBatch(fileSchema,
+                [
+                    new Int64Array.Builder().Append(id).Append(id + 10).Build(),
+                    new TimestampArray.Builder(nanos)
+                        .Append(new DateTimeOffset(2024, 3, 1, 0, 0, 0, TimeSpan.Zero))
+                        .Append(new DateTimeOffset(2024, 3, 2, 0, 0, 0, TimeSpan.Zero)).Build(),
+                ], 2));
+        }
+        await table.CommitDataFilesAsync([new WrittenDataFile(name, new FileInfo(path).Length, 2, null, null)]);
+        return name;
+    }
+
+    [Fact]
+    public async Task Rewrites_OfAForeignNanosecondTimestamp_AreRefusedAndNothingIsCommitted()
+    {
+        var zoned = new TimestampType(TimeUnit.Microsecond, "UTC");
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(Long("id"), new Field("t", zoned, true)));
+        string first = await CommitForeignNanosecondFileAsync(table, "foreign1.parquet", 1);
+        await CommitForeignNanosecondFileAsync(table, "foreign2.parquet", 2);
+        long version = table.CurrentSnapshot.Version;
+
+        // The premise: the reader keeps the file's nanosecond unit. Each file has two rows, so deleting one
+        // leaves a survivor the copy-on-write DELETE has to rewrite.
+        var read = (TimestampType)(await ReadAllAsync(table)).First().Schema.GetFieldByName("t").DataType;
+        Assert.Equal(TimeUnit.Nanosecond, read.Unit);
+
+        await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.UpdateAsync(
+            b => new BooleanArray.Builder().AppendRange(Enumerable.Repeat(true, b.Length)).Build(),
+            b => b));
+        await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.DeleteRowsAsync(
+            RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>> { [first] = [0L] }),
+            RowDeleteMode.CopyOnWrite));
+        await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue }));
+
+        Assert.Equal(version, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task ChangeData_OnATablePartitionedByADate64Column_IsWrittenUnderItsDay()
+    {
+        // The rows are split by partition value; before they were normalized first, Date64 had no partition
+        // value form ("Partition values of Arrow type Date64 are not supported").
+        var declared = Schema(new Field("p", Date32Type.Default, true), Long("v"));
+        await using var table = await DeltaTable.CreateAsync(Fs, declared, partitionColumns: ["p"],
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" });
+
+        var rows = new RecordBatch(Schema(new Field("p", Date64Type.Default, true), Long("v")),
+            [new Date64Array.Builder().Append(new DateTime(2024, 3, 1)).Build(), new Int64Array.Builder().Append(1).Build()], 1);
+        var txn = table.StartTransaction();
+        await txn.StageChangeDataAsync(rows, "delete");
+        await txn.CommitAsync();
+
+        string log = File.ReadAllText(Directory.GetFiles(Path.Combine(_tempDir, "_delta_log"), "*.json").Max()!);
+        Assert.Contains("\"p\":\"2024-03-01\"", log);
+    }
+
     // ── Integer to decimal widening ───────────────────────────────────────────────────────────────────
 
     [Theory]
