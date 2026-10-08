@@ -24,10 +24,10 @@ namespace EngineeredWood.DeltaLake.Table;
 /// <para>
 /// The match is Spark's (<c>SchemaUtils.containsDependentExpression</c>): an expression depends
 /// on a change when the changed column IS one of its references or a prefix of one, compared
-/// case-insensitively. An expression referring to <c>s</c> as a whole does not depend on a DROP
-/// of <c>s.b</c>. The parser joins a nested access into one dotted name, which a quoted name
-/// containing a dot also produces, so the comparison is on the dotted text — over-refusing only
-/// when a quoted name happens to spell another column's path.
+/// part by part, case-insensitively. An expression referring to <c>s</c> as a whole does not
+/// depend on a DROP of <c>s.b</c>. The comparison is on the reference's name parts, so a quoted
+/// name containing a dot (<c>`a.b`</c>, one part) is never taken for the nested path
+/// <c>a.b</c> (#466).
 /// </para>
 /// </remarks>
 internal static class SchemaChangeDependents
@@ -52,7 +52,7 @@ internal static class SchemaChangeDependents
 
         foreach (var (key, sql) in Constraints(metadata))
         {
-            if (References($"CHECK constraint '{key}'", sql).Any(r => DependsOn(r, target)))
+            if (References($"CHECK constraint '{key}'", sql).Any(r => DependsOn(r, path)))
             {
                 throw new DeltaFormatException(
                     DeltaTableErrorCodes.ConstraintDependentColumnChange,
@@ -69,7 +69,7 @@ internal static class SchemaChangeDependents
                 continue;
             }
 
-            if (References($"generated column '{field.Name}'", sql).Any(r => DependsOn(r, target)))
+            if (References($"generated column '{field.Name}'", sql).Any(r => DependsOn(r, path)))
             {
                 throw new DeltaFormatException(
                     DeltaTableErrorCodes.GeneratedColumnsDependentColumnChange,
@@ -115,24 +115,20 @@ internal static class SchemaChangeDependents
     /// <see cref="EnsureChangeable"/>.
     /// </summary>
     /// <remarks>
-    /// A reference must keep the binding it had in <paramref name="oldSchema"/>. The parser's dotted
-    /// text cannot say whether <c>`a.b`</c> was one quoted column or <c>a</c>'s field <c>b</c>, so
-    /// accepting any split that resolves would let a replacement swap the one for the other, and the
-    /// write path, which binds the old way, would then fail. A reference the old schema cannot bind
-    /// (a new generated column's, say) only has to resolve somehow.
+    /// A reference resolves when its exact path does, as the write path binds it: <c>`a.b`</c> needs a
+    /// column named <c>a.b</c>, and <c>a.b</c> needs field <c>b</c> of a struct <c>a</c>.
     /// </remarks>
-    public static void EnsureReplacementResolves(
-        MetadataAction metadata, StructType oldSchema, StructType newSchema)
+    public static void EnsureReplacementResolves(MetadataAction metadata, StructType newSchema)
     {
         foreach (var (key, sql) in Constraints(metadata))
         {
             foreach (var reference in References($"CHECK constraint '{key}'", sql))
             {
-                if (!StillResolves(oldSchema, newSchema, reference))
+                if (!Resolves(newSchema, reference))
                 {
                     throw new DeltaFormatException(
                         DeltaTableErrorCodes.ConstraintDependentColumnChange,
-                        $"The new schema has no column '{reference}', which CHECK constraint '{key}' "
+                        $"The new schema has no column '{Text(reference)}', which CHECK constraint '{key}' "
                         + $"({sql}) reads. Drop the constraint first.");
                 }
             }
@@ -148,11 +144,11 @@ internal static class SchemaChangeDependents
 
             foreach (var reference in References($"generated column '{field.Name}'", sql))
             {
-                if (!StillResolves(oldSchema, newSchema, reference))
+                if (!Resolves(newSchema, reference))
                 {
                     throw new DeltaFormatException(
                         DeltaTableErrorCodes.GeneratedColumnsDependentColumnChange,
-                        $"The new schema has no column '{reference}', which generated column "
+                        $"The new schema has no column '{Text(reference)}', which generated column "
                         + $"'{field.Name}' is computed from ({sql}).");
                 }
             }
@@ -283,47 +279,46 @@ internal static class SchemaChangeDependents
         }
     }
 
-    /// <summary>Whether a reference names <paramref name="target"/> or something inside it.</summary>
-    private static bool DependsOn(string reference, string target) =>
-        reference.Equals(target, StringComparison.OrdinalIgnoreCase)
-        || (reference.Length > target.Length
-            && reference[target.Length] == '.'
-            && reference.StartsWith(target, StringComparison.OrdinalIgnoreCase));
-
-    private static bool StillResolves(StructType oldSchema, StructType newSchema, string reference)
+    /// <summary>Whether a reference names the field at <paramref name="path"/> or something inside it.</summary>
+    private static bool DependsOn(IReadOnlyList<string> reference, IReadOnlyList<string> path)
     {
-        var bound = Bindings(oldSchema.Fields, reference).ToList();
-        return bound.Count == 0
-            ? Bindings(newSchema.Fields, reference).Any()
-            : bound.All(path => TranslatePath(newSchema, path, f => f.Name, f => f.Name) is not null);
-    }
-
-    /// <summary>Every field path a dotted reference can name in <paramref name="fields"/>, trying every
-    /// split, since a quoted name may itself contain a dot.</summary>
-    private static IEnumerable<IReadOnlyList<string>> Bindings(IReadOnlyList<StructField> fields, string reference)
-    {
-        foreach (var field in fields)
+        if (reference.Count < path.Count)
+            return false;
+        for (int i = 0; i < path.Count; i++)
         {
-            if (reference.Equals(field.Name, StringComparison.OrdinalIgnoreCase))
-                yield return [field.Name];
-            if (field.Type is StructType st
-                && reference.Length > field.Name.Length
-                && reference[field.Name.Length] == '.'
-                && reference.StartsWith(field.Name, StringComparison.OrdinalIgnoreCase))
-            {
-                foreach (var rest in Bindings(st.Fields, reference.Substring(field.Name.Length + 1)))
-                    yield return [field.Name, .. rest];
-            }
+            if (!string.Equals(reference[i], path[i], StringComparison.OrdinalIgnoreCase))
+                return false;
         }
+        return true;
     }
 
-    /// <summary>The column names an expression reads.</summary>
+    /// <summary>Whether <paramref name="schema"/> has the field at <paramref name="reference"/>'s path,
+    /// matching each part case-insensitively through structs.</summary>
+    private static bool Resolves(StructType schema, IReadOnlyList<string> reference)
+    {
+        DeltaDataType type = schema;
+        foreach (string part in reference)
+        {
+            if (type is not StructType st)
+                return false;
+            var field = st.Fields.FirstOrDefault(
+                f => string.Equals(f.Name, part, StringComparison.OrdinalIgnoreCase));
+            if (field is null)
+                return false;
+            type = field.Type;
+        }
+        return true;
+    }
+
+    private static string Text(IReadOnlyList<string> reference) => string.Join(".", reference);
+
+    /// <summary>The column paths an expression reads.</summary>
     /// <exception cref="DeltaFormatException">
     /// The expression does not parse. Not knowing what it reads, the change is refused: the
     /// alternative is guessing, and a wrong guess is the unwritable table this class exists to
     /// prevent.
     /// </exception>
-    private static List<string> References(string description, string sql)
+    private static List<IReadOnlyList<string>> References(string description, string sql)
     {
         Expression expression;
         try
@@ -339,20 +334,20 @@ internal static class SchemaChangeDependents
                 ex);
         }
 
-        var references = new List<string>();
+        var references = new List<IReadOnlyList<string>>();
         Collect(expression, references);
         return references;
     }
 
-    private static void Collect(Expression expression, List<string> references)
+    private static void Collect(Expression expression, List<IReadOnlyList<string>> references)
     {
         switch (expression)
         {
             case UnboundReference reference:
-                references.Add(reference.Name);
+                references.Add(reference.NameParts);
                 break;
             case BoundReference reference:
-                references.Add(reference.Name);
+                references.Add([reference.Name]);
                 break;
             case FunctionCall call:
                 foreach (var argument in call.Arguments)

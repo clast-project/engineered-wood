@@ -164,8 +164,33 @@ public sealed class SparkSqlParserTests
     [Fact]
     public void DottedNamesStayOneReferenceBecauseThatIsHowDeltaWritesThem()
     {
-        Assert.Equal(new UnboundReference("nested.arr"), Parse("nested.arr"));
+        var nested = Assert.IsType<UnboundReference>(Parse("nested.arr"));
+        Assert.Equal("nested.arr", nested.Name);
+        Assert.Equal(UnboundReference.FromParts(["nested", "arr"]), nested);
         Assert.Equal(new UnboundReference("weird name"), Parse("`weird name`"));
+    }
+
+    // #466: the four spellings the issue lists all have Name "a.b"; the parts tell the nested path from the column
+    // whose name contains a dot.
+    [Theory]
+    [InlineData("a.b", new[] { "a", "b" })]
+    [InlineData("`a`.`b`", new[] { "a", "b" })]
+    [InlineData("`a`.b", new[] { "a", "b" })]
+    [InlineData("`a.b`", new[] { "a.b" })]
+    [InlineData("s.`x.y`.z", new[] { "s", "x.y", "z" })]
+    public void AReferenceKeepsItsNameParts(string sql, string[] parts)
+    {
+        var reference = Assert.IsType<UnboundReference>(Parse(sql));
+
+        Assert.Equal(string.Join(".", parts), reference.Name);
+        Assert.Equal(parts, reference.NameParts);
+    }
+
+    [Fact]
+    public void ANestedPathAndAQuotedDottedNameAreDifferentReferences()
+    {
+        Assert.NotEqual(Parse("a.b"), Parse("`a.b`"));
+        Assert.Equal(Parse("a.b"), Parse("`a`.`b`"));
     }
 
     // ── Literal typing, every rule measured from Spark ─────────────────────────────────────

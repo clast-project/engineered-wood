@@ -368,11 +368,13 @@ public static class SparkSqlParser
             {
                 if (TakeToken(TokenKind.Dot))
                 {
-                    // Nested field access joins the path, so `nested.arr` binds as one name the
-                    // way Delta writes it rather than as a call on `nested`.
+                    // Nested field access extends the reference's path, so `nested.arr` binds as one
+                    // name the way Delta writes it rather than as a call on `nested`. The parts are
+                    // kept: `a`.`b` is field b of struct a, while `a.b` quoted whole is one column,
+                    // and only the parts can tell them apart.
                     var field = ExpectIdentifier("a field name after '.'");
                     if (expression is UnboundReference reference)
-                        expression = new UnboundReference(reference.Name + "." + field);
+                        expression = UnboundReference.FromParts([.. reference.NameParts, field]);
                     else
                         expression = new FunctionCall("getfield", new[] { expression, Lit(field) });
                 }
