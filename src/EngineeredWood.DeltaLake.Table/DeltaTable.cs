@@ -1022,6 +1022,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 + $"than the existing table's maxColumnId ({previousMaxId}).");
         }
 
+        // An IcebergCompatV2 nested id comes from the same sequence, so the same rule holds for it.
+        foreach (var nested in ColumnMapping.GetNestedIds(field))
+        {
+            if (nested.Value <= previousMaxId)
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.InvalidPreAssignedSchema,
+                    $"preAssignedSchema reuses column-mapping id {nested.Value} (nested id '{nested.Key}'); "
+                    + $"replacement ids must be greater than the existing table's maxColumnId ({previousMaxId}).");
+            }
+        }
+
         ValidateReplacementColumnMappingIds(field.Type, previousMaxId);
     }
 
@@ -1289,11 +1301,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 .ToList();
         }
 
+        IReadOnlyDictionary<string, string>? newConfig =
+            DataSkippingStatsColumns.AfterRename(baseMeta.Configuration, [oldName], [newName]);
+        (newSchema, newConfig) = FillIcebergNestedIds(newSchema, newConfig);
         var metadata = baseMeta with
         {
             SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
             PartitionColumns = newPartitionColumns,
-            Configuration = DataSkippingStatsColumns.AfterRename(baseMeta.Configuration, [oldName], [newName]),
+            Configuration = newConfig,
         };
         return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
     }
@@ -1340,10 +1355,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // and passes, while any other drop on such a table would commit the invalid schema again.
         CommitSchemaValidation.EnsureValid(newSchema);
 
+        IReadOnlyDictionary<string, string>? newConfig =
+            DataSkippingStatsColumns.AfterDrop(baseMeta.Configuration, [name]);
+        (newSchema, newConfig) = FillIcebergNestedIds(newSchema, newConfig);
         var metadata = baseMeta with
         {
             SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
-            Configuration = DataSkippingStatsColumns.AfterDrop(baseMeta.Configuration, [name]),
+            Configuration = newConfig,
         };
         return new DeferredSchemaChange(
             new List<DeltaAction> { metadata }, metadata, null, newSchema, [ClusteringDomain]);
@@ -1479,11 +1497,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             baseSchema, baseMeta, snapshot.DomainMetadata, fieldPath, isDrop: false);
         CommitSchemaValidation.EnsureValid(newSchema);
 
+        IReadOnlyDictionary<string, string>? newConfig = DataSkippingStatsColumns.AfterRename(
+            baseMeta.Configuration, fieldPath, [.. containerPath, newName]);
+        (newSchema, newConfig) = FillIcebergNestedIds(newSchema, newConfig);
         var metadata = baseMeta with
         {
             SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
-            Configuration = DataSkippingStatsColumns.AfterRename(
-                baseMeta.Configuration, fieldPath, [.. containerPath, newName]),
+            Configuration = newConfig,
         };
         return new DeferredSchemaChange(new List<DeltaAction> { metadata }, metadata, null, newSchema);
     }
@@ -1534,10 +1554,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             baseSchema, baseMeta, snapshot.DomainMetadata, fieldPath, isDrop: true);
         CommitSchemaValidation.EnsureValid(newSchema); // see ComputeDropColumn
 
+        IReadOnlyDictionary<string, string>? newConfig =
+            DataSkippingStatsColumns.AfterDrop(baseMeta.Configuration, fieldPath);
+        (newSchema, newConfig) = FillIcebergNestedIds(newSchema, newConfig);
         var metadata = baseMeta with
         {
             SchemaString = DeltaSchemaSerializer.Serialize(newSchema),
-            Configuration = DataSkippingStatsColumns.AfterDrop(baseMeta.Configuration, fieldPath),
+            Configuration = newConfig,
         };
         return new DeferredSchemaChange(
             new List<DeltaAction> { metadata }, metadata, null, newSchema, [ClusteringDomain]);
@@ -2145,8 +2168,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     // IcebergCompatV2 gives array elements and map keys/values column ids too, recorded on the nearest ancestor
-    // field (ColumnMapping.AssignNestedIds). Spark and Kernel assign the missing ones on every schema change of
-    // such a table, after the column ids and from the same sequence, so maxId moves past them. Any other table
+    // field (ColumnMapping.AssignNestedIds). Spark and Kernel assign the missing ones on every metadata update of
+    // such a table, after the column ids and from the same sequence, so maxId moves past them. EW does so on
+    // every schema DDL; the identity high-water-mark updates a write makes are the exception. Any other table
     // gets none, and its schema comes back unchanged.
     private static StructType WithIcebergNestedIds(
         StructType schema, IReadOnlyDictionary<string, string>? config, ref int maxId)
@@ -2156,6 +2180,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var (assigned, lastId) = ColumnMapping.AssignNestedIds(schema, maxId);
         maxId = lastId;
         return assigned;
+    }
+
+    // WithIcebergNestedIds for a schema change that assigns no column ids (a RENAME or DROP): fills in whatever the
+    // schema lacks — a V2 table an older EW wrote has no nested ids at all — and records the new maxColumnId.
+    // The schema and config come back unchanged when there is nothing to fill.
+    private static (StructType Schema, IReadOnlyDictionary<string, string>? Config) FillIcebergNestedIds(
+        StructType schema, IReadOnlyDictionary<string, string>? config)
+    {
+        int maxId = config is not null && config.TryGetValue(ColumnMapping.MaxColumnIdKey, out var maxStr)
+            && int.TryParse(maxStr, out var configured)
+                ? configured
+                : 0;
+        var filled = WithIcebergNestedIds(schema, config, ref maxId);
+        if (ReferenceEquals(filled, schema))
+            return (schema, config);
+
+        var cfg = config!.ToDictionary(kv => kv.Key, kv => kv.Value);
+        cfg[ColumnMapping.MaxColumnIdKey] = maxId.ToString();
+        return (filled, cfg);
     }
 
     // Assigns column-mapping metadata (id + physical name) to a NEW field being added to a mapped table —

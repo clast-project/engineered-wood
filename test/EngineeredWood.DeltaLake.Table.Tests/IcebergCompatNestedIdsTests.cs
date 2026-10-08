@@ -316,6 +316,90 @@ public class IcebergCompatNestedIdsTests : IDisposable
         Assert.Equal(11, sameMax);
     }
 
+    [Fact]
+    public void AssignNestedIds_StartsPastTheIdsTheSchemaRecords()
+    {
+        // A caller's startId can lag a schema that carries ids of its own; 3 would be assigned below key's 10.
+        var schema = DeltaSchemaSerializer.Parse(
+            """
+            {"type":"struct","fields":[
+             {"name":"m","type":{"type":"map","keyType":"string","valueType":"long","valueContainsNull":true},
+              "nullable":true,"metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"col-2",
+              "delta.columnMapping.nested.ids":{"col-2.key":10}}}]}
+            """);
+
+        var (assigned, max) = ColumnMapping.AssignNestedIds(schema, startId: 2);
+
+        Assert.Equal(11, Nested(assigned.Fields[0])["col-2.value"]);
+        Assert.Equal(11, max);
+    }
+
+    [Fact]
+    public async Task Replace_PreAssignedSchemaReusingANestedId_IsRefused()
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(ListOf("arr", Int64Type.Default)).Build();
+        var fs = new LocalTableFileSystem(_tempDir);
+        await (await CreateAsync(schema)).DisposeAsync(); // ids 1 (arr) and 2 (arr.element)
+
+        // A fresh column id above the old maximum, but the element keeps an id the old table used.
+        var preAssigned = DeltaSchemaSerializer.Parse(
+            """
+            {"type":"struct","fields":[{"name":"arr","type":{"type":"array","elementType":"long","containsNull":true},
+             "nullable":true,"metadata":{"delta.columnMapping.id":3,"delta.columnMapping.physicalName":"col-new",
+             "delta.columnMapping.nested.ids":{"col-new.element":2}}}]}
+            """);
+        var error = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await DeltaTable.CreateOrReplaceAsync(fs, schema, [], columnMappingMode: ColumnMappingMode.Name,
+                configuration: V2, preAssignedSchema: preAssigned));
+        Assert.Contains("col-new.element", error.Message);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RenameOrDrop_FillsInTheIdsAnOlderWriterLeftOut(bool rename)
+    {
+        // A V2 table as EW wrote it before #467: column ids only, and maxColumnId past an id it burned.
+        var fs = new LocalTableFileSystem(_tempDir);
+        await new EngineeredWood.DeltaLake.Log.TransactionLog(fs).WriteCommitAsync(0,
+        [
+            new EngineeredWood.DeltaLake.Actions.ProtocolAction
+            {
+                MinReaderVersion = 2, MinWriterVersion = 7,
+                ReaderFeatures = ["columnMapping"], WriterFeatures = ["columnMapping", "icebergCompatV2"],
+            },
+            new EngineeredWood.DeltaLake.Actions.MetadataAction
+            {
+                Id = "older-ew",
+                Format = EngineeredWood.DeltaLake.Actions.Format.Parquet,
+                SchemaString = """
+                    {"type":"struct","fields":[
+                     {"name":"id","type":"long","nullable":true,"metadata":{"delta.columnMapping.id":1,
+                      "delta.columnMapping.physicalName":"col-1"}},
+                     {"name":"arr","type":{"type":"array","elementType":"long","containsNull":true},"nullable":true,
+                      "metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"col-2"}}]}
+                    """,
+                PartitionColumns = [],
+                Configuration = new Dictionary<string, string>
+                {
+                    [ColumnMapping.ModeKey] = "name",
+                    [ColumnMapping.MaxColumnIdKey] = "4",
+                    [IcebergCompat.EnableV2Key] = "true",
+                },
+            },
+        ]);
+        await using var table = await DeltaTable.OpenAsync(fs);
+
+        if (rename)
+            await table.RenameColumnAsync("id", "key");
+        else
+            await table.DropColumnAsync("id");
+
+        var arr = table.CurrentSnapshot.Schema.Fields.Single(f => f.Name == "arr");
+        Assert.Equal(new Dictionary<string, int> { ["col-2.element"] = 5 }, Nested(arr));
+        Assert.Equal(5, MaxColumnId(table));
+    }
+
     [Theory]
     [InlineData("\"not an object\"")]
     [InlineData("{\"col-1.element\":\"7\"}")]

@@ -272,8 +272,9 @@ public static class ColumnMapping
     /// <summary>
     /// Gives every array element and map key/value in <paramref name="schema"/> a column id, as IcebergCompatV2
     /// requires (PROTOCOL.md, "Writer Requirements for IcebergCompatV2"), continuing past
-    /// <paramref name="startId"/>. Returns the schema and the new maximum column id; the same schema instance
-    /// when every one already has an id.
+    /// <paramref name="startId"/> or the highest id <paramref name="schema"/> already records, whichever is
+    /// higher. Returns the schema and the new maximum column id; the same schema instance when every one already
+    /// has an id.
     /// </summary>
     /// <remarks>
     /// <para>The ids are recorded under <see cref="NestedIdsKey"/> on the nearest ancestor
@@ -288,7 +289,9 @@ public static class ColumnMapping
     /// </remarks>
     public static (StructType Schema, int MaxColumnId) AssignNestedIds(StructType schema, int startId)
     {
-        int nextId = startId;
+        // A caller's high-water mark can lag the schema (one carrying ids of its own); an id at or below an
+        // existing one could duplicate it.
+        int nextId = Math.Max(startId, GetMaxColumnId(schema));
         var result = AssignNestedIdsIn(schema, ref nextId);
         return (result, nextId);
     }
