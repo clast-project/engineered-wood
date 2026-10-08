@@ -585,7 +585,7 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             _file.Dispose();
     }
 
-    private static bool IsNestedType(Apache.Arrow.Types.IArrowType type) =>
+    internal static bool IsNestedType(Apache.Arrow.Types.IArrowType type) =>
         type is Apache.Arrow.Types.StructType
             or Apache.Arrow.Types.ListType
             or Apache.Arrow.Types.FixedSizeListType
