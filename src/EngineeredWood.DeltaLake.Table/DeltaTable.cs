@@ -1611,7 +1611,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     $"The new schema has no partition column '{partitionColumn}'.");
             }
         }
-        SchemaChangeDependents.EnsureReplacementResolves(snapshot.Metadata, snapshot.Schema, newDeltaSchema);
+        SchemaChangeDependents.EnsureReplacementResolves(snapshot.Metadata, newDeltaSchema);
         var clustering = RekeyClusteringDomain(snapshot, newDeltaSchema, mappingMode);
 
         var protocolUpgrade = UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaSchema));

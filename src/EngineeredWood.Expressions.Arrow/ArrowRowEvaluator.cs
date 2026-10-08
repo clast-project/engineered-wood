@@ -403,7 +403,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         switch (expression)
         {
             case UnboundReference u:
-                return GetColumn(batch, u.Name).Data.DataType;
+                return GetColumn(batch, u).Data.DataType;
 
             case BoundReference b:
                 return GetColumn(batch, b.Name).Data.DataType;
@@ -940,7 +940,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         IArrowArray array;
         switch (expression)
         {
-            case UnboundReference u: array = GetColumn(batch, u.Name); break;
+            case UnboundReference u: array = GetColumn(batch, u); break;
             case BoundReference b: array = GetColumn(batch, b.Name); break;
             case FunctionCall fc: array = InvokeFunction(fc, batch); break;
             default: return (EvalExpression(expression, batch), null);
@@ -1251,7 +1251,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
                 return Repeat(lit.Value.IsNull ? null : (LiteralValue?)lit.Value, batch.Length);
 
             case UnboundReference u:
-                return ArrowToLiteralValues(GetColumn(batch, u.Name), batch.Length);
+                return ArrowToLiteralValues(GetColumn(batch, u), batch.Length);
 
             case BoundReference b:
                 return ArrowToLiteralValues(GetColumn(batch, b.Name), batch.Length);
@@ -1288,7 +1288,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     private IArrowArray EvalExpressionAsArray(Expression expression, RecordBatch batch) =>
         expression switch
         {
-            UnboundReference u => GetColumn(batch, u.Name),
+            UnboundReference u => GetColumn(batch, u),
             BoundReference b => GetColumn(batch, b.Name),
             FunctionCall fc => InvokeFunction(fc, batch),
             Predicate p => ToBooleanArray(EvalPredicate(p, batch), batch.Length),
@@ -1668,7 +1668,7 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// read it.
     /// </para>
     /// <para>
-    /// Every column matching a name is kept, not the first. <see cref="GetColumn"/> resolves
+    /// Every column matching a name is kept, not the first. <see cref="GetColumn(RecordBatch, string)"/> resolves
     /// case-insensitively and refuses an ambiguous match, and dropping the second of a colliding
     /// pair here would turn that refusal into a wrong answer.
     /// </para>
@@ -1715,7 +1715,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         switch (expression)
         {
             case UnboundReference u:
-                names.Add(u.Name);
+                // A path is read through its top-level column, which is the one to keep.
+                names.Add(u.NameParts[0]);
                 break;
 
             case BoundReference b:
@@ -1926,6 +1927,81 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     /// case-insensitive dictionary would need an ambiguity sentinel and a rebuild per batch.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// The values a reference names: its top-level column, then, for a nested path, a field of each struct below
+    /// it, every part matched case-insensitively. A field of a null struct row is null there, as in Spark.
+    /// </summary>
+    private static IArrowArray GetColumn(RecordBatch batch, UnboundReference reference)
+    {
+        var parts = reference.NameParts;
+        var array = GetColumn(batch, parts[0]);
+        for (var p = 1; p < parts.Count; p++)
+        {
+            string path = string.Join(".", parts.Take(p));
+            if (array is not StructArray parent)
+            {
+                throw new ArgumentException(
+                    $"Column '{reference.Name}' not found in batch schema: '{path}' is not a struct.");
+            }
+
+            var fields = ((StructType)parent.Data.DataType).Fields;
+            var match = -1;
+            for (var i = 0; i < fields.Count; i++)
+            {
+                if (!string.Equals(fields[i].Name, parts[p], StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (match >= 0)
+                {
+                    throw new ArgumentException(
+                        $"Column '{reference.Name}' is ambiguous in the batch schema: struct '{path}' has fields "
+                        + $"'{fields[match].Name}' and '{fields[i].Name}', which differ only in case, and "
+                        + "identifiers resolve case-insensitively.");
+                }
+                match = i;
+            }
+
+            if (match < 0)
+            {
+                throw new ArgumentException(
+                    $"Column '{reference.Name}' not found in batch schema: struct '{path}' has no field "
+                    + $"'{parts[p]}'.");
+            }
+
+            array = StructField(parent, match);
+        }
+
+        return array;
+    }
+
+    /// <summary>
+    /// Field <paramref name="index"/> of <paramref name="parent"/>, row for row: a struct's children are not sliced
+    /// with it, and a child slot under a null struct row holds whatever was written there, so this slices the child
+    /// and makes those rows null.
+    /// </summary>
+    private static IArrowArray StructField(StructArray parent, int index)
+    {
+        var data = parent.Data.Children[index].Slice(parent.Data.Offset, parent.Length);
+        var child = ArrowArrayFactory.BuildArray(data);
+        if (parent.NullCount == 0 || data.DataType.TypeId is ArrowTypeId.Null)
+            return child;
+
+        // The validity bitmap is read from the data's own offset, so the new one is laid out the same way.
+        var bits = new byte[(data.Offset + data.Length + 7) / 8];
+        var nulls = 0;
+        for (var i = 0; i < data.Length; i++)
+        {
+            if (parent.IsValid(i) && child.IsValid(i))
+                bits[(data.Offset + i) >> 3] |= (byte)(1 << ((data.Offset + i) & 7));
+            else
+                nulls++;
+        }
+
+        var buffers = data.Buffers.ToArray();
+        buffers[0] = new ArrowBuffer(bits);
+        return ArrowArrayFactory.BuildArray(new ArrayData(
+            data.DataType, data.Length, nulls, data.Offset, buffers, data.Children, data.Dictionary));
+    }
+
     private static IArrowArray GetColumn(RecordBatch batch, string name)
     {
         var fields = batch.Schema.FieldsList;
