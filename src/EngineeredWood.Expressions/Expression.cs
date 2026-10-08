@@ -42,7 +42,7 @@ public sealed record UnboundReference(string Name) : Expression
             throw new ArgumentException("A reference needs at least one name part.", nameof(parts));
         return parts.Count == 1
             ? new UnboundReference(parts[0])
-            : new UnboundReference(string.Join(".", parts), parts.ToArray());
+            : new UnboundReference(string.Join(".", parts), Array.AsReadOnly(parts.ToArray()));
     }
 
     private UnboundReference(string name, IReadOnlyList<string> parts) : this(name)

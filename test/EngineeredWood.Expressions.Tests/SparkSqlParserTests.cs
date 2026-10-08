@@ -186,6 +186,17 @@ public sealed class SparkSqlParserTests
         Assert.Equal(parts, reference.NameParts);
     }
 
+    // Review of #479: the parts are the reference's identity, so a caller cannot change them through the list.
+    [Fact]
+    public void NamePartsCannotBeChangedThroughTheList()
+    {
+        var reference = UnboundReference.FromParts(["a", "b"]);
+
+        Assert.False(reference.NameParts is string[]);
+        Assert.Throws<NotSupportedException>(() => ((IList<string>)reference.NameParts)[0] = "x");
+        Assert.Equal(["a", "b"], reference.NameParts);
+    }
+
     [Fact]
     public void ANestedPathAndAQuotedDottedNameAreDifferentReferences()
     {
