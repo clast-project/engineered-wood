@@ -70,7 +70,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         _fs = fileSystem;
         _options = options;
-        _dataFileReadOptions = WithVariantExtension(options.ParquetReadOptions);
+        _dataFileReadOptions = DataFileReadOptions(options.ParquetReadOptions);
         _log = new TransactionLog(fileSystem);
         _checkpointReader = new CheckpointReader(fileSystem);
         _dvReader = new DeletionVectorReader(fileSystem);
@@ -186,6 +186,18 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         _dataFileWriteOptions = (schema, mode, options);
         return options;
     }
+
+    /// <summary>
+    /// The read options for a data file: the table's <see cref="DeltaTableOptions.ParquetReadOptions"/>, with
+    /// what the table's schema decides rather than the caller. A Delta decimal is <c>Decimal128</c>
+    /// (<see cref="SchemaConverter"/>), but the reader's default hands back the narrowest type that fits, so a
+    /// column of precision 18 or less came back as Decimal32/64 whoever wrote the file (#469). Every read
+    /// through the built-in ParquetFileReader takes these options: scans, CDF, compaction and the DML rewrites.
+    /// A host <see cref="DeltaTableOptions.DataFileReader"/> decodes scans and compaction itself and is not
+    /// given them, so its batches keep whatever decimal type it produces.
+    /// </summary>
+    private static ParquetReadOptions DataFileReadOptions(ParquetReadOptions options) =>
+        WithVariantExtension(options) with { DecimalOutput = DecimalOutputKind.Decimal128 };
 
     private static ParquetReadOptions WithVariantExtension(ParquetReadOptions options)
     {
@@ -3909,8 +3921,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             for (int k = 0; k < dataBatches.Count; k++)
             {
                 // Canonical Arrow forms (WriteTypeNormalization): rows read back from a file arrive in whatever
-                // form its reader produced — Decimal32 from an INT32 decimal, FixedSizeBinary from a foreign
-                // FLBA binary — and a rewrite must not carry that into the file it writes.
+                // form its reader produced — FixedSizeBinary from a foreign FLBA binary, or whatever a host
+                // IDataFileReader hands back — and a rewrite must not carry that into the file it writes.
                 var physicalBatch = NormalizeUnlessHostOwnsBytes(ColumnMappingRecursive.ToPhysical(
                     dataBatches[k], snapshot.Schema, mappingMode));
                 // The append path's guard, for the same reason: a foreign file's TIMESTAMP(NANOS) reads back
@@ -6624,9 +6636,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// The write-boundary checks, applied to what an UPDATE's updater returned. Only the columns it CHANGED
     /// are type-checked: those whose type differs from the batch it was handed, or that it added. A column
     /// passed through keeps whatever form the reader produced — which need not be the declared one (an
-    /// INT96 timestamp reads as a naive <c>timestamp[us]</c>, a decimal(9,2) as Decimal32, #469) — and was
-    /// written back in that form before these checks existed, so refusing it would break an identity UPDATE
-    /// over data another engine wrote.
+    /// INT96 timestamp reads as a naive <c>timestamp[us]</c>, and a host IDataFileReader may hand back any
+    /// form) — and was written back in that form before these checks existed, so refusing it would break an
+    /// identity UPDATE over data another engine wrote.
     /// </summary>
     private void ThrowIfUpdaterChangedTypes(
         RecordBatch input, RecordBatch output, Schema.StructType schema)

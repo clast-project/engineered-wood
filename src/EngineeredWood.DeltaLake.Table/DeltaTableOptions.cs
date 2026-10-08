@@ -31,6 +31,10 @@ public sealed record DeltaTableOptions
     /// Parquet read options for data files. <see cref="ParquetReadOptions.Filter"/> must be unset (opening
     /// the table refuses it): these options serve every read of a data file, compaction and DML rewrites
     /// included, which must see every row. Push a predicate down with <see cref="DeltaReadOptions.Filter"/>.
+    /// <see cref="ParquetReadOptions.DecimalOutput"/> is ignored: through the built-in reader, a decimal column
+    /// always reads as the <c>Decimal128</c> the table's schema declares, whatever width the file stores it in.
+    /// A <see cref="DataFileReader"/>, when set, does not use these options for the reads it serves, and its
+    /// batches keep the decimal types it produces.
     /// </summary>
     public ParquetReadOptions ParquetReadOptions { get; init; } = ParquetReadOptions.Default;
 
