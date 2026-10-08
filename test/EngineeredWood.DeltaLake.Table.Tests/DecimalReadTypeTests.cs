@@ -13,7 +13,8 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// used the Parquet reader's default <see cref="DecimalOutputKind"/>, the narrowest type that fits. So a column of
 /// precision 18 or less came back as <c>Decimal32</c>/<c>Decimal64</c>, whoever wrote the file: EW's own
 /// FIXED_LEN_BYTE_ARRAY(16) files as well as the INT32/INT64-backed ones Spark writes. Every path that reads a data
-/// file must hand back the declared type.
+/// file through the built-in Parquet reader must hand back the declared type. A host IDataFileReader is outside
+/// this: the codec seam is value-blind, and its batches keep whatever type it produces.
 /// </summary>
 public class DecimalReadTypeTests : IDisposable
 {

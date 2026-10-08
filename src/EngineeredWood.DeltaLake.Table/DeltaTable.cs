@@ -191,8 +191,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// The read options for a data file: the table's <see cref="DeltaTableOptions.ParquetReadOptions"/>, with
     /// what the table's schema decides rather than the caller. A Delta decimal is <c>Decimal128</c>
     /// (<see cref="SchemaConverter"/>), but the reader's default hands back the narrowest type that fits, so a
-    /// column of precision 18 or less came back as Decimal32/64 whoever wrote the file (#469). Every read of a
-    /// data file takes these options: scans, CDF, compaction and the DML rewrites.
+    /// column of precision 18 or less came back as Decimal32/64 whoever wrote the file (#469). Every read
+    /// through the built-in ParquetFileReader takes these options: scans, CDF, compaction and the DML rewrites.
+    /// A host <see cref="DeltaTableOptions.DataFileReader"/> decodes scans and compaction itself and is not
+    /// given them, so its batches keep whatever decimal type it produces.
     /// </summary>
     private static ParquetReadOptions DataFileReadOptions(ParquetReadOptions options) =>
         WithVariantExtension(options) with { DecimalOutput = DecimalOutputKind.Decimal128 };

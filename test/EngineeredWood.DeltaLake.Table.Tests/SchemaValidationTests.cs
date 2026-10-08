@@ -597,8 +597,9 @@ public class SchemaValidationTests : IDisposable
     public async Task Rewrites_AndChangeFiles_WriteDecimalsInTheCanonicalForm()
     {
         // Until #469, reads handed back Decimal32 for a decimal(9,2) column, so every rewrite started from a
-        // non-canonical batch and wrote INT32. UPDATE, a copy-on-write DELETE, OPTIMIZE and the change files
-        // they emit must all write the canonical FIXED_LEN_BYTE_ARRAY(16).
+        // non-canonical batch, and the rewrites' write-side normalization (#468) is what turned it back into
+        // Decimal128. A host IDataFileReader can still hand back such a batch. UPDATE, a copy-on-write DELETE,
+        // OPTIMIZE and the change files they emit must all write the canonical FIXED_LEN_BYTE_ARRAY(16).
         var type = new Decimal128Type(9, 2);
         var schema = Schema(new Field("d", type, true));
         await using var table = await DeltaTable.CreateAsync(Fs, schema,
