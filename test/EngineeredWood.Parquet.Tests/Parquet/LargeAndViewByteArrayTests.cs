@@ -101,6 +101,8 @@ public class LargeAndViewByteArrayTests : IDisposable
     // Any byte-array layout the reader hands back, as text.
     private static string? Text(IArrowArray array, int i)
     {
+        if (array is ExtensionArray extension)
+            return Text(extension.Storage, i);
         if (array.IsNull(i))
             return null;
         return array switch
@@ -254,5 +256,44 @@ public class LargeAndViewByteArrayTests : IDisposable
 
         var plain = read is RunEndEncodedArray r ? EngineeredWood.Arrow.RunEndEncoding.Expand(r) : read;
         Assert.Equal(["a", "a", null, Long, Long], Texts(plain));
+    }
+
+    // Review of #482: an extension type is written as its storage, so one over a large or view layout reached the
+    // encoders unconverted.
+    private sealed class TagType(IArrowType storage) : ExtensionType(storage)
+    {
+        public override string Name => "ew.test.tag";
+
+        public override string ExtensionMetadata => "";
+
+        public override ExtensionArray CreateArray(IArrowArray storageArray) => new TagArray(this, storageArray);
+    }
+
+    private sealed class TagArray(ExtensionType type, IArrowArray storage) : ExtensionArray(type, storage);
+
+    [Theory]
+    [MemberData(nameof(NestedLayouts))]
+    public async Task AnExtensionColumn_RoundTrips(string layout)
+    {
+        var storage = Build(layout, Values);
+        var column = new TagType(storage.Data.DataType).CreateArray(storage);
+
+        var read = await RoundTripAsync(column);
+
+        Assert.Equal(Values, Texts(read));
+    }
+
+    [Theory]
+    [MemberData(nameof(NestedLayouts))]
+    public async Task AListOfAnExtension_RoundTrips(string layout)
+    {
+        var storage = Build(layout, Values);
+        var values = new TagType(storage.Data.DataType).CreateArray(storage);
+        var type = new ListType(new Field("element", values.Data.DataType, true));
+        var list = new ListArray(type, 2, Offsets(0, 2, 5), values, ArrowBuffer.Empty, nullCount: 0);
+
+        var read = (ListArray)await RoundTripAsync(list);
+
+        Assert.Equal(Values, Texts(read.Values));
     }
 }
