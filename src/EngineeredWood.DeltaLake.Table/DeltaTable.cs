@@ -485,8 +485,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // Re-assigning would mint FRESH physical names — random GUIDs — and every data file the
                 // caller already wrote under the old ones would become unreadable. Keep what was assigned and
                 // only derive the max id the metadata must record.
-                maxId = ColumnMapping.GetMaxColumnId(deltaSchema);
-                if (maxId == 0)
+                // Checked on the column ids themselves: the max below counts nested ids too, and a schema
+                // carrying only those would have nothing for id mode to bind.
+                if (!ValidatePreAssignedColumnMappingIds(deltaSchema))
                 {
                     throw new DeltaFormatException(
                         DeltaTableErrorCodes.InvalidPreAssignedSchema,
@@ -494,6 +495,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         + $"created with column mapping '{mappingMode}'. Assign ids and physical names before "
                         + "writing the data files, or create without column mapping.");
                 }
+                maxId = ColumnMapping.GetMaxColumnId(deltaSchema);
                 if (previousSnapshot is not null)
                 {
                     int previousMaxId = GetColumnMappingHighWaterMark(previousSnapshot);
@@ -1003,6 +1005,58 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             maxId = Math.Max(maxId, configuredMax);
         }
         return maxId;
+    }
+
+    // Refuses an id a pre-assigned schema declares twice — two column ids, or a column id and an IcebergCompatV2
+    // nested id, which come from the same sequence. Each becomes a Parquet field_id, and id-mode readers and
+    // Iceberg resolve columns by it, so a repeat binds two columns to one. Returns whether the schema declares
+    // any column id at all.
+    private static bool ValidatePreAssignedColumnMappingIds(StructType schema)
+    {
+        var owners = new Dictionary<int, string>();
+        bool anyColumnId = false;
+        Walk(schema, "");
+        return anyColumnId;
+
+        void Walk(DeltaDataType type, string path)
+        {
+            switch (type)
+            {
+                case StructType structure:
+                    foreach (var field in structure.Fields)
+                    {
+                        string fieldPath = path.Length == 0 ? field.Name : path + "." + field.Name;
+                        if (ColumnMapping.GetFieldId(field) is int id)
+                        {
+                            anyColumnId = true;
+                            Claim(id, $"column '{fieldPath}'");
+                        }
+                        foreach (var nested in ColumnMapping.GetNestedIds(field))
+                            Claim(nested.Value, $"nested id '{nested.Key}' of '{fieldPath}'");
+                        Walk(field.Type, fieldPath);
+                    }
+                    break;
+                case ArrayType array:
+                    Walk(array.ElementType, path);
+                    break;
+                case MapType map:
+                    Walk(map.KeyType, path);
+                    Walk(map.ValueType, path);
+                    break;
+            }
+        }
+
+        void Claim(int id, string owner)
+        {
+            if (owners.TryGetValue(id, out var first))
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.InvalidPreAssignedSchema,
+                    $"preAssignedSchema gives column-mapping id {id} to both {first} and {owner}; "
+                    + "every id must be distinct.");
+            }
+            owners[id] = owner;
+        }
     }
 
     private static void ValidateReplacementColumnMappingIds(StructType schema, int previousMaxId)

@@ -354,6 +354,45 @@ public class IcebergCompatNestedIdsTests : IDisposable
         Assert.Contains("col-new.element", error.Message);
     }
 
+    [Fact]
+    public async Task Create_PreAssignedSchemaWithOnlyNestedIds_IsRefused()
+    {
+        // GetMaxColumnId counts nested ids, so the "no column ids" guard must look at column ids themselves.
+        var preAssigned = DeltaSchemaSerializer.Parse(
+            """
+            {"type":"struct","fields":[{"name":"arr","type":{"type":"array","elementType":"long","containsNull":true},
+             "nullable":true,"metadata":{"delta.columnMapping.nested.ids":{"arr.element":5}}}]}
+            """);
+        var schema = new Apache.Arrow.Schema.Builder().Field(ListOf("arr", Int64Type.Default)).Build();
+
+        var error = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema,
+                columnMappingMode: ColumnMappingMode.Id, configuration: V2, preAssignedSchema: preAssigned));
+        Assert.Contains("declares no column-mapping field ids", error.Message);
+    }
+
+    [Theory]
+    [InlineData("""{"col-x.element":1}""")] // a nested id equal to a column id
+    [InlineData("""{"col-x.element":2,"col-x.element.element":2}""")] // two nested ids
+    public async Task Create_PreAssignedSchemaRepeatingAnId_IsRefused(string nestedIds)
+    {
+        var preAssigned = DeltaSchemaSerializer.Parse(
+            """
+            {"type":"struct","fields":[{"name":"arr","type":{"type":"array","elementType":
+             {"type":"array","elementType":"long","containsNull":true},"containsNull":true},"nullable":true,
+             "metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-x",
+             "delta.columnMapping.nested.ids":
+            """ + nestedIds + "}}]}");
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(ListOf("arr", new ListType(new Field("element", Int64Type.Default, true))))
+            .Build();
+
+        var error = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema,
+                columnMappingMode: ColumnMappingMode.Name, configuration: V2, preAssignedSchema: preAssigned));
+        Assert.Contains("every id must be distinct", error.Message);
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
