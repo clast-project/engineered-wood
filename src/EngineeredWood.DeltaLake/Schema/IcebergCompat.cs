@@ -42,13 +42,6 @@ public static class IcebergCompat
     public const string EnableV2Key = "delta.enableIcebergCompatV2";
 
     /// <summary>
-    /// Metadata key for nested field IDs used by IcebergCompatV2.
-    /// Stored on the ancestor <see cref="StructField"/> that contains
-    /// Array or Map children.
-    /// </summary>
-    public const string NestedFieldIdsKey = "parquet.field.nested.ids";
-
-    /// <summary>
     /// Returns the active Iceberg compatibility version for the table,
     /// or <see cref="IcebergCompatVersion.None"/> if neither is enabled.
     /// V2 takes precedence if both are somehow enabled.

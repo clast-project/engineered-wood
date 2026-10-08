@@ -512,6 +512,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 maxId = assignedMaxId;
             }
 
+            // After the column ids, as Spark does. A pre-assigned schema keeps whatever nested ids it carries.
+            deltaSchema = WithIcebergNestedIds(deltaSchema, configurationBuilder, ref maxId);
+
             string modeStr = mappingMode switch
             {
                 ColumnMappingMode.Id => "id",
@@ -1209,6 +1212,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // may itself be a pending change that already bumped it).
             var (mappedField, lastId) = AssignMappedField(baseSchema, config, newDeltaField);
             newSchema = new StructType { Fields = new List<StructField>(baseSchema.Fields) { mappedField } };
+            newSchema = WithIcebergNestedIds(newSchema, config, ref lastId);
             var cfg = config is null
                 ? new Dictionary<string, string>()
                 : config.ToDictionary(kv => kv.Key, kv => kv.Value);
@@ -1377,17 +1381,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             new Apache.Arrow.Schema([newField], null)).Fields[0];
 
         var newConfig = config;
+        int lastId = 0;
         if (mappingMode != ColumnMappingMode.None)
         {
             // Fresh recursive ids + physical names, continuing past the base's maxColumnId (the base may itself
             // be a pending change that already bumped it) — struct/array/map descendants each get their own id.
-            var (mappedField, lastId) = AssignMappedField(baseSchema, config, newDeltaField);
-            newDeltaField = mappedField;
-            var cfg = config is null
-                ? new Dictionary<string, string>()
-                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
-            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
-            newConfig = cfg;
+            (newDeltaField, lastId) = AssignMappedField(baseSchema, config, newDeltaField);
         }
 
         var addedField = newDeltaField;
@@ -1401,6 +1400,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
             return new List<StructField>(fields) { addedField };
         });
+
+        if (mappingMode != ColumnMappingMode.None)
+        {
+            newSchema = WithIcebergNestedIds(newSchema, config, ref lastId);
+            var cfg = config is null
+                ? new Dictionary<string, string>()
+                : config.ToDictionary(kv => kv.Key, kv => kv.Value);
+            cfg[ColumnMapping.MaxColumnIdKey] = lastId.ToString();
+            newConfig = cfg;
+        }
 
         CommitSchemaValidation.EnsureValid(newSchema);
         var protocolUpgrade = UpgradeProtocolForFeatures(
@@ -1585,7 +1594,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 startId = Math.Max(startId, cfgMax);
             }
             var (mapped, newMax) = ColumnMapping.AssignColumnMapping(newDeltaSchema, startId);
-            newDeltaSchema = mapped;
+            newDeltaSchema = WithIcebergNestedIds(mapped, config, ref newMax);
             var cfg = config is null
                 ? new Dictionary<string, string>()
                 : config.ToDictionary(kv => kv.Key, kv => kv.Value);
@@ -2133,6 +2142,20 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var features = new List<string>();
         if (minReaderVersion >= 2) { features.Add("columnMapping"); }
         return features;
+    }
+
+    // IcebergCompatV2 gives array elements and map keys/values column ids too, recorded on the nearest ancestor
+    // field (ColumnMapping.AssignNestedIds). Spark and Kernel assign the missing ones on every schema change of
+    // such a table, after the column ids and from the same sequence, so maxId moves past them. Any other table
+    // gets none, and its schema comes back unchanged.
+    private static StructType WithIcebergNestedIds(
+        StructType schema, IReadOnlyDictionary<string, string>? config, ref int maxId)
+    {
+        if (Schema.IcebergCompat.GetVersion(config) != Schema.IcebergCompatVersion.V2)
+            return schema;
+        var (assigned, lastId) = ColumnMapping.AssignNestedIds(schema, maxId);
+        maxId = lastId;
+        return assigned;
     }
 
     // Assigns column-mapping metadata (id + physical name) to a NEW field being added to a mapped table —
