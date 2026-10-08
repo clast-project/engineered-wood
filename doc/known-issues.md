@@ -583,7 +583,7 @@ EW now refuses every commit to a table whose `enabledFormats` is non-empty: data
 transactions, and a REPLACE of it even when the replacement drops the property. Creating one is refused as well. The
 error code is `DELTA_UNIVERSAL_FORMAT_NOT_MAINTAINED`. Reads, checkpoints and VACUUM are unaffected. A host that runs
 the conversion itself, or accepts the lag until another engine's next commit, sets
-`DeltaTableOptions.AllowWritesWithoutUniversalFormatConversion`. Generating the metadata is a possible later feature.
+`DeltaTableOptions.AllowWritesWithoutUniversalFormatConversion`. Generating the metadata is #490.
 Its companions `delta.universalFormat.iceberg.atomicConversion.supported` and `delta.universalformat.config.*` are not
 read; they matter only to a converter. #473
 
