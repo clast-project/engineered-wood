@@ -1263,6 +1263,93 @@ public class SchemaValidationTests : IDisposable
         Assert.Equal(2, writer.Received.Count);
     }
 
+    // ── Drops on a table another writer left with a duplicate pair ────────────────────────────────────
+
+    /// <summary>Appends a metaData commit whose schema string is the latest one transformed by
+    /// <paramref name="edit"/> — a schema EW refuses to commit itself, written as another writer could —
+    /// and returns a fresh handle on the result.</summary>
+    private async Task<DeltaTable> WithForeignSchemaAsync(Action<System.Text.Json.Nodes.JsonNode> edit)
+    {
+        var log = Path.Combine(_tempDir, "_delta_log");
+        string latest = Directory.GetFiles(log, "*.json").OrderBy(f => f, StringComparer.Ordinal).Last();
+        long version = long.Parse(Path.GetFileNameWithoutExtension(latest));
+        var metadata = System.Text.Json.Nodes.JsonNode.Parse(
+            Directory.GetFiles(log, "*.json").OrderBy(f => f, StringComparer.Ordinal)
+                .SelectMany(File.ReadAllLines)
+                .Last(line => line.StartsWith("{\"metaData\"", StringComparison.Ordinal)))!;
+        var schema = System.Text.Json.Nodes.JsonNode.Parse((string)metadata["metaData"]!["schemaString"]!)!;
+        edit(schema);
+        metadata["metaData"]!["schemaString"] = schema.ToJsonString();
+        File.WriteAllText(Path.Combine(log, $"{version + 1:D20}.json"), metadata.ToJsonString() + "\n");
+        return await DeltaTable.OpenAsync(Fs);
+    }
+
+    private static void RenameInSchema(System.Text.Json.Nodes.JsonNode fields, string from, string to)
+    {
+        foreach (var field in fields.AsArray())
+        {
+            if ((string)field!["name"]! == from)
+                field["name"] = to;
+        }
+    }
+
+    [Fact]
+    public async Task DropColumn_OnATableWithADuplicatePair_RepairsItOrIsRefused()
+    {
+        await using (var created = await DeltaTable.CreateAsync(
+            Fs, Schema(Long("X"), Long("y"), Long("other")), columnMappingMode: ColumnMappingMode.Name)) { }
+        await using var table = await WithForeignSchemaAsync(s => RenameInSchema(s["fields"]!, "y", "x"));
+        Assert.Equal(["X", "x", "other"], table.CurrentSnapshot.Schema.Fields.Select(f => f.Name));
+
+        // An unrelated drop would commit the duplicate pair again.
+        await DuplicateAsync(async () => await table.DropColumnAsync("other"));
+        await DuplicateAsync(() => { table.ComputeDropColumn("other"); return Task.CompletedTask; });
+
+        // Dropping one member of the pair leaves a valid schema, so it is the way out.
+        await table.DropColumnAsync("x");
+        Assert.Equal(["X", "other"], table.CurrentSnapshot.Schema.Fields.Select(f => f.Name));
+    }
+
+    [Fact]
+    public async Task DropField_OnATableWithANestedDuplicatePair_RepairsItOrIsRefused()
+    {
+        await using (var created = await DeltaTable.CreateAsync(
+            Fs, Schema(Struct("s", Long("A"), Long("b"), Long("c"))), columnMappingMode: ColumnMappingMode.Name)) { }
+        await using var table = await WithForeignSchemaAsync(
+            s => RenameInSchema(s["fields"]![0]!["type"]!["fields"]!, "b", "a"));
+
+        await DuplicateAsync(async () => await table.DropFieldAsync(["s", "c"]));
+        await table.DropFieldAsync(["s", "a"]);
+    }
+
+    // ── Names and types are checked before anything is converted ──────────────────────────────────────
+
+    [Fact]
+    public async Task Write_UndeclaredDate64ColumnWithAPartDayValue_IsReportedAsUndeclared()
+    {
+        // Converting first would have refused the VALUE (not a whole day) and hidden the real problem.
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(Long("id")));
+
+        var batch = new RecordBatch(Schema(Long("id"), new Field("d", Date64Type.Default, true)),
+            [new Int64Array.Builder().Append(1).Build(), Date64s([Day + 1])], 1);
+        var ex = await MistypedAsync(async () => await table.WriteAsync([batch]));
+        Assert.Contains("'d'", ex.Message);
+        await MistypedAsync(async () => await table.WriteDataFilesAsync([batch]));
+    }
+
+    [Fact]
+    public async Task Write_MistypedConvertibleColumn_IsDescribedAsSupplied()
+    {
+        // The message names the type the caller handed in, not the Binary it would have been converted to.
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(new Field("d", new Decimal128Type(9, 2), true)));
+
+        var batch = new RecordBatch(Schema(new Field("d", new FixedSizeBinaryType(16), true)),
+            [FixedSizeBinary(16, 1, new byte[16])], 1);
+        var ex = await MistypedAsync(async () => await table.WriteAsync([batch]));
+        Assert.Contains(new FixedSizeBinaryType(16).ToString(), ex.Message);
+        Assert.DoesNotContain("Arrow " + BinaryType.Default, ex.Message);
+    }
+
     // ── Integer to decimal widening ───────────────────────────────────────────────────────────────────
 
     [Theory]

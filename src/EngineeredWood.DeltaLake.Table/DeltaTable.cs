@@ -1291,6 +1291,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         SchemaChangeDependents.EnsureChangeable(
             baseSchema, baseMeta, snapshot.DomainMetadata, [name], isDrop: true);
         var newSchema = new StructType { Fields = newFields };
+        // On the RESULT: dropping one member of an existing case-insensitive duplicate pair repairs the table
+        // and passes, while any other drop on such a table would commit the invalid schema again.
+        CommitSchemaValidation.EnsureValid(newSchema);
 
         var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
         return new DeferredSchemaChange(
@@ -1470,6 +1473,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         });
         SchemaChangeDependents.EnsureChangeable(
             baseSchema, baseMeta, snapshot.DomainMetadata, fieldPath, isDrop: true);
+        CommitSchemaValidation.EnsureValid(newSchema); // see ComputeDropColumn
 
         var metadata = baseMeta with { SchemaString = DeltaSchemaSerializer.Serialize(newSchema) };
         return new DeferredSchemaChange(
@@ -4983,21 +4987,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long? rowIdStart = null,
         WrittenFileLedger? written = null)
     {
-        // The shared chokepoint for both the auto-committing path and a transaction's append. First convert
-        // the Arrow types a Delta type accepts but does not read back as (FixedSizeBinary, Date64,
-        // Decimal32/64) to the ones it does, so every file of a column has one physical form. Then refuse
-        // what has no faithful encoding at all — nanosecond and second timestamps: creation and schema
-        // evolution reject those via SchemaConverter, but a write into an EXISTING table converts no schema.
-        batches = NormalizeUnlessHostOwnsBytes(batches, snapshot.Metadata.PartitionColumns);
-        foreach (var b in batches)
-            SchemaConverter.ThrowIfUnwritableType(b.Schema, convertibleTypesAllowed: HostOwnsBytes);
-
-        // Same chokepoint, same reason: this path converts no schema either, so a column the table does not
-        // declare would ride into the data file unnoticed. (No write here evolves the schema — the write
-        // schema is always the snapshot's — so an unknown column is a mistake, never an addition.)
+        // The shared chokepoint for both the auto-committing path and a transaction's append. This path
+        // converts no schema, so a column the table does not declare would ride into the data file unnoticed.
+        // (No write here evolves the schema — the write schema is always the snapshot's — so an unknown column
+        // is a mistake, never an addition.) Names and types are checked FIRST, against the batch as the caller
+        // built it: a conversion below can itself refuse a value, and must not pre-empt the real problem, and a
+        // type error should describe what the caller supplied rather than what it was converted to.
         ThrowIfUndeclaredColumns(batches, snapshot.Schema, "Write");
         if (!HostOwnsBytes)
             ThrowIfMistypedColumns(batches, snapshot.Schema, "Write");
+
+        // Then convert the Arrow types a Delta type accepts but does not read back as (FixedSizeBinary,
+        // Date64, the other decimal widths) to the ones it does, so every file of a column has one physical
+        // form, and refuse what has no faithful encoding at all — nanosecond and second timestamps.
+        batches = NormalizeUnlessHostOwnsBytes(batches, snapshot.Metadata.PartitionColumns);
+        foreach (var b in batches)
+            SchemaConverter.ThrowIfUnwritableType(b.Schema, convertibleTypesAllowed: HostOwnsBytes);
 
         // Generated columns first, because a CHECK constraint may reference one: validating before
         // the column exists would read a null the table never stores.
@@ -6013,10 +6018,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
         ProtocolVersions.ValidateWriteSupport(CurrentSnapshot.Protocol);
-        // Same normalization and unwritable-type rule as the committing write path; this entry point bypasses it.
-        batches = NormalizeUnlessHostOwnsBytes(batches, CurrentSnapshot.Metadata.PartitionColumns);
-        foreach (var b in batches)
-            SchemaConverter.ThrowIfUnwritableType(b.Schema, convertibleTypesAllowed: HostOwnsBytes);
         if (IsIcebergCompat)
             throw new NotSupportedException(
                 "WriteDataFilesAsync: IcebergCompat tables require the committing write path.");
@@ -6030,6 +6031,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfUndeclaredColumns(batches, writeSchema, nameof(WriteDataFilesAsync));
         if (!HostOwnsBytes)
             ThrowIfMistypedColumns(batches, writeSchema, nameof(WriteDataFilesAsync));
+        // Same order and rules as the committing write path, which this entry point bypasses: names and types
+        // against the caller's batch first, then conversion and the unwritable-type refusal.
+        batches = NormalizeUnlessHostOwnsBytes(batches, CurrentSnapshot.Metadata.PartitionColumns);
+        foreach (var b in batches)
+            SchemaConverter.ThrowIfUnwritableType(b.Schema, convertibleTypesAllowed: HostOwnsBytes);
         var partitionColumns = snapshot.Metadata.PartitionColumns;
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(writeSchema, mappingMode);
@@ -6604,12 +6610,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     internal static void ValidateChangeDataRows(Snapshot.Snapshot snapshot, RecordBatch rows, string entryPoint)
     {
-        var normalized = WriteTypeNormalization.Normalize(rows);
-        SchemaConverter.ThrowIfUnwritableType(normalized.Schema);
-        // CdfWriter writes every column the batch has, so an undeclared one would ride into the change file
-        // exactly as it would into a data file.
-        ThrowIfUndeclaredColumns([normalized], snapshot.Schema, entryPoint);
-        ThrowIfMistypedColumns([normalized], snapshot.Schema, entryPoint);
+        // Names and types against the rows as supplied, then conversion — the order of the write paths. CdfWriter
+        // writes every column the batch has, so an undeclared one would ride into the change file exactly as it
+        // would into a data file.
+        ThrowIfUndeclaredColumns([rows], snapshot.Schema, entryPoint);
+        ThrowIfMistypedColumns([rows], snapshot.Schema, entryPoint);
+        SchemaConverter.ThrowIfUnwritableType(WriteTypeNormalization.Normalize(rows).Schema);
     }
 
     /// <summary>
@@ -6641,10 +6647,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return;
 
         var changed = new RecordBatch(new Apache.Arrow.Schema(changedFields, null), changedColumns, output.Length);
+        if (!HostOwnsBytes)
+            ThrowIfMistypedColumns([changed], schema, entryPoint);
         var normalized = HostOwnsBytes ? changed : WriteTypeNormalization.Normalize(changed);
         SchemaConverter.ThrowIfUnwritableType(normalized.Schema, convertibleTypesAllowed: HostOwnsBytes);
-        if (!HostOwnsBytes)
-            ThrowIfMistypedColumns([normalized], schema, entryPoint);
     }
 
     /// <summary>Whether two Arrow types are the same object, or map onto the same Delta type.</summary>
