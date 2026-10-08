@@ -215,41 +215,47 @@ public class NonNullableNullsTests : IDisposable
         Assert.Equal([5, 6], new[] { read.GetValue(0)!.Value, read.GetValue(1)!.Value });
     }
 
-    // Nested columns: ParquetFileWriter only, since BufferedParquetWriter has no nested support (#462).
+    // Nested columns, which BufferedParquetWriter writes too since #462.
 
     private static StructType StructOfX(bool xNullable) => new([new Field("x", Int32Type.Default, xNullable)]);
 
-    [Fact]
-    public async Task NullSlotInANonNullableStruct_IsRefused()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullSlotInANonNullableStruct_IsRefused(Writer kind)
     {
         var type = StructOfX(xNullable: true);
         var structArray = new StructArray(type, 2, [Ints(1, 2)], Validity(true, false), nullCount: 1);
 
-        var ex = await RefusedAsync(Writer.File, Single(new Field("s", type, false), structArray));
+        var ex = await RefusedAsync(kind, Single(new Field("s", type, false), structArray));
 
         Assert.Contains("'s'", ex.Message);
     }
 
-    [Fact]
-    public async Task NullInANonNullableStructChild_IsRefused()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullInANonNullableStructChild_IsRefused(Writer kind)
     {
         var type = StructOfX(xNullable: false);
         var structArray = new StructArray(type, 2, [Ints(1, null)], ArrowBuffer.Empty, nullCount: 0);
 
-        var ex = await RefusedAsync(Writer.File, Single(new Field("s", type, true), structArray));
+        var ex = await RefusedAsync(kind, Single(new Field("s", type, true), structArray));
 
         Assert.Contains("'s.x'", ex.Message);
     }
 
     // A struct child's slot under a null struct row is never written.
-    [Fact]
-    public async Task NullInANonNullableStructChild_UnderANullStructSlot_IsAccepted()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullInANonNullableStructChild_UnderANullStructSlot_IsAccepted(Writer kind)
     {
         var type = StructOfX(xNullable: false);
         var structArray = new StructArray(type, 2, [Ints(2, null)], Validity(true, false), nullCount: 1);
         string path = NewPath();
 
-        await WriteAsync(Writer.File, path, Single(new Field("s", type, true), structArray));
+        await WriteAsync(kind, path, Single(new Field("s", type, true), structArray));
 
         var read = (StructArray)(await ReadAsync(path)).Column(0);
         Assert.Equal(2, ((Int32Array)read.Fields[0]).GetValue(0));
@@ -262,49 +268,57 @@ public class NonNullableNullsTests : IDisposable
     private static ListArray List(ListType type, bool[] valid, int[] offsets, Int32Array values) =>
         new(type, valid.Length, Offsets(offsets), values, Validity(valid), valid.Count(v => !v));
 
-    [Fact]
-    public async Task NullSlotInANonNullableList_IsRefused()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullSlotInANonNullableList_IsRefused(Writer kind)
     {
         var type = ListOfInts(elementNullable: true);
         var list = List(type, [true, false], [0, 1, 1], Ints(1));
 
-        var ex = await RefusedAsync(Writer.File, Single(new Field("l", type, false), list));
+        var ex = await RefusedAsync(kind, Single(new Field("l", type, false), list));
 
         Assert.Contains("'l'", ex.Message);
     }
 
-    [Fact]
-    public async Task NullElementInANonNullableList_IsRefused()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullElementInANonNullableList_IsRefused(Writer kind)
     {
         var type = ListOfInts(elementNullable: false);
         var list = List(type, [true, true], [0, 1, 2], Ints(1, null));
 
-        var ex = await RefusedAsync(Writer.File, Single(new Field("l", type, true), list));
+        var ex = await RefusedAsync(kind, Single(new Field("l", type, true), list));
 
         Assert.Contains("'l.element'", ex.Message);
     }
 
-    [Fact]
-    public async Task NullElementUnderANullListSlot_IsAccepted()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullElementUnderANullListSlot_IsAccepted(Writer kind)
     {
         var type = ListOfInts(elementNullable: false);
         var list = List(type, [true, false], [0, 1, 2], Ints(1, null));
         string path = NewPath();
 
-        await WriteAsync(Writer.File, path, Single(new Field("l", type, true), list));
+        await WriteAsync(kind, path, Single(new Field("l", type, true), list));
 
         var read = (ListArray)(await ReadAsync(path)).Column(0);
         Assert.Equal(1, ((Int32Array)read.GetSlicedValues(0)).GetValue(0));
         Assert.True(read.IsNull(1));
     }
 
-    [Fact]
-    public async Task NullElementInANonNullableFixedSizeList_IsRefused()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullElementInANonNullableFixedSizeList_IsRefused(Writer kind)
     {
         var type = new FixedSizeListType(new Field("element", Int32Type.Default, false), 2);
         var fixedList = new FixedSizeListArray(type, 2, Ints(1, 2, 3, null), ArrowBuffer.Empty, nullCount: 0);
 
-        var ex = await RefusedAsync(Writer.File, Single(new Field("f", type, true), fixedList));
+        var ex = await RefusedAsync(kind, Single(new Field("f", type, true), fixedList));
 
         Assert.Contains("'f.element'", ex.Message);
     }
@@ -316,34 +330,40 @@ public class NonNullableNullsTests : IDisposable
             Validity(true), nullCount: 0);
 
     // Parquet map keys are always required, whatever the Arrow key field says.
-    [Fact]
-    public async Task NullMapKey_IsRefused_EvenWhenTheKeyFieldIsNullable()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullMapKey_IsRefused_EvenWhenTheKeyFieldIsNullable(Writer kind)
     {
         var type = new MapType(new Field("key", Int32Type.Default, true), new Field("value", Int32Type.Default, true));
 
-        var ex = await RefusedAsync(Writer.File, Single(new Field("m", type, true), Map(type, Ints(1, null), Ints(10, 20))));
+        var ex = await RefusedAsync(kind, Single(new Field("m", type, true), Map(type, Ints(1, null), Ints(10, 20))));
 
         Assert.Contains("'m.key'", ex.Message);
         Assert.Contains("map key", ex.Message);
     }
 
-    [Fact]
-    public async Task NullInANonNullableMapValue_IsRefused()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullInANonNullableMapValue_IsRefused(Writer kind)
     {
         var type = new MapType(new Field("key", Int32Type.Default, false), new Field("value", Int32Type.Default, false));
 
-        var ex = await RefusedAsync(Writer.File, Single(new Field("m", type, true), Map(type, Ints(1, 2), Ints(10, null))));
+        var ex = await RefusedAsync(kind, Single(new Field("m", type, true), Map(type, Ints(1, 2), Ints(10, null))));
 
         Assert.Contains("'m.value'", ex.Message);
     }
 
     // A run-end encoded array's nulls are null runs in its values.
-    [Fact]
-    public async Task NullRunInANonNullableRunEndEncodedColumn_IsRefused()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullRunInANonNullableRunEndEncodedColumn_IsRefused(Writer kind)
     {
         var ree = new RunEndEncodedArray(Ints(2, 4), Ints(1, null));
 
-        var ex = await RefusedAsync(Writer.File, Single(new Field("r", ree.Data.DataType, false), ree));
+        var ex = await RefusedAsync(kind, Single(new Field("r", ree.Data.DataType, false), ree));
 
         Assert.Contains("'r'", ex.Message);
     }
@@ -357,25 +377,29 @@ public class NonNullableNullsTests : IDisposable
         return new ListArray(type, valid.Length, Offsets(offsets), ree, Validity(valid), valid.Count(v => !v));
     }
 
-    [Fact]
-    public async Task NullRunUnderANullListSlot_IsAccepted()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullRunUnderANullListSlot_IsAccepted(Writer kind)
     {
         var list = ListOfRuns([true, false], [0, 1, 2]);
         string path = NewPath();
 
-        await WriteAsync(Writer.File, path, Single(new Field("l", list.Data.DataType, true), list));
+        await WriteAsync(kind, path, Single(new Field("l", list.Data.DataType, true), list));
 
         var read = (ListArray)(await ReadAsync(path)).Column(0);
         Assert.Equal(1, read.GetValueLength(0));
         Assert.True(read.IsNull(1));
     }
 
-    [Fact]
-    public async Task NullRunInANonNullableListElement_IsRefused()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullRunInANonNullableListElement_IsRefused(Writer kind)
     {
         var list = ListOfRuns([true, true], [0, 1, 2]);
 
-        var ex = await RefusedAsync(Writer.File, Single(new Field("l", list.Data.DataType, true), list));
+        var ex = await RefusedAsync(kind, Single(new Field("l", list.Data.DataType, true), list));
 
         Assert.Contains("'l.element'", ex.Message);
     }
@@ -391,14 +415,16 @@ public class NonNullableNullsTests : IDisposable
             valid.Count(v => !v));
     }
 
-    [Fact]
-    public async Task NullStructChildPastTheWrittenSlots_OfASlicedStruct_IsAccepted()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullStructChildPastTheWrittenSlots_OfASlicedStruct_IsAccepted(Writer kind)
     {
         // Row 0 = null (over struct row 0), row 1 = [struct row 1]: x = 7 is written, the null is not.
         var list = ListOfSlicedStructs([5, 6, 7, null], 1, 3, [false, true], [0, 1, 2]);
         string path = NewPath();
 
-        await WriteAsync(Writer.File, path, Single(new Field("l", list.Data.DataType, true), list));
+        await WriteAsync(kind, path, Single(new Field("l", list.Data.DataType, true), list));
 
         var read = (ListArray)(await ReadAsync(path)).Column(0);
         Assert.True(read.IsNull(0));
@@ -406,13 +432,15 @@ public class NonNullableNullsTests : IDisposable
         Assert.Equal(7, ((Int32Array)row1.Fields[0]).GetValue(0));
     }
 
-    [Fact]
-    public async Task NullStructChildInAWrittenSlot_OfASlicedStruct_IsRefused()
+    [Theory]
+    [InlineData(Writer.File)]
+    [InlineData(Writer.Buffered)]
+    public async Task NullStructChildInAWrittenSlot_OfASlicedStruct_IsRefused(Writer kind)
     {
         // x = [5, null, 7], the struct is rows 1..2 (x = [null, 7]), and row 0 = [struct row 0] writes the null.
         var list = ListOfSlicedStructs([5, null, 7], 1, 2, [true], [0, 1]);
 
-        var ex = await RefusedAsync(Writer.File, Single(new Field("l", list.Data.DataType, true), list));
+        var ex = await RefusedAsync(kind, Single(new Field("l", list.Data.DataType, true), list));
 
         Assert.Contains("'l.element.x'", ex.Message);
     }

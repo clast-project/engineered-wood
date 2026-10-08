@@ -192,24 +192,37 @@ public class RowAlignedPagesTests : IDisposable
     }
 
     /// <summary>
-    /// <see cref="BufferedParquetWriter"/> shares the page loop, but it only ever buffers top-level
-    /// primitive columns, so it has no repeated leaf to misalign. Pinned so that if it ever gains
-    /// nested support, this test fails and the walker assertion above gets extended to it.
+    /// <see cref="BufferedParquetWriter"/> shares the page loop and, since #462, buffers nested columns too, so its
+    /// repeated leaves must start pages at row boundaries as well. The batch arrives in four appends, so the levels
+    /// the loop cuts are ones the writer stitched together across batches.
     /// </summary>
-    [Fact]
-    public async Task BufferedWriter_RefusesRepeatedColumns()
+    [Theory]
+    [MemberData(nameof(PageVersionsAndDictionary))]
+    public async Task BufferedWriter_RaggedNullableLists_PagesStartAtRowBoundaries(
+        DataPageVersion version, bool dictionary)
     {
-        var batch = BuildInt64Lists(rows: 10, length: _ => 10, distinct: 5);
-        string path = Path.Combine(_tempDir, "buffered.parquet");
-        await using var file = new LocalSequentialFile(path);
-        await using var writer = new BufferedParquetWriter(file, ownsFile: false);
+        const int rows = 2000;
+        var rng = new Random(462);
+        var lengths = new int[rows];
+        for (int i = 0; i < rows; i++)
+            lengths[i] = rng.Next(8) switch { 0 => -1, 1 => 0, _ => rng.Next(1, 200) };
 
-        var e = await Assert.ThrowsAnyAsync<Exception>(async () =>
+        var batch = BuildInt64Lists(rows, i => lengths[i], distinct: dictionary ? 50 : int.MaxValue,
+            nullElementEvery: 7);
+        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N")[..8] + ".parquet");
+        await using (var file = new LocalSequentialFile(path))
         {
-            await writer.AppendAsync(batch);
-            await writer.FlushRowGroupAsync();
-        });
-        _output.WriteLine($"{e.GetType().Name}: {e.Message}");
+            await using var writer = new BufferedParquetWriter(file, ownsFile: false,
+                Options(version, dictionary, dataPageSize: 1024));
+            for (int start = 0; start < rows; start += rows / 4)
+                await writer.AppendAsync(batch.Slice(start, rows / 4));
+            await writer.CloseAsync();
+        }
+
+        await AssertRoundTripsAsync(path, batch);
+        var pages = WalkDataPages(path, column: 0, maxRepLevel: 1);
+        AssertRowAligned(pages, version, expectedRows: rows);
+        Assert.True(pages.Count > 1);
     }
 
     /// <summary>

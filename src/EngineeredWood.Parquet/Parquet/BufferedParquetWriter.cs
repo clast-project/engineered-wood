@@ -23,6 +23,11 @@ namespace EngineeredWood.Parquet;
 /// write the accumulated data as a single row group. Flushing happens automatically when
 /// <see cref="ParquetWriteOptions.RowGroupMaxRows"/> is reached.
 /// </para>
+/// <para>
+/// Struct, list and map columns are split into their leaf columns as <see cref="ParquetFileWriter"/> splits them,
+/// and each leaf buffers its definition and repetition levels beside its dictionary indices. A batch is never
+/// split across row groups, so a row group holds whole records.
+/// </para>
 /// </remarks>
 public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 {
@@ -38,6 +43,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
     // Buffered column state — one per leaf column
     private BufferedColumnState[]? _columnStates;
+
+    // The index in _columnStates of each Arrow column's first leaf; a nested column's leaves follow it.
+    private int[]? _firstLeaf;
     private int _bufferedRows;
 
     /// <summary>
@@ -136,11 +144,13 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         var dictResults = new DictionaryEncoder.DictionaryResult?[states.Length];
         var useNonDictionary = new bool[states.Length]; // true if cardinality too high → plain encoding
         int[]?[] defLevelsPerColumn = new int[]?[states.Length];
+        int[]?[] repLevelsPerColumn = new int[]?[states.Length];
 
         for (int i = 0; i < states.Length; i++)
         {
             var s = states[i];
-            defLevelsPerColumn[i] = s.DefLevels?.ToArray(s.RowCount);
+            defLevelsPerColumn[i] = s.DefLevels?.ToArray(s.LevelCount);
+            repLevelsPerColumn[i] = s.RepLevels?.ToArray(s.LevelCount);
             if (s.DictionaryCount > 0)
             {
                 // Check cardinality threshold: if too many distinct values, fall back to
@@ -185,30 +195,28 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             {
                 // Dictionary encoding: cardinality is within threshold
                 columnResults[i] = ColumnChunkWriter.WriteDictionaryColumnFromResult(
-                    dictResults[i]!.Value, numRows, s.NonNullCount, s.PathInSchema, s.PhysicalType,
+                    dictResults[i]!.Value, s.LevelCount, s.NonNullCount, s.PathInSchema, s.PhysicalType,
                     s.TypeLength, s.ArrowType,
-                    s.MaxDefLevel, s.MaxRepLevel, defLevelsPerColumn[i], null, _options);
+                    s.MaxDefLevel, s.MaxRepLevel, defLevelsPerColumn[i], repLevelsPerColumn[i], _options);
             }
             else if (dictResults[i] != null && useNonDictionary[i])
             {
                 // Cardinality too high: reconstruct Arrow array from dictionary + indices
                 // and encode via the standard non-dictionary path (delta, BSS, plain, etc.)
                 var array = ReconstructArrowArray(s, dictResults[i]!.Value,
-                    defLevelsPerColumn[i], numRows);
+                    PresenceLevels(s, defLevelsPerColumn[i]), s.LevelCount);
                 var nonDictOptions = _options with { DictionaryEnabled = false };
-                columnResults[i] = ColumnChunkWriter.WriteColumn(
-                    array, s.PathInSchema, s.PhysicalType, s.TypeLength,
-                    s.IsNullable, nonDictOptions);
+                columnResults[i] = WriteLeaf(
+                    s, array, defLevelsPerColumn[i], repLevelsPerColumn[i], nonDictOptions);
             }
             else if (s.BooleanValues != null)
             {
-                var boolArr = BuildBooleanArray(s, numRows);
-                columnResults[i] = ColumnChunkWriter.WriteColumn(
-                    boolArr, s.PathInSchema, PhysicalType.Boolean, 0, s.IsNullable, _options);
+                var boolArr = BuildBooleanArray(s);
+                columnResults[i] = WriteLeaf(s, boolArr, defLevelsPerColumn[i], repLevelsPerColumn[i], _options);
             }
             else
             {
-                columnResults[i] = WriteValuelessColumn(s, defLevelsPerColumn[i], numRows);
+                columnResults[i] = WriteValuelessColumn(s, defLevelsPerColumn[i], repLevelsPerColumn[i]);
             }
         });
 
@@ -216,6 +224,33 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         // Reset buffers for next row group
         ResetBuffers();
+    }
+
+    /// <summary>
+    /// Encodes a leaf rebuilt in level order: a nested leaf with its own levels, as ParquetFileWriter writes it, and
+    /// a flat column through the flat overload, which derives its levels from the array.
+    /// </summary>
+    private static ColumnChunkWriter.ColumnChunkResult WriteLeaf(
+        BufferedColumnState state, IArrowArray array, int[]? defLevels, int[]? repLevels, ParquetWriteOptions options) =>
+        state.IsNested
+            ? ColumnChunkWriter.WriteColumn(
+                array, state.PathInSchema, state.PhysicalType, state.TypeLength, state.MaxDefLevel, state.MaxRepLevel,
+                defLevels ?? new int[state.LevelCount], repLevels, state.NonNullCount, state.LevelCount, options)
+            : ColumnChunkWriter.WriteColumn(
+                array, state.PathInSchema, state.PhysicalType, state.TypeLength, state.IsNullable, options);
+
+    /// <summary>
+    /// The definition levels as the reconstruction reads them: 1 where a level holds a value, 0 where it does not.
+    /// A flat column's already are; a nested leaf's are 0 to its maximum, and only the maximum holds a value.
+    /// </summary>
+    private static int[]? PresenceLevels(BufferedColumnState state, int[]? defLevels)
+    {
+        if (defLevels is null || state.MaxDefLevel == 1)
+            return defLevels;
+        var presence = new int[defLevels.Length];
+        for (int i = 0; i < presence.Length; i++)
+            presence[i] = defLevels[i] == state.MaxDefLevel ? 1 : 0;
+        return presence;
     }
 
     /// <summary>
@@ -273,10 +308,35 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     private void InitializeColumnStates(RecordBatch batch)
     {
         var leafColumns = new List<BufferedColumnState>();
+        _firstLeaf = new int[batch.ColumnCount];
 
         for (int c = 0; c < batch.ColumnCount; c++)
         {
             var field = _arrowSchema!.FieldsList[c];
+            _firstLeaf[c] = leafColumns.Count;
+
+            if (ParquetFileWriter.IsNestedType(field.DataType))
+            {
+                // One state per leaf, described as NestedLevelWriter describes it for ParquetFileWriter (#462). The
+                // first batch is decomposed again when it is appended; that is the only cost of reading the leaves'
+                // types from it.
+                foreach (var leaf in NestedLevelWriter.Decompose(batch.Column(c), field, batch.Length))
+                {
+                    leafColumns.Add(new BufferedColumnState
+                    {
+                        PathInSchema = leaf.PathInSchema,
+                        PhysicalType = leaf.PhysicalType,
+                        TypeLength = leaf.TypeLength,
+                        MaxDefLevel = leaf.MaxDefLevel,
+                        MaxRepLevel = leaf.MaxRepLevel,
+                        ArrowType = LeafValues(leaf.Array).Data.DataType,
+                        IsNullable = leaf.MaxDefLevel > 0,
+                        IsNested = true,
+                    });
+                }
+                continue;
+            }
+
             var element = FindLeafElement(_parquetSchema!, field.Name);
 
             // Encoders dispatch on the storage type, not the ExtensionType
@@ -318,10 +378,23 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     {
         int rowCount = batch.Length;
 
-        Parallel.For(0, _columnStates!.Length, c =>
+        Parallel.For(0, batch.ColumnCount, c =>
         {
-            var state = _columnStates[c];
             var array = batch.Column(c);
+            int first = _firstLeaf![c];
+            if (_columnStates![first].IsNested)
+            {
+                var leaves = NestedLevelWriter.Decompose(array, _arrowSchema!.FieldsList[c], rowCount);
+                for (int l = 0; l < leaves.Count; l++)
+                {
+                    var leaf = leaves[l];
+                    _columnStates[first + l].AppendLevels(
+                        LeafValues(leaf.Array), leaf.LevelCount, leaf.DefLevels, leaf.RepLevels);
+                }
+                return;
+            }
+
+            var state = _columnStates[first];
             // Mirror InitializeColumnStates: hand the encoder the storage
             // array so it dispatches on the Arrow storage type.
             if (array is ExtensionArray ea)
@@ -332,6 +405,20 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         });
 
         _bufferedRows += rowCount;
+    }
+
+    /// <summary>
+    /// A nested leaf as the state buffers it: the storage of an extension, since the encoders dispatch on that, and a
+    /// run-end encoded leaf expanded to its values. NestedLevelWriter hands a run-end encoded leaf over as runs when the
+    /// batch needs no rebuild and as plain values when it does, so its layout can change from batch to batch, while a
+    /// state reads every batch by the type it took from the first. The values are dictionary-encoded one by one either
+    /// way, so the expansion costs only the batch's own copy.
+    /// </summary>
+    private static IArrowArray LeafValues(IArrowArray array)
+    {
+        if (array is ExtensionArray extension)
+            array = extension.Storage;
+        return array is RunEndEncodedArray runs ? EngineeredWood.Arrow.RunEndEncoding.Expand(runs) : array;
     }
 
     private void ResetBuffers()
@@ -579,16 +666,14 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
     // ───── Boolean array reconstruction ─────
 
-    private static Apache.Arrow.BooleanArray BuildBooleanArray(
-        BufferedColumnState state, int numRows)
+    private static Apache.Arrow.BooleanArray BuildBooleanArray(BufferedColumnState state)
     {
         var builder = new Apache.Arrow.BooleanArray.Builder();
         var values = state.BooleanValues!;
-        var defLevels = state.DefLevels;
 
-        for (int i = 0; i < numRows; i++)
+        for (int i = 0; i < state.LevelCount; i++)
         {
-            if (defLevels != null && defLevels.Get(i) == 0)
+            if (!state.IsValue(i))
                 builder.AppendNull();
             else
                 builder.Append(values.Get(i) != 0);
@@ -612,7 +697,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     /// statistics all come from the one path that gets them right.
     /// </remarks>
     private ColumnChunkWriter.ColumnChunkResult WriteValuelessColumn(
-        BufferedColumnState state, int[]? defLevels, int numRows)
+        BufferedColumnState state, int[]? defLevels, int[]? repLevels)
     {
         if (state.NonNullCount > 0)
         {
@@ -632,12 +717,10 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 DictionaryCount = 0,
                 Indices = [],
             },
-            defLevels,
-            numRows);
+            PresenceLevels(state, defLevels),
+            state.LevelCount);
 
-        return ColumnChunkWriter.WriteColumn(
-            array, state.PathInSchema, state.PhysicalType, state.TypeLength,
-            state.IsNullable, _options);
+        return WriteLeaf(state, array, defLevels, repLevels, _options);
     }
 
     private static SchemaElement FindLeafElement(IReadOnlyList<SchemaElement> schema, string fieldName)
@@ -672,6 +755,12 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         /// </summary>
         public bool ExtendedTimestamp { get; init; }
 
+        /// <summary>
+        /// A leaf of a struct, list or map column. Its levels come from <see cref="NestedLevelWriter"/>, and its
+        /// level count is not its row count: a list row holds a level per element, or one for an empty or null list.
+        /// </summary>
+        public bool IsNested { get; init; }
+
         // Running dictionary: maps a value's BIT PATTERN → index. The float and double dictionaries are
         // keyed on uint/ulong rather than on the value because a dictionary entry is a set of BYTES, and
         // value equality is looser than that: IEquatable<double>.Equals(-0.0, 0.0) is true, which merged
@@ -688,6 +777,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         // Accumulated definition levels
         public GrowableIntList? DefLevels { get; private set; }
 
+        // Accumulated repetition levels (a leaf under a list or map)
+        public GrowableIntList? RepLevels { get; private set; }
+
         // Accumulated boolean values (for Boolean columns that can't be dictionary-encoded)
         public GrowableIntList? BooleanValues { get; private set; }
 
@@ -696,13 +788,55 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         private int _dictPageSize;
 
         public int DictionaryCount { get; private set; }
-        public int RowCount { get; private set; }
+        public int LevelCount { get; private set; }
         public int NonNullCount { get; private set; }
+
+        /// <summary>Whether level <paramref name="level"/> holds a value: its definition level is the maximum.</summary>
+        public bool IsValue(int level) => DefLevels is null || DefLevels.Get(level) == MaxDefLevel;
+
+        /// <summary>
+        /// Appends a nested leaf: <paramref name="array"/> holds one slot per level, in level order, as
+        /// <see cref="NestedLevelWriter"/> builds it, and only the slots at the maximum definition level are values.
+        /// </summary>
+        public void AppendLevels(IArrowArray array, int levelCount, int[] defLevels, int[]? repLevels)
+        {
+            // The encoders read a batch's raw buffers as ArrowType, taken from the first batch. A leaf whose layout
+            // changed since would be misread, so it is refused; LeafValues keeps the known case (runs) from reaching
+            // here.
+            if (array.Data.DataType.TypeId != ArrowType.TypeId)
+            {
+                throw new NotSupportedException(
+                    $"Column '{string.Join(".", PathInSchema)}' arrived as {array.Data.DataType.Name} after an earlier " +
+                    $"batch gave it as {ArrowType.Name}, which BufferedParquetWriter cannot buffer together. Write it " +
+                    "with ParquetFileWriter instead.");
+            }
+
+            if (MaxDefLevel > 0)
+            {
+                DefLevels ??= new GrowableIntList(levelCount);
+                for (int i = 0; i < levelCount; i++)
+                    DefLevels.Add(defLevels[i]);
+            }
+
+            if (MaxRepLevel > 0)
+            {
+                RepLevels ??= new GrowableIntList(levelCount);
+                for (int i = 0; i < levelCount; i++)
+                    RepLevels.Add(repLevels![i]);
+            }
+
+            int values = 0;
+            for (int i = 0; i < levelCount; i++)
+            {
+                if (IsValue(LevelCount + i))
+                    values++;
+            }
+
+            AppendValues(array, levelCount, values);
+        }
 
         public void AppendArray(IArrowArray array, int rowCount)
         {
-            int srcOffset = array.Data.Offset;
-
             // Build def levels
             if (IsNullable)
             {
@@ -726,6 +860,14 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     if (!array.IsNull(i)) batchNonNull++;
             }
 
+            AppendValues(array, rowCount, batchNonNull);
+        }
+
+        // The levels for these rowCount slots are already in DefLevels, from LevelCount on.
+        private void AppendValues(IArrowArray array, int rowCount, int batchNonNull)
+        {
+            int srcOffset = array.Data.Offset;
+
             // Dictionary-encode based on the Arrow type, or buffer boolean values
             if (PhysicalType == PhysicalType.Boolean)
             {
@@ -734,7 +876,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 var boolArr = (Apache.Arrow.BooleanArray)array;
                 for (int i = 0; i < rowCount; i++)
                 {
-                    if (IsNullable && DefLevels!.Get(RowCount + i) == 0)
+                    if (!IsValue(LevelCount + i))
                         BooleanValues.Add(0); // placeholder for null position
                     else
                         BooleanValues.Add(boolArr.GetValue(i) == true ? 1 : 0);
@@ -746,7 +888,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 DictionaryEncodeArray(array, rowCount, srcOffset);
             }
 
-            RowCount += rowCount;
+            LevelCount += rowCount;
             NonNullCount += batchNonNull;
         }
 
@@ -822,7 +964,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
             for (int i = 0; i < rowCount; i++)
             {
-                if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
+                if (!IsValue(LevelCount + i)) continue;
                 T val = valueBuffer[srcOffset + i];
                 // For the integers the key IS the INT32 value, so it is also what the entry holds.
                 int key = asInt32 ? Int32Value(val) : Widen(val);
@@ -871,7 +1013,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
             for (int i = 0; i < rowCount; i++)
             {
-                if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
+                if (!IsValue(LevelCount + i)) continue;
                 int val = valueBuffer[srcOffset + i];
                 if (!_fixedDict.TryGetValue(val, out int idx))
                 {
@@ -893,7 +1035,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
             for (int i = 0; i < rowCount; i++)
             {
-                if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
+                if (!IsValue(LevelCount + i)) continue;
                 long val = valueBuffer[srcOffset + i];
                 if (!_longDict.TryGetValue(val, out int idx))
                 {
@@ -917,7 +1059,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
             for (int i = 0; i < rowCount; i++)
             {
-                if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
+                if (!IsValue(LevelCount + i)) continue;
                 uint bits = bitBuffer[srcOffset + i];
                 if (!_floatDict.TryGetValue(bits, out int idx))
                 {
@@ -941,7 +1083,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
             for (int i = 0; i < rowCount; i++)
             {
-                if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
+                if (!IsValue(LevelCount + i)) continue;
                 ulong bits = bitBuffer[srcOffset + i];
                 if (!_doubleDict.TryGetValue(bits, out int idx))
                 {
@@ -965,7 +1107,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
             for (int i = 0; i < rowCount; i++)
             {
-                if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
+                if (!IsValue(LevelCount + i)) continue;
                 int start = arrowOffsets[srcOffset + i];
                 int len = arrowOffsets[srcOffset + i + 1] - start;
                 ReadOnlySpan<byte> valueBytes = arrowData.Slice(start, len);
@@ -992,7 +1134,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
             for (int i = 0; i < rowCount; i++)
             {
-                if (IsNullable && DefLevels!.Get(RowCount + i) == 0) continue;
+                if (!IsValue(LevelCount + i)) continue;
                 ReadOnlySpan<byte> valueBytes = valueBuffer.Slice((srcOffset + i) * byteWidth, byteWidth);
 
                 int idx = _bytesDict.GetOrAdd(valueBytes, DictionaryCount);
@@ -1045,7 +1187,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             Indices?.Reset();
             DefLevels?.Reset();
             BooleanValues?.Reset();
-            RowCount = 0;
+            RepLevels?.Reset();
+            LevelCount = 0;
             NonNullCount = 0;
         }
 
