@@ -121,6 +121,44 @@ public class OpaquePredicateConflictTests : IDisposable
     }
 
     /// <summary>
+    /// The auto-committing delegate <see cref="DeltaTable.UpdateAsync(Func{RecordBatch, BooleanArray}, Func{RecordBatch, RecordBatch}, CancellationToken)"/>,
+    /// which builds its read set itself rather than through a transaction. Two handles on one table: A's
+    /// UPDATE lands a post-image file (a non-blind add) while B still holds the older snapshot, so B's
+    /// UPDATE of a DIFFERENT file collides and must abort at the default WriteSerializable.
+    /// </summary>
+    [Fact]
+    public async Task AutoCommitDelegateUpdate_StaleHandle_ConcurrentNonBlindAdd_Aborts()
+    {
+        await using (var setup = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdRegionSchema, enableDeletionVectors: true))
+        {
+            await setup.WriteAsync([Batch([1], ["us"])]); // file 1
+            await setup.WriteAsync([Batch([2], ["eu"])]); // file 2
+        }
+
+        await using var tableA = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        await using var tableB = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+
+        await tableA.UpdateAsync(
+            batch =>
+            {
+                var regions = (StringArray)batch.Column("region");
+                var mask = new BooleanArray.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                    mask.Append(regions.GetString(i) == "eu");
+                return mask.Build();
+            },
+            SetRegion("ap"));
+
+        var ex = await Assert.ThrowsAsync<DeltaConflictException>(
+            async () => await tableB.UpdateAsync(RegionIsUs, SetRegion("xx")));
+        Assert.Equal(DeltaErrorCodes.ConcurrentAppend, ex.ErrorCode);
+
+        await using var fresh = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        Assert.Equal([(1L, "us"), (2L, "ap")], await ReadRows(fresh));
+    }
+
+    /// <summary>
     /// Under the default <see cref="IsolationLevel.WriteSerializable"/> a concurrent BLIND append is still
     /// exempt: the delete rebases and lands, and the appended row survives.
     /// </summary>
