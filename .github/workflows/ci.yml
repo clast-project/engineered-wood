@@ -287,14 +287,15 @@ jobs:
   # Starting all three as background processes is uniform, needs no image, and keeps the health
   # checks explicit rather than hidden behind `--health-cmd`.
   #
-  # THIS JOB IS NOT A REQUIRED CHECK. Making it one is a deliberate follow-up: it should earn
-  # that by being green and non-flaky across a few runs first. Until then a failure here is
-  # visible on the PR but does not block merging.
+  # THIS JOB IS A REQUIRED CHECK on main, alongside `build`. It earned that by passing 99 of 99
+  # completed CI runs before it was promoted. The rules at the top of this file therefore apply
+  # to it too: it must always run and always report, so do not give it a job-level `if:` or move
+  # it behind a path filter, or every PR waits on a check that never arrives.
   #
   # ONLY WHEN IT CAN MATTER. The cloud-backend tests live in EngineeredWood.Parquet.Tests, so
-  # this job runs when the project selection (the same script as in `build`) includes that
-  # project, and otherwise skips its remaining steps. It is not a required check, so a skipped
-  # run cannot block a merge.
+  # this job runs them when the project selection (the same script as in `build`) includes that
+  # project, and otherwise skips its remaining STEPS. The job itself still runs and reports
+  # success, which is what keeps the required check from sitting Pending on unrelated PRs.
   cloud-io:
     runs-on: ubuntu-latest
 
@@ -484,7 +485,7 @@ jobs:
   #
   # ONLY WHEN IT CAN MATTER. It runs when the project selection includes the Vortex tests, which
   # covers changes to the reader and writer, to the Rust crate, and to anything Vortex depends on.
-  # Like cloud-io it is not a required check.
+  # It is not a required check.
   vortex-interop:
     runs-on: ubuntu-latest
 
