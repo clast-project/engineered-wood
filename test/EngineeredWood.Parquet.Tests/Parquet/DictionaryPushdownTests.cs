@@ -130,6 +130,29 @@ public class DictionaryPushdownTests : IDisposable
             await Candidates(path, filter, WithDictionaries with { MaxPageUncompressedSize = 10 }));
     }
 
+    /// <summary>
+    /// A dictionary page the read refuses for declaring more than its chunk's total_uncompressed_size
+    /// is not asked either. Answering from it ruled the row group out, so the read that would have
+    /// reported the corrupt chunk never ran.
+    /// </summary>
+    [Fact]
+    public async Task ADictionaryPageTheReadRefusesForItsSize_IsNotAsked()
+    {
+        string path = await WriteThreeRowGroups("chunk-total");
+        FooterRewrite.Rewrite(path, metadata => FooterRewrite.With(metadata, nameof(FileMetaData.RowGroups),
+            metadata.RowGroups.Select(rowGroup => FooterRewrite.With(rowGroup, nameof(RowGroup.Columns),
+                rowGroup.Columns.Select(chunk => FooterRewrite.With(chunk, nameof(ColumnChunk.MetaData),
+                    FooterRewrite.With(chunk.MetaData!, nameof(ColumnMetaData.TotalUncompressedSize), 1L))).ToArray())).ToArray()));
+
+        Assert.Equal(new[] { true, true, true },
+            await Candidates(path, Ex.Equal("name", "banana"), WithDictionaries));
+
+        await using var input = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(input, ownsFile: false);
+        var ex = await Assert.ThrowsAsync<ParquetFormatException>(async () => await reader.ReadRowGroupAsync(0));
+        Assert.Contains("more than its whole column chunk (1)", ex.Message);
+    }
+
     [Fact]
     public async Task InList_KeepsAGroupHoldingAnyMember()
     {

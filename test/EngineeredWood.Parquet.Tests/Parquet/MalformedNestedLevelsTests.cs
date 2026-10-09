@@ -160,6 +160,44 @@ public class MalformedNestedLevelsTests
     }
 
     /// <summary>
+    /// A level above the column's maximum, which the width levels are packed at can still hold. The
+    /// assembler took a repetition level past it for deeper nesting and skipped it, and a definition
+    /// level past it for a value, so both read as wrong data rather than an error (#426).
+    /// </summary>
+    [Fact]
+    public async Task ARepetitionLevelAboveTheMaximum_IsRefused()
+    {
+        // list<list<boolean>>: maximum repetition level 2, packed two bits wide.
+        var ex = await ReadAsync(NestedListFile(
+            repLevels: [0, 3],
+            defLevels: [5, 5],
+            values: [true, false],
+            rowCount: 1));
+
+        Assert.NotNull(ex);
+        Assert.Contains("A level of 3 exceeds the column's maximum of 2", ex!.Message);
+
+        // The same file with the level in range: one row, [[true, false]].
+        var batch = await ReadBatchAsync(NestedListFile(
+            repLevels: [0, 2], defLevels: [5, 5], values: [true, false], rowCount: 1));
+        var outer = Assert.IsType<ListArray>(batch.Column(0));
+        Assert.Equal(1, outer.Length);
+        Assert.Equal(2, ((ListArray)outer.Values).GetValueLength(0));
+    }
+
+    [Fact]
+    public async Task ADefinitionLevelAboveTheMaximum_IsRefused()
+    {
+        var ex = await ReadAsync(StructFile(
+            aDefLevels: [2, 3], aValues: [true, false],
+            bDefLevels: [2, 2], bValues: [true, false],
+            rowCount: 2));
+
+        Assert.NotNull(ex);
+        Assert.Contains("A level of 3 exceeds the column's maximum of 2", ex!.Message);
+    }
+
+    /// <summary>
     /// Levels whose first entry continues a list rather than starting one, as in parquet-testing's
     /// bad_data/ARROW-GH-45185.parquet. The entry was counted into the first list and every list
     /// after it shifted by one, and the file read without complaint.
@@ -311,6 +349,50 @@ public class MalformedNestedLevelsTests
         [
             new ColumnSpec(["v", "list", "element"], PhysicalType.Boolean,
                 repLevels, 1, defLevels, 3, BoolValues(values)),
+        ]);
+    }
+
+    /// <summary>
+    /// <c>optional group v (LIST) { repeated group list { optional group element (LIST) {
+    /// repeated group list { optional boolean element; } } } }</c>: maximum repetition level 2,
+    /// maximum definition level 5.
+    /// </summary>
+    private static byte[] NestedListFile(
+        int[] repLevels, int[] defLevels, bool[] values, int rowCount)
+    {
+        List<SchemaElement> schema =
+        [
+            new() { Name = "root", NumChildren = 1 },
+            new()
+            {
+                Name = "v",
+                RepetitionType = FieldRepetitionType.Optional,
+                NumChildren = 1,
+                ConvertedType = ConvertedType.List,
+                LogicalType = new LogicalType.ListType(),
+            },
+            new() { Name = "list", RepetitionType = FieldRepetitionType.Repeated, NumChildren = 1 },
+            new()
+            {
+                Name = "element",
+                RepetitionType = FieldRepetitionType.Optional,
+                NumChildren = 1,
+                ConvertedType = ConvertedType.List,
+                LogicalType = new LogicalType.ListType(),
+            },
+            new() { Name = "list", RepetitionType = FieldRepetitionType.Repeated, NumChildren = 1 },
+            new()
+            {
+                Name = "element",
+                Type = PhysicalType.Boolean,
+                RepetitionType = FieldRepetitionType.Optional,
+            },
+        ];
+
+        return BuildFile(schema, rowCount,
+        [
+            new ColumnSpec(["v", "list", "element", "list", "element"], PhysicalType.Boolean,
+                repLevels, 2, defLevels, 5, BoolValues(values)),
         ]);
     }
 

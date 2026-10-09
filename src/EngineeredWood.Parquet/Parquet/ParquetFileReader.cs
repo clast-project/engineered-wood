@@ -1906,7 +1906,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 // candidate, and the read that follows is left to report what is wrong with the file.
                 var filter = MembershipPredicateEvaluator.Decode(
                     MembershipSource.BloomFilter, buffers[i].Memory.Span,
-                    metadata.RowGroups[rg].Columns[columnIndex].MetaData!.Codec, schema.Columns[columnIndex],
+                    metadata.RowGroups[rg].Columns[columnIndex].MetaData!, schema.Columns[columnIndex],
                     validateChecksums: false);
                 if (filter is null)
                     continue;

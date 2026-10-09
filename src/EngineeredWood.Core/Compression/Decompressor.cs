@@ -74,30 +74,42 @@ internal static class Decompressor
 #else
         // .NET Framework's GZipStream stops after the first Gzip member, so each concatenated member
         // (RFC 1952) gets a stream of its own. It also reads its input ahead in blocks, so its
-        // position does not say where the member ended: that is found from the member's trailer.
+        // position does not say where the member ended. That is found from the member's trailer, its
+        // CRC-32 and length, after its header; a boundary is only taken where a member then starts.
         byte[] sourceArray = source.ToArray();
         byte[] tempBuffer = new byte[destination.Length];
-        int totalRead = 0;
         int start = 0;
+        int memberStart = 0;
+        int totalRead = InflateGzipMember(sourceArray, 0, tempBuffer, 0);
 
-        while (start < sourceArray.Length && totalRead < tempBuffer.Length)
+        while (totalRead < tempBuffer.Length)
         {
-            int memberStart = totalRead;
-            using (var gzip = new GZipStream(
-                new MemoryStream(sourceArray, start, sourceArray.Length - start), CompressionMode.Decompress))
+            int next = -1;
+            int read = 0;
+            foreach (int end in GzipMemberEnds(sourceArray, start, tempBuffer.AsSpan(memberStart, totalRead - memberStart)))
             {
-                while (totalRead < tempBuffer.Length)
+                if (end == sourceArray.Length)
+                    break; // the last member
+                try
                 {
-                    int read = gzip.Read(tempBuffer, totalRead, tempBuffer.Length - totalRead);
-                    if (read == 0) break;
-                    totalRead += read;
+                    read = InflateGzipMember(sourceArray, end, tempBuffer, totalRead);
+                }
+                catch (InvalidDataException)
+                {
+                    continue; // the trailer's bytes matched by chance, inside the deflate data
+                }
+                if (read > 0)
+                {
+                    next = end;
+                    break;
                 }
             }
 
-            int end = FindGzipMemberEnd(sourceArray, start, tempBuffer.AsSpan(memberStart, totalRead - memberStart));
-            if (end <= start)
+            if (next < 0)
                 break;
-            start = end;
+            start = next;
+            memberStart = totalRead;
+            totalRead += read;
         }
 
         tempBuffer.AsSpan(0, totalRead).CopyTo(destination);
@@ -107,27 +119,87 @@ internal static class Decompressor
 
 #if !NET6_0_OR_GREATER
     /// <summary>
-    /// Where the Gzip member at <paramref name="start"/>, which decompressed to <paramref name="output"/>,
-    /// ends: the first position after its deflate data whose preceding eight bytes are a trailer that
-    /// matches the output (its CRC-32 and length) and that ends the source or starts another member.
-    /// -1 when there is none.
+    /// Inflates the Gzip member at <paramref name="start"/> into <paramref name="destination"/> from
+    /// <paramref name="offset"/>, until it ends or the destination is full; returns the bytes written.
     /// </summary>
-    private static int FindGzipMemberEnd(byte[] source, int start, ReadOnlySpan<byte> output)
+    private static int InflateGzipMember(byte[] source, int start, byte[] destination, int offset)
     {
-        const int MinMember = 18; // a 10-byte header, an empty deflate block, an 8-byte trailer
+        int total = 0;
+        using var gzip = new GZipStream(
+            new MemoryStream(source, start, source.Length - start), CompressionMode.Decompress);
+        while (offset + total < destination.Length)
+        {
+            int read = gzip.Read(destination, offset + total, destination.Length - offset - total);
+            if (read == 0)
+                break;
+            total += read;
+        }
+        return total;
+    }
+
+    /// <summary>
+    /// Where the Gzip member at <paramref name="start"/>, which decompressed to <paramref name="output"/>,
+    /// may end, in order: each position after its header whose preceding eight bytes are a trailer that
+    /// matches the output (its CRC-32 and length) and that ends the source or starts another member.
+    /// The header is skipped by its flags, since its optional fields can hold any bytes at all.
+    /// </summary>
+    private static List<int> GzipMemberEnds(byte[] source, int start, ReadOnlySpan<byte> output)
+    {
+        var ends = new List<int>();
+        int headerEnd = GzipHeaderEnd(source, start);
+        if (headerEnd < 0)
+            return ends;
+
         uint length = unchecked((uint)output.Length);
         uint? crc = null;
-        for (int end = start + MinMember; end <= source.Length; end++)
+        // At least an empty deflate block (2 bytes) and the 8-byte trailer follow the header.
+        for (int end = headerEnd + 10; end <= source.Length; end++)
         {
             bool atBoundary = end == source.Length
-                || (end + 1 < source.Length && source[end] == 0x1F && source[end + 1] == 0x8B);
+                || (end + 2 < source.Length && source[end] == 0x1F && source[end + 1] == 0x8B && source[end + 2] == 0x08);
             if (!atBoundary || BinaryPrimitives.ReadUInt32LittleEndian(source.AsSpan(end - 4)) != length)
                 continue;
             crc ??= Crc32(output);
             if (BinaryPrimitives.ReadUInt32LittleEndian(source.AsSpan(end - 8)) == crc)
-                return end;
+                ends.Add(end);
         }
-        return -1;
+        return ends;
+    }
+
+    /// <summary>
+    /// Where the deflate data of the Gzip member at <paramref name="start"/> begins: after its ten fixed
+    /// bytes and the optional fields its flags name (RFC 1952 section 2.3). -1 when the header runs past
+    /// the source.
+    /// </summary>
+    private static int GzipHeaderEnd(byte[] source, int start)
+    {
+        const byte FHCRC = 0x02, FEXTRA = 0x04, FNAME = 0x08, FCOMMENT = 0x10;
+        int position = start + 10;
+        if (position > source.Length)
+            return -1;
+
+        byte flags = source[start + 3];
+        if ((flags & FEXTRA) != 0)
+        {
+            if (position + 2 > source.Length)
+                return -1;
+            position += 2 + (source[position] | (source[position + 1] << 8));
+        }
+        foreach (byte zeroTerminated in new[] { FNAME, FCOMMENT })
+        {
+            if ((flags & zeroTerminated) == 0)
+                continue;
+            if (position >= source.Length)
+                return -1;
+            int zero = Array.IndexOf(source, (byte)0, position);
+            if (zero < 0)
+                return -1;
+            position = zero + 1;
+        }
+        if ((flags & FHCRC) != 0)
+            position += 2;
+
+        return position <= source.Length ? position : -1;
     }
 
     private static uint[]? s_crc32Table;

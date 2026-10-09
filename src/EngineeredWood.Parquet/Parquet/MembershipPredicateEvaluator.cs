@@ -303,7 +303,7 @@ internal static class MembershipPredicateEvaluator
 
         using var buffer = (await ctx.File.ReadRangesAsync(new[] { range }, ct).ConfigureAwait(false))[0];
         return Decode(
-            source, buffer.Memory.Span, chunk.MetaData!.Codec, descriptor, ctx.ValidateChecksums,
+            source, buffer.Memory.Span, chunk.MetaData!, descriptor, ctx.ValidateChecksums,
             ctx.MaxPageUncompressedSize);
     }
 
@@ -323,17 +323,18 @@ internal static class MembershipPredicateEvaluator
     /// Decodes what <see cref="TryGetRange"/> located, or returns null when it cannot be trusted: pruning
     /// declines on a page or filter it cannot read, and the ordinary read of the row group reports it.
     /// </summary>
+    /// <param name="chunk">The chunk's metadata: its codec, and the size no page of it may exceed.</param>
     /// <param name="maxPageUncompressedSize">
-    /// The caller's <see cref="ParquetReadOptions.MaxPageUncompressedSize"/>: a compressed dictionary page
-    /// declaring more is declined here, as the read would refuse it, rather than decompressed.
+    /// The caller's <see cref="ParquetReadOptions.MaxPageUncompressedSize"/>. A dictionary page the read
+    /// would refuse for its size, under this or its chunk's total, is declined here rather than decompressed.
     /// </param>
     internal static IValueSet? Decode(
-        MembershipSource source, ReadOnlySpan<byte> bytes, CompressionCodec codec, ColumnDescriptor descriptor,
+        MembershipSource source, ReadOnlySpan<byte> bytes, ColumnMetaData chunk, ColumnDescriptor descriptor,
         bool validateChecksums, int? maxPageUncompressedSize = null)
     {
         if (source == MembershipSource.Dictionary)
         {
-            return DecodeDictionary(bytes, codec, descriptor, validateChecksums, maxPageUncompressedSize) is { } values
+            return DecodeDictionary(bytes, chunk, descriptor, validateChecksums, maxPageUncompressedSize) is { } values
                 ? new DictionaryValues(values)
                 : null;
         }
@@ -454,12 +455,12 @@ internal static class MembershipPredicateEvaluator
     /// Decodes a dictionary page read from <see cref="TryGetDictionaryRange"/>'s extent, or returns null.
     /// </summary>
     internal static HashSet<byte[]>? DecodeDictionary(
-        ReadOnlySpan<byte> page, CompressionCodec codec, ColumnDescriptor descriptor, bool validateChecksums,
+        ReadOnlySpan<byte> page, ColumnMetaData chunk, ColumnDescriptor descriptor, bool validateChecksums,
         int? maxPageUncompressedSize = null)
     {
         try
         {
-            return DecodeDictionaryPage(page, codec, descriptor, validateChecksums, maxPageUncompressedSize);
+            return DecodeDictionaryPage(page, chunk, descriptor, validateChecksums, maxPageUncompressedSize);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -472,11 +473,13 @@ internal static class MembershipPredicateEvaluator
     }
 
     private static HashSet<byte[]>? DecodeDictionaryPage(
-        ReadOnlySpan<byte> page, CompressionCodec codec, ColumnDescriptor descriptor, bool validateChecksums,
+        ReadOnlySpan<byte> page, ColumnMetaData chunk, ColumnDescriptor descriptor, bool validateChecksums,
         int? maxPageUncompressedSize)
     {
-        // A payload that overruns the extent throws here, which DecodeDictionary turns into null.
-        var reader = new PageReader(page, descriptor);
+        // A payload that overruns the extent, or a page the read would refuse for its size, throws here,
+        // which DecodeDictionary turns into null: pruning must not answer from a page the read refuses.
+        var reader = new PageReader(page, descriptor, chunk: chunk, maxUncompressedPageSize: maxPageUncompressedSize);
+        var codec = chunk.Codec;
         if (!reader.TryRead(out var read))
             return null;
         var header = read.Header;
@@ -486,9 +489,6 @@ internal static class MembershipPredicateEvaluator
             return null;
         if (header.UncompressedPageSize < 0 || header.UncompressedPageSize > MaxDictionaryPageBytes
             || dictionaryHeader.NumValues < 0)
-            return null;
-        // As PageReader applies it: to a page that is decompressed.
-        if (codec != CompressionCodec.Uncompressed && header.UncompressedPageSize > maxPageUncompressedSize)
             return null;
 
         var payload = read.Payload;

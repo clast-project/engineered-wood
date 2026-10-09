@@ -108,7 +108,7 @@ internal sealed class MembershipPrefetch
     {
         _window.Clear();
         var ranges = new List<FileRange>();
-        var owners = new List<(int RowGroup, int Column, ColumnDescriptor Descriptor, CompressionCodec Codec)>();
+        var owners = new List<(int RowGroup, int Column, ColumnDescriptor Descriptor, ColumnMetaData Chunk)>();
         long bytes = 0;
 
         int group = first;
@@ -122,7 +122,7 @@ internal sealed class MembershipPrefetch
                 continue;
 
             var sets = new Dictionary<int, MembershipPredicateEvaluator.IValueSet?>();
-            var groupRanges = new List<(int Column, ColumnDescriptor Descriptor, CompressionCodec Codec, FileRange Range)>();
+            var groupRanges = new List<(int Column, ColumnDescriptor Descriptor, ColumnMetaData Chunk, FileRange Range)>();
             long groupBytes = 0;
             foreach (var (index, descriptor) in _columns)
             {
@@ -130,7 +130,7 @@ internal sealed class MembershipPrefetch
                 if (MembershipPredicateEvaluator.TryGetRange(
                         _source, chunk, descriptor, _fileLength, _filePath, out var range))
                 {
-                    groupRanges.Add((index, descriptor, chunk.MetaData!.Codec, range));
+                    groupRanges.Add((index, descriptor, chunk.MetaData!, range));
                     groupBytes += range.Length;
                 }
                 else
@@ -146,10 +146,10 @@ internal sealed class MembershipPrefetch
                 break;
 
             bytes += groupBytes;
-            foreach (var (column, descriptor, codec, range) in groupRanges)
+            foreach (var (column, descriptor, meta, range) in groupRanges)
             {
                 ranges.Add(range);
-                owners.Add((group, column, descriptor, codec));
+                owners.Add((group, column, descriptor, meta));
             }
             _window[group] = sets;
         }
@@ -163,9 +163,9 @@ internal sealed class MembershipPrefetch
         {
             for (int i = 0; i < owners.Count; i++)
             {
-                var (rowGroup, column, descriptor, codec) = owners[i];
+                var (rowGroup, column, descriptor, meta) = owners[i];
                 _window[rowGroup][column] = MembershipPredicateEvaluator.Decode(
-                    _source, buffers[i].Memory.Span, codec, descriptor, _validateChecksums, _maxPageUncompressedSize);
+                    _source, buffers[i].Memory.Span, meta, descriptor, _validateChecksums, _maxPageUncompressedSize);
             }
         }
         finally
