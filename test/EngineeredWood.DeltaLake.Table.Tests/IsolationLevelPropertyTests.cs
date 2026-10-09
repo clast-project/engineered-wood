@@ -191,6 +191,49 @@ public class IsolationLevelPropertyTests : IDisposable
 
     // ── A value naming no level ──
 
+    /// <summary>
+    /// Caller-supplied metaData cannot introduce a bad value either, through any of the seams that take it:
+    /// fused into an external-file commit, staged on a transaction, or riding a clustering change. One that
+    /// carries the table's own value through unchanged is not judged, so a valid table property update lands.
+    /// </summary>
+    [Fact]
+    public async Task InvalidValue_RefusedInCallerMetadata()
+    {
+        await using var table = await CreateAsync(isolationLevel: null);
+        var metadata = table.CurrentSnapshot.Metadata;
+        EngineeredWood.DeltaLake.Actions.MetadataAction WithLevel(string level)
+        {
+            var configuration = new Dictionary<string, string>();
+            foreach (var kv in metadata.Configuration ?? new Dictionary<string, string>())
+                configuration[kv.Key] = kv.Value;
+            configuration["delta.isolationLevel"] = level;
+            return metadata with { Configuration = configuration };
+        }
+        long version = table.CurrentSnapshot.Version;
+
+        var fused = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await table.CommitDataFilesAsync(
+                [new WrittenDataFile("elsewhere.parquet", 100, 1, null, null)],
+                extraActions: [WithLevel("RepeatableRead")]));
+        Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, fused.ErrorCode);
+
+        var txn = table.StartTransaction();
+        txn.StageActions([WithLevel("RepeatableRead")]);
+        var staged = await Assert.ThrowsAsync<DeltaFormatException>(async () => await txn.CommitAsync());
+        Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, staged.ErrorCode);
+
+        var clustering = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await table.SetClusteringColumnsAsync([], extraActions: [WithLevel("RepeatableRead")]));
+        Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, clustering.ErrorCode);
+
+        Assert.Equal(version, (await DeltaTable.OpenAsync(Fs())).CurrentSnapshot.Version);
+
+        // A valid value is a property update like any other.
+        await table.CommitDataFilesAsync(
+            System.Array.Empty<WrittenDataFile>(), extraActions: [WithLevel("Serializable")]);
+        Assert.Equal(IsolationLevel.Serializable, table.StartTransaction().IsolationLevel);
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

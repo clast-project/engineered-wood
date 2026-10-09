@@ -57,13 +57,16 @@ excluded from that re-derivation — a DV re-union re-add of an existing file, o
 concurrently-rewritten file — already carry the correct id.
 
 **Row-level reconciliation is bounded by the isolation level.** The gate is per RECONCILIATION KIND,
-not per transaction. After `ResolveRowLevelDeletesAsync`, a `Serializable` commit narrows
-`resolvedPaths` to the paths no concurrent commit removed with `dataChange=true`
-(`KeepOnlyDataPreservingResolutions`). So the DV union — which would otherwise silence a
-`dataChange=true` remove of a file we read, a conflict at both levels — stops applying, while the
-remap across a `dataChange=false` compaction keeps working (that changes no contents and is already
-read-exempt at both levels). Narrowing restores the ordinary checks for a path rather than forcing a
-conflict, so a delete whose files nobody touched still rebases.
+not per transaction. After `ResolveRowLevelDeletesAsync`, a `Serializable` commit refuses the
+resolution if any of its `resolvedPaths` saw a `dataChange=true` add or remove in its lineage through
+the concurrent commits (`EnsureNoDataChangeInResolvedLineage`). The lineage is carried forward through
+`dataChange=false` rewrites, so a compaction followed by an UPDATE, or an UPDATE followed by a
+compaction, is caught too. So the DV union — which would otherwise silence a `dataChange=true` remove
+of a file we read, a conflict at both levels — stops applying, while the remap across a
+`dataChange=false` compaction keeps working (that changes no contents and is already read-exempt at
+both levels). A resolution whose files nobody changed is kept whole, so such a delete still rebases.
+It throws rather than narrowing the resolved set: the conflict checker judges the read set and
+removes, and neither names the file a remap landed on.
 
 Deliberately **not** done: blinding the whole `ReadSet` when a row delete is staged. WriteSerializable
 exempts a concurrent *blind append* and nothing else; blinding also drops the `Predicates` of
