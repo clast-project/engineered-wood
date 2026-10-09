@@ -125,6 +125,7 @@ src/
     ChangeDataFeed/                     CDF config
     DeltaFilePruner.cs                  Partition + stats predicate pushdown
     IsolationLevel.cs                   WriteSerializable / Serializable
+    IsolationLevelProperty.cs           delta.isolationLevel: the table's demanded level
   EngineeredWood.DeltaLake.Table/       Delta table API (high-level Arrow I/O)
     DeltaTable.cs                       Open / Read / Write / Update / Delete / Compact / Vacuum
     Partitioning/, Compaction/, Vacuum/, ChangeDataFeed/, IdentityColumns/, RowTracking/, Stats/, TypeWidening/

@@ -225,6 +225,77 @@ public class RowLevelIsolationTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A data change hidden behind more than one rewrite still conflicts under Serializable, in any order. Each
+    /// sequence touches the rows this delete targets, and the remap lands them on a file whose own add can look
+    /// harmless:
+    /// <list type="bullet">
+    /// <item>compaction then UPDATE: the UPDATE removes the compacted file, not ours, and adds the final one;</item>
+    /// <item>UPDATE then compaction: the UPDATE removes our own file;</item>
+    /// <item>compaction, UPDATE, compaction: neither our file's remove nor the final file's add changes data,
+    /// and only carrying the UPDATE forward through the second compaction finds it.</item>
+    /// </list>
+    /// Under WriteSerializable all of them reconcile, as a single UPDATE rewrite does.
+    /// </summary>
+    [Theory]
+    [InlineData("compact,update", IsolationLevel.Serializable, true)]
+    [InlineData("update,compact", IsolationLevel.Serializable, true)]
+    [InlineData("compact,update,append,compact", IsolationLevel.Serializable, true)]
+    [InlineData("compact,update", IsolationLevel.WriteSerializable, false)]
+    [InlineData("update,compact", IsolationLevel.WriteSerializable, false)]
+    [InlineData("compact,update,append,compact", IsolationLevel.WriteSerializable, false)]
+    public async Task RowDelete_ThroughSeveralRewrites_ConflictsOnlyUnderSerializable(
+        string sequence, IsolationLevel level, bool expectConflict)
+    {
+        await using (var setup = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), BuildSchema(),
+            enableDeletionVectors: true, enableRowTracking: true))
+        {
+            await setup.WriteAsync([Batch(1, 3)]);
+            await setup.WriteAsync([Batch(4, 2)]); // something to compact with
+        }
+
+        await using var table = await OpenAsync();
+        var txn = table.StartTransaction(level);
+        await txn.StageRowDeletesAsync(AtFileZero(txn, 0)); // id 1
+
+        await using (var other = await OpenAsync())
+        {
+            // Changes id 3, a DIFFERENT row of the file our delete targets (or of the file it was compacted into).
+            async Task UpdateAsync() => await other.UpdateAsync(
+                Ex.Equal("id", 3L),
+                batch => new RecordBatch(BuildSchema(), [Batch(30, batch.Length).Column(0)], batch.Length));
+            async Task CompactAsync()
+            {
+                long before = other.CurrentSnapshot.Version;
+                await other.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+                Assert.NotEqual(before, other.CurrentSnapshot.Version); // the compaction really rewrote something
+            }
+
+            foreach (string step in sequence.Split(','))
+            {
+                switch (step)
+                {
+                    case "compact": await CompactAsync(); break;
+                    case "update": await UpdateAsync(); break;
+                    case "append": await other.WriteAsync([Batch(100, 1)]); break; // something to compact with
+                }
+            }
+        }
+
+        int expected = sequence.Contains("append") ? 6 : 5;
+        if (expectConflict)
+        {
+            await Assert.ThrowsAsync<DeltaConflictException>(async () => await txn.CommitAsync());
+            Assert.Equal(expected, await RowCountAsync()); // the concurrent commits landed; the delete did not
+        }
+        else
+        {
+            await txn.CommitAsync();
+            Assert.Equal(expected - 1, await RowCountAsync());
+        }
+    }
+
     // ── The read set stays the read set ──
 
     private static Apache.Arrow.Schema IdRegionSchema { get; } = new Apache.Arrow.Schema.Builder()

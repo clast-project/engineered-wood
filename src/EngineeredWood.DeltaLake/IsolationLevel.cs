@@ -25,10 +25,11 @@ namespace EngineeredWood.DeltaLake;
 public enum IsolationLevel
 {
     /// <summary>
-    /// The Delta default. A concurrent blind append never conflicts, on the reasoning that its rows did
+    /// This library's default. A concurrent blind append never conflicts, on the reasoning that its rows did
     /// not depend on anything this transaction might invalidate — so the two commits can be linearized
     /// as "append happened after". Strictly weaker than <see cref="Serializable"/> only for that one
-    /// case, and it is the level Spark and delta-rs use unless told otherwise.
+    /// case. It is Databricks' default; OSS delta-spark defaults to <see cref="Serializable"/> and refuses
+    /// to set this level at all (see <c>IsolationLevelProperty</c>).
     /// </summary>
     WriteSerializable = 0,
 

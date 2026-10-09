@@ -445,6 +445,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // refuse makes the table one Spark can no longer ALTER.
         DataSkippingStatsColumns.Validate(deltaSchema, partitionColumns, configuration);
         Stats.StatsColumnSelection.Validate(configuration);
+        // Spark refuses an unparseable delta.isolationLevel at CREATE TABLE too, data or none; a table created with
+        // one here would refuse every later data-changing commit, so it is refused now, before anything is written.
+        IsolationLevelProperty.Get(configuration);
 
         // Set protocol versions based on column mapping mode
         int minReaderVersion = 1;
@@ -1950,6 +1953,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (extraActions is { Count: > 0 })
         {
             EnsureUniversalFormatMaintained(extraActions, _options);
+            EnsureNoInvalidIsolationLevelIntroduced(snapshot, extraActions);
             actions.AddRange(extraActions);
         }
         if (actions.Count == 0)
@@ -2538,11 +2542,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// wins. Use this when a write depends on a read that a concurrent writer could invalidate; the
     /// auto-committing <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> / write methods are the single-shot equivalent.</para>
     /// </summary>
-    public DeltaTransaction StartTransaction(
-        IsolationLevel isolationLevel = IsolationLevel.WriteSerializable)
+    /// <param name="isolationLevel">Null — the default — runs at the level the table demands
+    /// (<c>delta.isolationLevel</c>; <see cref="IsolationLevel.WriteSerializable"/> when unset). A stronger level
+    /// may be asked for; a weaker one is refused, since the table's level is a demand on every writer.</param>
+    /// <exception cref="ArgumentException"><paramref name="isolationLevel"/> is weaker than the table's.</exception>
+    /// <exception cref="DeltaFormatException">The table's <c>delta.isolationLevel</c> names no level
+    /// (<see cref="DeltaErrorCodes.InvalidIsolationLevel"/>).</exception>
+    public DeltaTransaction StartTransaction(IsolationLevel? isolationLevel = null)
     {
         ThrowIfDisposed();
-        return new DeltaTransaction(this, CurrentSnapshot, isolationLevel);
+        var snapshot = CurrentSnapshot;
+        return new DeltaTransaction(this, snapshot, ResolveIsolation(snapshot, isolationLevel));
     }
 
     /// <summary>
@@ -2550,19 +2560,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// positions and scan decisions were captured against — rather than on whatever is current now.
     ///
     /// <para><b>Why this exists.</b> For a transaction spanning several of the host's own statements,
-    /// <see cref="StartTransaction(IsolationLevel)"/> makes the commit loop's validation VACUOUS: it asks "what
+    /// <see cref="StartTransaction(IsolationLevel?)"/> makes the commit loop's validation VACUOUS: it asks "what
     /// landed since the latest version?", and the answer is nothing. Basing on the version the work was actually
     /// planned against is what makes the check mean something — a concurrent commit between the host's first
     /// statement and its commit is then seen and adjudicated instead of silently ignored.</para>
     ///
     /// <para>A version number is what a host that cannot keep the table open between statements can carry
-    /// across its own statement boundary; <see cref="StartTransaction(Snapshot.Snapshot, IsolationLevel)"/> is
+    /// across its own statement boundary; <see cref="StartTransaction(Snapshot.Snapshot, IsolationLevel?)"/> is
     /// for a caller already holding the snapshot itself.</para>
     /// </summary>
     /// <param name="baseVersion">The pinned version. Must exist, and must not be ahead of the current one.</param>
     public async ValueTask<DeltaTransaction> StartTransactionAsync(
         long baseVersion,
-        IsolationLevel isolationLevel = IsolationLevel.WriteSerializable,
+        IsolationLevel? isolationLevel = null,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
@@ -2577,7 +2587,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var baseSnapshot = baseVersion == CurrentSnapshot.Version
             ? CurrentSnapshot
             : await GetSnapshotAtVersionAsync(baseVersion, cancellationToken).ConfigureAwait(false);
-        return new DeltaTransaction(this, baseSnapshot, isolationLevel);
+        return new DeltaTransaction(this, baseSnapshot, ResolveIsolation(baseSnapshot, isolationLevel));
     }
 
     /// <summary>
@@ -2590,7 +2600,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// ahead of the current version.</param>
     public DeltaTransaction StartTransaction(
         Snapshot.Snapshot baseSnapshot,
-        IsolationLevel isolationLevel = IsolationLevel.WriteSerializable)
+        IsolationLevel? isolationLevel = null)
     {
         ThrowIfDisposed();
         if (baseSnapshot is null)
@@ -2603,8 +2613,36 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 $"Cannot base a transaction on version {baseSnapshot.Version}: the table is at "
                 + $"{CurrentSnapshot.Version}, so that version does not exist yet.");
         }
-        return new DeltaTransaction(this, baseSnapshot, isolationLevel);
+        return new DeltaTransaction(this, baseSnapshot, ResolveIsolation(baseSnapshot, isolationLevel));
     }
+
+    /// <summary>
+    /// The level a data-changing commit based on <paramref name="snapshot"/> runs at: the table's
+    /// <c>delta.isolationLevel</c> unless the caller asked for a stronger one. Read off the BASE snapshot — a
+    /// concurrent change to the property is a metadata change, which conflicts at every level, so the base and
+    /// the version the commit lands on cannot disagree about it.
+    /// </summary>
+    /// <remarks>
+    /// <para>Every DML and append entry point resolves through here, and the metadata-only commits
+    /// (properties, domains, clustering) and OPTIMIZE do not. That is Delta's split: a commit that changes no
+    /// data drops to snapshot isolation, and the metadata commits record no reads, so no level would change
+    /// their verdict. So a table with an unparseable value still takes those commits, where every data-changing
+    /// one is refused as Spark refuses it.</para>
+    /// </remarks>
+    /// <summary>
+    /// The level a commit of <paramref name="actions"/> runs at: the table's when they change data, and otherwise
+    /// <see cref="IsolationLevel.WriteSerializable"/> without consulting the property. A commit that changes no
+    /// data (an append of no rows, a compaction, a metadata-only flush) never reads it, so a table with an
+    /// unparseable value still takes one, as it does in Spark.
+    /// </summary>
+    private static IsolationLevel IsolationFor(Snapshot.Snapshot snapshot, IEnumerable<DeltaAction> actions) =>
+        actions.Any(static a => a is AddFile { DataChange: true } or RemoveFile { DataChange: true })
+            ? ResolveIsolation(snapshot)
+            : IsolationLevel.WriteSerializable;
+
+    private static IsolationLevel ResolveIsolation(
+        Snapshot.Snapshot snapshot, IsolationLevel? requested = null, string paramName = "isolationLevel") =>
+        IsolationLevelProperty.Resolve(snapshot.Metadata.Configuration, requested, paramName);
 
     /// <summary>
     /// The check every write entry point makes before it writes anything: the protocol must be one this library
@@ -2626,6 +2664,29 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             if (action is MetadataAction metadata)
                 EnsureUniversalFormatMaintained(metadata.Configuration, options);
+        }
+    }
+
+    /// <summary>
+    /// Refuses caller-supplied <c>metaData</c> that SETS <c>delta.isolationLevel</c> to a value naming no level,
+    /// as <see cref="CreateCoreAsync"/> refuses it at create and Spark refuses it on any property update. Only a
+    /// value that differs from the base snapshot's is judged: one carried through unchanged was already the
+    /// table's, and a commit that changes no data may still land on such a table. A data-changing commit on it
+    /// is refused anyway, when its level is resolved.
+    /// </summary>
+    private static void EnsureNoInvalidIsolationLevelIntroduced(
+        Snapshot.Snapshot baseSnapshot, IEnumerable<DeltaAction> actions)
+    {
+        string? current = null;
+        baseSnapshot.Metadata.Configuration?.TryGetValue(IsolationLevelProperty.PropertyKey, out current);
+        foreach (var action in actions)
+        {
+            if (action is MetadataAction metadata
+                && metadata.Configuration?.TryGetValue(IsolationLevelProperty.PropertyKey, out string? proposed) == true
+                && !string.Equals(proposed, current, StringComparison.Ordinal))
+            {
+                IsolationLevelProperty.Get(metadata.Configuration);
+            }
         }
     }
 
@@ -2685,6 +2746,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // on the table it is based on, and on any metaData it stages.
         EnsureUniversalFormatMaintained(baseSnapshot.Metadata.Configuration, _options);
         EnsureUniversalFormatMaintained(transaction.DataActions, _options);
+        EnsureNoInvalidIsolationLevelIntroduced(baseSnapshot, transaction.DataActions);
 
         // Every transactional operation is now rebase-safe under row tracking: a DELETE only edits deletion
         // vectors on EXISTING files (its re-add keeps that file's own baseRowId), or — when a file was
@@ -3101,7 +3163,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 resolvedPaths = resolution.Value.ResolvedPaths;
                 // Carried to the NEXT retry: a remap writes vectors on files that are not in this delete's
                 // own edit list (the concurrent rewrite's output), so without this the next supersede pass
-                // would not recognise them as ours. Recorded BEFORE the isolation-level narrowing below —
+                // would not recognise them as ours. Recorded BEFORE the isolation-level check below —
                 // this is about provenance, not about what the checker is allowed to forgive.
                 _priorResolvedPaths = resolvedPaths;
 
@@ -3112,11 +3174,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // levels. So the reconciliation survives here only where the concurrent commit did not
                 // change data: a compaction's dataChange=false rewrite rearranges bytes without changing
                 // which rows the table contains, so remapping our rows onto the new file admits no
-                // interleaving the level forbids. Dropping a path from the resolved set does not force a
-                // conflict — it just restores the normal checks for it, so a delete whose files nobody
-                // touched still rebases and lands.
+                // interleaving the level forbids. The data change is traced through every rewrite the
+                // file went through, and a resolution none of whose files changed data is kept whole, so
+                // a delete whose files nobody touched still rebases and lands.
                 if (context.Isolation == IsolationLevel.Serializable)
-                    resolvedPaths = KeepOnlyDataPreservingResolutions(resolvedPaths, context.Concurrent);
+                    EnsureNoDataChangeInResolvedLineage(resolvedPaths, context.Concurrent);
             }
 
             // Re-derive row-tracking post-image ids against the snapshot we now land on (a concurrent commit
@@ -3200,8 +3262,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Narrows a row-level resolution to what <see cref="IsolationLevel.Serializable"/> admits: the paths no
-    /// concurrent commit removed with <c>dataChange=true</c>.
+    /// Refuses a row-level resolution that <see cref="IsolationLevel.Serializable"/> does not admit: one whose
+    /// files saw a <c>dataChange=true</c> add or remove anywhere in their lineage through the concurrent commits.
     ///
     /// <para>Row-level reconciliation has two mechanisms, and the isolation level bounds them differently.
     /// The DV union reconciles a concurrent DELETE — a <c>dataChange=true</c> remove/re-add of a file this
@@ -3209,27 +3271,66 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// The remap across a rewrite reconciles a COMPACTION, whose removes and adds carry
     /// <c>dataChange=false</c>: contents unchanged, only rearranged, which the conflict checker already
     /// exempts from read conflicts at both levels. Relocating rows across it admits no non-serializable
-    /// interleaving, so it survives here. A copy-on-write UPDATE's rewrite is a <c>dataChange=true</c> remove
-    /// and is dropped with the rest.</para>
+    /// interleaving, so it survives here. A copy-on-write UPDATE's rewrite changes data and is refused.</para>
     ///
     /// <para>Gating the resolution as a whole (one bool for both mechanisms) would abort the compaction case
     /// too, which no reading of the level requires.</para>
+    ///
+    /// <para>The file a remap lands on can sit behind more than one rewrite, so a data change is carried
+    /// FORWARD through the commits, oldest first: a path a commit adds or removes with <c>dataChange=true</c>
+    /// is tainted, and a <c>dataChange=false</c> rewrite of a tainted path taints every file it adds. A
+    /// compaction followed by an UPDATE then taints the UPDATE's output (its own add), and an UPDATE followed
+    /// by a compaction taints the compaction's. Every output of such a rewrite is tainted, not only the ones
+    /// the tainted input fed, because a commit does not record which input became which output; that can only
+    /// add conflicts. The buffered path's <see cref="CheckLogicalRebaseAsync"/> traces the same lineage
+    /// backwards from the files it modifies.</para>
+    ///
+    /// <para>This throws rather than dropping the tainted paths from the resolved set and leaving the verdict to
+    /// the conflict checker: the checker judges each concurrent commit against this transaction's read set and
+    /// removes, and neither names the file a remap landed on, so a data change that reached it only through an
+    /// earlier rewrite would pass. An untainted resolution is returned whole, so a delete whose files nobody
+    /// changed still rebases and lands.</para>
     /// </summary>
-    private static ISet<string> KeepOnlyDataPreservingResolutions(
+    private static void EnsureNoDataChangeInResolvedLineage(
         ISet<string> resolvedPaths,
         IReadOnlyList<(long Version, IReadOnlyList<DeltaAction> Actions)> concurrent)
     {
-        var kept = new HashSet<string>(resolvedPaths, StringComparer.Ordinal);
-        foreach (var (_, actions) in concurrent)
+        var tainted = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var (version, actions) in concurrent)
         {
+            bool rewritesTainted = false;
             foreach (var action in actions)
             {
-                if (action is RemoveFile { DataChange: true } remove)
-                    kept.Remove(remove.Path);
+                string? changed = action switch
+                {
+                    AddFile { DataChange: true } add => add.Path,
+                    RemoveFile { DataChange: true } remove => remove.Path,
+                    _ => null,
+                };
+                if (changed is not null)
+                {
+                    if (resolvedPaths.Contains(changed))
+                        throw SerializableRowLevelConflict(version, changed);
+                    tainted.Add(changed);
+                }
+                else if (action is RemoveFile { DataChange: false } input && tainted.Contains(input.Path))
+                {
+                    rewritesTainted = true;
+                }
+            }
+            if (rewritesTainted)
+            {
+                foreach (var action in actions)
+                {
+                    if (action is AddFile { DataChange: false } output)
+                    {
+                        if (resolvedPaths.Contains(output.Path))
+                            throw SerializableRowLevelConflict(version, output.Path);
+                        tainted.Add(output.Path);
+                    }
+                }
             }
         }
-
-        return kept;
     }
 
     /// <summary>
@@ -3927,7 +4028,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             long committed = await CommitOccAsync(
                 snapshot, plan.Actions,
                 new ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
-                IsolationLevel.WriteSerializable, "UPDATE",
+                IsolationFor(snapshot, plan.Actions), "UPDATE",
                 rebaseSafe: true, cancellationToken, written: written,
                 isBlindAppend: false).ConfigureAwait(false);
 
@@ -5193,9 +5294,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 cancellationToken, written: written).ConfigureAwait(false);
 
             long newVersion = snapshot.Version + 1;
+            // From the actions, not the mode: an append of no rows commits nothing and must not be refused, and an
+            // overwrite that removes files changes data even when it writes none. The overwrite branch makes one
+            // direct attempt and never passes the level on, so for it this is only the invalid-value refusal.
             return await CommitWriteAsync(
                 snapshot, actions, mode, dynamicPartitionOverwrite, newVersion,
-                cancellationToken, written, isBlindAppend).ConfigureAwait(false);
+                IsolationFor(snapshot, actions), cancellationToken, written, isBlindAppend).ConfigureAwait(false);
         }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -5625,6 +5729,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         DeltaWriteMode mode,
         bool dynamicPartitionOverwrite,
         long newVersion,
+        IsolationLevel isolation,
         CancellationToken cancellationToken,
         WrittenFileLedger? written = null,
         bool? isBlindAppend = null)
@@ -5667,7 +5772,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // so claiming WholeTable would be inventing detail we do not have.
             committedVersion = await CommitOccAsync(
                 snapshot, actions, ReadSet.Blind,
-                IsolationLevel.WriteSerializable, "WRITE", rebaseSafe: isBlindAppend != false,
+                isolation, "WRITE", rebaseSafe: isBlindAppend != false,
                 cancellationToken, written: written, isBlindAppend: isBlindAppend).ConfigureAwait(false);
         }
         else
@@ -6554,7 +6659,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
         ValidateWriteSupport(CurrentSnapshot);
         if (extraActions is not null)
+        {
             EnsureUniversalFormatMaintained(extraActions, _options);
+            EnsureNoInvalidIsolationLevelIntroduced(CurrentSnapshot, extraActions);
+        }
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
         // extraActions (a buffered transaction's deletion-vector remove/add pairs) likewise make this a
         // non-append. A dataChange=false rewrite (compaction) is append-LEGAL: appendOnly forbids removing
@@ -6610,12 +6718,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         var baseSnapshot = CurrentSnapshot;
+        // A data file added with dataChange=true changes data whatever else the commit holds, so its level is
+        // resolved BEFORE BuildActionsAsync, which can write an inline-deleted file's deletion vector: an
+        // unparseable delta.isolationLevel is then refused with nothing written. The decision below, from the
+        // built actions, still covers the file-less overwrite.
+        if (dataChange && files.Count > 0)
+            ResolveIsolation(baseSnapshot);
+        var initialActions = await BuildActionsAsync(baseSnapshot, cancellationToken).ConfigureAwait(false);
         var result = await _committer.CommitAsync(
             new LogCommitRequest
             {
                 BaseSnapshot = baseSnapshot,
-                Actions = await BuildActionsAsync(baseSnapshot, cancellationToken).ConfigureAwait(false),
+                Actions = initialActions,
                 Operation = operation,
+                // From the built actions: an Overwrite's removes are derived there, so a file-less overwrite
+                // changes data, and a compaction or metadata-only flush does not. The read set below is blind or
+                // domains-only, so the level cannot change this verdict; resolving it is what refuses an
+                // unparseable delta.isolationLevel here as everywhere else.
+                Isolation = IsolationFor(baseSnapshot, initialActions),
                 // The actions are a FUNCTION of the snapshot — an Overwrite's removes name its active set,
                 // and a row-tracking baseRowId is drawn from its high-water mark — so a collision re-derives
                 // them against the version that landed instead of re-committing a stale set. The data files
@@ -7486,7 +7606,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long version = await CommitOccAsync(
             snapshot, actions,
             new ReadSet { Files = removedPaths },
-            IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: true, cancellationToken,
+            IsolationFor(snapshot, actions), "DELETE", rebaseSafe: true, cancellationToken,
             rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written,
             isBlindAppend: false).ConfigureAwait(false);
         return (totalDeleted, version);
@@ -7643,7 +7763,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long version = await CommitOccAsync(
             snapshot, actions,
             new ReadSet { Files = removedPaths },
-            IsolationLevel.WriteSerializable, "DELETE", rebaseSafe: false, cancellationToken,
+            IsolationFor(snapshot, actions), "DELETE", rebaseSafe: false, cancellationToken,
             written: written, isBlindAppend: false)
             .ConfigureAwait(false);
         return (totalDeleted, version);
@@ -8100,7 +8220,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         return await CommitOccAsync(
             snapshot, actions,
             new ReadSet { Files = removedPaths },
-            IsolationLevel.WriteSerializable, "UPDATE", rebaseSafe: false, cancellationToken,
+            IsolationFor(snapshot, actions), "UPDATE", rebaseSafe: false, cancellationToken,
             written: written, isBlindAppend: false)
             .ConfigureAwait(false);
     }
@@ -8469,17 +8589,36 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// or <paramref name="readWholeTable"/>, isolation-scoped by <paramref name="serializable"/>) run unless
     /// <paramref name="rowLevelDml"/> — row-level mode replaces them with the row-granular validation the rebase
     /// already performed (same-row overlap conflicts there; under WriteSerializable reads are not serialized).
+    /// Under Serializable, row-level mode instead refuses any concurrent data change to a file the transaction
+    /// modifies, however disjoint the rows, and the read checks still run.
     /// </summary>
+    /// <param name="serializable">Null — the default — checks at the level the table demands
+    /// (<c>delta.isolationLevel</c>). <c>true</c> asks for <see cref="IsolationLevel.Serializable"/>; <c>false</c>
+    /// for <see cref="IsolationLevel.WriteSerializable"/>, which is refused on a table that demands
+    /// Serializable.</param>
+    /// <exception cref="ArgumentException"><paramref name="serializable"/> is <c>false</c> on a table whose
+    /// <c>delta.isolationLevel</c> is Serializable.</exception>
     public async ValueTask CheckLogicalRebaseAsync(
         Snapshot.Snapshot baseSnapshot,
         IReadOnlyList<DeltaAction> plannedActions,
         IReadOnlyList<Expressions.Predicate>? readPredicates = null,
         bool readWholeTable = false,
-        bool serializable = false,
+        bool? serializable = null,
         bool rowLevelDml = false,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        // Before the early return, so a weaker level than the table demands is refused whether or not anything
+        // landed concurrently — a check that only objected under contention would read as intermittent.
+        var isolation = ResolveIsolation(
+            baseSnapshot,
+            serializable switch
+            {
+                null => null,
+                true => IsolationLevel.Serializable,
+                false => IsolationLevel.WriteSerializable,
+            },
+            nameof(serializable));
         var latest = CurrentSnapshot;
         if (latest.Version == baseSnapshot.Version)
         {
@@ -8524,14 +8663,48 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        // Read-set checks (skipped when the caller recorded no reads — pure delete/delete mode). ROW-LEVEL mode
-        // (rowLevelDml, WriteSerializable only): the read checks are REPLACED by the row-level write validation
-        // the rebase performed.
+        // ROW-LEVEL mode is a WriteSerializable behaviour (IsolationLevel): the rebase reconciled concurrent changes
+        // to the files this transaction modifies at ROW granularity — a deletion-vector union, or a remap onto a
+        // copy-on-write rewrite — which is what let the delete/delete check above pass. Under Serializable that
+        // reconciliation may stand only past a change that preserved data (a compaction), as
+        // EnsureNoDataChangeInResolvedLineage enforces on the OCC path; and the read checks then run as for any
+        // other transaction instead of being replaced.
+        bool rowLevelReconciles = rowLevelDml && isolation != IsolationLevel.Serializable;
         bool hasReads = readWholeTable || readPredicates is { Count: > 0 };
-        if (!hasReads || rowLevelDml)
+        bool checkRowLevelUnderSerializable = rowLevelDml && !rowLevelReconciles;
+        if (!checkRowLevelUnderSerializable && (!hasReads || rowLevelReconciles))
         {
             return;
         }
+
+        bool checkReads = hasReads && !rowLevelReconciles;
+
+        // Under Serializable, the files this transaction modifies must have seen no concurrent DATA change, and
+        // "the files it modifies" has to be traced back through every rewrite in between, not read off the rebased
+        // actions alone: those name only the LAST file the rows landed in. A copy-on-write UPDATE followed by a
+        // compaction leaves a final file whose only visible history is the compaction's dataChange=false add, so a
+        // check of final paths would wave the UPDATE through.
+        //
+        // So the walk below goes NEWEST FIRST and carries a lineage: it starts as the paths the rebased removes
+        // name, and when a commit adds a lineage file with dataChange=false (a compaction), that commit's
+        // dataChange=false removes, its inputs, join the lineage. Any dataChange=true add or remove of a lineage
+        // file conflicts: a DV delete removes and re-adds its path, a copy-on-write UPDATE adds the file a remap
+        // later landed on. Every input of a compaction joins, not only the ones our rows came from, because a
+        // commit does not record which input fed which output. That can only add conflicts, which is the safe
+        // direction at the strict level.
+        HashSet<string>? lineage = null;
+        if (checkRowLevelUnderSerializable)
+        {
+            lineage = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var action in plannedActions)
+            {
+                if (action is RemoveFile remove)
+                {
+                    lineage.Add(remove.Path);
+                }
+            }
+        }
+
         var pruner = new DeltaFilePruner(baseSnapshot.Schema, baseSnapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
         bool ReadsMatch(AddFile file)
@@ -8549,16 +8722,59 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
             return false;
         }
-        var baseByPath = new Dictionary<string, AddFile>(baseSnapshot.ActiveFiles.Count, StringComparer.Ordinal);
-        foreach (var f in baseSnapshot.ActiveFiles.Values)
+        var baseByPath = new Dictionary<string, AddFile>(
+            checkReads ? baseSnapshot.ActiveFiles.Count : 0, StringComparer.Ordinal);
+        if (checkReads)
         {
-            baseByPath[f.Path] = f;
+            foreach (var f in baseSnapshot.ActiveFiles.Values)
+            {
+                baseByPath[f.Path] = f;
+            }
         }
         // A property of THIS transaction, so it is computed once rather than per concurrent commit.
         bool currentChangesMetadata = Concurrency.ConflictChecker.ChangesMetadata(plannedActions);
-        for (long v = baseSnapshot.Version + 1; v <= latest.Version; v++)
+
+        // ONE pass over the concurrent commits, streamed rather than held: newest first when tracing lineage
+        // (above), oldest first otherwise. The read checks judge each commit on its own, so the direction never
+        // changes their verdict, only which conflicting commit is named.
+        long concurrentCount = latest.Version - baseSnapshot.Version;
+        for (long i = 0; i < concurrentCount; i++)
         {
+            long v = lineage is null ? baseSnapshot.Version + 1 + i : latest.Version - i;
             var commitActions = await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false);
+
+            if (lineage is not null)
+            {
+                bool rewritesLineage = false;
+                foreach (var a in commitActions)
+                {
+                    switch (a)
+                    {
+                        case AddFile { DataChange: true } add when lineage.Contains(add.Path):
+                            throw SerializableRowLevelConflict(v, add.Path);
+                        case RemoveFile { DataChange: true } remove when lineage.Contains(remove.Path):
+                            throw SerializableRowLevelConflict(v, remove.Path);
+                        case AddFile { DataChange: false } add when lineage.Contains(add.Path):
+                            rewritesLineage = true;
+                            break;
+                    }
+                }
+                if (rewritesLineage)
+                {
+                    foreach (var a in commitActions)
+                    {
+                        if (a is RemoveFile { DataChange: false } input)
+                        {
+                            lineage.Add(input.Path);
+                        }
+                    }
+                }
+            }
+
+            if (!checkReads)
+            {
+                continue;
+            }
 
             // ONE rule, shared with ConflictChecker. This used to be a second copy — starting `true` and
             // clearing on remove/metaData/protocol — which differed from the checker's in requiring no
@@ -8574,7 +8790,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // which is how the divergence above became live — one call site learning something the other
             // did not. ExamineConcurrentAdds is the whole decision, third term included.
             bool examineAdds = Concurrency.ConflictChecker.ExamineConcurrentAdds(
-                serializable ? IsolationLevel.Serializable : IsolationLevel.WriteSerializable,
+                isolation,
                 Concurrency.ConflictChecker.IsBlindAppend(commitActions),
                 currentChangesMetadata);
             foreach (var a in commitActions)
@@ -8608,6 +8824,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
     }
+
+    private static DeltaConflictException SerializableRowLevelConflict(long version, string path) =>
+        new(
+            DeltaErrorCodes.ConcurrentDeleteDelete,
+            $"concurrent commit v{version} changed the data of file '{path}', which this transaction modifies (or "
+            + "whose rows it modifies after a rewrite); under Serializable isolation that conflicts at file "
+            + "granularity, however disjoint the rows — cannot rebase the transaction");
 
     private static bool MetadataEquals(MetadataAction a, MetadataAction b)
     {

@@ -8,7 +8,7 @@ namespace EngineeredWood.DeltaLake.Table;
 
 /// <summary>
 /// An optimistic-concurrency transaction over a <see cref="DeltaTable"/>, pinned to the table version
-/// it was started at (see <see cref="DeltaTable.StartTransaction(IsolationLevel)"/>).
+/// it was started at (see <see cref="DeltaTable.StartTransaction(IsolationLevel?)"/>).
 ///
 /// <para>Stage read-dependent operations on it, then <see cref="CommitAsync"/>. At commit the
 /// transaction is validated against every commit that landed since it started: if none invalidated
