@@ -357,6 +357,24 @@ public sealed record ParquetReadOptions
     public bool PageChecksumValidation { get; init; }
 
     /// <summary>
+    /// The largest <c>uncompressed_page_size</c> a page of a compressed column chunk may declare, in
+    /// bytes. A page declaring more is refused with a <see cref="ParquetFormatException"/> before
+    /// anything is allocated for it. Default: <see langword="null"/>, no limit.
+    /// </summary>
+    /// <remarks>
+    /// <para>A compressed page is decompressed into a buffer of the size its header declares, and
+    /// compression ratios have no useful bound (zstd shrinks a run of zeros a thousandfold), so a
+    /// page of a few bytes can ask for up to 2 GiB. Set this when reading files from a source you do
+    /// not trust, to bound what one page can allocate.</para>
+    /// <para>There is no default limit because real pages can be large: one value cannot span pages,
+    /// so a column of large blobs has pages at least that large, and parquet-testing's
+    /// <c>large_string_map.brotli.parquet</c> has a 1 GiB page. EW's writer cuts pages at
+    /// <see cref="ParquetWriteOptions.DataPageSize"/>, 1 MiB by default. Without this limit a page is
+    /// still refused when it declares more than its whole column chunk does.</para>
+    /// </remarks>
+    public int? MaxPageUncompressedSize { get; init; }
+
+    /// <summary>
     /// What to do with a column chunk whose <c>file_path</c> says it is stored in another file.
     /// Defaults to <see cref="ColumnChunkFilePathKind.Refuse"/>.
     /// </summary>

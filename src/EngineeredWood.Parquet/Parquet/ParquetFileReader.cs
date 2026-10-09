@@ -171,7 +171,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
                     ctx.HasNestedColumns,
                     _options.PageChecksumValidation,
-                    _options.FixedListFastPath);
+                    _options.FixedListFastPath,
+                    _options.MaxPageUncompressedSize);
             });
 
             return AssembleRecordBatch(ctx, results);
@@ -467,7 +468,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                         ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
                         ctx.HasNestedColumns,
                         _options.PageChecksumValidation,
-                        _options.FixedListFastPath);
+                        _options.FixedListFastPath,
+                        _options.MaxPageUncompressedSize);
                 });
                 yield return AssembleRecordBatch(ctx, results);
             }
@@ -605,7 +607,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                                 {
                                     pageMaps[i].CompleteSidePages(
                                         pageBuffers[prefixSlots[i]].Memory.Span, ctx.Columns[i],
-                                        ctx.Chunks[i].MetaData!, _options.PageChecksumValidation);
+                                        ctx.Chunks[i].MetaData!, _options.PageChecksumValidation,
+                                        _options.MaxPageUncompressedSize);
                                 }
 
                                 var buffer = pageBuffers[dataSlots[i]];
@@ -619,7 +622,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                                     startPage, endPages[i],
                                     ctx.LeafArrowFields[i],
                                     ctx.HasNestedColumns,
-                                    _options.PageChecksumValidation);
+                                    _options.PageChecksumValidation,
+                                    _options.MaxPageUncompressedSize);
                                 // Decoded rows that continue the held ones are appended; otherwise the
                                 // pages start at or before the next row to return, and replace them.
                                 if (pageMaps[i].CumulativeRows[startPage] == cursor.EndRow)
@@ -683,7 +687,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 if (needPageMaps)
                 {
                     pageMaps[i] = PageMapBuilder.Build(
-                        buffers[i].Memory.Span, ctx.Columns[i], ctx.Chunks[i].MetaData!);
+                        buffers[i].Memory.Span, ctx.Columns[i], ctx.Chunks[i].MetaData!,
+                        maxPageUncompressedSize: _options.MaxPageUncompressedSize);
                 }
 
                 results[i] = ColumnChunkReader.ReadColumn(
@@ -691,7 +696,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
                     ctx.HasNestedColumns,
                     _options.PageChecksumValidation,
-                    _options.FixedListFastPath);
+                    _options.FixedListFastPath,
+                    _options.MaxPageUncompressedSize);
             });
             full = AssembleRecordBatch(ctx, results);
         }
@@ -832,7 +838,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 buffer.Memory.Span,
                 ctx.Columns[i],
                 ctx.Chunks[i].MetaData!,
-                _options.PageChecksumValidation);
+                _options.PageChecksumValidation,
+                _options.MaxPageUncompressedSize);
         }
 
         return pageMaps!;
@@ -956,7 +963,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
                 pageMaps[i] = PageMapBuilder.BuildFromOffsetIndex(
                     prefix, range.Offset, range.Offset + range.Length, index, ctx.RowCount,
-                    ctx.Columns[i], ctx.Chunks[i].MetaData!, _options.PageChecksumValidation);
+                    ctx.Columns[i], ctx.Chunks[i].MetaData!, _options.PageChecksumValidation,
+                    _options.MaxPageUncompressedSize);
             }
         }
         finally
@@ -1070,7 +1078,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
                 ctx.HasNestedColumns,
                 validateCrc: _options.PageChecksumValidation,
-                fixedListFastPath: _options.FixedListFastPath);
+                fixedListFastPath: _options.FixedListFastPath,
+                maxPageUncompressedSize: _options.MaxPageUncompressedSize);
         }
 
         return AssembleRecordBatch(ctx, results);
@@ -1101,7 +1110,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
                     ctx.HasNestedColumns,
                     _options.PageChecksumValidation,
-                    _options.FixedListFastPath);
+                    _options.FixedListFastPath,
+                    _options.MaxPageUncompressedSize);
             });
 
             return AssembleRecordBatch(ctx, results);
@@ -1168,7 +1178,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
                     ctx.HasNestedColumns,
                     _options.PageChecksumValidation,
-                    _options.FixedListFastPath);
+                    _options.FixedListFastPath,
+                    _options.MaxPageUncompressedSize);
             }).ConfigureAwait(false);
 #else
         for (int i = 0; i < ctx.Count; i++)
@@ -1182,7 +1193,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
                 ctx.HasNestedColumns,
                 validateCrc: _options.PageChecksumValidation,
-                fixedListFastPath: _options.FixedListFastPath);
+                fixedListFastPath: _options.FixedListFastPath,
+                maxPageUncompressedSize: _options.MaxPageUncompressedSize);
         }
 #endif
 

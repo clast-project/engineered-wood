@@ -209,7 +209,7 @@ internal static class NestedAssembler
         var (offsets, bitmap, nullCount, _) = fixedLength > 0
             ? (BuildFixedOffsets(parentCount, fixedLength), (byte[]?)null, 0, parentCount * fixedLength)
             : BuildOffsetsAndBitmap(
-                repLevels, defLevels, parentDefLevel, nodeDefLevel, parentCount, numValues, repThreshold);
+                node, repLevels, defLevels, parentDefLevel, nodeDefLevel, parentCount, numValues, repThreshold);
 
         // Filter out phantom entries from the element array
         elementArray = FilterElementArray(elementArray, defLevels, nodeDefLevel);
@@ -259,7 +259,7 @@ internal static class NestedAssembler
         var (offsets, bitmap, nullCount, elementCount) = fixedLength > 0
             ? (BuildFixedOffsets(parentCount, fixedLength), (byte[]?)null, 0, parentCount * fixedLength)
             : BuildOffsetsAndBitmap(
-                repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
+                node, repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
 
         // Filter phantom entries (outer null/empty list markers) before inner recursive assembly
         FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
@@ -361,7 +361,7 @@ internal static class NestedAssembler
 
         // Build offsets FIRST to determine elementCount for inner assembly
         var (offsets, bitmap, nullCount, elementCount) = BuildOffsetsAndBitmap(
-            repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
+            node, repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
 
         // Filter phantom entries (outer null/empty map markers) before inner recursive assembly
         FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
@@ -411,6 +411,7 @@ internal static class NestedAssembler
     /// <summary>
     /// Builds offsets and validity bitmap from rep/def levels.
     /// </summary>
+    /// <param name="node">The list or map node, which an error names.</param>
     /// <param name="repLevels">Repetition levels for each encoded value.</param>
     /// <param name="defLevels">Definition levels for each encoded value.</param>
     /// <param name="nullDefThreshold">Accumulated def level of the LIST/MAP group node.
@@ -422,7 +423,7 @@ internal static class NestedAssembler
     /// <param name="repThreshold">Repetition level threshold for this list level.
     /// rep &lt; this → new parent slot; rep == this → new element; rep &gt; this → deeper nesting (skip).</param>
     private static (int[] offsets, byte[]? bitmap, int nullCount, int elementCount) BuildOffsetsAndBitmap(
-        int[]? repLevels, int[]? defLevels,
+        SchemaNode node, int[]? repLevels, int[]? defLevels,
         int nullDefThreshold, int emptyDefThreshold,
         int parentCount, int numValues, int repThreshold)
     {
@@ -437,6 +438,15 @@ internal static class NestedAssembler
             return (offsets, bitmap, nullCount, 0);
         }
 
+        // The first entry must start a list. One that continues a list no entry started was counted
+        // into the first, and every list after it shifted by one (parquet-testing's ARROW-GH-45185).
+        if (repLevels[0] >= repThreshold)
+        {
+            throw new ParquetFormatException(
+                $"Malformed Parquet file: column '{ColumnPath(node)}' begins with repetition level " +
+                $"{repLevels[0]}, which continues a list that no level started.");
+        }
+
         int slot = 0;
         int elementOffset = 0;
 
@@ -447,6 +457,14 @@ internal static class NestedAssembler
                 // Start of a new parent slot
                 if (i > 0)
                     slot++;
+                if (slot >= parentCount)
+                {
+                    // One list too many overwrote the end of the last, cutting it short; more ran
+                    // off the end of the offsets.
+                    throw new ParquetFormatException(
+                        $"Malformed Parquet file: column '{ColumnPath(node)}' holds {parentCount} list(s), " +
+                        $"but its repetition levels start more.");
+                }
 
                 offsets[slot] = elementOffset;
 

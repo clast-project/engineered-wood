@@ -140,6 +140,49 @@ public class MalformedNestedLevelsTests
     }
 
     /// <summary>
+    /// Repetition levels that start more lists than the row group has rows. One too many overwrote
+    /// the end offset of the last list, which read cut short; two ran off the end of the offsets as
+    /// an <see cref="IndexOutOfRangeException"/> (#426).
+    /// </summary>
+    [Theory]
+    [InlineData(3)]
+    [InlineData(4)]
+    public async Task MoreListsThanRows_IsRefused(int lists)
+    {
+        var ex = await ReadAsync(ThreeLevelListFile(
+            repLevels: new int[lists],
+            defLevels: Enumerable.Repeat(3, lists).ToArray(),
+            values: new bool[lists],
+            rowCount: 2));
+
+        Assert.NotNull(ex);
+        Assert.Contains("column 'v' holds 2 list(s), but its repetition levels start more", ex!.Message);
+    }
+
+    /// <summary>
+    /// Levels whose first entry continues a list rather than starting one, as in parquet-testing's
+    /// bad_data/ARROW-GH-45185.parquet. The entry was counted into the first list and every list
+    /// after it shifted by one, and the file read without complaint.
+    /// </summary>
+    [Fact]
+    public async Task FirstLevelContinuingAList_IsRefused()
+    {
+        var ex = await ReadAsync(ThreeLevelListFile(
+            repLevels: [1, 0, 1],
+            defLevels: [3, 3, 3],
+            values: [true, false, true],
+            rowCount: 2));
+
+        Assert.NotNull(ex);
+        Assert.Contains("column 'v' begins with repetition level 1", ex!.Message);
+
+        await using var file = new LocalRandomAccessFile(TestData.GetBadDataPath("ARROW-GH-45185.parquet"));
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var fixture = await Assert.ThrowsAsync<ParquetFormatException>(async () => await reader.ReadRowGroupAsync(0));
+        Assert.Contains("begins with repetition level 1", fixture.Message);
+    }
+
+    /// <summary>
     /// The list data written correctly — as PyArrow writes it, with ONE level entry for the null row
     /// — still reads, and produces offsets that stay inside the child.
     /// </summary>

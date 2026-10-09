@@ -72,19 +72,19 @@ internal static class Decompressor
             }
         }
 #else
-        // .NET Framework's GZipStream stops after the first Gzip member and may
-        // over-read the underlying stream. Use a MemoryStream and re-create the
-        // GZipStream for each concatenated member (per RFC 1952).
+        // .NET Framework's GZipStream stops after the first Gzip member, so each concatenated member
+        // (RFC 1952) gets a stream of its own. It also reads its input ahead in blocks, so its
+        // position does not say where the member ended: that is found from the member's trailer.
         byte[] sourceArray = source.ToArray();
-        var sourceStream = new MemoryStream(sourceArray);
         byte[] tempBuffer = new byte[destination.Length];
         int totalRead = 0;
+        int start = 0;
 
-        while (sourceStream.Position < sourceStream.Length && totalRead < tempBuffer.Length)
+        while (start < sourceArray.Length && totalRead < tempBuffer.Length)
         {
-            // Mark start so we can detect if GZipStream consumed anything
-            long before = sourceStream.Position;
-            using (var gzip = new GZipStream(sourceStream, CompressionMode.Decompress, leaveOpen: true))
+            int memberStart = totalRead;
+            using (var gzip = new GZipStream(
+                new MemoryStream(sourceArray, start, sourceArray.Length - start), CompressionMode.Decompress))
             {
                 while (totalRead < tempBuffer.Length)
                 {
@@ -93,15 +93,68 @@ internal static class Decompressor
                     totalRead += read;
                 }
             }
-            // If GZipStream didn't advance the stream, we're stuck — break to avoid infinite loop
-            if (sourceStream.Position == before)
+
+            int end = FindGzipMemberEnd(sourceArray, start, tempBuffer.AsSpan(memberStart, totalRead - memberStart));
+            if (end <= start)
                 break;
+            start = end;
         }
 
         tempBuffer.AsSpan(0, totalRead).CopyTo(destination);
         return totalRead;
 #endif
     }
+
+#if !NET6_0_OR_GREATER
+    /// <summary>
+    /// Where the Gzip member at <paramref name="start"/>, which decompressed to <paramref name="output"/>,
+    /// ends: the first position after its deflate data whose preceding eight bytes are a trailer that
+    /// matches the output (its CRC-32 and length) and that ends the source or starts another member.
+    /// -1 when there is none.
+    /// </summary>
+    private static int FindGzipMemberEnd(byte[] source, int start, ReadOnlySpan<byte> output)
+    {
+        const int MinMember = 18; // a 10-byte header, an empty deflate block, an 8-byte trailer
+        uint length = unchecked((uint)output.Length);
+        uint? crc = null;
+        for (int end = start + MinMember; end <= source.Length; end++)
+        {
+            bool atBoundary = end == source.Length
+                || (end + 1 < source.Length && source[end] == 0x1F && source[end + 1] == 0x8B);
+            if (!atBoundary || BinaryPrimitives.ReadUInt32LittleEndian(source.AsSpan(end - 4)) != length)
+                continue;
+            crc ??= Crc32(output);
+            if (BinaryPrimitives.ReadUInt32LittleEndian(source.AsSpan(end - 8)) == crc)
+                return end;
+        }
+        return -1;
+    }
+
+    private static uint[]? s_crc32Table;
+
+    /// <summary>The CRC-32 Gzip records (ISO 3309, reflected polynomial 0xEDB88320).</summary>
+    private static uint Crc32(ReadOnlySpan<byte> data)
+    {
+        var table = s_crc32Table;
+        if (table is null)
+        {
+            table = new uint[256];
+            for (uint n = 0; n < 256; n++)
+            {
+                uint c = n;
+                for (int k = 0; k < 8; k++)
+                    c = (c & 1) != 0 ? 0xEDB88320 ^ (c >> 1) : c >> 1;
+                table[n] = c;
+            }
+            s_crc32Table = table;
+        }
+
+        uint crc = 0xFFFFFFFF;
+        foreach (byte b in data)
+            crc = table[(crc ^ b) & 0xFF] ^ (crc >> 8);
+        return ~crc;
+    }
+#endif
 
     private static int DecompressBrotli(ReadOnlySpan<byte> source, Span<byte> destination)
     {

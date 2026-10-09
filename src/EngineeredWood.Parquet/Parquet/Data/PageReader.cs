@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using EngineeredWood.Compression;
 using EngineeredWood.Parquet.Schema;
 
 namespace EngineeredWood.Parquet.Data;
@@ -67,6 +68,8 @@ internal ref struct PageReader
 {
     private readonly ReadOnlySpan<byte> _data;
     private readonly ColumnDescriptor _column;
+    private readonly long _chunkUncompressedSize;
+    private readonly int? _maxUncompressedPageSize;
     private int _position;
     private int _nextOrdinal;
 
@@ -79,10 +82,30 @@ internal ref struct PageReader
     /// The ordinal of the first data page in <paramref name="data"/>: 0 when it starts at the
     /// chunk's first page, otherwise that page's position in the chunk.
     /// </param>
-    public PageReader(ReadOnlySpan<byte> data, ColumnDescriptor column, int firstOrdinal = 0)
+    /// <param name="chunk">
+    /// The chunk's metadata, whose <c>total_uncompressed_size</c> no page's uncompressed size may
+    /// exceed; null when unknown.
+    /// </param>
+    /// <param name="maxUncompressedPageSize">
+    /// The caller's limit on a page's uncompressed size (<see cref="ParquetReadOptions.MaxPageUncompressedSize"/>).
+    /// </param>
+    public PageReader(
+        ReadOnlySpan<byte> data,
+        ColumnDescriptor column,
+        int firstOrdinal = 0,
+        Metadata.ColumnMetaData? chunk = null,
+        int? maxUncompressedPageSize = null)
     {
         _data = data;
         _column = column;
+        // An uncompressed chunk's pages are read in place, so their uncompressed size sizes nothing
+        // and is not read; other readers ignore it there, and so is a wrong one here. A footer that
+        // records no size checks nothing, rather than refusing every page.
+        bool decompressed = chunk?.Codec != CompressionCodec.Uncompressed;
+        _chunkUncompressedSize = decompressed && chunk is { TotalUncompressedSize: > 0 } meta
+            ? meta.TotalUncompressedSize
+            : long.MaxValue;
+        _maxUncompressedPageSize = decompressed ? maxUncompressedPageSize : null;
         _position = 0;
         _nextOrdinal = firstOrdinal;
     }
@@ -133,6 +156,24 @@ internal ref struct PageReader
         {
             throw new ParquetFormatException(
                 $"Column '{_column.DottedPath}': the {header.Type} at byte offset {_position} is malformed: {problem}");
+        }
+
+        // A compressed page is decompressed into a buffer of its declared size, which nothing in the
+        // page bounds: a few bytes of zstd can declare 2 GiB. The chunk's own total is a bound that
+        // costs nothing; the caller's limit is the defense against a file built to lie about both.
+        if (header.UncompressedPageSize > _chunkUncompressedSize)
+        {
+            throw new ParquetFormatException(
+                $"Column '{_column.DottedPath}': the {header.Type} at byte offset {_position} declares " +
+                $"{header.UncompressedPageSize} uncompressed bytes, more than its whole column chunk " +
+                $"({_chunkUncompressedSize}).");
+        }
+        if (header.UncompressedPageSize > _maxUncompressedPageSize)
+        {
+            throw new ParquetFormatException(
+                $"Column '{_column.DottedPath}': the {header.Type} at byte offset {_position} declares " +
+                $"{header.UncompressedPageSize} uncompressed bytes, more than the " +
+                $"{_maxUncompressedPageSize} that MaxPageUncompressedSize allows.");
         }
 
         int ordinal = header.Type is PageType.DataPage or PageType.DataPageV2 ? _nextOrdinal++ : -1;
