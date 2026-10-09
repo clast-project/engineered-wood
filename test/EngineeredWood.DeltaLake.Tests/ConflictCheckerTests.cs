@@ -565,6 +565,78 @@ public class ConflictCheckerTests
         Assert.Equal(7, result.ConflictingVersion);
     }
 
+    // ── opaque predicate (#491) ──
+
+    /// <summary>
+    /// A delegate DELETE/UPDATE read through a condition nobody can inspect, so a concurrent add is taken
+    /// to match it — even one whose stats would have proved it disjoint from any analyzable predicate.
+    /// Here the concurrent commit is NOT a blind append (it also removes a file), so even
+    /// WriteSerializable examines its adds.
+    /// </summary>
+    [Fact]
+    public void OpaquePredicate_ConcurrentNonBlindAdd_ConflictsUnderWriteSerializable()
+    {
+        var reads = new ReadSet { Files = new HashSet<string> { "part-read.parquet" }, OpaquePredicate = true };
+
+        var result = Check(reads, IsolationLevel.WriteSerializable,
+            Commit(6, Remove("part-other.parquet"), Add("part-new.parquet", minId: 1000, maxId: 2000)));
+
+        Assert.Equal(ConflictType.ConcurrentAppend, result.Type);
+        Assert.Equal(6, result.ConflictingVersion);
+    }
+
+    /// <summary>The isolation gate still applies: a blind append is exempt under WriteSerializable…</summary>
+    [Fact]
+    public void OpaquePredicate_ConcurrentBlindAppend_PassesUnderWriteSerializable()
+    {
+        var reads = new ReadSet { Files = new HashSet<string> { "part-read.parquet" }, OpaquePredicate = true };
+
+        var result = Check(reads, IsolationLevel.WriteSerializable,
+            Commit(6, Add("part-new.parquet", minId: 1, maxId: 10)));
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>…and conflicts under Serializable.</summary>
+    [Fact]
+    public void OpaquePredicate_ConcurrentBlindAppend_ConflictsUnderSerializable()
+    {
+        var reads = new ReadSet { Files = new HashSet<string> { "part-read.parquet" }, OpaquePredicate = true };
+
+        var result = Check(reads, IsolationLevel.Serializable,
+            Commit(6, Add("part-new.parquet", minId: 1, maxId: 10)));
+
+        Assert.Equal(ConflictType.ConcurrentAppend, result.Type);
+    }
+
+    /// <summary>
+    /// What makes it narrower than <see cref="ReadSet.WholeTable"/>: a concurrent data-changing remove of a
+    /// file the transaction did NOT read is not concurrentDeleteRead.
+    /// </summary>
+    [Fact]
+    public void OpaquePredicate_ConcurrentRemoveOfUnreadFile_Passes()
+    {
+        var reads = new ReadSet { Files = new HashSet<string> { "part-read.parquet" }, OpaquePredicate = true };
+
+        var result = Check(reads, IsolationLevel.Serializable, Commit(6, Remove("part-other.parquet")));
+
+        Assert.False(result.HasConflict);
+    }
+
+    /// <summary>A compaction's <c>dataChange=false</c> add is no new data, so it matches nothing.</summary>
+    [Fact]
+    public void OpaquePredicate_ConcurrentCompactionAdd_Passes()
+    {
+        var reads = new ReadSet { OpaquePredicate = true };
+
+        var result = Check(reads, IsolationLevel.Serializable,
+            Commit(6,
+                Remove("part-a.parquet", dataChange: false),
+                Add("part-compacted.parquet", minId: 1, maxId: 10, dataChange: false)));
+
+        Assert.False(result.HasConflict);
+    }
+
     // ── domainMetadata (#109) ──
 
     private static DomainMetadata Domain(string domain, string configuration = "{}", bool removed = false) =>

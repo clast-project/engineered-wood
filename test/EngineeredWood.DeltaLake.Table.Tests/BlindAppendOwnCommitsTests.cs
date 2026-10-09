@@ -111,6 +111,36 @@ public class BlindAppendOwnCommitsTests : IDisposable
         Assert.False(await RecordedFlagAsync(table.CurrentSnapshot.Version));
     }
 
+    /// <summary>
+    /// A delegate DELETE that matched no rows still read the table to find that out, so a transaction
+    /// pairing one with an append declares <c>false</c>. Its commit carries no remove, so nothing but the
+    /// flag tells a reader it was not blind (#491).
+    /// </summary>
+    [Fact]
+    public async Task DelegateDeleteMatchingNothing_PlusAppend_DeclaresNotBlind()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var schema = IdSchema();
+
+        await using var table = await DeltaTable.CreateAsync(fs, schema, enableDeletionVectors: true);
+        await table.WriteAsync([Rows(schema, 1, 2)]);
+
+        await using var tx = table.StartTransaction();
+        Assert.Equal(0, await tx.DeleteAsync(batch =>
+        {
+            var mask = new BooleanArray.Builder();
+            for (int i = 0; i < batch.Length; i++)
+                mask.Append(false);
+            return mask.Build();
+        }));
+        await tx.WriteAsync([Rows(schema, 3)]);
+        long version = await tx.CommitAsync();
+
+        var actions = await new TransactionLog(new LocalTableFileSystem(_tempDir)).ReadCommitAsync(version);
+        Assert.DoesNotContain(actions, a => a is RemoveFile);
+        Assert.False(await RecordedFlagAsync(version));
+    }
+
     /// <summary>An overwrite reads the active-file set to decide what to remove, so it declares <c>false</c>.</summary>
     [Fact]
     public async Task Overwrite_DeclaresNotBlind()

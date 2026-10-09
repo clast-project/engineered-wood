@@ -205,6 +205,14 @@ In **`EngineeredWood.DeltaLake.Table`**:
 
 - A DELETE's read-set is exactly the files it rewrites, so the removed paths serve as **both** the
   concurrentDeleteRead read-set and the delete/delete planned-removes.
+- Its concurrentAppend read-set is its condition. The analyzable `Expressions.Predicate` overloads
+  test a concurrent add's stats against it. The delegate overloads can't inspect theirs, so they set
+  `ReadSet.OpaquePredicate`: every concurrent `dataChange` add matches (still behind the isolation
+  level's blind-append gate), while removes stay scoped to the files read. That is narrower than
+  `WholeTable`, which would also make every concurrent delete in the table a concurrentDeleteRead
+  (#491). One consequence: two delegate UPDATEs on different files conflict, because each one's
+  post-image is a non-blind add. Spark, which matches only partition predicates, does the same on an
+  unpartitioned table.
 - On a no-conflict rebase the staged actions are re-committed **verbatim** — valid precisely because
   "no conflict" means nothing the transaction read or removed was touched. No action re-resolution is
   needed at file-level granularity; that is only for row-level.

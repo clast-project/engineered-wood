@@ -2766,6 +2766,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // saw the scan. Honoured at both isolation levels; see the method's own remarks for the proposal
             // that would narrow it and why it is not implemented.
             WholeTable = transaction.DeclaredWholeTableRead,
+            // A staged functional-predicate DELETE/UPDATE: every concurrent add may match its condition.
+            OpaquePredicate = transaction.HasOpaqueReadPredicate,
             // Domains a staged schema change was validated against (StageSchemaChange).
             Domains = new HashSet<string>(transaction.ReadDomains, StringComparer.Ordinal),
         };
@@ -3711,6 +3713,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Deletes rows matching the predicate using deletion vectors.
     /// The predicate receives each batch (with logical column names) and returns
     /// a <see cref="BooleanArray"/> where <c>true</c> means the row should be deleted.
+    /// The delegate cannot be inspected, so a concurrent commit that adds any file is taken to match it
+    /// (concurrentAppend, precise to the isolation level — a concurrent blind append is exempt under the
+    /// default <see cref="IsolationLevel.WriteSerializable"/>). Prefer the
+    /// <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> overload where the condition can
+    /// be expressed: it tests the added file's statistics instead, and skips files that cannot match.
     /// Returns the number of rows deleted and the committed version.
     /// </summary>
     public async ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
@@ -3973,14 +3980,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// Updates rows matching the predicate. The <paramref name="updater"/> function
     /// receives matching rows and returns modified rows. Non-matching rows are
-    /// preserved unchanged. Affected files are rewritten.
+    /// preserved unchanged. Affected files are rewritten. As with the functional
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CancellationToken)"/>, a concurrent add of any
+    /// file is taken to match the opaque predicate (concurrentAppend, precise to the isolation level).
     /// Returns the number of rows updated and the committed version.
     /// </summary>
     public ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
         Func<RecordBatch, BooleanArray> predicate,
         Func<RecordBatch, RecordBatch> updater,
         CancellationToken cancellationToken = default)
-        => UpdateCoreAsync(predicate, updater, prunePredicate: null, readPredicates: [], cancellationToken);
+        => UpdateCoreAsync(predicate, updater, prunePredicate: null, readPredicates: [],
+            opaquePredicate: true, cancellationToken);
 
     /// <summary>
     /// Updates rows matching an analyzable <see cref="Expressions.Predicate"/>. As with the analyzable
@@ -3994,13 +4004,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         Func<RecordBatch, RecordBatch> updater,
         CancellationToken cancellationToken = default)
         => UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
-            readPredicates: [predicate], cancellationToken);
+            readPredicates: [predicate], opaquePredicate: false, cancellationToken);
 
     private async ValueTask<(long RowsUpdated, long Version)> UpdateCoreAsync(
         Func<RecordBatch, BooleanArray> predicate,
         Func<RecordBatch, RecordBatch> updater,
         Expressions.Predicate? prunePredicate,
         IReadOnlyList<Expressions.Predicate> readPredicates,
+        bool opaquePredicate,
         CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
@@ -4021,13 +4032,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             // An UPDATE reads exactly the files it rewrites, so — like DELETE — the removed paths are both its
             // read-set (concurrentDeleteRead) and its planned removes (delete/delete). The analyzable overload
-            // additionally records its read predicate so a concurrent add that matches it conflicts. Route it
+            // additionally records its read predicate so a concurrent add that matches it conflicts; the
+            // functional one cannot describe its condition, so ANY concurrent add matches it. Route it
             // through the OCC loop so a single-shot UPDATE rebases past a non-conflicting concurrent commit
             // instead of throwing — its copy-on-write post-image add's row-tracking baseRowId is re-derived on
             // rebase (a conflict on any file it rewrote aborts first, so the survivors' ids stay valid).
             long committed = await CommitOccAsync(
                 snapshot, plan.Actions,
-                new ReadSet { Files = plan.RemovedPaths, Predicates = readPredicates },
+                new ReadSet
+                {
+                    Files = plan.RemovedPaths, Predicates = readPredicates, OpaquePredicate = opaquePredicate,
+                },
                 IsolationFor(snapshot, plan.Actions), "UPDATE",
                 rebaseSafe: true, cancellationToken, written: written,
                 isBlindAppend: false).ConfigureAwait(false);

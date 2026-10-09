@@ -64,6 +64,10 @@ public sealed class DeltaTransaction : IAsyncDisposable
     // They become the transaction's ReadSet.Predicates so a concurrent add matching one is a
     // concurrentAppend conflict. Left empty by the functional-predicate and append-only paths.
     private readonly List<Expressions.Predicate> _readPredicates = [];
+    // Set by the functional-predicate DeleteAsync/UpdateAsync: they read through a condition we cannot
+    // inspect, so every concurrent add is taken to match it (ReadSet.OpaquePredicate). Not a whole-table
+    // read — removes stay scoped to the files the operation rewrote.
+    private bool _opaqueReadPredicate;
     private readonly HashSet<string> _readDomains = new(StringComparer.Ordinal);
     // Per-file row-level edits from staged DELETEs (the rows each removed, by absolute position). They let
     // the commit loop rebase this delete's deletion vectors onto a concurrent DV-delete of the same file
@@ -137,6 +141,9 @@ public sealed class DeltaTransaction : IAsyncDisposable
     internal ISet<string> RemovedPaths => _removedPaths;
 
     internal IReadOnlyList<Expressions.Predicate> ReadPredicates => _readPredicates;
+
+    /// <summary>Whether a staged DELETE or UPDATE selected its rows through an opaque delegate.</summary>
+    internal bool HasOpaqueReadPredicate => _opaqueReadPredicate;
 
     /// <summary>The <c>domainMetadata</c> domains staged schema changes were validated against; see
     /// <see cref="Concurrency.ReadSet.Domains"/>.</summary>
@@ -224,7 +231,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
     internal bool? EffectiveIsBlindAppend =>
         IsBlindAppend
         ?? (_declaredWholeTableRead || _removedPaths.Count > 0 || _dvEdits.Count > 0
-                || _readPredicates.Count > 0
+                || _readPredicates.Count > 0 || _opaqueReadPredicate
             ? false
             : null);
 
@@ -288,7 +295,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// returns a <see cref="BooleanArray"/> where <c>true</c> marks a row for deletion.
     ///
     /// <para>Nothing is written until <see cref="CommitAsync"/>. The files this delete rewrites become
-    /// the transaction's read-set: a concurrent commit that removed any of them aborts the commit.
+    /// the transaction's read-set: a concurrent commit that removed any of them aborts the commit. And since
+    /// the delegate cannot be inspected, a concurrent commit that adds ANY file is taken to match it
+    /// (concurrentAppend, precise to the isolation level: under the default
+    /// <see cref="IsolationLevel.WriteSerializable"/> a concurrent blind append is still exempt). The
+    /// <see cref="Expressions.Predicate"/> overload tests the added file against the predicate instead.
     /// Returns the number of rows this delete matched.</para>
     /// </summary>
     public async ValueTask<long> DeleteAsync(
@@ -305,6 +316,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
         _dvEdits.AddRange(plan.DvEdits);
+        _opaqueReadPredicate = true;
         _operations.Add("DELETE");
 
         return plan.TotalDeleted;
@@ -340,7 +352,9 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// <summary>
     /// Stages an update of the rows matching <paramref name="predicate"/> via <paramref name="updater"/>,
     /// evaluated against this transaction's pinned read version. Like a delete it reads exactly the files
-    /// it rewrites, so a concurrent commit that removed one of them aborts the commit.
+    /// it rewrites, so a concurrent commit that removed one of them aborts the commit; and as with the
+    /// functional delete, a concurrent add of any file is taken to match the opaque predicate
+    /// (concurrentAppend, precise to the isolation level).
     ///
     /// <para>Nothing is committed until <see cref="CommitAsync"/>, but the rewritten files ARE written
     /// now — and deleted again by <see cref="AbortAsync"/> if this transaction never commits. The files this
@@ -368,6 +382,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         StageInternal(plan.Actions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
+        _opaqueReadPredicate = true;
         _operations.Add("UPDATE");
 
         return plan.TotalUpdated;
