@@ -52,7 +52,9 @@ internal ref struct RleBitPackedDecoder
     /// </summary>
     public int ReadNext()
     {
-        if (_remaining == 0)
+        // A run can hold no values (a zero count, or no bytes left for a bit-packed one); the next
+        // header follows it, or the data ends and ReadNextGroup throws.
+        while (_remaining == 0)
             ReadNextGroup();
 
         _remaining--;
@@ -395,12 +397,16 @@ internal ref struct RleBitPackedDecoder
             // Bit-packed run
             _isRle = false;
             int groupCount = header >> 1;
-            _remaining = groupCount * 8;
             _bitPackedPos = _position;
             _bitOffset = 0;
-            // Advance _position past the bit-packed bytes
-            int totalBits = groupCount * 8 * _bitWidth;
-            _position += (totalBits + 7) / 8;
+            // The run is taken to hold only the values its bytes do. Reads past the data are padded
+            // with zeros, so a run claiming more read them as values of 0, and whatever followed the
+            // levels was read from the wrong place. A run that claims only padding it lacks still
+            // reads; asking for a value past the data ends it, as an error, at the next run's header.
+            long available = _bitWidth == 0 ? long.MaxValue : (_data.Length - _position) * 8L / _bitWidth;
+            _remaining = (int)Math.Min(groupCount * 8L, available);
+            // Every group of eight takes exactly _bitWidth bytes.
+            _position = (int)Math.Min(_data.Length, _position + (long)groupCount * _bitWidth);
         }
     }
 

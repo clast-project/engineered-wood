@@ -23,6 +23,74 @@ public class CompressorTests
         return data;
     }
 
+    /// <summary>
+    /// Concatenated Gzip members (RFC 1952), the first carrying an FEXTRA field that holds what a
+    /// member boundary looks like: its own trailer (CRC-32 and length) followed by a member's magic.
+    /// .NET Framework finds member ends by searching for that, so the search must skip the header,
+    /// whose optional fields can hold any bytes, and take a boundary only where a member starts (#426).
+    /// </summary>
+    [Fact]
+    public void ConcatenatedGzipMembers_WithABoundaryLookalikeInAHeaderField_Decompress()
+    {
+        byte[] first = TestData.AsSpan(0, 3_000).ToArray();
+        byte[] second = TestData.AsSpan(3_000).ToArray();
+
+        var crc = new System.IO.Hashing.Crc32();
+        crc.Append(first);
+        byte[] lookalike = [.. crc.GetCurrentHash(), .. BitConverter.GetBytes(first.Length), 0x1F, 0x8B, 0x08, 0x00];
+
+        byte[] member = GzipMember(first);
+        byte[] withExtra =
+        [
+            .. member.AsSpan(0, 3), (byte)(member[3] | 0x04), .. member.AsSpan(4, 6),
+            (byte)lookalike.Length, 0, .. lookalike,
+            .. member.AsSpan(10),
+        ];
+        byte[] source = [.. withExtra, .. GzipMember(second)];
+
+        // One byte to spare, as a page is read, so that a short or long result shows.
+        byte[] destination = new byte[TestData.Length + 1];
+        int written = Decompressor.Decompress(CompressionCodec.Gzip, source, destination);
+
+        Assert.Equal(TestData.Length, written);
+        Assert.Equal(TestData, destination.AsSpan(0, written).ToArray());
+
+    }
+
+    /// <summary>
+    /// An empty Gzip member, first, between two others or last: every member is read. On .NET Framework the
+    /// member search takes a boundary only where the next member produces bytes, which an empty one
+    /// does not; GZipStream steps over it into the member after, so nothing is lost.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void ConcatenatedGzipMembers_WithAnEmptyOne_Decompress(int emptyAt)
+    {
+        var members = new List<byte[]>
+        {
+            GzipMember(TestData.AsSpan(0, 3_000).ToArray()),
+            GzipMember(TestData.AsSpan(3_000).ToArray()),
+        };
+        members.Insert(emptyAt, GzipMember([]));
+        byte[] source = members.SelectMany(m => m).ToArray();
+
+        byte[] destination = new byte[TestData.Length + 1];
+        int written = Decompressor.Decompress(CompressionCodec.Gzip, source, destination);
+
+        Assert.Equal(TestData.Length, written);
+        Assert.Equal(TestData, destination.AsSpan(0, written).ToArray());
+    }
+
+    private static byte[] GzipMember(byte[] data)
+    {
+        using var output = new MemoryStream();
+        using (var gzip = new System.IO.Compression.GZipStream(output, System.IO.Compression.CompressionLevel.Optimal, leaveOpen: true))
+            gzip.Write(data, 0, data.Length);
+        return output.ToArray();
+    }
+
     [Fact]
     public void Uncompressed_RoundTrips()
     {

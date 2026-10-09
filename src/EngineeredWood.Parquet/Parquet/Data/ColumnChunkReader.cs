@@ -51,12 +51,13 @@ internal static class ColumnChunkReader
         Field arrowField,
         bool preserveDefLevels = false,
         bool validateCrc = false,
-        bool fixedListFastPath = false)
+        bool fixedListFastPath = false,
+        int? maxPageUncompressedSize = null)
     {
         if (fixedListFastPath && IsFixedListCandidate(column))
         {
             var fast = TryReadFixedListColumn(
-                data, column, columnMeta, rowCount, arrowField, validateCrc);
+                data, column, columnMeta, rowCount, arrowField, validateCrc, maxPageUncompressedSize);
             if (fast is not null)
                 return fast.Value;
         }
@@ -76,7 +77,7 @@ internal static class ColumnChunkReader
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
 
-        var pages = new PageReader(data, column);
+        var pages = new PageReader(data, column, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
         long valuesRead = 0;
 
         while (valuesRead < columnMeta.NumValues && pages.TryRead(out var page))
@@ -91,29 +92,36 @@ internal static class ColumnChunkReader
             if (page.NumValues > capacity - valuesRead)
                 throw TooManyValues(column, page, capacity - valuesRead);
 
-            switch (pageHeader.Type)
+            try
             {
-                case PageType.DictionaryPage:
-                    dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
-                    break;
+                switch (pageHeader.Type)
+                {
+                    case PageType.DictionaryPage:
+                        dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+                        break;
 
-                case PageType.SymbolTablePage:
-                    symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
-                    break;
+                    case PageType.SymbolTablePage:
+                        symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                        break;
 
-                case PageType.DataPage:
-                    valuesRead += ReadDataPageV1(
-                        pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
-                    break;
+                    case PageType.DataPage:
+                        valuesRead += ReadDataPageV1(
+                            pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
+                        break;
 
-                case PageType.DataPageV2:
-                    valuesRead += ReadDataPageV2(
-                        pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
-                    break;
+                    case PageType.DataPageV2:
+                        valuesRead += ReadDataPageV2(
+                            pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
+                        break;
 
-                default:
-                    // Skip index pages and unknown page types
-                    break;
+                    default:
+                        // Skip index pages and unknown page types
+                        break;
+                }
+            }
+            catch (Exception ex) when (IsDecodeFailure(ex))
+            {
+                throw UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
             }
         }
 
@@ -188,6 +196,61 @@ internal static class ColumnChunkReader
         "may be corrupted or truncated. To skip this column, pass a columnNames list excluding it.");
 
     /// <summary>
+    /// Whether <paramref name="ex"/>, thrown while a page was decoded, is a symptom of the page's data.
+    /// </summary>
+    /// <remarks>
+    /// The decoders trust the bytes they are given, so data that disagrees with its header fails as
+    /// whatever the decoder or codec happened to hit: an <see cref="IndexOutOfRangeException"/>, or a
+    /// codec's own type (ZstdSharp's <c>ZstdException</c>), so no list of expected types is complete.
+    /// Everything is taken as such but what says something else: a <see cref="ParquetFormatException"/>
+    /// already says it, a <see cref="NotSupportedException"/> is an encoding or type EW does not read,
+    /// and running out of memory or being cancelled is not the file's doing. A bug in EW is relabelled
+    /// too, which is why the original is kept as the inner exception.
+    /// </remarks>
+    internal static bool IsDecodeFailure(Exception ex) =>
+        ex is not (ParquetFormatException or NotSupportedException or OutOfMemoryException or OperationCanceledException);
+
+    /// <summary>A page whose data could not be decoded, for <paramref name="inner"/>, what the decoder threw.</summary>
+    /// <param name="ordinal">The data page's ordinal, which names it, or -1 for another kind of page.</param>
+    /// <param name="offset">Where another kind of page starts in the column chunk.</param>
+    internal static ParquetFormatException UndecodablePage(
+        ColumnDescriptor column, PageType type, int ordinal, long offset, Exception inner) => new(
+        $"Column '{column.DottedPath}': {(ordinal >= 0 ? $"data page {ordinal}" : $"the {type} at byte offset {offset}")} " +
+        $"could not be decoded; its data is corrupt or disagrees with its header. {inner.GetType().Name}: {inner.Message}",
+        inner);
+
+    /// <summary>
+    /// Decompresses a page's data into a rented buffer that it fills exactly: <paramref name="size"/>
+    /// bytes, the size the page's header declares. The caller returns the buffer to the pool.
+    /// </summary>
+    /// <exception cref="ParquetFormatException">The data decompresses to more or fewer bytes.</exception>
+    internal static byte[] DecompressPage(
+        CompressionCodec codec, ReadOnlySpan<byte> compressed, int size, ColumnDescriptor column)
+    {
+        // One byte more than declared: the streaming codecs (Gzip) stop when the destination is full
+        // and report it full, so a page that decompresses to more would otherwise pass as its prefix.
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(size + 1);
+        try
+        {
+            // A pooled buffer holds whatever its last renter left in it, so a short result read to the
+            // declared size would hand the decoders a stale tail as this page's data.
+            int written = Decompressor.Decompress(codec, compressed, buffer.AsSpan(0, size + 1));
+            if (written != size)
+            {
+                throw new ParquetFormatException(
+                    $"Column '{column.DottedPath}': a page declares {size} uncompressed bytes, but its data " +
+                    $"decompresses to {(written > size ? "more" : written.ToString())}.");
+            }
+            return buffer;
+        }
+        catch
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+            throw;
+        }
+    }
+
+    /// <summary>
     /// Whether a column is even eligible for the fixed-length list fast path: exactly one level of
     /// repetition (a single list), which is the shape embeddings and coordinate vectors take.
     /// </summary>
@@ -215,7 +278,8 @@ internal static class ColumnChunkReader
         ColumnMetaData columnMeta,
         int rowCount,
         Field arrowField,
-        bool validateCrc)
+        bool validateCrc,
+        int? maxPageUncompressedSize)
     {
         int numValues = checked((int)columnMeta.NumValues);
         var byteArrayOutput = arrowField.DataType switch
@@ -234,7 +298,7 @@ internal static class ColumnChunkReader
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
         int listLength = 0;
-        var pages = new PageReader(data, column);
+        var pages = new PageReader(data, column, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
         long valuesRead = 0;
 
         while (valuesRead < columnMeta.NumValues)
@@ -263,34 +327,41 @@ internal static class ColumnChunkReader
                     return null;
             }
 
-            switch (pageHeader.Type)
+            try
             {
-                case PageType.DictionaryPage:
-                    dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
-                    break;
+                switch (pageHeader.Type)
+                {
+                    case PageType.DictionaryPage:
+                        dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+                        break;
 
-                case PageType.SymbolTablePage:
-                    symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
-                    break;
+                    case PageType.SymbolTablePage:
+                        symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                        break;
 
-                case PageType.DataPage:
-                    if (!TryReadFixedListPageV1(
-                            pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
-                            ref listLength, valuesRead))
-                        return null;
-                    valuesRead += pageHeader.DataPageHeader!.NumValues;
-                    break;
+                    case PageType.DataPage:
+                        if (!TryReadFixedListPageV1(
+                                pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
+                                ref listLength, valuesRead))
+                            return null;
+                        valuesRead += pageHeader.DataPageHeader!.NumValues;
+                        break;
 
-                case PageType.DataPageV2:
-                    if (!TryReadFixedListPageV2(
-                            pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
-                            ref listLength, valuesRead))
-                        return null;
-                    valuesRead += pageHeader.DataPageHeaderV2!.NumValues;
-                    break;
+                    case PageType.DataPageV2:
+                        if (!TryReadFixedListPageV2(
+                                pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
+                                ref listLength, valuesRead))
+                            return null;
+                        valuesRead += pageHeader.DataPageHeaderV2!.NumValues;
+                        break;
 
-                default:
-                    break;
+                    default:
+                        break;
+                }
+            }
+            catch (Exception ex) when (IsDecodeFailure(ex))
+            {
+                throw UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
             }
         }
 
@@ -337,8 +408,7 @@ internal static class ColumnChunkReader
         else
         {
             int size = header.UncompressedPageSize;
-            decompressedBuffer = ArrayPool<byte>.Shared.Rent(size);
-            Decompressor.Decompress(columnMeta.Codec, compressedData, decompressedBuffer);
+            decompressedBuffer = DecompressPage(columnMeta.Codec, compressedData, size, column);
             pageData = decompressedBuffer.AsSpan(0, size);
         }
 
@@ -404,8 +474,7 @@ internal static class ColumnChunkReader
         else
         {
             int uncompressedValuesSize = header.UncompressedPageSize - repLen - defLen;
-            decompressedBuffer = ArrayPool<byte>.Shared.Rent(uncompressedValuesSize);
-            Decompressor.Decompress(columnMeta.Codec, valuesCompressed, decompressedBuffer);
+            decompressedBuffer = DecompressPage(columnMeta.Codec, valuesCompressed, uncompressedValuesSize, column);
             valueData = decompressedBuffer.AsSpan(0, uncompressedValuesSize);
         }
 
@@ -473,7 +542,8 @@ internal static class ColumnChunkReader
         int endPage,
         Field arrowField,
         bool preserveDefLevels = false,
-        bool validateCrc = false)
+        bool validateCrc = false,
+        int? maxPageUncompressedSize = null)
     {
         bool isRepeated = column.MaxRepetitionLevel > 0;
 
@@ -497,7 +567,8 @@ internal static class ColumnChunkReader
         {
             var located = pageMap.Pages[p];
             var pageBytes = data.Slice((int)(located.Offset - dataBaseOffset), located.CompressedSize);
-            var entry = PageMapBuilder.ResolveEntry(pageMap, p, pageBytes, column, columnMeta, out int headerSize);
+            var entry = PageMapBuilder.ResolveEntry(
+                pageMap, p, pageBytes, column, columnMeta, out int headerSize, maxPageUncompressedSize);
             var pageData = pageBytes.Slice(headerSize);
 
             // The buffers were sized from the map, which for an OffsetIndex map counts the index's rows.
@@ -511,13 +582,20 @@ internal static class ColumnChunkReader
             if (validateCrc)
                 ValidateCrc(entry.Crc, pageData, column);
 
-            if (entry.Type == PageType.DataPage)
+            try
             {
-                ReadDataPageV1FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
+                if (entry.Type == PageType.DataPage)
+                {
+                    ReadDataPageV1FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
+                }
+                else if (entry.Type == PageType.DataPageV2)
+                {
+                    ReadDataPageV2FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
+                }
             }
-            else if (entry.Type == PageType.DataPageV2)
+            catch (Exception ex) when (IsDecodeFailure(ex))
             {
-                ReadDataPageV2FromEntry(entry, pageData, column, columnMeta, pageMap.Dictionary, pageMap.SymbolTable, state);
+                throw UndecodablePage(column, entry.Type, entry.Ordinal, entry.Offset, ex);
             }
         }
 
@@ -578,8 +656,7 @@ internal static class ColumnChunkReader
         else
         {
             int size = entry.UncompressedSize;
-            decompressedBuffer = ArrayPool<byte>.Shared.Rent(size);
-            Decompressor.Decompress(columnMeta.Codec, compressedData, decompressedBuffer);
+            decompressedBuffer = DecompressPage(columnMeta.Codec, compressedData, size, column);
             pageData = decompressedBuffer.AsSpan(0, size);
         }
 
@@ -657,16 +734,16 @@ internal static class ColumnChunkReader
         }
         offset += entry.RepetitionLevelsByteLength;
 
+        // The values are those the definition levels place, as in ReadDataPageV2.
+        int nonNullCount = numValues;
         if (column.MaxDefinitionLevel > 0)
         {
             var defDest = state.ReserveDefLevels(numValues);
             LevelDecoder.DecodeV2(
                 rawData.Slice(offset, entry.DefinitionLevelsByteLength),
-                column.MaxDefinitionLevel, numValues, defDest, out _);
+                column.MaxDefinitionLevel, numValues, defDest, out nonNullCount);
         }
         offset += entry.DefinitionLevelsByteLength;
-
-        int nonNullCount = numValues - entry.NumNulls;
 
         var valuesCompressed = rawData.Slice(offset);
 
@@ -686,8 +763,7 @@ internal static class ColumnChunkReader
         {
             int levelsSize = entry.RepetitionLevelsByteLength + entry.DefinitionLevelsByteLength;
             int uncompressedValuesSize = entry.UncompressedSize - levelsSize;
-            decompressedBuffer = ArrayPool<byte>.Shared.Rent(uncompressedValuesSize);
-            Decompressor.Decompress(columnMeta.Codec, valuesCompressed, decompressedBuffer);
+            decompressedBuffer = DecompressPage(columnMeta.Codec, valuesCompressed, uncompressedValuesSize, column);
             valueData = decompressedBuffer.AsSpan(0, uncompressedValuesSize);
         }
 
@@ -721,8 +797,7 @@ internal static class ColumnChunkReader
         else
         {
             int size = header.UncompressedPageSize;
-            decompressedBuffer = ArrayPool<byte>.Shared.Rent(size);
-            Decompressor.Decompress(columnMeta.Codec, compressedData, decompressedBuffer);
+            decompressedBuffer = DecompressPage(columnMeta.Codec, compressedData, size, column);
             plainData = decompressedBuffer.AsSpan(0, size);
         }
 
@@ -764,8 +839,7 @@ internal static class ColumnChunkReader
         else
         {
             int size = header.UncompressedPageSize;
-            decompressedBuffer = ArrayPool<byte>.Shared.Rent(size);
-            Decompressor.Decompress(columnMeta.Codec, compressedData, decompressedBuffer);
+            decompressedBuffer = DecompressPage(columnMeta.Codec, compressedData, size, column);
             pageData = decompressedBuffer.AsSpan(0, size);
         }
 
@@ -851,18 +925,19 @@ internal static class ColumnChunkReader
         }
         offset += v2Header.RepetitionLevelsByteLength;
 
-        // Decode definition levels; non-null count is free from the V2 page header.
+        // The values are those the definition levels place, which counting them costs nothing. The
+        // header's num_nulls says the same of a sound page, but the array builders scatter the values
+        // by the levels, so a page whose num_nulls disagreed decoded too few values for them, or too
+        // many. arrow-rs too takes the count from the levels.
+        int nonNullCount = numValues;
         if (column.MaxDefinitionLevel > 0)
         {
             var defDest = state.ReserveDefLevels(numValues);
             LevelDecoder.DecodeV2(
                 rawData.Slice(offset, v2Header.DefinitionLevelsByteLength),
-                column.MaxDefinitionLevel, numValues, defDest, out _);
+                column.MaxDefinitionLevel, numValues, defDest, out nonNullCount);
         }
         offset += v2Header.DefinitionLevelsByteLength;
-
-        // V2 page headers carry NumNulls directly — no need to scan def levels again.
-        int nonNullCount = numValues - v2Header.NumNulls;
 
         // V2: only values portion is compressed (if is_compressed, default true)
         var valuesCompressed = rawData.Slice(offset);
@@ -883,8 +958,7 @@ internal static class ColumnChunkReader
         {
             int levelsSize = v2Header.RepetitionLevelsByteLength + v2Header.DefinitionLevelsByteLength;
             int uncompressedValuesSize = header.UncompressedPageSize - levelsSize;
-            decompressedBuffer = ArrayPool<byte>.Shared.Rent(uncompressedValuesSize);
-            Decompressor.Decompress(columnMeta.Codec, valuesCompressed, decompressedBuffer);
+            decompressedBuffer = DecompressPage(columnMeta.Codec, valuesCompressed, uncompressedValuesSize, column);
             valueData = decompressedBuffer.AsSpan(0, uncompressedValuesSize);
         }
 
@@ -1259,6 +1333,11 @@ internal static class ColumnChunkReader
 
         // First byte is the bit width for the RLE-encoded indices
         int bitWidth = data[0];
+        if (bitWidth > 32)
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}': a dictionary-encoded page's indices are {bitWidth} bits wide.");
+        }
         var rleData = data.Slice(1);
         var decoder = new RleBitPackedDecoder(rleData, bitWidth);
 
@@ -1267,6 +1346,7 @@ internal static class ColumnChunkReader
         {
             decoder.ReadBatch(indicesArray.AsSpan(0, count));
             ReadOnlySpan<int> indices = indicesArray.AsSpan(0, count);
+            dictionary.CheckIndices(indices, bitWidth, column);
 
             switch (column.PhysicalType)
             {

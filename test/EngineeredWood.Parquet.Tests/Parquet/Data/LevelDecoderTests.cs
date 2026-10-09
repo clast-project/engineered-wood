@@ -8,6 +8,31 @@ namespace EngineeredWood.Tests.Parquet.Data;
 
 public class LevelDecoderTests
 {
+    /// <summary>
+    /// A bit-packed run that claims a group of eight 2-bit levels but holds one byte, four levels.
+    /// The missing bytes were read as zeros, so the page took four levels of 0 it does not have (#426).
+    /// </summary>
+    [Fact]
+    public void DecodeV2_ABitPackedRunShortOfTheLevelsAskedFor_IsRefused()
+    {
+        byte[] data = [0x03, 0b10_01_00_01]; // one bit-packed group of eight; one byte of it
+        var levels = new byte[8];
+        var ex = Assert.Throws<ParquetFormatException>(() =>
+            LevelDecoder.DecodeV2(data, maxLevel: 2, valueCount: 8, levels, out _));
+        Assert.Contains("Unexpected end of RLE data", ex.Message);
+    }
+
+    /// <summary>A run short only of the padding of its last group still reads the levels it holds.</summary>
+    [Fact]
+    public void DecodeV2_ABitPackedRunShortOnlyOfItsPadding_Reads()
+    {
+        byte[] data = [0x03, 0b10_01_00_01];
+        var levels = new byte[4];
+        LevelDecoder.DecodeV2(data, maxLevel: 2, valueCount: 4, levels, out int atMax);
+        Assert.Equal(new byte[] { 1, 0, 1, 2 }, levels);
+        Assert.Equal(1, atMax);
+    }
+
     [Fact]
     public void DecodeV1_MaxLevelZero_ReturnsZeros()
     {

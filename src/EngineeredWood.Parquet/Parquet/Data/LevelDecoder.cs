@@ -44,7 +44,11 @@ internal static class LevelDecoder
         }
 
         if (encoding == Encoding.BitPacked)
-            return DecodeBitPacked(data, maxLevel, valueCount, levels, out matchCount);
+        {
+            int consumed = DecodeBitPacked(data, maxLevel, valueCount, levels, out matchCount);
+            CheckLevels(levels.Slice(0, valueCount), maxLevel);
+            return consumed;
+        }
 
         if (data.Length < 4)
             throw new ParquetFormatException("Not enough data for V1 level length prefix.");
@@ -58,6 +62,7 @@ internal static class LevelDecoder
         var rleData = data.Slice(4, encodedLength);
         var decoder = new RleBitPackedDecoder(rleData, bitWidth);
         decoder.ReadBatch(levels.Slice(0, valueCount), maxLevel, out matchCount);
+        CheckLevels(levels.Slice(0, valueCount), maxLevel);
 
         return 4 + encodedLength;
     }
@@ -86,6 +91,36 @@ internal static class LevelDecoder
         int bitWidth = GetBitWidth(maxLevel);
         var decoder = new RleBitPackedDecoder(data, bitWidth);
         decoder.ReadBatch(levels.Slice(0, valueCount), maxLevel, out matchCount);
+        CheckLevels(levels.Slice(0, valueCount), maxLevel);
+    }
+
+    /// <summary>
+    /// Refuses a level above <paramref name="maxLevel"/>. The width levels are packed at can hold
+    /// more than the maximum unless it is one less than a power of two, and an RLE run's value is
+    /// stored in whole bytes, so can hold more whatever the maximum. The assemblers took a repetition
+    /// level past it for deeper nesting and a definition level past it for a value, so corrupt levels
+    /// read as wrong lists and values.
+    /// </summary>
+    private static void CheckLevels(ReadOnlySpan<byte> levels, int maxLevel)
+    {
+        if (maxLevel >= byte.MaxValue)
+            return;
+
+#if NET8_0_OR_GREATER
+        int at = levels.IndexOfAnyInRange((byte)(maxLevel + 1), byte.MaxValue);
+#else
+        int at = -1;
+        for (int i = 0; i < levels.Length; i++)
+        {
+            if (levels[i] > maxLevel)
+            {
+                at = i;
+                break;
+            }
+        }
+#endif
+        if (at >= 0)
+            throw new ParquetFormatException($"A level of {levels[at]} exceeds the column's maximum of {maxLevel}.");
     }
 
     /// <summary>

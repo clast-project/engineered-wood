@@ -65,9 +65,13 @@ internal static class MembershipPredicateEvaluator
         ColumnChunkFilePathKind filePath,
         bool validateChecksums,
         CancellationToken ct,
-        IReadOnlyDictionary<int, IValueSet?>? prefetched = null)
+        IReadOnlyDictionary<int, IValueSet?>? prefetched = null,
+        int? maxPageUncompressedSize = null)
     {
-        var ctx = new Context(source, rowGroupIndex, metadata, schema, file, fileLength, filePath, validateChecksums);
+        var ctx = new Context(source, rowGroupIndex, metadata, schema, file, fileLength, filePath, validateChecksums)
+        {
+            MaxPageUncompressedSize = maxPageUncompressedSize,
+        };
         if (prefetched is not null)
         {
             // Read ahead by a MembershipPrefetch for this source: a column present here is never read
@@ -298,7 +302,9 @@ internal static class MembershipPredicateEvaluator
             return null;
 
         using var buffer = (await ctx.File.ReadRangesAsync(new[] { range }, ct).ConfigureAwait(false))[0];
-        return Decode(source, buffer.Memory.Span, chunk.MetaData!.Codec, descriptor, ctx.ValidateChecksums);
+        return Decode(
+            source, buffer.Memory.Span, chunk.MetaData!, descriptor, ctx.ValidateChecksums,
+            ctx.MaxPageUncompressedSize);
     }
 
     /// <summary>
@@ -317,13 +323,18 @@ internal static class MembershipPredicateEvaluator
     /// Decodes what <see cref="TryGetRange"/> located, or returns null when it cannot be trusted: pruning
     /// declines on a page or filter it cannot read, and the ordinary read of the row group reports it.
     /// </summary>
+    /// <param name="chunk">The chunk's metadata: its codec, and the size no page of it may exceed.</param>
+    /// <param name="maxPageUncompressedSize">
+    /// The caller's <see cref="ParquetReadOptions.MaxPageUncompressedSize"/>. A dictionary page the read
+    /// would refuse for its size, under this or its chunk's total, is declined here rather than decompressed.
+    /// </param>
     internal static IValueSet? Decode(
-        MembershipSource source, ReadOnlySpan<byte> bytes, CompressionCodec codec, ColumnDescriptor descriptor,
-        bool validateChecksums)
+        MembershipSource source, ReadOnlySpan<byte> bytes, ColumnMetaData chunk, ColumnDescriptor descriptor,
+        bool validateChecksums, int? maxPageUncompressedSize = null)
     {
         if (source == MembershipSource.Dictionary)
         {
-            return DecodeDictionary(bytes, codec, descriptor, validateChecksums) is { } values
+            return DecodeDictionary(bytes, chunk, descriptor, validateChecksums, maxPageUncompressedSize) is { } values
                 ? new DictionaryValues(values)
                 : null;
         }
@@ -444,11 +455,12 @@ internal static class MembershipPredicateEvaluator
     /// Decodes a dictionary page read from <see cref="TryGetDictionaryRange"/>'s extent, or returns null.
     /// </summary>
     internal static HashSet<byte[]>? DecodeDictionary(
-        ReadOnlySpan<byte> page, CompressionCodec codec, ColumnDescriptor descriptor, bool validateChecksums)
+        ReadOnlySpan<byte> page, ColumnMetaData chunk, ColumnDescriptor descriptor, bool validateChecksums,
+        int? maxPageUncompressedSize = null)
     {
         try
         {
-            return DecodeDictionaryPage(page, codec, descriptor, validateChecksums);
+            return DecodeDictionaryPage(page, chunk, descriptor, validateChecksums, maxPageUncompressedSize);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
@@ -461,10 +473,13 @@ internal static class MembershipPredicateEvaluator
     }
 
     private static HashSet<byte[]>? DecodeDictionaryPage(
-        ReadOnlySpan<byte> page, CompressionCodec codec, ColumnDescriptor descriptor, bool validateChecksums)
+        ReadOnlySpan<byte> page, ColumnMetaData chunk, ColumnDescriptor descriptor, bool validateChecksums,
+        int? maxPageUncompressedSize)
     {
-        // A payload that overruns the extent throws here, which DecodeDictionary turns into null.
-        var reader = new PageReader(page, descriptor);
+        // A payload that overruns the extent, or a page the read would refuse for its size, throws here,
+        // which DecodeDictionary turns into null: pruning must not answer from a page the read refuses.
+        var reader = new PageReader(page, descriptor, chunk: chunk, maxUncompressedPageSize: maxPageUncompressedSize);
+        var codec = chunk.Codec;
         if (!reader.TryRead(out var read))
             return null;
         var header = read.Header;
@@ -486,8 +501,10 @@ internal static class MembershipPredicateEvaluator
             ReadOnlySpan<byte> plain = payload;
             if (codec != CompressionCodec.Uncompressed)
             {
-                rented = ArrayPool<byte>.Shared.Rent(header.UncompressedPageSize);
-                int written = Decompressor.Decompress(codec, payload, rented.AsSpan(0, header.UncompressedPageSize));
+                // A byte past the declared size, so that Gzip, which stops when its destination is full,
+                // shows a page that decompresses to more.
+                rented = ArrayPool<byte>.Shared.Rent(header.UncompressedPageSize + 1);
+                int written = Decompressor.Decompress(codec, payload, rented.AsSpan(0, header.UncompressedPageSize + 1));
                 if (written != header.UncompressedPageSize)
                     return null;
                 plain = rented.AsSpan(0, written);
@@ -786,6 +803,7 @@ internal static class MembershipPredicateEvaluator
 
         public MembershipSource Source { get; }
         public bool ValidateChecksums { get; }
+        public int? MaxPageUncompressedSize { get; init; }
 
         /// <summary>Each column's values from this source once read, or null when it cannot answer.</summary>
         public Dictionary<int, IValueSet?> Sets { get; } = new();

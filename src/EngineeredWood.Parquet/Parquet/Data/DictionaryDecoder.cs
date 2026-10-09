@@ -111,6 +111,31 @@ internal sealed class DictionaryDecoder
         _ => 1,
     };
 
+    /// <summary>
+    /// Refuses a data page whose indices reach past the dictionary. The getters below trust their
+    /// index, and a BYTE_ARRAY index one past the end read an offset that is not there.
+    /// </summary>
+    /// <param name="indices">The page's decoded indices.</param>
+    /// <param name="bitWidth">The width they were encoded at: indices narrower than the dictionary's size need no check.</param>
+    /// <param name="column">The column, which the error names.</param>
+    /// <exception cref="ParquetFormatException">An index is not an entry of this dictionary.</exception>
+    public void CheckIndices(ReadOnlySpan<int> indices, int bitWidth, Schema.ColumnDescriptor column)
+    {
+        if (bitWidth < 31 && (1 << bitWidth) <= Count)
+            return;
+
+        uint count = (uint)Count;
+        for (int i = 0; i < indices.Length; i++)
+        {
+            if ((uint)indices[i] >= count)
+            {
+                throw new ParquetFormatException(
+                    $"Column '{column.DottedPath}': a data page refers to dictionary entry {(uint)indices[i]}, " +
+                    $"but the dictionary has {Count} entries.");
+            }
+        }
+    }
+
     /// <summary>Gets an Int32 dictionary value by index.</summary>
     public int GetInt32(int index) => _int32Values![index];
 

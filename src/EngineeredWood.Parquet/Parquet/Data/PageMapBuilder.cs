@@ -104,15 +104,21 @@ internal sealed class ColumnPageMap
     /// The bytes do not hold only side pages. The map was built on the OffsetIndex and the column
     /// metadata agreeing where the first data page starts, so both are wrong.
     /// </exception>
-    public void CompleteSidePages(ReadOnlySpan<byte> prefix, ColumnDescriptor column, ColumnMetaData columnMeta, bool validateCrc)
+    public void CompleteSidePages(
+        ReadOnlySpan<byte> prefix, ColumnDescriptor column, ColumnMetaData columnMeta, bool validateCrc,
+        int? maxPageUncompressedSize = null)
     {
         if (prefix.Length != PendingPrefixLength)
             throw new ArgumentException($"Expected {PendingPrefixLength} bytes, got {prefix.Length}.", nameof(prefix));
-        if (!PageMapBuilder.TryReadSidePages(prefix, column, columnMeta, validateCrc, out var dictionary, out var symbolTable))
+        if (!PageMapBuilder.TryReadSidePages(
+                prefix, column, columnMeta, validateCrc, maxPageUncompressedSize,
+                out var dictionary, out var symbolTable, out var unread))
         {
-            throw new ParquetFormatException(
-                $"Column '{column.DottedPath}': the bytes before the first data page, where its OffsetIndex and " +
-                "its metadata both put it, are not only a dictionary or symbol-table page.");
+            const string what = "the bytes before the first data page, where its OffsetIndex and its metadata both put it, " +
+                "are not only a dictionary or symbol-table page.";
+            throw unread is null
+                ? new ParquetFormatException($"Column '{column.DottedPath}': {what}")
+                : new ParquetFormatException($"Column '{column.DottedPath}': {what} {unread.Message}", unread);
         }
 
         Dictionary = dictionary;
@@ -161,13 +167,14 @@ internal static class PageMapBuilder
         ReadOnlySpan<byte> data,
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
-        bool validateCrc = false)
+        bool validateCrc = false,
+        int? maxPageUncompressedSize = null)
     {
         var pages = new List<PageMapEntry>();
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
 
-        var reader = new PageReader(data, column);
+        var reader = new PageReader(data, column, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
         long valuesRead = 0;
 
         while (valuesRead < columnMeta.NumValues && reader.TryRead(out var page))
@@ -175,38 +182,46 @@ internal static class PageMapBuilder
             var pageHeader = page.Header;
             var pageData = page.Payload;
 
-            switch (pageHeader.Type)
+            try
             {
-                case PageType.DictionaryPage:
-                    if (validateCrc)
-                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                    dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
-                    break;
-
-                case PageType.SymbolTablePage:
-                    if (validateCrc)
-                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                    symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
-                    break;
-
-                case PageType.DataPage:
-                case PageType.DataPageV2:
+                switch (pageHeader.Type)
                 {
-                    // As ColumnChunkReader.ReadColumn does: the map sizes the batch buffers, so a
-                    // page may not claim more values than the chunk's metadata has left.
-                    if (page.NumValues > columnMeta.NumValues - valuesRead)
-                        throw ColumnChunkReader.TooManyValues(column, page, columnMeta.NumValues - valuesRead);
+                    case PageType.DictionaryPage:
+                        if (validateCrc)
+                            ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
+                        dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+                        break;
 
-                    var entry = EntryFromHeader(
-                        pageHeader, page.PayloadOffset, pageData, page.Ordinal, column, columnMeta);
-                    pages.Add(entry);
-                    valuesRead += entry.NumValues;
-                    break;
+                    case PageType.SymbolTablePage:
+                        if (validateCrc)
+                            ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
+                        symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                        break;
+
+                    case PageType.DataPage:
+                    case PageType.DataPageV2:
+                    {
+                        // As ColumnChunkReader.ReadColumn does: the map sizes the batch buffers, so a
+                        // page may not claim more values than the chunk's metadata has left.
+                        if (page.NumValues > columnMeta.NumValues - valuesRead)
+                            throw ColumnChunkReader.TooManyValues(column, page, columnMeta.NumValues - valuesRead);
+
+                        var entry = EntryFromHeader(
+                            pageHeader, page.PayloadOffset, pageData, page.Ordinal, column, columnMeta);
+                        pages.Add(entry);
+                        valuesRead += entry.NumValues;
+                        break;
+                    }
+
+                    default:
+                        // Skip index pages and unknown page types
+                        break;
                 }
-
-                default:
-                    // Skip index pages and unknown page types
-                    break;
+            }
+            catch (Exception ex) when (ColumnChunkReader.IsDecodeFailure(ex))
+            {
+                // A dictionary, or a V1 page of a repeated column, whose levels are read for its rows.
+                throw ColumnChunkReader.UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
             }
         }
 
@@ -260,14 +275,17 @@ internal static class PageMapBuilder
         int rowCount,
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
-        bool validateCrc = false)
+        bool validateCrc = false,
+        int? maxPageUncompressedSize = null)
     {
         // A repeated column's map counts values as well as rows, and the index records only rows.
         if (column.MaxRepetitionLevel > 0)
             throw new ArgumentException($"Column '{column.DottedPath}' is repeated.", nameof(column));
 
         var layout = BuildLayoutFromOffsetIndex(prefix.Length, chunkStart, chunkEnd, index, rowCount, column, columnMeta);
-        if (layout is null || !TryReadSidePages(prefix, column, columnMeta, validateCrc, out var dictionary, out var symbolTable))
+        if (layout is null || !TryReadSidePages(
+                prefix, column, columnMeta, validateCrc, maxPageUncompressedSize,
+                out var dictionary, out var symbolTable, out _))
             return null;
 
         return new ColumnPageMap(
@@ -342,13 +360,16 @@ internal static class PageMapBuilder
     /// chunk's first data page. False when they are not only such pages: the prefix then ends inside a
     /// header or a page, or holds a data page the index does not list.
     /// </summary>
+    /// <param name="unread">Why a page in the prefix could not be read, when that is why it returns false.</param>
     internal static bool TryReadSidePages(
         ReadOnlySpan<byte> prefix, ColumnDescriptor column, ColumnMetaData columnMeta, bool validateCrc,
-        out DictionaryDecoder? dictionary, out FsstSymbolTable? symbolTable)
+        int? maxPageUncompressedSize,
+        out DictionaryDecoder? dictionary, out FsstSymbolTable? symbolTable, out ParquetFormatException? unread)
     {
         dictionary = null;
         symbolTable = null;
-        var reader = new PageReader(prefix, column);
+        unread = null;
+        var reader = new PageReader(prefix, column, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
         while (true)
         {
             // The prefix ends where the index puts the first data page. If that is wrong, it can end
@@ -360,30 +381,38 @@ internal static class PageMapBuilder
                 if (!reader.TryRead(out page))
                     break;
             }
-            catch (ParquetFormatException)
+            catch (ParquetFormatException ex)
             {
+                unread = ex;
                 return false;
             }
 
             var pageHeader = page.Header;
             var pageData = page.Payload;
 
-            switch (pageHeader.Type)
+            try
             {
-                case PageType.DictionaryPage:
-                    if (validateCrc)
-                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                    dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
-                    break;
-                case PageType.SymbolTablePage:
-                    if (validateCrc)
-                        ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                    symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
-                    break;
-                case PageType.DataPage:
-                case PageType.DataPageV2:
-                    // A data page the index does not list, whose rows the map would lose.
-                    return false;
+                switch (pageHeader.Type)
+                {
+                    case PageType.DictionaryPage:
+                        if (validateCrc)
+                            ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
+                        dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+                        break;
+                    case PageType.SymbolTablePage:
+                        if (validateCrc)
+                            ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
+                        symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                        break;
+                    case PageType.DataPage:
+                    case PageType.DataPageV2:
+                        // A data page the index does not list, whose rows the map would lose.
+                        return false;
+                }
+            }
+            catch (Exception ex) when (ColumnChunkReader.IsDecodeFailure(ex))
+            {
+                throw ColumnChunkReader.UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
             }
         }
 
@@ -438,6 +467,7 @@ internal static class PageMapBuilder
     /// <param name="column">The column.</param>
     /// <param name="columnMeta">The chunk's metadata.</param>
     /// <param name="headerSize">How many bytes of <paramref name="pageBytes"/> precede the page's data.</param>
+    /// <param name="maxPageUncompressedSize">The caller's limit on the page's uncompressed size.</param>
     /// <exception cref="ParquetFormatException">The header disagrees with the OffsetIndex.</exception>
     public static PageMapEntry ResolveEntry(
         ColumnPageMap map,
@@ -445,7 +475,8 @@ internal static class PageMapBuilder
         ReadOnlySpan<byte> pageBytes,
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
-        out int headerSize)
+        out int headerSize,
+        int? maxPageUncompressedSize = null)
     {
         var located = map.Pages[page];
         if (map.HeadersResolved)
@@ -455,7 +486,8 @@ internal static class PageMapBuilder
         }
 
         // The index located the page, so the reader starts there and knows its ordinal.
-        var reader = new PageReader(pageBytes, column, located.Ordinal);
+        var reader = new PageReader(
+            pageBytes, column, located.Ordinal, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
         Page read;
         try
         {
@@ -578,8 +610,7 @@ internal static class PageMapBuilder
             else
             {
                 int size = header.UncompressedPageSize;
-                decompressedBuffer = ArrayPool<byte>.Shared.Rent(size);
-                Decompressor.Decompress(columnMeta.Codec, compressedData, decompressedBuffer);
+                decompressedBuffer = ColumnChunkReader.DecompressPage(columnMeta.Codec, compressedData, size, column);
                 pageData = decompressedBuffer.AsSpan(0, size);
             }
 

@@ -59,6 +59,7 @@ internal sealed class MembershipPrefetch
     private readonly ColumnChunkFilePathKind _filePath;
     private readonly bool _validateChecksums;
     private readonly long _budgetBytes;
+    private readonly int? _maxPageUncompressedSize;
     private readonly List<(int Index, ColumnDescriptor Descriptor)> _columns;
 
     /// <summary>The current window: each covered row group's value sets by column index.</summary>
@@ -71,7 +72,7 @@ internal sealed class MembershipPrefetch
         MembershipSource source,
         Predicate filter, FileMetaData metadata, SchemaDescriptor schema, ParquetStatisticsAccessor accessor,
         IRandomAccessFile file, long fileLength, ColumnChunkFilePathKind filePath, bool validateChecksums,
-        long budgetBytes)
+        long budgetBytes, int? maxPageUncompressedSize = null)
     {
         _source = source;
         _filter = filter;
@@ -82,6 +83,7 @@ internal sealed class MembershipPrefetch
         _filePath = filePath;
         _validateChecksums = validateChecksums;
         _budgetBytes = budgetBytes;
+        _maxPageUncompressedSize = maxPageUncompressedSize;
         _columns = MembershipPredicateEvaluator.MembershipColumns(filter, schema);
     }
 
@@ -106,7 +108,7 @@ internal sealed class MembershipPrefetch
     {
         _window.Clear();
         var ranges = new List<FileRange>();
-        var owners = new List<(int RowGroup, int Column, ColumnDescriptor Descriptor, CompressionCodec Codec)>();
+        var owners = new List<(int RowGroup, int Column, ColumnDescriptor Descriptor, ColumnMetaData Chunk)>();
         long bytes = 0;
 
         int group = first;
@@ -120,7 +122,7 @@ internal sealed class MembershipPrefetch
                 continue;
 
             var sets = new Dictionary<int, MembershipPredicateEvaluator.IValueSet?>();
-            var groupRanges = new List<(int Column, ColumnDescriptor Descriptor, CompressionCodec Codec, FileRange Range)>();
+            var groupRanges = new List<(int Column, ColumnDescriptor Descriptor, ColumnMetaData Chunk, FileRange Range)>();
             long groupBytes = 0;
             foreach (var (index, descriptor) in _columns)
             {
@@ -128,7 +130,7 @@ internal sealed class MembershipPrefetch
                 if (MembershipPredicateEvaluator.TryGetRange(
                         _source, chunk, descriptor, _fileLength, _filePath, out var range))
                 {
-                    groupRanges.Add((index, descriptor, chunk.MetaData!.Codec, range));
+                    groupRanges.Add((index, descriptor, chunk.MetaData!, range));
                     groupBytes += range.Length;
                 }
                 else
@@ -144,10 +146,10 @@ internal sealed class MembershipPrefetch
                 break;
 
             bytes += groupBytes;
-            foreach (var (column, descriptor, codec, range) in groupRanges)
+            foreach (var (column, descriptor, meta, range) in groupRanges)
             {
                 ranges.Add(range);
-                owners.Add((group, column, descriptor, codec));
+                owners.Add((group, column, descriptor, meta));
             }
             _window[group] = sets;
         }
@@ -161,9 +163,9 @@ internal sealed class MembershipPrefetch
         {
             for (int i = 0; i < owners.Count; i++)
             {
-                var (rowGroup, column, descriptor, codec) = owners[i];
+                var (rowGroup, column, descriptor, meta) = owners[i];
                 _window[rowGroup][column] = MembershipPredicateEvaluator.Decode(
-                    _source, buffers[i].Memory.Span, codec, descriptor, _validateChecksums);
+                    _source, buffers[i].Memory.Span, meta, descriptor, _validateChecksums, _maxPageUncompressedSize);
             }
         }
         finally

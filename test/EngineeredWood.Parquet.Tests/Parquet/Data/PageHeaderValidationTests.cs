@@ -100,6 +100,37 @@ public class PageHeaderValidationTests : IDisposable
         static List<int?> Values(Int32Array a) => Enumerable.Range(0, a.Length).Select(i => a.IsNull(i) ? null : a.GetValue(i)).ToList();
     }
 
+    /// <summary>
+    /// A V2 page whose num_nulls disagrees with its definition levels. Its values were decoded by the
+    /// header's count but placed by the levels, so a page claiming too few nulls decoded more values
+    /// than its data holds, and one claiming all of them decoded none and read unwritten memory. The
+    /// levels decide now, as in arrow-rs (#426).
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AV2PageWhoseNullCountDisagreesWithItsLevels_ReadsItsValues(bool allNull)
+    {
+        var chunk = await FirstChunkAsync(DataPageVersion.V2, dictionary: false, column: "n");
+        byte[] tampered = RewriteDataPage(chunk.Bytes, ordinal: 2, h =>
+            Copy(h, v2: Copy(h.DataPageHeaderV2!, numNulls: allNull ? h.DataPageHeaderV2!.NumValues : 0)));
+
+        var expected = Values(ReadColumn(chunk, chunk.Bytes).Array);
+        Assert.Equal(expected, Values(ReadColumn(chunk, tampered).Array));
+
+        var map = PageMapBuilder.Build(tampered, chunk.Column, chunk.Meta);
+        var batched = ColumnChunkReader.ReadColumnBatchFromSlice(
+            tampered, 0, chunk.Column, chunk.Meta, map, 0, map.Pages.Length - 1,
+            new Field("n", Int32Type.Default, nullable: true));
+        Assert.Equal(expected, Values(batched.Array));
+
+        static List<int?> Values(IArrowArray array)
+        {
+            var a = (Int32Array)array;
+            return Enumerable.Range(0, a.Length).Select(i => a.IsNull(i) ? null : a.GetValue(i)).ToList();
+        }
+    }
+
     [Theory]
     [MemberData(nameof(DictionaryCases))]
     public async Task DictionaryPage(string defect)
