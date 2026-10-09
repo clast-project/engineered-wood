@@ -445,6 +445,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // refuse makes the table one Spark can no longer ALTER.
         DataSkippingStatsColumns.Validate(deltaSchema, partitionColumns, configuration);
         Stats.StatsColumnSelection.Validate(configuration);
+        // Spark refuses an unparseable delta.isolationLevel at CREATE TABLE too, data or none; a table created with
+        // one here would refuse every later data-changing commit, so it is refused now, before anything is written.
+        IsolationLevelProperty.Get(configuration);
 
         // Set protocol versions based on column mapping mode
         int minReaderVersion = 1;
@@ -6648,6 +6651,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         var baseSnapshot = CurrentSnapshot;
+        // A data file added with dataChange=true changes data whatever else the commit holds, so its level is
+        // resolved BEFORE BuildActionsAsync, which can write an inline-deleted file's deletion vector: an
+        // unparseable delta.isolationLevel is then refused with nothing written. The decision below, from the
+        // built actions, still covers the file-less overwrite.
+        if (dataChange && files.Count > 0)
+            ResolveIsolation(baseSnapshot);
         var initialActions = await BuildActionsAsync(baseSnapshot, cancellationToken).ConfigureAwait(false);
         var result = await _committer.CommitAsync(
             new LogCommitRequest

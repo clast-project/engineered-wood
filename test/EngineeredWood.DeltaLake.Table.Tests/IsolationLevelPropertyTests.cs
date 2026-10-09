@@ -191,6 +191,20 @@ public class IsolationLevelPropertyTests : IDisposable
 
     // ── A value naming no level ──
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task InvalidValue_RefusedAtCreate(bool withData)
+    {
+        var configuration = new Dictionary<string, string> { ["delta.isolationLevel"] = "RepeatableRead" };
+        var refused = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await (withData
+                ? DeltaTable.CreateOrReplaceAsync(Fs(), IdRegionSchema, [Batch([1], ["us"])], configuration: configuration)
+                : DeltaTable.CreateAsync(Fs(), IdRegionSchema, configuration: configuration)));
+        Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, refused.ErrorCode);
+        Assert.Empty(Directory.GetFiles(_tempDir, "*", SearchOption.AllDirectories));
+    }
+
     [Fact]
     public async Task InvalidValue_RefusesDataChangingCommits()
     {
@@ -224,6 +238,18 @@ public class IsolationLevelPropertyTests : IDisposable
         var external = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
             await reopened.CommitDataFilesAsync([new WrittenDataFile("elsewhere.parquet", 100, 1, null, null)]));
         Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, external.ErrorCode);
+
+        // ...and refused before anything is written: a commit whose file arrives with deleted rows writes their
+        // deletion vector while building its actions, and this one is too large to inline.
+        var sparse = new long[5000];
+        for (int i = 0; i < sparse.Length; i++)
+            sparse[i] = 2L * i;
+        var withDv = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await reopened.CommitDataFilesAsync(
+                [new WrittenDataFile("elsewhere.parquet", 100, 10000, null, null)],
+                deletedPositionsByFileIndex: new Dictionary<int, IReadOnlyCollection<long>> { [0] = sparse }));
+        Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, withDv.ErrorCode);
+        Assert.Empty(Directory.GetFiles(_tempDir, "deletion_vector_*", SearchOption.AllDirectories));
 
         // A file-less overwrite still removes every file, so it changes data and is refused too.
         var emptyOverwrite = await Assert.ThrowsAsync<DeltaFormatException>(async () =>

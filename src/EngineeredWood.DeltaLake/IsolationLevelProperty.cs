@@ -49,8 +49,9 @@ internal static class IsolationLevelProperty
 
         throw new DeltaFormatException(
             DeltaErrorCodes.InvalidIsolationLevel,
-            $"invalid isolation level '{raw}': the table property {PropertyKey} must be 'Serializable' "
-            + "(or absent, for the default WriteSerializable).");
+            $"invalid isolation level '{raw}': the table property {PropertyKey} must be 'Serializable' or "
+            + "'WriteSerializable' (the default when absent); 'SnapshotIsolation' is also accepted, and read as "
+            + "WriteSerializable.");
     }
 
     /// <summary>
