@@ -159,6 +159,73 @@ public class IsolationLevelPropertyTests : IDisposable
         await Assert.ThrowsAsync<DeltaConflictException>(async () => await tx.CommitAsync());
     }
 
+    // ── The auto-committing operations read the level themselves ──
+    //
+    // Each plans against its handle's current snapshot and commits through the OCC loop with the level it
+    // resolved, so a STALE handle races the way a transaction does. Of the auto-committing DML, these two are
+    // the ones where the level can change the verdict: the copy-on-write DELETE and the row-level UPDATE read
+    // only the files they rewrite, which no concurrent add can match at either level, so for them the level
+    // only refuses an invalid value (InvalidValue_RefusesDataChangingCommits).
+
+    /// <summary>
+    /// The predicate UPDATE: a concurrent blind append of a row matching its predicate aborts it on a Serializable
+    /// table, and is let through by default, as for a transaction's DELETE.
+    /// </summary>
+    [Theory]
+    [InlineData("Serializable", true)]
+    [InlineData(null, false)]
+    public async Task AutoCommitUpdate_ConcurrentBlindAppendMatchingPredicate(string? level, bool expectConflict)
+    {
+        await using var created = await CreateAsync(level);
+        await using var stale = await DeltaTable.OpenAsync(Fs());
+
+        await using (var other = await DeltaTable.OpenAsync(Fs()))
+            await other.WriteAsync([Batch([3], ["us"])]); // concurrent blind append
+
+        if (expectConflict)
+        {
+            var conflict = await Assert.ThrowsAsync<DeltaConflictException>(async () =>
+                await stale.UpdateAsync(Ex.Equal("region", "us"), batch => batch));
+            Assert.Equal(DeltaErrorCodes.ConcurrentAppend, conflict.ErrorCode);
+        }
+        else
+        {
+            var (updated, _) = await stale.UpdateAsync(Ex.Equal("region", "us"), batch => batch);
+            Assert.Equal(1, updated); // the appended row linearizes after the update
+        }
+    }
+
+    /// <summary>
+    /// The row DELETE with rowLevelRetry: two deletes of different rows in one file reconcile by default and
+    /// conflict on a Serializable table, as the transaction's staged row deletes do.
+    /// </summary>
+    [Theory]
+    [InlineData("Serializable", true)]
+    [InlineData(null, false)]
+    public async Task AutoCommitRowDelete_DisjointRowsOfOneFile(string? level, bool expectConflict)
+    {
+        await using var created = await CreateAsync(level, enableRowTracking: true);
+        await using var stale = await DeltaTable.OpenAsync(Fs());
+        var ours = RowSelection.FromRowAddresses([TransientRowAddress.Pack(0, 0)], stale.CurrentSnapshot);
+
+        await using (var other = await DeltaTable.OpenAsync(Fs()))
+        {
+            await other.DeleteRowsAsync(RowSelection.FromRowAddresses(
+                [TransientRowAddress.Pack(0, 1)], other.CurrentSnapshot));
+        }
+
+        if (expectConflict)
+        {
+            await Assert.ThrowsAsync<DeltaConflictException>(async () =>
+                await stale.DeleteRowsAsync(ours, rowLevelRetry: true));
+        }
+        else
+        {
+            var (deleted, _) = await stale.DeleteRowsAsync(ours, rowLevelRetry: true);
+            Assert.Equal(1, deleted);
+        }
+    }
+
     // ── The buffered rebase check ──
 
     [Fact]
@@ -281,6 +348,25 @@ public class IsolationLevelPropertyTests : IDisposable
         var external = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
             await reopened.CommitDataFilesAsync([new WrittenDataFile("elsewhere.parquet", 100, 1, null, null)]));
         Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, external.ErrorCode);
+
+        // So is each auto-committing DML that changes data: the predicate UPDATE, both row DELETE modes and the
+        // row-level UPDATE.
+        var update = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await reopened.UpdateAsync(Ex.Equal("region", "us"), batch => batch));
+        Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, update.ErrorCode);
+        foreach (var mode in new[] { RowDeleteMode.DeletionVector, RowDeleteMode.CopyOnWrite })
+        {
+            var rowDelete = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+                await reopened.DeleteRowsAsync(
+                    RowSelection.FromRowAddresses([TransientRowAddress.Pack(0, 0)], reopened.CurrentSnapshot),
+                    mode));
+            Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, rowDelete.ErrorCode);
+        }
+        var rowUpdate = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await reopened.UpdateRowsAsync(
+                RowSelection.FromRowAddresses([TransientRowAddress.Pack(0, 0)], reopened.CurrentSnapshot),
+                (_, batches, _) => batches));
+        Assert.Equal(DeltaErrorCodes.InvalidIsolationLevel, rowUpdate.ErrorCode);
 
         // ...and refused before anything is written: a commit whose file arrives with deleted rows writes their
         // deletion vector while building its actions, and this one is too large to inline.
