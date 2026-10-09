@@ -79,7 +79,8 @@ public sealed record ConflictResult(ConflictType Type, long ConflictingVersion, 
 /// could satisfy one of them is a conflict (a strict serial order might have required reading it).</item>
 /// </list>
 /// <see cref="WholeTable"/> is the "read everything" shortcut: every concurrent remove and every
-/// concurrent add matches. A blind append (<see cref="Blind"/>) reads nothing, so only metadata,
+/// concurrent add matches. <see cref="OpaquePredicate"/> is its add-side half alone: every concurrent add
+/// matches, while removes stay scoped to <see cref="Files"/>. A blind append (<see cref="Blind"/>) reads nothing, so only metadata,
 /// protocol, and delete/delete conflicts can touch it.</para>
 ///
 /// <para><see cref="Domains"/> is about table state rather than data: the <c>domainMetadata</c> domains
@@ -95,6 +96,24 @@ public sealed record ReadSet
 
     /// <summary>The transaction read the entire table — every concurrent add and remove is relevant.</summary>
     public bool WholeTable { get; init; }
+
+    /// <summary>
+    /// The transaction selected rows through a predicate it cannot describe — the delegate overloads of
+    /// DELETE and UPDATE, whose condition is an opaque function. Every concurrent <c>dataChange</c> add is
+    /// then taken to match it (concurrentAppend), still subject to the isolation level's blind-append gate.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Narrower than <see cref="WholeTable"/>, deliberately.</b> An opaque predicate says nothing
+    /// about which rows a concurrent ADD holds, so "it might match" is the only honest answer there. It says
+    /// nothing new about REMOVES: the files the operation actually read are already in <see cref="Files"/>,
+    /// and a concurrent delete of some other file did not touch anything it decided on. Claiming
+    /// <see cref="WholeTable"/> instead would turn every concurrent delete anywhere in the table into a
+    /// concurrentDeleteRead — inventing a dependency rather than recording one.</para>
+    /// <para>Spark has no counterpart because it has no opaque condition: it always registers the DML
+    /// condition as a read predicate. This is what that registration amounts to when the condition cannot
+    /// be inspected.</para>
+    /// </remarks>
+    public bool OpaquePredicate { get; init; }
 
     /// <summary>
     /// <c>domainMetadata</c> domains whose state the transaction's decision rested on; a concurrent
@@ -517,7 +536,7 @@ public static class ConflictChecker
 
     private static bool Matches(ReadSet reads, DeltaFilePruner? pruner, AddFile add)
     {
-        if (reads.WholeTable)
+        if (reads.WholeTable || reads.OpaquePredicate)
             return true;
 
         if (reads.Predicates.Count == 0)

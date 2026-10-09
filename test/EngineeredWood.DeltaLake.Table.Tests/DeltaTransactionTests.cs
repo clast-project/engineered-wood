@@ -6,6 +6,7 @@ using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.IO.Local;
+using Ex = EngineeredWood.Expressions.Expressions;
 
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
@@ -247,8 +248,12 @@ public class DeltaTransactionTests : IDisposable
     // ── Staged updates ──
 
     /// <summary>
-    /// Two transactions update rows living in DIFFERENT files. Neither touches what the other rewrote, so
-    /// the second rebases onto the first and both updates land.
+    /// Two transactions update rows living in DIFFERENT files. Neither touches what the other rewrote, and
+    /// the first's post-image file provably holds no row the second's predicate selects, so the second
+    /// rebases onto the first and both updates land.
+    ///
+    /// <para>Analyzable predicates, which is what makes the post-image provably disjoint. With delegate
+    /// predicates the second aborts instead (<see cref="TwoTransactions_DisjointDelegateUpdates_SecondAborts"/>).</para>
     /// </summary>
     [Fact]
     public async Task TwoTransactions_DisjointUpdates_BothCommit()
@@ -261,15 +266,44 @@ public class DeltaTransactionTests : IDisposable
         var tx1 = table.StartTransaction();
         var tx2 = table.StartTransaction();
 
-        await tx2.UpdateAsync(IdEquals(7), SetValue(700));
+        await tx2.UpdateAsync(Ex.Equal("id", 7L), SetValue(700));
         long v2 = await tx2.CommitAsync();
 
-        await tx1.UpdateAsync(IdEquals(5), SetValue(500));
+        await tx1.UpdateAsync(Ex.Equal("id", 5L), SetValue(500));
         long v1 = await tx1.CommitAsync();
 
         Assert.True(v1 > v2);
         var values = await ReadIdValues(table);
         Assert.Equal(500, values[5]);
+        Assert.Equal(700, values[7]);
+    }
+
+    /// <summary>
+    /// The same disjoint updates through the DELEGATE overload: the second aborts (#491). The first's
+    /// post-image is a data-changing add from a commit that read the table, and an opaque predicate cannot
+    /// be tested against it — had the first written <c>SET id = 5</c>, the second would have missed that
+    /// row. So the add is taken to match, as Spark's partition-only matching does on an unpartitioned table.
+    /// </summary>
+    [Fact]
+    public async Task TwoTransactions_DisjointDelegateUpdates_SecondAborts()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdValueSchema, enableDeletionVectors: true);
+        await table.WriteAsync([IdValueBatch([5], [50])]);  // file 1
+        await table.WriteAsync([IdValueBatch([7], [70])]);  // file 2
+
+        await using var tx1 = table.StartTransaction();
+        await using var tx2 = table.StartTransaction();
+
+        await tx2.UpdateAsync(IdEquals(7), SetValue(700));
+        await tx2.CommitAsync();
+
+        await tx1.UpdateAsync(IdEquals(5), SetValue(500));
+        var ex = await Assert.ThrowsAsync<DeltaConflictException>(async () => await tx1.CommitAsync());
+        Assert.Equal(DeltaErrorCodes.ConcurrentAppend, ex.ErrorCode);
+
+        var values = await ReadIdValues(table);
+        Assert.Equal(50, values[5]);
         Assert.Equal(700, values[7]);
     }
 

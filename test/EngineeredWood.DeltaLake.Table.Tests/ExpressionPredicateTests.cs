@@ -159,8 +159,8 @@ public class ExpressionPredicateTests : IDisposable
     /// The precision the analyzable predicate buys: even under <see cref="IsolationLevel.Serializable"/> a
     /// concurrent append whose file provably CANNOT match the predicate (its stats put it in a different
     /// partition of the value space) is NOT a conflict, so the delete rebases and lands. Without the
-    /// predicate this same append would either be ignored (functional DELETE) or, if the read-set were
-    /// faked as "everything", wrongly abort.
+    /// predicate this same append aborts: a functional DELETE's delegate cannot be inspected, so every
+    /// concurrent add is taken to match it (see <c>OpaquePredicateConflictTests</c>).
     /// </summary>
     [Fact]
     public async Task Serializable_ConcurrentAppendDisjointPredicate_Lands()
