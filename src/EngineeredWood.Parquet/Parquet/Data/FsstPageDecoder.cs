@@ -36,7 +36,9 @@ internal static class FsstPageDecoder
             throw new ParquetFormatException(
                 $"Symbol table page declares a negative uncompressed_page_size ({size}).");
 
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(Math.Max(size, 1));
+        // A byte past the declared size, so that Gzip, which stops when its destination is full, shows
+        // a table that decompresses to more.
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(size + 1);
         try
         {
             // The written count is checked rather than assumed: a pooled buffer arrives holding

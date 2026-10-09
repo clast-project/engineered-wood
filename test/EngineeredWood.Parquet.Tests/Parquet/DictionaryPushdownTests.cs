@@ -114,6 +114,22 @@ public class DictionaryPushdownTests : IDisposable
             await Candidates(path, Ex.Equal("name", "banana"), new ParquetReadOptions { FilterUseDictionaries = false }));
     }
 
+    /// <summary>
+    /// A dictionary page larger than <see cref="ParquetReadOptions.MaxPageUncompressedSize"/> is not
+    /// decompressed for pruning, which declines it as the read would refuse it (#426).
+    /// </summary>
+    [Fact]
+    public async Task ADictionaryPageOverMaxPageUncompressedSize_IsNotAsked()
+    {
+        string path = await WriteThreeRowGroups("limit");
+        var filter = Ex.Equal("name", "banana");
+
+        Assert.Equal(new[] { false, false, false },
+            await Candidates(path, filter, WithDictionaries with { MaxPageUncompressedSize = 1024 }));
+        Assert.Equal(new[] { true, true, true },
+            await Candidates(path, filter, WithDictionaries with { MaxPageUncompressedSize = 10 }));
+    }
+
     [Fact]
     public async Task InList_KeepsAGroupHoldingAnyMember()
     {

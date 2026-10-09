@@ -223,22 +223,23 @@ internal static class ColumnChunkReader
     /// Decompresses a page's data into a rented buffer that it fills exactly: <paramref name="size"/>
     /// bytes, the size the page's header declares. The caller returns the buffer to the pool.
     /// </summary>
-    /// <exception cref="ParquetFormatException">The data decompresses to fewer bytes.</exception>
+    /// <exception cref="ParquetFormatException">The data decompresses to more or fewer bytes.</exception>
     internal static byte[] DecompressPage(
         CompressionCodec codec, ReadOnlySpan<byte> compressed, int size, ColumnDescriptor column)
     {
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(size);
+        // One byte more than declared: the streaming codecs (Gzip) stop when the destination is full
+        // and report it full, so a page that decompresses to more would otherwise pass as its prefix.
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(size + 1);
         try
         {
             // A pooled buffer holds whatever its last renter left in it, so a short result read to the
-            // declared size would hand the decoders a stale tail as this page's data. More than the
-            // declared size does not fit the destination, and the codec throws.
-            int written = Decompressor.Decompress(codec, compressed, buffer.AsSpan(0, size));
+            // declared size would hand the decoders a stale tail as this page's data.
+            int written = Decompressor.Decompress(codec, compressed, buffer.AsSpan(0, size + 1));
             if (written != size)
             {
                 throw new ParquetFormatException(
                     $"Column '{column.DottedPath}': a page declares {size} uncompressed bytes, but its data " +
-                    $"decompresses to {written}.");
+                    $"decompresses to {(written > size ? "more" : written.ToString())}.");
             }
             return buffer;
         }

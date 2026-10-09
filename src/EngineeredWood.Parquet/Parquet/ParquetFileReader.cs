@@ -2275,7 +2275,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         MembershipPrefetch Create(MembershipSource source) =>
             new(source, filter, metadata, schema, accessor, _file, _fileLength,
-                _options.ColumnChunkFilePath, _options.PageChecksumValidation, MembershipPrefetchBudgetBytes);
+                _options.ColumnChunkFilePath, _options.PageChecksumValidation, MembershipPrefetchBudgetBytes,
+                _options.MaxPageUncompressedSize);
     }
 
     /// <summary>
@@ -2322,7 +2323,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 : await readAhead.ForRowGroupAsync(rowGroup, cancellationToken).ConfigureAwait(false);
             return await MembershipPredicateEvaluator.EvaluateAsync(
                     filter, source, rowGroup, metadata, schema, _file, _fileLength,
-                    _options.ColumnChunkFilePath, _options.PageChecksumValidation, cancellationToken, sets)
+                    _options.ColumnChunkFilePath, _options.PageChecksumValidation, cancellationToken, sets,
+                    _options.MaxPageUncompressedSize)
                 .ConfigureAwait(false) == EngineeredWood.Expressions.FilterResult.AlwaysFalse;
         }
     }

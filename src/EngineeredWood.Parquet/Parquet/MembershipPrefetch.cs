@@ -59,6 +59,7 @@ internal sealed class MembershipPrefetch
     private readonly ColumnChunkFilePathKind _filePath;
     private readonly bool _validateChecksums;
     private readonly long _budgetBytes;
+    private readonly int? _maxPageUncompressedSize;
     private readonly List<(int Index, ColumnDescriptor Descriptor)> _columns;
 
     /// <summary>The current window: each covered row group's value sets by column index.</summary>
@@ -71,7 +72,7 @@ internal sealed class MembershipPrefetch
         MembershipSource source,
         Predicate filter, FileMetaData metadata, SchemaDescriptor schema, ParquetStatisticsAccessor accessor,
         IRandomAccessFile file, long fileLength, ColumnChunkFilePathKind filePath, bool validateChecksums,
-        long budgetBytes)
+        long budgetBytes, int? maxPageUncompressedSize = null)
     {
         _source = source;
         _filter = filter;
@@ -82,6 +83,7 @@ internal sealed class MembershipPrefetch
         _filePath = filePath;
         _validateChecksums = validateChecksums;
         _budgetBytes = budgetBytes;
+        _maxPageUncompressedSize = maxPageUncompressedSize;
         _columns = MembershipPredicateEvaluator.MembershipColumns(filter, schema);
     }
 
@@ -163,7 +165,7 @@ internal sealed class MembershipPrefetch
             {
                 var (rowGroup, column, descriptor, codec) = owners[i];
                 _window[rowGroup][column] = MembershipPredicateEvaluator.Decode(
-                    _source, buffers[i].Memory.Span, codec, descriptor, _validateChecksums);
+                    _source, buffers[i].Memory.Span, codec, descriptor, _validateChecksums, _maxPageUncompressedSize);
             }
         }
         finally

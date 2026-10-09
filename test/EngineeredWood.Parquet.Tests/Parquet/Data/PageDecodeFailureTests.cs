@@ -109,12 +109,23 @@ public class PageDecodeFailureTests : IDisposable
         AssertRefused(chunk, "a page declares 20 uncompressed bytes, but its data decompresses to 16");
     }
 
-    /// <summary>One that decompresses to more no longer fits a buffer of the declared size.</summary>
-    [Fact]
-    public void APageDecompressingPastItsDeclaredSize_IsRefused()
+    /// <summary>
+    /// One that decompresses to more: five values' bytes in a page of four that declares 16. Most
+    /// codecs throw when the destination is too small, but Gzip stops when it is full and reports it
+    /// full, so the page passed as its first 16 bytes.
+    /// </summary>
+    [Theory]
+    [InlineData(CompressionCodec.Snappy)]
+    [InlineData(CompressionCodec.Gzip)]
+    [InlineData(CompressionCodec.Zstd)]
+    [InlineData(CompressionCodec.Brotli)]
+    [InlineData(CompressionCodec.Lz4)]
+    public void APageDecompressingPastItsDeclaredSize_IsRefused(CompressionCodec codec)
     {
-        var chunk = PlainSnappyChunk(declaredUncompressed: 12);
-        AssertRefused(chunk, "data page 0 could not be decoded");
+        var chunk = PlainCompressedChunk(codec, declaredUncompressed: 16, values: [1, 2, 3, 4, 5]);
+        var whole = Assert.Throws<ParquetFormatException>(() => ReadWhole(chunk));
+        var batched = Assert.Throws<ParquetFormatException>(() => ReadBatched(chunk));
+        Assert.Equal(whole.Message, batched.Message);
     }
 
     [Fact]
@@ -234,13 +245,21 @@ public class PageDecodeFailureTests : IDisposable
     }
 
     /// <summary>The PLAIN values 1, 2, 3, 4, Snappy-compressed, in a page declaring <paramref name="declaredUncompressed"/>.</summary>
-    private static TestChunk PlainSnappyChunk(int declaredUncompressed, long? chunkUncompressed = null)
-    {
-        byte[] plain = Plain(1, 2, 3, 4);
-        byte[] compressed = new byte[Compressor.GetMaxCompressedLength(CompressionCodec.Snappy, plain.Length)];
-        compressed = compressed.AsSpan(0, Compressor.Compress(CompressionCodec.Snappy, plain, compressed)).ToArray();
+    private static TestChunk PlainSnappyChunk(int declaredUncompressed, long? chunkUncompressed = null) =>
+        PlainCompressedChunk(CompressionCodec.Snappy, declaredUncompressed, chunkUncompressed);
 
-        var chunk = Chunk(PhysicalType.Int32, CompressionCodec.Snappy, numValues: 4,
+    /// <summary>
+    /// A page of four values whose data is the PLAIN <paramref name="values"/> (by default 1, 2, 3, 4),
+    /// compressed, declaring <paramref name="declaredUncompressed"/>.
+    /// </summary>
+    private static TestChunk PlainCompressedChunk(
+        CompressionCodec codec, int declaredUncompressed, long? chunkUncompressed = null, int[]? values = null)
+    {
+        byte[] plain = Plain(values ?? [1, 2, 3, 4]);
+        byte[] compressed = new byte[Compressor.GetMaxCompressedLength(codec, plain.Length)];
+        compressed = compressed.AsSpan(0, Compressor.Compress(codec, plain, compressed)).ToArray();
+
+        var chunk = Chunk(PhysicalType.Int32, codec, numValues: 4,
             (DataPage(4, Encoding.Plain, compressed.Length, declaredUncompressed), compressed));
         return chunkUncompressed is { } total
             ? chunk with { Meta = Copy(chunk.Meta, total) }
