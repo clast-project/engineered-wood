@@ -98,6 +98,10 @@ internal static class Decompressor
                 {
                     continue; // the trailer's bytes matched by chance, inside the deflate data
                 }
+                // Nothing inflated is not taken as a member: .NET Framework returns 0 for input cut off
+                // mid-stream, so a false boundary near the end can read as empty. A real empty member
+                // is not lost: GZipStream steps over one into the member after it, and one at the end
+                // adds nothing.
                 if (read > 0)
                 {
                     next = end;

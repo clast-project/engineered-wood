@@ -369,8 +369,11 @@ public sealed record ParquetReadOptions
     /// <para>There is no default limit because real pages can be large: one value cannot span pages,
     /// so a column of large blobs has pages at least that large, and parquet-testing's
     /// <c>large_string_map.brotli.parquet</c> has a 1 GiB page. EW's writer cuts pages at
-    /// <see cref="ParquetWriteOptions.DataPageSize"/>, 1 MiB by default. Without this limit a page is
-    /// still refused when it declares more than its whole column chunk does.</para>
+    /// <see cref="ParquetWriteOptions.DataPageSize"/>, 1 MiB by default.</para>
+    /// <para>Without this limit a page is still refused when it declares more than its column chunk's
+    /// <c>total_uncompressed_size</c>, when the footer records one. That catches a corrupt page header,
+    /// but the footer is the file's own word too: only this limit bounds what a file built to lie can
+    /// make the reader allocate.</para>
     /// </remarks>
     public int? MaxPageUncompressedSize { get; init; }
 

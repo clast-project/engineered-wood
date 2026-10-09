@@ -55,13 +55,40 @@ public class CompressorTests
         Assert.Equal(TestData.Length, written);
         Assert.Equal(TestData, destination.AsSpan(0, written).ToArray());
 
-        static byte[] GzipMember(byte[] data)
+    }
+
+    /// <summary>
+    /// An empty Gzip member, first, between two others or last: every member is read. On .NET Framework the
+    /// member search takes a boundary only where the next member produces bytes, which an empty one
+    /// does not; GZipStream steps over it into the member after, so nothing is lost.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void ConcatenatedGzipMembers_WithAnEmptyOne_Decompress(int emptyAt)
+    {
+        var members = new List<byte[]>
         {
-            using var output = new MemoryStream();
-            using (var gzip = new System.IO.Compression.GZipStream(output, System.IO.Compression.CompressionLevel.Optimal, leaveOpen: true))
-                gzip.Write(data, 0, data.Length);
-            return output.ToArray();
-        }
+            GzipMember(TestData.AsSpan(0, 3_000).ToArray()),
+            GzipMember(TestData.AsSpan(3_000).ToArray()),
+        };
+        members.Insert(emptyAt, GzipMember([]));
+        byte[] source = members.SelectMany(m => m).ToArray();
+
+        byte[] destination = new byte[TestData.Length + 1];
+        int written = Decompressor.Decompress(CompressionCodec.Gzip, source, destination);
+
+        Assert.Equal(TestData.Length, written);
+        Assert.Equal(TestData, destination.AsSpan(0, written).ToArray());
+    }
+
+    private static byte[] GzipMember(byte[] data)
+    {
+        using var output = new MemoryStream();
+        using (var gzip = new System.IO.Compression.GZipStream(output, System.IO.Compression.CompressionLevel.Optimal, leaveOpen: true))
+            gzip.Write(data, 0, data.Length);
+        return output.ToArray();
     }
 
     [Fact]
