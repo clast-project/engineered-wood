@@ -284,20 +284,18 @@ public sealed class V2CheckpointWriter
             return ndjson.Length;
         }
 
-        await using var file = await _fs.CreateAsync(checkpointPath, cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
-
         // Declared before the writer so it is disposed last; its buffers are native memory.
         using var batch = CheckpointWriter.BuildBatchForActions(
             snapshot, actions, out _, v2Spec: true);
 
-        // Scoped so the writer's footer lands before Position is read.
-        await using (var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions))
-        {
-            await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
-        }
-
-        return file.Position;
+        // A truncated body would be listed as this version's checkpoint, so a failed write deletes it.
+        return await CheckpointWriter.WriteFileOrDeleteAsync(_fs, checkpointPath, overwrite: false,
+            async file =>
+            {
+                // Scoped so the writer's footer lands before the helper reads Position.
+                await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
+                await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+            }, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -337,22 +335,21 @@ public sealed class V2CheckpointWriter
         // PROTOCOL.md allows a sidecar "only add file and remove file entries", so the batch cannot be
         // built from a snapshot (which would emit a protocol and a metaData row too, duplicating the ones
         // already in the checkpoint file itself).
-        await using (var file = await _fs.CreateAsync(sidecarPath, cancellationToken: cancellationToken)
-            .ConfigureAwait(false))
+        // Declared before the writer so it is disposed last; its buffers are native memory.
+        using (var batch = CheckpointWriter.BuildBatchForActions(snapshot, fileActions, out _))
         {
-            // Declared before the writer so it is disposed last; its buffers are native memory.
-            using var batch = CheckpointWriter.BuildBatchForActions(snapshot, fileActions, out _);
-
-            // Scoped so the writer's footer lands before Position is read.
-            await using (var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions))
-            {
-                await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
-            }
-
             // sidecar.sizeInBytes is required by the spec, and the write already knows it: Position is
             // the total written. Reading the file back to measure it doubled the I/O of every sidecar
             // and pulled a potentially multi-hundred-megabyte Parquet file into memory to take .Length.
-            sizeInBytes = file.Position;
+            // A partial sidecar is not discoverable the way a body is (the sweep would collect it), but
+            // there is no reason to leave one behind either.
+            sizeInBytes = await CheckpointWriter.WriteFileOrDeleteAsync(_fs, sidecarPath, overwrite: false,
+                async file =>
+                {
+                    // Scoped so the writer's footer lands before the helper reads Position.
+                    await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
+                    await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+                }, cancellationToken).ConfigureAwait(false);
         }
 
         return new SidecarFile

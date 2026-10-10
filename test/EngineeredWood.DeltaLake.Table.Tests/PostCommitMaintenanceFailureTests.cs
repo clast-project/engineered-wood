@@ -151,6 +151,38 @@ public class PostCommitMaintenanceFailureTests : IDisposable
         Assert.Equal(overwrite ? 1 : 2, await CountRowsAsync());
     }
 
+    /// <summary>
+    /// A checkpoint that breaks AFTER its first bytes must not leave a truncated file at its final name. The
+    /// hint still names the older good checkpoint, which masks one; without the hint the reader picks the
+    /// newest listed checkpoint, fails on it, and replays from v0, which cleanup below v2 has deleted.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CheckpointFailingMidStream_LeavesTheTableOpenable(bool overwrite)
+    {
+        var (table, fs, reports) = await CreateAsync();
+        await using var t = table;
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        await table.WriteAsync([Row(1)]);                              // v1
+        foreach (string file in Directory.GetFiles(logDir))
+            File.SetLastWriteTimeUtc(file, DateTime.UtcNow.AddDays(-60));
+        await table.WriteAsync([Row(2)]);                              // v2: checkpoint, then v0 and v1 cleaned
+        Assert.False(File.Exists(Path.Combine(logDir, $"{DeltaVersion.Format(0)}.json")));
+        await table.WriteAsync([Row(3)]);                              // v3
+        fs.FailMidStream = IsCheckpoint;
+
+        long v4 = overwrite                                            // v4: its checkpoint breaks mid-stream
+            ? await table.WriteAsync([Row(4)], DeltaWriteMode.Overwrite)
+            : await table.WriteAsync([Row(4)]);
+
+        Assert.Equal(4, v4);
+        Assert.Equal(PostCommitMaintenanceStep.Checkpoint, Assert.Single(reports).Step);
+        Assert.False(File.Exists(Path.Combine(_tempDir, DeltaVersion.CheckpointPath(4))));
+        File.Delete(Path.Combine(logDir, "_last_checkpoint"));
+        Assert.Equal(overwrite ? 1 : 4, await CountRowsAsync());
+    }
+
     [Fact]
     public async Task FailedCheckpoint_IsRetriedOnTheNextInterval()
     {
@@ -255,6 +287,9 @@ public class PostCommitMaintenanceFailureTests : IDisposable
 
         public bool FailDelete { get; set; }
 
+        /// <summary>Streamed files these match take their first write, then throw.</summary>
+        public Func<string, bool>? FailMidStream { get; set; }
+
         public PathNameConstraints PathConstraints => inner.PathConstraints;
 
         private void ThrowIfWriteFails(string path)
@@ -271,11 +306,12 @@ public class PostCommitMaintenanceFailureTests : IDisposable
             string path, CancellationToken cancellationToken = default) =>
             inner.OpenReadAsync(path, cancellationToken);
 
-        public ValueTask<ISequentialFile> CreateAsync(
+        public async ValueTask<ISequentialFile> CreateAsync(
             string path, bool overwrite = false, CancellationToken cancellationToken = default)
         {
             ThrowIfWriteFails(path);
-            return inner.CreateAsync(path, overwrite, cancellationToken);
+            var file = await inner.CreateAsync(path, overwrite, cancellationToken);
+            return FailMidStream?.Invoke(path) == true ? new BreaksAfterFirstWrite(file, path) : file;
         }
 
         public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
@@ -304,6 +340,26 @@ public class PostCommitMaintenanceFailureTests : IDisposable
         {
             ThrowIfWriteFails(path);
             return inner.WriteAllBytesAsync(path, data, cancellationToken);
+        }
+
+        private sealed class BreaksAfterFirstWrite(ISequentialFile inner, string path) : ISequentialFile
+        {
+            public long Position => inner.Position;
+
+            public async ValueTask WriteAsync(
+                ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            {
+                await inner.WriteAsync(data, cancellationToken);
+                await inner.FlushAsync(cancellationToken);
+                throw new IOException($"stream broke after its first write (injected): {path}");
+            }
+
+            public ValueTask FlushAsync(CancellationToken cancellationToken = default) =>
+                inner.FlushAsync(cancellationToken);
+
+            public ValueTask DisposeAsync() => inner.DisposeAsync();
+
+            public void Dispose() => inner.Dispose();
         }
     }
 }

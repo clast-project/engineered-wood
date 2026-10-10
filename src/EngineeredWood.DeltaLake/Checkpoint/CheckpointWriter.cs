@@ -88,12 +88,11 @@ public sealed class CheckpointWriter
         // than at finalization keeps a checkpoint's peak footprint bounded.
         using var batch = BuildCheckpointBatch(snapshot, out long actionCount);
 
-        await using (var file = await _fs.CreateAsync(path, overwrite: true, cancellationToken)
-            .ConfigureAwait(false))
+        await WriteFileOrDeleteAsync(_fs, path, overwrite: true, async file =>
         {
             await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
             await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
-        }
+        }, cancellationToken).ConfigureAwait(false);
 
         // Write _last_checkpoint
         using var lastCheckpointStream = new MemoryStream();
@@ -108,6 +107,52 @@ public sealed class CheckpointWriter
 
         await _fs.WriteAllBytesAsync(
             DeltaVersion.LastCheckpointPath, json, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Streams a checkpoint file to <paramref name="path"/> and returns its length, deleting the file again
+    /// if <paramref name="write"/> fails part-way.
+    /// </summary>
+    /// <remarks>
+    /// <para>A streamed file is published by disposing it, on every backend — local writes in place, and S3,
+    /// Azure and GCS complete their upload — and <c>await using</c> disposes on the failure path too. So a
+    /// write that threw after its first bytes left a truncated checkpoint at its final, discoverable name.
+    /// A reader that finds no usable <c>_last_checkpoint</c> picks the newest listed checkpoint, fails on
+    /// that one, and replays from version 0. That replay has a gap once log cleanup has run below an
+    /// older checkpoint, and then the table cannot be opened. Deleted only after the dispose, which is what
+    /// publishes it.</para>
+    ///
+    /// <para>Only a file this call created is deleted: if <c>CreateAsync</c> itself fails, whatever was
+    /// already at the path is not ours. The delete is best-effort and the original exception is what
+    /// propagates. Cancellation takes the same path, since a cancelled write is just as truncated.</para>
+    /// </remarks>
+    internal static async ValueTask<long> WriteFileOrDeleteAsync(
+        ITableFileSystem fs, string path, bool overwrite,
+        Func<ISequentialFile, ValueTask> write, CancellationToken cancellationToken)
+    {
+        var file = await fs.CreateAsync(path, overwrite, cancellationToken).ConfigureAwait(false);
+        long length;
+        try
+        {
+            await using (file)
+            {
+                await write(file).ConfigureAwait(false);
+                length = file.Position;
+            }
+        }
+        catch
+        {
+            try
+            {
+                await fs.DeleteAsync(path, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // The write's own failure is the one worth reporting.
+            }
+            throw;
+        }
+        return length;
     }
 
     /// <summary>
