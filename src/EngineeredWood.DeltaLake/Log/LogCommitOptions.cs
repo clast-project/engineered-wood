@@ -37,6 +37,26 @@ public sealed record LogCommitOptions
     public bool WriteVersionChecksums { get; init; } = true;
 
     /// <summary>
+    /// Called with each post-commit maintenance failure — a version checksum, an interval checkpoint, or a
+    /// log-cleanup step — that was swallowed because the commit before it had already landed. Default: null,
+    /// and the failures are dropped.
+    /// </summary>
+    /// <remarks>
+    /// <para>None of these fails the write. A listener is how a host learns that one did fail, and the case
+    /// worth catching is a checkpoint that fails on every interval, which otherwise degrades the table without
+    /// a word — see <see cref="PostCommitMaintenanceFailure"/>.</para>
+    ///
+    /// <para>Runs inline on the committing call, so it should be quick: log, count, or queue. Anything it
+    /// throws synchronously is ignored. It must be synchronous: an <c>async</c> lambda compiles to
+    /// <c>async void</c>, and what that throws after an <c>await</c> escapes to the thread pool, where it
+    /// ends the process. Queue asynchronous work, with its own error handling, and return.</para>
+    ///
+    /// <para>The post-commit snapshot refresh is not maintenance and is not reported here; it is
+    /// the commit's return value, and it still throws.</para>
+    /// </remarks>
+    public Action<PostCommitMaintenanceFailure>? OnPostCommitMaintenanceFailure { get; init; }
+
+    /// <summary>
     /// Write a checkpoint after every Nth version, or 0 to never checkpoint. A commit checkpoints when the
     /// version it LANDED on is a multiple of this — which after a rebase is not the version it first
     /// attempted — so the interval is honoured against the log's real numbering rather than the caller's

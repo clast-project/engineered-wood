@@ -132,18 +132,36 @@ public sealed class LogCommitter
                 // checksum this feature must never produce; writing the later version's is correct, since
                 // the snapshot is a genuine reconciliation at that version. The next commit's checksum
                 // covers `attemptVersion` no better and no worse than an absent one already does.
+                var onFailure = _options.OnPostCommitMaintenanceFailure;
                 if (_checksumWriter is not null)
                 {
-                    await _checksumWriter.TryWriteAsync(snapshot, cancellationToken)
-                        .ConfigureAwait(false);
+                    await _checksumWriter.TryWriteAsync(
+                        snapshot,
+                        onFailure is null ? null : ex => PostCommitMaintenanceFailure.Report(
+                            onFailure, PostCommitMaintenanceStep.VersionChecksum, snapshot.Version, ex),
+                        cancellationToken).ConfigureAwait(false);
                 }
 
                 if (request.WriteCheckpointOnInterval
                     && _checkpointWriter is not null
                     && attemptVersion % _options.CheckpointInterval == 0)
                 {
-                    await _checkpointWriter.WriteCheckpointAsync(snapshot, cancellationToken)
-                        .ConfigureAwait(false);
+                    // Swallowed, like the checksum above and the cleanup below, and for the same reason: the
+                    // commit is durable, a checkpoint is an optimisation, and the next commit on the interval
+                    // writes one anyway. delta-spark runs its checkpoint hook inside the same kind of catch.
+                    // Cancellation still throws, and the cleanup is SKIPPED — it may delete only what a
+                    // durable checkpoint covers.
+                    try
+                    {
+                        await _checkpointWriter.WriteCheckpointAsync(snapshot, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        PostCommitMaintenanceFailure.Report(
+                            onFailure, PostCommitMaintenanceStep.Checkpoint, snapshot.Version, ex);
+                        return new LogCommitResult(attemptVersion, snapshot, Committed: true);
+                    }
 
                     // Cleanup runs ONLY here, immediately after a checkpoint, for two reasons that both
                     // matter: this is the moment older commits become redundant, so it is the earliest
@@ -155,8 +173,10 @@ public sealed class LogCommitter
                     // is deleted, or a failure between the two leaves commits removed with nothing
                     // covering them.
                     await LogCleanup.RunAsync(
-                        _log, snapshot.Metadata.Configuration, attemptVersion,
-                        DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+                        _log, snapshot.Metadata.Configuration, attemptVersion, DateTimeOffset.UtcNow,
+                        onFailure is null ? null : ex => PostCommitMaintenanceFailure.Report(
+                            onFailure, PostCommitMaintenanceStep.LogCleanup, attemptVersion, ex),
+                        cancellationToken).ConfigureAwait(false);
                 }
 
                 return new LogCommitResult(attemptVersion, snapshot, Committed: true);

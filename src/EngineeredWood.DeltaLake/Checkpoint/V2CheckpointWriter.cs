@@ -109,37 +109,75 @@ public sealed class V2CheckpointWriter
         var fileActions = CheckpointWriter.CollectFileActions(snapshot);
         bool useSidecars = fileActions.Count > SidecarThreshold;
 
-        var sidecars = useSidecars
-            ? await WriteSidecarsAsync(fileActions, snapshot, cancellationToken).ConfigureAwait(false)
-            : [];
-
-        var actions = new List<DeltaAction>(
-            5 + snapshot.AppTransactions.Count + snapshot.DomainMetadata.Count +
-            (useSidecars ? sidecars.Count : fileActions.Count))
+        // Filled as each sidecar lands, so a failure part-way still knows what this attempt wrote.
+        var sidecars = new List<SidecarFile>();
+        long bodySize;
+        int actionCount;
+        try
         {
-            // Exactly one, and first.
-            BuildCheckpointMetadata(snapshot, fileActions, sidecars),
-            snapshot.Protocol,
-            snapshot.Metadata,
-        };
+            if (useSidecars)
+                await WriteSidecarsAsync(fileActions, snapshot, sidecars, cancellationToken).ConfigureAwait(false);
 
-        foreach (var txn in snapshot.AppTransactions.Values)
-            actions.Add(txn);
+            var actions = new List<DeltaAction>(
+                5 + snapshot.AppTransactions.Count + snapshot.DomainMetadata.Count +
+                (useSidecars ? sidecars.Count : fileActions.Count))
+            {
+                // Exactly one, and first.
+                BuildCheckpointMetadata(snapshot, fileActions, sidecars),
+                snapshot.Protocol,
+                snapshot.Metadata,
+            };
 
-        foreach (var dm in snapshot.DomainMetadata.Values)
-            actions.Add(dm);
+            foreach (var txn in snapshot.AppTransactions.Values)
+                actions.Add(txn);
 
-        if (useSidecars)
-            actions.AddRange(sidecars);
-        else
-            actions.AddRange(fileActions);
+            foreach (var dm in snapshot.DomainMetadata.Values)
+                actions.Add(dm);
 
-        long bodySize = await WriteBodyAsync(checkpointPath, actions, snapshot, cancellationToken)
-            .ConfigureAwait(false);
+            if (useSidecars)
+                actions.AddRange(sidecars);
+            else
+                actions.AddRange(fileActions);
+
+            actionCount = actions.Count;
+            bodySize = await WriteBodyAsync(checkpointPath, actions, snapshot, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // A failed body write deletes its own partial body, which leaves this attempt's sidecars
+            // referenced by nothing. Deleting them keeps a checkpoint that fails on every interval from
+            // piling up sidecars for the sweep's whole age guard. But only once the body is confirmed
+            // gone: if that delete failed too, the body still names them, and deleting them would turn it
+            // into a checkpoint that points at missing files. A failure writing _last_checkpoint (below)
+            // never reaches this catch, since by then the body is published and references them.
+            if (sidecars.Count > 0 && await IsAbsentAsync(checkpointPath).ConfigureAwait(false))
+            {
+                foreach (var sidecar in sidecars)
+                {
+                    await CheckpointWriter.DeleteQuietlyAsync(_fs, DeltaVersion.SidecarPrefix + sidecar.Path)
+                        .ConfigureAwait(false);
+                }
+            }
+            throw;
+        }
 
         await WriteLastCheckpointAsync(
-            snapshot, checkpointName, bodySize, actions.Count, fileActions, sidecars, cancellationToken)
+            snapshot, checkpointName, bodySize, actionCount, fileActions, sidecars, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>Whether <paramref name="path"/> is known not to exist. A failed probe counts as "not known".</summary>
+    private async ValueTask<bool> IsAbsentAsync(string path)
+    {
+        try
+        {
+            return !await _fs.ExistsAsync(path, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -279,38 +317,47 @@ public sealed class V2CheckpointWriter
         if (Body != V2CheckpointBody.Parquet)
         {
             byte[] ndjson = ActionSerializer.Serialize(actions);
-            await _fs.WriteAllBytesAsync(checkpointPath, ndjson, cancellationToken)
-                .ConfigureAwait(false);
+            try
+            {
+                await _fs.WriteAllBytesAsync(checkpointPath, ndjson, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // Not every backend writes this in one atomic step (the local one writes in place), so a
+                // failure can leave a partial body that is listed as this version's checkpoint. The name
+                // is a fresh UUID, so whatever is there is ours to delete.
+                await CheckpointWriter.DeleteQuietlyAsync(_fs, checkpointPath).ConfigureAwait(false);
+                throw;
+            }
             return ndjson.Length;
         }
-
-        await using var file = await _fs.CreateAsync(checkpointPath, cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
 
         // Declared before the writer so it is disposed last; its buffers are native memory.
         using var batch = CheckpointWriter.BuildBatchForActions(
             snapshot, actions, out _, v2Spec: true);
 
-        // Scoped so the writer's footer lands before Position is read.
-        await using (var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions))
-        {
-            await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
-        }
-
-        return file.Position;
+        // A truncated body would be listed as this version's checkpoint, so a failed write deletes it.
+        return await CheckpointWriter.WriteFileOrDeleteAsync(_fs, checkpointPath,
+            async file =>
+            {
+                // Scoped so the writer's footer lands before the helper reads Position.
+                await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
+                await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+            }, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
     /// Writes the file actions out across as many sidecars as <see cref="MaxActionsPerSidecar"/> calls
-    /// for, in order.
+    /// for, in order, adding each to <paramref name="sidecars"/> as it lands.
     /// </summary>
-    private async ValueTask<List<SidecarFile>> WriteSidecarsAsync(
+    private async ValueTask WriteSidecarsAsync(
         List<DeltaAction> fileActions,
         Snapshot.Snapshot snapshot,
+        List<SidecarFile> sidecars,
         CancellationToken cancellationToken)
     {
         int perSidecar = Math.Max(1, MaxActionsPerSidecar);
-        var sidecars = new List<SidecarFile>((fileActions.Count + perSidecar - 1) / perSidecar);
 
         for (int start = 0; start < fileActions.Count; start += perSidecar)
         {
@@ -318,8 +365,6 @@ public sealed class V2CheckpointWriter
             sidecars.Add(await WriteSidecarAsync(chunk, snapshot, cancellationToken)
                 .ConfigureAwait(false));
         }
-
-        return sidecars;
     }
 
     private async ValueTask<SidecarFile> WriteSidecarAsync(
@@ -337,22 +382,21 @@ public sealed class V2CheckpointWriter
         // PROTOCOL.md allows a sidecar "only add file and remove file entries", so the batch cannot be
         // built from a snapshot (which would emit a protocol and a metaData row too, duplicating the ones
         // already in the checkpoint file itself).
-        await using (var file = await _fs.CreateAsync(sidecarPath, cancellationToken: cancellationToken)
-            .ConfigureAwait(false))
+        // Declared before the writer so it is disposed last; its buffers are native memory.
+        using (var batch = CheckpointWriter.BuildBatchForActions(snapshot, fileActions, out _))
         {
-            // Declared before the writer so it is disposed last; its buffers are native memory.
-            using var batch = CheckpointWriter.BuildBatchForActions(snapshot, fileActions, out _);
-
-            // Scoped so the writer's footer lands before Position is read.
-            await using (var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions))
-            {
-                await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
-            }
-
             // sidecar.sizeInBytes is required by the spec, and the write already knows it: Position is
             // the total written. Reading the file back to measure it doubled the I/O of every sidecar
             // and pulled a potentially multi-hundred-megabyte Parquet file into memory to take .Length.
-            sizeInBytes = file.Position;
+            // A partial sidecar is not discoverable the way a body is (the sweep would collect it), but
+            // there is no reason to leave one behind either.
+            sizeInBytes = await CheckpointWriter.WriteFileOrDeleteAsync(_fs, sidecarPath,
+                async file =>
+                {
+                    // Scoped so the writer's footer lands before the helper reads Position.
+                    await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
+                    await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+                }, cancellationToken).ConfigureAwait(false);
         }
 
         return new SidecarFile

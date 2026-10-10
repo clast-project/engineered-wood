@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -37,6 +38,15 @@ public sealed class CheckpointWriter
     /// the table.
     /// </summary>
     public CheckpointFormat Format { get; init; } = CheckpointFormat.Automatic;
+
+    /// <summary>
+    /// The largest classic checkpoint, encoded, that can be written: the largest byte array .NET allocates,
+    /// which is what holding it in memory for a single atomic publish is bounded by.
+    /// </summary>
+    internal const int MaxClassicCheckpointBytes = 0x7FFFFFC7;
+
+    /// <summary>The ceiling to enforce. Lowered by tests only, so the refusal can be exercised.</summary>
+    internal int MaxEncodedClassicCheckpointBytes { get; init; } = MaxClassicCheckpointBytes;
 
     /// <summary>
     /// The writer used when a V2 checkpoint is called for, or null to construct one over the same
@@ -88,12 +98,27 @@ public sealed class CheckpointWriter
         // than at finalization keeps a checkpoint's peak footprint bounded.
         using var batch = BuildCheckpointBatch(snapshot, out long actionCount);
 
-        await using (var file = await _fs.CreateAsync(path, overwrite: true, cancellationToken)
-            .ConfigureAwait(false))
+        // Encoded in memory, then published in one create-if-absent request. A classic checkpoint has a
+        // fixed name, so any writer checkpointing this version targets the same file, and nothing about a
+        // failed write can prove which object at that name is its own: a storage interface without a
+        // conditional delete cannot clean up after a failure without risking another writer's good
+        // checkpoint, and an overwrite truncates a good one in place on the local backend. Publishing in
+        // one atomic step means a failure leaves nothing behind, so there is nothing to clean up.
+        //
+        // Streaming bought little here anyway: the batch above already holds the whole checkpoint in
+        // memory, and the encoded file is usually smaller. The cost is a 2 GB ceiling on the encoded
+        // checkpoint (a MemoryStream's), far past the point where V2 sidecars are the right format. #501
+        // tracks the streamed, failure-atomic publish that would lift it.
+        var encoded = new MemorySequentialFile(MaxEncodedClassicCheckpointBytes, snapshot.Version);
+        await using (var writer = new ParquetFileWriter(encoded, ownsFile: false, _parquetOptions))
         {
-            await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
             await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
         }
+
+        // False when a checkpoint for this version is already there: written by another writer, or by an
+        // earlier checkpoint of the same version. It covers the same state, so it is kept rather than
+        // replaced, and the hint below still names this version.
+        _ = await _fs.TryWriteAllBytesAsync(path, encoded.Written, cancellationToken).ConfigureAwait(false);
 
         // Write _last_checkpoint
         using var lastCheckpointStream = new MemoryStream();
@@ -108,6 +133,61 @@ public sealed class CheckpointWriter
 
         await _fs.WriteAllBytesAsync(
             DeltaVersion.LastCheckpointPath, json, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Streams a new, uniquely named checkpoint file (a V2 body or a sidecar) to <paramref name="path"/> and
+    /// returns its length, deleting the file again if <paramref name="write"/> fails part-way.
+    /// </summary>
+    /// <remarks>
+    /// <para>A streamed file is published by disposing it, on every backend — local writes in place, and S3,
+    /// Azure and GCS complete their upload — and <c>await using</c> disposes on the failure path too. So a
+    /// write that threw after its first bytes left a truncated checkpoint at its final, discoverable name.
+    /// A reader that finds no usable <c>_last_checkpoint</c> picks the newest listed checkpoint, fails on
+    /// that one, and replays from version 0. That replay has a gap once log cleanup has run below an
+    /// older checkpoint, and then the table cannot be opened. Deleted only after the dispose, which is what
+    /// publishes it.</para>
+    ///
+    /// <para>Safe only because the name is a fresh UUID: whatever is at the path is this call's own. The
+    /// classic checkpoint's fixed name does not have that property, which is why it does not stream. The
+    /// delete is best-effort and the original exception is what propagates. Cancellation takes the same
+    /// path, since a cancelled write is just as truncated.</para>
+    /// </remarks>
+    internal static async ValueTask<long> WriteFileOrDeleteAsync(
+        ITableFileSystem fs, string path,
+        Func<ISequentialFile, ValueTask> write, CancellationToken cancellationToken)
+    {
+        var file = await fs.CreateAsync(path, overwrite: false, cancellationToken).ConfigureAwait(false);
+        long length;
+        try
+        {
+            await using (file)
+            {
+                await write(file).ConfigureAwait(false);
+                length = file.Position;
+            }
+        }
+        catch
+        {
+            await DeleteQuietlyAsync(fs, path).ConfigureAwait(false);
+            throw;
+        }
+        return length;
+    }
+
+    /// <summary>
+    /// Deletes a file a failed write may have left behind, ignoring any failure to: the write's own
+    /// exception is the one worth reporting.
+    /// </summary>
+    internal static async ValueTask DeleteQuietlyAsync(ITableFileSystem fs, string path)
+    {
+        try
+        {
+            await fs.DeleteAsync(path, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+        }
     }
 
     /// <summary>
@@ -1129,4 +1209,51 @@ public sealed class CheckpointWriter
     }
 
     #endregion
+
+    /// <summary>
+    /// An <see cref="ISequentialFile"/> that collects what is written to it in memory, refusing to grow past
+    /// <c>maxBytes</c> with a message that says what to do about it.
+    /// </summary>
+    private sealed class MemorySequentialFile(int maxBytes, long version) : ISequentialFile
+    {
+        private readonly MemoryStream _stream = new();
+
+        public long Position => _stream.Length;
+
+        /// <summary>Everything written so far, without a copy.</summary>
+        public ReadOnlyMemory<byte> Written => new(_stream.GetBuffer(), 0, (int)_stream.Length);
+
+        public ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_stream.Length + data.Length > maxBytes)
+            {
+                throw new InvalidOperationException(
+                    $"The classic checkpoint for version {version} is larger than {maxBytes:N0} bytes encoded, " +
+                    "the most a classic checkpoint can be: it is held in memory so it can be published in one " +
+                    "atomic request. Write V2 checkpoints instead (table property delta.checkpointPolicy=v2, " +
+                    "which needs the v2Checkpoint reader and writer feature, so every engine reading the table " +
+                    "must support V2 checkpoints), whose sidecars bound a checkpoint's memory. Nothing was " +
+                    "written.");
+            }
+            if (MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment))
+            {
+                _stream.Write(segment.Array!, segment.Offset, segment.Count);
+            }
+            else
+            {
+                byte[] copy = data.ToArray();
+                _stream.Write(copy, 0, copy.Length);
+            }
+            return default;
+        }
+
+        public ValueTask FlushAsync(CancellationToken cancellationToken = default) => default;
+
+        public ValueTask DisposeAsync() => default;
+
+        public void Dispose()
+        {
+        }
+    }
 }

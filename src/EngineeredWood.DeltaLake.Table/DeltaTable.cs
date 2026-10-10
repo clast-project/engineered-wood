@@ -92,6 +92,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // caller's parquet options and checkpoint format rather than the committer's defaults.
             CheckpointWriter = _checkpointWriter,
             PreferTypedCheckpointStats = options.PreferTypedCheckpointStats,
+            // Same listener on both commit routes, for the same reason as the checksum switch above.
+            OnPostCommitMaintenanceFailure = options.OnPostCommitMaintenanceFailure,
         });
         _currentSnapshot = snapshot;
     }
@@ -5911,6 +5913,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     ///
     /// <para><c>CheckpointInterval = 0</c> is "never checkpoint", an absolute caller override — a host may
     /// be driving checkpoints on a cadence of its own and must not have one appear underneath it.</para>
+    ///
+    /// <para><b>Only the refresh can fail the caller's write.</b> Its result is what the table hands back,
+    /// so it is not maintenance. The checksum, the interval checkpoint and the cleanup are, and each one's
+    /// failure goes to <see cref="DeltaTableOptions.OnPostCommitMaintenanceFailure"/> instead of being
+    /// thrown — the same rule <see cref="LogCommitter"/> applies on the other commit route.</para>
     /// </remarks>
     private async ValueTask AfterCommitAsync(long committedVersion, CancellationToken cancellationToken)
     {
@@ -5928,19 +5935,45 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 _currentSnapshot, _log, cancellationToken).ConfigureAwait(false);
         }
 
+        var snapshot = CurrentSnapshot;
         if (_checksumWriter is not null)
         {
-            await _checksumWriter.TryWriteAsync(CurrentSnapshot, cancellationToken)
-                .ConfigureAwait(false);
+            await _checksumWriter.TryWriteAsync(
+                snapshot,
+                ReportTo(PostCommitMaintenanceStep.VersionChecksum, snapshot.Version),
+                cancellationToken).ConfigureAwait(false);
         }
 
         if (_checkpointInterval > 0
             && committedVersion != 0
             && committedVersion % _checkpointInterval == 0)
         {
-            await WriteCheckpointAndCleanUpLogAsync(CurrentSnapshot, cancellationToken)
-                .ConfigureAwait(false);
+            // The checkpoint is the one half of the shared seam that can throw (cleanup reports and never
+            // does). Caught HERE rather than inside the seam, because CheckpointAsync shares it and a caller
+            // who asked for a checkpoint is owed the exception.
+            try
+            {
+                await WriteCheckpointAndCleanUpLogAsync(snapshot, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                PostCommitMaintenanceFailure.Report(
+                    _options.OnPostCommitMaintenanceFailure, PostCommitMaintenanceStep.Checkpoint,
+                    snapshot.Version, ex);
+            }
         }
+    }
+
+    /// <summary>
+    /// The exception sink handing a swallowed maintenance failure to
+    /// <see cref="DeltaTableOptions.OnPostCommitMaintenanceFailure"/>, or null when nobody is listening.
+    /// </summary>
+    private Action<Exception>? ReportTo(PostCommitMaintenanceStep step, long version)
+    {
+        var listener = _options.OnPostCommitMaintenanceFailure;
+        return listener is null
+            ? null
+            : ex => PostCommitMaintenanceFailure.Report(listener, step, version, ex);
     }
 
     /// <summary>
@@ -5959,6 +5992,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     ///
     /// <para>Ordering: the checkpoint must be DURABLE before anything is deleted, or a failure between the
     /// two leaves commits removed with nothing covering them.</para>
+    ///
+    /// <para>A failed checkpoint THROWS from here, for both callers; <see cref="AfterCommitAsync"/> is the
+    /// one that swallows it. Cleanup never throws, and reports what it skipped to
+    /// <see cref="DeltaTableOptions.OnPostCommitMaintenanceFailure"/> after an explicit checkpoint too.</para>
     /// </remarks>
     private async ValueTask WriteCheckpointAndCleanUpLogAsync(
         Snapshot.Snapshot snapshot, CancellationToken cancellationToken)
@@ -5966,8 +6003,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         await _checkpointWriter.WriteCheckpointAsync(snapshot, cancellationToken).ConfigureAwait(false);
 
         await Log.LogCleanup.RunAsync(
-            _log, snapshot.Metadata.Configuration, snapshot.Version,
-            DateTimeOffset.UtcNow, cancellationToken).ConfigureAwait(false);
+            _log, snapshot.Metadata.Configuration, snapshot.Version, DateTimeOffset.UtcNow,
+            ReportTo(PostCommitMaintenanceStep.LogCleanup, snapshot.Version),
+            cancellationToken).ConfigureAwait(false);
     }
 
     // ── Buffered-transaction seam ──────────────────────────────────────────────────────────────────────

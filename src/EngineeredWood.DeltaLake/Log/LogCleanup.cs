@@ -72,12 +72,26 @@ internal static class LogCleanup
     /// <param name="latestCheckpointVersion">The version of the newest checkpoint, or null when there is
     /// none — in which case nothing is deleted.</param>
     /// <param name="now">The clock, injected so a test can force a horizon without sleeping.</param>
-    public static async ValueTask<int> RunAsync(
+    public static ValueTask<int> RunAsync(
         TransactionLog log,
         IReadOnlyDictionary<string, string>? configuration,
         long? latestCheckpointVersion,
         DateTimeOffset now,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        RunAsync(log, configuration, latestCheckpointVersion, now, onFailure: null, cancellationToken);
+
+    /// <summary>
+    /// <see cref="RunAsync(TransactionLog, IReadOnlyDictionary{string, string}?, long?, DateTimeOffset, CancellationToken)"/>,
+    /// also handing every failure it swallows to <paramref name="onFailure"/> — one call per failure, whether
+    /// it ended the pass or only skipped a file. Still never throws, cancellation excepted.
+    /// </summary>
+    internal static async ValueTask<int> RunAsync(
+        TransactionLog log,
+        IReadOnlyDictionary<string, string>? configuration,
+        long? latestCheckpointVersion,
+        DateTimeOffset now,
+        Action<Exception>? onFailure,
+        CancellationToken cancellationToken)
     {
         if (!IsEnabled(configuration) || latestCheckpointVersion is not { } checkpointVersion)
             return 0;
@@ -111,8 +125,9 @@ internal static class LogCleanup
                     checksums.Add((crcVersion, file.Path, file.LastModified));
             }
         }
-        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
+            onFailure?.Invoke(ex);
             return 0;
         }
 
@@ -184,8 +199,9 @@ internal static class LogCleanup
                 await log.FileSystem.DeleteAsync(candidates[i].Path, cancellationToken).ConfigureAwait(false);
                 deleted++;
             }
-            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
+                onFailure?.Invoke(ex);
                 // A file we could not remove ends the pass: continuing would delete a LATER version while
                 // leaving this one, which is the hole the prefix rule exists to prevent.
                 break;
@@ -195,7 +211,7 @@ internal static class LogCleanup
         // Deletion above is a strict prefix that stops at the first failure, so candidates[deleted..] is
         // exactly what is still on the log — which is what the sweeps below key off.
         deleted += await SweepUnreferencedSidecarsAsync(
-            log, candidates, firstSurvivor: deleted, cutoff, cancellationToken).ConfigureAwait(false);
+            log, candidates, firstSurvivor: deleted, cutoff, onFailure, cancellationToken).ConfigureAwait(false);
 
         // long.MaxValue when nothing survived: every commit this log had is gone, so every checksum
         // describes a version that is gone. Reachable only when the caller names a checkpoint version above
@@ -206,7 +222,7 @@ internal static class LogCleanup
             : long.MaxValue;
 
         deleted += await SweepExpiredChecksumsAsync(
-            log, checksums, firstSurvivingVersion, cutoff, cancellationToken).ConfigureAwait(false);
+            log, checksums, firstSurvivingVersion, cutoff, onFailure, cancellationToken).ConfigureAwait(false);
 
         return deleted;
     }
@@ -246,6 +262,7 @@ internal static class LogCleanup
         List<(long Version, string Path, DateTimeOffset Modified)> checksums,
         long firstSurvivingVersion,
         DateTimeOffset cutoff,
+        Action<Exception>? onFailure,
         CancellationToken cancellationToken)
     {
         int deleted = 0;
@@ -264,8 +281,9 @@ internal static class LogCleanup
                 await log.FileSystem.DeleteAsync(path, cancellationToken).ConfigureAwait(false);
                 deleted++;
             }
-            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
+                onFailure?.Invoke(ex);
                 continue;
             }
         }
@@ -307,6 +325,7 @@ internal static class LogCleanup
         List<(long Version, string Path, DateTimeOffset Modified)> candidates,
         int firstSurvivor,
         DateTimeOffset cutoff,
+        Action<Exception>? onFailure,
         CancellationToken cancellationToken)
     {
         // Listed FIRST, so a table that has never written a sidecar — every classic-checkpoint table, which
@@ -321,8 +340,9 @@ internal static class LogCleanup
                 sidecars.Add((file.Path, file.LastModified));
             }
         }
-        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
+            onFailure?.Invoke(ex);
             return 0;
         }
 
@@ -343,8 +363,9 @@ internal static class LogCleanup
                 foreach (string path in paths)
                     referenced.Add(Normalize(path));
             }
-            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
+                onFailure?.Invoke(ex);
                 return 0;
             }
         }
@@ -365,8 +386,9 @@ internal static class LogCleanup
                 await log.FileSystem.DeleteAsync(path, cancellationToken).ConfigureAwait(false);
                 deleted++;
             }
-            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
+                onFailure?.Invoke(ex);
                 continue;
             }
         }
