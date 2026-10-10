@@ -130,6 +130,28 @@ public class CheckpointPartialWriteTests : IDisposable
         Assert.Empty(fs.Deleted);
     }
 
+    /// <summary>
+    /// A classic checkpoint is held in memory for its one atomic publish, so it has a ceiling. Past it the
+    /// writer refuses with a message naming the way out, rather than the stream's "Stream was too long".
+    /// </summary>
+    [Fact]
+    public async Task Classic_PastTheInMemoryCeiling_RefusesAndWritesNothing()
+    {
+        var (fs, snapshot) = await BuildTableAsync();
+        var writer = new CheckpointWriter(fs)
+        {
+            Format = CheckpointFormat.Classic,
+            MaxEncodedClassicCheckpointBytes = 100,
+        };
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await writer.WriteCheckpointAsync(snapshot));
+
+        Assert.Contains("delta.checkpointPolicy=v2", ex.Message);
+        Assert.Empty(Directory.GetFiles(LogDir, "*.checkpoint*"));
+        Assert.False(File.Exists(Path.Combine(LogDir, "_last_checkpoint")));
+    }
+
     [Fact]
     public async Task V2ParquetBody_FailingMidStream_LeavesNoCheckpoint()
     {

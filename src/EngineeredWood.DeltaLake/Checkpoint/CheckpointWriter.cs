@@ -40,6 +40,15 @@ public sealed class CheckpointWriter
     public CheckpointFormat Format { get; init; } = CheckpointFormat.Automatic;
 
     /// <summary>
+    /// The largest classic checkpoint, encoded, that can be written: the largest byte array .NET allocates,
+    /// which is what holding it in memory for a single atomic publish is bounded by.
+    /// </summary>
+    internal const int MaxClassicCheckpointBytes = 0x7FFFFFC7;
+
+    /// <summary>The ceiling to enforce. Lowered by tests only, so the refusal can be exercised.</summary>
+    internal int MaxEncodedClassicCheckpointBytes { get; init; } = MaxClassicCheckpointBytes;
+
+    /// <summary>
     /// The writer used when a V2 checkpoint is called for, or null to construct one over the same
     /// filesystem and parquet options. Supply one to control the sidecar policy or the body format.
     /// </summary>
@@ -98,8 +107,9 @@ public sealed class CheckpointWriter
         //
         // Streaming bought little here anyway: the batch above already holds the whole checkpoint in
         // memory, and the encoded file is usually smaller. The cost is a 2 GB ceiling on the encoded
-        // checkpoint (a MemoryStream's), far past the point where V2 sidecars are the right format.
-        var encoded = new MemorySequentialFile();
+        // checkpoint (a MemoryStream's), far past the point where V2 sidecars are the right format. #501
+        // tracks the streamed, failure-atomic publish that would lift it.
+        var encoded = new MemorySequentialFile(MaxEncodedClassicCheckpointBytes, snapshot.Version);
         await using (var writer = new ParquetFileWriter(encoded, ownsFile: false, _parquetOptions))
         {
             await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
@@ -1200,8 +1210,11 @@ public sealed class CheckpointWriter
 
     #endregion
 
-    /// <summary>An <see cref="ISequentialFile"/> that collects what is written to it in memory.</summary>
-    private sealed class MemorySequentialFile : ISequentialFile
+    /// <summary>
+    /// An <see cref="ISequentialFile"/> that collects what is written to it in memory, refusing to grow past
+    /// <c>maxBytes</c> with a message that says what to do about it.
+    /// </summary>
+    private sealed class MemorySequentialFile(int maxBytes, long version) : ISequentialFile
     {
         private readonly MemoryStream _stream = new();
 
@@ -1213,6 +1226,16 @@ public sealed class CheckpointWriter
         public ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (_stream.Length + data.Length > maxBytes)
+            {
+                throw new InvalidOperationException(
+                    $"The classic checkpoint for version {version} is larger than {maxBytes:N0} bytes encoded, " +
+                    "the most a classic checkpoint can be: it is held in memory so it can be published in one " +
+                    "atomic request. Write V2 checkpoints instead (table property delta.checkpointPolicy=v2, " +
+                    "which needs the v2Checkpoint reader and writer feature, so every engine reading the table " +
+                    "must support V2 checkpoints), whose sidecars bound a checkpoint's memory. Nothing was " +
+                    "written.");
+            }
             if (MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment))
             {
                 _stream.Write(segment.Array!, segment.Offset, segment.Count);
