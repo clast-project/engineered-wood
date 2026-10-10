@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -88,11 +89,26 @@ public sealed class CheckpointWriter
         // than at finalization keeps a checkpoint's peak footprint bounded.
         using var batch = BuildCheckpointBatch(snapshot, out long actionCount);
 
-        await WriteFileOrDeleteAsync(_fs, path, overwrite: true, async file =>
+        // Encoded in memory, then published in one create-if-absent request. A classic checkpoint has a
+        // fixed name, so any writer checkpointing this version targets the same file, and nothing about a
+        // failed write can prove which object at that name is its own: a storage interface without a
+        // conditional delete cannot clean up after a failure without risking another writer's good
+        // checkpoint, and an overwrite truncates a good one in place on the local backend. Publishing in
+        // one atomic step means a failure leaves nothing behind, so there is nothing to clean up.
+        //
+        // Streaming bought little here anyway: the batch above already holds the whole checkpoint in
+        // memory, and the encoded file is usually smaller. The cost is a 2 GB ceiling on the encoded
+        // checkpoint (a MemoryStream's), far past the point where V2 sidecars are the right format.
+        var encoded = new MemorySequentialFile();
+        await using (var writer = new ParquetFileWriter(encoded, ownsFile: false, _parquetOptions))
         {
-            await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
             await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
-        }, cancellationToken).ConfigureAwait(false);
+        }
+
+        // False when a checkpoint for this version is already there: written by another writer, or by an
+        // earlier checkpoint of the same version. It covers the same state, so it is kept rather than
+        // replaced, and the hint below still names this version.
+        _ = await _fs.TryWriteAllBytesAsync(path, encoded.Written, cancellationToken).ConfigureAwait(false);
 
         // Write _last_checkpoint
         using var lastCheckpointStream = new MemoryStream();
@@ -110,8 +126,8 @@ public sealed class CheckpointWriter
     }
 
     /// <summary>
-    /// Streams a checkpoint file to <paramref name="path"/> and returns its length, deleting the file again
-    /// if <paramref name="write"/> fails part-way.
+    /// Streams a new, uniquely named checkpoint file (a V2 body or a sidecar) to <paramref name="path"/> and
+    /// returns its length, deleting the file again if <paramref name="write"/> fails part-way.
     /// </summary>
     /// <remarks>
     /// <para>A streamed file is published by disposing it, on every backend — local writes in place, and S3,
@@ -122,21 +138,16 @@ public sealed class CheckpointWriter
     /// older checkpoint, and then the table cannot be opened. Deleted only after the dispose, which is what
     /// publishes it.</para>
     ///
-    /// <para>Only a file this call created is deleted. If <c>CreateAsync</c> itself fails, nothing here is
-    /// ours. If <paramref name="overwrite"/> replaces a file that already existed (a classic checkpoint is
-    /// rewritten at its fixed name when the same version is checkpointed again), nothing is deleted
-    /// either: an object store keeps the old object until the new upload completes, so deleting would
-    /// remove a good checkpoint that the hint may still name and that cleanup may already rely on. The
-    /// local backend truncates on create, so there the old file is already lost; deleting would not bring
-    /// it back. The delete is best-effort and the original exception is what propagates. Cancellation takes
-    /// the same path, since a cancelled write is just as truncated.</para>
+    /// <para>Safe only because the name is a fresh UUID: whatever is at the path is this call's own. The
+    /// classic checkpoint's fixed name does not have that property, which is why it does not stream. The
+    /// delete is best-effort and the original exception is what propagates. Cancellation takes the same
+    /// path, since a cancelled write is just as truncated.</para>
     /// </remarks>
     internal static async ValueTask<long> WriteFileOrDeleteAsync(
-        ITableFileSystem fs, string path, bool overwrite,
+        ITableFileSystem fs, string path,
         Func<ISequentialFile, ValueTask> write, CancellationToken cancellationToken)
     {
-        bool replacing = overwrite && await fs.ExistsAsync(path, cancellationToken).ConfigureAwait(false);
-        var file = await fs.CreateAsync(path, overwrite, cancellationToken).ConfigureAwait(false);
+        var file = await fs.CreateAsync(path, overwrite: false, cancellationToken).ConfigureAwait(false);
         long length;
         try
         {
@@ -148,8 +159,7 @@ public sealed class CheckpointWriter
         }
         catch
         {
-            if (!replacing)
-                await DeleteQuietlyAsync(fs, path).ConfigureAwait(false);
+            await DeleteQuietlyAsync(fs, path).ConfigureAwait(false);
             throw;
         }
         return length;
@@ -1189,4 +1199,38 @@ public sealed class CheckpointWriter
     }
 
     #endregion
+
+    /// <summary>An <see cref="ISequentialFile"/> that collects what is written to it in memory.</summary>
+    private sealed class MemorySequentialFile : ISequentialFile
+    {
+        private readonly MemoryStream _stream = new();
+
+        public long Position => _stream.Length;
+
+        /// <summary>Everything written so far, without a copy.</summary>
+        public ReadOnlyMemory<byte> Written => new(_stream.GetBuffer(), 0, (int)_stream.Length);
+
+        public ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment))
+            {
+                _stream.Write(segment.Array!, segment.Offset, segment.Count);
+            }
+            else
+            {
+                byte[] copy = data.ToArray();
+                _stream.Write(copy, 0, copy.Length);
+            }
+            return default;
+        }
+
+        public ValueTask FlushAsync(CancellationToken cancellationToken = default) => default;
+
+        public ValueTask DisposeAsync() => default;
+
+        public void Dispose()
+        {
+        }
+    }
 }

@@ -152,14 +152,14 @@ public class PostCommitMaintenanceFailureTests : IDisposable
     }
 
     /// <summary>
-    /// A checkpoint that breaks AFTER its first bytes must not leave a truncated file at its final name. The
-    /// hint still names the older good checkpoint, which masks one; without the hint the reader picks the
-    /// newest listed checkpoint, fails on it, and replays from v0, which cleanup below v2 has deleted.
+    /// A checkpoint whose publish lands but then reports failure (a lost response, say) is reported and must
+    /// leave the table openable without the hint, after cleanup below the previous checkpoint. A writer that
+    /// deleted the path after the failure would remove the only checkpoint covering the cleaned commits.
     /// </summary>
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task CheckpointFailingMidStream_LeavesTheTableOpenable(bool overwrite)
+    public async Task CheckpointPublishFailure_LeavesTheTableOpenable(bool overwrite)
     {
         var (table, fs, reports) = await CreateAsync();
         await using var t = table;
@@ -170,15 +170,15 @@ public class PostCommitMaintenanceFailureTests : IDisposable
         await table.WriteAsync([Row(2)]);                              // v2: checkpoint, then v0 and v1 cleaned
         Assert.False(File.Exists(Path.Combine(logDir, $"{DeltaVersion.Format(0)}.json")));
         await table.WriteAsync([Row(3)]);                              // v3
-        fs.FailMidStream = IsCheckpoint;
+        fs.FailAfterLanding = path => path.Contains(".checkpoint");
 
-        long v4 = overwrite                                            // v4: its checkpoint breaks mid-stream
+        long v4 = overwrite                                            // v4: its checkpoint lands, then fails
             ? await table.WriteAsync([Row(4)], DeltaWriteMode.Overwrite)
             : await table.WriteAsync([Row(4)]);
 
         Assert.Equal(4, v4);
         Assert.Equal(PostCommitMaintenanceStep.Checkpoint, Assert.Single(reports).Step);
-        Assert.False(File.Exists(Path.Combine(_tempDir, DeltaVersion.CheckpointPath(4))));
+        Assert.True(File.Exists(Path.Combine(_tempDir, DeltaVersion.CheckpointPath(4))));
         File.Delete(Path.Combine(logDir, "_last_checkpoint"));
         Assert.Equal(overwrite ? 1 : 4, await CountRowsAsync());
     }
@@ -287,8 +287,11 @@ public class PostCommitMaintenanceFailureTests : IDisposable
 
         public bool FailDelete { get; set; }
 
-        /// <summary>Streamed files these match take their first write, then throw.</summary>
-        public Func<string, bool>? FailMidStream { get; set; }
+        /// <summary>
+        /// Writes to paths these match reach storage, then throw: a streamed file after its first write, a
+        /// whole-file write once it has landed.
+        /// </summary>
+        public Func<string, bool>? FailAfterLanding { get; set; }
 
         public PathNameConstraints PathConstraints => inner.PathConstraints;
 
@@ -311,7 +314,7 @@ public class PostCommitMaintenanceFailureTests : IDisposable
         {
             ThrowIfWriteFails(path);
             var file = await inner.CreateAsync(path, overwrite, cancellationToken);
-            return FailMidStream?.Invoke(path) == true ? new BreaksAfterFirstWrite(file, path) : file;
+            return FailAfterLanding?.Invoke(path) == true ? new BreaksAfterFirstWrite(file, path) : file;
         }
 
         public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
@@ -328,11 +331,14 @@ public class PostCommitMaintenanceFailureTests : IDisposable
             string path, CancellationToken cancellationToken = default) =>
             inner.ReadAllBytesAsync(path, cancellationToken);
 
-        public ValueTask<bool> TryWriteAllBytesAsync(
+        public async ValueTask<bool> TryWriteAllBytesAsync(
             string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
         {
             ThrowIfWriteFails(path);
-            return inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+            bool written = await inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+            if (FailAfterLanding?.Invoke(path) == true)
+                throw new IOException($"write failed after it landed (injected): {path}");
+            return written;
         }
 
         public ValueTask WriteAllBytesAsync(

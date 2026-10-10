@@ -147,7 +147,12 @@ public sealed record DeltaTableOptions
     /// altogether, set <see cref="CheckpointInterval"/> to 0.</para>
     ///
     /// <para>Runs inline on the committing call, so keep it quick: log, count, or queue. Anything it throws
-    /// is ignored.</para>
+    /// synchronously is ignored.</para>
+    ///
+    /// <para><b>Synchronous only.</b> An <c>async</c> lambda here compiles to <c>async void</c>: whatever it
+    /// throws after its first <c>await</c> reaches the synchronization context or the thread pool, not the
+    /// committing call, and on the thread pool that ends the process. To do asynchronous work, queue it (a
+    /// channel, or <c>Task.Run</c> with its own error handling) and return.</para>
     /// </remarks>
     public Action<Log.PostCommitMaintenanceFailure>? OnPostCommitMaintenanceFailure { get; init; }
 

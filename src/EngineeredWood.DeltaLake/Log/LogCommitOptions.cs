@@ -47,7 +47,11 @@ public sealed record LogCommitOptions
     /// a word — see <see cref="PostCommitMaintenanceFailure"/>.</para>
     ///
     /// <para>Runs inline on the committing call, so it should be quick: log, count, or queue. Anything it
-    /// throws is ignored. The post-commit snapshot refresh is not maintenance and is not reported here; it is
+    /// throws synchronously is ignored. It must be synchronous: an <c>async</c> lambda compiles to
+    /// <c>async void</c>, and what that throws after an <c>await</c> escapes to the thread pool, where it
+    /// ends the process. Queue asynchronous work, with its own error handling, and return.</para>
+    ///
+    /// <para>The post-commit snapshot refresh is not maintenance and is not reported here; it is
     /// the commit's return value, and it still throws.</para>
     /// </remarks>
     public Action<PostCommitMaintenanceFailure>? OnPostCommitMaintenanceFailure { get; init; }

@@ -50,6 +50,12 @@ public sealed record PostCommitMaintenanceFailure(
     /// letting it escape would fail a write that has already committed, which is the outcome this whole
     /// channel exists to avoid.
     /// </summary>
+    /// <remarks>
+    /// Only a synchronous throw can be caught here. An <c>async</c> lambda passed as the listener is
+    /// <c>async void</c>, and what it throws after an <c>await</c> never comes back through this call. The
+    /// option documents that the listener must be synchronous; an awaitable callback type would let this
+    /// catch cover it, but it would also put the listener's latency on every commit.
+    /// </remarks>
     internal static void Report(
         Action<PostCommitMaintenanceFailure>? listener,
         PostCommitMaintenanceStep step, long version, Exception exception)
