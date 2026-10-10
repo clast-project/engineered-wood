@@ -279,8 +279,19 @@ public sealed class V2CheckpointWriter
         if (Body != V2CheckpointBody.Parquet)
         {
             byte[] ndjson = ActionSerializer.Serialize(actions);
-            await _fs.WriteAllBytesAsync(checkpointPath, ndjson, cancellationToken)
-                .ConfigureAwait(false);
+            try
+            {
+                await _fs.WriteAllBytesAsync(checkpointPath, ndjson, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // Not every backend writes this in one atomic step (the local one writes in place), so a
+                // failure can leave a partial body that is listed as this version's checkpoint. The name
+                // is a fresh UUID, so whatever is there is ours to delete.
+                await CheckpointWriter.DeleteQuietlyAsync(_fs, checkpointPath).ConfigureAwait(false);
+                throw;
+            }
             return ndjson.Length;
         }
 

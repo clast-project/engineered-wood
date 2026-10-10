@@ -110,12 +110,49 @@ public class CheckpointPartialWriteTests : IDisposable
         Assert.Empty(Directory.GetFiles(LogDir, "*.checkpoint*"));
     }
 
-    /// <summary>Lets a streamed file's first write reach storage, then throws.</summary>
+    /// <summary>
+    /// A classic checkpoint is rewritten at its fixed name when the same version is checkpointed again. An
+    /// object store keeps the old object until the new upload completes, so a failed retry must not delete
+    /// the path: that would remove a good checkpoint the hint still names.
+    /// </summary>
+    [Fact]
+    public async Task Classic_FailedRetryOverAnExistingCheckpoint_DoesNotDeleteIt()
+    {
+        var (fs, snapshot) = await BuildTableAsync();
+        var writer = new CheckpointWriter(fs) { Format = CheckpointFormat.Classic };
+        await writer.WriteCheckpointAsync(snapshot);
+        fs.FailMidStream = path => path.Contains(".checkpoint");
+
+        await Assert.ThrowsAsync<IOException>(async () => await writer.WriteCheckpointAsync(snapshot));
+
+        Assert.True(fs.BytesReachedStorage);
+        Assert.DoesNotContain(DeltaVersion.CheckpointPath(snapshot.Version), fs.Deleted);
+    }
+
+    [Fact]
+    public async Task V2JsonBody_FailingAfterItsBytesLand_LeavesNoCheckpoint()
+    {
+        var (fs, snapshot) = await BuildTableAsync();
+        fs.FailAfterWriteAllBytes = path => path.Contains(".checkpoint.");
+
+        await Assert.ThrowsAsync<IOException>(async () =>
+            await new V2CheckpointWriter(fs) { Body = V2CheckpointBody.Json }.WriteCheckpointAsync(snapshot));
+
+        Assert.True(fs.BytesReachedStorage);
+        Assert.Empty(Directory.GetFiles(LogDir, "*.checkpoint*"));
+    }
+
+    /// <summary>Lets a write's bytes reach storage, then throws. Records every delete.</summary>
     private sealed class FailMidStreamFileSystem(ITableFileSystem inner) : ITableFileSystem
     {
         public Func<string, bool>? FailMidStream { get; set; }
 
+        /// <summary>Whole-file writes these match land, then throw.</summary>
+        public Func<string, bool>? FailAfterWriteAllBytes { get; set; }
+
         public bool BytesReachedStorage { get; private set; }
+
+        public List<string> Deleted { get; } = [];
 
         public PathNameConstraints PathConstraints => inner.PathConstraints;
 
@@ -134,8 +171,11 @@ public class CheckpointPartialWriteTests : IDisposable
             return FailMidStream?.Invoke(path) == true ? new FailingFile(this, file, path) : file;
         }
 
-        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default) =>
-            inner.DeleteAsync(path, cancellationToken);
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
+        {
+            Deleted.Add(path);
+            return inner.DeleteAsync(path, cancellationToken);
+        }
 
         public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default) =>
             inner.ExistsAsync(path, cancellationToken);
@@ -148,9 +188,16 @@ public class CheckpointPartialWriteTests : IDisposable
             string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
             inner.TryWriteAllBytesAsync(path, data, cancellationToken);
 
-        public ValueTask WriteAllBytesAsync(
-            string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
-            inner.WriteAllBytesAsync(path, data, cancellationToken);
+        public async ValueTask WriteAllBytesAsync(
+            string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+        {
+            await inner.WriteAllBytesAsync(path, data, cancellationToken);
+            if (FailAfterWriteAllBytes?.Invoke(path) == true)
+            {
+                BytesReachedStorage = true;
+                throw new IOException($"write failed after its bytes landed (injected): {path}");
+            }
+        }
 
         private sealed class FailingFile(FailMidStreamFileSystem owner, ISequentialFile inner, string path)
             : ISequentialFile

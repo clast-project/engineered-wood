@@ -122,14 +122,20 @@ public sealed class CheckpointWriter
     /// older checkpoint, and then the table cannot be opened. Deleted only after the dispose, which is what
     /// publishes it.</para>
     ///
-    /// <para>Only a file this call created is deleted: if <c>CreateAsync</c> itself fails, whatever was
-    /// already at the path is not ours. The delete is best-effort and the original exception is what
-    /// propagates. Cancellation takes the same path, since a cancelled write is just as truncated.</para>
+    /// <para>Only a file this call created is deleted. If <c>CreateAsync</c> itself fails, nothing here is
+    /// ours. If <paramref name="overwrite"/> replaces a file that already existed (a classic checkpoint is
+    /// rewritten at its fixed name when the same version is checkpointed again), nothing is deleted
+    /// either: an object store keeps the old object until the new upload completes, so deleting would
+    /// remove a good checkpoint that the hint may still name and that cleanup may already rely on. The
+    /// local backend truncates on create, so there the old file is already lost; deleting would not bring
+    /// it back. The delete is best-effort and the original exception is what propagates. Cancellation takes
+    /// the same path, since a cancelled write is just as truncated.</para>
     /// </remarks>
     internal static async ValueTask<long> WriteFileOrDeleteAsync(
         ITableFileSystem fs, string path, bool overwrite,
         Func<ISequentialFile, ValueTask> write, CancellationToken cancellationToken)
     {
+        bool replacing = overwrite && await fs.ExistsAsync(path, cancellationToken).ConfigureAwait(false);
         var file = await fs.CreateAsync(path, overwrite, cancellationToken).ConfigureAwait(false);
         long length;
         try
@@ -142,17 +148,26 @@ public sealed class CheckpointWriter
         }
         catch
         {
-            try
-            {
-                await fs.DeleteAsync(path, CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (Exception)
-            {
-                // The write's own failure is the one worth reporting.
-            }
+            if (!replacing)
+                await DeleteQuietlyAsync(fs, path).ConfigureAwait(false);
             throw;
         }
         return length;
+    }
+
+    /// <summary>
+    /// Deletes a file a failed write may have left behind, ignoring any failure to: the write's own
+    /// exception is the one worth reporting.
+    /// </summary>
+    internal static async ValueTask DeleteQuietlyAsync(ITableFileSystem fs, string path)
+    {
+        try
+        {
+            await fs.DeleteAsync(path, CancellationToken.None).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+        }
     }
 
     /// <summary>
