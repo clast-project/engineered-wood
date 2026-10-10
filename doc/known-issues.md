@@ -529,19 +529,31 @@ what the spec calls it, and kernel accepts either but rejects a file
 carrying both — so adding EW's is a compatibility question rather than a
 fill-in-a-field one.
 
-**Version checksums are validated against, never served from.**
-`VersionChecksumValidator` compares a reconstructed snapshot against the
-`.crc` beside its version and reports the fields that disagree, naming
-both values and which side each came from. Nothing READS a checksum to
-shortcut work: a snapshot is still built by replaying the log, and the
-counts, the metadata / protocol and the live `txn` / `domainMetadata` sets
-are recomputed rather than taken from the file. That asymmetry is
-deliberate — nothing signs a checksum and nothing cross-checks it, so
-using one as a second opinion costs a report when it is wrong, while
-using one as an answer costs a wrong answer. Validation is opt-in and off
-by default; a disagreement is returned, not thrown, because throwing,
-falling back to the log and reporting-without-failing all suit different
-callers.
+**Version checksums are validated against, and served from only on
+opt-in.** `VersionChecksumValidator` compares a reconstructed snapshot
+against the `.crc` beside its version and reports the fields that
+disagree, naming both values and which side each came from. By default
+nothing READS a checksum to shortcut work: a snapshot is still built by
+replaying the log, and the counts, the metadata / protocol and the live
+`txn` / `domainMetadata` sets are recomputed rather than taken from the
+file. That asymmetry is deliberate — nothing signs a checksum and nothing
+cross-checks it, so using one as a second opinion costs a report when it
+is wrong, while using one as an answer costs a wrong answer. Validation
+is opt-in and off by default; a disagreement is returned, not thrown,
+because throwing, falling back to the log and reporting-without-failing
+all suit different callers.
+
+The one shortcut is
+`DeltaTableOptions.ChangeFeedSchemaFromVersionChecksum` (default false):
+a change feed under column mapping whose range ends before the latest
+version takes that end version's schema from its checksum instead of
+building a whole snapshot there. It is the only consumer that today pays
+for a full reconstruction to read one field — the write-protocol gate,
+`GetDomainMetadata()` and the app-transaction check all read a snapshot
+the open has already built, so a checksum would save them nothing. Only a
+checksum AT the end version is used, and an absent or unusable one falls
+back to the replay. A wrong one is the hazard: it can rename or drop
+columns in the feed.
 
 **Full `_last_checkpoint` parsing.** `CheckpointReader` reads only
 `v2Checkpoint.path`; other fields (`sizeInBytes`, `numOfAddFiles`,

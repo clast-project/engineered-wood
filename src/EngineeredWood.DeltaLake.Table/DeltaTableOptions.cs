@@ -104,6 +104,32 @@ public sealed record DeltaTableOptions
     public bool WriteVersionChecksums { get; init; } = true;
 
     /// <summary>
+    /// Whether a change-feed read may take its schema from the <c>_delta_log/&lt;version&gt;.crc</c>
+    /// version checksum at its end version instead of reconstructing that version. Default: false.
+    /// </summary>
+    /// <remarks>
+    /// <para>Under column mapping, <see cref="DeltaTable.ReadChangesAsync"/> reconciles every batch to the
+    /// schema AT the range's end version, not the latest one. When that version is older than the table,
+    /// finding its schema means building a whole snapshot there — a checkpoint read and a commit replay,
+    /// active file set included — for one <c>metaData</c> action. A checksum records that action, so with
+    /// this set the read costs one small JSON request instead. A checksum that is missing, unreadable, or
+    /// whose schema cannot be parsed falls back to the reconstruction, so turning this on never makes a
+    /// read fail that would otherwise succeed. Nothing else is read from the checksum.</para>
+    ///
+    /// <para><b>Off by default because nothing verifies a checksum.</b> It is a second copy of the state
+    /// written by whichever engine made that commit, and trusting it inherits whatever that engine got
+    /// wrong. Here the consequence is concrete: the end version's schema names the feed's columns and
+    /// decides which physical columns are stale, so a checksum whose metadata disagrees with the log can
+    /// rename or silently drop columns in the feed. Turn it on where the log is written only by engines
+    /// whose checksums you trust — <see cref="Log.VersionChecksumValidator"/> will compare one against a
+    /// reconstruction if you want to establish that first.</para>
+    ///
+    /// <para>No effect on a table without column mapping, or on a range ending at the latest version: both
+    /// already take the schema from the snapshot in hand.</para>
+    /// </remarks>
+    public bool ChangeFeedSchemaFromVersionChecksum { get; init; }
+
+    /// <summary>
     /// Default retention period for vacuum operations. Default: 7 days.
     /// </summary>
     public TimeSpan VacuumRetention { get; init; } = TimeSpan.FromDays(7);

@@ -4591,6 +4591,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// is off now. Mapping is only turned off by rewriting every file, and telling that case apart would take
     /// two more snapshot builds on every read of an unmapped table, so it is decided by the latest snapshot
     /// alone.</para>
+    ///
+    /// <para>Only the result's metadata and schemas are read — <see cref="ChangeDataFeed.CdfReader"/> uses it
+    /// for nothing else — which is what lets <see cref="DeltaTableOptions.ChangeFeedSchemaFromVersionChecksum"/>
+    /// answer from a version checksum instead of a replay.</para>
     /// </summary>
     private async ValueTask<Snapshot.Snapshot> GetChangeFeedSchemaSnapshotAsync(
         Snapshot.Snapshot latest, long endVersion, CancellationToken cancellationToken)
@@ -4600,8 +4604,49 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             return latest;
         }
+
+        if (_options.ChangeFeedSchemaFromVersionChecksum
+            && await TryReadSchemaSnapshotFromChecksumAsync(endVersion, cancellationToken).ConfigureAwait(false)
+                is { } fromChecksum)
+        {
+            return fromChecksum;
+        }
+
         return await SnapshotBuilder.BuildAsync(_log, _checkpointReader, atVersion: endVersion, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The metadata and protocol recorded in the checksum at exactly <paramref name="version"/>, as a snapshot
+    /// with NO files — so it must never reach anything that reads <see cref="Snapshot.Snapshot.ActiveFiles"/>,
+    /// the app transactions or the domain metadata, all of which it reports as empty. Its one caller reads the
+    /// schema and nothing else.
+    ///
+    /// <para>Null whenever the checksum cannot answer — absent, unreadable, or carrying a schema that does not
+    /// parse — so the caller falls back to the replay rather than failing a read the log can serve. Only a
+    /// checksum AT the version is used: a stale one names an older schema, and moving it forward would need
+    /// the very commits this is avoiding.</para>
+    /// </summary>
+    private async ValueTask<Snapshot.Snapshot?> TryReadSchemaSnapshotFromChecksumAsync(
+        long version, CancellationToken cancellationToken)
+    {
+        var checksum = await new VersionChecksumWriter(_fs).TryReadAsync(version, cancellationToken)
+            .ConfigureAwait(false);
+        if (checksum is null)
+            return null;
+
+        var builder = new SnapshotBuilder();
+        builder.ApplyCommit(version, [checksum.Protocol, checksum.Metadata]);
+        try
+        {
+            return builder.Build();
+        }
+        catch (Exception)
+        {
+            // Build parses the schema string and converts it to Arrow; a checksum whose schema does neither
+            // is one more way for it to be unusable, not a reason to fail the read.
+            return null;
+        }
     }
 
     /// <summary>Drops the columns not in <paramref name="keep"/>, preserving order. A post-read projection:
