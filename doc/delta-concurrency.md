@@ -178,7 +178,11 @@ its own data plane can commit with real optimistic concurrency without taking th
   is Delta's snapshot-isolation downgrade for commits that change no data.
 - `Log/LogCommitter.cs` — the loop itself. Protocol gate, attempt, read `readVersion+1..latest` on a
   collision, rebase hook, conflict verdict, retry, post-commit snapshot refresh, checkpoint on
-  interval. It never inspects the actions beyond handing them to the log.
+  interval. It never inspects the actions beyond handing them to the log. Once the commit file lands,
+  only the refresh can still throw: the version checksum, the interval checkpoint and log cleanup are
+  maintenance, and their failures go to `OnPostCommitMaintenanceFailure` instead (#226; delta-spark
+  runs its post-commit hooks the same way). `DeltaTable.AfterCommitAsync` applies the same rule on the
+  overwrite route; an explicit `CheckpointAsync` still throws.
 - `Log/ICommitRebaseHandler.cs` — the seam for actions whose CONTENT is coupled to the version they
   land at. `RecomputeRebaseHandler` covers the common shape (re-derive from the newest snapshot); the
   table layer's `DeltaTable.OccRebaseHandler` implements the two hard ones, DV union/remap and

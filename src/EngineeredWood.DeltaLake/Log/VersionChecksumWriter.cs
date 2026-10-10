@@ -72,7 +72,16 @@ public sealed class VersionChecksumWriter
     /// there or the snapshot cannot describe it.
     /// </summary>
     public ValueTask<VersionChecksumWriteResult> TryWriteAsync(
-        Snapshot.Snapshot snapshot, CancellationToken cancellationToken = default)
+        Snapshot.Snapshot snapshot, CancellationToken cancellationToken = default) =>
+        TryWriteAsync(snapshot, onFailure: null, cancellationToken);
+
+    /// <summary>
+    /// <see cref="TryWriteAsync(Snapshot.Snapshot, CancellationToken)"/>, also handing the exception behind a
+    /// <see cref="VersionChecksumWriteResult.Failed"/> to <paramref name="onFailure"/>, which the result alone
+    /// cannot carry. For the commit paths, which report it as post-commit maintenance.
+    /// </summary>
+    internal ValueTask<VersionChecksumWriteResult> TryWriteAsync(
+        Snapshot.Snapshot snapshot, Action<Exception>? onFailure, CancellationToken cancellationToken)
     {
         if (snapshot is null)
             throw new ArgumentNullException(nameof(snapshot));
@@ -80,19 +89,24 @@ public sealed class VersionChecksumWriter
         var checksum = VersionChecksum.TryFromSnapshot(snapshot);
         return checksum is null
             ? new ValueTask<VersionChecksumWriteResult>(VersionChecksumWriteResult.NotDescribable)
-            : TryWriteAsync(checksum, cancellationToken);
+            : TryWriteCoreAsync(checksum, onFailure, cancellationToken);
     }
 
     /// <summary>
     /// Writes an already-built checksum at the version it names. For a caller that assembled one itself;
     /// the snapshot overload is what the commit paths use.
     /// </summary>
-    public async ValueTask<VersionChecksumWriteResult> TryWriteAsync(
+    public ValueTask<VersionChecksumWriteResult> TryWriteAsync(
         VersionChecksum checksum, CancellationToken cancellationToken = default)
     {
         if (checksum is null)
             throw new ArgumentNullException(nameof(checksum));
+        return TryWriteCoreAsync(checksum, onFailure: null, cancellationToken);
+    }
 
+    private async ValueTask<VersionChecksumWriteResult> TryWriteCoreAsync(
+        VersionChecksum checksum, Action<Exception>? onFailure, CancellationToken cancellationToken)
+    {
         try
         {
             byte[] json = VersionChecksumSerializer.Serialize(checksum);
@@ -104,8 +118,9 @@ public sealed class VersionChecksumWriter
                 ? VersionChecksumWriteResult.Written
                 : VersionChecksumWriteResult.AlreadyExists;
         }
-        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
         {
+            onFailure?.Invoke(ex);
             return VersionChecksumWriteResult.Failed;
         }
     }
@@ -115,9 +130,10 @@ public sealed class VersionChecksumWriter
     /// parsed.
     /// </summary>
     /// <remarks>
-    /// Nothing in this library READS a checksum to shortcut work yet — a snapshot is still built by
-    /// replaying the log — so this exists for callers that want to validate a version against a recorded
-    /// summary, and for the tests that prove what is written round-trips. An unparseable checksum reads
+    /// A snapshot is still built by replaying the log; the one shortcut that reads a checksum is the opt-in
+    /// change-feed schema lookup (<c>DeltaTableOptions.ChangeFeedSchemaFromVersionChecksum</c>). Otherwise
+    /// this exists for callers that want to validate a version against a recorded summary, and for the
+    /// tests that prove what is written round-trips. An unparseable checksum reads
     /// as an absent one for the same reason the spec makes the file optional: every version without one
     /// already works.
     /// </remarks>

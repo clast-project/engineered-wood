@@ -130,6 +130,28 @@ public sealed record DeltaTableOptions
     public bool ChangeFeedSchemaFromVersionChecksum { get; init; }
 
     /// <summary>
+    /// Called with each maintenance failure this table swallows: a version checksum, an interval checkpoint,
+    /// or a log-cleanup step. Default: null, and the failures are dropped.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>None of these fails a write.</b> Each runs after its commit is durable, is not needed for the
+    /// table to be correct, and is done again by a later commit — so, as in delta-spark, a failure costs a
+    /// report and not the caller's write. A listener is how you get the report.</para>
+    ///
+    /// <para><b>The case worth catching</b> is a checkpoint that fails on every interval. Log cleanup only
+    /// deletes what a checkpoint covers, so that table stops reclaiming its log, and every open replays a
+    /// longer tail, with nothing else to say so. See <see cref="Log.PostCommitMaintenanceFailure"/>.</para>
+    ///
+    /// <para>What still throws: an explicit <see cref="DeltaTable.CheckpointAsync"/> (its cleanup reports
+    /// here), the post-commit snapshot refresh, and cancellation. To keep checkpointing off the commit path
+    /// altogether, set <see cref="CheckpointInterval"/> to 0.</para>
+    ///
+    /// <para>Runs inline on the committing call, so keep it quick: log, count, or queue. Anything it throws
+    /// is ignored.</para>
+    /// </remarks>
+    public Action<Log.PostCommitMaintenanceFailure>? OnPostCommitMaintenanceFailure { get; init; }
+
+    /// <summary>
     /// Default retention period for vacuum operations. Default: 7 days.
     /// </summary>
     public TimeSpan VacuumRetention { get; init; } = TimeSpan.FromDays(7);
