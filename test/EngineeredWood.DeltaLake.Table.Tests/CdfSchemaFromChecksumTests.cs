@@ -133,10 +133,12 @@ public class CdfSchemaFromChecksumTests : IDisposable
     [InlineData("missing")]
     [InlineData("garbage")]
     [InlineData("unparseable-schema")]
+    [InlineData("unknown-mapping-mode")]
     public async Task OptedIn_AnUnusableChecksumFallsBackToTheReplay(string damage)
     {
         long v1 = await BuildHistoryAsync(ColumnMappingMode.Name);
         string path = ChecksumFile(v1);
+        VersionChecksum checksum;
         switch (damage)
         {
             case "missing":
@@ -146,9 +148,17 @@ public class CdfSchemaFromChecksumTests : IDisposable
                 File.WriteAllText(path, "{ not json");
                 break;
             case "unparseable-schema":
-                var checksum = VersionChecksumSerializer.Deserialize(File.ReadAllBytes(path), v1);
+                checksum = VersionChecksumSerializer.Deserialize(File.ReadAllBytes(path), v1);
                 File.WriteAllBytes(path, VersionChecksumSerializer.Serialize(
                     checksum with { Metadata = checksum.Metadata with { SchemaString = "{\"type\":" } }));
+                break;
+            case "unknown-mapping-mode":
+                // Schema and protocol intact, so the snapshot builds; only the reader would trip on this.
+                checksum = VersionChecksumSerializer.Deserialize(File.ReadAllBytes(path), v1);
+                var configuration = checksum.Metadata.Configuration!.ToDictionary(kv => kv.Key, kv => kv.Value);
+                configuration[ColumnMapping.ModeKey] = "bogus";
+                File.WriteAllBytes(path, VersionChecksumSerializer.Serialize(
+                    checksum with { Metadata = checksum.Metadata with { Configuration = configuration } }));
                 break;
         }
 

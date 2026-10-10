@@ -4639,12 +4639,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         builder.ApplyCommit(version, [checksum.Protocol, checksum.Metadata]);
         try
         {
-            return builder.Build();
+            var snapshot = builder.Build();
+
+            // Build never looks at the mapping mode, but CdfReader's first act is to parse it, and an unknown
+            // one throws there — past the point where falling back is still possible. Ask it here instead.
+            ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+            return snapshot;
         }
         catch (Exception)
         {
-            // Build parses the schema string and converts it to Arrow; a checksum whose schema does neither
-            // is one more way for it to be unusable, not a reason to fail the read.
+            // Build parses the schema string and converts it to Arrow; a checksum whose schema or mapping mode
+            // does not parse is one more way for it to be unusable, not a reason to fail the read.
             return null;
         }
     }
