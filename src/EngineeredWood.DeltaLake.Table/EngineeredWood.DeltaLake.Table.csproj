@@ -26,6 +26,8 @@
 
   <ItemGroup>
     <PackageReference Include="Apache.Arrow" Version="23.0.0" />
+    <!-- Int128 for the decimal widenings in ValueWidener; on netstandard2.0 this package's polyfill is the type. -->
+    <PackageReference Include="Clast.DatabaseDecimal" Version="0.3.0" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">

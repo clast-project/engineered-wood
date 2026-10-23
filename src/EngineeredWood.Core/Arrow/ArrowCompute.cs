@@ -819,7 +819,7 @@ public static class ArrowCompute
     /// bit — silently, and only for sliced arrays. The bitmap is re-derived instead. The same path handles a
     /// declared-but-unknown null count, which has to be counted rather than trusted.</para>
     /// </summary>
-    private static (ArrowBuffer Validity, int NullCount) AlignedValidity(IArrowArray source)
+    internal static (ArrowBuffer Validity, int NullCount) AlignedValidity(IArrowArray source)
     {
         int declared = source.NullCount;
 
@@ -1040,7 +1040,7 @@ public static class ArrowCompute
     /// <para>Below the runtime's threshold (a couple of KiB) this hands back a zeroed array anyway, so a
     /// short buffer neither gains nor loses. Never rely on that: it is an allocator detail, not a guarantee.</para>
     /// </summary>
-    private static T[] Uninitialized<T>(int count) =>
+    internal static T[] Uninitialized<T>(int count) =>
 #if NET6_0_OR_GREATER
         GC.AllocateUninitializedArray<T>(count);
 #else

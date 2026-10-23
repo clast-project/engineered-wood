@@ -2,7 +2,8 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers.Binary;
-using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Arrow;
@@ -116,10 +117,10 @@ internal static class ValueWidener
             (Decimal128Array a, Decimal128Type dt) => WidenDecimal128(a, dt),
 
             // Integer → Decimal widening
-            (Int8Array a, Decimal128Type dt) => WidenIntToDecimal(a, dt, v => (long)v),
-            (Int16Array a, Decimal128Type dt) => WidenIntToDecimal(a, dt, v => (long)v),
-            (Int32Array a, Decimal128Type dt) => WidenIntToDecimal(a, dt, v => (long)v),
-            (Int64Array a, Decimal128Type dt) => WidenLongToDecimal(a, dt),
+            (Int8Array, Decimal128Type dt) => WidenIntegerToDecimal<sbyte>(source, dt),
+            (Int16Array, Decimal128Type dt) => WidenIntegerToDecimal<short>(source, dt),
+            (Int32Array, Decimal128Type dt) => WidenIntegerToDecimal<int>(source, dt),
+            (Int64Array, Decimal128Type dt) => WidenIntegerToDecimal<long>(source, dt),
 
             // A field widened INSIDE a struct, list element or map key/value (PROTOCOL.md records those on the
             // struct child, or with fieldPath element/key/value). Without these arms an old file's nested
@@ -226,6 +227,8 @@ internal static class ValueWidener
 
     #region Decimal Widening
 
+    private const int Decimal128Width = 16;
+
     private static Decimal128Array WidenDecimal128(Decimal128Array source, Decimal128Type targetType)
     {
         var sourceType = (Decimal128Type)source.Data.DataType;
@@ -242,39 +245,32 @@ internal static class ValueWidener
             return RetagDecimal128(source, targetType);
         }
 
-        // Scale increased: multiply each value by 10^scaleDelta
-        // Decimal128 values are stored as 16-byte little-endian two's complement
-        var multiplier = BigInteger.Pow(10, scaleDelta);
-
-        int byteWidth = 16;
-        var resultBytes = new byte[source.Length * byteWidth];
-        var nullBitmap = new ArrowBuffer.BitmapBuilder();
-
-        for (int i = 0; i < source.Length; i++)
+        if (scaleDelta < 0)
         {
-            if (source.IsNull(i))
-            {
-                nullBitmap.Append(false);
-                // Leave bytes as zero
-            }
-            else
-            {
-                nullBitmap.Append(true);
-                var valueBytes = source.GetBytes(i);
-                var value = ReadInt128LE(valueBytes);
-                var scaled = value * multiplier;
-                WriteInt128LE(scaled, resultBytes.AsSpan(i * byteWidth, byteWidth));
-            }
+            throw new NotSupportedException(
+                $"Cannot widen {sourceType} to {targetType}: lowering the scale is not a widening.");
         }
 
-        var valueBuffer = new ArrowBuffer(resultBytes);
-        var nullBuffer = nullBitmap.Build();
+        // Scale increased: multiply each value by 10^scaleDelta, in Int128 rather than BigInteger — a
+        // BigInteger per row (plus ToByteArray's allocation on netstandard2.0) cost an order of magnitude more.
+        //
+        // Unchecked is safe for a legal widening: a value of precision p is below 10^p, so the product is
+        // below 10^(p + scaleDelta) <= 10^p' <= 10^38 < 2^127. The slots under nulls hold arbitrary bytes and
+        // may well wrap, which is harmless (validity masks them) — and is why the multiply can't be checked.
+        var multiplier = PowerOfTen(scaleDelta);
 
-        var data = new ArrayData(targetType, source.Length,
-            source.NullCount, 0,
-            [nullBuffer, valueBuffer]);
+        int length = source.Length;
+        ReadOnlySpan<byte> src = source.Data.Buffers[1].Span
+            .Slice(source.Data.Offset * Decimal128Width, length * Decimal128Width);
 
-        return new Decimal128Array(data);
+        // Every slot is written below, nulls included, so the buffer needs no zero-fill first.
+        var values = ArrowCompute.Uninitialized<byte>(length * Decimal128Width);
+        Span<byte> dst = values.AsSpan();
+
+        for (int i = 0, o = 0; i < length; i++, o += Decimal128Width)
+            WriteInt128LE(dst.Slice(o, Decimal128Width), ReadInt128LE(src.Slice(o, Decimal128Width)) * multiplier);
+
+        return BuildDecimal128(source, targetType, values);
     }
 
     /// <summary>
@@ -289,94 +285,67 @@ internal static class ValueWidener
     }
 
     /// <summary>
-    /// Widens an integer array to Decimal128.
+    /// Widens an integer array to Decimal128: each value times 10^scale. As with the decimal rescale, a legal
+    /// target has room for the source's whole range at that scale, so the multiply cannot overflow on a valid
+    /// slot, and every slot (nulls included) is written.
     /// </summary>
-    private static Decimal128Array WidenIntToDecimal<T>(
-        PrimitiveArray<T> source, Decimal128Type targetType, Func<T, long> toLong)
-        where T : struct, IEquatable<T>
+    private static Decimal128Array WidenIntegerToDecimal<T>(IArrowArray source, Decimal128Type targetType)
+        where T : struct
     {
-        var scaleFactor = BigInteger.Pow(10, targetType.Scale);
-        int byteWidth = 16;
-        var resultBytes = new byte[source.Length * byteWidth];
-        var nullBitmap = new ArrowBuffer.BitmapBuilder();
+        var multiplier = PowerOfTen(targetType.Scale);
 
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i))
-            {
-                nullBitmap.Append(false);
-            }
-            else
-            {
-                nullBitmap.Append(true);
-                long intVal = toLong(source.GetValue(i)!.Value);
-                var scaled = new BigInteger(intVal) * scaleFactor;
-                WriteInt128LE(scaled, resultBytes.AsSpan(i * byteWidth, byteWidth));
-            }
-        }
+        int length = source.Length;
+        ReadOnlySpan<T> src = MemoryMarshal
+            .Cast<byte, T>(source.Data.Buffers[1].Span)
+            .Slice(source.Data.Offset, length);
 
-        var data = new ArrayData(targetType, source.Length,
-            source.NullCount, 0,
-            [nullBitmap.Build(), new ArrowBuffer(resultBytes)]);
-        return new Decimal128Array(data);
+        var values = ArrowCompute.Uninitialized<byte>(length * Decimal128Width);
+        Span<byte> dst = values.AsSpan();
+
+        for (int i = 0, o = 0; i < length; i++, o += Decimal128Width)
+            WriteInt128LE(dst.Slice(o, Decimal128Width), (Int128)ToInt64(src[i]) * multiplier);
+
+        return BuildDecimal128(source, targetType, values);
     }
 
-    private static Decimal128Array WidenLongToDecimal(Int64Array source, Decimal128Type targetType)
+    // The typeof tests are JIT-time constants for a value-type T, so each instantiation keeps only its own arm.
+    private static long ToInt64<T>(T value) where T : struct
     {
-        var scaleFactor = BigInteger.Pow(10, targetType.Scale);
-        int byteWidth = 16;
-        var resultBytes = new byte[source.Length * byteWidth];
-        var nullBitmap = new ArrowBuffer.BitmapBuilder();
-
-        for (int i = 0; i < source.Length; i++)
-        {
-            if (source.IsNull(i))
-            {
-                nullBitmap.Append(false);
-            }
-            else
-            {
-                nullBitmap.Append(true);
-                var scaled = new BigInteger(source.GetValue(i)!.Value) * scaleFactor;
-                WriteInt128LE(scaled, resultBytes.AsSpan(i * byteWidth, byteWidth));
-            }
-        }
-
-        var data = new ArrayData(targetType, source.Length,
-            source.NullCount, 0,
-            [nullBitmap.Build(), new ArrowBuffer(resultBytes)]);
-        return new Decimal128Array(data);
+        if (typeof(T) == typeof(sbyte)) return Unsafe.As<T, sbyte>(ref value);
+        if (typeof(T) == typeof(short)) return Unsafe.As<T, short>(ref value);
+        if (typeof(T) == typeof(int)) return Unsafe.As<T, int>(ref value);
+        if (typeof(T) == typeof(long)) return Unsafe.As<T, long>(ref value);
+        throw new NotSupportedException($"Cannot widen {typeof(T)} to a decimal.");
     }
 
-    /// <summary>
-    /// Reads a 128-bit signed integer from a 16-byte little-endian buffer.
-    /// </summary>
-    private static BigInteger ReadInt128LE(ReadOnlySpan<byte> bytes)
+    private static Decimal128Array BuildDecimal128(IArrowArray source, Decimal128Type targetType, byte[] values)
     {
-        // BigInteger constructor expects little-endian, unsigned=false (signed)
-#if NET6_0_OR_GREATER
-        return new BigInteger(bytes, isUnsigned: false, isBigEndian: false);
-#else
-        var arr = bytes.ToArray();
-        return new BigInteger(arr);
-#endif
+        // Widening never changes which rows are null, so the source bitmap is shared when it can be.
+        var (validity, nullCount) = ArrowCompute.AlignedValidity(source);
+        return new Decimal128Array(new ArrayData(
+            targetType, source.Length, nullCount, offset: 0,
+            [validity, new ArrowBuffer(values)]));
     }
 
-    /// <summary>
-    /// Writes a BigInteger as a 128-bit little-endian two's complement value.
-    /// </summary>
-    private static void WriteInt128LE(BigInteger value, Span<byte> dest)
+    private static Int128 PowerOfTen(int exponent)
     {
-        // Fill with sign extension byte first
-        byte fill = value < 0 ? (byte)0xFF : (byte)0x00;
-        dest.Fill(fill);
+        Int128 result = Int128.One;
+        for (int i = 0; i < exponent; i++)
+            result *= 10;
+        return result;
+    }
 
-#if NET6_0_OR_GREATER
-        value.TryWriteBytes(dest, out _, isUnsigned: false, isBigEndian: false);
-#else
-        var bytes = value.ToByteArray(); // Little-endian, signed, minimal representation
-        bytes.AsSpan(0, Math.Min(bytes.Length, dest.Length)).CopyTo(dest);
-#endif
+    // Decimal128 values are 16-byte little-endian two's complement: the low 64 bits first. Composed from two
+    // 64-bit halves rather than reinterpreting the bytes, since the netstandard2.0 polyfill's field layout
+    // is not part of its contract.
+    private static Int128 ReadInt128LE(ReadOnlySpan<byte> bytes) =>
+        new(BinaryPrimitives.ReadUInt64LittleEndian(bytes.Slice(8)),
+            BinaryPrimitives.ReadUInt64LittleEndian(bytes));
+
+    private static void WriteInt128LE(Span<byte> dest, Int128 value)
+    {
+        BinaryPrimitives.WriteUInt64LittleEndian(dest, (ulong)value);
+        BinaryPrimitives.WriteUInt64LittleEndian(dest.Slice(8), (ulong)(value >> 64));
     }
 
     #endregion
