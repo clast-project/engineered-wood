@@ -41,6 +41,12 @@ if (args.Length > 0 && args[0] == "rowcap-ab")
     return;
 }
 
+if (args.Length > 0 && args[0] == "selection-ab")
+{
+    Environment.ExitCode = await SelectionPushdownAb.RunAsync(args);
+    return;
+}
+
 if (args.Length > 0 && args[0] == "dictpruning-ab")
 {
     Environment.ExitCode = await DictionaryPruningAb.RunAsync(args);

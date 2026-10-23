@@ -1201,6 +1201,35 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         return AssembleRecordBatch(ctx, results);
     }
 
+    /// <summary>
+    /// EXPERIMENT (perf/selection-pushdown-ab): one row group's column chunks, copied out, with what
+    /// <see cref="ColumnChunkReader.ReadColumn"/> needs to decode each.
+    /// </summary>
+    internal async ValueTask<RawRowGroup> ReadRawRowGroupAsync(int rowGroupIndex, CancellationToken cancellationToken = default)
+    {
+        var ctx = await PrepareRowGroupAsync(rowGroupIndex, null, cancellationToken).ConfigureAwait(false);
+        var buffers = await _file.ReadRangesAsync(ctx.Ranges, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var chunks = new byte[ctx.Count][];
+            for (int i = 0; i < ctx.Count; i++)
+                chunks[i] = buffers[i].Memory.ToArray();
+            return new RawRowGroup(chunks, ctx.Columns, ctx.Chunks, ctx.LeafArrowFields, ctx.RowCount);
+        }
+        finally
+        {
+            for (int i = 0; i < buffers.Count; i++)
+                buffers[i].Dispose();
+        }
+    }
+
+    internal sealed record RawRowGroup(
+        byte[][] Chunks,
+        IReadOnlyList<ColumnDescriptor> Columns,
+        IReadOnlyList<ColumnChunk> Meta,
+        Field[] Fields,
+        int RowCount);
+
     private async ValueTask<RowGroupContext> PrepareRowGroupAsync(
         int rowGroupIndex,
         IReadOnlyList<string>? columnNames,

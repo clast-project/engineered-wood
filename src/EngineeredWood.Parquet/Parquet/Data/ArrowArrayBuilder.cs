@@ -1234,6 +1234,165 @@ internal sealed class ColumnBuildState : IDisposable
         }
     }
 
+    // EXPERIMENT (perf/selection-pushdown-ab): a row selection applied page by page as the chunk decodes.
+    private RowSelection? _selection;
+    private int _selectionRowCursor;
+    private byte[]? _pageMaskBuffer;
+    private byte[]? _pageMaskArray;
+    private int _pageMaskOffset;
+    private int _pageMaskLength;
+
+    internal bool SkipInDecoder { get; private set; }
+
+    internal void SetSelection(RowSelection selection, bool skipInDecoder)
+    {
+        _selection = selection;
+        SkipInDecoder = skipInDecoder;
+    }
+
+    /// <summary>
+    /// The page's value mask (one byte per non-null value, 1 = keep) while a page with dropped values is
+    /// decoding; empty otherwise.
+    /// </summary>
+    internal ReadOnlySpan<byte> PageValueMask =>
+        _pageMaskArray is null ? default : _pageMaskArray.AsSpan(_pageMaskOffset, _pageMaskLength);
+
+    internal int PageKeptValues { get; private set; }
+
+    internal bool HasPageMask => _pageMaskArray is not null;
+
+    /// <summary>
+    /// Applies the selection to the page whose <paramref name="numValues"/> levels were just reserved:
+    /// drops the deselected rows' definition levels and, when any of the page's
+    /// <paramref name="nonNullCount"/> values are dropped, sets <see cref="PageValueMask"/> for them.
+    /// </summary>
+    internal void ApplySelectionToPage(int numValues, int nonNullCount)
+    {
+        if (_selection is null)
+            return;
+
+        var keep = _selection.KeepArray;
+        int rowStart = _selectionRowCursor;
+        _selectionRowCursor += numValues;
+
+        int kept = 0;
+        if (MaxDefLevel == 0)
+        {
+            for (int i = 0; i < numValues; i++)
+                kept += keep[rowStart + i];
+            if (kept < numValues)
+            {
+                _pageMaskArray = keep;
+                _pageMaskOffset = rowStart;
+                _pageMaskLength = numValues;
+            }
+            PageKeptValues = kept;
+            return;
+        }
+
+        var defs = _defLevels.AsSpan(_defLevelCount - numValues, numValues);
+        _pageMaskBuffer ??= ArrayPool<byte>.Shared.Rent(_capacity);
+        var mask = _pageMaskBuffer;
+        byte max = (byte)MaxDefLevel;
+        int write = 0, value = 0;
+        for (int r = 0; r < numValues; r++)
+        {
+            // Branch-free: nulls and dropped rows are interleaved at random.
+            byte d = defs[r];
+            int k = keep[rowStart + r];
+            int isValue = d == max ? 1 : 0;
+            mask[value] = (byte)k;
+            value += isValue;
+            kept += k & isValue;
+            defs[write] = d;
+            write += k;
+        }
+        _defLevelCount -= numValues - write;
+
+        if (kept < nonNullCount)
+        {
+            _pageMaskArray = mask;
+            _pageMaskOffset = 0;
+            _pageMaskLength = nonNullCount;
+        }
+        PageKeptValues = kept;
+    }
+
+    /// <summary>Gives back the last <paramref name="count"/> values reserved with <see cref="ReserveValues{T}"/>.</summary>
+    internal void ReleaseValues<T>(int count) where T : unmanaged
+    {
+        _valueByteOffset -= count * Unsafe.SizeOf<T>();
+        _valueCount -= count;
+    }
+
+    internal void ClearPageMask()
+    {
+        _pageMaskArray = null;
+        _pageMaskLength = 0;
+    }
+
+    /// <summary>
+    /// Compacts the <paramref name="count"/> values the last page decoded down to the ones
+    /// <see cref="PageValueMask"/> keeps, in place.
+    /// </summary>
+    internal void CompactPageValues(int count)
+    {
+        var mask = PageValueMask;
+        int kept = PageKeptValues;
+
+        if (_physicalType == PhysicalType.ByteArray && _byteArrayOutput == ByteArrayOutputKind.Default)
+        {
+            var offsets = _offsetsBuffer!.Span;
+            var data = _dataBuffer!.ByteSpan;
+            int first = _offsetsCount - count;
+            int writeData = offsets[first - 1];
+            int writeOffset = first;
+            int prevEnd = writeData;
+            for (int i = 0; i < count; i++)
+            {
+                int start = prevEnd;
+                int end = offsets[first + i];
+                prevEnd = end;
+                if (mask[i] != 0)
+                {
+                    int len = end - start;
+                    if (writeData != start)
+                        data.Slice(start, len).CopyTo(data.Slice(writeData));
+                    writeData += len;
+                    offsets[writeOffset++] = writeData;
+                }
+            }
+            _offsetsCount = writeOffset;
+            _dataByteOffset = writeData;
+            _valueCount -= count - kept;
+            return;
+        }
+
+        switch (_elementSize)
+        {
+            case 4: CompactFixed<int>(count, mask); break;
+            case 8: CompactFixed<long>(count, mask); break;
+            default:
+                throw new NotSupportedException(
+                    $"Selection compaction is not prototyped for {_physicalType} / {_byteArrayOutput}.");
+        }
+        _valueCount -= count - kept;
+    }
+
+    private void CompactFixed<T>(int count, ReadOnlySpan<byte> mask) where T : unmanaged
+    {
+        int size = Unsafe.SizeOf<T>();
+        int startByte = _valueByteOffset - count * size;
+        var values = MemoryMarshal.Cast<byte, T>(_valueBuffer!.ByteSpan.Slice(startByte, count * size));
+        int write = 0;
+        for (int i = 0; i < count; i++)
+        {
+            values[write] = values[i];
+            write += mask[i];
+        }
+        _valueByteOffset = startByte + write * size;
+    }
+
     /// <summary>Returns true if the value at position <paramref name="rowIndex"/> is null.</summary>
     public bool IsNull(int rowIndex) =>
         MaxDefLevel > 0 && _defLevels![rowIndex] < (byte)MaxDefLevel;
@@ -1853,6 +2012,11 @@ internal sealed class ColumnBuildState : IDisposable
         {
             ArrayPool<byte>.Shared.Return(_repLevels);
             _repLevels = null;
+        }
+        if (_pageMaskBuffer != null)
+        {
+            ArrayPool<byte>.Shared.Return(_pageMaskBuffer);
+            _pageMaskBuffer = null;
         }
         _valueBuffer?.Dispose();
         _offsetsBuffer?.Dispose();

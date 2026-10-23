@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\EngineeredWood.Parquet\EngineeredWood.Parquet.csproj" />
+    <ProjectReference Include="..\..\src\EngineeredWood.Expressions.Arrow\EngineeredWood.Expressions.Arrow.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Azure\EngineeredWood.Azure.csproj" />
   </ItemGroup>
 

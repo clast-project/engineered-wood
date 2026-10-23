@@ -52,8 +52,20 @@ internal static class ColumnChunkReader
         bool preserveDefLevels = false,
         bool validateCrc = false,
         bool fixedListFastPath = false,
-        int? maxPageUncompressedSize = null)
+        int? maxPageUncompressedSize = null,
+        RowSelection? selection = null,
+        bool skipInDecoder = true)
     {
+        if (selection is not null)
+        {
+            // EXPERIMENT (perf/selection-pushdown-ab): flat columns only.
+            if (column.MaxRepetitionLevel > 0)
+                throw new NotSupportedException("A row selection is prototyped for flat columns only.");
+            if (selection.RowCount != rowCount)
+                throw new ArgumentException("The selection must cover the row group.", nameof(selection));
+            fixedListFastPath = false;
+        }
+
         if (fixedListFastPath && IsFixedListCandidate(column))
         {
             var fast = TryReadFixedListColumn(
@@ -74,6 +86,8 @@ internal static class ColumnChunkReader
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
             byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
+        if (selection is not null)
+            state.SetSelection(selection, skipInDecoder);
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
 
@@ -146,7 +160,8 @@ internal static class ColumnChunkReader
                 repLevels[i] = src[i];
         }
 
-        EnsureFullRowCoverage(state, column, rowCount);
+        int outputRows = selection?.KeptCount ?? rowCount;
+        EnsureFullRowCoverage(state, column, outputRows);
 
         IArrowArray array;
         if (isRepeated)
@@ -156,7 +171,7 @@ internal static class ColumnChunkReader
         }
         else
         {
-            array = ArrowArrayBuilder.Build(state, arrowField, rowCount);
+            array = ArrowArrayBuilder.Build(state, arrowField, outputRows);
         }
 
         return new ColumnResult(array, defLevels, repLevels);
@@ -868,6 +883,7 @@ internal static class ColumnChunkReader
             {
                 nonNullCount = numValues;
             }
+            state.ApplySelectionToPage(numValues, nonNullCount);
 
             // Decode values
             var valueData = pageData.Slice(offset);
@@ -938,6 +954,7 @@ internal static class ColumnChunkReader
                 column.MaxDefinitionLevel, numValues, defDest, out nonNullCount);
         }
         offset += v2Header.DefinitionLevelsByteLength;
+        state.ApplySelectionToPage(numValues, nonNullCount);
 
         // V2: only values portion is compressed (if is_compressed, default true)
         var valuesCompressed = rawData.Slice(offset);
@@ -977,6 +994,37 @@ internal static class ColumnChunkReader
     }
 
     private static void DecodeValues(
+        ReadOnlySpan<byte> data,
+        Encoding encoding,
+        ColumnDescriptor column,
+        DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
+        int nonNullCount,
+        ColumnBuildState state)
+    {
+        if (!state.HasPageMask)
+        {
+            DecodeAllValues(data, encoding, column, dictionary, symbolTable, nonNullCount, state);
+            return;
+        }
+
+        // EXPERIMENT (perf/selection-pushdown-ab): some of this page's values are dropped.
+        try
+        {
+            if (!state.SkipInDecoder
+                || !SelectiveDecoder.TryDecode(data, encoding, column, dictionary, nonNullCount, state))
+            {
+                DecodeAllValues(data, encoding, column, dictionary, symbolTable, nonNullCount, state);
+                state.CompactPageValues(nonNullCount);
+            }
+        }
+        finally
+        {
+            state.ClearPageMask();
+        }
+    }
+
+    private static void DecodeAllValues(
         ReadOnlySpan<byte> data,
         Encoding encoding,
         ColumnDescriptor column,
