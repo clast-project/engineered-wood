@@ -65,8 +65,9 @@ public class BufferedDecimalTests : IDisposable
     }
 
     /// <summary>
-    /// The dictionary page holds big-endian values: the bytes of -1.00 at scale 2 (-100) start 0xFF
-    /// and end 0x9C. Little-endian, they would start 0x9C.
+    /// The dictionary page holds big-endian values at the column's width — FLBA(9), the narrowest that holds
+    /// precision 20 (#504): the bytes of -1.00 at scale 2 (-100) start 0xFF and end 0x9C. Little-endian,
+    /// they would start 0x9C.
     /// </summary>
     [Fact]
     public async Task DictionaryPage_IsBigEndian()
@@ -83,10 +84,10 @@ public class BufferedDecimalTests : IDisposable
         var header = EngineeredWood.Parquet.Data.PageHeaderDecoder.Decode(
             bytes.AsSpan(checked((int)chunk.DictionaryPageOffset!.Value)), out int headerLength);
         Assert.Equal(EngineeredWood.Parquet.PageType.DictionaryPage, header.Type);
-        var entry = bytes.AsSpan(checked((int)chunk.DictionaryPageOffset.Value) + headerLength, 16);
+        var entry = bytes.AsSpan(checked((int)chunk.DictionaryPageOffset.Value) + headerLength, 9);
 
         Assert.Equal(0xFF, entry[0]);
-        Assert.Equal(0x9C, entry[15]);
+        Assert.Equal(0x9C, entry[8]);
     }
 
     /// <summary>

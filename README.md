@@ -85,7 +85,9 @@ test/                                    xUnit tests, BenchmarkDotNet suites, an
 - **Flat columns**: all physical types (Boolean, Int32, Int64, Int96, Float, Double, ByteArray, FixedLenByteArray)
 - **Nested columns**: Struct (optional/required), List (3-level standard, 2-level legacy, bare repeated), Map
 - **Deeply nested**: list-of-list, map-of-map, list-of-map, etc.
-- **Decimal**: INT32→Decimal32, INT64→Decimal64, FLBA→Decimal128/256 with big-endian↔little-endian conversion
+- **Decimal**: INT32→Decimal32, INT64→Decimal64, FLBA→Decimal128/256 with big-endian↔little-endian conversion.
+  On write, a Decimal128/256 column's layout follows its precision, as Spark's does: INT32 up to 9 digits,
+  INT64 up to 18, otherwise the narrowest FLBA that holds the precision
 - **Temporal**: Timestamp (millis/micros/nanos), Date, Time
 - **INT96**: decoded to a naive `timestamp[us]` by default; `ParquetReadOptions.Int96Output`
   selects `timestamp[ns]` or the raw `fixed_size_binary[12]` instead

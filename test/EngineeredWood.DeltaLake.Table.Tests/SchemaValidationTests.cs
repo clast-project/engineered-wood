@@ -514,8 +514,9 @@ public class SchemaValidationTests : IDisposable
     [Fact]
     public void Normalize_WidensNarrowDecimalsToDecimal128_KeepingValuesAndSlices()
     {
-        // So every file EW writes for a decimal column has one physical form (FIXED_LEN_BYTE_ARRAY(16)),
-        // whichever Arrow width the caller handed in.
+        // So every file EW writes for a decimal column has one physical form — the one its precision calls for
+        // (#504) — whichever Arrow width the caller handed in. Written as it arrived, a Decimal64(5,2) would be
+        // INT64 where Decimal128(5,2) is INT32.
         var d64 = new Decimal64Type(15, 3);
         var array = new Decimal64Array(new ArrayData(d64, 3, 0, 0,
             [ArrowBuffer.Empty, new ArrowBuffer(new long[] { -1, 5_000, long.MaxValue / 1_000 }.SelectMany(BitConverter.GetBytes).ToArray())]));
@@ -599,7 +600,8 @@ public class SchemaValidationTests : IDisposable
         // Until #469, reads handed back Decimal32 for a decimal(9,2) column, so every rewrite started from a
         // non-canonical batch, and the rewrites' write-side normalization (#468) is what turned it back into
         // Decimal128. A host IDataFileReader can still hand back such a batch. UPDATE, a copy-on-write DELETE,
-        // OPTIMIZE and the change files they emit must all write the canonical FIXED_LEN_BYTE_ARRAY(16).
+        // OPTIMIZE and the change files they emit must all write the canonical form, which since #504 is the
+        // one the precision calls for: INT32 for decimal(9,2), as Spark writes it.
         var type = new Decimal128Type(9, 2);
         var schema = Schema(new Field("d", type, true));
         await using var table = await DeltaTable.CreateAsync(Fs, schema,
@@ -617,7 +619,7 @@ public class SchemaValidationTests : IDisposable
         var files = Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories);
         Assert.Contains(files, f => f.Contains("_change_data"));
         foreach (var file in files)
-            Assert.Equal((Parquet.PhysicalType.FixedLenByteArray, 16), await PhysicalTypeOf(file, "d"));
+            Assert.Equal((Parquet.PhysicalType.Int32, (int?)null), await PhysicalTypeOf(file, "d"));
 
         var values = new List<decimal?>();
         foreach (var b in await ReadAllAsync(table))

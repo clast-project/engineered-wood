@@ -329,7 +329,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                         TypeLength = leaf.TypeLength,
                         MaxDefLevel = leaf.MaxDefLevel,
                         MaxRepLevel = leaf.MaxRepLevel,
-                        ArrowType = LeafValues(leaf.Array).Data.DataType,
+                        ArrowType = DecimalNarrowing.EncodingType(
+                            LeafValues(leaf.Array).Data.DataType, leaf.PhysicalType),
                         IsNullable = leaf.MaxDefLevel > 0,
                         IsNested = true,
                     });
@@ -355,6 +356,10 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 && encodingType is Apache.Arrow.Types.TimestampType;
             if (extendedTimestamp)
                 encodingType = new Apache.Arrow.Types.FixedSizeBinaryType(ExtendedTimestamp.ByteWidth);
+
+            // A wide decimal written as INT32/INT64 (#504) is buffered as Decimal32/64, which the encoders below
+            // already handle; each batch is narrowed to it as it arrives.
+            encodingType = DecimalNarrowing.EncodingType(encodingType, element.Type!.Value);
 
             leafColumns.Add(new BufferedColumnState
             {
@@ -481,10 +486,11 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             Apache.Arrow.Types.BinaryType
                 => ReconstructByteArray(dictPage, dictCount, indices, defLevels, numRows, state.IsNullable, isString: false),
             Apache.Arrow.Types.FixedSizeBinaryType fsb
-                => ReconstructFixedLenByteArray(dictPage, indices, defLevels, numRows, state.IsNullable, fsb.ByteWidth, state.ArrowType),
+                => ReconstructFixedLenByteArray(dictPage, indices, defLevels, numRows, state.IsNullable,
+                    state.EntryWidth(fsb.ByteWidth), fsb.ByteWidth, state.ArrowType),
             // FIXED_LEN_BYTE_ARRAY(2), and its entries keep Arrow's two bytes (see EncodeFixed).
             Apache.Arrow.Types.HalfFloatType
-                => ReconstructFixedLenByteArray(dictPage, indices, defLevels, numRows, state.IsNullable, 2, state.ArrowType),
+                => ReconstructFixedLenByteArray(dictPage, indices, defLevels, numRows, state.IsNullable, 2, 2, state.ArrowType),
             _ => throw new NotSupportedException($"Cannot reconstruct array of type {state.ArrowType}"),
         };
     }
@@ -631,10 +637,14 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     private static bool IsFlbaDecimal(Apache.Arrow.Types.IArrowType type) =>
         type is Apache.Arrow.Types.Decimal128Type or Apache.Arrow.Types.Decimal256Type;
 
+    /// <param name="entryWidth">A dictionary entry's width: the column's FLBA width, which for a decimal is
+    /// narrower than its Arrow slot (#504).</param>
+    /// <param name="byteWidth">The Arrow slot width of <paramref name="arrowType"/>.</param>
     private static IArrowArray ReconstructFixedLenByteArray(
         byte[] dictPage, int[] indices, int[]? defLevels, int numRows,
-        bool isNullable, int byteWidth, Apache.Arrow.Types.IArrowType arrowType)
+        bool isNullable, int entryWidth, int byteWidth, Apache.Arrow.Types.IArrowType arrowType)
     {
+        bool decimalFlba = IsFlbaDecimal(arrowType);
         var values = new byte[numRows * byteWidth];
         var nullBitmap = isNullable ? new byte[(numRows + 7) / 8] : null;
 
@@ -645,12 +655,14 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 continue;
 
             int dictIdx = indices[idx++];
-            dictPage.AsSpan(dictIdx * byteWidth, byteWidth).CopyTo(values.AsSpan(row * byteWidth));
+            var entry = dictPage.AsSpan(dictIdx * entryWidth, entryWidth);
 
-            // The page holds a decimal big-endian, as Parquet stores it; the rebuilt array goes back
-            // through ColumnChunkWriter, which expects Arrow's little-endian order and reverses it again.
-            if (IsFlbaDecimal(arrowType))
-                values.AsSpan(row * byteWidth, byteWidth).Reverse();
+            // The page holds a decimal big-endian at the column's width, as Parquet stores it; the rebuilt array
+            // goes back through ColumnChunkWriter, which expects Arrow's little-endian slot and narrows it again.
+            if (decimalFlba)
+                DecimalNarrowing.Widen(entry, values.AsSpan(row * byteWidth, byteWidth), sourceBigEndian: true);
+            else
+                entry.CopyTo(values.AsSpan(row * byteWidth));
             if (nullBitmap != null)
                 nullBitmap[row / 8] |= (byte)(1 << (row % 8));
         }
@@ -800,6 +812,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         /// </summary>
         public void AppendLevels(IArrowArray array, int levelCount, int[] defLevels, int[]? repLevels)
         {
+            array = NarrowDecimal(array);
+
             // The encoders read a batch's raw buffers as ArrowType, taken from the first batch. A leaf whose layout
             // changed since would be misread, so it is refused; LeafValues keeps the known case (runs) from reaching
             // here.
@@ -837,6 +851,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
 
         public void AppendArray(IArrowArray array, int rowCount)
         {
+            array = NarrowDecimal(array);
+
             // Build def levels
             if (IsNullable)
             {
@@ -935,7 +951,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     break;
 
                 case Apache.Arrow.Types.FixedSizeBinaryType fsb:
-                    EncodeFixedLenByteArray(array.Data.Buffers[1].Span, srcOffset, rowCount, fsb.ByteWidth);
+                    EncodeFixedLenByteArray(
+                        array.Data.Buffers[1].Span, srcOffset, rowCount, fsb.ByteWidth, EntryWidth(fsb.ByteWidth));
                     break;
             }
 
@@ -1127,22 +1144,46 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             GC.KeepAlive(data);
         }
 
-        private void EncodeFixedLenByteArray(ReadOnlySpan<byte> valueBuffer, int srcOffset, int rowCount, int byteWidth)
+        /// <summary>
+        /// A dictionary entry's width for a FIXED_LEN_BYTE_ARRAY column whose Arrow slots are
+        /// <paramref name="slotWidth"/> bytes: the column's own width for a decimal, which is the narrowest its
+        /// precision allows (#504), and the slot width for everything else.
+        /// </summary>
+        public int EntryWidth(int slotWidth) => IsFlbaDecimal(ArrowType) ? TypeLength : slotWidth;
+
+        // A wide decimal written as INT32/INT64 arrives in Arrow's 16- or 32-byte slots; ArrowType is the
+        // Decimal32/64 it is buffered as.
+        private IArrowArray NarrowDecimal(IArrowArray array) =>
+            ArrowType is Apache.Arrow.Types.Decimal32Type or Apache.Arrow.Types.Decimal64Type
+                && DecimalNarrowing.IsWideDecimal(array.Data.DataType)
+                ? DecimalNarrowing.ToInteger(array, ArrowType)
+                : array;
+
+        private void EncodeFixedLenByteArray(
+            ReadOnlySpan<byte> valueBuffer, int srcOffset, int rowCount, int byteWidth, int entryWidth)
         {
             _bytesDict ??= new BytesDictionary();
             _dictEntries ??= new List<byte[]>();
+
+            // A decimal's entries are kept little-endian at the column's width; BuildDictionaryPage reverses them.
+            byte[]? narrowed = entryWidth < byteWidth ? new byte[entryWidth] : null;
 
             for (int i = 0; i < rowCount; i++)
             {
                 if (!IsValue(LevelCount + i)) continue;
                 ReadOnlySpan<byte> valueBytes = valueBuffer.Slice((srcOffset + i) * byteWidth, byteWidth);
+                if (entryWidth < byteWidth)
+                {
+                    DecimalNarrowing.Narrow(valueBytes, narrowed!, entryWidth, bigEndian: false);
+                    valueBytes = narrowed;
+                }
 
                 int idx = _bytesDict.GetOrAdd(valueBytes, DictionaryCount);
                 if (idx == DictionaryCount)
                 {
                     DictionaryCount++;
                     _dictEntries.Add(valueBytes.ToArray());
-                    _dictPageSize += byteWidth; // no length prefix for FLBA
+                    _dictPageSize += entryWidth; // no length prefix for FLBA
                 }
                 Indices!.Add(idx);
             }
