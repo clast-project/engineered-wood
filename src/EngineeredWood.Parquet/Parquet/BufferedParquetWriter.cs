@@ -512,6 +512,7 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 => ReconstructByteArray(dictPage, dictCount, indices, defLevels, numRows, state.IsNullable, isString: true),
             Apache.Arrow.Types.BinaryType
                 => ReconstructByteArray(dictPage, dictCount, indices, defLevels, numRows, state.IsNullable, isString: false),
+            // Decimal32/64 too: their entries are the slots DictionaryEncodeArray copied, so they rebuild unchanged.
             Apache.Arrow.Types.FixedSizeBinaryType fsb
                 => ReconstructFixedLenByteArray(dictPage, indices, defLevels, numRows, state.IsNullable,
                     state.EntryWidth(fsb.ByteWidth), fsb.ByteWidth, state.ArrowType),
@@ -991,6 +992,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     EncodeByteArray(array.Data, srcOffset, rowCount);
                     break;
 
+                // Every decimal derives from FixedSizeBinaryType and lands here. A Decimal32/64 (one written as
+                // INT32/INT64, #504) keeps its raw little-endian slot, which is the INT32/INT64 dictionary entry.
                 case Apache.Arrow.Types.FixedSizeBinaryType fsb:
                     EncodeFixedLenByteArray(
                         array.Data.Buffers[1].Span, srcOffset, rowCount, fsb.ByteWidth, EntryWidth(fsb.ByteWidth));
