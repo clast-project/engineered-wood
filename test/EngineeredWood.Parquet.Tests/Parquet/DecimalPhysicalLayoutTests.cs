@@ -138,8 +138,7 @@ public class DecimalPhysicalLayoutTests : IDisposable
     }
 
     /// <summary>
-    /// A value past its declared precision does not fit the narrowed layout; writing its low bytes would store
-    /// a different number, so the write is refused.
+    /// A value the narrowed layout cannot hold is refused: writing its low bytes would store a different number.
     /// </summary>
     [Theory]
     [InlineData("file", 9)]
@@ -148,7 +147,7 @@ public class DecimalPhysicalLayoutTests : IDisposable
     [InlineData("buffered", 9)]
     [InlineData("buffered", 18)]
     [InlineData("buffered", 20)]
-    public async Task ValuePastItsPrecision_IsRefused(string writer, int precision)
+    public async Task ValueTheLayoutCannotHold_IsRefused(string writer, int precision)
     {
         // 2^127 - 1 overflows every narrowed layout.
         BigInteger?[] values = [1, (BigInteger.One << 127) - 1];
@@ -158,6 +157,29 @@ public class DecimalPhysicalLayoutTests : IDisposable
             () => WriteAsync(writer, column, nullable: true, ParquetWriteOptions.Default));
 
         Assert.IsType<ArgumentException>(Unwrap(ex));
+    }
+
+    /// <summary>
+    /// The refusal guards the layout, not the declared precision: ±10^p is past the precision but still fits
+    /// INT32, INT64 and FLBA(9), and is written as given, as FLBA(16) wrote it before narrowing. What matters is
+    /// that it reads back unchanged.
+    /// </summary>
+    [Theory]
+    [InlineData("file", 9)]
+    [InlineData("file", 18)]
+    [InlineData("file", 20)]
+    [InlineData("buffered", 9)]
+    [InlineData("buffered", 18)]
+    [InlineData("buffered", 20)]
+    public async Task ValuePastItsPrecision_ThatTheLayoutHolds_RoundTrips(string writer, int precision)
+    {
+        var past = BigInteger.Pow(10, precision);
+        BigInteger?[] values = [past, -past, 1];
+
+        string path = await WriteAsync(writer, Decimals(16, precision, scale: 2, values), nullable: true,
+            ParquetWriteOptions.Default);
+
+        Assert.Equal(values, await ReadUnscaledAsync(path));
     }
 
     /// <summary>The bytes under a null are arbitrary, so they must not be checked against the layout.</summary>
@@ -172,6 +194,93 @@ public class DecimalPhysicalLayoutTests : IDisposable
         string path = await WriteAsync(writer, column, nullable: true, ParquetWriteOptions.Default);
 
         Assert.Equal(values, await ReadUnscaledAsync(path));
+    }
+
+    /// <summary>
+    /// A null struct row still occupies a slot in its children, and Arrow need not mark that slot null: its bytes
+    /// are as arbitrary as a null's. Only the definition level says it holds no value, so it must not be checked.
+    /// </summary>
+    [Theory]
+    [InlineData("file", 9)]
+    [InlineData("file", 20)]
+    [InlineData("buffered", 9)]
+    [InlineData("buffered", 20)]
+    public async Task GarbageUnderANullStructRow_IsIgnored(string writer, int precision)
+    {
+        // The child is valid in every slot; the struct is null at row 1, over a value no layout can hold.
+        var child = Decimals(16, precision, scale: 2, [1, (BigInteger.One << 127) - 1, -1]);
+        var structType = new StructType([new Field("d", child.Data.DataType, nullable: true)]);
+        var validity = new ArrowBuffer.BitmapBuilder().Append(true).Append(false).Append(true).Build();
+        var column = new StructArray(structType, 3, [child], validity, nullCount: 1);
+
+        string path = await WriteAsync(writer, column, nullable: true, ParquetWriteOptions.Default);
+
+        await using var input = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(input, ownsFile: false);
+        using var batch = await reader.ReadRowGroupAsync(0);
+        var read = (StructArray)batch.Column(0);
+        Assert.Equal([false, true, false], Enumerable.Range(0, 3).Select(read.IsNull));
+        Assert.Equal([BigInteger.One, BigInteger.MinusOne], new[] { 0, 2 }.Select(i => Unscaled(read.Fields[0], i)));
+    }
+
+    /// <summary>
+    /// A batch the buffered writer refuses is refused whole: no column keeps part of it. Columns are appended in
+    /// parallel, so a refusal found in one column after others had buffered the batch would leave them a batch
+    /// ahead, and the next flush would write a row group whose columns disagree on its row count.
+    /// </summary>
+    [Theory]
+    [InlineData(9)]
+    [InlineData(20)]
+    public async Task BufferedWriter_RefusedBatch_LeavesNothingBuffered(int precision)
+    {
+        static RecordBatch Batch(long firstId, int precision, BigInteger?[] values)
+        {
+            var ids = new Int64Array.Builder().AppendRange(Enumerable.Range(0, values.Length).Select(i => firstId + i)).Build();
+            var column = Decimals(16, precision, scale: 2, values);
+            var schema = new Apache.Arrow.Schema.Builder()
+                .Field(new Field("id", Int64Type.Default, nullable: false))
+                .Field(new Field("before", column.Data.DataType, nullable: true))
+                .Field(new Field("d", column.Data.DataType, nullable: true))
+                .Field(new Field("after", column.Data.DataType, nullable: true))
+                .Build();
+            // Only "d" is out of range in a refused batch; every other column of it is fine.
+            var fine = Decimals(16, precision, scale: 2, values.Select(_ => (BigInteger?)7).ToArray());
+            return new RecordBatch(schema, [ids, fine, column, fine], values.Length);
+        }
+
+        string path = Path.Combine(_tempDir, "refused.parquet");
+        await using (var file = new LocalSequentialFile(path))
+        await using (var w = new BufferedParquetWriter(file, ownsFile: false, ParquetWriteOptions.Default))
+        {
+            await w.AppendAsync(Batch(0, precision, [1, 2]));
+
+            var ex = await Record.ExceptionAsync(
+                () => w.AppendAsync(Batch(100, precision, [3, (BigInteger.One << 127) - 1, 4])).AsTask());
+            Assert.IsType<ArgumentException>(Unwrap(ex));
+            Assert.Equal(2, w.BufferedRows);
+
+            // The writer goes on as if the refused batch had never been offered.
+            await w.AppendAsync(Batch(200, precision, [5]));
+            await w.CloseAsync();
+        }
+
+        await using var input = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(input, ownsFile: false);
+        var ids = new List<long>();
+        var d = new List<BigInteger>();
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            var idColumn = (Int64Array)batch.Column(0);
+            for (int i = 0; i < batch.Length; i++)
+            {
+                ids.Add(idColumn.GetValue(i)!.Value);
+                d.Add(Unscaled(batch.Column(2), i));
+                Assert.Equal(7, Unscaled(batch.Column(1), i));
+                Assert.Equal(7, Unscaled(batch.Column(3), i));
+            }
+        }
+        Assert.Equal([0L, 1L, 200L], ids);
+        Assert.Equal([BigInteger.One, new BigInteger(2), new BigInteger(5)], d);
     }
 
     /// <summary>
@@ -309,6 +418,13 @@ public class DecimalPhysicalLayoutTests : IDisposable
             }
         }
         return result.ToArray();
+    }
+
+    /// <summary>Row <paramref name="i"/> of a decimal column as its unscaled value, whatever its width.</summary>
+    private static BigInteger Unscaled(IArrowArray column, int i)
+    {
+        int slot = ((FixedSizeBinaryType)column.Data.DataType).ByteWidth;
+        return new BigInteger(column.Data.Buffers[1].Span.Slice((column.Data.Offset + i) * slot, slot).ToArray());
     }
 
     private static BigInteger Decode(byte[] bound, PhysicalType physicalType) => physicalType switch

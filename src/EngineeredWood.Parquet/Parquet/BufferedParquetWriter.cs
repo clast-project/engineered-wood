@@ -383,6 +383,12 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     {
         int rowCount = batch.Length;
 
+        // Every column is brought to the form its state buffers, and refused if it cannot be (a decimal its layout
+        // cannot hold, a leaf whose type changed since the first batch), before any state takes it. The columns
+        // run in parallel, so a refusal found after other columns had buffered the batch would leave them a batch
+        // ahead of the rest and of _bufferedRows, and the next flush would write columns that disagree on the row
+        // group's row count.
+        var prepared = new PreparedLeaf[batch.ColumnCount][];
         Parallel.For(0, batch.ColumnCount, c =>
         {
             var array = batch.Column(c);
@@ -390,12 +396,15 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             if (_columnStates![first].IsNested)
             {
                 var leaves = NestedLevelWriter.Decompose(array, _arrowSchema!.FieldsList[c], rowCount);
+                var column = new PreparedLeaf[leaves.Count];
                 for (int l = 0; l < leaves.Count; l++)
                 {
                     var leaf = leaves[l];
-                    _columnStates[first + l].AppendLevels(
-                        LeafValues(leaf.Array), leaf.LevelCount, leaf.DefLevels, leaf.RepLevels);
+                    column[l] = new PreparedLeaf(
+                        _columnStates[first + l].Prepare(LeafValues(leaf.Array)),
+                        leaf.LevelCount, leaf.DefLevels, leaf.RepLevels);
                 }
+                prepared[c] = column;
                 return;
             }
 
@@ -406,11 +415,29 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                 array = ea.Storage;
             if (state.ExtendedTimestamp)
                 array = ExtendedTimestamp.EncodeColumn(array);
-            state.AppendArray(array, rowCount);
+            prepared[c] = [new PreparedLeaf(state.Prepare(array), rowCount, null, null)];
+        });
+
+        Parallel.For(0, batch.ColumnCount, c =>
+        {
+            int first = _firstLeaf![c];
+            var column = prepared[c];
+            for (int l = 0; l < column.Length; l++)
+            {
+                var leaf = column[l];
+                var state = _columnStates![first + l];
+                if (state.IsNested)
+                    state.AppendLevels(leaf.Array, leaf.LevelCount, leaf.DefLevels!, leaf.RepLevels);
+                else
+                    state.AppendArray(leaf.Array, leaf.LevelCount);
+            }
         });
 
         _bufferedRows += rowCount;
     }
+
+    /// <summary>One leaf of a batch as <see cref="BufferedColumnState.Prepare"/> left it, with its levels when nested.</summary>
+    private readonly record struct PreparedLeaf(IArrowArray Array, int LevelCount, int[]? DefLevels, int[]? RepLevels);
 
     /// <summary>
     /// A nested leaf as the state buffers it: the storage of an extension, since the encoders dispatch on that, and a
@@ -807,17 +834,18 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
         public bool IsValue(int level) => DefLevels is null || DefLevels.Get(level) == MaxDefLevel;
 
         /// <summary>
-        /// Appends a nested leaf: <paramref name="array"/> holds one slot per level, in level order, as
-        /// <see cref="NestedLevelWriter"/> builds it, and only the slots at the maximum definition level are values.
+        /// The batch's <paramref name="array"/> as this state buffers it, or a refusal. Called for every column of
+        /// a batch before any is appended, so everything that can refuse a batch belongs here and not in
+        /// <see cref="AppendArray"/> or <see cref="AppendLevels"/>.
         /// </summary>
-        public void AppendLevels(IArrowArray array, int levelCount, int[] defLevels, int[]? repLevels)
+        public IArrowArray Prepare(IArrowArray array)
         {
             array = NarrowDecimal(array);
 
             // The encoders read a batch's raw buffers as ArrowType, taken from the first batch. A leaf whose layout
             // changed since would be misread, so it is refused; LeafValues keeps the known case (runs) from reaching
-            // here.
-            if (array.Data.DataType.TypeId != ArrowType.TypeId)
+            // here. A flat column's type is held to the first batch's by RowGroupSchemaCheck.
+            if (IsNested && array.Data.DataType.TypeId != ArrowType.TypeId)
             {
                 throw new NotSupportedException(
                     $"Column '{string.Join(".", PathInSchema)}' arrived as {array.Data.DataType.Name} after an earlier " +
@@ -825,6 +853,20 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
                     "with ParquetFileWriter instead.");
             }
 
+            // A decimal FLBA is narrowed value by value as it is dictionary-encoded; checked whole here first.
+            if (IsFlbaDecimal(ArrowType))
+                DecimalNarrowing.EnsureFits(array, TypeLength);
+
+            return array;
+        }
+
+        /// <summary>
+        /// Appends a nested leaf from <see cref="Prepare"/>: <paramref name="array"/> holds one slot per level, in
+        /// level order, as <see cref="NestedLevelWriter"/> builds it, and only the slots at the maximum definition
+        /// level are values.
+        /// </summary>
+        public void AppendLevels(IArrowArray array, int levelCount, int[] defLevels, int[]? repLevels)
+        {
             if (MaxDefLevel > 0)
             {
                 DefLevels ??= new GrowableIntList(levelCount);
@@ -849,10 +891,9 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
             AppendValues(array, levelCount, values);
         }
 
+        /// <summary>Appends a flat column from <see cref="Prepare"/>.</summary>
         public void AppendArray(IArrowArray array, int rowCount)
         {
-            array = NarrowDecimal(array);
-
             // Build def levels
             if (IsNullable)
             {

@@ -16,8 +16,10 @@ namespace EngineeredWood.Parquet.Data;
 /// integer encodings.
 ///
 /// <para>The values are narrowed here from Arrow's 16- or 32-byte little-endian slots. The precision bounds
-/// the magnitude, so a well-formed value always fits; one that does not (a value past its declared precision)
-/// is refused rather than truncated, since truncating would write a different number.</para>
+/// the magnitude, so a well-formed value always fits. One that does not is refused rather than truncated, since
+/// truncating would write a different number. This guards the layout, not the precision: a value past its
+/// precision that the layout still holds (10^9 in an INT32 <c>decimal(9,2)</c>, anything in a full-width slot)
+/// is written as given, as it was before narrowing, and reads back unchanged.</para>
 /// </summary>
 internal static class DecimalNarrowing
 {
@@ -83,6 +85,29 @@ internal static class DecimalNarrowing
         var values = new byte[array.Length * typeLength];
         CopyNarrowed(array, values, typeLength, bigEndian: true);
         return Build(array, new FixedSizeBinaryType(typeLength), values);
+    }
+
+    /// <summary>
+    /// Refuses, as <see cref="ToInteger"/> and <see cref="ToBigEndian"/> would, an array holding a non-null
+    /// value that <paramref name="width"/> bytes cannot hold, without narrowing anything: for a caller that has
+    /// to know a batch is writable before it changes any state.
+    /// </summary>
+    public static void EnsureFits(IArrowArray array, int width)
+    {
+        int slot = ((FixedSizeBinaryType)array.Data.DataType).ByteWidth;
+        if (width >= slot)
+            return;
+
+        int length = array.Length;
+        ReadOnlySpan<byte> src = array.Data.Buffers[1].Span.Slice(array.Data.Offset * slot, length * slot);
+        bool checkNulls = array.NullCount != 0;
+        for (int i = 0; i < length; i++)
+        {
+            if (!Fits(src.Slice(i * slot, slot), width) && (!checkNulls || !array.IsNull(i)))
+                throw OutOfRange(slot, width);
+        }
+
+        GC.KeepAlive(array);
     }
 
     /// <summary>
@@ -161,7 +186,7 @@ internal static class DecimalNarrowing
 
     private static ArgumentException OutOfRange(int slot, int width) => new(
         $"A {slot * 8}-bit decimal value does not fit the {width}-byte Parquet layout its precision calls for, "
-        + "so it lies outside the column's declared precision. Writing it narrowed would store a different "
+        + "so it lies well outside the column's declared precision. Writing it narrowed would store a different "
         + "number; correct the value or declare a larger precision.");
 
     private static int[] BuildMinBytes(int maxPrecision)
