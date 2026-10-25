@@ -261,6 +261,63 @@ public class DeleteTrustsStatisticsTests : IDisposable
             Ex.Not(Ex.Or(Ex.GreaterThanOrEqual("v", 0L), other)), schema));
     }
 
+    /// <summary>The mask cannot read a struct column's values, so an OR with a struct comparison in it throws
+    /// whatever the other branch proves.</summary>
+    [Fact]
+    public async Task OrWithAStructComparison_StillFails()
+    {
+        var inner = new StructType([new Field("a", Int64Type.Default, true)]);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("s", inner, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(Path.Combine(_tempDir, "struct")), schema,
+            new DeltaTableOptions { DeleteTrustsStatistics = true }, enableDeletionVectors: true);
+        var s = new StructArray(inner, 2, [new Int64Array.Builder().Append(1).Append(2).Build()], ArrowBuffer.Empty, 0);
+        await table.WriteAsync([new RecordBatch(schema, [new Int64Array.Builder().Append(1).Append(2).Build(), s], 2)]);
+        long version = table.CurrentSnapshot.Version;
+
+        await Assert.ThrowsAnyAsync<Exception>(
+            () => table.DeleteAsync(Ex.Or(Ex.Equal("s", 1L), Ex.GreaterThanOrEqual("id", 0L))).AsTask());
+        Assert.Equal(version, table.CurrentSnapshot.Version);
+    }
+
+    /// <summary>A reference counts only when the mask can read it: a primitive column, other than variant, that
+    /// one name matches ignoring case, as the mask resolves it.</summary>
+    [Theory]
+    [InlineData("long", "x", true)]
+    [InlineData("long", "X", true)]
+    [InlineData("variant", "x", false)]
+    [InlineData("struct", "x", false)]
+    [InlineData("array", "x", false)]
+    [InlineData("map", "x", false)]
+    [InlineData("ambiguous", "x", false)]
+    public void EvaluatesEverywhere_NeedsAColumnTheMaskCanRead(string type, string reference, bool expected)
+    {
+        DeltaLake.Schema.PrimitiveType Primitive(string name) => new() { TypeName = name };
+        DeltaLake.Schema.StructField Field(string name, DeltaLake.Schema.DeltaDataType t) =>
+            new() { Name = name, Type = t, Nullable = true };
+        var fields = new List<DeltaLake.Schema.StructField> { Field("id", Primitive("long")) };
+        fields.Add(Field("x", type switch
+        {
+            "long" or "ambiguous" => Primitive("long"),
+            "variant" => Primitive("variant"),
+            "struct" => new DeltaLake.Schema.StructType { Fields = [Field("a", Primitive("long"))] },
+            "array" => new DeltaLake.Schema.ArrayType { ElementType = Primitive("long"), ContainsNull = true },
+            _ => new DeltaLake.Schema.MapType
+            {
+                KeyType = Primitive("string"), ValueType = Primitive("long"), ValueContainsNull = true,
+            },
+        }));
+        if (type == "ambiguous")
+            fields.Add(Field("X", Primitive("long")));
+        var schema = new DeltaLake.Schema.StructType { Fields = fields };
+
+        Assert.Equal(expected, DeltaTable.EvaluatesEverywhere(
+            Ex.Or(Ex.Equal(reference, 1L), Ex.GreaterThanOrEqual("id", 0L)), schema));
+    }
+
     [Fact]
     public async Task Or_IsProvenByAnyChild()
     {

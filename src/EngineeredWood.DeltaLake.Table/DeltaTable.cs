@@ -4053,14 +4053,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Whether the DELETE mask can evaluate <paramref name="predicate"/> on any file, so a proof may stand in for
-    /// it: no function call (the mask has no function registry) and every reference a top-level column. One OR
-    /// branch proven would otherwise remove files on a predicate whose other branch fails the read with an
-    /// error, turning a DELETE that throws into one that commits. A mixed-type comparison answers NULL rather
-    /// than throwing, so it needs no exclusion.
+    /// it: no function call (the mask has no function registry) and every reference a top-level column of a type
+    /// the mask can read a value from. One OR branch proven would otherwise remove files on a predicate whose
+    /// other branch fails the read with an error, turning a DELETE that throws into one that commits. The mask
+    /// resolves a name ignoring case and throws on an ambiguous one, and it cannot read a struct, array, map or
+    /// variant, so a reference must match exactly one primitive column that way. A mixed-type comparison answers
+    /// NULL rather than throwing, so it needs no exclusion.
     /// </summary>
     internal static bool EvaluatesEverywhere(Expressions.Predicate predicate, Schema.StructType schema)
     {
-        var columns = new HashSet<string>(schema.Fields.Select(f => f.Name), StringComparer.Ordinal);
+        var columns = new HashSet<string>(
+            schema.Fields
+                .GroupBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
+                .Where(g => g.Count() == 1 && g.Single().Type is Schema.PrimitiveType { TypeName: not "variant" })
+                .Select(g => g.Key),
+            StringComparer.OrdinalIgnoreCase);
         return Visit(predicate);
 
         bool Visit(Expressions.Expression expression) => expression switch
