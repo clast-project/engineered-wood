@@ -144,10 +144,16 @@ public sealed class DeltaFilePruner
         // The JSON parse is LAZY: a file answered entirely from a checkpoint's typed columns never
         // touches its statistics string, and one that falls back for a column pays for the parse only
         // then. The blob covers every column; a predicate names one or two.
-        var stats = new DeltaFileStats(addFile);
-        return StatisticsEvaluator.Evaluate(filter, stats, _accessor)
-            != FilterResult.AlwaysFalse;
+        return ShouldInclude(new DeltaFileStats(addFile), filter);
     }
+
+    /// <summary>
+    /// <see cref="ShouldInclude(AddFile, Predicate)"/> over statistics the caller holds, so a caller that also
+    /// asks <see cref="ProvesEveryRowTrue"/> of the file parses its JSON statistics once.
+    /// </summary>
+    internal bool ShouldInclude(DeltaFileStats stats, Predicate filter) =>
+        filter is TruePredicate
+        || StatisticsEvaluator.Evaluate(filter, stats, _accessor) != FilterResult.AlwaysFalse;
 
     /// <summary>
     /// Whether <paramref name="stats"/> prove <paramref name="leaf"/> TRUE for every row of the file, not merely

@@ -3847,7 +3847,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
-            if (pruner is not null && !pruner.ShouldInclude(addFile, prunePredicate!))
+            // One stats object serves the skip and the proof, so the JSON statistics are parsed once.
+            var stats = pruner is not null ? new DeltaFileStats(addFile) : null;
+            if (pruner is not null && !pruner.ShouldInclude(stats!, prunePredicate!))
                 continue; // stats prove no row here matches — nothing to delete, skip the read
 
             bool everyRowMatches = false;
@@ -3861,7 +3863,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             else if (statisticsProve)
             {
                 everyRowMatches = ProvesEveryRow(
-                    prunePredicate!, addFile, new DeltaFileStats(addFile), pruner!, partitionSchema, snapshot);
+                    prunePredicate!, addFile, stats!, pruner!, partitionSchema, snapshot);
             }
 
             if (everyRowMatches)
