@@ -4636,14 +4636,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             partitionValues, _options.PartitionPathSpelling, _fs.PathConstraints);
 
     // The canonical identity of ONE partition (for dynamic partition overwrite set membership and compaction
-    // grouping): the sorted "key=value" pairs joined with U+0001, with every key spelled PHYSICALLY when the
-    // table has column mapping — so a physical-keyed entry (the spec convention) and a logical-keyed one
-    // (older engineered-wood commits) canonicalize identically. The map's spelling is decided once, from every
-    // partition column (see PartitionValueKeys): translating keys that were already physical as if they were
+    // grouping): one length-prefixed key/value pair per partition column, sorted and concatenated, so no value,
+    // whatever characters it holds, can pass for NULL or reach into the next pair. Every key is spelled
+    // PHYSICALLY when the table has column mapping — so a physical-keyed entry (the spec convention) and a
+    // logical-keyed one (older engineered-wood commits) canonicalize identically. The map's spelling is decided
+    // once, from its keys (see PartitionValueKeys): translating keys that were already physical as if they were
     // logical merged two partitions of a table whose renamed partition column's logical name is another's
     // physical name. Each partition column contributes one pair, so a missing key, JSON null and every other
-    // spelling PartitionNulls reads as NULL are one partition (this engine leaves a NULL's key out; Spark writes
-    // it as null), marked apart from every value.
+    // spelling PartitionNulls reads as NULL are one partition (older checkpoints left a NULL's key out; Spark
+    // writes it as null).
     internal static string CanonicalPartitionKey(
         IReadOnlyDictionary<string, string> values,
         IReadOnlyList<string> partitionColumns,
@@ -4655,10 +4656,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             string key = PartitionValueKeys.ToPhysical(column, physicallyKeyed: false, logicalToPhysical);
             string? value = PartitionValueOrNull(values, column, partitionColumns, logicalToPhysical, schema);
-            parts.Add(key + "=" + (value is null ? "\u0000<null>" : value));
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            parts.Add(key.Length.ToString(inv) + ":" + key
+                + (value is null ? "-" : "=" + value.Length.ToString(inv) + ":" + value));
         }
         parts.Sort(StringComparer.Ordinal);
-        return string.Join("\u0001", parts);
+        return string.Concat(parts);
     }
 
     // A file's value for one partition column in the map's own spelling (PartitionValueKeys), or null for a

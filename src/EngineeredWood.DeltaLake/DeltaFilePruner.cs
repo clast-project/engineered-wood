@@ -312,15 +312,17 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     // to pick the spec's reading, but pruning can decline to guess. A value the read path materializes as NULL
     // (see PartitionNulls) comes back null, so the pruner sees what a scan reads. The sentinel for a column whose
     // type is unknown here could be either, and gives nothing; so does a NULL in a non-nullable column, which a
-    // read refuses: keeping the file lets the error surface rather than a skip deciding the answer.
+    // read refuses: keeping the file lets the error surface rather than a skip deciding the answer. A missing key
+    // is NULL, as the read materializes it (older checkpoints dropped NULL entries).
     private bool TryGetPartitionValue(AddFile addFile, string column, out string value)
     {
         value = default!;
-        if (PartitionValueKeys.IsAmbiguous(addFile.PartitionValues, _partitionColumnList, _logicalToPhysical)
-            || !PartitionValueKeys.TryGet(
+        if (PartitionValueKeys.IsAmbiguous(addFile.PartitionValues, _partitionColumnList, _logicalToPhysical))
+            return false;
+        if (!PartitionValueKeys.TryGet(
                 addFile.PartitionValues, column, _partitionColumnList, _logicalToPhysical, out string raw))
         {
-            return false;
+            raw = null!;
         }
         if (raw == PartitionNulls.HiveDefaultPartition && !_columnTypes.ContainsKey(column))
             return false;
@@ -367,7 +369,7 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
             // null (a null string, or a spelling PartitionNulls reads as NULL),
             // every row is null; otherwise no row is null in this column.
             if (TryGetPartitionValue(stats.AddFile, column, out var v))
-                return v is null ? stats.AddFile.PartitionValues.Count > 0 ? GetValueCount(stats, column) : null : 0;
+                return v is null ? GetValueCount(stats, column) : 0;
             return null;
         }
 

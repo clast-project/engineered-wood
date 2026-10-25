@@ -669,6 +669,75 @@ public class PartitionNullSentinelTests : IDisposable
         Assert.Equal([1L], await IdsAsync(table));
     }
 
+    /// <summary>The key is injective: no value, whatever characters it holds, passes for NULL or reaches into
+    /// the next column's pair.</summary>
+    [Fact]
+    public void CanonicalPartitionKey_ValuesHoldingItsDelimiters_StayDistinct()
+    {
+        var schema = new DeltaLake.Schema.StructType
+        {
+            Fields =
+            [
+                new DeltaLake.Schema.StructField
+                {
+                    Name = "p1", Type = new DeltaLake.Schema.PrimitiveType { TypeName = "string" }, Nullable = true,
+                },
+                new DeltaLake.Schema.StructField
+                {
+                    Name = "p2", Type = new DeltaLake.Schema.PrimitiveType { TypeName = "string" }, Nullable = true,
+                },
+            ],
+        };
+        string Key(string? p1, string? p2) => DeltaTable.CanonicalPartitionKey(
+            new Dictionary<string, string> { ["p1"] = p1!, ["p2"] = p2! }, ["p1", "p2"], null, schema);
+
+        Assert.NotEqual(Key("a\u0001p2=b", "c"), Key("a", "b\u0001p2=c"));
+        Assert.NotEqual(Key(null, "c"), Key("\u0000<null>", "c"));
+        Assert.NotEqual(Key("-", "c"), Key(null, "c"));
+        Assert.Equal(Key(null, "c"), Key("", "c"));
+    }
+
+    /// <summary>A missing key is NULL to the pruner, as to the read: <c>p1 = 'a'</c> skips a file whose map has
+    /// no <c>p1</c>, and its null count is the row count. A NOT NULL column or an ambiguous map still keeps
+    /// the file.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Pruner_MissingKey_IsNull(bool emptyMap)
+    {
+        var schema = new DeltaLake.Schema.StructType
+        {
+            Fields =
+            [
+                new DeltaLake.Schema.StructField
+                {
+                    Name = "p1", Type = new DeltaLake.Schema.PrimitiveType { TypeName = "string" }, Nullable = true,
+                },
+                new DeltaLake.Schema.StructField
+                {
+                    Name = "p2", Type = new DeltaLake.Schema.PrimitiveType { TypeName = "string" }, Nullable = false,
+                },
+            ],
+        };
+        var pruner = new DeltaFilePruner(schema, partitionColumns: ["p1", "p2"]);
+        var addFile = new AddFile
+        {
+            Path = "f.parquet",
+            PartitionValues = emptyMap ? new Dictionary<string, string>() : new Dictionary<string, string> { ["p2"] = "x" },
+            Size = 1,
+            ModificationTime = 0,
+            DataChange = true,
+            Stats = """{"numRecords":10}""",
+        };
+
+        Assert.False(pruner.ShouldInclude(addFile, Ex.Equal("p1", "a")));
+        Assert.True(pruner.ShouldInclude(addFile, Ex.IsNull("p1")));
+        Assert.False(pruner.ShouldInclude(addFile, Ex.IsNotNull("p1")));
+        // p2 is NOT NULL: missing, the read refuses the file, so the pruner keeps it for the error to surface.
+        Assert.Equal(emptyMap, pruner.ShouldInclude(addFile, Ex.Equal("p2", "y")));
+        Assert.True(pruner.ShouldInclude(addFile, Ex.Equal("p2", "x")));
+    }
+
     // ── IcebergCompat files store their partition values; the log's are the ones a read returns ──
 
     /// <summary>The file holds <c>part = 'a'</c>, materialized as IcebergCompat requires, and the log says
