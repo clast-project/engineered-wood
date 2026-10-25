@@ -108,11 +108,12 @@ internal static class PartitionUtils
     /// CHECK constraints are evaluated, so those describe the rows the table will hold. With
     /// <paramref name="refuseNulls"/>, a null in a partition column <paramref name="schema"/> declares
     /// non-nullable is refused, whatever the batch's own field says: the read refuses such a file, so a commit
-    /// must never make one.
+    /// must never make one. An empty string in one of <paramref name="generatedColumns"/> is refused too: the
+    /// expression produced it, and storing NULL instead would break the expression's own definition.
     /// </summary>
     public static RecordBatch NormalizePartitionValues(
         RecordBatch batch, IReadOnlyList<string> partitionColumns, DeltaLake.Schema.StructType schema,
-        bool refuseNulls)
+        bool refuseNulls, IReadOnlyCollection<string>? generatedColumns = null)
     {
         IArrowArray[]? columns = null;
         Field[]? fields = null;
@@ -124,6 +125,14 @@ internal static class PartitionUtils
 
             var array = columns?[index] ?? batch.Column(index);
             var replaced = EmptyStringsAsNull(array);
+            if (replaced is not null && generatedColumns is not null && generatedColumns.Contains(column))
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.GeneratedColumnMismatch,
+                    $"Partition column '{column}' is generated, and its expression gives an empty string for a row "
+                    + "being written. A partition value stores an empty string as NULL, which the expression does "
+                    + "not produce, so the row cannot be stored as computed.");
+            }
             if (replaced is not null)
             {
                 columns ??= batch.Arrays.ToArray();
@@ -161,25 +170,24 @@ internal static class PartitionUtils
     {
         switch (array)
         {
-            case StringArray s when HasEmpty(s.Length, i => !s.IsNull(i) && s.GetString(i).Length == 0):
+            // Found by byte length, so a batch with no empty string (nearly every one) decodes nothing.
+            case StringArray s when HasEmpty(s.Length, i => !s.IsNull(i) && s.GetValueLength(i) == 0):
             {
                 var b = new StringArray.Builder();
                 for (int i = 0; i < s.Length; i++)
                 {
-                    if (s.IsNull(i)) { b.AppendNull(); continue; }
-                    string v = s.GetString(i);
-                    if (v.Length == 0) b.AppendNull(); else b.Append(v);
+                    if (s.IsNull(i) || s.GetValueLength(i) == 0) b.AppendNull();
+                    else b.Append(s.GetString(i));
                 }
                 return b.Build();
             }
-            case LargeStringArray s when HasEmpty(s.Length, i => !s.IsNull(i) && s.GetString(i).Length == 0):
+            case LargeStringArray s when HasEmpty(s.Length, i => !s.IsNull(i) && s.GetValueLength(i) == 0):
             {
                 var b = new LargeStringArray.Builder();
                 for (int i = 0; i < s.Length; i++)
                 {
-                    if (s.IsNull(i)) { b.AppendNull(); continue; }
-                    string v = s.GetString(i);
-                    if (v.Length == 0) b.AppendNull(); else b.Append(v);
+                    if (s.IsNull(i) || s.GetValueLength(i) == 0) b.AppendNull();
+                    else b.Append(s.GetString(i));
                 }
                 return b.Build();
             }

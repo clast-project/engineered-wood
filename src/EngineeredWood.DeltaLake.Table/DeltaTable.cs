@@ -3845,12 +3845,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             ? BuildProjectedSchema(snapshot.ArrowSchema, partitionColumns)
             : null;
 
+        var partitionKeyMap = ColumnMapping.BuildLogicalToPhysicalMap(
+            snapshot.Schema, ColumnMapping.GetMode(snapshot.Metadata.Configuration));
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
             // One stats object serves the skip and the proof, so the JSON statistics are parsed once.
             var stats = pruner is not null ? new DeltaFileStats(addFile) : null;
             if (pruner is not null && !pruner.ShouldInclude(stats!, prunePredicate!))
                 continue; // stats prove no row here matches — nothing to delete, skip the read
+
+            // As a scan does, and before anything below can decide the file without reading a row of it (the
+            // whole-file shortcuts, or row-group pruning that skips every row group).
+            if (partitionColumns.Count > 0)
+            {
+                Partitioning.PartitionUtils.ThrowIfNullInNonNullablePartition(
+                    addFile.PartitionValues, snapshot.ArrowSchema, partitionColumns, partitionKeyMap, addFile.Path);
+            }
 
             bool everyRowMatches = false;
             if (partitionOnly)
@@ -4372,7 +4382,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: false);
                     updatedBatch = generatedColumns?.Recompute(updatedBatch) ?? updatedBatch;
                     updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
-                        updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: true);
+                        updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: true,
+                        generatedColumns?.ColumnNames);
                     constraints?.Validate(updatedBatch);
 
                     outputBatches.Add(updatedBatch);
@@ -5639,10 +5650,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         // Again, for a generated partition column, and now refusing a NULL the table declares impossible: the
-        // read refuses a file holding one.
+        // read refuses a file holding one. An empty string a generation expression produced is refused, since
+        // storing it as NULL would break the expression.
         batches = batches
             .Select(b => Partitioning.PartitionUtils.NormalizePartitionValues(
-                b, splitColumns, snapshot.Schema, refuseNulls: true))
+                b, splitColumns, snapshot.Schema, refuseNulls: true, generated?.ColumnNames))
             .ToList();
 
         // Beside the other per-batch guard, and before anything is written: a constraint

@@ -257,6 +257,35 @@ public class PartitionNullSentinelTests : IDisposable
         Assert.Equal(version, table.CurrentSnapshot.Version);
     }
 
+    /// <summary>A DELETE checks the file before row-group pruning can skip every row of it: with no statistics
+    /// in the log the file is not skipped, and <c>id &gt; 100</c> then rules out its only row group.</summary>
+    [Fact]
+    public async Task NonNullableColumn_DeleteWhoseRowGroupsAreAllPruned_RefusesTheFile()
+    {
+        await using var table = await CreateAsync("string", "", nullable: false);
+        var file = table.CurrentSnapshot.ActiveFiles.Values.Single(f => f.PartitionValues.TryGetValue("part", out var v) && v == "");
+        await using (var transaction = table.StartTransaction())
+        {
+            transaction.StageActions(
+            [
+                new RemoveFile
+                {
+                    Path = file.Path,
+                    DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    DataChange = false,
+                },
+                file with { Stats = null, TypedStats = null, DataChange = false },
+            ]);
+            await transaction.CommitAsync();
+        }
+        long version = table.CurrentSnapshot.Version;
+
+        var error = await Assert.ThrowsAsync<DeltaFormatException>(() => table.DeleteAsync(
+            Ex.And(Ex.IsNull("part"), Ex.GreaterThan("id", 100L))).AsTask());
+        Assert.Equal(DeltaTableErrorCodes.NotNullConstraintViolated, error.ErrorCode);
+        Assert.Equal(version, table.CurrentSnapshot.Version);
+    }
+
     [Theory]
     [InlineData("string", "")]
     [InlineData("integer", Sentinel)]
@@ -407,6 +436,52 @@ public class PartitionNullSentinelTests : IDisposable
                 rows[ids.GetValue(i)!.Value] = g.GetValue(i);
         }
         Assert.Equal([true, false], rows.Values);
+    }
+
+    /// <summary><c>part GENERATED ALWAYS AS (source)</c>: an empty source gives an empty string, which a partition
+    /// value would store as NULL, breaking the expression. Refused whether the column is omitted, supplied, or
+    /// recomputed by an UPDATE.</summary>
+    [Theory]
+    [InlineData("omitted")]
+    [InlineData("supplied")]
+    [InlineData("update")]
+    public async Task GeneratedPartitionColumn_EmptyString_IsRefused(string how)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("source", StringType.Default, true))
+            .Field(new Field("part", StringType.Default, true,
+                new Dictionary<string, string> { ["delta.generationExpression"] = "source" }))
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(Path.Combine(_tempDir, Guid.NewGuid().ToString("N"))), schema,
+            partitionColumns: ["part"]);
+        var withoutPart = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("source", StringType.Default, true))
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+        RecordBatch Omitted(string source) => new(withoutPart,
+            [new StringArray.Builder().Append(source).Build(), new Int64Array.Builder().Append(0).Build()], 1);
+        await table.WriteAsync([Omitted("a")]);
+        long version = table.CurrentSnapshot.Version;
+
+        Task act = how switch
+        {
+            "omitted" => table.WriteAsync([Omitted("")]).AsTask(),
+            "supplied" => table.WriteAsync([new RecordBatch(schema,
+                [new StringArray.Builder().Append("").Build(), new StringArray.Builder().Append("").Build(),
+                 new Int64Array.Builder().Append(1).Build()], 1)]).AsTask(),
+            _ => table.UpdateAsync(Ex.Equal("id", 0L), batch =>
+            {
+                var columns = batch.Arrays.ToArray();
+                columns[batch.Schema.GetFieldIndex("source")] = new StringArray.Builder().Append("").Build();
+                return new RecordBatch(batch.Schema, columns, batch.Length);
+            }).AsTask(),
+        };
+
+        var error = await Assert.ThrowsAsync<DeltaFormatException>(() => act);
+        Assert.Equal(DeltaTableErrorCodes.GeneratedColumnMismatch, error.ErrorCode);
+        Assert.Equal(version, table.CurrentSnapshot.Version);
     }
 
     /// <summary>Two partition columns whose values hold the old group key's separator stay two partitions.</summary>

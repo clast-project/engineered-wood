@@ -40,6 +40,9 @@ internal sealed class DeltaGeneratedColumns
         _evaluator = new ArrowRowEvaluator(new SparkFunctionRegistry());
     }
 
+    /// <summary>The names of the generated columns.</summary>
+    public IReadOnlyCollection<string> ColumnNames => _columns.Select(c => c.Name).ToList();
+
     /// <summary>Whether the table declares any generated column.</summary>
     /// <remarks>Does not parse — see <see cref="DeltaConstraintEnforcer.Declares"/> for why.</remarks>
     public static bool Declares(Snapshot.Snapshot snapshot)
