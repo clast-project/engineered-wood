@@ -235,6 +235,25 @@ public sealed record DeltaTableOptions
     public bool PreferTypedCheckpointStats { get; init; } = true;
 
     /// <summary>
+    /// Whether a predicate DELETE removes a data file without reading it when the file's statistics prove the
+    /// predicate TRUE for every row. Default: false.
+    /// </summary>
+    /// <remarks>
+    /// <para>Statistics are trusted here in a direction file skipping never needs. A file skipped on a wrong bound
+    /// costs a read rows it should have returned; a file removed on one deletes rows the predicate does not
+    /// match. Spark trusts them only for skipping: it removes files unread when the condition names partition
+    /// columns alone, and reads every other candidate. That is this library's default too. The partition case
+    /// needs no statistics and removes files unread whatever this says.</para>
+    /// <para>Turn it on for a table whose writers' bounds are bounds (a truncated string maximum rounded up, as
+    /// this library and Spark write it). Only what statistics can prove is proven: AND and OR of comparisons,
+    /// <c>IS [NOT] NULL</c> and <c>IN</c> over one top-level column against literals of its own type, each with a
+    /// null count of 0 unless it is <c>IS NULL</c>, beside any partition-only part. A file with an existing
+    /// deletion vector qualifies, its count of deleted rows taken from the row count less the vector's. With the
+    /// change data feed on, files are read regardless.</para>
+    /// </remarks>
+    public bool DeleteTrustsStatistics { get; init; }
+
+    /// <summary>
     /// Whether a <c>variant</c> column's parquet group carries the <c>VARIANT</c> logical-type
     /// annotation. Default: <see langword="true"/>.
     /// <para>The Delta spec defines a variant's physical layout as a plain <c>struct&lt;value,

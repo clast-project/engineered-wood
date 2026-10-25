@@ -3798,8 +3798,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>With the change data feed off, a predicate over partition columns alone gives every row of a file the
     /// same answer, from the file's partition values (see <see cref="MatchesEveryRow"/>). A file it does not match
     /// is left alone unread. One it matches is removed whole unread when its statistics give a row count above
-    /// its deletion vector's, and read otherwise, since the count is what the delete reports.</para>
+    /// its deletion vector's, and read otherwise, since the count is what the delete reports. Under
+    /// <see cref="DeltaTableOptions.DeleteTrustsStatistics"/> a file whose statistics prove the whole predicate
+    /// is removed the same way (see <see cref="ProvesEveryRow"/>).</para>
     /// </summary>
+    /// <param name="prunePredicate">When supplied, the predicate <paramref name="predicate"/> evaluates, not
+    /// merely a superset of it: the statistics proof removes a file on this predicate's answer alone.</param>
     /// <param name="written">Records the deletion-vector and change-data files this delete creates — never the
     /// data file its re-add names, which is LIVE table data this delete only masks rows in. See
     /// <see cref="WrittenFileLedger"/>.</param>
@@ -3830,24 +3834,38 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             _options.PreferTypedCheckpointStats);
 
         // A predicate over partition columns alone has one answer for every row of a file, so the file's
-        // partition values decide it without the file being opened (#506). The change feed needs the deleted
-        // rows themselves, so it still reads.
-        var partitionSchema = prunePredicate is not null && !cdfEnabled
-            && ReferencesOnlyPartitionColumns(prunePredicate, snapshot.Metadata.PartitionColumns)
-                ? BuildProjectedSchema(snapshot.ArrowSchema, snapshot.Metadata.PartitionColumns)
-                : null;
+        // partition values decide it without the file being opened (#506). Opted into, the statistics may prove
+        // the rest. The change feed needs the deleted rows themselves, so it still reads.
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        bool partitionOnly = prunePredicate is not null && !cdfEnabled
+            && ReferencesOnlyPartitionColumns(prunePredicate, partitionColumns);
+        bool statisticsProve = prunePredicate is not null && !cdfEnabled && !partitionOnly
+            && _options.DeleteTrustsStatistics;
+        var partitionSchema = (partitionOnly || statisticsProve) && partitionColumns.Count > 0
+            ? BuildProjectedSchema(snapshot.ArrowSchema, partitionColumns)
+            : null;
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
             if (pruner is not null && !pruner.ShouldInclude(addFile, prunePredicate!))
                 continue; // stats prove no row here matches — nothing to delete, skip the read
 
-            if (partitionSchema is not null)
+            bool everyRowMatches = false;
+            if (partitionOnly)
             {
                 // No row of the file matches: nothing to delete, whatever the file holds.
-                if (!MatchesEveryRow(addFile, partitionSchema, snapshot, predicate))
+                if (!MatchesEveryRow(addFile, partitionSchema!, snapshot, predicate))
                     continue;
+                everyRowMatches = true;
+            }
+            else if (statisticsProve)
+            {
+                everyRowMatches = ProvesEveryRow(
+                    prunePredicate!, addFile, new DeltaFileStats(addFile), pruner!, partitionSchema, snapshot);
+            }
 
+            if (everyRowMatches)
+            {
                 // Every row matches, so every live one goes: the rows the existing vector already deleted are not
                 // deleted again. The count is the only thing taken on trust, so a count that cannot be right reads
                 // the file instead. A JSON stats object without numRecords parses as 0, and a file with no live
@@ -3882,7 +3900,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
                 snapshot.Schema, mappingMode);
             var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
-            var partitionColumns = snapshot.Metadata.PartitionColumns;
 
             // The file's row count, from the footer: the read below may skip rows, so it cannot be counted
             // from the batches. It decides the whole-file remove, and a short count would turn a partial
@@ -4032,6 +4049,28 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         DeletionVector = addFile.DeletionVector,
         BaseRowId = addFile.BaseRowId,
         DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
+    };
+
+    /// <summary>
+    /// Whether <paramref name="predicate"/> is TRUE for every row of <paramref name="addFile"/>, as far as its
+    /// statistics and partition values can prove: AND needs every child proven, OR one. A part over partition
+    /// columns alone is decided by <see cref="MatchesEveryRow"/>; any other part must be a leaf
+    /// <see cref="DeltaFilePruner.ProvesEveryRowTrue"/> proves. NOT and everything else is not proven, which
+    /// reads the file.
+    /// </summary>
+    private static bool ProvesEveryRow(
+        Expressions.Predicate predicate, AddFile addFile, DeltaFileStats stats, DeltaFilePruner pruner,
+        Apache.Arrow.Schema? partitionSchema, Snapshot.Snapshot snapshot) => predicate switch
+    {
+        Expressions.TruePredicate => true,
+        _ when partitionSchema is not null
+            && ReferencesOnlyPartitionColumns(predicate, snapshot.Metadata.PartitionColumns)
+            => MatchesEveryRow(addFile, partitionSchema, snapshot, MaskFor(predicate)),
+        Expressions.AndPredicate and => and.Children.All(
+            c => ProvesEveryRow(c, addFile, stats, pruner, partitionSchema, snapshot)),
+        Expressions.OrPredicate or => or.Children.Any(
+            c => ProvesEveryRow(c, addFile, stats, pruner, partitionSchema, snapshot)),
+        _ => pruner.ProvesEveryRowTrue(stats, predicate),
     };
 
     /// <summary>

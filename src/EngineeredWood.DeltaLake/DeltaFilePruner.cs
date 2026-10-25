@@ -24,6 +24,7 @@ namespace EngineeredWood.DeltaLake;
 public sealed class DeltaFilePruner
 {
     private readonly DeltaFileStatsAccessor _accessor;
+    private readonly HashSet<string> _partitionColumns;
 
     /// <param name="schema">The table schema, used to type each column's bounds.</param>
     /// <param name="partitionColumns">Partition columns, whose values are constant per file.</param>
@@ -62,6 +63,7 @@ public sealed class DeltaFilePruner
         }
 
         var partitionSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
+        _partitionColumns = partitionSet;
         _accessor = new DeltaFileStatsAccessor(
             typeMap, partitionSet, logicalToPhysical, preferTypedStats, unattributable, noBounds);
     }
@@ -145,6 +147,73 @@ public sealed class DeltaFilePruner
         var stats = new DeltaFileStats(addFile);
         return StatisticsEvaluator.Evaluate(filter, stats, _accessor)
             != FilterResult.AlwaysFalse;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="stats"/> prove <paramref name="leaf"/> TRUE for every row of the file, not merely
+    /// that no row is ruled out. Only a comparison, <c>IS [NOT] NULL</c> or non-empty <c>IN</c> over ONE
+    /// top-level data column and literals of the type its bounds decode to is answered; anything else is not
+    /// proven.
+    /// </summary>
+    /// <remarks>
+    /// <para>The evaluator is built for pruning, where AlwaysFalse means "no row is TRUE", NULL rows included.
+    /// That makes its AlwaysTrue unsound in two places this must not follow: under NOT, which turns such an
+    /// AlwaysFalse into AlwaysTrue, and for a prefix test, which it answers without the null count. So the
+    /// caller combines leaves itself (AND and OR only), and here every leaf but <c>IS NULL</c> also needs a null
+    /// count of 0: a NULL row answers NULL, which deletes nothing.</para>
+    /// <para>A literal of another type would hand the decision to cross-type comparison rules the row
+    /// evaluator need not share, and a partition column's NULL is read differently here than by a scan (see
+    /// #511), so neither is answered.</para>
+    /// </remarks>
+    internal bool ProvesEveryRowTrue(DeltaFileStats stats, Predicate leaf)
+    {
+        Expression operand;
+        IReadOnlyList<Expression> literals;
+        bool isNull = false;
+        switch (leaf)
+        {
+            case ComparisonPredicate cmp when cmp.Right is LiteralExpression:
+                operand = cmp.Left;
+                literals = [cmp.Right];
+                break;
+            case ComparisonPredicate cmp when cmp.Left is LiteralExpression:
+                operand = cmp.Right;
+                literals = [cmp.Left];
+                break;
+            case UnaryPredicate { Op: UnaryOperator.IsNull or UnaryOperator.IsNotNull } unary:
+                operand = unary.Operand;
+                literals = [];
+                isNull = unary.Op == UnaryOperator.IsNull;
+                break;
+            case SetPredicate { Op: SetOperator.In } set when set.Values.Count > 0:
+                operand = set.Operand;
+                literals = set.Values;
+                break;
+            default:
+                return false;
+        }
+
+        if (operand is not UnboundReference { NameParts.Count: 1 } reference
+            || _partitionColumns.Contains(reference.Name))
+        {
+            return false;
+        }
+        string column = reference.Name;
+
+        if (literals.Count > 0)
+        {
+            if (_accessor.GetMinValue(stats, column) is not { } min)
+                return false;
+            foreach (var literal in literals)
+            {
+                if (literal is not LiteralExpression { Value: var value } || value.Type != min.Type)
+                    return false;
+            }
+        }
+
+        if (StatisticsEvaluator.Evaluate(leaf, stats, _accessor) != FilterResult.AlwaysTrue)
+            return false;
+        return isNull || _accessor.GetNullCount(stats, column) == 0;
     }
 }
 
