@@ -11,8 +11,12 @@ namespace EngineeredWood.DeltaLake.Actions;
 /// </summary>
 public sealed record ColumnStats
 {
-    /// <summary>Total number of records in the file.</summary>
-    public long NumRecords { get; init; }
+    /// <summary>
+    /// Total number of records in the file, or null when the statistics do not carry one. A missing count
+    /// is unknown, never zero: a stats object may hold only bounds, and reading it as an empty file would
+    /// mis-assign row ids and let a DELETE treat a file of rows as having none.
+    /// </summary>
+    public long? NumRecords { get; init; }
 
     /// <summary>Minimum values per column (column name → value).</summary>
     public IReadOnlyDictionary<string, JsonElement>? MinValues { get; init; }
@@ -38,10 +42,11 @@ public sealed record ColumnStats
             using var doc = JsonDocument.Parse(json!);
             var root = doc.RootElement;
 
-            long numRecords = 0;
+            long? numRecords = null;
             if (root.TryGetProperty("numRecords", out var nr)
-                && nr.ValueKind == JsonValueKind.Number)
-                numRecords = nr.GetInt64();
+                && nr.ValueKind == JsonValueKind.Number
+                && nr.TryGetInt64(out long n))
+                numRecords = n;
 
             return new ColumnStats
             {

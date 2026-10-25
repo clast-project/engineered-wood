@@ -618,6 +618,52 @@ public class BufferedTransactionTests : IDisposable
         Assert.Equal(new long[] { 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, await ReadIdsFreshAsync());
     }
 
+    /// <summary>
+    /// A post-image without a row count is refused before any deletion vector is re-written (#516): the refusal
+    /// comes from re-deriving its row ids, and a vector written for an earlier pair would be left orphaned.
+    /// </summary>
+    [Fact]
+    public async Task BufferedFlow_PostImageWithoutACount_IsRefusedBeforeAnyVectorIsWritten()
+    {
+        await using var table = await CreateRowTrackedTableAsync((1, 5000));
+        var pinned = table.CurrentSnapshot;
+
+        // Every other row: a vector too large to be stored inline, so re-writing it writes a file.
+        var positions = new Dictionary<int, IReadOnlyCollection<long>>
+        {
+            [0] = Enumerable.Range(0, 2500).Select(i => 2L * i).ToArray(),
+        };
+        var (dvActions, _) = await table.ComputeDeletionVectorActionsAsync(positions, resolveAgainst: pinned);
+        var postImage = (await table.WriteDataFilesAsync([BuildBatch(10_000, 2)])).Single();
+        var actions = dvActions.Append(new AddFile
+        {
+            Path = DeltaPath.Encode(postImage.RelativePath),
+            PartitionValues = new Dictionary<string, string>(),
+            Size = postImage.SizeBytes,
+            ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            DataChange = true,
+            Stats = """{"minValues":{"id":10000},"maxValues":{"id":10001}}""",
+            BaseRowId = pinned.RowIdHighWaterMark,
+            DefaultRowCommitVersion = pinned.Version + 1,
+        }).ToList();
+
+        // A concurrent delete on the same file (id 2 = position 1, not one of ours), so the pair must be
+        // re-unioned into a new vector.
+        await using (var racer = await OpenAsync())
+        {
+            await racer.DeleteAsync(IdEquals(2));
+        }
+
+        int VectorFiles() => Directory.GetFiles(_tempDir, "deletion_vector_*.bin", SearchOption.AllDirectories).Length;
+        int before = VectorFiles();
+
+        await using var committer = await OpenAsync();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await committer.RebaseDvDmlActionsAsync(actions, positions, pinned, committer.CurrentSnapshot));
+        Assert.Contains("numRecords", ex.Message);
+        Assert.Equal(before, VectorFiles());
+    }
+
     /// <summary>A row the concurrent rewrite UPDATED is a conflict too, discriminated by commit version rather
     /// than absence: the id is found in the new file but carries the rewrite's version, not its original.</summary>
     [Fact]

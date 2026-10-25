@@ -149,6 +149,12 @@ public static class RowTrackingConfig
     /// Estimates the row count for a file from its statistics.
     /// Falls back to 0 when neither copy carries one.
     /// </summary>
+    /// <remarks>
+    /// The 0 only weakens this estimate, which is a floor under the <c>delta.rowTracking</c> domain's mark
+    /// (the source of truth) rather than a replacement for it: a countless file still lifts the floor to its
+    /// own base id. Refusing here instead would make the snapshot unreadable. The writes that ASSIGN ids
+    /// refuse a countless file, as delta-spark does (<c>DELTA_ROW_ID_ASSIGNMENT_WITHOUT_STATS</c>).
+    /// </remarks>
     private static long EstimateRowCount(Actions.AddFile addFile) =>
         // Reads whichever copy of the statistics carries a row count: a checkpoint written with
         // writeStatsAsJson=false has only the typed one, and taking 0 there would break row ids.

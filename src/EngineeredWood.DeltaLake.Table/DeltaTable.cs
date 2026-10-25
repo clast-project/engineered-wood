@@ -3673,7 +3673,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         BaseRowId = nextRowId,
                         DefaultRowCommitVersion = attemptVersion,
                     });
-                    nextRowId += add.GetNumRecords() ?? 0;
+                    nextRowId += RowCountForRowIds(add);
                     changed = true;
                     break;
 
@@ -3880,14 +3880,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 // Every row matches, so every live one goes: the rows the existing vector already deleted are not
                 // deleted again. The count is the only thing taken on trust, so a count that cannot be right reads
-                // the file instead. A JSON stats object without numRecords parses as 0, and a file with no live
-                // row left would not still be in the table.
-                long liveRows = (addFile.GetNumRecords() ?? 0) - (addFile.DeletionVector?.Cardinality ?? 0);
-                if (liveRows > 0)
+                // the file instead: one with no count at all, or with no live row left (which would not still be
+                // in the table).
+                long? liveRows = addFile.GetNumRecords() - (addFile.DeletionVector?.Cardinality ?? 0);
+                if (liveRows is long live && live > 0)
                 {
                     actions.Add(RemoveOf(addFile));
                     removedPaths.Add(addFile.Path);
-                    totalDeleted += liveRows;
+                    totalDeleted += live;
                     continue;
                 }
             }
@@ -7178,6 +7178,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
             long newVersion = snapshot.Version + 1;
+            // Every file's stats before any deletion vector is written: a refusal part-way would orphan one.
+            var statsByIndex = new string[files.Count];
+            for (int fi = 0; fi < files.Count; fi++)
+                statsByIndex[fi] = StatsCarryingCount(files[fi]);
             for (int fi = 0; fi < files.Count; fi++)
             {
                 var f = files[fi];
@@ -7186,7 +7190,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // vector, so the rows never appear in any committed version. Stats stay physical-row stats,
                 // marked tightBounds=false per the spec (loose supersets).
                 DeletionVector? dv = null;
-                string? stats = f.StatsJson ?? $"{{\"numRecords\":{f.NumRecords}}}";
+                string? stats = statsByIndex[fi];
                 if (deletedPositionsByFileIndex is not null
                     && deletedPositionsByFileIndex.TryGetValue(fi, out var deletedPositions)
                     && deletedPositions.Count > 0)
@@ -7270,6 +7274,72 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return stats;
         }
     }
+
+    /// <summary>
+    /// A host file's stats JSON, made to carry its <see cref="WrittenDataFile.NumRecords"/>. Row ids are assigned
+    /// from that count, but a later rebase re-sizes them from the committed stats, so stats missing it would leave
+    /// the file countless in the log. A count is written in when absent; one that disagrees is refused, since the
+    /// two cannot both describe the file.
+    /// </summary>
+    private static string StatsCarryingCount(WrittenDataFile f)
+    {
+        string count = f.NumRecords.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (f.StatsJson is null)
+            return "{\"numRecords\":" + count + "}";
+
+        System.Text.Json.JsonDocument doc;
+        try
+        {
+            doc = System.Text.Json.JsonDocument.Parse(f.StatsJson);
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            throw new ArgumentException(
+                $"The stats JSON for '{f.RelativePath}' does not parse: {ex.Message}", nameof(f), ex);
+        }
+
+        using (doc)
+        {
+            var root = doc.RootElement;
+            if (root.ValueKind != System.Text.Json.JsonValueKind.Object)
+                throw new ArgumentException(
+                    $"The stats JSON for '{f.RelativePath}' is not a JSON object.", nameof(f));
+
+            if (root.TryGetProperty("numRecords", out var nr)
+                && nr.ValueKind == System.Text.Json.JsonValueKind.Number)
+            {
+                if (!nr.TryGetInt64(out long stated) || stated != f.NumRecords)
+                    throw new ArgumentException(
+                        $"The stats JSON for '{f.RelativePath}' says numRecords {nr.GetRawText()}, but the file "
+                        + $"is described as holding {count} rows.", nameof(f));
+                return f.StatsJson;
+            }
+
+            using var stream = new MemoryStream();
+            using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
+            {
+                writer.WriteStartObject();
+                writer.WriteNumber("numRecords", f.NumRecords);
+                foreach (var prop in root.EnumerateObject())
+                {
+                    if (!prop.NameEquals("numRecords"))
+                        prop.WriteTo(writer);
+                }
+                writer.WriteEndObject();
+            }
+            return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        }
+    }
+
+    /// <summary>
+    /// The row count an add's row-id range is sized by. A file without one is refused rather than given an empty
+    /// range: the next file's ids would overlap its rows. delta-spark refuses the same file
+    /// (<c>DELTA_ROW_ID_ASSIGNMENT_WITHOUT_STATS</c>).
+    /// </summary>
+    private static long RowCountForRowIds(AddFile add) =>
+        add.GetNumRecords() ?? throw new InvalidOperationException(
+            $"Cannot assign row ids to '{add.Path}': its statistics carry no numRecords. Row tracking needs "
+            + "each new file's row count to size its row-id range.");
 
     // ── Buffered-transaction DML seam ──────────────────────────────────────────────────────────────────
     //
@@ -7462,11 +7532,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var actions = new List<DeltaAction>(files.Count + 1);
         long liveRows = 0;
+        // Every file's stats before any deletion vector is written: a refusal part-way would orphan one.
+        var statsByIndex = new string[files.Count];
+        for (int fi = 0; fi < files.Count; fi++)
+            statsByIndex[fi] = StatsCarryingCount(files[fi]);
 
-        foreach (var f in files)
+        for (int fi = 0; fi < files.Count; fi++)
         {
+            var f = files[fi];
             DeletionVector? dv = null;
-            string? stats = f.StatsJson ?? $"{{\"numRecords\":{f.NumRecords}}}";
+            string? stats = statsByIndex[fi];
             long hidden = 0;
             if (deletedByPath is not null
                 && deletedByPath.TryGetValue(f.RelativePath, out var positions) && positions.Count > 0)
@@ -8814,6 +8889,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 kvp.Key, kvp.Value as IReadOnlyList<long> ?? [.. kvp.Value]));
         }
 
+        // Likewise a post-image without a row count, which cannot have its row ids re-derived below.
+        if (rowTrackingEnabled)
+        {
+            foreach (var action in actions)
+            {
+                if (action is AddFile add && !fromByPath.Contains(add.Path) && add.DataChange
+                    && add.BaseRowId is not null)
+                    RowCountForRowIds(add);
+            }
+        }
+
         foreach (var action in actions)
         {
             switch (action)
@@ -8870,7 +8956,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     // committing onto — concurrent commits may have consumed row-id space.
                     if (rowTrackingEnabled && add.BaseRowId is not null)
                     {
-                        long rows = add.GetNumRecords() ?? 0;
+                        long rows = RowCountForRowIds(add);
                         rebased.Add(add with
                         {
                             BaseRowId = nextRowId,
@@ -9355,7 +9441,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     case AddFile add when add.BaseRowId is not null:
                         result.Add(add with { BaseRowId = nextRowId });
-                        nextRowId += add.GetNumRecords() ?? 0;
+                        nextRowId += RowCountForRowIds(add);
                         break;
 
                     case DomainMetadata dm when string.Equals(
