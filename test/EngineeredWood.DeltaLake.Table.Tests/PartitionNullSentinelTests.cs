@@ -229,6 +229,22 @@ public class PartitionNullSentinelTests : IDisposable
         await Assert.ThrowsAsync<DeltaFormatException>(() => IdsAsync(table, Ex.IsNull("part")));
     }
 
+    /// <summary>A projection that leaves the column out is refused all the same.</summary>
+    [Theory]
+    [MemberData(nameof(NotNullViolations))]
+    public async Task NonNullableColumn_ProjectedScanRefusesTheFile(string type, string? spelling)
+    {
+        await using var table = await CreateAsync(type, spelling, nullable: false);
+
+        var error = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+        {
+            await foreach (var _ in table.ReadAsync(new DeltaReadOptions { Columns = ["id"] }))
+            {
+            }
+        });
+        Assert.Equal(DeltaTableErrorCodes.NotNullConstraintViolated, error.ErrorCode);
+    }
+
     [Theory]
     [MemberData(nameof(NotNullViolations))]
     public async Task NonNullableColumn_DeleteRefusesTheFile(string type, string? spelling)
@@ -480,6 +496,46 @@ public class PartitionNullSentinelTests : IDisposable
         Assert.Equal(allNull, Key(new() { ["n"] = Sentinel }));
         Assert.NotEqual(allNull, Key(new() { ["s"] = Sentinel }));
         Assert.NotEqual(allNull, Key(new() { ["n"] = "1" }));
+    }
+
+    // ── A JSON-null entry is kept when the log is read ──
+
+    /// <summary>Under column mapping a map is read in physical spelling only when it carries every partition
+    /// column's physical key. The log reader dropped a JSON-null entry, so <c>{p1: null, p2: "x"}</c> came back
+    /// incomplete, was read as logical-keyed, and lost <c>p2</c> too, once the table was reopened.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ColumnMapping_NullBesideAValue_SurvivesAReopen(bool checkpoint)
+    {
+        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N"));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("p1", StringType.Default, true))
+            .Field(new Field("p2", StringType.Default, true))
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+        RecordBatch Row(long id) => new(schema,
+            [new StringArray.Builder().AppendNull().Build(), new StringArray.Builder().Append("x").Build(),
+             new Int64Array.Builder().Append(id).Build()], 1);
+        await using (var created = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(path), schema, partitionColumns: ["p1", "p2"],
+            columnMappingMode: DeltaLake.Schema.ColumnMappingMode.Name))
+        {
+            await created.WriteAsync([Row(0)]);
+            if (checkpoint)
+                await created.CheckpointAsync();
+        }
+
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(path));
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions()))
+        {
+            Assert.True(((StringArray)batch.Column("p1")).IsNull(0));
+            Assert.Equal("x", ((StringArray)batch.Column("p2")).GetString(0));
+        }
+
+        // The overwrite key reads the same map: overwriting (NULL, x) replaces the file, and only it.
+        await table.DynamicOverwriteAsync([Row(1)]);
+        Assert.Equal([1L], await IdsAsync(table));
     }
 
     // ── IcebergCompat files store their partition values; the log's are the ones a read returns ──

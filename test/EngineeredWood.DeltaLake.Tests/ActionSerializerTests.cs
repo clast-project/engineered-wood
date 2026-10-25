@@ -286,4 +286,29 @@ public class ActionSerializerTests
         Assert.Equal(1234L, add.Size);
         Assert.NotNull(add.Stats);
     }
+
+    /// <summary>A JSON-null partition value is an entry, as the spec writes a NULL partition and the checkpoint
+    /// reader keeps it; elsewhere a null value still means "absent".</summary>
+    [Fact]
+    public void Deserialize_KeepsANullPartitionValue()
+    {
+        byte[] json = System.Text.Encoding.UTF8.GetBytes(
+            """{"add":{"path":"f.parquet","partitionValues":{"p1":null,"p2":"x"},"size":1,"modificationTime":0,"dataChange":true}}"""
+            + "\n"
+            + """{"remove":{"path":"g.parquet","partitionValues":{"p1":null},"dataChange":true}}"""
+            + "\n"
+            + """{"metaData":{"id":"m","format":{"provider":"parquet","options":{}},"schemaString":"{}","partitionColumns":[],"configuration":{"k":null,"j":"v"}}}""");
+
+        var actions = ActionSerializer.Deserialize(json);
+
+        var add = Assert.IsType<AddFile>(actions[0]);
+        Assert.Equal(2, add.PartitionValues.Count);
+        Assert.True(add.PartitionValues.ContainsKey("p1"));
+        Assert.Null(add.PartitionValues["p1"]);
+        Assert.Equal("x", add.PartitionValues["p2"]);
+        var remove = Assert.IsType<RemoveFile>(actions[1]);
+        Assert.True(remove.PartitionValues!.ContainsKey("p1"));
+        var metadata = Assert.IsType<MetadataAction>(actions[2]);
+        Assert.False(metadata.Configuration!.ContainsKey("k"));
+    }
 }

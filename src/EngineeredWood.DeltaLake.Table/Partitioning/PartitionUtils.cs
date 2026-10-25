@@ -416,11 +416,7 @@ internal static class PartitionUtils
         if (PartitionNulls.IsNull(value, isString: type is StringType))
         {
             if (!field.IsNullable)
-                throw new DeltaFormatException(
-                    DeltaTableErrorCodes.NotNullConstraintViolated,
-                    $"{(filePath is null ? "A file" : $"File '{filePath}'")} has a NULL value"
-                    + $"{(value is null ? "" : $" ('{value}')")} for partition column '{field.Name}', which is "
-                    + "declared non-nullable.");
+                throw NotNullViolation(field.Name, value, filePath);
             return ArrowCompute.MakeNullArray(type, length);
         }
 
@@ -428,6 +424,33 @@ internal static class PartitionUtils
         // all-zero validity bitmap, while a constant column needs no validity buffer at all.
         return ArrowCompute.Repeat(type, EncodePartitionValue(type, value!), length);
     }
+
+    /// <summary>
+    /// Refuses a file whose <paramref name="partitionValues"/> hold NULL for a partition column
+    /// <paramref name="tableSchema"/> declares non-nullable, whichever columns the read projects: a projection
+    /// that leaves the column out must not turn the refusal into an answer.
+    /// </summary>
+    public static void ThrowIfNullInNonNullablePartition(
+        IReadOnlyDictionary<string, string> partitionValues, Apache.Arrow.Schema tableSchema,
+        IReadOnlyList<string> partitionColumns, IReadOnlyDictionary<string, string>? logicalToPhysical,
+        string? filePath)
+    {
+        foreach (string column in partitionColumns)
+        {
+            var field = tableSchema.GetFieldByName(column);
+            if (field is null || field.IsNullable)
+                continue;
+            if (!PartitionValueKeys.TryGet(partitionValues, column, partitionColumns, logicalToPhysical, out var value))
+                value = null;
+            if (PartitionNulls.IsNull(value, isString: field.DataType is StringType))
+                throw NotNullViolation(field.Name, value, filePath);
+        }
+    }
+
+    private static DeltaFormatException NotNullViolation(string column, string? value, string? filePath) => new(
+        DeltaTableErrorCodes.NotNullConstraintViolated,
+        $"{(filePath is null ? "A file" : $"File '{filePath}'")} has a NULL value"
+        + $"{(value is null ? "" : $" ('{value}')")} for partition column '{column}', which is declared non-nullable.");
 
     /// <summary>
     /// Decodes one partition value string into the raw little-endian Arrow encoding of a single value slot

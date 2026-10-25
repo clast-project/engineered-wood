@@ -9473,6 +9473,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
             snapshot.Schema, mappingMode);
+        // Before any projection: a read that leaves the column out is refused all the same.
+        if (hasPartitions)
+        {
+            Partitioning.PartitionUtils.ThrowIfNullInNonNullablePartition(
+                addFile.PartitionValues, snapshot.ArrowSchema, partitionColumns, logicalToPhysical, addFile.Path);
+        }
         var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
             snapshot.Schema, mappingMode);
         // Load the deletion vector first — it is independent of the byte source.

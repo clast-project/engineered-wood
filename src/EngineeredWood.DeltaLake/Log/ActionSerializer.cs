@@ -242,7 +242,7 @@ internal static class ActionSerializer
                 switch (prop)
                 {
                     case "path": path = r.GetString(); break;
-                    case "partitionValues": partitionValues = ReadStringDict(ref r); break;
+                    case "partitionValues": partitionValues = ReadStringDict(ref r, keepNulls: true); break;
                     case "size": size = r.GetInt64(); break;
                     case "modificationTime": modificationTime = r.GetInt64(); break;
                     case "dataChange": dataChange = r.GetBoolean(); break;
@@ -295,7 +295,7 @@ internal static class ActionSerializer
                     case "deletionTimestamp": deletionTimestamp = r.GetInt64(); break;
                     case "dataChange": dataChange = r.GetBoolean(); break;
                     case "extendedFileMetadata": extendedFileMetadata = r.GetBoolean(); break;
-                    case "partitionValues": partitionValues = ReadStringDict(ref r); break;
+                    case "partitionValues": partitionValues = ReadStringDict(ref r, keepNulls: true); break;
                     case "size": size = r.GetInt64(); break;
                     case "tags": tags = ReadStringDict(ref r); break;
                     case "deletionVector": deletionVector = JsonSerializer.Deserialize(ref r, s_deletionVectorInfo); break;
@@ -468,7 +468,7 @@ internal static class ActionSerializer
                 switch (prop)
                 {
                     case "path": path = r.GetString(); break;
-                    case "partitionValues": partitionValues = ReadStringDict(ref r); break;
+                    case "partitionValues": partitionValues = ReadStringDict(ref r, keepNulls: true); break;
                     case "size": size = r.GetInt64(); break;
                     case "dataChange": dataChange = r.GetBoolean(); break;
                     case "tags": tags = ReadStringDict(ref r); break;
@@ -789,7 +789,11 @@ internal static class ActionSerializer
             }
         }
 
-        private static Dictionary<string, string> ReadStringDict(ref Utf8JsonReader reader)
+        // keepNulls: a JSON null VALUE is kept as a null entry. In partitionValues it is meaningful: the spec writes
+        // a NULL partition value that way, and dropping the entry left a column-mapping map incomplete in physical
+        // spelling, so the map was read as logical-keyed and its other values were lost (the checkpoint reader keeps
+        // them already).
+        private static Dictionary<string, string> ReadStringDict(ref Utf8JsonReader reader, bool keepNulls = false)
         {
             var dict = new Dictionary<string, string>();
             if (reader.TokenType != JsonTokenType.StartObject)
@@ -808,8 +812,8 @@ internal static class ActionSerializer
                 string? value = reader.TokenType == JsonTokenType.Null
                     ? null!
                     : reader.GetString()!;
-                if (value is not null)
-                    dict[key] = value;
+                if (value is not null || keepNulls)
+                    dict[key] = value!;
             }
 
             return dict;
