@@ -37,11 +37,12 @@ internal sealed class DeltaGeneratedColumns
     private DeltaGeneratedColumns(IReadOnlyList<Generated> columns)
     {
         _columns = columns;
+        ColumnNames = new HashSet<string>(columns.Select(c => c.Name), StringComparer.Ordinal);
         _evaluator = new ArrowRowEvaluator(new SparkFunctionRegistry());
     }
 
-    /// <summary>The names of the generated columns.</summary>
-    public IReadOnlyCollection<string> ColumnNames => _columns.Select(c => c.Name).ToList();
+    /// <summary>The names of the generated columns, built once: each batch of a write consults them.</summary>
+    public IReadOnlyCollection<string> ColumnNames { get; }
 
     /// <summary>Whether the table declares any generated column.</summary>
     /// <remarks>Does not parse — see <see cref="DeltaConstraintEnforcer.Declares"/> for why.</remarks>
