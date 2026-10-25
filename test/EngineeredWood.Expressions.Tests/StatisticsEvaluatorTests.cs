@@ -503,6 +503,22 @@ public class StatisticsEvaluatorTests
             Eval(Expressions.StartsWith("name", "zebra"), stats));
     }
 
+    /// <summary>
+    /// <c>'ab' STARTS WITH name</c> is not <c>name STARTS WITH 'ab'</c>: it holds for a name <c>a</c>, which the
+    /// turned-round test rules out. The bounds of name say nothing about which names prefix a literal.
+    /// </summary>
+    [Fact]
+    public void StartsWith_LiteralOnTheLeft_IsUnknown()
+    {
+        var stats = new TestStats().With("name", min: "a", max: "a", nullCount: 0, valueCount: 1);
+        var prefixOfLiteral = new ComparisonPredicate(
+            new LiteralExpression(LiteralValue.Of("ab")), ComparisonOperator.StartsWith, new UnboundReference("name"));
+        var notPrefixOfLiteral = prefixOfLiteral with { Op = ComparisonOperator.NotStartsWith };
+
+        Assert.Equal(FilterResult.Unknown, Eval(prefixOfLiteral, stats));
+        Assert.Equal(FilterResult.Unknown, Eval(notPrefixOfLiteral, stats));
+    }
+
     // ── NullSafeEqual ──
 
     [Fact]
