@@ -422,6 +422,153 @@ public class UpdatePartitionMoveTests : IDisposable
             Assert.Equal("z", ((StringArray)b.Column(b.Schema.GetFieldIndex("part"))).GetString(0));
     }
 
+    // ── Partition values the log cannot hold ─────────────────────────────────────────────────────────────
+
+    private static readonly Apache.Arrow.Schema IntPartitioned = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("n", Int32Type.Default, true))
+        .Field(new Field("id", Int64Type.Default, false))
+        .Build();
+
+    private static RecordBatch IntRows(int n, long id) => new(IntPartitioned,
+        [new Int32Array.Builder().Append(n).Build(), new Int64Array.Builder().Append(id).Build()], 1);
+
+    /// <summary>The batch with its <c>n</c> column replaced by the string <paramref name="text"/>.</summary>
+    private static RecordBatch WithStringN(RecordBatch b, string text)
+    {
+        var fields = b.Schema.FieldsList.ToArray();
+        var columns = b.Arrays.ToArray();
+        int index = b.Schema.GetFieldIndex("n");
+        fields[index] = new Field("n", StringType.Default, true);
+        columns[index] = new StringArray.Builder().AppendRange(Enumerable.Repeat(text, b.Length)).Build();
+        return new RecordBatch(new Apache.Arrow.Schema(fields, null), columns, b.Length);
+    }
+
+    /// <summary>
+    /// A partition column retyped by the updater is refused before anything is committed: the value would become
+    /// log metadata the read cannot parse (<c>n: "abc"</c> under an integer column). Partition values are the
+    /// library's to format whoever writes the data bytes, so a host writer does not lift the check.
+    /// </summary>
+    [Theory]
+    [InlineData("update-rows", false)]
+    [InlineData("update-rows", true)]
+    [InlineData("predicate", true)]
+    public async Task RetypedPartitionColumn_IsRefused(string entryPoint, bool hostWriter)
+    {
+        // Seeded through the built-in writer, so the UPDATE has a real file to read; the host writer, when there is
+        // one, would only have received the rewrite.
+        var fs = new LocalTableFileSystem(Path.Combine(_tempDir, "retyped"));
+        await using (var seed = await DeltaTable.CreateAsync(fs, IntPartitioned, partitionColumns: ["n"]))
+            await seed.WriteAsync([IntRows(1, 1)]);
+        await using var table = await DeltaTable.OpenAsync(fs, hostWriter
+            ? DeltaTableOptions.Default with { DataFileWriter = new DiscardingWriter() }
+            : DeltaTableOptions.Default);
+        long version = table.CurrentSnapshot.Version;
+
+        Task act = entryPoint == "predicate"
+            ? table.UpdateAsync(Ex.Equal("id", 1L), b => WithStringN(b, "abc")).AsTask()
+            : table.UpdateRowsAsync(
+                RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
+                {
+                    [table.CurrentSnapshot.ActiveFiles.Values.Single().Path] = [0L],
+                }),
+                (_, batches, _) => batches.Select(b => WithStringN(b, "abc")).ToList()).AsTask();
+
+        await Assert.ThrowsAsync<ArgumentException>(() => act);
+        Assert.Equal(version, table.CurrentSnapshot.Version);
+    }
+
+    /// <summary>Writes nothing: the refusal must come before any data file is written.</summary>
+    private sealed class DiscardingWriter : IDataFileWriter
+    {
+        public async ValueTask<long> WriteAsync(
+            IAsyncEnumerable<RecordBatch> batches, string relativePath, CancellationToken cancellationToken)
+        {
+            await foreach (var _ in batches.WithCancellation(cancellationToken)) { }
+            return 4096;
+        }
+    }
+
+    /// <summary>
+    /// A decimal(38,0) partition value wider than <see cref="decimal"/> holds. Every UPDATE of such a file formats its
+    /// partition values to decide which rows stay, and formatting through <see cref="decimal"/> overflowed, so even
+    /// an UPDATE of another column failed.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task WideDecimalPartition_UpdatesAndMoves(bool move)
+    {
+        const string Wide = "99999999999999999999999999999999999999";
+        const string Other = "-12345678901234567890123456789012345678";
+        var type = new Decimal128Type(38, 0);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("d", type, true))
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(Path.Combine(_tempDir, "wide")), schema, partitionColumns: ["d"]);
+        await table.WriteAsync([new RecordBatch(schema,
+            [new Decimal128Array.Builder(type).Append(1m).Build(), new Int64Array.Builder().Append(1).Build()], 1)]);
+        var file = table.CurrentSnapshot.ActiveFiles.Values.Single();
+        await using (var transaction = table.StartTransaction())
+        {
+            transaction.StageActions(
+            [
+                new RemoveFile { Path = file.Path, DeletionTimestamp = 1, DataChange = false },
+                file with { PartitionValues = new Dictionary<string, string> { ["d"] = Wide }, DataChange = false },
+            ]);
+            await transaction.CommitAsync();
+        }
+
+        await table.UpdateAsync(Ex.Equal("id", 1L), b =>
+        {
+            var columns = b.Arrays.ToArray();
+            columns[b.Schema.GetFieldIndex("id")] = new Int64Array.Builder().Append(2).Build();
+            if (move)
+                columns[b.Schema.GetFieldIndex("d")] = WideDecimal(type, Other);
+            return new RecordBatch(b.Schema, columns, b.Length);
+        });
+
+        var rewritten = table.CurrentSnapshot.ActiveFiles.Values.Single();
+        Assert.Equal(move ? Other : Wide, rewritten.PartitionValues["d"]);
+    }
+
+    /// <summary>The append path's partition split formats with the same code, and overflowed the same way.</summary>
+    [Fact]
+    public async Task WideDecimalPartition_Appends()
+    {
+        const string Wide = "-99999999999999999999999999999999.999999";
+        var type = new Decimal128Type(38, 6);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("d", type, true))
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(Path.Combine(_tempDir, "wide-append")), schema, partitionColumns: ["d"]);
+
+        await table.WriteAsync([new RecordBatch(schema,
+            [WideDecimal(type, "-99999999999999999999999999999999999999"), new Int64Array.Builder().Append(1).Build()],
+            1)]);
+
+        Assert.Equal(Wide, table.CurrentSnapshot.ActiveFiles.Values.Single().PartitionValues["d"]);
+    }
+
+    /// <summary>A one-value Decimal128 array holding <paramref name="text"/> exactly, built from its two's-complement
+    /// bytes since <see cref="decimal"/> cannot hold it.</summary>
+    private static Decimal128Array WideDecimal(Decimal128Type type, string text)
+    {
+        var unscaled = System.Numerics.BigInteger.Parse(text, System.Globalization.CultureInfo.InvariantCulture);
+        var bytes = new byte[16];
+        byte[] le = unscaled.ToByteArray();
+        System.Array.Copy(le, bytes, le.Length);
+        if (unscaled.Sign < 0)
+        {
+            for (int i = le.Length; i < 16; i++)
+                bytes[i] = 0xFF;
+        }
+        return new Decimal128Array(new ArrayData(type, 1, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(bytes)]));
+    }
+
     /// <summary>The host-driven UPDATE now holds a moved row to the write path's partition rule.</summary>
     [Theory]
     [InlineData(null)]

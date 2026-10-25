@@ -106,4 +106,32 @@ internal static class DecimalText
         rescaled = BigInteger.DivRem(unscaled, divisor, out var remainder);
         return remainder.IsZero;
     }
+
+    /// <summary>
+    /// Renders the decimal at <paramref name="row"/> of a fixed-width decimal array (<paramref name="width"/> bytes
+    /// per value) as its exact digits: <c>-0.05</c>, <c>1.50</c>, every digit of a decimal(38,x). Never goes through
+    /// <see cref="decimal"/>, which holds ~28-29 significant digits and throws on Delta's own decimal(38,0) range.
+    /// Used for statistics bounds, where a rounded bound shifts what prunes, and partition values, where a rounded
+    /// value is the wrong partition.
+    /// </summary>
+    public static string Format(Apache.Arrow.IArrowArray array, int row, int width, int scale)
+    {
+        var bytes = array.Data.Buffers[1].Span.Slice((row + array.Data.Offset) * width, width);
+#if NET6_0_OR_GREATER
+        var unscaled = new BigInteger(bytes, isUnsigned: false, isBigEndian: false);
+#else
+        var unscaled = new BigInteger(bytes.ToArray());
+#endif
+        // The array's buffers may be native memory the span does not root. See doc/arrow-span-lifetime.md.
+        GC.KeepAlive(array);
+        if (scale == 0)
+            return unscaled.ToString(CultureInfo.InvariantCulture);
+
+        string sign = unscaled.Sign < 0 ? "-" : "";
+        string digits = BigInteger.Abs(unscaled).ToString(CultureInfo.InvariantCulture);
+        if (digits.Length <= scale)
+            digits = digits.PadLeft(scale + 1, '0');
+        return sign + digits.Substring(0, digits.Length - scale)
+            + "." + digits.Substring(digits.Length - scale);
+    }
 }

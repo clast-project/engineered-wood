@@ -419,8 +419,10 @@ internal static class PartitionUtils
             Date32Array d32 => DateTimeOffset.FromUnixTimeSeconds(
                 d32.GetValue(row)!.Value * 86400L).ToString("yyyy-MM-dd"),
             TimestampArray ts => FormatTimestampPartitionValue(ts, row),
-            // Spec dot-notation decimal string.
-            Decimal128Array dec => dec.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            // Spec dot-notation decimal string, from the exact digits: System.Decimal overflows on a decimal(38,0)
+            // value such as 10^38 - 1, and every UPDATE formats the partition values of the files it rewrites.
+            Decimal128Array dec => DeltaLake.Schema.DecimalText.Format(
+                dec, row, 16, ((Decimal128Type)dec.Data.DataType).Scale),
             // A type we cannot encode per the spec (binary, nested, ...) must THROW, never fall back to
             // .ToString() — that silently wrote the .NET type name as the partition value.
             _ => throw new NotSupportedException(

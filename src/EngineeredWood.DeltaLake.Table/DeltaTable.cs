@@ -4372,6 +4372,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     var matchBatch = TakeRowsFromBatch(batch, matchRows);
                     var updatedBatch = updater(matchBatch);
                     ThrowIfUpdaterChangedTypes(matchBatch, updatedBatch, snapshot.Schema);
+                    ThrowIfPartitionColumnsRetyped(updatedBatch, snapshot, "UPDATE");
 
                     // Only the post-image. Rows the predicate did not match are copied through
                     // untouched: they were already in the table, so re-checking them would refuse
@@ -7345,6 +7346,33 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         SchemaConverter.ThrowIfUnwritableType(normalized.Schema, convertibleTypesAllowed: HostOwnsBytes);
     }
 
+    /// <summary>
+    /// Refuses a rewritten batch whose partition column no longer maps onto the type the table declares. Its values
+    /// become log metadata this library formats, and an UPDATE that changes them moves the row (#519), so the check
+    /// holds under a host writer too, unlike the data columns': an integer partition handed back as the string
+    /// <c>"abc"</c> committed <c>n: "abc"</c>, which no read can parse.
+    /// </summary>
+    private static void ThrowIfPartitionColumnsRetyped(
+        RecordBatch rewritten, Snapshot.Snapshot snapshot, string entryPoint)
+    {
+        var fields = new List<Field>();
+        var columns = new List<IArrowArray>();
+        foreach (string column in snapshot.Metadata.PartitionColumns)
+        {
+            int index = rewritten.Schema.GetFieldIndex(column);
+            if (index < 0)
+                continue;
+            fields.Add(rewritten.Schema.FieldsList[index]);
+            columns.Add(rewritten.Column(index));
+        }
+        if (fields.Count > 0)
+        {
+            ThrowIfMistypedColumns(
+                [new RecordBatch(new Apache.Arrow.Schema(fields, null), columns, rewritten.Length)],
+                snapshot.Schema, entryPoint);
+        }
+    }
+
     /// <summary>Whether two Arrow types are the same object, or map onto the same Delta type.</summary>
     private static bool SameDeltaType(Apache.Arrow.Types.IArrowType a, Apache.Arrow.Types.IArrowType b)
     {
@@ -8603,6 +8631,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var partitionColumns = snapshot.Metadata.PartitionColumns;
             if (partitionColumns.Count > 0)
             {
+                foreach (var b in rewritten)
+                    ThrowIfPartitionColumnsRetyped(b, snapshot, "UpdateRowsAsync");
                 rewritten = rewritten
                     .Select(b => Partitioning.PartitionUtils.NormalizePartitionValues(
                         WriteTypeNormalization.NormalizeColumns(b, partitionColumns),
