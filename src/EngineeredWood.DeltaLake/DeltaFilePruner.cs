@@ -300,16 +300,24 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     // A file's partition value, in its map's own spelling: physical keys (the spec), or the logical keys of an
     // older engineered-wood commit. The spelling is decided per map, not per key (see PartitionValueKeys). A map
     // complete in BOTH spellings that disagree (renames that permute names) gives the pruner nothing: a read has
-    // to pick the spec's reading, but pruning can decline to guess.
+    // to pick the spec's reading, but pruning can decline to guess. A value the read path materializes as NULL
+    // (see PartitionNulls) comes back null, so the pruner sees what a scan reads; an empty string for a column
+    // whose type is unknown here could be either, and gives nothing.
     private bool TryGetPartitionValue(AddFile addFile, string column, out string value)
     {
-        if (PartitionValueKeys.IsAmbiguous(addFile.PartitionValues, _partitionColumns, _logicalToPhysical))
+        value = default!;
+        if (PartitionValueKeys.IsAmbiguous(addFile.PartitionValues, _partitionColumns, _logicalToPhysical)
+            || !PartitionValueKeys.TryGet(
+                addFile.PartitionValues, column, _partitionColumns, _logicalToPhysical, out string raw))
         {
-            value = default!;
             return false;
         }
-        return PartitionValueKeys.TryGet(
-            addFile.PartitionValues, column, _partitionColumns, _logicalToPhysical, out value);
+        if (raw is { Length: 0 } && !_columnTypes.ContainsKey(column))
+            return false;
+        value = PartitionNulls.IsNull(raw, isString: _columnTypes.TryGetValue(column, out var t) && t == "string")
+            ? null!
+            : raw;
+        return true;
     }
 
     // A file's statistic for a column: under the column's PHYSICAL name ONLY when it has one distinct from its
@@ -341,8 +349,8 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
         if (_partitionColumns.Contains(column))
         {
             // Partition value is constant per file. If the stored value is
-            // null (the dictionary holds a null string), every row is null;
-            // otherwise no row is null in this column.
+            // null (a null string, or a spelling PartitionNulls reads as NULL),
+            // every row is null; otherwise no row is null in this column.
             if (TryGetPartitionValue(stats.AddFile, column, out var v))
                 return v is null ? stats.AddFile.PartitionValues.Count > 0 ? GetValueCount(stats, column) : null : 0;
             return null;

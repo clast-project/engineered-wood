@@ -305,11 +305,7 @@ internal static class PartitionUtils
     /// </summary>
     private static IArrowArray BuildConstantArray(IArrowType type, string? value, int length)
     {
-        bool isNull = value is null
-            || value == "__HIVE_DEFAULT_PARTITION__"
-            || (value.Length == 0 && type is not StringType);
-
-        if (isNull)
+        if (PartitionNulls.IsNull(value, isString: type is StringType))
             return ArrowCompute.MakeNullArray(type, length);
 
         // The two shapes are inverses and each gets its own path: an all-null column needs an allocated,
