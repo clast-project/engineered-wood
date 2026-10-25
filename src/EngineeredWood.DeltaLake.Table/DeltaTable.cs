@@ -4377,7 +4377,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     // an unrelated UPDATE over data another engine wrote under semantics we do not
                     // share, and would be work with nothing to find.
                     // As the write path does: partition values as stored before any expression reads them, then
-                    // a NULL the table declares impossible refused.
+                    // a NULL the table declares impossible refused. The partition columns in their canonical
+                    // Arrow forms first, as on the write path: the rule reads only those (a StringView's empty
+                    // string went through unrefused).
+                    updatedBatch = WriteTypeNormalization.NormalizeColumns(
+                        updatedBatch, snapshot.Metadata.PartitionColumns);
                     updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
                         updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: false);
                     updatedBatch = generatedColumns?.Recompute(updatedBatch) ?? updatedBatch;
