@@ -294,12 +294,19 @@ public class DeleteWithoutReadingTests : IDisposable
         Assert.Equal(Ids(0, 100), deletedIds);
     }
 
-    /// <summary>A file whose statistics carry no row count has none to report, so it alone is read.</summary>
-    [Fact]
-    public async Task NoRowCount_ReadsThatFile()
+    /// <summary>
+    /// Statistics without a row count, as a writer that kept none or only bounds would leave them. A JSON object
+    /// without <c>numRecords</c> parses as a count of 0, which taken on trust would leave the file's rows
+    /// undeleted. The file has no count to report, so it alone is read.
+    /// </summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("{}")]
+    [InlineData("""{"minValues":{"id":0},"maxValues":{"id":9},"nullCount":{"id":0}}""")]
+    public async Task NoRowCount_ReadsThatFile(string? stats)
     {
         var (shortcut, oracle) = await DeleteBothWaysAsync(
-            new Shape(), Ex.Equal("part", "a"), setup: DropStatsOfOneFileOfAAsync);
+            new Shape(), Ex.Equal("part", "a"), setup: table => ReplaceStatsOfOneFileOfAAsync(table, stats));
         await using var _ = shortcut;
         await using var __ = oracle;
 
@@ -308,8 +315,22 @@ public class DeleteWithoutReadingTests : IDisposable
         await AssertSameOutcomeAsync(shortcut, oracle);
     }
 
-    /// <summary>Re-adds one file of partition <c>a</c> without statistics, as a writer that kept none would.</summary>
-    private static async Task DropStatsOfOneFileOfAAsync(DeltaTable table)
+    /// <summary>A file the predicate does not match needs no count: it is left alone unread either way.</summary>
+    [Fact]
+    public async Task NoRowCount_UnmatchedFile_IsNotOpened()
+    {
+        var (shortcut, oracle) = await DeleteBothWaysAsync(
+            new Shape(), Ex.Equal("part", "b"), setup: table => ReplaceStatsOfOneFileOfAAsync(table, null));
+        await using var _ = shortcut;
+        await using var __ = oracle;
+
+        Assert.Empty(shortcut.Opened);
+        Assert.Equal(20, shortcut.Deleted);
+        await AssertSameOutcomeAsync(shortcut, oracle);
+    }
+
+    /// <summary>Re-adds one file of partition <c>a</c> with <paramref name="stats"/> as its statistics.</summary>
+    private static async Task ReplaceStatsOfOneFileOfAAsync(DeltaTable table, string? stats)
     {
         var file = table.CurrentSnapshot.ActiveFiles.Values
             .Where(f => f.PartitionValues.Values.Contains("a"))
@@ -324,10 +345,10 @@ public class DeleteWithoutReadingTests : IDisposable
                 DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 DataChange = false,
             },
-            file with { Stats = null, TypedStats = null, DataChange = false },
+            file with { Stats = stats, TypedStats = null, DataChange = false },
         ]);
         await transaction.CommitAsync();
-        Assert.Null(table.CurrentSnapshot.ActiveFiles[file.Path].GetNumRecords());
+        Assert.Equal(stats, table.CurrentSnapshot.ActiveFiles[file.Path].Stats);
     }
 
     [Fact]
@@ -353,6 +374,7 @@ public class DeleteWithoutReadingTests : IDisposable
         { "mixed", false },
         { "function", false },
         { "case", false },
+        { "nested", false },
     };
 
     [Theory]
@@ -370,10 +392,17 @@ public class DeleteWithoutReadingTests : IDisposable
             "function" => Ex.Equal(
                 new FunctionCall("upper", [new UnboundReference("part")]), new LiteralExpression(LiteralValue.Of("A"))),
             // A reference must match the partition column's name exactly.
-            _ => Ex.Equal("PART", "a"),
+            "case" => Ex.Equal("PART", "a"),
+            // Field b of a struct a, whose dotted name is the "a.b" partition column's.
+            _ => Ex.Equal(UnboundReference.FromParts(["a", "b"]), new LiteralExpression(LiteralValue.Of("x"))),
         };
-        Assert.Equal(expected, DeltaTable.ReferencesOnlyPartitionColumns(predicate, ["part"]));
+        Assert.Equal(expected, DeltaTable.ReferencesOnlyPartitionColumns(predicate, ["part", "a.b"]));
     }
+
+    /// <summary>The one-part reference to a partition column literally called <c>a.b</c> does take the shortcut.</summary>
+    [Fact]
+    public void ReferencesOnlyPartitionColumns_DottedPartitionColumnName_IsAPartitionReference() =>
+        Assert.True(DeltaTable.ReferencesOnlyPartitionColumns(Ex.Equal("a.b", "x"), ["a.b"]));
 
     [Fact]
     public void ReferencesOnlyPartitionColumns_UnpartitionedTable_IsFalse() =>
