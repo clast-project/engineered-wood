@@ -3840,7 +3840,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool partitionOnly = prunePredicate is not null && !cdfEnabled
             && ReferencesOnlyPartitionColumns(prunePredicate, partitionColumns);
         bool statisticsProve = prunePredicate is not null && !cdfEnabled && !partitionOnly
-            && _options.DeleteTrustsStatistics;
+            && _options.DeleteTrustsStatistics && EvaluatesEverywhere(prunePredicate, snapshot.Schema);
         var partitionSchema = (partitionOnly || statisticsProve) && partitionColumns.Count > 0
             ? BuildProjectedSchema(snapshot.ArrowSchema, partitionColumns)
             : null;
@@ -4050,6 +4050,33 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         BaseRowId = addFile.BaseRowId,
         DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
     };
+
+    /// <summary>
+    /// Whether the DELETE mask can evaluate <paramref name="predicate"/> on any file, so a proof may stand in for
+    /// it: no function call (the mask has no function registry) and every reference a top-level column. One OR
+    /// branch proven would otherwise remove files on a predicate whose other branch fails the read with an
+    /// error, turning a DELETE that throws into one that commits. A mixed-type comparison answers NULL rather
+    /// than throwing, so it needs no exclusion.
+    /// </summary>
+    internal static bool EvaluatesEverywhere(Expressions.Predicate predicate, Schema.StructType schema)
+    {
+        var columns = new HashSet<string>(schema.Fields.Select(f => f.Name), StringComparer.Ordinal);
+        return Visit(predicate);
+
+        bool Visit(Expressions.Expression expression) => expression switch
+        {
+            Expressions.TruePredicate or Expressions.FalsePredicate or Expressions.LiteralExpression => true,
+            Expressions.AndPredicate and => and.Children.All(Visit),
+            Expressions.OrPredicate or => or.Children.All(Visit),
+            Expressions.NotPredicate not => Visit(not.Child),
+            Expressions.ComparisonPredicate cmp => Visit(cmp.Left) && Visit(cmp.Right),
+            Expressions.UnaryPredicate unary => Visit(unary.Operand),
+            Expressions.SetPredicate set => Visit(set.Operand) && set.Values.All(Visit),
+            Expressions.UnboundReference reference =>
+                reference.NameParts.Count == 1 && columns.Contains(reference.Name),
+            _ => false,
+        };
+    }
 
     /// <summary>
     /// Whether <paramref name="predicate"/> is TRUE for every row of <paramref name="addFile"/>, as far as its

@@ -289,4 +289,29 @@ public class NestedStatsPruningTests : IDisposable
 
         Assert.Equal([2L], rows);
     }
+
+    /// <summary>
+    /// A top-level column literally named <c>s.a</c> beside struct <c>s</c>'s leaf <c>a</c> shares the flattened
+    /// statistics key <c>s.a</c>, and its bounds were already left unused. Its null count was not: the leaf's 0
+    /// pruned <c>`s.a` IS NULL</c> from a file written before the column was added, where it reads as all NULL.
+    /// </summary>
+    [Fact]
+    public void CollidedName_NullCountIsNotUsed()
+    {
+        var schema = SchemaConverter.FromArrowSchema(new Apache.Arrow.Schema.Builder()
+            .Field(new Field("s.a", Int64Type.Default, true))
+            .Field(new Field("s", new ArrowStructType([new Field("a", Int64Type.Default, true)]), true))
+            .Build());
+        var olderFile = new AddFile
+        {
+            Path = "f.parquet",
+            PartitionValues = new Dictionary<string, string>(),
+            Size = 1,
+            ModificationTime = 0,
+            DataChange = true,
+            Stats = """{"numRecords":3,"nullCount":{"s":{"a":0}}}""",
+        };
+
+        Assert.True(new DeltaFilePruner(schema, []).ShouldInclude(olderFile, Ex.IsNull("s.a")));
+    }
 }

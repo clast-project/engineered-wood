@@ -583,7 +583,11 @@ public static class StatisticsEvaluator
             return true;
         }
 
-        if (left is LiteralExpression ll && TryGetColumnName(right, out column))
+        // A prefix test has no mirror image: 'ab' STARTS WITH name asks whether name is a prefix of 'ab', which
+        // the bounds of name do not answer. Read as name STARTS WITH 'ab', a file holding 'a' was pruned.
+        if (left is LiteralExpression ll
+            && op is not (ComparisonOperator.StartsWith or ComparisonOperator.NotStartsWith)
+            && TryGetColumnName(right, out column))
         {
             value = ll.Value;
             effectiveOp = FlipOperator(op);

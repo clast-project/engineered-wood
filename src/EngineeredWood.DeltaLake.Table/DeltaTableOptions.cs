@@ -245,9 +245,11 @@ public sealed record DeltaTableOptions
     /// columns alone, and reads every other candidate. That is this library's default too. The partition case
     /// needs no statistics and removes files unread whatever this says.</para>
     /// <para>Turn it on for a table whose writers' bounds are bounds (a truncated string maximum rounded up, as
-    /// this library and Spark write it). Only what statistics can prove is proven: AND and OR of comparisons,
-    /// <c>IS [NOT] NULL</c> and <c>IN</c> over one top-level column against literals of its own type, each with a
-    /// null count of 0 unless it is <c>IS NULL</c>, beside any partition-only part. A file with an existing
+    /// this library and Spark write it). Only what statistics can prove is proven: AND and OR of comparisons and
+    /// <c>IS [NOT] NULL</c> over one top-level column against a literal of its own type, each with a null count of
+    /// 0 unless it is <c>IS NULL</c>, beside any partition-only part. A predicate holding a function call or a
+    /// reference to a nested field is not proven anywhere, so that a failing part fails the delete. A file with an
+    /// existing
     /// deletion vector qualifies, its count of deleted rows taken from the row count less the vector's. With the
     /// change data feed on, files are read regardless.</para>
     /// </remarks>

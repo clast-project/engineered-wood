@@ -200,6 +200,67 @@ public class DeleteTrustsStatisticsTests : IDisposable
         Assert.Equal(25, outcome.Deleted);
     }
 
+    /// <summary>
+    /// <c>'ab' STARTS WITH name</c> asks whether name is a prefix of <c>'ab'</c>. No <c>ab0</c>.. is, so nothing
+    /// goes; read as <c>name STARTS WITH 'ab'</c>, F0 and F1 were removed.
+    /// </summary>
+    [Fact]
+    public async Task LiteralLeftStartsWith_IsNotTurnedRound()
+    {
+        var outcome = await DeleteAsync(new Shape(), new ComparisonPredicate(
+            new LiteralExpression(LiteralValue.Of("ab")), ComparisonOperator.StartsWith, new UnboundReference("name")));
+
+        Assert.Equal(0, outcome.Deleted);
+    }
+
+    /// <summary>The evaluator never answers a non-empty IN AlwaysTrue, so IN is read. (F2 is read too: an
+    /// all-NULL column has no bounds, and IN, unlike a comparison, does not rule it out from its null count.)</summary>
+    [Fact]
+    public async Task In_IsRead()
+    {
+        var outcome = await DeleteAsync(new Shape(), Ex.In("v", LiteralValue.Of(100L), LiteralValue.Of(101L)));
+
+        Assert.Equal(["F1", "F2"], outcome.Opened);
+        Assert.Equal(2, outcome.Deleted);
+    }
+
+    /// <summary>
+    /// The mask cannot evaluate a function, so the read throws. Proving the other OR branch would remove every
+    /// file unread and commit instead.
+    /// </summary>
+    [Fact]
+    public async Task OrWithAFunction_StillFails()
+    {
+        var built = await CreateAsync("fails", new Shape());
+        await using var _ = built.Table;
+        long version = built.Table.CurrentSnapshot.Version;
+        var predicate = Ex.Or(
+            Ex.Equal(new FunctionCall("abs", [new UnboundReference("id")]), new LiteralExpression(LiteralValue.Of(0L))),
+            Ex.GreaterThanOrEqual("id", 0L));
+
+        await Assert.ThrowsAnyAsync<Exception>(() => built.Table.DeleteAsync(predicate).AsTask());
+        Assert.Equal(version, built.Table.CurrentSnapshot.Version);
+    }
+
+    [Theory]
+    [InlineData("id", true)]
+    [InlineData("missing", false)]
+    [InlineData("nested", false)]
+    [InlineData("function", false)]
+    public void EvaluatesEverywhere_DeclinesWhatTheMaskCannotEvaluate(string kind, bool expected)
+    {
+        Predicate other = kind switch
+        {
+            "id" => Ex.Equal("id", 1L),
+            "missing" => Ex.Equal("nope", 1L),
+            "nested" => Ex.Equal(UnboundReference.FromParts(["v", "x"]), new LiteralExpression(LiteralValue.Of(1L))),
+            _ => Ex.Equal(new FunctionCall("abs", [new UnboundReference("id")]), new LiteralExpression(LiteralValue.Of(1L))),
+        };
+        var schema = DeltaLake.Schema.SchemaConverter.FromArrowSchema(TableSchema);
+        Assert.Equal(expected, DeltaTable.EvaluatesEverywhere(
+            Ex.Not(Ex.Or(Ex.GreaterThanOrEqual("v", 0L), other)), schema));
+    }
+
     [Fact]
     public async Task Or_IsProvenByAnyChild()
     {
@@ -295,7 +356,8 @@ public class DeleteTrustsStatisticsTests : IDisposable
         Assert.All(opened, p => Assert.DoesNotContain("part=a", p));
     }
 
-    public static TheoryData<string> Unprovable => ["nested", "column-vs-column", "partition-column", "not-in", "function"];
+    public static TheoryData<string> Unprovable =>
+        ["nested", "column-vs-column", "partition-column", "not-in", "in", "function", "literal-left-starts-with"];
 
     [Theory]
     [MemberData(nameof(Unprovable))]
@@ -319,10 +381,38 @@ public class DeleteTrustsStatisticsTests : IDisposable
             "partition-column" => Ex.Equal("name", "x"),
             "not-in" => new SetPredicate(new UnboundReference("id"),
                 [new LiteralExpression(LiteralValue.Of(1L))], SetOperator.NotIn),
+            "in" => Ex.In("id", LiteralValue.Of(5L)),
+            "literal-left-starts-with" => new ComparisonPredicate(
+                new LiteralExpression(LiteralValue.Of(5L)), ComparisonOperator.StartsWith, new UnboundReference("id")),
             _ => Ex.Equal(new FunctionCall("abs", [new UnboundReference("id")]), new LiteralExpression(LiteralValue.Of(5L))),
         };
 
         Assert.True(pruner.ProvesEveryRowTrue(new DeltaFileStats(addFile), Ex.Equal("id", 5L)));
         Assert.False(pruner.ProvesEveryRowTrue(new DeltaFileStats(addFile), leaf));
+    }
+
+    /// <summary>
+    /// A top-level column literally named <c>s.a</c> beside struct <c>s</c>'s leaf <c>a</c>: the flattened null
+    /// count <c>s.a</c> is the struct leaf's. An older file lacks the added <c>s.a</c> column, which reads as all
+    /// NULL there, so <c>`s.a` IS NOT NULL</c> must not be proven from the leaf's count of 0.
+    /// </summary>
+    [Fact]
+    public void ProvesEveryRowTrue_CollidedName_UsesNoNullCount()
+    {
+        var schema = DeltaLake.Schema.SchemaConverter.FromArrowSchema(new Apache.Arrow.Schema.Builder()
+            .Field(new Field("s.a", Int64Type.Default, true))
+            .Field(new Field("s", new StructType([new Field("a", Int64Type.Default, true)]), true))
+            .Build());
+        var addFile = new DeltaLake.Actions.AddFile
+        {
+            Path = "f.parquet",
+            PartitionValues = new Dictionary<string, string>(),
+            Size = 1,
+            ModificationTime = 0,
+            DataChange = true,
+            Stats = """{"numRecords":3,"nullCount":{"s":{"a":0}}}""",
+        };
+
+        Assert.False(new DeltaFilePruner(schema, []).ProvesEveryRowTrue(new DeltaFileStats(addFile), Ex.IsNotNull("s.a")));
     }
 }

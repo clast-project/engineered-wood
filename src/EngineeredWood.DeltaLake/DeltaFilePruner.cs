@@ -151,9 +151,10 @@ public sealed class DeltaFilePruner
 
     /// <summary>
     /// Whether <paramref name="stats"/> prove <paramref name="leaf"/> TRUE for every row of the file, not merely
-    /// that no row is ruled out. Only a comparison, <c>IS [NOT] NULL</c> or non-empty <c>IN</c> over ONE
-    /// top-level data column and literals of the type its bounds decode to is answered; anything else is not
-    /// proven.
+    /// that no row is ruled out. Only a comparison or <c>IS [NOT] NULL</c> over ONE top-level data column and a
+    /// literal of the type its bounds decode to is answered; anything else is not proven. That includes
+    /// <c>IN</c>, which the evaluator never answers AlwaysTrue: for a column whose bounds meet, write
+    /// <c>=</c>.
     /// </summary>
     /// <remarks>
     /// <para>The evaluator is built for pruning, where AlwaysFalse means "no row is TRUE", NULL rows included.
@@ -176,7 +177,9 @@ public sealed class DeltaFilePruner
                 operand = cmp.Left;
                 literals = [cmp.Right];
                 break;
-            case ComparisonPredicate cmp when cmp.Left is LiteralExpression:
+            // A prefix test does not turn round (see StatisticsEvaluator.TryExtractColumnAndLiteral).
+            case ComparisonPredicate cmp when cmp.Left is LiteralExpression
+                && cmp.Op is not (ComparisonOperator.StartsWith or ComparisonOperator.NotStartsWith):
                 operand = cmp.Right;
                 literals = [cmp.Left];
                 break;
@@ -184,10 +187,6 @@ public sealed class DeltaFilePruner
                 operand = unary.Operand;
                 literals = [];
                 isNull = unary.Op == UnaryOperator.IsNull;
-                break;
-            case SetPredicate { Op: SetOperator.In } set when set.Values.Count > 0:
-                operand = set.Operand;
-                literals = set.Values;
                 break;
             default:
                 return false;
@@ -342,6 +341,11 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
                 return v is null ? stats.AddFile.PartitionValues.Count > 0 ? GetValueCount(stats, column) : null : 0;
             return null;
         }
+
+        // As for bounds: a column the constructor dropped (a literal dotted name beside a struct leaf of the same
+        // path) has a count no lookup can attribute, since the flattened key is the struct leaf's too.
+        if (!_columnTypes.ContainsKey(column))
+            return null;
 
         if (TypedFor(stats.AddFile) is { } typed
             && TryResolveTyped(typed, column, typed.View.HasNullCount, out string resolved))
