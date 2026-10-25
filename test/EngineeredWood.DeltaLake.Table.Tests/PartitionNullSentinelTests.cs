@@ -538,6 +538,62 @@ public class PartitionNullSentinelTests : IDisposable
         Assert.Equal([1L], await IdsAsync(table));
     }
 
+    /// <summary>A spec-keyed map whose NULL entry is a missing key, as a checkpoint written from a log whose
+    /// null entries were dropped holds it: the keys present decide the spelling, so p2 keeps its value, an
+    /// overwrite finds the file, and a non-nullable p2 is not taken for NULL.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ColumnMapping_MissingNullKey_KeepsTheOtherValues(bool p2Nullable)
+    {
+        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N"));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("p1", StringType.Default, true))
+            .Field(new Field("p2", StringType.Default, p2Nullable))
+            .Field(new Field("id", Int64Type.Default, false))
+            .Build();
+        RecordBatch Row(long id) => new(schema,
+            [new StringArray.Builder().AppendNull().Build(), new StringArray.Builder().Append("x").Build(),
+             new Int64Array.Builder().Append(id).Build()], 1);
+        await using (var created = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(path), schema, partitionColumns: ["p1", "p2"],
+            columnMappingMode: DeltaLake.Schema.ColumnMappingMode.Name))
+        {
+            await created.WriteAsync([Row(0)]);
+            var file = created.CurrentSnapshot.ActiveFiles.Values.Single();
+            await using var transaction = created.StartTransaction();
+            transaction.StageActions(
+            [
+                new RemoveFile
+                {
+                    Path = file.Path,
+                    DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                    DataChange = false,
+                },
+                file with
+                {
+                    PartitionValues = file.PartitionValues.Where(kv => kv.Value is not null)
+                        .ToDictionary(kv => kv.Key, kv => kv.Value),
+                    DataChange = false,
+                },
+            ]);
+            await transaction.CommitAsync();
+            Assert.Single(created.CurrentSnapshot.ActiveFiles.Values.Single().PartitionValues);
+        }
+
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(path));
+        Assert.Single(table.CurrentSnapshot.ActiveFiles.Values.Single().PartitionValues);
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions()))
+        {
+            Assert.True(((StringArray)batch.Column("p1")).IsNull(0));
+            Assert.Equal("x", ((StringArray)batch.Column("p2")).GetString(0));
+        }
+        Assert.Equal([0L], await IdsAsync(table, Ex.Equal("p2", "x")));
+
+        await table.DynamicOverwriteAsync([Row(1)]);
+        Assert.Equal([1L], await IdsAsync(table));
+    }
+
     // ── IcebergCompat files store their partition values; the log's are the ones a read returns ──
 
     /// <summary>The file holds <c>part = 'a'</c>, materialized as IcebergCompat requires, and the log says

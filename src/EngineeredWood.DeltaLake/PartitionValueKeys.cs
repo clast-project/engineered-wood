@@ -7,54 +7,56 @@ namespace EngineeredWood.DeltaLake;
 /// Resolves the keys of an <c>add.partitionValues</c> map under column mapping. The Delta spec (and Spark) key
 /// it by the PHYSICAL column name; engineered-wood commits before 2026-07 keyed it by the logical name.
 ///
-/// <para>A map's spelling is decided ONCE, from every partition column, never key by key: a spec-keyed map
-/// carries every partition column's physical key, and a map that does not is logical-keyed throughout. Key by
-/// key goes wrong either way on a table upgraded to name mode, whose original names stay as physical names.
-/// After renaming <c>p1</c> to <c>x</c> and then <c>p2</c> to <c>p1</c>, the logical name <c>p1</c> is the
-/// physical key of <c>x</c>, so logical-first bound the wrong column in a spec-keyed map; and in a
-/// logical-keyed map <c>{x, p1}</c>, physical-first found <c>x</c>'s physical key <c>p1</c> and read the other
-/// column's value.</para>
+/// <para>A map's spelling is decided ONCE, from all of its keys, never key by key. Key by key goes wrong either
+/// way on a table upgraded to name mode, whose original names stay as physical names. After renaming <c>p1</c>
+/// to <c>x</c> and then <c>p2</c> to <c>p1</c>, the logical name <c>p1</c> is the physical key of <c>x</c>, so
+/// logical-first bound the wrong column in a spec-keyed map; and in a logical-keyed map <c>{x, p1}</c>,
+/// physical-first found <c>x</c>'s physical key <c>p1</c> and read the other column's value.</para>
 ///
-/// <para>Renames can also PERMUTE names, leaving a map complete in both spellings (<see cref="IsAmbiguous"/>).
-/// Nothing in the map decides it; a read follows the spec, and the pruner declines.</para>
+/// <para>The keys a map HAS decide it, not the keys it would need to be complete: a NULL partition value may be
+/// a missing key (checkpoints written from a log whose null entries were dropped hold such maps), and requiring
+/// every physical key read the rest of such a map as logical-keyed and lost its values. A map is physical when
+/// every key is some partition column's physical name and one of them is no column's logical name, and logical
+/// in the mirror case.</para>
+///
+/// <para>When every key is both a logical and a physical name, the keys cannot decide. If the two readings
+/// bind some key to different columns, as renames that PERMUTE names do, the map is ambiguous
+/// (<see cref="IsAmbiguous"/>): a read follows the spec (physical), and the pruner declines.</para>
 /// </summary>
 internal static class PartitionValueKeys
 {
     /// <summary>
-    /// True when <paramref name="values"/> is keyed by physical name: it carries every partition column's
-    /// physical key. With no column mapping the two spellings are the same and this is true whenever the map is
-    /// complete.
+    /// True when <paramref name="values"/> is keyed by physical name, decided from the keys it holds; a map its
+    /// keys cannot decide is read in the spec's spelling, physical. With no column mapping the two spellings are
+    /// the same.
     /// </summary>
     public static bool IsPhysicallyKeyed<TValue>(
         IReadOnlyDictionary<string, TValue> values, IEnumerable<string> partitionColumns,
-        IReadOnlyDictionary<string, string>? logicalToPhysical)
-    {
-        foreach (var column in partitionColumns)
-        {
-            if (!values.ContainsKey(Physical(column, logicalToPhysical)))
-                return false;
-        }
-        return true;
-    }
+        IReadOnlyDictionary<string, string>? logicalToPhysical) =>
+        Decide(values, partitionColumns, logicalToPhysical) ?? true;
 
     /// <summary>
-    /// True when <paramref name="values"/> is complete in BOTH spellings and they differ: renames that permute
-    /// names (logical <c>p1</c> physical <c>p2</c>, logical <c>p2</c> physical <c>p1</c>) leave a map whose keys
-    /// say nothing about which column each belongs to. <see cref="TryGet"/> then follows the spec (physical), as a
-    /// read must produce some value; a consumer that may decline, such as the pruner, should.
+    /// True when <paramref name="values"/>'s keys cannot decide its spelling and the two readings differ: renames
+    /// that permute names (logical <c>p1</c> physical <c>p2</c>, logical <c>p2</c> physical <c>p1</c>) leave
+    /// keys that say nothing about which column each belongs to. <see cref="TryGet"/> then follows the spec
+    /// (physical), as a read must produce some value; a consumer that may decline, such as the pruner, should.
     /// </summary>
     public static bool IsAmbiguous<TValue>(
         IReadOnlyDictionary<string, TValue> values, IEnumerable<string> partitionColumns,
         IReadOnlyDictionary<string, string>? logicalToPhysical)
     {
-        bool spellingsDiffer = false;
-        foreach (var column in partitionColumns)
+        var columns = partitionColumns as IReadOnlyCollection<string> ?? partitionColumns.ToList();
+        if (Decide(values, columns, logicalToPhysical) is not null)
+            return false;
+        foreach (var key in values.Keys)
         {
-            if (!values.ContainsKey(column))
-                return false;
-            spellingsDiffer |= !string.Equals(Physical(column, logicalToPhysical), column, StringComparison.Ordinal);
+            // Every key here is a logical name and a physical one; ambiguous when they are different columns'.
+            string? byPhysical = columns.FirstOrDefault(
+                c => string.Equals(Physical(c, logicalToPhysical), key, StringComparison.Ordinal));
+            if (byPhysical is not null && !string.Equals(byPhysical, key, StringComparison.Ordinal))
+                return true;
         }
-        return spellingsDiffer && IsPhysicallyKeyed(values, partitionColumns, logicalToPhysical);
+        return false;
     }
 
     /// <summary>
@@ -78,6 +80,33 @@ internal static class PartitionValueKeys
     public static string ToPhysical(
         string key, bool physicallyKeyed, IReadOnlyDictionary<string, string>? logicalToPhysical) =>
         physicallyKeyed ? key : Physical(key, logicalToPhysical);
+
+    // True for physical, false for logical, null when the keys cannot tell. A key that is no partition column's
+    // name in either spelling says nothing and is passed over.
+    private static bool? Decide<TValue>(
+        IReadOnlyDictionary<string, TValue> values, IEnumerable<string> partitionColumns,
+        IReadOnlyDictionary<string, string>? logicalToPhysical)
+    {
+        var logical = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
+        var physical = new HashSet<string>(logical.Select(c => Physical(c, logicalToPhysical)), StringComparer.Ordinal);
+        bool allPhysical = true, allLogical = true, physicalOnly = false, logicalOnly = false;
+        foreach (var key in values.Keys)
+        {
+            bool isPhysical = physical.Contains(key);
+            bool isLogical = logical.Contains(key);
+            if (!isPhysical && !isLogical)
+                continue;
+            allPhysical &= isPhysical;
+            allLogical &= isLogical;
+            physicalOnly |= isPhysical && !isLogical;
+            logicalOnly |= isLogical && !isPhysical;
+        }
+        if (allPhysical && physicalOnly)
+            return true;
+        if (allLogical && logicalOnly)
+            return false;
+        return null;
+    }
 
     private static string Physical(string logical, IReadOnlyDictionary<string, string>? logicalToPhysical) =>
         logicalToPhysical is not null && logicalToPhysical.TryGetValue(logical, out var physical)
