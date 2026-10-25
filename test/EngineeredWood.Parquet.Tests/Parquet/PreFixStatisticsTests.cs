@@ -25,6 +25,10 @@ namespace EngineeredWood.Tests.Parquet;
 /// Such a file cannot be written any more, so this writes today's and puts back the bounds the
 /// old writer chose, which were measured by writing the same data with a build of edabc29~1:
 /// the smallest value above the break as the minimum, the largest below it as the maximum.
+///
+/// <para>The narrowest decimal is <c>d20</c>. It was <c>d20</c>, but a precision-18 decimal is INT64
+/// now (#504), where the break cannot happen. The old writer stored it as FLBA(16), and the
+/// inversion is the same at any FLBA width.</para>
 /// </remarks>
 public class PreFixStatisticsTests : IDisposable
 {
@@ -48,14 +52,14 @@ public class PreFixStatisticsTests : IDisposable
     public static TheoryData<string, string, bool> Queries() => new()
     {
         // label, column, whether row group 1 (the control, whose bounds are right) can be skipped
-        { "d18 = -250", "d18", true },
-        { "d18 < 0", "d18", true },
-        { "d18 > 400", "d18", false },
+        { "d20 = -250", "d20", true },
+        { "d20 < 0", "d20", true },
+        { "d20 > 400", "d20", false },
         { "d38 < 0", "d38", true },
         { "d50 < 0", "d50", true },
         // A decimal IN list widens its members by type before comparing (#280/#323), which here
         // forces a rounding the evaluator will not guess at: Unknown even against correct bounds.
-        { "d18 IN (-250, -1)", "d18", false },
+        { "d20 IN (-250, -1)", "d20", false },
         { "u32 = 100", "u32", true },
         { "u32 > 2^31", "u32", true },
         { "u64 = 100", "u64", true },
@@ -84,13 +88,13 @@ public class PreFixStatisticsTests : IDisposable
 
     private static (Predicate Filter, Func<RecordBatch, int, bool> Match) Query(string label) => label switch
     {
-        "d18 = -250" => (Ex.Equal("d18", LiteralValue.Of(-250m)), (b, r) => Dec(b, "d18", r) == -250m),
-        "d18 < 0" => (Ex.LessThan("d18", LiteralValue.Of(0m)), (b, r) => Dec(b, "d18", r) < 0m),
-        "d18 > 400" => (Ex.GreaterThan("d18", LiteralValue.Of(400m)), (b, r) => Dec(b, "d18", r) > 400m),
+        "d20 = -250" => (Ex.Equal("d20", LiteralValue.Of(-250m)), (b, r) => Dec(b, "d20", r) == -250m),
+        "d20 < 0" => (Ex.LessThan("d20", LiteralValue.Of(0m)), (b, r) => Dec(b, "d20", r) < 0m),
+        "d20 > 400" => (Ex.GreaterThan("d20", LiteralValue.Of(400m)), (b, r) => Dec(b, "d20", r) > 400m),
         "d38 < 0" => (Ex.LessThan("d38", LiteralValue.Of(0m)), (b, r) => Dec(b, "d38", r) < 0m),
         "d50 < 0" => (Ex.LessThan("d50", LiteralValue.Of(0m)), (b, r) => Dec(b, "d50", r) < 0m),
-        "d18 IN (-250, -1)" => (Ex.In("d18", LiteralValue.Of(-250m), LiteralValue.Of(-1m)),
-            (b, r) => Dec(b, "d18", r) is -250m or -1m),
+        "d20 IN (-250, -1)" => (Ex.In("d20", LiteralValue.Of(-250m), LiteralValue.Of(-1m)),
+            (b, r) => Dec(b, "d20", r) is -250m or -1m),
         "u32 = 100" => (Ex.Equal("u32", LiteralValue.Of(100u)), (b, r) => U32(b, r) == 100u),
         "u32 > 2^31" => (Ex.GreaterThan("u32", LiteralValue.Of(2_147_483_648u)), (b, r) => U32(b, r) > 2_147_483_648u),
         "u64 = 100" => (Ex.Equal("u64", LiteralValue.Of(100UL)), (b, r) => U64(b, r) == 100UL),
@@ -135,7 +139,7 @@ public class PreFixStatisticsTests : IDisposable
             if (name.StartsWith("d", StringComparison.Ordinal))
             {
                 int width = metadata.Schema.Single(e => e.Name == name).TypeLength!.Value;
-                int scale = name == "d18" ? 2 : 5;
+                int scale = name == "d20" ? 2 : 5;
                 // 0 and -1, at the column's scale
                 bounds = (BigEndian(BigInteger.Zero, width), BigEndian(-BigInteger.Pow(10, scale), width));
             }
@@ -176,7 +180,7 @@ public class PreFixStatisticsTests : IDisposable
 
     private static RecordBatch Group(int group)
     {
-        var d18 = new Decimal128Array.Builder(new Decimal128Type(18, 2));
+        var d20 = new Decimal128Array.Builder(new Decimal128Type(20, 2));
         var d38 = new Decimal128Array.Builder(new Decimal128Type(38, 5));
         var d50 = new Decimal256Array.Builder(new Decimal256Type(50, 5));
         var u32 = new UInt32Array.Builder();
@@ -184,7 +188,7 @@ public class PreFixStatisticsTests : IDisposable
         for (int i = 0; i < Rows; i++)
         {
             decimal d = group == 0 ? i - 500 : 1000 + i;
-            d18.Append(d);
+            d20.Append(d);
             d38.Append(d);
             d50.Append(d);
             u32.Append(group == 0 ? (i < 500 ? (uint)i : 2_147_483_648u + (uint)i) : 10_000u + (uint)i);
@@ -192,13 +196,13 @@ public class PreFixStatisticsTests : IDisposable
         }
 
         var schema = new Apache.Arrow.Schema.Builder()
-            .Field(new Field("d18", new Decimal128Type(18, 2), false))
+            .Field(new Field("d20", new Decimal128Type(20, 2), false))
             .Field(new Field("d38", new Decimal128Type(38, 5), false))
             .Field(new Field("d50", new Decimal256Type(50, 5), false))
             .Field(new Field("u32", UInt32Type.Default, false))
             .Field(new Field("u64", UInt64Type.Default, false))
             .Build();
-        return new RecordBatch(schema, [d18.Build(), d38.Build(), d50.Build(), u32.Build(), u64.Build()], Rows);
+        return new RecordBatch(schema, [d20.Build(), d38.Build(), d50.Build(), u32.Build(), u64.Build()], Rows);
     }
 
     private static async Task<List<RecordBatch>> ReadAsync(string path, Predicate? filter)

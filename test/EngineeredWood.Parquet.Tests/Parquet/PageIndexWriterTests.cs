@@ -683,7 +683,8 @@ public class PageIndexWriterTests : IDisposable
         string path = await WriteAsync(Batch("d", builder.Build(), nullable: false),
             Indexed with { PageIndexTruncateLength = 4 });
 
-        Assert.All(Chunks(path).Single().ColumnIndex!.MinValues, v => Assert.Equal(32, v.Length));
+        // FLBA(30), the narrowest that holds precision 70 (#504), kept whole despite the truncate length.
+        Assert.All(Chunks(path).Single().ColumnIndex!.MinValues, v => Assert.Equal(30, v.Length));
     }
 
     // ───── Layout ─────

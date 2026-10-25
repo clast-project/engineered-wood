@@ -1130,7 +1130,9 @@ public class CrossValidationTests : IDisposable
     public async Task Roundtrip_Decimal128()
     {
         var path = TempPath("rt-dec128.parquet");
-        var decType = new Decimal128Type(28, 6);
+        // The values below are raw decimal mantissas, the largest 29 digits long, so the precision is 29: at 28
+        // the writer would narrow them to FLBA(12), which cannot hold them, and it refuses (#504).
+        var decType = new Decimal128Type(29, 6);
         var schema = new Apache.Arrow.Schema.Builder()
             .Field(new Field("amount", decType, nullable: true))
             .Build();

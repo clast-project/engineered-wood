@@ -183,6 +183,15 @@ internal static class ColumnChunkWriter
             array = MapValues(array, a => ArrowCompute.Widen(a, Int32Type.Default));
         }
 
+        // A Decimal128/256 of precision <= 18 is written as INT32/INT64 (#504). Narrowed to Decimal32/64 here,
+        // before the statistics order is read off the type, it takes the integer path end to end.
+        if (physicalType is PhysicalType.Int32 or PhysicalType.Int64
+            && DecimalNarrowing.IsWideDecimal(ValueType(array)))
+        {
+            var target = DecimalNarrowing.EncodingType(ValueType(array), physicalType);
+            array = MapValues(array, a => DecimalNarrowing.ToInteger(a, target));
+        }
+
         // An Arrow timestamp promoted to the extended-precision carrier becomes twelve little-endian bytes
         // here, for the same reason the decimal reversal below happens here: everything downstream --
         // dictionary, page encoders, statistics, bloom filter -- must see the bytes that reach the file.
@@ -206,12 +215,12 @@ internal static class ColumnChunkWriter
             array = MapValues(array, ExtendedTimestamp.EncodeColumn);
         }
 
-        // For decimal FLBA types, reverse bytes from Arrow little-endian to Parquet big-endian.
-        // This must happen before encoding/dictionary/statistics so all downstream code sees big-endian.
-        if (physicalType == PhysicalType.FixedLenByteArray &&
-            ValueType(array) is Apache.Arrow.Types.Decimal128Type or Apache.Arrow.Types.Decimal256Type)
+        // For decimal FLBA types, narrow to the column's width and reverse from Arrow little-endian to Parquet
+        // big-endian. This must happen before encoding/dictionary/statistics so all downstream code sees the
+        // bytes that reach the file; the statistics order was read off the decimal type above.
+        if (physicalType == PhysicalType.FixedLenByteArray && DecimalNarrowing.IsWideDecimal(ValueType(array)))
         {
-            array = MapValues(array, a => ReverseFlbaDecimalBytes(a, typeLength));
+            array = MapValues(array, a => DecimalNarrowing.ToBigEndian(a, typeLength));
         }
 
         // Try dictionary encoding (uses normalized levels for null detection)
@@ -2019,36 +2028,6 @@ internal static class ColumnChunkWriter
         for (int i = 0; i < defLevels.Length; i++)
             normalized[i] = defLevels[i] >= maxDefLevel ? 1 : 0;
         return normalized;
-    }
-
-    /// <summary>
-    /// Creates a copy of an FLBA array with each value's bytes reversed (little-endian → big-endian).
-    /// Used for decimal FLBA columns where Arrow stores little-endian but Parquet requires big-endian.
-    /// </summary>
-    private static IArrowArray ReverseFlbaDecimalBytes(IArrowArray array, int typeLength)
-    {
-        var data = array.Data;
-        var sourceValues = data.Buffers[1].Span;
-        int count = array.Length;
-
-        var reversed = new byte[count * typeLength];
-        for (int i = 0; i < count; i++)
-        {
-            var src = sourceValues.Slice(i * typeLength, typeLength);
-            var dst = reversed.AsSpan(i * typeLength, typeLength);
-            for (int j = 0; j < typeLength; j++)
-                dst[j] = src[typeLength - 1 - j];
-        }
-
-        // Build new ArrayData with reversed value buffer, preserving null bitmap
-        var buffers = new ArrowBuffer[]
-        {
-            data.Buffers[0], // null bitmap (unchanged)
-            new ArrowBuffer(reversed)
-        };
-        var newData = new Apache.Arrow.ArrayData(
-            data.DataType, count, data.NullCount, data.Offset, buffers);
-        return Apache.Arrow.ArrowArrayFactory.BuildArray(newData);
     }
 
     /// <summary>Minimum bit width to represent values 0..maxValue.</summary>

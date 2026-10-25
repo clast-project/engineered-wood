@@ -338,12 +338,11 @@ internal static class ArrowToSchemaConverter
             Decimal64Type d64 => (PhysicalType.Int64, null,
                 new LogicalType.DecimalType(d64.Scale, d64.Precision),
                 ConvertedType.Decimal, d64.Scale, d64.Precision),
-            Decimal128Type d128 => (PhysicalType.FixedLenByteArray, 16,
-                new LogicalType.DecimalType(d128.Scale, d128.Precision),
-                ConvertedType.Decimal, d128.Scale, d128.Precision),
-            Decimal256Type d256 => (PhysicalType.FixedLenByteArray, 32,
-                new LogicalType.DecimalType(d256.Scale, d256.Precision),
-                ConvertedType.Decimal, d256.Scale, d256.Precision),
+            // The wide decimals take their layout from the PRECISION, not the Arrow type (#504): INT32 to 9
+            // digits, INT64 to 18, then the narrowest FIXED_LEN_BYTE_ARRAY — what Spark writes. Every
+            // producer, and Delta's write normalization, hands over Decimal128 whatever the precision.
+            Decimal128Type d128 => MapWideDecimal(d128.Precision, d128.Scale),
+            Decimal256Type d256 => MapWideDecimal(d256.Precision, d256.Scale),
 
             FixedSizeBinaryType fsb => (PhysicalType.FixedLenByteArray, fsb.ByteWidth,
                 null, null, null, null),
@@ -369,6 +368,20 @@ internal static class ArrowToSchemaConverter
             _ => throw new NotSupportedException(
                 $"Arrow type '{arrowType.Name}' is not supported for Parquet writing."),
         };
+    }
+
+    private static (
+        PhysicalType PhysicalType,
+        int? TypeLength,
+        LogicalType? LogicalType,
+        ConvertedType? ConvertedType,
+        int? Scale,
+        int? Precision)
+        MapWideDecimal(int precision, int scale)
+    {
+        var (physicalType, typeLength) = DecimalNarrowing.PhysicalTypeFor(precision);
+        return (physicalType, typeLength, new LogicalType.DecimalType(scale, precision),
+            ConvertedType.Decimal, scale, precision);
     }
 
     private static (

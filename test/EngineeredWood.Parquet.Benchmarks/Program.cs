@@ -64,4 +64,5 @@ BenchmarkSwitcher.FromTypes([
     typeof(FixedListFallbackBenchmarks),
     typeof(FixedListDetectorBenchmarks),
     typeof(BatchedRunsReadBenchmarks),
+    typeof(DecimalLayoutBenchmarks),
 ]).Run(args);
