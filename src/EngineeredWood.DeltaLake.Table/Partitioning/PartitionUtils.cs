@@ -61,10 +61,22 @@ internal static class PartitionUtils
             for (int p = 0; p < partitionColumns.Count; p++)
             {
                 // A null partition value is stored as JSON null in add.partitionValues (the Delta spec /
-                // Spark convention); __HIVE_DEFAULT_PARTITION__ is only the DIRECTORY name.
+                // Spark convention); __HIVE_DEFAULT_PARTITION__ is only the DIRECTORY name. An empty string is
+                // stored as null too: the protocol reads an empty string as NULL for every type, and Spark
+                // writes it so.
                 string? value = GetStringValue(batch.Column(partColIndices[p]), row);
+                if (value is { Length: 0 })
+                    value = null;
+                if (value is null && !batch.Schema.FieldsList[partColIndices[p]].IsNullable)
+                    throw new ArgumentException(
+                        $"The batch has a null or empty value in partition column '{partitionColumns[p]}'. The "
+                        + "column is declared non-nullable, and a partition value stores an empty string as null. "
+                        + "Declare the field nullable, or remove those values.",
+                        nameof(batch));
                 partValues[partitionColumns[p]] = value!;
-                keyParts[p] = value ?? "__HIVE_DEFAULT_PARTITION__";
+                // Marked apart from every value: a NULL row and a row holding the sentinel's text are different
+                // partitions, though both live in the sentinel's directory.
+                keyParts[p] = value is null ? "\u0001" : "=" + value;
             }
 
             string groupKey = string.Join("\0", keyParts);
@@ -132,12 +144,15 @@ internal static class PartitionUtils
     /// written before that convention are logical-keyed — so each map's spelling is decided from the optional
     /// <paramref name="logicalToPhysical"/> map and every partition column (see PartitionValueKeys).
     /// </summary>
+    /// <param name="filePath">The file the values belong to, named by the error a NULL in a non-nullable
+    /// column raises.</param>
     public static RecordBatch AddPartitionColumns(
         RecordBatch dataBatch,
         Apache.Arrow.Schema fullSchema,
         IReadOnlyDictionary<string, string> partitionValues,
         IReadOnlyList<string> partitionColumns,
-        IReadOnlyDictionary<string, string>? logicalToPhysical = null)
+        IReadOnlyDictionary<string, string>? logicalToPhysical = null,
+        string? filePath = null)
     {
         if (partitionColumns.Count == 0)
             return dataBatch;
@@ -158,7 +173,7 @@ internal static class PartitionUtils
                 if (!PartitionValueKeys.TryGet(
                         partitionValues, field.Name, partitionColumns, logicalToPhysical, out var v))
                     v = null;
-                columns.Add(BuildConstantArray(field.DataType, v, dataBatch.Length));
+                columns.Add(BuildConstantArray(field, v, dataBatch.Length, filePath));
                 fields.Add(field);
             }
             else
@@ -216,8 +231,9 @@ internal static class PartitionUtils
                 ? pn : partCol;
 
             string? value = partitionValues.TryGetValue(partCol, out var v) ? v : null;
-            columns.Add(BuildConstantArray(arrowType, value, dataBatch.Length));
-            fields.Add(new Field(physicalName, arrowType, deltaField.Nullable));
+            var field = new Field(physicalName, arrowType, deltaField.Nullable);
+            columns.Add(BuildConstantArray(field, value, dataBatch.Length, filePath: null));
+            fields.Add(field);
         }
 
         var schemaBuilder = new Apache.Arrow.Schema.Builder();
@@ -293,9 +309,9 @@ internal static class PartitionUtils
 
     /// <summary>
     /// Builds a constant-value array of the given type and length.
-    /// Used to materialize partition columns on read. A null <paramref name="value"/>, the
-    /// <c>__HIVE_DEFAULT_PARTITION__</c> directory sentinel (some writers put it into
-    /// <c>partitionValues</c>), or an empty string for a non-string type all decode as SQL NULL.
+    /// Used to materialize partition columns on read. A value <see cref="PartitionNulls"/> reads as NULL
+    /// decodes as SQL NULL, and in a non-nullable column is refused: the file breaks the column's constraint,
+    /// and an error is better than a row the schema says cannot exist.
     ///
     /// <para>The value is decoded ONCE into its raw Arrow encoding and then tiled across the column, rather
     /// than appended per row through a typed builder. Besides being the read path's hottest loop — it runs
@@ -303,10 +319,19 @@ internal static class PartitionUtils
     /// a builder round-trips each value through its .NET surface type, which for <c>decimal</c> silently
     /// rounds away anything past ~28 significant digits.</para>
     /// </summary>
-    private static IArrowArray BuildConstantArray(IArrowType type, string? value, int length)
+    private static IArrowArray BuildConstantArray(Field field, string? value, int length, string? filePath)
     {
+        var type = field.DataType;
         if (PartitionNulls.IsNull(value, isString: type is StringType))
+        {
+            if (!field.IsNullable)
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.NotNullConstraintViolated,
+                    $"{(filePath is null ? "A file" : $"File '{filePath}'")} has a NULL value"
+                    + $"{(value is null ? "" : $" ('{value}')")} for partition column '{field.Name}', which is "
+                    + "declared non-nullable.");
             return ArrowCompute.MakeNullArray(type, length);
+        }
 
         // The two shapes are inverses and each gets its own path: an all-null column needs an allocated,
         // all-zero validity bitmap, while a constant column needs no validity buffer at all.

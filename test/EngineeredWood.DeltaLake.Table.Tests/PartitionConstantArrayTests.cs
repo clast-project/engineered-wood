@@ -246,16 +246,22 @@ public class PartitionConstantArrayTests
     }
 
     [Fact]
-    public void String_EmptyValueStaysAnEmptyString()
+    public void String_EmptyValue_IsNull()
     {
-        // An empty string is NULL for every other type, but a legitimate value for a string column.
+        // The protocol: "An empty string for any type translates to a null partition value."
         var column = Assert.IsType<StringArray>(Materialize(StringType.Default, "", 3));
 
-        for (int i = 0; i < 3; i++)
-        {
-            Assert.False(column.IsNull(i));
-            Assert.Equal("", column.GetString(i));
-        }
+        Assert.Equal(3, column.Data.NullCount);
+    }
+
+    [Fact]
+    public void String_HiveDefaultPartitionSentinel_IsTheText()
+    {
+        // The sentinel is a directory name; for a string column Spark and Delta Kernel read it as its text.
+        var column = Assert.IsType<StringArray>(Materialize(StringType.Default, "__HIVE_DEFAULT_PARTITION__", 2));
+
+        Assert.Equal(0, column.Data.NullCount);
+        Assert.Equal("__HIVE_DEFAULT_PARTITION__", column.GetString(0));
     }
 
     // ── The NULL shapes, which take the other helper. ──
@@ -292,6 +298,8 @@ public class PartitionConstantArrayTests
     public void HiveDefaultPartitionSentinel_IsNull(string label, IArrowType type)
     {
         Assert.NotNull(label);
+        if (type is StringType)
+            return; // the text itself: String_HiveDefaultPartitionSentinel_IsTheText
 
         // Some writers put the DIRECTORY sentinel into partitionValues rather than a JSON null.
         var column = Materialize(type, "__HIVE_DEFAULT_PARTITION__", 2);

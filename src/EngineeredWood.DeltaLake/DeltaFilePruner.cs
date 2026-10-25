@@ -64,8 +64,12 @@ public sealed class DeltaFilePruner
 
         var partitionSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
         _partitionColumns = partitionSet;
+        var nonNullablePartitions = new HashSet<string>(
+            schema.Fields.Where(f => !f.Nullable && partitionSet.Contains(f.Name)).Select(f => f.Name),
+            StringComparer.Ordinal);
         _accessor = new DeltaFileStatsAccessor(
-            typeMap, partitionSet, logicalToPhysical, preferTypedStats, unattributable, noBounds);
+            typeMap, partitionSet, logicalToPhysical, preferTypedStats, unattributable, noBounds,
+            nonNullablePartitions);
     }
 
     // A column widened from float (to double) has old files whose bounds are a float's shortest text: "0.1"
@@ -270,6 +274,7 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     private readonly bool _preferTypedStats;
     private readonly HashSet<string> _unattributable;
     private readonly HashSet<string> _noBounds;
+    private readonly HashSet<string> _nonNullablePartitions;
 
     public DeltaFileStatsAccessor(
         IReadOnlyDictionary<string, string> columnTypes,
@@ -277,7 +282,8 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
         IReadOnlyDictionary<string, string>? logicalToPhysical = null,
         bool preferTypedStats = true,
         HashSet<string>? unattributableStatsColumns = null,
-        HashSet<string>? noBoundsColumns = null)
+        HashSet<string>? noBoundsColumns = null,
+        HashSet<string>? nonNullablePartitionColumns = null)
     {
         _columnTypes = columnTypes;
         _partitionColumns = partitionColumns;
@@ -285,6 +291,7 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
         _preferTypedStats = preferTypedStats;
         _unattributable = unattributableStatsColumns ?? new HashSet<string>(StringComparer.Ordinal);
         _noBounds = noBoundsColumns ?? new HashSet<string>(StringComparer.Ordinal);
+        _nonNullablePartitions = nonNullablePartitionColumns ?? new HashSet<string>(StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -301,8 +308,9 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     // older engineered-wood commit. The spelling is decided per map, not per key (see PartitionValueKeys). A map
     // complete in BOTH spellings that disagree (renames that permute names) gives the pruner nothing: a read has
     // to pick the spec's reading, but pruning can decline to guess. A value the read path materializes as NULL
-    // (see PartitionNulls) comes back null, so the pruner sees what a scan reads; an empty string for a column
-    // whose type is unknown here could be either, and gives nothing.
+    // (see PartitionNulls) comes back null, so the pruner sees what a scan reads. The sentinel for a column whose
+    // type is unknown here could be either, and gives nothing; so does a NULL in a non-nullable column, which a
+    // read refuses: keeping the file lets the error surface rather than a skip deciding the answer.
     private bool TryGetPartitionValue(AddFile addFile, string column, out string value)
     {
         value = default!;
@@ -312,11 +320,16 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
         {
             return false;
         }
-        if (raw is { Length: 0 } && !_columnTypes.ContainsKey(column))
+        if (raw == PartitionNulls.HiveDefaultPartition && !_columnTypes.ContainsKey(column))
             return false;
-        value = PartitionNulls.IsNull(raw, isString: _columnTypes.TryGetValue(column, out var t) && t == "string")
-            ? null!
-            : raw;
+        if (!PartitionNulls.IsNull(raw, isString: _columnTypes.TryGetValue(column, out var t) && t == "string"))
+        {
+            value = raw;
+            return true;
+        }
+        if (_nonNullablePartitions.Contains(column))
+            return false;
+        value = null!;
         return true;
     }
 

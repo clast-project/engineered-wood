@@ -3944,7 +3944,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // file was written as NULL, partition columns re-materialized, widened types widened.
                 logicalBatch = ReconcileToTableShape(
                     logicalBatch, snapshot, addFile.PartitionValues, columns: null, partitionColumns, partitionColumns.Count > 0,
-                    logicalToPhysical);
+                    logicalToPhysical, addFile.Path);
 
                 var mask = predicate(logicalBatch);
                 var matchRows = new List<int>();
@@ -4124,7 +4124,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var row = Partitioning.PartitionUtils.AddPartitionColumns(
             noColumns, partitionSchema, addFile.PartitionValues, snapshot.Metadata.PartitionColumns,
-            ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode));
+            ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode), addFile.Path);
         var mask = predicate(row);
         return !mask.IsNull(0) && mask.GetValue(0) == true;
     }
@@ -9415,9 +9415,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // delete's target positions with stable row ids and to place the rebased deletion vector. The hidden
         // materialized columns are always stripped from the emitted user batches regardless (a foreign reader
         // must never see them).
+        // An empty map still goes through the partition step: a missing key is a NULL value, and in a
+        // non-nullable column one the read refuses. This engine's own NULL partition is such a map.
         var partitionColumns = snapshot.Metadata.PartitionColumns;
-        bool hasPartitions = partitionColumns.Count > 0 &&
-            addFile.PartitionValues.Count > 0;
+        bool hasPartitions = partitionColumns.Count > 0;
 
         // Column mapping setup
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
@@ -9685,7 +9686,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             // The materialized row-tracking columns were already stripped up front (above).
             var cleanResult = ReconcileToTableShape(
-                result, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions, logicalToPhysical);
+                result, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions, logicalToPhysical,
+                addFile.Path);
 
             // Surface each surviving row's RESOLVED id + commit version (row-aligned with cleanResult): the
             // materialized value where present, else add.baseRowId + absolute position / defaultRowCommitVersion
@@ -9725,12 +9727,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <paramref name="snapshot"/>'s schema (or the <paramref name="columns"/> projection of it), whatever
     /// schema the file was written under. <paramref name="partitionValues"/> are the file's action's. Every
     /// path that hands a file's rows onward uses it, so a DELETE predicate and the change feed see what a scan
-    /// sees.
+    /// sees. <paramref name="filePath"/> names the file in the error a NULL in a non-nullable partition column
+    /// raises.
     /// </summary>
     internal static RecordBatch ReconcileToTableShape(
         RecordBatch result, Snapshot.Snapshot snapshot, IReadOnlyDictionary<string, string>? partitionValues,
         IReadOnlyList<string>? columns, IReadOnlyList<string> partitionColumns, bool hasPartitions,
-        IReadOnlyDictionary<string, string> logicalToPhysical)
+        IReadOnlyDictionary<string, string> logicalToPhysical, string? filePath = null)
     {
         // Apply type widening — convert narrow types from old files to current schema types
         if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
@@ -9763,7 +9766,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // while files written before that convention are logical-keyed — the map resolves both.
             result = Partitioning.PartitionUtils.AddPartitionColumns(
                 result, fullSchema, partitionValues ?? EmptyPartitionValues, partitionColumns,
-                logicalToPhysical);
+                logicalToPhysical, filePath);
         }
 
         // Schema evolution: ADD/DROP COLUMN are metadata-only commits, so a file written before an ADD

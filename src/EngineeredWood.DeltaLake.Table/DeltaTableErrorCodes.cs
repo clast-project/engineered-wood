@@ -70,6 +70,17 @@ public static class DeltaTableErrorCodes
     /// </remarks>
     public const string InvalidPartitionColumn = "DELTA_INVALID_PARTITION_COLUMN";
 
+    /// <summary>
+    /// A file's <c>partitionValues</c> hold NULL (JSON null, a missing key, an empty string, or the Hive
+    /// sentinel for a column that is not a string) for a partition column the schema declares non-nullable.
+    /// The read refuses the file rather than return a row the schema says cannot exist.
+    /// </summary>
+    /// <remarks>
+    /// delta-spark: <c>DELTA_NOT_NULL_CONSTRAINT_VIOLATED</c> — "NOT NULL constraint violated for column:
+    /// &lt;columnName&gt;". delta-spark raises it on write; the condition is the same one, found on read.
+    /// </remarks>
+    public const string NotNullConstraintViolated = "DELTA_NOT_NULL_CONSTRAINT_VIOLATED";
+
     // ── Time travel ──
 
     /// <summary>
