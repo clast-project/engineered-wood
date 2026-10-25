@@ -61,10 +61,19 @@ internal static class PartitionUtils
             for (int p = 0; p < partitionColumns.Count; p++)
             {
                 // A null partition value is stored as JSON null in add.partitionValues (the Delta spec /
-                // Spark convention); __HIVE_DEFAULT_PARTITION__ is only the DIRECTORY name.
+                // Spark convention); __HIVE_DEFAULT_PARTITION__ is only the DIRECTORY name. An empty string is
+                // stored as null too: the protocol reads an empty string as NULL for every type, and Spark
+                // writes it so.
+                // The write entry points already did this (NormalizePartitionValues), and refused a NULL the table
+                // declares impossible; this covers every other caller.
                 string? value = GetStringValue(batch.Column(partColIndices[p]), row);
+                if (value is { Length: 0 })
+                    value = null;
                 partValues[partitionColumns[p]] = value!;
-                keyParts[p] = value ?? "__HIVE_DEFAULT_PARTITION__";
+                // Marked apart from every value, so a NULL row and a row holding the sentinel's text are different
+                // partitions, though both live in the sentinel's directory; and length-prefixed, so no value can
+                // reach across the separator into the next column's.
+                keyParts[p] = value is null ? "-" : value.Length.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + value;
             }
 
             string groupKey = string.Join("\0", keyParts);
@@ -91,6 +100,108 @@ internal static class PartitionUtils
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Brings <paramref name="batch"/>'s partition columns to the values a commit stores: an empty string becomes
+    /// null, as the protocol reads it and Spark writes it. The write paths call this before generated columns and
+    /// CHECK constraints are evaluated, so those describe the rows the table will hold. With
+    /// <paramref name="refuseNulls"/>, a null in a partition column <paramref name="schema"/> declares
+    /// non-nullable is refused, whatever the batch's own field says: the read refuses such a file, so a commit
+    /// must never make one. An empty string in one of <paramref name="generatedColumns"/> is refused too: the
+    /// expression produced it, and storing NULL instead would break the expression's own definition.
+    /// </summary>
+    public static RecordBatch NormalizePartitionValues(
+        RecordBatch batch, IReadOnlyList<string> partitionColumns, DeltaLake.Schema.StructType schema,
+        bool refuseNulls, IReadOnlyCollection<string>? generatedColumns = null)
+    {
+        IArrowArray[]? columns = null;
+        Field[]? fields = null;
+        foreach (string column in partitionColumns)
+        {
+            int index = batch.Schema.GetFieldIndex(column);
+            if (index < 0)
+                continue;
+
+            var array = columns?[index] ?? batch.Column(index);
+            var replaced = EmptyStringsAsNull(array);
+            if (replaced is not null && generatedColumns is not null && generatedColumns.Contains(column))
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.GeneratedColumnMismatch,
+                    $"Partition column '{column}' is generated, and its expression gives an empty string for a row "
+                    + "being written. A partition value stores an empty string as NULL, which the expression does "
+                    + "not produce, so the row cannot be stored as computed.");
+            }
+            if (replaced is not null)
+            {
+                columns ??= batch.Arrays.ToArray();
+                fields ??= batch.Schema.FieldsList.ToArray();
+                columns[index] = replaced;
+                array = replaced;
+                if (!fields[index].IsNullable)
+                    fields[index] = new Field(fields[index].Name, fields[index].DataType, true, fields[index].Metadata);
+            }
+
+            if (refuseNulls && array.NullCount > 0
+                && schema.Fields.FirstOrDefault(f => string.Equals(f.Name, column, StringComparison.Ordinal))
+                    is { Nullable: false })
+            {
+                throw new ArgumentException(
+                    $"The batch has a null or empty value in partition column '{column}', which the table declares "
+                    + "non-nullable. A partition value stores an empty string as null. Remove those values, or "
+                    + "make the column nullable.",
+                    nameof(batch));
+            }
+        }
+
+        if (columns is null)
+            return batch;
+        var builder = new Apache.Arrow.Schema.Builder();
+        foreach (var field in fields!)
+            builder.Field(field);
+        foreach (var kv in batch.Schema.Metadata ?? new Dictionary<string, string>())
+            builder.Metadata(kv.Key, kv.Value);
+        return new RecordBatch(builder.Build(), columns, batch.Length);
+    }
+
+    // The array with each empty string made null, or null when it holds none (or is not a string array).
+    private static IArrowArray? EmptyStringsAsNull(IArrowArray array)
+    {
+        switch (array)
+        {
+            // Found by byte length, so a batch with no empty string (nearly every one) decodes nothing.
+            case StringArray s when HasEmpty(s.Length, i => !s.IsNull(i) && s.GetValueLength(i) == 0):
+            {
+                var b = new StringArray.Builder();
+                for (int i = 0; i < s.Length; i++)
+                {
+                    if (s.IsNull(i) || s.GetValueLength(i) == 0) b.AppendNull();
+                    else b.Append(s.GetString(i));
+                }
+                return b.Build();
+            }
+            case LargeStringArray s when HasEmpty(s.Length, i => !s.IsNull(i) && s.GetValueLength(i) == 0):
+            {
+                var b = new LargeStringArray.Builder();
+                for (int i = 0; i < s.Length; i++)
+                {
+                    if (s.IsNull(i) || s.GetValueLength(i) == 0) b.AppendNull();
+                    else b.Append(s.GetString(i));
+                }
+                return b.Build();
+            }
+            default:
+                return null;
+        }
+
+        static bool HasEmpty(int length, Func<int, bool> isEmpty)
+        {
+            for (int i = 0; i < length; i++)
+                if (isEmpty(i))
+                    return true;
+            return false;
+        }
     }
 
     /// <summary>
@@ -132,12 +243,15 @@ internal static class PartitionUtils
     /// written before that convention are logical-keyed — so each map's spelling is decided from the optional
     /// <paramref name="logicalToPhysical"/> map and every partition column (see PartitionValueKeys).
     /// </summary>
+    /// <param name="filePath">The file the values belong to, named by the error a NULL in a non-nullable
+    /// column raises.</param>
     public static RecordBatch AddPartitionColumns(
         RecordBatch dataBatch,
         Apache.Arrow.Schema fullSchema,
         IReadOnlyDictionary<string, string> partitionValues,
         IReadOnlyList<string> partitionColumns,
-        IReadOnlyDictionary<string, string>? logicalToPhysical = null)
+        IReadOnlyDictionary<string, string>? logicalToPhysical = null,
+        string? filePath = null)
     {
         if (partitionColumns.Count == 0)
             return dataBatch;
@@ -158,7 +272,7 @@ internal static class PartitionUtils
                 if (!PartitionValueKeys.TryGet(
                         partitionValues, field.Name, partitionColumns, logicalToPhysical, out var v))
                     v = null;
-                columns.Add(BuildConstantArray(field.DataType, v, dataBatch.Length));
+                columns.Add(BuildConstantArray(field, v, dataBatch.Length, filePath));
                 fields.Add(field);
             }
             else
@@ -216,8 +330,9 @@ internal static class PartitionUtils
                 ? pn : partCol;
 
             string? value = partitionValues.TryGetValue(partCol, out var v) ? v : null;
-            columns.Add(BuildConstantArray(arrowType, value, dataBatch.Length));
-            fields.Add(new Field(physicalName, arrowType, deltaField.Nullable));
+            var field = new Field(physicalName, arrowType, deltaField.Nullable);
+            columns.Add(BuildConstantArray(field, value, dataBatch.Length, filePath: null));
+            fields.Add(field);
         }
 
         var schemaBuilder = new Apache.Arrow.Schema.Builder();
@@ -293,9 +408,9 @@ internal static class PartitionUtils
 
     /// <summary>
     /// Builds a constant-value array of the given type and length.
-    /// Used to materialize partition columns on read. A null <paramref name="value"/>, the
-    /// <c>__HIVE_DEFAULT_PARTITION__</c> directory sentinel (some writers put it into
-    /// <c>partitionValues</c>), or an empty string for a non-string type all decode as SQL NULL.
+    /// Used to materialize partition columns on read. A value <see cref="PartitionNulls"/> reads as NULL
+    /// decodes as SQL NULL, and in a non-nullable column is refused: the file breaks the column's constraint,
+    /// and an error is better than a row the schema says cannot exist.
     ///
     /// <para>The value is decoded ONCE into its raw Arrow encoding and then tiled across the column, rather
     /// than appended per row through a typed builder. Besides being the read path's hottest loop — it runs
@@ -303,19 +418,47 @@ internal static class PartitionUtils
     /// a builder round-trips each value through its .NET surface type, which for <c>decimal</c> silently
     /// rounds away anything past ~28 significant digits.</para>
     /// </summary>
-    private static IArrowArray BuildConstantArray(IArrowType type, string? value, int length)
+    private static IArrowArray BuildConstantArray(Field field, string? value, int length, string? filePath)
     {
-        bool isNull = value is null
-            || value == "__HIVE_DEFAULT_PARTITION__"
-            || (value.Length == 0 && type is not StringType);
-
-        if (isNull)
+        var type = field.DataType;
+        if (PartitionNulls.IsNull(value, isString: type is StringType))
+        {
+            if (!field.IsNullable)
+                throw NotNullViolation(field.Name, value, filePath);
             return ArrowCompute.MakeNullArray(type, length);
+        }
 
         // The two shapes are inverses and each gets its own path: an all-null column needs an allocated,
         // all-zero validity bitmap, while a constant column needs no validity buffer at all.
         return ArrowCompute.Repeat(type, EncodePartitionValue(type, value!), length);
     }
+
+    /// <summary>
+    /// Refuses a file whose <paramref name="partitionValues"/> hold NULL for a partition column
+    /// <paramref name="tableSchema"/> declares non-nullable, whichever columns the read projects: a projection
+    /// that leaves the column out must not turn the refusal into an answer.
+    /// </summary>
+    public static void ThrowIfNullInNonNullablePartition(
+        IReadOnlyDictionary<string, string> partitionValues, Apache.Arrow.Schema tableSchema,
+        IReadOnlyList<string> partitionColumns, IReadOnlyDictionary<string, string>? logicalToPhysical,
+        string? filePath)
+    {
+        foreach (string column in partitionColumns)
+        {
+            var field = tableSchema.GetFieldByName(column);
+            if (field is null || field.IsNullable)
+                continue;
+            if (!PartitionValueKeys.TryGet(partitionValues, column, partitionColumns, logicalToPhysical, out var value))
+                value = null;
+            if (PartitionNulls.IsNull(value, isString: field.DataType is StringType))
+                throw NotNullViolation(field.Name, value, filePath);
+        }
+    }
+
+    private static DeltaFormatException NotNullViolation(string column, string? value, string? filePath) => new(
+        DeltaTableErrorCodes.NotNullConstraintViolated,
+        $"{(filePath is null ? "A file" : $"File '{filePath}'")} has a NULL value"
+        + $"{(value is null ? "" : $" ('{value}')")} for partition column '{column}', which is declared non-nullable.");
 
     /// <summary>
     /// Decodes one partition value string into the raw little-endian Arrow encoding of a single value slot

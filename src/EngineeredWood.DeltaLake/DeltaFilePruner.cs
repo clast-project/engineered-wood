@@ -64,8 +64,12 @@ public sealed class DeltaFilePruner
 
         var partitionSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
         _partitionColumns = partitionSet;
+        var nonNullablePartitions = new HashSet<string>(
+            schema.Fields.Where(f => !f.Nullable && partitionSet.Contains(f.Name)).Select(f => f.Name),
+            StringComparer.Ordinal);
         _accessor = new DeltaFileStatsAccessor(
-            typeMap, partitionSet, logicalToPhysical, preferTypedStats, unattributable, noBounds);
+            typeMap, partitionSet, logicalToPhysical, preferTypedStats, unattributable, noBounds,
+            nonNullablePartitions);
     }
 
     // A column widened from float (to double) has old files whose bounds are a float's shortest text: "0.1"
@@ -266,10 +270,12 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
 {
     private readonly IReadOnlyDictionary<string, string> _columnTypes;
     private readonly HashSet<string> _partitionColumns;
+    private readonly IReadOnlyList<string> _partitionColumnList; // for PartitionValueKeys
     private readonly IReadOnlyDictionary<string, string> _logicalToPhysical;
     private readonly bool _preferTypedStats;
     private readonly HashSet<string> _unattributable;
     private readonly HashSet<string> _noBounds;
+    private readonly HashSet<string> _nonNullablePartitions;
 
     public DeltaFileStatsAccessor(
         IReadOnlyDictionary<string, string> columnTypes,
@@ -277,14 +283,17 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
         IReadOnlyDictionary<string, string>? logicalToPhysical = null,
         bool preferTypedStats = true,
         HashSet<string>? unattributableStatsColumns = null,
-        HashSet<string>? noBoundsColumns = null)
+        HashSet<string>? noBoundsColumns = null,
+        HashSet<string>? nonNullablePartitionColumns = null)
     {
         _columnTypes = columnTypes;
         _partitionColumns = partitionColumns;
+        _partitionColumnList = new List<string>(partitionColumns);
         _logicalToPhysical = logicalToPhysical ?? new Dictionary<string, string>();
         _preferTypedStats = preferTypedStats;
         _unattributable = unattributableStatsColumns ?? new HashSet<string>(StringComparer.Ordinal);
         _noBounds = noBoundsColumns ?? new HashSet<string>(StringComparer.Ordinal);
+        _nonNullablePartitions = nonNullablePartitionColumns ?? new HashSet<string>(StringComparer.Ordinal);
     }
 
     /// <summary>
@@ -300,16 +309,32 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     // A file's partition value, in its map's own spelling: physical keys (the spec), or the logical keys of an
     // older engineered-wood commit. The spelling is decided per map, not per key (see PartitionValueKeys). A map
     // complete in BOTH spellings that disagree (renames that permute names) gives the pruner nothing: a read has
-    // to pick the spec's reading, but pruning can decline to guess.
+    // to pick the spec's reading, but pruning can decline to guess. A value the read path materializes as NULL
+    // (see PartitionNulls) comes back null, so the pruner sees what a scan reads. The sentinel for a column whose
+    // type is unknown here could be either, and gives nothing; so does a NULL in a non-nullable column, which a
+    // read refuses: keeping the file lets the error surface rather than a skip deciding the answer. A missing key
+    // is NULL, as the read materializes it (older checkpoints dropped NULL entries).
     private bool TryGetPartitionValue(AddFile addFile, string column, out string value)
     {
-        if (PartitionValueKeys.IsAmbiguous(addFile.PartitionValues, _partitionColumns, _logicalToPhysical))
-        {
-            value = default!;
+        value = default!;
+        if (PartitionValueKeys.IsAmbiguous(addFile.PartitionValues, _partitionColumnList, _logicalToPhysical))
             return false;
+        if (!PartitionValueKeys.TryGet(
+                addFile.PartitionValues, column, _partitionColumnList, _logicalToPhysical, out string raw))
+        {
+            raw = null!;
         }
-        return PartitionValueKeys.TryGet(
-            addFile.PartitionValues, column, _partitionColumns, _logicalToPhysical, out value);
+        if (raw == PartitionNulls.HiveDefaultPartition && !_columnTypes.ContainsKey(column))
+            return false;
+        if (!PartitionNulls.IsNull(raw, isString: _columnTypes.TryGetValue(column, out var t) && t == "string"))
+        {
+            value = raw;
+            return true;
+        }
+        if (_nonNullablePartitions.Contains(column))
+            return false;
+        value = null!;
+        return true;
     }
 
     // A file's statistic for a column: under the column's PHYSICAL name ONLY when it has one distinct from its
@@ -341,10 +366,10 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
         if (_partitionColumns.Contains(column))
         {
             // Partition value is constant per file. If the stored value is
-            // null (the dictionary holds a null string), every row is null;
-            // otherwise no row is null in this column.
+            // null (a null string, or a spelling PartitionNulls reads as NULL),
+            // every row is null; otherwise no row is null in this column.
             if (TryGetPartitionValue(stats.AddFile, column, out var v))
-                return v is null ? stats.AddFile.PartitionValues.Count > 0 ? GetValueCount(stats, column) : null : 0;
+                return v is null ? GetValueCount(stats, column) : 0;
             return null;
         }
 

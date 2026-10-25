@@ -88,7 +88,7 @@ internal static class CompactionExecutor
             .OrderBy(f => f.Size)
             .Take(options.MaxFilesPerCommit)
             .GroupBy(f => DeltaTable.CanonicalPartitionKey(
-                f.PartitionValues, snapshot.Metadata.PartitionColumns, logicalToPhysical))
+                f.PartitionValues, snapshot.Metadata.PartitionColumns, logicalToPhysical, snapshot.Schema))
             .Select(g => g.ToList())
             .Where(g => g.Count >= 2) // a partition with a single small file is not worth compacting
             .ToList();

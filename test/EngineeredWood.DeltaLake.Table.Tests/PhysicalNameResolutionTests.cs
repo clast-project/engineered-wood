@@ -443,6 +443,45 @@ public class PhysicalNameResolutionTests : IDisposable
         }
     }
 
+    /// <summary>A NULL partition value may be a missing key, so the keys a map HAS decide its spelling: p2 is no
+    /// column's logical name, so {p2} is spec-keyed; x is no column's physical name, so {x} is logical-keyed.
+    /// Requiring every physical key read {p2: B} as logical-keyed and lost B.</summary>
+    [Theory]
+    [InlineData("p2", "B", null, "B")]
+    [InlineData("x", "A", "A", null)]
+    public void AddPartitionColumns_PartialMap_IsDecidedByTheKeysItHas(string key, string value, string? x, string? p1)
+    {
+        var full = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", StringType.Default, true))
+            .Field(new Field("p1", StringType.Default, true))
+            .Field(new Field("v", Int64Type.Default, true))
+            .Build();
+        var map = ColumnMapping.BuildLogicalToPhysicalMap(CollidingPartitionSchema(), ColumnMappingMode.Name);
+        var values = new Dictionary<string, string> { [key] = value };
+
+        var batch = Partitioning.PartitionUtils.AddPartitionColumns(LongRow(LongSchema("v"), 1), full, values, ["x", "p1"], map);
+
+        var xs = (StringArray)batch.Column("x");
+        var p1s = (StringArray)batch.Column("p1");
+        Assert.Equal(x, xs.IsNull(0) ? null : xs.GetString(0));
+        Assert.Equal(p1, p1s.IsNull(0) ? null : p1s.GetString(0));
+        Assert.False(PartitionValueKeys.IsAmbiguous(values, ["x", "p1"], map));
+    }
+
+    /// <summary>{p1} alone is x's physical key and p1's logical one: nothing decides it, so the read follows the
+    /// spec and the pruner declines.</summary>
+    [Fact]
+    public void PartialMap_TheKeysCannotDecide_IsAmbiguous()
+    {
+        var map = ColumnMapping.BuildLogicalToPhysicalMap(CollidingPartitionSchema(), ColumnMappingMode.Name);
+        var values = new Dictionary<string, string> { ["p1"] = "A" };
+
+        Assert.True(PartitionValueKeys.IsAmbiguous(values, ["x", "p1"], map));
+        Assert.True(PartitionValueKeys.IsPhysicallyKeyed(values, ["x", "p1"], map));
+        var pruner = new DeltaFilePruner(CollidingPartitionSchema(), ["x", "p1"]);
+        Assert.True(pruner.ShouldInclude(MakeAdd(null, values), Ex.Equal("x", LiteralValue.Of("B"))));
+    }
+
     [Fact]
     public void CanonicalPartitionKey_SpellingsOfOnePartitionAgree_AndDistinctPartitionsDiffer()
     {
@@ -450,12 +489,12 @@ public class PhysicalNameResolutionTests : IDisposable
         string[] partitionColumns = ["x", "p1"];
 
         Assert.Equal(
-            DeltaTable.CanonicalPartitionKey(SpecValues, partitionColumns, map),
-            DeltaTable.CanonicalPartitionKey(LegacyCollidingValues, partitionColumns, map));
+            DeltaTable.CanonicalPartitionKey(SpecValues, partitionColumns, map, CollidingPartitionSchema()),
+            DeltaTable.CanonicalPartitionKey(LegacyCollidingValues, partitionColumns, map, CollidingPartitionSchema()));
         Assert.NotEqual(
-            DeltaTable.CanonicalPartitionKey(SpecValues, partitionColumns, map),
+            DeltaTable.CanonicalPartitionKey(SpecValues, partitionColumns, map, CollidingPartitionSchema()),
             DeltaTable.CanonicalPartitionKey(
-                new Dictionary<string, string> { ["p1"] = "B", ["p2"] = "A" }, partitionColumns, map));
+                new Dictionary<string, string> { ["p1"] = "B", ["p2"] = "A" }, partitionColumns, map, CollidingPartitionSchema()));
     }
 
     // ── Spellings that cannot be told apart ──────────────────────────────────────────────────────────

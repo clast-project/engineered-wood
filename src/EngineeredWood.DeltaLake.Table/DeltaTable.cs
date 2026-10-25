@@ -3845,12 +3845,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             ? BuildProjectedSchema(snapshot.ArrowSchema, partitionColumns)
             : null;
 
+        var partitionKeyMap = ColumnMapping.BuildLogicalToPhysicalMap(
+            snapshot.Schema, ColumnMapping.GetMode(snapshot.Metadata.Configuration));
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
             // One stats object serves the skip and the proof, so the JSON statistics are parsed once.
             var stats = pruner is not null ? new DeltaFileStats(addFile) : null;
             if (pruner is not null && !pruner.ShouldInclude(stats!, prunePredicate!))
                 continue; // stats prove no row here matches — nothing to delete, skip the read
+
+            // As a scan does, and before anything below can decide the file without reading a row of it (the
+            // whole-file shortcuts, or row-group pruning that skips every row group).
+            if (partitionColumns.Count > 0)
+            {
+                Partitioning.PartitionUtils.ThrowIfNullInNonNullablePartition(
+                    addFile.PartitionValues, snapshot.ArrowSchema, partitionColumns, partitionKeyMap, addFile.Path);
+            }
 
             bool everyRowMatches = false;
             if (partitionOnly)
@@ -3918,7 +3928,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             {
                 var parquetSchema = await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
                 filePredicate = RowGroupPushdown.ToFileColumns(
-                    prunePredicate, snapshot.Schema, mappingMode, parquetSchema);
+                    prunePredicate, snapshot.Schema, mappingMode, parquetSchema, snapshot.Metadata.PartitionColumns);
             }
 
             await foreach (var (batch, firstRow) in ReadPositionedAsync(
@@ -3944,7 +3954,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // file was written as NULL, partition columns re-materialized, widened types widened.
                 logicalBatch = ReconcileToTableShape(
                     logicalBatch, snapshot, addFile.PartitionValues, columns: null, partitionColumns, partitionColumns.Count > 0,
-                    logicalToPhysical);
+                    logicalToPhysical, addFile.Path);
 
                 var mask = predicate(logicalBatch);
                 var matchRows = new List<int>();
@@ -4124,7 +4134,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var row = Partitioning.PartitionUtils.AddPartitionColumns(
             noColumns, partitionSchema, addFile.PartitionValues, snapshot.Metadata.PartitionColumns,
-            ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode));
+            ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode), addFile.Path);
         var mask = predicate(row);
         return !mask.IsNull(0) && mask.GetValue(0) == true;
     }
@@ -4366,7 +4376,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     // untouched: they were already in the table, so re-checking them would refuse
                     // an unrelated UPDATE over data another engine wrote under semantics we do not
                     // share, and would be work with nothing to find.
+                    // As the write path does: partition values as stored before any expression reads them, then
+                    // a NULL the table declares impossible refused.
+                    updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
+                        updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: false);
                     updatedBatch = generatedColumns?.Recompute(updatedBatch) ?? updatedBatch;
+                    updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
+                        updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: true,
+                        generatedColumns?.ColumnNames);
                     constraints?.Validate(updatedBatch);
 
                     outputBatches.Add(updatedBatch);
@@ -4619,28 +4636,48 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             partitionValues, _options.PartitionPathSpelling, _fs.PathConstraints);
 
     // The canonical identity of ONE partition (for dynamic partition overwrite set membership and compaction
-    // grouping): the sorted "key=value" pairs joined with U+0001, with every key spelled PHYSICALLY when the
-    // table has column mapping — so a physical-keyed entry (the spec convention) and a logical-keyed one
-    // (older engineered-wood commits) canonicalize identically. The map's spelling is decided once, from every
-    // partition column (see PartitionValueKeys): translating keys that were already physical as if they were
+    // grouping): one length-prefixed key/value pair per partition column, sorted and concatenated, so no value,
+    // whatever characters it holds, can pass for NULL or reach into the next pair. Every key is spelled
+    // PHYSICALLY when the table has column mapping — so a physical-keyed entry (the spec convention) and a
+    // logical-keyed one (older engineered-wood commits) canonicalize identically. The map's spelling is decided
+    // once, from its keys (see PartitionValueKeys): translating keys that were already physical as if they were
     // logical merged two partitions of a table whose renamed partition column's logical name is another's
-    // physical name. A null value (Delta's "row is null in this partition column") is marked distinctly from an
-    // empty string.
+    // physical name. Each partition column contributes one pair, so a missing key, JSON null and every other
+    // spelling PartitionNulls reads as NULL are one partition (older checkpoints left a NULL's key out; Spark
+    // writes it as null).
     internal static string CanonicalPartitionKey(
         IReadOnlyDictionary<string, string> values,
         IReadOnlyList<string> partitionColumns,
-        IReadOnlyDictionary<string, string>? logicalToPhysical)
+        IReadOnlyDictionary<string, string>? logicalToPhysical,
+        Schema.StructType schema)
     {
-        bool physicallyKeyed = PartitionValueKeys.IsPhysicallyKeyed(values, partitionColumns, logicalToPhysical);
-        var parts = new List<string>(values.Count);
-        foreach (var kv in values)
+        var parts = new List<string>(partitionColumns.Count);
+        foreach (var column in partitionColumns)
         {
-            string key = PartitionValueKeys.ToPhysical(kv.Key, physicallyKeyed, logicalToPhysical);
-            parts.Add(key + "=" + (kv.Value is null ? "\u0000<null>" : kv.Value));
+            string key = PartitionValueKeys.ToPhysical(column, physicallyKeyed: false, logicalToPhysical);
+            string? value = PartitionValueOrNull(values, column, partitionColumns, logicalToPhysical, schema);
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            parts.Add(key.Length.ToString(inv) + ":" + key
+                + (value is null ? "-" : "=" + value.Length.ToString(inv) + ":" + value));
         }
         parts.Sort(StringComparer.Ordinal);
-        return string.Join("\u0001", parts);
+        return string.Concat(parts);
     }
+
+    // A file's value for one partition column in the map's own spelling (PartitionValueKeys), or null for a
+    // missing key or any spelling PartitionNulls reads as NULL.
+    private static string? PartitionValueOrNull(
+        IReadOnlyDictionary<string, string> values, string column, IReadOnlyList<string> partitionColumns,
+        IReadOnlyDictionary<string, string>? logicalToPhysical, Schema.StructType schema)
+    {
+        if (!PartitionValueKeys.TryGet(values, column, partitionColumns, logicalToPhysical, out var value))
+            return null;
+        return PartitionNulls.IsNull(value, IsStringColumn(schema, column)) ? null : value;
+    }
+
+    private static bool IsStringColumn(Schema.StructType schema, string column) =>
+        schema.Fields.FirstOrDefault(f => string.Equals(f.Name, column, StringComparison.Ordinal))?.Type
+            is Schema.PrimitiveType { TypeName: "string" };
 
     // True when `fileValues` matches every entry in `filter` (partition-overwrite file selection). A file matches
     // only if it carries each filter key with the exact same value (ordinal string compare — partition values are
@@ -4648,19 +4685,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     // user-facing LOGICAL names; under column mapping a file's partitionValues are keyed by the PHYSICAL name
     // (the Delta-spec convention — physical keys survive a partition-column rename), while files written before
     // that convention are logical-keyed — so each filter key is looked up in the map's own spelling, decided from
-    // every partition column (see PartitionValueKeys).
+    // every partition column (see PartitionValueKeys). Both sides are read by the PartitionNulls rule, so a
+    // filter of null or "" matches a file whose value is NULL in any spelling, a missing key included.
     private static bool PartitionValuesMatch(
         IReadOnlyDictionary<string, string> fileValues, IReadOnlyDictionary<string, string> filter,
-        IReadOnlyList<string> partitionColumns, IReadOnlyDictionary<string, string>? logicalToPhysical = null)
+        IReadOnlyList<string> partitionColumns, Schema.StructType schema,
+        IReadOnlyDictionary<string, string>? logicalToPhysical = null)
     {
         foreach (var kv in filter)
         {
-            if (!PartitionValueKeys.TryGet(fileValues, kv.Key, partitionColumns, logicalToPhysical, out var v))
+            string? v = PartitionValueOrNull(fileValues, kv.Key, partitionColumns, logicalToPhysical, schema);
+            string? wanted = PartitionNulls.IsNull(kv.Value, IsStringColumn(schema, kv.Key)) ? null : kv.Value;
+            if (!string.Equals(v, wanted, StringComparison.Ordinal))
                 return false;
-            if (!string.Equals(v, kv.Value, StringComparison.Ordinal))
-            {
-                return false;
-            }
         }
         return true;
     }
@@ -5591,9 +5628,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // form, and refuse what has no faithful encoding at all — nanosecond and second timestamps.
         // Under a host writer only the partition columns are converted — and a repartitioning overwrite
         // splits by the NEW ones, so those are the ones whose values get formatted.
-        batches = NormalizeUnlessHostOwnsBytes(batches, repartitionTo ?? snapshot.Metadata.PartitionColumns);
+        var splitColumns = repartitionTo ?? snapshot.Metadata.PartitionColumns;
+        batches = NormalizeUnlessHostOwnsBytes(batches, splitColumns);
         foreach (var b in batches)
             SchemaConverter.ThrowIfUnwritableType(b.Schema, convertibleTypesAllowed: HostOwnsBytes);
+
+        // The partition values as they will be stored (an empty string is stored as null) BEFORE any expression
+        // reads them, so a generated column or CHECK constraint describes the row the table will hold.
+        batches = batches
+            .Select(b => Partitioning.PartitionUtils.NormalizePartitionValues(
+                b, splitColumns, snapshot.Schema, refuseNulls: false))
+            .ToList();
 
         // Generated columns first, because a CHECK constraint may reference one: validating before
         // the column exists would read a null the table never stores.
@@ -5606,6 +5651,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             batches = materialized;
         }
+
+        // Again, for a generated partition column, and now refusing a NULL the table declares impossible: the
+        // read refuses a file holding one. An empty string a generation expression produced is refused, since
+        // storing it as NULL would break the expression.
+        batches = batches
+            .Select(b => Partitioning.PartitionUtils.NormalizePartitionValues(
+                b, splitColumns, snapshot.Schema, refuseNulls: true, generated?.ColumnNames))
+            .ToList();
 
         // Beside the other per-batch guard, and before anything is written: a constraint
         // violation must leave the table untouched rather than half-written. Create parses, so an
@@ -5712,7 +5765,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 if (overwritePartitions is { Count: > 0 } &&
                     !PartitionValuesMatch(
                         existingFile.PartitionValues, overwritePartitions, snapshot.Metadata.PartitionColumns,
-                        logicalToPhysical))
+                        snapshot.Schema, logicalToPhysical))
                 {
                     continue; // keep files outside the target partition(s)
                 }
@@ -5776,7 +5829,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // Partition overwrite: the input must fall within the target partition(s) — otherwise we'd ADD
                 // files in partitions we didn't clear, silently mixing overwrite + append semantics.
                 if (overwritePartitions is { Count: > 0 }
-                    && !PartitionValuesMatch(partValues, overwritePartitions, partitionColumns))
+                    && !PartitionValuesMatch(partValues, overwritePartitions, partitionColumns, snapshot.Schema))
                 {
                     throw new DeltaFormatException(
                         DeltaTableErrorCodes.DataOutsideTargetPartitions,
@@ -5826,7 +5879,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     }
                 }
 
-                touchedPartitions?.Add(CanonicalPartitionKey(trackedPartValues, partitionColumns, logicalToPhysical));
+                touchedPartitions?.Add(CanonicalPartitionKey(
+                    trackedPartValues, partitionColumns, logicalToPhysical, snapshot.Schema));
 
                 // Build file path: partition subdirectory + UUID filename
                 string partDir = BuildPartitionPath(trackedPartValues);
@@ -5906,7 +5960,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             foreach (var existingFile in snapshot.ActiveFiles.Values)
             {
                 if (!touchedPartitions.Contains(CanonicalPartitionKey(
-                        existingFile.PartitionValues, snapshot.Metadata.PartitionColumns, logicalToPhysical)))
+                        existingFile.PartitionValues, snapshot.Metadata.PartitionColumns, logicalToPhysical,
+                        snapshot.Schema)))
                     continue;
                 actions.Add(new RemoveFile
                 {
@@ -6680,6 +6735,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         foreach (var b in batches)
             SchemaConverter.ThrowIfUnwritableType(b.Schema, convertibleTypesAllowed: HostOwnsBytes);
         var partitionColumns = snapshot.Metadata.PartitionColumns;
+        batches = batches
+            .Select(b => Partitioning.PartitionUtils.NormalizePartitionValues(
+                b, partitionColumns, writeSchema, refuseNulls: true))
+            .ToList();
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(writeSchema, mappingMode);
         // The committed properties: a pending schema change's rewrite of delta.dataSkippingStatsColumns is not
@@ -7091,13 +7150,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 var touched = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var f in files)
                 {
-                    if (f.PartitionValues is { Count: > 0 } pv)
-                        touched.Add(CanonicalPartitionKey(pv, snapshot.Metadata.PartitionColumns, logicalToPhysical));
+                    // An empty map is this engine's NULL partition, not "no partition".
+                    if (f.PartitionValues is { } pv)
+                        touched.Add(CanonicalPartitionKey(
+                            pv, snapshot.Metadata.PartitionColumns, logicalToPhysical, snapshot.Schema));
                 }
                 foreach (var existingFile in snapshot.ActiveFiles.Values)
                 {
                     if (!touched.Contains(CanonicalPartitionKey(
-                        existingFile.PartitionValues, snapshot.Metadata.PartitionColumns, logicalToPhysical)))
+                        existingFile.PartitionValues, snapshot.Metadata.PartitionColumns, logicalToPhysical,
+                        snapshot.Schema)))
                         continue;
                     actions.Add(new RemoveFile
                     {
@@ -9415,9 +9477,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // delete's target positions with stable row ids and to place the rebased deletion vector. The hidden
         // materialized columns are always stripped from the emitted user batches regardless (a foreign reader
         // must never see them).
+        // An empty map still goes through the partition step: a missing key is a NULL value, and in a
+        // non-nullable column one the read refuses. This engine's own NULL partition is such a map.
         var partitionColumns = snapshot.Metadata.PartitionColumns;
-        bool hasPartitions = partitionColumns.Count > 0 &&
-            addFile.PartitionValues.Count > 0;
+        bool hasPartitions = partitionColumns.Count > 0;
 
         // Column mapping setup
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
@@ -9425,6 +9488,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
             snapshot.Schema, mappingMode);
+        // Before any projection: a read that leaves the column out is refused all the same.
+        if (hasPartitions)
+        {
+            Partitioning.PartitionUtils.ThrowIfNullInNonNullablePartition(
+                addFile.PartitionValues, snapshot.ArrowSchema, partitionColumns, logicalToPhysical, addFile.Path);
+        }
         var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
             snapshot.Schema, mappingMode);
         // Load the deletion vector first — it is independent of the byte source.
@@ -9594,7 +9663,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
             filePredicate = RowGroupPushdown.ToFileColumns(
-                rowGroupFilter, snapshot.Schema, mappingMode, parquetSchema);
+                rowGroupFilter, snapshot.Schema, mappingMode, parquetSchema, snapshot.Metadata.PartitionColumns);
         }
 
         var builtinBatches = ReadPositionedAsync(reader, filePredicate, fileColumns, cancellationToken);
@@ -9685,7 +9754,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             // The materialized row-tracking columns were already stripped up front (above).
             var cleanResult = ReconcileToTableShape(
-                result, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions, logicalToPhysical);
+                result, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions, logicalToPhysical,
+                addFile.Path);
 
             // Surface each surviving row's RESOLVED id + commit version (row-aligned with cleanResult): the
             // materialized value where present, else add.baseRowId + absolute position / defaultRowCommitVersion
@@ -9725,12 +9795,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <paramref name="snapshot"/>'s schema (or the <paramref name="columns"/> projection of it), whatever
     /// schema the file was written under. <paramref name="partitionValues"/> are the file's action's. Every
     /// path that hands a file's rows onward uses it, so a DELETE predicate and the change feed see what a scan
-    /// sees.
+    /// sees. <paramref name="filePath"/> names the file in the error a NULL in a non-nullable partition column
+    /// raises.
     /// </summary>
     internal static RecordBatch ReconcileToTableShape(
         RecordBatch result, Snapshot.Snapshot snapshot, IReadOnlyDictionary<string, string>? partitionValues,
         IReadOnlyList<string>? columns, IReadOnlyList<string> partitionColumns, bool hasPartitions,
-        IReadOnlyDictionary<string, string> logicalToPhysical)
+        IReadOnlyDictionary<string, string> logicalToPhysical, string? filePath = null)
     {
         // Apply type widening — convert narrow types from old files to current schema types
         if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
@@ -9763,7 +9834,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // while files written before that convention are logical-keyed — the map resolves both.
             result = Partitioning.PartitionUtils.AddPartitionColumns(
                 result, fullSchema, partitionValues ?? EmptyPartitionValues, partitionColumns,
-                logicalToPhysical);
+                logicalToPhysical, filePath);
         }
 
         // Schema evolution: ADD/DROP COLUMN are metadata-only commits, so a file written before an ADD

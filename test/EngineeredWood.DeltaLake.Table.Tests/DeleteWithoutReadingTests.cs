@@ -134,9 +134,9 @@ public class DeleteWithoutReadingTests : IDisposable
         Assert.Equal(await IdsAsync(oracle.Table), await IdsAsync(shortcut.Table));
     }
 
-    /// <summary>What the read path opens for <c>part = 'a'</c>.</summary>
-    private static readonly string[] ReadPathOpens =
-        ["part=__HIVE_DEFAULT_PARTITION__", "part=__HIVE_DEFAULT_PARTITION__", "part=a", "part=a"];
+    /// <summary>What the read path opens for <c>part = 'a'</c>: the two files of a. The null partition's files
+    /// are skipped, since their partition value is known to be NULL and NULL = 'a' is never true.</summary>
+    private static readonly string[] ReadPathOpens = ["part=a", "part=a"];
 
     private static List<long> Ids(params int[] starts) =>
         starts.SelectMany(s => Enumerable.Range(s, 10)).Select(v => (long)v).OrderBy(v => v).ToList();
@@ -259,7 +259,6 @@ public class DeleteWithoutReadingTests : IDisposable
         await using var _ = shortcut;
         await using var __ = oracle;
 
-        // The two files of a, and the null partition's two: the statistics cannot rule NULL = 'a' out.
         Assert.Equal(ReadPathOpens, shortcut.Opened);
         Assert.Equal(20, shortcut.Deleted);
         await AssertSameOutcomeAsync(shortcut, oracle);
@@ -273,7 +272,6 @@ public class DeleteWithoutReadingTests : IDisposable
         await using var _ = shortcut;
         await using var __ = oracle;
 
-        // The two files of a, and the null partition's two: the statistics cannot rule NULL = 'a' out.
         Assert.Equal(ReadPathOpens, shortcut.Opened);
         await AssertSameOutcomeAsync(shortcut, oracle);
 
