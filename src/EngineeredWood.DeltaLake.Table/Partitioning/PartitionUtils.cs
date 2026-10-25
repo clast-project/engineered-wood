@@ -64,19 +64,16 @@ internal static class PartitionUtils
                 // Spark convention); __HIVE_DEFAULT_PARTITION__ is only the DIRECTORY name. An empty string is
                 // stored as null too: the protocol reads an empty string as NULL for every type, and Spark
                 // writes it so.
+                // The write entry points already did this (NormalizePartitionValues), and refused a NULL the table
+                // declares impossible; this covers every other caller.
                 string? value = GetStringValue(batch.Column(partColIndices[p]), row);
                 if (value is { Length: 0 })
                     value = null;
-                if (value is null && !batch.Schema.FieldsList[partColIndices[p]].IsNullable)
-                    throw new ArgumentException(
-                        $"The batch has a null or empty value in partition column '{partitionColumns[p]}'. The "
-                        + "column is declared non-nullable, and a partition value stores an empty string as null. "
-                        + "Declare the field nullable, or remove those values.",
-                        nameof(batch));
                 partValues[partitionColumns[p]] = value!;
-                // Marked apart from every value: a NULL row and a row holding the sentinel's text are different
-                // partitions, though both live in the sentinel's directory.
-                keyParts[p] = value is null ? "\u0001" : "=" + value;
+                // Marked apart from every value, so a NULL row and a row holding the sentinel's text are different
+                // partitions, though both live in the sentinel's directory; and length-prefixed, so no value can
+                // reach across the separator into the next column's.
+                keyParts[p] = value is null ? "-" : value.Length.ToString(System.Globalization.CultureInfo.InvariantCulture) + ":" + value;
             }
 
             string groupKey = string.Join("\0", keyParts);
@@ -103,6 +100,100 @@ internal static class PartitionUtils
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Brings <paramref name="batch"/>'s partition columns to the values a commit stores: an empty string becomes
+    /// null, as the protocol reads it and Spark writes it. The write paths call this before generated columns and
+    /// CHECK constraints are evaluated, so those describe the rows the table will hold. With
+    /// <paramref name="refuseNulls"/>, a null in a partition column <paramref name="schema"/> declares
+    /// non-nullable is refused, whatever the batch's own field says: the read refuses such a file, so a commit
+    /// must never make one.
+    /// </summary>
+    public static RecordBatch NormalizePartitionValues(
+        RecordBatch batch, IReadOnlyList<string> partitionColumns, DeltaLake.Schema.StructType schema,
+        bool refuseNulls)
+    {
+        IArrowArray[]? columns = null;
+        Field[]? fields = null;
+        foreach (string column in partitionColumns)
+        {
+            int index = batch.Schema.GetFieldIndex(column);
+            if (index < 0)
+                continue;
+
+            var array = columns?[index] ?? batch.Column(index);
+            var replaced = EmptyStringsAsNull(array);
+            if (replaced is not null)
+            {
+                columns ??= batch.Arrays.ToArray();
+                fields ??= batch.Schema.FieldsList.ToArray();
+                columns[index] = replaced;
+                array = replaced;
+                if (!fields[index].IsNullable)
+                    fields[index] = new Field(fields[index].Name, fields[index].DataType, true, fields[index].Metadata);
+            }
+
+            if (refuseNulls && array.NullCount > 0
+                && schema.Fields.FirstOrDefault(f => string.Equals(f.Name, column, StringComparison.Ordinal))
+                    is { Nullable: false })
+            {
+                throw new ArgumentException(
+                    $"The batch has a null or empty value in partition column '{column}', which the table declares "
+                    + "non-nullable. A partition value stores an empty string as null. Remove those values, or "
+                    + "make the column nullable.",
+                    nameof(batch));
+            }
+        }
+
+        if (columns is null)
+            return batch;
+        var builder = new Apache.Arrow.Schema.Builder();
+        foreach (var field in fields!)
+            builder.Field(field);
+        foreach (var kv in batch.Schema.Metadata ?? new Dictionary<string, string>())
+            builder.Metadata(kv.Key, kv.Value);
+        return new RecordBatch(builder.Build(), columns, batch.Length);
+    }
+
+    // The array with each empty string made null, or null when it holds none (or is not a string array).
+    private static IArrowArray? EmptyStringsAsNull(IArrowArray array)
+    {
+        switch (array)
+        {
+            case StringArray s when HasEmpty(s.Length, i => !s.IsNull(i) && s.GetString(i).Length == 0):
+            {
+                var b = new StringArray.Builder();
+                for (int i = 0; i < s.Length; i++)
+                {
+                    if (s.IsNull(i)) { b.AppendNull(); continue; }
+                    string v = s.GetString(i);
+                    if (v.Length == 0) b.AppendNull(); else b.Append(v);
+                }
+                return b.Build();
+            }
+            case LargeStringArray s when HasEmpty(s.Length, i => !s.IsNull(i) && s.GetString(i).Length == 0):
+            {
+                var b = new LargeStringArray.Builder();
+                for (int i = 0; i < s.Length; i++)
+                {
+                    if (s.IsNull(i)) { b.AppendNull(); continue; }
+                    string v = s.GetString(i);
+                    if (v.Length == 0) b.AppendNull(); else b.Append(v);
+                }
+                return b.Build();
+            }
+            default:
+                return null;
+        }
+
+        static bool HasEmpty(int length, Func<int, bool> isEmpty)
+        {
+            for (int i = 0; i < length; i++)
+                if (isEmpty(i))
+                    return true;
+            return false;
+        }
     }
 
     /// <summary>

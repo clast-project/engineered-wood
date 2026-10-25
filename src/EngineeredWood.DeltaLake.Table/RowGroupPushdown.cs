@@ -23,7 +23,8 @@ namespace EngineeredWood.DeltaLake.Table;
 /// <para>
 /// Every reference that does not resolve to exactly one leaf is pointed at a name no Parquet file can
 /// contain, so the accessor answers null and the evaluator Unknown: the row group is KEPT. That covers
-/// partition columns (not stored in the file), list and map elements, columns absent from an older file,
+/// partition columns (whose values come from the log, even where IcebergCompat also stores them in the file),
+/// list and map elements, columns absent from an older file,
 /// ambiguous dotted names, and any column whose type has changed (the file's statistics are of the old
 /// type, and a Bloom filter hashes the old physical encoding). Pruning never guesses.
 /// </para>
@@ -35,12 +36,17 @@ internal static class RowGroupPushdown
 
     /// <summary>
     /// Rewrites <paramref name="predicate"/>'s references from the table's logical names to
-    /// <paramref name="fileSchema"/>'s dotted leaf paths.
+    /// <paramref name="fileSchema"/>'s dotted leaf paths. A <paramref name="partitionColumns"/> reference never
+    /// resolves, even to a leaf the file holds: an IcebergCompat file materializes its partition values, but the
+    /// log's are the ones a read returns, and the two can disagree (a stored empty string reads as NULL).
     /// </summary>
     public static Predicate ToFileColumns(
-        Predicate predicate, StructType tableSchema, ColumnMappingMode mode, SchemaDescriptor fileSchema)
+        Predicate predicate, StructType tableSchema, ColumnMappingMode mode, SchemaDescriptor fileSchema,
+        IReadOnlyCollection<string> partitionColumns)
     {
         var map = LogicalToFileLeaf(tableSchema, mode, fileSchema);
+        foreach (var column in partitionColumns)
+            map.Remove(column);
         return Rewrite(predicate, name => map.TryGetValue(name, out var leaf) ? leaf : Unresolved);
     }
 

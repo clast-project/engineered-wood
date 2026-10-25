@@ -450,12 +450,12 @@ public class PhysicalNameResolutionTests : IDisposable
         string[] partitionColumns = ["x", "p1"];
 
         Assert.Equal(
-            DeltaTable.CanonicalPartitionKey(SpecValues, partitionColumns, map),
-            DeltaTable.CanonicalPartitionKey(LegacyCollidingValues, partitionColumns, map));
+            DeltaTable.CanonicalPartitionKey(SpecValues, partitionColumns, map, CollidingPartitionSchema()),
+            DeltaTable.CanonicalPartitionKey(LegacyCollidingValues, partitionColumns, map, CollidingPartitionSchema()));
         Assert.NotEqual(
-            DeltaTable.CanonicalPartitionKey(SpecValues, partitionColumns, map),
+            DeltaTable.CanonicalPartitionKey(SpecValues, partitionColumns, map, CollidingPartitionSchema()),
             DeltaTable.CanonicalPartitionKey(
-                new Dictionary<string, string> { ["p1"] = "B", ["p2"] = "A" }, partitionColumns, map));
+                new Dictionary<string, string> { ["p1"] = "B", ["p2"] = "A" }, partitionColumns, map, CollidingPartitionSchema()));
     }
 
     // ── Spellings that cannot be told apart ──────────────────────────────────────────────────────────
