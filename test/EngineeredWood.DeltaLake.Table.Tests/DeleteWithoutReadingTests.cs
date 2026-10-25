@@ -294,8 +294,8 @@ public class DeleteWithoutReadingTests : IDisposable
 
     /// <summary>
     /// Statistics without a row count, as a writer that kept none or only bounds would leave them. A JSON object
-    /// without <c>numRecords</c> parses as a count of 0, which taken on trust would leave the file's rows
-    /// undeleted. The file has no count to report, so it alone is read.
+    /// without <c>numRecords</c> has no count (#516), and the DELETE cannot report the rows it removes without
+    /// one. That file has no count to report, so it alone is read.
     /// </summary>
     [Theory]
     [InlineData(null)]

@@ -261,4 +261,96 @@ public class ExternalDataFileCommitTests : IDisposable
 
         Assert.Equal(new long[] { 1, 2, 3, 4, 5, 100, 101 }, await ReadIdsFresh());
     }
+
+    /// <summary>
+    /// A host's stats JSON without <c>numRecords</c> still commits the file's count (#516). A concurrent append
+    /// forces the commit to re-assign the row ids, and the re-assignment reads the committed stats; without the
+    /// count it once sized the file's range as empty, so the next write reused the file's ids.
+    /// </summary>
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("""{"minValues":{"id":4},"maxValues":{"id":5},"nullCount":{"id":0}}""")]
+    public async Task CommitDataFiles_StatsWithoutACount_CommitTheFilesCount(string statsJson)
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdValueSchema, enableRowTracking: true);
+        await table.WriteAsync([Batch(1, 3)]); // v1 — row ids 0..2
+
+        var written = await table.WriteDataFilesAsync([Batch(4, 2)]);
+        var files = written.Select(f => f with { StatsJson = statsJson }).ToList();
+
+        await using (var racer = await OpenAsync())
+        {
+            await racer.WriteAsync([Batch(100, 2)]); // v2 — row ids 3..4
+        }
+
+        await table.CommitDataFilesAsync(files, DeltaWriteMode.Append); // rebases → v3, row ids 5..6
+
+        var add = ReadCommitActions(3).Single(a => a.TryGetProperty("add", out _)).GetProperty("add");
+        using var stats = JsonDocument.Parse(add.GetProperty("stats").GetString()!);
+        Assert.Equal(2, stats.RootElement.GetProperty("numRecords").GetInt64());
+        if (statsJson.Contains("minValues"))
+            Assert.Equal(4, stats.RootElement.GetProperty("minValues").GetProperty("id").GetInt64());
+
+        await using var check = await OpenAsync();
+        Assert.Equal(7, check.CurrentSnapshot.RowIdHighWaterMark);
+        var baseIds = check.CurrentSnapshot.ActiveFiles.Values
+            .Select(a => a.BaseRowId!.Value).OrderBy(x => x).ToArray();
+        Assert.Equal(new long[] { 0, 3, 5 }, baseIds);
+    }
+
+    /// <summary>A count in the stats that disagrees with the file's is refused before anything is committed.</summary>
+    [Theory]
+    [InlineData("""{"numRecords":3}""")]
+    [InlineData("""{"numRecords":2.5}""")]
+    [InlineData("not json")]
+    [InlineData("[]")]
+    public async Task CommitDataFiles_StatsThatCannotDescribeTheFile_AreRefused(string statsJson)
+    {
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), IdValueSchema);
+        var written = await table.WriteDataFilesAsync([Batch(1, 2)]);
+        var files = written.Select(f => f with { StatsJson = statsJson }).ToList();
+
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await table.CommitDataFilesAsync(files, DeltaWriteMode.Append));
+        Assert.Equal(0, table.CurrentSnapshot.Version);
+    }
+
+    /// <summary>
+    /// A staged add with a row id but no count cannot have its ids re-assigned after a concurrent commit: an
+    /// empty range would hand its rows' ids to the next file. delta-spark refuses the same add
+    /// (<c>DELTA_ROW_ID_ASSIGNMENT_WITHOUT_STATS</c>).
+    /// </summary>
+    [Fact]
+    public async Task StagedAddWithoutACount_IsRefusedWhenItsRowIdsMove()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdValueSchema, enableRowTracking: true);
+        await table.WriteAsync([Batch(1, 3)]); // v1 — row ids 0..2
+        var file = (await table.WriteDataFilesAsync([Batch(4, 2)])).Single();
+
+        await using var transaction = table.StartTransaction();
+        transaction.StageActions(
+        [
+            new AddFile
+            {
+                Path = DeltaPath.Encode(file.RelativePath),
+                PartitionValues = new Dictionary<string, string>(),
+                Size = file.SizeBytes,
+                ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = true,
+                Stats = """{"minValues":{"id":4},"maxValues":{"id":5}}""",
+                BaseRowId = 3,
+                DefaultRowCommitVersion = 2,
+            },
+        ]);
+
+        await using (var racer = await OpenAsync())
+        {
+            await racer.WriteAsync([Batch(100, 2)]); // v2 — takes row ids 3..4
+        }
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await transaction.CommitAsync());
+        Assert.Contains("numRecords", ex.Message);
+    }
 }

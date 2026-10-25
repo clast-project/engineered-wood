@@ -164,4 +164,39 @@ public class PublicStatsSurfaceTests : IDisposable
             $"AddFile.{methodName} must stay public: it is the only way a consumer outside this " +
             "assembly can read the statistics of a file in a stats_parsed-only checkpoint.");
     }
+
+    /// <summary>
+    /// A stats object without a row count is unknown, not empty (#516): a writer may keep only bounds, and a 0
+    /// here once let row-id assignment hand the next file the same ids.
+    /// </summary>
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("""{"minValues":{"id":0},"maxValues":{"id":9},"nullCount":{"id":0}}""")]
+    [InlineData("""{"numRecords":null}""")]
+    [InlineData("""{"numRecords":"10"}""")]
+    [InlineData("""{"numRecords":1.5}""")]
+    public void StatsWithoutARowCount_HaveNoCount(string stats)
+    {
+        var parsed = ColumnStats.Parse(stats);
+        Assert.NotNull(parsed);
+        Assert.Null(parsed!.NumRecords);
+        Assert.Null(FileWithStats(stats).GetNumRecords());
+    }
+
+    [Theory]
+    [InlineData("""{"numRecords":0}""", 0L)]
+    [InlineData("""{"numRecords":10,"minValues":{"id":0}}""", 10L)]
+    public void StatsWithARowCount_ReportIt(string stats, long expected)
+    {
+        Assert.Equal(expected, ColumnStats.Parse(stats)!.NumRecords);
+        Assert.Equal(expected, FileWithStats(stats).GetNumRecords());
+    }
+
+    private static AddFile FileWithStats(string stats) => new()
+    {
+        Path = "data.parquet",
+        PartitionValues = new Dictionary<string, string>(),
+        Size = 1000, ModificationTime = 1000, DataChange = true,
+        Stats = stats,
+    };
 }
