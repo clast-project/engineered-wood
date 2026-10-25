@@ -8889,6 +8889,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 kvp.Key, kvp.Value as IReadOnlyList<long> ?? [.. kvp.Value]));
         }
 
+        // Likewise a post-image without a row count, which cannot have its row ids re-derived below.
+        if (rowTrackingEnabled)
+        {
+            foreach (var action in actions)
+            {
+                if (action is AddFile add && !fromByPath.Contains(add.Path) && add.DataChange
+                    && add.BaseRowId is not null)
+                    RowCountForRowIds(add);
+            }
+        }
+
         foreach (var action in actions)
         {
             switch (action)
