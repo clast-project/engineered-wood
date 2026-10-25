@@ -270,6 +270,7 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
 {
     private readonly IReadOnlyDictionary<string, string> _columnTypes;
     private readonly HashSet<string> _partitionColumns;
+    private readonly IReadOnlyList<string> _partitionColumnList; // for PartitionValueKeys
     private readonly IReadOnlyDictionary<string, string> _logicalToPhysical;
     private readonly bool _preferTypedStats;
     private readonly HashSet<string> _unattributable;
@@ -287,6 +288,7 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     {
         _columnTypes = columnTypes;
         _partitionColumns = partitionColumns;
+        _partitionColumnList = new List<string>(partitionColumns);
         _logicalToPhysical = logicalToPhysical ?? new Dictionary<string, string>();
         _preferTypedStats = preferTypedStats;
         _unattributable = unattributableStatsColumns ?? new HashSet<string>(StringComparer.Ordinal);
@@ -314,9 +316,9 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     private bool TryGetPartitionValue(AddFile addFile, string column, out string value)
     {
         value = default!;
-        if (PartitionValueKeys.IsAmbiguous(addFile.PartitionValues, _partitionColumns, _logicalToPhysical)
+        if (PartitionValueKeys.IsAmbiguous(addFile.PartitionValues, _partitionColumnList, _logicalToPhysical)
             || !PartitionValueKeys.TryGet(
-                addFile.PartitionValues, column, _partitionColumns, _logicalToPhysical, out string raw))
+                addFile.PartitionValues, column, _partitionColumnList, _logicalToPhysical, out string raw))
         {
             return false;
         }

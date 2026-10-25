@@ -31,7 +31,7 @@ internal static class PartitionValueKeys
     /// the same.
     /// </summary>
     public static bool IsPhysicallyKeyed<TValue>(
-        IReadOnlyDictionary<string, TValue> values, IEnumerable<string> partitionColumns,
+        IReadOnlyDictionary<string, TValue> values, IReadOnlyList<string> partitionColumns,
         IReadOnlyDictionary<string, string>? logicalToPhysical) =>
         Decide(values, partitionColumns, logicalToPhysical) ?? true;
 
@@ -42,18 +42,17 @@ internal static class PartitionValueKeys
     /// (physical), as a read must produce some value; a consumer that may decline, such as the pruner, should.
     /// </summary>
     public static bool IsAmbiguous<TValue>(
-        IReadOnlyDictionary<string, TValue> values, IEnumerable<string> partitionColumns,
+        IReadOnlyDictionary<string, TValue> values, IReadOnlyList<string> partitionColumns,
         IReadOnlyDictionary<string, string>? logicalToPhysical)
     {
-        var columns = partitionColumns as IReadOnlyCollection<string> ?? partitionColumns.ToList();
-        if (Decide(values, columns, logicalToPhysical) is not null)
+        if (Decide(values, partitionColumns, logicalToPhysical) is not null)
             return false;
-        foreach (var key in values.Keys)
+        // Every partition key present is a logical name and a physical one; ambiguous when one of them is a
+        // physical name of a column other than the one it names logically.
+        for (int i = 0; i < partitionColumns.Count; i++)
         {
-            // Every key here is a logical name and a physical one; ambiguous when they are different columns'.
-            string? byPhysical = columns.FirstOrDefault(
-                c => string.Equals(Physical(c, logicalToPhysical), key, StringComparison.Ordinal));
-            if (byPhysical is not null && !string.Equals(byPhysical, key, StringComparison.Ordinal))
+            string physical = Physical(partitionColumns[i], logicalToPhysical);
+            if (values.ContainsKey(physical) && !string.Equals(physical, partitionColumns[i], StringComparison.Ordinal))
                 return true;
         }
         return false;
@@ -65,7 +64,7 @@ internal static class PartitionValueKeys
     /// its logical one.
     /// </summary>
     public static bool TryGet<TValue>(
-        IReadOnlyDictionary<string, TValue> values, string column, IEnumerable<string> partitionColumns,
+        IReadOnlyDictionary<string, TValue> values, string column, IReadOnlyList<string> partitionColumns,
         IReadOnlyDictionary<string, string>? logicalToPhysical, out TValue value)
     {
         string key = IsPhysicallyKeyed(values, partitionColumns, logicalToPhysical)
@@ -81,31 +80,53 @@ internal static class PartitionValueKeys
         string key, bool physicallyKeyed, IReadOnlyDictionary<string, string>? logicalToPhysical) =>
         physicallyKeyed ? key : Physical(key, logicalToPhysical);
 
-    // True for physical, false for logical, null when the keys cannot tell. A key that is no partition column's
-    // name in either spelling says nothing and is passed over.
+    // True for physical, false for logical, null when the keys cannot tell. Only keys that are some partition
+    // column's name in one spelling or the other are looked at; anything else in the map says nothing. Index
+    // loops over the handful of partition columns, so the hot read and pruning paths allocate nothing.
     private static bool? Decide<TValue>(
-        IReadOnlyDictionary<string, TValue> values, IEnumerable<string> partitionColumns,
+        IReadOnlyDictionary<string, TValue> values, IReadOnlyList<string> partitionColumns,
         IReadOnlyDictionary<string, string>? logicalToPhysical)
     {
-        var logical = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
-        var physical = new HashSet<string>(logical.Select(c => Physical(c, logicalToPhysical)), StringComparer.Ordinal);
         bool allPhysical = true, allLogical = true, physicalOnly = false, logicalOnly = false;
-        foreach (var key in values.Keys)
+        for (int i = 0; i < partitionColumns.Count; i++)
         {
-            bool isPhysical = physical.Contains(key);
-            bool isLogical = logical.Contains(key);
-            if (!isPhysical && !isLogical)
-                continue;
-            allPhysical &= isPhysical;
-            allLogical &= isLogical;
-            physicalOnly |= isPhysical && !isLogical;
-            logicalOnly |= isLogical && !isPhysical;
+            string logicalName = partitionColumns[i];
+            string physicalName = Physical(logicalName, logicalToPhysical);
+            for (int spelling = 0; spelling < 2; spelling++)
+            {
+                string key = spelling == 0 ? logicalName : physicalName;
+                if ((spelling == 1 && ReferenceEquals(key, logicalName)) || !values.ContainsKey(key))
+                    continue;
+                bool isPhysical = spelling == 1 || IsPhysicalName(key, partitionColumns, logicalToPhysical);
+                bool isLogical = spelling == 0 || IsLogicalName(key, partitionColumns);
+                allPhysical &= isPhysical;
+                allLogical &= isLogical;
+                physicalOnly |= isPhysical && !isLogical;
+                logicalOnly |= isLogical && !isPhysical;
+            }
         }
         if (allPhysical && physicalOnly)
             return true;
         if (allLogical && logicalOnly)
             return false;
         return null;
+    }
+
+    private static bool IsLogicalName(string key, IReadOnlyList<string> partitionColumns)
+    {
+        for (int i = 0; i < partitionColumns.Count; i++)
+            if (string.Equals(partitionColumns[i], key, StringComparison.Ordinal))
+                return true;
+        return false;
+    }
+
+    private static bool IsPhysicalName(
+        string key, IReadOnlyList<string> partitionColumns, IReadOnlyDictionary<string, string>? logicalToPhysical)
+    {
+        for (int i = 0; i < partitionColumns.Count; i++)
+            if (string.Equals(Physical(partitionColumns[i], logicalToPhysical), key, StringComparison.Ordinal))
+                return true;
+        return false;
     }
 
     private static string Physical(string logical, IReadOnlyDictionary<string, string>? logicalToPhysical) =>
