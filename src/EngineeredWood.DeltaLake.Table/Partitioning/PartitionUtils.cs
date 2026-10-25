@@ -39,6 +39,35 @@ internal static class PartitionUtils
             return [(new Dictionary<string, string>(), batch, all)];
         }
 
+        var groups = GroupRows(batch, partitionColumns);
+        var partColIndices = new int[partitionColumns.Count];
+        for (int i = 0; i < partitionColumns.Count; i++)
+            partColIndices[i] = batch.Schema.GetFieldIndex(partitionColumns[i]);
+
+        // Build non-partition schema
+        var dataSchema = BuildNonPartitionSchema(batch.Schema, partColIndices);
+
+        // Build output batches
+        var result = new List<(Dictionary<string, string>, RecordBatch, List<int>)>();
+
+        foreach (var group in groups)
+        {
+            var dataBatch = BuildFilteredBatch(batch, dataSchema, partColIndices, group.Rows);
+            result.Add((group.PartitionValues, dataBatch, group.Rows));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// The rows of <paramref name="batch"/> grouped by their partition values, as <see cref="SplitByPartition"/>
+    /// groups them but without building a batch per group, in first-appearance order. <c>Key</c> identifies a
+    /// group's values: two rows share it exactly when they belong in the same partition, so a caller can tell
+    /// whether a row's partition is the one it came from by comparing keys.
+    /// </summary>
+    public static List<(Dictionary<string, string> PartitionValues, string Key, List<int> Rows)> GroupRows(
+        RecordBatch batch, IReadOnlyList<string> partitionColumns)
+    {
         // Find partition column indices
         var partColIndices = new int[partitionColumns.Count];
         for (int i = 0; i < partitionColumns.Count; i++)
@@ -52,6 +81,7 @@ internal static class PartitionUtils
         // Group rows by partition values
         var groups = new Dictionary<string, (Dictionary<string, string> Values, List<int> Rows)>(
             StringComparer.Ordinal);
+        var order = new List<string>();
 
         for (int row = 0; row < batch.Length; row++)
         {
@@ -82,23 +112,15 @@ internal static class PartitionUtils
             {
                 group = (partValues, new List<int>());
                 groups[groupKey] = group;
+                order.Add(groupKey);
             }
 
             group.Rows.Add(row);
         }
 
-        // Build non-partition schema
-        var dataSchema = BuildNonPartitionSchema(batch.Schema, partColIndices);
-
-        // Build output batches
-        var result = new List<(Dictionary<string, string>, RecordBatch, List<int>)>();
-
-        foreach (var group in groups)
-        {
-            var dataBatch = BuildFilteredBatch(batch, dataSchema, partColIndices, group.Value.Rows);
-            result.Add((group.Value.Values, dataBatch, group.Value.Rows));
-        }
-
+        var result = new List<(Dictionary<string, string>, string, List<int>)>(order.Count);
+        foreach (string key in order)
+            result.Add((groups[key].Values, key, groups[key].Rows));
         return result;
     }
 

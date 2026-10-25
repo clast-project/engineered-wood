@@ -4324,11 +4324,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             // Evaluate predicate and apply updates
             bool fileModified = false;
-            var outputBatches = new List<RecordBatch>();
-            // Per output batch, the ORIGINAL id + commit version to materialize (null entry = no tracking). An
-            // UPDATE keeps EVERY row (matched rows updated in place, the rest copied), so each output row carries
-            // its source id; a matched row's version becomes newVersion, an untouched row keeps its original.
-            var outTracking = materializeIds ? new List<(Int64Array Ids, Int64Array Vers)?>() : null;
+            // The output rows by destination: an updated row whose partition values changed moves to its new
+            // partition (#519). Each output batch carries the ORIGINAL id + commit version to materialize (null =
+            // no tracking). An UPDATE keeps EVERY row (matched rows updated in place, the rest copied), so each
+            // output row carries its source id; a matched row's version becomes newVersion, an untouched row keeps
+            // its original.
+            var router = new PartitionRouter(
+                snapshot, mappingMode, batches.FirstOrDefault(b => b.Length > 0), materializeIds);
             var preimages = new List<RecordBatch>();
             var postimages = new List<RecordBatch>();
             // Paired 1:1 with preimages/postimages: the identity to materialize in each change file.
@@ -4345,10 +4347,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 if (matchCount == 0)
                 {
-                    outputBatches.Add(batch);
                     // Untouched but (once the file is modified) rewritten: keep every row's original id + version.
-                    outTracking?.Add(batchIds is not null && batchVers is not null
-                        ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null);
+                    router.Add(batch, batchIds is not null && batchVers is not null
+                        ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null, mayMove: false);
                     continue;
                 }
 
@@ -4390,11 +4391,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         generatedColumns?.ColumnNames);
                     constraints?.Validate(updatedBatch);
 
-                    outputBatches.Add(updatedBatch);
                     // Matched rows keep their id; their commit version advances to this commit (they changed).
-                    outTracking?.Add(batchIds is not null
+                    router.Add(updatedBatch, batchIds is not null
                         ? (TakeIds(batchIds, matchRows), ConstInt64(newVersion, matchRows.Count))
-                        : ((Int64Array, Int64Array)?)null);
+                        : ((Int64Array, Int64Array)?)null, mayMove: true);
 
                     // Collect preimage and postimage for CDC, each with the touched rows' identity. Both images
                     // are the SAME rows, so both carry the same ids; only the commit version differs — the
@@ -4418,136 +4418,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 if (keepRows.Count > 0)
                 {
-                    outputBatches.Add(TakeRowsFromBatch(batch, keepRows));
                     // Untouched rows in a modified file: original id + original commit version.
-                    outTracking?.Add(batchIds is not null && batchVers is not null
+                    router.Add(TakeRowsFromBatch(batch, keepRows), batchIds is not null && batchVers is not null
                         ? (TakeIds(batchIds, keepRows), TakeIds(batchVers, keepRows))
-                        : ((Int64Array, Int64Array)?)null);
+                        : ((Int64Array, Int64Array)?)null, mayMove: false);
                 }
             }
 
             if (!fileModified)
                 continue;
 
-            // Write new file with all output batches. The rewritten file joins its source's partition
-            // directory (a partitioned table's data must live under its Hive dir, matching the append path);
-            // reuse the source path's ENCODED prefix verbatim for the add — never re-encode, which would
-            // double-encode a non-ASCII partition value — and its DECODED form for the physical write. An
-            // empty prefix means an unpartitioned table (files at the root). Mirrors the compaction rewrite.
-            string encodedDir = "";
-            int dirSlash = addFile.Path.LastIndexOf('/');
-            if (dirSlash >= 0)
-                encodedDir = addFile.Path.Substring(0, dirSlash + 1);
-            string baseName = $"{Guid.NewGuid():N}.parquet";
-            string newFileName = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir) + baseName;
-            // Recorded before the write, like the append path's: a part-written rewrite is still an orphan.
-            written?.Record(newFileName);
-            long fileSize;
-
-            // The rows were READ, so they carry the partition columns the read path materializes — a data file
-            // never stores those (their values live in add.partitionValues). Drop them first, so the rewrite's
-            // layout AND its statistics match what the append path writes for the same rows.
-            var dataBatches = new List<RecordBatch>(outputBatches.Count);
-            foreach (var ob in outputBatches)
-            {
-                dataBatches.Add(Partitioning.PartitionUtils.RemovePartitionColumns(
-                    ob, snapshot.Metadata.PartitionColumns));
-            }
-
-            // Physical names + parquet field ids at EVERY level (nested struct children included — the
-            // top-level-only rename/stamp pair left them logical-named and id-less). When row tracking is on,
-            // append the materialized id + commit-version columns (declared physical names) carrying each moved
-            // row's ORIGINAL values. Prepared up front so both the built-in and pluggable writers see the same
-            // batches.
-            var writeBatches = new List<RecordBatch>(dataBatches.Count);
-            var statsBatches = new List<RecordBatch>(dataBatches.Count);
-            for (int k = 0; k < dataBatches.Count; k++)
-            {
-                // Canonical Arrow forms (WriteTypeNormalization): rows read back from a file arrive in whatever
-                // form its reader produced — FixedSizeBinary from a foreign FLBA binary, or whatever a host
-                // IDataFileReader hands back — and a rewrite must not carry that into the file it writes.
-                var physicalBatch = NormalizeUnlessHostOwnsBytes(ColumnMappingRecursive.ToPhysical(
-                    dataBatches[k], snapshot.Schema, mappingMode));
-                // The append path's guard, for the same reason: a foreign file's TIMESTAMP(NANOS) reads back
-                // as a nanosecond column, and rewriting it would emit it under a microsecond Delta timestamp.
-                SchemaConverter.ThrowIfUnwritableType(physicalBatch.Schema, convertibleTypesAllowed: HostOwnsBytes);
-                // Statistics are keyed by PHYSICAL name, as the append path keys them; collected from the
-                // logical rows, they were keyed by names that can belong to another column after a rename or
-                // to a dropped one after a re-add, and the pruner skipped files holding matching rows.
-                statsBatches.Add(physicalBatch);
-                // Drop the VARIANT annotation for a Spark 4.0.x-compatible table (bytes unchanged; the
-                // read path recovers the type from the schema). Stats use statsBatches, not these.
-                if (!_options.EmitVariantLogicalType)
-                    physicalBatch = VariantColumnCoercion.StripAnnotation(physicalBatch);
-                if (materializeIds && outTracking![k] is { } trk)
-                {
-                    physicalBatch = RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
-                        physicalBatch, trk.Ids, trk.Vers, matRowIdName!, matRowVerName!, nullable: true);
-                }
-                writeBatches.Add(physicalBatch);
-            }
-
-            if (_options.DataFileWriter is { } rewriteWriter)
-            {
-                fileSize = await rewriteWriter.WriteAsync(
-                    writeBatches.ToAsyncEnumerable(), newFileName, cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                await using var file = await _fs.CreateAsync(
-                    newFileName, cancellationToken: cancellationToken).ConfigureAwait(false);
-                await using var writer = new Parquet.ParquetFileWriter(
-                    file, ownsFile: false, DataFileWriteOptions(snapshot));
-
-                foreach (var batch in writeBatches)
-                {
-                    await writer.WriteRowGroupAsync(batch, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-
-                await writer.DisposeAsync().ConfigureAwait(false);
-                fileSize = file.Position;
-            }
-
-            string? stats = Stats.StatsCollector.Collect(
-                statsBatches, StatsSelection(snapshot.Schema, snapshot.Metadata));
-
-            // Remove old, add new
-            actions.Add(new RemoveFile
-            {
-                Path = addFile.Path,
-                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                DataChange = true,
-                ExtendedFileMetadata = true,
-                PartitionValues = addFile.PartitionValues,
-                Size = addFile.Size,
-                // Keyed by (path, deletionVector) — see the Overwrite remove. The rewritten file already
-                // has the DV's deletions applied, so the source must be removed under its DV-qualified key.
-                DeletionVector = addFile.DeletionVector,
-                BaseRowId = addFile.BaseRowId,
-                DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
-            });
+            // Each destination as its own file: the stayers under the source's partition directory, each moved group
+            // under its new one. The remove, adds and statistics are built as the row-level rewrites build them.
+            nextRowId = await WriteRewriteGroupsAsync(
+                snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
+                rowTrackingEnabled, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
             removedPaths.Add(addFile.Path);
-
-            long addedRows = 0;
-            foreach (var ob in outputBatches)
-                addedRows += ob.Length;
-
-            actions.Add(new AddFile
-            {
-                Path = encodedDir + baseName, // encoded prefix reused verbatim (see newFileName above)
-                PartitionValues = addFile.PartitionValues,
-                Size = fileSize,
-                ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                DataChange = true,
-                Stats = stats,
-                // Fresh baseRowId reserves an id range for any null-materialized fallback row; every row here
-                // actually carries its original id in the materialized column, which overrides it.
-                BaseRowId = rowTrackingEnabled ? nextRowId : null,
-                DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
-            });
-            if (rowTrackingEnabled)
-                nextRowId += addedRows;
 
             // Write CDC files for update preimage/postimage
             if (cdfEnabled)
@@ -4564,11 +4450,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 for (int b = 0; b < postimages.Count; b++)
                 {
                     var trk = b < changeTracking.Count ? changeTracking[b] : default;
-                    var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, postimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
-                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                        cancellationToken, trk.PostIds, trk.PostVers, written).ConfigureAwait(false);
-                    actions.Add(cdcAction);
+                    // A post-image row belongs to the partition the row now lives in, so the change files split
+                    // as the data did.
+                    foreach (var (target, _, post, aligned) in router.Split(postimages[b], trk.PostIds, trk.PostVers))
+                    {
+                        var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
+                            _fs, snapshot, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
+                            target ?? addFile.PartitionValues, DataFileWriteOptions(snapshot),
+                            cancellationToken, aligned[0], aligned[1], written).ConfigureAwait(false);
+                        actions.Add(cdcAction);
+                    }
                 }
             }
         }
@@ -8214,8 +8105,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     // Physical-writes the rewritten output batches for one file and returns the remove(old)+add(new) pair (Add is
-    // null when every row was deleted → whole-file remove). Mirrors ComputeUpdateActionsAsync's write block;
-    // shared by the copy-on-write DeleteRowsAsync + UpdateRowsAsync.
+    // null when every row was deleted → whole-file remove). Shared by the copy-on-write UPDATE, DeleteRowsAsync and
+    // UpdateRowsAsync. With targetPartition (tracked, so physical-keyed under column mapping) the add goes to that
+    // partition instead of the source's: an UPDATE that changed a row's partition values writes the moved rows
+    // there, and only one of the calls for a source file contributes its remove.
     private async ValueTask<(RemoveFile Remove, AddFile? Add, long AddedRows)> RewriteRowsToNewFileAsync(
         Snapshot.Snapshot snapshot, Actions.AddFile source, ColumnMappingMode mappingMode,
         IReadOnlyList<RecordBatch> outputBatches,
@@ -8223,7 +8116,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool materializeIds, string? matRowIdName, string? matRowVerName,
         bool rowTrackingEnabled, long baseRowId, long newVersion,
         CancellationToken cancellationToken,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        IReadOnlyDictionary<string, string>? targetPartition = null)
     {
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var remove = new RemoveFile
@@ -8245,11 +8139,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (addedRows == 0)
             return (remove, null, 0); // every row deleted — drop the file outright
 
-        // Reuse the source path's ENCODED prefix verbatim (partition dir) for the add; DECODED for the write.
+        // Reuse the source path's ENCODED prefix verbatim (partition dir) for the add — never re-encode, which would
+        // double-encode a non-ASCII partition value — and its DECODED form for the write. A moved group's directory
+        // is built as the append path builds it, then encoded once.
         string encodedDir = "";
-        int dirSlash = source.Path.LastIndexOf('/');
-        if (dirSlash >= 0)
-            encodedDir = source.Path.Substring(0, dirSlash + 1);
+        if (targetPartition is not null)
+        {
+            string partDir = BuildPartitionPath(targetPartition);
+            if (partDir.Length > 0)
+                encodedDir = DeltaPath.Encode(partDir) + "/";
+        }
+        else
+        {
+            int dirSlash = source.Path.LastIndexOf('/');
+            if (dirSlash >= 0)
+                encodedDir = source.Path.Substring(0, dirSlash + 1);
+        }
         string baseName = $"{Guid.NewGuid():N}.parquet";
         string newFileName = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir) + baseName;
         // Recorded before the write. The SOURCE file is deliberately not recorded: it stays the table's data
@@ -8307,7 +8212,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var add = new AddFile
         {
             Path = encodedDir + baseName,
-            PartitionValues = source.PartitionValues,
+            PartitionValues = targetPartition ?? source.PartitionValues,
             Size = fileSize,
             ModificationTime = now,
             DataChange = true,
@@ -8317,6 +8222,155 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
         };
         return (remove, add, addedRows);
+    }
+
+    /// <summary>
+    /// The rows of one file an UPDATE rewrites, sorted by where they now belong (#519). A row whose partition values
+    /// the update left alone stays in the source file's partition, under its stored spelling; a row whose values it
+    /// changed moves to the partition they name, as delta-spark's UPDATE writes it. Without this, the rewrite took
+    /// the source's partition values for every row and the change was silently lost.
+    /// </summary>
+    /// <remarks>
+    /// A row stays when its values format to the same key as the source's: each read row carries the source's values
+    /// as typed columns, so formatting one gives that key without re-parsing the stored strings, whose spelling (a
+    /// timestamp's precision, a decimal's trailing zeros) may not be the one the formatter writes.
+    /// </remarks>
+    private sealed class PartitionRouter
+    {
+        private readonly IReadOnlyList<string> _partitionColumns;
+        private readonly IReadOnlyDictionary<string, string> _logicalToPhysical;
+        private readonly string? _sourceKey;
+        private readonly Dictionary<string, RewriteGroup> _moved = new(StringComparer.Ordinal);
+
+        /// <param name="sourceRow">A batch read from the source file, so carrying its partition values; null
+        /// when nothing was read, in which case every row stays.</param>
+        public PartitionRouter(
+            Snapshot.Snapshot snapshot, ColumnMappingMode mappingMode, RecordBatch? sourceRow, bool tracked)
+        {
+            _partitionColumns = snapshot.Metadata.PartitionColumns;
+            _logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+            if (_partitionColumns.Count > 0 && sourceRow is { Length: > 0 })
+                _sourceKey = Partitioning.PartitionUtils.GroupRows(sourceRow.Slice(0, 1), _partitionColumns)[0].Key;
+            Stay = new RewriteGroup(null, tracked);
+            _tracked = tracked;
+        }
+
+        private readonly bool _tracked;
+
+        /// <summary>The rows still in the source file's partition.</summary>
+        public RewriteGroup Stay { get; }
+
+        /// <summary>The stayers first, then each partition rows moved to, in the order first seen.</summary>
+        public IEnumerable<RewriteGroup> Groups => new[] { Stay }.Concat(_moved.Values);
+
+        /// <summary>Adds <paramref name="batch"/>'s rows to their groups. Only a batch the update changed
+        /// (<paramref name="mayMove"/>) is examined; the others stay whole.</summary>
+        public void Add(RecordBatch batch, (Int64Array Ids, Int64Array Vers)? tracking, bool mayMove)
+        {
+            if (!mayMove)
+            {
+                Stay.Add(batch, tracking);
+                return;
+            }
+
+            foreach (var (target, key, part, aligned) in Split(batch, tracking?.Ids, tracking?.Vers))
+            {
+                var trk = tracking is null ? ((Int64Array, Int64Array)?)null : (aligned[0]!, aligned[1]!);
+                if (target is null)
+                {
+                    Stay.Add(part, trk);
+                    continue;
+                }
+                if (!_moved.TryGetValue(key, out var group))
+                    _moved[key] = group = new RewriteGroup(target, _tracked);
+                group.Add(part, trk);
+            }
+        }
+
+        /// <summary>
+        /// <paramref name="batch"/>'s rows by destination, each part with the per-row arrays in
+        /// <paramref name="aligned"/> taken to match. <c>Target</c> is null for the rows that stay, and otherwise the
+        /// partition values the rows moved to, keyed as the log tracks them (physical names under column mapping).
+        /// </summary>
+        public List<(IReadOnlyDictionary<string, string>? Target, string Key, RecordBatch Batch, Int64Array?[] Aligned)>
+            Split(RecordBatch batch, params Int64Array?[] aligned)
+        {
+            if (_sourceKey is null || batch.Length == 0)
+                return [(null, "", batch, aligned)];
+
+            var groups = Partitioning.PartitionUtils.GroupRows(batch, _partitionColumns);
+            if (groups.Count == 1 && groups[0].Key == _sourceKey)
+                return [(null, _sourceKey, batch, aligned)];
+
+            var result = new List<(IReadOnlyDictionary<string, string>?, string, RecordBatch, Int64Array?[])>(
+                groups.Count);
+            foreach (var (values, key, rows) in groups)
+            {
+                var part = rows.Count == batch.Length ? batch : TakeRowsFromBatch(batch, rows);
+                var partAligned = aligned
+                    .Select(a => a is null || rows.Count == batch.Length ? a : TakeIds(a, rows))
+                    .ToArray();
+                result.Add((key == _sourceKey ? null : Tracked(values), key, part, partAligned));
+            }
+            return result;
+        }
+
+        private IReadOnlyDictionary<string, string> Tracked(Dictionary<string, string> values)
+        {
+            if (_logicalToPhysical.Count == 0)
+                return values;
+            var tracked = new Dictionary<string, string>(values.Count);
+            foreach (var kv in values)
+                tracked[_logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
+            return tracked;
+        }
+    }
+
+    /// <summary>One destination of a rewritten file's rows: its batches, and their row-tracking identity.</summary>
+    private sealed class RewriteGroup(IReadOnlyDictionary<string, string>? target, bool tracked)
+    {
+        /// <summary>The partition the rows moved to (tracked keys), or null for the source's own.</summary>
+        public IReadOnlyDictionary<string, string>? Target { get; } = target;
+
+        public List<RecordBatch> Batches { get; } = [];
+
+        public List<(Int64Array Ids, Int64Array Vers)?>? Tracking { get; } = tracked ? [] : null;
+
+        public void Add(RecordBatch batch, (Int64Array Ids, Int64Array Vers)? tracking)
+        {
+            Batches.Add(batch);
+            Tracking?.Add(tracking);
+        }
+    }
+
+    /// <summary>
+    /// Writes each of <paramref name="router"/>'s groups as its own file and adds the source's remove followed by
+    /// their adds to <paramref name="actions"/>. Returns the next free row id.
+    /// </summary>
+    private async ValueTask<long> WriteRewriteGroupsAsync(
+        Snapshot.Snapshot snapshot, Actions.AddFile source, ColumnMappingMode mappingMode, PartitionRouter router,
+        bool materializeIds, string? matRowIdName, string? matRowVerName,
+        bool rowTrackingEnabled, long nextRowId, long newVersion, List<DeltaAction> actions,
+        WrittenFileLedger? written, CancellationToken cancellationToken)
+    {
+        RemoveFile? remove = null;
+        var adds = new List<DeltaAction>();
+        foreach (var group in router.Groups)
+        {
+            var (groupRemove, add, addedRows) = await RewriteRowsToNewFileAsync(
+                snapshot, source, mappingMode, group.Batches, group.Tracking, materializeIds,
+                matRowIdName, matRowVerName, rowTrackingEnabled, nextRowId, newVersion,
+                cancellationToken, written, group.Target).ConfigureAwait(false);
+            remove ??= groupRemove;
+            if (add is null)
+                continue;
+            adds.Add(add);
+            if (rowTrackingEnabled)
+                nextRowId += addedRows;
+        }
+        actions.Add(remove!);
+        actions.AddRange(adds);
+        return nextRowId;
     }
 
     /// <summary>
@@ -8544,6 +8598,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (rewritten.Count != userBatches.Count)
                 throw new InvalidOperationException(
                     "UpdateRowsAsync: rewriteFile must return one batch per source batch.");
+            // The write path's partition rule, since a changed partition value moves its row (#519): canonical
+            // Arrow forms, an empty string stored as null, and a NULL the table declares impossible refused.
+            var partitionColumns = snapshot.Metadata.PartitionColumns;
+            if (partitionColumns.Count > 0)
+            {
+                rewritten = rewritten
+                    .Select(b => Partitioning.PartitionUtils.NormalizePartitionValues(
+                        WriteTypeNormalization.NormalizeColumns(b, partitionColumns),
+                        partitionColumns, snapshot.Schema, refuseNulls: true))
+                    .ToList();
+            }
 
             // Build the materialized id/version arrays (an UPDATED row's version advances to this commit) and
             // count the rows actually matched in this file.
@@ -8554,6 +8619,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 ? new List<(RecordBatch Pre, RecordBatch Post, Int64Array? Ids, Int64Array? PreVers)>()
                 : null;
             long updatedHere = 0;
+            var touched = new bool[userBatches.Count];
             for (int bi = 0; bi < userBatches.Count; bi++)
             {
                 var src = userBatches[bi];
@@ -8574,6 +8640,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     if (updated)
                     {
                         updatedHere++;
+                        touched[bi] = true;
                         matchedRows?.Add(i);
                     }
                     if (materializeIds)
@@ -8602,18 +8669,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (updatedHere == 0)
                 continue; // no target row actually present in this file — leave it untouched
 
-            var (remove, add, addedRows) = await RewriteRowsToNewFileAsync(
-                snapshot, addFile, mappingMode, rewritten, outTracking, materializeIds,
-                matRowIdName, matRowVerName, rowTrackingEnabled, nextRowId, newVersion,
-                cancellationToken, written).ConfigureAwait(false);
-            actions.Add(remove);
+            // Only a batch holding an updated row can have moved one: the rest are the rows as read.
+            var router = new PartitionRouter(
+                snapshot, mappingMode, userBatches.FirstOrDefault(b => b.Length > 0), materializeIds);
+            for (int bi = 0; bi < rewritten.Count; bi++)
+                router.Add(rewritten[bi], outTracking?[bi], mayMove: touched[bi]);
+            nextRowId = await WriteRewriteGroupsAsync(
+                snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
+                rowTrackingEnabled, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
             removedPaths.Add(addFile.Path);
-            if (add is not null)
-            {
-                actions.Add(add);
-                if (rowTrackingEnabled)
-                    nextRowId += addedRows;
-            }
 
             // update_preimage + update_postimage change files for the touched rows. As in the copy-on-write
             // DELETE, these replace what the reader would otherwise infer from remove(old)+add(new) — which for
@@ -8626,12 +8690,16 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         _fs, snapshot, pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
                         addFile.PartitionValues, DataFileWriteOptions(snapshot),
                         cancellationToken, ids, preVers, written).ConfigureAwait(false));
-                    actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
-                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                        cancellationToken,
-                        ids, ids is not null ? ConstInt64(newVersion, ids.Length) : null,
-                        written).ConfigureAwait(false));
+                    // Split as the data was: a post-image row belongs to the partition the row now lives in.
+                    foreach (var (target, _, part, aligned) in router.Split(post, ids))
+                    {
+                        actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
+                            _fs, snapshot, part, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
+                            target ?? addFile.PartitionValues, DataFileWriteOptions(snapshot),
+                            cancellationToken,
+                            aligned[0], aligned[0] is { } partIds ? ConstInt64(newVersion, partIds.Length) : null,
+                            written).ConfigureAwait(false));
+                    }
                 }
             }
         }
