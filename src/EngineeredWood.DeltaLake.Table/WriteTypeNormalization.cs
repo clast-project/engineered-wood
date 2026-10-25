@@ -15,17 +15,20 @@ namespace EngineeredWood.DeltaLake.Table;
 /// </summary>
 /// <remarks>
 /// <para>
-/// Several Arrow types map onto one Delta type: <c>binary</c> takes FixedSizeBinary, <c>date</c>
-/// takes Date64, and <c>decimal(p,s)</c> takes Decimal32, Decimal64 and Decimal256. Written as they
-/// arrive, each would reach Parquet in its own physical form, and the files of one column would
-/// disagree with each other and with the table's read schema (Binary, Date32, Decimal128).
+/// Several Arrow types map onto one Delta type: <c>string</c> takes StringView, <c>binary</c> takes
+/// FixedSizeBinary and BinaryView, <c>date</c> takes Date64, and <c>decimal(p,s)</c> takes Decimal32,
+/// Decimal64 and Decimal256. Written as they arrive, each would reach Parquet in its own physical form,
+/// or under its own <c>ARROW:schema</c> type, and the files of one column would disagree with each other
+/// and with the table's read schema (String, Binary, Date32, Decimal128). The partition split formats
+/// only the canonical forms, so a StringView partition column could not be written at all (#515).
 /// Converting at the write boundary keeps every file this library writes in the canonical form. That
 /// includes rewrites (UPDATE, DELETE, OPTIMIZE, change files), whose rows come back from a reader in
 /// whatever form the source file implied.
 /// </para>
 /// <para>
-/// Every conversion is lossless or refused. FixedSizeBinary to Binary and the decimal widenings are
-/// lossless by construction. Two can meet a value that does not fit, and refuse it rather than guess:
+/// Every conversion is lossless or refused. FixedSizeBinary to Binary, the views to their offset forms
+/// and the decimal widenings are lossless by construction; a batch whose view values exceed 32-bit
+/// offsets is refused, as the Parquet writer would refuse it. Two can meet a value that does not fit, and refuse it rather than guess:
 /// a Date64 that is not a whole number of days (the Arrow format requires values "evenly divisible by
 /// 86400000"), and a Decimal256 whose value does not fit Decimal128 (its precision promises it does).
 /// </para>
@@ -135,6 +138,7 @@ internal static class WriteTypeNormalization
         // By TypeId: every Arrow decimal type derives from FixedSizeBinaryType.
         FixedSizeBinaryType when type.TypeId == ArrowTypeId.FixedSizedBinary => true,
         Date64Type or Decimal32Type or Decimal64Type or Decimal256Type => true,
+        _ when type.TypeId is ArrowTypeId.StringView or ArrowTypeId.BinaryView => true,
         ArrowStructType s => s.Fields.Any(f => Needs(f.DataType)),
         ListType l => Needs(l.ValueDataType),
         ArrowMapType m => Needs(m.KeyField.DataType) || Needs(m.ValueField.DataType),
@@ -158,6 +162,10 @@ internal static class WriteTypeNormalization
         {
             case FixedSizeBinaryType fsb when fsb.TypeId == ArrowTypeId.FixedSizedBinary:
                 return FixedSizeBinaryToBinary(data, fsb.ByteWidth);
+            case { TypeId: ArrowTypeId.StringView }:
+                return ViewToOffsets(data, StringType.Default, path);
+            case { TypeId: ArrowTypeId.BinaryView }:
+                return ViewToOffsets(data, BinaryType.Default, path);
             case Date64Type:
                 return Date64ToDate32(data, path, visible);
             case Decimal32Type d32:
@@ -300,6 +308,45 @@ internal static class WriteTypeNormalization
         var values = data.Buffers[1].Memory.Slice(data.Offset * width, data.Length * width);
         return new ArrayData(
             BinaryType.Default, data.Length, data.NullCount, 0,
+            [RebaseBitmap(data.Buffers[0], data.Offset, data.Length), new ArrowBuffer(offsets), new ArrowBuffer(values)]);
+    }
+
+    /// <summary>A string or binary array over the same values, each copied out of its view. Null slots
+    /// copy nothing: a view's bytes under a null are not values.</summary>
+    private static ArrayData ViewToOffsets(ArrayData data, IArrowType target, string path)
+    {
+        // The typed accessors apply the slice's offset, so the copy starts at the first row it exposes.
+        var views = (BinaryViewArray)ArrowArrayFactory.BuildArray(data);
+        long total = 0;
+        for (int i = 0; i < views.Length; i++)
+        {
+            if (!views.IsNull(i))
+                total += views.GetBytes(i).Length;
+        }
+        if (total > int.MaxValue)
+        {
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.UnwritableValue,
+                $"Column '{path}': {total} bytes of {data.DataType.Name} values are too many to write as Delta "
+                + $"{(target is StringType ? "string" : "binary")} in one batch; split the batch.");
+        }
+
+        var offsets = new byte[(data.Length + 1) * sizeof(int)];
+        var values = new byte[total];
+        int position = 0;
+        for (int i = 0; i < views.Length; i++)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(offsets.AsSpan(i * sizeof(int)), position);
+            if (views.IsNull(i))
+                continue;
+            var value = views.GetBytes(i);
+            value.CopyTo(values.AsSpan(position));
+            position += value.Length;
+        }
+        BinaryPrimitives.WriteInt32LittleEndian(offsets.AsSpan(data.Length * sizeof(int)), position);
+
+        return new ArrayData(
+            target, data.Length, data.NullCount, 0,
             [RebaseBitmap(data.Buffers[0], data.Offset, data.Length), new ArrowBuffer(offsets), new ArrowBuffer(values)]);
     }
 
