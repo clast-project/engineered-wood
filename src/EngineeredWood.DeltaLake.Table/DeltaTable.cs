@@ -3790,7 +3790,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>When <paramref name="prunePredicate"/> is supplied (the analyzable-predicate overloads pass
     /// it), files whose statistics prove no row can match are skipped without being opened. This never
     /// changes the removed-file set — a pruned file could not have contained a matching row, so it would
-    /// not have been rewritten anyway — it only avoids reading files that cannot contribute.</para>
+    /// not have been rewritten anyway — it only avoids reading files that cannot contribute. Within a file
+    /// it read, the predicate prunes row groups and pages too, on the same argument: a skipped row cannot
+    /// match. Rows are still keyed by their file position, and the whole-file test counts the footer's
+    /// rows, not the rows read.</para>
     /// </summary>
     /// <param name="written">Records the deletion-vector and change-data files this delete creates — never the
     /// data file its re-add names, which is LIVE table data this delete only masks rows in. See
@@ -3836,7 +3839,6 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // Paired 1:1 with deletedRowBatches: each deleted row's STABLE id + commit version, for the change
             // file. A deletion vector moves no row, so a row's identity here is exactly what it already was.
             var deletedRowTracking = new List<(Int64Array Ids, Int64Array Vers)>();
-            long rowOffset = 0;
 
             await using var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
                 .ConfigureAwait(false);
@@ -3849,8 +3851,26 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
             var partitionColumns = snapshot.Metadata.PartitionColumns;
 
-            await foreach (var batch in reader.ReadAllAsync(
-                cancellationToken: cancellationToken).ConfigureAwait(false))
+            // The file's row count, from the footer: the read below may skip rows, so it cannot be counted
+            // from the batches. It decides the whole-file remove, and a short count would turn a partial
+            // delete into one.
+            var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+            long fileRows = 0;
+            foreach (var rowGroup in footer.RowGroups)
+                fileRows += rowGroup.NumRows;
+
+            // A row is deleted only when the predicate is TRUE for it, and pruning keeps a superset of those
+            // rows, so the row groups and pages it skips hold none: the same rows are deleted either way.
+            Expressions.Predicate? filePredicate = null;
+            if (prunePredicate is not null)
+            {
+                var parquetSchema = await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+                filePredicate = RowGroupPushdown.ToFileColumns(
+                    prunePredicate, snapshot.Schema, mappingMode, parquetSchema);
+            }
+
+            await foreach (var (batch, firstRow) in ReadPositionedAsync(
+                reader, filePredicate, columns: null, cancellationToken).ConfigureAwait(false))
             {
                 // Resolved exactly as the read path resolves it: the predicate must see what a scan sees.
                 var logicalBatch = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
@@ -3879,7 +3899,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
                 for (int i = 0; i < batch.Length; i++)
                 {
-                    long absIdx = rowOffset + i;
+                    long absIdx = firstRow + i;
                     if (rawDeletedRows.Contains(absIdx))
                         continue;
 
@@ -3898,11 +3918,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     {
                         deletedRowTracking.Add(ResolveRowTrackingAt(
                             matchRows, rawMatIds, rawMatVers, addFile.BaseRowId,
-                            addFile.DefaultRowCommitVersion, rowOffset));
+                            addFile.DefaultRowCommitVersion, firstRow));
                     }
                 }
-
-                rowOffset += batch.Length;
             }
 
             if (newDeletedIndices.Count == 0)
@@ -3918,7 +3936,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // metadata-only remove needing no deletion vector, valid even when DVs are not enabled. When a
             // file is only PARTIALLY matched a soft-delete is unavoidable, which requires DVs; without them
             // enabled the delete is rejected rather than writing a vector a foreign reader would ignore.
-            bool wholeFile = allDeleted.Count == rowOffset;
+            bool wholeFile = allDeleted.Count == fileRows;
 
             if (!wholeFile && !deletionVectorsEnabled)
             {
@@ -4981,9 +4999,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
 
             int bi = -1;
-            // The scan is the ONE read that forwards its predicate to the row-group level: it promises only
-            // a superset of the matching rows. Compaction, CDF and the DML rewrites must see every row of a
-            // file they read, and never pass one.
+            // The scan forwards its predicate to the row-group level: it promises only a superset of the
+            // matching rows (so does a predicate DELETE, which prunes in ComputeDeleteActionsAsync).
+            // Compaction, CDF and the copy-on-write rewrites must see every row of a file they read, and
+            // never pass one.
             await foreach (var batch in ReadFileAsync(
                                addFile, options.Columns, snapshot, cancellationToken,
                                strippedRowIdsOut: idsOut, strippedVersionsOut: versOut,
