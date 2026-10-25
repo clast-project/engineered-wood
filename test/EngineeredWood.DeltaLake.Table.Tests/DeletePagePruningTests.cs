@@ -7,7 +7,6 @@ using EngineeredWood.DeltaLake.RowTracking;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.Expressions;
-using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 using Ex = EngineeredWood.Expressions.Expressions;
@@ -82,9 +81,9 @@ public class DeletePagePruningTests : IDisposable
         ParquetReadOptions = ParquetReadOptions.Default with { BatchSize = 4 },
     };
 
-    private async Task<(DeltaTable Table, CountingFileSystem Fs)> CreateAsync(string name, Shape shape)
+    private async Task<(DeltaTable Table, DataFileCountingFileSystem Fs)> CreateAsync(string name, Shape shape)
     {
-        var fs = new CountingFileSystem(new LocalTableFileSystem(Path.Combine(_tempDir, name)));
+        var fs = new DataFileCountingFileSystem(new LocalTableFileSystem(Path.Combine(_tempDir, name)));
         var configuration = shape.Cdf
             ? new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" }
             : null;
@@ -140,7 +139,7 @@ public class DeletePagePruningTests : IDisposable
 
     /// <summary>One side of a <see cref="DeleteBothWaysAsync"/> run.</summary>
     /// <param name="BytesRead">The data-file bytes the DELETE alone read.</param>
-    private sealed record Twin(DeltaTable Table, CountingFileSystem Fs, long Deleted, long BytesRead) : IAsyncDisposable
+    private sealed record Twin(DeltaTable Table, DataFileCountingFileSystem Fs, long Deleted, long BytesRead) : IAsyncDisposable
     {
         public ValueTask DisposeAsync() => Table.DisposeAsync();
     }
@@ -373,71 +372,5 @@ public class DeletePagePruningTests : IDisposable
         }
         rows.Sort();
         return rows;
-    }
-
-    /// <summary>Counts the bytes read from data files (Parquet outside the log); everything else passes through.</summary>
-    private sealed class CountingFileSystem(ITableFileSystem inner) : ITableFileSystem
-    {
-        private long _dataBytesRead;
-
-        public long DataBytesRead => Interlocked.Read(ref _dataBytesRead);
-
-        public void Reset() => Interlocked.Exchange(ref _dataBytesRead, 0);
-
-        public PathNameConstraints PathConstraints => inner.PathConstraints;
-
-        public async ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
-        {
-            var file = await inner.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
-            bool isData = path.EndsWith(".parquet", StringComparison.Ordinal)
-                && path.IndexOf("_delta_log", StringComparison.Ordinal) < 0;
-            return isData ? new CountingFile(file, this) : file;
-        }
-
-        public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default)
-            => inner.ListAsync(prefix, cancellationToken);
-
-        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
-            => inner.ReadAllBytesAsync(path, cancellationToken);
-
-        public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
-            => inner.CreateAsync(path, overwrite, cancellationToken);
-
-        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
-            => inner.DeleteAsync(path, cancellationToken);
-
-        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
-            => inner.ExistsAsync(path, cancellationToken);
-
-        public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
-            => inner.TryWriteAllBytesAsync(path, data, cancellationToken);
-
-        public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
-            => inner.WriteAllBytesAsync(path, data, cancellationToken);
-
-        private sealed class CountingFile(IRandomAccessFile inner, CountingFileSystem owner) : IRandomAccessFile
-        {
-            public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
-                => inner.GetLengthAsync(cancellationToken);
-
-            public ValueTask<System.Buffers.IMemoryOwner<byte>> ReadAsync(
-                FileRange range, CancellationToken cancellationToken = default)
-            {
-                Interlocked.Add(ref owner._dataBytesRead, range.Length);
-                return inner.ReadAsync(range, cancellationToken);
-            }
-
-            public ValueTask<IReadOnlyList<System.Buffers.IMemoryOwner<byte>>> ReadRangesAsync(
-                IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
-            {
-                foreach (var range in ranges)
-                    Interlocked.Add(ref owner._dataBytesRead, range.Length);
-                return inner.ReadRangesAsync(ranges, cancellationToken);
-            }
-
-            public void Dispose() => inner.Dispose();
-
-            public ValueTask DisposeAsync() => inner.DisposeAsync();
-        }
     }
 }

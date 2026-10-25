@@ -3748,8 +3748,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// Deletes rows matching an analyzable <see cref="Expressions.Predicate"/>. Beyond the functional
     /// overload this gives the writer a predicate it can reason about: files whose statistics prove no row
-    /// matches are skipped without being read, and — because the predicate is recorded as the operation's
-    /// read-set — a concurrent commit that adds a file matching it is detected as a conflict
+    /// matches are skipped without being read, a predicate over partition columns alone removes whole files
+    /// without reading them (unless the change data feed is on), and — because the predicate is recorded as
+    /// the operation's read-set — a concurrent commit that adds a file matching it is detected as a conflict
     /// (concurrentAppend). Under the default <see cref="IsolationLevel.WriteSerializable"/> a concurrent
     /// blind append is still exempt; under <see cref="IsolationLevel.Serializable"/> it conflicts.
     /// Returns the number of rows deleted and the committed version.
@@ -3794,6 +3795,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// it read, the predicate prunes row groups and pages too, on the same argument: a skipped row cannot
     /// match. Rows are still keyed by their file position, and the whole-file test counts the footer's
     /// rows, not the rows read.</para>
+    /// <para>With the change data feed off, a predicate over partition columns alone gives every row of a file the
+    /// same answer, from the file's partition values (see <see cref="MatchesEveryRow"/>). A file it does not match
+    /// is left alone unread. One it matches is removed whole unread when its statistics give a row count above
+    /// its deletion vector's, and read otherwise, since the count is what the delete reports.</para>
     /// </summary>
     /// <param name="written">Records the deletion-vector and change-data files this delete creates — never the
     /// data file its re-add names, which is LIVE table data this delete only masks rows in. See
@@ -3824,10 +3829,38 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot.Schema, snapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
 
+        // A predicate over partition columns alone has one answer for every row of a file, so the file's
+        // partition values decide it without the file being opened (#506). The change feed needs the deleted
+        // rows themselves, so it still reads.
+        var partitionSchema = prunePredicate is not null && !cdfEnabled
+            && ReferencesOnlyPartitionColumns(prunePredicate, snapshot.Metadata.PartitionColumns)
+                ? BuildProjectedSchema(snapshot.ArrowSchema, snapshot.Metadata.PartitionColumns)
+                : null;
+
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
             if (pruner is not null && !pruner.ShouldInclude(addFile, prunePredicate!))
                 continue; // stats prove no row here matches — nothing to delete, skip the read
+
+            if (partitionSchema is not null)
+            {
+                // No row of the file matches: nothing to delete, whatever the file holds.
+                if (!MatchesEveryRow(addFile, partitionSchema, snapshot, predicate))
+                    continue;
+
+                // Every row matches, so every live one goes: the rows the existing vector already deleted are not
+                // deleted again. The count is the only thing taken on trust, so a count that cannot be right reads
+                // the file instead. A JSON stats object without numRecords parses as 0, and a file with no live
+                // row left would not still be in the table.
+                long liveRows = (addFile.GetNumRecords() ?? 0) - (addFile.DeletionVector?.Cardinality ?? 0);
+                if (liveRows > 0)
+                {
+                    actions.Add(RemoveOf(addFile));
+                    removedPaths.Add(addFile.Path);
+                    totalDeleted += liveRows;
+                    continue;
+                }
+            }
 
             var rawDeletedRows = addFile.DeletionVector is not null
                 ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
@@ -3946,15 +3979,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     + "the predicate so it removes whole files/partitions (which needs no deletion vector).");
             }
 
-            actions.Add(new RemoveFile
-            {
-                Path = addFile.Path,
-                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
-                DataChange = true,
-                DeletionVector = addFile.DeletionVector,
-                BaseRowId = addFile.BaseRowId,
-                DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
-            });
+            actions.Add(RemoveOf(addFile));
             removedPaths.Add(addFile.Path);
 
             if (!wholeFile)
@@ -3995,6 +4020,68 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         return new DeleteActions(actions, removedPaths, totalDeleted, dvEdits);
+    }
+
+    /// <summary>The <c>remove</c> a DELETE writes for a file it changes. It carries the file's existing deletion
+    /// vector and row-tracking fields; a partial delete follows it with a re-add under the new vector.</summary>
+    private static RemoveFile RemoveOf(AddFile addFile) => new()
+    {
+        Path = addFile.Path,
+        DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+        DataChange = true,
+        DeletionVector = addFile.DeletionVector,
+        BaseRowId = addFile.BaseRowId,
+        DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
+    };
+
+    /// <summary>
+    /// Whether the DELETE mask is TRUE for <paramref name="addFile"/>'s rows, for a predicate over partition
+    /// columns alone, which has one answer for all of them. The mask is the real one, run on a single row
+    /// built from the file's partition values exactly as a read builds them, so the answer is the one a full
+    /// read would give each row. Bounds from the statistics evaluator are not trusted for it: they only ever
+    /// decided which files to skip, where a wrong answer misses rows, and here it would delete them.
+    /// </summary>
+    private static bool MatchesEveryRow(
+        AddFile addFile, Apache.Arrow.Schema partitionSchema, Snapshot.Snapshot snapshot,
+        Func<RecordBatch, BooleanArray> predicate)
+    {
+        var noColumns = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], 1);
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var row = Partitioning.PartitionUtils.AddPartitionColumns(
+            noColumns, partitionSchema, addFile.PartitionValues, snapshot.Metadata.PartitionColumns,
+            ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode));
+        var mask = predicate(row);
+        return !mask.IsNull(0) && mask.GetValue(0) == true;
+    }
+
+    /// <summary>
+    /// True when every column <paramref name="predicate"/> references is a partition column. A node kind this
+    /// does not know, or a function call (the DELETE mask has no function registry), answers false, so the
+    /// file is read: a reference it cannot see could be a data column. So does a reference to a struct field,
+    /// even one whose dotted name is a partition column's.
+    /// </summary>
+    internal static bool ReferencesOnlyPartitionColumns(
+        Expressions.Predicate predicate, IReadOnlyList<string> partitionColumns)
+    {
+        if (partitionColumns.Count == 0)
+            return false;
+        var partitions = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
+        return Visit(predicate);
+
+        bool Visit(Expressions.Expression expression) => expression switch
+        {
+            Expressions.TruePredicate or Expressions.FalsePredicate or Expressions.LiteralExpression => true,
+            Expressions.AndPredicate and => and.Children.All(Visit),
+            Expressions.OrPredicate or => or.Children.All(Visit),
+            Expressions.NotPredicate not => Visit(not.Child),
+            Expressions.ComparisonPredicate cmp => Visit(cmp.Left) && Visit(cmp.Right),
+            Expressions.UnaryPredicate unary => Visit(unary.Operand),
+            Expressions.SetPredicate set => Visit(set.Operand) && set.Values.All(Visit),
+            // A nested reference a.b shares its Name with a top-level column literally called "a.b".
+            Expressions.UnboundReference reference =>
+                reference.NameParts.Count == 1 && partitions.Contains(reference.Name),
+            _ => false,
+        };
     }
 
     /// <summary>
