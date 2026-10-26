@@ -489,4 +489,140 @@ public class HostStagedTransactionTests : IDisposable
         Assert.Throws<InvalidOperationException>(() => txn.StageActions([]));
         Assert.Throws<InvalidOperationException>(() => txn.StageDataFiles([]));
     }
+
+    // ── Two operations on one file (#523) ──
+    //
+    // Every staging call computes against the transaction's BASE snapshot, so a second operation on a file
+    // the first already deleted from or rewrote re-added its own version of the base file beside the first's
+    // — both stayed active and the commit silently duplicated rows, bringing back the ones the first deleted.
+    // A second operation on such a file is refused, and the refusal leaves the transaction as it was.
+
+    private string[] DataFilesOnDisk() =>
+        [.. Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories)
+            .Where(p => !p.Contains("_delta_log", StringComparison.Ordinal))];
+
+    private string[] DeletionVectorsOnDisk() =>
+        [.. Directory.GetFiles(_tempDir, "deletion_vector_*.bin", SearchOption.AllDirectories)];
+
+    [Fact]
+    public async Task StagedRowDeletes_TwiceOnOneFile_RefusesTheSecond()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(), enableDeletionVectors: true);
+        await table.WriteAsync([Batch(1, 5)]);
+        var at = await LocateRowsAsync(table);
+
+        var txn = table.StartTransaction();
+        await txn.StageRowDeletesAsync(Sel(at[2]));
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => txn.StageRowDeletesAsync(Sel(at[3])).AsTask());
+        Assert.Contains(at[3].Path, ex.Message, StringComparison.Ordinal);
+        await txn.CommitAsync();
+
+        // Was 1,1,2,3,4,4,5,5: the second delete's re-add of the base file brought id 2 back.
+        Assert.Equal(new long[] { 1, 3, 4, 5 }, await ReadIdsFreshAsync());
+    }
+
+    [Fact]
+    public async Task Update_ThenStagedRowDeleteOfTheSameFile_RefusesTheDelete()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(), enableDeletionVectors: true);
+        await table.WriteAsync([Batch(1, 5)]);
+        var at = await LocateRowsAsync(table);
+
+        var txn = table.StartTransaction();
+        await txn.UpdateAsync(Ex.Equal("id", 2L), b => b);
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => txn.StageRowDeletesAsync(Sel(at[3])).AsTask());
+        await txn.CommitAsync();
+
+        Assert.Equal(new long[] { 1, 2, 3, 4, 5 }, await ReadIdsFreshAsync());
+    }
+
+    /// <summary>A predicate only finds its files by reading them, so the refusal comes after the second
+    /// delete wrote its deletion vector — which must not outlive the refusal.</summary>
+    [Fact]
+    public async Task PredicateDeletes_TwiceOnOneFile_RefusesTheSecondAndTakesBackItsVector()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(), enableDeletionVectors: true);
+        await table.WriteAsync([Batch(1, 4000)]);
+
+        var txn = table.StartTransaction();
+        // Both deletes hit 1000+ scattered rows, so each vector outgrows the inline limit and lands in a .bin.
+        await txn.DeleteAsync(IdModulo(2, 0));
+        Assert.Single(DeletionVectorsOnDisk());
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => txn.DeleteAsync(IdModulo(4, 1)).AsTask());
+        Assert.Single(DeletionVectorsOnDisk());
+        await txn.CommitAsync();
+
+        var ids = await ReadIdsFreshAsync();
+        Assert.Equal(2000, ids.Count);
+        Assert.All(ids, id => Assert.Equal(1, id % 2));
+    }
+
+    private static Func<RecordBatch, BooleanArray> IdModulo(long divisor, long remainder) => batch =>
+    {
+        var id = (Int64Array)batch.Column("id");
+        var mask = new BooleanArray.Builder();
+        for (int i = 0; i < id.Length; i++)
+            mask.Append(id.GetValue(i) % divisor == remainder);
+        return mask.Build();
+    };
+
+    /// <summary>No deletion vectors needed: each copy-on-write rewrite keeps every row of the file, so two of
+    /// them doubled the whole file.</summary>
+    [Fact]
+    public async Task Updates_TwiceOnOneFile_RefusesTheSecondAndTakesBackItsRewrite()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
+        await table.WriteAsync([Batch(1, 5)]);
+
+        var txn = table.StartTransaction();
+        await txn.UpdateAsync(Ex.Equal("id", 2L), b => b);
+        int filesAfterFirst = DataFilesOnDisk().Length;
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => txn.UpdateAsync(batch => new BooleanArray.Builder().AppendRange(
+                Enumerable.Repeat(true, batch.Length)).Build(), b => b).AsTask());
+        Assert.Equal(filesAfterFirst, DataFilesOnDisk().Length);
+        await txn.CommitAsync();
+
+        // Was 1,1,2,2,3,3,4,4,5,5.
+        Assert.Equal(new long[] { 1, 2, 3, 4, 5 }, await ReadIdsFreshAsync());
+    }
+
+    [Fact]
+    public async Task OperationsOnDifferentFiles_StillComposeInOneTransaction()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(), enableDeletionVectors: true);
+        await table.WriteAsync([Batch(1, 5)]);
+        await table.WriteAsync([Batch(11, 5)]);
+        var at = await LocateRowsAsync(table);
+
+        var txn = table.StartTransaction();
+        await txn.DeleteAsync(Ex.Equal("id", 2L));
+        await txn.StageRowDeletesAsync(Sel(at[12]));
+        await txn.CommitAsync();
+
+        Assert.Equal(new long[] { 1, 3, 4, 5, 11, 13, 14, 15 }, await ReadIdsFreshAsync());
+    }
+
+    /// <summary>The backstop: <see cref="DeltaTransaction.StageActions"/> commits verbatim, so it is the one
+    /// way left to stage two actions for one file, and the commit refuses that before writing anything.</summary>
+    [Fact]
+    public async Task StageActions_TwoRemovesOfOneFile_RefusedAtCommit()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
+        await table.WriteAsync([Batch(1, 5)]);
+        long before = table.CurrentSnapshot.Version;
+        var add = table.CurrentSnapshot.ActiveFiles.Values.Single();
+        var remove = new RemoveFile { Path = add.Path, DeletionTimestamp = 1, DataChange = true };
+
+        var txn = table.StartTransaction();
+        txn.StageActions([remove, remove]);
+        await Assert.ThrowsAsync<InvalidOperationException>(() => txn.CommitAsync().AsTask());
+        await txn.AbortAsync();
+
+        await using var check = await OpenAsync();
+        Assert.Equal(before, check.CurrentSnapshot.Version);
+    }
 }

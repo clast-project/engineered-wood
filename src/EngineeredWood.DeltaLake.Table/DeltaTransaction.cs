@@ -32,7 +32,9 @@ namespace EngineeredWood.DeltaLake.Table;
 /// passes — a crash-looping producer's whole batch, on every restart.</para>
 ///
 /// <para><b>Scope.</b> Appends (<see cref="WriteAsync"/>), deletes (<see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/>), and
-/// updates (<see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken)"/>) can be staged, including several on one transaction. An append is
+/// updates (<see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken)"/>) can be staged, including several on one transaction — so long as no two of them delete
+/// from or rewrite the same data file. Each is computed against the base snapshot rather than against what
+/// earlier ones staged, so a second operation on a file is refused; combine them into one. An append is
 /// a blind write with no read dependency, so two concurrent transactional appends both land; a
 /// delete/update reads the files it rewrites, so it aborts only if a concurrent commit removed one of
 /// them — and a delete of DIFFERENT rows in a file someone else also deleted from reconciles row-by-row
@@ -308,8 +310,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
         EnsureOpen();
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
 
+        int mark = _written.Paths.Count;
         var plan = await _table.ComputeDeleteActionsAsync(
             _baseSnapshot, predicate, cancellationToken, written: _written)
+            .ConfigureAwait(false);
+        await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "DELETE", cancellationToken)
             .ConfigureAwait(false);
 
         StageInternal(plan.DataActions);
@@ -334,9 +339,12 @@ public sealed class DeltaTransaction : IAsyncDisposable
         EnsureOpen();
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
 
+        int mark = _written.Paths.Count;
         var plan = await _table.ComputeDeleteActionsAsync(
             _baseSnapshot, DeltaTable.MaskFor(predicate), cancellationToken, prunePredicate: predicate,
             written: _written)
+            .ConfigureAwait(false);
+        await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "DELETE", cancellationToken)
             .ConfigureAwait(false);
 
         StageInternal(plan.DataActions);
@@ -374,8 +382,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _baseSnapshot, isAppend: false,
             handling: WriteTimeExpressionHandling.ValidatedHere);
 
+        int mark = _written.Paths.Count;
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId, written: _written)
+            .ConfigureAwait(false);
+        await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "UPDATE", cancellationToken)
             .ConfigureAwait(false);
 
         _nextRowId = plan.NextRowId;
@@ -407,9 +418,12 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _baseSnapshot, isAppend: false,
             handling: WriteTimeExpressionHandling.ValidatedHere);
 
+        int mark = _written.Paths.Count;
         var plan = await _table.ComputeUpdateActionsAsync(
             _baseSnapshot, DeltaTable.MaskFor(predicate), updater, cancellationToken,
             prunePredicate: predicate, rowIdStart: _nextRowId, written: _written).ConfigureAwait(false);
+        await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "UPDATE", cancellationToken)
+            .ConfigureAwait(false);
 
         _nextRowId = plan.NextRowId;
         StageInternal(plan.Actions);
@@ -530,8 +544,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// <see cref="Snapshot"/> — this transaction's pinned version — so the addresses and what the commit
     /// validates agree. Returns the rows newly hidden.
     ///
-    /// <para>Each touched file's existing vector is unioned with the new positions, so repeated deletes
-    /// compose, and a position already covered is not counted or replayed. The per-file edits are recorded, so
+    /// <para>Each touched file's existing vector is unioned with the new positions, so a delete composes with
+    /// the deletes COMMITTED before it, and a position already covered is not counted or replayed. It does not
+    /// compose with work staged earlier on this transaction: a selection naming a file an earlier operation
+    /// here already deleted from or rewrote throws <see cref="InvalidOperationException"/> — pass all of a
+    /// file's positions in one selection. The per-file edits are recorded, so
     /// at commit a concurrent delete of DIFFERENT rows in the same file reconciles row-by-row and a concurrent
     /// rewrite relocates these rows by stable id — the caller does not drive that rebase.</para>
     /// </summary>
@@ -545,6 +562,9 @@ public sealed class DeltaTransaction : IAsyncDisposable
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
         if (selection.IsEmpty)
             return 0;
+        // The selection names its files up front, so this refusal costs no I/O and leaves nothing to collect.
+        if (FirstRestagedPath(selection.Paths) is { } restaged)
+            throw RestagedFile(restaged, "DELETE");
 
         var result = await _table.ComputeDvActionsWithEditsAsync(
             selection, _baseSnapshot, cancellationToken, written: _written).ConfigureAwait(false);
@@ -849,6 +869,82 @@ public sealed class DeltaTransaction : IAsyncDisposable
         _declaredWholeTableRead = true;
     }
 
+    // ── One operation per file ─────────────────────────────────────────────────────────────────────────
+    //
+    // Every staging call computes against the BASE snapshot, not against what earlier calls staged. Two
+    // operations on one file therefore each remove the base file and each add their own version of it, and
+    // both adds stay active: rows come back and survivors are duplicated (#523). Composing them would mean
+    // reading through this transaction's own staged state — and rebasing that at commit — so a second
+    // operation on a file is refused instead, and the caller combines its selections or predicates.
+
+    /// <summary>The first of <paramref name="paths"/> an earlier staged operation already removed or
+    /// rewrote, or null.</summary>
+    private string? FirstRestagedPath(IEnumerable<string> paths)
+    {
+        foreach (string path in paths)
+        {
+            if (_removedPaths.Contains(path))
+                return path;
+        }
+        return null;
+    }
+
+    private static InvalidOperationException RestagedFile(string path, string operation) => new(
+        $"{operation} would modify '{path}', which an earlier operation staged on this transaction already "
+        + "deleted from or rewrote. Each staged operation is computed against the transaction's base snapshot, "
+        + "not against what earlier ones staged, so committing both would keep both versions of the file and "
+        + "duplicate its rows. Combine the operations into one (a single RowSelection or predicate), or commit "
+        + "the first and start a new transaction. Nothing from this call was staged.");
+
+    /// <summary>
+    /// Refuses an operation that turned out to touch a file an earlier one already staged — known only once
+    /// the operation has run, since a predicate's files are found by reading. By then its deletion vectors,
+    /// rewritten parquet and change files are on storage, so they are taken back before throwing: the
+    /// transaction is left exactly as it was, and a caller that catches this and commits the rest leaks
+    /// nothing. <paramref name="mark"/> is the ledger's count from before the operation ran.
+    /// </summary>
+    private async ValueTask RefuseRestagedFilesAsync(
+        IEnumerable<string> paths, int mark, string operation, CancellationToken cancellationToken)
+    {
+        if (FirstRestagedPath(paths) is not { } restaged)
+            return;
+
+        var refused = new WrittenFileLedger();
+        foreach (string path in _written.TakeRecordedSince(mark))
+            refused.Record(path);
+        await _table.DeleteWrittenFilesAsync(refused, cancellationToken).ConfigureAwait(false);
+        throw RestagedFile(restaged, operation);
+    }
+
+    /// <summary>
+    /// The protocol's rule for a single version: at most one <c>add</c> and at most one <c>remove</c> per
+    /// reconciliation key (<c>path</c> plus deletion-vector id). The typed staging methods cannot break it
+    /// now, but <see cref="StageActions"/> can, and a version that breaks it is not a recoverable state —
+    /// readers keep every add, so the table reads duplicated rows from then on. Checked before the commit
+    /// rather than left to a reader to discover.
+    /// </summary>
+    private void ValidateOneActionPerFile()
+    {
+        var adds = new HashSet<string>(StringComparer.Ordinal);
+        var removes = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var action in _dataActions)
+        {
+            (string Kind, string Key)? duplicate = action switch
+            {
+                AddFile add when !adds.Add(add.ReconciliationKey) => ("add", add.ReconciliationKey),
+                RemoveFile remove when !removes.Add(remove.ReconciliationKey) => ("remove", remove.ReconciliationKey),
+                _ => null,
+            };
+            if (duplicate is { } d)
+            {
+                throw new InvalidOperationException(
+                    $"This transaction stages two '{d.Kind}' actions for the same file ('{d.Key}'). A version may "
+                    + "carry at most one add and one remove per file and deletion vector; committing both would "
+                    + "leave the table reading duplicated rows. Nothing was committed.");
+            }
+        }
+    }
+
     /// <summary>
     /// Adds staged actions, holding back the row-tracking high-water mark. That action is a per-domain
     /// SINGLETON — every staging call computes one, and a version carrying two <c>domainMetadata</c> entries
@@ -882,6 +978,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
     public async ValueTask<long> CommitAsync(CancellationToken cancellationToken = default)
     {
         EnsureOpen();
+        // Before _completed: a malformed staging is the caller's to abort, not a commit that ran.
+        ValidateOneActionPerFile();
         _completed = true;
         long version = await _table.CommitTransactionAsync(this, cancellationToken).ConfigureAwait(false);
 
