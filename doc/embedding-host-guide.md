@@ -301,6 +301,7 @@ verdicts at different isolation levels.
 | `StageDataFiles(files)` | Data files you already wrote (append-shaped) |
 | `StageDataFilesAsync(files, bornDeleted:, identityValuesPreGenerated:)` | The same, with full parity to `CommitDataFilesAsync` |
 | `StageRowDeletesAsync(selection)` | A deletion-vector DELETE of rows you identified (§4) |
+| `StageRowDeletesAsync(selection, RowDeleteMode.CopyOnWrite)` | The same DELETE as a file rewrite, for a table without deletion vectors |
 | `StageSchemaChange(change)` | An ALTER computed by `ComputeAddColumn` / `ComputeRenameColumn` / … |
 | `StageChangeDataAsync(rows, changeType)` | Change Data Feed rows for the statement you just ran |
 | `StageActions(actions)` | Anything else — your own domain metadata |
@@ -339,6 +340,19 @@ long version = await txn.CommitAsync();   // ONE atomic version
 
 Build the selection against `txn.Snapshot`, not `table.CurrentSnapshot` — that is what makes the rows the
 delete names agree with what the commit validates.
+
+A staged delete needs deletion vectors by default, and throws on a table without them rather than commit a
+vector its protocol never declared. Pass `RowDeleteMode.CopyOnWrite` to stage it as a rewrite instead. Each
+touched file is rewritten at staging time without the selected rows (an abort deletes the rewrite), and the
+commit carries `remove`(old) + `add`(rewritten). The two modes differ on the Change Data Feed:
+
+- **Deletion vector** writes no change rows, as Spark's vector DML doesn't. Stage them yourself with
+  `StageChangeDataAsync`, as above, if you want a change file.
+- **Copy-on-write** writes its own `delete` change file, as an immediate copy-on-write delete does. Don't
+  stage those rows again: they would appear twice in the feed.
+
+A commit that carries any change file is read from its change files alone, so the rest of the transaction's
+data changes need change rows too. See #530.
 
 ### Abandoning a transaction
 

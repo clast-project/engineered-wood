@@ -46,7 +46,7 @@ namespace EngineeredWood.DeltaLake.Table;
 /// <para><b>Host-staged work.</b> A host that owns its own data plane — its own parquet codec behind
 /// <see cref="IDataFileWriter"/>, its own engine deciding which rows to delete — stages work it has
 /// ALREADY done rather than handing over batches and predicates: <see cref="StageDataFiles"/>,
-/// <see cref="StageRowDeletesAsync"/>, <see cref="StageSchemaChange"/>,
+/// <see cref="StageRowDeletesAsync(RowSelection, CancellationToken)"/>, <see cref="StageSchemaChange"/>,
 /// <see cref="StageChangeDataAsync"/>, and <see cref="StageActions"/>. These commit through the same
 /// conflict-check, rebase, and retry loop as the computed ones, so an embedding host does not reimplement
 /// it. Plan against <see cref="Snapshot"/> so the rows a staged delete names agree with what the
@@ -127,7 +127,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// host-driven step needs to agree with the transaction on what the table looks like — most importantly
     /// <see cref="DeltaTable.PlanFiles"/>, whose <see cref="PlannedFile.FileOrdinal"/> values are the keys
     /// <see cref="RowSelection.FromRowAddresses"/> resolves into the paths
-    /// <see cref="StageRowDeletesAsync"/> expects. Planning against
+    /// <see cref="StageRowDeletesAsync(RowSelection, CancellationToken)"/> expects. Planning against
     /// <see cref="DeltaTable.CurrentSnapshot"/> instead would silently key positions to a different file
     /// ordering once another writer commits.
     /// </summary>
@@ -554,12 +554,46 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// rewrite relocates these rows by stable id — the caller does not drive that rebase.</para>
     ///
     /// <para>The table must have deletion vectors enabled; on one without them this throws
-    /// <see cref="InvalidOperationException"/> rather than commit a vector its protocol never declared.</para>
+    /// <see cref="InvalidOperationException"/> rather than commit a vector its protocol never declared. Stage
+    /// the delete with <see cref="RowDeleteMode.CopyOnWrite"/> instead.</para>
+    ///
+    /// <para>No change data is written, as with Spark's deletion-vector DML: on a Change Data Feed table the
+    /// deleted rows are what the new vector hides beyond the old one. A host that wants them in a change file
+    /// stages them itself with <see cref="StageChangeDataAsync"/>.</para>
+    /// </summary>
+    public ValueTask<long> StageRowDeletesAsync(
+        RowSelection selection,
+        CancellationToken cancellationToken = default) =>
+        StageRowDeletesAsync(selection, RowDeleteMode.DeletionVector, cancellationToken);
+
+    /// <summary>
+    /// Stages a DELETE of rows the caller identified itself, as
+    /// <see cref="StageRowDeletesAsync(RowSelection, CancellationToken)"/> does, choosing how the rows go.
+    /// <see cref="RowDeleteMode.DeletionVector"/> is that overload exactly.
+    ///
+    /// <para><see cref="RowDeleteMode.CopyOnWrite"/> needs no deletion vectors, so it is the way to stage a
+    /// delete on a table that must stay readable by engines without them. Each touched file is rewritten NOW,
+    /// without the selected rows — and deleted again by <see cref="AbortAsync"/> if the transaction never
+    /// commits — and the commit carries <c>remove</c>(old) + <c>add</c>(rewritten), just the <c>remove</c>
+    /// when every row of a file goes. On a row-tracking table the survivors keep their ids. The rewritten
+    /// files become the transaction's read-set: a concurrent change to one aborts the commit, with no
+    /// row-by-row reconciliation as for a vector. On a Change Data Feed table each rewritten file also gets a
+    /// <c>delete</c> change file holding the rows it lost, as an immediate copy-on-write delete writes, so do
+    /// NOT stage those rows again with <see cref="StageChangeDataAsync"/>: they would appear twice.</para>
+    ///
+    /// <para>A selection naming a file an earlier operation on this transaction already deleted from or
+    /// rewrote throws <see cref="InvalidOperationException"/>, in either mode. Returns the rows deleted.</para>
     /// </summary>
     public async ValueTask<long> StageRowDeletesAsync(
         RowSelection selection,
+        RowDeleteMode mode,
         CancellationToken cancellationToken = default)
     {
+        if (mode == RowDeleteMode.CopyOnWrite)
+            return await StageCopyOnWriteRowDeletesAsync(selection, cancellationToken).ConfigureAwait(false);
+        if (mode != RowDeleteMode.DeletionVector)
+            throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown RowDeleteMode.");
+
         EnsureOpen();
         if (selection is null)
             throw new ArgumentNullException(nameof(selection));
@@ -581,6 +615,33 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _removedPaths.Add(path);
         _operations.Add("DELETE");
         return result.RowsDeleted;
+    }
+
+    private async ValueTask<long> StageCopyOnWriteRowDeletesAsync(
+        RowSelection selection, CancellationToken cancellationToken)
+    {
+        EnsureOpen();
+        if (selection is null)
+            throw new ArgumentNullException(nameof(selection));
+        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+        if (selection.IsEmpty)
+            return 0;
+        // Refused before the rewrite, so a refusal writes nothing that would have to be taken back.
+        if (FirstRestagedPath(selection.Paths) is { } restaged)
+            throw RestagedFile(restaged, "DELETE");
+
+        var plan = await _table.ComputeCopyOnWriteDeleteActionsAsync(
+            selection, _baseSnapshot, cancellationToken, rowIdStart: _nextRowId, written: _written)
+            .ConfigureAwait(false);
+        if (plan.RowsDeleted == 0)
+            return 0;
+
+        _nextRowId = plan.NextRowId;
+        StageInternal(plan.Actions);
+        foreach (string path in plan.RemovedPaths)
+            _removedPaths.Add(path);
+        _operations.Add("DELETE");
+        return plan.RowsDeleted;
     }
 
     /// <summary>
