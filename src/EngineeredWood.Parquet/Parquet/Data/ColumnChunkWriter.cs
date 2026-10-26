@@ -1432,16 +1432,11 @@ internal static class ColumnChunkWriter
         // growing buffer of its own and its bytes are not copied afterwards.
         EnsureValuesBuffer(DeltaBinaryPackedEncoder.MaxEncodedLength(nonNullCount, 32));
         var encoder = new DeltaBinaryPackedEncoder(t_valuesBuffer!);
-        if (defLevels == null)
-        {
-            var span = MemoryMarshal.Cast<byte, int>(array.Data.Buffers[1].Span).Slice(offset, numValues);
-            encoder.EncodeInt32s(span);
-        }
-        else
-        {
-            var values = ExtractNonNullValues<int>(array, offset, numValues, nonNullCount, defLevels);
-            encoder.EncodeInt32s(values);
-        }
+        // The encoder reads past the null slots itself, so a page with nulls is not compacted first.
+        encoder.EncodeInt32s(
+            MemoryMarshal.Cast<byte, int>(array.Data.Buffers[1].Span).Slice(offset, numValues),
+            defLevels == null ? default : defLevels.AsSpan(offset, numValues),
+            nonNullCount);
 
         t_valuesBuffer = encoder.Buffer;
         return encoder.Length;
@@ -1452,16 +1447,10 @@ internal static class ColumnChunkWriter
     {
         EnsureValuesBuffer(DeltaBinaryPackedEncoder.MaxEncodedLength(nonNullCount, 64));
         var encoder = new DeltaBinaryPackedEncoder(t_valuesBuffer!);
-        if (defLevels == null)
-        {
-            var span = MemoryMarshal.Cast<byte, long>(array.Data.Buffers[1].Span).Slice(offset, numValues);
-            encoder.EncodeInt64s(span);
-        }
-        else
-        {
-            var values = ExtractNonNullValues<long>(array, offset, numValues, nonNullCount, defLevels);
-            encoder.EncodeInt64s(values);
-        }
+        encoder.EncodeInt64s(
+            MemoryMarshal.Cast<byte, long>(array.Data.Buffers[1].Span).Slice(offset, numValues),
+            defLevels == null ? default : defLevels.AsSpan(offset, numValues),
+            nonNullCount);
 
         t_valuesBuffer = encoder.Buffer;
         return encoder.Length;

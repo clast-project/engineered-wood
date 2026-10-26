@@ -83,52 +83,89 @@ internal sealed class DeltaBinaryPackedEncoder
     /// Encodes INT32 values. Deltas are computed with wrapping arithmetic
     /// to match the decoder's unchecked 32-bit accumulation.
     /// </summary>
-    public void EncodeInt32s(ReadOnlySpan<int> values)
+    public void EncodeInt32s(ReadOnlySpan<int> values) => EncodeInt32s(values, default, values.Length);
+
+    /// <summary>
+    /// Encodes the INT32 values among <paramref name="slots"/> whose definition level is not 0, of
+    /// which there are <paramref name="count"/>. Empty <paramref name="definitionLevels"/> means every
+    /// slot holds a value. Reading past the nulls here spares a page the copy that compacting it
+    /// first would take.
+    /// </summary>
+    public void EncodeInt32s(ReadOnlySpan<int> slots, ReadOnlySpan<int> definitionLevels, int count)
     {
-        if (values.Length == 0)
+        if (count == 0)
         {
             WriteHeader(0, 0);
             return;
         }
 
-        WriteHeader(values.Length, values[0]);
-
-        if (values.Length == 1)
-            return;
+        bool dense = definitionLevels.IsEmpty;
+        int slot = dense ? 0 : NextDefined(definitionLevels, 0);
+        int previous = slots[slot];
+        WriteHeader(count, previous);
 
         // Compute deltas with wrapping 32-bit subtraction (matches decoder's unchecked accumulation).
         // Using 64-bit subtraction would produce deltas > 32 bits for values spanning the full
         // INT32 range, which violates the spec constraint that bit widths ≤ physical type width.
-        int deltaCount = values.Length - 1;
-        var deltas = new long[deltaCount];
-        for (int i = 0; i < deltaCount; i++)
-            deltas[i] = unchecked(values[i + 1] - values[i]);
+        // They are computed a block at a time, so a page allocates no array of them.
+        Span<long> deltas = stackalloc long[BlockSize];
+        for (int remaining = count - 1; remaining > 0;)
+        {
+            int blockValues = Math.Min(BlockSize, remaining);
+            for (int i = 0; i < blockValues; i++)
+            {
+                slot = dense ? slot + 1 : NextDefined(definitionLevels, slot + 1);
+                int value = slots[slot];
+                deltas[i] = unchecked(value - previous);
+                previous = value;
+            }
 
-        EncodeDeltas(deltas);
+            EncodeBlock(deltas.Slice(0, blockValues));
+            remaining -= blockValues;
+        }
     }
 
     /// <summary>
     /// Encodes INT64 values. Deltas are computed with wrapping arithmetic.
     /// </summary>
-    public void EncodeInt64s(ReadOnlySpan<long> values)
+    public void EncodeInt64s(ReadOnlySpan<long> values) => EncodeInt64s(values, default, values.Length);
+
+    /// <inheritdoc cref="EncodeInt32s(ReadOnlySpan{int}, ReadOnlySpan{int}, int)"/>
+    public void EncodeInt64s(ReadOnlySpan<long> slots, ReadOnlySpan<int> definitionLevels, int count)
     {
-        if (values.Length == 0)
+        if (count == 0)
         {
             WriteHeader(0, 0);
             return;
         }
 
-        WriteHeader(values.Length, values[0]);
+        bool dense = definitionLevels.IsEmpty;
+        int slot = dense ? 0 : NextDefined(definitionLevels, 0);
+        long previous = slots[slot];
+        WriteHeader(count, previous);
 
-        if (values.Length == 1)
-            return;
+        Span<long> deltas = stackalloc long[BlockSize];
+        for (int remaining = count - 1; remaining > 0;)
+        {
+            int blockValues = Math.Min(BlockSize, remaining);
+            for (int i = 0; i < blockValues; i++)
+            {
+                slot = dense ? slot + 1 : NextDefined(definitionLevels, slot + 1);
+                long value = slots[slot];
+                deltas[i] = unchecked(value - previous); // wrapping
+                previous = value;
+            }
 
-        int deltaCount = values.Length - 1;
-        var deltas = new long[deltaCount];
-        for (int i = 0; i < deltaCount; i++)
-            deltas[i] = values[i + 1] - values[i]; // wrapping
+            EncodeBlock(deltas.Slice(0, blockValues));
+            remaining -= blockValues;
+        }
+    }
 
-        EncodeDeltas(deltas);
+    private static int NextDefined(ReadOnlySpan<int> definitionLevels, int slot)
+    {
+        while (definitionLevels[slot] == 0)
+            slot++;
+        return slot;
     }
 
     private void WriteHeader(int totalCount, long firstValue)
@@ -139,91 +176,85 @@ internal sealed class DeltaBinaryPackedEncoder
         WriteZigZagVarInt(firstValue);
     }
 
-    private void EncodeDeltas(long[] deltas)
+    /// <summary>Writes one block: up to <see cref="BlockSize"/> deltas.</summary>
+    private void EncodeBlock(ReadOnlySpan<long> deltas)
     {
-        int deltaIdx = 0;
+        int blockValues = deltas.Length;
         Span<byte> bitWidths = stackalloc byte[MiniblockCount];
 
-        while (deltaIdx < deltas.Length)
+        // Find min delta for this block
+        long minDelta = long.MaxValue;
+        for (int i = 0; i < blockValues; i++)
+            minDelta = Math.Min(minDelta, deltas[i]);
+
+        WriteZigZagVarInt(minDelta);
+
+        // Compute bit widths for each miniblock
+        for (int mb = 0; mb < MiniblockCount; mb++)
         {
-            int blockValues = Math.Min(BlockSize, deltas.Length - deltaIdx);
+            int mbStart = mb * ValuesPerMiniblock;
+            int mbEnd = Math.Min(mbStart + ValuesPerMiniblock, blockValues);
 
-            // Find min delta for this block
-            long minDelta = long.MaxValue;
-            for (int i = 0; i < blockValues; i++)
-                minDelta = Math.Min(minDelta, deltas[deltaIdx + i]);
-
-            WriteZigZagVarInt(minDelta);
-
-            // Compute bit widths for each miniblock
-            for (int mb = 0; mb < MiniblockCount; mb++)
+            if (mbStart >= blockValues)
             {
-                int mbStart = deltaIdx + mb * ValuesPerMiniblock;
-                int mbEnd = Math.Min(mbStart + ValuesPerMiniblock, deltaIdx + blockValues);
+                bitWidths[mb] = 0;
+                continue;
+            }
 
-                if (mbStart >= deltaIdx + blockValues)
-                {
-                    bitWidths[mb] = 0;
-                    continue;
-                }
-
-                ulong maxRemainder = 0;
-                for (int i = mbStart; i < mbEnd; i++)
-                {
-                    ulong remainder = unchecked((ulong)(deltas[i] - minDelta));
-                    if (remainder > maxRemainder) maxRemainder = remainder;
-                }
+            ulong maxRemainder = 0;
+            for (int i = mbStart; i < mbEnd; i++)
+            {
+                ulong remainder = unchecked((ulong)(deltas[i] - minDelta));
+                if (remainder > maxRemainder) maxRemainder = remainder;
+            }
 
 #if NET8_0_OR_GREATER
-                bitWidths[mb] = maxRemainder == 0 ? (byte)0 : (byte)(64 - ulong.LeadingZeroCount(maxRemainder));
+            bitWidths[mb] = maxRemainder == 0 ? (byte)0 : (byte)(64 - ulong.LeadingZeroCount(maxRemainder));
 #else
-                bitWidths[mb] = maxRemainder == 0 ? (byte)0 : (byte)(64 - BitPolyfills.LeadingZeroCount(maxRemainder));
+            bitWidths[mb] = maxRemainder == 0 ? (byte)0 : (byte)(64 - BitPolyfills.LeadingZeroCount(maxRemainder));
 #endif
-            }
+        }
 
-            // Write bit widths
-            EnsureCapacity(MiniblockCount);
-            for (int mb = 0; mb < MiniblockCount; mb++)
-                _buffer[_position++] = bitWidths[mb];
+        // Write bit widths
+        EnsureCapacity(MiniblockCount);
+        for (int mb = 0; mb < MiniblockCount; mb++)
+            _buffer[_position++] = bitWidths[mb];
 
-            // Bit-pack values for each miniblock
-            for (int mb = 0; mb < MiniblockCount; mb++)
+        // Bit-pack values for each miniblock
+        for (int mb = 0; mb < MiniblockCount; mb++)
+        {
+            int bw = bitWidths[mb];
+            if (bw == 0)
+                continue;
+
+            int mbStart = mb * ValuesPerMiniblock;
+            int bytesNeeded = (ValuesPerMiniblock * bw + 7) / 8;
+            EnsureCapacity(bytesNeeded);
+            _buffer.AsSpan(_position, bytesNeeded).Clear();
+
+            int bitPos = 0;
+            for (int i = 0; i < ValuesPerMiniblock; i++)
             {
-                int bw = bitWidths[mb];
-                if (bw == 0)
-                    continue;
+                ulong val = (mbStart + i < blockValues)
+                    ? unchecked((ulong)(deltas[mbStart + i] - minDelta))
+                    : 0UL; // padding for partial miniblock
 
-                int mbStart = deltaIdx + mb * ValuesPerMiniblock;
-                int bytesNeeded = (ValuesPerMiniblock * bw + 7) / 8;
-                EnsureCapacity(bytesNeeded);
-                _buffer.AsSpan(_position, bytesNeeded).Clear();
-
-                int bitPos = 0;
-                for (int i = 0; i < ValuesPerMiniblock; i++)
+                if (val != 0)
                 {
-                    ulong val = (mbStart + i < deltaIdx + blockValues)
-                        ? unchecked((ulong)(deltas[mbStart + i] - minDelta))
-                        : 0UL; // padding for partial miniblock
+                    int byteOffset = bitPos / 8;
+                    int bitOffset = bitPos % 8;
 
-                    if (val != 0)
-                    {
-                        int byteOffset = bitPos / 8;
-                        int bitOffset = bitPos % 8;
-
-                        int bytesToWrite = (bitOffset + bw + 7) / 8;
-                        // First byte: shift left (only low byte matters)
-                        _buffer[_position + byteOffset] |= (byte)(val << bitOffset);
-                        // Remaining bytes: shift right
-                        for (int b = 1; b < bytesToWrite; b++)
-                            _buffer[_position + byteOffset + b] |= (byte)(val >> (b * 8 - bitOffset));
-                    }
-                    bitPos += bw;
+                    int bytesToWrite = (bitOffset + bw + 7) / 8;
+                    // First byte: shift left (only low byte matters)
+                    _buffer[_position + byteOffset] |= (byte)(val << bitOffset);
+                    // Remaining bytes: shift right
+                    for (int b = 1; b < bytesToWrite; b++)
+                        _buffer[_position + byteOffset + b] |= (byte)(val >> (b * 8 - bitOffset));
                 }
-
-                _position += bytesNeeded;
+                bitPos += bw;
             }
 
-            deltaIdx += blockValues;
+            _position += bytesNeeded;
         }
     }
 
