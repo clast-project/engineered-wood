@@ -205,18 +205,17 @@ internal static class DeltaByteArrayEncoder
     }
 
     /// <summary>
-    /// Estimates the maximum encoded size for budget/buffer sizing.
-    /// Worst case: no prefix sharing, so suffix data == original data.
-    /// Delta headers are bounded by ~10 bytes per 128 values.
+    /// The most bytes the encoding can take, which the destination buffer is sized by: the suffixes,
+    /// at most the values themselves, after two streams of lengths at their largest.
     /// </summary>
-    public static int EstimateMaxSize(int nonNullCount, int totalDataBytes)
-    {
-        // Two DELTA_BINARY_PACKED headers (prefix lengths + suffix lengths):
-        // header = 4 varints (~40 bytes) + per-block overhead
-        // Conservative: 20 bytes per 128 values for each delta block
-        int deltaOverhead = 2 * (40 + (nonNullCount / 128 + 1) * 20);
-        return deltaOverhead + totalDataBytes;
-    }
+    /// <remarks>
+    /// The lengths are bounded by what DELTA_BINARY_PACKED can encode, not by a typical case. A
+    /// shared prefix of one byte per 32 values saves 4 bytes per 128 values and widens both streams
+    /// to 2 bits, which costs them 64; the 20 bytes per 128 values this used to allow per stream let
+    /// such a page overrun the buffer and throw.
+    /// </remarks>
+    public static int EstimateMaxSize(int nonNullCount, int totalDataBytes) =>
+        checked(2 * DeltaBinaryPackedEncoder.MaxEncodedLength(nonNullCount, 32) + totalDataBytes);
 
     private static int CommonPrefixLength(ReadOnlySpan<byte> a, ReadOnlySpan<byte> b)
     {
