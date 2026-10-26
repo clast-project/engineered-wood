@@ -22,10 +22,11 @@ public class RowGroupWriteBenchmarks
     private RecordBatch _intBatch = null!;
     private RecordBatch _stringBatch = null!;
     private RecordBatch _mixedBatch = null!;
+    private RecordBatch _dictBatch = null!;
 
     private const int RowCount = 100_000;
 
-    [Params("int_cols", "string_cols", "mixed_cols")]
+    [Params("int_cols", "string_cols", "mixed_cols", "dict_cols")]
     public string Scenario { get; set; } = null!;
 
     private RecordBatch CurrentBatch => Scenario switch
@@ -33,6 +34,7 @@ public class RowGroupWriteBenchmarks
         "int_cols" => _intBatch,
         "string_cols" => _stringBatch,
         "mixed_cols" => _mixedBatch,
+        "dict_cols" => _dictBatch,
         _ => throw new InvalidOperationException(),
     };
 
@@ -121,6 +123,30 @@ public class RowGroupWriteBenchmarks
             _mixedBatch = new RecordBatch(schema,
                 [intBuilder.Build(), longBuilder.Build(), doubleBuilder.Build(),
                  stringBuilder.Build(), boolBuilder.Build()], RowCount);
+        }
+
+        // Dictionary columns: 5 int32 columns of 10,000 distinct values (2 nullable), so they stay
+        // dictionary-encoded with 14-bit indices — wider than a byte, as most dictionaries are.
+        {
+            var fields = new List<Field>();
+            var arrays = new List<IArrowArray>();
+            for (int c = 0; c < 5; c++)
+            {
+                bool nullable = c >= 3;
+                fields.Add(new Field($"d{c}", Int32Type.Default, nullable));
+                var builder = new Int32Array.Builder();
+                for (int r = 0; r < RowCount; r++)
+                {
+                    if (nullable && random.NextDouble() < 0.1)
+                        builder.AppendNull();
+                    else
+                        builder.Append(random.Next(10_000) * 7919);
+                }
+                arrays.Add(builder.Build());
+            }
+            var schema = new Apache.Arrow.Schema.Builder();
+            foreach (var f in fields) schema.Field(f);
+            _dictBatch = new RecordBatch(schema.Build(), arrays, RowCount);
         }
     }
 

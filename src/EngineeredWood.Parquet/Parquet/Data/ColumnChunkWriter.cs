@@ -648,9 +648,12 @@ internal static class ColumnChunkWriter
         ParquetWriteOptions options,
         PageIndexCollector? pageIndex)
     {
-        var output = new ColumnChunkOutput(dictResult.DictionaryPageData.Length + rowCount, options);
-
         int bitWidth = DictionaryEncoder.GetIndexBitWidth(dictResult.DictionaryCount);
+
+        var output = new ColumnChunkOutput(
+            EstimateDictionaryColumnSize(
+                dictResult.DictionaryPageData.Length, rowCount, bitWidth, maxDefLevel, maxRepLevel),
+            options);
 
         // 1. Encode dictionary page
         int dictionaryPageSize = WriteDictionaryPage(output, dictResult, options);
@@ -1886,6 +1889,36 @@ internal static class ColumnChunkWriter
             : 0;
         return (int)Math.Min(raw + deltaBlocks * 14 + raw / 64 + 256, 256L * 1024 * 1024);
     }
+
+    /// <summary>
+    /// The initial capacity of a dictionary-encoded chunk's stream: the dictionary page, and every
+    /// row's index and levels bit-packed at their full widths.
+    /// </summary>
+    /// <remarks>
+    /// An index is counted for every row, null or not. Page headers get a byte per 128 rows, 156 bytes
+    /// for a default 20,000-row page: indices can be too narrow for a fraction of them to cover the
+    /// headers, as with a single-entry dictionary, whose indices are one run per page. The 1/64 covers
+    /// codec framing, and the cap matches <see cref="EstimateColumnSize"/>.
+    /// </remarks>
+    internal static int EstimateDictionaryColumnSize(
+        int dictionaryBytes, int rowCount, int indexBitWidth, int maxDefLevel, int maxRepLevel)
+    {
+        int bitsPerRow = HybridBitsPerValue(indexBitWidth)
+            + HybridBitsPerValue(BitWidth(maxDefLevel))
+            + HybridBitsPerValue(BitWidth(maxRepLevel));
+        long bytes = dictionaryBytes + ((long)rowCount * bitsPerRow + 7) / 8 + rowCount / 128;
+        return (int)Math.Min(bytes + bytes / 64 + 256, 256L * 1024 * 1024);
+    }
+
+    /// <summary>
+    /// The most bits per value the RLE/bit-packed hybrid spends at <paramref name="bitWidth"/>.
+    /// </summary>
+    /// <remarks>
+    /// Unless <see cref="ParquetWriteOptions.BatchBitPackedRuns"/> is set, every 8-value bit-packed
+    /// group carries its own 1-byte header: a bit per value over the width. A run of 8 or more
+    /// repeats, a 1-byte header and one value, is never more.
+    /// </remarks>
+    private static int HybridBitsPerValue(int bitWidth) => bitWidth == 0 ? 0 : bitWidth + 1;
 
     /// <summary>
     /// Drops the DEPRECATED <c>min</c>/<c>max</c> fields on the column types where signed byte ordering
