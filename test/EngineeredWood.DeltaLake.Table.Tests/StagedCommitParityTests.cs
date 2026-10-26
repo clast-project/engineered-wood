@@ -289,6 +289,47 @@ public class StagedCommitParityTests : IDisposable
         Assert.Contains("3 row", ex.Message);
     }
 
+    /// <summary>Born-deleted rows become an inline deletion vector, which a table without vectors has not
+    /// declared — refused on both surfaces rather than committed under a protocol that hides it (#524).</summary>
+    [Fact]
+    public async Task BornDeleted_OnATableWithoutDeletionVectors_Throws()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, IdSchema);
+        var files = await table.WriteDataFilesAsync([Batch(1, 3)]);
+        var file = Assert.Single(files);
+        var txn = table.StartTransaction();
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(() => txn.StageDataFilesAsync(
+            files,
+            bornDeleted: RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
+            {
+                [file.RelativePath] = new long[] { 1 },
+            })).AsTask());
+        Assert.Contains("enableDeletionVectors", ex.Message);
+
+        // An empty selection names no rows, so it needs no vector and stays a plain append.
+        Assert.Equal(3, await txn.StageDataFilesAsync(
+            files,
+            bornDeleted: RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>())));
+        await txn.CommitAsync();
+        Assert.Equal(new long[] { 1, 2, 3 }, await ReadIdsFreshAsync());
+    }
+
+    [Fact]
+    public async Task CommitDataFiles_DeletedPositions_OnATableWithoutDeletionVectors_Throws()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, IdSchema);
+        var files = await table.WriteDataFilesAsync([Batch(1, 3)]);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => table.CommitDataFilesAsync(
+            files,
+            deletedPositionsByFileIndex: new Dictionary<int, IReadOnlyCollection<long>>
+            {
+                [0] = new long[] { 1 },
+            }).AsTask());
+        Assert.Equal(0, table.CurrentSnapshot.Version);
+    }
+
     // ── the identity gap ──
 
     private static string IdentitySchemaString()

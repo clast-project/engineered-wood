@@ -504,6 +504,53 @@ public class HostStagedTransactionTests : IDisposable
     private string[] DeletionVectorsOnDisk() =>
         [.. Directory.GetFiles(_tempDir, "deletion_vector_*.bin", SearchOption.AllDirectories)];
 
+    // ── A deletion vector only where the table declared them (#524) ──
+    //
+    // The staged delete used to write its vector regardless, and the commit left an inline vector under a
+    // protocol 1/2 table: a reader may treat that as a table where vectors do not exist and return the row.
+
+    [Fact]
+    public async Task StagedRowDeletes_OnATableWithoutDeletionVectors_Throws()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
+        await table.WriteAsync([Batch(1, 5)]);
+        var at = await LocateRowsAsync(table);
+
+        var txn = table.StartTransaction();
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => txn.StageRowDeletesAsync(Sel(at[2])).AsTask());
+        Assert.Contains("enableDeletionVectors", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(DeletionVectorsOnDisk());
+
+        // The refusal staged nothing: the transaction still commits the rest of its work.
+        txn.StageDataFiles(await table.WriteDataFilesAsync([Batch(6, 1)]));
+        await txn.CommitAsync();
+        Assert.Equal(new long[] { 1, 2, 3, 4, 5, 6 }, await ReadIdsFreshAsync());
+        await using var check = await OpenAsync();
+        Assert.All(check.CurrentSnapshot.ActiveFiles.Values, a => Assert.Null(a.DeletionVector));
+    }
+
+    [Fact]
+    public async Task StagedRowDeletes_EmptySelection_OnATableWithoutDeletionVectors_IsANoOp()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
+        await table.WriteAsync([Batch(1, 3)]);
+
+        var txn = table.StartTransaction();
+        Assert.Equal(0, await txn.StageRowDeletesAsync(Sel()));
+    }
+
+    [Fact]
+    public async Task ComputeDeletionVectorActions_OnATableWithoutDeletionVectors_Throws()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
+        await table.WriteAsync([Batch(1, 5)]);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => table.ComputeDeletionVectorActionsAsync(
+            new Dictionary<int, IReadOnlyCollection<long>> { [0] = new long[] { 1 } }).AsTask());
+        Assert.Empty(DeletionVectorsOnDisk());
+    }
+
     [Fact]
     public async Task StagedRowDeletes_TwiceOnOneFile_RefusesTheSecond()
     {

@@ -6948,6 +6948,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             constraintsEnforcedByCaller
                 ? WriteTimeExpressionHandling.AssertedByCaller
                 : WriteTimeExpressionHandling.Refuse);
+        if (deletedPositionsByFileIndex is not null && deletedPositionsByFileIndex.Values.Any(p => p.Count > 0))
+            EnsureDeletionVectorsEnabled(CurrentSnapshot, "Committing born-deleted rows");
 
         if (dynamicPartitionOverwrite)
         {
@@ -7478,6 +7480,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         var deletedByPath = ValidateBornDeleted(files, bornDeleted);
+        if (deletedByPath is not null && deletedByPath.Values.Any(p => p.Count > 0))
+            EnsureDeletionVectorsEnabled(snapshot, "Staging born-deleted rows");
 
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
         long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
@@ -7745,6 +7749,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         WrittenFileLedger? written = null)
     {
+        if (!selection.IsEmpty)
+            EnsureDeletionVectorsEnabled(snapshot, "Deleting rows by position");
+
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var byPath = ActiveFilesByPath(snapshot);
         var actions = new List<DeltaAction>();
@@ -7855,6 +7862,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 cancellationToken),
             _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown row delete mode."),
         };
+    }
+
+    /// <summary>
+    /// Refuses to write a deletion vector into a table that has not enabled them. The commit would otherwise
+    /// succeed and leave a vector under a protocol that never declared the feature: a reader is entitled to
+    /// treat the table as one where vectors do not exist and return the hidden rows, and a reader without
+    /// vector support — the reason a table is created without them — refuses the table outright.
+    /// </summary>
+    internal static void EnsureDeletionVectorsEnabled(Snapshot.Snapshot snapshot, string what)
+    {
+        if (!DeletionVectors.DeletionVectorConfig.IsEnabled(snapshot.Metadata.Configuration))
+            throw new InvalidOperationException(
+                what + " writes a deletion vector, and this table does not have deletion vectors enabled — "
+                + "create the table with DeltaTable.CreateAsync(..., enableDeletionVectors: true), or delete "
+                + "outside a transaction with DeleteRowsAsync(selection, RowDeleteMode.CopyOnWrite).");
     }
 
     /// <summary>
