@@ -82,4 +82,16 @@ internal sealed class WrittenFileLedger
         }
         return taken;
     }
+
+    /// <summary>
+    /// Removes and returns everything recorded after the first <paramref name="mark"/> entries — the files
+    /// one staging call wrote, for a transaction that refuses that call after it ran. Take the mark from
+    /// <see cref="Paths"/>' count before the call.
+    /// </summary>
+    public List<string> TakeRecordedSince(int mark)
+    {
+        var taken = _paths.GetRange(mark, _paths.Count - mark);
+        _paths.RemoveRange(mark, taken.Count);
+        return taken;
+    }
 }
