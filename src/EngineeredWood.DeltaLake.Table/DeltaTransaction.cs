@@ -498,7 +498,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// <c>add.path</c> becomes. The add is born with an inline deletion vector and its stats marked
     /// <c>tightBounds=false</c>, as the spec requires once a vector hides rows the bounds were computed over.
     /// The key can only name a file in this same call — these files are in no snapshot yet — and a path or
-    /// position that does not is reported rather than dropped.</param>
+    /// position that does not is reported rather than dropped. Naming any rows requires a table with deletion
+    /// vectors enabled; on one without them this throws <see cref="InvalidOperationException"/>.</param>
     /// <param name="identityValuesPreGenerated">The caller generated the identity-column values itself (see
     /// <see cref="DeltaTable.GenerateIdentityValues"/>), so the write-time per-row processing an outside
     /// writer skipped has already happened. Without this an identity table's appends cannot be staged at
@@ -551,6 +552,9 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// file's positions in one selection. The per-file edits are recorded, so
     /// at commit a concurrent delete of DIFFERENT rows in the same file reconciles row-by-row and a concurrent
     /// rewrite relocates these rows by stable id — the caller does not drive that rebase.</para>
+    ///
+    /// <para>The table must have deletion vectors enabled; on one without them this throws
+    /// <see cref="InvalidOperationException"/> rather than commit a vector its protocol never declared.</para>
     /// </summary>
     public async ValueTask<long> StageRowDeletesAsync(
         RowSelection selection,
