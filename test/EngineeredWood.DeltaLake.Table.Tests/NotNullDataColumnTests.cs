@@ -347,6 +347,56 @@ public class NotNullDataColumnTests : IDisposable
     }
 
     /// <summary>
+    /// <c>m MAP&lt;STRING, INT NOT NULL&gt;</c>: a null value is refused, and so is a null key (a Delta map key is
+    /// never null), but an entry under a null map is no row's value. Row 0 holds entry 0 and row 1 entry 1.
+    /// </summary>
+    [Theory]
+    [InlineData("none", null)]
+    [InlineData("value", "m.value")]
+    [InlineData("key", "m.key")]
+    [InlineData("valueUnderNullMap", null)]
+    public void Enforcer_Map_ChecksKeysAndValues(string nullAt, string? violation)
+    {
+        var schema = new DeltaLake.Schema.StructType
+        {
+            Fields =
+            [
+                new DeltaLake.Schema.StructField
+                {
+                    Name = "m", Nullable = true,
+                    Type = new DeltaLake.Schema.MapType
+                    {
+                        KeyType = new DeltaLake.Schema.PrimitiveType { TypeName = "string" },
+                        ValueType = new DeltaLake.Schema.PrimitiveType { TypeName = "integer" },
+                        ValueContainsNull = false,
+                    },
+                },
+            ],
+        };
+        var mapType = new MapType(
+            new Field("key", StringType.Default, true), new Field("value", Int32Type.Default, true));
+        var keys = new StringArray.Builder().Append("k0");
+        if (nullAt == "key") keys.AppendNull(); else keys.Append("k1");
+        var values = new Int32Array.Builder().Append(0);
+        if (nullAt is "value" or "valueUnderNullMap") values.AppendNull(); else values.Append(1);
+        var entries = new StructArray(
+            new StructType([mapType.KeyField, mapType.ValueField]), 2,
+            [keys.Build(), values.Build()], ArrowBuffer.Empty);
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(1).Append(2).Build();
+        bool rowOneNull = nullAt == "valueUnderNullMap";
+        var validity = new ArrowBuffer.BitmapBuilder().Append(true).Append(!rowOneNull).Build();
+        var map = new MapArray(mapType, 2, offsets, entries, validity, rowOneNull ? 1 : 0);
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("m", mapType, true)).Build(), [map], 2);
+
+        if (violation is null)
+            DeltaNotNullEnforcer.Validate(batch, schema);
+        else
+            AssertNotNullViolation(
+                Assert.Throws<DeltaFormatException>(() => DeltaNotNullEnforcer.Validate(batch, schema)), violation);
+    }
+
+    /// <summary>
     /// Only the given rows are checked, read in place (a host writer's dictionary column is not gathered, which
     /// the gather cannot do).
     /// </summary>
