@@ -71,6 +71,74 @@ internal static class DeltaNotNullEnforcer
         }
     }
 
+    /// <summary>
+    /// <paramref name="pending"/> with every field, element and map value made no more nullable than its
+    /// counterpart in <paramref name="committed"/>: the schema to check a write against when the caller supplies
+    /// a pending one (a buffered transaction's ALTERed schema). Nothing here can relax a NOT NULL, so a pending
+    /// schema that does would only be a way around the check. Fields are matched by column-mapping id where
+    /// they carry one (a pending RENAME keeps it), else by name; a field the committed schema lacks (a pending
+    /// ADD) is taken as given. Returns <paramref name="pending"/> itself when nothing is tightened.
+    /// </summary>
+    public static StructType NoLooserThan(StructType pending, StructType committed) =>
+        (StructType)Tighten(pending, committed);
+
+    private static DeltaDataType Tighten(DeltaDataType pending, DeltaDataType committed)
+    {
+        switch (pending, committed)
+        {
+            case (StructType p, StructType c):
+            {
+                StructField[]? fields = null;
+                for (int i = 0; i < p.Fields.Count; i++)
+                {
+                    var field = p.Fields[i];
+                    if (Counterpart(c.Fields, field) is not { } was)
+                        continue;
+                    var type = Tighten(field.Type, was.Type);
+                    bool nullable = field.Nullable && was.Nullable;
+                    if (nullable == field.Nullable && ReferenceEquals(type, field.Type))
+                        continue;
+                    fields ??= p.Fields.ToArray();
+                    fields[i] = new StructField
+                    {
+                        Name = field.Name, Type = type, Nullable = nullable, Metadata = field.Metadata,
+                    };
+                }
+                return fields is null ? p : new StructType { Fields = fields };
+            }
+
+            case (ArrayType p, ArrayType c):
+            {
+                var element = Tighten(p.ElementType, c.ElementType);
+                bool containsNull = p.ContainsNull && c.ContainsNull;
+                return containsNull == p.ContainsNull && ReferenceEquals(element, p.ElementType)
+                    ? p
+                    : new ArrayType { ElementType = element, ContainsNull = containsNull };
+            }
+
+            case (MapType p, MapType c):
+            {
+                var key = Tighten(p.KeyType, c.KeyType);
+                var value = Tighten(p.ValueType, c.ValueType);
+                bool valueContainsNull = p.ValueContainsNull && c.ValueContainsNull;
+                return valueContainsNull == p.ValueContainsNull
+                    && ReferenceEquals(key, p.KeyType) && ReferenceEquals(value, p.ValueType)
+                    ? p
+                    : new MapType { KeyType = key, ValueType = value, ValueContainsNull = valueContainsNull };
+            }
+
+            default:
+                return pending;
+        }
+    }
+
+    private static StructField? Counterpart(IReadOnlyList<StructField> committed, StructField pending)
+    {
+        if (ColumnMapping.GetFieldId(pending) is { } id)
+            return committed.FirstOrDefault(f => ColumnMapping.GetFieldId(f) == id);
+        return committed.FirstOrDefault(f => string.Equals(f.Name, pending.Name, StringComparison.Ordinal));
+    }
+
     // Slots: the positions of the array that hold a row's value, in the array's own index space; null is every
     // position. A position under a null parent or outside a list's offsets is no row's value.
     private static void Check(

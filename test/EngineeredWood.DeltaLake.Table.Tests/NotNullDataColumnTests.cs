@@ -142,6 +142,23 @@ public class NotNullDataColumnTests : IDisposable
         Assert.Empty(Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories));
     }
 
+    /// <summary>
+    /// A pending schema cannot relax a NOT NULL (nothing here can), so an override declaring <c>v</c> nullable is
+    /// checked under the committed schema's nullability rather than becoming a way around it.
+    /// </summary>
+    [Fact]
+    public async Task WriteDataFiles_OverrideThatRelaxesNotNull_IsStillRefused()
+    {
+        await using var table = await NewTableAsync(TableSchema);
+        var relaxed = DeltaLake.Schema.SchemaConverter.FromArrowSchema(Rows("a").Schema);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await table.WriteDataFilesAsync([Rows("a", null)], schemaOverride: relaxed));
+
+        AssertNotNullViolation(ex, "v");
+        await table.WriteDataFilesAsync([Rows("a", "b")], schemaOverride: relaxed);
+    }
+
     [Fact]
     public async Task Update_SettingNull_IsRefused()
     {
@@ -174,18 +191,25 @@ public class NotNullDataColumnTests : IDisposable
     }
 
     /// <summary>
-    /// Only the post-image is checked, as for CHECK constraints: a file already holding a null (here committed
-    /// under a nullable write schema, as an earlier writer without this check could leave one) does not block
-    /// an update of a different row.
+    /// Only the post-image is checked, as for CHECK constraints: a file already holding a null (as an earlier
+    /// writer without this check could leave one; here written by a twin table whose <c>v</c> is nullable, and
+    /// committed through the seam that takes finished files) does not block an update of a different row.
     /// </summary>
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
     public async Task Update_OfAnotherRow_DoesNotRecheckAnExistingNull(bool byRows)
     {
-        await using var table = await NewTableAsync(TableSchema);
-        var nullable = DeltaLake.Schema.SchemaConverter.FromArrowSchema(Rows("a").Schema);
-        await table.CommitDataFilesAsync(await table.WriteDataFilesAsync([Rows("a", null)], schemaOverride: nullable));
+        string root = Path.Combine(_tempDir, "strict");
+        string twinRoot = Path.Combine(_tempDir, "twin");
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(root), TableSchema);
+        await using (var twin = await DeltaTable.CreateAsync(new LocalTableFileSystem(twinRoot), Rows("a").Schema))
+        {
+            var files = await twin.WriteDataFilesAsync([Rows("a", null)]);
+            foreach (var f in files)
+                File.Copy(Path.Combine(twinRoot, f.RelativePath), Path.Combine(root, f.RelativePath));
+            await table.CommitDataFilesAsync(files);
+        }
 
         if (byRows)
         {
