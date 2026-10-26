@@ -1864,7 +1864,7 @@ internal static class ColumnChunkWriter
         return 32;
     }
 
-    private static int EstimateColumnSize(int rowCount, PhysicalType physicalType, int typeLength)
+    internal static int EstimateColumnSize(int rowCount, PhysicalType physicalType, int typeLength)
     {
         int bytesPerValue = physicalType switch
         {
@@ -1874,12 +1874,17 @@ internal static class ColumnChunkWriter
             PhysicalType.FixedLenByteArray => typeLength > 0 ? typeLength : 16,
             _ => 8,
         };
-        // Sized at the raw width plus 1/64 for page headers and codec framing. An estimate below
-        // what an incompressible chunk needs costs a doubling and a copy of the whole stream, which
-        // is more than the memory the margin holds back from a chunk that compresses. Capped so a
-        // huge row count over-estimated (booleans, nulls) cannot reserve gigabytes up front.
+        // Sized for an incompressible chunk: an estimate below what it needs costs a doubling and a
+        // copy of the whole stream, which is more than the memory the headroom holds back from a
+        // chunk that compresses. That is the raw width, plus what DELTA_BINARY_PACKED adds at full
+        // width (a min-delta varint and four bit widths per 128 values, +1.8% for INT32, more than
+        // the margin alone covers), plus 1/64 for page headers and codec framing. Capped so a huge
+        // row count over-estimated (booleans, nulls) cannot reserve gigabytes up front.
         long raw = (long)rowCount * bytesPerValue;
-        return (int)Math.Min(raw + raw / 64 + 256, 256L * 1024 * 1024);
+        long deltaBlocks = physicalType is PhysicalType.Int32 or PhysicalType.Int64
+            ? rowCount / 128 + 1
+            : 0;
+        return (int)Math.Min(raw + deltaBlocks * 14 + raw / 64 + 256, 256L * 1024 * 1024);
     }
 
     /// <summary>
