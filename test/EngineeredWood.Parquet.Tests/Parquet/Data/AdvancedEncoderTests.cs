@@ -170,6 +170,75 @@ public class AdvancedEncoderTests
         Assert.Equal(values, decoded);
     }
 
+    // The overloads that take definition levels read past null slots instead of having the page
+    // compacted first. They must write exactly what encoding the compacted values writes.
+    public static IEnumerable<object[]> NullPatterns()
+    {
+        // slots, then which of them are null
+        yield return ["none", 300];
+        yield return ["all", 300];
+        yield return ["leading", 300];
+        yield return ["trailing", 300];
+        yield return ["single", 300];
+        yield return ["alternate", 300];
+        yield return ["random", 20_000];
+        yield return ["block-edge", 129];
+        yield return ["block-edge", 130];
+        yield return ["block-edge", 131];
+        yield return ["miniblock-edge", 33];
+    }
+
+    [Theory]
+    [MemberData(nameof(NullPatterns))]
+    public void DeltaBinaryPacked_SkippingNulls_MatchesCompactedValues(string pattern, int slots)
+    {
+        var rng = new Random(slots);
+        var definitionLevels = new int[slots];
+        for (int i = 0; i < slots; i++)
+        {
+            definitionLevels[i] = pattern switch
+            {
+                "none" => 1,
+                "all" => 0,
+                "leading" => i < 100 ? 0 : 1,
+                "trailing" => i >= slots - 100 ? 0 : 1,
+                "single" => i == slots / 2 ? 1 : 0,
+                "alternate" => i % 2,
+                "random" => rng.NextDouble() < 0.1 ? 0 : 1,
+                // Every slot but the first defined: 127, 128 or 129 deltas, around a block's end.
+                _ => i == 0 ? 0 : 1,
+            };
+        }
+
+        var ints = new int[slots];
+        var longs = new long[slots];
+        for (int i = 0; i < slots; i++)
+        {
+            ints[i] = rng.Next(int.MinValue, int.MaxValue);
+            longs[i] = ((long)ints[i] << 32) ^ rng.Next();
+        }
+
+        int count = definitionLevels.Count(level => level != 0);
+        int[] compactInts = ints.Where((_, i) => definitionLevels[i] != 0).ToArray();
+        long[] compactLongs = longs.Where((_, i) => definitionLevels[i] != 0).ToArray();
+
+        var expected = new DeltaBinaryPackedEncoder();
+        expected.EncodeInt32s(compactInts);
+        var actual = new DeltaBinaryPackedEncoder();
+        actual.EncodeInt32s(ints, definitionLevels, count);
+        Assert.Equal(expected.ToArray(), actual.ToArray());
+
+        expected = new DeltaBinaryPackedEncoder();
+        expected.EncodeInt64s(compactLongs);
+        actual = new DeltaBinaryPackedEncoder();
+        actual.EncodeInt64s(longs, definitionLevels, count);
+        Assert.Equal(expected.ToArray(), actual.ToArray());
+
+        var decoded = new long[count];
+        new DeltaBinaryPackedDecoder(actual.ToArray()).DecodeInt64s(decoded);
+        Assert.Equal(compactLongs, decoded);
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
