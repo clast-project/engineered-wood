@@ -322,7 +322,8 @@ internal static class ColumnChunkWriter
                 rowCount, nonNullCount, PlainValueBytes(array, nonNullCount, physicalType, typeLength),
                 LayOutPages(repLevels, rowCount, valuesPerPage, options.DataPageRowCountLimit),
                 physicalType, typeLength,
-                maxDefLevel, maxRepLevel, options.ByteArrayEncoding == ByteArrayEncoding.DeltaByteArray),
+                maxDefLevel, maxRepLevel, options.ByteArrayEncoding == ByteArrayEncoding.DeltaByteArray,
+                options.Compression),
             options);
         var encodings = new HashSet<Encoding>();
 
@@ -662,7 +663,7 @@ internal static class ColumnChunkWriter
             EstimateDictionaryColumnSize(
                 dictResult.DictionaryPageData.Length, rowCount,
                 LayOutPages(repLevels, rowCount, valuesPerPage, options.DataPageRowCountLimit),
-                bitWidth, maxDefLevel, maxRepLevel),
+                bitWidth, maxDefLevel, maxRepLevel, options.Compression),
             options);
 
         // 1. Encode dictionary page
@@ -1897,7 +1898,7 @@ internal static class ColumnChunkWriter
     internal static int EstimateColumnSize(
         int levelCount, int nonNullCount, long plainValueBytes, PageLayout pages,
         PhysicalType physicalType, int typeLength, int maxDefLevel, int maxRepLevel,
-        bool deltaByteArray)
+        bool deltaByteArray, CompressionCodec codec)
     {
         long bytes = plainValueBytes
             + pages.Count * PageHeaderAllowance
@@ -1925,7 +1926,7 @@ internal static class ColumnChunkWriter
                 + DeltaOverheadBytes(nonNullCount, pages, lengthBits));
         }
 
-        return WithMargin(bytes);
+        return WithMargin(bytes + CodecBytes(bytes, pages, codec));
     }
 
     /// <summary>
@@ -1971,14 +1972,14 @@ internal static class ColumnChunkWriter
     /// <remarks>An index is counted for every level, null or not.</remarks>
     internal static int EstimateDictionaryColumnSize(
         int dictionaryBytes, int levelCount, PageLayout pages,
-        int indexBitWidth, int maxDefLevel, int maxRepLevel)
+        int indexBitWidth, int maxDefLevel, int maxRepLevel, CompressionCodec codec)
     {
         long bytes = PageHeaderAllowance + dictionaryBytes
             // Each data page leads its indices with their bit width.
             + pages.Count * (PageHeaderAllowance + 1) + HybridBytes(levelCount, pages, indexBitWidth)
             + LevelBytes(levelCount, pages, maxDefLevel, allDefined: false)
             + LevelBytes(levelCount, pages, maxRepLevel, allDefined: false);
-        return WithMargin(bytes);
+        return WithMargin(bytes + CodecBytes(bytes, pages, codec));
     }
 
     /// <summary>How many data pages a chunk is cut into, and the most levels any one of them holds.</summary>
@@ -2080,8 +2081,29 @@ internal static class ColumnChunkWriter
         return length;
     }
 
-    // The 1/64 covers codec framing. Capped so a huge chunk over-estimated (booleans, nulls) cannot
-    // reserve gigabytes up front.
+    /// <summary>
+    /// What <paramref name="codec"/> adds to <paramref name="bytes"/> of incompressible pages: framing
+    /// on each page, which a page of a few bytes cannot cover in proportion, and for Gzip a share of
+    /// the bytes.
+    /// </summary>
+    /// <remarks>
+    /// The framing is what each codec was measured to add to a 2-byte page, with room: Gzip 20 bytes
+    /// of header and trailer, Zstd 8, Brotli 3, Snappy 1, LZ4 none. zlib-ng, which .NET's GZipStream
+    /// uses from .NET 9 on, writes incompressible input at Fastest as static-Huffman literals of up to
+    /// 9 bits: up to 1/8 more, and 5.5% more for uniformly random bytes. Other codecs' expansion of
+    /// large incompressible input is within the 1/64 that <see cref="WithMargin"/> adds.
+    /// </remarks>
+    private static long CodecBytes(long bytes, PageLayout pages, CompressionCodec codec) => codec switch
+    {
+        CompressionCodec.Uncompressed => 0,
+        CompressionCodec.Snappy or CompressionCodec.Lz4 or CompressionCodec.Brotli => pages.Count * 8,
+        CompressionCodec.Zstd => pages.Count * 16,
+        CompressionCodec.Gzip or CompressionCodec.Deflate => pages.Count * 24 + bytes / 8,
+        _ => pages.Count * 32,
+    };
+
+    // The 1/64 covers the rest of codec framing. Capped so a huge chunk over-estimated (booleans,
+    // nulls) cannot reserve gigabytes up front.
     private static int WithMargin(long bytes) =>
         (int)Math.Min(bytes + bytes / 64 + 256, 256L * 1024 * 1024);
 

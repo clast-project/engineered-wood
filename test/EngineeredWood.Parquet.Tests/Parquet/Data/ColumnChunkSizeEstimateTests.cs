@@ -52,7 +52,7 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         long size = await WriteAndMeasure(Int32Values(shape, RowCount, nullable: false), options);
 
         AssertFits(size, ColumnChunkWriter.EstimateColumnSize(
-            RowCount, RowCount, RowCount * 4L, Layout(RowCount, DefaultPageLength), PhysicalType.Int32, 0, 0, 0, deltaByteArray: false));
+            RowCount, RowCount, RowCount * 4L, Layout(RowCount, DefaultPageLength), PhysicalType.Int32, 0, 0, 0, deltaByteArray: false, options.Compression));
     }
 
     [Theory]
@@ -66,7 +66,7 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         long size = await WriteAndMeasure(Int64Values(shape, RowCount), options);
 
         AssertFits(size, ColumnChunkWriter.EstimateColumnSize(
-            RowCount, RowCount, RowCount * 8L, Layout(RowCount, DefaultPageLength), PhysicalType.Int64, 0, 0, 0, deltaByteArray: false));
+            RowCount, RowCount, RowCount * 8L, Layout(RowCount, DefaultPageLength), PhysicalType.Int64, 0, 0, 0, deltaByteArray: false, options.Compression));
     }
 
     // "wide": 100,000 entries, so 17-bit indices, where the estimate this replaced allowed 8.
@@ -90,7 +90,7 @@ public class ColumnChunkSizeEstimateTests : IDisposable
 
         AssertFits(size, ColumnChunkWriter.EstimateDictionaryColumnSize(
             distinct * sizeof(int), RowCount, Layout(RowCount, DefaultPageLength), DictionaryEncoder.GetIndexBitWidth(distinct),
-            maxDefLevel: nullable ? 1 : 0, maxRepLevel: 0));
+            maxDefLevel: nullable ? 1 : 0, maxRepLevel: 0, options.Compression));
     }
 
     // BYTE_ARRAY values are random bytes of random length, so nothing compresses and nothing shares a
@@ -147,7 +147,7 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         AssertFits(size, ColumnChunkWriter.EstimateColumnSize(
             RowCount, nonNull,
             ColumnChunkWriter.PlainValueBytes(array, nonNull, PhysicalType.ByteArray, 0),
-            Layout(RowCount, DefaultPageLength), PhysicalType.ByteArray, 0, nullable ? 1 : 0, 0, deltaByteArray));
+            Layout(RowCount, DefaultPageLength), PhysicalType.ByteArray, 0, nullable ? 1 : 0, 0, deltaByteArray, options.Compression));
     }
 
     [Fact]
@@ -203,7 +203,7 @@ public class ColumnChunkSizeEstimateTests : IDisposable
             $"{layout.Count} pages: the cut was meant to shorten them");
         AssertFits(size, ColumnChunkWriter.EstimateColumnSize(
             levels, levels, levels * 4L, layout, PhysicalType.Int32, 0, maxDefLevel: 1, maxRepLevel: 1,
-            deltaByteArray: false));
+            deltaByteArray: false, options.Compression));
     }
 
     // A small DataPageRowCountLimit makes per-page costs outweigh the values: a 1-row INT32 page is
@@ -244,29 +244,70 @@ public class ColumnChunkSizeEstimateTests : IDisposable
             case "int32-nullable":
                 array = Int32Values("random", rows, nullable);
                 estimate = ColumnChunkWriter.EstimateColumnSize(
-                    rows, rows - array.NullCount, (rows - array.NullCount) * 4L, Layout(rows, limit), PhysicalType.Int32, 0, nullable ? 1 : 0, 0, false);
+                    rows, rows - array.NullCount, (rows - array.NullCount) * 4L, Layout(rows, limit), PhysicalType.Int32, 0, nullable ? 1 : 0, 0, false, options.Compression);
                 break;
             case "int64":
                 array = Int64Values("random", rows);
                 estimate = ColumnChunkWriter.EstimateColumnSize(
-                    rows, rows, rows * 8L, Layout(rows, limit), PhysicalType.Int64, 0, 0, 0, false);
+                    rows, rows, rows * 8L, Layout(rows, limit), PhysicalType.Int64, 0, 0, 0, false, options.Compression);
                 break;
             case "flba":
             case "flba-dba":
                 array = SharedPrefixFlba(rows, 16);
                 estimate = ColumnChunkWriter.EstimateColumnSize(
-                    rows, rows, rows * 16L, Layout(rows, limit), PhysicalType.FixedLenByteArray, 16, 0, 0, kind == "flba-dba");
+                    rows, rows, rows * 16L, Layout(rows, limit), PhysicalType.FixedLenByteArray, 16, 0, 0, kind == "flba-dba", options.Compression);
                 break;
             default:
                 int distinct;
                 (array, distinct) = DictionaryValues("wide", rows, nullable);
                 estimate = ColumnChunkWriter.EstimateDictionaryColumnSize(
                     distinct * sizeof(int), rows, Layout(rows, limit), DictionaryEncoder.GetIndexBitWidth(distinct),
-                    maxDefLevel: nullable ? 1 : 0, maxRepLevel: 0);
+                    maxDefLevel: nullable ? 1 : 0, maxRepLevel: 0, options.Compression);
                 break;
         }
 
         AssertFits(await WriteAndMeasure(array, options), estimate);
+    }
+
+    // A codec frames every page, and a page of a few bytes cannot cover that in proportion: a 2-byte
+    // page compresses to 22 bytes of Gzip. Checksums add a CRC to every page header.
+    [Theory]
+    [InlineData(CompressionCodec.Snappy, false)]
+    [InlineData(CompressionCodec.Gzip, false)]
+    [InlineData(CompressionCodec.Gzip, true)]
+    [InlineData(CompressionCodec.Brotli, false)]
+    [InlineData(CompressionCodec.Lz4, false)]
+    [InlineData(CompressionCodec.Zstd, false)]
+    [InlineData(CompressionCodec.Zstd, true)]
+    [InlineData(CompressionCodec.Uncompressed, true)]
+    public async Task SmallPages_EachCodec_FitTheirEstimate(CompressionCodec codec, bool checksums)
+    {
+        const int rows = 20_000;
+        var rng = new Random(508);
+        var flbaBytes = new byte[rows * 2];
+        rng.NextBytes(flbaBytes);
+        var flba = new FixedSizeBinaryArray(new ArrayData(
+            new FixedSizeBinaryType(2), rows, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(flbaBytes)]));
+        var ints = Int32Values("random", rows, nullable: false);
+        var (dictionary, distinct) = DictionaryValues("wide", rows, nullable: false);
+
+        foreach (int limit in new[] { 1, 7 })
+        {
+            var layout = Layout(rows, limit);
+            var plain = Options(codec, dictionary: false) with
+            {
+                DataPageRowCountLimit = limit,
+                PageChecksumEnabled = checksums,
+            };
+            var dictionaryOptions = plain with { DictionaryEnabled = true };
+
+            AssertFits(await WriteAndMeasure(flba, plain), ColumnChunkWriter.EstimateColumnSize(
+                rows, rows, rows * 2L, layout, PhysicalType.FixedLenByteArray, 2, 0, 0, false, codec));
+            AssertFits(await WriteAndMeasure(ints, plain), ColumnChunkWriter.EstimateColumnSize(
+                rows, rows, rows * 4L, layout, PhysicalType.Int32, 0, 0, 0, false, codec));
+            AssertFits(await WriteAndMeasure(dictionary, dictionaryOptions), ColumnChunkWriter.EstimateDictionaryColumnSize(
+                distinct * sizeof(int), rows, layout, DictionaryEncoder.GetIndexBitWidth(distinct), 0, 0, codec));
+        }
     }
 
     // DELTA_BYTE_ARRAY lengths: one value per 32 shares a 1-byte prefix with the one before, which
@@ -285,7 +326,7 @@ public class ColumnChunkSizeEstimateTests : IDisposable
 
         AssertFits(size, ColumnChunkWriter.EstimateColumnSize(
             RowCount, RowCount, (long)RowCount * typeLength, Layout(RowCount, DefaultPageLength), PhysicalType.FixedLenByteArray, typeLength, 0, 0,
-            deltaByteArray: true));
+            deltaByteArray: true, options.Compression));
         Assert.Equal(
             array.Data.Buffers[1].Span.ToArray(),
             read.Data.Buffers[1].Span.Slice(0, RowCount * typeLength).ToArray());
