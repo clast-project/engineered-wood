@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Runtime.CompilerServices;
 using Apache.Arrow;
 using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Schema;
@@ -35,35 +36,38 @@ namespace EngineeredWood.DeltaLake.Table;
 internal static class DeltaNotNullEnforcer
 {
     /// <summary>Refuses <paramref name="batch"/> if any row holds a NULL that <paramref name="schema"/> forbids.</summary>
-    /// <param name="batch">The rows being written, by logical name (a physical name is also matched).</param>
+    /// <param name="batch">The rows being written. Its fields bind to the schema's as the write's physical rename
+    /// binds them: by logical name across the whole level first, then by physical name.</param>
     /// <param name="schema">The table schema the rows are written under.</param>
     /// <param name="writerSupplied">Columns the writer fills in after this check (identity columns), keyed by
     /// name: <c>true</c> when the writer replaces any value the batch carries, <c>false</c> when it fills the
     /// column only if the batch omits it. A column the writer supplies is never refused for being absent.</param>
+    /// <param name="rows">The rows of <paramref name="batch"/> to check; null checks every row.</param>
     /// <exception cref="DeltaFormatException">A row holds a forbidden NULL.</exception>
     public static void Validate(
-        RecordBatch batch, StructType schema, IReadOnlyDictionary<string, bool>? writerSupplied = null)
+        RecordBatch batch, StructType schema, IReadOnlyDictionary<string, bool>? writerSupplied = null,
+        IReadOnlyList<int>? rows = null)
     {
-        if (batch.Length == 0)
+        if (batch.Length == 0 || rows is { Count: 0 })
             return;
 
-        var arrowFields = batch.Schema.FieldsList;
-        foreach (var field in schema.Fields)
+        var bound = Bind(batch.Schema.FieldsList, schema.Fields);
+        for (int f = 0; f < schema.Fields.Count; f++)
         {
+            var field = schema.Fields[f];
             bool replaced = false;
             bool supplied = writerSupplied is not null && writerSupplied.TryGetValue(field.Name, out replaced);
             if (supplied && replaced)
                 continue;
 
-            int index = IndexOf(arrowFields, field);
-            if (index < 0)
+            if (bound[f] < 0)
             {
                 if (!field.Nullable && !supplied)
                     throw Absent(field.Name);
                 continue;
             }
 
-            Check(field.Type, field.Nullable, batch.Column(index), slots: null, field.Name);
+            Check(field.Type, field.Nullable, batch.Column(bound[f]), rows, field.Name);
         }
     }
 
@@ -72,7 +76,39 @@ internal static class DeltaNotNullEnforcer
     private static void Check(
         DeltaDataType type, bool nullable, IArrowArray array, IReadOnlyList<int>? slots, string path)
     {
-        array = Logical(array);
+        // Nothing at or below this level can be violated, so nothing is decoded or gathered.
+        if (nullable && !Constrains(type))
+            return;
+
+        switch (array)
+        {
+            case ExtensionArray extension:
+                Check(type, nullable, extension.Storage, slots, path);
+                return;
+
+            // No validity bitmap of its own: its nulls are null runs in its values.
+            case RunEndEncodedArray runs:
+                Check(type, nullable, RunEndEncoding.Expand(runs), slots, path);
+                return;
+
+            // A row's value is the dictionary entry its index names, so a null index is a null, and the entries
+            // the present indices name are checked as the values themselves (an entry no row uses is not).
+            case DictionaryArray dictionary:
+            {
+                var indices = dictionary.Indices;
+                if (!nullable && HasNull(indices, slots))
+                    throw Violation(path);
+                var entries = new List<int>();
+                foreach (int slot in slots ?? Enumerable.Range(0, indices.Length))
+                {
+                    if (!indices.IsNull(slot))
+                        entries.Add(checked((int)IndexAt(indices, slot)));
+                }
+                Check(type, nullable, dictionary.Dictionary, entries, path);
+                return;
+            }
+        }
+
         if (!nullable && HasNull(array, slots))
             throw Violation(path);
 
@@ -83,17 +119,17 @@ internal static class DeltaNotNullEnforcer
                 var present = PresentSlots(structs, slots);
                 if (present.Count == 0)
                     return;
-                var children = ((ArrowStructType)structs.Data.DataType).Fields;
-                foreach (var child in declared.Fields)
+                var bound = Bind(((ArrowStructType)structs.Data.DataType).Fields, declared.Fields);
+                for (int f = 0; f < declared.Fields.Count; f++)
                 {
-                    int index = IndexOf(children, child);
-                    if (index < 0)
+                    var child = declared.Fields[f];
+                    if (bound[f] < 0)
                     {
                         if (!child.Nullable)
                             throw Absent(path + "." + child.Name);
                         continue;
                     }
-                    Check(child.Type, child.Nullable, structs.Fields[index], present, path + "." + child.Name);
+                    Check(child.Type, child.Nullable, structs.Fields[bound[f]], present, path + "." + child.Name);
                 }
                 return;
             }
@@ -146,44 +182,29 @@ internal static class DeltaNotNullEnforcer
         // to judge.
     }
 
-    // The array whose validity a row's value is read from: an extension's storage, a run-end encoded array
-    // expanded (its nulls are null runs in its values, and it has no validity bitmap of its own).
-    private static IArrowArray Logical(IArrowArray array) => array switch
-    {
-        ExtensionArray extension => Logical(extension.Storage),
-        RunEndEncodedArray runs => Logical(RunEndEncoding.Expand(runs)),
-        _ => array,
-    };
+    // Whether anything strictly below a value of this type is non-nullable. A map always is: its keys.
+    private static bool Constrains(DeltaDataType type) =>
+        type is PrimitiveType ? false : ConstrainsCache.GetValue(type, static t => new StrongBox<bool>(t switch
+        {
+            StructType s => s.Fields.Any(f => !f.Nullable || Constrains(f.Type)),
+            ArrayType a => !a.ContainsNull || Constrains(a.ElementType),
+            MapType => true,
+            _ => false,
+        })).Value;
+
+    // Keyed weakly on the schema's type objects, which a snapshot reuses for every batch it writes.
+    private static readonly ConditionalWeakTable<DeltaDataType, StrongBox<bool>> ConstrainsCache = new();
 
     private static bool HasNull(IArrowArray array, IReadOnlyList<int>? slots)
     {
-        // A valid index that points at a null dictionary value is a null too.
-        var dictionaryValues = (array as DictionaryArray)?.Dictionary;
-        bool valuesHaveNulls = dictionaryValues is not null && dictionaryValues.NullCount > 0;
-        if (array.NullCount == 0 && !valuesHaveNulls)
+        if (array.NullCount == 0)
             return false;
-
         if (slots is null)
-        {
-            for (int i = 0; i < array.Length; i++)
-                if (IsNull(array, i, valuesHaveNulls))
-                    return true;
-            return false;
-        }
+            return true;
         foreach (int slot in slots)
-            if (IsNull(array, slot, valuesHaveNulls))
+            if (array.IsNull(slot))
                 return true;
         return false;
-    }
-
-    private static bool IsNull(IArrowArray array, int index, bool dictionaryValuesHaveNulls)
-    {
-        if (array.IsNull(index))
-            return true;
-        if (!dictionaryValuesHaveNulls)
-            return false;
-        var dictionary = (DictionaryArray)array;
-        return dictionary.Dictionary.IsNull(checked((int)IndexAt(dictionary.Indices, index)));
     }
 
     private static long IndexAt(IArrowArray indices, int i) => indices switch
@@ -202,17 +223,10 @@ internal static class DeltaNotNullEnforcer
     private static List<int> PresentSlots(IArrowArray parent, IReadOnlyList<int>? slots)
     {
         var result = new List<int>();
-        if (slots is null)
+        foreach (int slot in slots ?? Enumerable.Range(0, parent.Length))
         {
-            for (int i = 0; i < parent.Length; i++)
-                if (!parent.IsNull(i))
-                    result.Add(i);
-        }
-        else
-        {
-            foreach (int slot in slots)
-                if (!parent.IsNull(slot))
-                    result.Add(slot);
+            if (!parent.IsNull(slot))
+                result.Add(slot);
         }
         return result;
     }
@@ -229,21 +243,37 @@ internal static class DeltaNotNullEnforcer
         return elements;
     }
 
-    // By logical name, or by physical name under column mapping, as the write paths' rename accepts either.
-    private static int IndexOf(IReadOnlyList<Field> arrowFields, StructField declared)
+    // For each declared field, the index of the Arrow field the write's physical rename binds to it, or -1. That
+    // rename (ColumnMappingRecursive.ToPhysical) resolves an Arrow name by LOGICAL name across the whole level
+    // first and by physical name only when no field has that logical name. After a rename one column's physical
+    // name can be another's logical name, so matching either spelling field by field could credit a column
+    // with another column's values.
+    private static int[] Bind(IReadOnlyList<Field> arrowFields, IReadOnlyList<StructField> declared)
     {
-        string? physical = null;
-        declared.Metadata?.TryGetValue(ColumnMapping.PhysicalNameKey, out physical);
+        var byLogical = new Dictionary<string, int>(StringComparer.Ordinal);
+        var byPhysical = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int f = 0; f < declared.Count; f++)
+        {
+            if (!byLogical.ContainsKey(declared[f].Name))
+                byLogical[declared[f].Name] = f;
+            if (declared[f].Metadata is { } md
+                && md.TryGetValue(ColumnMapping.PhysicalNameKey, out var physical)
+                && !byPhysical.ContainsKey(physical))
+            {
+                byPhysical[physical] = f;
+            }
+        }
+
+        var bound = new int[declared.Count];
+        for (int f = 0; f < bound.Length; f++)
+            bound[f] = -1;
         for (int i = 0; i < arrowFields.Count; i++)
         {
             string name = arrowFields[i].Name;
-            if (string.Equals(name, declared.Name, StringComparison.Ordinal)
-                || (physical is not null && string.Equals(name, physical, StringComparison.Ordinal)))
-            {
-                return i;
-            }
+            if ((byLogical.TryGetValue(name, out int f) || byPhysical.TryGetValue(name, out f)) && bound[f] < 0)
+                bound[f] = i;
         }
-        return -1;
+        return bound;
     }
 
     private static DeltaFormatException Violation(string path) => new(

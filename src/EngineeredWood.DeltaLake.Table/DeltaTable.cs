@@ -8711,9 +8711,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 outTracking?.Add(materializeIds ? (idb!.Build(), vdb!.Build()) : ((Int64Array, Int64Array)?)null);
                 // The post-image's NOT NULL columns (#514). Only the selected rows, as UPDATE checks only its
                 // post-image: the rest are copied through, and re-checking them would refuse this update over a
-                // null an earlier writer left behind.
-                if (matchedRows.Count > 0)
-                    DeltaNotNullEnforcer.Validate(TakeRowsFromBatch(rewritten[bi], matchedRows), snapshot.Schema);
+                // null an earlier writer left behind. Read in place rather than gathered: a host writer's batch
+                // may hold a representation (a dictionary) the gather does not take.
+                DeltaNotNullEnforcer.Validate(rewritten[bi], snapshot.Schema, rows: matchedRows);
                 if (cdfEnabled && matchedRows.Count > 0)
                 {
                     // Both images are the same rows, so one id array serves both; the pre-image keeps the

@@ -243,6 +243,104 @@ public class NotNullDataColumnTests : IDisposable
     }
 
     /// <summary>
+    /// A dictionary of structs: each row's value is the entry its index names, so a present entry's NULL
+    /// <c>NOT NULL</c> child is a violation, and one in an entry no row names is not.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Enforcer_DictionaryOfStructs_ChecksTheNamedEntries(bool namesTheBadEntry)
+    {
+        var schema = new DeltaLake.Schema.StructType
+        {
+            Fields =
+            [
+                new DeltaLake.Schema.StructField
+                {
+                    Name = "s", Nullable = true,
+                    Type = new DeltaLake.Schema.StructType
+                    {
+                        Fields =
+                        [
+                            new DeltaLake.Schema.StructField
+                            {
+                                Name = "c", Type = new DeltaLake.Schema.PrimitiveType { TypeName = "integer" },
+                                Nullable = false,
+                            },
+                        ],
+                    },
+                },
+            ],
+        };
+        var structType = new StructType([new Field("c", Int32Type.Default, true)]);
+        var entries = new StructArray(
+            structType, 2, [new Int32Array.Builder().Append(1).AppendNull().Build()],
+            ArrowBuffer.Empty, nullCount: 0);
+        var indices = new Int32Array.Builder().Append(0).Append(namesTheBadEntry ? 1 : 0).Build();
+        var type = new DictionaryType(Int32Type.Default, structType, false);
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("s", type, true)).Build(),
+            [new DictionaryArray(type, indices, entries)], 2);
+
+        if (namesTheBadEntry)
+            AssertNotNullViolation(
+                Assert.Throws<DeltaFormatException>(() => DeltaNotNullEnforcer.Validate(batch, schema)), "s.c");
+        else
+            DeltaNotNullEnforcer.Validate(batch, schema);
+    }
+
+    /// <summary>
+    /// After a rename, one column's physical name can be another's logical name: <c>x NOT NULL</c> stored as
+    /// <c>a</c>, beside a nullable column now NAMED <c>a</c>. The write binds a batch field by logical name
+    /// first, so a batch carrying only <c>a</c> omits <c>x</c> and must be refused, not credited with
+    /// <c>a</c>'s values.
+    /// </summary>
+    [Fact]
+    public void Enforcer_ReusedName_BindsLogicalFirst()
+    {
+        static DeltaLake.Schema.StructField Column(string name, string physical, bool nullable) => new()
+        {
+            Name = name, Type = new DeltaLake.Schema.PrimitiveType { TypeName = "string" }, Nullable = nullable,
+            Metadata = new Dictionary<string, string> { [DeltaLake.Schema.ColumnMapping.PhysicalNameKey] = physical },
+        };
+        var schema = new DeltaLake.Schema.StructType
+        {
+            Fields = [Column("x", "a", nullable: false), Column("a", "col-2", nullable: true)],
+        };
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("a", StringType.Default, true)).Build(),
+            [new StringArray.Builder().Append("v").Build()], 1);
+
+        AssertNotNullViolation(
+            Assert.Throws<DeltaFormatException>(() => DeltaNotNullEnforcer.Validate(batch, schema)), "x");
+
+        // And a physical-named batch still binds by physical name where no logical name claims it.
+        var physical = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("col-2", StringType.Default, true)).Build(),
+            [new StringArray.Builder().AppendNull().Build()], 1);
+        AssertNotNullViolation(
+            Assert.Throws<DeltaFormatException>(() => DeltaNotNullEnforcer.Validate(physical, schema)), "x");
+    }
+
+    /// <summary>
+    /// Only the given rows are checked, read in place (a host writer's dictionary column is not gathered, which
+    /// the gather cannot do).
+    /// </summary>
+    [Fact]
+    public void Enforcer_Rows_ChecksOnlyThoseRows()
+    {
+        var dictionary = new StringArray.Builder().Append("a").Build();
+        var indices = new Int32Array.Builder().Append(0).AppendNull().Build();
+        var type = new DictionaryType(Int32Type.Default, StringType.Default, false);
+        var batch = WithV(Rows("x", "y"), new DictionaryArray(type, indices, dictionary), type);
+
+        DeltaNotNullEnforcer.Validate(batch, DeltaSchema, rows: [0]);
+        AssertNotNullViolation(
+            Assert.Throws<DeltaFormatException>(() => DeltaNotNullEnforcer.Validate(batch, DeltaSchema, rows: [1])),
+            "v");
+    }
+
+    /// <summary>
     /// <c>s STRUCT&lt;c INT NOT NULL&gt;</c>, nullable: <c>c</c> applies only where <c>s</c> holds a value, so a
     /// null <c>c</c> under a null <c>s</c> is fine and one under a present <c>s</c> is not.
     /// </summary>
