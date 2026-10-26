@@ -333,7 +333,6 @@ var selection = RowSelection.FromRowAddresses(doomedAddresses, txn.Snapshot);
 var files = await table.WriteDataFilesAsync(newRows);   // or your own writer
 txn.StageDataFiles(files);
 await txn.StageRowDeletesAsync(selection);
-await txn.StageChangeDataAsync(deletedRows, "delete");
 
 long version = await txn.CommitAsync();   // ONE atomic version
 ```
@@ -346,13 +345,23 @@ vector its protocol never declared. Pass `RowDeleteMode.CopyOnWrite` to stage it
 touched file is rewritten at staging time without the selected rows (an abort deletes the rewrite), and the
 commit carries `remove`(old) + `add`(rewritten). The two modes differ on the Change Data Feed:
 
-- **Deletion vector** writes no change rows, as Spark's vector DML doesn't. Stage them yourself with
-  `StageChangeDataAsync`, as above, if you want a change file.
-- **Copy-on-write** writes its own `delete` change file, as an immediate copy-on-write delete does. Don't
-  stage those rows again: they would appear twice in the feed.
+- **Deletion vector** writes no change rows at staging, as Spark's vector DML doesn't. The feed infers the
+  deleted rows from the vectors.
+- **Copy-on-write** writes its own `delete` change file, as an immediate copy-on-write delete does.
 
-A commit that carries any change file is read from its change files alone, so the rest of the transaction's
-data changes need change rows too. See #530.
+A commit that carries any change file is read from its change files alone, and one operation per commit
+(as Spark and delta-rs write) never mixes the two kinds. A transaction can. So when the commit carries a
+change file from anything (a copy-on-write delete, a computed `DeleteAsync` or `UpdateAsync`,
+`StageChangeDataAsync`, a raw `cdc` action), it also writes change rows for every staged append (`insert`)
+and deletion-vector delete (`delete`). Nothing you staged drops out of the feed, and you don't need to
+stage those rows yourself (#530).
+
+If you do stage an operation's change rows yourself with `StageChangeDataAsync`, pass
+`changeDataStagedByCaller: true` to the call that staged the operation (`StageDataFiles`,
+`StageDataFilesAsync`, or `StageRowDeletesAsync(selection, mode, ct, changeDataStagedByCaller: true)`).
+Otherwise the rows appear twice. For a copy-on-write delete the flag also stops its own change file from
+being written. Coverage is per operation: the library can't match your rows against what changed. Actions
+you stage raw with `StageActions` are yours to cover.
 
 ### Abandoning a transaction
 

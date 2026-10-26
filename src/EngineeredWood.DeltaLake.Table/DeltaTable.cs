@@ -2738,7 +2738,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// exactly the files it removes, so the removed paths are both the read-set (concurrentDeleteRead)
     /// and the planned removes (delete/delete).
     /// </summary>
-    internal ValueTask<long> CommitTransactionAsync(
+    internal async ValueTask<long> CommitTransactionAsync(
         DeltaTransaction transaction, CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
@@ -2821,7 +2821,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        return CommitOccAsync(
+        var (filled, insertFillIn) = await FillInChangeDataAsync(transaction, actions, cancellationToken)
+            .ConfigureAwait(false);
+        actions = filled;
+
+        return await CommitOccAsync(
             baseSnapshot, actions, reads,
             transaction.IsolationLevel, transaction.EffectiveOperation, rebaseSafe: true,
             cancellationToken,
@@ -2833,7 +2837,148 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             // The host's claim, passed through verbatim. NOT derived from `reads` above: a transaction
             // records the reads made THROUGH it, and a host that scanned the table itself and staged the
             // result made one this library never saw.
-            isBlindAppend: transaction.EffectiveIsBlindAppend);
+            isBlindAppend: transaction.EffectiveIsBlindAppend,
+            insertFillIn: insertFillIn).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Writes change rows for the staged operations that wrote none of their own, when the commit would
+    /// otherwise lose them from the feed (#530).
+    ///
+    /// <para>A reader takes a version's <c>cdc</c> actions as the whole of its change feed whenever it has any,
+    /// and infers from <c>add</c>/<c>remove</c> only when it has none. One operation per commit, as Spark and
+    /// delta-rs write, never mixes the two; a transaction can. So once anything in it writes a change file (a
+    /// computed DELETE or UPDATE, a copy-on-write staged delete,
+    /// <see cref="DeltaTransaction.StageChangeDataAsync"/>, a raw <c>cdc</c> action), each staged append
+    /// becomes <c>insert</c> rows and each staged deletion-vector delete <c>delete</c> rows, unless its staging
+    /// call said the host covers it. A commit with no change file writes none and stays inferred, which is what
+    /// one operation's commit does.</para>
+    ///
+    /// <para>Coverage is per staged operation, not per row: rows a host stages for some statement cannot be
+    /// matched against what changed.</para>
+    /// </summary>
+    private async ValueTask<(IReadOnlyList<DeltaAction> Actions, InsertChangeDataFillIn? InsertFillIn)>
+        FillInChangeDataAsync(
+            DeltaTransaction transaction, IReadOnlyList<DeltaAction> actions, CancellationToken cancellationToken)
+    {
+        var snapshot = transaction.BaseSnapshot;
+        if (transaction.UncoveredAppends.Count == 0 && transaction.UncoveredVectorDeletes.Count == 0)
+            return (actions, null);
+        if (!DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration)
+            || !actions.Any(static a => a is CdcFile))
+        {
+            return (actions, null);
+        }
+
+        var filled = new List<DeltaAction>(actions);
+        var written = transaction.Written;
+
+        if (transaction.UncoveredVectorDeletes.Count > 0)
+        {
+            // Read from the BASE file: the rows a vector newly hides are the same rows wherever a rebase moves
+            // them (a concurrent compaction remaps them by stable id), so these files never need rewriting.
+            var byPath = ActiveFilesByPath(snapshot);
+            foreach (var edit in transaction.UncoveredVectorDeletes)
+            {
+                filled.AddRange(await WriteVectorDeleteChangeDataAsync(
+                    snapshot, byPath[edit.Path], edit.NewlyDeletedRows, cancellationToken, written)
+                    .ConfigureAwait(false));
+            }
+        }
+
+        InsertChangeDataFillIn? insertFillIn = null;
+        if (transaction.UncoveredAppends.Count > 0)
+        {
+            bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
+            insertFillIn = rowTracking ? new InsertChangeDataFillIn(this, snapshot, written) : null;
+            foreach (var add in transaction.UncoveredAppends)
+            {
+                var files = await WriteInsertChangeDataAsync(snapshot, add, cancellationToken, written)
+                    .ConfigureAwait(false);
+                filled.AddRange(files);
+                insertFillIn?.Record(add, files);
+            }
+        }
+
+        return (filled, insertFillIn);
+    }
+
+    /// <summary>
+    /// The <c>insert</c> change files a transaction's fill-in wrote for its appends on a row-tracking table, kept
+    /// so a rebase can write them again. Each row's id is its add's <c>baseRowId</c> plus its position, and a
+    /// rebase re-derives that <c>baseRowId</c> against the advanced high-water mark
+    /// (<see cref="RebaseRowTrackingAddIds"/>), so files written for the old one would name ids the commit no
+    /// longer assigns. A change file is the only place a change row's identity lives (a <c>cdc</c> action has
+    /// no <c>baseRowId</c> to shift), so it is rewritten rather than adjusted.
+    /// </summary>
+    internal sealed class InsertChangeDataFillIn
+    {
+        private readonly DeltaTable _table;
+        private readonly Snapshot.Snapshot _snapshot;
+        private readonly WrittenFileLedger _written;
+        // By add.path: the baseRowId the current files were written for, and the files.
+        private readonly Dictionary<string, (long? BaseRowId, List<CdcFile> Files)> _byAdd =
+            new(StringComparer.Ordinal);
+        // Every fill-in file the STAGED actions carry. Each rebase starts again from those actions.
+        private readonly HashSet<string> _stagedPaths = new(StringComparer.Ordinal);
+
+        public InsertChangeDataFillIn(DeltaTable table, Snapshot.Snapshot snapshot, WrittenFileLedger written)
+        {
+            _table = table;
+            _snapshot = snapshot;
+            _written = written;
+        }
+
+        public void Record(AddFile add, List<CdcFile> files)
+        {
+            _byAdd[add.Path] = (add.BaseRowId, files);
+            foreach (var f in files)
+                _stagedPaths.Add(f.Path);
+        }
+
+        /// <summary>
+        /// Swaps the staged fill-in files in <paramref name="actions"/> for ones matching the ids the rebased
+        /// adds now carry, writing new ones only for an add whose <c>baseRowId</c> moved since its files were
+        /// last written. A superseded attempt's files are deleted at once: a commit that lands clears the
+        /// ledger, which would otherwise forget them. They leave the ledger only after every replacement is
+        /// written, so a write that fails part way leaves both old and new files for the abort to collect.
+        /// </summary>
+        public async ValueTask<IReadOnlyList<DeltaAction>> RebaseAsync(
+            IReadOnlyList<DeltaAction> actions, CancellationToken cancellationToken)
+        {
+            var supersededPaths = new List<string>();
+            foreach (var action in actions)
+            {
+                if (action is not AddFile add || !_byAdd.TryGetValue(add.Path, out var current)
+                    || current.BaseRowId == add.BaseRowId)
+                {
+                    continue;
+                }
+                var replacement = await _table.WriteInsertChangeDataAsync(
+                    _snapshot, add, cancellationToken, _written).ConfigureAwait(false);
+                foreach (var f in current.Files)
+                    supersededPaths.Add(DeltaPath.Decode(f.Path));
+                _byAdd[add.Path] = (add.BaseRowId, replacement);
+            }
+            if (supersededPaths.Count > 0)
+            {
+                var superseded = new WrittenFileLedger();
+                foreach (string path in _written.TakeRecorded(supersededPaths))
+                    superseded.Record(path);
+                await _table.DeleteWrittenFilesAsync(superseded, cancellationToken).ConfigureAwait(false);
+            }
+
+            var result = new List<DeltaAction>(actions.Count);
+            foreach (var action in actions)
+            {
+                if (action is CdcFile cdc && _stagedPaths.Contains(cdc.Path))
+                    continue;
+                result.Add(action);
+            }
+            foreach (var entry in _byAdd.Values)
+                result.AddRange(entry.Files);
+            return result;
+        }
     }
 
     /// <summary>
@@ -3019,7 +3164,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<DeltaTransaction.AppTransactionRequirement>? appTransactions = null,
         WrittenFileLedger? written = null,
         bool? isBlindAppend = null,
-        ICommitRebaseHandler? rebase = null)
+        ICommitRebaseHandler? rebase = null,
+        InsertChangeDataFillIn? insertFillIn = null)
     {
         ThrowIfDisposed();
 
@@ -3044,7 +3190,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 // from their sources, neither of which OccRebaseHandler's rule fits), so it brings a
                 // handler of its own rather than bend this one to two shapes.
                 Rebase = rebase ?? (rowLevel || rowTrackingEnabled
-                    ? new OccRebaseHandler(this, rowLevelDeletes, rowTrackingEnabled, written)
+                    ? new OccRebaseHandler(this, rowLevelDeletes, rowTrackingEnabled, written, insertFillIn)
                     : null),
                 Precondition = appTransactions is { Count: > 0 }
                     ? (snapshot, concurrent) =>
@@ -3111,18 +3257,21 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         private readonly IReadOnlyList<DeleteDvEdit>? _rowLevelDeletes;
         private readonly bool _rowTrackingEnabled;
         private readonly WrittenFileLedger? _written;
+        private readonly InsertChangeDataFillIn? _insertFillIn;
         private ISet<string>? _priorResolvedPaths;
 
         public OccRebaseHandler(
             DeltaTable table,
             IReadOnlyList<DeleteDvEdit>? rowLevelDeletes,
             bool rowTrackingEnabled,
-            WrittenFileLedger? written)
+            WrittenFileLedger? written,
+            InsertChangeDataFillIn? insertFillIn = null)
         {
             _table = table;
             _rowLevelDeletes = rowLevelDeletes;
             _rowTrackingEnabled = rowTrackingEnabled;
             _written = written;
+            _insertFillIn = insertFillIn;
         }
 
         private bool RowLevel => _rowLevelDeletes is { Count: > 0 };
@@ -3193,6 +3342,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 actions = RebaseRowTrackingAddIds(
                     actions, context.BaseSnapshot, context.LatestSnapshot!,
                     context.NextAttemptVersion, resolvedPaths);
+
+                // The fill-in's insert rows carry those ids, so they follow them.
+                if (_insertFillIn is not null)
+                    actions = await _insertFillIn.RebaseAsync(actions, cancellationToken).ConfigureAwait(false);
             }
 
             return new CommitRebase(actions, resolvedPaths);
@@ -7968,47 +8121,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             removedPaths.Add(addFile.Path);
             dvEdits.Add(new DeleteDvEdit(addFile.Path, newPositions));
 
-            // Change Data Feed: a DV delete rewrites no data, so read the newly-deleted rows (matched by
-            // ABSOLUTE position — the file's original DV survivors keep their absolute positions) and emit a
-            // "delete" change file.
+            // Change Data Feed: a DV delete rewrites no data, so the change file is read back from the file.
             if (cdfEnabled)
             {
-                bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-                    snapshot.Metadata.Configuration);
-                var newSet = new HashSet<long>(newPositions);
-                var absOut = new List<Int64Array?>();
-                // The deleted rows' stable identity, for the change file. ReadFileAsync resolves it (materialized
-                // else baseRowId + position) on the same batches the positions come from, so they stay aligned.
-                var idsOut = rowTracking ? new List<Int64Array?>() : null;
-                var versOut = rowTracking ? new List<Int64Array?>() : null;
-                int bi = -1;
-                await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
-                                                          strippedRowIdsOut: idsOut,
-                                                          strippedVersionsOut: versOut,
-                                                          strippedAbsPositionsOut: absOut).ConfigureAwait(false))
-                {
-                    bi++;
-                    var absPos = bi < absOut.Count ? absOut[bi] : null;
-                    if (absPos is null)
-                        continue;
-                    var delRows = new List<int>();
-                    for (int i = 0; i < batch.Length; i++)
-                        if (!absPos.IsNull(i) && newSet.Contains(absPos.GetValue(i)!.Value))
-                            delRows.Add(i);
-                    if (delRows.Count > 0)
-                    {
-                        var batchIds = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
-                        var batchVers = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
-                        var cdc = await ChangeDataFeed.CdfWriter.WriteAsync(
-                            _fs, snapshot, TakeRowsFromBatch(batch, delRows), DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                            addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                            cancellationToken,
-                            batchIds is not null ? TakeIds(batchIds, delRows) : null,
-                            batchVers is not null ? TakeIds(batchVers, delRows) : null,
-                            written).ConfigureAwait(false);
-                        actions.Add(cdc);
-                    }
-                }
+                actions.AddRange(await WriteVectorDeleteChangeDataAsync(
+                    snapshot, addFile, newPositions, cancellationToken, written).ConfigureAwait(false));
             }
         }
 
@@ -8022,6 +8139,92 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written,
             isBlindAppend: false).ConfigureAwait(false);
         return (totalDeleted, version);
+    }
+
+    /// <summary>
+    /// The <c>delete</c> change files for a deletion-vector delete of <paramref name="newPositions"/> from
+    /// <paramref name="addFile"/>. A vector rewrites no data, so the rows are read back from the file, matched by
+    /// ABSOLUTE position (the survivors of the file's existing vector keep their absolute positions), with their
+    /// stable identity on a row-tracking table. Shared by the auto-committing vector delete and a transaction's
+    /// change-data fill-in.
+    /// </summary>
+    internal async ValueTask<List<CdcFile>> WriteVectorDeleteChangeDataAsync(
+        Snapshot.Snapshot snapshot,
+        AddFile addFile,
+        IEnumerable<long> newPositions,
+        CancellationToken cancellationToken,
+        WrittenFileLedger? written)
+    {
+        bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
+        var newSet = new HashSet<long>(newPositions);
+        var absOut = new List<Int64Array?>();
+        // The deleted rows' stable identity, for the change file. ReadFileAsync resolves it (materialized
+        // else baseRowId + position) on the same batches the positions come from, so they stay aligned.
+        var idsOut = rowTracking ? new List<Int64Array?>() : null;
+        var versOut = rowTracking ? new List<Int64Array?>() : null;
+        var files = new List<CdcFile>();
+        int bi = -1;
+        await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
+                                                  strippedRowIdsOut: idsOut,
+                                                  strippedVersionsOut: versOut,
+                                                  strippedAbsPositionsOut: absOut).ConfigureAwait(false))
+        {
+            bi++;
+            var absPos = bi < absOut.Count ? absOut[bi] : null;
+            if (absPos is null)
+                continue;
+            var delRows = new List<int>();
+            for (int i = 0; i < batch.Length; i++)
+                if (!absPos.IsNull(i) && newSet.Contains(absPos.GetValue(i)!.Value))
+                    delRows.Add(i);
+            if (delRows.Count > 0)
+            {
+                var batchIds = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
+                var batchVers = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
+                files.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
+                    _fs, snapshot, TakeRowsFromBatch(batch, delRows), DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                    addFile.PartitionValues, DataFileWriteOptions(snapshot),
+                    cancellationToken,
+                    batchIds is not null ? TakeIds(batchIds, delRows) : null,
+                    batchVers is not null ? TakeIds(batchVers, delRows) : null,
+                    written).ConfigureAwait(false));
+            }
+        }
+        return files;
+    }
+
+    /// <summary>
+    /// The <c>insert</c> change files for an appended file: its rows as a reader would see them, so a vector it
+    /// was born with hides what it hides. On a row-tracking table each row carries <c>baseRowId</c> + its
+    /// position as its id, which is why a rebase that moves the add's <c>baseRowId</c> must write these again
+    /// (<see cref="InsertChangeDataFillIn"/>). The commit version is left null: a change file's null version
+    /// reads as the version it was committed in, which is exactly an inserted row's, wherever the commit lands.
+    /// </summary>
+    internal async ValueTask<List<CdcFile>> WriteInsertChangeDataAsync(
+        Snapshot.Snapshot snapshot,
+        AddFile addFile,
+        CancellationToken cancellationToken,
+        WrittenFileLedger? written)
+    {
+        bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
+        var idsOut = rowTracking ? new List<Int64Array?>() : null;
+        var files = new List<CdcFile>();
+        int bi = -1;
+        await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
+                                                  strippedRowIdsOut: idsOut).ConfigureAwait(false))
+        {
+            bi++;
+            if (batch.Length == 0)
+                continue;
+            files.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
+                _fs, snapshot, batch, DeltaLake.ChangeDataFeed.CdfConfig.Insert,
+                addFile.PartitionValues, DataFileWriteOptions(snapshot),
+                cancellationToken,
+                idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null,
+                rowCommitVersions: null,
+                written).ConfigureAwait(false));
+        }
+        return files;
     }
 
     /// <summary>
@@ -8064,7 +8267,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>The remove/add (and change-data) actions a copy-on-write DELETE produces, the paths it
     /// rewrote, and the rows it deleted — everything a commit needs, without committing. Shared by the
     /// auto-committing <see cref="DeleteRowsAsync"/> and the transactional
-    /// <see cref="DeltaTransaction.StageRowDeletesAsync(RowSelection, RowDeleteMode, CancellationToken)"/>.</summary>
+    /// <see cref="DeltaTransaction.StageRowDeletesAsync(RowSelection, RowDeleteMode, CancellationToken, bool)"/>.</summary>
     internal sealed record CopyOnWriteDeleteActions(
         IReadOnlyList<DeltaAction> Actions, ISet<string> RemovedPaths, long RowsDeleted, long NextRowId);
 
@@ -8079,12 +8282,15 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="ComputeUpdateActionsAsync"/>. Null starts at the snapshot's mark.</param>
     /// <param name="written">Records the rewritten and change-data files. The files it REMOVES are not
     /// recorded: they are the table's data until the commit lands, so an abort must leave them in place.</param>
+    /// <param name="writeChangeData">False when the caller writes this delete's change rows itself, so none are
+    /// written here even on a Change Data Feed table.</param>
     internal async ValueTask<CopyOnWriteDeleteActions> ComputeCopyOnWriteDeleteActionsAsync(
         RowSelection selection,
         Snapshot.Snapshot snapshot,
         CancellationToken cancellationToken,
         long? rowIdStart = null,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        bool writeChangeData = true)
     {
         RejectCopyOnWriteRowIdUnsupported("copy-on-write DELETE");
 
@@ -8094,7 +8300,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         bool materializeIds = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
-        bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
+        bool cdfEnabled = writeChangeData
+            && DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         long newVersion = snapshot.Version + 1;
         long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
 

@@ -116,4 +116,84 @@ public class CdfDeletionVectorInteropTests : IDisposable
             spark);
         Assert.Equal(spark, ours);
     }
+
+    /// <summary>
+    /// The other direction, for a commit no Spark operation writes: one engineered-wood transaction fusing a
+    /// copy-on-write delete (which writes a change file), a vector delete and an append (which write none).
+    /// The version is read from its change files alone, so the commit fills in the other two (#530), and
+    /// Spark's feed of it must report all three operations, as ours does.
+    /// </summary>
+    [SkippableFact]
+    public async Task EwMultiOperationTransaction_SparkFeedReportsEveryOperation()
+    {
+        Spark.Require();
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        long version;
+        await using (var table = await DeltaTable.CreateAsync(
+            fs, IdSchema, enableDeletionVectors: true, enableRowTracking: true,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" }))
+        {
+            await table.WriteAsync([Ids(1, 2, 3)]);
+            await table.WriteAsync([Ids(11, 12, 13)]);
+            var ordered = table.CurrentSnapshot.ActiveFiles.Values
+                .Select(a => a.Path).OrderBy(p => p, StringComparer.Ordinal).ToList();
+
+            // Which file holds which rows: each write is one file, its rows in the order written.
+            string fileOf1 = "", fileOf11 = "";
+            await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress }))
+            {
+                var ids = (Int64Array)batch.Column("id");
+                var rids = (Int64Array)batch.Column(TransientRowAddress.ColumnName);
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    string path = ordered[TransientRowAddress.FileOrdinal(rids.GetValue(i)!.Value)];
+                    if (ids.GetValue(i) == 1) fileOf1 = path;
+                    if (ids.GetValue(i) == 11) fileOf11 = path;
+                }
+            }
+
+            var txn = table.StartTransaction();
+            await txn.StageRowDeletesAsync(At(fileOf1, 1), RowDeleteMode.CopyOnWrite); // id 2
+            await txn.StageRowDeletesAsync(At(fileOf11, 2));                           // id 13, by vector
+            await txn.WriteAsync([Ids(20, 21)]);
+            version = await txn.CommitAsync();
+        }
+
+        Assert.Contains(await new TransactionLog(fs).ReadCommitAsync(version), a => a is CdcFile);
+
+        var spark = Spark.Invoke("read_changes", new { path = _tempDir, start = version, end = version })
+            .GetProperty("rows").EnumerateArray()
+            .Select(r => (Type: r.GetProperty("_change_type").GetString()!, Id: r.GetProperty("id").GetInt64()))
+            .OrderBy(r => r.Type, StringComparer.Ordinal).ThenBy(r => r.Id)
+            .ToList();
+
+        var ours = new List<(string Type, long Id)>();
+        await using (var reader = await DeltaTable.OpenAsync(fs))
+        {
+            await foreach (var batch in reader.ReadChangesAsync(
+                new DeltaChangeReadOptions { StartVersion = version, EndVersion = version }))
+            {
+                var ids = (Int64Array)batch.Column("id");
+                var types = (StringArray)batch.Column("_change_type");
+                for (int i = 0; i < batch.Length; i++)
+                    ours.Add((types.GetString(i), ids.GetValue(i)!.Value));
+            }
+        }
+        ours = [.. ours.OrderBy(r => r.Type, StringComparer.Ordinal).ThenBy(r => r.Id)];
+
+        Assert.Equal(
+            new (string, long)[] { ("delete", 2), ("delete", 13), ("insert", 20), ("insert", 21) },
+            spark);
+        Assert.Equal(spark, ours);
+    }
+
+    private static RecordBatch Ids(params long[] ids) =>
+        new(IdSchema, [new Int64Array.Builder().AppendRange(ids).Build()], ids.Length);
+
+    private static RowSelection At(string path, long position) =>
+        RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal)
+        {
+            [path] = new HashSet<long> { position },
+        });
 }
