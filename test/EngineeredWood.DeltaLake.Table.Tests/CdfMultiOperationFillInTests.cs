@@ -345,6 +345,87 @@ public class CdfMultiOperationFillInTests : IDisposable
         Assert.Empty(await OrphanChangeFilesAsync());
     }
 
+    /// <summary>A rebase rewrites each append's insert files in turn. If a rewrite fails part way, the files
+    /// it was replacing, and those an earlier rewrite in the same pass already replaced, must still be the
+    /// abort's to collect.</summary>
+    [Fact]
+    public async Task ARebaseRewriteThatFails_LeavesEveryFillInFileForTheAbort()
+    {
+        var faulting = new FailNthChangeFileFileSystem(Fs);
+        await using var table = await DeltaTable.CreateAsync(
+            faulting, BuildSchema(), enableDeletionVectors: true, enableRowTracking: true,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" });
+        await table.WriteAsync([Batch(1, 3)]);
+        await table.WriteAsync([Batch(11, 3)]);
+        var at = await LocateRowsAsync(table);
+
+        await using var txn = table.StartTransaction();
+        await txn.StageRowDeletesAsync(Sel(at[2]), RowDeleteMode.CopyOnWrite);
+        await txn.WriteAsync([Batch(50, 1)]);
+        await txn.WriteAsync([Batch(60, 1)]);
+
+        // The racer moves both appends' ids, so the rebase rewrites both appends' insert files.
+        await using (var racer = await OpenAsync())
+            await racer.WriteAsync([Batch(100, 2)]);
+
+        // Two initial fill-in files, then the first rewrite lands and the second is refused.
+        faulting.FailChangeFileCreate = 4;
+        await Assert.ThrowsAsync<IOException>(async () => await txn.CommitAsync());
+        faulting.FailChangeFileCreate = 0;
+        await txn.AbortAsync();
+
+        Assert.Empty(await OrphanChangeFilesAsync());
+    }
+
+    /// <summary>Refuses the <see cref="FailChangeFileCreate"/>th change-file create counted from when it is set.
+    /// </summary>
+    private sealed class FailNthChangeFileFileSystem(IO.ITableFileSystem inner) : IO.ITableFileSystem
+    {
+        private int _failAt;
+        private int _seen;
+
+        public int FailChangeFileCreate
+        {
+            get => _failAt;
+            set { _failAt = value; _seen = 0; }
+        }
+
+        public IO.PathNameConstraints PathConstraints => inner.PathConstraints;
+
+        public IAsyncEnumerable<IO.TableFileInfo> ListAsync(
+            string prefix, CancellationToken cancellationToken = default) =>
+            inner.ListAsync(prefix, cancellationToken);
+
+        public ValueTask<IO.IRandomAccessFile> OpenReadAsync(
+            string path, CancellationToken cancellationToken = default) =>
+            inner.OpenReadAsync(path, cancellationToken);
+
+        public ValueTask<IO.ISequentialFile> CreateAsync(
+            string path, bool overwrite = false, CancellationToken cancellationToken = default)
+        {
+            if (_failAt > 0 && path.StartsWith("_change_data/", StringComparison.Ordinal) && ++_seen == _failAt)
+                throw new IOException($"write refused (injected): {path}");
+            return inner.CreateAsync(path, overwrite, cancellationToken);
+        }
+
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default) =>
+            inner.DeleteAsync(path, cancellationToken);
+
+        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default) =>
+            inner.ExistsAsync(path, cancellationToken);
+
+        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default) =>
+            inner.ReadAllBytesAsync(path, cancellationToken);
+
+        public ValueTask<bool> TryWriteAllBytesAsync(
+            string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
+            inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+
+        public ValueTask WriteAllBytesAsync(
+            string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
+            inner.WriteAllBytesAsync(path, data, cancellationToken);
+    }
+
     private static BooleanArray Matching(RecordBatch batch, Func<long, bool> match)
     {
         var ids = (Int64Array)batch.Column("id");

@@ -2940,12 +2940,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         /// Swaps the staged fill-in files in <paramref name="actions"/> for ones matching the ids the rebased
         /// adds now carry, writing new ones only for an add whose <c>baseRowId</c> moved since its files were
         /// last written. A superseded attempt's files are deleted at once: a commit that lands clears the
-        /// ledger, which would otherwise forget them.
+        /// ledger, which would otherwise forget them. They leave the ledger only after every replacement is
+        /// written, so a write that fails part way leaves both old and new files for the abort to collect.
         /// </summary>
         public async ValueTask<IReadOnlyList<DeltaAction>> RebaseAsync(
             IReadOnlyList<DeltaAction> actions, CancellationToken cancellationToken)
         {
-            var superseded = new WrittenFileLedger();
+            var supersededPaths = new List<string>();
             foreach (var action in actions)
             {
                 if (action is not AddFile add || !_byAdd.TryGetValue(add.Path, out var current)
@@ -2953,13 +2954,19 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     continue;
                 }
-                foreach (string path in _written.TakeRecorded(current.Files.Select(f => DeltaPath.Decode(f.Path))))
-                    superseded.Record(path);
-                _byAdd[add.Path] = (add.BaseRowId, await _table.WriteInsertChangeDataAsync(
-                    _snapshot, add, cancellationToken, _written).ConfigureAwait(false));
+                var replacement = await _table.WriteInsertChangeDataAsync(
+                    _snapshot, add, cancellationToken, _written).ConfigureAwait(false);
+                foreach (var f in current.Files)
+                    supersededPaths.Add(DeltaPath.Decode(f.Path));
+                _byAdd[add.Path] = (add.BaseRowId, replacement);
             }
-            if (superseded.Paths.Count > 0)
+            if (supersededPaths.Count > 0)
+            {
+                var superseded = new WrittenFileLedger();
+                foreach (string path in _written.TakeRecorded(supersededPaths))
+                    superseded.Record(path);
                 await _table.DeleteWrittenFilesAsync(superseded, cancellationToken).ConfigureAwait(false);
+            }
 
             var result = new List<DeltaAction>(actions.Count);
             foreach (var action in actions)
