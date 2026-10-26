@@ -2861,9 +2861,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         FillInChangeDataAsync(
             DeltaTransaction transaction, IReadOnlyList<DeltaAction> actions, CancellationToken cancellationToken)
     {
-        var snapshot = transaction.BaseSnapshot;
         if (transaction.UncoveredAppends.Count == 0 && transaction.UncoveredVectorDeletes.Count == 0)
             return (actions, null);
+        // The rows are read and written under the table as this commit publishes it (#534): an append staged
+        // beside a schema change was written under the NEW schema, and the base would drop a column it added.
+        var snapshot = WithStagedMetadata(transaction.BaseSnapshot, actions);
         if (!DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration)
             || !actions.Any(static a => a is CdcFile))
         {
@@ -2901,6 +2903,36 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         return (filled, insertFillIn);
+    }
+
+    /// <summary>
+    /// <paramref name="snapshot"/> with the <c>metaData</c> and <c>protocol</c> that <paramref name="actions"/>
+    /// stage, if any: the schema, column mapping and features of the version the commit writes. Only those
+    /// change; the active files are still the base's.
+    /// </summary>
+    private static Snapshot.Snapshot WithStagedMetadata(
+        Snapshot.Snapshot snapshot, IReadOnlyList<DeltaAction> actions)
+    {
+        var metadata = actions.OfType<MetadataAction>().LastOrDefault();
+        var protocol = actions.OfType<ProtocolAction>().LastOrDefault();
+        if (metadata is null && protocol is null)
+            return snapshot;
+
+        var schema = metadata is null ? snapshot.Schema : DeltaSchemaSerializer.Parse(metadata.SchemaString);
+        return new Snapshot.Snapshot
+        {
+            Version = snapshot.Version,
+            Metadata = metadata ?? snapshot.Metadata,
+            Protocol = protocol ?? snapshot.Protocol,
+            Schema = schema,
+            ArrowSchema = metadata is null ? snapshot.ArrowSchema : SchemaConverter.ToArrowSchema(schema),
+            ActiveFiles = snapshot.ActiveFiles,
+            AppTransactions = snapshot.AppTransactions,
+            DomainMetadata = snapshot.DomainMetadata,
+            Tombstones = snapshot.Tombstones,
+            InCommitTimestamp = snapshot.InCommitTimestamp,
+            RowIdHighWaterMark = snapshot.RowIdHighWaterMark,
+        };
     }
 
     /// <summary>
