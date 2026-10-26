@@ -27,18 +27,47 @@ internal static class Compressor
         {
             CompressionCodec.Uncompressed => inputLength,
             CompressionCodec.Snappy => Snappy.GetMaxCompressedLength(inputLength),
-            CompressionCodec.Gzip => inputLength + 64, // conservative overhead estimate
+            CompressionCodec.Gzip => DeflateBound(inputLength),
 #if NET6_0_OR_GREATER
             CompressionCodec.Brotli => BrotliEncoder.GetMaxCompressedLength(inputLength),
 #else
             CompressionCodec.Brotli => inputLength + 64, // conservative estimate for BrotliSharpLib
 #endif
             CompressionCodec.Lz4 => LZ4Codec.MaximumOutputSize(inputLength),
-            CompressionCodec.Deflate => inputLength + 64,
+            CompressionCodec.Deflate => DeflateBound(inputLength),
             CompressionCodec.Zstd => ZstdSharp.Compressor.GetCompressBound(inputLength),
             _ => throw new NotSupportedException($"Compression codec '{codec}' is not supported for writing."),
         };
     }
+
+    /// <summary>
+    /// The most bytes Gzip or Deflate writes for <paramref name="inputLength"/> bytes, at any level and
+    /// on any runtime.
+    /// </summary>
+    /// <remarks>
+    /// zlib-ng, which .NET's GZipStream and DeflateStream use from .NET 9 on, writes incompressible
+    /// input at Fastest as static-Huffman literals, and bytes 144 to 255 take 9 bits: up to 1/8 more,
+    /// and about 5.5% for uniformly random bytes. zlib's stored blocks, on earlier runtimes, add 5
+    /// bytes per 64 KB, well within that. The 64 covers the Gzip header and trailer and the final
+    /// block. A bound of <c>inputLength + 64</c> was overrun from 1 KB of random bytes on .NET 10 and
+    /// from about 200 KB on .NET 8 and .NET Framework.
+    /// </remarks>
+    private static int DeflateBound(int inputLength) =>
+        checked((int)(inputLength + (inputLength + 7L) / 8 + 64));
+
+    // An empty input's streams, written here rather than left to the runtime: zlib-ng writes nothing
+    // at all for a stream with nothing written to it, and so does .NET Framework's DeflateStream. A
+    // 0-byte payload declared compressed is not a valid stream (see Decompressor). Deflate: one final
+    // fixed-Huffman block holding only end-of-block. Gzip: a header with no optional fields and an
+    // unknown OS, that block, and a trailer of CRC-32 0 and length 0.
+    private static ReadOnlySpan<byte> EmptyDeflateStream => [0x03, 0x00];
+
+    private static ReadOnlySpan<byte> EmptyGzipStream =>
+    [
+        0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
+        0x03, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
 
     /// <summary>
     /// Compresses <paramref name="source"/> into <paramref name="destination"/>.
@@ -101,6 +130,12 @@ internal static class Compressor
 
     private static int CompressGzip(ReadOnlySpan<byte> source, Span<byte> destination, BlockCompressionLevel? level)
     {
+        if (source.IsEmpty)
+        {
+            EmptyGzipStream.CopyTo(destination);
+            return EmptyGzipStream.Length;
+        }
+
         var bclLevel = level.HasValue ? MapBclLevel(level.Value) : CompressionLevel.Fastest;
         using var outputStream = new MemoryStream();
         using (var gzip = new GZipStream(outputStream, bclLevel, leaveOpen: true))
@@ -187,6 +222,12 @@ internal static class Compressor
 
     private static int CompressDeflate(ReadOnlySpan<byte> source, Span<byte> destination, BlockCompressionLevel? level)
     {
+        if (source.IsEmpty)
+        {
+            EmptyDeflateStream.CopyTo(destination);
+            return EmptyDeflateStream.Length;
+        }
+
         var bclLevel = level.HasValue ? MapBclLevel(level.Value) : CompressionLevel.Fastest;
         using var outputStream = new MemoryStream();
         using (var deflate = new DeflateStream(outputStream, bclLevel, leaveOpen: true))

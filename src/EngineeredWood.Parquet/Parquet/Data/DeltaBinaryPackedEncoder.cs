@@ -39,6 +39,34 @@ internal sealed class DeltaBinaryPackedEncoder
         _buffer = new byte[initialCapacity];
     }
 
+    /// <summary>
+    /// Creates an encoder that writes into <paramref name="buffer"/> from its start. The buffer is
+    /// replaced only if it fills; size it with <see cref="MaxEncodedLength"/> and it never is.
+    /// </summary>
+    public DeltaBinaryPackedEncoder(byte[] buffer)
+    {
+        _buffer = buffer;
+    }
+
+    /// <summary>
+    /// The most bytes <paramref name="count"/> values can encode to, when every delta needs
+    /// <paramref name="bitWidth"/> bits (32 for INT32, whose deltas wrap; 64 for INT64).
+    /// </summary>
+    public static int MaxEncodedLength(int count, int bitWidth)
+    {
+        // Header: four varints, at most 5 + 5 + 5 + 10 bytes. Each block: a min-delta varint of at
+        // most 10 bytes, a bit width per miniblock, and its 128 values at the full width.
+        const int headerBytes = 25;
+        long blocks = count <= 1 ? 0 : (count - 1 + BlockSize - 1) / BlockSize;
+        long blockBytes = 10 + MiniblockCount + BlockSize * bitWidth / 8;
+        return checked((int)(headerBytes + blocks * blockBytes));
+    }
+
+    /// <summary>
+    /// The buffer written into: the one passed to the constructor unless it had to grow.
+    /// </summary>
+    public byte[] Buffer => _buffer;
+
     /// <summary>Number of bytes written.</summary>
     public int Length => _position;
 
@@ -145,7 +173,7 @@ internal sealed class DeltaBinaryPackedEncoder
                     ulong remainder = unchecked((ulong)(deltas[i] - minDelta));
                     if (remainder > maxRemainder) maxRemainder = remainder;
                 }
-
+
 #if NET8_0_OR_GREATER
                 bitWidths[mb] = maxRemainder == 0 ? (byte)0 : (byte)(64 - ulong.LeadingZeroCount(maxRemainder));
 #else

@@ -205,6 +205,55 @@ public class CompressorTests
                 yield return new object[] { c, l };
     }
 
+    public static IEnumerable<object[]> IncompressibleInputs()
+    {
+        foreach (var codec in new[]
+        {
+            CompressionCodec.Snappy, CompressionCodec.Gzip, CompressionCodec.Deflate,
+            CompressionCodec.Brotli, CompressionCodec.Lz4, CompressionCodec.Zstd,
+        })
+        foreach (var level in new BlockCompressionLevel?[]
+        {
+            null, BlockCompressionLevel.Fastest, BlockCompressionLevel.Optimal, BlockCompressionLevel.SmallestSize,
+        })
+        foreach (int length in new[] { 0, 1, 1024, 65_536, 1 << 20 })
+        foreach (bool highBytes in new[] { false, true })
+            yield return new object[] { codec, level!, length, highBytes };
+    }
+
+    /// <summary>
+    /// The buffer a caller sizes by <see cref="Compressor.GetMaxCompressedLength"/> must hold what
+    /// <see cref="Compressor.Compress"/> writes for any input, not only input that compresses. zlib-ng,
+    /// which .NET's GZipStream and DeflateStream use from .NET 9 on, writes incompressible input at
+    /// Fastest as static-Huffman literals: bytes 144 to 255 take 9 bits, so input made only of them
+    /// grows by 1/8, and uniformly random bytes by about 5.5%.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(IncompressibleInputs))]
+    public void IncompressibleInput_FitsMaxCompressedLength_AndRoundTrips(
+        CompressionCodec codec, BlockCompressionLevel? level, int length, bool highBytes)
+    {
+        var data = new byte[length];
+        new Random(length).NextBytes(data);
+        if (highBytes)
+        {
+            for (int i = 0; i < data.Length; i++)
+                data[i] = (byte)(144 + data[i] % 112);
+        }
+
+        int maxLen = Compressor.GetMaxCompressedLength(codec, length);
+        // One byte of slack past the bound, so an overrun shows as a length rather than a throw.
+        var compressed = new byte[maxLen + 1];
+        int compressedLength = Compressor.Compress(codec, data, compressed.AsSpan(0, maxLen), level);
+        Assert.True(compressedLength <= maxLen, $"{compressedLength} bytes against a bound of {maxLen}");
+
+        var decompressed = new byte[length];
+        int decompressedLength = Decompressor.Decompress(
+            codec, compressed.AsSpan(0, compressedLength), decompressed);
+        Assert.Equal(length, decompressedLength);
+        Assert.Equal(data, decompressed);
+    }
+
     [Theory]
     [MemberData(nameof(TunableCodecsAndLevels))]
     public void RoundTrips_AtLevel(CompressionCodec codec, BlockCompressionLevel level)
