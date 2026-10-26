@@ -39,6 +39,35 @@ internal static class PartitionUtils
             return [(new Dictionary<string, string>(), batch, all)];
         }
 
+        var groups = GroupRows(batch, partitionColumns);
+        var partColIndices = new int[partitionColumns.Count];
+        for (int i = 0; i < partitionColumns.Count; i++)
+            partColIndices[i] = batch.Schema.GetFieldIndex(partitionColumns[i]);
+
+        // Build non-partition schema
+        var dataSchema = BuildNonPartitionSchema(batch.Schema, partColIndices);
+
+        // Build output batches
+        var result = new List<(Dictionary<string, string>, RecordBatch, List<int>)>();
+
+        foreach (var group in groups)
+        {
+            var dataBatch = BuildFilteredBatch(batch, dataSchema, partColIndices, group.Rows);
+            result.Add((group.PartitionValues, dataBatch, group.Rows));
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// The rows of <paramref name="batch"/> grouped by their partition values, as <see cref="SplitByPartition"/>
+    /// groups them but without building a batch per group, in first-appearance order. <c>Key</c> identifies a
+    /// group's values: two rows share it exactly when they belong in the same partition, so a caller can tell
+    /// whether a row's partition is the one it came from by comparing keys.
+    /// </summary>
+    public static List<(Dictionary<string, string> PartitionValues, string Key, List<int> Rows)> GroupRows(
+        RecordBatch batch, IReadOnlyList<string> partitionColumns)
+    {
         // Find partition column indices
         var partColIndices = new int[partitionColumns.Count];
         for (int i = 0; i < partitionColumns.Count; i++)
@@ -52,6 +81,7 @@ internal static class PartitionUtils
         // Group rows by partition values
         var groups = new Dictionary<string, (Dictionary<string, string> Values, List<int> Rows)>(
             StringComparer.Ordinal);
+        var order = new List<string>();
 
         for (int row = 0; row < batch.Length; row++)
         {
@@ -82,23 +112,15 @@ internal static class PartitionUtils
             {
                 group = (partValues, new List<int>());
                 groups[groupKey] = group;
+                order.Add(groupKey);
             }
 
             group.Rows.Add(row);
         }
 
-        // Build non-partition schema
-        var dataSchema = BuildNonPartitionSchema(batch.Schema, partColIndices);
-
-        // Build output batches
-        var result = new List<(Dictionary<string, string>, RecordBatch, List<int>)>();
-
-        foreach (var group in groups)
-        {
-            var dataBatch = BuildFilteredBatch(batch, dataSchema, partColIndices, group.Value.Rows);
-            result.Add((group.Value.Values, dataBatch, group.Value.Rows));
-        }
-
+        var result = new List<(Dictionary<string, string>, string, List<int>)>(order.Count);
+        foreach (string key in order)
+            result.Add((groups[key].Values, key, groups[key].Rows));
         return result;
     }
 
@@ -397,8 +419,10 @@ internal static class PartitionUtils
             Date32Array d32 => DateTimeOffset.FromUnixTimeSeconds(
                 d32.GetValue(row)!.Value * 86400L).ToString("yyyy-MM-dd"),
             TimestampArray ts => FormatTimestampPartitionValue(ts, row),
-            // Spec dot-notation decimal string.
-            Decimal128Array dec => dec.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            // Spec dot-notation decimal string, from the exact digits: System.Decimal overflows on a decimal(38,0)
+            // value such as 10^38 - 1, and every UPDATE formats the partition values of the files it rewrites.
+            Decimal128Array dec => DeltaLake.Schema.DecimalText.Format(
+                dec, row, 16, ((Decimal128Type)dec.Data.DataType).Scale),
             // A type we cannot encode per the spec (binary, nested, ...) must THROW, never fall back to
             // .ToString() — that silently wrote the .NET type name as the partition value.
             _ => throw new NotSupportedException(

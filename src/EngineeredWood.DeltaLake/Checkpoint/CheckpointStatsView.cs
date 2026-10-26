@@ -247,7 +247,7 @@ internal sealed class CheckpointStatsView
         Utf8JsonWriter writer, string name, IArrowArray array, int row, int width, int scale)
     {
         writer.WritePropertyName(name);
-        writer.WriteRawValue(FormatDecimal(array, row, width, scale), skipInputValidation: true);
+        writer.WriteRawValue(Schema.DecimalText.Format(array, row, width, scale), skipInputValidation: true);
     }
 
     private static string FormatTimestamp(TimestampArray array, int row)
@@ -258,34 +258,6 @@ internal sealed class CheckpointStatsView
         return type.Timezone is not null
             ? value.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff'Z'", CultureInfo.InvariantCulture)
             : value.ToString("yyyy-MM-dd'T'HH:mm:ss.ffffff", CultureInfo.InvariantCulture);
-    }
-
-    /// <summary>
-    /// Renders a decimal's exact digits as JSON number text. Never goes through
-    /// <c>System.Decimal</c>: a decimal(38,30) bound has more significant digits than it can hold, and
-    /// rounding one shifts the bound.
-    /// </summary>
-    private static string FormatDecimal(IArrowArray array, int row, int width, int scale)
-    {
-        var bytes = array.Data.Buffers[1].Span.Slice((row + array.Data.Offset) * width, width);
-#if NET6_0_OR_GREATER
-        var unscaled = new BigInteger(bytes, isUnsigned: false, isBigEndian: false);
-#else
-        var unscaled = new BigInteger(bytes.ToArray());
-#endif
-        // Today this array always comes from EngineeredWood's own reader, whose buffers are managed
-        // arrays and therefore rooted by the span itself. Rooting anyway keeps the method correct for
-        // any array it might be handed. See doc/arrow-span-lifetime.md.
-        GC.KeepAlive(array);
-        if (scale == 0)
-            return unscaled.ToString(CultureInfo.InvariantCulture);
-
-        string sign = unscaled.Sign < 0 ? "-" : "";
-        string digits = BigInteger.Abs(unscaled).ToString(CultureInfo.InvariantCulture);
-        if (digits.Length <= scale)
-            digits = digits.PadLeft(scale + 1, '0');
-        return sign + digits.Substring(0, digits.Length - scale)
-            + "." + digits.Substring(digits.Length - scale);
     }
 
     private static readonly DateTime s_epoch = new(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
