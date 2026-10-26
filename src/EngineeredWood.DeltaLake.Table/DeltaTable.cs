@@ -3440,6 +3440,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 Path = latestAdd.Path,
                 DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 DataChange = true,
+                PartitionValues = latestAdd.PartitionValues,
                 DeletionVector = latestAdd.DeletionVector,
                 // A remove carries the row-tracking fields of the add it removes (spec; measured on Spark
                 // 4.0.1, which populates both on every remove of a row-tracking table). They are what lets a
@@ -3617,6 +3618,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 Path = cand.Path,
                 DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 DataChange = true,
+                PartitionValues = cand.PartitionValues,
                 DeletionVector = cand.DeletionVector,
                 BaseRowId = cand.BaseRowId,
                 DefaultRowCommitVersion = cand.DefaultRowCommitVersion,
@@ -7800,6 +7802,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 Path = addFile.Path,
                 DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 DataChange = true,
+                PartitionValues = addFile.PartitionValues,
                 DeletionVector = addFile.DeletionVector,
                 BaseRowId = addFile.BaseRowId,
                 DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
@@ -7943,6 +7946,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 Path = addFile.Path,
                 DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 DataChange = true,
+                PartitionValues = addFile.PartitionValues,
                 DeletionVector = addFile.DeletionVector,
                 BaseRowId = addFile.BaseRowId,
                 DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,

@@ -4,6 +4,7 @@
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.RowTracking;
 using EngineeredWood.IO.Local;
@@ -234,5 +235,100 @@ public class CdfDeletionVectorInferenceTests : IDisposable
         }
 
         Assert.Equal([(4L, (long?)rowIds[4], "delete")], feed);
+    }
+
+    /// <summary>A delete read from a vector edit takes its partition values from the remove, which EW's vector
+    /// writers once left off (the protocol makes them optional on a remove) — so the paired add's are the
+    /// fallback, and a non-nullable partition column came back NULL or threw.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task OnAPartitionedTable_TheDeletedRowKeepsItsPartitionValue(bool removeCarriesPartitionValues)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("region", StringType.Default, false))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, schema, partitionColumns: ["region"], enableDeletionVectors: true,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" });
+        var ids = new Int64Array.Builder().AppendRange([1L, 2L, 3L]).Build();
+        var regions = new StringArray.Builder().AppendRange(["eu", "eu", "eu"]).Build();
+        await table.WriteAsync([new RecordBatch(schema, [ids, regions], 3)]);
+
+        var file = Assert.Single(table.CurrentSnapshot.ActiveFiles.Values);
+        var txn = table.StartTransaction();
+        if (removeCarriesPartitionValues)
+        {
+            await txn.StageRowDeletesAsync(Sel((file.Path, 1)));
+        }
+        else
+        {
+            // What an older writer commits: the same edit, with the remove's partition values left off.
+            var (staged, _) = await table.ComputeDeletionVectorActionsAsync(
+                new Dictionary<int, IReadOnlyCollection<long>> { [0] = [1L] });
+            txn.StageActions([.. staged.Select(a => a is RemoveFile r ? r with { PartitionValues = null } : a)]);
+        }
+        long version = await txn.CommitAsync();
+        await AssertNoChangeFileAsync(version);
+
+        var remove = Assert.Single((await new TransactionLog(Fs).ReadCommitAsync(version)).OfType<RemoveFile>());
+        if (removeCarriesPartitionValues)
+            Assert.Equal("eu", remove.PartitionValues?["region"]);
+        else
+            Assert.Null(remove.PartitionValues);
+
+        await using var check = await OpenAsync();
+        var feed = new List<(long, string?, string)>();
+        await foreach (var batch in check.ReadChangesAsync(
+            new DeltaChangeReadOptions { StartVersion = version, EndVersion = version }))
+        {
+            var id = (Int64Array)batch.Column("id");
+            var region = (StringArray)batch.Column("region");
+            var types = (StringArray)batch.Column("_change_type");
+            for (int i = 0; i < batch.Length; i++)
+                feed.Add((id.GetValue(i)!.Value, region.GetString(i), types.GetString(i)));
+        }
+        Assert.Equal([(2L, (string?)"eu", "delete")], feed);
+    }
+
+    /// <summary>VACUUM removes a data file together with its vectors. A version naming such a file is skipped,
+    /// as it was before vector edits were paired — reading the vector first threw instead.</summary>
+    [Fact]
+    public async Task AVacuumedFile_IsSkippedRatherThanThrowing()
+    {
+        await using var table = await CreateAsync();
+        await table.WriteAsync([Batch(1, 3)]);
+        var file = Assert.Single(table.CurrentSnapshot.ActiveFiles.Values);
+        string original = file.Path;
+
+        // A vector this small is written inline; force a file, since that is what VACUUM can delete.
+        var vector = await new DeletionVectorWriter(Fs) { InlineThreshold = 0 }.CreateAsync([1L], 1);
+        Assert.Equal("u", vector.StorageType);
+        var txn = table.StartTransaction();
+        txn.StageActions(
+        [
+            new RemoveFile
+            {
+                Path = file.Path,
+                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = true,
+                PartitionValues = file.PartitionValues,
+                Size = file.Size,
+            },
+            file with { DeletionVector = vector, DataChange = true },
+        ]);
+        long vectorDelete = await txn.CommitAsync();
+        // Removes the vector-carrying file, unpaired.
+        long overwrite = await table.WriteAsync([Batch(10, 1)], DeltaWriteMode.Overwrite);
+
+        File.Delete(Path.Combine(_tempDir, DeltaPath.Decode(original)));
+        var vectors = Directory.GetFiles(_tempDir, "deletion_vector_*.bin");
+        Assert.NotEmpty(vectors);
+        foreach (var vectorFile in vectors)
+            File.Delete(vectorFile);
+
+        Assert.Empty(await ReadFeedAsync(vectorDelete));
+        Assert.Equal([(10L, "insert", (string?)"v10")], await ReadFeedAsync(overwrite));
     }
 }

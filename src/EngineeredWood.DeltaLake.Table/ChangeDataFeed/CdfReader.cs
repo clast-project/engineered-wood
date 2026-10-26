@@ -127,7 +127,7 @@ internal static class CdfReader
                 // vector edit rather than a file replaced: what changed is the difference between the two
                 // vectors, not every row of the file. Read whole, the pair reported every survivor deleted and
                 // re-inserted. Spark's reader pairs them the same way (CDCReader.processDeletionVectorActions).
-                var vectorEdits = await PairVectorEditsAsync(removes, adds, dvReader, cancellationToken)
+                var vectorEdits = await PairVectorEditsAsync(fs, removes, adds, dvReader, cancellationToken)
                     .ConfigureAwait(false);
 
                 // Removed files → "delete" rows. The action's DELETION VECTOR is honored: rows it already
@@ -147,14 +147,13 @@ internal static class CdfReader
                     }
                     else
                     {
-                        filter = await RowFilter.ExcludeAsync(remove.DeletionVector, dvReader, cancellationToken)
-                            .ConfigureAwait(false);
+                        filter = RowFilter.Exclude(remove.DeletionVector);
                     }
 
                     await foreach (var batch in ReadDataFileAsChangesAsync(
-                        fs, remove.Path, remove.PartitionValues, filter,
+                        fs, remove.Path, remove.PartitionValues ?? edit?.Add.PartitionValues, filter,
                         CdfConfig.Delete, version,
-                        commitTimestamp, readOptions, ctx,
+                        commitTimestamp, readOptions, ctx, dvReader,
                         remove.BaseRowId ?? edit?.Add.BaseRowId,
                         remove.DefaultRowCommitVersion ?? edit?.Add.DefaultRowCommitVersion,
                         cancellationToken)
@@ -178,14 +177,13 @@ internal static class CdfReader
                     }
                     else
                     {
-                        filter = await RowFilter.ExcludeAsync(add.DeletionVector, dvReader, cancellationToken)
-                            .ConfigureAwait(false);
+                        filter = RowFilter.Exclude(add.DeletionVector);
                     }
 
                     await foreach (var batch in ReadDataFileAsChangesAsync(
                         fs, add.Path, add.PartitionValues, filter,
                         CdfConfig.Insert, version,
-                        commitTimestamp, readOptions, ctx,
+                        commitTimestamp, readOptions, ctx, dvReader,
                         add.BaseRowId, add.DefaultRowCommitVersion, cancellationToken)
                         .ConfigureAwait(false))
                     {
@@ -259,7 +257,7 @@ internal static class CdfReader
     /// removed or added twice is left unpaired, since there is no one pair to diff.
     /// </summary>
     private static async ValueTask<Dictionary<string, VectorEdit>> PairVectorEditsAsync(
-        List<RemoveFile> removes, List<AddFile> adds, DeletionVectorReader dvReader,
+        ITableFileSystem fs, List<RemoveFile> removes, List<AddFile> adds, DeletionVectorReader dvReader,
         CancellationToken cancellationToken)
     {
         var edits = new Dictionary<string, VectorEdit>(StringComparer.Ordinal);
@@ -273,6 +271,14 @@ internal static class CdfReader
             if (!addByPath.TryGetValue(path, out var add)
                 || (remove.DeletionVector is null && add.DeletionVector is null))
             {
+                continue;
+            }
+
+            // A file VACUUM has removed takes its vectors with it, and is skipped on both sides as before.
+            if (!await fs.ExistsAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(path), cancellationToken)
+                    .ConfigureAwait(false))
+            {
+                edits[path] = new VectorEdit(add, new HashSet<long>(), new HashSet<long>());
                 continue;
             }
 
@@ -304,18 +310,23 @@ internal static class CdfReader
     }
 
     /// <summary>Which rows of a data file belong to a change: all but <see cref="Positions"/> (a deletion
-    /// vector's hidden rows), or only <see cref="Positions"/> (the rows a vector edit changed).</summary>
-    private readonly record struct RowFilter(HashSet<long>? Positions, bool KeepOnlyPositions)
+    /// vector's hidden rows), or only <see cref="Positions"/> (the rows a vector edit changed). An excluding
+    /// vector is read only by <see cref="ResolveAsync"/>, once the data file is known to exist — VACUUM removes
+    /// a file's vector along with it.</summary>
+    private readonly record struct RowFilter(
+        HashSet<long>? Positions, bool KeepOnlyPositions,
+        EngineeredWood.DeltaLake.Actions.DeletionVector? Unread = null)
     {
         public static RowFilter KeepOnly(HashSet<long> positions) => new(positions, true);
 
-        public static async ValueTask<RowFilter> ExcludeAsync(
-            EngineeredWood.DeltaLake.Actions.DeletionVector? deletionVector, DeletionVectorReader dvReader,
-            CancellationToken cancellationToken) =>
-            new(deletionVector is null
-                    ? null
-                    : await dvReader.ReadAsync(deletionVector, cancellationToken).ConfigureAwait(false),
-                false);
+        public static RowFilter Exclude(EngineeredWood.DeltaLake.Actions.DeletionVector? deletionVector) =>
+            new(null, false, deletionVector);
+
+        public async ValueTask<RowFilter> ResolveAsync(
+            DeletionVectorReader dvReader, CancellationToken cancellationToken) =>
+            Unread is null
+                ? this
+                : new(await dvReader.ReadAsync(Unread, cancellationToken).ConfigureAwait(false), false);
 
         public bool Includes(long position) =>
             Positions is null ? !KeepOnlyPositions : Positions.Contains(position) == KeepOnlyPositions;
@@ -331,6 +342,7 @@ internal static class CdfReader
         long? commitTimestamp,
         ParquetReadOptions? readOptions,
         CdfSchemaContext ctx,
+        DeletionVectorReader dvReader,
         long? baseRowId,
         long? defaultRowCommitVersion,
         [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -341,6 +353,8 @@ internal static class CdfReader
         // Try to read the file — it may have been deleted already
         if (!await fs.ExistsAsync(diskPath, cancellationToken).ConfigureAwait(false))
             yield break;
+
+        filter = await filter.ResolveAsync(dvReader, cancellationToken).ConfigureAwait(false);
 
         await using var file = await fs.OpenReadAsync(diskPath, cancellationToken)
             .ConfigureAwait(false);
