@@ -1416,7 +1416,10 @@ internal static class ColumnChunkWriter
     private static int EncodeDeltaInt32ToBuffer(
         IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels)
     {
-        var encoder = new DeltaBinaryPackedEncoder();
+        // Encodes straight into t_valuesBuffer, sized for the worst case, so a page allocates no
+        // growing buffer of its own and its bytes are not copied afterwards.
+        EnsureValuesBuffer(DeltaBinaryPackedEncoder.MaxEncodedLength(nonNullCount, 32));
+        var encoder = new DeltaBinaryPackedEncoder(t_valuesBuffer!);
         if (defLevels == null)
         {
             var span = MemoryMarshal.Cast<byte, int>(array.Data.Buffers[1].Span).Slice(offset, numValues);
@@ -1428,15 +1431,15 @@ internal static class ColumnChunkWriter
             encoder.EncodeInt32s(values);
         }
 
-        EnsureValuesBuffer(encoder.Length);
-        encoder.WrittenSpan.CopyTo(t_valuesBuffer);
+        t_valuesBuffer = encoder.Buffer;
         return encoder.Length;
     }
 
     private static int EncodeDeltaInt64ToBuffer(
         IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels)
     {
-        var encoder = new DeltaBinaryPackedEncoder();
+        EnsureValuesBuffer(DeltaBinaryPackedEncoder.MaxEncodedLength(nonNullCount, 64));
+        var encoder = new DeltaBinaryPackedEncoder(t_valuesBuffer!);
         if (defLevels == null)
         {
             var span = MemoryMarshal.Cast<byte, long>(array.Data.Buffers[1].Span).Slice(offset, numValues);
@@ -1448,8 +1451,7 @@ internal static class ColumnChunkWriter
             encoder.EncodeInt64s(values);
         }
 
-        EnsureValuesBuffer(encoder.Length);
-        encoder.WrittenSpan.CopyTo(t_valuesBuffer);
+        t_valuesBuffer = encoder.Buffer;
         return encoder.Length;
     }
 
@@ -1588,13 +1590,13 @@ internal static class ColumnChunkWriter
         }
 
         // Delta-encode lengths
-        var deltaEncoder = new DeltaBinaryPackedEncoder();
+        EnsureValuesBuffer(DeltaBinaryPackedEncoder.MaxEncodedLength(nonNullCount, 32) + totalDataLen);
+        var deltaEncoder = new DeltaBinaryPackedEncoder(t_valuesBuffer!);
         deltaEncoder.EncodeInt32s(lengths);
+        t_valuesBuffer = deltaEncoder.Buffer;
 
         // Write delta_lengths + compact_data into values buffer
         int totalLen = deltaEncoder.Length + totalDataLen;
-        EnsureValuesBuffer(totalLen);
-        deltaEncoder.WrittenSpan.CopyTo(t_valuesBuffer);
 
         // Copy non-null byte data directly
         int pos = deltaEncoder.Length;
@@ -1872,8 +1874,12 @@ internal static class ColumnChunkWriter
             PhysicalType.FixedLenByteArray => typeLength > 0 ? typeLength : 16,
             _ => 8,
         };
-        // Compressed data is typically smaller; estimate 75% of raw size + overhead
-        return Math.Max(256, (int)(rowCount * bytesPerValue * 0.75) + 256);
+        // Sized at the raw width plus 1/64 for page headers and codec framing. An estimate below
+        // what an incompressible chunk needs costs a doubling and a copy of the whole stream, which
+        // is more than the memory the margin holds back from a chunk that compresses. Capped so a
+        // huge row count over-estimated (booleans, nulls) cannot reserve gigabytes up front.
+        long raw = (long)rowCount * bytesPerValue;
+        return (int)Math.Min(raw + raw / 64 + 256, 256L * 1024 * 1024);
     }
 
     /// <summary>

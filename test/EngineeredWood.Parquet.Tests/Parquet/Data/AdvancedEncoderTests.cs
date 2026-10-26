@@ -142,6 +142,59 @@ public class AdvancedEncoderTests
         Assert.Equal(values, decoded);
     }
 
+    // The worst case: every delta alternates between the type's extremes, so the min delta is the
+    // longest varint and every miniblock needs the full width. A buffer of MaxEncodedLength must
+    // hold it without growing, because the writer hands the encoder its page buffer at that size.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(129)]
+    [InlineData(1000)]
+    [InlineData(20_001)]
+    public void DeltaBinaryPacked_Int64_WorstCase_FitsMaxEncodedLength(int count)
+    {
+        var values = new long[count];
+        if (count > 0)
+            values[0] = long.MinValue;
+        for (int i = 1; i < count; i++)
+            values[i] = unchecked(values[i - 1] + (i % 2 == 1 ? long.MinValue : long.MaxValue));
+
+        var buffer = new byte[DeltaBinaryPackedEncoder.MaxEncodedLength(count, 64)];
+        var encoder = new DeltaBinaryPackedEncoder(buffer);
+        encoder.EncodeInt64s(values);
+
+        Assert.Same(buffer, encoder.Buffer);
+        var decoded = new long[count];
+        new DeltaBinaryPackedDecoder(encoder.ToArray()).DecodeInt64s(decoded);
+        Assert.Equal(values, decoded);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(129)]
+    [InlineData(1000)]
+    [InlineData(20_001)]
+    public void DeltaBinaryPacked_Int32_WorstCase_FitsMaxEncodedLength(int count)
+    {
+        var values = new int[count];
+        if (count > 0)
+            values[0] = int.MinValue;
+        for (int i = 1; i < count; i++)
+            values[i] = unchecked(values[i - 1] + (i % 2 == 1 ? int.MinValue : int.MaxValue));
+
+        var buffer = new byte[DeltaBinaryPackedEncoder.MaxEncodedLength(count, 32)];
+        var encoder = new DeltaBinaryPackedEncoder(buffer);
+        encoder.EncodeInt32s(values);
+
+        Assert.Same(buffer, encoder.Buffer);
+        var decoded = new int[count];
+        new DeltaBinaryPackedDecoder(encoder.ToArray()).DecodeInt32s(decoded);
+        Assert.Equal(values, decoded);
+    }
+
     // ── ByteStreamSplit ──
 
     [Fact]
