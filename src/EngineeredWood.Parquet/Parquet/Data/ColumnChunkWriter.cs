@@ -320,7 +320,8 @@ internal static class ColumnChunkWriter
         var output = new ColumnChunkOutput(
             EstimateColumnSize(
                 rowCount, nonNullCount, PlainValueBytes(array, nonNullCount, physicalType, typeLength),
-                PageLength(valuesPerPage, options), physicalType, typeLength,
+                LayOutPages(repLevels, rowCount, valuesPerPage, options.DataPageRowCountLimit),
+                physicalType, typeLength,
                 maxDefLevel, maxRepLevel, options.ByteArrayEncoding == ByteArrayEncoding.DeltaByteArray),
             options);
         var encodings = new HashSet<Encoding>();
@@ -659,7 +660,8 @@ internal static class ColumnChunkWriter
 
         var output = new ColumnChunkOutput(
             EstimateDictionaryColumnSize(
-                dictResult.DictionaryPageData.Length, rowCount, PageLength(valuesPerPage, options),
+                dictResult.DictionaryPageData.Length, rowCount,
+                LayOutPages(repLevels, rowCount, valuesPerPage, options.DataPageRowCountLimit),
                 bitWidth, maxDefLevel, maxRepLevel),
             options);
 
@@ -1875,9 +1877,11 @@ internal static class ColumnChunkWriter
 
     // The chunk stream is sized for an incompressible chunk: an estimate below what it needs costs a
     // doubling and a copy of the whole stream, which is more than the memory the headroom holds back
-    // from a chunk that compresses. Each estimate below counts the pages the writer will cut, at the
-    // length it cuts them, because at small DataPageRowCountLimit values the per-page costs — headers,
-    // DELTA_BINARY_PACKED stream headers and miniblock padding — outweigh the values (#522 review).
+    // from a chunk that compresses. Each estimate below counts the pages the writer will cut, because
+    // at small DataPageRowCountLimit values the per-page costs — headers, DELTA_BINARY_PACKED stream
+    // headers and miniblock padding — outweigh the values, and a repeated column's pages are cut short
+    // at record boundaries (#522 review). Every per-page cost is bounded by a term in the values plus a
+    // constant per page, which holds however unevenly the pages are cut.
 
     // A data page header, which carries no statistics: measured at 22–28 bytes, with room for a CRC
     // and larger sizes.
@@ -1889,17 +1893,16 @@ internal static class ColumnChunkWriter
     /// <param name="levelCount">Levels in the chunk: rows, for a column that is not repeated.</param>
     /// <param name="nonNullCount">Values in the chunk.</param>
     /// <param name="plainValueBytes">The values' PLAIN size, from <see cref="PlainValueBytes"/>.</param>
-    /// <param name="pageLength">The most levels a page holds.</param>
+    /// <param name="pages">The pages the writer will cut, from <see cref="LayOutPages"/>.</param>
     internal static int EstimateColumnSize(
-        int levelCount, int nonNullCount, long plainValueBytes, int pageLength,
+        int levelCount, int nonNullCount, long plainValueBytes, PageLayout pages,
         PhysicalType physicalType, int typeLength, int maxDefLevel, int maxRepLevel,
         bool deltaByteArray)
     {
-        long pages = PageCount(levelCount, pageLength);
         long bytes = plainValueBytes
-            + pages * PageHeaderAllowance
-            + LevelBytes(pages, pageLength, maxDefLevel, allDefined: nonNullCount == levelCount)
-            + LevelBytes(pages, pageLength, maxRepLevel, allDefined: false);
+            + pages.Count * PageHeaderAllowance
+            + LevelBytes(levelCount, pages, maxDefLevel, allDefined: nonNullCount == levelCount)
+            + LevelBytes(levelCount, pages, maxRepLevel, allDefined: false);
 
         // DELTA_BINARY_PACKED at full width is larger than the raw values (+1.8% for INT32). A
         // BYTE_ARRAY's lengths are its PLAIN size's 4-byte prefixes, which DELTA_LENGTH_BYTE_ARRAY
@@ -1907,19 +1910,19 @@ internal static class ColumnChunkWriter
         // FIXED_LEN_BYTE_ARRAY, DELTA_BYTE_ARRAY adds both streams, each in [0, typeLength].
         if (physicalType is PhysicalType.Int32 or PhysicalType.Int64)
         {
-            bytes += DeltaOverheadBytes(pages, pageLength, physicalType == PhysicalType.Int32 ? 32 : 64);
+            bytes += DeltaOverheadBytes(nonNullCount, pages, physicalType == PhysicalType.Int32 ? 32 : 64);
         }
         else if (physicalType == PhysicalType.ByteArray)
         {
-            bytes += DeltaOverheadBytes(pages, pageLength, 32);
+            bytes += DeltaOverheadBytes(nonNullCount, pages, 32);
             if (deltaByteArray)
-                bytes += 4L * nonNullCount + DeltaOverheadBytes(pages, pageLength, 32);
+                bytes += 4L * nonNullCount + DeltaOverheadBytes(nonNullCount, pages, 32);
         }
         else if (physicalType == PhysicalType.FixedLenByteArray && deltaByteArray)
         {
             int lengthBits = BitWidth(2 * typeLength);
             bytes += 2 * (((long)nonNullCount * lengthBits + 7) / 8
-                + DeltaOverheadBytes(pages, pageLength, lengthBits));
+                + DeltaOverheadBytes(nonNullCount, pages, lengthBits));
         }
 
         return WithMargin(bytes);
@@ -1967,73 +1970,104 @@ internal static class ColumnChunkWriter
     /// </summary>
     /// <remarks>An index is counted for every level, null or not.</remarks>
     internal static int EstimateDictionaryColumnSize(
-        int dictionaryBytes, int levelCount, int pageLength,
+        int dictionaryBytes, int levelCount, PageLayout pages,
         int indexBitWidth, int maxDefLevel, int maxRepLevel)
     {
-        long pages = PageCount(levelCount, pageLength);
         long bytes = PageHeaderAllowance + dictionaryBytes
             // Each data page leads its indices with their bit width.
-            + pages * (PageHeaderAllowance + 1 + HybridBytes(pageLength, indexBitWidth))
-            + LevelBytes(pages, pageLength, maxDefLevel, allDefined: false)
-            + LevelBytes(pages, pageLength, maxRepLevel, allDefined: false);
+            + pages.Count * (PageHeaderAllowance + 1) + HybridBytes(levelCount, pages, indexBitWidth)
+            + LevelBytes(levelCount, pages, maxDefLevel, allDefined: false)
+            + LevelBytes(levelCount, pages, maxRepLevel, allDefined: false);
         return WithMargin(bytes);
     }
 
-    /// <summary>
-    /// The most levels a page holds, as <see cref="PageTargetLength"/> cuts it. For a repeated column
-    /// the row limit counts rows, which span several levels, so this over-counts its pages.
-    /// </summary>
-    private static int PageLength(int valuesPerPage, ParquetWriteOptions options) =>
-        Math.Min(valuesPerPage, options.DataPageRowCountLimit ?? int.MaxValue);
-
-    private static long PageCount(int levelCount, int pageLength) =>
-        Math.Max(1, (levelCount + (long)pageLength - 1) / pageLength);
+    /// <summary>How many data pages a chunk is cut into, and the most levels any one of them holds.</summary>
+    internal readonly record struct PageLayout(long Count, int MaxLength);
 
     /// <summary>
-    /// What a page's DELTA_BINARY_PACKED stream adds to its values at <paramref name="bitWidth"/>,
-    /// summed as though every page were full. The values themselves are the caller's to count.
+    /// The pages the write loops will cut, found the way they cut them: <see cref="PageTargetLength"/>,
+    /// then <see cref="RecordAlignedPageLength"/>.
     /// </summary>
     /// <remarks>
-    /// Per page: a header of block size, miniblock count, value count and first value; per 128
-    /// deltas, a min-delta varint and four bit widths; and the last miniblock padded to 32 deltas.
+    /// A column that is not repeated is cut into equal pages and needs no walk. A repeated column's
+    /// cut backs up to the start of the record it falls in, so its pages can be shorter than the
+    /// target, and more of them; a record larger than a page gets an oversized page to itself.
     /// </remarks>
-    private static long DeltaOverheadBytes(long pages, int pageLength, int bitWidth)
+    internal static PageLayout LayOutPages(int[]? repLevels, int levelCount, int valuesPerPage, int? rowLimit)
     {
-        int varintBytes = (bitWidth + 7) / 7; // a zigzag value of bitWidth bits
-        long deltas = Math.Max(0, pageLength - 1);
-        long perPage = 2 + 1 + VarintLength((uint)pageLength) + varintBytes
-            + (deltas + 127) / 128 * (varintBytes + 4)
-            + ((deltas + 31) / 32 * 32 - deltas) * bitWidth / 8;
-        return pages * perPage;
+        if (repLevels is null)
+        {
+            int length = Math.Max(1, Math.Min(valuesPerPage, rowLimit ?? int.MaxValue));
+            return new PageLayout(
+                Math.Max(1, (levelCount + (long)length - 1) / length),
+                Math.Max(1, Math.Min(length, levelCount)));
+        }
+
+        long count = 0;
+        int maxLength = 1;
+        for (int offset = 0; offset < levelCount;)
+        {
+            int length = RecordAlignedPageLength(
+                repLevels, offset,
+                PageTargetLength(repLevels, offset, valuesPerPage, levelCount, rowLimit),
+                levelCount);
+            count++;
+            maxLength = Math.Max(maxLength, length);
+            offset += length;
+        }
+        return new PageLayout(Math.Max(1, count), maxLength);
     }
 
     /// <summary>
-    /// A page's levels at the hybrid encoding's largest, behind the 4-byte length a V1 page gives them.
+    /// What the pages' DELTA_BINARY_PACKED streams add to <paramref name="valueCount"/> values at
+    /// <paramref name="bitWidth"/>. The values themselves are the caller's to count.
+    /// </summary>
+    /// <remarks>
+    /// Per page: a header of block size, miniblock count, value count and first value; per 128
+    /// deltas, a min-delta varint and four bit widths; and the last miniblock padded to 32 deltas,
+    /// up to 31 values of padding. A page of one value has no deltas, so none of the last two.
+    /// </remarks>
+    private static long DeltaOverheadBytes(long valueCount, PageLayout pages, int bitWidth)
+    {
+        int varintBytes = (bitWidth + 7) / 7; // a zigzag value of bitWidth bits
+        long header = 2 + 1 + VarintLength((uint)pages.MaxLength) + varintBytes;
+        if (pages.MaxLength < 2)
+            return pages.Count * header;
+
+        // Blocks: at most valueCount / 128 across the chunk, plus a partial one per page.
+        long blockBytes = varintBytes + 4;
+        return valueCount / 128 * blockBytes
+            + pages.Count * (header + blockBytes + 31L * bitWidth / 8);
+    }
+
+    /// <summary>
+    /// The pages' levels at the hybrid encoding's largest, behind the 4-byte length a V1 page gives
+    /// them.
     /// </summary>
     /// <remarks>
     /// When every level is the maximum, a page's levels are one run: a header and one value.
     /// </remarks>
-    private static long LevelBytes(long pages, int pageLength, int maxLevel, bool allDefined)
+    private static long LevelBytes(int levelCount, PageLayout pages, int maxLevel, bool allDefined)
     {
         if (maxLevel == 0)
             return 0;
         int bitWidth = BitWidth(maxLevel);
-        long perPage = allDefined
-            ? 5 + (bitWidth + 7) / 8
-            : HybridBytes(pageLength, bitWidth);
-        return pages * (4 + perPage);
+        return allDefined
+            ? pages.Count * (4 + 5 + (bitWidth + 7) / 8)
+            : pages.Count * 4 + HybridBytes(levelCount, pages, bitWidth);
     }
 
     /// <summary>
-    /// The most bytes the RLE/bit-packed hybrid spends on <paramref name="count"/> values.
+    /// The most bytes the RLE/bit-packed hybrid spends on <paramref name="count"/> values cut into
+    /// <paramref name="pages"/>.
     /// </summary>
     /// <remarks>
     /// Unless <see cref="ParquetWriteOptions.BatchBitPackedRuns"/> is set, every 8-value bit-packed
     /// group carries its own 1-byte header: a bit per value over the width. A run of 8 or more
-    /// repeats, a 1-byte header and one value, is never more.
+    /// repeats, a 1-byte header and one value, is never more. Each page can end on a partial group.
     /// </remarks>
-    private static long HybridBytes(int count, int bitWidth) =>
-        bitWidth == 0 ? 0 : (count + 7L) / 8 * (1 + bitWidth);
+    private static long HybridBytes(long count, PageLayout pages, int bitWidth) =>
+        bitWidth == 0 ? 0 : (count / 8 + pages.Count) * (1 + bitWidth);
 
     private static int VarintLength(uint value)
     {

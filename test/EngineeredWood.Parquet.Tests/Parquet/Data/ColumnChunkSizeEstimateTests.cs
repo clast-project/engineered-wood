@@ -52,7 +52,7 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         long size = await WriteAndMeasure(Int32Values(shape, RowCount, nullable: false), options);
 
         AssertFits(size, ColumnChunkWriter.EstimateColumnSize(
-            RowCount, RowCount, RowCount * 4L, DefaultPageLength, PhysicalType.Int32, 0, 0, 0, deltaByteArray: false));
+            RowCount, RowCount, RowCount * 4L, Layout(RowCount, DefaultPageLength), PhysicalType.Int32, 0, 0, 0, deltaByteArray: false));
     }
 
     [Theory]
@@ -66,7 +66,7 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         long size = await WriteAndMeasure(Int64Values(shape, RowCount), options);
 
         AssertFits(size, ColumnChunkWriter.EstimateColumnSize(
-            RowCount, RowCount, RowCount * 8L, DefaultPageLength, PhysicalType.Int64, 0, 0, 0, deltaByteArray: false));
+            RowCount, RowCount, RowCount * 8L, Layout(RowCount, DefaultPageLength), PhysicalType.Int64, 0, 0, 0, deltaByteArray: false));
     }
 
     // "wide": 100,000 entries, so 17-bit indices, where the estimate this replaced allowed 8.
@@ -89,18 +89,22 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         long size = await WriteAndMeasure(array, options);
 
         AssertFits(size, ColumnChunkWriter.EstimateDictionaryColumnSize(
-            distinct * sizeof(int), RowCount, DefaultPageLength, DictionaryEncoder.GetIndexBitWidth(distinct),
+            distinct * sizeof(int), RowCount, Layout(RowCount, DefaultPageLength), DictionaryEncoder.GetIndexBitWidth(distinct),
             maxDefLevel: nullable ? 1 : 0, maxRepLevel: 0));
     }
 
-    // BYTE_ARRAY values are sized from their offsets, which a slice does not start at 0. The values
-    // are random bytes of random length, so nothing compresses and nothing shares a prefix.
+    // BYTE_ARRAY values are random bytes of random length, so nothing compresses and nothing shares a
+    // prefix. ParquetFileWriter compacts a sliced column before it is encoded, so the sliced cases
+    // check the values that come back; PlainValueBytes_SlicedBinary covers a slice's offsets.
     [Theory]
     [InlineData(false, false, false)]
     [InlineData(true, false, false)]
     [InlineData(false, true, false)]
     [InlineData(true, true, false)]
+    [InlineData(false, false, true)]
     [InlineData(true, false, true)]
+    [InlineData(false, true, true)]
+    [InlineData(true, true, true)]
     public async Task ByteArrayChunk_FitsItsEstimate(bool nullable, bool deltaByteArray, bool sliced)
     {
         var builder = new BinaryArray.Builder();
@@ -126,13 +130,80 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         {
             ByteArrayEncoding = deltaByteArray ? ByteArrayEncoding.DeltaByteArray : ByteArrayEncoding.DeltaLengthByteArray,
         };
-        long size = await WriteAndMeasure(array, options);
+        var (size, read) = await WriteMeasureAndRead(array, options);
+
+        // A slice keeps the parent's buffers and an offset into them; the values written must be the
+        // slice's, not the parent's first rows.
+        var expected = (BinaryArray)array;
+        var actual = (BinaryArray)read;
+        Assert.Equal(expected.Length, actual.Length);
+        for (int i = 0; i < expected.Length; i++)
+        {
+            Assert.Equal(expected.IsNull(i), actual.IsNull(i));
+            Assert.True(expected.GetBytes(i).SequenceEqual(actual.GetBytes(i)), $"row {i} differs");
+        }
 
         int nonNull = RowCount - array.NullCount;
         AssertFits(size, ColumnChunkWriter.EstimateColumnSize(
             RowCount, nonNull,
             ColumnChunkWriter.PlainValueBytes(array, nonNull, PhysicalType.ByteArray, 0),
-            DefaultPageLength, PhysicalType.ByteArray, 0, nullable ? 1 : 0, 0, deltaByteArray));
+            Layout(RowCount, DefaultPageLength), PhysicalType.ByteArray, 0, nullable ? 1 : 0, 0, deltaByteArray));
+    }
+
+    [Fact]
+    public void PlainValueBytes_SlicedBinary_CountsTheSliceOnly()
+    {
+        var builder = new BinaryArray.Builder();
+        for (int i = 0; i < 100; i++)
+            builder.Append((ReadOnlySpan<byte>)new byte[i]);
+        var slice = Apache.Arrow.ArrowArrayFactory.BuildArray(builder.Build().Data.Slice(10, 5));
+
+        // Rows 10..14 hold 10 + 11 + 12 + 13 + 14 bytes, each behind a 4-byte length.
+        Assert.Equal(60 + 5 * 4, ColumnChunkWriter.PlainValueBytes(slice, 5, PhysicalType.ByteArray, 0));
+    }
+
+    // A repeated column's page cut backs up to the start of the record it falls in. Records of 3 and
+    // 6 values against 8-value pages cut each pair into two pages, where equal pages of 8 would be
+    // 1.125. Every page then has random deltas to pack, so each pads a full-width
+    // DELTA_BINARY_PACKED miniblock to 32 deltas: an estimate counting equal pages falls short.
+    [Fact]
+    public async Task RepeatedChunk_ShortenedPages_FitsItsEstimate()
+    {
+        const int pageLength = 8;
+        const int levelTarget = 200_000;
+        var options = Options(CompressionCodec.Uncompressed, dictionary: false)
+            with { DataPageSize = pageLength * sizeof(int) };
+
+        var rng = new Random(508);
+        var type = new ListType(new Field("item", Int32Type.Default, nullable: false));
+        var values = new Int32Array.Builder();
+        var offsets = new List<int> { 0 };
+        var repLevels = new List<int>();
+        for (int record = 0; repLevels.Count < levelTarget; record++)
+        {
+            int length = record % 2 == 0 ? 3 : pageLength - 2;
+            for (int i = 0; i < length; i++)
+            {
+                values.Append(rng.Next(int.MinValue, int.MaxValue));
+                repLevels.Add(i == 0 ? 0 : 1);
+            }
+            offsets.Add(repLevels.Count);
+        }
+        var offsetBytes = new byte[offsets.Count * sizeof(int)];
+        Buffer.BlockCopy(offsets.ToArray(), 0, offsetBytes, 0, offsetBytes.Length);
+        var array = new ListArray(
+            type, offsets.Count - 1, new ArrowBuffer(offsetBytes), values.Build(), ArrowBuffer.Empty);
+
+        long size = await WriteAndMeasure(array, options);
+
+        int levels = repLevels.Count;
+        var layout = ColumnChunkWriter.LayOutPages(repLevels.ToArray(), levels, pageLength, options.DataPageRowCountLimit);
+        Assert.True(
+            layout.Count > Layout(levels, pageLength).Count * 3 / 2,
+            $"{layout.Count} pages: the cut was meant to shorten them");
+        AssertFits(size, ColumnChunkWriter.EstimateColumnSize(
+            levels, levels, levels * 4L, layout, PhysicalType.Int32, 0, maxDefLevel: 1, maxRepLevel: 1,
+            deltaByteArray: false));
     }
 
     // A small DataPageRowCountLimit makes per-page costs outweigh the values: a 1-row INT32 page is
@@ -173,24 +244,24 @@ public class ColumnChunkSizeEstimateTests : IDisposable
             case "int32-nullable":
                 array = Int32Values("random", rows, nullable);
                 estimate = ColumnChunkWriter.EstimateColumnSize(
-                    rows, rows - array.NullCount, (rows - array.NullCount) * 4L, limit, PhysicalType.Int32, 0, nullable ? 1 : 0, 0, false);
+                    rows, rows - array.NullCount, (rows - array.NullCount) * 4L, Layout(rows, limit), PhysicalType.Int32, 0, nullable ? 1 : 0, 0, false);
                 break;
             case "int64":
                 array = Int64Values("random", rows);
                 estimate = ColumnChunkWriter.EstimateColumnSize(
-                    rows, rows, rows * 8L, limit, PhysicalType.Int64, 0, 0, 0, false);
+                    rows, rows, rows * 8L, Layout(rows, limit), PhysicalType.Int64, 0, 0, 0, false);
                 break;
             case "flba":
             case "flba-dba":
                 array = SharedPrefixFlba(rows, 16);
                 estimate = ColumnChunkWriter.EstimateColumnSize(
-                    rows, rows, rows * 16L, limit, PhysicalType.FixedLenByteArray, 16, 0, 0, kind == "flba-dba");
+                    rows, rows, rows * 16L, Layout(rows, limit), PhysicalType.FixedLenByteArray, 16, 0, 0, kind == "flba-dba");
                 break;
             default:
                 int distinct;
                 (array, distinct) = DictionaryValues("wide", rows, nullable);
                 estimate = ColumnChunkWriter.EstimateDictionaryColumnSize(
-                    distinct * sizeof(int), rows, limit, DictionaryEncoder.GetIndexBitWidth(distinct),
+                    distinct * sizeof(int), rows, Layout(rows, limit), DictionaryEncoder.GetIndexBitWidth(distinct),
                     maxDefLevel: nullable ? 1 : 0, maxRepLevel: 0);
                 break;
         }
@@ -213,7 +284,7 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         var (size, read) = await WriteMeasureAndRead(array, options);
 
         AssertFits(size, ColumnChunkWriter.EstimateColumnSize(
-            RowCount, RowCount, (long)RowCount * typeLength, DefaultPageLength, PhysicalType.FixedLenByteArray, typeLength, 0, 0,
+            RowCount, RowCount, (long)RowCount * typeLength, Layout(RowCount, DefaultPageLength), PhysicalType.FixedLenByteArray, typeLength, 0, 0,
             deltaByteArray: true));
         Assert.Equal(
             array.Data.Buffers[1].Span.ToArray(),
@@ -328,6 +399,10 @@ public class ColumnChunkSizeEstimateTests : IDisposable
             new ArrayData(type, rows, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(bytes)]));
     }
 
+    // A column that is not repeated is cut into equal pages of this length, or fewer at the end.
+    private static ColumnChunkWriter.PageLayout Layout(int rows, int pageLength) =>
+        ColumnChunkWriter.LayOutPages(repLevels: null, rows, int.MaxValue, pageLength);
+
     private static ParquetWriteOptions Options(CompressionCodec codec, bool dictionary) =>
         ParquetWriteOptions.Default with
         {
@@ -370,7 +445,8 @@ public class ColumnChunkSizeEstimateTests : IDisposable
     // Each case asserts the encoding it means to measure, so a change of default cannot quietly
     // turn one into a different case.
     private static EngineeredWood.Parquet.Encoding ExpectedEncoding(IArrowType type, ParquetWriteOptions options) =>
-        options.DictionaryEnabled ? EngineeredWood.Parquet.Encoding.RleDictionary
+        type is ListType list ? ExpectedEncoding(list.ValueDataType, options)
+        : options.DictionaryEnabled ? EngineeredWood.Parquet.Encoding.RleDictionary
         : type is Int32Type or Int64Type ? EngineeredWood.Parquet.Encoding.DeltaBinaryPacked
         : options.ByteArrayEncoding == ByteArrayEncoding.DeltaByteArray ? EngineeredWood.Parquet.Encoding.DeltaByteArray
         : type is BinaryType ? EngineeredWood.Parquet.Encoding.DeltaLengthByteArray
