@@ -54,6 +54,12 @@ internal static class Decompressor
 
     private static int DecompressGzip(ReadOnlySpan<byte> source, Span<byte> destination)
     {
+        // A 0-byte payload is not a Gzip stream, but writers on .NET 9 and later produced one for an
+        // empty section (Compressor now writes a real one); read it as the nothing it encodes. The
+        // pointer a fixed statement gives an empty span is null, which UnmanagedMemoryStream refuses.
+        if (source.IsEmpty)
+            return 0;
+
 #if NET6_0_OR_GREATER
         unsafe
         {
@@ -404,6 +410,10 @@ internal static class Decompressor
 
     private static unsafe int DecompressDeflate(ReadOnlySpan<byte> source, Span<byte> destination)
     {
+        // As for Gzip: an empty payload, as earlier writers produced for an empty input, is nothing.
+        if (source.IsEmpty)
+            return 0;
+
         fixed (byte* ptr = source)
         {
             using var sourceStream = new UnmanagedMemoryStream(ptr, source.Length);
