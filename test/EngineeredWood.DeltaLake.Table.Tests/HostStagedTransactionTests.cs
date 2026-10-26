@@ -326,7 +326,8 @@ public class HostStagedTransactionTests : IDisposable
         var at = await LocateRowsAsync(table);
 
         var txn = table.StartTransaction();
-        await txn.StageRowDeletesAsync(Sel(at[3]));
+        // The host covers the delete's change rows itself, so the commit must not fill them in as well.
+        await txn.StageRowDeletesAsync(Sel(at[3]), RowDeleteMode.DeletionVector, changeDataStagedByCaller: true);
         await txn.StageChangeDataAsync(Batch(3, 1), "delete");
         long version = await txn.CommitAsync();
 
@@ -340,8 +341,7 @@ public class HostStagedTransactionTests : IDisposable
                 changes.Add((ids.GetValue(i)!.Value, types.GetString(i)));
         }
 
-        // A commit carrying a cdc action reads cdc-only: exactly the staged delete, not an inferred whole-file
-        // delete plus re-insert of the survivors.
+        // A commit carrying a cdc action reads cdc-only: exactly the staged delete, once.
         var change = Assert.Single(changes);
         Assert.Equal((3L, "delete"), change);
     }

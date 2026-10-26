@@ -51,6 +51,17 @@ namespace EngineeredWood.DeltaLake.Table;
 /// conflict-check, rebase, and retry loop as the computed ones, so an embedding host does not reimplement
 /// it. Plan against <see cref="Snapshot"/> so the rows a staged delete names agree with what the
 /// transaction validates.</para>
+///
+/// <para><b>Change Data Feed.</b> A reader takes a version's change files as its whole change feed whenever it
+/// has any, and infers the feed from adds and removes only when it has none. Spark and delta-rs commit one
+/// operation per version, so the two never mix there; a transaction can mix them. The DELETEs and UPDATEs
+/// computed here, and a copy-on-write staged delete, write their own change files, as each does committed alone.
+/// Appends and deletion-vector deletes write none, also as alone, and stay inferred, unless the commit carries
+/// some change file anyway. Then the commit writes their change rows itself — <c>insert</c> for an append's
+/// rows, <c>delete</c> for the rows a vector newly hides — so nothing staged drops out of the feed. A host that
+/// stages such rows itself with <see cref="StageChangeDataAsync"/> passes <c>changeDataStagedByCaller: true</c>
+/// to the staging call so they do not appear twice. Actions staged raw with <see cref="StageActions"/> are the
+/// host's to cover.</para>
 /// </summary>
 public sealed class DeltaTransaction : IAsyncDisposable
 {
@@ -75,6 +86,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
     // the commit loop rebase this delete's deletion vectors onto a concurrent DV-delete of the same file
     // (row-level concurrency) instead of aborting. Only DELETEs contribute; appends and updates do not.
     private readonly List<DeltaTable.DeleteDvEdit> _dvEdits = [];
+    // Staged work that wrote no change rows of its own and whose host did not say it covered them: appends (the
+    // adds, as staged) and deletion-vector deletes (the rows each newly hid). A commit that carries any cdc
+    // action is read from its change files alone, so the commit writes change rows for these then (#530).
+    private readonly List<AddFile> _uncoveredAppends = [];
+    private readonly List<DeltaTable.DeleteDvEdit> _uncoveredVectorDeletes = [];
     // Where the NEXT staged add starts reserving stable row ids. Each staging call must continue from here
     // rather than restart at the base snapshot's high-water mark: two appends staged on one transaction
     // otherwise reserve the SAME ids, and the duplicate is invisible until a spec reader resolves two rows
@@ -152,6 +168,12 @@ public sealed class DeltaTransaction : IAsyncDisposable
     internal IReadOnlyCollection<string> ReadDomains => _readDomains;
 
     internal IReadOnlyList<DeltaTable.DeleteDvEdit> DvEdits => _dvEdits;
+
+    /// <summary>The staged appends whose rows no change file covers.</summary>
+    internal IReadOnlyList<AddFile> UncoveredAppends => _uncoveredAppends;
+
+    /// <summary>The staged deletion-vector deletes whose rows no change file covers.</summary>
+    internal IReadOnlyList<DeltaTable.DeleteDvEdit> UncoveredVectorDeletes => _uncoveredVectorDeletes;
 
     /// <summary>The files this transaction's own writers created, for the commit loop to keep recording into
     /// and for <see cref="AbortAsync"/> to delete.</summary>
@@ -283,6 +305,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
 
         _nextRowId = nextRowId;
         StageInternal(actions);
+        RecordUncoveredAppends(actions);
         _operations.Add("WRITE");
 
         long rows = 0;
@@ -461,8 +484,14 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// reader will trust. Left false, a table declaring any of those is refused, and
     /// <see cref="DeltaTable.SupportsExternalDataFileCommit"/> reports false for it.
     /// </param>
+    /// <param name="changeDataStagedByCaller">
+    /// Declares that the caller stages these rows' <c>insert</c> change rows itself with
+    /// <see cref="StageChangeDataAsync"/>. Left false, a commit that carries any change file writes them for
+    /// the caller; see the Change Data Feed remarks on <see cref="DeltaTransaction"/>.
+    /// </param>
     public void StageDataFiles(
-        IReadOnlyList<WrittenDataFile> files, bool constraintsEnforcedByCaller = false)
+        IReadOnlyList<WrittenDataFile> files, bool constraintsEnforcedByCaller = false,
+        bool changeDataStagedByCaller = false)
     {
         EnsureOpen();
         if (files is null)
@@ -481,6 +510,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
         var (actions, nextRowId) = _table.BuildStagedAppendActions(_baseSnapshot, files, _nextRowId);
         _nextRowId = nextRowId;
         StageInternal(actions);
+        if (!changeDataStagedByCaller)
+            RecordUncoveredAppends(actions);
         _operations.Add("WRITE");
     }
 
@@ -504,12 +535,15 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// <see cref="DeltaTable.GenerateIdentityValues"/>), so the write-time per-row processing an outside
     /// writer skipped has already happened. Without this an identity table's appends cannot be staged at
     /// all — the reason this overload exists.</param>
+    /// <param name="changeDataStagedByCaller">As for <see cref="StageDataFiles"/>: the caller stages the
+    /// visible rows' <c>insert</c> change rows itself, so the commit never writes them.</param>
     public async ValueTask<long> StageDataFilesAsync(
         IReadOnlyList<WrittenDataFile> files,
         RowSelection? bornDeleted = null,
         bool identityValuesPreGenerated = false,
         CancellationToken cancellationToken = default,
-        bool constraintsEnforcedByCaller = false)
+        bool constraintsEnforcedByCaller = false,
+        bool changeDataStagedByCaller = false)
     {
         EnsureOpen();
         if (files is null)
@@ -533,6 +567,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
 
         _nextRowId = nextRowId;
         StageInternal(actions);
+        if (!changeDataStagedByCaller)
+            RecordUncoveredAppends(actions);
         _operations.Add("WRITE");
         return liveRows;
     }
@@ -557,9 +593,12 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// <see cref="InvalidOperationException"/> rather than commit a vector its protocol never declared. Stage
     /// the delete with <see cref="RowDeleteMode.CopyOnWrite"/> instead.</para>
     ///
-    /// <para>No change data is written, as with Spark's deletion-vector DML: on a Change Data Feed table the
-    /// deleted rows are what the new vector hides beyond the old one. A host that wants them in a change file
-    /// stages them itself with <see cref="StageChangeDataAsync"/>.</para>
+    /// <para>No change data is written at staging, as with Spark's deletion-vector DML: on a Change Data Feed
+    /// table the deleted rows are what the new vector hides beyond the old one. If the commit carries some
+    /// change file anyway, the commit writes these rows as <c>delete</c> change rows, so they stay in the feed.
+    /// A host that stages them itself with <see cref="StageChangeDataAsync"/> says so with the
+    /// <see cref="StageRowDeletesAsync(RowSelection, RowDeleteMode, CancellationToken, bool)"/> overload's
+    /// <c>changeDataStagedByCaller</c>.</para>
     /// </summary>
     public ValueTask<long> StageRowDeletesAsync(
         RowSelection selection,
@@ -578,19 +617,27 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// when every row of a file goes. On a row-tracking table the survivors keep their ids. The rewritten
     /// files become the transaction's read-set: a concurrent change to one aborts the commit, with no
     /// row-by-row reconciliation as for a vector. On a Change Data Feed table each rewritten file also gets a
-    /// <c>delete</c> change file holding the rows it lost, as an immediate copy-on-write delete writes, so do
-    /// NOT stage those rows again with <see cref="StageChangeDataAsync"/>: they would appear twice.</para>
+    /// <c>delete</c> change file holding the rows it lost, as an immediate copy-on-write delete writes.</para>
     ///
     /// <para>A selection naming a file an earlier operation on this transaction already deleted from or
     /// rewrote throws <see cref="InvalidOperationException"/>, in either mode. Returns the rows deleted.</para>
     /// </summary>
+    /// <param name="changeDataStagedByCaller">Declares that the caller stages this delete's <c>delete</c>
+    /// change rows itself with <see cref="StageChangeDataAsync"/>, so none are written for it: not the
+    /// copy-on-write change file, and not the rows a commit carrying some other change file would otherwise
+    /// write for a vector delete. Left false, the deleted rows reach the feed without the caller's help; staging
+    /// them as well would put them in it twice.</param>
     public async ValueTask<long> StageRowDeletesAsync(
         RowSelection selection,
         RowDeleteMode mode,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool changeDataStagedByCaller = false)
     {
         if (mode == RowDeleteMode.CopyOnWrite)
-            return await StageCopyOnWriteRowDeletesAsync(selection, cancellationToken).ConfigureAwait(false);
+        {
+            return await StageCopyOnWriteRowDeletesAsync(selection, changeDataStagedByCaller, cancellationToken)
+                .ConfigureAwait(false);
+        }
         if (mode != RowDeleteMode.DeletionVector)
             throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown RowDeleteMode.");
 
@@ -611,6 +658,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
 
         StageInternal(result.Actions);
         _dvEdits.AddRange(result.Edits);
+        if (!changeDataStagedByCaller)
+            _uncoveredVectorDeletes.AddRange(result.Edits);
         foreach (string path in result.TouchedPaths)
             _removedPaths.Add(path);
         _operations.Add("DELETE");
@@ -618,7 +667,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
     }
 
     private async ValueTask<long> StageCopyOnWriteRowDeletesAsync(
-        RowSelection selection, CancellationToken cancellationToken)
+        RowSelection selection, bool changeDataStagedByCaller, CancellationToken cancellationToken)
     {
         EnsureOpen();
         if (selection is null)
@@ -631,8 +680,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
             throw RestagedFile(restaged, "DELETE");
 
         var plan = await _table.ComputeCopyOnWriteDeleteActionsAsync(
-            selection, _baseSnapshot, cancellationToken, rowIdStart: _nextRowId, written: _written)
-            .ConfigureAwait(false);
+            selection, _baseSnapshot, cancellationToken, rowIdStart: _nextRowId, written: _written,
+            writeChangeData: !changeDataStagedByCaller).ConfigureAwait(false);
         if (plan.RowsDeleted == 0)
             return 0;
 
@@ -669,8 +718,10 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// <para><paramref name="rows"/> carry the table's logical columns INCLUDING partition columns: the rows
     /// are split per partition and each file's <c>partitionValues</c> encoded the way a data file's are, which
     /// is work a caller cannot do from outside the assembly. A commit carrying any cdc action is read
-    /// cdc-only, so a change file staged here replaces — rather than adds to — what the reader would otherwise
-    /// infer from this version's adds and removes.</para>
+    /// cdc-only, so staging a change file here makes the commit write change rows for the staged appends and
+    /// deletion-vector deletes whose staging call did not pass <c>changeDataStagedByCaller: true</c>. Rows for
+    /// an operation staged with that flag are this call's to supply; rows for any other would appear
+    /// twice.</para>
     /// </summary>
     /// <param name="rowIds">On a ROW TRACKING table, each row's stable row id — one per row of
     /// <paramref name="rows"/>, ordinarily what a <see cref="DeltaRowMetadata.RowTracking"/> read reported
@@ -1026,6 +1077,16 @@ public sealed class DeltaTransaction : IAsyncDisposable
                 continue;
             }
             _dataActions.Add(action);
+        }
+    }
+
+    /// <summary>Records an append's adds as work no change file covers, for the commit's fill-in.</summary>
+    private void RecordUncoveredAppends(IEnumerable<DeltaAction> actions)
+    {
+        foreach (var action in actions)
+        {
+            if (action is AddFile { DataChange: true } add)
+                _uncoveredAppends.Add(add);
         }
     }
 

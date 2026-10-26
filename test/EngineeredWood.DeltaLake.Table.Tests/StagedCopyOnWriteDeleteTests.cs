@@ -10,7 +10,7 @@ using Ex = EngineeredWood.Expressions.Expressions;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// <see cref="DeltaTransaction.StageRowDeletesAsync(RowSelection, RowDeleteMode, CancellationToken)"/> with
+/// <see cref="DeltaTransaction.StageRowDeletesAsync(RowSelection, RowDeleteMode, CancellationToken, bool)"/> with
 /// <see cref="RowDeleteMode.CopyOnWrite"/> (#525): the way a host that buffers DML stages a delete on a table
 /// that must stay readable by engines without deletion vectors. Before it, such a table could only take a
 /// delete as its own commit (<see cref="DeltaTable.DeleteRowsAsync"/>), never inside a transaction with other
