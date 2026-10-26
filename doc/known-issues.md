@@ -1095,6 +1095,25 @@ data another engine wrote under semantics we do not share. `DELETE`
 still refuses, which costs nothing to fix but has not been done: a
 delete removes rows and cannot newly violate a row-level rule.
 
+**NOT NULL is enforced against the table's schema** (`DeltaNotNullEnforcer`,
+[#514](https://github.com/clast-project/engineered-wood/issues/514)),
+not the batch's own fields: a batch declaring a field nullable used to
+commit nulls into a column the table declares `NOT NULL`. Refused with
+`DELTA_NOT_NULL_CONSTRAINT_VIOLATED`, as delta-spark refuses it, on
+`WriteAsync`, the transactional append, create-with-data,
+`WriteDataFilesAsync`, and the post-images of `UpdateAsync` and
+`UpdateRowsAsync`. Nested fields apply only where every parent holds a
+value; array elements, map keys and map values are checked too. Spark
+refuses to create a table with a NOT NULL inside an array or map
+(`DELTA_NESTED_NOT_NULL_CONSTRAINT`) unless a config tells it to ignore
+the constraint silently, so on such a table EW refuses a null element
+that Spark would write: stricter, never looser. A batch that omits a `NOT NULL`
+column is refused, since the column would read as null; identity columns
+the writer fills in are exempt. Unlike CHECK constraints this needs no
+evaluator, so it does not gate `SupportsExternalDataFileCommit`: the
+commit seam takes finished files, and nothing checks a host's own files
+for nulls.
+
 **Gaps inside the parser and registry**, each of which refuses by name
 rather than producing a wrong answer:
 
