@@ -267,14 +267,19 @@ public class CdfDeletionVectorInferenceTests : IDisposable
             // What an older writer commits: the same edit, with the remove's partition values left off.
             var (staged, _) = await table.ComputeDeletionVectorActionsAsync(
                 new Dictionary<int, IReadOnlyCollection<long>> { [0] = [1L] });
-            txn.StageActions([.. staged.Select(a => a is RemoveFile r ? r with { PartitionValues = null } : a)]);
+            txn.StageActions([.. staged.Select(a => a is RemoveFile r ? r with { ExtendedFileMetadata = null, PartitionValues = null, Size = null } : a)]);
         }
         long version = await txn.CommitAsync();
         await AssertNoChangeFileAsync(version);
 
         var remove = Assert.Single((await new TransactionLog(Fs).ReadCommitAsync(version)).OfType<RemoveFile>());
         if (removeCarriesPartitionValues)
+        {
+            // Declared, as on every other remove EW writes: the flag is what tells a reader the map is there.
+            Assert.True(remove.ExtendedFileMetadata);
             Assert.Equal("eu", remove.PartitionValues?["region"]);
+            Assert.Equal(file.Size, remove.Size);
+        }
         else
             Assert.Null(remove.PartitionValues);
 
