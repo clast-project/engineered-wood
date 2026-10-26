@@ -6949,7 +6949,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 ? WriteTimeExpressionHandling.AssertedByCaller
                 : WriteTimeExpressionHandling.Refuse);
         if (deletedPositionsByFileIndex is not null && deletedPositionsByFileIndex.Values.Any(p => p.Count > 0))
-            EnsureDeletionVectorsEnabled(CurrentSnapshot, "Committing born-deleted rows");
+            EnsureDeletionVectorsEnabled(
+                CurrentSnapshot, "Committing born-deleted rows", WithoutBornDeletedAlternative);
 
         if (dynamicPartitionOverwrite)
         {
@@ -7481,7 +7482,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var deletedByPath = ValidateBornDeleted(files, bornDeleted);
         if (deletedByPath is not null && deletedByPath.Values.Any(p => p.Count > 0))
-            EnsureDeletionVectorsEnabled(snapshot, "Staging born-deleted rows");
+            EnsureDeletionVectorsEnabled(snapshot, "Staging born-deleted rows", WithoutBornDeletedAlternative);
 
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
         long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
@@ -7750,7 +7751,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         WrittenFileLedger? written = null)
     {
         if (!selection.IsEmpty)
-            EnsureDeletionVectorsEnabled(snapshot, "Deleting rows by position");
+            EnsureDeletionVectorsEnabled(snapshot, "Deleting rows by position", CopyOnWriteAlternative);
 
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var byPath = ActiveFilesByPath(snapshot);
@@ -7870,14 +7871,17 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// treat the table as one where vectors do not exist and return the hidden rows, and a reader without
     /// vector support — the reason a table is created without them — refuses the table outright.
     /// </summary>
-    internal static void EnsureDeletionVectorsEnabled(Snapshot.Snapshot snapshot, string what)
+    internal static void EnsureDeletionVectorsEnabled(Snapshot.Snapshot snapshot, string what, string alternative)
     {
         if (!DeletionVectors.DeletionVectorConfig.IsEnabled(snapshot.Metadata.Configuration))
             throw new InvalidOperationException(
                 what + " writes a deletion vector, and this table does not have deletion vectors enabled — "
-                + "create the table with DeltaTable.CreateAsync(..., enableDeletionVectors: true), or delete "
-                + "outside a transaction with DeleteRowsAsync(selection, RowDeleteMode.CopyOnWrite).");
+                + "create the table with DeltaTable.CreateAsync(..., enableDeletionVectors: true), or "
+                + alternative + ".");
     }
+
+    private const string CopyOnWriteAlternative = "pass RowDeleteMode.CopyOnWrite";
+    private const string WithoutBornDeletedAlternative = "write the files without the rows instead";
 
     /// <summary>
     /// <see cref="RowDeleteMode.DeletionVector"/>: each affected file's existing DV is unioned with the
@@ -8027,6 +8031,49 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             return (0, snapshot.Version);
 
         HonorWriterFeatures(snapshot, isAppend: false);
+        var plan = await ComputeCopyOnWriteDeleteActionsAsync(
+            selection, snapshot, cancellationToken, written: written).ConfigureAwait(false);
+        if (plan.Actions.Count == 0)
+            return (0, snapshot.Version);
+
+        // A copy-on-write DELETE reads exactly the files it rewrites (removedPaths = its read-set), so it
+        // rebases past a non-conflicting concurrent commit and aborts only on a real conflict — but a rewrite's
+        // fresh add is NOT verbatim-rebase-safe (its baseRowId embeds the attempted version's HWM), so
+        // single-attempt (rebaseSafe:false) as the overwrite family does.
+        long version = await CommitOccAsync(
+            snapshot, plan.Actions,
+            new ReadSet { Files = plan.RemovedPaths },
+            IsolationFor(snapshot, plan.Actions), "DELETE", rebaseSafe: false, cancellationToken,
+            written: written, isBlindAppend: false)
+            .ConfigureAwait(false);
+        return (plan.RowsDeleted, version);
+    }
+
+    /// <summary>The remove/add (and change-data) actions a copy-on-write DELETE produces, the paths it
+    /// rewrote, and the rows it deleted — everything a commit needs, without committing. Shared by the
+    /// auto-committing <see cref="DeleteRowsAsync"/> and the transactional
+    /// <see cref="DeltaTransaction.StageRowDeletesAsync(RowSelection, RowDeleteMode, CancellationToken)"/>.</summary>
+    internal sealed record CopyOnWriteDeleteActions(
+        IReadOnlyList<DeltaAction> Actions, ISet<string> RemovedPaths, long RowsDeleted, long NextRowId);
+
+    /// <summary>
+    /// Computes a copy-on-write DELETE of <paramref name="selection"/> against <paramref name="snapshot"/>
+    /// WITHOUT committing: each touched file is rewritten now, without the selected rows, and the result is a
+    /// <c>remove</c>(old) + <c>add</c>(rewritten) pair per file — just the <c>remove</c> when every row goes.
+    /// On a Change Data Feed table each rewritten file also gets a <c>delete</c> change file holding the rows
+    /// it lost, since nothing on disk holds them afterwards.
+    /// </summary>
+    /// <param name="rowIdStart">Where the rewrites' adds begin reserving stable row ids, as for
+    /// <see cref="ComputeUpdateActionsAsync"/>. Null starts at the snapshot's mark.</param>
+    /// <param name="written">Records the rewritten and change-data files. The files it REMOVES are not
+    /// recorded: they are the table's data until the commit lands, so an abort must leave them in place.</param>
+    internal async ValueTask<CopyOnWriteDeleteActions> ComputeCopyOnWriteDeleteActionsAsync(
+        RowSelection selection,
+        Snapshot.Snapshot snapshot,
+        CancellationToken cancellationToken,
+        long? rowIdStart = null,
+        WrittenFileLedger? written = null)
+    {
         RejectCopyOnWriteRowIdUnsupported("copy-on-write DELETE");
 
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
@@ -8037,7 +8084,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         bool materializeIds = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         long newVersion = snapshot.Version + 1;
-        long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+        long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
 
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
@@ -8146,23 +8193,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        if (actions.Count == 0)
-            return (0, snapshot.Version);
-
-        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        if (actions.Count > 0 && rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
 
-        // A copy-on-write DELETE reads exactly the files it rewrites (removedPaths = its read-set), so it
-        // rebases past a non-conflicting concurrent commit and aborts only on a real conflict — but a rewrite's
-        // fresh add is NOT verbatim-rebase-safe (its baseRowId embeds the attempted version's HWM), so
-        // single-attempt (rebaseSafe:false) as the overwrite family does.
-        long version = await CommitOccAsync(
-            snapshot, actions,
-            new ReadSet { Files = removedPaths },
-            IsolationFor(snapshot, actions), "DELETE", rebaseSafe: false, cancellationToken,
-            written: written, isBlindAppend: false)
-            .ConfigureAwait(false);
-        return (totalDeleted, version);
+        return new CopyOnWriteDeleteActions(actions, removedPaths, totalDeleted, nextRowId);
     }
 
     /// <summary>

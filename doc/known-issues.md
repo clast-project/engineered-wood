@@ -871,7 +871,9 @@ exist — `DeleteRowsAsync(selection, RowDeleteMode.CopyOnWrite)` / `UpdateRowsA
 — which rewrites the affected files with no DV. It needs neither deletion
 vectors nor row tracking, preserves row-tracking ids when the table has them,
 and writes the Change Data Feed for exactly the rows it touched; only
-IcebergCompat tables are still refused on that path.)
+IcebergCompat tables are still refused on that path. It can also be staged on
+a transaction: `DeltaTransaction.StageRowDeletesAsync(selection,
+RowDeleteMode.CopyOnWrite)`.)
 Earlier EW always wrote a DV without declaring the feature, so a conformant
 foreign reader silently returned the deleted rows; that data-loss gap is closed.
 
