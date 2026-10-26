@@ -316,17 +316,18 @@ public class ChangeDataFeedTests : IDisposable
         Assert.Equal("insert", ct.GetString(0));
     }
 
-    // The add side of the same rule, on a table where CDF is OFF so a DV delete produces no cdc file and the
-    // whole commit is inferred: the remove carries the file's PRE-image DV (none here, so all five rows are
-    // deletes) and the add carries the new DV, so only the four survivors are inserts. Net: id=2 deleted.
-    // Without the add-side filter the survivors and the deleted row all re-insert, and the delete disappears.
+    // On a table where CDF is OFF, a DV delete produces no cdc file and the whole commit is inferred. The
+    // commit is remove(file, no DV) + add(the same file, new DV): a vector edit, so the feed is the difference
+    // between the two vectors, id=2 deleted and nothing else. Read as two whole files it reported all five rows
+    // deleted and the four survivors re-inserted (#529).
     //
     // NOTE: this mode is EW-ONLY and has no reference oracle. Measured against Spark 4.0: asking for a change
     // feed over a version where delta.enableChangeDataFeed was never set fails with DELTA_MISSING_CHANGE_DATA
     // rather than inferring anything. EW deliberately answers instead (see ReadChanges_WithoutCdf_InfersChanges)
-    // — so these expectations are EW's own semantics, not a conformance claim. The remove side, which DOES have
-    // a Spark counterpart, is pinned cross-engine by
-    // SparkInteropTests.EwWritten_CdfInference_OverDeletionVector_MatchesSparkFeed.
+    // — so these expectations are EW's own semantics, not a conformance claim. The same pairing on a CDF table,
+    // which DOES have a Spark counterpart, is pinned cross-engine by
+    // CdfDeletionVectorInteropTests.SparkVectorDeletes_FeedMatchesSparksOwn, and an unpaired remove of a
+    // DV-carrying file by SparkInteropTests.EwWritten_CdfInference_OverDeletionVector_MatchesSparkFeed.
     [Fact]
     public async Task ReadChanges_Inferred_DvDeleteWithoutCdf_ReportsNetDelete()
     {
@@ -368,8 +369,8 @@ public class ChangeDataFeedTests : IDisposable
             }
         }
 
-        Assert.Equal([1L, 2L, 3L, 4L, 5L], deleted.OrderBy(x => x).ToArray());
-        Assert.Equal([1L, 3L, 4L, 5L], inserted.OrderBy(x => x).ToArray());
+        Assert.Equal([2L], deleted.ToArray());
+        Assert.Empty(inserted);
     }
 
     [Fact]
