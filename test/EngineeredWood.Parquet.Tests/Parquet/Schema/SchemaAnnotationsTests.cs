@@ -163,13 +163,56 @@ public class SchemaAnnotationsTests
     public void TimeUnitThisReaderDoesNotKnow_DropsTheAnnotation(short logicalField, short unitField, PhysicalType physical)
     {
         var metadata = MetadataDecoder.DecodeFileMetaData(FooterWithTimeUnit(logicalField, unitField, physical));
-        var raw = metadata.Schema[1];
-        Assert.Equal(new LogicalType.UnknownLogicalType(logicalField), raw.LogicalType);
+        var raw = Assert.IsType<LogicalType.UnknownLogicalType>(metadata.Schema[1].LogicalType);
+        Assert.Equal(logicalField, raw.ThriftFieldId);
 
         var column = new SchemaDescriptor(metadata.Schema).Columns[0];
         Assert.Null(column.SchemaElement.LogicalType);
         Assert.Null(column.SchemaElement.ConvertedType);
         Assert.True(column.SchemaNode.AnnotationIgnored);
+    }
+
+    /// <summary>
+    /// FileMetaData.Schema keeps an unrecognized annotation as written: a footer re-encoded from the
+    /// decoded metadata (the TestTool's path_in_schema rewrite does this) writes it back byte for
+    /// byte, instead of dropping it or writing an empty union.
+    /// </summary>
+    [Theory]
+    [InlineData(8, (short)4)]
+    [InlineData(7, (short)4)]
+    [InlineData(8, (short)0)]
+    [InlineData(8, (short)2)]   // and a recognized one, for contrast
+    public void UnrecognizedAnnotation_SurvivesAFooterRewrite_ByteForByte(short logicalField, short unitField)
+    {
+        byte[] footer = FooterWithTimeUnit(logicalField, unitField, PhysicalType.Int64);
+
+        byte[] rewritten = MetadataEncoder.EncodeFileMetaData(MetadataDecoder.DecodeFileMetaData(footer));
+
+        Assert.Equal(footer, rewritten);
+    }
+
+    /// <summary>
+    /// The same for a logical type id this reader does not know at all, with a non-empty body —
+    /// GEOGRAPHY (18) with a CRS string and an algorithm, which this library does not model yet (#549).
+    /// </summary>
+    [Fact]
+    public void UnrecognizedLogicalTypeId_SurvivesAFooterRewrite_ByteForByte()
+    {
+        byte[] footer = Footer(PhysicalType.ByteArray, converted: null, w =>
+        {
+            w.WriteFieldHeader(ThriftType.Struct, 18);
+            w.PushStruct();
+            w.WriteFieldHeader(ThriftType.Binary, 1);
+            w.WriteString("OGC:CRS84");
+            w.WriteFieldHeader(ThriftType.I32, 2);
+            w.WriteZigZagInt32(0);
+            w.WriteStructStop();
+            w.PopStruct();
+        });
+
+        var metadata = MetadataDecoder.DecodeFileMetaData(footer);
+        Assert.Equal((short)18, Assert.IsType<LogicalType.UnknownLogicalType>(metadata.Schema[1].LogicalType).ThriftFieldId);
+        Assert.Equal(footer, MetadataEncoder.EncodeFileMetaData(metadata));
     }
 
     [Theory]
@@ -189,7 +232,33 @@ public class SchemaAnnotationsTests
     /// TIMESTAMP_MICROS, and logical type <paramref name="logicalField"/> (7 TIME, 8 TIMESTAMP) whose
     /// TimeUnit union sets member <paramref name="unitField"/>, or nothing when it is 0.
     /// </summary>
-    private static byte[] FooterWithTimeUnit(short logicalField, short unitField, PhysicalType physical)
+    private static byte[] FooterWithTimeUnit(short logicalField, short unitField, PhysicalType physical) =>
+        Footer(physical, ConvertedType.TimestampMicros, w =>
+        {
+            w.WriteFieldHeader(ThriftType.Struct, logicalField);
+            w.PushStruct();
+            w.WriteBoolField(1, true); // isAdjustedToUTC
+            w.WriteFieldHeader(ThriftType.Struct, 2); // unit: TimeUnit union
+            w.PushStruct();
+            if (unitField != 0)
+            {
+                w.WriteFieldHeader(ThriftType.Struct, unitField);
+                w.PushStruct();
+                w.WriteStructStop();
+                w.PopStruct();
+            }
+            w.WriteStructStop();
+            w.PopStruct();
+            w.WriteStructStop();
+            w.PopStruct();
+        });
+
+    /// <summary>
+    /// A footer with one optional leaf <c>t</c> of <paramref name="physical"/> type and
+    /// <paramref name="converted"/> type, whose LogicalType union member <paramref name="writeMember"/>
+    /// writes. Fields in the order MetadataEncoder writes them, so a faithful rewrite is byte-identical.
+    /// </summary>
+    private static byte[] Footer(PhysicalType physical, ConvertedType? converted, Action<ThriftCompactWriter> writeMember)
     {
         var w = new ThriftCompactWriter();
         w.PushStruct();
@@ -213,26 +282,14 @@ public class SchemaAnnotationsTests
         w.WriteZigZagInt32((int)FieldRepetitionType.Optional);
         w.WriteFieldHeader(ThriftType.Binary, 4);
         w.WriteString("t");
-        w.WriteFieldHeader(ThriftType.I32, 6);
-        w.WriteZigZagInt32((int)ConvertedType.TimestampMicros);
+        if (converted is { } c)
+        {
+            w.WriteFieldHeader(ThriftType.I32, 6);
+            w.WriteZigZagInt32((int)c);
+        }
         w.WriteFieldHeader(ThriftType.Struct, 10); // logicalType union
         w.PushStruct();
-        w.WriteFieldHeader(ThriftType.Struct, logicalField);
-        w.PushStruct();
-        w.WriteBoolField(1, true); // isAdjustedToUTC
-        w.WriteFieldHeader(ThriftType.Struct, 2); // unit: TimeUnit union
-        w.PushStruct();
-        if (unitField != 0)
-        {
-            w.WriteFieldHeader(ThriftType.Struct, unitField);
-            w.PushStruct();
-            w.WriteStructStop();
-            w.PopStruct();
-        }
-        w.WriteStructStop();
-        w.PopStruct();
-        w.WriteStructStop();
-        w.PopStruct();
+        writeMember(w);
         w.WriteStructStop();
         w.PopStruct();
         w.WriteStructStop();

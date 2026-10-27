@@ -247,6 +247,7 @@ internal static class MetadataDecoder
         {
             var (type, fid) = reader.ReadFieldHeader();
             if (type == ThriftType.Stop) break;
+            int start = reader.Position;
 
             switch (fid)
             {
@@ -310,6 +311,14 @@ internal static class MetadataDecoder
                     reader.Skip(type);
                     result = new LogicalType.UnknownLogicalType(fid);
                     break;
+            }
+
+            // Keep an unrecognized member's bytes so a re-encoded footer writes it back unchanged.
+            // Every LogicalType member the spec defines is a struct; anything else is malformed.
+            if (result is LogicalType.UnknownLogicalType { RawStruct: null } unknown
+                && unknown.ThriftFieldId == fid && type == ThriftType.Struct)
+            {
+                result = unknown with { RawStruct = reader.ReadSince(start).ToArray() };
             }
         }
 

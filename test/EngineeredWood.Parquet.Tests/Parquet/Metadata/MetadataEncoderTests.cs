@@ -354,6 +354,65 @@ public class MetadataEncoderTests
         Assert.False(intType.IsSigned);
     }
 
+    /// <summary>The spec's UNKNOWN (always-null) annotation, union field 11.</summary>
+    [Fact]
+    public void RoundTrip_LogicalTypes_Null()
+    {
+        var original = new FileMetaData
+        {
+            Version = 1,
+            Schema =
+            [
+                new SchemaElement { Name = "schema", NumChildren = 1 },
+                new SchemaElement
+                {
+                    Name = "nothing",
+                    Type = PhysicalType.Int32,
+                    RepetitionType = FieldRepetitionType.Optional,
+                    LogicalType = new LogicalType.NullType(),
+                },
+            ],
+            NumRows = 0,
+            RowGroups = [],
+        };
+
+        byte[] encoded = MetadataEncoder.EncodeFileMetaData(original);
+        var decoded = MetadataDecoder.DecodeFileMetaData(encoded);
+
+        Assert.IsType<LogicalType.NullType>(decoded.Schema[1].LogicalType);
+        Assert.Equal(encoded, MetadataEncoder.EncodeFileMetaData(decoded));
+    }
+
+    /// <summary>
+    /// An UnknownLogicalType built in code has no bytes to write, so the encoder omits the annotation
+    /// rather than write an empty union, which is malformed.
+    /// </summary>
+    [Fact]
+    public void ConstructedUnknownLogicalType_IsOmitted()
+    {
+        var original = new FileMetaData
+        {
+            Version = 1,
+            Schema =
+            [
+                new SchemaElement { Name = "schema", NumChildren = 1 },
+                new SchemaElement
+                {
+                    Name = "c",
+                    Type = PhysicalType.ByteArray,
+                    RepetitionType = FieldRepetitionType.Optional,
+                    LogicalType = new LogicalType.UnknownLogicalType(99),
+                },
+            ],
+            NumRows = 0,
+            RowGroups = [],
+        };
+
+        var decoded = MetadataDecoder.DecodeFileMetaData(MetadataEncoder.EncodeFileMetaData(original));
+
+        Assert.Null(decoded.Schema[1].LogicalType);
+    }
+
     [Theory]
     [InlineData(TimeUnit.Millis)]
     [InlineData(TimeUnit.Micros)]
