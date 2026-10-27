@@ -65,6 +65,23 @@ public sealed class RecentParquetTestingFixturesTests
         Assert.True(values.IsNull(2));
     }
 
+    /// <summary>
+    /// UUID on INT32 is not a valid combination; parquet-format 2.14 (GH-606) says to ignore the
+    /// annotation and read the physical type. This used to build a 16-byte fixed-size binary array
+    /// over the column's 4-byte values.
+    /// </summary>
+    [Fact]
+    public async Task UuidOnInt32_IgnoresTheAnnotationAndReadsInt32()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("int32_with_uuid_logical_type.parquet"));
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        var values = Assert.IsType<Int32Array>(batch.Column(0));
+
+        Assert.Equal(Enumerable.Range(0, 10).Select(i => (int?)i), values.ToList());
+    }
+
     [Fact]
     public async Task Int96TimestampOrder_IsUnknownAndValuesReadAsTimestamps()
     {

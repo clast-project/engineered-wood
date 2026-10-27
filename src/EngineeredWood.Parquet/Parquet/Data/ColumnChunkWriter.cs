@@ -1248,9 +1248,7 @@ internal static class ColumnChunkWriter
     {
         bool useDba = options.ByteArrayEncoding == ByteArrayEncoding.DeltaByteArray;
         bool usePlainBa = options.ByteArrayEncoding == ByteArrayEncoding.Plain;
-#pragma warning disable EWPARQUET0001 // Caller has opted in via the experimental enum value; internal dispatch should not re-warn.
         bool useAlp = options.FloatingPointEncoding == FloatingPointEncoding.Alp;
-#pragma warning restore EWPARQUET0001
         bool usePlainFp = options.FloatingPointEncoding == FloatingPointEncoding.Plain;
 #pragma warning disable EWPARQUET0005 // Caller has opted in via the experimental enum value; internal dispatch should not re-warn.
         bool usePfor = options.IntegerEncoding == IntegerEncoding.Pfor;

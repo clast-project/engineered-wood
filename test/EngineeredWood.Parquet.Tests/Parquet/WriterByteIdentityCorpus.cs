@@ -1,7 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-#pragma warning disable EWPARQUET0001 // ALP
 #pragma warning disable EWPARQUET0002 // OmitPathInSchema
 #pragma warning disable EWPARQUET0003 // FSST
 #pragma warning disable EWPARQUET0005 // PFOR

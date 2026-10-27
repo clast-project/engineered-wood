@@ -1,7 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-#pragma warning disable EWPARQUET0001 // Pinning the experimental enum values is the point of this file.
 #pragma warning disable EWPARQUET0003
 #pragma warning disable EWPARQUET0005
 

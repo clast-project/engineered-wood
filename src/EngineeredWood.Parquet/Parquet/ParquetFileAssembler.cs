@@ -151,7 +151,9 @@ internal sealed class ParquetFileAssembler
 
         var fileMetaData = new FileMetaData
         {
-            Version = 2,
+            // parquet-format 2.13 (GH-534): there is no agreed meaning for "version 2", and writers
+            // should always write 1 for the widest reader compatibility. parquet-java does the same.
+            Version = 1,
             Schema = schema,
             NumRows = totalRows,
             RowGroups = rowGroups,

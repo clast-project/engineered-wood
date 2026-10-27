@@ -104,7 +104,7 @@ test/                                    xUnit tests, BenchmarkDotNet suites, an
 | BYTE_STREAM_SPLIT | yes | opt-in |
 | RLE (levels) | yes | yes |
 | BIT_PACKED (deprecated, levels) | yes | — |
-| ALP (experimental) | yes | opt-in |
+| ALP (preview) | yes | opt-in |
 | PFOR (experimental) | yes | opt-in |
 | FSST (experimental) | yes | opt-in |
 
@@ -114,11 +114,16 @@ Spark's vectorized Parquet reader — on by default — cannot decode it in eith
 `ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.ByteStreamSplit` when the
 consumers are known; it compresses smooth float series far better than PLAIN.
 
-The last three are **unratified parquet-format proposals**, gated behind
-`[Experimental]` diagnostics (`EWPARQUET0001` for ALP, `EWPARQUET0005` for PFOR,
-`EWPARQUET0003` for FSST) and off by default. Opt in per column or per file with
-`ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.Alp`,
-`ParquetWriteOptions.IntegerEncoding = IntegerEncoding.Pfor`, and
+ALP is in the spec as of parquet-format 2.14.0, as a **Preview** encoding: the wire format is
+final, but few readers decode it yet (arrow-rs from 60.0.0; not yet arrow C++, parquet-java or
+DuckDB), and the spec asks writers to make it opt-in. So it is off by default; turn it on with
+`ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.Alp` when the consumers are
+known to read it.
+
+PFOR and FSST are **unratified parquet-format proposals**, gated behind
+`[Experimental]` diagnostics (`EWPARQUET0005` for PFOR, `EWPARQUET0003` for FSST) and off by
+default. Opt in per column or per file with
+`ParquetWriteOptions.IntegerEncoding = IntegerEncoding.Pfor` and
 `ParquetWriteOptions.ByteArrayEncoding = ByteArrayEncoding.Fsst`.
 
 PFOR (Patched Frame of Reference) subtracts a frame of reference from an integer column and
@@ -147,7 +152,6 @@ these can produce a file that some other implementation reads differently, or no
 
 | ID | Feature | Why it is gated |
 |---|---|---|
-| `EWPARQUET0001` | ALP floating-point encoding | Unratified proposal; the wire format may change |
 | `EWPARQUET0002` | `ParquetWriteOptions.OmitPathInSchema` | **Produces files no other implementation can read.** pyarrow, ParquetSharp and delta-kernel-rs report the file as corrupt rather than as using an unsupported feature. Our own reader tolerates it, so a round trip through this library will not detect the problem |
 | `EWPARQUET0003` | FSST substring compression | Unratified, **and this library writes encoding 12 where the proposal says 10** (see below) |
 | `EWPARQUET0004` | Extended-precision timestamps | Unratified, **and the byte order is still undecided upstream** (see below) |
@@ -155,6 +159,9 @@ these can produce a file that some other implementation reads differently, or no
 
 Suppress with a narrow `#pragma warning disable` at the use site rather than a project-wide
 `NoWarn`, so the choice stays visible where it is made.
+
+`EWPARQUET0001` used to gate ALP. ALP is now part of the spec, so the diagnostic is retired;
+existing suppressions of it are harmless and can be deleted.
 
 FSST (Fast Static Symbol Table) replaces frequent 1–8 byte substrings with single-byte
 codes drawn from a symbol table trained per column chunk and stored in its own
@@ -165,8 +172,8 @@ result and falls back to `DELTA_LENGTH_BYTE_ARRAY` for any column chunk FSST did
 actually shrink, so enabling it cannot make a file bigger.
 
 > **Encoding numbers.** FSST's proposal claims encoding 10, and it does not get it. ALP
-> claimed 10 too, shipped here first, and has since been merged into `parquet.thrift` on
-> parquet-format `main`, so 10 is settled. FSST then held 11 here — what the arrow-rs
+> claimed 10 too, shipped here first, and was released with it in parquet-format 2.14.0, so 10
+> is settled. FSST then held 11 here — what the arrow-rs
 > proof-of-concept predicted — until PFOR claimed 11 in a spec PR backed by both a
 > parquet-java and an arrow-rs implementation. So **this library writes FSST as 12**.
 > Files written here are self-consistent, but will not interoperate with an implementation
