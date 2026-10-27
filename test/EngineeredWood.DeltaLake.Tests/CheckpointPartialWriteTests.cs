@@ -11,10 +11,11 @@ using EngineeredWood.IO.Local;
 namespace EngineeredWood.DeltaLake.Tests;
 
 /// <summary>
-/// A streamed checkpoint file is published by disposing it, and <c>await using</c> disposes on the failure
-/// path too, so a write that threw after its first bytes used to leave a truncated checkpoint at its final,
-/// listable name. The V2 writers, whose files have unique names, now delete what they created when the write
-/// fails; the classic writer, whose name is fixed, no longer streams at all. The streaming faults here land
+/// A streamed checkpoint file used to be published by disposing it, and <c>await using</c> disposes on the
+/// failure path too, so a write that threw after its first bytes left a truncated checkpoint at its final,
+/// listable name. A streamed file is now published only by <c>CompleteAsync</c>, but the Parquet writer still
+/// completes the file when it is disposed, so the V2 writers, whose files have unique names, delete what they
+/// published when the write fails; the classic writer, whose name is fixed, no longer streams at all. The streaming faults here land
 /// AFTER bytes reach storage: one before <c>CreateAsync</c> never creates the file and proves nothing.
 /// </summary>
 public class CheckpointPartialWriteTests : IDisposable
@@ -238,6 +239,45 @@ public class CheckpointPartialWriteTests : IDisposable
         Assert.Equal(2, Sidecars().Length);
     }
 
+    [Fact]
+    public async Task WriteFileOrDelete_DeletesWhatItPublished_WhenTheWriteThenFails()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        const string path = "_delta_log/_sidecars/published-then-failed.parquet";
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await CheckpointWriter.WriteFileOrDeleteAsync(fs, path, async file =>
+            {
+                // What a Parquet writer's dispose does after a row group throws: footer, then completion.
+                await file.WriteAsync(new byte[] { 1, 2, 3 });
+                await file.CompleteAsync();
+                throw new InvalidOperationException("the write failed after publishing (injected)");
+            }, CancellationToken.None));
+
+        Assert.False(await fs.ExistsAsync(path));
+    }
+
+    /// <summary>
+    /// A file this call did not publish is never deleted: here another writer's, which made this call's own
+    /// completion lose the create-if-absent race.
+    /// </summary>
+    [Fact]
+    public async Task WriteFileOrDelete_LeavesAFileItDidNotPublish()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        const string path = "_delta_log/_sidecars/lost-the-race.parquet";
+        byte[] theirs = [9, 9, 9];
+
+        await Assert.ThrowsAsync<IOException>(async () =>
+            await CheckpointWriter.WriteFileOrDeleteAsync(fs, path, async file =>
+            {
+                await file.WriteAsync(new byte[] { 1, 2, 3 });
+                Assert.True(await fs.TryWriteAllBytesAsync(path, theirs));
+            }, CancellationToken.None));
+
+        Assert.Equal(theirs, await fs.ReadAllBytesAsync(path));
+    }
+
     /// <summary>Lets a write's bytes reach storage, then throws. Records every delete.</summary>
     private sealed class FailMidStreamFileSystem(ITableFileSystem inner) : ITableFileSystem
     {
@@ -333,6 +373,9 @@ public class CheckpointPartialWriteTests : IDisposable
 
             public ValueTask FlushAsync(CancellationToken cancellationToken = default) =>
                 inner.FlushAsync(cancellationToken);
+
+            public ValueTask CompleteAsync(CancellationToken cancellationToken = default) =>
+                inner.CompleteAsync(cancellationToken);
 
             public ValueTask DisposeAsync() => inner.DisposeAsync();
 

@@ -28,6 +28,7 @@ public class LocalSequentialFileTests : IDisposable
         await using (var file = new LocalSequentialFile(path))
         {
             await file.WriteAsync(new byte[] { 1, 2, 3 });
+            await file.CompleteAsync();
         }
 
         Assert.True(File.Exists(path));
@@ -56,6 +57,7 @@ public class LocalSequentialFileTests : IDisposable
             await file.WriteAsync(new byte[] { 0x50, 0x41, 0x52, 0x31 }); // "PAR1"
             await file.WriteAsync(new byte[] { 0x00, 0x01, 0x02 });
             await file.WriteAsync(new byte[] { 0x50, 0x41, 0x52, 0x31 }); // "PAR1"
+            await file.CompleteAsync();
         }
 
         var content = await ReadAllBytesAsync(path);
@@ -83,6 +85,7 @@ public class LocalSequentialFileTests : IDisposable
         await using (var file = new LocalSequentialFile(path))
         {
             await file.WriteAsync(new byte[] { 1, 2, 3 });
+            await file.CompleteAsync();
         }
 
         Assert.Equal(new byte[] { 1, 2, 3 }, await ReadAllBytesAsync(path));
@@ -95,6 +98,7 @@ public class LocalSequentialFileTests : IDisposable
         await using (var file = new LocalSequentialFile(path))
         {
             // Write nothing
+            await file.CompleteAsync();
         }
 
         Assert.True(File.Exists(path));
@@ -111,9 +115,132 @@ public class LocalSequentialFileTests : IDisposable
         await using (var file = new LocalSequentialFile(path))
         {
             await file.WriteAsync(data);
+            await file.CompleteAsync();
         }
 
         Assert.Equal(data, await ReadAllBytesAsync(path));
+    }
+
+    [Fact]
+    public async Task DisposeWithoutComplete_LeavesNothing()
+    {
+        string path = Path.Combine(_tempDir, "test.bin");
+        await using (var file = new LocalSequentialFile(path))
+        {
+            await file.WriteAsync(new byte[] { 1, 2, 3 });
+            await file.FlushAsync();
+        }
+
+        Assert.False(File.Exists(path));
+        Assert.Empty(Directory.GetFileSystemEntries(_tempDir));
+    }
+
+    [Fact]
+    public async Task DisposeWithoutComplete_LeavesAnExistingFileAlone()
+    {
+        string path = Path.Combine(_tempDir, "test.bin");
+        await WriteAllBytesAsync(path, new byte[] { 0xFF });
+
+        await using (var file = new LocalSequentialFile(path))
+        {
+            await file.WriteAsync(new byte[] { 1, 2, 3 });
+        }
+
+        Assert.Equal(new byte[] { 0xFF }, await ReadAllBytesAsync(path));
+        Assert.Single(Directory.GetFileSystemEntries(_tempDir));
+    }
+
+    [Fact]
+    public void SyncDisposeWithoutComplete_LeavesNothing()
+    {
+        string path = Path.Combine(_tempDir, "test.bin");
+        using (var file = new LocalSequentialFile(path))
+        {
+            file.WriteAsync(new byte[] { 1, 2, 3 }).AsTask().GetAwaiter().GetResult();
+        }
+
+        Assert.Empty(Directory.GetFileSystemEntries(_tempDir));
+    }
+
+    [Fact]
+    public async Task InFlightWrite_IsAHiddenTempFile()
+    {
+        string path = Path.Combine(_tempDir, "00000000000000000010.checkpoint.parquet");
+        await using var file = new LocalSequentialFile(path);
+        await file.WriteAsync(new byte[] { 1, 2, 3 });
+        await file.FlushAsync();
+
+        string temp = Assert.Single(Directory.GetFiles(_tempDir));
+        string name = Path.GetFileName(temp);
+        Assert.StartsWith(".00000000000000000010.checkpoint.parquet.", name);
+        Assert.EndsWith(".tmp", name);
+        Assert.False(File.Exists(path));
+    }
+
+    [Fact]
+    public async Task CompleteWithoutOverwrite_FailsWhenTheFileAppeared_AndLeavesIt()
+    {
+        string path = Path.Combine(_tempDir, "test.bin");
+        await using (var file = new LocalSequentialFile(path, overwrite: false))
+        {
+            await file.WriteAsync(new byte[] { 1, 2, 3 });
+            await WriteAllBytesAsync(path, new byte[] { 0xFF });
+
+            await Assert.ThrowsAsync<IOException>(async () => await file.CompleteAsync());
+            await Assert.ThrowsAsync<InvalidOperationException>(async () => await file.CompleteAsync());
+        }
+
+        Assert.Equal(new byte[] { 0xFF }, await ReadAllBytesAsync(path));
+        Assert.Single(Directory.GetFileSystemEntries(_tempDir));
+    }
+
+    [Fact]
+    public async Task LongName_StillFitsTheTempName()
+    {
+        // 240 characters is a legal name everywhere this runs; the name plus a full guid would not be.
+        string path = Path.Combine(_tempDir, new string('a', 236) + ".bin");
+        await using (var file = new LocalSequentialFile(path))
+        {
+            await file.WriteAsync(new byte[] { 1, 2, 3 });
+            Assert.True(Path.GetFileName(Assert.Single(Directory.GetFiles(_tempDir))).Length <= 255);
+            await file.CompleteAsync();
+        }
+
+        Assert.Equal(new byte[] { 1, 2, 3 }, await ReadAllBytesAsync(path));
+    }
+
+    [Fact]
+    public async Task CancelledComplete_AbortsAndLeavesNothing()
+    {
+        string path = Path.Combine(_tempDir, "test.bin");
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        await using (var file = new LocalSequentialFile(path))
+        {
+            await file.WriteAsync(new byte[] { 1, 2, 3 });
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                async () => await file.CompleteAsync(cancelled.Token));
+            Assert.Empty(Directory.GetFileSystemEntries(_tempDir));
+
+            await Assert.ThrowsAsync<InvalidOperationException>(async () => await file.CompleteAsync());
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                async () => await file.WriteAsync(new byte[] { 4 }));
+        }
+
+        Assert.Empty(Directory.GetFileSystemEntries(_tempDir));
+    }
+
+    [Fact]
+    public async Task Position_SurvivesComplete()
+    {
+        string path = Path.Combine(_tempDir, "test.bin");
+        await using var file = new LocalSequentialFile(path);
+        await file.WriteAsync(new byte[] { 1, 2, 3, 4 });
+        await file.CompleteAsync();
+
+        Assert.Equal(4, file.Position);
+        await Assert.ThrowsAsync<InvalidOperationException>(async () => await file.WriteAsync(new byte[] { 5 }));
     }
 
 #if NET8_0_OR_GREATER

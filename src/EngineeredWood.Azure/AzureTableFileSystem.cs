@@ -113,7 +113,7 @@ public sealed class AzureTableFileSystem : ITableFileSystem
                 throw new IOException($"Blob already exists: {path}");
         }
 
-        return new AzureBlobSequentialFile(_container.GetBlockBlobClient(blobName));
+        return new AzureBlobSequentialFile(_container.GetBlockBlobClient(blobName), overwrite: overwrite);
     }
 
     /// <inheritdoc/>

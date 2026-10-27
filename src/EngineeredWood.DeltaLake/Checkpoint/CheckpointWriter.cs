@@ -137,42 +137,67 @@ public sealed class CheckpointWriter
 
     /// <summary>
     /// Streams a new, uniquely named checkpoint file (a V2 body or a sidecar) to <paramref name="path"/> and
-    /// returns its length, deleting the file again if <paramref name="write"/> fails part-way.
+    /// returns its length, deleting the file again if this call published it and then failed.
     /// </summary>
     /// <remarks>
-    /// <para>A streamed file is published by disposing it, on every backend — local writes in place, and S3,
-    /// Azure and GCS complete their upload — and <c>await using</c> disposes on the failure path too. So a
-    /// write that threw after its first bytes left a truncated checkpoint at its final, discoverable name.
-    /// A reader that finds no usable <c>_last_checkpoint</c> picks the newest listed checkpoint, fails on
-    /// that one, and replays from version 0. That replay has a gap once log cleanup has run below an
-    /// older checkpoint, and then the table cannot be opened. Deleted only after the dispose, which is what
-    /// publishes it.</para>
+    /// <para>A streamed file is published only by <see cref="ISequentialFile.CompleteAsync"/>, and a write that
+    /// fails before completing is discarded, so most failures leave nothing to clean up. The exception is the
+    /// Parquet writer that <paramref name="write"/> wraps around the file: its dispose still closes it, and
+    /// closing completes the file, so a row group that throws part-way is followed by a footer and a
+    /// well-formed checkpoint missing that row group, at its final, discoverable name. A reader that picked it
+    /// would see a table without those files. Until the writers abort on dispose instead (#501), such a file is
+    /// deleted here.</para>
     ///
-    /// <para>Safe only because the name is a fresh UUID: whatever is at the path is this call's own. The
-    /// classic checkpoint's fixed name does not have that property, which is why it does not stream. The
-    /// delete is best-effort and the original exception is what propagates. Cancellation takes the same
-    /// path, since a cancelled write is just as truncated.</para>
+    /// <para>Deleted only when this call's own <see cref="ISequentialFile.CompleteAsync"/> succeeded, so a file
+    /// that is there for any other reason is never touched. The delete is best-effort and the original
+    /// exception is what propagates.</para>
     /// </remarks>
     internal static async ValueTask<long> WriteFileOrDeleteAsync(
         ITableFileSystem fs, string path,
         Func<ISequentialFile, ValueTask> write, CancellationToken cancellationToken)
     {
-        var file = await fs.CreateAsync(path, overwrite: false, cancellationToken).ConfigureAwait(false);
+        var file = new PublishTrackingFile(
+            await fs.CreateAsync(path, overwrite: false, cancellationToken).ConfigureAwait(false));
         long length;
         try
         {
             await using (file)
             {
                 await write(file).ConfigureAwait(false);
+                await file.CompleteAsync(cancellationToken).ConfigureAwait(false);
                 length = file.Position;
             }
         }
-        catch
+        catch (Exception) when (file.Published)
         {
             await DeleteQuietlyAsync(fs, path).ConfigureAwait(false);
             throw;
         }
         return length;
+    }
+
+    /// <summary>Passes everything through, recording whether <see cref="CompleteAsync"/> succeeded.</summary>
+    private sealed class PublishTrackingFile(ISequentialFile inner) : ISequentialFile
+    {
+        public bool Published { get; private set; }
+
+        public long Position => inner.Position;
+
+        public ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
+            inner.WriteAsync(data, cancellationToken);
+
+        public ValueTask FlushAsync(CancellationToken cancellationToken = default) =>
+            inner.FlushAsync(cancellationToken);
+
+        public async ValueTask CompleteAsync(CancellationToken cancellationToken = default)
+        {
+            await inner.CompleteAsync(cancellationToken).ConfigureAwait(false);
+            Published = true;
+        }
+
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
+
+        public void Dispose() => inner.Dispose();
     }
 
     /// <summary>
@@ -1249,6 +1274,9 @@ public sealed class CheckpointWriter
         }
 
         public ValueTask FlushAsync(CancellationToken cancellationToken = default) => default;
+
+        // Nothing to publish: the caller publishes Written itself.
+        public ValueTask CompleteAsync(CancellationToken cancellationToken = default) => default;
 
         public ValueTask DisposeAsync() => default;
 

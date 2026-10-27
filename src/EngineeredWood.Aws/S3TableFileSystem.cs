@@ -143,7 +143,7 @@ public sealed class S3TableFileSystem : ITableFileSystem
         if (!overwrite && await ObjectExistsAsync(key, cancellationToken).ConfigureAwait(false))
             throw new IOException($"Object already exists: {path}");
 
-        return new S3SequentialFile(_client, _bucket, key);
+        return new S3SequentialFile(_client, _bucket, key, overwrite: overwrite);
     }
 
     /// <inheritdoc/>

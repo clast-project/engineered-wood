@@ -3005,8 +3005,9 @@ public sealed class LanceFileWriter : IAsyncDisposable
     /// <summary>
     /// Finalises the file: writes column metadata blobs, the CMO table,
     /// the FileDescriptor (global buffer 0), the GBO table, and the
-    /// 40-byte footer with <c>"LANC"</c> magic. Once called, the writer
-    /// rejects further <see cref="WriteInt32ColumnAsync"/> calls.
+    /// 40-byte footer with <c>"LANC"</c> magic, then completes the
+    /// underlying <see cref="ISequentialFile"/>, which is what publishes
+    /// it. Once called, the writer rejects further <see cref="WriteInt32ColumnAsync"/> calls.
     /// </summary>
     public async Task FinishAsync(CancellationToken cancellationToken = default)
     {
@@ -3079,7 +3080,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         footer.WriteTo(footerBytes);
         await _file.WriteAsync(footerBytes, cancellationToken).ConfigureAwait(false);
 
-        await _file.FlushAsync(cancellationToken).ConfigureAwait(false);
+        await _file.CompleteAsync(cancellationToken).ConfigureAwait(false);
         _finalSizeBytes = _file.Position;
         _finalized = true;
     }

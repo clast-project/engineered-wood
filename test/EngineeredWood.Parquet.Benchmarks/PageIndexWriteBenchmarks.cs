@@ -229,6 +229,8 @@ internal sealed class CountingSequentialFile : ISequentialFile
 
     public ValueTask FlushAsync(CancellationToken cancellationToken = default) => default;
 
+    public ValueTask CompleteAsync(CancellationToken cancellationToken = default) => default;
+
     public ValueTask DisposeAsync() => default;
 
     public void Dispose()

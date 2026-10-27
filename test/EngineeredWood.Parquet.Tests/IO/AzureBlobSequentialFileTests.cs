@@ -184,17 +184,16 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
         await file.WriteAsync(new byte[200]);
         Assert.Equal(300, file.Position);
 
-        await file.FlushAsync();
+        await file.CompleteAsync();
     }
 
     /// <summary>
     /// Writing again after an explicit <c>FlushAsync</c> must not lose the second write.
     ///
-    /// <para>Nothing forbids it — <c>WriteAsync</c> guards on disposed, not on committed — but the
-    /// commit used to be conditional on <c>!_committed</c>, so the trailing block was staged and then
-    /// never referenced by any block list. The blob read back as just the first write, with no error
-    /// anywhere. Both halves matter: the length proves the second write landed, and reading it proves
-    /// the re-commit kept the first block rather than replacing the list with only the new one.</para>
+    /// <para>A flush used to commit the block list, and a later commit used to be conditional on
+    /// <c>!_committed</c>, so the trailing block was staged and then never referenced by any block list.
+    /// Flushing no longer commits anything; the blob must not exist until <c>CompleteAsync</c>, and must
+    /// then hold both writes.</para>
     /// </summary>
     [SkippableFact]
     public async Task WriteAfterFlush_IsStillCommitted()
@@ -208,7 +207,9 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
         {
             await file.WriteAsync(System.Text.Encoding.UTF8.GetBytes("first"));
             await file.FlushAsync();
+            Assert.False((await Container.GetBlobClient(blobName).ExistsAsync()).Value);
             await file.WriteAsync(System.Text.Encoding.UTF8.GetBytes("second"));
+            await file.CompleteAsync();
         }
 
         var downloaded = await Container.GetBlobClient(blobName).DownloadContentAsync();

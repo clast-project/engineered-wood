@@ -131,4 +131,27 @@ public sealed class S3TableFileSystemPathConformanceTests : TableFileSystemPathC
         // Dispose on every path: the probe builds the client before the call that can fail.
         _client?.Dispose();
     }
+
+    /// <summary>
+    /// An aborted multipart write must abort its upload, not just skip completing it: an in-progress upload
+    /// is invisible, but its parts are billed until a lifecycle rule reclaims them.
+    /// </summary>
+    [SkippableFact]
+    public async Task AbortedMultipartWrite_LeavesNoUploadInProgress()
+    {
+        Require();
+        byte[] chunk = new byte[1024 * 1024];
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await using var file = await FileSystem.CreateAsync("abort/multipart.bin", overwrite: false);
+            for (int written = 0; written < 10 * 1024 * 1024; written += chunk.Length)
+                await file.WriteAsync(chunk);
+            throw new InvalidOperationException("the write failed part-way (injected)");
+        });
+
+        var uploads = await _client!.ListMultipartUploadsAsync(
+            new ListMultipartUploadsRequest { BucketName = _bucket });
+        Assert.Empty(uploads.MultipartUploads ?? []);
+    }
 }

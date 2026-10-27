@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using Azure;
+using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
 
 namespace EngineeredWood.IO.Azure;
@@ -8,12 +10,21 @@ namespace EngineeredWood.IO.Azure;
 /// <summary>
 /// <see cref="ISequentialFile"/> implementation for Azure Block Blob Storage.
 /// Buffers writes in memory and stages blocks when the buffer reaches a threshold.
-/// All staged blocks are committed on <see cref="FlushAsync"/> or disposal.
+/// The staged blocks are committed by <see cref="CompleteAsync"/>.
 /// </summary>
 /// <remarks>
+/// <para>
+/// Disposing without completing aborts: the block list is never committed, so nothing is published,
+/// and Azure garbage-collects the uncommitted blocks. Without overwrite, the commit carries
+/// <c>If-None-Match: *</c>, so it cannot replace a blob another writer published in the meantime.
+/// Block IDs start with a random per-file prefix, so two writers staging blocks for the same blob name
+/// never overwrite each other's blocks.
+/// </para>
+/// <para>
 /// Azure block blobs support up to 50,000 blocks of up to 4 GiB each (service version 2019-12-12+).
 /// The default block size of 4 MiB allows files up to ~195 GiB, which is well beyond
 /// typical Parquet file sizes. For larger files, increase the <c>blockSize</c> constructor argument.
+/// </para>
 /// </remarks>
 public sealed class AzureBlobSequentialFile : ISequentialFile
 {
@@ -22,11 +33,14 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
 
     private readonly BlockBlobClient _blobClient;
     private readonly int _blockSize;
-    private readonly List<string> _committedBlockIds = new();
+    private readonly bool _overwrite;
+    private readonly byte[] _blockIdPrefix = Guid.NewGuid().ToByteArray();
+    private readonly List<string> _stagedBlockIds = new();
     private byte[] _buffer;
     private int _bufferPosition;
     private long _position;
-    private bool _committed;
+    private bool _completed;
+    private bool _aborted;
     private bool _disposed;
 
     /// <summary>
@@ -37,7 +51,12 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
     /// Size threshold at which buffered data is staged as a block.
     /// Defaults to 4 MiB. Must be between 1 and 4 GiB.
     /// </param>
-    public AzureBlobSequentialFile(BlockBlobClient blobClient, int blockSize = DefaultBlockSize)
+    /// <param name="overwrite">
+    /// Whether completion may replace an existing blob. When false, <see cref="CompleteAsync"/> throws
+    /// <see cref="IOException"/> if the blob exists by then.
+    /// </param>
+    public AzureBlobSequentialFile(
+        BlockBlobClient blobClient, int blockSize = DefaultBlockSize, bool overwrite = true)
     {
 #if NET8_0_OR_GREATER
         ArgumentOutOfRangeException.ThrowIfLessThan(blockSize, 1);
@@ -46,6 +65,7 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
 #endif
         _blobClient = blobClient;
         _blockSize = blockSize;
+        _overwrite = overwrite;
         _buffer = new byte[blockSize];
     }
 
@@ -60,6 +80,9 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
 #else
         if (_disposed) throw new ObjectDisposedException(GetType().FullName);
 #endif
+        if (_completed || _aborted)
+            throw new InvalidOperationException(
+                "Cannot write to an Azure blob that has already been completed or aborted.");
 
         int remaining = data.Length;
         int sourceOffset = 0;
@@ -80,43 +103,76 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         }
     }
 
-    /// <inheritdoc/>
-    public async ValueTask FlushAsync(CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Does nothing: a block blob becomes visible only when its block list is committed, which is
+    /// <see cref="CompleteAsync"/>'s job, and staging a partial buffer early would only make more blocks.
+    /// </summary>
+    public ValueTask FlushAsync(CancellationToken cancellationToken = default)
     {
 #if NET8_0_OR_GREATER
         ObjectDisposedException.ThrowIf(_disposed, this);
 #else
         if (_disposed) throw new ObjectDisposedException(GetType().FullName);
 #endif
-
-        await FinalizeAsync(cancellationToken).ConfigureAwait(false);
+        return default;
     }
 
-    /// <summary>
-    /// Stages whatever is buffered and commits the block list. Unguarded, so the dispose paths can
-    /// reach it: <see cref="FlushAsync"/> keeps the disposed check for external callers, but dispose
-    /// must be able to finish the upload while tearing the object down.
-    /// </summary>
-    private async ValueTask FinalizeAsync(CancellationToken cancellationToken)
+    /// <inheritdoc/>
+    public async ValueTask CompleteAsync(CancellationToken cancellationToken = default)
     {
-        // Stage any remaining buffered data
-        bool staged = false;
-        if (_bufferPosition > 0)
+#if NET8_0_OR_GREATER
+        ObjectDisposedException.ThrowIf(_disposed, this);
+#else
+        if (_disposed) throw new ObjectDisposedException(GetType().FullName);
+#endif
+        if (_completed)
+            return;
+        if (_aborted)
+            throw new InvalidOperationException("Cannot complete an Azure blob whose write was aborted.");
+
+        try
         {
             await StageCurrentBlockAsync(cancellationToken).ConfigureAwait(false);
-            staged = true;
-        }
-
-        // Commit the block list. `staged` is what makes a SECOND finalize correct: nothing stops a
-        // caller writing more after a FlushAsync — WriteAsync guards on _disposed, not on _committed —
-        // and committing only when !_committed staged that block and then never referenced it, so the
-        // write vanished with no error. Re-committing is cheap and idempotent: CommitBlockList replaces
-        // the blob's block list, and _committedBlockIds is the full list, not a delta.
-        if (!_committed || staged)
-        {
-            _committed = true;
             await _blobClient.CommitBlockListAsync(
-                _committedBlockIds, cancellationToken: cancellationToken).ConfigureAwait(false);
+                _stagedBlockIds,
+                new CommitBlockListOptions
+                {
+                    Conditions = _overwrite ? null : new BlobRequestConditions { IfNoneMatch = ETag.All },
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (RequestFailedException ex) when (!_overwrite && ex.Status is 409 or 412)
+        {
+            _aborted = true;
+            throw new IOException($"Blob already exists: {_blobClient.Name}", ex);
+        }
+        catch (RequestFailedException ex) when (!_overwrite && ex.ErrorCode == "InvalidBlockList")
+        {
+            // Another writer publishing the blob while this one had blocks staged discards them, so the
+            // commit names blocks that are gone and fails before its precondition is evaluated. If the blob
+            // is there now, that is the same lost race as a 412.
+            _aborted = true;
+            if (await BlobExistsQuietlyAsync().ConfigureAwait(false))
+                throw new IOException($"Blob already exists: {_blobClient.Name}", ex);
+            throw;
+        }
+        catch
+        {
+            _aborted = true;
+            throw;
+        }
+        _completed = true;
+    }
+
+    private async Task<bool> BlobExistsQuietlyAsync()
+    {
+        try
+        {
+            return (await _blobClient.ExistsAsync(CancellationToken.None).ConfigureAwait(false)).Value;
+        }
+        catch (Exception)
+        {
+            return false;
         }
     }
 
@@ -125,57 +181,38 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         if (_bufferPosition == 0)
             return;
 
-        // Block IDs must be base64 strings of uniform length
-        string blockId = Convert.ToBase64String(
-            BitConverter.GetBytes(_committedBlockIds.Count));
+        // Block IDs must be base64 strings of uniform length. They are scoped to the blob name, not to
+        // this writer, so the random prefix keeps a concurrent writer to the same name from replacing
+        // this one's staged blocks with its own.
+        byte[] rawId = new byte[_blockIdPrefix.Length + sizeof(int)];
+        _blockIdPrefix.CopyTo(rawId, 0);
+        BitConverter.GetBytes(_stagedBlockIds.Count).CopyTo(rawId, _blockIdPrefix.Length);
+        string blockId = Convert.ToBase64String(rawId);
 
         using var stream = new MemoryStream(_buffer, 0, _bufferPosition, writable: false);
         await _blobClient.StageBlockAsync(
             blockId, stream, cancellationToken: cancellationToken).ConfigureAwait(false);
 
-        _committedBlockIds.Add(blockId);
+        _stagedBlockIds.Add(blockId);
         _bufferPosition = 0;
     }
 
     /// <summary>
-    /// Commits the upload, then marks the object disposed — in that order, and via the unguarded
-    /// <see cref="FinalizeAsync"/>.
-    ///
-    /// <para>This used to set <c>_disposed = true</c> first and then call the guarded
-    /// <see cref="FlushAsync"/>, whose first statement throws on exactly that flag. So
-    /// <c>await using</c> — the documented way to use this type, and the only way a caller who never
-    /// calls <c>FlushAsync</c> by hand commits anything — threw <see cref="ObjectDisposedException"/>
-    /// AND left the block list uncommitted, losing the write. It went unnoticed because CI has never
-    /// executed this class (issue #79); <c>S3SequentialFile</c> and <c>GcsSequentialFile</c> already
-    /// had this shape.</para>
+    /// Aborts the write unless it was completed. Nothing needs sending: uncommitted blocks are never
+    /// visible, and Azure garbage-collects them.
     /// </summary>
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
-        if (_disposed) return;
-        try
-        {
-            await FinalizeAsync(CancellationToken.None).ConfigureAwait(false);
-        }
-        finally
-        {
-            _disposed = true;
-        }
+        Dispose();
+        return default;
     }
 
-    /// <inheritdoc/>
+    /// <inheritdoc cref="DisposeAsync"/>
     public void Dispose()
     {
         if (_disposed) return;
-        // Finalize off the current synchronization context to avoid sync-over-async deadlocks;
-        // DisposeAsync is the preferred path. Matches S3SequentialFile/GcsSequentialFile — this used
-        // to only set the flag, which discarded every buffered block without so much as an error.
-        try
-        {
-            Task.Run(() => FinalizeAsync(CancellationToken.None).AsTask()).GetAwaiter().GetResult();
-        }
-        finally
-        {
-            _disposed = true;
-        }
+        _disposed = true;
+        if (!_completed)
+            _aborted = true;
     }
 }
