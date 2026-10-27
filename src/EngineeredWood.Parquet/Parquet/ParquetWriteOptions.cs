@@ -558,11 +558,11 @@ public sealed record ParquetWriteOptions
     /// </summary>
     /// <remarks>
     /// <para>The OffsetIndex locates every data page and is written for every column. The ColumnIndex
-    /// holds each page's bounds, null count and (for FLOAT/DOUBLE) NaN count, and is written only for
-    /// columns that also get chunk statistics (see <see cref="WriteStatistics"/>). It is omitted for
-    /// FLOAT16 columns, whose bounds are not yet ordered correctly, and, as the format requires, for
-    /// a FLOAT/DOUBLE chunk under <see cref="FloatingPointColumnOrder.TypeDefined"/> in which some
-    /// page holds only NaNs.</para>
+    /// holds each page's bounds, null count and (for FLOAT/DOUBLE/FLOAT16) NaN count, and is written
+    /// only for columns that also get chunk statistics (see <see cref="WriteStatistics"/>). It is
+    /// omitted for INT96, whose statistics have no defined order, and, as the format requires, for a
+    /// FLOAT/DOUBLE/FLOAT16 chunk under <see cref="FloatingPointColumnOrder.TypeDefined"/> in which
+    /// some page holds only NaNs.</para>
     /// <para>The indexes are written after the last row group, before the footer, and kept in memory
     /// until <c>CloseAsync</c>: a few bytes per page.</para>
     /// <para>Measured cost at the default page size, over plain, dictionary, string-heavy and nested

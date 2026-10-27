@@ -28,6 +28,12 @@ internal enum StatisticsOrder
 
     /// <summary>The extended-precision timestamp carrier, a signed little-endian integer.</summary>
     ExtendedTimestamp,
+
+    /// <summary>
+    /// FIXED_LEN_BYTE_ARRAY(2) holding a little-endian IEEE 754 half-precision float: FLOAT16, which
+    /// parquet-format orders like FLOAT and DOUBLE — numerically, NaN aside, with a <c>nan_count</c>.
+    /// </summary>
+    Float16,
 }
 
 internal static class StatisticsOrders
@@ -50,6 +56,8 @@ internal static class StatisticsOrders
                 => StatisticsOrder.Unsigned,
             PhysicalType.FixedLenByteArray when valueType is Decimal128Type or Decimal256Type
                 => StatisticsOrder.SignedBigEndian,
+            PhysicalType.FixedLenByteArray when valueType is HalfFloatType
+                => StatisticsOrder.Float16,
             _ => StatisticsOrder.Default,
         };
     }

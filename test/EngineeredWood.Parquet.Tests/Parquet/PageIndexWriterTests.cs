@@ -566,8 +566,12 @@ public class PageIndexWriterTests : IDisposable
     }
 
 #if NET8_0_OR_GREATER // Half and HalfFloatArray do not exist on .NET Framework.
+    /// <summary>
+    /// FLOAT16 used to get only an OffsetIndex, its bounds being ordered by the bytes. They are numeric
+    /// now (#547), so it gets a ColumnIndex like FLOAT and DOUBLE, with a NaN count per page.
+    /// </summary>
     [Fact]
-    public async Task Float16_GetsAnOffsetIndexOnly()
+    public async Task Float16_GetsAColumnIndex()
     {
         var builder = new HalfFloatArray.Builder();
         for (int i = 0; i < 100; i++)
@@ -576,7 +580,10 @@ public class PageIndexWriterTests : IDisposable
 
         var chunk = Chunks(path).Single();
         Assert.NotNull(chunk.OffsetIndex);
-        Assert.Null(chunk.ColumnIndex);
+        Assert.NotNull(chunk.ColumnIndex);
+        Assert.Equal((Half)(-50), BitConverter.UInt16BitsToHalf(BitConverter.ToUInt16(chunk.ColumnIndex!.MinValues[0], 0)));
+        Assert.Equal((Half)49, BitConverter.UInt16BitsToHalf(BitConverter.ToUInt16(chunk.ColumnIndex.MaxValues[^1], 0)));
+        Assert.NotNull(chunk.ColumnIndex.NanCounts);
     }
 #endif
 
