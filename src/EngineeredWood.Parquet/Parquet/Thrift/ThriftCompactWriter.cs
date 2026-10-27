@@ -56,7 +56,6 @@ internal sealed class ThriftCompactWriter
         _buffer = newBuffer;
     }
 
-    /// <summary>Writes a single byte.</summary>
     /// <summary>
     /// Appends <paramref name="bytes"/> verbatim: an already-encoded value, such as a struct copied
     /// from decoded metadata. Field-id state is untouched, so it must be a complete value.
@@ -68,6 +67,7 @@ internal sealed class ThriftCompactWriter
         _position += bytes.Length;
     }
 
+    /// <summary>Writes a single byte.</summary>
     public void WriteByte(byte value)
     {
         EnsureCapacity(1);

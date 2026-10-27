@@ -95,8 +95,8 @@ public sealed class RecentParquetTestingFixturesTests
     }
 
     /// <summary>
-    /// An unrecognized logical type (here field id 99999, standing in for one added after this
-    /// reader) is ignored and the column read as its physical type, BYTE_ARRAY — as binary, not as a
+    /// An unrecognized logical type (here LogicalType union field 2555, standing in for one added after
+    /// this reader) is ignored and the column read as its physical type, BYTE_ARRAY — as binary, not as a
     /// string, since there is nothing to say the bytes are UTF-8.
     /// </summary>
     [Fact]
