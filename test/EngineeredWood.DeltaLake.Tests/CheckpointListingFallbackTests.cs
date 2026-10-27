@@ -332,6 +332,27 @@ public class CheckpointListingFallbackTests : IDisposable
     }
 
     /// <summary>
+    /// A stale hint naming an older checkpoint is not tried ahead of a newer listed one. The listing can
+    /// only say a commit is THERE, not that it reads, so the older start chose a replay through a corrupt
+    /// commit and failed, although the newer checkpoint lies past it.
+    /// </summary>
+    [Fact]
+    public async Task StaleOlderHint_DoesNotOutrankANewerListedCheckpoint()
+    {
+        await WriteTableAsync(addCommits: 6);
+        await CheckpointAsync(2);
+        string staleHint = File.ReadAllText(LogPath("_last_checkpoint"));
+        await CheckpointAsync(5);
+        WriteHint(staleHint);
+        File.WriteAllText(Path.Combine(_tempDir, DeltaVersion.CommitPath(4)), "{not json");
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>
     /// Replay uses a compaction file only when it starts at or after the replay's first version. From the
     /// older checkpoint here it does not, so that checkpoint is no starting point — but a full replay can
     /// use it, and opens the table. Taking the readable older checkpoint shut that replay out.

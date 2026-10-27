@@ -71,9 +71,8 @@ public sealed class SnapshotBuilder
             // the rest few.
             var seen = new List<LastCheckpointInfo>();
             var stranded = new List<LastCheckpointInfo>();
-            var candidates = hint is null
-                ? CheckpointReader.ListCheckpointCandidates(listing, targetVersion)
-                : CheckpointReader.ListCheckpointCandidates(listing, targetVersion).Prepend(hint);
+            var candidates = WithHint(
+                hint, CheckpointReader.ListCheckpointCandidates(listing, targetVersion));
 
             bool bootstrapped = false;
             foreach (var candidate in candidates)
@@ -231,6 +230,35 @@ public sealed class SnapshotBuilder
             throw ReplayGap(listing, unreadable, missing, firstNeeded, targetVersion);
 
         return builder.Build();
+    }
+
+    /// <summary>
+    /// The listed candidates, newest first, with the hint placed ahead of the listed ones at its own
+    /// version and never ahead of a newer one.
+    /// </summary>
+    /// <remarks>
+    /// The hint wins ties because it names the file a writer chose. It does not outrank a newer
+    /// checkpoint, because a stale one usually names an OLDER checkpoint, and the listing can say only
+    /// that the commits after it are there, not that they read. Starting from it chose a replay through a
+    /// corrupt commit that the newer checkpoint lies past, and the build failed without trying it. Newest
+    /// first means every newer candidate has been tried by the time one is taken.
+    /// </remarks>
+    private static IEnumerable<LastCheckpointInfo> WithHint(
+        LastCheckpointInfo? hint, IEnumerable<LastCheckpointInfo> listed)
+    {
+        bool placed = hint is null;
+        foreach (var candidate in listed)
+        {
+            if (!placed && candidate.Version <= hint!.Version)
+            {
+                yield return hint;
+                placed = true;
+            }
+            yield return candidate;
+        }
+
+        if (!placed)
+            yield return hint!;
     }
 
     /// <summary>
