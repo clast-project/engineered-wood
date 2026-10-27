@@ -274,6 +274,7 @@ internal static class ColumnChunkWriter
                     ?? StatisticsCollector.Compute(
                         array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
                         floatingPointTotalOrder, statisticsOrder);
+            stats = StatisticsCollector.ApplyTypeOrderZeroRule(stats, physicalType, floatingPointTotalOrder);
             result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array), physicalType);
         }
 
@@ -632,6 +633,8 @@ internal static class ColumnChunkWriter
                     dictResult.DictionaryPageData, dictResult.DictionaryCount,
                     physicalType, typeLength, rowCount - nonNullCount, statisticsOrder);
 
+            stats = StatisticsCollector.ApplyTypeOrderZeroRule(stats, physicalType,
+                options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder);
             result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
         }
 

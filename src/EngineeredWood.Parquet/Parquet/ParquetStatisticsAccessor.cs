@@ -172,9 +172,9 @@ public sealed class ParquetStatisticsAccessor
     /// </param>
     private static LiteralValue? Decode(ColumnDescriptor desc, byte[] bytes, bool isMax)
     {
-        // The bounds were ordered by an annotation the reader does not honour (parquet-format 2.14:
-        // ignore the column order along with the annotation), so their order is unknown.
-        if (desc.SchemaNode.AnnotationIgnored)
+        // An order this reader does not recognize — or none it can use: an annotation it ignored, a
+        // malformed column_orders list — says nothing it can compare a literal against.
+        if (desc.ColumnOrder == ColumnOrder.Undefined)
             return null;
 
         var logical = desc.SchemaElement.LogicalType;

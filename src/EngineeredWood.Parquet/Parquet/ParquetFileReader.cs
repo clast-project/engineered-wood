@@ -116,7 +116,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             return _schema;
 
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
-        _schema = new SchemaDescriptor(metadata.Schema);
+        _schema = new SchemaDescriptor(metadata.Schema, metadata.ColumnOrders);
         return _schema;
     }
 
