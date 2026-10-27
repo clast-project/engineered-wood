@@ -173,6 +173,58 @@ public sealed class Float16StatisticsTests : IDisposable
     }
 
     /// <summary>
+    /// A sliced column (Arrow's zero-copy view, <c>Data.Offset != 0</c>) gets the bounds of the slice,
+    /// not of the rows before it: ParquetFileWriter compacts a sliced column on entry and
+    /// BufferedParquetWriter copies from the offset, so no scan sees one. Top-level and as a struct's
+    /// child, where only the child carries the offset.
+    /// </summary>
+    [Theory]
+    [InlineData("file", false)]
+    [InlineData("file", true)]
+    [InlineData("buffered", false)]
+    [InlineData("buffered", true)]
+    public async Task SlicedColumn_GetsTheBoundsOfTheSlice(string writer, bool nested)
+    {
+        // Backing 100, 200, 1, 2, 3 as halves; the slice [2, 5) holds 1, 2, 3.
+        ushort[] backing = [0x5640, 0x5A40, One, Two, 0x4200];
+        var bytes = backing.SelectMany(b => new[] { (byte)b, (byte)(b >> 8) }).ToArray();
+        var slice = ArrowArrayFactory.Slice(new HalfFloatArray(new ArrayData(HalfFloatType.Default, 5, 0, 0,
+            [ArrowBuffer.Empty, new ArrowBuffer(bytes)])), 2, 3);
+        Assert.Equal(2, slice.Data.Offset);
+
+        IArrowArray column = slice;
+        if (nested)
+        {
+            var structType = new StructType([new Field("h", HalfFloatType.Default, false)]);
+            column = new StructArray(structType, 3, [slice], ArrowBuffer.Empty, 0);
+        }
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("c", column.Data.DataType, nullable: false)).Build(),
+            [column], 3);
+
+        string path = Path.Combine(_dir, Guid.NewGuid().ToString("N")[..8] + ".parquet");
+        await using (var file = new LocalSequentialFile(path))
+        {
+            if (writer == "file")
+            {
+                await using var w = new ParquetFileWriter(file, ownsFile: false);
+                await w.WriteRowGroupAsync(batch);
+                await w.CloseAsync();
+            }
+            else
+            {
+                await using var w = new BufferedParquetWriter(file, ownsFile: false);
+                await w.AppendAsync(batch);
+                await w.CloseAsync();
+            }
+        }
+
+        var stats = await ReadStatisticsAsync(path);
+        Assert.Equal(One, Bits(stats.MinValue!));
+        Assert.Equal(0x4200, Bits(stats.MaxValue!));   // 3.0
+    }
+
+    /// <summary>
     /// The configured floating-point column order applies to FLOAT16 too — parquet-format recommends
     /// IEEE 754 total order for it — and the reader honours it on a FLOAT16 column.
     /// </summary>
