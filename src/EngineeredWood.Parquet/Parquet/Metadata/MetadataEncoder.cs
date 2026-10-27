@@ -176,8 +176,9 @@ internal static class MetadataEncoder
             writer.WriteZigZagInt32(element.FieldId.Value);
         }
 
-        // Field 10: logicalType (optional, LogicalType union)
-        if (element.LogicalType != null)
+        // Field 10: logicalType (optional, LogicalType union). An unrecognized one is written back
+        // only when it was read from a file and so has its bytes; an empty union is malformed.
+        if (element.LogicalType is not null and not LogicalType.UnknownLogicalType { RawStruct: null })
         {
             writer.WriteFieldHeader(ThriftType.Struct, 10);
             WriteLogicalType(writer, element.LogicalType);
@@ -256,7 +257,14 @@ internal static class MetadataEncoder
                 writer.WriteStructStop();
                 writer.PopStruct();
                 break;
-            // UnknownLogicalType is not written — it only exists for forward-compat on read
+            case LogicalType.NullType:
+                writer.WriteFieldHeader(ThriftType.Struct, 11);
+                WriteEmptyStruct(writer);
+                break;
+            case LogicalType.UnknownLogicalType { RawStruct: { } raw } unknown:
+                writer.WriteFieldHeader(ThriftType.Struct, unknown.ThriftFieldId);
+                writer.WriteRaw(raw);
+                break;
         }
 
         writer.WriteStructStop();

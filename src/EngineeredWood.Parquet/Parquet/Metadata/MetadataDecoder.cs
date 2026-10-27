@@ -234,6 +234,7 @@ internal static class MetadataDecoder
     private static readonly LogicalType CachedUuid = new LogicalType.UuidType();
     private static readonly LogicalType CachedFloat16 = new LogicalType.Float16Type();
     private static readonly LogicalType CachedVariant = new LogicalType.VariantType();
+    private static readonly LogicalType CachedNull = new LogicalType.NullType();
 
     private static LogicalType ReadLogicalType(ref ThriftCompactReader reader)
     {
@@ -246,6 +247,7 @@ internal static class MetadataDecoder
         {
             var (type, fid) = reader.ReadFieldHeader();
             if (type == ThriftType.Stop) break;
+            int start = reader.Position;
 
             switch (fid)
             {
@@ -281,9 +283,9 @@ internal static class MetadataDecoder
                 case 10 when type == ThriftType.Struct: // INTEGER
                     result = ReadIntLogicalType(ref reader);
                     break;
-                case 11 when type == ThriftType.Struct: // UNKNOWN (null type)
+                case 11 when type == ThriftType.Struct: // UNKNOWN (NullType)
                     SkipEmptyStruct(ref reader);
-                    result = new LogicalType.UnknownLogicalType(fid);
+                    result = CachedNull;
                     break;
                 case 12 when type == ThriftType.Struct: // JSON
                     SkipEmptyStruct(ref reader);
@@ -309,6 +311,14 @@ internal static class MetadataDecoder
                     reader.Skip(type);
                     result = new LogicalType.UnknownLogicalType(fid);
                     break;
+            }
+
+            // Keep an unrecognized member's bytes so a re-encoded footer writes it back unchanged.
+            // Every LogicalType member the spec defines is a struct; anything else is malformed.
+            if (result is LogicalType.UnknownLogicalType { RawStruct: null } unknown
+                && unknown.ThriftFieldId == fid && type == ThriftType.Struct)
+            {
+                result = unknown with { RawStruct = reader.ReadSince(start).ToArray() };
             }
         }
 
@@ -348,10 +358,15 @@ internal static class MetadataDecoder
         return new LogicalType.DecimalType(scale, precision);
     }
 
-    private static TimeUnit ReadTimeUnit(ref ThriftCompactReader reader)
+    /// <summary>
+    /// Reads the <c>TimeUnit</c> union. Null when no member is one this reader knows — a unit added
+    /// after it — so the caller can treat the whole TIME/TIMESTAMP as unrecognized rather than guess a
+    /// unit and misread the values (parquet-format 2.14, GH-606).
+    /// </summary>
+    private static TimeUnit? ReadTimeUnit(ref ThriftCompactReader reader)
     {
         reader.PushStruct();
-        TimeUnit unit = TimeUnit.Millis;
+        TimeUnit? unit = null;
         while (true)
         {
             var (type, fid) = reader.ReadFieldHeader();
@@ -368,11 +383,15 @@ internal static class MetadataDecoder
         return unit;
     }
 
-    private static LogicalType.TimeType ReadTimeLogicalType(ref ThriftCompactReader reader)
+    /// <summary>
+    /// Reads a TIME annotation; an <see cref="LogicalType.UnknownLogicalType"/> when its unit is
+    /// missing or unrecognized, so <c>SchemaAnnotations</c> drops it along with its statistics.
+    /// </summary>
+    private static LogicalType ReadTimeLogicalType(ref ThriftCompactReader reader)
     {
         reader.PushStruct();
         bool isAdjustedToUtc = false;
-        TimeUnit unit = TimeUnit.Millis;
+        TimeUnit? unit = null;
         while (true)
         {
             var (type, fid) = reader.ReadFieldHeader();
@@ -385,14 +404,20 @@ internal static class MetadataDecoder
             }
         }
         reader.PopStruct();
-        return new LogicalType.TimeType(isAdjustedToUtc, unit);
+        return unit is { } known
+            ? new LogicalType.TimeType(isAdjustedToUtc, known)
+            : new LogicalType.UnknownLogicalType(7);
     }
 
-    private static LogicalType.TimestampType ReadTimestampLogicalType(ref ThriftCompactReader reader)
+    /// <summary>
+    /// Reads a TIMESTAMP annotation; an <see cref="LogicalType.UnknownLogicalType"/> when its unit is
+    /// missing or unrecognized, so <c>SchemaAnnotations</c> drops it along with its statistics.
+    /// </summary>
+    private static LogicalType ReadTimestampLogicalType(ref ThriftCompactReader reader)
     {
         reader.PushStruct();
         bool isAdjustedToUtc = false;
-        TimeUnit unit = TimeUnit.Millis;
+        TimeUnit? unit = null;
         while (true)
         {
             var (type, fid) = reader.ReadFieldHeader();
@@ -405,7 +430,9 @@ internal static class MetadataDecoder
             }
         }
         reader.PopStruct();
-        return new LogicalType.TimestampType(isAdjustedToUtc, unit);
+        return unit is { } known
+            ? new LogicalType.TimestampType(isAdjustedToUtc, known)
+            : new LogicalType.UnknownLogicalType(8);
     }
 
     private static LogicalType.IntType ReadIntLogicalType(ref ThriftCompactReader reader)

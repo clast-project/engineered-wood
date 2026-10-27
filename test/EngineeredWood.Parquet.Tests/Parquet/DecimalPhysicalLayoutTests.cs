@@ -67,7 +67,9 @@ public class DecimalPhysicalLayoutTests : IDisposable
         int slot, int precision, PhysicalType physicalType, int? typeLength, string writer, bool dictionary)
     {
         var values = Values(precision, dictionary, rows: 600);
-        var column = Decimals(slot, precision, scale: 2, values);
+        // DECIMAL requires scale <= precision; a scale of 2 on precision 1 is an annotation readers drop.
+        int scale = Math.Min(2, precision);
+        var column = Decimals(slot, precision, scale, values);
         string path = await WriteAsync(writer, column, nullable: true,
             dictionary ? ParquetWriteOptions.Default : ParquetWriteOptions.Default with { DictionaryEnabled = false });
 
@@ -76,10 +78,30 @@ public class DecimalPhysicalLayoutTests : IDisposable
         Assert.Equal(physicalType, element.Type);
         Assert.Equal(typeLength, element.TypeLength);
         Assert.Equal(precision, element.Precision);
-        Assert.Equal(2, element.Scale);
+        Assert.Equal(scale, element.Scale);
         Assert.Equal(dictionary, metadata.RowGroups[0].Columns[0].MetaData!.DictionaryPageOffset is not null);
 
         Assert.Equal(values, await ReadUnscaledAsync(path));
+    }
+
+    /// <summary>
+    /// Arrow allows a negative scale or one above the precision; Parquet's DECIMAL does not, and a
+    /// reader drops such an annotation and returns bare integers (#548). Both writers refuse it, as
+    /// arrow C++ and parquet-java do, rather than write a file that silently loses its type.
+    /// </summary>
+    [Theory]
+    [InlineData("file", 16, 1, 2)]
+    [InlineData("buffered", 16, 1, 2)]
+    [InlineData("file", 16, 5, -1)]
+    [InlineData("buffered", 16, 5, -1)]
+    [InlineData("file", 32, 40, 41)]
+    public async Task ScaleOutsideZeroToPrecision_IsRefused(string writer, int slot, int precision, int scale)
+    {
+        var column = Decimals(slot, precision, scale, new BigInteger?[] { 1, null, -1 });
+
+        var ex = await Assert.ThrowsAsync<NotSupportedException>(
+            () => WriteAsync(writer, column, nullable: true, ParquetWriteOptions.Default));
+        Assert.Contains("0 <= scale <= precision", ex.Message);
     }
 
     /// <summary>
