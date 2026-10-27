@@ -234,6 +234,7 @@ internal static class MetadataDecoder
     private static readonly LogicalType CachedUuid = new LogicalType.UuidType();
     private static readonly LogicalType CachedFloat16 = new LogicalType.Float16Type();
     private static readonly LogicalType CachedVariant = new LogicalType.VariantType();
+    private static readonly LogicalType CachedNull = new LogicalType.NullType();
 
     private static LogicalType ReadLogicalType(ref ThriftCompactReader reader)
     {
@@ -281,9 +282,9 @@ internal static class MetadataDecoder
                 case 10 when type == ThriftType.Struct: // INTEGER
                     result = ReadIntLogicalType(ref reader);
                     break;
-                case 11 when type == ThriftType.Struct: // UNKNOWN (null type)
+                case 11 when type == ThriftType.Struct: // UNKNOWN (NullType)
                     SkipEmptyStruct(ref reader);
-                    result = new LogicalType.UnknownLogicalType(fid);
+                    result = CachedNull;
                     break;
                 case 12 when type == ThriftType.Struct: // JSON
                     SkipEmptyStruct(ref reader);

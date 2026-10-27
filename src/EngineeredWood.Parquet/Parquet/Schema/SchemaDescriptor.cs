@@ -44,7 +44,7 @@ public sealed class SchemaDescriptor
         if (index >= elements.Count)
             throw new ParquetFormatException("Unexpected end of schema elements.");
 
-        var element = elements[index++];
+        var element = SchemaAnnotations.Honoured(elements[index++], out bool annotationIgnored);
         int numChildren = element.NumChildren ?? 0;
 
         if (numChildren == 0)
@@ -54,6 +54,7 @@ public sealed class SchemaDescriptor
                 Element = element,
                 Parent = parent,
                 Children = Array.Empty<SchemaNode>(),
+                AnnotationIgnored = annotationIgnored,
             };
         }
 
@@ -63,6 +64,7 @@ public sealed class SchemaDescriptor
             Element = element,
             Parent = parent,
             Children = children,
+            AnnotationIgnored = annotationIgnored,
         };
 
         for (int i = 0; i < numChildren; i++)

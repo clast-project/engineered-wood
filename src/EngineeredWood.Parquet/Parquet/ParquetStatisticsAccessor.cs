@@ -172,6 +172,11 @@ public sealed class ParquetStatisticsAccessor
     /// </param>
     private static LiteralValue? Decode(ColumnDescriptor desc, byte[] bytes, bool isMax)
     {
+        // The bounds were ordered by an annotation the reader does not honour (parquet-format 2.14:
+        // ignore the column order along with the annotation), so their order is unknown.
+        if (desc.SchemaNode.AnnotationIgnored)
+            return null;
+
         var logical = desc.SchemaElement.LogicalType;
 
         return desc.PhysicalType switch

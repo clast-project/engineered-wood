@@ -257,7 +257,7 @@ internal static class ArrowToSchemaConverter
         int? Precision)
         MapArrowType(IArrowType arrowType, bool extendedTimestamp = false)
     {
-        return arrowType switch
+        var mapped = arrowType switch
         {
             BooleanType => (PhysicalType.Boolean, null, null, null, null, null),
 
@@ -368,6 +368,20 @@ internal static class ArrowToSchemaConverter
             _ => throw new NotSupportedException(
                 $"Arrow type '{arrowType.Name}' is not supported for Parquet writing."),
         };
+
+        // Arrow allows a negative scale, or one above the precision; Parquet's DECIMAL does not, and
+        // readers drop such an annotation and read the bare integers (parquet-format 2.14, GH-606). arrow
+        // C++ and parquet-java refuse to write one, and so does this: a file that silently loses its
+        // decimal type is worse than an error.
+        if (mapped.LogicalType is LogicalType.DecimalType { Scale: var scale, Precision: var precision }
+            && (scale < 0 || scale > precision))
+        {
+            throw new NotSupportedException(
+                $"Arrow type '{arrowType}' has scale {scale} and precision {precision}; Parquet's DECIMAL "
+                + "requires 0 <= scale <= precision. Cast the column to a decimal type that satisfies it.");
+        }
+
+        return mapped;
     }
 
     private static (

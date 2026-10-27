@@ -11,8 +11,19 @@ namespace EngineeredWood.Parquet.Schema;
 /// </summary>
 public sealed class SchemaNode
 {
-    /// <summary>The underlying schema element from the flattened Parquet metadata.</summary>
+    /// <summary>
+    /// The underlying schema element from the flattened Parquet metadata, less any type annotation
+    /// the reader does not honour (an unrecognized logical type, or one the spec does not allow on
+    /// this physical type). <c>FileMetaData.Schema</c> keeps the annotations as written.
+    /// </summary>
     public required SchemaElement Element { get; init; }
+
+    /// <summary>
+    /// Whether the annotation that defined this column's sort order was dropped (see
+    /// <see cref="Element"/>). Its min/max statistics were ordered by that annotation, so they are
+    /// not used either.
+    /// </summary>
+    internal bool AnnotationIgnored { get; init; }
 
     /// <summary>Parent node. Null for the root.</summary>
     public SchemaNode? Parent { get; init; }

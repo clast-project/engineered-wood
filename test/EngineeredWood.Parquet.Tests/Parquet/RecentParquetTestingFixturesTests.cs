@@ -80,6 +80,39 @@ public sealed class RecentParquetTestingFixturesTests
         var values = Assert.IsType<Int32Array>(batch.Column(0));
 
         Assert.Equal(Enumerable.Range(0, 10).Select(i => (int?)i), values.ToList());
+
+        // The footer keeps the annotation as written; only the reader's view drops it.
+        var metadata = await reader.ReadMetadataAsync();
+        Assert.IsType<LogicalType.UuidType>(metadata.Schema[1].LogicalType);
+        var schema = await reader.GetSchemaAsync();
+        Assert.Null(schema.Columns[0].SchemaElement.LogicalType);
+
+        // Its min/max were ordered by the annotation, so they are not used (the order is ignored too).
+        Assert.NotNull(metadata.RowGroups[0].Columns[0].MetaData!.Statistics?.MinValue);
+        var accessor = new ParquetStatisticsAccessor(schema);
+        Assert.Null(accessor.GetMinValue(metadata.RowGroups[0], "int32_uuid"));
+        Assert.Null(accessor.GetMaxValue(metadata.RowGroups[0], "int32_uuid"));
+    }
+
+    /// <summary>
+    /// An unrecognized logical type (here field id 99999, standing in for one added after this
+    /// reader) is ignored and the column read as its physical type, BYTE_ARRAY — as binary, not as a
+    /// string, since there is nothing to say the bytes are UTF-8.
+    /// </summary>
+    [Fact]
+    public async Task UnrecognizedLogicalType_ReadsThePhysicalType()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("unknown-logical-type.parquet"));
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        var known = Assert.IsType<StringArray>(batch.Column(0));
+        Assert.Equal("known string 1", known.GetString(0));
+        var unknown = Assert.IsType<BinaryArray>(batch.Column(1));
+        Assert.Equal(
+            ["unknown string 1", "unknown string 2", "unknown string 3"],
+            Enumerable.Range(0, 3).Select(i => System.Text.Encoding.UTF8.GetString(unknown.GetBytes(i).ToArray())));
     }
 
     [Fact]
