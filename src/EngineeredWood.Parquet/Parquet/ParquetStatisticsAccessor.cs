@@ -18,8 +18,10 @@ namespace EngineeredWood.Parquet;
 /// each column's physical and logical type.
 /// </summary>
 /// <remarks>
-/// Returns <c>null</c> for unknown columns, missing stats, INT96 (sort order
-/// undefined per spec), or types this accessor doesn't yet decode. The
+/// Returns <c>null</c> for unknown columns, missing stats, a column whose
+/// <see cref="ColumnDescriptor.ColumnOrder"/> is undefined, INT96 other than
+/// under <see cref="ColumnOrder.Int96TimestampOrder"/>, or types this accessor
+/// doesn't yet decode. The
 /// evaluator treats null as "Unknown" and conservatively keeps the row group.
 ///
 /// Prefers the typed <c>min_value</c>/<c>max_value</c> fields (correct logical
@@ -119,6 +121,9 @@ public sealed class ParquetStatisticsAccessor
         if (bytes is null)
             return null;
 
+        if (desc.PhysicalType == PhysicalType.Int96)
+            return Int96Bound(desc, bytes, maxBytes, isMax: false);
+
         // A NaN MINIMUM is trustworthy only when the maximum is NaN too. Under SQL's order (#204)
         // that pair means every value is NaN, and so it does under .NET's opposite order -- the two
         // agree on exactly this shape. A NaN min beside a FINITE max is the signature of a writer
@@ -130,12 +135,77 @@ public sealed class ParquetStatisticsAccessor
         return Decode(desc, bytes, isMax: false);
     }
 
-    /// <summary>Decodes a maximum. Chunk statistics and page-index bounds share it.</summary>
-    internal static LiteralValue? DecodeUpperBound(ColumnDescriptor desc, byte[]? bytes) =>
-        bytes is null ? null : Decode(desc, bytes, isMax: true);
+    /// <summary>
+    /// Decodes a maximum, given the minimum beside it. Chunk statistics and page-index bounds share it.
+    /// </summary>
+    internal static LiteralValue? DecodeUpperBound(ColumnDescriptor desc, byte[]? bytes, byte[]? minBytes)
+    {
+        if (bytes is null)
+            return null;
+
+        if (desc.PhysicalType == PhysicalType.Int96)
+            return Int96Bound(desc, bytes, minBytes, isMax: true);
+
+        return Decode(desc, bytes, isMax: true);
+    }
 
     private static LiteralValue? DecodeMax(ColumnDescriptor desc, Statistics stats) =>
-        DecodeUpperBound(desc, stats.MaxValue ?? FallbackBytes(desc, stats.Max));
+        DecodeUpperBound(desc, stats.MaxValue ?? FallbackBytes(desc, stats.Max), stats.MinValue ?? FallbackBytes(desc, stats.Min));
+
+    private const long JulianDayOfUnixEpoch = 2_440_588;
+    private const long NanosPerDay = 86_400_000_000_000;
+
+    /// <summary>
+    /// An INT96 bound, as a timestamp. Only under <see cref="ColumnOrder.Int96TimestampOrder"/>: under
+    /// TYPE_ORDER an INT96 column's statistics have no defined order (parquet-format 2.14).
+    /// </summary>
+    /// <remarks>
+    /// <para>The bound must hold for the values as the reader returns them, not only for the exact
+    /// nanoseconds: by default INT96 reads as microseconds, floored. So a minimum is floored to the
+    /// microsecond, which is at or below the value in either unit, and a maximum is the exact value
+    /// rounded up to the 100 ns a <see cref="DateTimeOffset"/> holds.</para>
+    ///
+    /// <para>Both ends must be within <see cref="DateTimeOffset"/>'s range, or neither is used. The
+    /// order compares the stored day as a signed int32, but the reader lets day arithmetic wrap so that
+    /// Spark's overflowed far-future values (a negative stored day) read back as the year-290000 dates
+    /// they are. Such a value is the chunk's minimum in stored order and its maximum in time, so a
+    /// maximum alone would exclude it. With both ends in range, every value between them in stored
+    /// order is too, and reads back in that same order. A nanosecond-of-day outside one day is
+    /// malformed and gives no bound.</para>
+    /// </remarks>
+    private static LiteralValue? Int96Bound(ColumnDescriptor desc, byte[] bytes, byte[]? other, bool isMax)
+    {
+        if (desc.ColumnOrder != ColumnOrder.Int96TimestampOrder)
+            return null;
+        if (other is null || Int96Ticks(other, !isMax) is null)
+            return null;
+
+        return Int96Ticks(bytes, isMax) is { } ticks
+            ? (LiteralValue?)LiteralValue.Of(new DateTimeOffset(ticks, TimeSpan.Zero))
+            : null;
+    }
+
+    /// <summary>The bound's .NET ticks, rounded outward per <see cref="Int96Bound"/>; null outside range.</summary>
+    private static long? Int96Ticks(byte[] bytes, bool isMax)
+    {
+        if (bytes.Length != 12)
+            return null;
+
+        long nanosOfDay = BinaryPrimitives.ReadInt64LittleEndian(bytes);
+        long julianDay = BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(8));
+        if (nanosOfDay < 0 || nanosOfDay >= NanosPerDay)
+            return null;
+
+        BigInteger nanos = (julianDay - JulianDayOfUnixEpoch) * new BigInteger(NanosPerDay) + nanosOfDay;
+        BigInteger unixTicks = isMax
+            ? DivideOutward(nanos, 100, isMax: true)
+            : DivideOutward(nanos, 1000, isMax: false) * 10;
+
+        BigInteger ticks = unixTicks + UnixEpochTicks;
+        if (ticks < BigInteger.Zero || ticks > DateTime.MaxValue.Ticks)
+            return null;
+        return (long)ticks;
+    }
 
     /// <summary>Whether a raw FLOAT/DOUBLE bound holds a NaN.</summary>
     private static bool IsNaNBound(ColumnDescriptor desc, byte[]? bytes) =>
@@ -189,7 +259,7 @@ public sealed class ParquetStatisticsAccessor
             PhysicalType.Double => DecodeDouble(bytes),
             PhysicalType.ByteArray => DecodeByteArray(bytes, logical),
             PhysicalType.FixedLenByteArray => DecodeFixedLenByteArray(desc, bytes, logical, isMax),
-            // INT96 sort order is undefined per the Parquet spec.
+            // DecodeLowerBound and DecodeUpperBound route INT96 to Int96Bound, which needs both ends.
             PhysicalType.Int96 => null,
             _ => null,
         };

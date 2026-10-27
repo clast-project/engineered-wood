@@ -115,8 +115,13 @@ public sealed class RecentParquetTestingFixturesTests
             Enumerable.Range(0, 3).Select(i => System.Text.Encoding.UTF8.GetString(unknown.GetBytes(i).ToArray())));
     }
 
+    /// <summary>
+    /// The column is declared in INT96_TIMESTAMP_ORDER (parquet-format 2.14), and its values are chosen
+    /// so that comparing the raw bytes gives the wrong min/max. Its bounds are EARLY
+    /// (1968-05-23 00:00:00.000000123) and NEXT_DAY (1970-01-02 00:00:00).
+    /// </summary>
     [Fact]
-    public async Task Int96TimestampOrder_IsUnknownAndValuesReadAsTimestamps()
+    public async Task Int96TimestampOrder_IsHonouredAndValuesReadAsTimestamps()
     {
         await using var file = new LocalRandomAccessFile(TestData.GetPath("int96_timestamp_order.parquet"));
         await using var reader = new ParquetFileReader(file, ownsFile: false);
@@ -124,7 +129,8 @@ public sealed class RecentParquetTestingFixturesTests
         var metadata = await reader.ReadMetadataAsync();
         var batch = await reader.ReadRowGroupAsync(0);
 
-        Assert.Equal([ColumnOrder.Undefined], metadata.ColumnOrders);
+        Assert.Equal([ColumnOrder.Int96TimestampOrder], metadata.ColumnOrders);
+        Assert.Equal(ColumnOrder.Int96TimestampOrder, (await reader.GetSchemaAsync()).Columns[0].ColumnOrder);
         var values = Assert.IsType<TimestampArray>(batch.Column(0));
         var type = Assert.IsType<TimestampType>(values.Data.DataType);
         Assert.Equal(Apache.Arrow.Types.TimeUnit.Microsecond, type.Unit);
@@ -132,7 +138,47 @@ public sealed class RecentParquetTestingFixturesTests
         Assert.Equal(
             [86_399_999_999L, 86_400_000_000L, -50_803_200_000_000L, 1L],
             values.Values.ToArray());
+
+        // The minimum is floored to the microsecond, as the reader floors the value it returns.
+        var accessor = new ParquetStatisticsAccessor(await reader.GetSchemaAsync());
+        Assert.Equal(Unix(-50_803_200_000_000L * 10), accessor.GetMinValue(metadata.RowGroups[0], "ts")?.AsDateTimeOffset);
+        Assert.Equal(Unix(86_400_000_000L * 10), accessor.GetMaxValue(metadata.RowGroups[0], "ts")?.AsDateTimeOffset);
     }
+
+    public static TheoryData<string, long, bool> Int96PruningCases() => new()
+    {
+        // (operator, literal in .NET ticks since the Unix epoch, whether the row group may match)
+        { ">", 86_400_000_000L * 10, false },          // after NEXT_DAY, the maximum
+        { ">=", 86_400_000_000L * 10, true },
+        { "<", -50_803_200_000_000L * 10, false },     // before EARLY's microsecond
+        // 100 ns after EARLY's midnight. EARLY is really 123 ns after it, but reads back as midnight
+        // (microseconds, floored), which IS earlier: a bound floored only to 100 ns would prune this.
+        { "<", -50_803_200_000_000L * 10 + 1, true },
+        { "=", 43_200_000_000L * 10, true },           // noon on 1970-01-01, between the bounds
+    };
+
+    /// <summary>The bounds prune, in the order the file declares, and soundly for the values as read.</summary>
+    [Theory]
+    [MemberData(nameof(Int96PruningCases))]
+    public async Task Int96TimestampOrder_Prunes(string op, long unixTicks, bool candidate)
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("int96_timestamp_order.parquet"));
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var literal = EngineeredWood.Expressions.LiteralValue.Of(Unix(unixTicks));
+        var filter = op switch
+        {
+            ">" => EngineeredWood.Expressions.Expressions.GreaterThan("ts", literal),
+            ">=" => EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("ts", literal),
+            "<" => EngineeredWood.Expressions.Expressions.LessThan("ts", literal),
+            _ => (EngineeredWood.Expressions.Predicate)EngineeredWood.Expressions.Expressions.Equal("ts", literal),
+        };
+
+        var candidates = await reader.GetCandidateRowGroupsAsync(filter);
+
+        Assert.Equal(candidate, candidates[0]);
+    }
+
+    private static DateTimeOffset Unix(long ticks) => new(621_355_968_000_000_000L + ticks, TimeSpan.Zero);
 
     [Theory]
     [MemberData(nameof(MalformedVariantFiles))]

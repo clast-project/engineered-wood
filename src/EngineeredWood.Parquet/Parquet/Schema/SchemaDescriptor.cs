@@ -56,8 +56,8 @@ public sealed class SchemaDescriptor
 
     /// <summary>
     /// <paramref name="declared"/>, unless the reader cannot use it: a column whose type annotation was
-    /// ignored has no known order (parquet-format 2.14, GH-606), and IEEE 754 total order applies only
-    /// to FLOAT, DOUBLE and FLOAT16.
+    /// ignored has no known order (parquet-format 2.14, GH-606), IEEE 754 total order applies only
+    /// to FLOAT, DOUBLE and FLOAT16, and INT96 timestamp order only to INT96.
     /// </summary>
     private static ColumnOrder EffectiveOrder(ColumnDescriptor column, ColumnOrder declared)
     {
@@ -70,6 +70,9 @@ public sealed class SchemaDescriptor
         {
             return ColumnOrder.Undefined;
         }
+
+        if (declared == ColumnOrder.Int96TimestampOrder && column.PhysicalType != PhysicalType.Int96)
+            return ColumnOrder.Undefined;
 
         return declared;
     }

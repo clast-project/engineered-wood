@@ -324,7 +324,7 @@ internal static class PageIndexPruner
                 else
                 {
                     _min[slot] = ParquetStatisticsAccessor.DecodeLowerBound(indexed.Descriptor, index.MinValues[page], index.MaxValues[page]);
-                    _max[slot] = ParquetStatisticsAccessor.DecodeUpperBound(indexed.Descriptor, index.MaxValues[page]);
+                    _max[slot] = ParquetStatisticsAccessor.DecodeUpperBound(indexed.Descriptor, index.MaxValues[page], index.MinValues[page]);
                 }
 
                 _decodedPage[slot] = page;

@@ -36,6 +36,14 @@ public enum ColumnOrder
     /// value is NaN. Recognized only by newer readers.
     /// </summary>
     Ieee754TotalOrder = 2,
+
+    /// <summary>
+    /// <c>INT96_TIMESTAMP_ORDER</c> (union field 3, parquet-format 2.14): an INT96 column ordered
+    /// chronologically — by the Julian day (the last 4 bytes, a signed little-endian int32), then by
+    /// the nanoseconds of the day (the first 8, a signed little-endian int64). Under
+    /// <see cref="TypeDefined"/> an INT96 column's statistics have no defined order and are ignored.
+    /// </summary>
+    Int96TimestampOrder = 3,
 }
 
 /// <summary>

@@ -109,6 +109,17 @@ public sealed class ColumnOrderTests : IDisposable
         Assert.Equal(new[] { true, true }, await CandidatesAsync(path, Ex.GreaterThan("i", 150L)));
     }
 
+    /// <summary>INT96 timestamp order is only for INT96.</summary>
+    [Fact]
+    public async Task Int96OrderOnAnotherType_IsUndefined()
+    {
+        string path = await WriteTwoRowGroupsAsync();
+        SetColumnOrders(path, [ColumnOrder.TypeDefined, ColumnOrder.Int96TimestampOrder]);
+
+        Assert.Equal(ColumnOrder.Undefined, (await SchemaAsync(path)).Columns[1].ColumnOrder);
+        Assert.Equal(new[] { true, true }, await CandidatesAsync(path, Ex.GreaterThan("i", 150L)));
+    }
+
     [Fact]
     public async Task TotalOrderFile_Prunes()
     {

@@ -100,6 +100,10 @@ internal static class MetadataEncoder
                 writer.WriteFieldHeader(ThriftType.Struct, 2); // IEEE_754_TOTAL_ORDER
                 writer.WriteStructStop();                      // empty IEEE754TotalOrder
                 break;
+            case ColumnOrder.Int96TimestampOrder:
+                writer.WriteFieldHeader(ThriftType.Struct, 3); // INT96_TIMESTAMP_ORDER
+                writer.WriteStructStop();                      // empty Int96TimestampOrder
+                break;
         }
         writer.WriteStructStop(); // union stop
         writer.PopStruct();

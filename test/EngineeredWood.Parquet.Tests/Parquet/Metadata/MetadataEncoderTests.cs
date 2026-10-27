@@ -354,6 +354,28 @@ public class MetadataEncoderTests
         Assert.False(intType.IsSigned);
     }
 
+    /// <summary>INT96_TIMESTAMP_ORDER, ColumnOrder union field 3 (parquet-format 2.14).</summary>
+    [Fact]
+    public void RoundTrip_ColumnOrder_Int96TimestampOrder()
+    {
+        var original = new FileMetaData
+        {
+            Version = 1,
+            Schema =
+            [
+                new SchemaElement { Name = "schema", NumChildren = 1 },
+                new SchemaElement { Name = "ts", Type = PhysicalType.Int96, RepetitionType = FieldRepetitionType.Required },
+            ],
+            NumRows = 0,
+            RowGroups = [],
+            ColumnOrders = [ColumnOrder.Int96TimestampOrder],
+        };
+
+        var decoded = MetadataDecoder.DecodeFileMetaData(MetadataEncoder.EncodeFileMetaData(original));
+
+        Assert.Equal([ColumnOrder.Int96TimestampOrder], decoded.ColumnOrders);
+    }
+
     /// <summary>The spec's UNKNOWN (always-null) annotation, union field 11.</summary>
     [Fact]
     public void RoundTrip_LogicalTypes_Null()
