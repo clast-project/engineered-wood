@@ -190,17 +190,52 @@ public class CheckpointPartialWriteTests : IDisposable
         Assert.Empty(Directory.GetFiles(LogDir, "*.checkpoint*"));
     }
 
+    /// <summary>
+    /// An NDJSON body cut at a line break still parses, and nothing in it says how many lines it should
+    /// have, so a partial one at its final name loads with file actions silently missing (#539). It is
+    /// streamed like the Parquet body, never written whole, since the local whole-file write is in place.
+    /// </summary>
     [Fact]
-    public async Task V2JsonBody_FailingAfterItsBytesLand_LeavesNoCheckpoint()
+    public async Task V2JsonBody_FailingMidStream_LeavesNoCheckpoint()
     {
         var (fs, snapshot) = await BuildTableAsync();
-        fs.FailAfterWriteAllBytes = path => path.Contains(".checkpoint.");
+        fs.FailMidStream = path => path.Contains(".checkpoint.");
 
         await Assert.ThrowsAsync<IOException>(async () =>
             await new V2CheckpointWriter(fs) { Body = V2CheckpointBody.Json }.WriteCheckpointAsync(snapshot));
 
         Assert.True(fs.BytesReachedStorage);
+        Assert.Contains(fs.Streamed, p => p.Contains(".checkpoint.") && p.EndsWith(".json", StringComparison.Ordinal));
+        Assert.DoesNotContain(fs.WrittenWhole, p => p.Contains(".checkpoint."));
         Assert.Empty(Directory.GetFiles(LogDir, "*.checkpoint*"));
+        Assert.Empty(Directory.GetFiles(LogDir, ".*"));
+    }
+
+    /// <summary>A compacted log file has the same NDJSON shape, and the same exposure, as a JSON body.</summary>
+    [Fact]
+    public async Task Compaction_FailingMidStream_LeavesNoCompactedFile()
+    {
+        var (fs, _) = await BuildTableAsync();
+        var log = new TransactionLog(fs);
+        await log.WriteCommitAsync(1, new List<DeltaAction>
+        {
+            new AddFile
+            {
+                Path = "part-4.parquet",
+                PartitionValues = new Dictionary<string, string>(),
+                Size = 100, ModificationTime = 2000, DataChange = true,
+            },
+        });
+        fs.FailMidStream = path => path.EndsWith(".compacted.json", StringComparison.Ordinal);
+
+        await Assert.ThrowsAsync<IOException>(async () =>
+            await new LogCompaction(fs, log).CompactRangeAsync(0, 1));
+
+        Assert.True(fs.BytesReachedStorage);
+        Assert.DoesNotContain(fs.WrittenWhole, p => p.EndsWith(".compacted.json", StringComparison.Ordinal));
+        Assert.Empty(Directory.GetFiles(LogDir, "*.compacted.json"));
+        Assert.Empty(Directory.GetFiles(LogDir, ".*"));
+        Assert.Equal(5, (await SnapshotBuilder.BuildAsync(log)).FileCount);
     }
 
     private string[] Sidecars()
@@ -217,7 +252,7 @@ public class CheckpointPartialWriteTests : IDisposable
     public async Task V2_FailedBody_DeletesTheSidecarsItsAttemptWrote()
     {
         var (fs, snapshot) = await BuildTableAsync();
-        fs.FailAfterWriteAllBytes = path => path.Contains(".checkpoint.");
+        fs.FailMidStream = path => path.Contains(".checkpoint.");
 
         await Assert.ThrowsAsync<IOException>(async () =>
             await new V2CheckpointWriter(fs) { SidecarThreshold = 1, MaxActionsPerSidecar = 2 }
@@ -230,22 +265,25 @@ public class CheckpointPartialWriteTests : IDisposable
     }
 
     /// <summary>
-    /// If the failed body could not be deleted either, it still names its sidecars. Deleting them would
-    /// turn a checkpoint that was only partial into one that points at missing files.
+    /// A body whose completion landed but reported failure is whole, and it names its sidecars. Deleting
+    /// them would turn it into a checkpoint that points at missing files.
     /// </summary>
-    [Fact]
-    public async Task V2_FailedBodyThatCouldNotBeDeleted_KeepsItsSidecars()
+    [Theory]
+    [InlineData(V2CheckpointBody.Json)]
+    [InlineData(V2CheckpointBody.Parquet)]
+    public async Task V2_FailedBodyThatLanded_KeepsItsSidecars(V2CheckpointBody body)
     {
         var (fs, snapshot) = await BuildTableAsync();
-        fs.FailAfterWriteAllBytes = path => path.Contains(".checkpoint.");
-        fs.FailDelete = path => path.Contains(".checkpoint.");
+        fs.FailAfterComplete = path => path.Contains(".checkpoint.");
 
         await Assert.ThrowsAsync<IOException>(async () =>
-            await new V2CheckpointWriter(fs) { SidecarThreshold = 1, MaxActionsPerSidecar = 2 }
+            await new V2CheckpointWriter(fs) { Body = body, SidecarThreshold = 1, MaxActionsPerSidecar = 2 }
                 .WriteCheckpointAsync(snapshot));
 
+        Assert.True(fs.BytesReachedStorage);
         Assert.Single(Directory.GetFiles(LogDir, "*.checkpoint*"));
         Assert.Equal(2, Sidecars().Length);
+        Assert.Empty(fs.Deleted);
     }
 
     [Fact]
@@ -301,15 +339,12 @@ public class CheckpointPartialWriteTests : IDisposable
         /// <summary>Every path opened for streaming.</summary>
         public List<string> Streamed { get; } = [];
 
-        /// <summary>Whole-file writes (either kind) these match land, then throw.</summary>
-        public Func<string, bool>? FailAfterWriteAllBytes { get; set; }
+        /// <summary>Every path written whole, by either kind of whole-file write.</summary>
+        public List<string> WrittenWhole { get; } = [];
 
         public bool BytesReachedStorage { get; private set; }
 
         public List<string> Deleted { get; } = [];
-
-        /// <summary>Deletes of paths these match throw instead.</summary>
-        public Func<string, bool>? FailDelete { get; set; }
 
         public PathNameConstraints PathConstraints => inner.PathConstraints;
 
@@ -331,8 +366,6 @@ public class CheckpointPartialWriteTests : IDisposable
 
         public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
         {
-            if (FailDelete?.Invoke(path) == true)
-                throw new IOException($"delete refused (injected): {path}");
             Deleted.Add(path);
             return inner.DeleteAsync(path, cancellationToken);
         }
@@ -347,24 +380,15 @@ public class CheckpointPartialWriteTests : IDisposable
         public async ValueTask<bool> TryWriteAllBytesAsync(
             string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
         {
-            bool written = await inner.TryWriteAllBytesAsync(path, data, cancellationToken);
-            if (FailAfterWriteAllBytes?.Invoke(path) == true)
-            {
-                BytesReachedStorage = true;
-                throw new IOException($"write failed after its bytes landed (injected): {path}");
-            }
-            return written;
+            WrittenWhole.Add(path);
+            return await inner.TryWriteAllBytesAsync(path, data, cancellationToken);
         }
 
         public async ValueTask WriteAllBytesAsync(
             string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
         {
+            WrittenWhole.Add(path);
             await inner.WriteAllBytesAsync(path, data, cancellationToken);
-            if (FailAfterWriteAllBytes?.Invoke(path) == true)
-            {
-                BytesReachedStorage = true;
-                throw new IOException($"write failed after its bytes landed (injected): {path}");
-            }
         }
 
         private sealed class FailingFile(FailMidStreamFileSystem owner, ISequentialFile inner, string path)

@@ -145,11 +145,11 @@ public sealed class V2CheckpointWriter
         }
         catch
         {
-            // A failed body write leaves no body (a streamed one is discarded, and a JSON one deletes what
-            // it wrote), which leaves this attempt's sidecars referenced by nothing. Deleting them keeps a checkpoint that fails on every interval from
+            // A failed body write usually leaves no body (an uncompleted stream is discarded), which leaves
+            // this attempt's sidecars referenced by nothing. Deleting them keeps a checkpoint that fails on every interval from
             // piling up sidecars for the sweep's whole age guard. But only once the body is confirmed
-            // gone: if that delete failed too, the body still names them, and deleting them would turn it
-            // into a checkpoint that points at missing files. A failure writing _last_checkpoint (below)
+            // gone: a completion can land and still report failure, and then the body is there and names
+            // them, and deleting them would turn it into a checkpoint that points at missing files. A failure writing _last_checkpoint (below)
             // never reaches this catch, since by then the body is published and references them.
             if (sidecars.Count > 0 && await IsAbsentAsync(checkpointPath).ConfigureAwait(false))
             {
@@ -316,21 +316,14 @@ public sealed class V2CheckpointWriter
     {
         if (Body != V2CheckpointBody.Parquet)
         {
+            // Streamed and completed rather than written whole, because a whole-file write is not atomic
+            // on every backend: the local one writes in place, so a process that died part-way left a
+            // partial body at its final name. An NDJSON body cut at a line break still parses, and nothing
+            // in it records how many lines it should have, so that checkpoint loaded with file actions
+            // silently missing (#539). A streamed file is visible only once completed.
             byte[] ndjson = ActionSerializer.Serialize(actions);
-            try
-            {
-                await _fs.WriteAllBytesAsync(checkpointPath, ndjson, cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch
-            {
-                // Not every backend writes this in one atomic step (the local one writes in place), so a
-                // failure can leave a partial body that is listed as this version's checkpoint. The name
-                // is a fresh UUID, so whatever is there is ours to delete.
-                await CheckpointWriter.DeleteQuietlyAsync(_fs, checkpointPath).ConfigureAwait(false);
-                throw;
-            }
-            return ndjson.Length;
+            return await CheckpointWriter.WriteNewFileAsync(_fs, checkpointPath,
+                file => file.WriteAsync(ndjson, cancellationToken), cancellationToken).ConfigureAwait(false);
         }
 
         // Declared before the writer so it is disposed last; its buffers are native memory.
