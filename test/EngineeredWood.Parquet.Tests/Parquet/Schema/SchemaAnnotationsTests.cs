@@ -4,6 +4,7 @@
 using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.Metadata;
 using EngineeredWood.Parquet.Schema;
+using EngineeredWood.Parquet.Thrift;
 
 namespace EngineeredWood.Tests.Parquet.Schema;
 
@@ -147,6 +148,103 @@ public class SchemaAnnotationsTests
 
         Assert.Same(element, SchemaAnnotations.Honoured(element, out bool ignored));
         Assert.False(ignored);
+    }
+
+    /// <summary>
+    /// A TIME or TIMESTAMP whose unit is one this reader does not know (a unit added after it) is an
+    /// unrecognized annotation: it used to decode as MILLIS, reading the values in the wrong unit and
+    /// keeping their statistics. Decoded here from footer bytes, since no writer of ours can produce it.
+    /// The converted type beside it goes too.
+    /// </summary>
+    [Theory]
+    [InlineData(8, (short)4, PhysicalType.Int64)]   // TIMESTAMP, unit member 4
+    [InlineData(7, (short)4, PhysicalType.Int64)]   // TIME, unit member 4
+    [InlineData(8, (short)0, PhysicalType.Int64)]   // TIMESTAMP, no unit at all (unit is required)
+    public void TimeUnitThisReaderDoesNotKnow_DropsTheAnnotation(short logicalField, short unitField, PhysicalType physical)
+    {
+        var metadata = MetadataDecoder.DecodeFileMetaData(FooterWithTimeUnit(logicalField, unitField, physical));
+        var raw = metadata.Schema[1];
+        Assert.Equal(new LogicalType.UnknownLogicalType(logicalField), raw.LogicalType);
+
+        var column = new SchemaDescriptor(metadata.Schema).Columns[0];
+        Assert.Null(column.SchemaElement.LogicalType);
+        Assert.Null(column.SchemaElement.ConvertedType);
+        Assert.True(column.SchemaNode.AnnotationIgnored);
+    }
+
+    [Theory]
+    [InlineData((short)1, TimeUnit.Millis)]
+    [InlineData((short)2, TimeUnit.Micros)]
+    [InlineData((short)3, TimeUnit.Nanos)]
+    public void TimeUnitThisReaderKnows_DecodesAsBefore(short unitField, TimeUnit unit)
+    {
+        var metadata = MetadataDecoder.DecodeFileMetaData(FooterWithTimeUnit(8, unitField, PhysicalType.Int64));
+
+        Assert.Equal(new LogicalType.TimestampType(true, unit), metadata.Schema[1].LogicalType);
+        Assert.False(new SchemaDescriptor(metadata.Schema).Columns[0].SchemaNode.AnnotationIgnored);
+    }
+
+    /// <summary>
+    /// A footer with one optional leaf of <paramref name="physical"/> type, converted type
+    /// TIMESTAMP_MICROS, and logical type <paramref name="logicalField"/> (7 TIME, 8 TIMESTAMP) whose
+    /// TimeUnit union sets member <paramref name="unitField"/>, or nothing when it is 0.
+    /// </summary>
+    private static byte[] FooterWithTimeUnit(short logicalField, short unitField, PhysicalType physical)
+    {
+        var w = new ThriftCompactWriter();
+        w.PushStruct();
+        w.WriteFieldHeader(ThriftType.I32, 1); // version
+        w.WriteZigZagInt32(1);
+        w.WriteFieldHeader(ThriftType.List, 2); // schema
+        w.WriteListHeader(ThriftType.Struct, 2);
+
+        w.PushStruct(); // root
+        w.WriteFieldHeader(ThriftType.Binary, 4);
+        w.WriteString("schema");
+        w.WriteFieldHeader(ThriftType.I32, 5); // num_children
+        w.WriteZigZagInt32(1);
+        w.WriteStructStop();
+        w.PopStruct();
+
+        w.PushStruct(); // the leaf
+        w.WriteFieldHeader(ThriftType.I32, 1);
+        w.WriteZigZagInt32((int)physical);
+        w.WriteFieldHeader(ThriftType.I32, 3);
+        w.WriteZigZagInt32((int)FieldRepetitionType.Optional);
+        w.WriteFieldHeader(ThriftType.Binary, 4);
+        w.WriteString("t");
+        w.WriteFieldHeader(ThriftType.I32, 6);
+        w.WriteZigZagInt32((int)ConvertedType.TimestampMicros);
+        w.WriteFieldHeader(ThriftType.Struct, 10); // logicalType union
+        w.PushStruct();
+        w.WriteFieldHeader(ThriftType.Struct, logicalField);
+        w.PushStruct();
+        w.WriteBoolField(1, true); // isAdjustedToUTC
+        w.WriteFieldHeader(ThriftType.Struct, 2); // unit: TimeUnit union
+        w.PushStruct();
+        if (unitField != 0)
+        {
+            w.WriteFieldHeader(ThriftType.Struct, unitField);
+            w.PushStruct();
+            w.WriteStructStop();
+            w.PopStruct();
+        }
+        w.WriteStructStop();
+        w.PopStruct();
+        w.WriteStructStop();
+        w.PopStruct();
+        w.WriteStructStop();
+        w.PopStruct();
+        w.WriteStructStop();
+        w.PopStruct();
+
+        w.WriteFieldHeader(ThriftType.I64, 3); // num_rows
+        w.WriteZigZagInt64(0);
+        w.WriteFieldHeader(ThriftType.List, 4); // row_groups
+        w.WriteListHeader(ThriftType.Struct, 0);
+        w.WriteStructStop();
+        w.PopStruct();
+        return w.ToArray();
     }
 
     [Fact]
