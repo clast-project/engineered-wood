@@ -337,7 +337,8 @@ public sealed class V2CheckpointWriter
         using var batch = CheckpointWriter.BuildBatchForActions(
             snapshot, actions, out _, v2Spec: true);
 
-        // A truncated body would be listed as this version's checkpoint, so a failed write deletes it.
+        // A body missing rows would be listed as this version's checkpoint, so one this write published
+        // before failing is deleted.
         return await CheckpointWriter.WriteFileOrDeleteAsync(_fs, checkpointPath,
             async file =>
             {
