@@ -195,6 +195,43 @@ public class LocalSequentialFileTests : IDisposable
     }
 
     [Fact]
+    public async Task LongName_StillFitsTheTempName()
+    {
+        // 240 characters is a legal name everywhere this runs; the name plus a full guid would not be.
+        string path = Path.Combine(_tempDir, new string('a', 236) + ".bin");
+        await using (var file = new LocalSequentialFile(path))
+        {
+            await file.WriteAsync(new byte[] { 1, 2, 3 });
+            Assert.True(Path.GetFileName(Assert.Single(Directory.GetFiles(_tempDir))).Length <= 255);
+            await file.CompleteAsync();
+        }
+
+        Assert.Equal(new byte[] { 1, 2, 3 }, await ReadAllBytesAsync(path));
+    }
+
+    [Fact]
+    public async Task CancelledComplete_AbortsAndLeavesNothing()
+    {
+        string path = Path.Combine(_tempDir, "test.bin");
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        await using (var file = new LocalSequentialFile(path))
+        {
+            await file.WriteAsync(new byte[] { 1, 2, 3 });
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                async () => await file.CompleteAsync(cancelled.Token));
+            Assert.Empty(Directory.GetFileSystemEntries(_tempDir));
+
+            await Assert.ThrowsAsync<InvalidOperationException>(async () => await file.CompleteAsync());
+            await Assert.ThrowsAsync<InvalidOperationException>(
+                async () => await file.WriteAsync(new byte[] { 4 }));
+        }
+
+        Assert.Empty(Directory.GetFileSystemEntries(_tempDir));
+    }
+
+    [Fact]
     public async Task Position_SurvivesComplete()
     {
         string path = Path.Combine(_tempDir, "test.bin");

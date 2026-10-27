@@ -139,8 +139,8 @@ public sealed class GcsSequentialFile : ISequentialFile
             }
             catch (ChannelClosedException)
             {
-                // The reader side completed the channel, which only happens when the
-                // upload task faulted. Await it to surface the underlying exception.
+                // The upload ended before its stream did, so EnsureUploadStarted's continuation closed
+                // the channel. Await the upload to surface the underlying exception.
                 await AwaitUploadAsync().ConfigureAwait(false);
                 throw; // Upload somehow completed without faulting; preserve original signal.
             }
@@ -176,6 +176,13 @@ public sealed class GcsSequentialFile : ISequentialFile
             return;
         if (_aborted)
             throw new InvalidOperationException("Cannot complete a GCS object whose write was aborted.");
+
+        // Checked here and not later: once the stream has ended the upload may finalize at any moment.
+        if (cancellationToken.IsCancellationRequested)
+        {
+            await AbortAsync().ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+        }
 
         // Ensure the upload exists even for an empty object (no prior writes).
         EnsureUploadStarted();
@@ -248,6 +255,17 @@ public sealed class GcsSequentialFile : ISequentialFile
         // of the channel or by an abort, not by any single caller's cancellation token.
         _uploadTask = _client.UploadObjectAsync(
             _bucket, _objectName, _contentType, source, options, _abort.Token);
+
+        // An upload that fails stops reading, so a WriteAsync waiting on a full channel would wait forever.
+        // Closing the channel when the upload ends wakes it with ChannelClosedException, which it answers
+        // by surfacing the upload's own failure. It is a no-op after CompleteAsync or an abort, which have
+        // closed the channel already.
+        _ = _uploadTask.ContinueWith(
+            static (_, channel) => ((Channel<byte[]>)channel!).Writer.TryComplete(),
+            _channel,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     private async ValueTask AwaitUploadAsync()

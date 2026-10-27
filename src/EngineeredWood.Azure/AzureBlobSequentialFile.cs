@@ -146,12 +146,34 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
             _aborted = true;
             throw new IOException($"Blob already exists: {_blobClient.Name}", ex);
         }
+        catch (RequestFailedException ex) when (!_overwrite && ex.ErrorCode == "InvalidBlockList")
+        {
+            // Another writer publishing the blob while this one had blocks staged discards them, so the
+            // commit names blocks that are gone and fails before its precondition is evaluated. If the blob
+            // is there now, that is the same lost race as a 412.
+            _aborted = true;
+            if (await BlobExistsQuietlyAsync().ConfigureAwait(false))
+                throw new IOException($"Blob already exists: {_blobClient.Name}", ex);
+            throw;
+        }
         catch
         {
             _aborted = true;
             throw;
         }
         _completed = true;
+    }
+
+    private async Task<bool> BlobExistsQuietlyAsync()
+    {
+        try
+        {
+            return (await _blobClient.ExistsAsync(CancellationToken.None).ConfigureAwait(false)).Value;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     private async ValueTask StageCurrentBlockAsync(CancellationToken cancellationToken)

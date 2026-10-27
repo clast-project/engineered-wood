@@ -110,19 +110,27 @@ public abstract partial class TableFileSystemPathConformanceTests
 
     /// <summary>
     /// The create-time existence check only fails early. A file another writer published between create and
-    /// complete must survive: completion is the create-if-absent step.
+    /// complete must survive: completion is the create-if-absent step. Run large as well as small, because
+    /// the request that completes the write differs: S3's CompleteMultipartUpload rather than PutObject
+    /// must carry the precondition, and on Azure the other writer's upload discards this one's staged
+    /// blocks, so its commit fails for that reason rather than on the precondition.
     /// </summary>
-    [SkippableFact]
-    public async Task CompleteWithoutOverwrite_LosesToAFilePublishedSinceCreate()
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CompleteWithoutOverwrite_LosesToAFilePublishedSinceCreate(bool largerThanOnePart)
     {
         Require();
         var fs = FileSystem;
         const string path = "race/checkpoint.parquet";
         byte[] theirs = Encoding.UTF8.GetBytes("the other writer's file");
+        byte[] mine = largerThanOnePart
+            ? new byte[LargerThanOnePart]
+            : Encoding.UTF8.GetBytes("this writer's file");
 
         await using (var file = await fs.CreateAsync(path, overwrite: false))
         {
-            await file.WriteAsync(Encoding.UTF8.GetBytes("this writer's file"));
+            await file.WriteAsync(mine);
             Assert.True(await fs.TryWriteAllBytesAsync(path, theirs));
 
             await Assert.ThrowsAsync<IOException>(async () => await file.CompleteAsync());
@@ -130,6 +138,29 @@ public abstract partial class TableFileSystemPathConformanceTests
 
         Assert.Equal(theirs, await fs.ReadAllBytesAsync(path));
         Assert.Equal([path], (await ListAsync(fs, "race/")).Select(static info => info.Path).ToArray());
+    }
+
+    [SkippableFact]
+    public async Task CancelledComplete_PublishesNothing()
+    {
+        Require();
+        var fs = FileSystem;
+        const string path = "cancel/file.bin";
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+
+        await using (var file = await fs.CreateAsync(path, overwrite: false))
+        {
+            await file.WriteAsync(PayloadFor(path));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                async () => await file.CompleteAsync(cancelled.Token));
+
+            // The cancelled completion aborted the write; it cannot be completed after all.
+            await Assert.ThrowsAsync<InvalidOperationException>(async () => await file.CompleteAsync());
+        }
+
+        Assert.False(await fs.ExistsAsync(path), "a cancelled completion published the file.");
+        Assert.Empty(await ListAsync(fs, "cancel/"));
     }
 
     [SkippableFact]

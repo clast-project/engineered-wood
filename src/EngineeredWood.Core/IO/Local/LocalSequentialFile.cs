@@ -41,12 +41,24 @@ public sealed class LocalSequentialFile : ISequentialFile
         _path = Path.GetFullPath(path);
         _overwrite = overwrite;
         string directory = Path.GetDirectoryName(_path) ?? ".";
-        _tempPath = Path.Combine(directory, "." + Path.GetFileName(_path) + "." + Guid.NewGuid().ToString("N") + TempSuffix);
+        // The target's name is kept only as a hint for whoever finds a temp file a crash left behind, and is
+        // cut short so the temp name stays within a 255-byte component limit however long the target's is.
+        string name = Path.GetFileName(_path);
+        if (name.Length > MaxNameHintLength)
+            name = name.Substring(0, MaxNameHintLength);
+        _tempPath = Path.Combine(directory, "." + name + "." + Guid.NewGuid().ToString("N") + TempSuffix);
         _stream = new FileStream(_tempPath, FileMode.CreateNew, FileAccess.Write,
             FileShare.None, bufferSize: 81920, useAsync: false);
     }
 
     private const string TempSuffix = ".tmp";
+
+    /// <summary>
+    /// How much of the target's name the temp name carries, in UTF-16 units. A unit is at most 3 bytes of
+    /// UTF-8, so the hint is at most 192 bytes, and with the ASCII dots, guid and suffix (38 bytes) the temp
+    /// name stays under the common 255-byte component limit.
+    /// </summary>
+    private const int MaxNameHintLength = 64;
 
     /// <summary>
     /// Whether <paramref name="fileName"/> is the temp file of a write still in flight (or abandoned by a
@@ -109,17 +121,20 @@ public sealed class LocalSequentialFile : ISequentialFile
         if (_completed)
             return default;
         ThrowIfAborted();
-        cancellationToken.ThrowIfCancellationRequested();
 
-        // The stream must be closed before the move: Windows cannot rename a file that is open.
-        _stream.Dispose();
         try
         {
+            // Inside the try: a completion that is cancelled fails like any other, and aborts the write.
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // The stream must be closed before the move: Windows cannot rename a file that is open.
+            _stream.Dispose();
             Publish();
         }
         catch
         {
             _aborted = true;
+            _stream.Dispose();
             DeleteTemp();
             throw;
         }
@@ -147,20 +162,28 @@ public sealed class LocalSequentialFile : ISequentialFile
 #else
         // .NET Framework has no overwriting move. File.Replace swaps an existing target in one step but
         // requires it to exist, so a target that is absent (or deleted in between) takes the plain move.
-        if (File.Exists(_path))
+        // Either can lose a race with another writer that creates or deletes the target in between, so the
+        // pair is retried a few times; overwrite means the last writer wins, not that this one gives up.
+        for (int attempt = 1; ; attempt++)
         {
             try
             {
-                File.Replace(_tempPath, _path, destinationBackupFileName: null);
+                if (File.Exists(_path))
+                    File.Replace(_tempPath, _path, destinationBackupFileName: null);
+                else
+                    File.Move(_tempPath, _path);
                 return;
             }
-            catch (FileNotFoundException) when (!File.Exists(_path))
+            catch (IOException) when (attempt < MaxOverwriteAttempts && File.Exists(_tempPath))
             {
             }
         }
-        File.Move(_tempPath, _path);
 #endif
     }
+
+#if !NET6_0_OR_GREATER
+    private const int MaxOverwriteAttempts = 3;
+#endif
 
     /// <summary>Aborts the write unless it was completed: the temp file is deleted and nothing is published.</summary>
     public void Dispose()
