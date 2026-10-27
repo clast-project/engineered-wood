@@ -127,8 +127,9 @@ runs once per chunk. The work:
   and null count. A later optimization could derive the chunk stats from the page stats and
   drop the second pass. That is not required.
 - **Scope follows the chunk stats.** If a column gets no chunk statistics (for example
-  `ColumnWriteStatistics[col] = false`, or FLOAT16 until its statistics gap closes; see the
-  float-stats follow-ups), it gets **no ColumnIndex**. It still gets an OffsetIndex, which
+  `ColumnWriteStatistics[col] = false`), it gets **no ColumnIndex**. INT96 gets none either:
+  its statistics have no defined order. (FLOAT16 was excluded until its bounds were ordered
+  numerically, #547.) It still gets an OffsetIndex, which
   needs no statistics.
 
 ### W-3. Truncation

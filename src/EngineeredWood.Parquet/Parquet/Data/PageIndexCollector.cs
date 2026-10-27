@@ -63,7 +63,7 @@ internal sealed class PageIndexCollector
         FloatingPointTotalOrder = floatingPointTotalOrder;
         _truncateLength = physicalType == PhysicalType.ByteArray ? truncateLength : null;
         _utf8 = utf8;
-        _floatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
+        _floatingPoint = StatisticsCollector.IsFloatingPoint(physicalType, order);
         WritesColumnIndex = writeColumnIndex;
     }
 
@@ -127,7 +127,7 @@ internal sealed class PageIndexCollector
 
         return StatisticsCollector.FromBounds(
             _physicalType, _chunkMin, _chunkMax, _minNaN, _maxNaN, _chunkNanCount,
-            levelCount - nonNullCount, FloatingPointTotalOrder);
+            levelCount - nonNullCount, FloatingPointTotalOrder, _order);
     }
 
     private void Fold(in PageBounds bounds)
@@ -229,9 +229,7 @@ internal sealed class PageIndexCollector
 
     private long TotalOrderKey(byte[] value) => StatisticsCollector.TotalOrderKey(value, _physicalType);
 
-    private bool IsNaN(byte[] value) => _physicalType == PhysicalType.Float
-        ? float.IsNaN(MemoryMarshal.Read<float>(value))
-        : double.IsNaN(MemoryMarshal.Read<double>(value));
+    private bool IsNaN(byte[] value) => StatisticsCollector.IsNaN(value, _physicalType);
 }
 
 /// <summary>
@@ -303,15 +301,11 @@ internal sealed class DictionaryPageBounds
             }
         }
 
-        if (_physicalType is PhysicalType.Float or PhysicalType.Double)
+        if (StatisticsCollector.IsFloatingPoint(_physicalType, _order))
         {
             for (int i = 0; i < count; i++)
             {
-                var entry = Entry(i);
-                bool nan = _physicalType == PhysicalType.Float
-                    ? float.IsNaN(MemoryMarshal.Read<float>(entry))
-                    : double.IsNaN(MemoryMarshal.Read<double>(entry));
-                if (!nan) continue;
+                if (!StatisticsCollector.IsNaN(Entry(i), _physicalType)) continue;
                 _nanEntries ??= new bool[count];
                 _nanEntries[i] = true;
             }

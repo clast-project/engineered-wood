@@ -55,7 +55,7 @@ internal static class ColumnOrderBuilder
     /// <summary>
     /// Produces one <see cref="ColumnOrder"/> per leaf column (each flattened
     /// <see cref="SchemaElement"/> carrying a physical type), in schema order.
-    /// FLOAT and DOUBLE columns receive <paramref name="floatingPointOrder"/>;
+    /// FLOAT, DOUBLE and FLOAT16 columns receive <paramref name="floatingPointOrder"/>;
     /// every other column receives <see cref="ColumnOrder.TypeDefined"/>.
     /// </summary>
     public static ColumnOrder[] Build(
@@ -69,7 +69,8 @@ internal static class ColumnOrderBuilder
                 continue;
 
             bool isFloatingPoint =
-                element.Type == PhysicalType.Float || element.Type == PhysicalType.Double;
+                element.Type == PhysicalType.Float || element.Type == PhysicalType.Double
+                || element.LogicalType is LogicalType.Float16Type;
             orders.Add(isFloatingPoint ? floatingPointOrder : ColumnOrder.TypeDefined);
         }
 

@@ -165,7 +165,7 @@ internal static class ColumnChunkWriter
         // plain one.
         if (array is RunEndEncodedArray reeColumn)
         {
-            array = physicalType is PhysicalType.Float or PhysicalType.Double
+            array = physicalType is PhysicalType.Float or PhysicalType.Double || ValueType(reeColumn) is HalfFloatType
                 ? RunEndEncoding.Expand(RunEndEncoding.Compact(reeColumn))
                 : RunEndEncoding.Compact(reeColumn);
         }
@@ -261,7 +261,7 @@ internal static class ColumnChunkWriter
             // Compute column-level statistics: use dictionary entries when available (O(unique) vs O(total)).
             // FLOAT/DOUBLE columns are always full-scanned so the NaN count covers every value,
             // not just the distinct dictionary entries.
-            bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
+            bool isFloatingPoint = StatisticsCollector.IsFloatingPoint(physicalType, statisticsOrder);
             bool floatingPointTotalOrder =
                 options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder;
             // A page index already found every page's bounds with the same scans; folding them gives
@@ -274,7 +274,7 @@ internal static class ColumnChunkWriter
                     ?? StatisticsCollector.Compute(
                         array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount,
                         floatingPointTotalOrder, statisticsOrder);
-            stats = StatisticsCollector.ApplyTypeOrderZeroRule(stats, physicalType, floatingPointTotalOrder);
+            stats = StatisticsCollector.ApplyTypeOrderZeroRule(stats, physicalType, floatingPointTotalOrder, statisticsOrder);
             result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, ValueType(array), physicalType);
         }
 
@@ -442,8 +442,8 @@ internal static class ColumnChunkWriter
 
     /// <summary>
     /// A collector for one chunk's page index. The ColumnIndex follows the chunk statistics: a column
-    /// without them gets none, and neither does INT96 (its order is undefined) or FLOAT16 (whose
-    /// bounds are not yet ordered correctly). The OffsetIndex is written regardless.
+    /// without them gets none, and neither does INT96 (its order is undefined). The OffsetIndex is
+    /// written regardless.
     /// </summary>
     private static PageIndexCollector NewPageIndexCollector(
         Apache.Arrow.Types.IArrowType valueType, PhysicalType physicalType, int typeLength,
@@ -453,8 +453,7 @@ internal static class ColumnChunkWriter
             truncateLength: options.PageIndexTruncateLength,
             utf8: valueType is StringType or LargeStringType or StringViewType,
             writeColumnIndex: options.GetWriteStatistics(pathInSchema)
-                && physicalType != PhysicalType.Int96
-                && valueType is not HalfFloatType);
+                && physicalType != PhysicalType.Int96);
 
     /// <summary>Rows that start in a page: every level entry for a flat column, rep = 0 for a repeated one.</summary>
     private static int PageRows(int[]? repLevels, int offset, int pageValues, int maxRepLevel) =>
@@ -625,7 +624,7 @@ internal static class ColumnChunkWriter
             // FLOAT/DOUBLE take the index-aware overload: the bounds come from the dictionary entries
             // either way, but nan_count counts VALUES, so it has to see the indices. WriteColumn
             // full-scans the Arrow array for the same reason; here there is no array left to scan.
-            var stats = physicalType is PhysicalType.Float or PhysicalType.Double
+            var stats = StatisticsCollector.IsFloatingPoint(physicalType, statisticsOrder)
                 ? StatisticsCollector.ComputeFloatingPointFromDictEntries(
                     dictResult, physicalType, rowCount - nonNullCount,
                     options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder)
@@ -634,7 +633,7 @@ internal static class ColumnChunkWriter
                     physicalType, typeLength, rowCount - nonNullCount, statisticsOrder);
 
             stats = StatisticsCollector.ApplyTypeOrderZeroRule(stats, physicalType,
-                options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder);
+                options.FloatingPointOrder == FloatingPointColumnOrder.Ieee754TotalOrder, statisticsOrder);
             result.MetaData.Statistics = DropDeprecatedMinMaxIfMisordered(stats, arrowType, physicalType);
         }
 
@@ -2143,10 +2142,9 @@ internal static class ColumnChunkWriter
         BooleanType => true,
         Int8Type or Int16Type or Int32Type or Int64Type => true,
         FloatType or DoubleType => true,
-        // FLOAT16 is FLBA(2), so this claim is already wrong for it — its bounds come from a lexicographic
-        // byte comparison over IEEE-754 halves. That is a separately tracked gap (doc/known-issues.md), and
-        // is left exactly as it was rather than quietly changed under cover of this fix.
-        HalfFloatType => true,
+        // FLOAT16 is FLBA(2): its bounds are ordered numerically (StatisticsOrder.Float16), which no
+        // signed comparison of the two bytes reproduces, so it gets only min_value/max_value.
+        HalfFloatType => false,
         // Date/Time/Duration only ever arrive on INT32/INT64, so the collector used a typed comparator.
         Date32Type or Date64Type or Time32Type or Time64Type or DurationType => true,
         // TIMESTAMP is the one that can also arrive on FIXED_LEN_BYTE_ARRAY. There the collector compares

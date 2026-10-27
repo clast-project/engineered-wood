@@ -301,6 +301,38 @@ public class RunEndEncodedWriteTests : IDisposable
             (new RunEndEncodedArray(ends, values), plain.Build()), nullable: false);
     }
 
+#if NET8_0_OR_GREATER // HalfFloatArray does not exist on .NET Framework.
+    /// <summary>
+    /// FLOAT16 is full-scanned for its NaN count and numeric bounds like FLOAT/DOUBLE (#547), so it too
+    /// is expanded up front; the file must match the expanded form's — statistics, ColumnIndex and all —
+    /// with the dictionary on and off and the runs spread over several pages.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Float16Runs_AreExpandedForTheNanScanAndStillMatch(bool dictionary)
+    {
+        // -3.0, NaN, -0.0, 1.5 as raw half-precision bits, in runs of 300, 100, 150 and 250 rows.
+        ushort[] halves = [0xC200, 0x7E00, 0x8000, 0x3E00];
+        int[] ends = [300, 400, 550, 800];
+
+        static HalfFloatArray Halves(IEnumerable<ushort> bits)
+        {
+            var bytes = bits.SelectMany(b => new[] { (byte)b, (byte)(b >> 8) }).ToArray();
+            return new HalfFloatArray(new ArrayData(HalfFloatType.Default, bytes.Length / 2, 0, 0,
+                [ArrowBuffer.Empty, new ArrowBuffer(bytes)]));
+        }
+
+        var runEnds = new Int32Array.Builder().AppendRange(ends).Build();
+        var expanded = Enumerable.Range(0, halves.Length)
+            .SelectMany(r => Enumerable.Repeat(halves[r], ends[r] - (r == 0 ? 0 : ends[r - 1])));
+
+        await AssertIdenticalFilesAsync(
+            (new RunEndEncodedArray(runEnds, Halves(halves)), Halves(expanded)), nullable: false,
+            new ParquetWriteOptions { DictionaryEnabled = dictionary, DataPageSize = 64 });
+    }
+#endif
+
     // ── Value types that are normalized before encoding ──
 
     [Fact]

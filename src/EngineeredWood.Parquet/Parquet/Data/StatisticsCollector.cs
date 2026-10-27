@@ -47,7 +47,7 @@ internal static class StatisticsCollector
         StatisticsOrder order = StatisticsOrder.Default)
     {
         long nullCount = rowCount - nonNullCount;
-        bool isFloatingPoint = physicalType is PhysicalType.Float or PhysicalType.Double;
+        bool isFloatingPoint = IsFloatingPoint(physicalType, order);
 
         if (nonNullCount == 0)
         {
@@ -59,9 +59,12 @@ internal static class StatisticsCollector
         // and max all come from a single pass.
         if (isFloatingPoint)
         {
-            var (fpMin, fpMax, nanCount) = physicalType == PhysicalType.Float
-                ? ComputeFloatMinMax(array, defLevels, floatingPointTotalOrder, 0, array.Length)
-                : ComputeDoubleMinMax(array, defLevels, floatingPointTotalOrder, 0, array.Length);
+            var (fpMin, fpMax, nanCount) = physicalType switch
+            {
+                PhysicalType.Float => ComputeFloatMinMax(array, defLevels, floatingPointTotalOrder, 0, array.Length),
+                PhysicalType.Double => ComputeDoubleMinMax(array, defLevels, floatingPointTotalOrder, 0, array.Length),
+                _ => ComputeFloat16MinMax(array, defLevels, floatingPointTotalOrder, 0, array.Length),
+            };
 
             var fpStats = new Statistics
             {
@@ -133,6 +136,12 @@ internal static class StatisticsCollector
         PageBounds bounds;
         switch (physicalType)
         {
+            case PhysicalType.FixedLenByteArray when order == StatisticsOrder.Float16:
+            {
+                var (min, max, nanCount) = ComputeFloat16MinMax(array, defLevels, floatingPointTotalOrder, start, end);
+                bounds = new PageBounds(min, max, nanCount);
+                break;
+            }
             case PhysicalType.Float:
             {
                 var (min, max, nanCount) = ComputeFloatMinMax(array, defLevels, floatingPointTotalOrder, start, end);
@@ -214,9 +223,10 @@ internal static class StatisticsCollector
         byte[]? maxNaN,
         long nanCount,
         long nullCount,
-        bool floatingPointTotalOrder)
+        bool floatingPointTotalOrder,
+        StatisticsOrder order = StatisticsOrder.Default)
     {
-        if (physicalType is PhysicalType.Float or PhysicalType.Double)
+        if (IsFloatingPoint(physicalType, order))
         {
             if (min is null && floatingPointTotalOrder && nanCount > 0)
             {
@@ -360,16 +370,23 @@ internal static class StatisticsCollector
             return new Statistics { NullCount = nullCount, NanCount = 0L };
         }
 
-        bool isFloat = physicalType == PhysicalType.Float;
-        int elementSize = isFloat ? 4 : 8;
+        int elementSize = physicalType switch
+        {
+            PhysicalType.Float => 4,
+            PhysicalType.Double => 8,
+            _ => 2, // FLOAT16, the only FIXED_LEN_BYTE_ARRAY routed here
+        };
         var span = dictResult.DictionaryPageData.AsSpan();
 
         // NaN is excluded from the bounds, exactly as the full scan excludes it.
-        var (minBytes, maxBytes, _, _) = isFloat
-            ? ComputeFixedMinMaxTypedFloat(span, dictCount, elementSize)
-            : ComputeFixedMinMaxTypedDouble(span, dictCount, elementSize);
+        var (minBytes, maxBytes, _, _) = elementSize switch
+        {
+            4 => ComputeFixedMinMaxTypedFloat(span, dictCount, elementSize),
+            8 => ComputeFixedMinMaxTypedDouble(span, dictCount, elementSize),
+            _ => ComputeFixedMinMaxHalf(span, dictCount),
+        };
 
-        var nanEntries = FindNaNEntries(span, dictCount, isFloat);
+        var nanEntries = FindNaNEntries(span, dictCount, elementSize);
         long nanCount = 0;
         int minNaNEntry = -1, maxNaNEntry = -1;
         if (nanEntries != null)
@@ -401,10 +418,20 @@ internal static class StatisticsCollector
     /// Flags which dictionary entries are NaN, or returns <see langword="null"/> when none is — the
     /// signal to the caller that no index scan is needed at all.
     /// </summary>
-    private static bool[]? FindNaNEntries(ReadOnlySpan<byte> dictPage, int dictCount, bool isFloat)
+    private static bool[]? FindNaNEntries(ReadOnlySpan<byte> dictPage, int dictCount, int elementSize)
     {
         bool[]? flags = null;
-        if (isFloat)
+        if (elementSize == 2)
+        {
+            var values = MemoryMarshal.Cast<byte, ushort>(dictPage[..(dictCount * 2)]);
+            for (int i = 0; i < dictCount; i++)
+            {
+                if (!IsHalfNaN(values[i])) continue;
+                flags ??= new bool[dictCount];
+                flags[i] = true;
+            }
+        }
+        else if (elementSize == 4)
         {
             var values = MemoryMarshal.Cast<byte, float>(dictPage[..(dictCount * 4)]);
             for (int i = 0; i < dictCount; i++)
@@ -437,7 +464,12 @@ internal static class StatisticsCollector
         in DictionaryEncoder.DictionaryResult dictResult, bool[] nanEntries, ReadOnlySpan<byte> dictPage,
         PhysicalType physicalType, out int minNaNEntry, out int maxNaNEntry)
     {
-        int elementSize = physicalType == PhysicalType.Float ? 4 : 8;
+        int elementSize = physicalType switch
+        {
+            PhysicalType.Float => 4,
+            PhysicalType.Double => 8,
+            _ => 2,
+        };
         long nanCount = 0;
         int minEntry = -1, maxEntry = -1;
         long minKey = 0, maxKey = 0;
@@ -620,6 +652,22 @@ internal static class StatisticsCollector
         return (minB, maxB, true, true);
     }
 
+    /// <summary>The non-NaN FLOAT16 dictionary entries' least and greatest, by total-order key.</summary>
+    private static (byte[]?, byte[]?, bool, bool) ComputeFixedMinMaxHalf(ReadOnlySpan<byte> span, int count)
+    {
+        var values = MemoryMarshal.Cast<byte, ushort>(span[..(count * 2)]);
+        int min = -1, max = -1, minKey = 0, maxKey = 0;
+        for (int i = 0; i < count; i++)
+        {
+            int bits = values[i];
+            if (IsHalfNaN(bits)) continue;
+            int key = HalfKey(bits);
+            if (min < 0 || key < minKey) { min = bits; minKey = key; }
+            if (max < 0 || key > maxKey) { max = bits; maxKey = key; }
+        }
+        return min < 0 ? (null, null, true, true) : (Half16Bytes(min), Half16Bytes(max), true, true);
+    }
+
     private static (byte[]?, byte[]?, bool, bool) ComputeFixedMinMaxTypedDouble(
         ReadOnlySpan<byte> span, int count, int elementSize)
     {
@@ -769,6 +817,52 @@ internal static class StatisticsCollector
         return (FloatToBytes(min), FloatToBytes(max), nanCount);
     }
 
+    /// <summary>
+    /// The FLOAT16 counterpart of <see cref="ComputeFloatMinMax"/>, on the raw 16 bits (System.Half is
+    /// not on every target). Non-NaN values are ordered by total-order key, which is numeric order with
+    /// -0 below +0 — the tie-break the FLOAT scan applies.
+    /// </summary>
+    private static (byte[]?, byte[]?, long) ComputeFloat16MinMax(
+        IArrowArray array, int[]? defLevels, bool totalOrder, int start, int end)
+    {
+        var bitsBuffer = MemoryMarshal.Cast<byte, ushort>(array.Data.Buffers[1].Span);
+        int min = -1, max = -1, minKey = 0, maxKey = 0;
+        long nanCount = 0;
+        var nans = default(NaNRange);
+
+        for (int i = start; i < end; i++)
+        {
+            if (defLevels != null && defLevels[i] == 0) continue;
+            int bits = bitsBuffer[i];
+            int key = HalfKey(bits);
+            if (IsHalfNaN(bits))
+            {
+                if (totalOrder)
+                    nans.Add(bits, key);
+                nanCount++;
+                continue;
+            }
+            if (min < 0 || key < minKey) { min = bits; minKey = key; }
+            if (max < 0 || key > maxKey) { max = bits; maxKey = key; }
+        }
+
+        if (min < 0)
+        {
+            if (nans.Any)
+                return (Half16Bytes(nans.MinBits), Half16Bytes(nans.MaxBits), nanCount);
+            return (null, null, nanCount);
+        }
+
+        return (Half16Bytes(min), Half16Bytes(max), nanCount);
+    }
+
+    private static byte[] Half16Bytes(long bits)
+    {
+        var bytes = new byte[2];
+        BinaryPrimitives.WriteUInt16LittleEndian(bytes, (ushort)bits);
+        return bytes;
+    }
+
     private static (byte[]?, byte[]?, long) ComputeDoubleMinMax(
         IArrowArray array, int[]? defLevels, bool totalOrder, int start, int end)
     {
@@ -844,9 +938,10 @@ internal static class StatisticsCollector
     /// <see cref="TypeOrderUpperBound"/> applied to its bounds; itself when the column is not
     /// FLOAT/DOUBLE, is written in IEEE 754 total order, or has no zero bound.
     /// </summary>
-    internal static Statistics ApplyTypeOrderZeroRule(Statistics stats, PhysicalType physicalType, bool totalOrder)
+    internal static Statistics ApplyTypeOrderZeroRule(
+        Statistics stats, PhysicalType physicalType, bool totalOrder, StatisticsOrder order = StatisticsOrder.Default)
     {
-        if (totalOrder || physicalType is not (PhysicalType.Float or PhysicalType.Double))
+        if (totalOrder || !IsFloatingPoint(physicalType, order))
             return stats;
 
         byte[]? Lower(byte[]? b) => b is null ? null : TypeOrderLowerBound(b, physicalType);
@@ -876,20 +971,54 @@ internal static class StatisticsCollector
     {
         PhysicalType.Float => bound.Length == 4 && MemoryMarshal.Read<float>(bound) == 0f,
         PhysicalType.Double => bound.Length == 8 && MemoryMarshal.Read<double>(bound) == 0.0,
+        PhysicalType.FixedLenByteArray => bound.Length == 2 && (BinaryPrimitives.ReadUInt16LittleEndian(bound) & 0x7FFF) == 0,
         _ => false,
     };
 
-    private static byte[] SignedZero(PhysicalType physicalType, bool negative) => physicalType == PhysicalType.Float
-        ? FloatToBytes(negative ? -0.0f : 0.0f)
-        : DoubleToBytes(negative ? -0.0 : 0.0);
+    private static byte[] SignedZero(PhysicalType physicalType, bool negative) => physicalType switch
+    {
+        PhysicalType.Float => FloatToBytes(negative ? -0.0f : 0.0f),
+        PhysicalType.Double => DoubleToBytes(negative ? -0.0 : 0.0),
+        _ => Half16Bytes(negative ? 0x8000 : 0x0000),
+    };
 
     /// <summary>
-    /// A FLOAT or DOUBLE value's position in IEEE 754 total order, as a signed integer: the bits, with
-    /// a negative value's magnitude bits flipped so that more negative sorts lower. Orders NaNs too —
-    /// by sign, then payload — which is what an all-NaN chunk's bounds need under total order.
+    /// Whether a column's statistics follow the floating-point rules — NaN kept out of the bounds and
+    /// counted, signed zeros, IEEE 754 total order: FLOAT, DOUBLE, and FLOAT16 (a FIXED_LEN_BYTE_ARRAY(2)
+    /// written with <see cref="StatisticsOrder.Float16"/>).
+    /// </summary>
+    internal static bool IsFloatingPoint(PhysicalType physicalType, StatisticsOrder order) =>
+        physicalType is PhysicalType.Float or PhysicalType.Double || order == StatisticsOrder.Float16;
+
+    /// <summary>Whether a FLOAT, DOUBLE or FLOAT16 value is a NaN; FLOAT16 is told apart by width.</summary>
+    internal static bool IsNaN(ReadOnlySpan<byte> value, PhysicalType physicalType) => value.Length switch
+    {
+        2 => IsHalfNaN(BinaryPrimitives.ReadUInt16LittleEndian(value)),
+        _ when physicalType == PhysicalType.Float => float.IsNaN(MemoryMarshal.Read<float>(value)),
+        _ => double.IsNaN(MemoryMarshal.Read<double>(value)),
+    };
+
+    /// <summary>Whether a half-precision float's bits are a NaN: all-ones exponent, non-zero mantissa.</summary>
+    private static bool IsHalfNaN(int bits) => (bits & 0x7C00) == 0x7C00 && (bits & 0x03FF) != 0;
+
+    /// <summary>A half-precision float's total-order key; see <see cref="TotalOrderKey"/>.</summary>
+    private static int HalfKey(int bits)
+    {
+        int signed = (short)bits;
+        return signed ^ ((signed >> 15) & 0x7FFF);
+    }
+
+    /// <summary>
+    /// A FLOAT, DOUBLE or FLOAT16 value's position in IEEE 754 total order, as a signed integer: the
+    /// bits, with a negative value's magnitude bits flipped so that more negative sorts lower. Orders
+    /// NaNs too — by sign, then payload — which is what an all-NaN chunk's bounds need under total
+    /// order. For non-NaN values it is numeric order with -0 below +0. FLOAT16 is told apart by width.
     /// </summary>
     internal static long TotalOrderKey(ReadOnlySpan<byte> value, PhysicalType physicalType)
     {
+        if (value.Length == 2)
+            return HalfKey(BinaryPrimitives.ReadUInt16LittleEndian(value));
+
         if (physicalType == PhysicalType.Float)
         {
             int bits = BinaryPrimitives.ReadInt32LittleEndian(value);
@@ -1048,6 +1177,9 @@ internal static class StatisticsCollector
         {
             StatisticsOrder.ExtendedTimestamp => ExtendedTimestamp.Compare(left, right),
             StatisticsOrder.SignedBigEndian => CompareSignedBigEndian(left, right),
+            // NaN never reaches here: the scans keep it out of the bounds.
+            StatisticsOrder.Float16 => HalfKey(BinaryPrimitives.ReadUInt16LittleEndian(left))
+                .CompareTo(HalfKey(BinaryPrimitives.ReadUInt16LittleEndian(right))),
             _ => left.SequenceCompareTo(right),
         };
 
