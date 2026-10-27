@@ -138,21 +138,41 @@ internal sealed class LogListing
     /// first is filesystem-dependent, though, so the choice is pinned rather than left to listing order:
     /// a JSON body wins over a Parquet one (it is read without a Parquet footer round-trip), and
     /// otherwise the ordinally smallest name wins. Snapshots then do not vary between two reads of an
-    /// unchanged table.
+    /// unchanged table. The others are kept too, for when the chosen one cannot be read.
     /// </remarks>
     private void AddV2Checkpoint(long version, string fileName)
     {
         string path = DeltaVersion.LogPrefix + fileName;
-        if (!V2Checkpoints.TryGetValue(version, out string? existing) || Beats(path, existing))
+        if (!V2Checkpoints.TryGetValue(version, out string? existing) || CompareV2Preference(path, existing) < 0)
             V2Checkpoints[version] = path;
 
-        static bool Beats(string candidate, string incumbent)
-        {
-            bool candidateIsJson = candidate.EndsWith(".json", StringComparison.OrdinalIgnoreCase);
-            if (candidateIsJson != incumbent.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
-                return candidateIsJson;
-            return string.CompareOrdinal(candidate, incumbent) < 0;
-        }
+        if (!_allV2Checkpoints.TryGetValue(version, out var all))
+            _allV2Checkpoints[version] = all = [];
+        all.Add(path);
+    }
+
+    private readonly Dictionary<long, List<string>> _allV2Checkpoints = [];
+
+    /// <summary>Negative when <paramref name="a"/> is the V2 checkpoint to prefer over <paramref name="b"/>.</summary>
+    private static int CompareV2Preference(string a, string b)
+    {
+        bool aIsJson = a.EndsWith(".json", StringComparison.OrdinalIgnoreCase);
+        if (aIsJson != b.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            return aIsJson ? -1 : 1;
+        return string.CompareOrdinal(a, b);
+    }
+
+    /// <summary>
+    /// Every UUID-named V2 checkpoint at this version, the one in <see cref="V2Checkpoints"/> first.
+    /// </summary>
+    public IEnumerable<string> V2CheckpointsInPreferenceOrder(long version)
+    {
+        if (!_allV2Checkpoints.TryGetValue(version, out var all))
+            return [];
+
+        var sorted = new List<string>(all);
+        sorted.Sort(CompareV2Preference);
+        return sorted;
     }
 
     private void Observe(long version)
@@ -172,43 +192,46 @@ internal sealed class LogListing
     }
 
     /// <summary>
-    /// The highest version in <c>[0, through]</c> that neither a commit file nor a compaction file
-    /// supplies, or -1 when replay could reach every one of them.
+    /// How a replay of <c>[from, through]</c> would use this log: the one compaction file it applies, if
+    /// any, and whether the commit files around it supply every other version.
     /// </summary>
     /// <remarks>
-    /// A checkpoint below this version is no starting point for <paramref name="through"/>: the replay
-    /// from it would have to cross the hole. One at or above it may be. That makes this a filter on which
-    /// checkpoints are worth reading, not a guarantee: replay still checks every version it applies, and
-    /// still reports a hole this missed (two compaction files the replay cannot both use, say).
+    /// <para>The one place that decides which compaction file a replay uses — the longest that lies
+    /// wholly inside the range — so that the snapshot build applies the same plan it judged a checkpoint
+    /// by. Judging with a looser rule than replay applies is how a checkpoint got chosen whose replay
+    /// then crossed a hole: a compaction file that starts before the replay does, or ends past the
+    /// target, covers versions the replay never takes from it.</para>
+    ///
+    /// <para>Complete is a statement about the LISTING. A commit that is listed but cannot be read still
+    /// leaves a hole, which the replay reports when it gets there.</para>
     /// </remarks>
-    public long HighestUnreplayableVersion(long through)
+    public ReplayPlan PlanReplay(long from, long through)
     {
-        int i = CommitVersions.Count - 1;
-        long next = through;
-        while (next >= 0)
+        (long Start, long End, string Path)? best = null;
+        foreach (var cf in CompactedRanges)
         {
-            while (i >= 0 && CommitVersions[i] > next)
-                i--;
-            if (i >= 0 && CommitVersions[i] == next)
+            if (cf.Start >= from && cf.End <= through &&
+                (best is null || (cf.End - cf.Start) > (best.Value.End - best.Value.Start)))
             {
-                next--;
-                i--;
-                continue;
+                best = cf;
             }
-
-            long? coveredFrom = null;
-            foreach (var (start, end, _) in CompactedRanges)
-            {
-                if (start <= next && next <= end && (coveredFrom is null || start < coveredFrom))
-                    coveredFrom = start;
-            }
-
-            if (coveredFrom is not long from)
-                return next;
-            next = from - 1;
         }
 
-        return -1;
+        bool complete = best is { } b
+            ? AllCommitsListed(from, b.Start - 1) && AllCommitsListed(b.End + 1, through)
+            : AllCommitsListed(from, through);
+        return new ReplayPlan(best, complete);
+    }
+
+    /// <summary>Whether a commit file is listed for every version in <c>[from, through]</c>.</summary>
+    private bool AllCommitsListed(long from, long through) =>
+        from > through || CountCommitsBelow(through + 1) - CountCommitsBelow(from) == through - from + 1;
+
+    /// <summary>The number of listed commits below <paramref name="version"/>; the list is sorted.</summary>
+    private int CountCommitsBelow(long version)
+    {
+        int i = CommitVersions.BinarySearch(version);
+        return i >= 0 ? i : ~i;
     }
 
     /// <summary>Every version that carries a checkpoint of any form, descending.</summary>
@@ -236,16 +259,30 @@ internal sealed class LogListing
     /// </remarks>
     public int? CompleteMultiPartCount(long version)
     {
-        if (!MultiPartCheckpoints.TryGetValue(version, out var byTotal))
-            return null;
+        foreach (int total in CompleteMultiPartCounts(version))
+            return total;
 
+        return null;
+    }
+
+    /// <summary>
+    /// The part count of every COMPLETE multi-part checkpoint at this version, smallest first, so that
+    /// the choice does not depend on listing order.
+    /// </summary>
+    public IEnumerable<int> CompleteMultiPartCounts(long version)
+    {
+        if (!MultiPartCheckpoints.TryGetValue(version, out var byTotal))
+            return [];
+
+        var totals = new List<int>();
         foreach (var (total, seen) in byTotal)
         {
             if (seen.Count == total)
-                return total;
+                totals.Add(total);
         }
 
-        return null;
+        totals.Sort();
+        return totals;
     }
 
     /// <summary>
@@ -300,3 +337,8 @@ internal sealed class LogListing
         return all;
     }
 }
+
+/// <summary>What <see cref="LogListing.PlanReplay"/> decided for one range.</summary>
+/// <param name="Compacted">The compaction file the replay applies, or null when it reads commits only.</param>
+/// <param name="IsComplete">Whether the listing supplies every version in the range.</param>
+internal readonly record struct ReplayPlan((long Start, long End, string Path)? Compacted, bool IsComplete);

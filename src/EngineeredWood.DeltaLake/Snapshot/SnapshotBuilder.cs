@@ -67,26 +67,50 @@ public sealed class SnapshotBuilder
             // outright once log cleanup has run, although an older checkpoint and the commits after it
             // would have rebuilt the table. delta-spark retries the same way ("Trying a different
             // checkpoint"); it caps the retries at 2, and this does not need to, because a checkpoint
-            // whose replay would cross a hole is skipped without being read, and log cleanup keeps the
-            // rest few.
-            long floor = listing.HighestUnreplayableVersion(targetVersion);
-            var tried = new List<LastCheckpointInfo>();
+            // whose replay would cross a hole is set aside without being read, and log cleanup keeps
+            // the rest few.
+            var seen = new List<LastCheckpointInfo>();
+            var stranded = new List<LastCheckpointInfo>();
             var candidates = hint is null
                 ? CheckpointReader.ListCheckpointCandidates(listing, targetVersion)
                 : CheckpointReader.ListCheckpointCandidates(listing, targetVersion).Prepend(hint);
 
+            bool bootstrapped = false;
             foreach (var candidate in candidates)
             {
                 // Skip a re-read only of the SAME checkpoint that already failed — same version AND same
                 // file. Comparing versions alone was too coarse: a hint whose path is wrong names the
                 // version correctly, so the listing's candidate (which has the right path) was discarded
                 // as a duplicate and the table failed to open at all.
-                if (candidate.Version < floor || tried.Exists(t => SameCandidate(candidate, t)))
+                if (seen.Exists(t => SameCandidate(candidate, t)))
                     continue;
+                seen.Add(candidate);
 
-                tried.Add(candidate);
-                if (await TryBootstrapAsync(candidate).ConfigureAwait(false))
+                // Judged by the plan the replay below will follow, not by a looser model of it: a
+                // checkpoint whose replay crosses a hole is no starting point even when it reads, and
+                // taking it anyway shut out a full replay that would have succeeded.
+                if (!listing.PlanReplay(candidate.Version + 1, targetVersion).IsComplete)
+                {
+                    stranded.Add(candidate);
+                    continue;
+                }
+
+                bootstrapped = await TryBootstrapAsync(candidate).ConfigureAwait(false);
+                if (bootstrapped)
                     break;
+            }
+
+            // Nothing usable read, and a full replay has a hole too, so the table cannot be rebuilt at
+            // this version. Starting from the newest checkpoint that reads anyway does not change that,
+            // but it makes the error name the hole above that checkpoint rather than claim version 0
+            // is missing.
+            if (!bootstrapped && !listing.PlanReplay(0, targetVersion).IsComplete)
+            {
+                foreach (var candidate in stranded.OrderByDescending(c => c.Version))
+                {
+                    if (await TryBootstrapAsync(candidate).ConfigureAwait(false))
+                        break;
+                }
             }
 
             async ValueTask<bool> TryBootstrapAsync(LastCheckpointInfo info)
@@ -124,17 +148,8 @@ public sealed class SnapshotBuilder
         long nextNeeded = replayFrom;
         long? firstMissing = null;
 
-        // Find the best compaction file covering [replayFrom..targetVersion]
-        (long Start, long End, string Path)? bestCompacted = null;
-        foreach (var cf in listing.CompactedRanges)
-        {
-            if (cf.Start >= replayFrom && cf.End <= targetVersion)
-            {
-                if (bestCompacted is null ||
-                    (cf.End - cf.Start) > (bestCompacted.Value.End - bestCompacted.Value.Start))
-                    bestCompacted = cf;
-            }
-        }
+        // The same plan the checkpoint choice above was judged by.
+        var bestCompacted = listing.PlanReplay(replayFrom, targetVersion).Compacted;
 
         // Use compacted file if available
         if (bestCompacted is not null)
