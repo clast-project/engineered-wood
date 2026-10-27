@@ -230,9 +230,9 @@ public sealed class S3TableFileSystem : ITableFileSystem
         }
     }
 
-    private const int MaxConflictRetries = 3;
+    internal const int MaxConflictRetries = 3;
 
-    private static TimeSpan ConflictRetryDelay(int attempt)
+    internal static TimeSpan ConflictRetryDelay(int attempt)
     {
         // 25ms, 50ms, 100ms, each with up to 100% jitter added. Commit files are small and the window a
         // conflicting write occupies is short, so the base stays well under the cost of the PUT itself.

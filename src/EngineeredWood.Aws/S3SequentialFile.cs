@@ -152,6 +152,14 @@ public sealed class S3SequentialFile : ISequentialFile
             await AbortAsync().ConfigureAwait(false);
             throw new IOException($"Object already exists: {_key}", ex);
         }
+        catch (AmazonS3Exception ex) when (!_overwrite && ex.StatusCode == HttpStatusCode.Conflict)
+        {
+            // Still conflicting after the retries: another writer is creating the same key, and this one
+            // cannot tell whether it will win. Reported like a lost race, so a caller that checks whether the
+            // object exists (the classic checkpoint writer does) can find out which way it went.
+            await AbortAsync().ConfigureAwait(false);
+            throw new IOException($"A concurrent write to {_key} kept conflicting with this one.", ex);
+        }
         catch
         {
             await AbortAsync().ConfigureAwait(false);
@@ -227,31 +235,34 @@ public sealed class S3SequentialFile : ISequentialFile
 
     private async ValueTask PublishAsync(CancellationToken cancellationToken)
     {
-        // Conflicts (409) are not retried here as TryWriteAllBytesAsync retries them: the body is a
-        // stream of parts already sent, and a lost race is reported to the caller like any other failure.
         string? ifNoneMatch = _overwrite ? null : "*";
         if (_uploadId is null)
         {
             // The whole object fit in under one part: write it with a single PutObject.
             // Also handles the empty-object case (zero writes).
-            _buffer.Position = 0;
-            await _client.PutObjectAsync(
-                new PutObjectRequest
-                {
-                    BucketName = _bucket,
-                    Key = _key,
-                    InputStream = _buffer,
-                    AutoCloseStream = false,
-                    IfNoneMatch = ifNoneMatch,
-                },
-                cancellationToken).ConfigureAwait(false);
+            await RetryConflictsAsync(() =>
+            {
+                _buffer.Position = 0;
+                return _client.PutObjectAsync(
+                    new PutObjectRequest
+                    {
+                        BucketName = _bucket,
+                        Key = _key,
+                        InputStream = _buffer,
+                        AutoCloseStream = false,
+                        IfNoneMatch = ifNoneMatch,
+                    },
+                    cancellationToken);
+            }, cancellationToken).ConfigureAwait(false);
         }
         else
         {
             if (_buffer.Length > 0)
                 await FlushBufferAsPartAsync(cancellationToken).ConfigureAwait(false);
 
-            await _client.CompleteMultipartUploadAsync(
+            // The upload stays in progress until it is completed or aborted, so a retry completes the same
+            // parts.
+            await RetryConflictsAsync(() => _client.CompleteMultipartUploadAsync(
                 new CompleteMultipartUploadRequest
                 {
                     BucketName = _bucket,
@@ -260,7 +271,31 @@ public sealed class S3SequentialFile : ISequentialFile
                     PartETags = _parts,
                     IfNoneMatch = ifNoneMatch,
                 },
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken), cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Retries a 409 ConditionalRequestConflict the way <see cref="S3TableFileSystem.TryWriteAllBytesAsync"/>
+    /// does: a concurrent write to the same key was in flight and S3 could not evaluate the precondition, so
+    /// the request provably did not create the object. Backed off and jittered, so racing writers spread out
+    /// instead of colliding again. The last conflict propagates.
+    /// </summary>
+    private static async ValueTask RetryConflictsAsync(Func<Task> request, CancellationToken cancellationToken)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await request().ConfigureAwait(false);
+                return;
+            }
+            catch (AmazonS3Exception ex) when (
+                ex.StatusCode == HttpStatusCode.Conflict && attempt < S3TableFileSystem.MaxConflictRetries)
+            {
+                await Task.Delay(S3TableFileSystem.ConflictRetryDelay(attempt), cancellationToken)
+                    .ConfigureAwait(false);
+            }
         }
     }
 
