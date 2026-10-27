@@ -171,6 +171,46 @@ internal sealed class LogListing
         }
     }
 
+    /// <summary>
+    /// The highest version in <c>[0, through]</c> that neither a commit file nor a compaction file
+    /// supplies, or -1 when replay could reach every one of them.
+    /// </summary>
+    /// <remarks>
+    /// A checkpoint below this version is no starting point for <paramref name="through"/>: the replay
+    /// from it would have to cross the hole. One at or above it may be. That makes this a filter on which
+    /// checkpoints are worth reading, not a guarantee: replay still checks every version it applies, and
+    /// still reports a hole this missed (two compaction files the replay cannot both use, say).
+    /// </remarks>
+    public long HighestUnreplayableVersion(long through)
+    {
+        int i = CommitVersions.Count - 1;
+        long next = through;
+        while (next >= 0)
+        {
+            while (i >= 0 && CommitVersions[i] > next)
+                i--;
+            if (i >= 0 && CommitVersions[i] == next)
+            {
+                next--;
+                i--;
+                continue;
+            }
+
+            long? coveredFrom = null;
+            foreach (var (start, end, _) in CompactedRanges)
+            {
+                if (start <= next && next <= end && (coveredFrom is null || start < coveredFrom))
+                    coveredFrom = start;
+            }
+
+            if (coveredFrom is not long from)
+                return next;
+            next = from - 1;
+        }
+
+        return -1;
+    }
+
     /// <summary>Every version that carries a checkpoint of any form, descending.</summary>
     /// <remarks>
     /// Includes multi-part versions whose parts are INCOMPLETE — callers that intend to read the

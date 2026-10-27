@@ -125,7 +125,20 @@ public sealed class CheckpointReader
     /// The selection half of <see cref="FindLatestCheckpointAsync"/>, over a listing the caller already
     /// has. A snapshot build reads <c>_delta_log</c> once and answers this from the same pass.
     /// </summary>
-    internal static LastCheckpointInfo? SelectLatestCheckpoint(Log.LogListing listing, long maxVersion)
+    internal static LastCheckpointInfo? SelectLatestCheckpoint(Log.LogListing listing, long maxVersion) =>
+        ListCheckpointCandidates(listing, maxVersion).FirstOrDefault();
+
+    /// <summary>
+    /// Every readable checkpoint at or below <paramref name="maxVersion"/>, newest version first, and
+    /// within one version in the order a reader should try them.
+    /// </summary>
+    /// <remarks>
+    /// All of them rather than one per version: a version can carry more than one form (a classic file
+    /// and a V2 one written by different engines, say), and when the preferred one turns out to be
+    /// unreadable the other covers exactly the same state.
+    /// </remarks>
+    internal static IEnumerable<LastCheckpointInfo> ListCheckpointCandidates(
+        Log.LogListing listing, long maxVersion)
     {
         foreach (long version in listing.CheckpointVersionsDescending())
         {
@@ -134,16 +147,14 @@ public sealed class CheckpointReader
 
             // Classic first: it is the one form every reader here handles without further lookups.
             if (listing.ClassicCheckpoints.Contains(version))
-                return new LastCheckpointInfo { Version = version, Size = 0 };
+                yield return new LastCheckpointInfo { Version = version, Size = 0 };
 
             if (listing.CompleteMultiPartCount(version) is int total)
-                return new LastCheckpointInfo { Version = version, Size = 0, Parts = total };
+                yield return new LastCheckpointInfo { Version = version, Size = 0, Parts = total };
 
             if (listing.V2Checkpoints.TryGetValue(version, out string? path))
-                return new LastCheckpointInfo { Version = version, Size = 0, V2CheckpointPath = path };
+                yield return new LastCheckpointInfo { Version = version, Size = 0, V2CheckpointPath = path };
         }
-
-        return null;
     }
 
     /// <summary>
