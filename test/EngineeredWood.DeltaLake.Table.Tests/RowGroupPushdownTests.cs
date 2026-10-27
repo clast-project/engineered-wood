@@ -238,6 +238,7 @@ public class RowGroupPushdownTests : IDisposable
             await using var writer = new ParquetFileWriter(file, ownsFile: false);
             var columns = schema.FieldsList.Select(f => ArrowNulls(f.DataType)).ToList();
             await writer.WriteRowGroupAsync(new RecordBatch(schema, columns, 1));
+            await writer.CloseAsync();
         }
         await using var read = new EngineeredWood.IO.Local.LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(read, ownsFile: false);

@@ -1650,6 +1650,7 @@ public class ParquetFileWriterTests : IDisposable
         // same as any other failure raised while writing one.
         var ex = await Assert.ThrowsAsync<AggregateException>(
             async () => await writer.WriteRowGroupAsync(batch));
+        await writer.CloseAsync();
         var inner = Assert.IsType<NotSupportedException>(ex.Flatten().InnerExceptions.Single());
         Assert.Contains("DataPageVersion.V2", inner.Message);
     }
@@ -2718,6 +2719,7 @@ public class ParquetFileWriterTests : IDisposable
             new ParquetWriteOptions { DictionaryEnabled = false }))
         {
             await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
         }
 
         // Read back and check stats
@@ -2753,6 +2755,7 @@ public class ParquetFileWriterTests : IDisposable
             new ParquetWriteOptions { DictionaryEnabled = false }))
         {
             await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
         }
 
         await using var readFile = new LocalRandomAccessFile(path);
@@ -2790,6 +2793,7 @@ public class ParquetFileWriterTests : IDisposable
         await using (var writer = new ParquetFileWriter(file, ownsFile: false))
         {
             await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
         }
 
         await using var readFile = new LocalRandomAccessFile(path);
@@ -2820,6 +2824,7 @@ public class ParquetFileWriterTests : IDisposable
         await using (var writer = new ParquetFileWriter(file, ownsFile: false))
         {
             await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
         }
 
         await using var readFile = new LocalRandomAccessFile(path);
@@ -2863,6 +2868,7 @@ public class ParquetFileWriterTests : IDisposable
         await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
         {
             await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
         }
 
         await using var readFile = new LocalRandomAccessFile(path);
@@ -2909,6 +2915,7 @@ public class ParquetFileWriterTests : IDisposable
         await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
         {
             await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
         }
 
         await using var readFile = new LocalRandomAccessFile(path);
@@ -3010,5 +3017,73 @@ public class ParquetFileWriterTests : IDisposable
     {
         Assert.True(EncodingStrategyResolver.ShouldAttemptDictionary(
             PhysicalType.Int32, ParquetWriteOptions.Default));
+    }
+
+    // ───── Dispose without CloseAsync (#501) ─────
+
+    /// <summary>
+    /// A writer disposed without <see cref="ParquetFileWriter.CloseAsync"/> abandons the file: dispose used
+    /// to write the footer, so a write that failed part-way published a well-formed file missing whatever
+    /// had not been written yet.
+    /// </summary>
+    [Fact]
+    public async Task DisposeWithoutClose_OwnedFile_PublishesNothing()
+    {
+        string path = TempPath("abandoned.parquet");
+        await using (var writer = new ParquetFileWriter(new LocalSequentialFile(path), ownsFile: true))
+        {
+            await writer.WriteRowGroupAsync(MakeInt32Batch(10));
+        }
+
+        Assert.False(File.Exists(path));
+        Assert.Empty(Directory.GetFileSystemEntries(_tempDir));
+    }
+
+    /// <summary>
+    /// The case the change exists for: the caller's own code fails between row groups. The rows already
+    /// written must not be published as though they were the whole file.
+    /// </summary>
+    [Fact]
+    public async Task FailureBetweenRowGroups_PublishesNothing()
+    {
+        string path = TempPath("half-written.parquet");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await using var file = new LocalSequentialFile(path);
+            await using var writer = new ParquetFileWriter(file, ownsFile: false);
+            await writer.WriteRowGroupAsync(MakeInt32Batch(10));
+            throw new InvalidOperationException("the next batch could not be produced (injected)");
+        });
+
+        Assert.False(File.Exists(path));
+        Assert.Empty(Directory.GetFileSystemEntries(_tempDir));
+    }
+
+    [Fact]
+    public async Task CloseThenDispose_Publishes()
+    {
+        string path = TempPath("closed.parquet");
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(MakeInt32Batch(10));
+            await writer.CloseAsync();
+            Assert.True(File.Exists(path));
+            Assert.Equal(new FileInfo(path).Length, file.Position);
+        }
+
+        await using var read = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(read, ownsFile: false);
+        Assert.Equal(10, (await reader.ReadMetadataAsync()).NumRows);
+    }
+
+    private static RecordBatch MakeInt32Batch(int rows)
+    {
+        var values = new Int32Array.Builder();
+        for (int i = 0; i < rows; i++)
+            values.Append(i);
+        var schema = new Apache.Arrow.Schema([new Field("id", Int32Type.Default, nullable: false)], null);
+        return new RecordBatch(schema, [values.Build()], rows);
     }
 }

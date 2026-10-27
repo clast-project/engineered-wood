@@ -934,6 +934,7 @@ public class SchemaValidationTests : IDisposable
             await using var writer = new Parquet.ParquetFileWriter(file, ownsFile: false);
             await writer.WriteRowGroupAsync(new RecordBatch(fileSchema,
                 [new Int64Array.Builder().Append(1).Build(), new TimestampArray.Builder(naive).Append(when).Build()], 1));
+            await writer.CloseAsync();
         }
         await table.CommitDataFilesAsync([new WrittenDataFile("foreign.parquet", new FileInfo(path).Length, 1, null, null)]);
 
@@ -1100,6 +1101,7 @@ public class SchemaValidationTests : IDisposable
                         .Append(new DateTimeOffset(2024, 3, 1, 0, 0, 0, TimeSpan.Zero))
                         .Append(new DateTimeOffset(2024, 3, 2, 0, 0, 0, TimeSpan.Zero)).Build(),
                 ], 2));
+            await writer.CloseAsync();
         }
         await table.CommitDataFilesAsync([new WrittenDataFile(name, new FileInfo(path).Length, 2, null, null)]);
         return name;

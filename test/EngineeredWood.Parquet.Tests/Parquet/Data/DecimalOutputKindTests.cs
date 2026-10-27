@@ -95,6 +95,7 @@ public class DecimalOutputKindTests : IDisposable
             await using var writer = new ParquetFileWriter(outFile, ownsFile: false);
             await writer.WriteRowGroupAsync(
                 new RecordBatch(schema, [builder.Build()], expected.Length));
+            await writer.CloseAsync();
         }
 
         // Narrow (default) round-trip — the baseline.

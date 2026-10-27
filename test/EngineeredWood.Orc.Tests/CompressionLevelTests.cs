@@ -48,6 +48,7 @@ public class CompressionLevelTests
             {
                 var arr = new Int64Array.Builder().AppendRange(values).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], values.Length));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -96,6 +97,7 @@ public class CompressionLevelTests
             {
                 var arr = new Int64Array.Builder().AppendRange(values).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], values.Length));
+                await writer.CloseAsync();
             }
             return new FileInfo(path).Length;
         }

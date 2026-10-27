@@ -49,6 +49,7 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
     private long _currentRowGroupRows;
     private bool _headerWritten;
     private bool _closed;
+    private bool _disposed;
 
     private bool RowIndexEnabled => _options.RowIndexStride > 0;
 
@@ -848,20 +849,26 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
         }
     }
 
+    /// <summary>
+    /// Releases the writer. Without a prior <see cref="CloseAsync"/> this abandons the file: no footer is
+    /// written and, when the writer owns the file, disposing it discards the write, so a write that failed
+    /// part-way publishes nothing.
+    /// </summary>
     public void Dispose()
     {
-        if (!_closed)
-        {
-            _closed = true;
-            // Best-effort sync close — callers should prefer CloseAsync/DisposeAsync
-        }
+        if (_disposed) return;
+        _disposed = true;
+        _closed = true;
         if (_ownsFile)
             _file.Dispose();
     }
 
+    /// <inheritdoc cref="Dispose"/>
     public async ValueTask DisposeAsync()
     {
-        await CloseAsync().ConfigureAwait(false);
+        if (_disposed) return;
+        _disposed = true;
+        _closed = true;
         if (_ownsFile)
             await _file.DisposeAsync().ConfigureAwait(false);
     }

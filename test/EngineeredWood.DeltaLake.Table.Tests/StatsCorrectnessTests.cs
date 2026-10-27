@@ -279,6 +279,7 @@ public class StatsCorrectnessTests : IDisposable
             await using var writer = new ParquetFileWriter(file, ownsFile: false);
             await writer.WriteRowGroupAsync(new RecordBatch(fileSchema,
                 [new TimestampArray.Builder(tsType).Append(InFile).Build()], 1));
+            await writer.CloseAsync();
         }
         await new TransactionLog(fs).WriteCommitAsync(0,
         [
@@ -358,6 +359,7 @@ public class StatsCorrectnessTests : IDisposable
         {
             await using var writer = new ParquetFileWriter(file, ownsFile: false);
             await writer.WriteRowGroupAsync(new RecordBatch(schema, [new FloatArray.Builder().Append(0.1f).Build()], 1));
+            await writer.CloseAsync();
         }
         await new TransactionLog(fs).WriteCommitAsync(0,
         [

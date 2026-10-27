@@ -124,6 +124,7 @@ public class DeletePredicateInputTests : IDisposable
         {
             await writer.WriteRowGroupAsync(new RecordBatch(
                 int32Schema, [new Int32Array.Builder().AppendRange([10, 20, 30]).Build()], 3));
+            await writer.CloseAsync();
         }
 
         await new TransactionLog(fs).WriteCommitAsync(0, new List<DeltaAction>

@@ -70,6 +70,7 @@ public class WriteBenchmarks
         await using var writer = new OrcWriter(file, _batch.Schema, ownsFile: false,
             new OrcWriterOptions { Compression = CompressionKind.None });
         await writer.WriteBatchAsync(_batch);
+        await writer.CloseAsync();
     }
 
     [Benchmark]
@@ -80,6 +81,7 @@ public class WriteBenchmarks
         await using var writer = new OrcWriter(file, _batch.Schema, ownsFile: false,
             new OrcWriterOptions { Compression = CompressionKind.Zlib });
         await writer.WriteBatchAsync(_batch);
+        await writer.CloseAsync();
     }
 
     [Benchmark]
@@ -90,5 +92,6 @@ public class WriteBenchmarks
         await using var writer = new OrcWriter(file, _batch.Schema, ownsFile: false,
             new OrcWriterOptions { Compression = CompressionKind.Zstd });
         await writer.WriteBatchAsync(_batch);
+        await writer.CloseAsync();
     }
 }

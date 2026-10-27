@@ -51,7 +51,7 @@ public class CodecSeamTests : IDisposable
                 await writer.WriteRowGroupAsync(b, cancellationToken);
                 count++;
             }
-            await writer.DisposeAsync();
+            await writer.CloseAsync();
             BatchCounts.Add(count); // count as we stream — no materialized list to .Count
             return file.Position;
         }

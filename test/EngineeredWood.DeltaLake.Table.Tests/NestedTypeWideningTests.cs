@@ -42,6 +42,7 @@ public class NestedTypeWideningTests : IDisposable
         await using var file = await fs.CreateAsync(name);
         await using var writer = new ParquetFileWriter(file, ownsFile: false);
         await writer.WriteRowGroupAsync(batch);
+        await writer.CloseAsync();
     }
 
     // Commits version 0: the typeWidening feature, `schemaString`, and one AddFile per data file.

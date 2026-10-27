@@ -324,7 +324,7 @@ ParquetFileWriter.WriteRowGroupAsync(RecordBatch)
   │    ├─ Compressor                        Codec dispatch
   │    └─ StatisticsCollector               Min/max/null_count (O(unique) when dict available)
   ├─ Sequential column writes to ISequentialFile
-  └─ CloseAsync() → MetadataEncoder → footer + footer length + trailing PAR1
+  └─ CloseAsync() → MetadataEncoder → footer + footer length + trailing PAR1 → CompleteAsync (publishes)
 ```
 
 **Encoding strategy** — `EncodingStrategyResolver` selects the encoding per column:
@@ -464,7 +464,7 @@ OrcWriter (init with Arrow schema, create column writers)
       └─ Collect streams (PRESENT + data streams per column)
       └─ Write row index (positions, per-row-group stats)
       └─ Write stripe footer, compress if needed
-  └─ CloseAsync → WriteFileTailAsync (metadata, footer, postscript)
+  └─ CloseAsync → WriteFileTailAsync (metadata, footer, postscript) → CompleteAsync (publishes)
 ```
 
 **Stripe management** — Auto-flush at configurable size (default 64 MB). Row indexing at configurable stride (default 10K rows) with byte-offset tracking for skip-scan.

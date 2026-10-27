@@ -777,6 +777,10 @@ await writer.WriteRowGroupAsync(recordBatch);
 await writer.CloseAsync();
 ```
 
+`CloseAsync` writes the footer and is what publishes the file. Disposing a writer without closing it
+abandons the file, so a write that fails part-way leaves nothing behind. The ORC and Lance writers work the
+same way with `CloseAsync` and `FinishAsync`.
+
 ### Parquet — Predicate pushdown
 
 ```csharp

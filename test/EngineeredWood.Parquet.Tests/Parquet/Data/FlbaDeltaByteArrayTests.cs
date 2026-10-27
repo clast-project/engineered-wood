@@ -56,6 +56,7 @@ public sealed class FlbaDeltaByteArrayTests : IDisposable
         {
             await using var writer = new ParquetFileWriter(outFile, options: DeltaByteArrayOptions);
             await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
         }
 
         await using var inFile = new LocalRandomAccessFile(path);

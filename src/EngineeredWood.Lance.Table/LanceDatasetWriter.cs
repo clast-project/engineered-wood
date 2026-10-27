@@ -264,8 +264,8 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         }
         else
         {
-            // No rows in current writer; just dispose it (its file is empty
-            // / partial — we leave it on disk; vacuum can clean up).
+            // No rows in current writer; just dispose it. An unfinished
+            // writer's file is never completed, so nothing is left on disk.
             await _currentFileWriter.DisposeAsync().ConfigureAwait(false);
         }
 
