@@ -191,6 +191,58 @@ public class LogCompactionTests : IDisposable
             Assert.Contains($"v{v}.parquet", snapshot.ActiveFiles.Keys);
     }
 
+    /// <summary>
+    /// A compacted file an in-place write left cut at a line break (or empty) still parses, and the snapshot
+    /// prefers it to the commits it covers, so it loads with files silently missing (#539). Compacting the
+    /// range again replaces it rather than keeping it.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(0)]
+    public async Task CompactRange_ReplacesAPartialFile(int linesKept)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+
+        await log.WriteCommitAsync(0, new List<DeltaAction>
+        {
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            new MetadataAction
+            {
+                Id = "lc-partial",
+                Format = Format.Parquet,
+                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
+                PartitionColumns = [],
+            },
+        });
+        for (int v = 1; v <= 3; v++)
+        {
+            await log.WriteCommitAsync(v, new List<DeltaAction>
+            {
+                new AddFile
+                {
+                    Path = $"v{v}.parquet",
+                    PartitionValues = new Dictionary<string, string>(),
+                    Size = 100, ModificationTime = 1000 + v, DataChange = true,
+                },
+            });
+        }
+
+        var compaction = new LogCompaction(fs, log);
+        await compaction.CompactRangeAsync(1, 3);
+        string fullPath = Path.Combine(_tempDir, DeltaVersion.CompactedPath(1, 3));
+        string[] lines = File.ReadAllLines(fullPath);
+        Assert.Equal(3, lines.Length);
+        File.WriteAllText(fullPath, string.Concat(lines.Take(linesKept).Select(l => l + "\n")));
+        Assert.Equal(linesKept, (await SnapshotBuilder.BuildAsync(log)).FileCount);   // the bug, as it reads
+
+        await compaction.CompactRangeAsync(1, 3);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(log);
+        Assert.Equal(3, snapshot.FileCount);
+        Assert.Empty(Directory.GetFiles(Path.Combine(_tempDir, "_delta_log"), ".*"));
+    }
+
     [Fact]
     public async Task CompactRange_ExcludesCommitInfo()
     {

@@ -97,11 +97,21 @@ public sealed class LogCompaction
         foreach (var dm in domains.Values)
             compactedActions.Add(dm);
 
-        // Write the compacted file
+        // Write the compacted file. Streamed and completed rather than written whole, because a whole-file
+        // write is not atomic on every backend: the local one writes in place, so a process that died
+        // part-way left a partial file at the final name. The file has no header and records no counts, so
+        // one cut at a line break (or left empty) parsed, and a snapshot built over it silently lost every
+        // file action past the cut (#539). A streamed file is visible only once completed.
+        //
+        // It replaces an existing file rather than keeping it: the contents are a function of commits that
+        // never change, so a replaced file held the same actions, unless it is a partial one an in-place
+        // write left behind, which this repairs.
         string path = DeltaVersion.CompactedPath(startVersion, endVersion);
         byte[] ndjson = ActionSerializer.Serialize(compactedActions);
-        await _fs.WriteAllBytesAsync(path, ndjson, cancellationToken)
+        await using var file = await _fs.CreateAsync(path, overwrite: true, cancellationToken)
             .ConfigureAwait(false);
+        await file.WriteAsync(ndjson, cancellationToken).ConfigureAwait(false);
+        await file.CompleteAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
