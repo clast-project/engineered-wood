@@ -255,6 +255,7 @@ public class BufferedParquetWriterTests : IDisposable
         await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
         {
             await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
         }
 
         await using var bufferedFile = new LocalRandomAccessFile(buffered);
@@ -363,6 +364,7 @@ public class BufferedParquetWriterTests : IDisposable
         await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
         {
             await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
         }
 
         await using var bufferedFile = new LocalRandomAccessFile(buffered);
@@ -483,5 +485,22 @@ public class BufferedParquetWriterTests : IDisposable
         var readBatch = await reader.ReadRowGroupAsync(0);
         Assert.Equal(expectedRows, readBatch.Length);
         Assert.Equal(expectedCols, readBatch.ColumnCount);
+    }
+
+    /// <summary>
+    /// Dispose used to flush the buffered rows and write the footer. Without <c>CloseAsync</c> it now
+    /// abandons the file, so rows buffered by a write that failed part-way are not published.
+    /// </summary>
+    [Fact]
+    public async Task DisposeWithoutClose_PublishesNothing()
+    {
+        string path = TempPath("abandoned.parquet");
+        await using (var writer = new BufferedParquetWriter(new LocalSequentialFile(path), ownsFile: true))
+        {
+            await writer.AppendAsync(MakeMixedBatch(100));
+        }
+
+        Assert.False(File.Exists(path));
+        Assert.Empty(Directory.GetFileSystemEntries(_tempDir));
     }
 }

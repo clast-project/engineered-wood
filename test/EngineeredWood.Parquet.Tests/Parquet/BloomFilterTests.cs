@@ -164,6 +164,7 @@ public class BloomFilterTests
             await using (var writer = new ParquetFileWriter(file, ownsFile: false, writeOptions))
             {
                 await writer.WriteRowGroupAsync(batch);
+                await writer.CloseAsync();
             }
 
             // Read back and verify bloom filter works.

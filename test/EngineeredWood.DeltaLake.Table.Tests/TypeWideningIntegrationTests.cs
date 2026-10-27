@@ -45,6 +45,7 @@ public class TypeWideningIntegrationTests : IDisposable
             await using var writer = new ParquetFileWriter(file, ownsFile: false);
             var ids = new Int32Array.Builder().Append(10).Append(20).Append(30).Build();
             await writer.WriteRowGroupAsync(new RecordBatch(int32Schema, [ids], 3));
+            await writer.CloseAsync();
         }
 
         // Step 2: Create table with Int64 schema + type change metadata
@@ -128,6 +129,7 @@ public class TypeWideningIntegrationTests : IDisposable
             var values = new FloatArray.Builder()
                 .Append(1.5f).AppendNull().Append(3.7f).Build();
             await writer.WriteRowGroupAsync(new RecordBatch(floatSchema, [values], 3));
+            await writer.CloseAsync();
         }
 
         // Create table with Double schema
@@ -197,6 +199,7 @@ public class TypeWideningIntegrationTests : IDisposable
                 await using var writer = new ParquetFileWriter(file, ownsFile: false);
                 var ids = new Int32Array.Builder().Append(f * 10 + 1).Build();
                 await writer.WriteRowGroupAsync(new RecordBatch(int32Schema, [ids], 1));
+                await writer.CloseAsync();
             }
         }
 

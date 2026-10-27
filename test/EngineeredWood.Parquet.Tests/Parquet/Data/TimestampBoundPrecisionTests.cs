@@ -66,6 +66,7 @@ public sealed class TimestampBoundPrecisionTests : IDisposable
         {
             await using var writer = new ParquetFileWriter(file, options: new ParquetWriteOptions());
             await writer.WriteRowGroupAsync(new RecordBatch(schema, [array], values.Length));
+            await writer.CloseAsync();
         }
 
         await using var input = new LocalRandomAccessFile(path);

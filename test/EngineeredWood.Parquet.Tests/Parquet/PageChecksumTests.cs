@@ -56,6 +56,7 @@ public class PageChecksumTests : IDisposable
             }))
             {
                 await writer.WriteRowGroupAsync(batch);
+                await writer.CloseAsync();
             }
 
             // Read with CRC validation enabled — should succeed.
@@ -101,6 +102,7 @@ public class PageChecksumTests : IDisposable
             }))
             {
                 await writer.WriteRowGroupAsync(batch);
+                await writer.CloseAsync();
             }
 
             // Tamper with a byte that's definitely in compressed page data: 5 bytes before the end of the
@@ -174,6 +176,7 @@ public class PageChecksumTests : IDisposable
             await using (var writer = new ParquetFileWriter(file, ownsFile: false))
             {
                 await writer.WriteRowGroupAsync(batch);
+                await writer.CloseAsync();
             }
 
             // Read WITH validation — should succeed (no CRC to validate).
@@ -214,6 +217,7 @@ public class PageChecksumTests : IDisposable
             }))
             {
                 await writer.WriteRowGroupAsync(batch);
+                await writer.CloseAsync();
             }
 
             // ParquetSharp should read the file without errors.

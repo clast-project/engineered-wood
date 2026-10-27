@@ -81,7 +81,7 @@ internal static class CdfWriter
                 file, ownsFile: false, parquetOptions);
             await writer.WriteRowGroupAsync(batchWithChangeType, cancellationToken)
                 .ConfigureAwait(false);
-            await writer.DisposeAsync().ConfigureAwait(false);
+            await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
             fileSize = file.Position;
         }
 

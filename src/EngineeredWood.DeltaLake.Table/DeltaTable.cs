@@ -6013,8 +6013,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     await writer.WriteRowGroupAsync(writeBatch, cancellationToken)
                         .ConfigureAwait(false);
 
-                    // DisposeAsync writes the Parquet footer before we read Position
-                    await writer.DisposeAsync().ConfigureAwait(false);
+                    // CloseAsync writes the footer and publishes the file before we read Position
+                    await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
                     fileSize = file.Position;
                 }
 
@@ -6975,7 +6975,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     await using var writer = new ParquetFileWriter(
                         file, ownsFile: false, DataFileWriteOptions(writeSchema, mappingMode));
                     await writer.WriteRowGroupAsync(writeBatch, cancellationToken).ConfigureAwait(false);
-                    await writer.DisposeAsync().ConfigureAwait(false);
+                    await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
                     fileSize = file.Position;
                 }
 
@@ -8591,7 +8591,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                 file, ownsFile: false, DataFileWriteOptions(snapshot));
             foreach (var batch in writeBatches)
                 await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
-            await writer.DisposeAsync().ConfigureAwait(false);
+            await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
             fileSize = file.Position;
         }
 

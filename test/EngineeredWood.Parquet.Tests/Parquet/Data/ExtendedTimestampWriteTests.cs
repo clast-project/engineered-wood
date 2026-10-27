@@ -97,6 +97,7 @@ public sealed class ExtendedTimestampWriteTests : IDisposable
         {
             await using var writer = new ParquetFileWriter(file, options: options);
             await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
         }
 
         return path;

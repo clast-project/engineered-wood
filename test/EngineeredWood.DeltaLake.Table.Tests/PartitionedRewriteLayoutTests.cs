@@ -251,7 +251,7 @@ public class PartitionedRewriteLayoutTests : IDisposable
             {
                 await using var writer = new Parquet.ParquetFileWriter(file, ownsFile: false);
                 await writer.WriteRowGroupAsync(Batch(10, 2, "east")); // id, region, val — the stray column
-                await writer.DisposeAsync();
+                await writer.CloseAsync();
                 size = file.Position;
             }
             await new EngineeredWood.DeltaLake.Log.TransactionLog(fs).WriteCommitAsync(

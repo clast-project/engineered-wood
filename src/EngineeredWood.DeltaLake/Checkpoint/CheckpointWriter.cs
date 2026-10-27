@@ -113,6 +113,7 @@ public sealed class CheckpointWriter
         await using (var writer = new ParquetFileWriter(encoded, ownsFile: false, _parquetOptions))
         {
             await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+            await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
         }
 
         // False when a checkpoint for this version is already there: written by another writer, or by an
@@ -137,67 +138,22 @@ public sealed class CheckpointWriter
 
     /// <summary>
     /// Streams a new, uniquely named checkpoint file (a V2 body or a sidecar) to <paramref name="path"/> and
-    /// returns its length, deleting the file again if this call published it and then failed.
+    /// returns its length.
     /// </summary>
     /// <remarks>
-    /// <para>A streamed file is published only by <see cref="ISequentialFile.CompleteAsync"/>, and a write that
-    /// fails before completing is discarded, so most failures leave nothing to clean up. The exception is the
-    /// Parquet writer that <paramref name="write"/> wraps around the file: its dispose still closes it, and
-    /// closing completes the file, so a row group that throws part-way is followed by a footer and a
-    /// well-formed checkpoint missing that row group, at its final, discoverable name. A reader that picked it
-    /// would see a table without those files. Until the writers abort on dispose instead (#501), such a file is
-    /// deleted here.</para>
-    ///
-    /// <para>Deleted only when this call's own <see cref="ISequentialFile.CompleteAsync"/> succeeded, so a file
-    /// that is there for any other reason is never touched. The delete is best-effort and the original
-    /// exception is what propagates.</para>
+    /// A streamed file is published only when it is completed: by <paramref name="write"/> closing the Parquet
+    /// writer it wraps around the file, or by the completion here when it does not. A write that throws
+    /// before then is disposed without completing, which discards it, so a failure leaves no truncated
+    /// checkpoint at the final, discoverable name and there is nothing to clean up.
     /// </remarks>
-    internal static async ValueTask<long> WriteFileOrDeleteAsync(
+    internal static async ValueTask<long> WriteNewFileAsync(
         ITableFileSystem fs, string path,
         Func<ISequentialFile, ValueTask> write, CancellationToken cancellationToken)
     {
-        var file = new PublishTrackingFile(
-            await fs.CreateAsync(path, overwrite: false, cancellationToken).ConfigureAwait(false));
-        long length;
-        try
-        {
-            await using (file)
-            {
-                await write(file).ConfigureAwait(false);
-                await file.CompleteAsync(cancellationToken).ConfigureAwait(false);
-                length = file.Position;
-            }
-        }
-        catch (Exception) when (file.Published)
-        {
-            await DeleteQuietlyAsync(fs, path).ConfigureAwait(false);
-            throw;
-        }
-        return length;
-    }
-
-    /// <summary>Passes everything through, recording whether <see cref="CompleteAsync"/> succeeded.</summary>
-    private sealed class PublishTrackingFile(ISequentialFile inner) : ISequentialFile
-    {
-        public bool Published { get; private set; }
-
-        public long Position => inner.Position;
-
-        public ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
-            inner.WriteAsync(data, cancellationToken);
-
-        public ValueTask FlushAsync(CancellationToken cancellationToken = default) =>
-            inner.FlushAsync(cancellationToken);
-
-        public async ValueTask CompleteAsync(CancellationToken cancellationToken = default)
-        {
-            await inner.CompleteAsync(cancellationToken).ConfigureAwait(false);
-            Published = true;
-        }
-
-        public ValueTask DisposeAsync() => inner.DisposeAsync();
-
-        public void Dispose() => inner.Dispose();
+        await using var file = await fs.CreateAsync(path, overwrite: false, cancellationToken).ConfigureAwait(false);
+        await write(file).ConfigureAwait(false);
+        await file.CompleteAsync(cancellationToken).ConfigureAwait(false);
+        return file.Position;
     }
 
     /// <summary>

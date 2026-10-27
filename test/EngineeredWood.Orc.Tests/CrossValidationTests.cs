@@ -273,6 +273,7 @@ public class CrossValidationTests
             {
                 var arr = new Int64Array.Builder().AppendRange([1L, 2L, 3L, 100L, -50L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 5));
+                await writer.CloseAsync();
             }
 
             var json = ReadOrcWithPyArrow(path);
@@ -313,6 +314,7 @@ public class CrossValidationTests
             {
                 var arr = new StringArray.Builder().Append("hello").Append("world").Append("test").Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             var json = ReadOrcWithPyArrow(path);
@@ -343,6 +345,7 @@ public class CrossValidationTests
             {
                 var arr = new Int64Array.Builder().Append(10).AppendNull().Append(30).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             var json = ReadOrcWithPyArrow(path);
@@ -384,6 +387,7 @@ public class CrossValidationTests
                 var vals = new DoubleArray.Builder().AppendRange([1.5, 2.5, 3.5]).Build();
                 var names = new StringArray.Builder().Append("a").Append("b").Append("c").Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [ids, vals, names], 3));
+                await writer.CloseAsync();
             }
 
             var json = ReadOrcWithPyArrow(path);
@@ -436,6 +440,7 @@ public class CrossValidationTests
                 var ys = new StringArray.Builder().Append("foo").Append("bar").Append("baz").Build();
                 var structArr = new StructArray(structType, 3, [xs, ys], ArrowBuffer.Empty, 0);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [structArr], 3));
+                await writer.CloseAsync();
             }
 
             var json = ReadOrcWithPyArrowStructured(path);
@@ -477,6 +482,7 @@ public class CrossValidationTests
                 var offsets = new ArrowBuffer.Builder<int>().AppendRange([0, 2, 3, 5]).Build();
                 var listArr = new ListArray(listType, 3, offsets, values, ArrowBuffer.Empty, 0);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [listArr], 3));
+                await writer.CloseAsync();
             }
 
             var json = ReadOrcWithPyArrowStructured(path);
@@ -535,6 +541,7 @@ public class CrossValidationTests
                 // 12.34, 56.78, -9.99
                 var arr = BuildDecimal128Array(decType, [1234L, 5678L, -999L]);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             var json = ReadOrcWithPyArrowStructured(path);
@@ -590,6 +597,7 @@ public class CrossValidationTests
 
                 var unionArr = new DenseUnionArray(unionType, 5, [intChild, strChild], typeIdBuf, offsetBuf);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [unionArr], 5));
+                await writer.CloseAsync();
             }
 
             var json = ReadOrcWithPyArrowStructured(path);
@@ -643,6 +651,7 @@ public class CrossValidationTests
                 var mapArr = new MapArray(mapType, 3, offsets, structArr, ArrowBuffer.Empty, 0);
 
                 await writer.WriteBatchAsync(new RecordBatch(schema, [mapArr], 3));
+                await writer.CloseAsync();
             }
 
             var json = ReadOrcWithPyArrowMap(path);
@@ -694,6 +703,7 @@ public class CrossValidationTests
             {
                 var arr = new Int64Array.Builder().AppendRange(Enumerable.Range(0, 100).Select(i => (long)i)).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 100));
+                await writer.CloseAsync();
             }
 
             var json = ReadOrcWithPyArrow(path);
@@ -740,6 +750,7 @@ public class CrossValidationTests
                 for (int i = 0; i < 100; i++) names.Append($"name_{i}");
                 await writer.WriteBatchAsync(new RecordBatch(schema,
                     [ids, names.Build()], 100));
+                await writer.CloseAsync();
             }
 
             // PyArrow should read the file without errors.
@@ -792,6 +803,7 @@ public class CrossValidationTests
                 var names = new StringArray.Builder();
                 for (int i = 0; i < 200; i++) names.Append($"name_{i}");
                 await writer.WriteBatchAsync(new RecordBatch(schema, [names.Build()], 200));
+                await writer.CloseAsync();
             }
 
             // Use Python to independently parse and probe the bloom filter.

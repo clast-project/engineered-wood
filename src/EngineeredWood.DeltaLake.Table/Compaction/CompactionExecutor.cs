@@ -432,7 +432,7 @@ internal static class CompactionExecutor
                         await writer.WriteRowGroupAsync(batch, cancellationToken)
                             .ConfigureAwait(false);
                     }
-                    await writer.DisposeAsync().ConfigureAwait(false);
+                    await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
                     fileSize = outFile.Position;
                 }
 

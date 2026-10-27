@@ -2384,7 +2384,7 @@ public class ReadRowGroupTests
         {
             await using (var wf = new LocalSequentialFile(path))
             await using (var writer = new ParquetFileWriter(wf, ownsFile: false))
-                await writer.CloseAsync();
+            await writer.CloseAsync();
 
             await using var file = new LocalRandomAccessFile(path);
             using var reader = new ParquetFileReader(file, ownsFile: false);

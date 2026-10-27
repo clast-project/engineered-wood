@@ -78,6 +78,7 @@ public sealed class TemporalBloomFilterTests : IDisposable
             ExtendedTimestampColumns = promoted,
         });
         await writer.WriteRowGroupAsync(new RecordBatch(schema, [array], values.Length));
+        await writer.CloseAsync();
         return path;
     }
 

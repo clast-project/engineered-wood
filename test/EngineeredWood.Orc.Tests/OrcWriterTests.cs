@@ -26,6 +26,7 @@ public class OrcWriterTests
             {
                 var idArray = new Int64Array.Builder().AppendRange([1L, 2L, 3L, 100L, -50L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [idArray], 5));
+                await writer.CloseAsync();
             }
 
             // Read back
@@ -69,6 +70,7 @@ public class OrcWriterTests
             {
                 var arr = new StringArray.Builder().Append("hello").Append("world").Append("foo").Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -107,6 +109,7 @@ public class OrcWriterTests
                     .Append("red").Append("blue").Append("red").Append("green").Append("blue")
                     .Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 5));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -147,6 +150,7 @@ public class OrcWriterTests
                 var vals = new DoubleArray.Builder().AppendRange([1.5, 2.5, 3.5]).Build();
                 var flags = new BooleanArray.Builder().Append(true).Append(false).Append(true).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [ids, vals, flags], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -189,6 +193,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().Append(1).AppendNull().Append(3).AppendNull().Append(5).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 5));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -224,6 +229,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange(Enumerable.Range(0, 1000).Select(i => (long)i)).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1000));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -260,6 +266,7 @@ public class OrcWriterTests
                     var arr = new Int32Array.Builder().AppendRange(Enumerable.Range(batch * 100, 100)).Build();
                     await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 100));
                 }
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -301,6 +308,7 @@ public class OrcWriterTests
                         .Build();
                     await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1000));
                 }
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -343,6 +351,7 @@ public class OrcWriterTests
             {
                 var arr = new Int32Array.Builder().AppendRange(Enumerable.Range(0, 100)).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 100));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -367,6 +376,7 @@ public class OrcWriterTests
             {
                 var arr = new FloatArray.Builder().AppendRange([1.0f, 2.5f, -3.14f]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -407,6 +417,7 @@ public class OrcWriterTests
                         .Build();
                     await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1000));
                 }
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -468,6 +479,7 @@ public class OrcWriterTests
                         .Build();
                     await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1000));
                 }
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -522,6 +534,7 @@ public class OrcWriterTests
                         .Build();
                     await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1000));
                 }
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -564,6 +577,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange([1L, 2L, 3L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -605,6 +619,7 @@ public class OrcWriterTests
                         .Build();
                     await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1000));
                 }
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -645,6 +660,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange([1L, 2L, 3L, 100L, -50L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 5));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -684,6 +700,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange([1L, 2L, 3L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -710,6 +727,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().Append(10).AppendNull().Append(30).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -744,6 +762,7 @@ public class OrcWriterTests
                 var vals = new DoubleArray.Builder().AppendRange([1.5, 2.5, 3.5]).Build();
                 var flags = new BooleanArray.Builder().Append(true).Append(false).Append(true).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [ids, vals, flags], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -788,6 +807,7 @@ public class OrcWriterTests
             {
                 var arr = new StringArray.Builder().Append("banana").Append("apple").Append("cherry").Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -825,6 +845,7 @@ public class OrcWriterTests
                 var ys = new StringArray.Builder().Append("a").Append("b").Append("c").Build();
                 var structArr = new StructArray(structType, 3, [xs, ys], ArrowBuffer.Empty, 0);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [structArr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -867,6 +888,7 @@ public class OrcWriterTests
                 var offsets = new ArrowBuffer.Builder<int>().AppendRange([0, 2, 3, 6]).Build();
                 var listArr = new ListArray(listType, 3, offsets, values, ArrowBuffer.Empty, 0);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [listArr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -930,6 +952,7 @@ public class OrcWriterTests
                 var offsets = new ArrowBuffer.Builder<int>().AppendRange([0, 2, 3]).Build();
                 var mapArr = new MapArray(mapType, 2, offsets, kvStruct, ArrowBuffer.Empty, 0);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [mapArr], 2));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -984,6 +1007,7 @@ public class OrcWriterTests
                 var bArr = new Int32Array.Builder().AppendRange([300, 400]).Build();
                 var nested = new StructArray(innerType, 2, [aArr, bArr], ArrowBuffer.Empty, 0);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [ids, nested], 2));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1031,6 +1055,7 @@ public class OrcWriterTests
                 var offsets = new ArrowBuffer.Builder<int>().AppendRange([0, 2, 3]).Build();
                 var listArr = new ListArray(listType, 2, offsets, elemArr, ArrowBuffer.Empty, 0);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [listArr], 2));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1069,6 +1094,7 @@ public class OrcWriterTests
             {
                 var arr = new Int8Array.Builder().Append(-128).Append(-1).Append(0).Append(1).Append(127).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 5));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1104,6 +1130,7 @@ public class OrcWriterTests
             {
                 var arr = new Int16Array.Builder().Append(-32768).Append(-1).Append(0).Append(1).Append(32767).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 5));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1139,6 +1166,7 @@ public class OrcWriterTests
             {
                 var arr = new BinaryArray.Builder().Append(System.Array.Empty<byte>()).Append(new byte[] { 0x01, 0x02 }).Append(new byte[] { 0xFF }).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1172,6 +1200,7 @@ public class OrcWriterTests
             {
                 var arr = new BinaryArray.Builder().Append(new byte[] { 0x01, 0x02 }).AppendNull().Append(new byte[] { 0x03 }).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1220,6 +1249,7 @@ public class OrcWriterTests
                 builder.Append(ts3);
                 var arr = builder.Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1264,6 +1294,7 @@ public class OrcWriterTests
                 builder.Append(ts3);
                 var arr = builder.Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1299,6 +1330,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendNull().AppendNull().AppendNull().Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1336,6 +1368,7 @@ public class OrcWriterTests
             {
                 var arr = new StringArray.Builder().AppendNull().AppendNull().AppendNull().Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1369,6 +1402,7 @@ public class OrcWriterTests
             {
                 var arr = new BooleanArray.Builder().AppendNull().AppendNull().AppendNull().Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1402,6 +1436,7 @@ public class OrcWriterTests
             {
                 var arr = new DoubleArray.Builder().AppendNull().AppendNull().AppendNull().Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1435,6 +1470,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().Append(42L).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1466,6 +1502,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange(Enumerable.Range(0, 1000).Select(i => (long)i)).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1000));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1497,6 +1534,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange(Enumerable.Range(0, 1000).Select(i => (long)i)).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1000));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1528,6 +1566,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange(Enumerable.Range(0, 1000).Select(i => (long)i)).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1000));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1572,6 +1611,7 @@ public class OrcWriterTests
                 var nameArr = names.Build();
                 var vals = new DoubleArray.Builder().AppendRange(Enumerable.Range(0, 100).Select(i => i * 1.5)).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [ids, nameArr, vals], 100));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1656,6 +1696,7 @@ public class OrcWriterTests
                 // Values are unscaled: 1234 means 12.34 at scale 2
                 var arr = BuildDecimal128Array(decType, [1234L, 5678L, -999L]);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1695,6 +1736,7 @@ public class OrcWriterTests
             {
                 var arr = BuildDecimal128ArrayWithNulls(decType, [100L, null, 300L]);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1733,6 +1775,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange([1L, 2L, 3L, 100L, -50L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 5));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1780,6 +1823,7 @@ public class OrcWriterTests
                         .Build();
                     await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1000));
                 }
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1832,6 +1876,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange([1L, 2L, 3L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1865,6 +1910,7 @@ public class OrcWriterTests
                         .Build();
                     await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 500));
                 }
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1903,6 +1949,7 @@ public class OrcWriterTests
                 // 12.34, 56.78, -9.99
                 var arr = BuildDecimal128Array(decType, [1234L, 5678L, -999L]);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -1943,6 +1990,7 @@ public class OrcWriterTests
                 builder.Append(); valueBuilder.Append(6); // length 1
 
                 await writer.WriteBatchAsync(new RecordBatch(schema, [builder.Build()], 5));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2007,6 +2055,7 @@ public class OrcWriterTests
                     keyValues, validityBuilder.Build(), 1);
 
                 await writer.WriteBatchAsync(new RecordBatch(schema, [mapArray], 4));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2048,6 +2097,7 @@ public class OrcWriterTests
                 b2.Append(); v2.Append(20); // length 1
                 b2.Append(); for (int i = 0; i < 4; i++) v2.Append(30 + i); // length 4
                 await writer.WriteBatchAsync(new RecordBatch(schema, [b2.Build()], 2));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2074,6 +2124,7 @@ public class OrcWriterTests
                 // Date32 stores days since epoch
                 var arr = new Date32Array.Builder().Append(new DateTime(2024, 1, 15)).Append(new DateTime(2024, 6, 30)).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 2));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2109,6 +2160,7 @@ public class OrcWriterTests
                 // 5 identical values → should use Short Repeat
                 var arr = new Int64Array.Builder().AppendRange([42L, 42L, 42L, 42L, 42L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 5));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2142,6 +2194,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange([-100L, -100L, -100L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2183,6 +2236,7 @@ public class OrcWriterTests
                 }
                 var arr = builder.Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 100));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2235,6 +2289,7 @@ public class OrcWriterTests
                 }
                 var arr = builder.Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 200));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2284,6 +2339,7 @@ public class OrcWriterTests
             {
                 var arr = new Int32Array.Builder().AppendRange([1, 2, 3]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2311,6 +2367,7 @@ public class OrcWriterTests
             {
                 var arr = new Int32Array.Builder().Append(1).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 1));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2356,6 +2413,7 @@ public class OrcWriterTests
 
                 var unionArr = new DenseUnionArray(unionType, 5, [intChild, strChild], typeIdBuf, offsetBuf);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [unionArr], 5));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2425,6 +2483,7 @@ public class OrcWriterTests
 
                 var unionArr = new DenseUnionArray(unionType, 5, [intChild, dblChild], typeIdBuf, offsetBuf);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [unionArr], 5));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2473,6 +2532,7 @@ public class OrcWriterTests
             {
                 var arr = new Int32Array.Builder().AppendRange([10, 20, 30]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2507,6 +2567,7 @@ public class OrcWriterTests
                 for (int i = 0; i < 10; i++)
                     builder.Append($"unique_{i}");
                 await writer.WriteBatchAsync(new RecordBatch(schema, [builder.Build()], 10));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2552,6 +2613,7 @@ public class OrcWriterTests
                 // Second batch: more unique strings (should trigger fallback)
                 var b2 = new StringArray.Builder().Append("d").Append("e").Append("f").Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [b2], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2598,6 +2660,7 @@ public class OrcWriterTests
                 var dictArr = new StringArray.Builder().Append("red").Append("blue").Append("red").Build();
                 var directArr = new StringArray.Builder().Append("x").Append("y").Append("z").Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [dictArr, directArr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2642,6 +2705,7 @@ public class OrcWriterTests
                 for (int i = 0; i < 500; i++)
                     builder.Append(i);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [builder.Build()], 500));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2687,6 +2751,7 @@ public class OrcWriterTests
                     values.Append(i * 1.5);
                 }
                 await writer.WriteBatchAsync(new RecordBatch(schema, [names.Build(), values.Build()], 200));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2739,6 +2804,7 @@ public class OrcWriterTests
                 var mapArr = new MapArray(mapType, 3, offsets, structArr, ArrowBuffer.Empty, 0);
 
                 await writer.WriteBatchAsync(new RecordBatch(schema, [mapArr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2814,6 +2880,7 @@ public class OrcWriterTests
 
                 var mapArr = new MapArray(mapType, 3, offsets, structArr, validity, 1);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [mapArr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2872,6 +2939,7 @@ public class OrcWriterTests
                 var mapArr = new MapArray(mapType, 3, offsets, structArr, ArrowBuffer.Empty, 0);
 
                 await writer.WriteBatchAsync(new RecordBatch(schema, [mapArr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2939,6 +3007,7 @@ public class OrcWriterTests
                 var mapArr = new MapArray(mapType, 50, offsetBuilder.Build(), structArr, ArrowBuffer.Empty, 0);
 
                 await writer.WriteBatchAsync(new RecordBatch(schema, [mapArr], 50));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -2987,6 +3056,7 @@ public class OrcWriterTests
                     .Append(new DateTime(2000, 1, 1))    // 10957
                     .Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 4));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             Assert.Equal(4, reader.NumberOfRows);
@@ -3021,6 +3091,7 @@ public class OrcWriterTests
                     .AppendNull()
                     .Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 4));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             var rowReader = reader.CreateRowReader();
@@ -3056,6 +3127,7 @@ public class OrcWriterTests
                     .Append(float.MaxValue)
                     .Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 6));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             var rowReader = reader.CreateRowReader();
@@ -3092,6 +3164,7 @@ public class OrcWriterTests
                     .Append(double.Epsilon)
                     .Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 7));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             var rowReader = reader.CreateRowReader();
@@ -3128,6 +3201,7 @@ public class OrcWriterTests
                 // Epoch exactly
                 builder.Append(new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero));
                 await writer.WriteBatchAsync(new RecordBatch(schema, [builder.Build()], 3));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             var rowReader = reader.CreateRowReader();
@@ -3178,6 +3252,7 @@ public class OrcWriterTests
                 arr.Append(new DateTimeOffset(2024, 1, 15, 12, 30, 0, 0, TimeSpan.Zero).AddTicks(2500));
 #endif
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr.Build()], 3));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             var rowReader = reader.CreateRowReader();
@@ -3219,6 +3294,7 @@ public class OrcWriterTests
                 var data = new ArrayData(decType, 3, 0, 0, [ArrowBuffer.Empty, valueBuf]);
                 var arr = new Decimal128Array(data);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             var rowReader = reader.CreateRowReader();
@@ -3264,6 +3340,7 @@ public class OrcWriterTests
                 var data = new ArrayData(decType, 3, 1, 0, [validityBuf.Build(), valueBuf]);
                 var arr = new Decimal128Array(data);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             var rowReader = reader.CreateRowReader();
@@ -3305,6 +3382,7 @@ public class OrcWriterTests
                 var c = new DoubleArray.Builder().AppendRange([1.1, 2.2, 3.3]).Build();
                 var d = new BooleanArray.Builder().Append(true).Append(false).Append(true).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [a, b, c, d], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -3341,6 +3419,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange([10L, 20L, 30L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             var rowReader = reader.CreateRowReader(new OrcReaderOptions { BatchSize = 1 });
@@ -3367,6 +3446,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange([1L, 2L, 3L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             var rowReader = reader.CreateRowReader(new OrcReaderOptions { BatchSize = 10000 });
@@ -3397,29 +3477,24 @@ public class OrcWriterTests
         finally { File.Delete(path); }
     }
 
+    /// <summary>
+    /// Dispose used to write the footer. Without <c>CloseAsync</c> it now abandons the file, so a write that
+    /// failed part-way publishes nothing rather than a well-formed file missing the rest of its rows.
+    /// </summary>
     [Fact]
-    public async Task Writer_DisposeFlushesProperly()
+    public async Task Writer_DisposeWithoutClose_PublishesNothing()
     {
         var path = GetTempPath();
         try
         {
             var schema = new Schema([new Field("id", Int64Type.Default, nullable: false)], null);
-            // No explicit Close — just Dispose via `using`
             await using (var writer = OrcWriter.Create(path, schema, new OrcWriterOptions { Compression = CompressionKind.None }))
             {
                 var arr = new Int64Array.Builder().AppendRange([1L, 2L, 3L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
             }
-            // File should be readable after dispose
-            await using var reader = await OrcReader.OpenAsync(path);
-            Assert.Equal(3, reader.NumberOfRows);
-            var rowReader = reader.CreateRowReader();
-            await foreach (var batch in rowReader)
-            {
-                var col = (Int64Array)batch.Column(0);
-                Assert.Equal(1L, col.GetValue(0));
-                Assert.Equal(3L, col.GetValue(2));
-            }
+
+            Assert.False(File.Exists(path));
         }
         finally { File.Delete(path); }
     }
@@ -3452,6 +3527,7 @@ public class OrcWriterTests
                 var innerStruct = new StructArray(innerStructType, 2, [xs, ys], ArrowBuffer.Empty, 0);
                 var outerStruct = new StructArray(outerStructType, 2, [names, innerStruct], ArrowBuffer.Empty, 0);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [outerStruct], 2));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             Assert.Equal(2, reader.NumberOfRows);
@@ -3496,6 +3572,7 @@ public class OrcWriterTests
                 var outerList = new ListArray(outerListType, 2, outerOffsets, innerList, ArrowBuffer.Empty, 0);
 
                 await writer.WriteBatchAsync(new RecordBatch(schema, [outerList], 2));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             Assert.Equal(2, reader.NumberOfRows);
@@ -3552,6 +3629,7 @@ public class OrcWriterTests
                 var values = new Int32Array.Builder().AppendNull().Append(42).Append(99).Build();
                 var structArr = new StructArray(structType, 3, [names, values], ArrowBuffer.Empty, 0);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [structArr], 3));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             var rowReader = reader.CreateRowReader();
@@ -3594,6 +3672,7 @@ public class OrcWriterTests
                         builder.Append(batch * 100 + i);
                     await writer.WriteBatchAsync(new RecordBatch(schema, [builder.Build()], 100));
                 }
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             Assert.Equal(500, reader.NumberOfRows);
@@ -3664,6 +3743,7 @@ public class OrcWriterTests
                     .Append("\u4e16\u754c") // Chinese "世界"
                     .Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 5));
+                await writer.CloseAsync();
             }
             await using var reader = await OrcReader.OpenAsync(path);
             var rowReader = reader.CreateRowReader();
@@ -3707,6 +3787,7 @@ public class OrcWriterTests
                     for (int i = 0; i < 1000; i++) names.Append($"item_{b * 1000 + i}");
                     await writer.WriteBatchAsync(new RecordBatch(schema, [ids, names.Build()], 1000));
                 }
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -3758,6 +3839,7 @@ public class OrcWriterTests
 
                 var listArr = new ListArray(listType, 4, offsets, elements, validity.Build(), 2);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [listArr], 4));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -3809,6 +3891,7 @@ public class OrcWriterTests
                 var offsets = new ArrowBuffer.Builder<int>().AppendRange([0, 3, 5]).Build();
                 var listArr = new ListArray(listType, 2, offsets, elements, ArrowBuffer.Empty, 0);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [listArr], 2));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -3860,6 +3943,7 @@ public class OrcWriterTests
 
                 var structArr = new StructArray(structType, 4, [xs, ys], validity.Build(), 2);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [structArr], 4));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -3920,6 +4004,7 @@ public class OrcWriterTests
                     }
                     await writer.WriteBatchAsync(new RecordBatch(schema, [aArr.Build(), bArr.Build(), cArr.Build()], 100));
                 }
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -3988,6 +4073,7 @@ public class OrcWriterTests
             {
                 var arr = new Int64Array.Builder().AppendRange([1L, 2L, 3L]).Build();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [arr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -4031,6 +4117,7 @@ public class OrcWriterTests
                 var typeIdBuf = new ArrowBuffer(typeIds);
                 var unionArr = new SparseUnionArray(unionType, 5, [intChild, strChild], typeIdBuf);
                 await writer.WriteBatchAsync(new RecordBatch(schema, [unionArr], 5));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -4099,6 +4186,7 @@ public class OrcWriterTests
                 builder.Append();
                 builder.Append();
                 await writer.WriteBatchAsync(new RecordBatch(schema, [builder.Build()], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -4146,6 +4234,7 @@ public class OrcWriterTests
                 var map = new MapArray(mapType, 2, offsets.Build(), entries, ArrowBuffer.Empty, 0);
 
                 await writer.WriteBatchAsync(new RecordBatch(schema, [map], 2));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -4202,6 +4291,7 @@ public class OrcWriterTests
                     new ArrowBuffer(System.Runtime.InteropServices.MemoryMarshal
                         .AsBytes(offsets.AsSpan()).ToArray()));
                 await writer.WriteBatchAsync(new RecordBatch(schema, [unionArr], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -4256,6 +4346,7 @@ public class OrcWriterTests
                 var list = new ListArray(listType, 3, offsets.Build(), emptyUnion, ArrowBuffer.Empty, 0);
 
                 await writer.WriteBatchAsync(new RecordBatch(schema, [list], 3));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -4318,6 +4409,7 @@ public class OrcWriterTests
                 var list = new ListArray(listType, 2, offsets.Build(), emptyStruct, ArrowBuffer.Empty, 0);
 
                 await writer.WriteBatchAsync(new RecordBatch(schema, [list], 2));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);

@@ -145,8 +145,8 @@ public sealed class V2CheckpointWriter
         }
         catch
         {
-            // A failed body write deletes its own partial body, which leaves this attempt's sidecars
-            // referenced by nothing. Deleting them keeps a checkpoint that fails on every interval from
+            // A failed body write leaves no body (a streamed one is discarded, and a JSON one deletes what
+            // it wrote), which leaves this attempt's sidecars referenced by nothing. Deleting them keeps a checkpoint that fails on every interval from
             // piling up sidecars for the sweep's whole age guard. But only once the body is confirmed
             // gone: if that delete failed too, the body still names them, and deleting them would turn it
             // into a checkpoint that points at missing files. A failure writing _last_checkpoint (below)
@@ -337,14 +337,14 @@ public sealed class V2CheckpointWriter
         using var batch = CheckpointWriter.BuildBatchForActions(
             snapshot, actions, out _, v2Spec: true);
 
-        // A body missing rows would be listed as this version's checkpoint, so one this write published
-        // before failing is deleted.
-        return await CheckpointWriter.WriteFileOrDeleteAsync(_fs, checkpointPath,
+        // Published only by the close: a body that fails part-way is discarded rather than listed as this
+        // version's checkpoint.
+        return await CheckpointWriter.WriteNewFileAsync(_fs, checkpointPath,
             async file =>
             {
-                // Scoped so the writer's footer lands before the helper reads Position.
                 await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
                 await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+                await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
             }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -389,14 +389,13 @@ public sealed class V2CheckpointWriter
             // sidecar.sizeInBytes is required by the spec, and the write already knows it: Position is
             // the total written. Reading the file back to measure it doubled the I/O of every sidecar
             // and pulled a potentially multi-hundred-megabyte Parquet file into memory to take .Length.
-            // A partial sidecar is not discoverable the way a body is (the sweep would collect it), but
-            // there is no reason to leave one behind either.
-            sizeInBytes = await CheckpointWriter.WriteFileOrDeleteAsync(_fs, sidecarPath,
+            // A sidecar that fails part-way is discarded, like a body.
+            sizeInBytes = await CheckpointWriter.WriteNewFileAsync(_fs, sidecarPath,
                 async file =>
                 {
-                    // Scoped so the writer's footer lands before the helper reads Position.
                     await using var writer = new ParquetFileWriter(file, ownsFile: false, _parquetOptions);
                     await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+                    await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
                 }, cancellationToken).ConfigureAwait(false);
         }
 

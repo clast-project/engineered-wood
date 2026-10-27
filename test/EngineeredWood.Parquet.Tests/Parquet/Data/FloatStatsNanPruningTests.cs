@@ -64,6 +64,7 @@ public sealed class FloatStatsNanPruningTests : IDisposable
             await using var writer = new ParquetFileWriter(file, options: new ParquetWriteOptions());
             await writer.WriteRowGroupAsync(
                 new RecordBatch(schema, [builder.Build()], values.Length));
+            await writer.CloseAsync();
         }
 
         await using var input = new LocalRandomAccessFile(path);
@@ -92,6 +93,7 @@ public sealed class FloatStatsNanPruningTests : IDisposable
             await using var writer = new ParquetFileWriter(file, options: new ParquetWriteOptions());
             await writer.WriteRowGroupAsync(new RecordBatch(schema,
                 [new DoubleArray.Builder().Append(1.0).Append(2.0).Build()], 2));
+            await writer.CloseAsync();
         }
 
         await using var input = new LocalRandomAccessFile(path);

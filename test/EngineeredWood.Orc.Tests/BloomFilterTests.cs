@@ -209,6 +209,7 @@ public class BloomFilterTests
                 var names = new StringArray.Builder();
                 for (int i = 0; i < 100; i++) names.Append($"name_{i}");
                 await writer.WriteBatchAsync(new RecordBatch(schema, [names.Build()], 100));
+                await writer.CloseAsync();
             }
 
             await using var reader = await OrcReader.OpenAsync(path);
@@ -257,6 +258,7 @@ public class BloomFilterTests
                     await writer.WriteBatchAsync(new RecordBatch(schema,
                         [ids.Build(), names.Build()], 200));
                 }
+                await writer.CloseAsync();
             }
 
             // Read back and verify bloom filters.
@@ -309,6 +311,7 @@ public class BloomFilterTests
                 var vals = new StringArray.Builder();
                 for (int i = 0; i < 100; i++) vals.Append($"v{i}");
                 await writer.WriteBatchAsync(new RecordBatch(schema, [vals.Build()], 100));
+                await writer.CloseAsync();
             }
 
             // Verify the bloom filter stream kind and encoding.

@@ -563,19 +563,21 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             .ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Releases the writer. Without a prior <see cref="CloseAsync"/> this abandons the file: no footer is
+    /// written and, when the writer owns the file, disposing it discards the write, so a write that failed
+    /// part-way publishes nothing.
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
-
-        if (!_closed)
-            await CloseAsync().ConfigureAwait(false);
-
         _disposed = true;
 
         if (_ownsFile)
             await _file.DisposeAsync().ConfigureAwait(false);
     }
 
+    /// <inheritdoc cref="DisposeAsync"/>
     public void Dispose()
     {
         if (_disposed) return;
