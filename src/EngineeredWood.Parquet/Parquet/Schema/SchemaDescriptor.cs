@@ -17,7 +17,12 @@ public sealed class SchemaDescriptor
     /// <summary>All leaf (primitive) columns in pre-order traversal order.</summary>
     public IReadOnlyList<ColumnDescriptor> Columns { get; }
 
-    public SchemaDescriptor(IReadOnlyList<SchemaElement> schemaElements)
+    /// <param name="schemaElements">The file's flattened schema.</param>
+    /// <param name="columnOrders">
+    /// The file's <c>column_orders</c>, one per leaf column, or null when it has none. Sets each
+    /// column's <see cref="ColumnDescriptor.ColumnOrder"/>.
+    /// </param>
+    public SchemaDescriptor(IReadOnlyList<SchemaElement> schemaElements, IReadOnlyList<ColumnOrder>? columnOrders = null)
     {
         if (schemaElements.Count == 0)
             throw new ParquetFormatException("Schema must contain at least a root element.");
@@ -33,7 +38,40 @@ public sealed class SchemaDescriptor
         // Pre-allocate a path buffer sized to the maximum possible tree depth.
         var pathBuffer = new string[schemaElements.Count];
         CollectLeaves(Root, pathBuffer, depth: 0, defLevel: 0, repLevel: 0, columns);
+
+        // A list that does not match the leaves cannot be attributed to them, so no column's order is
+        // known. That costs pruning, never a wrong answer.
+        bool ordersUsable = columnOrders is null || columnOrders.Count == columns.Count;
+        for (int i = 0; i < columns.Count; i++)
+        {
+            var declared = columnOrders is null ? ColumnOrder.TypeDefined
+                : ordersUsable ? columnOrders[i]
+                : ColumnOrder.Undefined;
+            var order = EffectiveOrder(columns[i], declared);
+            if (order != ColumnOrder.TypeDefined)
+                columns[i] = columns[i].WithColumnOrder(order);
+        }
         Columns = columns;
+    }
+
+    /// <summary>
+    /// <paramref name="declared"/>, unless the reader cannot use it: a column whose type annotation was
+    /// ignored has no known order (parquet-format 2.14, GH-606), and IEEE 754 total order applies only
+    /// to FLOAT, DOUBLE and FLOAT16.
+    /// </summary>
+    private static ColumnOrder EffectiveOrder(ColumnDescriptor column, ColumnOrder declared)
+    {
+        if (column.SchemaNode.AnnotationIgnored)
+            return ColumnOrder.Undefined;
+
+        if (declared == ColumnOrder.Ieee754TotalOrder
+            && column.PhysicalType is not (PhysicalType.Float or PhysicalType.Double)
+            && column.SchemaElement.LogicalType is not LogicalType.Float16Type)
+        {
+            return ColumnOrder.Undefined;
+        }
+
+        return declared;
     }
 
     private static SchemaNode BuildTree(

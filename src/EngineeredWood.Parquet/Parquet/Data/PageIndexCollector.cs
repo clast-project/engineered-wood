@@ -109,8 +109,8 @@ internal sealed class PageIndexCollector
             Fold(bounds);
 
         _nullPages.Add(nullPage);
-        _mins.Add(nullPage ? [] : Truncate(bounds.Min!, max: false));
-        _maxes.Add(nullPage ? [] : Truncate(bounds.Max!, max: true));
+        _mins.Add(nullPage ? [] : Truncate(LowerBound(bounds.Min!), max: false));
+        _maxes.Add(nullPage ? [] : Truncate(UpperBound(bounds.Max!), max: true));
         _nullCounts.Add(nullCount);
         if (_floatingPoint)
             _nanCounts.Add(nullPage ? 0 : bounds.NanCount);
@@ -214,6 +214,14 @@ internal sealed class PageIndexCollector
 
     private int Compare(byte[] left, byte[] right) =>
         StatisticsCollector.CompareValues(left, right, _physicalType, _order);
+
+    // TYPE_ORDER's signed-zero rule (see StatisticsCollector.TypeOrderLowerBound). The chunk fold above
+    // keeps the exact bounds; the chunk statistics get the same rule where they are written.
+    private byte[] LowerBound(byte[] min) =>
+        _floatingPoint && !FloatingPointTotalOrder ? StatisticsCollector.TypeOrderLowerBound(min, _physicalType) : min;
+
+    private byte[] UpperBound(byte[] max) =>
+        _floatingPoint && !FloatingPointTotalOrder ? StatisticsCollector.TypeOrderUpperBound(max, _physicalType) : max;
 
     private bool IsNaN(byte[] value) => _physicalType == PhysicalType.Float
         ? float.IsNaN(MemoryMarshal.Read<float>(value))

@@ -36,4 +36,25 @@ public sealed class ColumnDescriptor
 
     /// <summary>The Parquet field_id for this column, if set.</summary>
     public int? FieldId => SchemaElement.FieldId;
+
+    /// <summary>
+    /// The order this column's min/max statistics and page-index bounds are in, as the reader honours
+    /// it: the file's <c>column_orders</c> entry, or <see cref="ColumnOrder.TypeDefined"/> when the
+    /// file has none. <see cref="ColumnOrder.Undefined"/> — an order this reader does not recognize,
+    /// one the spec does not allow on this column's type, or a column whose type annotation was
+    /// ignored — means the bounds are not used.
+    /// </summary>
+    public ColumnOrder ColumnOrder { get; internal init; } = ColumnOrder.TypeDefined;
+
+    internal ColumnDescriptor WithColumnOrder(ColumnOrder order) => new()
+    {
+        Path = Path,
+        PhysicalType = PhysicalType,
+        TypeLength = TypeLength,
+        MaxDefinitionLevel = MaxDefinitionLevel,
+        MaxRepetitionLevel = MaxRepetitionLevel,
+        SchemaElement = SchemaElement,
+        SchemaNode = SchemaNode,
+        ColumnOrder = order,
+    };
 }

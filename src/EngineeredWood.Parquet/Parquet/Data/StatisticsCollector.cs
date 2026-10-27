@@ -795,6 +795,65 @@ internal static class StatisticsCollector
         return (DoubleToBytes(min), DoubleToBytes(max), nanCount);
     }
 
+    /// <summary>
+    /// TYPE_ORDER's rule for signed zeros, for a FLOAT/DOUBLE lower bound: a zero minimum is written as
+    /// <c>-0.0</c> whichever zero the values held. TYPE_ORDER does not say whether -0 sorts below +0, so
+    /// the bound must hold under either reading; a reader that orders them would otherwise prune
+    /// <c>x = -0.0</c> from a chunk of <c>+0.0</c>. IEEE 754 total order needs no such rule: it orders
+    /// the zeros, and its bounds are exact. Returns <paramref name="bound"/> itself when nothing changes.
+    /// </summary>
+    internal static byte[] TypeOrderLowerBound(byte[] bound, PhysicalType physicalType) =>
+        IsZero(bound, physicalType) ? SignedZero(physicalType, negative: true) : bound;
+
+    /// <summary>The upper-bound counterpart of <see cref="TypeOrderLowerBound"/>: a zero maximum is
+    /// written as <c>+0.0</c>.</summary>
+    internal static byte[] TypeOrderUpperBound(byte[] bound, PhysicalType physicalType) =>
+        IsZero(bound, physicalType) ? SignedZero(physicalType, negative: false) : bound;
+
+    /// <summary>
+    /// <paramref name="stats"/> with <see cref="TypeOrderLowerBound"/> and
+    /// <see cref="TypeOrderUpperBound"/> applied to its bounds; itself when the column is not
+    /// FLOAT/DOUBLE, is written in IEEE 754 total order, or has no zero bound.
+    /// </summary>
+    internal static Statistics ApplyTypeOrderZeroRule(Statistics stats, PhysicalType physicalType, bool totalOrder)
+    {
+        if (totalOrder || physicalType is not (PhysicalType.Float or PhysicalType.Double))
+            return stats;
+
+        byte[]? Lower(byte[]? b) => b is null ? null : TypeOrderLowerBound(b, physicalType);
+        byte[]? Upper(byte[]? b) => b is null ? null : TypeOrderUpperBound(b, physicalType);
+        var min = Lower(stats.Min);
+        var max = Upper(stats.Max);
+        var minValue = Lower(stats.MinValue);
+        var maxValue = Upper(stats.MaxValue);
+        if (min == stats.Min && max == stats.Max && minValue == stats.MinValue && maxValue == stats.MaxValue)
+            return stats;
+
+        return new Statistics
+        {
+            NullCount = stats.NullCount,
+            DistinctCount = stats.DistinctCount,
+            Min = min,
+            Max = max,
+            MinValue = minValue,
+            MaxValue = maxValue,
+            IsMinValueExact = stats.IsMinValueExact,
+            IsMaxValueExact = stats.IsMaxValueExact,
+            NanCount = stats.NanCount,
+        };
+    }
+
+    private static bool IsZero(byte[] bound, PhysicalType physicalType) => physicalType switch
+    {
+        PhysicalType.Float => bound.Length == 4 && MemoryMarshal.Read<float>(bound) == 0f,
+        PhysicalType.Double => bound.Length == 8 && MemoryMarshal.Read<double>(bound) == 0.0,
+        _ => false,
+    };
+
+    private static byte[] SignedZero(PhysicalType physicalType, bool negative) => physicalType == PhysicalType.Float
+        ? FloatToBytes(negative ? -0.0f : 0.0f)
+        : DoubleToBytes(negative ? -0.0 : 0.0);
+
     private static byte[] FloatToBytes(float value)
     {
         var bytes = new byte[4];
