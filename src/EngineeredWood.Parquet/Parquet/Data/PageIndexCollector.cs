@@ -40,7 +40,7 @@ internal sealed class PageIndexCollector
     // The chunk's bounds, folded from the untruncated page bounds as the pages arrive, so the chunk
     // statistics need not scan the values a second time. Strict comparisons keep the first of equal
     // values, as the full scan does.
-    private byte[]? _chunkMin, _chunkMax, _firstNaN;
+    private byte[]? _chunkMin, _chunkMax, _minNaN, _maxNaN;
     private long _chunkNanCount;
 
     /// <param name="writeColumnIndex">
@@ -126,7 +126,7 @@ internal sealed class PageIndexCollector
             return null;
 
         return StatisticsCollector.FromBounds(
-            _physicalType, _chunkMin, _chunkMax, _firstNaN, _chunkNanCount,
+            _physicalType, _chunkMin, _chunkMax, _minNaN, _maxNaN, _chunkNanCount,
             levelCount - nonNullCount, FloatingPointTotalOrder);
     }
 
@@ -134,10 +134,14 @@ internal sealed class PageIndexCollector
     {
         _chunkNanCount += bounds.NanCount;
 
-        // A NaN bound is an all-NaN page under total order; it takes part only if nothing else does.
+        // A NaN bound is an all-NaN page under total order, its smallest and largest NaN; they take part
+        // only if nothing else does, and then as the chunk's smallest and largest NaN.
         if (_floatingPoint && IsNaN(bounds.Min!))
         {
-            _firstNaN ??= bounds.Min;
+            if (_minNaN is null || TotalOrderKey(bounds.Min!) < TotalOrderKey(_minNaN))
+                _minNaN = bounds.Min;
+            if (_maxNaN is null || TotalOrderKey(bounds.Max!) > TotalOrderKey(_maxNaN))
+                _maxNaN = bounds.Max;
             return;
         }
 
@@ -223,6 +227,8 @@ internal sealed class PageIndexCollector
     private byte[] UpperBound(byte[] max) =>
         _floatingPoint && !FloatingPointTotalOrder ? StatisticsCollector.TypeOrderUpperBound(max, _physicalType) : max;
 
+    private long TotalOrderKey(byte[] value) => StatisticsCollector.TotalOrderKey(value, _physicalType);
+
     private bool IsNaN(byte[] value) => _physicalType == PhysicalType.Float
         ? float.IsNaN(MemoryMarshal.Read<float>(value))
         : double.IsNaN(MemoryMarshal.Read<double>(value));
@@ -235,8 +241,8 @@ internal sealed class PageIndexCollector
 /// <remarks>
 /// Each distinct entry a page references is compared once, with
 /// <see cref="StatisticsCollector.CompareValues"/>, the comparator the chunk statistics use. NaN
-/// entries are counted, not compared; an all-NaN page under IEEE 754 total order takes the first NaN
-/// in row order as both bounds, as the full scan does.
+/// entries are counted, not compared by value; an all-NaN page under IEEE 754 total order takes its
+/// smallest and largest NaN as its bounds, as the full scan does.
 /// </remarks>
 internal sealed class DictionaryPageBounds
 {
@@ -253,7 +259,7 @@ internal sealed class DictionaryPageBounds
     private readonly int[] _seen;
     private int _page;
 
-    private int _min, _max, _firstNaN;
+    private int _min, _max, _minNaN, _maxNaN;
     private long _nanCount;
 
     public DictionaryPageBounds(in DictionaryEncoder.DictionaryResult dictionary, PageIndexCollector collector)
@@ -316,7 +322,7 @@ internal sealed class DictionaryPageBounds
     public void Begin()
     {
         _page++;
-        _min = _max = _firstNaN = -1;
+        _min = _max = _minNaN = _maxNaN = -1;
         _nanCount = 0;
     }
 
@@ -325,7 +331,14 @@ internal sealed class DictionaryPageBounds
     {
         if (_nanEntries is not null && _nanEntries[entry])
         {
-            if (_firstNaN < 0) _firstNaN = entry;
+            if (_totalOrder)
+            {
+                long key = StatisticsCollector.TotalOrderKey(Entry(entry), _physicalType);
+                if (_minNaN < 0 || key < StatisticsCollector.TotalOrderKey(Entry(_minNaN), _physicalType))
+                    _minNaN = entry;
+                if (_maxNaN < 0 || key > StatisticsCollector.TotalOrderKey(Entry(_maxNaN), _physicalType))
+                    _maxNaN = entry;
+            }
             _nanCount += count;
             return;
         }
@@ -357,11 +370,8 @@ internal sealed class DictionaryPageBounds
         if (_min >= 0)
             return new PageBounds(Entry(_min).ToArray(), Entry(_max).ToArray(), _nanCount);
 
-        if (_firstNaN >= 0 && _totalOrder)
-        {
-            byte[] nan = Entry(_firstNaN).ToArray();
-            return new PageBounds(nan, nan, _nanCount);
-        }
+        if (_minNaN >= 0)
+            return new PageBounds(Entry(_minNaN).ToArray(), Entry(_maxNaN).ToArray(), _nanCount);
 
         return new PageBounds(null, null, _nanCount);
     }

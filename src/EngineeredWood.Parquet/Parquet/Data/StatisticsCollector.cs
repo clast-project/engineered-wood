@@ -30,8 +30,8 @@ internal static class StatisticsCollector
     /// </summary>
     /// <param name="floatingPointTotalOrder">
     /// When <see langword="true"/>, FLOAT/DOUBLE min/max follow IEEE 754 total
-    /// order: an all-NaN chunk records the NaN value as its bounds rather than
-    /// omitting them. When <see langword="false"/> (the TYPE_ORDER default) an
+    /// order: an all-NaN chunk records its smallest and largest NaN (in that order)
+    /// as its bounds rather than omitting them. When <see langword="false"/> (the TYPE_ORDER default) an
     /// all-NaN chunk omits min/max. NaN is excluded from the bounds either way,
     /// and a <c>nan_count</c> is always recorded for FLOAT/DOUBLE columns.
     /// </param>
@@ -198,7 +198,8 @@ internal static class StatisticsCollector
     /// </summary>
     /// <param name="min">The least non-NaN value, untruncated; null if every value is NaN.</param>
     /// <param name="max">The greatest non-NaN value, untruncated.</param>
-    /// <param name="firstNaN">The first NaN in row order, for an all-NaN chunk under total order.</param>
+    /// <param name="minNaN">The smallest NaN in IEEE 754 total order, for an all-NaN chunk under total order.</param>
+    /// <param name="maxNaN">The largest NaN in IEEE 754 total order, likewise.</param>
     /// <param name="nanCount">NaN values in the chunk, for FLOAT/DOUBLE.</param>
     /// <remarks>
     /// Mirrors <see cref="Compute"/> field for field, including the 64-byte BYTE_ARRAY truncation and
@@ -209,7 +210,8 @@ internal static class StatisticsCollector
         PhysicalType physicalType,
         byte[]? min,
         byte[]? max,
-        byte[]? firstNaN,
+        byte[]? minNaN,
+        byte[]? maxNaN,
         long nanCount,
         long nullCount,
         bool floatingPointTotalOrder)
@@ -217,7 +219,10 @@ internal static class StatisticsCollector
         if (physicalType is PhysicalType.Float or PhysicalType.Double)
         {
             if (min is null && floatingPointTotalOrder && nanCount > 0)
-                min = max = firstNaN;
+            {
+                min = minNaN;
+                max = maxNaN;
+            }
 
             return new Statistics
             {
@@ -366,16 +371,17 @@ internal static class StatisticsCollector
 
         var nanEntries = FindNaNEntries(span, dictCount, isFloat);
         long nanCount = 0;
-        int firstNaNEntry = -1;
+        int minNaNEntry = -1, maxNaNEntry = -1;
         if (nanEntries != null)
-            nanCount = CountNaNRows(dictResult, nanEntries, out firstNaNEntry);
+            nanCount = CountNaNRows(dictResult, nanEntries, span, physicalType, out minNaNEntry, out maxNaNEntry);
 
         if (minBytes is null && floatingPointTotalOrder && nanCount > 0)
         {
-            // No non-NaN values. Under IEEE 754 total order, an all-NaN chunk records the NaN as both
-            // bounds; under TYPE_ORDER, min/max are omitted. Which NaN is not arbitrary — payloads differ
-            // — so it is the first in ROW order, the one the full scan would have picked.
-            minBytes = maxBytes = span.Slice(firstNaNEntry * elementSize, elementSize).ToArray();
+            // No non-NaN values. Under IEEE 754 total order, an all-NaN chunk records its smallest and
+            // largest NaN as the bounds — the ones the full scan picks; under TYPE_ORDER, min/max are
+            // omitted.
+            minBytes = span.Slice(minNaNEntry * elementSize, elementSize).ToArray();
+            maxBytes = span.Slice(maxNaNEntry * elementSize, elementSize).ToArray();
         }
 
         return new Statistics
@@ -423,21 +429,32 @@ internal static class StatisticsCollector
     }
 
     /// <summary>
-    /// Counts the rows whose index points at a NaN entry, and reports the entry the FIRST such row
-    /// points at. Reads whichever index form the dictionary result carries.
+    /// Counts the rows whose index points at a NaN entry, and reports the referenced NaN entries that
+    /// are smallest and largest in IEEE 754 total order. Reads whichever index form the dictionary
+    /// result carries.
     /// </summary>
     private static long CountNaNRows(
-        in DictionaryEncoder.DictionaryResult dictResult, bool[] nanEntries, out int firstNaNEntry)
+        in DictionaryEncoder.DictionaryResult dictResult, bool[] nanEntries, ReadOnlySpan<byte> dictPage,
+        PhysicalType physicalType, out int minNaNEntry, out int maxNaNEntry)
     {
+        int elementSize = physicalType == PhysicalType.Float ? 4 : 8;
         long nanCount = 0;
-        firstNaNEntry = -1;
+        int minEntry = -1, maxEntry = -1;
+        long minKey = 0, maxKey = 0;
+
+        void See(int entry, ReadOnlySpan<byte> page)
+        {
+            long key = TotalOrderKey(page.Slice(entry * elementSize, elementSize), physicalType);
+            if (minEntry < 0 || key < minKey) { minEntry = entry; minKey = key; }
+            if (maxEntry < 0 || key > maxKey) { maxEntry = entry; maxKey = key; }
+        }
 
         if (dictResult.Indices is { } indices)
         {
             foreach (int index in indices)
             {
                 if (!nanEntries[index]) continue;
-                if (nanCount == 0) firstNaNEntry = index;
+                See(index, dictPage);
                 nanCount++;
             }
         }
@@ -446,11 +463,13 @@ internal static class StatisticsCollector
             for (int r = 0; r < runs.Values.Length; r++)
             {
                 if (!nanEntries[runs.Values[r]]) continue;
-                if (nanCount == 0) firstNaNEntry = runs.Values[r];
+                See(runs.Values[r], dictPage);
                 nanCount += runs.Lengths[r];
             }
         }
 
+        minNaNEntry = minEntry;
+        maxNaNEntry = maxEntry;
         return nanCount;
     }
 
@@ -697,10 +716,11 @@ internal static class StatisticsCollector
         IArrowArray array, int[]? defLevels, bool totalOrder, int start, int end)
     {
         var valueBuffer = MemoryMarshal.Cast<byte, float>(array.Data.Buffers[1].Span);
+        var bitsBuffer = MemoryMarshal.Cast<byte, int>(array.Data.Buffers[1].Span);
         bool first = true;
         float min = 0, max = 0;
         long nanCount = 0;
-        float firstNaN = 0;
+        var nans = default(NaNRange);
 
         for (int i = start; i < end; i++)
         {
@@ -708,7 +728,11 @@ internal static class StatisticsCollector
             float val = valueBuffer[i];
             if (float.IsNaN(val))
             {
-                if (nanCount == 0) firstNaN = val;
+                if (totalOrder)
+                {
+                    int bits = bitsBuffer[i];
+                    nans.Add(bits, bits ^ ((bits >> 31) & 0x7FFF_FFFF));
+                }
                 nanCount++;
                 continue; // NaN excluded from min/max
             }
@@ -735,10 +759,10 @@ internal static class StatisticsCollector
 
         if (first)
         {
-            // No non-NaN values. Under IEEE 754 total order, an all-NaN chunk
-            // records the NaN as both bounds; under TYPE_ORDER, min/max are omitted.
-            if (totalOrder && nanCount > 0)
-                return (FloatToBytes(firstNaN), FloatToBytes(firstNaN), nanCount);
+            // No non-NaN values. Under IEEE 754 total order, an all-NaN chunk records its smallest
+            // and largest NaN as the bounds; under TYPE_ORDER, min/max are omitted.
+            if (nans.Any)
+                return (Int32BitsToBytes(nans.MinBits), Int32BitsToBytes(nans.MaxBits), nanCount);
             return (null, null, nanCount);
         }
 
@@ -749,10 +773,11 @@ internal static class StatisticsCollector
         IArrowArray array, int[]? defLevels, bool totalOrder, int start, int end)
     {
         var valueBuffer = MemoryMarshal.Cast<byte, double>(array.Data.Buffers[1].Span);
+        var bitsBuffer = MemoryMarshal.Cast<byte, long>(array.Data.Buffers[1].Span);
         bool first = true;
         double min = 0, max = 0;
         long nanCount = 0;
-        double firstNaN = 0;
+        var nans = default(NaNRange);
 
         for (int i = start; i < end; i++)
         {
@@ -760,7 +785,11 @@ internal static class StatisticsCollector
             double val = valueBuffer[i];
             if (double.IsNaN(val))
             {
-                if (nanCount == 0) firstNaN = val;
+                if (totalOrder)
+                {
+                    long bits = bitsBuffer[i];
+                    nans.Add(bits, bits ^ ((bits >> 63) & 0x7FFF_FFFF_FFFF_FFFF));
+                }
                 nanCount++;
                 continue;
             }
@@ -787,8 +816,8 @@ internal static class StatisticsCollector
 
         if (first)
         {
-            if (totalOrder && nanCount > 0)
-                return (DoubleToBytes(firstNaN), DoubleToBytes(firstNaN), nanCount);
+            if (nans.Any)
+                return (Int64BitsToBytes(nans.MinBits), Int64BitsToBytes(nans.MaxBits), nanCount);
             return (null, null, nanCount);
         }
 
@@ -853,6 +882,55 @@ internal static class StatisticsCollector
     private static byte[] SignedZero(PhysicalType physicalType, bool negative) => physicalType == PhysicalType.Float
         ? FloatToBytes(negative ? -0.0f : 0.0f)
         : DoubleToBytes(negative ? -0.0 : 0.0);
+
+    /// <summary>
+    /// A FLOAT or DOUBLE value's position in IEEE 754 total order, as a signed integer: the bits, with
+    /// a negative value's magnitude bits flipped so that more negative sorts lower. Orders NaNs too —
+    /// by sign, then payload — which is what an all-NaN chunk's bounds need under total order.
+    /// </summary>
+    internal static long TotalOrderKey(ReadOnlySpan<byte> value, PhysicalType physicalType)
+    {
+        if (physicalType == PhysicalType.Float)
+        {
+            int bits = BinaryPrimitives.ReadInt32LittleEndian(value);
+            return bits ^ ((bits >> 31) & 0x7FFF_FFFF);
+        }
+
+        long bits64 = BinaryPrimitives.ReadInt64LittleEndian(value);
+        return bits64 ^ ((bits64 >> 63) & 0x7FFF_FFFF_FFFF_FFFF);
+    }
+
+    /// <summary>
+    /// Tracks the smallest and largest NaN in IEEE 754 total order, kept as raw bits so payloads
+    /// survive. Under total order these are an all-NaN chunk's or page's bounds (parquet.thrift).
+    /// </summary>
+    private struct NaNRange
+    {
+        private long _minKey, _maxKey;
+        public long MinBits, MaxBits;
+        public bool Any;
+
+        public void Add(long bits, long key)
+        {
+            if (!Any || key < _minKey) { _minKey = key; MinBits = bits; }
+            if (!Any || key > _maxKey) { _maxKey = key; MaxBits = bits; }
+            Any = true;
+        }
+    }
+
+    private static byte[] Int32BitsToBytes(long bits)
+    {
+        var bytes = new byte[4];
+        BinaryPrimitives.WriteInt32LittleEndian(bytes, (int)bits);
+        return bytes;
+    }
+
+    private static byte[] Int64BitsToBytes(long bits)
+    {
+        var bytes = new byte[8];
+        BinaryPrimitives.WriteInt64LittleEndian(bytes, bits);
+        return bytes;
+    }
 
     private static byte[] FloatToBytes(float value)
     {
