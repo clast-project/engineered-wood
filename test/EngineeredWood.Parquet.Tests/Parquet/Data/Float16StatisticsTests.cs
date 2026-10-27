@@ -26,6 +26,14 @@ public sealed class Float16StatisticsTests : IDisposable
         MinusHalf = 0xB800, PlusZero = 0x0000, MinusZero = 0x8000, Two = 0x4000;
     private const ushort QuietNaN = 0x7E00, NegativeNaN = 0xFE01, PayloadNaN = 0x7E05;
 
+    /// <summary>
+    /// Each value in a test is written as a run of this many rows. A handful of rows would put every
+    /// distinct value over the writers' 20% dictionary-cardinality limit, so a "dictionary" case would
+    /// quietly write plain and the dictionary paths would go untested; runs keep the dictionary, and with
+    /// small pages they also spread each column over several pages. WriteAsync checks the encoding.
+    /// </summary>
+    private const int RunLength = 100;
+
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ew-f16stats-" + Guid.NewGuid().ToString("N")[..8]);
 
     public Float16StatisticsTests() => Directory.CreateDirectory(_dir);
@@ -82,7 +90,7 @@ public sealed class Float16StatisticsTests : IDisposable
         string path = await WriteAsync([QuietNaN, One, NegativeNaN, Two], writer, dictionary, pageIndex);
 
         var stats = await ReadStatisticsAsync(path);
-        Assert.Equal(2, stats.NanCount);
+        Assert.Equal(2 * RunLength, stats.NanCount);
         Assert.Equal(One, Bits(stats.MinValue!));
         Assert.Equal(Two, Bits(stats.MaxValue!));
     }
@@ -101,7 +109,8 @@ public sealed class Float16StatisticsTests : IDisposable
 
     /// <summary>
     /// Under IEEE 754 total order an all-NaN chunk's bounds are its smallest and largest NaN (#553);
-    /// under TYPE_ORDER it has none.
+    /// under TYPE_ORDER it has none. The NaNs fall in different pages, so with a page index the chunk's
+    /// bounds are folded across pages, and each page's ColumnIndex bounds are its own NaNs.
     /// </summary>
     [Theory]
     [MemberData(nameof(Writers))]
@@ -109,16 +118,28 @@ public sealed class Float16StatisticsTests : IDisposable
     {
         ushort[] values = [QuietNaN, NegativeNaN, PayloadNaN];
 
-        var total = await ReadStatisticsAsync(await WriteAsync(values, writer, dictionary, pageIndex,
-            FloatingPointColumnOrder.Ieee754TotalOrder));
+        string totalPath = await WriteAsync(values, writer, dictionary, pageIndex, FloatingPointColumnOrder.Ieee754TotalOrder);
+        var total = await ReadStatisticsAsync(totalPath);
         Assert.Equal(NegativeNaN, Bits(total.MinValue!));
         Assert.Equal(PayloadNaN, Bits(total.MaxValue!));
-        Assert.Equal(3, total.NanCount);
+        Assert.Equal(3 * RunLength, total.NanCount);
+
+        if (pageIndex)
+        {
+            await using var file = new LocalRandomAccessFile(totalPath);
+            await using var reader = new ParquetFileReader(file, ownsFile: false);
+            var columnIndex = Assert.IsType<ColumnIndex>((await reader.ReadPageIndexAsync(0))[0].ColumnIndex);
+            Assert.True(columnIndex.MinValues.Count > 1, "expected several pages");
+            Assert.Equal(NegativeNaN, columnIndex.MinValues.Select(Bits).OrderBy(Key).First());
+            Assert.Equal(PayloadNaN, columnIndex.MaxValues.Select(Bits).OrderBy(Key).Last());
+            Assert.Equal(3L * RunLength, columnIndex.NanCounts!.Sum());
+            Assert.Equal(QuietNaN, Bits(columnIndex.MinValues[0]));   // the first page holds only the first run
+        }
 
         var typeOrder = await ReadStatisticsAsync(await WriteAsync(values, writer, dictionary, pageIndex));
         Assert.Null(typeOrder.MinValue);
         Assert.Null(typeOrder.MaxValue);
-        Assert.Equal(3, typeOrder.NanCount);
+        Assert.Equal(3 * RunLength, typeOrder.NanCount);
     }
 
     /// <summary>
@@ -134,7 +155,7 @@ public sealed class Float16StatisticsTests : IDisposable
     {
         ushort[] runs = [MinusThree, MinusHalf, One, JustAboveOne, OnePointFive, Two];
         var values = runs.SelectMany(v => Enumerable.Repeat(v, 500)).Append(QuietNaN).ToArray();
-        string path = await WriteAsync(values, writer, dictionary, pageIndex: true, dataPageSize: 256);
+        string path = await WriteAsync(values, writer, dictionary, pageIndex: true, dataPageSize: 256, runLength: 1);
 
         await using var file = new LocalRandomAccessFile(path);
         await using var reader = new ParquetFileReader(file, ownsFile: false);
@@ -170,9 +191,15 @@ public sealed class Float16StatisticsTests : IDisposable
 
     // ── Helpers ──
 
-    private async Task<string> WriteAsync(ushort[] halves, string writer, bool dictionary, bool pageIndex,
-        FloatingPointColumnOrder order = FloatingPointColumnOrder.TypeDefined, int? dataPageSize = null)
+    /// <summary>
+    /// Writes <paramref name="values"/>, each as a run of <paramref name="runLength"/> rows, and checks
+    /// that the chunk was dictionary-encoded exactly when <paramref name="dictionary"/> says so.
+    /// </summary>
+    private async Task<string> WriteAsync(ushort[] values, string writer, bool dictionary, bool pageIndex,
+        FloatingPointColumnOrder order = FloatingPointColumnOrder.TypeDefined, int dataPageSize = 64,
+        int runLength = RunLength)
     {
+        var halves = values.SelectMany(v => Enumerable.Repeat(v, runLength)).ToArray();
         var bytes = new byte[halves.Length * 2];
         for (int i = 0; i < halves.Length; i++)
             BinaryPrimitives.WriteUInt16LittleEndian(bytes.AsSpan(i * 2), halves[i]);
@@ -187,9 +214,8 @@ public sealed class Float16StatisticsTests : IDisposable
             DictionaryEnabled = dictionary,
             WritePageIndex = pageIndex,
             FloatingPointOrder = order,
+            DataPageSize = dataPageSize,
         };
-        if (dataPageSize is { } size)
-            options = options with { DataPageSize = size };
 
         string path = Path.Combine(_dir, Guid.NewGuid().ToString("N")[..8] + ".parquet");
         await using var file = new LocalSequentialFile(path);
@@ -205,7 +231,18 @@ public sealed class Float16StatisticsTests : IDisposable
             await w.AppendAsync(batch);
             await w.CloseAsync();
         }
+
+        var chunk = (await ReadStatisticsChunkAsync(path)).MetaData!;
+        Assert.True(dictionary == chunk.DictionaryPageOffset is not null,
+            $"expected the chunk {(dictionary ? "" : "not ")}to be dictionary-encoded");
         return path;
+    }
+
+    private static async Task<ColumnChunk> ReadStatisticsChunkAsync(string path)
+    {
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        return (await reader.ReadMetadataAsync()).RowGroups[0].Columns[0];
     }
 
     private static async Task<Statistics> ReadStatisticsAsync(string path)
