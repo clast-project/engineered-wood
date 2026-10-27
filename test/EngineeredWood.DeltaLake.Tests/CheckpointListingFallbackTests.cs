@@ -425,6 +425,59 @@ public class CheckpointListingFallbackTests : IDisposable
     }
 
     /// <summary>
+    /// A hint naming a multi-part checkpoint of zero parts read as zero files and counted as a starting
+    /// point. With a later commit that carries its own protocol and metadata, the table then opened
+    /// holding only that commit's file, the five before it silently gone. The listed checkpoint is used.
+    /// </summary>
+    [Fact]
+    public async Task HintOfZeroParts_DoesNotStartTheTableEmpty()
+    {
+        await WriteTableAsync(addCommits: 5);
+        await CheckpointAsync(5);
+        await _log.WriteCommitAsync(6, [
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            new MetadataAction
+            {
+                Id = "listing-fallback",
+                Format = Format.Parquet,
+                SchemaString = SchemaJson,
+                PartitionColumns = [],
+            },
+            new AddFile
+            {
+                Path = "part-6.parquet",
+                PartitionValues = new Dictionary<string, string>(),
+                Size = 600,
+                ModificationTime = 1700000000006,
+                DataChange = true,
+            },
+        ]);
+        DeleteCommitsBefore(5);
+        WriteHint("""{"version":5,"size":7,"parts":0}""");
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// The read itself refuses a checkpoint with no protocol or metadata, however it came to read
+    /// nothing, so a bootstrap moves on to the next candidate rather than starting from it.
+    /// </summary>
+    [Fact]
+    public async Task CheckpointReadYieldingNoProtocolOrMetadata_IsRefused()
+    {
+        await WriteTableAsync(addCommits: 1);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await new CheckpointReader(_fs).ReadCheckpointAsync(
+                new LastCheckpointInfo { Version = 1, Size = 0, Parts = 0 }));
+
+        Assert.Equal(DeltaErrorCodes.StateRecoverError, ex.ErrorCode);
+    }
+
+    /// <summary>
     /// A hole above the only checkpoint cannot be replayed around. The error names that hole, as it did
     /// before checkpoints were judged by their replay, rather than claiming version 0 is missing.
     /// </summary>

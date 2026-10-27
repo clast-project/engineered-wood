@@ -109,6 +109,8 @@ public class LastCheckpointToleranceTests : IDisposable
     [InlineData("""{"version":null,"size":42}""")]  // version is null
     [InlineData("""{"version":7.5,"size":42}""")]   // version is not an integer
     [InlineData("""{"version":7,"size":42,"parts":"3"}""")]        // optional field, wrong type
+    [InlineData("""{"version":7,"size":42,"parts":0}""")]          // a multi-part checkpoint of no parts
+    [InlineData("""{"version":7,"size":42,"parts":-1}""")]
     [InlineData("""{"version":7,"size":42,"sizeInBytes":null}""")] // optional field, null
     public async Task HintWithUnusableField_IsNull(string content)
     {

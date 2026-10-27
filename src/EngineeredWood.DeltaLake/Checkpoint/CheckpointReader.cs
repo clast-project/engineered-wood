@@ -55,11 +55,18 @@ public sealed class CheckpointReader
                     v2Path = NormalizeLogPath(pathProp.GetString());
             }
 
+            int? partCount = root.TryGetProperty("parts", out var parts) ? parts.GetInt32() : null;
+
+            // A multi-part checkpoint has at least one part. Zero parts would be read as zero files — a
+            // checkpoint with no protocol, no metadata and no files — so the hint is unusable instead.
+            if (partCount < 1)
+                return null;
+
             return new LastCheckpointInfo
             {
                 Version = root.GetProperty("version").GetInt64(),
                 Size = root.GetProperty("size").GetInt64(),
-                Parts = root.TryGetProperty("parts", out var parts) ? parts.GetInt32() : null,
+                Parts = partCount,
                 SizeInBytes = root.TryGetProperty("sizeInBytes", out var sib)
                     ? sib.GetInt64() : null,
                 NumOfAddFiles = root.TryGetProperty("numOfAddFiles", out var naf)
@@ -203,6 +210,20 @@ public sealed class CheckpointReader
             // `sidecar` row — a sidecar that referenced another would otherwise be an unbounded read.
             await ReadParquetCheckpointBodyAsync(
                 SidecarPath(sidecar), actions, sidecars: null, cancellationToken).ConfigureAwait(false);
+        }
+
+        // PROTOCOL.md: a checkpoint MUST contain the protocol and the metadata. A read that yields neither
+        // read nothing that is a checkpoint — a hint naming zero parts, say, or a V2 JSON body cut off
+        // after its first line — and starting a snapshot from it, rather than refusing it, began the
+        // table at that version with no files, so that a later commit carrying its own protocol and
+        // metadata opened it with every file before the checkpoint silently gone.
+        if (!actions.Exists(a => a is ProtocolAction) || !actions.Exists(a => a is MetadataAction))
+        {
+            throw new DeltaFormatException(
+                DeltaErrorCodes.StateRecoverError,
+                $"The checkpoint at version {info.Version} has no " +
+                (actions.Exists(a => a is ProtocolAction) ? "metaData" : "protocol") +
+                " action, which every checkpoint must carry, so it cannot be a starting point.");
         }
 
         return actions;
