@@ -114,6 +114,10 @@ public abstract partial class TableFileSystemPathConformanceTests
     /// the request that completes the write differs: S3's CompleteMultipartUpload rather than PutObject
     /// must carry the precondition, and on Azure the other writer's upload discards this one's staged
     /// blocks, so its commit fails for that reason rather than on the precondition.
+    ///
+    /// <para>The other writer publishes unconditionally. A create-if-absent publish is not a fair stand-in:
+    /// Azurite refuses an <c>If-None-Match: *</c> Put Blob while this writer has blocks staged under the
+    /// name, as though the uncommitted blob already existed.</para>
     /// </summary>
     [SkippableTheory]
     [InlineData(false)]
@@ -131,7 +135,7 @@ public abstract partial class TableFileSystemPathConformanceTests
         await using (var file = await fs.CreateAsync(path, overwrite: false))
         {
             await file.WriteAsync(mine);
-            Assert.True(await fs.TryWriteAllBytesAsync(path, theirs));
+            await fs.WriteAllBytesAsync(path, theirs);
 
             await Assert.ThrowsAsync<IOException>(async () => await file.CompleteAsync());
         }
