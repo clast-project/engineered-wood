@@ -309,6 +309,63 @@ public class AutoCommitOrphanTests : IDisposable
         Assert.Equal(199, (await ReadIds(reopened)).Count); // 801..999
     }
 
+    // ── Committing files written elsewhere, born with deleted rows (#493) ──
+
+    /// <summary>Every even position of a 10,000-row file: sparse enough that the vector is too large to inline,
+    /// so it becomes a <c>.bin</c>.</summary>
+    private static Dictionary<int, IReadOnlyCollection<long>> EveryEvenRowOfFirstFile() =>
+        new() { [0] = Enumerable.Range(0, 5000).Select(i => 2L * i).ToArray() };
+
+    /// <summary>
+    /// A snapshot-coupled commit (<c>expectedVersion</c>) gets one attempt. When it loses the race at the log
+    /// write, the vector written for the file's born-deleted rows goes with it.
+    /// </summary>
+    [Fact]
+    public async Task CommitDataFiles_BornDeleted_ThatLosesTheRace_TakesBackTheVector()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var stale = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        var files = await stale.WriteDataFilesAsync([Range(0, 9999)]);
+        long expected = stale.CurrentSnapshot.Version;
+
+        await using (var other = OpenSecondHandle())
+            await other.WriteAsync([Batch(-1)]); // takes the version the commit is aiming at
+
+        await Assert.ThrowsAsync<DeltaConflictException>(async () => await stale.CommitDataFilesAsync(
+            files, expectedVersion: expected, deletedPositionsByFileIndex: EveryEvenRowOfFirstFile()));
+
+        Assert.Empty(DeletionVectorFiles());
+    }
+
+    /// <summary>
+    /// Without <c>expectedVersion</c> the commit rebases past a concurrent append and LANDS. Its actions are
+    /// re-derived per attempt, but the vector is not: exactly one <c>.bin</c> exists, and it is the one the
+    /// committed add names.
+    /// </summary>
+    [Fact]
+    public async Task CommitDataFiles_BornDeleted_ThatRebasesAndLands_WritesOneVector()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var stale = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        var files = await stale.WriteDataFilesAsync([Range(0, 9999)]);
+
+        await using (var other = OpenSecondHandle())
+            await other.WriteAsync([Batch(-1)]);
+
+        await stale.CommitDataFilesAsync(files, deletedPositionsByFileIndex: EveryEvenRowOfFirstFile());
+
+        Assert.Single(DeletionVectorFiles());
+        var add = Assert.Single(
+            stale.CurrentSnapshot.ActiveFiles.Values, a => a.DeletionVector is not null);
+        Assert.Equal("u", add.DeletionVector!.StorageType); // a file, not inline
+
+        // ...and that one file is the vector the committed add names: the read finds it and applies it.
+        await using var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        var ids = await ReadIds(reopened);
+        Assert.Equal(5001, ids.Count); // the 5,000 odd ids plus the concurrent -1
+        Assert.DoesNotContain(0L, ids);
+    }
+
     // ── Compaction: the one with the most to lose ──
 
     /// <summary>

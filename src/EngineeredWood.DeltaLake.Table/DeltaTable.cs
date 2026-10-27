@@ -7182,61 +7182,96 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         var baseSnapshot = CurrentSnapshot;
         // A data file added with dataChange=true changes data whatever else the commit holds, so its level is
-        // resolved BEFORE BuildActionsAsync, which can write an inline-deleted file's deletion vector: an
-        // unparseable delta.isolationLevel is then refused with nothing written. The decision below, from the
-        // built actions, still covers the file-less overwrite.
+        // resolved BEFORE any inline-deleted file's deletion vector is written: an unparseable
+        // delta.isolationLevel is then refused with nothing written. The decision below, from the built
+        // actions, still covers the file-less overwrite.
         if (dataChange && files.Count > 0)
             ResolveIsolation(baseSnapshot);
-        var initialActions = await BuildActionsAsync(baseSnapshot, cancellationToken).ConfigureAwait(false);
-        var result = await _committer.CommitAsync(
-            new LogCommitRequest
-            {
-                BaseSnapshot = baseSnapshot,
-                Actions = initialActions,
-                Operation = operation,
-                // From the built actions: an Overwrite's removes are derived there, so a file-less overwrite
-                // changes data, and a compaction or metadata-only flush does not. The read set below is blind or
-                // domains-only, so the level cannot change this verdict; resolving it is what refuses an
-                // unparseable delta.isolationLevel here as everywhere else.
-                Isolation = IsolationFor(baseSnapshot, initialActions),
-                // The actions are a FUNCTION of the snapshot — an Overwrite's removes name its active set,
-                // and a row-tracking baseRowId is drawn from its high-water mark — so a collision re-derives
-                // them against the version that landed instead of re-committing a stale set. The data files
-                // themselves are reused as-is: they were written before any of this and are still fine.
-                Rebase = new RecomputeRebaseHandler(BuildActionsAsync),
-                // A snapshot-coupled commit gets ONE attempt: its extraActions were computed against
-                // expectedVersion, so there is no version but that one they are correct at. The collision
-                // then propagates unexamined, which is the answer the caller is waiting for.
-                MaxAttempts = expectedVersion is null ? 16 : 1,
-                // Reads nothing and (as far as the checker is concerned) removes nothing: the recompute above
-                // re-derives the Overwrite removes from the newest active set, so there is no stale remove
-                // for the delete/delete rule to catch. What the checker DOES contribute here is the
-                // metadata/protocol rule — this path used to retry straight through a concurrent schema
-                // change and commit files against a schema that had moved, while the Arrow append path
-                // (CommitWriteAsync, same blind read-set) aborted. They now agree.
-                //
-                // NOTE: if a host turns out to depend on the old permissiveness — a producer appending
-                // through this while another process edits table properties will now see conflicts it did
-                // not before — the fix is a public opt-out on the request rather than a quiet revert here.
-                // That reopens a real hole, so it should be asked for rather than offered.
-                //
-                // The one thing it can be told: domains a fused schema change was validated against.
-                Reads = readDomains is { Count: > 0 }
-                    ? new ReadSet { Domains = new HashSet<string>(readDomains, StringComparer.Ordinal) }
-                    : ReadSet.Blind,
-                // The caller's own claim about what it read, passed through verbatim. ⚠ NOT derived from
-                // Reads above: that is Blind here (bar declared domains) because this method cannot see a scan, which
-                // is precisely why the claim has to come from the caller. See LogCommitRequest.IsBlindAppend.
-                IsBlindAppend = isBlindAppend,
-            },
-            cancellationToken).ConfigureAwait(false);
 
-        _currentSnapshot = result.Snapshot;
-        return result.Version;
+        // Every file's stats before any deletion vector is written: a refusal part-way would orphan one.
+        var statsByIndex = new string[files.Count];
+        for (int fi = 0; fi < files.Count; fi++)
+            statsByIndex[fi] = StatsCarryingCount(files[fi]);
+
+        // deletedPositionsByFileIndex: rows of a not-yet-committed file that a buffered transaction deleted
+        // after inserting them (same-transaction DML) — the add is born with a deletion vector, so the rows
+        // never appear in any committed version. The vector depends only on positions within that file, never
+        // on the snapshot, so it is written ONCE, here, and every attempt reuses it: written per attempt, each
+        // rebase minted a fresh .bin and orphaned the last (#493).
+        var bornDeleted = new DeletionVector?[files.Count];
+
+        return await CollectOnFailureAsync(async written =>
+        {
+            if (deletedPositionsByFileIndex is not null)
+            {
+                var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+                for (int fi = 0; fi < files.Count; fi++)
+                {
+                    if (!deletedPositionsByFileIndex.TryGetValue(fi, out var deletedPositions)
+                        || deletedPositions.Count == 0)
+                        continue;
+                    var dv = await dvWriter.CreateAsync(deletedPositions, deletedPositions.Count, cancellationToken)
+                        .ConfigureAwait(false);
+                    // Uncommitted until the log says otherwise: collected if the commit does not land.
+                    written.RecordDeletionVector(dv);
+                    bornDeleted[fi] = dv;
+                }
+            }
+
+            var initialActions = await BuildActionsAsync(baseSnapshot, cancellationToken).ConfigureAwait(false);
+            var result = await _committer.CommitAsync(
+                new LogCommitRequest
+                {
+                    BaseSnapshot = baseSnapshot,
+                    Actions = initialActions,
+                    Operation = operation,
+                    // From the built actions: an Overwrite's removes are derived there, so a file-less overwrite
+                    // changes data, and a compaction or metadata-only flush does not. The read set below is blind or
+                    // domains-only, so the level cannot change this verdict; resolving it is what refuses an
+                    // unparseable delta.isolationLevel here as everywhere else.
+                    Isolation = IsolationFor(baseSnapshot, initialActions),
+                    // The actions are a FUNCTION of the snapshot — an Overwrite's removes name its active set,
+                    // and a row-tracking baseRowId is drawn from its high-water mark — so a collision re-derives
+                    // them against the version that landed instead of re-committing a stale set. The data files
+                    // themselves are reused as-is: they were written before any of this and are still fine.
+                    Rebase = new RecomputeRebaseHandler(BuildActionsAsync),
+                    // A snapshot-coupled commit gets ONE attempt: its extraActions were computed against
+                    // expectedVersion, so there is no version but that one they are correct at. The collision
+                    // then propagates unexamined, which is the answer the caller is waiting for.
+                    MaxAttempts = expectedVersion is null ? 16 : 1,
+                    // Reads nothing and (as far as the checker is concerned) removes nothing: the recompute above
+                    // re-derives the Overwrite removes from the newest active set, so there is no stale remove
+                    // for the delete/delete rule to catch. What the checker DOES contribute here is the
+                    // metadata/protocol rule — this path used to retry straight through a concurrent schema
+                    // change and commit files against a schema that had moved, while the Arrow append path
+                    // (CommitWriteAsync, same blind read-set) aborted. They now agree.
+                    //
+                    // NOTE: if a host turns out to depend on the old permissiveness — a producer appending
+                    // through this while another process edits table properties will now see conflicts it did
+                    // not before — the fix is a public opt-out on the request rather than a quiet revert here.
+                    // That reopens a real hole, so it should be asked for rather than offered.
+                    //
+                    // The one thing it can be told: domains a fused schema change was validated against.
+                    Reads = readDomains is { Count: > 0 }
+                        ? new ReadSet { Domains = new HashSet<string>(readDomains, StringComparer.Ordinal) }
+                        : ReadSet.Blind,
+                    // The caller's own claim about what it read, passed through verbatim. ⚠ NOT derived from
+                    // Reads above: that is Blind here (bar declared domains) because this method cannot see a scan, which
+                    // is precisely why the claim has to come from the caller. See LogCommitRequest.IsBlindAppend.
+                    IsBlindAppend = isBlindAppend,
+                    // The vectors above are table data from this instant: a throw from post-commit work must
+                    // not collect them.
+                    OnCommitDurable = written.Clear,
+                },
+                cancellationToken).ConfigureAwait(false);
+
+            _currentSnapshot = result.Snapshot;
+            return result.Version;
+        }, cancellationToken).ConfigureAwait(false);
 
         // The commit's actions, derived from whichever version they are about to land on. Called once up
         // front and again per collision — see RecomputeRebaseHandler for what that demands of it.
-        async ValueTask<IReadOnlyList<DeltaAction>> BuildActionsAsync(
+        ValueTask<IReadOnlyList<DeltaAction>> BuildActionsAsync(
             Snapshot.Snapshot snapshot, CancellationToken ct)
         {
             var actions = new List<DeltaAction>();
@@ -7298,28 +7333,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
             long newVersion = snapshot.Version + 1;
-            // Every file's stats before any deletion vector is written: a refusal part-way would orphan one.
-            var statsByIndex = new string[files.Count];
-            for (int fi = 0; fi < files.Count; fi++)
-                statsByIndex[fi] = StatsCarryingCount(files[fi]);
             for (int fi = 0; fi < files.Count; fi++)
             {
                 var f = files[fi];
-                // deletedPositionsByFileIndex: rows of THIS not-yet-committed file that a buffered transaction
-                // deleted after inserting them (same-transaction DML) — the add is born with an inline deletion
-                // vector, so the rows never appear in any committed version. Stats stay physical-row stats,
-                // marked tightBounds=false per the spec (loose supersets).
-                DeletionVector? dv = null;
-                string? stats = statsByIndex[fi];
-                if (deletedPositionsByFileIndex is not null
-                    && deletedPositionsByFileIndex.TryGetValue(fi, out var deletedPositions)
-                    && deletedPositions.Count > 0)
-                {
-                    var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
-                    dv = await dvWriter.CreateAsync(deletedPositions, deletedPositions.Count, ct)
-                        .ConfigureAwait(false);
-                    stats = StatsWithLooseBounds(stats);
-                }
+                // A born-deleted file's stats stay physical-row stats, marked tightBounds=false per the spec
+                // (loose supersets).
+                DeletionVector? dv = bornDeleted[fi];
+                string? stats = dv is null ? statsByIndex[fi] : StatsWithLooseBounds(statsByIndex[fi]);
                 long fileBaseRowId = nextRowId;
                 actions.Add(new AddFile
                 {
@@ -7351,7 +7371,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (extraActions is { Count: > 0 })
                 actions.AddRange(extraActions);
 
-            return actions;
+            // Nothing here awaits now: the only write it did, the born-deleted vector, moved ahead of the loop.
+            return new ValueTask<IReadOnlyList<DeltaAction>>(actions);
         }
     }
 
