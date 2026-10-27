@@ -69,7 +69,9 @@ public sealed class SnapshotBuilder
             // checkpoint"); it caps the retries at 2, and this does not need to, because a checkpoint
             // whose replay would cross a hole is set aside without being read, and log cleanup keeps
             // the rest few.
-            var seen = new List<LastCheckpointInfo>();
+            // A set, not a list: when every candidate fails, all of them pass through here, and a table
+            // whose log has never been cleaned can list thousands.
+            var seen = new HashSet<(long Version, int? Parts, string? V2Path)>();
             var stranded = new List<LastCheckpointInfo>();
             var candidates = WithHint(
                 hint, CheckpointReader.ListCheckpointCandidates(listing, targetVersion));
@@ -81,9 +83,8 @@ public sealed class SnapshotBuilder
                 // file. Comparing versions alone was too coarse: a hint whose path is wrong names the
                 // version correctly, so the listing's candidate (which has the right path) was discarded
                 // as a duplicate and the table failed to open at all.
-                if (seen.Exists(t => SameCandidate(candidate, t)))
+                if (!seen.Add(CandidateKey(candidate)))
                     continue;
-                seen.Add(candidate);
 
                 // Judged by the plan the replay below will follow, not by a looser model of it: a
                 // checkpoint whose replay crosses a hole is no starting point even when it reads, and
@@ -262,14 +263,11 @@ public sealed class SnapshotBuilder
     }
 
     /// <summary>
-    /// Whether two checkpoint candidates name the same file, so that retrying the second after the
-    /// first failed would only repeat the same read.
+    /// What makes two checkpoint candidates the same file, so that trying the second after the first
+    /// would only repeat the same read. The path compares ordinally, as the tuple's default comparer does.
     /// </summary>
-    private static bool SameCandidate(LastCheckpointInfo listed, LastCheckpointInfo? hint) =>
-        hint is not null
-        && listed.Version == hint.Version
-        && listed.Parts == hint.Parts
-        && string.Equals(listed.V2CheckpointPath, hint.V2CheckpointPath, StringComparison.Ordinal);
+    private static (long Version, int? Parts, string? V2Path) CandidateKey(LastCheckpointInfo info) =>
+        (info.Version, info.Parts, info.V2CheckpointPath);
 
     /// <summary>
     /// The exception for a replay that could not cover its whole range — which is two different
