@@ -43,10 +43,18 @@ public class CheckpointListingFallbackTests : IDisposable
         """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""";
 
     /// <summary>Commit 0: protocol + metadata. Commits 1..n: one add each, named part-N.parquet.</summary>
-    private async Task WriteTableAsync(int addCommits)
+    private async Task WriteTableAsync(int addCommits, bool v2Checkpoints = false)
     {
         await _log.WriteCommitAsync(0, [
-            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            v2Checkpoints
+                ? new ProtocolAction
+                {
+                    MinReaderVersion = 3,
+                    MinWriterVersion = 7,
+                    ReaderFeatures = ["v2Checkpoint"],
+                    WriterFeatures = ["v2Checkpoint"],
+                }
+                : new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
             new MetadataAction
             {
                 Id = "listing-fallback",
@@ -74,6 +82,25 @@ public class CheckpointListingFallbackTests : IDisposable
     private async Task CheckpointAsync(long version) =>
         await new CheckpointWriter(_fs).WriteCheckpointAsync(
             await SnapshotBuilder.BuildAsync(_log, atVersion: version));
+
+    private async Task V2CheckpointAsync(long version) =>
+        await new V2CheckpointWriter(_fs).WriteCheckpointAsync(
+            await SnapshotBuilder.BuildAsync(_log, atVersion: version));
+
+    /// <summary>What a write that died part-way leaves: the first half of the file, at its final name.</summary>
+    private static void Truncate(string path)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        File.WriteAllBytes(path, bytes.AsSpan(0, bytes.Length / 2).ToArray());
+    }
+
+    private void TruncateClassicCheckpoint(long version) =>
+        Truncate(Path.Combine(_tempDir, DeltaVersion.CheckpointPath(version)));
+
+    /// <summary>The UUID-named top-level file of the V2 checkpoint at <paramref name="version"/>.</summary>
+    private string V2CheckpointFile(long version) =>
+        Assert.Single(Directory.GetFiles(
+            Path.Combine(_tempDir, "_delta_log"), $"{DeltaVersion.Format(version)}.checkpoint.*-*.*"));
 
     private string LogPath(string fileName) => Path.Combine(_tempDir, "_delta_log", fileName);
 
@@ -177,6 +204,353 @@ public class CheckpointListingFallbackTests : IDisposable
 
         Assert.Equal(3L, snapshot.Version);
         Assert.Equal(3, snapshot.FileCount);
+    }
+
+    #endregion
+
+    #region An unreadable checkpoint (#500)
+
+    /// <summary>
+    /// The newest checkpoint is truncated and the commits below the older one are gone, so the table opens
+    /// only through the older checkpoint and the commits after it. Trying the newest and then replaying
+    /// from 0 failed here, although nothing the table needs was missing.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task TruncatedNewestCheckpoint_FallsBackToAnOlderOne(bool keepHint)
+    {
+        await WriteTableAsync(addCommits: 6);
+        await CheckpointAsync(2);
+        await CheckpointAsync(5);
+        DeleteCommitsBefore(2);
+        TruncateClassicCheckpoint(5);
+        if (!keepHint)
+            DeleteHint();
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>Time travel takes the same path: the newest checkpoint at or below the target is unreadable.</summary>
+    [Fact]
+    public async Task TimeTravel_ToAnUnreadableCheckpointsVersion_UsesAnOlderOne()
+    {
+        await WriteTableAsync(addCommits: 6);
+        await CheckpointAsync(2);
+        await CheckpointAsync(5);
+        await CheckpointAsync(6);
+        DeleteCommitsBefore(2);
+        TruncateClassicCheckpoint(5);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs), atVersion: 5);
+
+        Assert.Equal(5L, snapshot.Version);
+        Assert.Equal(5, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// The way EW itself can still leave one: a process that dies while streaming a V2 checkpoint on local
+    /// disk never reaches the cleanup that deletes the partial file, so it stays at its final UUID name.
+    /// </summary>
+    [Fact]
+    public async Task TruncatedV2Checkpoint_FallsBackToAnOlderClassicOne()
+    {
+        await WriteTableAsync(addCommits: 6, v2Checkpoints: true);
+        await CheckpointAsync(2);
+        await V2CheckpointAsync(5);
+        DeleteCommitsBefore(2);
+        Truncate(V2CheckpointFile(5));
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// Two forms of one version cover the same state, so when the preferred one is unreadable the other is
+    /// as good — even with every commit below that version gone, and no older checkpoint at all.
+    /// </summary>
+    [Fact]
+    public async Task UnreadableClassicCheckpoint_FallsBackToAV2OneAtTheSameVersion()
+    {
+        await WriteTableAsync(addCommits: 6, v2Checkpoints: true);
+        await V2CheckpointAsync(5);
+        await CheckpointAsync(5);
+        DeleteCommitsBefore(5);
+        TruncateClassicCheckpoint(5);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// A replay may cross a compacted range in place of its commits, so a checkpoint below that range is
+    /// still a starting point.
+    /// </summary>
+    [Fact]
+    public async Task OlderCheckpoint_IsUsable_AcrossACompactedRange()
+    {
+        await WriteTableAsync(addCommits: 6);
+        await CheckpointAsync(2);
+        await CheckpointAsync(5);
+        await new LogCompaction(_fs, _log).CompactRangeAsync(3, 4);
+        DeleteCommitsBefore(2);
+        File.Delete(Path.Combine(_tempDir, DeltaVersion.CommitPath(3)));
+        File.Delete(Path.Combine(_tempDir, DeltaVersion.CommitPath(4)));
+        TruncateClassicCheckpoint(5);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// A hint naming a checkpoint whose replay would cross a hole is passed over for a listed one that does
+    /// not. It used to be read, and the replay after it failed, although the newer checkpoint was there.
+    /// </summary>
+    [Fact]
+    public async Task HintBelowAHole_IsPassedOverForANewerListedCheckpoint()
+    {
+        await WriteTableAsync(addCommits: 6);
+        await CheckpointAsync(2);
+        string staleHint = File.ReadAllText(LogPath("_last_checkpoint"));
+        await CheckpointAsync(5);
+        WriteHint(staleHint);
+        DeleteCommitsBefore(5);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// A stale hint naming an older checkpoint is not tried ahead of a newer listed one. The listing can
+    /// only say a commit is THERE, not that it reads, so the older start chose a replay through a corrupt
+    /// commit and failed, although the newer checkpoint lies past it.
+    /// </summary>
+    [Fact]
+    public async Task StaleOlderHint_DoesNotOutrankANewerListedCheckpoint()
+    {
+        await WriteTableAsync(addCommits: 6);
+        await CheckpointAsync(2);
+        string staleHint = File.ReadAllText(LogPath("_last_checkpoint"));
+        await CheckpointAsync(5);
+        WriteHint(staleHint);
+        File.WriteAllText(Path.Combine(_tempDir, DeltaVersion.CommitPath(4)), "{not json");
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// Replay uses a compaction file only when it starts at or after the replay's first version. From the
+    /// older checkpoint here it does not, so that checkpoint is no starting point — but a full replay can
+    /// use it, and opens the table. Taking the readable older checkpoint shut that replay out.
+    /// </summary>
+    [Fact]
+    public async Task CompactionStartingBelowTheReplay_LeavesTheFullReplay()
+    {
+        await WriteTableAsync(addCommits: 6);
+        await CheckpointAsync(2);
+        await CheckpointAsync(5);
+        await new LogCompaction(_fs, _log).CompactRangeAsync(1, 5);
+        for (long v = 1; v <= 5; v++)
+            File.Delete(Path.Combine(_tempDir, DeltaVersion.CommitPath(v)));
+        TruncateClassicCheckpoint(5);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// Nor does replay use a compaction file that ends past the target, so one cannot bridge a hole for a
+    /// time-travel read. The stale hint below the hole is passed over for the checkpoint at the target.
+    /// </summary>
+    [Fact]
+    public async Task CompactionEndingPastTheTarget_DoesNotRescueAStaleHint()
+    {
+        await WriteTableAsync(addCommits: 6);
+        await CheckpointAsync(2);
+        string staleHint = File.ReadAllText(LogPath("_last_checkpoint"));
+        await CheckpointAsync(5);
+        WriteHint(staleHint);
+        await new LogCompaction(_fs, _log).CompactRangeAsync(3, 6);
+        File.Delete(Path.Combine(_tempDir, DeltaVersion.CommitPath(4)));
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs), atVersion: 5);
+
+        Assert.Equal(5L, snapshot.Version);
+        Assert.Equal(5, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// Two complete multi-part checkpoints at one version (a re-checkpoint that split differently) cover
+    /// the same state, so the second is tried when the first does not read. The parts here are copies of
+    /// one classic checkpoint; the two-part one carries every action twice, which replay reconciles.
+    /// </summary>
+    [Fact]
+    public async Task UnreadableMultiPartCheckpoint_FallsBackToAnotherAtTheSameVersion()
+    {
+        await WriteTableAsync(addCommits: 6);
+        await CheckpointAsync(5);
+        string classic = Path.Combine(_tempDir, DeltaVersion.CheckpointPath(5));
+        string onePart = Path.Combine(_tempDir, DeltaVersion.CheckpointPartPath(5, 1, 1));
+        File.Copy(classic, onePart);
+        File.Copy(classic, Path.Combine(_tempDir, DeltaVersion.CheckpointPartPath(5, 1, 2)));
+        File.Copy(classic, Path.Combine(_tempDir, DeltaVersion.CheckpointPartPath(5, 2, 2)));
+        File.Delete(classic);
+        Truncate(onePart);
+        DeleteHint();
+        DeleteCommitsBefore(5);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// Two writers racing to checkpoint one version leave two UUID-named V2 files. The listing prefers one
+    /// of them; when that one does not read, the other covers the same state.
+    /// </summary>
+    [Fact]
+    public async Task UnreadableV2Checkpoint_FallsBackToAnotherV2AtTheSameVersion()
+    {
+        await WriteTableAsync(addCommits: 6, v2Checkpoints: true);
+        await V2CheckpointAsync(5);
+        await V2CheckpointAsync(5);
+        var both = Directory.GetFiles(
+            Path.Combine(_tempDir, "_delta_log"), $"{DeltaVersion.Format(5)}.checkpoint.*-*.json");
+        Assert.Equal(2, both.Length);
+        Array.Sort(both, StringComparer.Ordinal);
+        Truncate(both[0]); // the ordinally smaller JSON body is the preferred one
+        DeleteHint();
+        DeleteCommitsBefore(5);
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// A hint naming a multi-part checkpoint of zero parts read as zero files and counted as a starting
+    /// point. With a later commit that carries its own protocol and metadata, the table then opened
+    /// holding only that commit's file, the five before it silently gone. The listed checkpoint is used.
+    /// </summary>
+    [Fact]
+    public async Task HintOfZeroParts_DoesNotStartTheTableEmpty()
+    {
+        await WriteTableAsync(addCommits: 5);
+        await CheckpointAsync(5);
+        await _log.WriteCommitAsync(6, [
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            new MetadataAction
+            {
+                Id = "listing-fallback",
+                Format = Format.Parquet,
+                SchemaString = SchemaJson,
+                PartitionColumns = [],
+            },
+            new AddFile
+            {
+                Path = "part-6.parquet",
+                PartitionValues = new Dictionary<string, string>(),
+                Size = 600,
+                ModificationTime = 1700000000006,
+                DataChange = true,
+            },
+        ]);
+        DeleteCommitsBefore(5);
+        WriteHint("""{"version":5,"size":7,"parts":0}""");
+
+        var snapshot = await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs));
+
+        Assert.Equal(6L, snapshot.Version);
+        Assert.Equal(6, snapshot.FileCount);
+    }
+
+    /// <summary>
+    /// The read itself refuses a checkpoint with no protocol or metadata, however it came to read
+    /// nothing, so a bootstrap moves on to the next candidate rather than starting from it.
+    /// </summary>
+    [Fact]
+    public async Task CheckpointReadYieldingNoProtocolOrMetadata_IsRefused()
+    {
+        await WriteTableAsync(addCommits: 1);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await new CheckpointReader(_fs).ReadCheckpointAsync(
+                new LastCheckpointInfo { Version = 1, Size = 0, Parts = 0 }));
+
+        Assert.Equal(DeltaErrorCodes.StateRecoverError, ex.ErrorCode);
+    }
+
+    /// <summary>
+    /// A hole above the only checkpoint cannot be replayed around. The error names that hole, as it did
+    /// before checkpoints were judged by their replay, rather than claiming version 0 is missing.
+    /// </summary>
+    [Fact]
+    public async Task HoleAboveTheCheckpoint_IsTheOneReported()
+    {
+        await WriteTableAsync(addCommits: 7);
+        await CheckpointAsync(5);
+        DeleteCommitsBefore(5);
+        File.Delete(Path.Combine(_tempDir, DeltaVersion.CommitPath(6)));
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs)));
+
+        Assert.Equal(DeltaErrorCodes.TruncatedTransactionLog, ex.ErrorCode);
+        Assert.Contains("version 6 is missing", ex.Message);
+    }
+
+    /// <summary>
+    /// With no readable checkpoint left, the error names the one that would have covered the hole and
+    /// carries why it could not be read. It used to say no checkpoint covered the hole at all.
+    /// </summary>
+    [Fact]
+    public async Task NoReadableCheckpoint_NamesTheUnreadableOne()
+    {
+        await WriteTableAsync(addCommits: 6);
+        await CheckpointAsync(5);
+        DeleteCommitsBefore(5);
+        TruncateClassicCheckpoint(5);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs)));
+
+        Assert.Equal(DeltaErrorCodes.TruncatedTransactionLog, ex.ErrorCode);
+        Assert.Contains(DeltaVersion.CheckpointPath(5), ex.Message);
+        Assert.NotNull(ex.InnerException);
+    }
+
+    /// <summary>An unreadable checkpoint the replay never needed is not blamed for a hole above it.</summary>
+    [Fact]
+    public async Task UnreadableCheckpoint_BelowTheHole_IsNotBlamed()
+    {
+        await WriteTableAsync(addCommits: 6);
+        await CheckpointAsync(2);
+        TruncateClassicCheckpoint(2);
+        File.Delete(Path.Combine(_tempDir, DeltaVersion.CommitPath(4)));
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await SnapshotBuilder.BuildAsync(_log, new CheckpointReader(_fs)));
+
+        Assert.Equal(DeltaErrorCodes.TruncatedTransactionLog, ex.ErrorCode);
+        Assert.DoesNotContain(DeltaVersion.CheckpointPath(2), ex.Message);
     }
 
     #endregion

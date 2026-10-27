@@ -55,11 +55,18 @@ public sealed class CheckpointReader
                     v2Path = NormalizeLogPath(pathProp.GetString());
             }
 
+            int? partCount = root.TryGetProperty("parts", out var parts) ? parts.GetInt32() : null;
+
+            // A multi-part checkpoint has at least one part. Zero parts would be read as zero files — a
+            // checkpoint with no protocol, no metadata and no files — so the hint is unusable instead.
+            if (partCount < 1)
+                return null;
+
             return new LastCheckpointInfo
             {
                 Version = root.GetProperty("version").GetInt64(),
                 Size = root.GetProperty("size").GetInt64(),
-                Parts = root.TryGetProperty("parts", out var parts) ? parts.GetInt32() : null,
+                Parts = partCount,
                 SizeInBytes = root.TryGetProperty("sizeInBytes", out var sib)
                     ? sib.GetInt64() : null,
                 NumOfAddFiles = root.TryGetProperty("numOfAddFiles", out var naf)
@@ -125,7 +132,20 @@ public sealed class CheckpointReader
     /// The selection half of <see cref="FindLatestCheckpointAsync"/>, over a listing the caller already
     /// has. A snapshot build reads <c>_delta_log</c> once and answers this from the same pass.
     /// </summary>
-    internal static LastCheckpointInfo? SelectLatestCheckpoint(Log.LogListing listing, long maxVersion)
+    internal static LastCheckpointInfo? SelectLatestCheckpoint(Log.LogListing listing, long maxVersion) =>
+        ListCheckpointCandidates(listing, maxVersion).FirstOrDefault();
+
+    /// <summary>
+    /// Every readable checkpoint at or below <paramref name="maxVersion"/>, newest version first, and
+    /// within one version in the order a reader should try them.
+    /// </summary>
+    /// <remarks>
+    /// All of them rather than one per version: a version can carry more than one form (a classic file
+    /// and a V2 one written by different engines, say), and when the preferred one turns out to be
+    /// unreadable the other covers exactly the same state.
+    /// </remarks>
+    internal static IEnumerable<LastCheckpointInfo> ListCheckpointCandidates(
+        Log.LogListing listing, long maxVersion)
     {
         foreach (long version in listing.CheckpointVersionsDescending())
         {
@@ -134,16 +154,14 @@ public sealed class CheckpointReader
 
             // Classic first: it is the one form every reader here handles without further lookups.
             if (listing.ClassicCheckpoints.Contains(version))
-                return new LastCheckpointInfo { Version = version, Size = 0 };
+                yield return new LastCheckpointInfo { Version = version, Size = 0 };
 
-            if (listing.CompleteMultiPartCount(version) is int total)
-                return new LastCheckpointInfo { Version = version, Size = 0, Parts = total };
+            foreach (int total in listing.CompleteMultiPartCounts(version))
+                yield return new LastCheckpointInfo { Version = version, Size = 0, Parts = total };
 
-            if (listing.V2Checkpoints.TryGetValue(version, out string? path))
-                return new LastCheckpointInfo { Version = version, Size = 0, V2CheckpointPath = path };
+            foreach (string path in listing.V2CheckpointsInPreferenceOrder(version))
+                yield return new LastCheckpointInfo { Version = version, Size = 0, V2CheckpointPath = path };
         }
-
-        return null;
     }
 
     /// <summary>
@@ -192,6 +210,20 @@ public sealed class CheckpointReader
             // `sidecar` row — a sidecar that referenced another would otherwise be an unbounded read.
             await ReadParquetCheckpointBodyAsync(
                 SidecarPath(sidecar), actions, sidecars: null, cancellationToken).ConfigureAwait(false);
+        }
+
+        // PROTOCOL.md: a checkpoint MUST contain the protocol and the metadata. A read that yields neither
+        // read nothing that is a checkpoint — a hint naming zero parts, say, or a V2 JSON body cut off
+        // after its first line — and starting a snapshot from it, rather than refusing it, began the
+        // table at that version with no files, so that a later commit carrying its own protocol and
+        // metadata opened it with every file before the checkpoint silently gone.
+        if (!actions.Exists(a => a is ProtocolAction) || !actions.Exists(a => a is MetadataAction))
+        {
+            throw new DeltaFormatException(
+                DeltaErrorCodes.StateRecoverError,
+                $"The checkpoint at version {info.Version} has no " +
+                (actions.Exists(a => a is ProtocolAction) ? "metaData" : "protocol") +
+                " action, which every checkpoint must carry, so it cannot be a starting point.");
         }
 
         return actions;

@@ -47,6 +47,7 @@ public sealed class SnapshotBuilder
 
         // Try to bootstrap from a checkpoint
         long replayFrom = 0;
+        var unreadable = new List<(LastCheckpointInfo Info, Exception Error)>();
         if (checkpointReader is not null)
         {
             // _last_checkpoint is an advisory hint, so it can be absent, unusable, or STALE — naming a
@@ -60,16 +61,56 @@ public sealed class SnapshotBuilder
             if (hint is not null && hint.Version > targetVersion)
                 hint = null;
 
-            if (hint is null || !await TryBootstrapAsync(hint).ConfigureAwait(false))
-            {
-                var listed = CheckpointReader.SelectLatestCheckpoint(listing, targetVersion);
+            // The newest checkpoint can be unreadable too — a crash part-way through a write leaves a
+            // truncated file at a listable name — so every listed one is a candidate, newest first, and
+            // the first that reads wins. Stopping after the newest replayed from 0 instead, which fails
+            // outright once log cleanup has run, although an older checkpoint and the commits after it
+            // would have rebuilt the table. delta-spark retries the same way ("Trying a different
+            // checkpoint"); it caps the retries at 2, and this does not need to, because a checkpoint
+            // whose replay would cross a hole is set aside without being read, and log cleanup keeps
+            // the rest few.
+            // A set, not a list: when every candidate fails, all of them pass through here, and a table
+            // whose log has never been cleaned can list thousands.
+            var seen = new HashSet<(long Version, int? Parts, string? V2Path)>();
+            var stranded = new List<LastCheckpointInfo>();
+            var candidates = WithHint(
+                hint, CheckpointReader.ListCheckpointCandidates(listing, targetVersion));
 
-                // Skip the re-read only when listing found the SAME checkpoint that already failed —
-                // same version AND same file. Comparing versions alone was too coarse: a hint whose
-                // path is wrong names the version correctly, so the listing's candidate (which has
-                // the right path) was discarded as a duplicate and the table failed to open at all.
-                if (listed is not null && !SameCandidate(listed, hint))
-                    await TryBootstrapAsync(listed).ConfigureAwait(false);
+            bool bootstrapped = false;
+            foreach (var candidate in candidates)
+            {
+                // Skip a re-read only of the SAME checkpoint that already failed — same version AND same
+                // file. Comparing versions alone was too coarse: a hint whose path is wrong names the
+                // version correctly, so the listing's candidate (which has the right path) was discarded
+                // as a duplicate and the table failed to open at all.
+                if (!seen.Add(CandidateKey(candidate)))
+                    continue;
+
+                // Judged by the plan the replay below will follow, not by a looser model of it: a
+                // checkpoint whose replay crosses a hole is no starting point even when it reads, and
+                // taking it anyway shut out a full replay that would have succeeded.
+                if (!listing.PlanReplay(candidate.Version + 1, targetVersion).IsComplete)
+                {
+                    stranded.Add(candidate);
+                    continue;
+                }
+
+                bootstrapped = await TryBootstrapAsync(candidate).ConfigureAwait(false);
+                if (bootstrapped)
+                    break;
+            }
+
+            // Nothing usable read, and a full replay has a hole too, so the table cannot be rebuilt at
+            // this version. Starting from the newest checkpoint that reads anyway does not change that,
+            // but it makes the error name the hole above that checkpoint rather than claim version 0
+            // is missing.
+            if (!bootstrapped && !listing.PlanReplay(0, targetVersion).IsComplete)
+            {
+                foreach (var candidate in stranded.OrderByDescending(c => c.Version))
+                {
+                    if (await TryBootstrapAsync(candidate).ConfigureAwait(false))
+                        break;
+                }
             }
 
             async ValueTask<bool> TryBootstrapAsync(LastCheckpointInfo info)
@@ -86,12 +127,14 @@ public sealed class SnapshotBuilder
                 {
                     throw;
                 }
-                catch (Exception)
+                catch (Exception ex)
                 {
                     // Discard whatever was applied before the failure — a half-read checkpoint is not a
                     // valid starting state — and let the caller try the next candidate or full replay.
+                    // Kept, so that a replay which then cannot cover the range names this as the cause.
                     builder = new SnapshotBuilder();
                     replayFrom = 0;
+                    unreadable.Add((info, ex));
                     return false;
                 }
             }
@@ -105,17 +148,8 @@ public sealed class SnapshotBuilder
         long nextNeeded = replayFrom;
         long? firstMissing = null;
 
-        // Find the best compaction file covering [replayFrom..targetVersion]
-        (long Start, long End, string Path)? bestCompacted = null;
-        foreach (var cf in listing.CompactedRanges)
-        {
-            if (cf.Start >= replayFrom && cf.End <= targetVersion)
-            {
-                if (bestCompacted is null ||
-                    (cf.End - cf.Start) > (bestCompacted.Value.End - bestCompacted.Value.Start))
-                    bestCompacted = cf;
-            }
-        }
+        // The same plan the checkpoint choice above was judged by.
+        var bestCompacted = listing.PlanReplay(replayFrom, targetVersion).Compacted;
 
         // Use compacted file if available
         if (bestCompacted is not null)
@@ -194,20 +228,46 @@ public sealed class SnapshotBuilder
             firstMissing ??= nextNeeded;
 
         if (firstMissing is long missing)
-            throw ReplayGap(listing, missing, firstNeeded, targetVersion);
+            throw ReplayGap(listing, unreadable, missing, firstNeeded, targetVersion);
 
         return builder.Build();
     }
 
     /// <summary>
-    /// Whether two checkpoint candidates name the same file, so that retrying the second after the
-    /// first failed would only repeat the same read.
+    /// The listed candidates, newest first, with the hint placed ahead of the listed ones at its own
+    /// version and never ahead of a newer one.
     /// </summary>
-    private static bool SameCandidate(LastCheckpointInfo listed, LastCheckpointInfo? hint) =>
-        hint is not null
-        && listed.Version == hint.Version
-        && listed.Parts == hint.Parts
-        && string.Equals(listed.V2CheckpointPath, hint.V2CheckpointPath, StringComparison.Ordinal);
+    /// <remarks>
+    /// The hint wins ties because it names the file a writer chose. It does not outrank a newer
+    /// checkpoint, because a stale one usually names an OLDER checkpoint, and the listing can say only
+    /// that the commits after it are there, not that they read. Starting from it chose a replay through a
+    /// corrupt commit that the newer checkpoint lies past, and the build failed without trying it. Newest
+    /// first means every newer candidate has been tried by the time one is taken.
+    /// </remarks>
+    private static IEnumerable<LastCheckpointInfo> WithHint(
+        LastCheckpointInfo? hint, IEnumerable<LastCheckpointInfo> listed)
+    {
+        bool placed = hint is null;
+        foreach (var candidate in listed)
+        {
+            if (!placed && candidate.Version <= hint!.Version)
+            {
+                yield return hint;
+                placed = true;
+            }
+            yield return candidate;
+        }
+
+        if (!placed)
+            yield return hint!;
+    }
+
+    /// <summary>
+    /// What makes two checkpoint candidates the same file, so that trying the second after the first
+    /// would only repeat the same read. The path compares ordinally, as the tuple's default comparer does.
+    /// </summary>
+    private static (long Version, int? Parts, string? V2Path) CandidateKey(LastCheckpointInfo info) =>
+        (info.Version, info.Parts, info.V2CheckpointPath);
 
     /// <summary>
     /// The exception for a replay that could not cover its whole range — which is two different
@@ -217,12 +277,29 @@ public sealed class SnapshotBuilder
     /// A checkpoint that would have covered the hole, but which this reader passed over, leaves exactly
     /// the same hole in the replay as a deleted commit. Reporting both as "the log is incomplete" sent a
     /// user to look at retention settings for what is really a property of the checkpoint, so the
-    /// checkpoint is named as the cause instead. Two shapes of that: a body this reader has no decoder
-    /// for, and a multi-part checkpoint whose parts did not all land.
+    /// checkpoint is named as the cause instead. Three shapes of that: a checkpoint that was tried and
+    /// failed to read, a body this reader has no decoder for, and a multi-part checkpoint whose parts did
+    /// not all land.
     /// </remarks>
     private static DeltaFormatException ReplayGap(
-        LogListing listing, long missing, long from, long through)
+        LogListing listing, IReadOnlyList<(LastCheckpointInfo Info, Exception Error)> unreadable,
+        long missing, long from, long through)
     {
+        // The newest first: it is the one that would have needed the fewest commits behind it.
+        foreach (var (info, error) in unreadable.OrderByDescending(u => u.Info.Version))
+        {
+            if (info.Version >= missing && info.Version <= through)
+            {
+                return new DeltaFormatException(
+                    DeltaErrorCodes.TruncatedTransactionLog,
+                    $"Delta log is incomplete: version {missing} is missing, and the checkpoint at " +
+                    $"version {info.Version} ('{DescribeCheckpoint(info)}') that would have covered it " +
+                    $"could not be read: {error.Message} Building a snapshot at version {through} " +
+                    $"requires every version in [{from}..{through}].",
+                    error);
+            }
+        }
+
         foreach (var (version, path) in listing.UndecodableCheckpoints)
         {
             // Only a checkpoint inside the hole is an explanation for it: one below `missing` was
@@ -251,6 +328,13 @@ public sealed class SnapshotBuilder
 
         return IncompleteLog(missing, from, through);
     }
+
+    /// <summary>The checkpoint's file, or for a multi-part one the shape of its name.</summary>
+    private static string DescribeCheckpoint(LastCheckpointInfo info) =>
+        info.V2CheckpointPath
+        ?? (info.Parts is int parts
+            ? $"{DeltaVersion.LogPrefix}{DeltaVersion.Format(info.Version)}.checkpoint.*.{parts:D10}.parquet"
+            : DeltaVersion.CheckpointPath(info.Version));
 
     /// <summary>
     /// A replay that cannot cover its whole range would silently return a snapshot missing whatever the
