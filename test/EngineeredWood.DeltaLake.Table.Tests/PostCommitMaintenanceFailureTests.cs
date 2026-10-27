@@ -152,9 +152,10 @@ public class PostCommitMaintenanceFailureTests : IDisposable
     }
 
     /// <summary>
-    /// A checkpoint whose publish lands but then reports failure (a lost response, say) is reported and must
-    /// leave the table openable without the hint, after cleanup below the previous checkpoint. A writer that
-    /// deleted the path after the failure would remove the only checkpoint covering the cleaned commits.
+    /// A checkpoint whose publish lands but then reports failure (a lost response, say) must leave the table
+    /// openable without the hint, after cleanup below the previous checkpoint. A writer that deleted the path
+    /// after the failure would remove the only checkpoint covering the cleaned commits. The classic writer
+    /// finds the checkpoint there, so it is not even a failure: nothing is reported, and the hint is written.
     /// </summary>
     [Theory]
     [InlineData(false)]
@@ -177,7 +178,7 @@ public class PostCommitMaintenanceFailureTests : IDisposable
             : await table.WriteAsync([Row(4)]);
 
         Assert.Equal(4, v4);
-        Assert.Equal(PostCommitMaintenanceStep.Checkpoint, Assert.Single(reports).Step);
+        Assert.Empty(reports);
         Assert.True(File.Exists(Path.Combine(_tempDir, DeltaVersion.CheckpointPath(4))));
         File.Delete(Path.Combine(logDir, "_last_checkpoint"));
         Assert.Equal(overwrite ? 1 : 4, await CountRowsAsync());
@@ -288,7 +289,7 @@ public class PostCommitMaintenanceFailureTests : IDisposable
         public bool FailDelete { get; set; }
 
         /// <summary>
-        /// Writes to paths these match reach storage, then throw: a streamed file after its first write, a
+        /// Writes to paths these match reach storage, then throw: a streamed file once it is completed, a
         /// whole-file write once it has landed.
         /// </summary>
         public Func<string, bool>? FailAfterLanding { get; set; }
@@ -314,7 +315,7 @@ public class PostCommitMaintenanceFailureTests : IDisposable
         {
             ThrowIfWriteFails(path);
             var file = await inner.CreateAsync(path, overwrite, cancellationToken);
-            return FailAfterLanding?.Invoke(path) == true ? new BreaksAfterFirstWrite(file, path) : file;
+            return FailAfterLanding?.Invoke(path) == true ? new FailsAfterCompleting(file, path) : file;
         }
 
         public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
@@ -348,23 +349,22 @@ public class PostCommitMaintenanceFailureTests : IDisposable
             return inner.WriteAllBytesAsync(path, data, cancellationToken);
         }
 
-        private sealed class BreaksAfterFirstWrite(ISequentialFile inner, string path) : ISequentialFile
+        private sealed class FailsAfterCompleting(ISequentialFile inner, string path) : ISequentialFile
         {
             public long Position => inner.Position;
 
-            public async ValueTask WriteAsync(
-                ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
-            {
-                await inner.WriteAsync(data, cancellationToken);
-                await inner.FlushAsync(cancellationToken);
-                throw new IOException($"stream broke after its first write (injected): {path}");
-            }
+            public ValueTask WriteAsync(
+                ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default) =>
+                inner.WriteAsync(data, cancellationToken);
 
             public ValueTask FlushAsync(CancellationToken cancellationToken = default) =>
                 inner.FlushAsync(cancellationToken);
 
-            public ValueTask CompleteAsync(CancellationToken cancellationToken = default) =>
-                inner.CompleteAsync(cancellationToken);
+            public async ValueTask CompleteAsync(CancellationToken cancellationToken = default)
+            {
+                await inner.CompleteAsync(cancellationToken);
+                throw new IOException($"completion landed, then reported failure (injected): {path}");
+            }
 
             public ValueTask DisposeAsync() => inner.DisposeAsync();
 

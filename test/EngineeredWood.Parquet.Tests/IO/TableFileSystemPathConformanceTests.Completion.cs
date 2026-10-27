@@ -117,7 +117,8 @@ public abstract partial class TableFileSystemPathConformanceTests
     ///
     /// <para>The other writer publishes unconditionally. A create-if-absent publish is not a fair stand-in:
     /// Azurite refuses an <c>If-None-Match: *</c> Put Blob while this writer has blocks staged under the
-    /// name, as though the uncommitted blob already existed.</para>
+    /// name, as though the uncommitted blob already existed. Azure itself does not (checked against a real
+    /// account): the Put Blob succeeds and discards the staged blocks.</para>
     /// </summary>
     [SkippableTheory]
     [InlineData(false)]

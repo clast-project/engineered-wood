@@ -148,9 +148,10 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         }
         catch (RequestFailedException ex) when (!_overwrite && ex.ErrorCode == "InvalidBlockList")
         {
-            // Another writer publishing the blob while this one had blocks staged discards them, so the
-            // commit names blocks that are gone and fails before its precondition is evaluated. If the blob
-            // is there now, that is the same lost race as a 412.
+            // Another writer publishing the blob while this one had blocks staged discards them. Azure then
+            // still evaluates the precondition first and answers 409, handled above; Azurite instead fails
+            // the commit because it names blocks that are gone. If the blob is there now, that is the same
+            // lost race.
             _aborted = true;
             if (await BlobExistsQuietlyAsync().ConfigureAwait(false))
                 throw new IOException($"Blob already exists: {_blobClient.Name}", ex);
