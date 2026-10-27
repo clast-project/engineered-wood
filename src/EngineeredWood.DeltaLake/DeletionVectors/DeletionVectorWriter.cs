@@ -101,8 +101,19 @@ public sealed class DeletionVectorWriter
         fileBytes[tail + 2] = crcLe[1];
         fileBytes[tail + 3] = crcLe[0];
 
-        await _fs.WriteAllBytesAsync(fileName, fileBytes, cancellationToken)
-            .ConfigureAwait(false);
+        try
+        {
+            await _fs.WriteAllBytesAsync(fileName, fileBytes, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // Not every backend writes this in one atomic step (the local one writes in place), so a failure
+            // can leave a partial file — and no caller can collect it, since the descriptor naming it is never
+            // returned. The name is a fresh UUID, so whatever is there is ours to delete.
+            await Checkpoint.CheckpointWriter.DeleteQuietlyAsync(_fs, fileName).ConfigureAwait(false);
+            throw;
+        }
 
         return new DeletionVector
         {
