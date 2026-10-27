@@ -7271,7 +7271,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
         // The commit's actions, derived from whichever version they are about to land on. Called once up
         // front and again per collision — see RecomputeRebaseHandler for what that demands of it.
-        async ValueTask<IReadOnlyList<DeltaAction>> BuildActionsAsync(
+        ValueTask<IReadOnlyList<DeltaAction>> BuildActionsAsync(
             Snapshot.Snapshot snapshot, CancellationToken ct)
         {
             var actions = new List<DeltaAction>();
@@ -7371,7 +7371,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             if (extraActions is { Count: > 0 })
                 actions.AddRange(extraActions);
 
-            return actions;
+            // Nothing here awaits now: the only write it did, the born-deleted vector, moved ahead of the loop.
+            return new ValueTask<IReadOnlyList<DeltaAction>>(actions);
         }
     }
 
