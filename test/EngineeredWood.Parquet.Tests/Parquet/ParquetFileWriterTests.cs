@@ -2955,10 +2955,8 @@ public class ParquetFileWriterTests : IDisposable
     [Fact]
     public void EncodingStrategyResolver_V2_Float_Alp()
     {
-#pragma warning disable EWPARQUET0001 // Test exercises the experimental enum value intentionally.
         var enc = EncodingStrategyResolver.GetValueEncoding(PhysicalType.Float, ByteArrayEncoding.DeltaLengthByteArray, FloatingPointEncoding.Alp, IntegerEncoding.DeltaBinaryPacked);
         Assert.Equal(Encoding.Alp, enc);
-#pragma warning restore EWPARQUET0001
     }
 
     [Fact]

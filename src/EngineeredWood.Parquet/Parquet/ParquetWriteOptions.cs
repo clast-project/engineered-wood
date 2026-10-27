@@ -47,7 +47,9 @@ public enum FloatingPointEncoding
     /// ADAPTIVE_LOSSLESS_FLOATING_POINT (ALP, encoding 10): decimal-aware integer encoding plus
     /// frame-of-reference and bit-packing. Strong for monetary, sensor, and scientific data with
     /// limited decimal precision.
-    /// New in parquet-format; older readers will not be able to decode it.
+    /// Specified in parquet-format 2.14.0 as a Preview encoding: the wire format is final, but few
+    /// readers decode it yet (arrow-rs from 60.0.0; not arrow C++, parquet-java or DuckDB as of
+    /// this writing), which is why it is opt-in.
     /// </summary>
     /// <remarks>
     /// Data with no decimal structure — raw coordinates, high-precision irrational values — cannot
@@ -57,7 +59,6 @@ public enum FloatingPointEncoding
     /// bigger than leaving it alone. Pages within one column chunk may therefore differ in
     /// encoding, which is what the format allows for.
     /// </remarks>
-    [Experimental("EWPARQUET0001")]
     Alp,
 
     /// <summary>

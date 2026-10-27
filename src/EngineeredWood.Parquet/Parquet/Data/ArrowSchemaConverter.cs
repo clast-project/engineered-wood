@@ -356,8 +356,16 @@ internal static class ArrowSchemaConverter
             LogicalType.TimeType => new Time64Type(Apache.Arrow.Types.TimeUnit.Microsecond),
             LogicalType.EnumType => Apache.Arrow.Types.StringType.Default,
             LogicalType.JsonType => Apache.Arrow.Types.StringType.Default,
-            LogicalType.UuidType => MakeUuidArrowType(options),
-            LogicalType.Float16Type => HalfFloatType.Default,
+            // Guarded like TIMESTAMP above: both reinterpret a fixed-width value buffer, so an annotation
+            // on any other physical type (parquet-testing's int32_with_uuid_logical_type.parquet) built
+            // an Arrow array over the wrong byte width. parquet-format 2.14 (GH-606) says to ignore an
+            // invalid logical/physical combination and read the physical type. The other arms are #548.
+            LogicalType.UuidType
+                when column.PhysicalType == PhysicalType.FixedLenByteArray && column.TypeLength == 16
+                => MakeUuidArrowType(options),
+            LogicalType.Float16Type
+                when column.PhysicalType == PhysicalType.FixedLenByteArray && column.TypeLength == 2
+                => HalfFloatType.Default,
             LogicalType.DecimalType dt => MakeDecimalType(dt.Precision, dt.Scale, column.PhysicalType, options),
             LogicalType.UnknownLogicalType { ThriftFieldId: 11 } => NullType.Default,
             _ => null, // fall through to ConvertedType or PhysicalType

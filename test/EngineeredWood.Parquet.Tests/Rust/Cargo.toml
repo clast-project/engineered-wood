@@ -1,0 +1,21 @@
+[package]
+name = "parquet-alp-oracle"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Reference implementation for ALP (encoding 10) cross-validation in EngineeredWood.Parquet.Tests.
+# Build from this directory:  cargo build --release --locked
+#
+# Temporary: arrow-rs is the only ALP implementation so far, and the Python packages the
+# ExternalParquetReaders tier uses (datafusion 55.0.0) are still on arrow-rs 59. Once a
+# datafusion release on arrow-rs 60+ is out, ALP moves into that tier and this crate goes away (#550).
+
+[[bin]]
+name = "parquet-alp-oracle"
+path = "src/main.rs"
+
+[dependencies]
+arrow-array = "=60.0.0"
+arrow-schema = "=60.0.0"
+parquet = { version = "=60.0.0", default-features = false, features = ["arrow", "snap"] }

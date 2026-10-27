@@ -40,9 +40,7 @@ internal static class EncodingStrategyResolver
             },
             PhysicalType.Float or PhysicalType.Double => floatingPointEncoding switch
             {
-#pragma warning disable EWPARQUET0001 // ALP is intentionally selectable; the experimental signal lives on the enum value, not internal dispatch.
                 FloatingPointEncoding.Alp => Encoding.Alp,
-#pragma warning restore EWPARQUET0001
                 FloatingPointEncoding.ByteStreamSplit => Encoding.ByteStreamSplit,
                 FloatingPointEncoding.Plain => Encoding.Plain,
                 // Every arm above is named, and the catch-all is PLAIN rather than

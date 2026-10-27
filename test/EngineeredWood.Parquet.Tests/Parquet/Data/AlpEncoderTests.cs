@@ -1,7 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-#pragma warning disable EWPARQUET0001 // ALP-specific tests intentionally reference the experimental enum values.
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -76,6 +75,41 @@ public class AlpEncoderTests : IDisposable
 
         for (int i = 0; i < values.Length; i++)
             AssertBitEqual(values[i], output[i]);
+    }
+
+    /// <summary>
+    /// AlpEncoding.md: exception values are stored as their exact IEEE 754 bits, and implementations
+    /// MUST NOT canonicalize NaN. Covers a payload NaN, a negative NaN and a signaling NaN.
+    /// </summary>
+    [Fact]
+    public void Exceptions_PreserveNaNBitPatterns()
+    {
+        var doubles = new[]
+        {
+            1.5,
+            BitConverter.Int64BitsToDouble(0x7FF8_0000_DEAD_BEEFL),
+            BitConverter.Int64BitsToDouble(unchecked((long)0xFFF8_0000_0000_0001UL)),
+            BitConverter.Int64BitsToDouble(0x7FF0_0000_0000_0001L),
+            2.25,
+        };
+        var doubleOutput = new double[doubles.Length];
+        AlpDecoder.DecodeDoubles(AlpEncoder.EncodeDoubles(doubles), doubleOutput, doubles.Length);
+        for (int i = 0; i < doubles.Length; i++)
+            AssertBitEqual(doubles[i], doubleOutput[i]);
+
+        static float FloatFromBits(uint bits) => BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
+        var floats = new[]
+        {
+            1.5f,
+            FloatFromBits(0x7FC0_BEEFu),
+            FloatFromBits(0xFFC0_0001u),
+            FloatFromBits(0x7F80_0001u),
+            2.25f,
+        };
+        var floatOutput = new float[floats.Length];
+        AlpDecoder.DecodeFloats(AlpEncoder.EncodeFloats(floats), floatOutput, floats.Length);
+        for (int i = 0; i < floats.Length; i++)
+            AssertBitEqual(floats[i], floatOutput[i]);
     }
 
     [Fact]

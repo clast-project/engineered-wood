@@ -1,7 +1,6 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-#pragma warning disable EWPARQUET0001 // ALP-specific tests intentionally reference the experimental enum values.
 
 using Apache.Arrow;
 using Apache.Arrow.Types;

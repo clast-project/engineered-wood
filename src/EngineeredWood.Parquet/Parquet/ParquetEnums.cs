@@ -36,10 +36,10 @@ public enum Encoding
     ByteStreamSplit = 9,
 
     /// <summary>
-    /// Adaptive Lossless floating-Point Compression (ALP). The Parquet spec proposal is
-    /// not yet finalized; the wire format may change before the spec is ratified.
+    /// Adaptive Lossless floating-Point Compression (ALP), for FLOAT and DOUBLE. Specified in
+    /// parquet-format 2.14.0 (<c>AlpEncoding.md</c>), where it is marked Preview: the wire format
+    /// is final, but few readers decode it yet, so writers should only use it on request.
     /// </summary>
-    [Experimental("EWPARQUET0001")]
     Alp = 10,
 
     /// <summary>
@@ -64,8 +64,8 @@ public enum Encoding
     /// <remarks>
     /// <para><b>This is 12, but the FSST proposal says 10.</b> FSST has been bumped twice
     /// because it keeps losing the slot it asks for to a proposal further along. It claimed
-    /// 10; ALP took 10 and has since been merged into <c>parquet.thrift</c> on
-    /// parquet-format <c>main</c>, so 10 is settled and not FSST's. FSST then sat on 11 here
+    /// 10; ALP took 10 and shipped with it in parquet-format 2.14.0, so 10 is settled and not
+    /// FSST's. FSST then sat on 11 here
     /// — which is what the arrow-rs proof-of-concept predicted ("may become 11 once ALP
     /// encoding lands") — until PFOR claimed 11, in a spec PR backed by both a parquet-java
     /// and an arrow-rs implementation. So FSST moves again, to the next free slot.</para>

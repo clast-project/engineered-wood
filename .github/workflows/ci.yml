@@ -590,3 +590,104 @@ jobs:
         with:
           name: vortex-interop-test-results
           path: '**/vortex-interop-results.trx'
+
+  # ALP (encoding 10) against arrow-rs, in both directions: EW-written files must decode bit for
+  # bit in arrow-rs, and arrow-rs-written files must decode bit for bit here. AlpArrowRsInteropTests
+  # hands each file to `parquet-alp-oracle`, a small Rust binary on the pinned parquet crate
+  # (test/EngineeredWood.Parquet.Tests/Rust).
+  #
+  # TEMPORARY. arrow-rs 60 is the only other ALP implementation, and ExternalParquetReaders — the
+  # tier that already checks DuckDB and DataFusion — cannot reach it until a datafusion Python
+  # release is built on arrow-rs 60 or later (55.0.0 is on 59). When one is, ALP moves into that
+  # tier and this job and the crate are deleted (#550).
+  #
+  # Like vortex-interop: a separate Linux job so the Windows `build` job never pays for a Rust
+  # toolchain, the tests skip rather than fail where the binary is not built, and
+  # EW_REQUIRE_PARQUET_ALP_ORACLE=1 here turns that skip into a failure so green means checked.
+  # It runs when the project selection includes the Parquet tests. It is not a required check.
+  parquet-alp-interop:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the project selection can diff against the base commit.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Select affected projects
+        id: select
+        shell: bash
+        run: |
+          python .github/scripts/select_projects.py \
+            --base "${{ github.event.pull_request.base.sha || github.event.before }}" \
+            --head "${{ github.sha }}" \
+            --slnf /dev/null \
+            ${{ github.event_name == 'push' && '--full' || '' }} \
+          || echo "scope=full" >> "$GITHUB_OUTPUT"
+          echo "::group::parquet-alp-interop relevance"
+          if grep -qx 'scope=full' "$GITHUB_OUTPUT" \
+             || grep -q '^tests=.*EngineeredWood\.Parquet\.Tests\.csproj' "$GITHUB_OUTPUT"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "EngineeredWood.Parquet.Tests is not affected; skipping the ALP interop check."
+          fi
+          echo "::endgroup::"
+
+      # Pinned, like the vortex oracles; parquet 60.0.0 builds with it.
+      - name: Setup Rust
+        if: steps.select.outputs.run == 'true'
+        run: |
+          rustup toolchain install 1.96.0 --profile minimal
+          rustup default 1.96.0
+
+      - name: Cache Rust build
+        if: steps.select.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: test/EngineeredWood.Parquet.Tests/Rust
+
+      # --locked: the arrow-rs version is the oracle, so it must not drift between runs.
+      - name: Build parquet-alp-oracle
+        if: steps.select.outputs.run == 'true'
+        working-directory: test/EngineeredWood.Parquet.Tests/Rust
+        run: cargo build --release --locked
+
+      - name: Setup .NET
+        if: steps.select.outputs.run == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Restore
+        if: steps.select.outputs.run == 'true'
+        run: dotnet restore test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj
+
+      - name: Build
+        if: steps.select.outputs.run == 'true'
+        run: >
+          dotnet build test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj
+          --no-restore --configuration Release --framework net10.0
+
+      - name: Test ALP against arrow-rs
+        if: steps.select.outputs.run == 'true'
+        env:
+          EW_REQUIRE_PARQUET_ALP_ORACLE: '1'
+        run: >
+          dotnet test test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj
+          --no-build --configuration Release --framework net10.0
+          --filter "FullyQualifiedName~AlpArrowRsInteropTests"
+          --logger "trx;LogFileName=parquet-alp-interop-results.trx"
+
+      - name: Upload test results
+        if: always() && steps.select.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: parquet-alp-interop-test-results
+          path: '**/parquet-alp-interop-results.trx'
