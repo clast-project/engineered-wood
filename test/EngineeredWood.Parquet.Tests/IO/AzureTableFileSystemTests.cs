@@ -155,6 +155,7 @@ public class AzureTableFileSystemTests : IAsyncLifetime
         await using (var file = await fs.CreateAsync("file.bin", overwrite: true))
         {
             await file.WriteAsync(Bytes("replaced"));
+            await file.CompleteAsync();
         }
 
         Assert.Equal("replaced", Encoding.UTF8.GetString(await fs.ReadAllBytesAsync("file.bin")));

@@ -526,8 +526,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Finalizes the file by writing the footer and closing magic.
-    /// Must be called before disposing.
+    /// Finalizes the file by writing the footer and closing magic, then completes the underlying
+    /// <see cref="ISequentialFile"/>, which is what publishes it.
     /// </summary>
     public async ValueTask CloseAsync(CancellationToken cancellationToken = default)
     {

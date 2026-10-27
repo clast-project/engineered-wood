@@ -164,6 +164,7 @@ public sealed class CheckpointWriter
             await using (file)
             {
                 await write(file).ConfigureAwait(false);
+                await file.CompleteAsync(cancellationToken).ConfigureAwait(false);
                 length = file.Position;
             }
         }
@@ -1249,6 +1250,9 @@ public sealed class CheckpointWriter
         }
 
         public ValueTask FlushAsync(CancellationToken cancellationToken = default) => default;
+
+        // Nothing to publish: the caller publishes Written itself.
+        public ValueTask CompleteAsync(CancellationToken cancellationToken = default) => default;
 
         public ValueTask DisposeAsync() => default;
 

@@ -254,7 +254,8 @@ public sealed class BufferedParquetWriter : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Finalizes the file: flushes any remaining buffered rows, writes the footer.
+    /// Finalizes the file: flushes any remaining buffered rows, writes the footer, and completes the
+    /// underlying <see cref="ISequentialFile"/>, which is what publishes it.
     /// </summary>
     public async ValueTask CloseAsync(CancellationToken cancellationToken = default)
     {

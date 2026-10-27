@@ -33,7 +33,7 @@ namespace EngineeredWood.Tests.IO;
 /// <see cref="PathNameConstraints.Win32"/> and so skips <c>?</c>; every object store declares it can hold
 /// all of these, and is held to it.</para>
 /// </summary>
-public abstract class TableFileSystemPathConformanceTests : IAsyncLifetime
+public abstract partial class TableFileSystemPathConformanceTests : IAsyncLifetime
 {
     /// <summary>Long enough that a ranged read is a real read and not the whole object.</summary>
     private const int PayloadLength = 600;
@@ -146,6 +146,7 @@ public abstract class TableFileSystemPathConformanceTests : IAsyncLifetime
         await using (var file = await fs.CreateAsync(path, overwrite: true))
         {
             await file.WriteAsync(replacement);
+            await file.CompleteAsync();
         }
 
         Assert.Equal(replacement, await fs.ReadAllBytesAsync(path));

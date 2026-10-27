@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Net;
 using Amazon.S3;
 using Amazon.S3.Model;
 
@@ -14,15 +15,17 @@ namespace EngineeredWood.IO.Aws;
 /// <remarks>
 /// <para>
 /// Writes accumulate in a buffer; once the buffer reaches the configured part size it is
-/// uploaded as a multipart part, and the upload is finalized on the first
-/// <see cref="FlushAsync"/> or on disposal. Because this driver owns the chunking loop,
-/// peak memory is roughly one part (plus the largest single write) rather than the whole
-/// object.
+/// uploaded as a multipart part, and the upload is completed by <see cref="CompleteAsync"/>.
+/// Because this driver owns the chunking loop, peak memory is roughly one part (plus the
+/// largest single write) rather than the whole object.
 /// </para>
 /// <para>
 /// Objects smaller than one part skip multipart entirely and are written with a single
-/// <c>PutObject</c>. An in-progress multipart upload is aborted if finalization fails.
-/// The object becomes visible only when finalized; writing after finalization throws.
+/// <c>PutObject</c>, sent by <see cref="CompleteAsync"/>. The object becomes visible only then;
+/// writing afterwards throws. Disposing without completing aborts: an in-progress multipart
+/// upload is aborted, so neither the object nor its parts are left behind. Without overwrite,
+/// the completing request carries <c>If-None-Match: *</c>, so it cannot replace an object
+/// another writer published in the meantime.
 /// </para>
 /// </remarks>
 public sealed class S3SequentialFile : ISequentialFile
@@ -37,6 +40,7 @@ public sealed class S3SequentialFile : ISequentialFile
     private readonly string _bucket;
     private readonly string _key;
     private readonly int _partSize;
+    private readonly bool _overwrite;
     private readonly List<PartETag> _parts = new();
 
     private MemoryStream _buffer = new();
@@ -44,6 +48,7 @@ public sealed class S3SequentialFile : ISequentialFile
     private int _partNumber = 1;
     private long _position;
     private bool _completed;
+    private bool _aborted;
     private bool _disposed;
 
     /// <summary>
@@ -56,11 +61,16 @@ public sealed class S3SequentialFile : ISequentialFile
     /// Multipart part size in bytes. Must be at least <see cref="MinPartSize"/> (5 MiB).
     /// Defaults to <see cref="DefaultPartSize"/>.
     /// </param>
+    /// <param name="overwrite">
+    /// Whether completion may replace an existing object. When false, <see cref="CompleteAsync"/>
+    /// throws <see cref="IOException"/> if <paramref name="key"/> exists by then.
+    /// </param>
     public S3SequentialFile(
         IAmazonS3 client,
         string bucket,
         string key,
-        int partSize = DefaultPartSize)
+        int partSize = DefaultPartSize,
+        bool overwrite = true)
     {
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _bucket = bucket ?? throw new ArgumentNullException(nameof(bucket));
@@ -71,6 +81,7 @@ public sealed class S3SequentialFile : ISequentialFile
                 nameof(partSize), partSize,
                 $"Part size must be at least {MinPartSize} bytes (5 MiB).");
         _partSize = partSize;
+        _overwrite = overwrite;
     }
 
     /// <inheritdoc/>
@@ -84,9 +95,9 @@ public sealed class S3SequentialFile : ISequentialFile
 #else
         if (_disposed) throw new ObjectDisposedException(GetType().FullName);
 #endif
-        if (_completed)
+        if (_completed || _aborted)
             throw new InvalidOperationException(
-                "Cannot write after the S3 object has been finalized by FlushAsync or disposal.");
+                "Cannot write to an S3 object that has already been completed or aborted.");
 
 #if NET8_0_OR_GREATER
         _buffer.Write(data.Span);
@@ -105,7 +116,10 @@ public sealed class S3SequentialFile : ISequentialFile
             await FlushBufferAsPartAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    /// <inheritdoc/>
+    /// <summary>
+    /// Does nothing: S3 makes an object visible only whole, and a part smaller than 5 MiB can be
+    /// uploaded only as the last one, so there is nothing to send early.
+    /// </summary>
     public ValueTask FlushAsync(CancellationToken cancellationToken = default)
     {
 #if NET8_0_OR_GREATER
@@ -113,16 +127,47 @@ public sealed class S3SequentialFile : ISequentialFile
 #else
         if (_disposed) throw new ObjectDisposedException(GetType().FullName);
 #endif
-        return FinalizeAsync(cancellationToken);
+        return default;
     }
 
     /// <inheritdoc/>
+    public async ValueTask CompleteAsync(CancellationToken cancellationToken = default)
+    {
+#if NET8_0_OR_GREATER
+        ObjectDisposedException.ThrowIf(_disposed, this);
+#else
+        if (_disposed) throw new ObjectDisposedException(GetType().FullName);
+#endif
+        if (_completed)
+            return;
+        if (_aborted)
+            throw new InvalidOperationException("Cannot complete an S3 object whose write was aborted.");
+
+        try
+        {
+            await PublishAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (AmazonS3Exception ex) when (!_overwrite && ex.StatusCode == HttpStatusCode.PreconditionFailed)
+        {
+            await AbortAsync().ConfigureAwait(false);
+            throw new IOException($"Object already exists: {_key}", ex);
+        }
+        catch
+        {
+            await AbortAsync().ConfigureAwait(false);
+            throw;
+        }
+        _completed = true;
+    }
+
+    /// <summary>Aborts the upload unless it was completed: nothing is published, and staged parts are discarded.</summary>
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
         try
         {
-            await FinalizeAsync(CancellationToken.None).ConfigureAwait(false);
+            if (!_completed)
+                await AbortAsync().ConfigureAwait(false);
         }
         finally
         {
@@ -131,15 +176,16 @@ public sealed class S3SequentialFile : ISequentialFile
         }
     }
 
-    /// <inheritdoc/>
+    /// <inheritdoc cref="DisposeAsync"/>
     public void Dispose()
     {
         if (_disposed) return;
-        // Finalize off the current synchronization context to avoid sync-over-async
-        // deadlocks; DisposeAsync is the preferred path.
+        // Abort off the current synchronization context to avoid sync-over-async deadlocks;
+        // DisposeAsync is the preferred path.
         try
         {
-            Task.Run(() => FinalizeAsync(CancellationToken.None).AsTask()).GetAwaiter().GetResult();
+            if (!_completed)
+                Task.Run(() => AbortAsync().AsTask()).GetAwaiter().GetResult();
         }
         finally
         {
@@ -179,68 +225,70 @@ public sealed class S3SequentialFile : ISequentialFile
         _buffer = new MemoryStream();
     }
 
-    private async ValueTask FinalizeAsync(CancellationToken cancellationToken)
+    private async ValueTask PublishAsync(CancellationToken cancellationToken)
     {
-        if (_completed)
-            return;
-        _completed = true;
+        // Conflicts (409) are not retried here as TryWriteAllBytesAsync retries them: the body is a
+        // stream of parts already sent, and a lost race is reported to the caller like any other failure.
+        string? ifNoneMatch = _overwrite ? null : "*";
+        if (_uploadId is null)
+        {
+            // The whole object fit in under one part: write it with a single PutObject.
+            // Also handles the empty-object case (zero writes).
+            _buffer.Position = 0;
+            await _client.PutObjectAsync(
+                new PutObjectRequest
+                {
+                    BucketName = _bucket,
+                    Key = _key,
+                    InputStream = _buffer,
+                    AutoCloseStream = false,
+                    IfNoneMatch = ifNoneMatch,
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            if (_buffer.Length > 0)
+                await FlushBufferAsPartAsync(cancellationToken).ConfigureAwait(false);
 
+            await _client.CompleteMultipartUploadAsync(
+                new CompleteMultipartUploadRequest
+                {
+                    BucketName = _bucket,
+                    Key = _key,
+                    UploadId = _uploadId,
+                    PartETags = _parts,
+                    IfNoneMatch = ifNoneMatch,
+                },
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async ValueTask AbortAsync()
+    {
+        if (_aborted)
+            return;
+        _aborted = true;
+
+        // Leave no dangling multipart upload (which would otherwise accrue storage cost). A small object
+        // has staged nothing: its bytes are only in the buffer.
+        if (_uploadId is null)
+            return;
         try
         {
-            if (_uploadId is null)
-            {
-                // The whole object fit in under one part: write it with a single PutObject.
-                // Also handles the empty-object case (zero writes).
-                _buffer.Position = 0;
-                await _client.PutObjectAsync(
-                    new PutObjectRequest
-                    {
-                        BucketName = _bucket,
-                        Key = _key,
-                        InputStream = _buffer,
-                        AutoCloseStream = false,
-                    },
-                    cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                if (_buffer.Length > 0)
-                    await FlushBufferAsPartAsync(cancellationToken).ConfigureAwait(false);
-
-                await _client.CompleteMultipartUploadAsync(
-                    new CompleteMultipartUploadRequest
-                    {
-                        BucketName = _bucket,
-                        Key = _key,
-                        UploadId = _uploadId,
-                        PartETags = _parts,
-                    },
-                    cancellationToken).ConfigureAwait(false);
-            }
+            await _client.AbortMultipartUploadAsync(
+                new AbortMultipartUploadRequest
+                {
+                    BucketName = _bucket,
+                    Key = _key,
+                    UploadId = _uploadId,
+                },
+                CancellationToken.None).ConfigureAwait(false);
         }
         catch
         {
-            // Leave no dangling multipart upload (which would otherwise accrue storage cost).
-            if (_uploadId is not null)
-            {
-                try
-                {
-                    await _client.AbortMultipartUploadAsync(
-                        new AbortMultipartUploadRequest
-                        {
-                            BucketName = _bucket,
-                            Key = _key,
-                            UploadId = _uploadId,
-                        },
-                        CancellationToken.None).ConfigureAwait(false);
-                }
-                catch
-                {
-                    // Best-effort cleanup; surface the original failure.
-                }
-            }
-
-            throw;
+            // Best-effort cleanup; an abandoned upload is invisible, and a bucket lifecycle rule
+            // (AbortIncompleteMultipartUpload) reclaims it.
         }
     }
 }

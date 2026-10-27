@@ -194,7 +194,7 @@ public class GcsFileTests : IAsyncLifetime
         await file.WriteAsync(new byte[200]);
         Assert.Equal(300, file.Position);
 
-        await file.FlushAsync();
+        await file.CompleteAsync();
     }
 
     [SkippableFact]
@@ -211,7 +211,7 @@ public class GcsFileTests : IAsyncLifetime
         await using (var file = new GcsSequentialFile(Client, _bucket, objectName))
         {
             await file.WriteAsync(payload);
-            await file.FlushAsync();
+            await file.CompleteAsync();
         }
 
         await using var readFile = new GcsRandomAccessFile(Client, _bucket, objectName);
@@ -247,7 +247,7 @@ public class GcsFileTests : IAsyncLifetime
         await using (var file = new GcsSequentialFile(Client, _bucket, objectName))
         {
             await file.WriteAsync(payload);
-            await file.FlushAsync();
+            await file.CompleteAsync();
         }
 
         await using var readFile = new GcsRandomAccessFile(Client, _bucket, objectName, knownLength: payload.Length);

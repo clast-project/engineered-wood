@@ -164,7 +164,8 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Closes the writer, flushing any remaining data and writing the file footer.
+    /// Closes the writer, flushing any remaining data and writing the file footer, then completes the
+    /// underlying <see cref="ISequentialFile"/>, which is what publishes it.
     /// </summary>
     public async ValueTask CloseAsync(CancellationToken cancellationToken = default)
     {
@@ -731,7 +732,7 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
 
         await _file.WriteAsync(psBytes, cancellationToken).ConfigureAwait(false);
         await _file.WriteAsync(new[] { (byte)psBytes.Length }, cancellationToken).ConfigureAwait(false);
-        await _file.FlushAsync(cancellationToken).ConfigureAwait(false);
+        await _file.CompleteAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private static List<Type> BuildTypeList(Schema arrowSchema)

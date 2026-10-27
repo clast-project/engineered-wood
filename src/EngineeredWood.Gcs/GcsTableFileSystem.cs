@@ -162,7 +162,7 @@ public sealed class GcsTableFileSystem : ITableFileSystem
         if (!overwrite && await ObjectExistsAsync(objectName, cancellationToken).ConfigureAwait(false))
             throw new IOException($"Object already exists: {path}");
 
-        return new GcsSequentialFile(_client, _bucket, objectName);
+        return new GcsSequentialFile(_client, _bucket, objectName, overwrite: overwrite);
     }
 
     /// <inheritdoc/>

@@ -170,7 +170,7 @@ internal sealed class ParquetFileAssembler
         await _file.WriteAsync(footerLengthBytes, cancellationToken).ConfigureAwait(false);
 
         await _file.WriteAsync(Par1Magic, cancellationToken).ConfigureAwait(false);
-        await _file.FlushAsync(cancellationToken).ConfigureAwait(false);
+        await _file.CompleteAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

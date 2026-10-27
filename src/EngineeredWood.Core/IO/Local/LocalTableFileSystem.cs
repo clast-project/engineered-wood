@@ -77,6 +77,11 @@ public sealed class LocalTableFileSystem : ITableFileSystem
         {
             cancellationToken.ThrowIfCancellationRequested();
 
+            // A streamed write in flight is not a file yet, as on an object store; and it can be moved or
+            // deleted between the enumeration and the FileInfo below.
+            if (LocalSequentialFile.IsTempFileName(Path.GetFileName(fullPath)))
+                continue;
+
             var info = new FileInfo(fullPath);
             string relativePath = GetRelativePath(_rootPath, fullPath)
                 .Replace('\\', '/');
@@ -113,7 +118,7 @@ public sealed class LocalTableFileSystem : ITableFileSystem
         if (directory is not null)
             Directory.CreateDirectory(directory);
 
-        return new ValueTask<ISequentialFile>(new LocalSequentialFile(fullPath));
+        return new ValueTask<ISequentialFile>(new LocalSequentialFile(fullPath, overwrite));
     }
 
     /// <inheritdoc/>

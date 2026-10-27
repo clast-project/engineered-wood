@@ -48,6 +48,12 @@ public interface ITableFileSystem
     /// The caller owns the returned handle and must dispose it.
     /// Fails if the file already exists when <paramref name="overwrite"/> is false.
     /// </summary>
+    /// <remarks>
+    /// Nothing is published until the caller calls <see cref="ISequentialFile.CompleteAsync"/>; disposing
+    /// the file without completing it discards the write. With <paramref name="overwrite"/> false the
+    /// existence check here only fails early: completion checks again, atomically where the backend can, so
+    /// a file another writer published in the meantime is never replaced.
+    /// </remarks>
     ValueTask<ISequentialFile> CreateAsync(
         string path, bool overwrite = false,
         CancellationToken cancellationToken = default);

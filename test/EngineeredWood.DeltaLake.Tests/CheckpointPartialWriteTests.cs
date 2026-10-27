@@ -334,6 +334,9 @@ public class CheckpointPartialWriteTests : IDisposable
             public ValueTask FlushAsync(CancellationToken cancellationToken = default) =>
                 inner.FlushAsync(cancellationToken);
 
+            public ValueTask CompleteAsync(CancellationToken cancellationToken = default) =>
+                inner.CompleteAsync(cancellationToken);
+
             public ValueTask DisposeAsync() => inner.DisposeAsync();
 
             public void Dispose() => inner.Dispose();

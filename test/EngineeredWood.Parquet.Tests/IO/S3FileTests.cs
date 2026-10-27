@@ -185,7 +185,7 @@ public class S3FileTests : IAsyncLifetime
                 await file.WriteAsync(payload.AsMemory(offset, n));
                 offset += n;
             }
-            await file.FlushAsync();
+            await file.CompleteAsync();
         }
 
         await using var readFile = new S3RandomAccessFile(Client, _bucket, key);
@@ -214,7 +214,7 @@ public class S3FileTests : IAsyncLifetime
         await file.WriteAsync(new byte[200]);
         Assert.Equal(300, file.Position);
 
-        await file.FlushAsync();
+        await file.CompleteAsync();
     }
 
     [SkippableFact]
@@ -231,7 +231,7 @@ public class S3FileTests : IAsyncLifetime
         await using (var file = new S3SequentialFile(Client, _bucket, key))
         {
             await file.WriteAsync(payload);
-            await file.FlushAsync();
+            await file.CompleteAsync();
         }
 
         await using var readFile = new S3RandomAccessFile(Client, _bucket, key);
