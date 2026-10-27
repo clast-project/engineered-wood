@@ -125,6 +125,7 @@ internal static class MetadataDecoder
             {
                 1 => ColumnOrder.TypeDefined,        // TYPE_ORDER: TypeDefinedOrder
                 2 => ColumnOrder.Ieee754TotalOrder,  // IEEE_754_TOTAL_ORDER: IEEE754TotalOrder
+                3 => ColumnOrder.Int96TimestampOrder, // INT96_TIMESTAMP_ORDER: Int96TimestampOrder
                 _ => order,                          // unknown future member
             };
             reader.Skip(type); // consume the (empty) member struct
