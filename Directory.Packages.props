@@ -1,0 +1,100 @@
+<Project>
+
+  <!--
+    Central Package Management: every PackageReference in the repository takes its
+    version from here, so a package is bumped in one place. A project that genuinely
+    needs a different version says so with VersionOverride on its PackageReference;
+    each of those is listed beside the package it overrides below.
+
+    Floating versions (1.*, 9.*, ...) were already in use before CPM and are kept as
+    they were; CPM refuses them (NU1011) unless CentralPackageFloatingVersionsEnabled
+    is set.
+  -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageFloatingVersionsEnabled>true</CentralPackageFloatingVersionsEnabled>
+  </PropertyGroup>
+
+  <!-- Apache Arrow -->
+  <ItemGroup>
+    <PackageVersion Include="Apache.Arrow" Version="23.0.0" />
+    <PackageVersion Include="Apache.Arrow.Operations" Version="23.0.0" />
+  </ItemGroup>
+
+  <!-- Clast -->
+  <ItemGroup>
+    <PackageVersion Include="Clast.Alp" Version="0.2.0" />
+    <PackageVersion Include="Clast.BloomFilter" Version="0.2.0" />
+    <PackageVersion Include="Clast.DatabaseDecimal" Version="0.3.0" />
+    <PackageVersion Include="Clast.FastLanes" Version="0.2.0" />
+    <PackageVersion Include="Clast.Fsst" Version="0.3.1" />
+    <PackageVersion Include="Clast.Google.Cloud.Storage.V1" Version="4.15.0" />
+    <PackageVersion Include="Clast.Pcodec" Version="0.2.0" />
+  </ItemGroup>
+
+  <!-- Compression -->
+  <ItemGroup>
+    <PackageVersion Include="BrotliSharpLib" Version="0.3.3" />
+    <PackageVersion Include="K4os.Compression.LZ4" Version="1.*" />
+    <PackageVersion Include="Snappier" Version="1.*" />
+    <PackageVersion Include="ZstdSharp.Port" Version="0.*" />
+  </ItemGroup>
+
+  <!-- Protobuf (ORC and Lance) -->
+  <ItemGroup>
+    <PackageVersion Include="Google.Protobuf" Version="3.*" />
+    <PackageVersion Include="Grpc.Tools" Version="2.*" />
+  </ItemGroup>
+
+  <!-- Cloud storage -->
+  <ItemGroup>
+    <PackageVersion Include="AWSSDK.S3" Version="4.*" />
+    <PackageVersion Include="Azure.Storage.Blobs" Version="12.*" />
+  </ItemGroup>
+
+  <!--
+    BCL packages and polyfills, mostly for the netstandard2.0 / net472 legs.
+      Microsoft.Bcl.AsyncInterfaces: DeltaLake, DeltaLake.Table and Iceberg override to 9.*.
+      System.Text.Json: DeltaLake and Iceberg override to 9.*; Expressions.Tests,
+        Expressions.Arrow.Tests and Vortex.Tests override to 9.0.0.
+      PolySharp: Parquet.Benchmarks overrides to 1.*.
+  -->
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.Bcl.AsyncInterfaces" Version="8.0.0" />
+    <PackageVersion Include="PolySharp" Version="1.15.0" />
+    <PackageVersion Include="System.IO.Hashing" Version="9.*" />
+    <PackageVersion Include="System.IO.Pipelines" Version="8.0.0" />
+    <PackageVersion Include="System.Memory" Version="4.6.3" />
+    <PackageVersion Include="System.Text.Json" Version="8.0.5" />
+    <PackageVersion Include="System.Threading.Channels" Version="8.*" />
+    <PackageVersion Include="System.Threading.Tasks.Extensions" Version="4.6.0" />
+  </ItemGroup>
+
+  <!-- Build and packaging -->
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.SourceLink.GitHub" Version="10.0.111" />
+    <PackageVersion Include="Mono.Cecil" Version="0.11.6" />
+  </ItemGroup>
+
+  <!-- Tests -->
+  <ItemGroup>
+    <PackageVersion Include="coverlet.collector" Version="6.0.4" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageVersion Include="xunit" Version="2.9.3" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <PackageVersion Include="Xunit.SkippableFact" Version="1.5.61" />
+  </ItemGroup>
+
+  <!--
+    Benchmarks and interop oracles.
+      ParquetSharp: Parquet.Benchmarks overrides to 23.*.
+      Parquet.Net: Parquet.Benchmarks overrides to 5.5.0 on net472, the last release
+        with a netstandard2.0 build.
+  -->
+  <ItemGroup>
+    <PackageVersion Include="BenchmarkDotNet" Version="0.*" />
+    <PackageVersion Include="Parquet.Net" Version="6.*" />
+    <PackageVersion Include="ParquetSharp" Version="23.0.0.2" />
+  </ItemGroup>
+
+</Project>

@@ -14,24 +14,24 @@
   <Import Project="$(MSBuildThisFileDirectory)..\..\build\StrongNameUnsignedReferences.targets" />
   <ItemGroup>
     <UnsignedReferenceToSign Include="ParquetSharp" />
-    <PackageReference Include="Mono.Cecil" Version="0.11.6" PrivateAssets="all" ExcludeAssets="all" GeneratePathProperty="true" />
+    <PackageReference Include="Mono.Cecil" PrivateAssets="all" ExcludeAssets="all" GeneratePathProperty="true" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Apache.Arrow" Version="23.0.0" />
-    <PackageReference Include="Azure.Storage.Blobs" Version="12.*" />
-    <PackageReference Include="Clast.BloomFilter" Version="0.2.0" />
-    <PackageReference Include="coverlet.collector" Version="6.0.4" />
-    <PackageReference Include="Clast.Google.Cloud.Storage.V1" Version="4.15.0" />
-    <PackageReference Include="AWSSDK.S3" Version="4.*" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
-    <PackageReference Include="ParquetSharp" Version="23.0.0.2" />
-    <PackageReference Include="xunit" Version="2.9.3" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <PackageReference Include="Apache.Arrow" />
+    <PackageReference Include="Azure.Storage.Blobs" />
+    <PackageReference Include="Clast.BloomFilter" />
+    <PackageReference Include="coverlet.collector" />
+    <PackageReference Include="Clast.Google.Cloud.Storage.V1" />
+    <PackageReference Include="AWSSDK.S3" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="ParquetSharp" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" />
     <!-- Runtime skips for the cloud-emulator tests (see IO/CloudEmulator.cs). xUnit 2.9.3 cannot skip
          from inside a test body — Assert.Skip is a v3 API — and whether an emulator is listening is
          only knowable at runtime. Same package and version the ORC, Avro and Delta suites use. -->
-    <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
+    <PackageReference Include="Xunit.SkippableFact" />
   </ItemGroup>
 
   <ItemGroup>
