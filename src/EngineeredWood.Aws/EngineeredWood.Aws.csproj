@@ -8,8 +8,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="AWSSDK.S3" Version="4.*" />
-    <PackageReference Include="PolySharp" Version="1.15.0">
+    <PackageReference Include="AWSSDK.S3" />
+    <PackageReference Include="PolySharp">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>

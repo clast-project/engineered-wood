@@ -9,8 +9,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Apache.Arrow" Version="23.0.0" />
-    <PackageReference Include="Clast.DatabaseDecimal" Version="0.3.0" />
+    <PackageReference Include="Apache.Arrow" />
+    <PackageReference Include="Clast.DatabaseDecimal" />
     <ProjectReference Include="..\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
     <!--
       For ArrowCompute's gather/scatter. Evaluating a conditional's branch over only the rows that
@@ -23,11 +23,11 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
-    <PackageReference Include="System.Memory" Version="4.6.3" />
+    <PackageReference Include="System.Memory" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="PolySharp" Version="1.15.0">
+    <PackageReference Include="PolySharp">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>

@@ -8,8 +8,8 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Clast.Google.Cloud.Storage.V1" Version="4.15.0" />
-    <PackageReference Include="PolySharp" Version="1.15.0">
+    <PackageReference Include="Clast.Google.Cloud.Storage.V1" />
+    <PackageReference Include="PolySharp">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
       <PrivateAssets>all</PrivateAssets>
     </PackageReference>
@@ -17,7 +17,7 @@
 
   <!-- System.Threading.Channels is in-box on net8.0+; the package supplies it for netstandard2.0. -->
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
-    <PackageReference Include="System.Threading.Channels" Version="8.*" />
+    <PackageReference Include="System.Threading.Channels" />
   </ItemGroup>
 
   <ItemGroup>
