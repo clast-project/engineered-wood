@@ -29,6 +29,12 @@ internal static class Verify
             .Where(t => filter is null || t.Name.Contains(filter, StringComparison.OrdinalIgnoreCase))
             .OrderBy(t => t.Name)
             .ToList();
+        if (types.Count == 0)
+        {
+            // A mistyped filter must not report a successful verification of nothing.
+            Console.Error.WriteLine($"VERIFY FAILED: no benchmark class matches '{filter}'.");
+            return 2;
+        }
 
         int failures = 0;
         foreach (var type in types)
@@ -63,11 +69,12 @@ internal static class Verify
                             {
                                 result = byEw.ToString();
                             }
-                            else if (byEw.Equals(byDf))
+                            else if (byEw.Equals(byDf) && method.Name == nameof(DmlBenchmarks.EW_DeleteDeletionVector))
                             {
-                                // Two independent readers agree; only delta-dotnet's kernel scan differs. Known
-                                // case: its ReadParquetAsArrow drops the kernel's selection vector, so deletion
-                                // vectors are ignored and deleted rows come back. A finding, not a harness fault.
+                                // The ONE known exception, and only on the one benchmark that writes a deletion
+                                // vector: delta-dotnet's ReadParquetAsArrow drops the kernel's selection vector, so
+                                // DV-deleted rows come back (delta-incubator/delta-dotnet#234). Two independent
+                                // readers agree here. Any other kernel disagreement is a failure.
                                 result = byEw.ToString();
                                 Console.WriteLine($"   WARN {method.Name}: delta-dotnet ReadAsArrowTableAsync read {byDd} " +
                                     "(EW and delta-rs DataFusion agree on the value below)");
@@ -76,6 +83,11 @@ internal static class Verify
                             {
                                 result = $"READERS DISAGREE: EW {byEw} / DD kernel {byDd} / DD DataFusion {byDf}";
                             }
+
+                            // Checkpoint, compaction and vacuum all preserve the rows, so a no-op would pass the
+                            // fingerprint. Check that each did its job too.
+                            if (instance is MaintenanceBenchmarks)
+                                result += " " + await MaintenancePostconditionAsync(category, mutation.CurrentPath!, method.Name);
                         }
                         else
                         {
@@ -95,8 +107,18 @@ internal static class Verify
                     }
 
                     Console.WriteLine($"   {method.Name,-18} {sw.Elapsed.TotalMilliseconds,9:F1} ms  {result}");
-                    if (!(method.Name == nameof(FilteredScanBenchmarks.EW_PruneOnly)))
-                        (byCategory.TryGetValue(category, out var list) ? list : byCategory[category] = []).Add((method.Name, result));
+                    if (method.Name == nameof(FilteredScanBenchmarks.EW_PruneOnly))
+                    {
+                        // Its row count is a superset by design, so it is exempt from the comparison, but not
+                        // from failing.
+                        if (result.StartsWith("THREW", StringComparison.Ordinal))
+                        {
+                            failures++;
+                            Console.WriteLine($"   !! FAILED {method.Name}: {result}");
+                        }
+                        continue;
+                    }
+                    (byCategory.TryGetValue(category, out var list) ? list : byCategory[category] = []).Add((method.Name, result));
                 }
 
                 foreach (var (category, results) in byCategory)
@@ -113,6 +135,59 @@ internal static class Verify
 
         Console.WriteLine(failures == 0 ? "VERIFY OK" : $"VERIFY FAILED: {failures} categories");
         return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// What a maintenance operation must have changed, as a string the category comparison checks for
+    /// equality across engines. A "NOT …" result is a failure on its own, so it is prefixed to mark the
+    /// category as a mismatch even when every engine fails the same way.
+    /// </summary>
+    private static async Task<string> MaintenancePostconditionAsync(string category, string path, string method)
+    {
+        await using var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(Ew.Fs(path));
+        var snapshot = table.CurrentSnapshot;
+        string log = Path.Combine(path, "_delta_log");
+        switch (category)
+        {
+            case "Checkpoint":
+            {
+                // A checkpoint at the latest version, published through _last_checkpoint.
+                string hint = Path.Combine(log, "_last_checkpoint");
+                if (!File.Exists(hint))
+                    return "READERS DISAGREE: NOT checkpointed (no _last_checkpoint)";
+                using var json = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(hint));
+                long version = json.RootElement.GetProperty("version").GetInt64();
+                bool fileExists = Directory.EnumerateFiles(log, $"{version:D20}.checkpoint*").Any();
+                return version == snapshot.Version && fileExists
+                    ? $"checkpoint@v{version}"
+                    : $"READERS DISAGREE: NOT checkpointed at the latest version (hint v{version}, latest v{snapshot.Version}, file {(fileExists ? "present" : "missing")})";
+            }
+            case "Compact":
+            {
+                // Fewer active files than the 100 small ones. The exact count is engine-specific (target sizes
+                // differ), so it is printed but not compared.
+                int active = snapshot.FileCount;
+                Console.WriteLine($"   ({method}: {active} active files after compaction)");
+                return active < Fixtures.Commits
+                    ? "compacted"
+                    : $"READERS DISAGREE: NOT compacted ({active} active files)";
+            }
+            case "Vacuum":
+            {
+                // Every data file on disk is referenced by the snapshot: the removed small files are gone.
+                var referenced = new HashSet<string>(
+                    snapshot.ActiveFiles.Keys.Select(p => Path.GetFullPath(Path.Combine(path, Uri.UnescapeDataString(p)))),
+                    StringComparer.OrdinalIgnoreCase);
+                int unreferenced = Directory.EnumerateFiles(path, "*.parquet", SearchOption.AllDirectories)
+                    .Where(f => !f.StartsWith(log, StringComparison.OrdinalIgnoreCase))
+                    .Count(f => !referenced.Contains(Path.GetFullPath(f)));
+                return unreferenced == 0
+                    ? "vacuumed (0 unreferenced data files)"
+                    : $"READERS DISAGREE: NOT vacuumed ({unreferenced} unreferenced data files remain)";
+            }
+            default:
+                return "";
+        }
     }
 
     private static IEnumerable<List<(PropertyInfo Property, object Value)>> Combinations(Type type)

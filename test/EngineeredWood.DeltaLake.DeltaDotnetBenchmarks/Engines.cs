@@ -91,18 +91,39 @@ internal static class Ew
                 continue;
             }
 
-            var mask = Evaluator.EvaluatePredicate(predicate, batch);
-            var indices = new List<int>(mask.Length);
-            for (int i = 0; i < mask.Length; i++)
+            var indices = new List<int>();
+            using (var mask = Evaluator.EvaluatePredicate(predicate, batch))
             {
-                if (mask.GetValue(i) == true)
-                    indices.Add(i);
+                for (int i = 0; i < mask.Length; i++)
+                {
+                    if (mask.GetValue(i) == true)
+                        indices.Add(i);
+                }
             }
-            using var filtered = ArrowCompute.Take(batch, batch.Schema, indices);
+
+            // Gather only the projected columns: the predicate's own column was read to evaluate the filter,
+            // but the query does not return it, and the SQL engine does not materialize it either.
+            var projected = Project(batch, columns);
+            using var filtered = ArrowCompute.Take(projected, projected.Schema, indices);
             rows += filtered.Length;
-            batch.Dispose();
+            batch.Dispose(); // owns the arrays `projected` shares, so `projected` is not disposed separately
         }
         return rows;
+    }
+
+    private static RecordBatch Project(RecordBatch batch, IReadOnlyList<string> columns)
+    {
+        if (batch.ColumnCount == columns.Count)
+            return batch;
+        var fields = new List<Field>(columns.Count);
+        var arrays = new IArrowArray[columns.Count];
+        for (int c = 0; c < columns.Count; c++)
+        {
+            int index = batch.Schema.GetFieldIndex(columns[c]);
+            fields.Add(batch.Schema.FieldsList[index]);
+            arrays[c] = batch.Column(index);
+        }
+        return new RecordBatch(new Schema(fields, batch.Schema.Metadata), arrays, batch.Length);
     }
 
     /// <summary>
@@ -139,8 +160,8 @@ internal static class Ew
         var positions = new Dictionary<string, List<long>>(StringComparer.Ordinal);
         await foreach (var batch in table.ReadAsync(options))
         {
-            var mask = Evaluator.EvaluatePredicate(predicate, batch);
-            var paths = (StringArray)batch.Column(batch.Schema.GetFieldIndex(pathColumn));
+            using var mask = Evaluator.EvaluatePredicate(predicate, batch);
+            var paths =(StringArray)batch.Column(batch.Schema.GetFieldIndex(pathColumn));
             var indexes = (Int64Array)batch.Column(batch.Schema.GetFieldIndex(indexColumn));
             for (int i = 0; i < batch.Length; i++)
             {

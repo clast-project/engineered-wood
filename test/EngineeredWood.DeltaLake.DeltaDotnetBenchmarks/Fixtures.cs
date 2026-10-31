@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Globalization;
 using DeltaLake.Table;
 using EwDeltaTable = EngineeredWood.DeltaLake.Table.DeltaTable;
 
@@ -41,7 +42,14 @@ internal static class Fixtures
         ?? Path.Combine(Path.GetTempPath(), "ew-vs-delta-dotnet");
 
     private static string Templates => Path.Combine(Root, "templates");
-    private static string Scratch => Path.Combine(Root, "scratch");
+    private static string ScratchRoot => Path.Combine(Root, "scratch");
+
+    /// <summary>
+    /// This process's own scratch directory. BenchmarkDotNet runs each benchmark in a child process, and a
+    /// <c>--verify</c> or a second filtered run may share <see cref="Root"/> with a run in progress, so no
+    /// process may sweep another live process's iteration copies.
+    /// </summary>
+    private static string Scratch => Path.Combine(ScratchRoot, Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
 
     /// <summary>One commit of <see cref="Rows"/> rows.</summary>
     public static string SingleCommit(TableWriter writer) =>
@@ -80,13 +88,26 @@ internal static class Fixtures
         });
 
     /// <summary>
-    /// <see cref="ManyCommits"/> then compacted by the same writer: the removed small files are what a
-    /// vacuum collects.
+    /// The <see cref="ManyCommits"/> shape, then compacted by the same writer: the 100 removed small files are
+    /// what a vacuum collects.
+    ///
+    /// <para>Built with <c>delta.deletedFileRetentionDuration = interval 0 seconds</c>, and both engines vacuum
+    /// with the TABLE's retention rather than an explicit one. delta-dotnet cannot be asked for zero retention:
+    /// its bridge maps <c>VacuumOptions.RetentionHours = 0</c> to "no override", so delta-rs falls back to the
+    /// 7-day default and deletes nothing. That made an earlier version of this benchmark time EW's vacuum
+    /// against a delta-rs no-op.</para>
     /// </summary>
     public static string Compacted(TableWriter writer) =>
-        Ensure($"compacted-{writer}-{Commits}x{RowsPerCommit}", async path =>
+        Ensure($"compacted-retain0-{writer}-{Commits}x{RowsPerCommit}", async path =>
         {
-            CopyDirectory(ManyCommits(writer, checkpointed: false), path);
+            var configuration = new Dictionary<string, string>(NoAutoCheckpoint)
+            {
+                ["delta.deletedFileRetentionDuration"] = "interval 0 seconds",
+            };
+            await Write(writer, path,
+                Enumerable.Range(0, Commits)
+                    .Select(i => Data.Generate((long)i * RowsPerCommit, RowsPerCommit)).ToList(),
+                configuration);
             await CompactAsync(writer, path);
         });
 
@@ -149,8 +170,46 @@ internal static class Fixtures
         }
     }
 
-    /// <summary>Clears out iteration copies left by an earlier, interrupted run.</summary>
-    public static void SweepScratch() => Delete(Scratch);
+    /// <summary>
+    /// Clears out iteration copies left by interrupted runs: this process's own directory, and those of
+    /// processes that have exited. A directory whose process is still running is left alone. (A reused process
+    /// id can only make a dead run's copies survive one more sweep; it can never delete a live run's.)
+    /// </summary>
+    public static void SweepScratch()
+    {
+        Delete(Scratch);
+        if (!Directory.Exists(ScratchRoot))
+            return;
+        foreach (string dir in Directory.EnumerateDirectories(ScratchRoot))
+        {
+            if (int.TryParse(Path.GetFileName(dir), NumberStyles.None, CultureInfo.InvariantCulture, out int pid)
+                && !IsRunning(pid))
+            {
+                Delete(dir);
+            }
+        }
+    }
+
+    private static bool IsRunning(int pid)
+    {
+        try
+        {
+            using var process = System.Diagnostics.Process.GetProcessById(pid);
+            return !process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false; // no such process
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return true; // exists but not inspectable: assume it is live
+        }
+    }
 
     private static string Ensure(string name, Func<string, Task> build)
     {

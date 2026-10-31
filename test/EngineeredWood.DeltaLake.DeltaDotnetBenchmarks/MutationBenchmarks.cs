@@ -209,27 +209,27 @@ public class MaintenanceBenchmarks : MutationBenchmark
         return (long)table.Version()!.Value;
     }
 
-    [BenchmarkCategory("Vacuum"), Benchmark(Baseline = true, Description = "EW VacuumAsync(retain 0)")]
+    [BenchmarkCategory("Vacuum"), Benchmark(Baseline = true, Description = "EW VacuumAsync (table retention: 0s)")]
     public async Task<long> EW_Vacuum()
     {
         await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(CurrentPath!));
-        var result = await table.VacuumAsync(TimeSpan.Zero);
+        var result = await table.VacuumAsync(); // the table's delta.deletedFileRetentionDuration (0s)
         return result.FilesDeleted;
     }
 
-    [BenchmarkCategory("Vacuum"), Benchmark(Description = "DD VacuumAsync(Full, retain 0)")]
+    [BenchmarkCategory("Vacuum"), Benchmark(Description = "DD VacuumAsync(Full, table retention: 0s)")]
     public async Task<long> DD_VacuumFull()
     {
         using var table = await Dd.OpenAsync(CurrentPath!);
-        await table.VacuumAsync(new VacuumOptions { RetentionHours = 0, VacuumMode = VacuumMode.Full }, CancellationToken.None);
+        await table.VacuumAsync(new VacuumOptions { VacuumMode = VacuumMode.Full }, CancellationToken.None);
         return (long)table.Version()!.Value;
     }
 
-    [BenchmarkCategory("Vacuum"), Benchmark(Description = "DD VacuumAsync(Lite, retain 0)")]
+    [BenchmarkCategory("Vacuum"), Benchmark(Description = "DD VacuumAsync(Lite, table retention: 0s)")]
     public async Task<long> DD_VacuumLite()
     {
         using var table = await Dd.OpenAsync(CurrentPath!);
-        await table.VacuumAsync(new VacuumOptions { RetentionHours = 0, VacuumMode = VacuumMode.Lite }, CancellationToken.None);
+        await table.VacuumAsync(new VacuumOptions { VacuumMode = VacuumMode.Lite }, CancellationToken.None);
         return (long)table.Version()!.Value;
     }
 }

@@ -11,7 +11,9 @@ that nothing in the build or test gate needs. Build and run it directly.
 
 ```sh
 # 1. Check that both engines do the same work (row counts, and the table each mutation leaves behind,
-#    read back by EW, by delta-dotnet's kernel scan and by delta-rs's DataFusion scan). Builds the fixtures.
+#    read back by EW, by delta-dotnet's kernel scan and by delta-rs's DataFusion scan; for maintenance, that
+#    the checkpoint was published, the file count fell, and no unreferenced data file remains). Builds the
+#    fixtures. Exits non-zero on any mismatch, or when the filter matches no class.
 dotnet run -c Release --project test/EngineeredWood.DeltaLake.DeltaDotnetBenchmarks -- --verify [ClassFilter]
 
 # 2. Benchmark (all, or e.g. --filter *FullScan*).
@@ -81,8 +83,8 @@ means EW is faster.
 | Operation | EW | delta-dotnet | DD/EW ratio (EW-written / DD-written) |
 |---|---|---|---|
 | Full scan, 1M rows | 13.6 / 24.1 ms | DataFusion 17.3 / 60.9 ms; kernel 93 / 111 ms | 1.27 / 2.53 (DataFusion); 6.9 / 4.6 (kernel) |
-| Filtered scan, 1 file of 20 (`Selective`) | 4.3 / 4.6 ms | 8.6 / 10.8 ms | 2.0 / 2.4 |
-| Filtered scan, 1 row in 16 (`OneCategory`) | 101 / 92 ms (prune only: 10 / 14 ms) | 17.4 / 21.0 ms | **0.17 / 0.23** |
+| Filtered scan, 1 file of 20 (`Selective`) | 4.1 / 6.3 ms | 8.7 / 12.0 ms | 2.1 / 1.9 |
+| Filtered scan, 1 row in 16 (`OneCategory`) | 87 / 94 ms (prune only: 14 / 18 ms) | 19.1 / 22.7 ms | **0.22 / 0.24** |
 | Open latest, 100 commits, no checkpoint | 11.1 / 10.7 ms | 35.9 / 50.3 ms | 3.2 / 4.7 |
 | Open latest, 100 commits, checkpointed | 8.3 / 6.5 ms | 4.2 / 5.5 ms | **0.51 / 0.86** |
 | Open at version 50 | 12–17 ms | 29–33 ms | 1.7–2.8 |
@@ -90,12 +92,20 @@ means EW is faster.
 | Change data feed | 32 / 40 ms | 156 / 166 ms | 4.9 / 4.1 |
 | Create + write 1M rows | 246 ms (min 151, noisy) | 199 ms (default) / 174 ms (64K batches) | **0.85 / 0.75** |
 | Open + append 10K rows, no checkpoint / checkpointed | 28–34 / 18–23 ms | 56–63 / 25–27 ms | 1.9–2.0 / 1.2–1.4 |
-| DELETE 1 row in 16, copy-on-write | 395 / 347 ms | 273 / 312 ms | **0.70 / 0.90** |
-| DELETE 1 row in 16, EW deletion vector | 193 / 168 ms | none | — |
-| UPDATE 1 row in 16 | 401 / 265 ms | 208 / 253 ms | **0.54 / 0.96** |
-| Checkpoint, 100 commits | 32 / 26 ms | 93 / 91 ms | 2.9 / 3.5 |
-| Compact 100 small files | 253 / 303 ms | 473 / 567 ms | 1.9 / 2.0 |
-| Vacuum 100 removed files | 60 / 53 ms | Full 71 / 80 ms; Lite 55 / 62 ms | 1.2 / 1.5 (Full) |
+| DELETE 1 row in 16, copy-on-write | 404 / 351 ms | 271 / 312 ms | **0.69 / 0.89** |
+| DELETE 1 row in 16, EW deletion vector | 156 / 167 ms | none | — |
+| UPDATE 1 row in 16 | 432 / 285 ms (noisy: min 299 / 249) | 211 / 248 ms | **0.51 / 0.90** |
+| Checkpoint, 100 commits | 31 / 26 ms | 90 / 96 ms | 2.9 / 3.7 |
+| Compact 100 small files | 245 / 301 ms | 468 / 466 ms | 1.9 / 1.7 |
+| Vacuum 100 removed files | 54 / 48 ms | Full 128 / 114 ms; Lite 116 / 103 ms | 2.4 / 2.4 (Full) |
+
+The filtered-scan, DML and maintenance rows come from a second run, after review fixes:
+- EW's exact filter now gathers only the projected columns.
+- Evaluator masks are disposed.
+- The vacuum benchmark previously compared EW against a delta-rs no-op. delta-dotnet maps
+  `VacuumOptions.RetentionHours = 0` to "no override", so delta-rs kept its 7-day default and deleted nothing.
+  Both engines now vacuum a table whose own `delta.deletedFileRetentionDuration` is 0, and `--verify` checks
+  that no unreferenced data file remains.
 
 Where delta-dotnet wins, the cause was found for one case and is suspected for the rest:
 
