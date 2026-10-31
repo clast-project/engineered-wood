@@ -6016,6 +6016,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         }
         var allIdentityUpdates = new List<(string Name, long HighWaterMark)>();
 
+        // Each partition's rows, in input order, gathered from every batch before anything is written: a partition
+        // goes to as few files as the target size allows, however the caller batched it (#559).
+        var groups = new PartitionGroups(partitionColumns);
         foreach (var batch in batches)
         {
             if (batch.Length == 0)
@@ -6050,114 +6053,91 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                         $"({string.Join(", ", overwritePartitions.Select(kv => kv.Key + "=" + kv.Value))}).");
                 }
 
-                // Rename logical columns to physical names + stamp field ids, at EVERY level (nested struct
-                // children included — the top-level-only pair left them logical-named/id-less).
-                var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode);
+                groups.Add(partValues, dataBatch);
+            }
+        }
 
-                // IcebergCompat: materialize partition columns into Parquet file
-                if (Schema.IcebergCompat.RequiresPartitionMaterialization(icebergVersion) &&
-                    partValues.Count > 0)
+        // IcebergCompat requires numRecords in stats regardless of options
+        bool collectStats = _options.CollectStats || Schema.IcebergCompat.RequiresNumRecords(icebergVersion);
+
+        foreach (var group in groups)
+        {
+            var partValues = group.PartitionValues;
+
+            // Under column mapping the tracked partitionValues are keyed by the PHYSICAL column name (Delta
+            // spec: "track partition values with the physical name" — Spark does the same; physical keys
+            // survive a partition-column RENAME, which never rewrites add actions). The Hive-style directory
+            // follows the same (physical) keys; readers treat paths as opaque and take values from the log.
+            var trackedPartValues = partValues;
+            if (mappingMode != ColumnMappingMode.None && partValues.Count > 0)
+            {
+                trackedPartValues = new Dictionary<string, string>(partValues.Count);
+                foreach (var kv in partValues)
                 {
-                    physicalBatch = Partitioning.PartitionUtils.AppendPartitionColumns(
-                        physicalBatch, partValues, snapshot.Schema, partitionColumns,
-                        logicalToPhysical);
+                    trackedPartValues[logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
+                }
+            }
+
+            touchedPartitions?.Add(CanonicalPartitionKey(
+                trackedPartValues, partitionColumns, logicalToPhysical, snapshot.Schema));
+
+            IReadOnlyList<RolledDataFile> files;
+            await using (var writer = new RollingDataFileWriter(
+                _fs, _options.DataFileWriter, DataFileWriteOptions(snapshot), _options.TargetFileSize,
+                BuildPartitionPath(trackedPartValues), written, collectStats, statsSelection))
+            {
+                foreach (var dataBatch in group.Batches)
+                {
+                    // Rename logical columns to physical names + stamp field ids, at EVERY level (nested struct
+                    // children included — the top-level-only pair left them logical-named/id-less). The file's
+                    // stats are collected over this batch: keyed PHYSICAL at every level under mapping, matching
+                    // what spec readers use for data skipping.
+                    var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode);
+
+                    // IcebergCompat: materialize partition columns into the Parquet file (physical-named by
+                    // AppendPartitionColumns, and carrying no mapping ids of their own).
+                    var fileBatch = physicalBatch;
+                    if (Schema.IcebergCompat.RequiresPartitionMaterialization(icebergVersion) &&
+                        partValues.Count > 0)
+                    {
+                        fileBatch = Partitioning.PartitionUtils.AppendPartitionColumns(
+                            fileBatch, partValues, snapshot.Schema, partitionColumns,
+                            logicalToPhysical);
+                    }
+
+                    // For a Spark 4.0.x-compatible table, drop the VARIANT logical-type annotation by writing
+                    // the bare storage struct. Bytes are identical; only the parquet schema differs, and the
+                    // read path recovers the variant type from the Delta schema.
+                    var writeBatch = _options.EmitVariantLogicalType
+                        ? fileBatch
+                        : VariantColumnCoercion.StripAnnotation(fileBatch);
+
+                    await writer.AddAsync(writeBatch, physicalBatch, cancellationToken).ConfigureAwait(false);
                 }
 
-                // (field ids already stamped recursively above; IcebergCompat-appended partition columns are
-                // physical-named by AppendPartitionColumns and carry no mapping ids of their own)
+                files = await writer.CompleteAsync(cancellationToken).ConfigureAwait(false);
+            }
 
+            foreach (var file in files)
+            {
                 // Assign row IDs if row tracking is enabled. A freshly-appended file needs ONLY
-                // add.baseRowId + add.defaultRowCommitVersion (set on the AddFile below): a row's stable id is
-                // baseRowId + its physical position, and its commit version is the file's default. NO
-                // materialized column is written — that is reserved for rows RELOCATED by a copy-on-write
-                // rewrite (deferred). Materializing one here produced a non-spec physical column a foreign
-                // reader would surface as a stray column.
+                // add.baseRowId + add.defaultRowCommitVersion: a row's stable id is baseRowId + its physical
+                // position, and its commit version is the file's default. NO materialized column is written —
+                // that is reserved for rows RELOCATED by a copy-on-write rewrite. Materializing one here produced
+                // a non-spec physical column a foreign reader would surface as a stray column.
                 long fileBaseRowId = nextRowId;
                 if (rowTrackingEnabled)
-                {
-                    nextRowId += dataBatch.Length;
-                }
-
-                // Under column mapping the tracked partitionValues are keyed by the PHYSICAL column name (Delta
-                // spec: "track partition values with the physical name" — Spark does the same; physical keys
-                // survive a partition-column RENAME, which never rewrites add actions). The Hive-style directory
-                // follows the same (physical) keys; readers treat paths as opaque and take values from the log.
-                var trackedPartValues = partValues;
-                if (mappingMode != ColumnMappingMode.None && partValues.Count > 0)
-                {
-                    trackedPartValues = new Dictionary<string, string>(partValues.Count);
-                    foreach (var kv in partValues)
-                    {
-                        trackedPartValues[logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
-                    }
-                }
-
-                touchedPartitions?.Add(CanonicalPartitionKey(
-                    trackedPartValues, partitionColumns, logicalToPhysical, snapshot.Schema));
-
-                // Build file path: partition subdirectory + UUID filename
-                string partDir = BuildPartitionPath(trackedPartValues);
-                string fileName = string.IsNullOrEmpty(partDir)
-                    ? $"{Guid.NewGuid():N}.parquet"
-                    : $"{partDir}/{Guid.NewGuid():N}.parquet";
-
-                // Recorded BEFORE the write: a write that fails part-way leaves bytes at this path, and they
-                // are as orphaned as a complete file's.
-                written?.Record(fileName);
-
-                long fileSize;
-
-                // For a Spark 4.0.x-compatible table, drop the VARIANT logical-type annotation by writing
-                // the bare storage struct. Bytes are identical; only the parquet schema differs, and the
-                // read path recovers the variant type from the Delta schema. Stats above use dataBatch, so
-                // this does not touch them.
-                var writeBatch = _options.EmitVariantLogicalType
-                    ? physicalBatch
-                    : VariantColumnCoercion.StripAnnotation(physicalBatch);
-
-                if (_options.DataFileWriter is { } dataFileWriter)
-                {
-                    // Delegate the parquet bytes to the host writer; it places the file at the location the
-                    // table filesystem maps `fileName` to and returns its byte size.
-                    fileSize = await dataFileWriter.WriteAsync(
-                        new[] { writeBatch }.ToAsyncEnumerable(), fileName, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                else
-                {
-                    await using var file = await _fs.CreateAsync(
-                        fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
-                    await using var writer = new ParquetFileWriter(
-                        file, ownsFile: false, DataFileWriteOptions(snapshot));
-                    await writer.WriteRowGroupAsync(writeBatch, cancellationToken)
-                        .ConfigureAwait(false);
-
-                    // CloseAsync writes the footer and publishes the file before we read Position
-                    await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
-                    fileSize = file.Position;
-                }
-
-                // Collect stats from the data batch. Under column mapping the Delta-spec convention keys the
-                // per-file stats by the PHYSICAL column names (matching what the streaming writer emits and what
-                // spec readers use for data skipping) — collect over the top-level-renamed batch (stats cover
-                // top-level primitives only, so the flat rename suffices).
-                // IcebergCompat requires numRecords in stats regardless of options
-                string? stats = null;
-                if (_options.CollectStats ||
-                    Schema.IcebergCompat.RequiresNumRecords(icebergVersion))
-                    // Stats keys are PHYSICAL at every level under mapping (nested struct leaves included).
-                    stats = CollectStats(
-                        ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode), statsSelection);
+                    nextRowId += file.Rows;
 
                 actions.Add(new AddFile
                 {
                     // add.path is the URL-encoded form of the on-disk relative path (spec / Spark).
-                    Path = DeltaPath.Encode(fileName),
+                    Path = DeltaPath.Encode(file.FileName),
                     PartitionValues = trackedPartValues,
-                    Size = fileSize,
+                    Size = file.Size,
                     ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                     DataChange = true,
-                    Stats = stats,
+                    Stats = file.Stats,
                     BaseRowId = rowTrackingEnabled ? fileBaseRowId : null,
                     DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
                 });
@@ -7007,6 +6987,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
+        // Each partition's rows, in input order, gathered before anything is written, so a partition goes to as
+        // few files as the target size allows (#559).
+        var groups = new PartitionGroups(partitionColumns);
         int rowIdOffset = 0;
         foreach (var batch in batches)
         {
@@ -7033,80 +7016,72 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
             rowIdOffset += batch.Length;
 
-            var partitions = Partitioning.PartitionUtils.SplitByPartition(splitInput, partitionColumns);
-            foreach (var (partValues, splitBatch) in partitions)
+            foreach (var (partValues, splitBatch) in Partitioning.PartitionUtils.SplitByPartition(splitInput, partitionColumns))
             {
-                if (splitBatch.Length == 0)
-                    continue;
+                if (splitBatch.Length > 0)
+                    groups.Add(partValues, splitBatch);
+            }
+        }
 
-                var dataBatch = splitBatch;
-                Int64Array? rideAlongIds = null;
-                if (materializedRowIds is not null)
+        foreach (var group in groups)
+        {
+            var partValues = group.PartitionValues;
+
+            // partitionValues keyed by the PHYSICAL column name under mapping (the spec convention).
+            var trackedPartValues = partValues;
+            if (mappingMode != ColumnMappingMode.None && partValues.Count > 0)
+            {
+                trackedPartValues = new Dictionary<string, string>(partValues.Count);
+                foreach (var kv in partValues)
                 {
-                    rideAlongIds = (Int64Array)splitBatch.Column(RowIdRideAlongColumn);
-                    dataBatch = DropColumn(splitBatch, RowIdRideAlongColumn);
+                    trackedPartValues[logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
                 }
+            }
 
-                // Rename logical columns to physical names + stamp field ids at every nesting level.
-                var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode);
-
-                // partitionValues keyed by the PHYSICAL column name under mapping (the spec convention).
-                var trackedPartValues = partValues;
-                if (mappingMode != ColumnMappingMode.None && partValues.Count > 0)
+            IReadOnlyList<RolledDataFile> rolled;
+            await using (var writer = new RollingDataFileWriter(
+                _fs, _options.DataFileWriter, DataFileWriteOptions(writeSchema, mappingMode), _options.TargetFileSize,
+                BuildPartitionPath(trackedPartValues), written: null, _options.CollectStats, statsSelection))
+            {
+                foreach (var splitBatch in group.Batches)
                 {
-                    trackedPartValues = new Dictionary<string, string>(partValues.Count);
-                    foreach (var kv in partValues)
+                    var dataBatch = splitBatch;
+                    Int64Array? rideAlongIds = null;
+                    if (materializedRowIds is not null)
                     {
-                        trackedPartValues[logicalToPhysical.TryGetValue(kv.Key, out var p) ? p : kv.Key] = kv.Value;
+                        rideAlongIds = (Int64Array)splitBatch.Column(RowIdRideAlongColumn);
+                        dataBatch = DropColumn(splitBatch, RowIdRideAlongColumn);
                     }
+
+                    // Rename logical columns to physical names + stamp field ids at every nesting level. Stats are
+                    // collected over this batch, keyed PHYSICAL at every level, matching spec readers.
+                    var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode);
+
+                    // Same variant logical-type policy as the committing write path (Spark 4.0.x tables drop the
+                    // annotation; the read path recovers the type from the Delta schema).
+                    var writeBatch = _options.EmitVariantLogicalType
+                        ? physicalBatch
+                        : VariantColumnCoercion.StripAnnotation(physicalBatch);
+
+                    // The materialized ids go back on AFTER the physical rename — the column's name comes from
+                    // table metadata and is already physical, so passing it through the mapping would rename it.
+                    if (rideAlongIds is not null)
+                    {
+                        writeBatch = RowTracking.RowTrackingWriter.AddRowIdColumn(
+                            writeBatch, rideAlongIds, matRowIdName!, nullable: true);
+                    }
+
+                    await writer.AddAsync(writeBatch, physicalBatch, cancellationToken).ConfigureAwait(false);
                 }
 
-                string partDir = BuildPartitionPath(trackedPartValues);
-                string fileName = string.IsNullOrEmpty(partDir)
-                    ? $"{Guid.NewGuid():N}.parquet"
-                    : $"{partDir}/{Guid.NewGuid():N}.parquet";
+                rolled = await writer.CompleteAsync(cancellationToken).ConfigureAwait(false);
+            }
 
-                // Same variant logical-type policy as the committing write path (Spark 4.0.x tables drop the
-                // annotation; the read path recovers the type from the Delta schema).
-                var writeBatch = _options.EmitVariantLogicalType
-                    ? physicalBatch
-                    : VariantColumnCoercion.StripAnnotation(physicalBatch);
-
-                // The materialized ids go back on AFTER the physical rename — the column's name comes from
-                // table metadata and is already physical, so passing it through the mapping would rename it.
-                if (rideAlongIds is not null)
-                {
-                    writeBatch = RowTracking.RowTrackingWriter.AddRowIdColumn(
-                        writeBatch, rideAlongIds, matRowIdName!, nullable: true);
-                }
-
-                long fileSize;
-                if (_options.DataFileWriter is { } dataFileWriter)
-                {
-                    fileSize = await dataFileWriter.WriteAsync(
-                        new[] { writeBatch }.ToAsyncEnumerable(), fileName, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                else
-                {
-                    await using var file = await _fs.CreateAsync(
-                        fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
-                    await using var writer = new ParquetFileWriter(
-                        file, ownsFile: false, DataFileWriteOptions(writeSchema, mappingMode));
-                    await writer.WriteRowGroupAsync(writeBatch, cancellationToken).ConfigureAwait(false);
-                    await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
-                    fileSize = file.Position;
-                }
-
-                // Stats keyed PHYSICAL at every level, matching the streaming writer + spec readers.
-                string? stats = _options.CollectStats
-                    ? CollectStats(
-                        ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode), statsSelection)
-                    : null;
-
+            foreach (var file in rolled)
+            {
                 files.Add(new WrittenDataFile(
-                    fileName, fileSize, dataBatch.Length,
-                    trackedPartValues.Count > 0 ? trackedPartValues : null, stats));
+                    file.FileName, file.Size, file.Rows,
+                    trackedPartValues.Count > 0 ? trackedPartValues : null, file.Stats));
             }
         }
 

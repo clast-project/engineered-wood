@@ -28,8 +28,10 @@ public interface IDataFileWriter
 {
     /// <summary>Writes <paramref name="batches"/> as a single parquet file at <paramref name="relativePath"/>
     /// (relative to the table root, including any partition subdirectory), and returns the written file's byte
-    /// size (stored on the <c>add</c> action). The batches are <b>streamed</b> — a fresh write yields one batch,
-    /// a copy-on-write rewrite yields the surviving batches of one source file — so an implementation may consume
+    /// size (stored on the <c>add</c> action). The batches are <b>streamed</b> — a fresh write yields the caller's
+    /// batches for one partition, as many as fit <see cref="DeltaTableOptions.TargetFileSize"/> by their Arrow size,
+    /// and a copy-on-write rewrite yields the surviving batches of one source file. The batches are passed as they
+    /// came, so the implementation chooses its own row groups. An implementation may consume
     /// them incrementally (e.g. a streaming DuckDB <c>COPY</c>) instead of holding the whole file in memory; one
     /// that wants a materialized list can collect them itself. This is symmetric with the streaming
     /// <see cref="IDataFileReader.ReadAsync"/>. The implementation is responsible for placing the bytes at the

@@ -32,26 +32,41 @@ internal static class StatsCollector
     /// </summary>
     public static string? Collect(IReadOnlyList<RecordBatch> batches, StatsColumnSelection? selection = null)
     {
-        selection ??= StatsColumnSelection.All;
-        long totalRows = 0;
-        var minValues = new Dictionary<string, object?>();
-        var maxValues = new Dictionary<string, object?>();
+        var accumulator = new Accumulator(selection);
+        foreach (var batch in batches)
+            accumulator.Add(batch);
+        return accumulator.Serialize();
+    }
+
+    /// <summary>
+    /// One file's statistics, built up batch by batch as the file is written, so the batches need not be kept
+    /// until it is closed. <see cref="Collect(IReadOnlyList{RecordBatch}, StatsColumnSelection?)"/> is the same
+    /// over a list.
+    /// </summary>
+    internal sealed class Accumulator
+    {
+        private readonly StatsColumnSelection _selection;
+        private long _totalRows;
+        private readonly Dictionary<string, object?> _minValues = new();
+        private readonly Dictionary<string, object?> _maxValues = new();
         // Values are long (a leaf) or a nested Dictionary<string, object> (a struct subtree) — the Delta
         // stats JSON nests objects mirroring the schema.
-        var nullCounts = new Dictionary<string, object>();
+        private readonly Dictionary<string, object> _nullCounts = new();
 
-        foreach (var batch in batches)
+        public Accumulator(StatsColumnSelection? selection) => _selection = selection ?? StatsColumnSelection.All;
+
+        public void Add(RecordBatch batch)
         {
             if (batch.Length == 0)
-                continue;
+                return;
 
-            totalRows += batch.Length;
+            _totalRows += batch.Length;
 
             for (int col = 0; col < batch.ColumnCount; col++)
             {
                 var field = batch.Schema.FieldsList[col];
                 var array = batch.Column(col);
-                if (!selection.Includes(field.Name, out var selected))
+                if (!_selection.Includes(field.Name, out var selected))
                 {
                     continue;
                 }
@@ -59,28 +74,28 @@ internal static class StatsCollector
                 if (array is StructArray structCol)
                 {
                     // Nested stats: recurse into struct leaves (list/map subtrees carry no per-column stats).
-                    var nMin = GetOrAddNested(minValues, field.Name);
-                    var nMax = GetOrAddNested(maxValues, field.Name);
-                    var nNull = GetOrAddNestedCounts(nullCounts, field.Name);
+                    var nMin = GetOrAddNested(_minValues, field.Name);
+                    var nMax = GetOrAddNested(_maxValues, field.Name);
+                    var nNull = GetOrAddNestedCounts(_nullCounts, field.Name);
                     CollectStruct(
                         structCol, firstElement: 0, structCol.Length, ancestorNull: null, selected, nMin, nMax, nNull);
                 }
                 else
                 {
                     // Sum null counts across batches
-                    long existing = nullCounts.TryGetValue(field.Name, out var ex) && ex is long l ? l : 0;
-                    nullCounts[field.Name] = existing + array.NullCount;
+                    long existing = _nullCounts.TryGetValue(field.Name, out var ex) && ex is long l ? l : 0;
+                    _nullCounts[field.Name] = existing + array.NullCount;
 
                     // Merge min/max across batches
-                    CollectMinMax(field.Name, array, minValues, maxValues);
+                    CollectMinMax(field.Name, array, _minValues, _maxValues);
                 }
             }
         }
 
-        if (totalRows == 0)
-            return null;
-
-        return SerializeStats(totalRows, minValues, maxValues, nullCounts, selection.StringPrefixLength);
+        /// <summary>The stats JSON, or null when no row was added.</summary>
+        public string? Serialize() => _totalRows == 0
+            ? null
+            : SerializeStats(_totalRows, _minValues, _maxValues, _nullCounts, _selection.StringPrefixLength);
     }
 
     private static string SerializeStats(

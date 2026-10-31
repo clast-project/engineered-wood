@@ -45,11 +45,10 @@ runs against both.
 
 ## Read these numbers with care
 
-- **The two writers lay the "same" table out very differently.** EW writes one Parquet file per input
-  `RecordBatch` (`DeltaTableOptions.TargetFileSize` is declared but nothing reads it; #559), so the one-commit 1M-row
-  table is **16 files, 23 MB** when EW writes it (65,536-row batches), and **1 file, 34 MB** when delta-dotnet
-  does. Multi-file tables parallelise better, DataFusion's above all, which is most of the gap between the two
-  `Writer` rows of FullScan.
+- **The two writers lay the "same" table out differently.** Both now write the one-commit 1M-row table as
+  **one file**: 22.5 MB when EW writes it, 34 MB when delta-dotnet does. Until #559, EW wrote one file per input
+  `RecordBatch`, which made it 16 files of about 1.5 MB. Multi-file tables parallelise better, DataFusion's
+  above all, so the full-scan numbers fell for the EW-written table when it became one file.
 - **Allocated is managed memory only.** delta-dotnet works in the Rust heap, which BenchmarkDotNet cannot
   see, so its Allocated column is close to zero and **not comparable** to EW's.
 - **Parallelism differs.** delta-rs runs on a multi-threaded tokio runtime and DataFusion parallelises scans.
@@ -84,7 +83,7 @@ means EW is faster.
 
 | Operation | EW | delta-dotnet | DD/EW ratio (EW-written / DD-written) |
 |---|---|---|---|
-| Full scan, 1M rows | 13.6 / 24.1 ms | DataFusion 17.3 / 60.9 ms; kernel 93 / 111 ms | 1.27 / 2.53 (DataFusion); 6.9 / 4.6 (kernel) |
+| Full scan, 1M rows | 17.9 / 22.9 ms | DataFusion 43.6 / 62.5 ms; kernel 94 / 115 ms | 2.44 / 2.73 (DataFusion); 5.3 / 5.0 (kernel) |
 | Filtered scan, 1 file of 20 (`Selective`) | 4.1 / 6.3 ms | 8.7 / 12.0 ms | 2.1 / 1.9 |
 | Filtered scan, 1 row in 16 (`OneCategory`) | 87 / 94 ms (prune only: 14 / 18 ms) | 19.1 / 22.7 ms | **0.22 / 0.24** |
 | Open latest, 100 commits, no checkpoint | 11.1 / 10.7 ms | 35.9 / 50.3 ms | 3.2 / 4.7 |
@@ -92,16 +91,17 @@ means EW is faster.
 | Open at version 50 | 12–17 ms | 29–33 ms | 1.7–2.8 |
 | History, no checkpoint / checkpointed | 18–20 / 14–16 ms | 36–39 / 13–16 ms | ~2 / ~1 |
 | Change data feed | 32 / 40 ms | 156 / 166 ms | 4.9 / 4.1 |
-| Create + write 1M rows | 246 ms (min 151, noisy) | 199 ms (default) / 174 ms (64K batches) | **0.85 / 0.75** |
+| Create + write 1M rows | 182 ms (min 132, noisy) | 202 ms (default) / 177 ms (64K batches) | 1.11 / **0.97** |
 | Open + append 10K rows, no checkpoint / checkpointed | 28–34 / 18–23 ms | 56–63 / 25–27 ms | 1.9–2.0 / 1.2–1.4 |
-| DELETE 1 row in 16, copy-on-write (`DeleteAsync`, since #562) | 396 / 310 ms (host-composed before #562: 420 / 341) | 268 / 305 ms | **0.68** / 0.99 |
-| DELETE 1 row in 16, EW deletion vector (EW-written DV table only) | 174 ms | none (delta-rs writes no DVs) | — |
-| UPDATE 1 row in 16 | 432 / 285 ms (noisy: min 299 / 249) | 211 / 248 ms | **0.51 / 0.90** |
+| DELETE 1 row in 16, copy-on-write (`DeleteAsync`, since #562) | 335 / 304 ms (host-composed before #562: 357 / 346) | 299 / 307 ms | **0.89** / 1.01 |
+| DELETE 1 row in 16, EW deletion vector (EW-written DV table only) | 129 ms | none (delta-rs writes no DVs) | — |
+| UPDATE 1 row in 16 | 289 / 275 ms (noisy: min 256 / 243) | 236 / 249 ms | **0.82 / 0.91** |
 | Checkpoint, 100 commits | 31 / 26 ms | 90 / 96 ms | 2.9 / 3.7 |
 | Compact 100 small files | 245 / 301 ms | 468 / 466 ms | 1.9 / 1.7 |
 | Vacuum 100 removed files | 54 / 48 ms | Full 128 / 114 ms; Lite 116 / 103 ms | 2.4 / 2.4 (Full) |
 
-The filtered-scan, DML and maintenance rows come from a second run, after review fixes:
+The full-scan, write and DML rows come from a third run, after #559 made EW write the one-commit table as one
+file instead of 16. The filtered-scan and maintenance rows are from the second run, after review fixes:
 - EW's exact filter now gathers only the projected columns.
 - Evaluator masks are disposed.
 - The vacuum benchmark previously compared EW against a delta-rs no-op. delta-dotnet maps
@@ -116,5 +116,5 @@ Where delta-dotnet wins, the cause was found for one case and is suspected for t
   takes 90–105 ms, about 100 ns/row (#560). A naive `GetString` loop takes about 40 ms. The same evaluator drives EW's
   own DELETE/UPDATE masks, which probably explains part of their gap too.
 - **Opening a checkpointed table:** delta-kernel-rs is up to 2× faster at reading a small checkpoint.
-- **Write:** close on minimum times, but EW allocates about 286 MB of managed memory for 1M rows, and its mean
-  carries GC noise.
+- **Write:** EW is now ahead of delta-dotnet's default and level with its 64K-batch setting, but allocates about 322 MB of managed memory for 1M rows
+  (286 MB before #559: joining the batches into one row group costs a copy), and its mean carries GC noise.
