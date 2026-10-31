@@ -128,7 +128,7 @@ internal static class Fixtures
             if (writer == TableWriter.EngineeredWood)
             {
                 await Ew.UpdateAsync(path, Sql.OneCategory);
-                await Ew.DeleteCopyOnWriteAsync(path, "category = 'cat_05'");
+                await Ew.DeleteAsync(path, "category = 'cat_05'");
             }
             else
             {

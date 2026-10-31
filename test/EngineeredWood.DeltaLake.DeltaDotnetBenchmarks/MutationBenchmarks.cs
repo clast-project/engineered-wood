@@ -108,8 +108,9 @@ public class AppendBenchmarks : MutationBenchmark
 /// deletion vectors, so both engines copy-on-write: read the file, drop/alter the matching rows, rewrite them.
 ///
 /// <para>EW's predicate <c>DeleteAsync</c> refuses a partial-file delete on such a table (it only writes
-/// deletion vectors), so the like-for-like EW DELETE is the host-composed copy-on-write in
-/// <see cref="Ew.DeleteCopyOnWriteAsync"/>. EW's own deletion-vector DELETE is measured separately, in
+/// deletion vectors) until #562; it now rewrites, as delta-rs does. The copy-on-write a host had to compose
+/// before that (<see cref="Ew.DeleteHostComposedCopyOnWriteAsync"/>) is kept beside it as a reference. EW's own
+/// deletion-vector DELETE is measured separately, in
 /// <see cref="DeletionVectorDeleteBenchmarks"/>.</para>
 /// </summary>
 [Config(typeof(SingleShotConfig))]
@@ -130,8 +131,11 @@ public class DmlBenchmarks : MutationBenchmark
     [IterationSetup]
     public void Fresh() => CurrentPath = Fixtures.FreshCopy(_template);
 
-    [BenchmarkCategory("Delete"), Benchmark(Baseline = true, Description = "EW scan + DeleteRowsAsync(CopyOnWrite)")]
-    public Task<long> EW_DeleteCopyOnWrite() => Ew.DeleteCopyOnWriteAsync(CurrentPath!, Sql.OneCategory);
+    [BenchmarkCategory("Delete"), Benchmark(Baseline = true, Description = "EW DeleteAsync (copy-on-write)")]
+    public Task<long> EW_DeleteCopyOnWrite() => Ew.DeleteAsync(CurrentPath!, Sql.OneCategory);
+
+    [BenchmarkCategory("Delete"), Benchmark(Description = "EW scan + DeleteRowsAsync(CopyOnWrite), host-composed")]
+    public Task<long> EW_DeleteHostComposed() => Ew.DeleteHostComposedCopyOnWriteAsync(CurrentPath!, Sql.OneCategory);
 
     [BenchmarkCategory("Delete"), Benchmark(Description = "DD DeleteAsync")]
     public Task<long> DD_Delete() => Dd.DeleteAsync(CurrentPath!, Sql.OneCategory);

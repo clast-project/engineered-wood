@@ -523,4 +523,81 @@ public class DeltaTransactionAbortTests : IDisposable
             async () => await tx1.CommitAsync());
         Assert.Contains("did not succeed", again.Message, StringComparison.Ordinal);
     }
+
+    // ── A staging call that fails partway takes back what it wrote ──
+
+    /// <summary>A DELETE mask that matches <paramref name="target"/> and throws on any batch holding an id of
+    /// <paramref name="throwFrom"/> or more: the scan fails on the second file, after the first is done.</summary>
+    private static Func<RecordBatch, BooleanArray> IdEqualsThenThrows(long target, long throwFrom) => batch =>
+    {
+        var id = (Int64Array)batch.Column("id");
+        var mask = new BooleanArray.Builder();
+        for (int i = 0; i < id.Length; i++)
+        {
+            if (id.GetValue(i) >= throwFrom)
+                throw new InvalidOperationException("predicate failed");
+            mask.Append(id.GetValue(i) == target);
+        }
+        return mask.Build();
+    };
+
+    /// <summary>
+    /// A DELETE whose predicate throws on the second file has already written the first file's change file.
+    /// Nothing staged references it, so the failed call takes it back. A caller that catches the failure and
+    /// commits the rest of the transaction must not leave it orphaned.
+    /// </summary>
+    [Fact]
+    public async Task AFailedDelete_TakesBackTheChangeFileItWrote_SoCommittingTheRestLeaksNothing()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" });
+        await table.WriteAsync([Range(1, 5)]);
+        await table.WriteAsync([Range(10, 14)]);
+
+        var txn = table.StartTransaction();
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => txn.DeleteAsync(IdEqualsThenThrows(target: 2, throwFrom: 10)).AsTask());
+        Assert.Empty(ChangeDataFiles());
+
+        await txn.WriteAsync([Batch(100)]);
+        await txn.CommitAsync();
+
+        Assert.Empty(ChangeDataFiles());
+        Assert.Equal(3, DataFiles().Length);
+        Assert.Equal([1L, 2L, 3L, 4L, 5L, 10L, 11L, 12L, 13L, 14L, 100L], await ReadIds(table));
+    }
+
+    /// <summary>
+    /// The same for an UPDATE whose updater throws on the second file, after it has written the first file's
+    /// post-image.
+    /// </summary>
+    [Fact]
+    public async Task AFailedUpdate_TakesBackTheRewriteItWrote_SoCommittingTheRestLeaksNothing()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdSchema);
+        await table.WriteAsync([Range(1, 5)]);
+        await table.WriteAsync([Range(10, 14)]);
+        string[] before = DataFiles();
+
+        var txn = table.StartTransaction();
+        await Assert.ThrowsAsync<InvalidOperationException>(() => txn.UpdateAsync(IdAtMost(100), batch =>
+        {
+            var id = (Int64Array)batch.Column("id");
+            for (int i = 0; i < id.Length; i++)
+            {
+                if (id.GetValue(i) >= 10)
+                    throw new InvalidOperationException("updater failed");
+            }
+            return batch;
+        }).AsTask());
+        Assert.Equal(before, DataFiles());
+
+        await txn.WriteAsync([Batch(100)]);
+        await txn.CommitAsync();
+
+        Assert.Equal(before.Length + 1, DataFiles().Length);
+        Assert.Equal([1L, 2L, 3L, 4L, 5L, 10L, 11L, 12L, 13L, 14L, 100L], await ReadIds(table));
+    }
 }

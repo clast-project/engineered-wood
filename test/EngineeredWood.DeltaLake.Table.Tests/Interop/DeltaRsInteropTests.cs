@@ -217,6 +217,58 @@ public class DeltaRsInteropTests : IDisposable
             await ReadAllViaEw(table));
     }
 
+    /// <summary>
+    /// A predicate DELETE that matches part of a file, on a table without deletion vectors, rewrites the file
+    /// (#562) where it used to refuse. delta-rs reads no deletion vectors, so it is the reader the rewrite is for:
+    /// it must see exactly the survivors, from a plain remove/add commit.
+    /// </summary>
+    [SkippableFact]
+    public async Task EwCopyOnWriteDeleted_DeltaRsReadsTheSurvivors()
+    {
+        DeltaRs.Require();
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, IdRegionSchema);
+        await table.WriteAsync([IdRegionBatch([1, 2, 3, 4, 5], ["us", "eu", "us", "apac", "eu"])]);
+        var (deleted, _) = await table.DeleteAsync(Expressions.Expressions.Equal("region", "eu"));
+        Assert.Equal(2, deleted);
+
+        var result = DeltaRs.Invoke("read", new { path = _tempDir });
+
+        Assert.Equal([(1L, "us"), (3L, "us"), (4L, "apac")], RowsFromJson(result));
+        Assert.Equal(await ReadAllViaEw(table), RowsFromJson(result));
+    }
+
+    /// <summary>
+    /// The case #562 names: a table delta-rs wrote has no deletion vectors, so a partial DELETE from EW used to
+    /// refuse every time. EW now rewrites the delta-rs file, and delta-rs reads the result back.
+    /// </summary>
+    [SkippableFact]
+    public async Task DeltaRsWritten_EwCopyOnWriteDeleted_DeltaRsReadsTheSurvivors()
+    {
+        DeltaRs.Require();
+
+        DeltaRs.Invoke("write", new
+        {
+            path = _tempDir,
+            columns = new object[]
+            {
+                new { name = "id", type = "int64", values = new long[] { 1, 2, 3, 4 } },
+                new { name = "region", type = "string", values = new[] { "us", "eu", "us", "apac" } },
+            },
+        });
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.OpenAsync(fs);
+        var (deleted, _) = await table.DeleteAsync(Expressions.Expressions.Equal("region", "us"));
+        Assert.Equal(2, deleted);
+
+        var result = DeltaRs.Invoke("read", new { path = _tempDir });
+
+        Assert.Equal([(2L, "eu"), (4L, "apac")], RowsFromJson(result));
+        Assert.Equal(await ReadAllViaEw(table), RowsFromJson(result));
+    }
+
     // ── Path encoding — landing notes "Deferred follow-up B". ──
 
     /// <summary>

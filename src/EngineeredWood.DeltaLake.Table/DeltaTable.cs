@@ -3903,7 +3903,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         batch => RowEvaluator.EvaluatePredicate(predicate, batch);
 
     /// <summary>
-    /// Deletes rows matching the predicate using deletion vectors.
+    /// Deletes rows matching the predicate.
     /// The predicate receives each batch (with logical column names) and returns
     /// a <see cref="BooleanArray"/> where <c>true</c> means the row should be deleted.
     /// The delegate cannot be inspected, so a concurrent commit that adds any file is taken to match it
@@ -3912,10 +3912,37 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> overload where the condition can
     /// be expressed: it tests the added file's statistics instead, and skips files that cannot match.
     /// Returns the number of rows deleted and the committed version.
+    ///
+    /// <para>A file the predicate matches entirely is removed. One it matches only in part gets a deletion
+    /// vector when the table enables them (<c>delta.enableDeletionVectors</c>), and is otherwise rewritten
+    /// without the matched rows (copy-on-write), as Spark and delta-rs delete;
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken)"/> chooses
+    /// explicitly.</para>
     /// </summary>
-    public async ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
+    public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
         Func<RecordBatch, BooleanArray> predicate,
         CancellationToken cancellationToken = default)
+        => DeleteCoreAsync(predicate, mode: null, cancellationToken);
+
+    /// <summary>
+    /// Deletes rows matching the predicate, as
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CancellationToken)"/> does, choosing how a file the
+    /// predicate matches only in part is changed: <see cref="RowDeleteMode.CopyOnWrite"/> rewrites it without the
+    /// matched rows (no deletion vector, so engines without vector support can still read the table), and
+    /// <see cref="RowDeleteMode.DeletionVector"/> soft-deletes them in place — and on a table without deletion
+    /// vectors refuses such a delete rather than rewrite. A file the predicate matches entirely is removed whole
+    /// in both modes. See <see cref="DeltaTransaction.DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken)"/>.
+    /// </summary>
+    public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
+        Func<RecordBatch, BooleanArray> predicate,
+        RowDeleteMode mode,
+        CancellationToken cancellationToken = default)
+        => DeleteCoreAsync(predicate, mode, cancellationToken);
+
+    private async ValueTask<(long RowsDeleted, long Version)> DeleteCoreAsync(
+        Func<RecordBatch, BooleanArray> predicate,
+        RowDeleteMode? mode,
+        CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
 
@@ -3927,10 +3954,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // validated by the transaction's DeleteAsync (against the same pinned base snapshot).
         //
         // `await using`: a delete that aborts — a real conflict, an exhausted retry loop — has already written
-        // its deletion vectors and change files, and disposal takes them back. A successful commit disposes to
-        // a no-op.
+        // its deletion vectors, rewritten files and change files, and disposal takes them back. A successful
+        // commit disposes to a no-op.
         await using var transaction = StartTransaction();
-        long rowsDeleted = await transaction.DeleteAsync(predicate, cancellationToken)
+        long rowsDeleted = await (mode is RowDeleteMode m
+                ? transaction.DeleteAsync(predicate, m, cancellationToken)
+                : transaction.DeleteAsync(predicate, cancellationToken))
             .ConfigureAwait(false);
         long version = await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return (rowsDeleted, version);
@@ -3945,14 +3974,38 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// (concurrentAppend). Under the default <see cref="IsolationLevel.WriteSerializable"/> a concurrent
     /// blind append is still exempt; under <see cref="IsolationLevel.Serializable"/> it conflicts.
     /// Returns the number of rows deleted and the committed version.
+    ///
+    /// <para>A file the predicate matches only in part gets a deletion vector when the table enables them, and
+    /// is otherwise rewritten without the matched rows (copy-on-write);
+    /// <see cref="DeleteAsync(Expressions.Predicate, RowDeleteMode, CancellationToken)"/> chooses explicitly.</para>
     /// </summary>
-    public async ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
+    public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
         Expressions.Predicate predicate,
         CancellationToken cancellationToken = default)
+        => DeleteCoreAsync(predicate, mode: null, cancellationToken);
+
+    /// <summary>
+    /// Deletes rows matching an analyzable <see cref="Expressions.Predicate"/>, as
+    /// <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> does, choosing how a file the predicate
+    /// matches only in part is changed — see
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken)"/>.
+    /// </summary>
+    public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
+        Expressions.Predicate predicate,
+        RowDeleteMode mode,
+        CancellationToken cancellationToken = default)
+        => DeleteCoreAsync(predicate, mode, cancellationToken);
+
+    private async ValueTask<(long RowsDeleted, long Version)> DeleteCoreAsync(
+        Expressions.Predicate predicate,
+        RowDeleteMode? mode,
+        CancellationToken cancellationToken)
     {
         ThrowIfDisposed();
         await using var transaction = StartTransaction(); // aborts (and cleans up) on any failure — see above
-        long rowsDeleted = await transaction.DeleteAsync(predicate, cancellationToken)
+        long rowsDeleted = await (mode is RowDeleteMode m
+                ? transaction.DeleteAsync(predicate, m, cancellationToken)
+                : transaction.DeleteAsync(predicate, cancellationToken))
             .ConfigureAwait(false);
         long version = await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return (rowsDeleted, version);
@@ -3962,9 +4015,27 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// count, and the per-file row-level edits — everything a commit needs, but without committing. Shared
     /// by the auto-committing <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> and the transactional <see cref="DeltaTransaction"/>
     /// path.</summary>
+    /// <param name="NextRowId">Where the next staged rewrite in the same transaction begins reserving stable row
+    /// ids, when a copy-on-write rewrite reserved some; null when this delete wrote no rewritten file, so the
+    /// caller's mark stands.</param>
     internal sealed record DeleteActions(
         IReadOnlyList<DeltaAction> DataActions, ISet<string> RemovedPaths, long TotalDeleted,
-        IReadOnlyList<DeleteDvEdit> DvEdits);
+        IReadOnlyList<DeleteDvEdit> DvEdits, long? NextRowId = null);
+
+    /// <summary>
+    /// Whether a predicate DELETE on <paramref name="snapshot"/> rewrites the files it partly matches (copy-on-write)
+    /// rather than writing deletion vectors. An explicit <paramref name="mode"/> decides. Without one, the table
+    /// does: deletion vectors where it enables them, and copy-on-write where it does not, as Spark and delta-rs
+    /// delete. An explicit <see cref="RowDeleteMode.DeletionVector"/> on a table without them keeps the refusal of
+    /// a partial-file delete, for a caller that would rather fail than rewrite.
+    /// </summary>
+    internal static bool DeletesByCopyOnWrite(Snapshot.Snapshot snapshot, RowDeleteMode? mode) => mode switch
+    {
+        null => !DeletionVectors.DeletionVectorConfig.IsEnabled(snapshot.Metadata.Configuration),
+        RowDeleteMode.CopyOnWrite => true,
+        RowDeleteMode.DeletionVector => false,
+        _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown RowDeleteMode."),
+    };
 
     /// <summary>
     /// The rows one DELETE newly marked deleted in one file, by absolute row position. Deletion vectors
@@ -3995,15 +4066,24 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     /// <param name="prunePredicate">When supplied, the predicate <paramref name="predicate"/> evaluates, not
     /// merely a superset of it: the statistics proof removes a file on this predicate's answer alone.</param>
-    /// <param name="written">Records the deletion-vector and change-data files this delete creates — never the
-    /// data file its re-add names, which is LIVE table data this delete only masks rows in. See
+    /// <param name="written">Records the deletion-vector, rewritten and change-data files this delete creates —
+    /// never the data file a vector's re-add names, which is LIVE table data this delete only masks rows in. See
     /// <see cref="WrittenFileLedger"/>.</param>
+    /// <param name="copyOnWrite">Rewrite each file the predicate PARTLY matches without the matched rows, as
+    /// <see cref="ComputeCopyOnWriteDeleteActionsAsync"/> does, instead of writing it a deletion vector (see
+    /// <see cref="DeletesByCopyOnWrite"/>). Everything before the rewrite is unchanged: files are found, pruned
+    /// and matched exactly as for a vector, and a file every row of which matches is still removed whole, with no
+    /// rewrite.</param>
+    /// <param name="rowIdStart">Where a copy-on-write rewrite begins reserving stable row ids, as for
+    /// <see cref="ComputeCopyOnWriteDeleteActionsAsync"/>. Null starts at the snapshot's mark.</param>
     internal async ValueTask<DeleteActions> ComputeDeleteActionsAsync(
         Snapshot.Snapshot snapshot,
         Func<RecordBatch, BooleanArray> predicate,
         CancellationToken cancellationToken,
         Expressions.Predicate? prunePredicate = null,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        bool copyOnWrite = false,
+        long? rowIdStart = null)
     {
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var actions = new List<DeltaAction>();
@@ -4016,10 +4096,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             snapshot.Metadata.Configuration);
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
-        // Deletion vectors are opt-in. When disabled, a DELETE may only remove WHOLE files (a clean
-        // file/partition boundary); a partial match that would need a soft-delete throws below.
+        // Deletion vectors are opt-in. Without them a partly-matched file is rewritten (copy-on-write), or, when
+        // the caller asked for vectors explicitly, the delete is refused below.
         bool deletionVectorsEnabled = DeletionVectors.DeletionVectorConfig.IsEnabled(
             snapshot.Metadata.Configuration);
+        // The partly-matched files a copy-on-write delete rewrites, with the absolute positions it found matching
+        // in each: the same coordinates the rewrite reads back, since both skip the rows a vector already hid.
+        Dictionary<string, IReadOnlyCollection<long>>? copyOnWriteTargets = null;
         var pruner = prunePredicate is null ? null : new DeltaFilePruner(
             snapshot.Schema, snapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
@@ -4186,45 +4269,63 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             totalDeleted += newDeletedIndices.Count;
 
             // Whole-file delete: every physical row is now gone, so the file can be dropped outright — a
-            // metadata-only remove needing no deletion vector, valid even when DVs are not enabled. When a
-            // file is only PARTIALLY matched a soft-delete is unavoidable, which requires DVs; without them
-            // enabled the delete is rejected rather than writing a vector a foreign reader would ignore.
+            // metadata-only remove needing no deletion vector and no rewrite, in either mode. A file only PARTLY
+            // matched is either rewritten without the matched rows (copy-on-write) or soft-deleted with a vector,
+            // which needs DVs enabled; asked for vectors on a table without them, the delete is refused rather
+            // than writing a vector a foreign reader would ignore.
             bool wholeFile = allDeleted.Count == fileRows;
 
-            if (!wholeFile && !deletionVectorsEnabled)
+            if (!wholeFile && copyOnWrite)
             {
-                throw new InvalidOperationException(
-                    "DELETE would soft-delete part of a data file, which requires deletion vectors. Create "
-                    + "the table with DeltaTable.CreateAsync(..., enableDeletionVectors: true), or restrict "
-                    + "the predicate so it removes whole files/partitions (which needs no deletion vector).");
+                // Refused here, at the first file that needs a rewrite the table cannot take, rather than after the
+                // scan has read every file and written their change files. (The transaction takes back whatever
+                // the scan already wrote.)
+                RejectCopyOnWriteRowIdUnsupported("copy-on-write DELETE");
+
+                // Rewritten after the scan, which writes its remove and add. Its change file is written below, from
+                // the deleted rows this scan already captured, so the rewrite is told not to capture them again.
+                (copyOnWriteTargets ??= new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal))
+                    [addFile.Path] = newDeletedIndices;
             }
-
-            actions.Add(RemoveOf(addFile));
-            removedPaths.Add(addFile.Path);
-
-            if (!wholeFile)
+            else
             {
-                var newDv = await dvWriter.CreateAsync(
-                    allDeleted, allDeleted.Count, cancellationToken).ConfigureAwait(false);
-                // The vector is ours; the file it masks is not — the re-add below names the SOURCE data file,
-                // which is live table data whatever becomes of this transaction.
-                written?.RecordDeletionVector(newDv);
-
-                actions.Add(addFile with
+                if (!wholeFile && !deletionVectorsEnabled)
                 {
-                    DeletionVector = newDv,
-                    DataChange = true,
-                    Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
-                });
+                    throw new InvalidOperationException(
+                        "DELETE was asked to soft-delete part of a data file with a deletion vector, and this table "
+                        + "does not have deletion vectors enabled. Pass RowDeleteMode.CopyOnWrite (or no mode) to "
+                        + "rewrite the affected files instead, or create the table with "
+                        + "DeltaTable.CreateAsync(..., enableDeletionVectors: true).");
+                }
 
-                // Record the exact rows this delete added (absolute positions), so a concurrent DV-delete
-                // of the same file can be reconciled row-by-row rather than aborting the whole file. A
-                // whole-file remove has no surviving rows to reconcile, so it records no edit (a concurrent
-                // delete of that file is a genuine file-level conflict).
-                dvEdits.Add(new DeleteDvEdit(addFile.Path, newDeletedIndices));
+                actions.Add(RemoveOf(addFile));
+                removedPaths.Add(addFile.Path);
+
+                if (!wholeFile)
+                {
+                    var newDv = await dvWriter.CreateAsync(
+                        allDeleted, allDeleted.Count, cancellationToken).ConfigureAwait(false);
+                    // The vector is ours; the file it masks is not — the re-add below names the SOURCE data file,
+                    // which is live table data whatever becomes of this transaction.
+                    written?.RecordDeletionVector(newDv);
+
+                    actions.Add(addFile with
+                    {
+                        DeletionVector = newDv,
+                        DataChange = true,
+                        Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
+                    });
+
+                    // Record the exact rows this delete added (absolute positions), so a concurrent DV-delete
+                    // of the same file can be reconciled row-by-row rather than aborting the whole file. A
+                    // whole-file remove has no surviving rows to reconcile, so it records no edit (a concurrent
+                    // delete of that file is a genuine file-level conflict).
+                    dvEdits.Add(new DeleteDvEdit(addFile.Path, newDeletedIndices));
+                }
             }
 
-            // Write CDC file for deleted rows
+            // The change file for the deleted rows, whichever way the file went — removed, masked or rewritten — from
+            // the rows the scan captured. They are the rows a scan returns, with their stable identity.
             if (cdfEnabled)
             {
                 for (int b = 0; b < deletedRowBatches.Count; b++)
@@ -4239,7 +4340,25 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        return new DeleteActions(actions, removedPaths, totalDeleted, dvEdits);
+        long? nextRowId = null;
+        if (copyOnWriteTargets is not null)
+        {
+            // The rewrite reads each file again, whole: the scan above may have skipped row groups and pages that
+            // hold no matching row, and every one of those rows survives into the new file. It writes the remove,
+            // the add and the row-id reservation exactly as a row-level copy-on-write delete does. Not the change file:
+            // the scan wrote that from the rows it had already captured.
+            var rewrite = await ComputeCopyOnWriteDeleteActionsAsync(
+                RowSelection.ByPath(copyOnWriteTargets), snapshot, cancellationToken,
+                rowIdStart: rowIdStart, written: written, writeChangeData: false).ConfigureAwait(false);
+            System.Diagnostics.Debug.Assert(
+                rewrite.RowsDeleted == copyOnWriteTargets.Values.Sum(p => (long)p.Count),
+                "The rewrite must find live exactly the rows the scan matched.");
+            actions.AddRange(rewrite.Actions);
+            removedPaths.UnionWith(rewrite.RemovedPaths);
+            nextRowId = rewrite.NextRowId;
+        }
+
+        return new DeleteActions(actions, removedPaths, totalDeleted, dvEdits, nextRowId);
     }
 
     /// <summary>The <c>remove</c> a DELETE writes for a file it changes. It carries the file's existing deletion
@@ -8482,12 +8601,14 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             + "rebuild the selection, or stage the delete on a DeltaTransaction, whose commit loop reconciles "
             + "a concurrently-rewritten file for you.");
 
-    // The corner the copy-on-write row-id DML path does not yet cover: IcebergCompat needs the committing
-    // writer. (Change Data Feed IS captured — each rewritten file emits its own change files.)
+    // The corner the copy-on-write rewrite does not yet cover: IcebergCompat needs the committing writer. It is
+    // reached by a row-level delete or update, and by a predicate DELETE that rewrites (an IcebergCompat table
+    // cannot have deletion vectors, so every partial delete there rewrites). (Change Data Feed IS captured — each
+    // rewritten file emits its own change files.)
     private void RejectCopyOnWriteRowIdUnsupported(string op)
     {
         if (IsIcebergCompat)
-            throw new NotSupportedException($"{op} by row id is not supported on IcebergCompat tables.");
+            throw new NotSupportedException($"A {op} is not supported on IcebergCompat tables.");
     }
 
     // Physical-writes the rewritten output batches for one file and returns the remove(old)+add(new) pair (Add is

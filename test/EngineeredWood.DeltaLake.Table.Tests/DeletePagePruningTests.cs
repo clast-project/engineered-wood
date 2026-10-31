@@ -214,17 +214,41 @@ public class DeletePagePruningTests : IDisposable
     }
 
     /// <summary>
-    /// The same trap without deletion vectors, where it is louder: the partial delete must be refused, where a
-    /// short row count would make it a whole-file remove that deletes the 280 rows it never read.
+    /// The same trap without deletion vectors, where it is louder: the delete rewrites the file (copy-on-write),
+    /// and the rewrite must carry the 280 rows the pruned read never saw. A short row count would make it a
+    /// whole-file remove that loses them; a rewrite of only the rows read would lose them too. Both twins rewrite,
+    /// so the oracle's unpruned read pins the outcome.
     /// </summary>
     [Fact]
-    public async Task EveryRowReadMatches_WithoutDeletionVectors_IsRefused()
+    public async Task EveryRowReadMatches_WithoutDeletionVectors_RewritesKeepingTheUnreadRows()
+    {
+        var (pruned, oracle) = await DeleteBothWaysAsync(new Shape(Dv: false), TwoWholePages);
+        await using var _ = pruned;
+        await using var __ = oracle;
+
+        var file = Assert.Single(pruned.Table.CurrentSnapshot.ActiveFiles.Values);
+        Assert.Null(file.DeletionVector);
+        Assert.Equal(Rows - 2 * RowsPerPage, file.GetNumRecords());
+        Assert.Equal(2 * RowsPerPage, pruned.Deleted);
+        var (ids, _) = await StateAsync(pruned);
+        Assert.Equal(Enumerable.Range(0, Rows).Select(v => (long)v).Except(TwoWholePagesRows), ids);
+        await AssertSameOutcomeAsync(pruned, oracle);
+    }
+
+    /// <summary>
+    /// Asked for a deletion vector on a table without them, the partial delete is refused as it always was, and
+    /// commits nothing: the explicit mode is how a caller keeps a table from being rewritten.
+    /// </summary>
+    [Fact]
+    public async Task EveryRowReadMatches_DeletionVectorModeWithoutVectors_IsRefused()
     {
         var (table, _) = await CreateAsync("nodv", new Shape(Dv: false));
         await using var __ = table;
         long version = table.CurrentSnapshot.Version;
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() => table.DeleteAsync(TwoWholePages).AsTask());
+        var refusal = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => table.DeleteAsync(TwoWholePages, RowDeleteMode.DeletionVector).AsTask());
+        Assert.Contains("RowDeleteMode.CopyOnWrite", refusal.Message);
 
         Assert.Equal(version, table.CurrentSnapshot.Version);
         var count = 0L;
