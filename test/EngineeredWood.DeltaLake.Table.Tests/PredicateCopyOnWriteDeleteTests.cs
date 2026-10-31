@@ -278,6 +278,71 @@ public class PredicateCopyOnWriteDeleteTests : IDisposable
         Assert.Equal(new long[] { 10, 11, 12 }, await ReadIdsFreshAsync());
     }
 
+    /// <summary>
+    /// On an IcebergCompat change-feed table, a DELETE that removes one file whole and needs to rewrite another
+    /// is refused, but only once the scan reaches the second file. By then it has written the first file's change
+    /// file. In a transaction the refusal takes that file back, so committing the rest leaves nothing orphaned.
+    /// </summary>
+    [Fact]
+    public async Task OnAnIcebergCompatChangeFeedTable_ARefusedDeleteInATransaction_LeavesNoChangeFile()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(),
+            new DeltaTableOptions { AllowWritesWithoutUniversalFormatConversion = true },
+            columnMappingMode: ColumnMappingMode.Name,
+            configuration: new Dictionary<string, string>
+            {
+                [IcebergCompat.EnableV2Key] = "true",
+                ["delta.enableChangeDataFeed"] = "true",
+            });
+        await table.WriteAsync([Batch(1, 2)]);
+        await table.WriteAsync([Batch(10, 3)]);
+        var before = DataFilesOnDisk();
+
+        var txn = table.StartTransaction();
+        await Assert.ThrowsAsync<NotSupportedException>(
+            () => txn.DeleteAsync(Ex.Or(Ex.LessThanOrEqual("id", 2L), Ex.Equal("id", 11L))).AsTask());
+        Assert.Equal(before, DataFilesOnDisk());
+
+        await txn.WriteAsync([Batch(100, 1)]);
+        await txn.CommitAsync();
+
+        Assert.Equal(before.Length + 1, DataFilesOnDisk().Length);
+        Assert.Equal(new long[] { 1, 2, 10, 11, 12, 100 }, await ReadIdsFreshAsync());
+    }
+
+    /// <summary>
+    /// A positional <c>default</c> second argument still binds to the <see cref="CancellationToken"/> overloads,
+    /// the ones that choose the mode automatically: C# prefers the candidate that needs no default arguments
+    /// filled in. Bound to <see cref="RowDeleteMode"/> instead, <c>default</c> would be
+    /// <see cref="RowDeleteMode.DeletionVector"/>, which this table without deletion vectors refuses.
+    /// </summary>
+    [Fact]
+    public async Task APositionalDefaultSecondArgument_StillChoosesTheModeAutomatically()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
+        await table.WriteAsync([Batch(1, 8)]);
+
+        await table.DeleteAsync(Ex.Equal("id", 1L), default);
+        await table.DeleteAsync(batch => MaskForId(batch, 2), default);
+        var txn = table.StartTransaction();
+        await txn.DeleteAsync(Ex.Equal("id", 3L), default);
+        await txn.CommitAsync();
+        txn = table.StartTransaction();
+        await txn.DeleteAsync(batch => MaskForId(batch, 4), default);
+        await txn.CommitAsync();
+
+        Assert.Equal(new long[] { 5, 6, 7, 8 }, await ReadIdsFreshAsync());
+    }
+
+    private static BooleanArray MaskForId(RecordBatch batch, long target)
+    {
+        var ids = (Int64Array)batch.Column("id");
+        var mask = new BooleanArray.Builder();
+        for (int i = 0; i < batch.Length; i++)
+            mask.Append(ids.GetValue(i) == target);
+        return mask.Build();
+    }
+
     [Fact]
     public async Task NoMatchingRow_CommitsNothing()
     {

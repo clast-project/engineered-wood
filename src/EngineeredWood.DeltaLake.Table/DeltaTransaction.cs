@@ -298,10 +298,10 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _baseSnapshot, isAppend: true,
             handling: WriteTimeExpressionHandling.ValidatedHere);
 
-        var (actions, nextRowId) = await _table.ComputeWriteActionsAsync(
+        var (actions, nextRowId) = await TakingBackOnFailureAsync(_written.Paths.Count, () => _table.ComputeWriteActionsAsync(
             _baseSnapshot, batches, DeltaWriteMode.Append,
             overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
-            cancellationToken, rowIdStart: _nextRowId, written: _written).ConfigureAwait(false);
+            cancellationToken, rowIdStart: _nextRowId, written: _written), cancellationToken).ConfigureAwait(false);
 
         _nextRowId = nextRowId;
         StageInternal(actions);
@@ -397,9 +397,9 @@ public sealed class DeltaTransaction : IAsyncDisposable
         bool copyOnWrite = DeltaTable.DeletesByCopyOnWrite(_baseSnapshot, mode);
 
         int mark = _written.Paths.Count;
-        var plan = await _table.ComputeDeleteActionsAsync(
+        var plan = await TakingBackOnFailureAsync(mark, () => _table.ComputeDeleteActionsAsync(
             _baseSnapshot, predicate, cancellationToken, prunePredicate: analyzable, written: _written,
-            copyOnWrite: copyOnWrite, rowIdStart: _nextRowId)
+            copyOnWrite: copyOnWrite, rowIdStart: _nextRowId), cancellationToken)
             .ConfigureAwait(false);
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "DELETE", cancellationToken)
             .ConfigureAwait(false);
@@ -446,9 +446,9 @@ public sealed class DeltaTransaction : IAsyncDisposable
             handling: WriteTimeExpressionHandling.ValidatedHere);
 
         int mark = _written.Paths.Count;
-        var plan = await _table.ComputeUpdateActionsAsync(
-            _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId, written: _written)
-            .ConfigureAwait(false);
+        var plan = await TakingBackOnFailureAsync(mark, () => _table.ComputeUpdateActionsAsync(
+            _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId, written: _written),
+            cancellationToken).ConfigureAwait(false);
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "UPDATE", cancellationToken)
             .ConfigureAwait(false);
 
@@ -482,9 +482,10 @@ public sealed class DeltaTransaction : IAsyncDisposable
             handling: WriteTimeExpressionHandling.ValidatedHere);
 
         int mark = _written.Paths.Count;
-        var plan = await _table.ComputeUpdateActionsAsync(
+        var plan = await TakingBackOnFailureAsync(mark, () => _table.ComputeUpdateActionsAsync(
             _baseSnapshot, DeltaTable.MaskFor(predicate), updater, cancellationToken,
-            prunePredicate: predicate, rowIdStart: _nextRowId, written: _written).ConfigureAwait(false);
+            prunePredicate: predicate, rowIdStart: _nextRowId, written: _written), cancellationToken)
+            .ConfigureAwait(false);
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "UPDATE", cancellationToken)
             .ConfigureAwait(false);
 
@@ -598,11 +599,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
         if (files.Count == 0)
             return 0;
 
-        var (actions, nextRowId, liveRows) = await _table.BuildStagedAppendActionsAsync(
+        var (actions, nextRowId, liveRows) = await TakingBackOnFailureAsync(_written.Paths.Count, () => _table.BuildStagedAppendActionsAsync(
             _baseSnapshot, files, bornDeleted, identityValuesPreGenerated, _nextRowId, cancellationToken,
             // Only the born-deleted vector is ours. The DATA files came in already written by the host, so an
             // abort leaves them where they are — it never staged them, and it does not own them.
-            written: _written)
+            written: _written), cancellationToken)
             .ConfigureAwait(false);
 
         _nextRowId = nextRowId;
@@ -691,8 +692,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
         if (FirstRestagedPath(selection.Paths) is { } restaged)
             throw RestagedFile(restaged, "DELETE");
 
-        var result = await _table.ComputeDvActionsWithEditsAsync(
-            selection, _baseSnapshot, cancellationToken, written: _written).ConfigureAwait(false);
+        var result = await TakingBackOnFailureAsync(_written.Paths.Count, () => _table.ComputeDvActionsWithEditsAsync(
+            selection, _baseSnapshot, cancellationToken, written: _written), cancellationToken).ConfigureAwait(false);
         if (result.RowsDeleted == 0)
             return 0;
 
@@ -719,9 +720,9 @@ public sealed class DeltaTransaction : IAsyncDisposable
         if (FirstRestagedPath(selection.Paths) is { } restaged)
             throw RestagedFile(restaged, "DELETE");
 
-        var plan = await _table.ComputeCopyOnWriteDeleteActionsAsync(
+        var plan = await TakingBackOnFailureAsync(_written.Paths.Count, () => _table.ComputeCopyOnWriteDeleteActionsAsync(
             selection, _baseSnapshot, cancellationToken, rowIdStart: _nextRowId, written: _written,
-            writeChangeData: !changeDataStagedByCaller).ConfigureAwait(false);
+            writeChangeData: !changeDataStagedByCaller), cancellationToken).ConfigureAwait(false);
         if (plan.RowsDeleted == 0)
             return 0;
 
@@ -782,9 +783,9 @@ public sealed class DeltaTransaction : IAsyncDisposable
         _table.ValidateChangeDataStageable(_baseSnapshot, changeType);
         DeltaTable.ValidateChangeDataRows(_baseSnapshot, rows, nameof(StageChangeDataAsync));
 
-        var files = await _table.WriteChangeDataFilesForAsync(
-            _baseSnapshot, rows, changeType, cancellationToken, rowIds, rowCommitVersions, written: _written)
-            .ConfigureAwait(false);
+        var files = await TakingBackOnFailureAsync(_written.Paths.Count, () => _table.WriteChangeDataFilesForAsync(
+            _baseSnapshot, rows, changeType, cancellationToken, rowIds, rowCommitVersions, written: _written),
+            cancellationToken).ConfigureAwait(false);
         StageInternal(files);
     }
 
@@ -1065,11 +1066,40 @@ public sealed class DeltaTransaction : IAsyncDisposable
         if (FirstRestagedPath(paths) is not { } restaged)
             return;
 
-        var refused = new WrittenFileLedger();
-        foreach (string path in _written.TakeRecordedSince(mark))
-            refused.Record(path);
-        await _table.DeleteWrittenFilesAsync(refused, cancellationToken).ConfigureAwait(false);
+        await TakeBackSinceAsync(mark, cancellationToken).ConfigureAwait(false);
         throw RestagedFile(restaged, operation);
+    }
+
+    /// <summary>
+    /// Runs one staging call's compute, which writes its data files, deletion vectors and change files as it
+    /// goes. If it throws partway through (a refusal found on a later file, a predicate or updater that throws,
+    /// an I/O failure, cancellation) nothing was staged that references what it already wrote, so that is
+    /// taken back before the exception leaves. Otherwise a caller that catches the failure and commits the rest
+    /// of the transaction would clear the ledger and leave those files orphaned. <paramref name="mark"/> is the
+    /// ledger's count from before the call.
+    /// </summary>
+    private async ValueTask<T> TakingBackOnFailureAsync<T>(
+        int mark, Func<ValueTask<T>> compute, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await compute().ConfigureAwait(false);
+        }
+        catch
+        {
+            await TakeBackSinceAsync(mark, cancellationToken).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <summary>Deletes the files the ledger recorded since <paramref name="mark"/>, best-effort, and forgets
+    /// them, leaving the ledger as it was at the mark.</summary>
+    private async ValueTask TakeBackSinceAsync(int mark, CancellationToken cancellationToken)
+    {
+        var taken = new WrittenFileLedger();
+        foreach (string path in _written.TakeRecordedSince(mark))
+            taken.Record(path);
+        await _table.DeleteWrittenFilesAsync(taken, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

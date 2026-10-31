@@ -4277,6 +4277,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             if (!wholeFile && copyOnWrite)
             {
+                // Refused here, at the first file that needs a rewrite the table cannot take, rather than after the
+                // scan has read every file and written their change files. (The transaction takes back whatever
+                // the scan already wrote.)
+                RejectCopyOnWriteRowIdUnsupported("copy-on-write DELETE");
+
                 // Rewritten after the scan, which writes its remove and add. Its change file is written below, from
                 // the deleted rows this scan already captured, so the rewrite is told not to capture them again.
                 (copyOnWriteTargets ??= new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal))
