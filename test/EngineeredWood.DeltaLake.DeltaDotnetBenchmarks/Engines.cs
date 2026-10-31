@@ -127,9 +127,10 @@ internal static class Ew
     }
 
     /// <summary>
-    /// Predicate DELETE through <see cref="EwDeltaTable.DeleteAsync(Expressions.Predicate, CancellationToken)"/>.
-    /// A delete that removes PART of a file writes a deletion vector, so this needs a table with
-    /// <c>delta.enableDeletionVectors</c>; on any other table it refuses.
+    /// Predicate DELETE through <see cref="EwDeltaTable.DeleteAsync(Expressions.Predicate, CancellationToken)"/>. A
+    /// file the predicate matches only in part gets a deletion vector on a table with
+    /// <c>delta.enableDeletionVectors</c>, and is rewritten without the matched rows (copy-on-write, what delta-rs
+    /// does) on any other table (#562).
     /// </summary>
     public static async Task<long> DeleteAsync(string path, string predicateSql)
     {
@@ -139,12 +140,12 @@ internal static class Ew
     }
 
     /// <summary>
-    /// Predicate DELETE as copy-on-write, which is what delta-rs does. EW has no predicate overload for it:
-    /// a host scans with <see cref="DeltaRowMetadata.Locator"/>, evaluates the predicate itself, and hands
-    /// the matching positions to <see cref="EwDeltaTable.DeleteRowsAsync"/> with
-    /// <see cref="RowDeleteMode.CopyOnWrite"/>. That whole sequence is what is measured.
+    /// Predicate copy-on-write DELETE as a host had to compose it before the predicate overload did it (#562):
+    /// scan with <see cref="DeltaRowMetadata.Locator"/>, evaluate the predicate itself, and hand the matching
+    /// positions to <see cref="EwDeltaTable.DeleteRowsAsync"/> with <see cref="RowDeleteMode.CopyOnWrite"/>. Kept as
+    /// a reference row beside <see cref="DeleteAsync"/>.
     /// </summary>
-    public static async Task<long> DeleteCopyOnWriteAsync(string path, string predicateSql)
+    public static async Task<long> DeleteHostComposedCopyOnWriteAsync(string path, string predicateSql)
     {
         await using var table = await EwDeltaTable.OpenAsync(Fs(path));
         var predicate = SparkSqlParser.ParsePredicate(predicateSql);

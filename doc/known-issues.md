@@ -855,25 +855,25 @@ masked. EngineeredWood never writes `p` vectors.
 
 ### Correctness / interop issues
 
-**Deletion vectors are opt-in; DELETE fails on a partial match when they are
-off.** `DeltaTable.CreateAsync(..., enableDeletionVectors: true)` sets the
+**Deletion vectors are opt-in; without them a DELETE rewrites.**
+`DeltaTable.CreateAsync(..., enableDeletionVectors: true)` sets the
 `delta.enableDeletionVectors` property and declares the `deletionVectors`
-reader+writer feature (reader 3 / writer 7). Only then does a partial DELETE
-soft-delete rows with a deletion vector. With DVs disabled, a DELETE may only
-remove WHOLE files (a clean file/partition boundary — a metadata-only remove
-needing no DV); a predicate that would soft-delete part of a file throws
-`InvalidOperationException` rather than write a vector a foreign reader would
-not apply. There is still **no way to enable DVs on an EXISTING table** (no
-`ALTER TABLE`-style property update / protocol upgrade), and the predicate
-`DeleteAsync` path has **no copy-on-write fallback** when DVs are off — it
-removes whole files or throws. (A separate copy-on-write DELETE/UPDATE does
-exist — `DeleteRowsAsync(selection, RowDeleteMode.CopyOnWrite)` / `UpdateRowsAsync`
-— which rewrites the affected files with no DV. It needs neither deletion
-vectors nor row tracking, preserves row-tracking ids when the table has them,
-and writes the Change Data Feed for exactly the rows it touched; only
-IcebergCompat tables are still refused on that path. It can also be staged on
-a transaction: `DeltaTransaction.StageRowDeletesAsync(selection,
-RowDeleteMode.CopyOnWrite)`.)
+reader+writer feature (reader 3 / writer 7). Only then does a predicate DELETE
+that matches part of a file soft-delete the rows with a deletion vector.
+Without DVs (the default, and every table delta-rs writes) it rewrites each
+partly-matched file without the matched rows (copy-on-write, #562), as Spark
+and delta-rs do; a file matched entirely is removed with no rewrite either way.
+The copy-on-write delete preserves row-tracking ids and writes the Change Data
+Feed for exactly the deleted rows. `DeleteAsync(predicate, RowDeleteMode)` (and
+the same on `DeltaTransaction`) chooses explicitly: `CopyOnWrite` also works on
+a DV table, dropping the file's existing vector with the rewrite, and
+`DeletionVector` on a table without DVs refuses a partial-file delete with
+`InvalidOperationException` rather than rewrite. IcebergCompat tables, which
+cannot have DVs, refuse the copy-on-write path with `NotSupportedException`.
+There is still **no way to enable DVs on an EXISTING table** (no
+`ALTER TABLE`-style property update / protocol upgrade). The row-level forms
+are `DeleteRowsAsync(selection, RowDeleteMode)` / `UpdateRowsAsync` and
+`DeltaTransaction.StageRowDeletesAsync(selection, RowDeleteMode)`.
 Earlier EW always wrote a DV without declaring the feature, so a conformant
 foreign reader silently returned the deleted rows; that data-loss gap is closed.
 

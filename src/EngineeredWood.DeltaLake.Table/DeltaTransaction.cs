@@ -326,55 +326,95 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// <see cref="IsolationLevel.WriteSerializable"/> a concurrent blind append is still exempt). The
     /// <see cref="Expressions.Predicate"/> overload tests the added file against the predicate instead.
     /// Returns the number of rows this delete matched.</para>
+    ///
+    /// <para>A file the predicate matches entirely is removed. One it matches only in part gets a deletion
+    /// vector when the table enables them, and is otherwise rewritten without the matched rows
+    /// (copy-on-write); <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken)"/>
+    /// chooses explicitly.</para>
     /// </summary>
-    public async ValueTask<long> DeleteAsync(
+    public ValueTask<long> DeleteAsync(
         Func<RecordBatch, BooleanArray> predicate, CancellationToken cancellationToken = default)
-    {
-        EnsureOpen();
-        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+        => StageDeleteAsync(predicate, analyzable: null, mode: null, cancellationToken);
 
-        int mark = _written.Paths.Count;
-        var plan = await _table.ComputeDeleteActionsAsync(
-            _baseSnapshot, predicate, cancellationToken, written: _written)
-            .ConfigureAwait(false);
-        await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "DELETE", cancellationToken)
-            .ConfigureAwait(false);
-
-        StageInternal(plan.DataActions);
-        foreach (string path in plan.RemovedPaths)
-            _removedPaths.Add(path);
-        _dvEdits.AddRange(plan.DvEdits);
-        _opaqueReadPredicate = true;
-        _operations.Add("DELETE");
-
-        return plan.TotalDeleted;
-    }
+    /// <summary>
+    /// Stages a delete of the rows matching <paramref name="predicate"/>, as
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CancellationToken)"/> does, choosing how a file
+    /// the predicate matches only in part is changed.
+    ///
+    /// <para><see cref="RowDeleteMode.CopyOnWrite"/> rewrites it now without the matched rows — deleted again by
+    /// <see cref="AbortAsync"/> if the transaction never commits — and stages <c>remove</c>(old) +
+    /// <c>add</c>(rewritten), with the survivors' row ids preserved and a <c>delete</c> change file on a Change
+    /// Data Feed table. It needs no deletion vectors, so the table stays readable by engines without them, and on
+    /// a table that has vectors it removes the file's existing one along with the file.
+    /// <see cref="RowDeleteMode.DeletionVector"/> soft-deletes the rows in place, and on a table without
+    /// deletion vectors refuses such a delete instead of rewriting. A file the predicate matches entirely is
+    /// removed whole in both modes, with no rewrite.</para>
+    /// </summary>
+    public ValueTask<long> DeleteAsync(
+        Func<RecordBatch, BooleanArray> predicate, RowDeleteMode mode,
+        CancellationToken cancellationToken = default)
+        => StageDeleteAsync(predicate, analyzable: null, mode, cancellationToken);
 
     /// <summary>
     /// Stages a delete of the rows matching an analyzable <see cref="Expressions.Predicate"/>. Beyond the
     /// functional overload the predicate is recorded as a read dependency: a concurrent commit that adds a
     /// file matching it aborts this transaction (concurrentAppend), precise to the isolation level. Files
     /// whose statistics prove no row matches are skipped without being read. Returns the rows matched.
+    ///
+    /// <para>A file the predicate matches only in part gets a deletion vector when the table enables them, and
+    /// is otherwise rewritten without the matched rows (copy-on-write);
+    /// <see cref="DeleteAsync(Expressions.Predicate, RowDeleteMode, CancellationToken)"/> chooses explicitly.</para>
     /// </summary>
-    public async ValueTask<long> DeleteAsync(
+    public ValueTask<long> DeleteAsync(
         Expressions.Predicate predicate, CancellationToken cancellationToken = default)
+        => StageDeleteAsync(MaskForNonNull(predicate), predicate, mode: null, cancellationToken);
+
+    /// <summary>
+    /// Stages a delete of the rows matching an analyzable <see cref="Expressions.Predicate"/>, as
+    /// <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> does, choosing how a file the predicate
+    /// matches only in part is changed — see
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken)"/>.
+    /// </summary>
+    public ValueTask<long> DeleteAsync(
+        Expressions.Predicate predicate, RowDeleteMode mode, CancellationToken cancellationToken = default)
+        => StageDeleteAsync(MaskForNonNull(predicate), predicate, mode, cancellationToken);
+
+    private static Func<RecordBatch, BooleanArray> MaskForNonNull(Expressions.Predicate predicate) =>
+        DeltaTable.MaskFor(predicate ?? throw new ArgumentNullException(nameof(predicate)));
+
+    /// <param name="predicate">The row mask: TRUE marks a row for deletion.</param>
+    /// <param name="analyzable">The predicate <paramref name="predicate"/> evaluates, when the caller gave one: it
+    /// prunes the scan and is recorded as the read dependency. Null for a delegate, which reads as opaque.</param>
+    /// <param name="mode">Null lets the table decide: see <see cref="DeltaTable.DeletesByCopyOnWrite"/>.</param>
+    private async ValueTask<long> StageDeleteAsync(
+        Func<RecordBatch, BooleanArray> predicate, Expressions.Predicate? analyzable, RowDeleteMode? mode,
+        CancellationToken cancellationToken)
     {
         EnsureOpen();
+        if (predicate is null)
+            throw new ArgumentNullException(nameof(predicate));
         _table.ValidateWritable(_baseSnapshot, isAppend: false);
+        bool copyOnWrite = DeltaTable.DeletesByCopyOnWrite(_baseSnapshot, mode);
 
         int mark = _written.Paths.Count;
         var plan = await _table.ComputeDeleteActionsAsync(
-            _baseSnapshot, DeltaTable.MaskFor(predicate), cancellationToken, prunePredicate: predicate,
-            written: _written)
+            _baseSnapshot, predicate, cancellationToken, prunePredicate: analyzable, written: _written,
+            copyOnWrite: copyOnWrite, rowIdStart: _nextRowId)
             .ConfigureAwait(false);
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "DELETE", cancellationToken)
             .ConfigureAwait(false);
 
+        // A rewrite reserved row ids past the mark; the next staged write in this transaction starts after them.
+        if (plan.NextRowId is long nextRowId)
+            _nextRowId = nextRowId;
         StageInternal(plan.DataActions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
         _dvEdits.AddRange(plan.DvEdits);
-        _readPredicates.Add(predicate);
+        if (analyzable is not null)
+            _readPredicates.Add(analyzable);
+        else
+            _opaqueReadPredicate = true;
         _operations.Add("DELETE");
 
         return plan.TotalDeleted;

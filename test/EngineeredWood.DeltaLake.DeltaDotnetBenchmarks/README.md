@@ -56,10 +56,11 @@ runs against both.
   Wall-clock times are compared; CPU time is not.
 - **EW's `DeltaReadOptions.Filter` prunes, it does not filter.** The like-for-like EW method applies the
   predicate per row itself (as an EW host must); `EW_PruneOnly` shows the pruning alone and returns a superset.
-- **EW has no copy-on-write predicate DELETE.** `DeleteAsync(predicate)` refuses a partial-file delete on a
-  table without deletion vectors. The EW DELETE measured against delta-rs is therefore the host composition:
-  a Locator scan, evaluating the predicate, then `DeleteRowsAsync(…, RowDeleteMode.CopyOnWrite)`. EW's own
-  deletion-vector DELETE is measured separately (`DeletionVectorDeleteBenchmarks`), on an EW-written DV table.
+- **EW's predicate DELETE copy-on-writes on a table without deletion vectors** (#562), as delta-rs does; before
+  #562 it refused a partial-file delete there. `EW_DeleteHostComposed` keeps the copy-on-write a host had to
+  compose until then (a Locator scan, evaluating the predicate, then
+  `DeleteRowsAsync(…, RowDeleteMode.CopyOnWrite)`) as a reference row. EW's own deletion-vector DELETE is
+  measured separately (`DeletionVectorDeleteBenchmarks`), on an EW-written DV table.
 - **EW has no "open at version".** It opens the latest snapshot and then builds the older one, so its
   OpenAtVersion includes a latest-snapshot load.
 - **delta-dotnet's `InsertOptions.MaxRowsPerGroup` defaults to 100**, which delta-rs uses as its
@@ -93,7 +94,7 @@ means EW is faster.
 | Change data feed | 32 / 40 ms | 156 / 166 ms | 4.9 / 4.1 |
 | Create + write 1M rows | 246 ms (min 151, noisy) | 199 ms (default) / 174 ms (64K batches) | **0.85 / 0.75** |
 | Open + append 10K rows, no checkpoint / checkpointed | 28–34 / 18–23 ms | 56–63 / 25–27 ms | 1.9–2.0 / 1.2–1.4 |
-| DELETE 1 row in 16, copy-on-write | 404 / 351 ms | 271 / 312 ms | **0.69 / 0.89** |
+| DELETE 1 row in 16, copy-on-write (`DeleteAsync`, since #562) | 396 / 310 ms (host-composed before #562: 420 / 341) | 268 / 305 ms | **0.68** / 0.99 |
 | DELETE 1 row in 16, EW deletion vector (EW-written DV table only) | 174 ms | none (delta-rs writes no DVs) | — |
 | UPDATE 1 row in 16 | 432 / 285 ms (noisy: min 299 / 249) | 211 / 248 ms | **0.51 / 0.90** |
 | Checkpoint, 100 commits | 31 / 26 ms | 90 / 96 ms | 2.9 / 3.7 |
