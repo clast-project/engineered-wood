@@ -109,9 +109,8 @@ public class AppendBenchmarks : MutationBenchmark
 ///
 /// <para>EW's predicate <c>DeleteAsync</c> refuses a partial-file delete on such a table (it only writes
 /// deletion vectors), so the like-for-like EW DELETE is the host-composed copy-on-write in
-/// <see cref="Ew.DeleteCopyOnWriteAsync"/>. EW's deletion-vector DELETE is measured too, on an EW-written
-/// DV-enabled copy of the same data (for either <see cref="Writer"/>), as a reference for what EW's own
-/// path costs; delta-rs has no DV-writing DELETE to compare it with.</para>
+/// <see cref="Ew.DeleteCopyOnWriteAsync"/>. EW's own deletion-vector DELETE is measured separately, in
+/// <see cref="DeletionVectorDeleteBenchmarks"/>.</para>
 /// </summary>
 [Config(typeof(SingleShotConfig))]
 public class DmlBenchmarks : MutationBenchmark
@@ -120,21 +119,16 @@ public class DmlBenchmarks : MutationBenchmark
     public TableWriter Writer { get; set; }
 
     private string _template = "";
-    private string _dvTemplate = "";
 
     [GlobalSetup]
     public void Setup()
     {
         Fixtures.SweepScratch();
         _template = Fixtures.SingleCommit(Writer);
-        _dvTemplate = Fixtures.SingleCommitWithDeletionVectors();
     }
 
-    [IterationSetup(Targets = [nameof(EW_DeleteCopyOnWrite), nameof(DD_Delete), nameof(EW_Update), nameof(DD_Update)])]
+    [IterationSetup]
     public void Fresh() => CurrentPath = Fixtures.FreshCopy(_template);
-
-    [IterationSetup(Targets = [nameof(EW_DeleteDeletionVector)])]
-    public void FreshDv() => CurrentPath = Fixtures.FreshCopy(_dvTemplate);
 
     [BenchmarkCategory("Delete"), Benchmark(Baseline = true, Description = "EW scan + DeleteRowsAsync(CopyOnWrite)")]
     public Task<long> EW_DeleteCopyOnWrite() => Ew.DeleteCopyOnWriteAsync(CurrentPath!, Sql.OneCategory);
@@ -142,14 +136,37 @@ public class DmlBenchmarks : MutationBenchmark
     [BenchmarkCategory("Delete"), Benchmark(Description = "DD DeleteAsync")]
     public Task<long> DD_Delete() => Dd.DeleteAsync(CurrentPath!, Sql.OneCategory);
 
-    [BenchmarkCategory("Delete"), Benchmark(Description = "EW DeleteAsync (deletion vector; EW-written DV table)")]
-    public Task<long> EW_DeleteDeletionVector() => Ew.DeleteAsync(CurrentPath!, Sql.OneCategory);
-
     [BenchmarkCategory("Update"), Benchmark(Baseline = true, Description = "EW UpdateAsync")]
     public Task<long> EW_Update() => Ew.UpdateAsync(CurrentPath!, Sql.OneCategory);
 
     [BenchmarkCategory("Update"), Benchmark(Description = "DD UpdateAsync (SQL)")]
     public Task<long> DD_Update() => Dd.UpdateAsync(CurrentPath!, Sql.OneCategory);
+}
+
+/// <summary>
+/// EW's own predicate DELETE, which writes a deletion vector, on the same 1M rows written by EW with
+/// <c>delta.enableDeletionVectors</c>. A reference for what EW's native path costs next to the copy-on-write
+/// DELETE in <see cref="DmlBenchmarks"/>. It has no delta-dotnet counterpart (delta-rs never writes deletion
+/// vectors) and only one writer (delta-rs cannot create the table), so this class has no <c>Writer</c>
+/// parameter.
+/// </summary>
+[Config(typeof(SingleShotConfig))]
+public class DeletionVectorDeleteBenchmarks : MutationBenchmark
+{
+    private string _template = "";
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Fixtures.SweepScratch();
+        _template = Fixtures.SingleCommitWithDeletionVectors();
+    }
+
+    [IterationSetup]
+    public void Fresh() => CurrentPath = Fixtures.FreshCopy(_template);
+
+    [BenchmarkCategory("DeleteDeletionVector"), Benchmark(Baseline = true, Description = "EW DeleteAsync (deletion vector)")]
+    public Task<long> EW_DeleteDeletionVector() => Ew.DeleteAsync(CurrentPath!, Sql.OneCategory);
 }
 
 /// <summary>

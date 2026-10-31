@@ -40,6 +40,7 @@ runs against both.
 | `WriteBenchmarks` | CreateAndWrite | create + write 1M rows in one commit |
 | `AppendBenchmarks` | Append10K | open a 100-commit table + append 10K rows |
 | `DmlBenchmarks` | Delete, Update | copy-on-write DELETE / UPDATE of 1 row in 16 on the one-commit 1M-row table |
+| `DeletionVectorDeleteBenchmarks` | DeleteDeletionVector | EW's own deletion-vector DELETE of the same rows, on an EW-written DV table; no writer parameter and no delta-dotnet counterpart |
 | `MaintenanceBenchmarks` | Checkpoint, Compact, Vacuum | on the 100-small-file table |
 
 ## Read these numbers with care
@@ -58,7 +59,7 @@ runs against both.
 - **EW has no copy-on-write predicate DELETE.** `DeleteAsync(predicate)` refuses a partial-file delete on a
   table without deletion vectors. The EW DELETE measured against delta-rs is therefore the host composition:
   a Locator scan, evaluating the predicate, then `DeleteRowsAsync(…, RowDeleteMode.CopyOnWrite)`. EW's own
-  deletion-vector DELETE is measured beside it, on an EW-written DV table.
+  deletion-vector DELETE is measured separately (`DeletionVectorDeleteBenchmarks`), on an EW-written DV table.
 - **EW has no "open at version".** It opens the latest snapshot and then builds the older one, so its
   OpenAtVersion includes a latest-snapshot load.
 - **delta-dotnet's `InsertOptions.MaxRowsPerGroup` defaults to 100**, which delta-rs uses as its
@@ -93,7 +94,7 @@ means EW is faster.
 | Create + write 1M rows | 246 ms (min 151, noisy) | 199 ms (default) / 174 ms (64K batches) | **0.85 / 0.75** |
 | Open + append 10K rows, no checkpoint / checkpointed | 28–34 / 18–23 ms | 56–63 / 25–27 ms | 1.9–2.0 / 1.2–1.4 |
 | DELETE 1 row in 16, copy-on-write | 404 / 351 ms | 271 / 312 ms | **0.69 / 0.89** |
-| DELETE 1 row in 16, EW deletion vector | 156 / 167 ms | none | — |
+| DELETE 1 row in 16, EW deletion vector (EW-written DV table only) | 174 ms | none (delta-rs writes no DVs) | — |
 | UPDATE 1 row in 16 | 432 / 285 ms (noisy: min 299 / 249) | 211 / 248 ms | **0.51 / 0.90** |
 | Checkpoint, 100 commits | 31 / 26 ms | 90 / 96 ms | 2.9 / 3.7 |
 | Compact 100 small files | 245 / 301 ms | 468 / 466 ms | 1.9 / 1.7 |

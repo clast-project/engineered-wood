@@ -69,7 +69,7 @@ internal static class Verify
                             {
                                 result = byEw.ToString();
                             }
-                            else if (byEw.Equals(byDf) && method.Name == nameof(DmlBenchmarks.EW_DeleteDeletionVector))
+                            else if (byEw.Equals(byDf) && method.Name == nameof(DeletionVectorDeleteBenchmarks.EW_DeleteDeletionVector))
                             {
                                 // The ONE known exception, and only on the one benchmark that writes a deletion
                                 // vector: delta-dotnet's ReadParquetAsArrow drops the kernel's selection vector, so
