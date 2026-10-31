@@ -93,6 +93,7 @@
   -->
   <ItemGroup>
     <PackageVersion Include="BenchmarkDotNet" Version="0.*" />
+    <PackageVersion Include="DeltaLake.Net" Version="0.33.1" />
     <PackageVersion Include="Parquet.Net" Version="6.*" />
     <PackageVersion Include="ParquetSharp" Version="23.0.0.2" />
   </ItemGroup>
