@@ -111,7 +111,7 @@ internal static class Verify
                     {
                         // Its row count is a superset by design, so it is exempt from the comparison, but not
                         // from failing.
-                        if (result.StartsWith("THREW", StringComparison.Ordinal))
+                        if (IsFailure(result))
                         {
                             failures++;
                             Console.WriteLine($"   !! FAILED {method.Name}: {result}");
@@ -123,7 +123,7 @@ internal static class Verify
 
                 foreach (var (category, results) in byCategory)
                 {
-                    bool threw = results.Any(r => r.Result.StartsWith("THREW") || r.Result.StartsWith("READERS"));
+                    bool threw = results.Any(r => IsFailure(r.Result));
                     if (threw || results.Select(r => r.Result).Distinct().Count() > 1)
                     {
                         failures++;
@@ -139,9 +139,21 @@ internal static class Verify
 
     /// <summary>
     /// What a maintenance operation must have changed, as a string the category comparison checks for
-    /// equality across engines. A "NOT …" result is a failure on its own, so it is prefixed to mark the
-    /// category as a mismatch even when every engine fails the same way.
+    /// equality across engines. A failure carries <see cref="PostconditionFailed"/>, which <see cref="IsFailure"/>
+    /// finds ANYWHERE in a result (it follows the fingerprint), so the category fails even when every engine
+    /// fails the same way and the results are therefore equal.
     /// </summary>
+    private const string PostconditionFailed = "POSTCONDITION FAILED";
+
+    /// <summary>
+    /// A result that fails on its own, whatever the other engines returned. Markers are searched for anywhere,
+    /// not only at the start: a postcondition failure is appended after the fingerprint.
+    /// </summary>
+    private static bool IsFailure(string result) =>
+        result.StartsWith("THREW", StringComparison.Ordinal)
+        || result.Contains("READERS DISAGREE", StringComparison.Ordinal)
+        || result.Contains(PostconditionFailed, StringComparison.Ordinal);
+
     private static async Task<string> MaintenancePostconditionAsync(string category, string path, string method)
     {
         await using var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(Ew.Fs(path));
@@ -154,13 +166,13 @@ internal static class Verify
                 // A checkpoint at the latest version, published through _last_checkpoint.
                 string hint = Path.Combine(log, "_last_checkpoint");
                 if (!File.Exists(hint))
-                    return "READERS DISAGREE: NOT checkpointed (no _last_checkpoint)";
+                    return $"{PostconditionFailed}: NOT checkpointed (no _last_checkpoint)";
                 using var json = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(hint));
                 long version = json.RootElement.GetProperty("version").GetInt64();
                 bool fileExists = Directory.EnumerateFiles(log, $"{version:D20}.checkpoint*").Any();
                 return version == snapshot.Version && fileExists
                     ? $"checkpoint@v{version}"
-                    : $"READERS DISAGREE: NOT checkpointed at the latest version (hint v{version}, latest v{snapshot.Version}, file {(fileExists ? "present" : "missing")})";
+                    : $"{PostconditionFailed}: NOT checkpointed at the latest version (hint v{version}, latest v{snapshot.Version}, file {(fileExists ? "present" : "missing")})";
             }
             case "Compact":
             {
@@ -170,7 +182,7 @@ internal static class Verify
                 Console.WriteLine($"   ({method}: {active} active files after compaction)");
                 return active < Fixtures.Commits
                     ? "compacted"
-                    : $"READERS DISAGREE: NOT compacted ({active} active files)";
+                    : $"{PostconditionFailed}: NOT compacted ({active} active files)";
             }
             case "Vacuum":
             {
@@ -183,7 +195,7 @@ internal static class Verify
                     .Count(f => !referenced.Contains(Path.GetFullPath(f)));
                 return unreferenced == 0
                     ? "vacuumed (0 unreferenced data files)"
-                    : $"READERS DISAGREE: NOT vacuumed ({unreferenced} unreferenced data files remain)";
+                    : $"{PostconditionFailed}: NOT vacuumed ({unreferenced} unreferenced data files remain)";
             }
             default:
                 return "";

@@ -218,12 +218,46 @@ internal static class Fixtures
         if (File.Exists(marker))
             return path;
 
-        Delete(path);
-        Directory.CreateDirectory(path);
-        Console.WriteLine($"// building fixture {name} ...");
-        build(path).GetAwaiter().GetResult();
-        File.WriteAllText(marker, DateTime.UtcNow.ToString("O"));
+        // Two processes sharing a root (a --verify beside a benchmark run, or two filtered runs) could otherwise
+        // both find no marker, and one would delete or mark the other's half-built template. The lock covers
+        // the re-check, the build and the marker; a process that dies mid-build releases it (the OS closes the
+        // handle), leaves no marker, and the next holder rebuilds from scratch.
+        using (AcquireBuildLock(path + ".lock", name))
+        {
+            if (File.Exists(marker))
+                return path; // built by whoever held the lock before us
+
+            Delete(path);
+            Directory.CreateDirectory(path);
+            Console.WriteLine($"// building fixture {name} ...");
+            build(path).GetAwaiter().GetResult();
+            File.WriteAllText(marker, DateTime.UtcNow.ToString("O"));
+        }
         return path;
+    }
+
+    /// <summary>An exclusive, inter-process lock: a sibling file opened with no sharing, retried until free.</summary>
+    private static FileStream AcquireBuildLock(string lockPath, string name)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(lockPath)!);
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        bool announced = false;
+        while (true)
+        {
+            try
+            {
+                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+            }
+            catch (IOException) when (waited.Elapsed < TimeSpan.FromMinutes(30))
+            {
+                if (!announced)
+                {
+                    Console.WriteLine($"// waiting for another process to finish building fixture {name} ...");
+                    announced = true;
+                }
+                Thread.Sleep(250);
+            }
+        }
     }
 
     /// <summary>Creates the table with the first batch list, then appends each further list as one commit.</summary>
