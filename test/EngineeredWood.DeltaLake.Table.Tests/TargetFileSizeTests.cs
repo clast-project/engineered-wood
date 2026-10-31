@@ -140,6 +140,141 @@ public class TargetFileSizeTests : IDisposable
         Assert.Equal(Range(0, 2500), await ReadIdsAsync(table));
     }
 
+    /// <summary>
+    /// One batch larger than a row group is cut at row-group boundaries too, so the target is checked after each
+    /// row group, and the files come out as they do from the same rows in small batches. Handed whole to the Parquet
+    /// writer, it split into three row groups in one file.
+    /// </summary>
+    [Fact]
+    public async Task AnOversizedBatch_IsCutAtRowGroups_AndRollsLikeSmallBatches()
+    {
+        var options = new DeltaTableOptions
+        {
+            TargetFileSize = 1,
+            ParquetWriteOptions = ParquetWriteOptions.Default with { RowGroupMaxRows = 1000 },
+        };
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(), options);
+        await table.WriteAsync([Batch(0, 2500)]);
+
+        var files = table.CurrentSnapshot.ActiveFiles.Values.ToList();
+        Assert.Equal(3, files.Count);
+        foreach (var file in files)
+            Assert.Equal(1, await RowGroupCountAsync(file.Path));
+        Assert.Equal(Range(0, 2500), await ReadIdsAsync(table));
+    }
+
+    /// <summary>Batches that straddle a row-group boundary are cut there, so every row group but the last is
+    /// full.</summary>
+    [Fact]
+    public async Task BatchesCrossingARowGroupBoundary_FillEachRowGroupExactly()
+    {
+        var options = new DeltaTableOptions
+        {
+            ParquetWriteOptions = ParquetWriteOptions.Default with { RowGroupMaxRows = 1000 },
+        };
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(), options);
+        await table.WriteAsync(Batches(batches: 7, rowsEach: 300));
+
+        var file = Assert.Single(table.CurrentSnapshot.ActiveFiles.Values);
+        await using var stream = await Fs.OpenReadAsync(DeltaPath.Decode(file.Path));
+        using var reader = new ParquetFileReader(stream, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        Assert.Equal(new long[] { 1000, 1000, 100 }, metadata.RowGroups.Select(g => g.NumRows));
+        Assert.Equal(Range(0, 2100), await ReadIdsAsync(table));
+    }
+
+    private static readonly Decimal128Type Amount = new(10, 2);
+
+    private static Apache.Arrow.Schema DecimalSchema() => new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("amount", Amount, true))
+        .Build();
+
+    /// <summary>Rows <paramref name="startId"/>..; amount is id / 100, null on every seventh row.</summary>
+    private static RecordBatch DecimalBatch(long startId, int count)
+    {
+        var ids = new Int64Array.Builder();
+        var amounts = new Decimal128Array.Builder(Amount);
+        for (int i = 0; i < count; i++)
+        {
+            long id = startId + i;
+            ids.Append(id);
+            if (id % 7 == 0)
+                amounts.AppendNull();
+            else
+                amounts.Append(id / 100m);
+        }
+        return new RecordBatch(DecimalSchema(), [ids.Build(), amounts.Build()], count);
+    }
+
+    /// <summary>
+    /// Where a batch is cut between two files, each file's statistics describe exactly the rows it holds: row
+    /// count, null count and bounds, checked against the file's own contents.
+    /// </summary>
+    [Fact]
+    public async Task WhereABatchIsCutBetweenFiles_EachFilesStatisticsMatchItsRows()
+    {
+        var options = new DeltaTableOptions
+        {
+            TargetFileSize = 1,
+            ParquetWriteOptions = ParquetWriteOptions.Default with { RowGroupMaxRows = 1000 },
+        };
+        await using var table = await DeltaTable.CreateAsync(Fs, DecimalSchema(), options);
+        await table.WriteAsync([DecimalBatch(0, 600), DecimalBatch(600, 600), DecimalBatch(1200, 600)]);
+
+        var files = table.CurrentSnapshot.ActiveFiles.Values.ToList();
+        Assert.Equal(2, files.Count); // 1000 + 800 rows
+        foreach (var file in files)
+        {
+            var ids = new List<long>();
+            var amounts = new List<decimal?>();
+            await using var stream = await Fs.OpenReadAsync(DeltaPath.Decode(file.Path));
+            using var reader = new ParquetFileReader(stream, ownsFile: false);
+            await foreach (var batch in reader.ReadAllAsync())
+            {
+                var id = (Int64Array)batch.Column("id");
+                // The raw reader hands back the narrowest decimal that fits the file's column.
+                var amount = batch.Column("amount");
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    ids.Add(id.GetValue(i)!.Value);
+                    amounts.Add(amount switch
+                    {
+                        Decimal64Array d64 => d64.GetValue(i),
+                        Decimal128Array d128 => d128.GetValue(i),
+                        _ => throw new InvalidOperationException(amount.Data.DataType.Name),
+                    });
+                }
+            }
+
+            using var stats = JsonDocument.Parse(file.GetStatsJson()!);
+            var root = stats.RootElement;
+            Assert.Equal(ids.Count, root.GetProperty("numRecords").GetInt64());
+            Assert.Equal(ids.Min(), root.GetProperty("minValues").GetProperty("id").GetInt64());
+            Assert.Equal(ids.Max(), root.GetProperty("maxValues").GetProperty("id").GetInt64());
+            Assert.Equal(amounts.Count(a => a is null), root.GetProperty("nullCount").GetProperty("amount").GetInt64());
+            Assert.Equal(amounts.Min(), root.GetProperty("minValues").GetProperty("amount").GetDecimal());
+            Assert.Equal(amounts.Max(), root.GetProperty("maxValues").GetProperty("amount").GetDecimal());
+        }
+    }
+
+    /// <summary>
+    /// A sliced decimal column gets its bounds from its own rows. The Decimal128 collector read the value buffer
+    /// from slot 0, ignoring the slice's offset, so a caller's sliced batch got bounds from rows it never wrote, and
+    /// pruning could skip the file for a value it holds.
+    /// </summary>
+    [Fact]
+    public async Task ASlicedDecimalColumn_GetsBoundsFromItsOwnRows()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, DecimalSchema());
+        await table.WriteAsync([DecimalBatch(1, 20).Slice(10, 5)]); // ids 11..15, amounts 0.11..0.15
+
+        var file = Assert.Single(table.CurrentSnapshot.ActiveFiles.Values);
+        using var stats = JsonDocument.Parse(file.GetStatsJson()!);
+        Assert.Equal(0.11m, stats.RootElement.GetProperty("minValues").GetProperty("amount").GetDecimal());
+        Assert.Equal(0.15m, stats.RootElement.GetProperty("maxValues").GetProperty("amount").GetDecimal());
+    }
+
     /// <summary>Under a large target, the same row groups share one file.</summary>
     [Fact]
     public async Task UnderTheTarget_RowGroupsShareAFile()

@@ -145,6 +145,43 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         if (_fileSchema is not null && !SameLayout(_fileSchema.FieldsList, writeBatch.Schema.FieldsList))
             await CloseFileAsync(cancellationToken).ConfigureAwait(false);
 
+        long batchBytes = EstimatedBytes(writeBatch);
+        if (_host is not null)
+        {
+            Append(writeBatch, statsBatch, batchBytes);
+            if (_pendingBytes >= _targetFileSize)
+                await CloseFileAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // The batch is cut where a row group fills, so every row group but a file's last holds exactly
+        // RowGroupMaxRows rows, and the target is checked after each one. Handing the Parquet writer more rows than
+        // that would have it split them into several row groups itself, unseen here: a file's overshoot would then
+        // depend on how the caller batched its rows. Each piece is charged its share of the batch's bytes.
+        long maxRows = Math.Max(1, _options.RowGroupMaxRows);
+        int offset = 0;
+        while (offset < writeBatch.Length)
+        {
+            int take = (int)Math.Min(writeBatch.Length - offset, maxRows - _pendingRows);
+            bool whole = take == writeBatch.Length;
+            Append(
+                whole ? writeBatch : writeBatch.Slice(offset, take),
+                whole ? statsBatch : statsBatch.Slice(offset, take),
+                whole ? batchBytes : batchBytes * take / writeBatch.Length);
+            offset += take;
+
+            if (_pendingRows >= maxRows || _pendingBytes >= _options.RowGroupMaxBytes)
+            {
+                await FlushRowGroupAsync(cancellationToken).ConfigureAwait(false);
+                if (_file!.Position >= _targetFileSize)
+                    await CloseFileAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    // Adds rows to the file being filled. They are written to it: the file closes only once they are flushed.
+    private void Append(RecordBatch writeBatch, RecordBatch statsBatch, long bytes)
+    {
         _fileSchema ??= writeBatch.Schema;
         _fileRows += writeBatch.Length;
         if (_collectStats)
@@ -152,21 +189,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
 
         _pending.Add(writeBatch);
         _pendingRows += writeBatch.Length;
-        _pendingBytes += EstimatedBytes(writeBatch);
-
-        if (_host is not null)
-        {
-            if (_pendingBytes >= _targetFileSize)
-                await CloseFileAsync(cancellationToken).ConfigureAwait(false);
-            return;
-        }
-
-        if (_pendingRows >= _options.RowGroupMaxRows || _pendingBytes >= _options.RowGroupMaxBytes)
-        {
-            await FlushRowGroupAsync(cancellationToken).ConfigureAwait(false);
-            if (_file!.Position >= _targetFileSize)
-                await CloseFileAsync(cancellationToken).ConfigureAwait(false);
-        }
+        _pendingBytes += bytes;
     }
 
     /// <summary>Writes what is pending and closes the last file. Returns every file written, in order.</summary>

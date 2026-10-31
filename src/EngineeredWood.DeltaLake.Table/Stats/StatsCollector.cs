@@ -716,10 +716,14 @@ internal static class StatsCollector
     {
         BigInteger? min = null;
         BigInteger? max = null;
+        // The value buffer is the whole array's: a sliced array's slot i is at its offset plus i. Reading from
+        // slot 0 took the bounds from the wrong rows, and a bound that misses the real values lets pruning skip
+        // a file holding matching rows.
+        int offset = array.Data.Offset;
         for (int i = 0; i < array.Length; i++)
         {
             if (array.IsNull(i)) continue;
-            BigInteger u = ToBigInteger(valueBuffer.Span.Slice(i * width, width));
+            BigInteger u = ToBigInteger(valueBuffer.Span.Slice((offset + i) * width, width));
             if (min is null || u < min.Value) min = u;
             if (max is null || u > max.Value) max = u;
         }
