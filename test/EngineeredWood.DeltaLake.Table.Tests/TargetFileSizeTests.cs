@@ -275,6 +275,58 @@ public class TargetFileSizeTests : IDisposable
         Assert.Equal(0.15m, stats.RootElement.GetProperty("maxValues").GetProperty("amount").GetDecimal());
     }
 
+    /// <summary>
+    /// A sliced struct column's leaf bounds come from the slice's own rows, at every depth. A struct's children are
+    /// not sliced with it, and the leaf collector read the whole child: bounds from every row the batch was sliced
+    /// from. Never wrong to prune by, since they contain the slice's values, but looser than the file's rows, and a
+    /// write slices batches at every row-group boundary.
+    /// </summary>
+    [Fact]
+    public async Task ASlicedStructColumn_GetsLeafBoundsFromItsOwnRows()
+    {
+        var innerType = new StructType([new Field("w", Int64Type.Default, true)]);
+        var structType = new StructType(
+        [
+            new Field("v", Int64Type.Default, true),
+            new Field("d", Amount, true),
+            new Field("inner", innerType, true),
+        ]);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("s", structType, true))
+            .Build();
+
+        const int rows = 20;
+        var ids = new Int64Array.Builder();
+        var v = new Int64Array.Builder();
+        var d = new Decimal128Array.Builder(Amount);
+        var w = new Int64Array.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            ids.Append(i);
+            v.Append(i);
+            d.Append(i / 100m);
+            w.Append(1000 + i);
+        }
+        var inner = new StructArray(innerType, rows, [w.Build()], ArrowBuffer.Empty, nullCount: 0);
+        var s = new StructArray(structType, rows, [v.Build(), d.Build(), inner], ArrowBuffer.Empty, nullCount: 0);
+        var batch = new RecordBatch(schema, [ids.Build(), s], rows);
+
+        await using var table = await DeltaTable.CreateAsync(Fs, schema);
+        await table.WriteAsync([batch.Slice(10, 5)]); // ids 10..14
+
+        var file = Assert.Single(table.CurrentSnapshot.ActiveFiles.Values);
+        using var stats = JsonDocument.Parse(file.GetStatsJson()!);
+        var min = stats.RootElement.GetProperty("minValues").GetProperty("s");
+        var max = stats.RootElement.GetProperty("maxValues").GetProperty("s");
+        Assert.Equal(10, min.GetProperty("v").GetInt64());
+        Assert.Equal(14, max.GetProperty("v").GetInt64());
+        Assert.Equal(0.10m, min.GetProperty("d").GetDecimal());
+        Assert.Equal(0.14m, max.GetProperty("d").GetDecimal());
+        Assert.Equal(1010, min.GetProperty("inner").GetProperty("w").GetInt64());
+        Assert.Equal(1014, max.GetProperty("inner").GetProperty("w").GetInt64());
+    }
+
     /// <summary>Under a large target, the same row groups share one file.</summary>
     [Fact]
     public async Task UnderTheTarget_RowGroupsShareAFile()

@@ -49,8 +49,8 @@ public sealed record DeltaTableOptions
     /// to <see cref="ParquetWriteOptions.RowGroupMaxRows"/> rows (or about
     /// <see cref="ParquetWriteOptions.RowGroupMaxBytes"/> of Arrow data), and a file is closed once its size reaches
     /// this target. It is checked after each row group, so a file can overshoot by up to one.</para>
-    /// <para>A <see cref="DataFileWriter"/> reports a file's size only once it has written it, so under one a
-    /// file is cut when its batches' Arrow size reaches this target instead. Arrow data is larger than the Parquet
+    /// <para>A <see cref="DataFileWriter"/> reports a file's size only once it has written it, so with a host
+    /// writer a file is cut when its batches' Arrow size reaches this target instead. Arrow data is larger than the Parquet
     /// it becomes, so those files come out smaller than the target.</para>
     /// <para>The rewrites that DML and compaction do are not governed by this. Compaction has its own
     /// <see cref="CompactionOptions.TargetFileSize"/>.</para>
