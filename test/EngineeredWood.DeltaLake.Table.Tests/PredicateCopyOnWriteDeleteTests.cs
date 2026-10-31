@@ -359,6 +359,54 @@ public class PredicateCopyOnWriteDeleteTests : IDisposable
         Assert.Equal([(1L, "delete"), (2L, "delete"), (11L, "delete")], await ReadFeedAsync(version));
     }
 
+    /// <summary>
+    /// On a table with both row tracking and the change feed, each deleted row reaches the feed with the stable id
+    /// and commit version a scan reported for it before the delete. The change file is written from the delete's
+    /// scan, not from the rewrite, so this is what pins the two to the same identity.
+    /// </summary>
+    [Fact]
+    public async Task OnAChangeFeedRowTrackingTable_TheFeedCarriesEachDeletedRowsStableId()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, BuildSchema(), enableRowTracking: true, configuration: Cdf());
+        await table.WriteAsync([Batch(1, 5)]);
+        // A first rewrite, so the rows the second delete removes carry MATERIALIZED ids, not baseRowId + position.
+        await table.DeleteAsync(Ex.Equal("id", 1L));
+        await using (var before = await OpenAsync())
+            Assert.NotNull(Assert.Single(before.CurrentSnapshot.ActiveFiles.Values).BaseRowId);
+        var idsBefore = await ReadRowIdsAsync();
+
+        var (_, version) = await table.DeleteAsync(TwoAndFour);
+
+        var feed = new Dictionary<long, (long RowId, long CommitVersion)>();
+        await using (var check = await OpenAsync())
+        {
+            await foreach (var batch in check.ReadChangesAsync(new DeltaChangeReadOptions
+            {
+                StartVersion = version, EndVersion = version, Metadata = DeltaRowMetadata.RowTracking,
+            }))
+            {
+                var ids = (Int64Array)batch.Column("id");
+                var types = (StringArray)batch.Column("_change_type");
+                var rowIds = (Int64Array)batch.Column(batch.Schema.GetFieldIndex(RowTrackingConfig.RowIdColumnName));
+                var versions = (Int64Array)batch.Column(
+                    batch.Schema.GetFieldIndex(RowTrackingConfig.RowCommitVersionColumnName));
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    Assert.Equal("delete", types.GetString(i));
+                    feed[ids.GetValue(i)!.Value] = (rowIds.GetValue(i)!.Value, versions.GetValue(i)!.Value);
+                }
+            }
+        }
+
+        Assert.Equal(new long[] { 2, 4 }, feed.Keys.OrderBy(k => k));
+        Assert.Equal(idsBefore[2], feed[2].RowId);
+        Assert.Equal(idsBefore[4], feed[4].RowId);
+        // Written at version 1 and carried through the first rewrite unchanged.
+        Assert.Equal(1, feed[2].CommitVersion);
+        Assert.Equal(1, feed[4].CommitVersion);
+    }
+
     [Fact]
     public async Task InATransaction_AbortDeletesTheRewrite()
     {

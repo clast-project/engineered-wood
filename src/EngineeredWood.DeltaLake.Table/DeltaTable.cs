@@ -4277,47 +4277,50 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
 
             if (!wholeFile && copyOnWrite)
             {
-                // Rewritten after the scan, with its own remove, add and change file; nothing is staged here.
+                // Rewritten after the scan, which writes its remove and add. Its change file is written below, from
+                // the deleted rows this scan already captured, so the rewrite is told not to capture them again.
                 (copyOnWriteTargets ??= new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal))
                     [addFile.Path] = newDeletedIndices;
-                continue;
             }
-
-            if (!wholeFile && !deletionVectorsEnabled)
+            else
             {
-                throw new InvalidOperationException(
-                    "DELETE was asked to soft-delete part of a data file with a deletion vector, and this table "
-                    + "does not have deletion vectors enabled. Pass RowDeleteMode.CopyOnWrite (or no mode) to "
-                    + "rewrite the affected files instead, or create the table with "
-                    + "DeltaTable.CreateAsync(..., enableDeletionVectors: true).");
-            }
-
-            actions.Add(RemoveOf(addFile));
-            removedPaths.Add(addFile.Path);
-
-            if (!wholeFile)
-            {
-                var newDv = await dvWriter.CreateAsync(
-                    allDeleted, allDeleted.Count, cancellationToken).ConfigureAwait(false);
-                // The vector is ours; the file it masks is not — the re-add below names the SOURCE data file,
-                // which is live table data whatever becomes of this transaction.
-                written?.RecordDeletionVector(newDv);
-
-                actions.Add(addFile with
+                if (!wholeFile && !deletionVectorsEnabled)
                 {
-                    DeletionVector = newDv,
-                    DataChange = true,
-                    Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
-                });
+                    throw new InvalidOperationException(
+                        "DELETE was asked to soft-delete part of a data file with a deletion vector, and this table "
+                        + "does not have deletion vectors enabled. Pass RowDeleteMode.CopyOnWrite (or no mode) to "
+                        + "rewrite the affected files instead, or create the table with "
+                        + "DeltaTable.CreateAsync(..., enableDeletionVectors: true).");
+                }
 
-                // Record the exact rows this delete added (absolute positions), so a concurrent DV-delete
-                // of the same file can be reconciled row-by-row rather than aborting the whole file. A
-                // whole-file remove has no surviving rows to reconcile, so it records no edit (a concurrent
-                // delete of that file is a genuine file-level conflict).
-                dvEdits.Add(new DeleteDvEdit(addFile.Path, newDeletedIndices));
+                actions.Add(RemoveOf(addFile));
+                removedPaths.Add(addFile.Path);
+
+                if (!wholeFile)
+                {
+                    var newDv = await dvWriter.CreateAsync(
+                        allDeleted, allDeleted.Count, cancellationToken).ConfigureAwait(false);
+                    // The vector is ours; the file it masks is not — the re-add below names the SOURCE data file,
+                    // which is live table data whatever becomes of this transaction.
+                    written?.RecordDeletionVector(newDv);
+
+                    actions.Add(addFile with
+                    {
+                        DeletionVector = newDv,
+                        DataChange = true,
+                        Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
+                    });
+
+                    // Record the exact rows this delete added (absolute positions), so a concurrent DV-delete
+                    // of the same file can be reconciled row-by-row rather than aborting the whole file. A
+                    // whole-file remove has no surviving rows to reconcile, so it records no edit (a concurrent
+                    // delete of that file is a genuine file-level conflict).
+                    dvEdits.Add(new DeleteDvEdit(addFile.Path, newDeletedIndices));
+                }
             }
 
-            // Write CDC file for deleted rows
+            // The change file for the deleted rows, whichever way the file went — removed, masked or rewritten — from
+            // the rows the scan captured. They are the rows a scan returns, with their stable identity.
             if (cdfEnabled)
             {
                 for (int b = 0; b < deletedRowBatches.Count; b++)
@@ -4337,10 +4340,11 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             // The rewrite reads each file again, whole: the scan above may have skipped row groups and pages that
             // hold no matching row, and every one of those rows survives into the new file. It writes the remove,
-            // the add, the change file and the row-id reservation exactly as a row-level copy-on-write delete does.
+            // the add and the row-id reservation exactly as a row-level copy-on-write delete does. Not the change file:
+            // the scan wrote that from the rows it had already captured.
             var rewrite = await ComputeCopyOnWriteDeleteActionsAsync(
                 RowSelection.ByPath(copyOnWriteTargets), snapshot, cancellationToken,
-                rowIdStart: rowIdStart, written: written).ConfigureAwait(false);
+                rowIdStart: rowIdStart, written: written, writeChangeData: false).ConfigureAwait(false);
             System.Diagnostics.Debug.Assert(
                 rewrite.RowsDeleted == copyOnWriteTargets.Values.Sum(p => (long)p.Count),
                 "The rewrite must find live exactly the rows the scan matched.");
