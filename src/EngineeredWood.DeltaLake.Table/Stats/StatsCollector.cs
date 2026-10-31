@@ -32,26 +32,41 @@ internal static class StatsCollector
     /// </summary>
     public static string? Collect(IReadOnlyList<RecordBatch> batches, StatsColumnSelection? selection = null)
     {
-        selection ??= StatsColumnSelection.All;
-        long totalRows = 0;
-        var minValues = new Dictionary<string, object?>();
-        var maxValues = new Dictionary<string, object?>();
+        var accumulator = new Accumulator(selection);
+        foreach (var batch in batches)
+            accumulator.Add(batch);
+        return accumulator.Serialize();
+    }
+
+    /// <summary>
+    /// One file's statistics, built up batch by batch as the file is written, so the batches need not be kept
+    /// until it is closed. <see cref="Collect(IReadOnlyList{RecordBatch}, StatsColumnSelection?)"/> is the same
+    /// over a list.
+    /// </summary>
+    internal sealed class Accumulator
+    {
+        private readonly StatsColumnSelection _selection;
+        private long _totalRows;
+        private readonly Dictionary<string, object?> _minValues = new();
+        private readonly Dictionary<string, object?> _maxValues = new();
         // Values are long (a leaf) or a nested Dictionary<string, object> (a struct subtree) — the Delta
         // stats JSON nests objects mirroring the schema.
-        var nullCounts = new Dictionary<string, object>();
+        private readonly Dictionary<string, object> _nullCounts = new();
 
-        foreach (var batch in batches)
+        public Accumulator(StatsColumnSelection? selection) => _selection = selection ?? StatsColumnSelection.All;
+
+        public void Add(RecordBatch batch)
         {
             if (batch.Length == 0)
-                continue;
+                return;
 
-            totalRows += batch.Length;
+            _totalRows += batch.Length;
 
             for (int col = 0; col < batch.ColumnCount; col++)
             {
                 var field = batch.Schema.FieldsList[col];
                 var array = batch.Column(col);
-                if (!selection.Includes(field.Name, out var selected))
+                if (!_selection.Includes(field.Name, out var selected))
                 {
                     continue;
                 }
@@ -59,28 +74,28 @@ internal static class StatsCollector
                 if (array is StructArray structCol)
                 {
                     // Nested stats: recurse into struct leaves (list/map subtrees carry no per-column stats).
-                    var nMin = GetOrAddNested(minValues, field.Name);
-                    var nMax = GetOrAddNested(maxValues, field.Name);
-                    var nNull = GetOrAddNestedCounts(nullCounts, field.Name);
+                    var nMin = GetOrAddNested(_minValues, field.Name);
+                    var nMax = GetOrAddNested(_maxValues, field.Name);
+                    var nNull = GetOrAddNestedCounts(_nullCounts, field.Name);
                     CollectStruct(
                         structCol, firstElement: 0, structCol.Length, ancestorNull: null, selected, nMin, nMax, nNull);
                 }
                 else
                 {
                     // Sum null counts across batches
-                    long existing = nullCounts.TryGetValue(field.Name, out var ex) && ex is long l ? l : 0;
-                    nullCounts[field.Name] = existing + array.NullCount;
+                    long existing = _nullCounts.TryGetValue(field.Name, out var ex) && ex is long l ? l : 0;
+                    _nullCounts[field.Name] = existing + array.NullCount;
 
                     // Merge min/max across batches
-                    CollectMinMax(field.Name, array, minValues, maxValues);
+                    CollectMinMax(field.Name, array, _minValues, _maxValues);
                 }
             }
         }
 
-        if (totalRows == 0)
-            return null;
-
-        return SerializeStats(totalRows, minValues, maxValues, nullCounts, selection.StringPrefixLength);
+        /// <summary>The stats JSON, or null when no row was added.</summary>
+        public string? Serialize() => _totalRows == 0
+            ? null
+            : SerializeStats(_totalRows, _minValues, _maxValues, _nullCounts, _selection.StringPrefixLength);
     }
 
     private static string SerializeStats(
@@ -141,7 +156,7 @@ internal static class StatsCollector
     /// counts as null for a leaf when ANY struct above it is null on that row, not just its direct parent, or
     /// the leaf slot is (exactness matters, IS NULL pruning relies on it). <paramref name="ancestorNull"/> carries
     /// the rows some enclosing struct already made null, or is null when none did. min/max reuse the flat
-    /// collectors over the child arrays; a child slot under a null ancestor, or outside the batch's rows, may hold
+    /// collectors over the child arrays, sliced to the struct's rows; a child slot under a null ancestor may hold
     /// an arbitrary value, which can only WIDEN the bounds — a superset bound never wrongly skips a file, so it is
     /// prune-safe (same argument as deletion-vector stats).
     /// </summary>
@@ -196,7 +211,13 @@ internal static class StatsCollector
                     }
                     long existing = nullCounts.TryGetValue(childName, out var ex) && ex is long l ? l : 0;
                     nullCounts[childName] = existing + nulls;
-                    CollectMinMax(childName, child, minValues, maxValues);
+                    // Over this struct's rows only. The child is the whole unsliced array, so reading all of it took
+                    // the bounds of every row the parent was sliced from: never wrong to prune by, but looser than the
+                    // file's own rows, and a write cuts batches into slices at every row-group boundary.
+                    var rows = childFirst == 0 && rowCount == child.Length
+                        ? child
+                        : ArrowArrayFactory.Slice(child, childFirst, rowCount);
+                    CollectMinMax(childName, rows, minValues, maxValues);
                 }
             }
         }
@@ -701,10 +722,14 @@ internal static class StatsCollector
     {
         BigInteger? min = null;
         BigInteger? max = null;
+        // The value buffer is the whole array's: a sliced array's slot i is at its offset plus i. Reading from
+        // slot 0 took the bounds from the wrong rows, and a bound that misses the real values lets pruning skip
+        // a file holding matching rows.
+        int offset = array.Data.Offset;
         for (int i = 0; i < array.Length; i++)
         {
             if (array.IsNull(i)) continue;
-            BigInteger u = ToBigInteger(valueBuffer.Span.Slice(i * width, width));
+            BigInteger u = ToBigInteger(valueBuffer.Span.Slice((offset + i) * width, width));
             if (min is null || u < min.Value) min = u;
             if (max is null || u > max.Value) max = u;
         }

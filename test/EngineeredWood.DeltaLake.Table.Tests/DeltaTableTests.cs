@@ -347,7 +347,8 @@ public class DeltaTableTests : IDisposable
 
         long version = await table.WriteAsync([batch1, batch2]);
         Assert.Equal(1L, version);
-        Assert.Equal(2, table.CurrentSnapshot.FileCount);
+        // One file, not one per batch: the file count follows the data's size (#559).
+        Assert.Equal(1, table.CurrentSnapshot.FileCount);
 
         // Read back
         int totalRows = 0;

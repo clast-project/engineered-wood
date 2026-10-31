@@ -38,7 +38,23 @@ public sealed record DeltaTableOptions
     /// </summary>
     public ParquetReadOptions ParquetReadOptions { get; init; } = ParquetReadOptions.Default;
 
-    /// <summary>Target size for individual data files in bytes. Default: 128 MB.</summary>
+    /// <summary>
+    /// Target size for the data files a write creates, in bytes. Default: 128 MB.
+    /// </summary>
+    /// <remarks>
+    /// <para>A write (<see cref="DeltaTable.WriteAsync(IReadOnlyList{Apache.Arrow.RecordBatch}, DeltaWriteMode, CancellationToken, IReadOnlyList{string}, bool?)"/>,
+    /// a transaction's <see cref="DeltaTransaction.WriteAsync"/>, <see cref="DeltaTable.WriteDataFilesAsync"/>)
+    /// gathers each partition's rows from all of its batches, so the number of files follows the data's size and
+    /// not how the caller batched it. With the built-in writer, consecutive batches are joined into row groups of up
+    /// to <see cref="ParquetWriteOptions.RowGroupMaxRows"/> rows (or about
+    /// <see cref="ParquetWriteOptions.RowGroupMaxBytes"/> of Arrow data), and a file is closed once its size reaches
+    /// this target. It is checked after each row group, so a file can overshoot by up to one.</para>
+    /// <para>A <see cref="DataFileWriter"/> reports a file's size only once it has written it, so with a host
+    /// writer a file is cut when its batches' Arrow size reaches this target instead. Arrow data is larger than the Parquet
+    /// it becomes, so those files come out smaller than the target.</para>
+    /// <para>The rewrites that DML and compaction do are not governed by this. Compaction has its own
+    /// <see cref="CompactionOptions.TargetFileSize"/>.</para>
+    /// </remarks>
     public long TargetFileSize { get; init; } = 128L * 1024 * 1024;
 
     /// <summary>

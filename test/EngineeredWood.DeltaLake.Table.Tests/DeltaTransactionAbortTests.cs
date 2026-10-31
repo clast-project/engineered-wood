@@ -116,7 +116,7 @@ public class DeltaTransactionAbortTests : IDisposable
 
         var txn = table.StartTransaction();
         await txn.WriteAsync([Batch(2), Batch(3)]);
-        Assert.Equal(before.Length + 2, DataFiles().Length); // written, not committed
+        Assert.Equal(before.Length + 1, DataFiles().Length); // written, not committed
 
         await txn.AbortAsync();
 
