@@ -163,6 +163,32 @@ public class TargetFileSizeTests : IDisposable
         Assert.Equal(Range(0, 2500), await ReadIdsAsync(table));
     }
 
+    /// <summary>
+    /// One batch larger than <see cref="ParquetWriteOptions.RowGroupMaxBytes"/> is cut at the byte budget too, as
+    /// smaller batches of the same rows would be, rather than becoming one oversized row group.
+    /// </summary>
+    [Fact]
+    public async Task ABatchOverTheByteLimit_IsCutIntoRowGroupsWithinIt()
+    {
+        long batchBytes = RollingDataFileWriter.EstimatedBytes(Batch(0, 1000));
+        var options = new DeltaTableOptions
+        {
+            ParquetWriteOptions = ParquetWriteOptions.Default with { RowGroupMaxBytes = batchBytes / 4 },
+        };
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(), options);
+        await table.WriteAsync([Batch(0, 1000)]);
+
+        var file = Assert.Single(table.CurrentSnapshot.ActiveFiles.Values);
+        await using var stream = await Fs.OpenReadAsync(DeltaPath.Decode(file.Path));
+        using var reader = new ParquetFileReader(stream, ownsFile: false);
+        var groups = (await reader.ReadMetadataAsync()).RowGroups.Select(g => g.NumRows).ToList();
+        // A quarter of the batch's bytes is a quarter of its rows, rounded up; the last group takes what is left.
+        Assert.Equal(4, groups.Count);
+        Assert.All(groups, rows => Assert.InRange(rows, 249, 251));
+        Assert.Equal(1000, groups.Sum());
+        Assert.Equal(Range(0, 1000), await ReadIdsAsync(table));
+    }
+
     /// <summary>Batches that straddle a row-group boundary are cut there, so every row group but the last is
     /// full.</summary>
     [Fact]

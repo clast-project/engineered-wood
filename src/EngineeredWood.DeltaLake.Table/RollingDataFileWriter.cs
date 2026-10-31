@@ -154,21 +154,29 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             return;
         }
 
-        // The batch is cut where a row group fills, so every row group but a file's last holds exactly
-        // RowGroupMaxRows rows, and the target is checked after each one. Handing the Parquet writer more rows than
-        // that would have it split them into several row groups itself, unseen here: a file's overshoot would then
-        // depend on how the caller batched its rows. Each piece is charged its share of the batch's bytes.
+        // The batch is cut where a row group fills, by rows or by bytes, and the target is checked after each one.
+        // Handing the Parquet writer more than RowGroupMaxRows rows would have it split them into several row
+        // groups itself, unseen here, and nothing downstream honours RowGroupMaxBytes: either way the layout would
+        // depend on how the caller batched its rows. Each piece is charged its share of the batch's bytes, and the
+        // byte budget rounds up to whole rows, so a row group by bytes ends at most one row past the limit.
         long maxRows = Math.Max(1, _options.RowGroupMaxRows);
         int offset = 0;
         while (offset < writeBatch.Length)
         {
-            int take = (int)Math.Min(writeBatch.Length - offset, maxRows - _pendingRows);
-            bool whole = take == writeBatch.Length;
+            long take = Math.Min(writeBatch.Length - offset, maxRows - _pendingRows);
+            if (batchBytes > 0)
+            {
+                long byteRoom = Math.Max(1, _options.RowGroupMaxBytes - _pendingBytes);
+                long rowsInRoom = (byteRoom * writeBatch.Length + batchBytes - 1) / batchBytes;
+                take = Math.Min(take, Math.Max(1, rowsInRoom));
+            }
+            int rows = (int)take;
+            bool whole = rows == writeBatch.Length;
             Append(
-                whole ? writeBatch : writeBatch.Slice(offset, take),
-                whole ? statsBatch : statsBatch.Slice(offset, take),
-                whole ? batchBytes : batchBytes * take / writeBatch.Length);
-            offset += take;
+                whole ? writeBatch : writeBatch.Slice(offset, rows),
+                whole ? statsBatch : statsBatch.Slice(offset, rows),
+                whole ? batchBytes : batchBytes * rows / writeBatch.Length);
+            offset += rows;
 
             if (_pendingRows >= maxRows || _pendingBytes >= _options.RowGroupMaxBytes)
             {
