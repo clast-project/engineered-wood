@@ -2446,9 +2446,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Gets a snapshot at the latest version whose in-commit timestamp
-    /// is at or before the specified timestamp.
-    /// Requires <c>delta.enableInCommitTimestamps</c> to be enabled.
+    /// Gets a snapshot at the latest version committed at or before the specified timestamp. A commit's time is its
+    /// in-commit timestamp, else its <c>commitInfo.timestamp</c>, else (a commit that records neither) its commit
+    /// file's modification time, as Spark falls back to it; and never earlier than the commit before it. A
+    /// timestamp after the latest commit gives the latest version.
     /// </summary>
     public async ValueTask<Snapshot.Snapshot> GetSnapshotAtTimestampAsync(
         DateTimeOffset timestamp, CancellationToken cancellationToken = default)
@@ -2456,29 +2457,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
 
         long targetMs = timestamp.ToUnixTimeMilliseconds();
-
-        // Scan commits to find the latest version at or before the target timestamp
         long? bestVersion = null;
-
-        await foreach (long version in _log.ListVersionsAsync(0, cancellationToken)
-            .ConfigureAwait(false))
+        await foreach (var (version, commitTs) in ReadCommitTimestampsAsync(cancellationToken).ConfigureAwait(false))
         {
-            var actions = await _log.ReadCommitAsync(version, cancellationToken)
-                .ConfigureAwait(false);
-
-            long? commitTs = Log.InCommitTimestamp.GetTimestampFromActions(actions);
-
-            if (commitTs.HasValue && commitTs.Value <= targetMs)
-                bestVersion = version;
-            else if (commitTs.HasValue && commitTs.Value > targetMs)
-                break; // Timestamps are monotonically increasing
+            if (commitTs > targetMs)
+                break; // the sequence never goes backwards
+            bestVersion = version;
         }
 
         if (bestVersion is null)
             throw new DeltaFormatException(
                 DeltaTableErrorCodes.NoCommitAtTimestamp,
-                "No commit found at or before the specified timestamp. " +
-                "Ensure the table has in-commit timestamps enabled.");
+                "No commit found at or before the specified timestamp.");
 
         return await GetSnapshotAtVersionAsync(bestVersion.Value, cancellationToken)
             .ConfigureAwait(false);
