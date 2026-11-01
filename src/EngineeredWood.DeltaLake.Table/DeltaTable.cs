@@ -4500,18 +4500,23 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="DeltaFilePruner.ProvesEveryRowTrue"/> proves. NOT and everything else is not proven, which
     /// reads the file.
     /// </summary>
+    /// <param name="mask">Evaluates a partition-only part on the row built from the file's partition values. It
+    /// must be the evaluator the operation uses on rows, or the proof answers a different question: DELETE's
+    /// <see cref="MaskFor"/> by default, and ADD CONSTRAINT passes the constraint enforcer's, whose Spark coercion
+    /// can disagree (a <c>decimal(38,38)</c> compared with an integer is rounded first).</param>
     private static bool ProvesEveryRow(
         Expressions.Predicate predicate, AddFile addFile, DeltaFileStats stats, DeltaFilePruner pruner,
-        Apache.Arrow.Schema? partitionSchema, Snapshot.Snapshot snapshot) => predicate switch
+        Apache.Arrow.Schema? partitionSchema, Snapshot.Snapshot snapshot,
+        Func<Expressions.Predicate, Func<RecordBatch, BooleanArray>>? mask = null) => predicate switch
     {
         Expressions.TruePredicate => true,
         _ when partitionSchema is not null
             && ReferencesOnlyPartitionColumns(predicate, snapshot.Metadata.PartitionColumns)
-            => MatchesEveryRow(addFile, partitionSchema, snapshot, MaskFor(predicate)),
+            => MatchesEveryRow(addFile, partitionSchema, snapshot, (mask ?? MaskFor)(predicate)),
         Expressions.AndPredicate and => and.Children.All(
-            c => ProvesEveryRow(c, addFile, stats, pruner, partitionSchema, snapshot)),
+            c => ProvesEveryRow(c, addFile, stats, pruner, partitionSchema, snapshot, mask)),
         Expressions.OrPredicate or => or.Children.Any(
-            c => ProvesEveryRow(c, addFile, stats, pruner, partitionSchema, snapshot)),
+            c => ProvesEveryRow(c, addFile, stats, pruner, partitionSchema, snapshot, mask)),
         _ => pruner.ProvesEveryRowTrue(stats, predicate),
     };
 

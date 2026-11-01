@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using Apache.Arrow;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.Concurrency;
 using EngineeredWood.Expressions.Arrow;
@@ -141,10 +142,12 @@ public sealed partial class DeltaTable
         if (existing is { } found)
         {
             parameters["expr"] = found.Value;
+            // Every key naming it, in whatever case. A table can carry two that differ only in case (both given
+            // at creation), the enforcer applies both, and leaving one would report a drop that did not happen.
             var configuration = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var pair in snapshot.Metadata.Configuration!)
             {
-                if (pair.Key != found.Key)
+                if (!string.Equals(pair.Key, found.Key, StringComparison.OrdinalIgnoreCase))
                     configuration[pair.Key] = pair.Value;
             }
             metadata = metadata with { Configuration = configuration };
@@ -228,17 +231,23 @@ public sealed partial class DeltaTable
             ? BuildProjectedSchema(snapshot.ArrowSchema, partitionColumns)
             : null;
         var evaluator = new ArrowRowEvaluator(new SparkFunctionRegistry());
-        var proofForm = prove ? ProofForm(predicate, snapshot.Schema) : predicate;
+        var proofForm = prove ? ProofForm(predicate, snapshot.Schema, partitionColumns) : predicate;
+        // A partition-only part is decided by evaluating it on a row built from the file's partition values, and that
+        // has to be the evaluator the rows are checked with: the plain one DELETE uses answers `p > 0` TRUE for a
+        // decimal(38,38) of 4E-38, which Spark's coercion (rounding to decimal(38,37) first) answers FALSE.
+        Func<Expressions.Predicate, Func<RecordBatch, BooleanArray>> mask =
+            part => batch => evaluator.EvaluatePredicate(part, batch);
 
         long violations = 0;
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
-            if (prove && ProvesEveryRow(proofForm, addFile, new DeltaFileStats(addFile), pruner!, partitionSchema, snapshot))
+            if (prove && ProvesEveryRow(
+                    proofForm, addFile, new DeltaFileStats(addFile), pruner!, partitionSchema, snapshot, mask))
                 continue;
 
-            // A constraint that names no column (CHECK (1 = 1)) still has to see each row once.
-            await foreach (var batch in ReadFileAsync(
-                               addFile, columns.Count > 0 ? columns : null, snapshot, cancellationToken)
+            // A constraint that names no column (CHECK (1 = 1)) still has to see each row once. The empty projection
+            // gives batches of the right length, deletion vectors applied, without decoding a column.
+            await foreach (var batch in ReadFileAsync(addFile, columns, snapshot, cancellationToken)
                                .ConfigureAwait(false))
             {
                 violations += DeltaConstraintEnforcer.CountViolations(evaluator, predicate, batch, description, sql);
@@ -254,14 +263,17 @@ public sealed partial class DeltaTable
     /// <c>id &gt; 0</c> with an <c>int</c> literal, which the proof would otherwise decline against a
     /// <c>long</c> column. Spark compares two integers at the wider of their types, so a literal that fits the
     /// narrower one compares the same at either. Anything else is left as it was, and stays unproven if the proof
-    /// declines it.
+    /// declines it. A part over partition columns alone is left exactly as written, since it is decided by
+    /// evaluating it rather than by statistics, and so is a comparison of a partition column.
     /// </summary>
-    internal static Expressions.Predicate ProofForm(Expressions.Predicate predicate, Schema.StructType schema)
+    internal static Expressions.Predicate ProofForm(
+        Expressions.Predicate predicate, Schema.StructType schema, IReadOnlyList<string> partitionColumns)
     {
         return Rewrite(predicate);
 
         Expressions.Predicate Rewrite(Expressions.Predicate p) => p switch
         {
+            _ when partitionColumns.Count > 0 && ReferencesOnlyPartitionColumns(p, partitionColumns) => p,
             Expressions.AndPredicate and => new Expressions.AndPredicate([.. and.Children.Select(Rewrite)]),
             Expressions.OrPredicate or => new Expressions.OrPredicate([.. or.Children.Select(Rewrite)]),
             Expressions.ComparisonPredicate { Left: Expressions.UnboundReference column, Right: Expressions.LiteralExpression literal } cmp
@@ -280,8 +292,11 @@ public sealed partial class DeltaTable
                 return column;
             var field = schema.Fields.Where(f => string.Equals(f.Name, column.Name, StringComparison.OrdinalIgnoreCase))
                 .Take(2).ToList();
-            if (field.Count != 1)
+            if (field.Count != 1
+                || partitionColumns.Contains(field[0].Name, StringComparer.OrdinalIgnoreCase))
+            {
                 return column;
+            }
             type = (field[0].Type as Schema.PrimitiveType)?.TypeName;
             return new Expressions.UnboundReference(field[0].Name);
         }

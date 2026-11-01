@@ -330,6 +330,69 @@ public class ConstraintDdlTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A partition-only constraint is proven with the enforcer's own evaluator. The plain evaluator DELETE uses
+    /// answers <c>p &gt; 0</c> TRUE for a <c>decimal(38,38)</c> of 4E-38; Spark's coercion rounds it to
+    /// <c>decimal(38,37)</c> first and answers FALSE, which is what a write would be held to. So the file is not
+    /// skipped and the constraint is refused.
+    /// </summary>
+    [Fact]
+    public async Task APartitionProof_UsesTheEnforcersEvaluator()
+    {
+        var decimalType = new Decimal128Type(38, 38);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("p", decimalType, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, schema, new DeltaTableOptions { CheckpointInterval = 0, TrustStatisticsProofs = true },
+            partitionColumns: ["p"]);
+        var p = new Decimal128Array.Builder(decimalType);
+        p.Append(System.Data.SqlTypes.SqlDecimal.Parse("0.00000000000000000000000000000000000004"));
+        await table.WriteAsync([new RecordBatch(schema, [new Int64Array.Builder().Append(1).Build(), p.Build()], 1)]);
+
+        var ex = await RefusedAsync(DeltaTableErrorCodes.NewCheckConstraintViolation,
+            async () => await table.AddConstraintAsync("pos", "p > 0"));
+        Assert.StartsWith("1 rows", ex.Message);
+    }
+
+    /// <summary>
+    /// Two keys differing only in case, both given at creation and both enforced, are dropped together; leaving one
+    /// would report a drop while writes stayed refused.
+    /// </summary>
+    [Fact]
+    public async Task Drop_RemovesEveryCaseOfTheName()
+    {
+        await using var table = await CreateAsync(configuration: new Dictionary<string, string>
+        {
+            ["delta.constraints.Positive"] = "id > 0",
+            ["delta.constraints.positive"] = "id > 1",
+        });
+
+        await table.DropConstraintAsync("POSITIVE");
+
+        Assert.DoesNotContain(table.CurrentSnapshot.Metadata.Configuration!.Keys, k => k.StartsWith("delta.constraints."));
+        await table.WriteAsync([Rows(-1)]);
+        await table.AddConstraintAsync("positive", "id IS NOT NULL");
+    }
+
+    /// <summary>
+    /// A constraint naming no column reads no column, and still sees each live row once: <c>1 = 0</c> is violated by
+    /// exactly the rows a deletion vector leaves.
+    /// </summary>
+    [Fact]
+    public async Task AColumnFreeConstraint_CountsEveryLiveRow()
+    {
+        await using var table = await CreateAsync(deletionVectors: true);
+        await table.WriteAsync([Rows(1, 2, 3)]);
+        await table.WriteAsync([Rows(4, 5)]);
+        await table.DeleteAsync(Expressions.Expressions.Equal("id", 2L));
+
+        var ex = await RefusedAsync(DeltaTableErrorCodes.NewCheckConstraintViolation,
+            async () => await table.AddConstraintAsync("never", "1 = 0"));
+        Assert.StartsWith("4 rows", ex.Message);
+    }
+
     /// <summary>On a column-mapped table the constraint names the logical column, and the read resolves it.</summary>
     [Fact]
     public async Task OnAColumnMappedTable_TheLogicalNameIsChecked()
