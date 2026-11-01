@@ -2788,8 +2788,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // vectors on EXISTING files (its re-add keeps that file's own baseRowId), or — when a file was
         // concurrently rewritten — remaps its rows by STABLE ROW ID onto the new files (Layer 3 B); an append
         // or an UPDATE's copy-on-write rewrite is a fresh (post-image) add whose baseRowId CommitOccAsync
-        // re-derives against the advanced high-water mark on rebase. Overwrite modes are not stageable on a
-        // transaction, so nothing here reads the whole active-file set (the one remaining non-rebase-safe case).
+        // re-derives against the advanced high-water mark on rebase. The full, partition-scoped and dynamic
+        // overwrites are not stageable on a transaction, so nothing here reads the whole active-file set (the one
+        // remaining non-rebase-safe case). A predicate overwrite is stageable because it is a predicate DELETE
+        // plus an append, and both of those rebase.
         var reads = new ReadSet
         {
             // The files this transaction's own DML rewrites, plus the ones the HOST declared its scan read

@@ -41,8 +41,11 @@ namespace EngineeredWood.DeltaLake.Table;
 /// them — and a delete of DIFFERENT rows in a file someone else also deleted from reconciles row-by-row
 /// rather than aborting, including across a concurrent compaction that rewrote the file away. Row ids stay
 /// correct throughout: staged work reserves a contiguous range, and a rebase re-derives it against the
-/// advanced high-water mark. Overwrite modes are not stageable — they remove the whole active set, which
-/// is exactly what a rebase cannot re-derive.</para>
+/// advanced high-water mark. The full, partition-scoped and dynamic overwrites are not stageable — they
+/// remove the whole active set, or every file of a partition, which is exactly what a rebase cannot
+/// re-derive. A predicate overwrite (Spark's <c>replaceWhere</c>) is: <see cref="OverwriteWhereAsync"/> reads
+/// only the files its predicate can match and stages a predicate delete plus an append, which rebase like
+/// any other.</para>
 ///
 /// <para><b>Host-staged work.</b> A host that owns its own data plane — its own parquet codec behind
 /// <see cref="IDataFileWriter"/>, its own engine deciding which rows to delete — stages work it has
