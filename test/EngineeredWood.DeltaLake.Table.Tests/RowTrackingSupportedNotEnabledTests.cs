@@ -89,9 +89,9 @@ public class RowTrackingSupportedNotEnabledTests : IDisposable
 
     /// <summary>
     /// Every active file has row ids, no two files' ranges overlap, the high-water mark covers them all, and every
-    /// file added at <paramref name="version"/> carries that version (or, for compaction, a source's).
+    /// file the commit at <paramref name="version"/> added carries that version (or, for compaction, a source's).
     /// </summary>
-    private static void AssertRowIdsAssigned(DeltaTable table, long version, bool versionIsCommit = true)
+    private void AssertRowIdsAssigned(DeltaTable table, long version, bool versionIsCommit = true)
     {
         var snapshot = table.CurrentSnapshot;
         var ranges = new List<(long Start, long End, string Path)>();
@@ -116,8 +116,29 @@ public class RowTrackingSupportedNotEnabledTests : IDisposable
         }
     }
 
-    private static List<AddFile> AddsAt(DeltaTable table, long version) =>
-        [.. table.CurrentSnapshot.ActiveFiles.Values.Where(a => a.DefaultRowCommitVersion == version)];
+    /// <summary>
+    /// The files the commit at <paramref name="version"/> added, read from that commit's own log entry (NOT
+    /// picked out by their defaultRowCommitVersion, which would hide a mis-stamped file from the assertions).
+    /// Each is returned as the snapshot holds it; every one must still be active.
+    /// </summary>
+    private List<AddFile> AddsAt(DeltaTable table, long version)
+    {
+        string log = Path.Combine(_tempDir, "_delta_log", $"{version:D20}.json");
+        var added = new List<AddFile>();
+        foreach (string line in File.ReadAllLines(log))
+        {
+            if (string.IsNullOrWhiteSpace(line))
+                continue;
+            using var doc = System.Text.Json.JsonDocument.Parse(line);
+            if (!doc.RootElement.TryGetProperty("add", out var add))
+                continue;
+            string path = add.GetProperty("path").GetString()!;
+            Assert.True(table.CurrentSnapshot.ActiveFiles.TryGetValue(path, out var active),
+                $"{path}, added at v{version}, is not active");
+            added.Add(active!);
+        }
+        return added;
+    }
 
     /// <summary>A rewrite does not preserve ids while tracking is off, so it writes no materialized id columns.</summary>
     private async Task AssertNoMaterializedColumnsAsync(DeltaTable table)
@@ -381,6 +402,52 @@ public class RowTrackingSupportedNotEnabledTests : IDisposable
         Assert.Equal(0, add.BaseRowId);
         Assert.Equal(version, add.DefaultRowCommitVersion);
         Assert.Equal(2, tracked.CurrentSnapshot.RowIdHighWaterMark);
+    }
+
+    /// <summary>
+    /// The same compaction, planned on a stale handle and rebased past a concurrent append: the version it gave
+    /// the compacted file moves to the version the OPTIMIZE actually lands at (the append took the planned one),
+    /// and its ids move past the append's.
+    /// </summary>
+    [Fact]
+    public async Task Compaction_OfFilesWithoutACommitVersion_RebasedPastAnAppend_MovesItsVersion()
+    {
+        var fs = Fs;
+        await using (var table = await DeltaTable.CreateAsync(
+            fs, Schema, new DeltaTableOptions { CheckpointInterval = 0 }))
+        {
+            await table.WriteAsync([Rows(1)]);                                          // v1, no row ids
+            await table.WriteAsync([Rows(2)]);                                          // v2, no row ids
+            await new TransactionLog(fs).WriteCommitAsync(3,
+            [
+                new ProtocolAction
+                {
+                    MinReaderVersion = 1,
+                    MinWriterVersion = 7,
+                    WriterFeatures = ["domainMetadata", "rowTracking", "appendOnly", "invariants"],
+                },
+            ]);                                                                         // v3: supported only
+        }
+        await using var stale = await DeltaTable.OpenAsync(fs);
+        await using (var other = await DeltaTable.OpenAsync(fs))
+        {
+            long appended = await other.WriteAsync([Rows(3, 4)]);                      // v4, ids 0..1
+            Assert.Equal(4, appended);
+        }
+
+        // The stale plan sees only the two versionless files and stamps the compacted one v4, which the append took.
+        long? version = await stale.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+
+        Assert.Equal(5, version);
+        await using var check = await DeltaTable.OpenAsync(fs);
+        var compacted = Assert.Single(AddsAt(check, 5));
+        Assert.Equal(5, compacted.DefaultRowCommitVersion);
+        var append = check.CurrentSnapshot.ActiveFiles.Values.Single(f => f.Path != compacted.Path);
+        Assert.Equal(0, append.BaseRowId);
+        Assert.Equal(4, append.DefaultRowCommitVersion);
+        Assert.Equal(2, compacted.BaseRowId);
+        Assert.Equal(4, check.CurrentSnapshot.RowIdHighWaterMark);
+        AssertRowIdsAssigned(check, 5);
     }
 
     /// <summary>Without the feature nothing changes: no ids, no high-water mark.</summary>
