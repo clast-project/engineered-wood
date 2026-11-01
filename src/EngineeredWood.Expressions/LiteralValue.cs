@@ -530,7 +530,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     }
 #endif
 
-    private static bool TryAsInt64(LiteralValue v, out long result)
+    internal static bool TryAsInt64(LiteralValue v, out long result)
     {
         switch (v._kind)
         {
