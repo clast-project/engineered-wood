@@ -206,6 +206,38 @@ public class CommitPropertiesTests : IDisposable
     }
 
     /// <summary>
+    /// Neither the keys nor the reserved set can be changed through a cast, which would get a key past the
+    /// validation: a string-valued <c>readVersion</c> in the first case, and every later instance in the second.
+    /// </summary>
+    [Fact]
+    public void TheKeysAndTheReservedSet_CannotBeChangedThroughACast()
+    {
+        var properties = new CommitProperties
+        {
+            Metadata = new Dictionary<string, JsonElement>
+            {
+                ["jobId"] = JsonDocument.Parse("\"a\"").RootElement.Clone(),
+            },
+        };
+        var keys = Assert.IsAssignableFrom<IDictionary<string, JsonElement>>(properties.Metadata);
+        Assert.Throws<NotSupportedException>(
+            () => keys["readVersion"] = JsonDocument.Parse("\"x\"").RootElement.Clone());
+
+        if (CommitProperties.ReservedKeys is ICollection<string> reserved)
+        {
+            Assert.True(reserved.IsReadOnly);
+            Assert.Throws<NotSupportedException>(() => reserved.Remove("readVersion"));
+        }
+        Assert.Throws<ArgumentException>(() => new CommitProperties
+        {
+            Metadata = new Dictionary<string, JsonElement>
+            {
+                ["readVersion"] = JsonDocument.Parse("\"x\"").RootElement.Clone(),
+            },
+        });
+    }
+
+    /// <summary>
     /// A commit that already carries a commitInfo (a host can pass one through) gets the properties added to it,
     /// and a key both name is refused rather than either side winning.
     /// </summary>

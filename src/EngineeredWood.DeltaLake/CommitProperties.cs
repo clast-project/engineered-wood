@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Collections.ObjectModel;
 using System.Text.Json;
 
 namespace EngineeredWood.DeltaLake;
@@ -31,7 +32,11 @@ public sealed class CommitProperties
     /// <c>operationMetrics</c>, <c>isBlindAppend</c>, <c>engineInfo</c>, <c>userMetadata</c>), and Spark
     /// reads every one of them as a typed value.
     /// </summary>
-    public static IReadOnlyCollection<string> ReservedKeys { get; } = new HashSet<string>(StringComparer.Ordinal)
+    /// <remarks>A read-only view: the set the validation consults is private, so nothing a caller does to this
+    /// collection can change what is refused.</remarks>
+    public static IReadOnlyCollection<string> ReservedKeys { get; }
+
+    private static readonly HashSet<string> Reserved = new(StringComparer.Ordinal)
     {
         "version",
         "inCommitTimestamp",
@@ -53,6 +58,13 @@ public sealed class CommitProperties
         "txnId",
     };
 
+    static CommitProperties()
+    {
+        var keys = new string[Reserved.Count];
+        Reserved.CopyTo(keys);
+        ReservedKeys = Array.AsReadOnly(keys);
+    }
+
     private readonly IReadOnlyDictionary<string, JsonElement>? _metadata;
 
     /// <summary>
@@ -62,7 +74,8 @@ public sealed class CommitProperties
 
     /// <summary>
     /// Further <c>commitInfo</c> keys, written as given. The dictionary is copied when it is set, so changing
-    /// it afterwards has no effect on these properties.
+    /// it afterwards has no effect on these properties, and the copy is read-only, so the keys cannot be changed
+    /// past the validation either.
     /// </summary>
     /// <exception cref="ArgumentException">A key is one of <see cref="ReservedKeys"/>, or is empty.</exception>
     public IReadOnlyDictionary<string, JsonElement>? Metadata
@@ -81,7 +94,7 @@ public sealed class CommitProperties
             {
                 if (string.IsNullOrEmpty(kvp.Key))
                     throw new ArgumentException("A commitInfo key may not be empty.", nameof(Metadata));
-                if (ReservedKeys.Contains(kvp.Key))
+                if (Reserved.Contains(kvp.Key))
                 {
                     throw new ArgumentException(
                         $"'{kvp.Key}' is a commitInfo field this library or Spark defines, so it cannot be set " +
@@ -93,7 +106,7 @@ public sealed class CommitProperties
                 // Clone: an element still tied to its JsonDocument is unusable once the caller disposes it.
                 copy[kvp.Key] = kvp.Value.Clone();
             }
-            _metadata = copy;
+            _metadata = new ReadOnlyDictionary<string, JsonElement>(copy);
         }
     }
 
