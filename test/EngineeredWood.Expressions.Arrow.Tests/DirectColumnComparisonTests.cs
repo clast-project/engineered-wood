@@ -364,6 +364,39 @@ public class DirectColumnComparisonTests
         Assert.Equal(1, evaluator.DirectComparisons);
     }
 
+    /// <summary>
+    /// An array may carry a null count of -1, meaning "not counted"; its nulls are still in the bitmap and
+    /// must still answer null (false under <c>&lt;=&gt;</c>).
+    /// </summary>
+    [Fact]
+    public void AnUncountedNullCountStillReadsTheBitmap()
+    {
+        var values = new byte[12];
+        BitConverter.GetBytes(5).CopyTo(values, 0);
+        BitConverter.GetBytes(5).CopyTo(values, 8);
+        var validity = new byte[] { 0b101 };   // row 1 is null
+        var column = new Int32Array(new ArrowBuffer(values), new ArrowBuffer(validity), 3, -1, 0);
+        var flags = new BooleanArray(new ArrowBuffer(new byte[] { 0b001 }), new ArrowBuffer(validity), 3, -1, 0);
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema([new Field("x", Int32Type.Default, true), new Field("b", BooleanType.Default, true)], null),
+            [column, flags], 3);
+
+        foreach (var (predicate, expected) in new (Predicate, bool?[])[]
+                 {
+                     (Expressions.Equal("x", LiteralValue.Of(5)), [true, null, true]),
+                     (Expressions.Equal("x", LiteralValue.Of(0)), [false, null, false]),
+                     (Expressions.NullSafeEqual("x", LiteralValue.Of(0)), [false, false, false]),
+                     (Expressions.Equal("b", LiteralValue.Of(true)), [true, null, false]),
+                 })
+        {
+            var evaluator = new ArrowRowEvaluator();
+            var mask = evaluator.EvaluatePredicate(predicate, batch);
+
+            Assert.Equal(expected, Enumerable.Range(0, 3).Select(i => mask.GetValue(i)));
+            Assert.Equal(1, evaluator.DirectComparisons);
+        }
+    }
+
     [Fact]
     public void ABatchWithNoNullsHasNoValidityBitmap()
     {

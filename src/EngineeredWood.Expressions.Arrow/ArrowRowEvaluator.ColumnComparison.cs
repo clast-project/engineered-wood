@@ -310,7 +310,7 @@ public sealed partial class ArrowRowEvaluator
         var result = new bool?[length];
         var offsets = column.ValueOffsets;
         var data = column.ValueBuffer.Span;
-        bool hasNulls = column.NullCount > 0;
+        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
         var target = new ReadOnlySpan<byte>(literal);
 
         if (startsWith)
@@ -365,7 +365,7 @@ public sealed partial class ArrowRowEvaluator
 
         int length = column.Length;
         var result = new bool?[length];
-        bool hasNulls = column.NullCount > 0;
+        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
         bool? nullRow = NullRow(op);
 
         if (LiteralValue.TryAsInt64(constant, out long target))
@@ -439,7 +439,7 @@ public sealed partial class ArrowRowEvaluator
 
         int length = column.Length;
         var result = new bool?[length];
-        bool hasNulls = column.NullCount > 0;
+        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
         bool? nullRow = NullRow(op);
         for (int i = 0; i < length; i++)
         {
@@ -468,7 +468,7 @@ public sealed partial class ArrowRowEvaluator
         bool target = constant.AsBoolean;
         int length = column.Length;
         var result = new bool?[length];
-        bool hasNulls = column.NullCount > 0;
+        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
         bool? nullRow = NullRow(op);
         for (int i = 0; i < length; i++)
         {
@@ -502,7 +502,7 @@ public sealed partial class ArrowRowEvaluator
 
         int length = column.Length;
         var result = new bool?[length];
-        bool hasNulls = column.NullCount > 0;
+        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
         bool? nullRow = NullRow(op);
         for (int i = 0; i < length; i++)
         {
@@ -550,7 +550,7 @@ public sealed partial class ArrowRowEvaluator
         var values = column.Values;
         int length = column.Length;
         var result = new bool?[length];
-        bool hasNulls = column.NullCount > 0;
+        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
         bool? nullRow = NullRow(op);
         for (int i = 0; i < length; i++)
         {
