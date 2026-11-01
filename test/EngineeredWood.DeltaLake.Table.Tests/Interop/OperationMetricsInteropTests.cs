@@ -107,15 +107,22 @@ public class OperationMetricsInteropTests : IDisposable
         throw new InvalidOperationException($"Spark's history has no version {version}.");
     }
 
+    /// <param name="unsetBySpark">Keys Spark records but never sets for this operation, so its value is the
+    /// metric's default of 0 whatever happened. Ours must still be a key Spark records.</param>
     private static void AssertMatchesSpark(
-        IReadOnlyDictionary<string, string> ours, IReadOnlyDictionary<string, string> theirs)
+        IReadOnlyDictionary<string, string> ours, IReadOnlyDictionary<string, string> theirs,
+        params string[] unsetBySpark)
     {
         Assert.NotEmpty(ours);
         foreach (var (key, value) in ours)
         {
             Assert.True(theirs.TryGetValue(key, out string? sparks),
                 $"Spark records no '{key}'. Spark's metrics: {string.Join(", ", theirs.Keys)}");
-            if (DependsOnFileLayout(key))
+            if (unsetBySpark.Contains(key))
+            {
+                Assert.Equal("0", sparks);
+            }
+            else if (DependsOnFileLayout(key))
             {
                 Assert.True(value == "0" == (sparks == "0"), $"{key}: ours {value}, Spark's {sparks}");
             }
@@ -143,9 +150,14 @@ public class OperationMetricsInteropTests : IDisposable
         await using (var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_ours)))
             (_, version) = await table.DeleteAsync(Ex.In("id", LiteralValue.Of(2L), LiteralValue.Of(4L), LiteralValue.Of(5L)));
 
+        // Spark's deletion-vector DELETE (DeleteCommand.performDelete, delta-spark 4.0.0) sets the row, vector and
+        // removed-file counts and nothing else, so numRemovedBytes stays 0 even for the file (4, 5) it removes
+        // whole. Its copy-on-write and metadata-only paths do set it, and this library reports the bytes in
+        // both modes.
         AssertMatchesSpark(
             await OurMetricsAsync(version),
-            TheirMetrics("DELETE FROM delta.`{path}` WHERE id IN (2, 4, 5)", version));
+            TheirMetrics("DELETE FROM delta.`{path}` WHERE id IN (2, 4, 5)", version),
+            unsetBySpark: deletionVectors ? ["numRemovedBytes"] : []);
     }
 
     [SkippableFact]

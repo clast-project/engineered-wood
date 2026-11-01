@@ -113,6 +113,25 @@ public class OperationMetricsTests : IDisposable
     }
 
     /// <summary>
+    /// A DELETE that empties a file removes it whole, rewriting nothing, and counts that file's size as removed
+    /// bytes, in both modes.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AWholeFileDelete_CountsTheRemovedFilesBytes(bool deletionVectors)
+    {
+        await using var table = await CreateAsync(deletionVectors);
+        long size = table.CurrentSnapshot.ActiveFiles.Values.Single(f => f.GetNumRecords() == 2).Size;
+
+        var (_, version) = await table.DeleteAsync(Ex.In("id", LiteralValue.Of(4L), LiteralValue.Of(5L)));
+
+        AssertCounts(await MetricsAsync(table, version),
+            ("numDeletedRows", 2), ("numCopiedRows", 0), ("numAddedFiles", 0), ("numRemovedFiles", 1),
+            ("numRemovedBytes", size), ("numAddedBytes", 0));
+    }
+
+    /// <summary>
     /// A deletion-vector DELETE adds no file and removes none for the file it marks: it adds a vector, and a
     /// second DELETE from the same file updates it. Only a file emptied whole counts as removed, with its vector.
     /// </summary>

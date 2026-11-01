@@ -4432,11 +4432,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>The <c>remove</c> a DELETE writes for a file it changes. It carries the file's existing deletion
     /// vector and row-tracking fields; a partial delete follows it with a re-add under the new vector.</summary>
+    // With the extended file metadata every other remove this library writes carries (Spark writes it on every
+    // remove): without its size a whole-file DELETE recorded numRemovedBytes 0.
     private static RemoveFile RemoveOf(AddFile addFile) => new()
     {
         Path = addFile.Path,
         DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         DataChange = true,
+        ExtendedFileMetadata = true,
+        PartitionValues = addFile.PartitionValues,
+        Size = addFile.Size,
         DeletionVector = addFile.DeletionVector,
         BaseRowId = addFile.BaseRowId,
         DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
