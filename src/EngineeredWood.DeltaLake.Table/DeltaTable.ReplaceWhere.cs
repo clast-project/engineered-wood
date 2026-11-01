@@ -90,6 +90,11 @@ public sealed partial class DeltaTable
                     type = field.Type;
                 }
                 return null;
+            // The evaluator resolves a bound reference by its name, as it does an unbound one.
+            case Expressions.BoundReference bound:
+                return schema.Fields.Any(f => string.Equals(f.Name, bound.Name, StringComparison.OrdinalIgnoreCase))
+                    ? null
+                    : bound.Name;
             case Expressions.AndPredicate and:
                 return and.Children.Select(c => FirstUnknownReference(c, schema)).FirstOrDefault(n => n is not null);
             case Expressions.OrPredicate or:
@@ -112,17 +117,18 @@ public sealed partial class DeltaTable
 
     /// <summary>
     /// Refuses replaceWhere rows the predicate is not TRUE for: false, or NULL, as a CHECK constraint refuses them
-    /// and as Spark's replaceWhere constraint check does.
+    /// and as Spark's replaceWhere constraint check does. A write may leave out a nullable column, or a nullable
+    /// struct field, which then reads back as NULL; the predicate sees it so, from a copy of
+    /// <paramref name="batch"/> with what is missing backfilled. The batch written is not changed.
     /// </summary>
-    private static void ThrowIfOutsideReplaceWhere(IReadOnlyList<RecordBatch> batches, Expressions.Predicate predicate)
+    private static void ThrowIfOutsideReplaceWhere(
+        RecordBatch batch, Apache.Arrow.Schema tableSchema, Expressions.Predicate predicate)
     {
+        var asStored = SchemaEvolution.BackfillMissingColumns(batch, tableSchema.FieldsList);
         long outside = 0;
-        foreach (var batch in batches)
+        using (var mask = RowEvaluator.EvaluatePredicate(predicate, asStored))
         {
-            if (batch.Length == 0)
-                continue;
-            using var mask = RowEvaluator.EvaluatePredicate(predicate, batch);
-            for (int row = 0; row < batch.Length; row++)
+            for (int row = 0; row < asStored.Length; row++)
             {
                 if (mask.GetValue(row) is not true)
                     outside++;

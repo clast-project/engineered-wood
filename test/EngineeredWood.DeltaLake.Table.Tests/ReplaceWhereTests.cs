@@ -4,6 +4,9 @@
 using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.Log;
+using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.IO.Local;
 using Ex = EngineeredWood.Expressions.Expressions;
 
@@ -368,6 +371,92 @@ public class ReplaceWhereTests : IDisposable
             () => table.OverwriteWhereAsync([], Ex.Equal("nope", 1)).AsTask());
 
         Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task ABoundReferenceToAnUnknownColumn_IsRefused_EvenOnAnEmptyTable()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, TableSchema);
+        var predicate = new Expressions.ComparisonPredicate(
+            new Expressions.BoundReference(99, "nope"), Expressions.ComparisonOperator.Equal,
+            new Expressions.LiteralExpression(1));
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            () => table.OverwriteWhereAsync([], predicate).AsTask());
+
+        Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
+    }
+
+    // ── The rows are judged as they will be stored ──
+
+    /// <summary>A write may leave out a nullable column, which reads back as NULL; the window sees it so.</summary>
+    [Fact]
+    public async Task AColumnLeftOut_IsJudgedAsTheNullItReadsBackAs()
+    {
+        await using var table = await CreateAsync();
+        var noV = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false)).Field(new Field("part", StringType.Default, true)).Build();
+        var batch = new RecordBatch(
+            noV, [new Int64Array.Builder().Append(20).Build(), new StringArray.Builder().Append("x").Build()], 1);
+
+        await table.OverwriteWhereAsync([batch], Ex.IsNull("v"));
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            () => table.OverwriteWhereAsync([batch], Window).AsTask());
+
+        Assert.Equal(DeltaTableErrorCodes.ReplaceWhereMismatch, ex.ErrorCode);
+        Assert.Contains((20L, "x", (int?)null), await ReadAsync());
+    }
+
+    private static readonly Apache.Arrow.Schema ValueOnly = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("value", StringType.Default, true)).Build();
+
+    /// <summary>A table whose <c>id</c> is GENERATED ALWAYS AS IDENTITY (start 1, step 1), holding id 1.</summary>
+    private async Task<DeltaTable> CreateIdentityTableAsync()
+    {
+        string idMeta = JsonSerializer.Serialize(IdentityColumn.CreateMetadata(1, 1, allowExplicitInsert: false));
+        string schema = $@"{{""type"":""struct"",""fields"":[{{""name"":""id"",""type"":""long"",""nullable"":false,""metadata"":{idMeta}}},{{""name"":""value"",""type"":""string"",""nullable"":true,""metadata"":{{}}}}]}}";
+        await new TransactionLog(Fs).WriteCommitAsync(0, new List<DeltaAction>
+        {
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["identityColumns"] },
+            new MetadataAction { Id = "identity", Format = Format.Parquet, SchemaString = schema, PartitionColumns = [] },
+        });
+        var table = await DeltaTable.OpenAsync(Fs);
+        await table.WriteAsync([Values("seed")]);
+        return table;
+    }
+
+    private static RecordBatch Values(string value) =>
+        new(ValueOnly, [new StringArray.Builder().Append(value).Build()], 1);
+
+    /// <summary>Spark judges the identity value it generates (measured: a window on the identity column accepts
+    /// rows that leave it out when the generated value falls inside, and refuses them when it falls outside).</summary>
+    [Fact]
+    public async Task AGeneratedIdentityValue_IsWhatTheWindowJudges()
+    {
+        await using var table = await CreateIdentityTableAsync();
+
+        await table.OverwriteWhereAsync([Values("inside")], Ex.GreaterThanOrEqual("id", 1L)); // generates id 2
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            () => table.OverwriteWhereAsync([Values("outside")], Ex.Equal("id", 100L)).AsTask());
+
+        Assert.Equal(DeltaTableErrorCodes.ReplaceWhereMismatch, ex.ErrorCode);
+    }
+
+    /// <summary>A value supplied for a GENERATED ALWAYS column is replaced by a generated one, so a window that the
+    /// supplied value satisfies must not let the row in: it would be stored outside the window.</summary>
+    [Fact]
+    public async Task ASuppliedValueAGeneratedAlwaysIdentityReplaces_CannotSlipIntoTheWindow()
+    {
+        await using var table = await CreateIdentityTableAsync();
+        var withId = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false)).Field(new Field("value", StringType.Default, true)).Build();
+        var batch = new RecordBatch(
+            withId, [new Int64Array.Builder().Append(0).Build(), new StringArray.Builder().Append("a").Build()], 1);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            () => table.OverwriteWhereAsync([batch], Ex.Equal("id", 0L)).AsTask());
+
+        Assert.Equal(DeltaTableErrorCodes.ReplaceWhereMismatch, ex.ErrorCode);
     }
 
     // ── Transactions and concurrency ──

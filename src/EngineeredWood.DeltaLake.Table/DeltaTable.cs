@@ -6151,11 +6151,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         foreach (var batch in batches)
             DeltaNotNullEnforcer.Validate(batch, snapshot.Schema, identitySupplied);
 
-        // A replaceWhere's rows must all lie inside the window they replace, checked as a CHECK constraint is:
-        // against the rows as they will be stored, generated columns included, before anything is written.
-        if (replaceWhere is not null)
-            ThrowIfOutsideReplaceWhere(batches, replaceWhere);
-
         // Repartition-on-overwrite: changing partitionColumns is protocol-legal ONLY when every active file
         // is removed in the same commit — i.e. a FULL overwrite (a partition-scoped or dynamic overwrite
         // keeps files that would no longer conform to the new partition schema).
@@ -6310,6 +6305,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 processedBatch = processed;
                 allIdentityUpdates.AddRange(updates);
             }
+
+            // A replaceWhere's rows must all lie inside the window they replace, judged on the rows exactly as they
+            // will be stored: generated columns computed, identity values generated (a GENERATED ALWAYS column
+            // replaces whatever the caller supplied), and a column the caller left out as the NULL it reads back
+            // as. Still before any file is written: the files are written after this loop.
+            if (replaceWhere is not null)
+                ThrowIfOutsideReplaceWhere(processedBatch, snapshot.ArrowSchema, replaceWhere);
 
             var partitions = Partitioning.PartitionUtils.SplitByPartition(
                 processedBatch, partitionColumns);
