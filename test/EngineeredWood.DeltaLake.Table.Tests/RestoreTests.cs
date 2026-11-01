@@ -546,6 +546,35 @@ public class RestoreTests : IDisposable
         Assert.Equal(["1:v1", "2:v2", "9:v9"], await ReadAsync(reopened));
     }
 
+    /// <summary>
+    /// Even a concurrent commit that changes no data fails the restore, which the conflict checker alone would let
+    /// through: the restore is not rebase-safe, and the committer's refusal to rebase it is not retried.
+    /// </summary>
+    [Fact]
+    public async Task Restore_FailsOnAConcurrentCommitThatChangesNoData()
+    {
+        await using (var setup = await CreateAsync(deletionVectors: false))
+        {
+            await setup.WriteAsync([Rows(1)]);                                            // v1
+            await setup.WriteAsync([Rows(2)]);                                            // v2
+            await setup.SetDomainMetadataAsync("app.first", "{}");                        // v3, declares the feature
+        }
+
+        var racing = new RacingFileSystem(Fs, async () =>
+        {
+            await using var other = await DeltaTable.OpenAsync(Fs);
+            await other.SetDomainMetadataAsync("app.unrelated", "{}");                    // takes v4
+        });
+        await using var table = await DeltaTable.OpenAsync(racing);
+
+        var ex = await Assert.ThrowsAsync<DeltaConflictException>(async () => await table.RestoreAsync(1));
+        Assert.Equal(DeltaErrorCodes.RebaseUnsafe, ex.ErrorCode);
+
+        await using var reopened = await DeltaTable.OpenAsync(Fs);
+        Assert.Equal(4, reopened.CurrentSnapshot.Version);
+        Assert.Equal(["1:v1", "2:v2"], await ReadAsync(reopened));
+    }
+
     private async Task<long> CommitTimestampAsync(long version) =>
         Of(await CommitAsync(version), "commitInfo").Single().GetProperty("timestamp").GetInt64();
 
