@@ -150,6 +150,25 @@ public class DmlPredicateSemanticsTests : IDisposable
         Assert.Equal(3, deleted);
     }
 
+    /// <summary>
+    /// Two timestamp literals a tick apart are folded by the statistics, and the mask agrees: neither path
+    /// materializes them at microseconds to compare (the row evaluator does so only to type a literal), so
+    /// both compare the ticks.
+    /// </summary>
+    [Theory]
+    [InlineData(ComparisonOperator.Equal, 0)]
+    [InlineData(ComparisonOperator.LessThan, 3)]
+    public async Task Delete_TwoTimestampLiteralsATickApart_FoldAsTheMaskCompares(ComparisonOperator op, long expected)
+    {
+        await using var table = await TableAsync();
+        var t = new DateTimeOffset(2026, 10, 3, 0, 0, 0, TimeSpan.Zero);
+
+        var (deleted, _) = await table.DeleteAsync(new ComparisonPredicate(
+            X.Lit(LiteralValue.Of(t)), op, X.Lit(LiteralValue.Of(t.AddTicks(1)))));
+
+        Assert.Equal(expected, deleted);
+    }
+
     [Fact]
     public async Task Delete_ACastThatFailsOnARow_IsNotProvenAwayByStatistics()
     {
