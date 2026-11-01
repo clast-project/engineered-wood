@@ -208,6 +208,91 @@ public class DmlPredicateSemanticsTests : IDisposable
         Assert.Equal(1, deleted);
     }
 
+    private RecordBatch SourceRow(long id, DateTimeOffset d) => new(
+        new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("d", Date32Type.Default, true))
+            .Build(),
+        [new Int64Array.Builder().Append(id).Build(), new Date32Array.Builder().Append(d).Build()], 1);
+
+    private static Expressions.Expression Side(string side, string column) =>
+        UnboundReference.FromParts([side, column]);
+
+    [Fact]
+    public async Task Merge_MatchedConditionSparkRefuses_IsRefusedWhenNoKeyMatches()
+    {
+        // No target row matches id 99, so the matched condition never sees a row; it must still be refused.
+        await using var table = await TableAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        await Assert.ThrowsAsync<ExpressionAnalysisException>(async () => await table.MergeAsync(
+            [SourceRow(99, Day)],
+            new MergeOptions
+            {
+                Keys = ["id"],
+                WhenMatched = MergeAction.Update,
+                WhenMatchedCondition = X.Equal(Side("target", "d"), X.Lit(LiteralValue.Of(5))),
+            }));
+
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task Merge_InsertConditionSparkRefuses_IsRefusedForAnEmptySource()
+    {
+        // An empty source has no row for the condition to see, nor a schema of its own.
+        await using var table = await TableAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        await Assert.ThrowsAsync<ExpressionAnalysisException>(async () => await table.MergeAsync(
+            [],
+            new MergeOptions
+            {
+                Keys = ["id"],
+                WhenNotMatched = MergeAction.Insert,
+                WhenNotMatchedCondition = X.Equal(Side("source", "d"), X.Lit(LiteralValue.Of(5))),
+            }));
+
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task Merge_SourcelessConditionSparkRefuses_IsRefusedOnAnEmptyTable()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("d", Date32Type.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
+
+        await Assert.ThrowsAsync<ExpressionAnalysisException>(async () => await table.MergeAsync(
+            [SourceRow(1, Day)],
+            new MergeOptions
+            {
+                Keys = ["id"],
+                WhenNotMatchedBySource = MergeAction.Delete,
+                WhenNotMatchedBySourceCondition = X.Equal(Side("target", "d"), X.Lit(LiteralValue.Of(5))),
+            }));
+    }
+
+    [Fact]
+    public async Task Merge_ConditionSparkCasts_StillMatches()
+    {
+        // The check refuses only what the types decide: a string against a date is cast, and matches.
+        await using var table = await TableAsync();
+
+        var (metrics, _) = await table.MergeAsync(
+            [SourceRow(2, Day)],
+            new MergeOptions
+            {
+                Keys = ["id"],
+                WhenMatched = MergeAction.Delete,
+                WhenMatchedCondition = X.Equal(Side("target", "d"), X.Lit(LiteralValue.Of("2026-10-03"))),
+            });
+
+        Assert.Equal(1, metrics.NumTargetRowsDeleted);
+    }
+
 #if NET6_0_OR_GREATER
     [Fact]
     public async Task Delete_TypedDateOnlyLiteral_StillMatches()

@@ -3968,14 +3968,23 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// operation, which reports it as it always has.
     /// </para>
     /// </remarks>
-    internal static void RefuseUnanalyzable(Expressions.Predicate predicate, Snapshot.Snapshot snapshot)
+    internal static void RefuseUnanalyzable(Expressions.Predicate predicate, Snapshot.Snapshot snapshot) =>
+        RefuseUnanalyzable(predicate, () => EmptyBatch(snapshot.ArrowSchema));
+
+    /// <summary>A batch of <paramref name="schema"/> with no rows.</summary>
+    internal static RecordBatch EmptyBatch(Apache.Arrow.Schema schema) =>
+        new(schema, schema.FieldsList.Select(f => ArrowCompute.MakeNullArray(f.DataType, 0)), 0);
+
+    /// <summary>
+    /// <see cref="RefuseUnanalyzable(Expressions.Predicate, Snapshot.Snapshot)"/> over the empty batch
+    /// <paramref name="noRows"/> builds, for a predicate evaluated over some other shape -- a MERGE condition
+    /// sees the target and source rows side by side.
+    /// </summary>
+    internal static void RefuseUnanalyzable(Expressions.Predicate predicate, Func<RecordBatch> noRows)
     {
         try
         {
-            var schema = snapshot.ArrowSchema;
-            var noRows = new RecordBatch(
-                schema, schema.FieldsList.Select(f => ArrowCompute.MakeNullArray(f.DataType, 0)), 0);
-            RowEvaluator.EvaluatePredicate(predicate, noRows).Dispose();
+            RowEvaluator.EvaluatePredicate(predicate, noRows()).Dispose();
         }
         catch (Expressions.Arrow.ExpressionAnalysisException)
         {
