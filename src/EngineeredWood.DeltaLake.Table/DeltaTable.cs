@@ -2458,7 +2458,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         long targetMs = timestamp.ToUnixTimeMilliseconds();
         long? bestVersion = null;
-        foreach (var (version, commitTs) in await ReadCommitTimestampsAsync(cancellationToken).ConfigureAwait(false))
+        await foreach (var (version, commitTs) in ReadCommitTimestampsAsync(cancellationToken).ConfigureAwait(false))
         {
             if (commitTs > targetMs)
                 break; // the sequence never goes backwards

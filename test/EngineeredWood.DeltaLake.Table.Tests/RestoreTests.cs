@@ -546,20 +546,248 @@ public class RestoreTests : IDisposable
         Assert.Equal(["1:v1", "2:v2", "9:v9"], await ReadAsync(reopened));
     }
 
+    private async Task<long> CommitTimestampAsync(long version) =>
+        Of(await CommitAsync(version), "commitInfo").Single().GetProperty("timestamp").GetInt64();
+
+    private async Task WriteRawAsync(long version, params DeltaAction[] actions) =>
+        await new TransactionLog(Fs).WriteCommitAsync(version, actions);
+
+    private static MetadataAction RawMetadata(IReadOnlyDictionary<string, string>? configuration = null) => new()
+    {
+        Id = "restore-raw",
+        Format = Format.Parquet,
+        SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{}}]}""",
+        PartitionColumns = [],
+        Configuration = configuration ?? new Dictionary<string, string>(),
+    };
+
+    /// <summary>
+    /// A timestamp landing on a version the log can no longer reconstruct (its predecessor's commit is gone, and the
+    /// checkpoint is later) is refused as that version, not quietly moved back to an older one that can be.
+    /// </summary>
+    [Fact]
+    public async Task Restore_ByTimestamp_OnAnUnreadableVersion_IsRefused()
+    {
+        await using (var table = await CreateAsync(deletionVectors: false))
+        {
+            for (long i = 1; i <= 5; i++)
+            {
+                await Task.Delay(5);
+                await table.WriteAsync([Rows(i)]);                                        // v1..v5
+            }
+            await table.CheckpointAsync();                                                // at v5
+            await Task.Delay(5);
+            await table.WriteAsync([Rows(6)]);                                            // v6
+        }
+        long atV4 = await CommitTimestampAsync(4);
+        File.Delete(Path.Combine(_tempDir, "_delta_log", $"{3:D20}.json"));
+
+        await using var reopened = await DeltaTable.OpenAsync(Fs);
+        await RefusedAsync(DeltaTableErrorCodes.CannotRestoreTableVersion,
+            async () => await reopened.RestoreAsync(DateTimeOffset.FromUnixTimeMilliseconds(atV4)));
+        Assert.Equal(6, reopened.CurrentSnapshot.Version);
+    }
+
+    /// <summary>
+    /// A version that enabled UniForm cannot be restored while this library does not maintain UniForm's metadata:
+    /// the restored properties would re-enable it, leaving Iceberg readers on stale metadata.
+    /// </summary>
+    [Fact]
+    public async Task Restore_ThatReEnablesUniForm_IsRefused()
+    {
+        await WriteRawAsync(0,
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            RawMetadata(new Dictionary<string, string> { [Schema.UniversalFormat.EnabledFormatsKey] = "iceberg" }));
+        await WriteRawAsync(1, RawMetadata());
+        await using var table = await DeltaTable.OpenAsync(Fs);
+
+        await RefusedAsync(DeltaTableErrorCodes.UniversalFormatNotMaintained, async () => await table.RestoreAsync(0));
+        Assert.Equal(1, table.CurrentSnapshot.Version);
+    }
+
+    /// <summary>
+    /// A restore that turns in-commit timestamps back on is where they begin again: its commit carries one, and the
+    /// metadata names it as the enablement point, as Spark stamps a mid-life enablement.
+    /// </summary>
+    [Fact]
+    public async Task Restore_ThatReEnablesInCommitTimestamps_StampsTheEnablement()
+    {
+        await WriteRawAsync(0,
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["inCommitTimestamp"] },
+            RawMetadata(new Dictionary<string, string> { [InCommitTimestamp.EnableKey] = "true" }));
+        await WriteRawAsync(1, RawMetadata());
+        await using var table = await DeltaTable.OpenAsync(Fs);
+
+        var result = await table.RestoreAsync(0);
+
+        var actions = await CommitAsync(result.Version);
+        var commitInfo = Of(actions, "commitInfo").Single();
+        long inCommit = commitInfo.GetProperty("inCommitTimestamp").GetInt64();
+        Assert.Equal("RESTORE", commitInfo.GetProperty("operation").GetString());
+        Assert.True(commitInfo.TryGetProperty("operationMetrics", out _));
+        var configuration = Of(actions, "metaData").Single().GetProperty("configuration");
+        Assert.Equal(result.Version.ToString(), configuration.GetProperty("delta.inCommitTimestampEnablementVersion").GetString());
+        Assert.Equal(inCommit.ToString(), configuration.GetProperty("delta.inCommitTimestampEnablementTimestamp").GetString());
+    }
+
+    /// <summary>
+    /// On a column-mapped table an identity column renamed since the target version is still the same column: its
+    /// high-water mark is matched by physical name and carried back, so values written since are never reissued.
+    /// </summary>
+    [Fact]
+    public async Task Restore_AcrossAMappedRename_KeepsTheIdentityHighWaterMark()
+    {
+        await WriteRawAsync(0,
+            new ProtocolAction
+            {
+                MinReaderVersion = 3,
+                MinWriterVersion = 7,
+                ReaderFeatures = ["columnMapping"],
+                WriterFeatures = ["columnMapping", "identityColumns"],
+            },
+            new MetadataAction
+            {
+                Id = "restore-mapped-identity",
+                Format = Format.Parquet,
+                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{"delta.identity.start":1,"delta.identity.step":1,"delta.identity.allowExplicitInsert":false,"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-a"}},{"name":"value","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"col-b"}}]}""",
+                PartitionColumns = [],
+                Configuration = new Dictionary<string, string>
+                {
+                    [ColumnMapping.ModeKey] = "name",
+                    [ColumnMapping.MaxColumnIdKey] = "2",
+                },
+            });
+        await using var table = await DeltaTable.OpenAsync(Fs);
+        var valueSchema = new Apache.Arrow.Schema.Builder().Field(new Field("value", StringType.Default, true)).Build();
+        RecordBatch Values(params string[] values) =>
+            new(valueSchema, [new StringArray.Builder().AppendRange(values).Build()], values.Length);
+        await table.WriteAsync([Values("a")]);                                            // v1, id 1
+        await table.RenameColumnAsync("id", "ident");                                     // v2
+        await table.WriteAsync([Values("b", "c")]);                                       // v3, ids 2-3
+
+        await table.RestoreAsync(1);
+        await table.WriteAsync([Values("d")]);
+
+        var ids = new List<long>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var id = (Int64Array)batch.Column("id");
+            for (int i = 0; i < batch.Length; i++)
+                ids.Add(id.GetValue(i)!.Value);
+        }
+        ids.Sort();
+        Assert.Equal([1L, 4L], ids);
+    }
+
+    /// <summary>
+    /// Restoring the version another handle already committed commits nothing, and this handle then reports that
+    /// version, as the result does.
+    /// </summary>
+    [Fact]
+    public async Task Restore_ToAVersionAnotherHandleCommitted_PublishesIt()
+    {
+        await using var table = await CreateAsync(deletionVectors: false);
+        await table.WriteAsync([Rows(1)]);                                               // v1
+        await using (var other = await DeltaTable.OpenAsync(Fs))
+            await other.WriteAsync([Rows(2)]);                                            // v2
+
+        var result = await table.RestoreAsync(2);
+
+        Assert.False(result.Committed);
+        Assert.Equal(2, result.Version);
+        Assert.Equal(2, table.CurrentSnapshot.Version);
+        Assert.Equal(["1:v1", "2:v2"], await ReadAsync(table));
+    }
+
+    /// <summary>An absolute-path deletion vector (storage type <c>p</c>) is checked for existence too.</summary>
+    [Fact]
+    public async Task Restore_ToAVersionWhoseAbsoluteDeletionVectorIsGone_IsRefused()
+    {
+        var dv = new DeletionVector
+        {
+            StorageType = "p",
+            PathOrInlineDv = "elsewhere/absolute_dv.bin",
+            Offset = 1,
+            SizeInBytes = 34,
+            Cardinality = 1,
+        };
+        File.WriteAllBytes(Path.Combine(_tempDir, "a.parquet"), [0]);
+        await WriteRawAsync(0,
+            new ProtocolAction
+            {
+                MinReaderVersion = 3,
+                MinWriterVersion = 7,
+                ReaderFeatures = ["deletionVectors"],
+                WriterFeatures = ["deletionVectors"],
+            },
+            RawMetadata(new Dictionary<string, string> { ["delta.enableDeletionVectors"] = "true" }));
+        await WriteRawAsync(1, new AddFile
+        {
+            Path = "a.parquet",
+            PartitionValues = new Dictionary<string, string>(),
+            Size = 1,
+            ModificationTime = 0,
+            DataChange = true,
+            Stats = """{"numRecords":2}""",
+            DeletionVector = dv,
+        });
+        await WriteRawAsync(2, new RemoveFile
+        {
+            Path = "a.parquet",
+            DataChange = true,
+            DeletionVector = dv,
+        });
+        await using var table = await DeltaTable.OpenAsync(Fs);
+
+        var ex = await RefusedAsync(DeltaTableErrorCodes.RestoreMissingFiles, async () => await table.RestoreAsync(1));
+        Assert.Contains("elsewhere/absolute_dv.bin", ex.Message);
+    }
+
+    /// <summary>
+    /// Resolving a timestamp near the start of history reads the commits only up to the one past it, not the whole
+    /// log.
+    /// </summary>
+    [Fact]
+    public async Task GetSnapshotAtTimestamp_StopsReadingAtTheBoundary()
+    {
+        await using (var table = await CreateAsync(deletionVectors: false))
+        {
+            for (long i = 1; i <= 10; i++)
+            {
+                await Task.Delay(5);
+                await table.WriteAsync([Rows(i)]);                                        // v1..v10
+            }
+        }
+        long atV1 = await CommitTimestampAsync(1);
+        var counting = new RacingFileSystem(Fs, race: null);
+        await using var reader = await DeltaTable.OpenAsync(counting);
+        int before = counting.CommitReads;
+
+        var snapshot = await reader.GetSnapshotAtTimestampAsync(DateTimeOffset.FromUnixTimeMilliseconds(atV1));
+
+        Assert.Equal(1, snapshot.Version);
+        // v0..v2 for the timestamps, then v0..v1 for the snapshot; reading the whole log would be 11 + 2.
+        Assert.True(counting.CommitReads - before <= 5, $"{counting.CommitReads - before} commit reads");
+    }
+
     /// <summary>
     /// Runs <paramref name="race"/> once, just before the first commit file this handle tries to create, so that
     /// another writer takes the version first.
     /// </summary>
-    private sealed class RacingFileSystem(ITableFileSystem inner, Func<Task> race) : ITableFileSystem
+    private sealed class RacingFileSystem(ITableFileSystem inner, Func<Task>? race) : ITableFileSystem
     {
         private int _raced;
+        private int _commitReads;
+
+        /// <summary>How many commit files have been read whole.</summary>
+        public int CommitReads => Volatile.Read(ref _commitReads);
 
         public PathNameConstraints PathConstraints => inner.PathConstraints;
 
         public async ValueTask<bool> TryWriteAllBytesAsync(
             string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
         {
-            if (path.EndsWith(".json", StringComparison.Ordinal) && path.Contains("_delta_log")
+            if (race is not null && path.EndsWith(".json", StringComparison.Ordinal) && path.Contains("_delta_log")
                 && Interlocked.Exchange(ref _raced, 1) == 0)
             {
                 await race();
@@ -574,7 +802,11 @@ public class RestoreTests : IDisposable
             => inner.ListAsync(prefix, cancellationToken);
 
         public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
-            => inner.ReadAllBytesAsync(path, cancellationToken);
+        {
+            if (path.EndsWith(".json", StringComparison.Ordinal) && path.Contains("_delta_log"))
+                Interlocked.Increment(ref _commitReads);
+            return inner.ReadAllBytesAsync(path, cancellationToken);
+        }
 
         public ValueTask<ISequentialFile> CreateAsync(
             string path, bool overwrite = false, CancellationToken cancellationToken = default)

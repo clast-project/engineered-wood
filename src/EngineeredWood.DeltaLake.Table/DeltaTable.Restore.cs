@@ -5,6 +5,7 @@ using System.Globalization;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.Concurrency;
 using EngineeredWood.DeltaLake.DeletionVectors;
+using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.DeltaLake.Snapshot;
 
@@ -12,6 +13,8 @@ namespace EngineeredWood.DeltaLake.Table;
 
 public sealed partial class DeltaTable
 {
+    private const string InCommitTimestampEnablementVersionKey = "delta.inCommitTimestampEnablementVersion";
+    private const string InCommitTimestampEnablementTimestampKey = "delta.inCommitTimestampEnablementTimestamp";
     private const int MissingFilesReported = 100;
     private const int ExistenceChecksInFlight = 32;
 
@@ -76,14 +79,20 @@ public sealed partial class DeltaTable
     {
         ThrowIfDisposed();
         long requested = timestamp.ToUnixTimeMilliseconds();
-        var commits = await ReadCommitTimestampsAsync(cancellationToken).ConfigureAwait(false);
+        var commits = new List<(long Version, long Timestamp)>();
+        await foreach (var commit in ReadCommitTimestampsAsync(cancellationToken).ConfigureAwait(false))
+            commits.Add(commit);
         var readable = (await _log.ReadVersionsAsync(cancellationToken).ConfigureAwait(false)).ReadableVersions;
         var readableSet = new HashSet<long>(readable);
-        var recreatable = commits.Where(c => readableSet.Contains(c.Version)).ToList();
+        // The earliest version that can still be reconstructed bounds the request from below, as in Spark.
+        var earliestReadable = commits.FirstOrDefault(c => readableSet.Contains(c.Version));
 
-        if (recreatable.Count == 0 || requested < recreatable[0].Timestamp)
+        if (commits.Count == 0 || !readableSet.Contains(earliestReadable.Version)
+            || requested < earliestReadable.Timestamp)
         {
-            string earliest = recreatable.Count == 0 ? "none" : FormatTimestamp(recreatable[0].Timestamp);
+            string earliest = commits.Count == 0 || !readableSet.Contains(earliestReadable.Version)
+                ? "none"
+                : FormatTimestamp(earliestReadable.Timestamp);
             throw new DeltaFormatException(
                 DeltaTableErrorCodes.CannotRestoreTimestampEarlier,
                 $"Cannot restore table to timestamp ({FormatTimestamp(requested)}) as it is before the earliest version "
@@ -97,7 +106,9 @@ public sealed partial class DeltaTable
                 + $"available. Please use a timestamp before ({FormatTimestamp(commits[^1].Timestamp)})");
         }
 
-        long version = recreatable.Last(c => c.Timestamp <= requested).Version;
+        // Against every commit, not only the readable ones: a timestamp that lands on a version the log can no
+        // longer reconstruct must be refused as that version, not quietly moved to an older one that can be.
+        long version = commits.Last(c => c.Timestamp <= requested).Version;
         return await RestoreCoreAsync(
             version, timestampText: timestamp.ToString("o", CultureInfo.InvariantCulture),
             options ?? RestoreOptions.Default, commitProperties, cancellationToken).ConfigureAwait(false);
@@ -124,6 +135,8 @@ public sealed partial class DeltaTable
 
         if (version == current.Version)
         {
+            // The handle reports the version the result names, as it would after a commit.
+            _currentSnapshot = current;
             return new RestoreResult
             {
                 Version = current.Version,
@@ -157,10 +170,32 @@ public sealed partial class DeltaTable
         ProtocolVersions.ValidateWriteSupport(protocol);
 
         long restoreVersion = current.Version + 1;
-        var actions = new List<DeltaAction>(toAdd.Count + toRemove.Count + 4)
+        var metadata = RestoredMetadata(current, target);
+        // The restored properties are the table's from this commit on, so they are judged as any new metadata is:
+        // a restore must not re-enable UniForm, whose metadata this library does not maintain.
+        EnsureUniversalFormatMaintained(metadata.Configuration, _options);
+
+        var actions = new List<DeltaAction>(toAdd.Count + toRemove.Count + 5);
+        if (InCommitTimestamp.IsEnabled(metadata.Configuration)
+            && !InCommitTimestamp.IsEnabled(current.Metadata.Configuration))
         {
-            RestoredMetadata(current, target),
-        };
+            // The restore turns in-commit timestamps back on, so it is where they begin again: this commit carries
+            // one, and the metadata records it as the enablement point, as Spark's commit stamps a mid-life
+            // enablement. The committer would otherwise judge by the current metadata and write none.
+            long timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var configuration = metadata.Configuration!.ToDictionary(p => p.Key, p => p.Value, StringComparer.Ordinal);
+            configuration[InCommitTimestampEnablementVersionKey] = Invariant(restoreVersion);
+            configuration[InCommitTimestampEnablementTimestampKey] = Invariant(timestamp);
+            metadata = metadata with { Configuration = configuration };
+            actions.Add(InCommitTimestamp.CreateCommitInfo(
+                timestamp, "RESTORE",
+                new Dictionary<string, System.Text.Json.JsonElement>(StringComparer.Ordinal)
+                {
+                    ["isBlindAppend"] = System.Text.Json.JsonDocument.Parse("false").RootElement.Clone(),
+                },
+                includeInCommitTimestamp: true));
+        }
+        actions.Add(metadata);
         if (!ProtocolEquals(protocol, current.Protocol))
             actions.Add(protocol);
 
@@ -239,16 +274,21 @@ public sealed partial class DeltaTable
     {
         var metadata = target.Metadata;
 
+        // Matched by physical name, which a column-mapped RENAME does not change, so a column renamed since the
+        // target version still carries its mark back; without mapping the physical name is the logical one.
+        var currentMode = ColumnMapping.GetMode(current.Metadata.Configuration);
+        var targetMode = ColumnMapping.GetMode(target.Metadata.Configuration);
         var currentFields = current.Schema.Fields
             .Where(IdentityColumn.IsIdentityColumn)
-            .ToDictionary(f => f.Name, StringComparer.Ordinal);
+            .GroupBy(f => ColumnMapping.GetPhysicalName(f, currentMode), StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
         bool schemaChanged = false;
         var fields = new List<StructField>(target.Schema.Fields.Count);
         foreach (var field in target.Schema.Fields)
         {
             var merged = field;
             if (IdentityColumn.GetConfig(field) is { } targetConfig
-                && currentFields.TryGetValue(field.Name, out var currentField)
+                && currentFields.TryGetValue(ColumnMapping.GetPhysicalName(field, targetMode), out var currentField)
                 && IdentityColumn.GetConfig(currentField)?.HighWaterMark is { } currentMark)
             {
                 long mark = targetConfig.HighWaterMark is not { } targetMark
@@ -339,8 +379,13 @@ public sealed partial class DeltaTable
         foreach (var file in files)
         {
             paths.Add(DeltaPath.Decode(file.Path));
-            if (file.DeletionVector is { } dv && DeletionVectorPath.GetRelativePath(dv) is { } dvPath)
+            if (file.DeletionVector is not { } dv)
+                continue;
+            // An absolute-path vector is read from its path as written, so it is checked the same way.
+            if (DeletionVectorPath.GetRelativePath(dv) is { } dvPath)
                 paths.Add(dvPath);
+            else if (DeletionVectorPath.IsAbsolute(dv))
+                paths.Add(dv.PathOrInlineDv);
         }
 
         var missing = new List<string>();
@@ -375,8 +420,10 @@ public sealed partial class DeltaTable
     /// goes backwards, as Spark does. Spark uses the modification time where this library uses
     /// <c>commitInfo.timestamp</c>; the two differ by the time the commit took to write, unless the log was copied.
     /// </summary>
-    private async ValueTask<List<(long Version, long Timestamp)>> ReadCommitTimestampsAsync(
-        CancellationToken cancellationToken)
+    /// <remarks>Lazy: each commit is read only when it is reached, so a caller looking for an early version stops
+    /// reading there. The listing itself is one call.</remarks>
+    private async IAsyncEnumerable<(long Version, long Timestamp)> ReadCommitTimestampsAsync(
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var modified = new Dictionary<long, long>();
         await foreach (var file in _fs.ListAsync(DeltaVersion.LogPrefix, cancellationToken).ConfigureAwait(false))
@@ -385,18 +432,16 @@ public sealed partial class DeltaTable
                 modified[v] = file.LastModified.ToUnixTimeMilliseconds();
         }
 
-        var result = new List<(long Version, long Timestamp)>(modified.Count);
         long? previous = null;
         foreach (long v in modified.Keys.OrderBy(v => v))
         {
             var actions = await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false);
-            long timestamp = Log.InCommitTimestamp.GetTimestampFromActions(actions) ?? modified[v];
+            long timestamp = InCommitTimestamp.GetTimestampFromActions(actions) ?? modified[v];
             if (previous is { } p && timestamp <= p)
                 timestamp = p + 1;
-            result.Add((v, timestamp));
             previous = timestamp;
+            yield return (v, timestamp);
         }
-        return result;
     }
 
     private static string FormatTimestamp(long unixMilliseconds) =>
