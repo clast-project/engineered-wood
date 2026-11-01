@@ -520,4 +520,64 @@ public class MergeSchemaTests : IDisposable
         await table.WriteAsync([new RecordBatch(schema, [Strings("c"), Strings("z")], 1)]);
         Assert.Equal(3, IdentityColumn.GetConfig(table.CurrentSnapshot.Schema.Fields[0])!.HighWaterMark);
     }
+
+    private int DataFileCount() =>
+        Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories)
+            .Count(f => !f.Contains("_delta_log"));
+
+    [Fact]
+    public async Task Transaction_IdentityMergeAfterASchemaMerge_IsRefused_AndLeavesNoFiles()
+    {
+        var fs = Fs;
+        var idMeta = JsonSerializer.Serialize(IdentityColumn.CreateMetadata(1, 1, false));
+        string schemaString =
+            $$$"""{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{{{idMeta}}}},{"name":"value","type":"string","nullable":true,"metadata":{}}]}""";
+        await new TransactionLog(fs).WriteCommitAsync(0, new List<DeltaAction>
+        {
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["identityColumns"] },
+            new MetadataAction { Id = "merge-identity-txn", Format = Format.Parquet, SchemaString = schemaString, PartitionColumns = [] },
+        });
+        await using var table = await DeltaTable.OpenAsync(fs);
+
+        await using var txn = table.StartTransaction();
+        await txn.WriteAsync(
+            [new RecordBatch(Schema(Str("value"), Str("extra")), [Strings("a"), Strings("x")], 1)], mergeSchema: true);
+        int files = DataFileCount();
+
+        // The MERGE inserts a row, so it advances the identity mark: a metaData of its own, which the commit
+        // cannot carry beside the merge's. Its insert file is written before that is known, and must go again.
+        var source = new RecordBatch(Schema(Str("value")), [Strings("b")], 1);
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+            await txn.MergeAsync([source], new MergeOptions { Keys = ["value"], WhenNotMatched = MergeAction.InsertColumns("value") }));
+        Assert.Equal(files, DataFileCount());
+
+        // The earlier work still commits.
+        await txn.CommitAsync();
+        Assert.Equal(["id", "value", "extra"], table.CurrentSnapshot.Schema.Fields.Select(f => f.Name));
+        Assert.Equal(files, DataFileCount());
+    }
+
+    // ── Names with dots ──
+
+    [Fact]
+    public async Task ADottedColumnName_IsNotMistakenForAFieldOfAColumnTheMergeAdds()
+    {
+        // A top-level column literally named "a.b", and a batch that adds a column "a" before widening "a.b":
+        // "a.b" is not a field of the new "a", so it is widened.
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, Schema(Long("id"), Int("a.b", nullable: true)), configuration: Widening);
+        await table.WriteAsync(
+            [new RecordBatch(Schema(Long("id"), Int("a.b", nullable: true)), [Longs(1), Ints(10)], 1)]);
+
+        var schema = Schema(Long("id"), Str("a"), Long("a.b", nullable: true));
+        await table.WriteAsync([new RecordBatch(schema, [Longs(2), Strings("x"), Longs(5_000_000_000L)], 1)],
+            mergeSchema: true);
+
+        var fields = table.CurrentSnapshot.Schema.Fields;
+        Assert.Equal(["id", "a.b", "a"], fields.Select(f => f.Name));
+        Assert.Equal("long", ((PrimitiveType)fields[1].Type).TypeName);
+        var rows = await RowsByIdAsync(table);
+        Assert.Equal(10L, rows[1]["a.b"]);
+        Assert.Equal(5_000_000_000L, rows[2]["a.b"]);
+    }
 }

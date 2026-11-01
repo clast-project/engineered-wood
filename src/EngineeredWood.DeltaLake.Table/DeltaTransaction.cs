@@ -654,7 +654,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "MERGE", cancellationToken)
             .ConfigureAwait(false);
 
-        RefuseBaseSchemaMetadataAfterMerge(plan.InsertActions, "MERGE");
+        await RefuseBaseSchemaMetadataAfterMergeAsync(plan.InsertActions, mark, "MERGE", cancellationToken)
+            .ConfigureAwait(false);
         if (plan.NextRowId is long nextRowId)
             _nextRowId = nextRowId;
         StageInternal(plan.RewriteActions);
@@ -729,7 +730,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
         await RefuseRestagedFilesAsync(delete.RemovedPaths, mark, "replaceWhere", cancellationToken)
             .ConfigureAwait(false);
 
-        RefuseBaseSchemaMetadataAfterMerge(write.Actions, "replaceWhere");
+        await RefuseBaseSchemaMetadataAfterMergeAsync(write.Actions, mark, "replaceWhere", cancellationToken)
+            .ConfigureAwait(false);
         _nextRowId = delete.NextRowId ?? write.NextRowId;
         StageInternal(write.Actions);
         ChainIdentityMarks(write.Actions);
@@ -1463,19 +1465,29 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// would carry the schema as it was before the merge, and replace the merge in the commit.</summary>
     private void RefuseBaseSchemaMetadataAfterMerge(IEnumerable<DeltaAction> actions, string operation)
     {
-        if (!_schemaMerged)
-            return;
-        foreach (var action in actions)
-        {
-            if (action is MetadataAction or ProtocolAction)
-            {
-                throw new InvalidOperationException(
-                    $"{operation}: this transaction already merged the schema (a mergeSchema write), and this "
-                    + "operation stages a metaData or protocol of its own, computed from the schema as it was "
-                    + "before the merge. The commit can carry only one; stage it on a transaction of its own.");
-            }
-        }
+        if (StagesBaseSchemaMetadataAfterMerge(actions))
+            throw BaseSchemaMetadataAfterMerge(operation);
     }
+
+    /// <summary>As <see cref="RefuseBaseSchemaMetadataAfterMerge"/>, for an operation that already wrote its
+    /// files: they are taken back first, as <see cref="RefuseRestagedFilesAsync"/> does, or a caller that catches
+    /// the refusal and commits would leave them orphaned.</summary>
+    private async ValueTask RefuseBaseSchemaMetadataAfterMergeAsync(
+        IEnumerable<DeltaAction> actions, int mark, string operation, CancellationToken cancellationToken)
+    {
+        if (!StagesBaseSchemaMetadataAfterMerge(actions))
+            return;
+        await TakeBackSinceAsync(mark, cancellationToken).ConfigureAwait(false);
+        throw BaseSchemaMetadataAfterMerge(operation);
+    }
+
+    private bool StagesBaseSchemaMetadataAfterMerge(IEnumerable<DeltaAction> actions) =>
+        _schemaMerged && actions.Any(a => a is MetadataAction or ProtocolAction);
+
+    private static InvalidOperationException BaseSchemaMetadataAfterMerge(string operation) =>
+        new($"{operation}: this transaction already merged the schema (a mergeSchema write), and this "
+            + "operation stages a metaData or protocol of its own, computed from the schema as it was "
+            + "before the merge. The commit can carry only one; stage it on a transaction of its own.");
 
     /// <summary>Records an append's adds as work no change file covers, for the commit's fill-in.</summary>
     private void RecordUncoveredAppends(IEnumerable<DeltaAction> actions)

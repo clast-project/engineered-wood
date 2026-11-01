@@ -70,9 +70,10 @@ public sealed partial class DeltaTable
         private StructType _schema;
         private bool _changed;
         private bool _protocolChanged;
-        // Paths (logical, dot-joined) this merge added. A later batch that disagrees about one of their types is
-        // not a widening — no file was ever written with the first type — so it is left to the type check.
-        private readonly HashSet<string> _added = new(StringComparer.Ordinal);
+        // Paths (logical, one segment per name) this merge added. A later batch that disagrees about one of their
+        // types is not a widening — no file was ever written with the first type — so it is left to the type
+        // check. Kept as segments: a column may itself be named "a.b", so a dot-joined path is ambiguous.
+        private readonly List<string[]> _added = [];
 
         public SchemaMerge(DeltaTable table, Snapshot.Snapshot snapshot)
         {
@@ -94,7 +95,7 @@ public sealed partial class DeltaTable
 
                 var added = AsNullable(ToDeltaField(field));
                 Apply(_table.ComputeAddColumn(added, _metadata, _protocol));
-                _added.Add(added.Name);
+                _added.Add([added.Name]);
                 return;
             }
 
@@ -129,7 +130,7 @@ public sealed partial class DeltaTable
                             }
                             var added = AsNullable(child);
                             Apply(_table.ComputeAddField(path, added, _metadata, _protocol));
-                            _added.Add(string.Join(".", path) + "." + added.Name);
+                            _added.Add([.. path, added.Name]);
                             continue;
                         }
                         Merge([.. path, match.Name], match.Type, child.Type, childDisplay, inCollection);
@@ -155,6 +156,18 @@ public sealed partial class DeltaTable
             }
         }
 
+        private static bool IsPrefix(string[] prefix, List<string> path)
+        {
+            if (prefix.Length > path.Count)
+                return false;
+            for (int i = 0; i < prefix.Length; i++)
+            {
+                if (!string.Equals(prefix[i], path[i], StringComparison.Ordinal))
+                    return false;
+            }
+            return true;
+        }
+
         private void Widen(
             List<string> path, PrimitiveType declared, PrimitiveType supplied, string display, bool inCollection)
         {
@@ -163,8 +176,7 @@ public sealed partial class DeltaTable
             if (!IsSchemaEvolutionWidening(declared.TypeName, supplied.TypeName, iceberg))
                 return; // not a widening: ThrowIfMistypedColumns refuses it
 
-            string joined = string.Join(".", path);
-            if (_added.Any(a => joined == a || joined.StartsWith(a + ".", StringComparison.Ordinal)))
+            if (_added.Any(a => IsPrefix(a, path)))
                 return; // added by this merge, so there is nothing to widen; the type check judges the disagreement
 
             string change = $"'{display}' is {declared.TypeName} in the table and {supplied.TypeName} in the batch";
