@@ -3233,7 +3233,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
 
         bool rowLevel = rowLevelDeletes is { Count: > 0 };
-        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(baseSnapshot.Protocol);
+        // Against the protocol this commit PUBLISHES, which a staged upgrade can make differ from the base's.
+        var stagedProtocol = dataActions.OfType<ProtocolAction>().LastOrDefault();
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(
+            stagedProtocol ?? baseSnapshot.Protocol);
+        if (assignRowIds)
+        {
+            var assigned = AssignMissingRowIds(dataActions, baseSnapshot);
+            // The mark rides a domainMetadata action, which the staged protocol must then declare.
+            if (!ReferenceEquals(assigned, dataActions) && stagedProtocol is not null)
+                RequireDomainMetadataDeclared(stagedProtocol, assigned);
+            dataActions = assigned;
+        }
 
         var result = await _committer.CommitAsync(
             new LogCommitRequest
@@ -7851,6 +7862,76 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// range: the next file's ids would overlap its rows. delta-spark refuses the same file
     /// (<c>DELTA_ROW_ID_ASSIGNMENT_WITHOUT_STATS</c>).
     /// </summary>
+    /// <summary>
+    /// Gives fresh row ids to every NEW file in <paramref name="actions"/> that has none, and advances the
+    /// <c>delta.rowTracking</c> high-water mark past them. Called only when the commit's protocol supports row
+    /// tracking, as delta-spark's commit runs <c>RowId.assignFreshRowIds</c> over every action with the
+    /// transaction's protocol.
+    /// </summary>
+    /// <remarks>
+    /// <para>EngineeredWood's own writers assign ids while staging, so this normally finds nothing to do. It
+    /// catches what they cannot see: a protocol upgrade adding <c>rowTracking</c> staged in the same
+    /// transaction (before or after the files), and adds staged raw through
+    /// <see cref="DeltaTransaction.StageActions"/>. Assignment starts past both the base snapshot's mark and
+    /// every id already staged, so it cannot collide with them; the commit's rebase re-derives all of a new
+    /// file's ids against the version it lands on.</para>
+    /// <para>A re-add of a file already active at the base keeps what it has: the rebase re-derives only new
+    /// files' ids, so ids given to an existing one here could collide after a concurrent commit.</para>
+    /// <para>A file without a row count is refused (<see cref="RowCountForRowIds"/>), as delta-spark refuses
+    /// one (<c>DELTA_ROW_ID_ASSIGNMENT_WITHOUT_STATS</c>).</para>
+    /// </remarks>
+    private static IReadOnlyList<DeltaAction> AssignMissingRowIds(
+        IReadOnlyList<DeltaAction> actions, Snapshot.Snapshot baseSnapshot)
+    {
+        bool IsNew(AddFile add) => !baseSnapshot.ActiveFiles.ContainsKey(add.Path);
+
+        if (!actions.Any(a => a is AddFile { BaseRowId: null } add && IsNew(add)))
+            return actions;
+
+        long nextRowId = baseSnapshot.RowIdHighWaterMark;
+        foreach (var action in actions)
+        {
+            switch (action)
+            {
+                case AddFile { BaseRowId: { } start } add:
+                    nextRowId = Math.Max(nextRowId, start + (add.GetNumRecords() ?? 0));
+                    break;
+                case DomainMetadata dm when string.Equals(
+                    dm.Domain, DeltaLake.RowTracking.RowTrackingConfig.DomainName, StringComparison.Ordinal):
+                    long? staged = DeltaLake.RowTracking.RowTrackingConfig.TryReadHighWaterMark(
+                        new Dictionary<string, DomainMetadata> { [dm.Domain] = dm });
+                    if (staged is { } mark)
+                        nextRowId = Math.Max(nextRowId, mark + 1);
+                    break;
+            }
+        }
+
+        long version = baseSnapshot.Version + 1;
+        var result = new List<DeltaAction>(actions.Count + 1);
+        foreach (var action in actions)
+        {
+            switch (action)
+            {
+                case AddFile { BaseRowId: null } add when IsNew(add):
+                    result.Add(add with
+                    {
+                        BaseRowId = nextRowId,
+                        DefaultRowCommitVersion = add.DefaultRowCommitVersion ?? version,
+                    });
+                    nextRowId += RowCountForRowIds(add);
+                    break;
+                case DomainMetadata dm when string.Equals(
+                    dm.Domain, DeltaLake.RowTracking.RowTrackingConfig.DomainName, StringComparison.Ordinal):
+                    break; // superseded by the mark below, which covers it
+                default:
+                    result.Add(action);
+                    break;
+            }
+        }
+        result.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
+        return result;
+    }
+
     private static long RowCountForRowIds(AddFile add) =>
         add.GetNumRecords() ?? throw new InvalidOperationException(
             $"Cannot assign row ids to '{add.Path}': its statistics carry no numRecords. Row tracking needs "

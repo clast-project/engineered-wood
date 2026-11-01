@@ -91,7 +91,8 @@ public class RowTrackingSupportedNotEnabledTests : IDisposable
     /// Every active file has row ids, no two files' ranges overlap, the high-water mark covers them all, and every
     /// file the commit at <paramref name="version"/> added carries that version (or, for compaction, a source's).
     /// </summary>
-    private void AssertRowIdsAssigned(DeltaTable table, long version, bool versionIsCommit = true)
+    private void AssertRowIdsAssigned(
+        DeltaTable table, long version, bool versionIsCommit = true, long minimumMark = 3)
     {
         var snapshot = table.CurrentSnapshot;
         var ranges = new List<(long Start, long End, string Path)>();
@@ -106,7 +107,7 @@ public class RowTrackingSupportedNotEnabledTests : IDisposable
         for (int i = 1; i < ranges.Count; i++)
             Assert.True(ranges[i - 1].End <= ranges[i].Start, $"{ranges[i - 1].Path} overlaps {ranges[i].Path}");
         Assert.True(ranges.Count == 0 || ranges[^1].End <= snapshot.RowIdHighWaterMark);
-        Assert.True(snapshot.RowIdHighWaterMark >= 3, "the high-water mark went backwards");
+        Assert.True(snapshot.RowIdHighWaterMark >= minimumMark, "the high-water mark went backwards");
 
         if (versionIsCommit)
         {
@@ -304,6 +305,87 @@ public class RowTrackingSupportedNotEnabledTests : IDisposable
         Assert.Equal(version, add.DefaultRowCommitVersion);
         Assert.Equal(2, table.CurrentSnapshot.RowIdHighWaterMark);
         Assert.Equal(1, RowTrackingConfig.TryReadHighWaterMark(table.CurrentSnapshot.DomainMetadata));
+    }
+
+    private static ProtocolAction RowTrackingUpgrade => new()
+    {
+        MinReaderVersion = 1,
+        MinWriterVersion = 7,
+        WriterFeatures = ["domainMetadata", "rowTracking", "appendOnly", "invariants"],
+    };
+
+    /// <summary>The transactional counterpart: a protocol upgrade staged in the same transaction as the files,
+    /// before or after them, still gives the files row ids, since the commit assigns them against the protocol
+    /// it publishes.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Transaction_WithAStagedProtocolUpgrade_AssignsRowIds(bool upgradeFirst)
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, Schema, new DeltaTableOptions { CheckpointInterval = 0 });
+        var files = await table.WriteDataFilesAsync([Rows(1, 2), Rows(3)]);
+
+        var txn = table.StartTransaction();
+        if (upgradeFirst)
+            txn.StageActions([RowTrackingUpgrade]);
+        txn.StageDataFiles(files);
+        if (!upgradeFirst)
+            txn.StageActions([RowTrackingUpgrade]);
+        long version = await txn.CommitAsync();
+
+        Assert.True(RowTrackingConfig.IsSupported(table.CurrentSnapshot.Protocol));
+        Assert.Equal(files.Count, AddsAt(table, version).Count);
+        AssertRowIdsAssigned(table, version, minimumMark: 0);
+        Assert.Equal(3, table.CurrentSnapshot.RowIdHighWaterMark);
+    }
+
+    /// <summary>The upgrade's high-water mark rides a domainMetadata action, so an upgrade that does not declare
+    /// that feature is refused as delta-spark refuses one, rather than committing an undeclared domain.</summary>
+    [Fact]
+    public async Task Transaction_WithAnUpgradeLackingDomainMetadata_IsRefused()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, Schema, new DeltaTableOptions { CheckpointInterval = 0 });
+        var files = await table.WriteDataFilesAsync([Rows(1)]);
+
+        var txn = table.StartTransaction();
+        txn.StageDataFiles(files);
+        txn.StageActions([RowTrackingUpgrade with { WriterFeatures = ["rowTracking", "appendOnly", "invariants"] }]);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await txn.CommitAsync());
+        Assert.Equal(DeltaErrorCodes.DomainMetadataNotSupported, ex.ErrorCode);
+    }
+
+    /// <summary>An add staged raw through StageActions gets row ids too (Spark assigns them to every add without
+    /// one), and they are re-derived when the transaction rebases past a concurrent append.</summary>
+    [Fact]
+    public async Task Transaction_RawStagedAdd_GetsRowIds_RebasedPastAConcurrentAppend()
+    {
+        await using var table = await SupportedNotEnabledAsync();
+        var file = (await table.WriteDataFilesAsync([Rows(4, 5)])).Single();
+        var txn = table.StartTransaction();
+        txn.StageActions(
+        [
+            new AddFile
+            {
+                Path = file.RelativePath,
+                PartitionValues = new Dictionary<string, string>(),
+                Size = file.SizeBytes,
+                ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = true,
+                Stats = file.StatsJson ?? $"{{\"numRecords\":{file.NumRecords}}}",
+            },
+        ]);
+        await using (var other = await DeltaTable.OpenAsync(Fs))
+            await other.WriteAsync([Rows(6)]);                                         // takes id 3
+
+        long version = await txn.CommitAsync();
+
+        var add = Assert.Single(AddsAt(table, version));
+        Assert.Equal(4, add.BaseRowId);
+        Assert.Equal(6, table.CurrentSnapshot.RowIdHighWaterMark);
+        AssertRowIdsAssigned(table, version);
     }
 
     [Fact]
