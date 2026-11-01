@@ -203,6 +203,19 @@ internal static class Ew
         return updated;
     }
 
+    /// <summary><c>MERGE … ON id WHEN MATCHED UPDATE SET * WHEN NOT MATCHED INSERT *</c>.</summary>
+    public static async Task<long> MergeAsync(string path, IReadOnlyList<RecordBatch> source)
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Fs(path));
+        var (metrics, _) = await table.MergeAsync(source, new MergeOptions
+        {
+            Keys = ["id"],
+            WhenMatched = MergeAction.Update,
+            WhenNotMatched = MergeAction.Insert,
+        });
+        return metrics.NumTargetRowsUpdated + metrics.NumTargetRowsInserted;
+    }
+
     /// <summary>Row count and sums, read back by EW: what the verify pass compares across engines.</summary>
     public static async Task<Fingerprint> FingerprintAsync(string path)
     {
@@ -286,6 +299,20 @@ internal static class Dd
         await table.UpdateAsync(
             $"UPDATE deltatable SET {Sql.UpdateAssignmentColumn} = {Sql.UpdateAssignment} WHERE {predicateSql}",
             CancellationToken.None);
+        return (long)(table.Version() ?? 0);
+    }
+
+    public static async Task<long> MergeAsync(string path, IReadOnlyList<RecordBatch> source)
+    {
+        using var table = await OpenAsync(path);
+        var columns = Data.Schema.FieldsList.Select(f => f.Name).ToList();
+        string set = string.Join(", ", columns.Select(c => $"{c} = source.{c}"));
+        string values = string.Join(", ", columns.Select(c => $"source.{c}"));
+        await table.MergeAsync(
+            "MERGE INTO deltatable USING source ON deltatable.id = source.id "
+            + $"WHEN MATCHED THEN UPDATE SET {set} "
+            + $"WHEN NOT MATCHED THEN INSERT ({string.Join(", ", columns)}) VALUES ({values})",
+            source.ToArray(), Data.Schema, CancellationToken.None);
         return (long)(table.Version() ?? 0);
     }
 

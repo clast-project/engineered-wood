@@ -21,7 +21,7 @@ namespace EngineeredWood.DeltaLake.Table;
 /// Supports reading and writing Arrow <see cref="RecordBatch"/> data,
 /// time travel, compaction, and vacuum.
 /// </summary>
-public sealed class DeltaTable : IAsyncDisposable, IDisposable
+public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 {
     private readonly ITableFileSystem _fs;
     private readonly DeltaTableOptions _options;
@@ -4692,16 +4692,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     // a NULL the table declares impossible refused. The partition columns in their canonical
                     // Arrow forms first, as on the write path: the rule reads only those (a StringView's empty
                     // string went through unrefused).
-                    updatedBatch = WriteTypeNormalization.NormalizeColumns(
-                        updatedBatch, snapshot.Metadata.PartitionColumns);
-                    updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
-                        updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: false);
-                    updatedBatch = generatedColumns?.Recompute(updatedBatch) ?? updatedBatch;
-                    updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
-                        updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: true,
-                        generatedColumns?.ColumnNames);
-                    constraints?.Validate(updatedBatch);
-                    DeltaNotNullEnforcer.Validate(updatedBatch, snapshot.Schema);
+                    updatedBatch = PreparePostImage(updatedBatch, snapshot, generatedColumns, constraints);
 
                     // Matched rows keep their id; their commit version advances to this commit (they changed).
                     router.Add(updatedBatch, batchIds is not null
@@ -4781,6 +4772,28 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
 
         return new UpdateActions(actions, removedPaths, totalUpdated, nextRowId);
+    }
+
+    /// <summary>
+    /// Readies the rows an UPDATE (or a MERGE's matched update) changed for the table, as the write path readies
+    /// an append's: the partition columns in their canonical Arrow forms and their values as stored, generated
+    /// columns recomputed, then a NULL the table declares impossible, a CHECK constraint and NOT NULL refused.
+    /// </summary>
+    private static RecordBatch PreparePostImage(
+        RecordBatch updatedBatch, Snapshot.Snapshot snapshot,
+        DeltaGeneratedColumns? generatedColumns, DeltaConstraintEnforcer? constraints)
+    {
+        updatedBatch = WriteTypeNormalization.NormalizeColumns(
+            updatedBatch, snapshot.Metadata.PartitionColumns);
+        updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
+            updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: false);
+        updatedBatch = generatedColumns?.Recompute(updatedBatch) ?? updatedBatch;
+        updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
+            updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: true,
+            generatedColumns?.ColumnNames);
+        constraints?.Validate(updatedBatch);
+        DeltaNotNullEnforcer.Validate(updatedBatch, snapshot.Schema);
+        return updatedBatch;
     }
 
     // Reorders/subsets a resolved row-id (or commit-version) array to match a rewritten batch's row order.
@@ -5597,10 +5610,13 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="WriteTimeExpressionHandling.Refuse"/>, so a path that cannot see the rows keeps
     /// refusing a table that declares any rather than committing it unchecked.
     /// </param>
+    /// <param name="appendOnlyCheckedLater">The path refuses an append-only table itself, once it knows whether it
+    /// removes anything (MERGE: Spark refuses only a commit that removes a file).</param>
     internal void ValidateWritable(
         Snapshot.Snapshot snapshot,
         bool isAppend,
-        WriteTimeExpressionHandling handling = WriteTimeExpressionHandling.Refuse)
+        WriteTimeExpressionHandling handling = WriteTimeExpressionHandling.Refuse,
+        bool appendOnlyCheckedLater = false)
     {
         ValidateWriteSupport(snapshot);
         // Appends to a row-tracking table are spec-conformant (baseRowId + position). A copy-on-write rewrite
@@ -5609,7 +5625,22 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         // row-tracking table missing them (spec-invalid) cannot materialize, so a rewrite is still refused.
         if (!isAppend)
             RejectRowTrackingWrite(snapshot);
-        HonorWriterFeatures(snapshot, isAppend, handling);
+        HonorWriterFeatures(snapshot, isAppend || appendOnlyCheckedLater, handling);
+    }
+
+    /// <summary>Refuses to remove data from a <c>delta.appendOnly=true</c> table.</summary>
+    internal static void ThrowIfAppendOnly(Snapshot.Snapshot snapshot, string entryPoint)
+    {
+        if (snapshot.Metadata.Configuration is { } cfg
+            && cfg.TryGetValue("delta.appendOnly", out var ao)
+            && string.Equals(ao, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.CannotModifyAppendOnly,
+                $"Table is append-only (delta.appendOnly=true): this {entryPoint} would update or delete rows, "
+                + "which is not permitted. A MERGE that only inserts, or whose matched and not-matched-by-source "
+                + "clauses change no row, is.");
+        }
     }
 
     /// <summary>
@@ -5809,6 +5840,9 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// Null starts at the snapshot's mark, which is right for a single-shot commit.</param>
     /// <param name="written">Records the data files this write creates, so a transaction that never commits
     /// can take them back (<see cref="DeltaTransaction.AbortAsync"/>). Null on the auto-committing path.</param>
+    /// <param name="identityHighWaterMarks">The identity high-water marks earlier appends staged against the same
+    /// snapshot left pending, for a transaction: generation continues from them, and the metaData action this
+    /// write emits carries them, so it supersedes the earlier one. Null starts at the snapshot's marks.</param>
     internal async ValueTask<(IReadOnlyList<DeltaAction> Actions, long NextRowId)> ComputeWriteActionsAsync(
         Snapshot.Snapshot snapshot,
         IReadOnlyList<RecordBatch> batches,
@@ -5818,7 +5852,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? repartitionTo,
         CancellationToken cancellationToken,
         long? rowIdStart = null,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        IReadOnlyDictionary<string, long>? identityHighWaterMarks = null)
     {
         // The shared chokepoint for both the auto-committing path and a transaction's append. This path
         // converts no schema, so a column the table does not declare would ride into the data file unnoticed.
@@ -6012,7 +6047,12 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         {
             var config = IdentityColumn.GetConfig(field);
             if (config is not null)
-                identityConfigs[field.Name] = config;
+            {
+                identityConfigs[field.Name] = identityHighWaterMarks is not null
+                    && identityHighWaterMarks.TryGetValue(field.Name, out long chained)
+                        ? config with { HighWaterMark = chained }
+                        : config;
+            }
         }
         var allIdentityUpdates = new List<(string Name, long HighWaterMark)>();
 
@@ -6177,7 +6217,10 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
         if (allIdentityUpdates.Count > 0)
         {
             var updatedSchema = snapshot.Schema;
-            foreach (var (name, hwm) in allIdentityUpdates)
+            // The pending marks first, so a column this write left alone keeps the earlier write's mark.
+            var marks = (identityHighWaterMarks ?? new Dictionary<string, long>())
+                .Select(kv => (kv.Key, kv.Value)).Concat(allIdentityUpdates);
+            foreach (var (name, hwm) in marks)
             {
                 var updatedFields = updatedSchema.Fields.Select(f =>
                     f.Name == name ? IdentityColumn.UpdateHighWaterMark(f, hwm) : f).ToList();
@@ -7659,9 +7702,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// identity UPDATE over data another engine wrote.
     /// </summary>
     private void ThrowIfUpdaterChangedTypes(
-        RecordBatch input, RecordBatch output, Schema.StructType schema)
+        RecordBatch input, RecordBatch output, Schema.StructType schema, string entryPoint = "UPDATE")
     {
-        const string entryPoint = "UPDATE";
         ThrowIfUndeclaredColumns([output], schema, entryPoint);
 
         var changedFields = new List<Field>();

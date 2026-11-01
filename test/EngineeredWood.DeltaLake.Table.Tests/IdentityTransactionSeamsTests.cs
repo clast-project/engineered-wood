@@ -121,6 +121,33 @@ public class IdentityTransactionSeamsTests : IDisposable
     }
 
     [Fact]
+    public async Task TwoStagedAppends_ChainTheirMarks_AndCommitOneMetadataAction()
+    {
+        await using var table = await CreateIdentityTableAsync();
+
+        await using (var txn = table.StartTransaction())
+        {
+            await txn.WriteAsync([InsertBatch("a", "b")]);
+            await txn.WriteAsync([InsertBatch("c")]); // continues from the first append's pending mark
+            await txn.CommitAsync();
+        }
+        await table.WriteAsync([InsertBatch("d")]); // and the committed mark carries both
+
+        var all = new List<long>();
+        await foreach (var b in table.ReadAllAsync())
+        {
+            var ids = (Int64Array)b.Column(0);
+            for (int i = 0; i < b.Length; i++)
+                all.Add(ids.GetValue(i)!.Value);
+        }
+        all.Sort();
+        Assert.Equal(new long[] { 1, 2, 3, 4 }, all);
+
+        string commit = File.ReadAllText(Path.Combine(_tempDir, "_delta_log", "00000000000000000001.json"));
+        Assert.Single(commit.Split('\n'), line => line.Contains("\"metaData\""));
+    }
+
+    [Fact]
     public async Task FusedIdentityCommit_OneMetadataAction_HwmPersists()
     {
         await using var table = await CreateIdentityTableAsync();

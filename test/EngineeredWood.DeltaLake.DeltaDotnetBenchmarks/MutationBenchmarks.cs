@@ -148,6 +148,38 @@ public class DmlBenchmarks : MutationBenchmark
 }
 
 /// <summary>
+/// An upsert of 10K rows into the one-commit 1M-row table on <c>id</c>: the last 5K ids exist (their
+/// <c>amount</c> doubled), the next 5K are new. Both engines rewrite the files holding a matched row and append
+/// the rest. The matched ids sit in one id range, so key statistics can rule out the other files.
+/// </summary>
+[Config(typeof(SingleShotConfig))]
+public class MergeBenchmarks : MutationBenchmark
+{
+    [ParamsAllValues]
+    public TableWriter Writer { get; set; }
+
+    private string _template = "";
+    private IReadOnlyList<RecordBatch> _source = [];
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Fixtures.SweepScratch();
+        _template = Fixtures.SingleCommit(Writer);
+        _source = Data.Generate(Fixtures.Rows - 5_000, 10_000).Select(Data.DoubleAmount).ToList();
+    }
+
+    [IterationSetup]
+    public void Fresh() => CurrentPath = Fixtures.FreshCopy(_template);
+
+    [BenchmarkCategory("Merge"), Benchmark(Baseline = true, Description = "EW MergeAsync (upsert on id)")]
+    public Task<long> EW_Merge() => Ew.MergeAsync(CurrentPath!, _source);
+
+    [BenchmarkCategory("Merge"), Benchmark(Description = "DD MergeAsync (SQL)")]
+    public Task<long> DD_Merge() => Dd.MergeAsync(CurrentPath!, _source);
+}
+
+/// <summary>
 /// EW's own predicate DELETE, which writes a deletion vector, on the same 1M rows written by EW with
 /// <c>delta.enableDeletionVectors</c>. A reference for what EW's native path costs next to the copy-on-write
 /// DELETE in <see cref="DmlBenchmarks"/>. It has no delta-dotnet counterpart (delta-rs never writes deletion
