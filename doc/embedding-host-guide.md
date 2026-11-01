@@ -641,7 +641,9 @@ attempt created.
 ## Limits
 
 - **Overwrite modes are not stageable.** They remove the whole active set, which is exactly what a rebase
-  cannot re-derive. Use the auto-committing `WriteAsync(mode: Overwrite)` / `DynamicOverwriteAsync`.
+  cannot re-derive. Use the auto-committing `WriteAsync(mode: Overwrite)` / `DynamicOverwriteAsync`. A
+  predicate overwrite (Spark's `replaceWhere`) is the exception: it reads only the files its predicate can
+  match, so `DeltaTransaction.OverwriteWhereAsync` stages it like a predicate DELETE plus an append.
 - **The rewrite family is not stageable either** — a `dataChange=false` compaction or a clustering
   OPTIMIZE removes the files it replaces, and a rewrite's fresh add embeds the attempted version's row-id
   high-water mark, so it cannot be replayed verbatim onto a newer one. Use `CompactAsync`.

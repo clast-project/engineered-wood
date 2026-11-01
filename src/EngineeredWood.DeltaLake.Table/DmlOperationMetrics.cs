@@ -7,7 +7,7 @@ using EngineeredWood.DeltaLake.Actions;
 namespace EngineeredWood.DeltaLake.Table;
 
 /// <summary>
-/// The <c>commitInfo.operationMetrics</c> a DELETE, UPDATE or MERGE records, under Spark's names
+/// The <c>commitInfo.operationMetrics</c> a DELETE, UPDATE, MERGE or replaceWhere records, under Spark's names
 /// (delta-spark's <c>DeltaOperationMetrics</c>) and as Spark writes them: every value a string.
 /// </summary>
 /// <remarks>
@@ -123,6 +123,33 @@ internal static class DmlOperationMetrics
         if (c.RowsInAddedFiles is { } rows)
             metrics["numCopiedRows"] = Text(Math.Max(0, rows - updatedRows));
         AddFileCounts(metrics, c);
+        return metrics;
+    }
+
+    /// <summary>
+    /// A replaceWhere's metrics, under the keys Spark records for a <c>WRITE</c> with a predicate. Its added files
+    /// hold the new rows and the rows it kept from the files it rewrote, so the copied rows are those beyond the
+    /// new ones. Spark counts every added file in <c>numFiles</c> and every added row in <c>numOutputRows</c>, the
+    /// copied ones included.
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> ForReplaceWhere(
+        IReadOnlyList<DeltaAction> actions, long deletedRows, long writtenRows)
+    {
+        var c = Count(actions);
+        var metrics = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["numFiles"] = Text(c.AddedFiles),
+            ["numRemovedFiles"] = Text(c.RemovedFiles),
+            ["numRemovedBytes"] = Text(c.RemovedBytes),
+            ["numAddedChangeFiles"] = Text(c.AddedChangeFiles),
+            ["numDeletedRows"] = Text(deletedRows),
+            ["numOutputBytes"] = Text(c.AddedBytes),
+        };
+        if (c.RowsInAddedFiles is { } rows)
+        {
+            metrics["numOutputRows"] = Text(rows);
+            metrics["numCopiedRows"] = Text(Math.Max(0, rows - writtenRows));
+        }
         return metrics;
     }
 

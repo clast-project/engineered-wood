@@ -2788,8 +2788,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // vectors on EXISTING files (its re-add keeps that file's own baseRowId), or — when a file was
         // concurrently rewritten — remaps its rows by STABLE ROW ID onto the new files (Layer 3 B); an append
         // or an UPDATE's copy-on-write rewrite is a fresh (post-image) add whose baseRowId CommitOccAsync
-        // re-derives against the advanced high-water mark on rebase. Overwrite modes are not stageable on a
-        // transaction, so nothing here reads the whole active-file set (the one remaining non-rebase-safe case).
+        // re-derives against the advanced high-water mark on rebase. The full, partition-scoped and dynamic
+        // overwrites are not stageable on a transaction, so nothing here reads the whole active-file set (the one
+        // remaining non-rebase-safe case). A predicate overwrite is stageable because it is a predicate DELETE
+        // plus an append, and both of those rebase.
         var reads = new ReadSet
         {
             // The files this transaction's own DML rewrites, plus the ones the HOST declared its scan read
@@ -6084,7 +6086,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         long? rowIdStart = null,
         WrittenFileLedger? written = null,
-        IReadOnlyDictionary<string, long>? identityHighWaterMarks = null)
+        IReadOnlyDictionary<string, long>? identityHighWaterMarks = null,
+        Expressions.Predicate? replaceWhere = null)
     {
         // The shared chokepoint for both the auto-committing path and a transaction's append. This path
         // converts no schema, so a column the table does not declare would ride into the data file unnoticed.
@@ -6304,6 +6307,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 processedBatch = processed;
                 allIdentityUpdates.AddRange(updates);
             }
+
+            // A replaceWhere's rows must all lie inside the window they replace, judged on the rows exactly as they
+            // will be stored: generated columns computed, identity values generated (a GENERATED ALWAYS column
+            // replaces whatever the caller supplied), and a column the caller left out as the NULL it reads back
+            // as. Still before any file is written: the files are written after this loop.
+            if (replaceWhere is not null)
+                ThrowIfOutsideReplaceWhere(processedBatch, snapshot.ArrowSchema, replaceWhere);
 
             var partitions = Partitioning.PartitionUtils.SplitByPartition(
                 processedBatch, partitionColumns);

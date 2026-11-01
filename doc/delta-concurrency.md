@@ -252,7 +252,9 @@ rule, which lives in the checker.
 - **The overwrite family does not rebase.** Full, partition-scoped and dynamic overwrite still
   single-attempt, because the remove-set is a read of the whole active-file set. Making it rebase-safe
   needs that read-set expressed as a partition predicate. This is the one remaining tail item, and it
-  is unrelated to row tracking or the buffered seam.
+  is unrelated to row tracking or the buffered seam. A predicate overwrite (`OverwriteWhereAsync`,
+  Spark's `replaceWhere`) is not in this family: it is a predicate DELETE plus an append in one
+  transaction, its read set is the predicate, and it rebases like any staged DML.
 - **`ArrowRowEvaluator` covers a bounded type set.** Bool, (u)int, float, double, string, binary, plus
   Date32/Date64/Timestamp and Decimal32/64/128/256. `DeltaFilePruner` (stats pruning) is independent
   and broader, so pruning can work where row evaluation does not.

@@ -274,11 +274,21 @@ public static class DeltaTableErrorCodes
     /// which would silently write into partitions the caller did not name.
     /// </summary>
     /// <remarks>
-    /// delta-spark's <c>DELTA_REPLACE_WHERE_MISMATCH</c> is the nearest thing and is deliberately NOT
-    /// reused: it is about a <c>replaceWhere</c> predicate, an API this library does not expose, so
-    /// the name would send a reader looking for something that is not here.
+    /// Not <see cref="ReplaceWhereMismatch"/>, though the condition is close: this one is about partition values
+    /// named by key, not a predicate, and the code predates that one.
     /// </remarks>
     public const string DataOutsideTargetPartitions = "DELTA_DATA_OUTSIDE_TARGET_PARTITIONS";
+
+    /// <summary>
+    /// A row handed to <see cref="DeltaTable.OverwriteWhereAsync"/> does not satisfy the predicate whose rows it
+    /// replaces: the predicate is false or null for it. Committing it would put a row outside the window being
+    /// replaced, where the next overwrite of the same window would not remove it.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_REPLACE_WHERE_MISMATCH</c> — "Written data does not conform to partial
+    /// table overwrite condition or constraint '&lt;replaceWhere&gt;'". Measured against Spark 4.0 / Delta 4.0.0
+    /// for a partition-only predicate, a data-column one and a mixed one, and for a row the predicate is NULL
+    /// for.</remarks>
+    public const string ReplaceWhereMismatch = "DELTA_REPLACE_WHERE_MISMATCH";
 
     // ── Concurrency conditions only the table layer can raise ──
     //
