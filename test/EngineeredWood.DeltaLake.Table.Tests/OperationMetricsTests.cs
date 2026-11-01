@@ -223,7 +223,7 @@ public class OperationMetricsTests : IDisposable
 
     /// <summary>
     /// A transaction of two DELETEs sums them. One that also appends, or that records a different operation,
-    /// records no metrics: Spark's describe one operation, and those of a DELETE would misdescribe the commit.
+    /// records no metrics: Spark's metrics describe one operation, and a DELETE's would misdescribe the commit.
     /// </summary>
     [Fact]
     public async Task ATransaction_SumsOneKindOfOperation_AndOtherwiseRecordsNone()
