@@ -788,9 +788,13 @@ an original one — including decimals, whose exact digits never pass through
 (at minimum an empty object, which strict readers require), plus
 `userMetadata` and any further keys a caller passes as `CommitProperties`
 (#564). A caller key may not be any field of Spark's `CommitInfo`, which Spark
-reads by type. Spec-standard fields still never emitted: `readVersion`,
-`isolationLevel`, `operationMetrics`, `userId`, `userName`, `txnId`,
-`clusterId`, `notebook`.
+reads by type. `operationMetrics` is written, under Spark's names and as
+strings, by DELETE, UPDATE and MERGE (#577), and by VACUUM; not by WRITE,
+OPTIMIZE or the metadata commits, and never Spark's timing metrics
+(`executionTimeMs`, `scanTimeMs`, `rewriteTimeMs`). A transaction records them
+only when everything it staged is one kind of DELETE, UPDATE or MERGE. Fields
+still never emitted: `readVersion`, `isolationLevel`, `userId`, `userName`,
+`txnId`, `clusterId`, `notebook`.
 
 **Post-creation protocol upgrades — partial.** `AddColumnAsync` and
 `SetClusteringColumnsAsync` upgrade the protocol as needed via

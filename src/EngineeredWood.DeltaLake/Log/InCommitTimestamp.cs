@@ -141,6 +141,8 @@ public static class InCommitTimestamp
     /// pass <c>false</c> — see <see cref="LogCommitRequest.IsBlindAppend"/>.</param>
     /// <param name="commitProperties">The caller's own commitInfo keys. Added to a commitInfo the actions
     /// already carry, too, since that is the commitInfo this commit will record.</param>
+    /// <param name="operationMetrics">Written as <c>commitInfo.operationMetrics</c>, a map of strings as Spark
+    /// writes it. A commitInfo the actions already carry keeps its own if it has one.</param>
     /// <exception cref="ArgumentException"><paramref name="commitProperties"/> names a key the commitInfo
     /// already records.</exception>
     public static IReadOnlyList<DeltaAction> EnsureCommitInfo(
@@ -148,20 +150,23 @@ public static class InCommitTimestamp
         IReadOnlyDictionary<string, string>? configuration,
         string operation = "WRITE",
         bool? isBlindAppend = null,
-        CommitProperties? commitProperties = null)
+        CommitProperties? commitProperties = null,
+        IReadOnlyDictionary<string, string>? operationMetrics = null)
     {
         // Already has a commitInfo (any kind): leave it, apart from adding the caller's properties to it.
         for (int i = 0; i < actions.Count; i++)
         {
             if (actions[i] is not CommitInfo existing)
                 continue;
-            if (commitProperties is null)
+            if (commitProperties is null && operationMetrics is null)
                 return actions;
 
             var values = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
             foreach (var kvp in existing.Values)
                 values[kvp.Key] = kvp.Value;
-            commitProperties.ApplyTo(values);
+            if (operationMetrics is not null && !values.ContainsKey("operationMetrics"))
+                values["operationMetrics"] = MetricsJson(operationMetrics);
+            commitProperties?.ApplyTo(values);
             var replaced = new List<DeltaAction>(actions);
             replaced[i] = existing with { Values = values };
             return replaced;
@@ -175,6 +180,11 @@ public static class InCommitTimestamp
                 ["isBlindAppend"] = JsonDocument.Parse(blind ? "true" : "false").RootElement.Clone(),
             };
         }
+        if (operationMetrics is not null)
+        {
+            extra ??= new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+            extra["operationMetrics"] = MetricsJson(operationMetrics);
+        }
 
         var result = new List<DeltaAction>(actions.Count + 1);
         result.Add(CreateCommitInfo(
@@ -183,5 +193,20 @@ public static class InCommitTimestamp
             commitProperties: commitProperties));
         result.AddRange(actions);
         return result;
+    }
+
+    // A JSON object of string values, which is how Spark writes operationMetrics (a Map[String, String]).
+    private static JsonElement MetricsJson(IReadOnlyDictionary<string, string> metrics)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            foreach (var kvp in metrics)
+                writer.WriteString(kvp.Key, kvp.Value);
+            writer.WriteEndObject();
+        }
+        using var document = JsonDocument.Parse(stream.ToArray());
+        return document.RootElement.Clone();
     }
 }

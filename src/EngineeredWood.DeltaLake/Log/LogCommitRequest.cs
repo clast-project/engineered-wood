@@ -177,4 +177,11 @@ public sealed record LogCommitRequest
     /// </summary>
     public CommitProperties? CommitProperties { get; init; }
 
+    /// <summary>
+    /// Computes <c>commitInfo.operationMetrics</c> from the actions an attempt is about to write: called once
+    /// per attempt, so the metrics describe what that attempt commits even after a rebase re-derived its
+    /// actions. Null, or a null result, writes no metrics.
+    /// </summary>
+    public Func<IReadOnlyList<DeltaAction>, IReadOnlyDictionary<string, string>?>? OperationMetrics { get; init; }
+
 }

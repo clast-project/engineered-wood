@@ -2504,10 +2504,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="OperationParameters"/> is the raw JSON of <c>commitInfo.operationParameters</c>.
     /// <see cref="UserMetadata"/> is <c>commitInfo.userMetadata</c>, the column of that name in Spark's
     /// <c>DESCRIBE HISTORY</c>: what the writer set through <see cref="CommitProperties.UserMetadata"/>.
+    /// <see cref="OperationMetrics"/> is <c>commitInfo.operationMetrics</c>, Spark's string-to-string map (a
+    /// non-string value comes back as its raw JSON), or null when the commit recorded none.
     /// </summary>
     public readonly record struct DeltaHistoryEntry(
         long Version, long? TimestampMs, string? Operation, string? OperationParameters,
-        string? UserMetadata = null);
+        string? UserMetadata = null, IReadOnlyDictionary<string, string>? OperationMetrics = null);
 
     /// <summary>
     /// Enumerates the table's commit history — every version and its commitInfo — oldest first.
@@ -2524,6 +2526,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             string? op = null;
             string? opParams = null;
             string? userMetadata = null;
+            Dictionary<string, string>? metrics = null;
             foreach (var action in actions)
             {
                 if (action is CommitInfo ci)
@@ -2536,10 +2539,20 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     opParams = p.HasValue ? p.Value.GetRawText() : null;
                     if (ci.GetValue("userMetadata") is { ValueKind: System.Text.Json.JsonValueKind.String } u)
                         userMetadata = u.GetString();
+                    if (ci.GetValue("operationMetrics") is { ValueKind: System.Text.Json.JsonValueKind.Object } m)
+                    {
+                        metrics = new Dictionary<string, string>(StringComparer.Ordinal);
+                        foreach (var property in m.EnumerateObject())
+                        {
+                            metrics[property.Name] = property.Value.ValueKind == System.Text.Json.JsonValueKind.String
+                                ? property.Value.GetString()!
+                                : property.Value.GetRawText();
+                        }
+                    }
                     break;
                 }
             }
-            yield return new DeltaHistoryEntry(version, ts, op, opParams, userMetadata);
+            yield return new DeltaHistoryEntry(version, ts, op, opParams, userMetadata, metrics);
         }
     }
 
@@ -2850,7 +2863,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // result made one this library never saw.
             isBlindAppend: transaction.EffectiveIsBlindAppend,
             insertFillIn: insertFillIn,
-            commitProperties: transaction.CommitProperties).ConfigureAwait(false);
+            commitProperties: transaction.CommitProperties,
+            operationMetrics: transaction.OperationMetricsFor).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -3210,7 +3224,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool? isBlindAppend = null,
         ICommitRebaseHandler? rebase = null,
         InsertChangeDataFillIn? insertFillIn = null,
-        CommitProperties? commitProperties = null)
+        CommitProperties? commitProperties = null,
+        Func<IReadOnlyList<DeltaAction>, IReadOnlyDictionary<string, string>?>? operationMetrics = null)
     {
         ThrowIfDisposed();
 
@@ -3244,6 +3259,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 OnCommitDurable = written is null ? null : written.Clear,
                 IsBlindAppend = isBlindAppend,
                 CommitProperties = commitProperties,
+                OperationMetrics = operationMetrics,
                 // Checkpoint here too. This line used to be `false`, with a comment calling it "an
                 // accident of where the call happened to sit rather than a decision" — see #86.
                 //
@@ -4416,11 +4432,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>The <c>remove</c> a DELETE writes for a file it changes. It carries the file's existing deletion
     /// vector and row-tracking fields; a partial delete follows it with a re-add under the new vector.</summary>
+    // With the extended file metadata every other remove this library writes carries (Spark writes it on every
+    // remove): without its size a whole-file DELETE recorded numRemovedBytes 0.
     private static RemoveFile RemoveOf(AddFile addFile) => new()
     {
         Path = addFile.Path,
         DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         DataChange = true,
+        ExtendedFileMetadata = true,
+        PartitionValues = addFile.PartitionValues,
+        Size = addFile.Size,
         DeletionVector = addFile.DeletionVector,
         BaseRowId = addFile.BaseRowId,
         DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
@@ -4603,7 +4624,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 },
                 IsolationFor(snapshot, plan.Actions), "UPDATE",
                 rebaseSafe: true, cancellationToken, written: written,
-                isBlindAppend: false, commitProperties: commitProperties).ConfigureAwait(false);
+                isBlindAppend: false, commitProperties: commitProperties,
+                operationMetrics: committing => DmlOperationMetrics.ForUpdate(committing, plan.TotalUpdated))
+                .ConfigureAwait(false);
 
             return (plan.TotalUpdated, committed);
         }, cancellationToken).ConfigureAwait(false);
@@ -8395,7 +8418,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             new ReadSet { Files = removedPaths },
             IsolationFor(snapshot, actions), "DELETE", rebaseSafe: true, cancellationToken,
             rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written,
-            isBlindAppend: false, commitProperties: commitProperties).ConfigureAwait(false);
+            isBlindAppend: false, commitProperties: commitProperties,
+            operationMetrics: committing => DmlOperationMetrics.ForDelete(committing, totalDeleted))
+            .ConfigureAwait(false);
         return (totalDeleted, version);
     }
 
@@ -8518,7 +8543,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, plan.Actions,
             new ReadSet { Files = plan.RemovedPaths },
             IsolationFor(snapshot, plan.Actions), "DELETE", rebaseSafe: false, cancellationToken,
-            written: written, isBlindAppend: false, commitProperties: commitProperties)
+            written: written, isBlindAppend: false, commitProperties: commitProperties,
+            operationMetrics: committing => DmlOperationMetrics.ForDelete(committing, plan.RowsDeleted))
             .ConfigureAwait(false);
         return (plan.RowsDeleted, version);
     }
@@ -9152,6 +9178,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         long newVersion = snapshot.Version + 1;
         long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+        long totalUpdated = 0;
 
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
@@ -9273,6 +9300,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             if (updatedHere == 0)
                 continue; // no target row actually present in this file — leave it untouched
+            totalUpdated += updatedHere;
 
             // Only a batch holding an updated row can have moved one: the rest are the rows as read.
             var router = new PartitionRouter(
@@ -9319,7 +9347,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, actions,
             new ReadSet { Files = removedPaths },
             IsolationFor(snapshot, actions), "UPDATE", rebaseSafe: false, cancellationToken,
-            written: written, isBlindAppend: false, commitProperties: commitProperties)
+            written: written, isBlindAppend: false, commitProperties: commitProperties,
+            operationMetrics: committing => DmlOperationMetrics.ForUpdate(committing, totalUpdated))
             .ConfigureAwait(false);
     }
 
