@@ -3876,7 +3876,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>delta.rowTracking</c> high-water-mark domain to match — mirroring Spark's row-id reassignment on
     /// conflict resolution.
     ///
-    /// <para>A post-image add is a data-change <see cref="AddFile"/> carrying a <c>baseRowId</c> whose path is
+    /// <para>A post-image add is an <see cref="AddFile"/> (data change or not) carrying a <c>baseRowId</c> whose path is
     /// NOT active in <paramref name="baseSnapshot"/> and was NOT produced by the row-level DELETE resolution
     /// (<paramref name="resolvedPaths"/>). Those excluded adds — a DV re-union re-add of an existing file, or a
     /// remap re-add on a concurrently-rewritten file — already carry the correct (their own) <c>baseRowId</c>
@@ -3900,13 +3900,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             switch (action)
             {
-                case AddFile add when add.DataChange && add.BaseRowId is not null
+                // Data change or not: a non-data-changing new add (one staged raw, given ids by
+                // AssignMissingRowIds) reserved its range from the same stale mark.
+                case AddFile add when add.BaseRowId is not null
                     && !baseActivePaths.Contains(add.Path)
                     && (resolvedPaths is null || !resolvedPaths.Contains(add.Path)):
                     result.Add(add with
                     {
                         BaseRowId = nextRowId,
-                        DefaultRowCommitVersion = attemptVersion,
+                        // The staged commit's own version follows the commit; one a raw caller set otherwise is
+                        // kept, as delta-spark's DefaultRowCommitVersion.assignIfMissing keeps it.
+                        DefaultRowCommitVersion = add.DefaultRowCommitVersion is null
+                            || add.DefaultRowCommitVersion == baseSnapshot.Version + 1
+                            ? attemptVersion : add.DefaultRowCommitVersion,
                     });
                     nextRowId += RowCountForRowIds(add);
                     changed = true;
@@ -7893,8 +7899,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             switch (action)
             {
-                case AddFile { BaseRowId: { } start } add:
-                    nextRowId = Math.Max(nextRowId, start + (add.GetNumRecords() ?? 0));
+                // A new file's staged range; an existing file's is already under the base mark. A new one without
+                // a row count has no known end to assign past, so it is refused like one being assigned.
+                case AddFile { BaseRowId: { } start } add when IsNew(add):
+                    nextRowId = Math.Max(nextRowId, start + RowCountForRowIds(add));
                     break;
                 case DomainMetadata dm when string.Equals(
                     dm.Domain, DeltaLake.RowTracking.RowTrackingConfig.DomainName, StringComparison.Ordinal):
@@ -7916,6 +7924,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     result.Add(add with
                     {
                         BaseRowId = nextRowId,
+                        // Filled only when missing: delta-spark's DefaultRowCommitVersion.assignIfMissing keeps
+                        // a version the add already carries, independently of assigning it a fresh baseRowId.
                         DefaultRowCommitVersion = add.DefaultRowCommitVersion ?? version,
                     });
                     nextRowId += RowCountForRowIds(add);

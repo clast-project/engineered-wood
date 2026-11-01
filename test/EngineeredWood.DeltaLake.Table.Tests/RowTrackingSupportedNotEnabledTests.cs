@@ -388,6 +388,76 @@ public class RowTrackingSupportedNotEnabledTests : IDisposable
         AssertRowIdsAssigned(table, version);
     }
 
+    private static AddFile RawAdd(WrittenDataFile file, bool dataChange = true, bool withRowCount = true) => new()
+    {
+        Path = file.RelativePath,
+        PartitionValues = new Dictionary<string, string>(),
+        Size = file.SizeBytes,
+        ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+        DataChange = dataChange,
+        Stats = withRowCount ? file.StatsJson ?? $"{{\"numRecords\":{file.NumRecords}}}" : null,
+    };
+
+    /// <summary>A NON-data-changing raw add gets ids too, and the rebase past a concurrent append re-derives them
+    /// (and moves the commit version it was given) rather than replaying a range the append took.</summary>
+    [Fact]
+    public async Task Transaction_RawNonDataChangingAdd_IsRebasedPastAConcurrentAppend()
+    {
+        await using var table = await SupportedNotEnabledAsync();
+        var file = (await table.WriteDataFilesAsync([Rows(4, 5)])).Single();
+        var txn = table.StartTransaction();
+        txn.StageActions([RawAdd(file, dataChange: false)]);
+        await using (var other = await DeltaTable.OpenAsync(Fs))
+            await other.WriteAsync([Rows(6)]);                                         // v3, takes id 3
+
+        long version = await txn.CommitAsync();
+
+        var add = Assert.Single(AddsAt(table, version));
+        Assert.Equal(4, add.BaseRowId);
+        Assert.Equal(version, add.DefaultRowCommitVersion);
+        Assert.Equal(6, table.CurrentSnapshot.RowIdHighWaterMark);
+        AssertRowIdsAssigned(table, version);
+    }
+
+    /// <summary>A new file staged with a baseRowId but no row count has no known end, so assigning ids to another
+    /// file past it is refused rather than risking an overlap.</summary>
+    [Fact]
+    public async Task Transaction_PreassignedAddWithoutARowCount_IsRefused()
+    {
+        await using var table = await SupportedNotEnabledAsync();
+        var files = await table.WriteDataFilesAsync([Rows(4)]);
+        var more = await table.WriteDataFilesAsync([Rows(5)]);
+        var txn = table.StartTransaction();
+        txn.StageActions(
+        [
+            RawAdd(files.Single(), withRowCount: false) with { BaseRowId = 3, DefaultRowCommitVersion = 3 },
+            RawAdd(more.Single()),
+        ]);
+
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () => await txn.CommitAsync());
+        Assert.Contains("numRecords", ex.Message);
+    }
+
+    /// <summary>
+    /// A raw add that brings its own defaultRowCommitVersion keeps it while getting a fresh baseRowId: delta-spark's
+    /// commit fills the version only when missing (<c>DefaultRowCommitVersion.assignIfMissing</c>, measured from
+    /// the 4.0.0 bytecode), independently of <c>RowId.assignFreshRowIds</c>.
+    /// </summary>
+    [Fact]
+    public async Task Transaction_RawAddWithItsOwnCommitVersion_KeepsIt()
+    {
+        await using var table = await SupportedNotEnabledAsync();
+        var file = (await table.WriteDataFilesAsync([Rows(4)])).Single();
+        var txn = table.StartTransaction();
+        txn.StageActions([RawAdd(file) with { DefaultRowCommitVersion = 1 }]);
+
+        long version = await txn.CommitAsync();
+
+        var add = Assert.Single(AddsAt(table, version));
+        Assert.Equal(3, add.BaseRowId);
+        Assert.Equal(1, add.DefaultRowCommitVersion);
+    }
+
     [Fact]
     public async Task TransactionalOverwriteWhere_AssignsDisjointIdsToBothHalves()
     {
