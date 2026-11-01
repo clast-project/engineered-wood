@@ -88,7 +88,7 @@ public class CommitPropertiesTests : IDisposable
         await table.WriteAsync([Rows(1, 2, 3, 4)], DeltaWriteMode.Overwrite, commitProperties: Tagged("overwrite"));
         await table.WriteAsync([Rows(5)]);
         await table.DeleteAsync(Ex.Equal("id", 1L), Tagged("delete"));
-        await table.DeleteAsync(Ex.Equal("id", 2L), RowDeleteMode.CopyOnWrite, commitProperties: Tagged("delete-cow"));
+        await table.DeleteAsync(Ex.Equal("id", 2L), Tagged("delete-cow"), RowDeleteMode.CopyOnWrite);
         await table.UpdateAsync(
             Ex.Equal("id", 3L), batch => batch, commitProperties: Tagged("update"));
         await table.MergeAsync(

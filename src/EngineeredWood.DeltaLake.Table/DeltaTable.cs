@@ -3930,7 +3930,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>A file the predicate matches entirely is removed. One it matches only in part gets a deletion
     /// vector when the table enables them (<c>delta.enableDeletionVectors</c>), and is otherwise rewritten
     /// without the matched rows (copy-on-write), as Spark and delta-rs delete;
-    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken, CommitProperties?)"/> chooses
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken)"/> chooses
     /// explicitly.</para>
     /// </summary>
     public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
@@ -3941,19 +3941,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// Deletes rows matching the predicate, as
     /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CancellationToken)"/> does, recording
-    /// <paramref name="commitProperties"/> in the commit.
+    /// <paramref name="commitProperties"/> in the commit. A null <paramref name="mode"/> chooses the mode as that
+    /// overload does; otherwise it is the one
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken)"/> takes.
     /// </summary>
     /// <remarks>
-    /// A separate overload, with the properties ahead of the token, rather than a trailing optional parameter
-    /// on the one above: with an optional parameter on both, <c>DeleteAsync(predicate, default)</c> would no
-    /// longer bind to the overload that chooses the mode, because C# prefers the candidate needing no default
-    /// arguments only when exactly one does.
+    /// The only overloads that take commit properties, with the properties second, so that no call the other
+    /// overloads accept binds differently or becomes ambiguous. A trailing optional parameter on both of them
+    /// would leave <c>DeleteAsync(predicate, default)</c> ambiguous, and a separate overload taking the
+    /// properties without a mode would make <c>DeleteAsync(predicate, default, default)</c> so.
     /// </remarks>
     public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
         Func<RecordBatch, BooleanArray> predicate,
         CommitProperties? commitProperties,
+        RowDeleteMode? mode = null,
         CancellationToken cancellationToken = default)
-        => DeleteCoreAsync(predicate, mode: null, cancellationToken, commitProperties);
+        => DeleteCoreAsync(predicate, mode, cancellationToken, commitProperties);
 
     /// <summary>
     /// Deletes rows matching the predicate, as
@@ -3967,9 +3970,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
         Func<RecordBatch, BooleanArray> predicate,
         RowDeleteMode mode,
-        CancellationToken cancellationToken = default,
-        CommitProperties? commitProperties = null)
-        => DeleteCoreAsync(predicate, mode, cancellationToken, commitProperties);
+        CancellationToken cancellationToken = default)
+        => DeleteCoreAsync(predicate, mode, cancellationToken, commitProperties: null);
 
     private async ValueTask<(long RowsDeleted, long Version)> DeleteCoreAsync(
         Func<RecordBatch, BooleanArray> predicate,
@@ -4011,7 +4013,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     ///
     /// <para>A file the predicate matches only in part gets a deletion vector when the table enables them, and
     /// is otherwise rewritten without the matched rows (copy-on-write);
-    /// <see cref="DeleteAsync(Expressions.Predicate, RowDeleteMode, CancellationToken, CommitProperties?)"/> chooses explicitly.</para>
+    /// <see cref="DeleteAsync(Expressions.Predicate, RowDeleteMode, CancellationToken)"/> chooses explicitly.</para>
     /// </summary>
     public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
         Expressions.Predicate predicate,
@@ -4020,27 +4022,30 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Deletes rows matching the predicate, as <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/>
-    /// does, recording <paramref name="commitProperties"/> in the commit. A separate overload for the reason
-    /// given on <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CommitProperties?, CancellationToken)"/>.
+    /// does, recording <paramref name="commitProperties"/> in the commit. A null <paramref name="mode"/> chooses
+    /// the mode as that overload does; otherwise it is the one
+    /// <see cref="DeleteAsync(Expressions.Predicate, RowDeleteMode, CancellationToken)"/> takes. The parameter
+    /// order is explained on
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CommitProperties?, RowDeleteMode?, CancellationToken)"/>.
     /// </summary>
     public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
         Expressions.Predicate predicate,
         CommitProperties? commitProperties,
+        RowDeleteMode? mode = null,
         CancellationToken cancellationToken = default)
-        => DeleteCoreAsync(predicate, mode: null, cancellationToken, commitProperties);
+        => DeleteCoreAsync(predicate, mode, cancellationToken, commitProperties);
 
     /// <summary>
     /// Deletes rows matching an analyzable <see cref="Expressions.Predicate"/>, as
     /// <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> does, choosing how a file the predicate
     /// matches only in part is changed — see
-    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken, CommitProperties?)"/>.
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken)"/>.
     /// </summary>
     public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
         Expressions.Predicate predicate,
         RowDeleteMode mode,
-        CancellationToken cancellationToken = default,
-        CommitProperties? commitProperties = null)
-        => DeleteCoreAsync(predicate, mode, cancellationToken, commitProperties);
+        CancellationToken cancellationToken = default)
+        => DeleteCoreAsync(predicate, mode, cancellationToken, commitProperties: null);
 
     private async ValueTask<(long RowsDeleted, long Version)> DeleteCoreAsync(
         Expressions.Predicate predicate,

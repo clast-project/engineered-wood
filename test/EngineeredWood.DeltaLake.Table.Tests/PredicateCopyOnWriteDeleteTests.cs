@@ -334,6 +334,26 @@ public class PredicateCopyOnWriteDeleteTests : IDisposable
         Assert.Equal(new long[] { 5, 6, 7, 8 }, await ReadIdsFreshAsync());
     }
 
+    /// <summary>
+    /// Two positional <c>default</c>s still bind to the <see cref="RowDeleteMode"/> overloads, as they did before
+    /// the overloads taking <see cref="CommitProperties"/> existed: those take the properties second and the mode
+    /// third, so they need a default filled in and lose the tie. So the mode is
+    /// <see cref="RowDeleteMode.DeletionVector"/>, and this table without deletion vectors refuses the delete.
+    /// </summary>
+    [Fact]
+    public async Task TwoPositionalDefaults_StillBindToTheExplicitModeOverloads()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema());
+        await table.WriteAsync([Batch(1, 8)]);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await table.DeleteAsync(Ex.Equal("id", 1L), default, default));
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            async () => await table.DeleteAsync(batch => MaskForId(batch, 2), default, default));
+
+        Assert.Equal(new long[] { 1, 2, 3, 4, 5, 6, 7, 8 }, await ReadIdsFreshAsync());
+    }
+
     private static BooleanArray MaskForId(RecordBatch batch, long target)
     {
         var ids = (Int64Array)batch.Column("id");
