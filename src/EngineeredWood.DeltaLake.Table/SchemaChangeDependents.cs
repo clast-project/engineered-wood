@@ -41,13 +41,14 @@ internal static class SchemaChangeDependents
 
     /// <summary>
     /// Throws if anything depends on the field at <paramref name="path"/> (LOGICAL names, as they
-    /// stand in <paramref name="schema"/>), which a RENAME or DROP is about to change.
+    /// stand in <paramref name="schema"/>), which a RENAME or DROP is about to change. <paramref name="verb"/>
+    /// names some other change for the message (a merge's type widening); it does not change the checks.
     /// </summary>
     public static void EnsureChangeable(
         StructType schema, MetadataAction metadata, IReadOnlyDictionary<string, DomainMetadata> domains,
-        IReadOnlyList<string> path, bool isDrop)
+        IReadOnlyList<string> path, bool isDrop, string? verb = null)
     {
-        string verb = isDrop ? "drop" : "rename";
+        verb ??= isDrop ? "drop" : "rename";
         string target = string.Join(".", path);
 
         foreach (var (key, sql) in Constraints(metadata))

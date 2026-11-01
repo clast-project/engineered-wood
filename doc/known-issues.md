@@ -830,7 +830,8 @@ clause of each kind (matched UPDATE/DELETE, not-matched INSERT, not-matched-by-s
 DELETE), each with an optional condition, with Spark's rules for duplicated source
 keys and for `SET *` / `INSERT *` (pinned by `MergeInteropTests`). It does not take
 an arbitrary ON condition, several clauses of one kind, SET or VALUES expressions
-(only source columns, all of them or a named list), or schema evolution (#568); it always copy-on-writes, never writing deletion vectors;
+(only source columns, all of them or a named list), or schema evolution (appends have it since #568; MERGE
+does not use it yet); it always copy-on-writes, never writing deletion vectors;
 it prunes files by the source's key range only for integer and string keys (not date, timestamp or decimal);
 an `INSERT *` into a table with a GENERATED ALWAYS identity column replaces the source's values for it, as an
 append does, where Spark's behavior has not been checked;
@@ -849,9 +850,19 @@ ADD / RENAME / DROP COLUMN (`AddColumnAsync` / `RenameColumnAsync` /
 `RenameFieldAsync` / `DropFieldAsync`) — each of those six also has a
 compute-only `Compute*` counterpart that a buffered transaction fuses with data
 changes — plus whole-schema adoption (`SetSchemaAsync`, the CREATE-OR-REPLACE
-building block, which commits directly). Still missing: column reorder and
-nullability change (drop/add NOT NULL). Column mapping mode is fixed at
-`CreateAsync`.
+building block, which commits directly). `WriteAsync(..., mergeSchema: true)`
+(table and transaction, #568) evolves the schema to fit the batches in the same
+commit as the data, opt-in as Spark's `mergeSchema` is: new columns and struct
+fields are added nullable, and a wider type is widened under
+`delta.enableTypeWidening`, limited to the changes Spark applies automatically
+(not integer to double or decimal). It refuses a name that differs from a column's
+only in case, where Spark's default case-insensitive resolution would write into
+the existing column; it adds no field and widens no value inside an array element
+or a map key or value (`DELTA_UNSUPPORTED_SCHEMA_MERGE`), and widens no partition
+column or column a CHECK constraint or generation expression reads. It never
+casts a narrower batch type up to the table's. MERGE's own schema evolution is
+not built on it yet. Still missing: column reorder and nullability change
+(drop/add NOT NULL). Column mapping mode is fixed at `CreateAsync`.
 
 **Vacuum does not collect expired change-data-feed files.** `_change_data/`
 is excluded from the sweep because CDF files are referenced by `cdc`

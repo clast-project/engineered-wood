@@ -1453,6 +1453,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// upgrade for a schema-driven feature (timestampNtz / variantType). Pure computation, no IO.</summary>
     public DeferredSchemaChange ComputeAddField(
         IReadOnlyList<string> containerPath, Field newField,
+        MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null) =>
+        ComputeAddField(containerPath, ToDeltaField(newField), baseMetadata, baseProtocol);
+
+    /// <summary>
+    /// <see cref="ComputeAddField(IReadOnlyList{string}, Field, MetadataAction, ProtocolAction)"/> taking the DELTA
+    /// field directly, as <see cref="ComputeAddColumn(StructField, MetadataAction, ProtocolAction)"/> does for a
+    /// top-level column. Do not pre-assign column-mapping metadata on it.
+    /// </summary>
+    public DeferredSchemaChange ComputeAddField(
+        IReadOnlyList<string> containerPath, StructField newField,
         MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null)
     {
         ThrowIfDisposed();
@@ -1460,7 +1470,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (containerPath.Count == 0)
             throw new ArgumentException(
                 "containerPath must name the containing struct column.", nameof(containerPath));
-        if (!newField.IsNullable)
+        if (!newField.Nullable)
             throw new InvalidOperationException(
                 $"ADD COLUMN '{PathText(containerPath)}.{newField.Name}' must be nullable — existing rows have "
                 + "no value for a new field.");
@@ -1473,8 +1483,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var config = baseMeta.Configuration;
         var mappingMode = ColumnMapping.GetMode(config);
 
-        var newDeltaField = SchemaConverter.FromArrowSchema(
-            new Apache.Arrow.Schema([newField], null)).Fields[0];
+        var newDeltaField = newField;
 
         var newConfig = config;
         int lastId = 0;
@@ -2938,7 +2947,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// stage, if any: the schema, column mapping and features of the version the commit writes. Only those
     /// change; the active files are still the base's.
     /// </summary>
-    private static Snapshot.Snapshot WithStagedMetadata(
+    internal static Snapshot.Snapshot WithStagedMetadata(
         Snapshot.Snapshot snapshot, IReadOnlyList<DeltaAction> actions)
     {
         var metadata = actions.OfType<MetadataAction>().LastOrDefault();
@@ -5984,15 +5993,31 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// mirrors on the auto-committing surface, and the note in <c>CommitWriteAsync</c> for why the library
     /// must not answer this itself.
     /// </param>
+    /// <param name="mergeSchema">
+    /// Spark's <c>mergeSchema=true</c>: evolve the table's schema to fit <paramref name="batches"/>, in the SAME
+    /// commit as the data. A column or struct field the table does not have is added, nullable, at the end; a
+    /// column whose type in the batch is a wider one Spark would widen to during schema evolution is widened, when
+    /// the table enables <c>delta.enableTypeWidening</c>; a name that differs from a column's only in case is
+    /// refused. Off by default, where a column the table does not declare is refused instead: a typo in a column
+    /// name should not silently add a column.
+    /// <para>The widenings are the ones Spark applies by itself: a wider integer, float to double, a decimal no
+    /// narrower in integer or fractional digits, and date to timestamp_ntz; integer to double or decimal is refused,
+    /// as are a narrower type, a widening of a partition column or of a column a CHECK constraint or generation
+    /// expression reads, and a new field or widening inside an array element or map key or value
+    /// (<see cref="DeltaTableErrorCodes.UnsupportedSchemaMerge"/>). A widened column records
+    /// <c>delta.typeChanges</c> and the protocol gains <c>typeWidening</c>; files written before it read
+    /// widened.</para>
+    /// </param>
     public ValueTask<long> WriteAsync(
         IReadOnlyList<RecordBatch> batches,
         DeltaWriteMode mode = DeltaWriteMode.Append,
         CancellationToken cancellationToken = default,
         IReadOnlyList<string>? repartitionTo = null,
         bool? isBlindAppend = null,
-        CommitProperties? commitProperties = null)
+        CommitProperties? commitProperties = null,
+        bool mergeSchema = false)
         => WriteCoreAsync(batches, mode, null, cancellationToken, repartitionTo: repartitionTo,
-            isBlindAppend: isBlindAppend, commitProperties: commitProperties);
+            isBlindAppend: isBlindAppend, commitProperties: commitProperties, mergeSchema: mergeSchema);
 
     /// <summary>
     /// Atomically overwrites one or more whole partitions in a SINGLE commit: removes exactly the active files
@@ -6033,7 +6058,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool dynamicPartitionOverwrite = false,
         IReadOnlyList<string>? repartitionTo = null,
         bool? isBlindAppend = null,
-        CommitProperties? commitProperties = null)
+        CommitProperties? commitProperties = null,
+        bool mergeSchema = false)
     {
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
@@ -6045,14 +6071,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             isAppend: mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite,
             handling: WriteTimeExpressionHandling.ValidatedHere);
 
+        // The merge is computed before anything is written, and the write then runs against the merged schema,
+        // so the new columns are declared (and renamed to their physical names) like any other. The commit's base
+        // stays the table's own snapshot: the merge's metaData is one of the actions it lands.
+        var schemaMerge = mergeSchema ? ComputeSchemaMerge(snapshot, batches) : null;
+        var writeSnapshot = schemaMerge is { } merge ? WithStagedMetadata(snapshot, merge.Actions) : snapshot;
+
         // No transaction here for a host to abort, so the cleanup is the operation's own: a commit that
         // conflicts — which for the overwrite family is any collision at all, it makes ONE attempt — takes
         // back the parquet it just wrote instead of leaving it for VACUUM.
         return await CollectOnFailureAsync(async written =>
         {
             var (actions, _) = await ComputeWriteActionsAsync(
-                snapshot, batches, mode, overwritePartitions, dynamicPartitionOverwrite, repartitionTo,
+                writeSnapshot, batches, mode, overwritePartitions, dynamicPartitionOverwrite, repartitionTo,
                 cancellationToken, written: written).ConfigureAwait(false);
+            if (schemaMerge is { } change)
+                actions = WithSchemaMerge(actions, change);
 
             long newVersion = snapshot.Version + 1;
             // From the actions, not the mode: an append of no rows commits nothing and must not be refused, and an
@@ -6097,8 +6131,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     {
         // The shared chokepoint for both the auto-committing path and a transaction's append. This path
         // converts no schema, so a column the table does not declare would ride into the data file unnoticed.
-        // (No write here evolves the schema — the write schema is always the snapshot's — so an unknown column
-        // is a mistake, never an addition.) Names and types are checked FIRST, against the batch as the caller
+        // (Nothing here evolves the schema — the write schema is always the snapshot's — so an unknown column
+        // is a mistake, never an addition. A mergeSchema write evolves it BEFORE calling this, and passes the
+        // merged snapshot.) Names and types are checked FIRST, against the batch as the caller
         // built it: a conversion below can itself refuse a value, and must not pre-empt the real problem, and a
         // type error should describe what the caller supplied rather than what it was converted to.
         ThrowIfUndeclaredColumns(batches, snapshot.Schema, "Write");
@@ -10252,14 +10287,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Writes a stream of RecordBatch data as a new commit.
+    /// Writes a stream of RecordBatch data as a new commit. <paramref name="mergeSchema"/> is
+    /// <see cref="WriteAsync(IReadOnlyList{RecordBatch}, DeltaWriteMode, CancellationToken, IReadOnlyList{string}, bool?, CommitProperties, bool)"/>'s.
     /// </summary>
     public async ValueTask<long> WriteAsync(
         IAsyncEnumerable<RecordBatch> batches,
         DeltaWriteMode mode = DeltaWriteMode.Append,
         CancellationToken cancellationToken = default,
         bool? isBlindAppend = null,
-        CommitProperties? commitProperties = null)
+        CommitProperties? commitProperties = null,
+        bool mergeSchema = false)
     {
         var batchList = new List<RecordBatch>();
         await foreach (var batch in batches.WithCancellation(cancellationToken)
@@ -10269,7 +10306,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
         return await WriteAsync(
                 batchList, mode, cancellationToken, isBlindAppend: isBlindAppend,
-                commitProperties: commitProperties)
+                commitProperties: commitProperties, mergeSchema: mergeSchema)
             .ConfigureAwait(false);
     }
 
