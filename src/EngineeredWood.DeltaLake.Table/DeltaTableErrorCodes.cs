@@ -190,6 +190,23 @@ public static class DeltaTableErrorCodes
     public const string DuplicateColumnsFound = "DELTA_DUPLICATE_COLUMNS_FOUND";
 
     /// <summary>
+    /// A <c>mergeSchema</c> write found a column whose type in the batch is wider than the table's, and the
+    /// widening cannot be applied: the table does not enable <c>delta.enableTypeWidening</c>, or the column is a
+    /// partition column. Nothing is written.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_MERGE_INCOMPATIBLE_DATATYPE</c> — "Failed to merge incompatible data types
+    /// &lt;currentDataType&gt; and &lt;updateDataType&gt;", which Spark's schema merge raises for the same
+    /// condition.</remarks>
+    public const string MergeIncompatibleDataType = "DELTA_MERGE_INCOMPATIBLE_DATATYPE";
+
+    /// <summary>
+    /// A <c>mergeSchema</c> write would need a change this library's merge does not make: a new field, or a
+    /// widening, inside an array element or a map key or value. Nothing is written.
+    /// </summary>
+    /// <remarks>No delta-spark equivalent: Spark's merge makes these changes.</remarks>
+    public const string UnsupportedSchemaMerge = "DELTA_UNSUPPORTED_SCHEMA_MERGE";
+
+    /// <summary>
     /// A RENAME or DROP would change a column that a CHECK constraint reads, or a schema replacement
     /// would remove one.
     /// </summary>

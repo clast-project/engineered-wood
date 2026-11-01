@@ -105,7 +105,16 @@ public sealed class DeltaTransaction : IAsyncDisposable
     // snapshot's (which would repeat values), and its metaData action replaces the earlier one, since a
     // commit must not carry two.
     private Dictionary<string, long>? _identityMarks;
+    // The one metaData action the staged writes carry: an append's identity marks, or a mergeSchema write's merged
+    // schema (which also carries the marks staged before it). Each write that emits one supersedes the last.
     private MetadataAction? _stagedIdentityMetadata;
+    // Set once a mergeSchema write staged a schema change. Later writes then run against the merged schema
+    // (PendingWriteSnapshot), and anything that would stage a metaData or protocol computed from the BASE schema
+    // is refused, since it would drop the merge from the commit.
+    private bool _schemaMerged;
+    // The protocol upgrade the merges staged (typeWidening, timestampNtz, ...), cumulative: a later merge's
+    // replaces it.
+    private ProtocolAction? _stagedMergeProtocol;
     // Preconditions: facts about the base version that must hold on EVERY commit attempt. Distinct from
     // staged effects, which are rebased and retried — a precondition cannot become true by retrying.
     private readonly List<AppTransactionRequirement> _appTransactions = [];
@@ -360,9 +369,17 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// <para>Nothing is committed until <see cref="CommitAsync"/>, but the data files ARE written now —
     /// <see cref="AbortAsync"/> (or disposal) deletes them again if this transaction never commits. Returns
     /// the number of rows staged.</para>
+    ///
+    /// <para><paramref name="mergeSchema"/> evolves the schema to fit the batches, in this transaction's commit,
+    /// as <see cref="DeltaTable.WriteAsync(IReadOnlyList{RecordBatch}, DeltaWriteMode, CancellationToken, IReadOnlyList{string}, bool?, CommitProperties, bool)"/>
+    /// does. Several merging writes compose, and every append staged after one sees the merged schema. A merge
+    /// cannot share a transaction with a schema change staged any other way (<see cref="StageSchemaChange"/>, a
+    /// <c>metaData</c> through <see cref="StageActions"/>), in either order: the commit carries one
+    /// <c>metaData</c>, and each was computed without the other. Nor with a later MERGE or replaceWhere that
+    /// advances identity marks, for the same reason.</para>
     /// </summary>
     public async ValueTask<long> WriteAsync(
-        IReadOnlyList<RecordBatch> batches, CancellationToken cancellationToken = default)
+        IReadOnlyList<RecordBatch> batches, CancellationToken cancellationToken = default, bool mergeSchema = false)
     {
         EnsureOpen();
 
@@ -373,11 +390,36 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _baseSnapshot, isAppend: true,
             handling: WriteTimeExpressionHandling.ValidatedHere);
 
+        var writeSnapshot = _schemaMerged || mergeSchema ? PendingWriteSnapshot() : _baseSnapshot;
+        DeltaTable.DeferredSchemaChange? merge = null;
+        if (mergeSchema)
+        {
+            merge = _table.ComputeSchemaMerge(writeSnapshot, batches);
+            if (merge is { } change)
+            {
+                RefuseSchemaMergeAfterOtherMetadata();
+                writeSnapshot = DeltaTable.WithStagedMetadata(writeSnapshot, change.Actions);
+            }
+        }
+
         var (actions, nextRowId) = await TakingBackOnFailureAsync(_written.Paths.Count, () => _table.ComputeWriteActionsAsync(
-            _baseSnapshot, batches, DeltaWriteMode.Append,
+            writeSnapshot, batches, DeltaWriteMode.Append,
             overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
             cancellationToken, rowIdStart: _nextRowId, written: _written, identityHighWaterMarks: _identityMarks),
             cancellationToken).ConfigureAwait(false);
+
+        if (merge is { } merged)
+        {
+            actions = DeltaTable.WithSchemaMerge(actions, merged);
+            if (merged.ProtocolUpgrade is { } protocol)
+            {
+                // Cumulative: computed on top of the previous merge's upgrade, so it replaces it.
+                if (_stagedMergeProtocol is not null)
+                    _dataActions.Remove(_stagedMergeProtocol);
+                _stagedMergeProtocol = protocol;
+            }
+            _schemaMerged = true;
+        }
 
         _nextRowId = nextRowId;
         StageInternal(actions);
@@ -612,6 +654,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "MERGE", cancellationToken)
             .ConfigureAwait(false);
 
+        await RefuseBaseSchemaMetadataAfterMergeAsync(plan.InsertActions, mark, "MERGE", cancellationToken)
+            .ConfigureAwait(false);
         if (plan.NextRowId is long nextRowId)
             _nextRowId = nextRowId;
         StageInternal(plan.RewriteActions);
@@ -686,6 +730,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
         await RefuseRestagedFilesAsync(delete.RemovedPaths, mark, "replaceWhere", cancellationToken)
             .ConfigureAwait(false);
 
+        await RefuseBaseSchemaMetadataAfterMergeAsync(write.Actions, mark, "replaceWhere", cancellationToken)
+            .ConfigureAwait(false);
         _nextRowId = delete.NextRowId ?? write.NextRowId;
         StageInternal(write.Actions);
         ChainIdentityMarks(write.Actions);
@@ -952,6 +998,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
     public void StageSchemaChange(DeltaTable.DeferredSchemaChange change)
     {
         EnsureOpen();
+        RefuseBaseSchemaMetadataAfterMerge(change.Actions, "StageSchemaChange");
         StageInternal(change.Actions);
         foreach (var domain in change.ReadDomains ?? [])
             _readDomains.Add(domain);
@@ -1009,6 +1056,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         EnsureOpen();
         if (actions is null)
             throw new ArgumentNullException(nameof(actions));
+        RefuseBaseSchemaMetadataAfterMerge(actions, "StageActions");
         StageInternal(actions);
         foreach (var action in actions)
         {
@@ -1383,6 +1431,63 @@ public sealed class DeltaTransaction : IAsyncDisposable
                 _identityMarks[field.Name] = mark;
         }
     }
+
+    /// <summary>The base snapshot with the metaData and protocol the staged writes carry, which a write after a
+    /// schema merge (or a merge after an identity-advancing write) must build on.</summary>
+    private Snapshot.Snapshot PendingWriteSnapshot()
+    {
+        var pending = new List<DeltaAction>(2);
+        if (_stagedMergeProtocol is not null)
+            pending.Add(_stagedMergeProtocol);
+        if (_stagedIdentityMetadata is not null)
+            pending.Add(_stagedIdentityMetadata);
+        return DeltaTable.WithStagedMetadata(_baseSnapshot, pending);
+    }
+
+    /// <summary>Refuses a schema merge on a transaction that already staged a metaData or protocol some other
+    /// way: the merge was computed without it, and the commit can carry only one.</summary>
+    private void RefuseSchemaMergeAfterOtherMetadata()
+    {
+        foreach (var action in _dataActions)
+        {
+            if ((action is MetadataAction && !ReferenceEquals(action, _stagedIdentityMetadata))
+                || (action is ProtocolAction && !ReferenceEquals(action, _stagedMergeProtocol)))
+            {
+                throw new InvalidOperationException(
+                    "mergeSchema: this transaction already stages a schema or protocol change, and a merge "
+                    + "computed without it would replace it in the commit. Stage the merging write on a "
+                    + "transaction of its own, or fold the change into one staged schema change.");
+            }
+        }
+    }
+
+    /// <summary>Refuses, after a schema merge, staging a metaData or protocol computed from the BASE schema: it
+    /// would carry the schema as it was before the merge, and replace the merge in the commit.</summary>
+    private void RefuseBaseSchemaMetadataAfterMerge(IEnumerable<DeltaAction> actions, string operation)
+    {
+        if (StagesBaseSchemaMetadataAfterMerge(actions))
+            throw BaseSchemaMetadataAfterMerge(operation);
+    }
+
+    /// <summary>As <see cref="RefuseBaseSchemaMetadataAfterMerge"/>, for an operation that already wrote its
+    /// files: they are taken back first, as <see cref="RefuseRestagedFilesAsync"/> does, or a caller that catches
+    /// the refusal and commits would leave them orphaned.</summary>
+    private async ValueTask RefuseBaseSchemaMetadataAfterMergeAsync(
+        IEnumerable<DeltaAction> actions, int mark, string operation, CancellationToken cancellationToken)
+    {
+        if (!StagesBaseSchemaMetadataAfterMerge(actions))
+            return;
+        await TakeBackSinceAsync(mark, cancellationToken).ConfigureAwait(false);
+        throw BaseSchemaMetadataAfterMerge(operation);
+    }
+
+    private bool StagesBaseSchemaMetadataAfterMerge(IEnumerable<DeltaAction> actions) =>
+        _schemaMerged && actions.Any(a => a is MetadataAction or ProtocolAction);
+
+    private static InvalidOperationException BaseSchemaMetadataAfterMerge(string operation) =>
+        new($"{operation}: this transaction already merged the schema (a mergeSchema write), and this "
+            + "operation stages a metaData or protocol of its own, computed from the schema as it was "
+            + "before the merge. The commit can carry only one; stage it on a transaction of its own.");
 
     /// <summary>Records an append's adds as work no change file covers, for the commit's fill-in.</summary>
     private void RecordUncoveredAppends(IEnumerable<DeltaAction> actions)
