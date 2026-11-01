@@ -462,6 +462,10 @@ public sealed partial class DeltaTable
         source = NormalizeUnlessHostOwnsBytes(source, snapshot.Metadata.PartitionColumns);
         if (source.Count == 0)
             return null;
+        // Each batch on its own, before they are combined: two batches may supply one column in different forms
+        // (milliseconds and microseconds), which only agree once both are the table's.
+        if (!HostOwnsBytes)
+            source = source.Select(b => ConformToTable(b, snapshot.ArrowSchema)).ToList();
 
         var schema = source[0].Schema;
         for (int b = 1; b < source.Count; b++)
@@ -491,7 +495,7 @@ public sealed partial class DeltaTable
                 columns[c] = ArrowCompute.Concatenate(source.Select(b => b.Column(c)).ToList());
             combined = new RecordBatch(schema, columns, source.Sum(b => b.Length));
         }
-        return HostOwnsBytes ? combined : ConformToTable(combined, snapshot.ArrowSchema);
+        return combined;
     }
 
     /// <summary>
@@ -886,7 +890,7 @@ internal static class MergeKeys
     /// the same Arrow type: a source may supply a <c>timestamp</c> in milliseconds against the table's
     /// microseconds, or (under a host's codec) a decimal or integer at another width. So each value is encoded in
     /// one form per Delta type: integers as 64 bits, dates as milliseconds, timestamps as microseconds plus any
-    /// nanoseconds, decimals sign-extended to 256 bits. Floating-point zeros and NaNs are canonicalized too,
+    /// nanoseconds, decimals by value whatever their width and scale. Floating-point zeros and NaNs are canonicalized too,
     /// since SQL takes <c>-0.0 = 0.0</c> and Spark <c>NaN = NaN</c>.</summary>
     public static byte[]? Encode(IArrowArray[] columns, int row)
     {
@@ -963,12 +967,33 @@ internal static class MergeKeys
                 Apache.Arrow.Types.Decimal32Type or Apache.Arrow.Types.Decimal64Type
                 or Apache.Arrow.Types.Decimal128Type or Apache.Arrow.Types.Decimal256Type:
             {
-                // Little-endian two's complement at the type's width; sign-extended, the widths agree.
-                var bytes = dec.GetBytes(row);
-                bytes.CopyTo(scratch);
-                byte sign = (bytes[bytes.Length - 1] & 0x80) != 0 ? (byte)0xFF : (byte)0;
-                scratch.Slice(bytes.Length, 32 - bytes.Length).Fill(sign);
-                return scratch.Slice(0, 32);
+                // By value, whatever the width and scale: the unscaled integer with its trailing zeros moved into
+                // the scale, so 1.00 at scale 2 and 1.000 at scale 3 are both (1, 0). (The bytes are little-endian
+                // two's complement at the type's width, as BigInteger reads them.)
+                int scale = dec.Data.DataType switch
+                {
+                    Apache.Arrow.Types.Decimal32Type t => t.Scale,
+                    Apache.Arrow.Types.Decimal64Type t => t.Scale,
+                    Apache.Arrow.Types.Decimal128Type t => t.Scale,
+                    Apache.Arrow.Types.Decimal256Type t => t.Scale,
+                    _ => 0,
+                };
+                var value = new System.Numerics.BigInteger(dec.GetBytes(row).ToArray());
+                if (value.IsZero)
+                    scale = 0;
+                while (scale > 0)
+                {
+                    var quotient = System.Numerics.BigInteger.DivRem(value, 10, out var remainder);
+                    if (!remainder.IsZero)
+                        break;
+                    value = quotient;
+                    scale--;
+                }
+                byte[] unscaled = value.ToByteArray();
+                var encoded = new byte[4 + unscaled.Length];
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(encoded, scale);
+                unscaled.CopyTo(encoded, 4);
+                return encoded;
             }
             case BooleanArray b:
                 scratch[0] = b.GetValue(row) == true ? (byte)1 : (byte)0;

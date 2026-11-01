@@ -711,6 +711,79 @@ public class MergeTests : IDisposable
         Assert.Equal([(1L, "A", 5_000L), (2L, "b", 20L)], rows.OrderBy(r => r.Item1));
     }
 
+    [Fact]
+    public async Task SourceBatchesInDifferentForms_AreEachConvertedBeforeTheyAreCombined()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", Micros, true)).Field(new Field("v", StringType.Default, true)).Build();
+        await using var table = await CreateAsync(schema: schema);
+        await table.WriteAsync([TimestampRows(Micros, [1_000_000],
+            new StringArray.Builder().Append("a").Build(), StringType.Default)]);
+
+        var (metrics, _) = await table.MergeAsync(
+            [
+                TimestampRows(Millis, [1_000], new LargeStringArray.Builder().Append("A").Build(), LargeStringType.Default),
+                TimestampRows(Micros, [2_000_000], new StringArray.Builder().Append("b").Build(), StringType.Default),
+            ],
+            new MergeOptions { Keys = ["k"], WhenMatched = MergeAction.Update, WhenNotMatched = MergeAction.Insert });
+
+        Assert.Equal(1, metrics.NumTargetRowsUpdated);
+        Assert.Equal(1, metrics.NumTargetRowsInserted);
+    }
+
+    [Fact]
+    public async Task ADecimalKeyAtAnotherScale_IsRefusedAsMistyped()
+    {
+        // decimal(10,3) is another Delta type than the table's decimal(10,2), so it never reaches the matching.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", new Decimal128Type(10, 2), true)).Field(new Field("v", StringType.Default, true)).Build();
+        await using var table = await CreateAsync(schema: schema);
+        var sourceType = new Decimal128Type(10, 3);
+        var source = new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field("k", sourceType, true)).Field(new Field("v", StringType.Default, true)).Build(),
+            [new Decimal128Array.Builder(sourceType).Append(1.000m).Build(), new StringArray.Builder().Append("A").Build()], 1);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => table.MergeAsync([source], new MergeOptions
+        {
+            Keys = ["k"], WhenMatched = MergeAction.Update, WhenNotMatched = MergeAction.Insert,
+        }).AsTask());
+    }
+
+    [Fact]
+    public void DecimalKeys_EncodeByValue_WhateverTheirWidthOrScale()
+    {
+        // A host's codec hands batches through unconverted, so a key may arrive at another width or scale.
+        static byte[] Key(IArrowArray column) => MergeKeys.Encode([column], 0)!;
+        var twoPlaces = new Decimal128Type(10, 2);
+        var threePlaces = new Decimal128Type(10, 3);
+        byte[] oneAtTwo = Key(new Decimal128Array.Builder(twoPlaces).Append(1.00m).Build());
+        byte[] oneAtThree = Key(new Decimal128Array.Builder(threePlaces).Append(1.000m).Build());
+        byte[] oneAt256 = Key(new Decimal256Array.Builder(new Decimal256Type(10, 2)).Append(1.00m).Build());
+        byte[] tenthAtThree = Key(new Decimal128Array.Builder(threePlaces).Append(0.100m).Build());
+        byte[] cents = Key(new Decimal128Array.Builder(twoPlaces).Append(0.01m).Build());
+        byte[] mils = Key(new Decimal128Array.Builder(threePlaces).Append(0.010m).Build());
+
+        Assert.Equal(oneAtTwo, oneAtThree, MergeKeyComparer.Instance);
+        Assert.Equal(oneAtTwo, oneAt256, MergeKeyComparer.Instance);
+        Assert.Equal(cents, mils, MergeKeyComparer.Instance);
+        Assert.NotEqual(oneAtTwo, tenthAtThree, MergeKeyComparer.Instance);
+        Assert.NotEqual(cents, oneAtTwo, MergeKeyComparer.Instance);
+    }
+
+    [Fact]
+    public async Task AMergeThatReadNothing_StillRecordsANonBlindCommit()
+    {
+        await using var table = await CreateAsync();
+        await table.WriteAsync([Rows((1, "a", 10))]);
+
+        // Every source key NULL: nothing can match, so nothing is scanned, and the row is only inserted.
+        var (_, version) = await table.MergeAsync([Rows((null, "n", 0))], Upsert);
+
+        string commit = File.ReadAllText(Path.Combine(_tempDir, "_delta_log", $"{version:D20}.json"));
+        Assert.Contains("\"isBlindAppend\":false", commit);
+    }
+
     private Task<DeltaTable> CreateAppendOnlyAsync() => DeltaTable.CreateAsync(
         new LocalTableFileSystem(_tempDir), TableSchema,
         configuration: new Dictionary<string, string> { ["delta.appendOnly"] = "true" }).AsTask();

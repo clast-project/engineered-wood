@@ -262,9 +262,13 @@ public sealed class DeltaTransaction : IAsyncDisposable
     internal bool? EffectiveIsBlindAppend =>
         IsBlindAppend
         ?? (_declaredWholeTableRead || _removedPaths.Count > 0 || _dvEdits.Count > 0
-                || _readPredicates.Count > 0 || _opaqueReadPredicate
+                || _readPredicates.Count > 0 || _opaqueReadPredicate || _mergeStaged
             ? false
             : null);
+
+    // A staged MERGE makes the commit non-blind, as Spark records isBlindAppend=false for every MERGE: even
+    // one that read nothing because no source key could match (all NULL), and so recorded no read set.
+    private bool _mergeStaged;
 
     /// <summary>The app-transaction preconditions to re-check on every commit attempt.</summary>
     internal IReadOnlyList<AppTransactionRequirement> AppTransactions => _appTransactions;
@@ -561,6 +565,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         else if (plan.ScannedTarget)
             _opaqueReadPredicate = true;
         _operations.Add("MERGE");
+        _mergeStaged = true;
 
         return plan.Metrics;
     }
