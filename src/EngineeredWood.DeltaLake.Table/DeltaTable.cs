@@ -6084,7 +6084,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         long? rowIdStart = null,
         WrittenFileLedger? written = null,
-        IReadOnlyDictionary<string, long>? identityHighWaterMarks = null)
+        IReadOnlyDictionary<string, long>? identityHighWaterMarks = null,
+        Expressions.Predicate? replaceWhere = null)
     {
         // The shared chokepoint for both the auto-committing path and a transaction's append. This path
         // converts no schema, so a column the table does not declare would ride into the data file unnoticed.
@@ -6149,6 +6150,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var identitySupplied = IdentitySuppliedByWriter(snapshot.Schema);
         foreach (var batch in batches)
             DeltaNotNullEnforcer.Validate(batch, snapshot.Schema, identitySupplied);
+
+        // A replaceWhere's rows must all lie inside the window they replace, checked as a CHECK constraint is:
+        // against the rows as they will be stored, generated columns included, before anything is written.
+        if (replaceWhere is not null)
+            ThrowIfOutsideReplaceWhere(batches, replaceWhere);
 
         // Repartition-on-overwrite: changing partitionColumns is protocol-legal ONLY when every active file
         // is removed in the same commit — i.e. a FULL overwrite (a partition-scoped or dynamic overwrite

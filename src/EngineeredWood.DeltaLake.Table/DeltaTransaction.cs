@@ -215,7 +215,13 @@ public sealed class DeltaTransaction : IAsyncDisposable
 
     /// <summary>The operation the commit actually records: the caller's if set, else the inference.</summary>
     internal string EffectiveOperation =>
-        _operation ?? (_operations.Count == 1 ? _operations.First() : "WRITE");
+        _operation ?? (_operations.Count == 1 ? RecordedOperation(_operations.First()) : "WRITE");
+
+    // A replaceWhere is staged as a kind of its own, so its metrics are not mistaken for a plain append's, and
+    // records the operation Spark records for it.
+    private const string ReplaceWhereKind = "REPLACE WHERE";
+
+    private static string RecordedOperation(string kind) => kind == ReplaceWhereKind ? "WRITE" : kind;
 
     /// <summary>
     /// This transaction's own claim about whether it READ anything, recorded as
@@ -278,6 +284,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
 
     // The row counts of the staged DML, summed across staging calls, for the commit's operationMetrics.
     private long _deletedRows;
+    private long _replaceWhereRows;
     private long _updatedRows;
     private MergeMetrics? _mergeMetrics;
 
@@ -301,13 +308,14 @@ public sealed class DeltaTransaction : IAsyncDisposable
         if (_operations.Count != 1 || _rawDataActionsStaged)
             return null;
         string kind = _operations.First();
-        if (EffectiveOperation != kind)
+        string recorded = RecordedOperation(kind);
+        if (EffectiveOperation != recorded)
             return null;
         foreach (var action in actions)
         {
             if (action is CommitInfo info
                 && !(info.GetValue("operation") is { ValueKind: System.Text.Json.JsonValueKind.String } op
-                    && op.GetString() == kind))
+                    && op.GetString() == recorded))
             {
                 return null;
             }
@@ -318,6 +326,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
             "DELETE" => DmlOperationMetrics.ForDelete(actions, _deletedRows),
             "UPDATE" => DmlOperationMetrics.ForUpdate(actions, _updatedRows),
             "MERGE" when _mergeMetrics is { } merge => DmlOperationMetrics.ForMerge(actions, merge),
+            ReplaceWhereKind => DmlOperationMetrics.ForReplaceWhere(actions, _deletedRows, _replaceWhereRows),
             _ => null,
         };
     }
@@ -624,6 +633,74 @@ public sealed class DeltaTransaction : IAsyncDisposable
         _mergeMetrics = _mergeMetrics is { } earlier ? DmlOperationMetrics.Sum(earlier, plan.Metrics) : plan.Metrics;
 
         return plan.Metrics;
+    }
+
+    /// <summary>
+    /// Stages a replaceWhere: deletes the rows matching <paramref name="predicate"/> and appends
+    /// <paramref name="batches"/>, which must all satisfy it. See
+    /// <see cref="DeltaTable.OverwriteWhereAsync"/> for the semantics, which are Spark's.
+    ///
+    /// <para>The new rows are checked before anything is written, so a row outside the window stages nothing and
+    /// writes nothing. The predicate becomes a read dependency, as for
+    /// <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/>. A transaction that stages only this
+    /// records the operation <c>WRITE</c> with Spark's metrics for it. Like any staged operation it refuses to
+    /// touch a file an earlier one on this transaction already rewrote.</para>
+    /// </summary>
+    /// <returns>The rows deleted and the rows written.</returns>
+    public async ValueTask<(long RowsDeleted, long RowsWritten)> OverwriteWhereAsync(
+        IReadOnlyList<RecordBatch> batches, Expressions.Predicate predicate,
+        CancellationToken cancellationToken = default)
+    {
+        EnsureOpen();
+        if (batches is null)
+            throw new ArgumentNullException(nameof(batches));
+        if (predicate is null)
+            throw new ArgumentNullException(nameof(predicate));
+
+        // Not an append, so an append-only table is refused here, before reading, even when the window turns out
+        // empty: Spark refuses it the same way. The append below validates the table's constraints itself.
+        _table.ValidateWritable(
+            _baseSnapshot, isAppend: false, handling: WriteTimeExpressionHandling.ValidatedHere);
+        DeltaTable.RefuseReplaceWhere(predicate, _baseSnapshot);
+
+        int mark = _written.Paths.Count;
+        var (write, delete) = await TakingBackOnFailureAsync(mark, async () =>
+        {
+            // The new rows first: they are checked against the predicate before anything is written, so a row
+            // outside the window fails the call before the delete reads a file.
+            var w = await _table.ComputeWriteActionsAsync(
+                _baseSnapshot, batches, DeltaWriteMode.Append,
+                overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
+                cancellationToken, rowIdStart: _nextRowId, written: _written, identityHighWaterMarks: _identityMarks,
+                replaceWhere: predicate).ConfigureAwait(false);
+            bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
+                _baseSnapshot.Metadata.Configuration);
+            var d = await _table.ComputeDeleteActionsAsync(
+                _baseSnapshot, DeltaTable.MaskFor(predicate), cancellationToken, prunePredicate: predicate,
+                written: _written, copyOnWrite: DeltaTable.DeletesByCopyOnWrite(_baseSnapshot, mode: null),
+                rowIdStart: rowTracking ? w.NextRowId : null).ConfigureAwait(false);
+            return (w, d);
+        }, cancellationToken).ConfigureAwait(false);
+        await RefuseRestagedFilesAsync(delete.RemovedPaths, mark, "replaceWhere", cancellationToken)
+            .ConfigureAwait(false);
+
+        _nextRowId = delete.NextRowId ?? write.NextRowId;
+        StageInternal(write.Actions);
+        ChainIdentityMarks(write.Actions);
+        RecordUncoveredAppends(write.Actions);
+        StageInternal(delete.DataActions);
+        foreach (string path in delete.RemovedPaths)
+            _removedPaths.Add(path);
+        _dvEdits.AddRange(delete.DvEdits);
+        _readPredicates.Add(predicate);
+        _operations.Add(ReplaceWhereKind);
+        _deletedRows += delete.TotalDeleted;
+
+        long rows = 0;
+        foreach (var batch in batches)
+            rows += batch.Length;
+        _replaceWhereRows += rows;
+        return (delete.TotalDeleted, rows);
     }
 
     // ── Host-staged work ───────────────────────────────────────────────────────────────────────────────
