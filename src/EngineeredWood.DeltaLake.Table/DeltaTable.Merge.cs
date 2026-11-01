@@ -759,8 +759,8 @@ public sealed partial class DeltaTable
 
     private static DeltaFormatException MultipleSourceRowsMatched(string path) => new(
         DeltaTableErrorCodes.MultipleSourceRowsMatchingTargetRow,
-        $"MERGE: a target row in '{path}' has keys more than one source row equals, so which source row's action "
-        + "applies is undefined. As in Spark, this is refused whatever the clause conditions say: make the source's "
+        $"MERGE: more than one source row has the same key as a target row in '{path}', so it is undefined which "
+        + "source row's action applies. As in Spark, this is refused whatever the clause conditions say: make the source's "
         + "keys unique. Only a MERGE whose sole matched clause is an unconditional DELETE, or one that only inserts, "
         + "may match a row more than once.");
 
