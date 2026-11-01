@@ -184,4 +184,10 @@ public sealed record LogCommitRequest
     /// </summary>
     public Func<IReadOnlyList<DeltaAction>, IReadOnlyDictionary<string, string>?>? OperationMetrics { get; init; }
 
+    /// <summary>
+    /// <c>commitInfo.operationParameters</c>: what the operation was asked to do (a constraint's name and
+    /// expression, say), a map of strings as Spark writes it. Null writes the empty object every commit carries.
+    /// </summary>
+    public IReadOnlyDictionary<string, string>? OperationParameters { get; init; }
+
 }

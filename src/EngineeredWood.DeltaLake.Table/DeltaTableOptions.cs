@@ -251,8 +251,9 @@ public sealed record DeltaTableOptions
     public bool PreferTypedCheckpointStats { get; init; } = true;
 
     /// <summary>
-    /// Whether a predicate DELETE removes a data file without reading it when the file's statistics prove the
-    /// predicate TRUE for every row. Default: false.
+    /// Whether a file's statistics may stand in for reading it where they prove a predicate TRUE for every row.
+    /// Default: false. A predicate DELETE then removes such a file unread, and
+    /// <see cref="DeltaTable.AddConstraintAsync"/> skips a file they prove satisfies the new constraint.
     /// </summary>
     /// <remarks>
     /// <para>Statistics are trusted here in a direction file skipping never needs. A file skipped on a wrong bound
@@ -260,6 +261,8 @@ public sealed record DeltaTableOptions
     /// match. Spark trusts them only for skipping: it removes files unread when the condition names partition
     /// columns alone, and reads every other candidate. That is this library's default too. The partition case
     /// needs no statistics and removes files unread whatever this says.</para>
+    /// <para>ADD CONSTRAINT trusts them the same way: a file skipped on a wrong proof could hold a row that violates
+    /// the constraint it lets in. Spark reads every file there too. Was <c>DeleteTrustsStatistics</c>.</para>
     /// <para>Turn it on for a table whose writers' bounds are bounds (a truncated string maximum rounded up, as
     /// this library and Spark write it). Only what statistics can prove is proven: AND and OR of comparisons and
     /// <c>IS [NOT] NULL</c> over one top-level column against a literal of its own type, each with a null count of
@@ -269,7 +272,7 @@ public sealed record DeltaTableOptions
     /// deletion vector qualifies, its count of deleted rows taken from the row count less the vector's. With the
     /// change data feed on, files are read regardless.</para>
     /// </remarks>
-    public bool DeleteTrustsStatistics { get; init; }
+    public bool TrustStatisticsProofs { get; init; }
 
     /// <summary>
     /// Whether a <c>variant</c> column's parquet group carries the <c>VARIANT</c> logical-type

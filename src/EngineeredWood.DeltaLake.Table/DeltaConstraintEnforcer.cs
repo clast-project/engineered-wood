@@ -3,6 +3,8 @@
 
 using System.Text.Json;
 using Apache.Arrow;
+using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.Expressions;
 using EngineeredWood.Expressions.Arrow;
 using EngineeredWood.Expressions.Arrow.Spark;
@@ -143,6 +145,103 @@ internal sealed class DeltaConstraintEnforcer
                     + " No data was committed.");
             }
         }
+    }
+
+    /// <summary>
+    /// Validates a CHECK constraint being added to <paramref name="snapshot"/>'s table, and returns the predicate
+    /// <see cref="Validate"/> would enforce for it. The constraint must parse, read only columns the table has,
+    /// be boolean, and evaluate: against no rows, so that a function or column type the evaluator cannot handle
+    /// is refused here rather than at the first write.
+    /// </summary>
+    /// <exception cref="DeltaFormatException">It does not parse or evaluate
+    /// (<see cref="DeltaTableErrorCodes.UnevaluableTableExpression"/>), names a column the table lacks
+    /// (<see cref="DeltaTableErrorCodes.UnresolvedColumn"/>), or is not boolean
+    /// (<see cref="DeltaTableErrorCodes.NonBooleanCheckConstraint"/>).</exception>
+    internal static Predicate ParseNewConstraint(string name, string sql, Snapshot.Snapshot snapshot)
+    {
+        string description = $"CHECK constraint '{name}'";
+        Expression expression;
+        try
+        {
+            expression = SparkSqlParser.ParseExpression(sql);
+        }
+        catch (SparkSqlParseException ex)
+        {
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.UnevaluableTableExpression,
+                $"{description} cannot be parsed, so it was not added: {ex.Reason} at position {ex.Position} "
+                + $"in: {sql}",
+                ex);
+        }
+
+        if (SchemaChangeDependents.FirstUnresolvedReference(snapshot.Schema, description, sql) is { } missing)
+        {
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.UnresolvedColumn,
+                $"{description} ({sql}) reads column '{missing}', which the table does not have. Its columns: "
+                + string.Join(", ", snapshot.ArrowSchema.FieldsList.Select(f => f.Name)) + ".");
+        }
+
+        var fields = snapshot.ArrowSchema.FieldsList;
+        var noRows = new RecordBatch(
+            snapshot.ArrowSchema, fields.Select(f => ArrowCompute.MakeNullArray(f.DataType, 0)), 0);
+        var evaluator = new ArrowRowEvaluator(new SparkFunctionRegistry());
+        IArrowType resultType;
+        try
+        {
+            resultType = expression is Predicate predicate
+                ? evaluator.EvaluatePredicate(predicate, noRows).Data.DataType
+                : evaluator.EvaluateExpression(expression, noRows).Data.DataType;
+        }
+        catch (Exception ex) when (ex is not DeltaFormatException)
+        {
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.UnevaluableTableExpression,
+                $"{description} ({sql}) cannot be evaluated by this library, so it was not added: {ex.Message}",
+                ex);
+        }
+
+        if (resultType is not BooleanType)
+        {
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.NonBooleanCheckConstraint,
+                $"{description} ({sql}) should be a boolean expression, but its value is {resultType.Name}.");
+        }
+
+        // The form Create parses a declared constraint into, so the rows are checked against what later writes
+        // will be.
+        return Parse(description, sql).Predicate;
+    }
+
+    /// <summary>
+    /// The number of rows of <paramref name="batch"/> that do not satisfy <paramref name="predicate"/>: those for
+    /// which it is false or null.
+    /// </summary>
+    /// <exception cref="DeltaFormatException">The predicate cannot be evaluated against the batch.</exception>
+    internal static long CountViolations(
+        ArrowRowEvaluator evaluator, Predicate predicate, RecordBatch batch, string description, string sql)
+    {
+        BooleanArray result;
+        try
+        {
+            result = evaluator.EvaluatePredicate(predicate, batch);
+        }
+        catch (Exception ex) when (ex is not DeltaFormatException)
+        {
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.UnevaluableTableExpression,
+                $"{description} ({sql}) could not be evaluated against the table's rows, so it was not added: "
+                + ex.Message,
+                ex);
+        }
+
+        long violations = 0;
+        for (int row = 0; row < batch.Length; row++)
+        {
+            if (result.GetValue(row) is not true)
+                violations++;
+        }
+        return violations;
     }
 
     private static Rule Parse(string description, string sql)

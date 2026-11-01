@@ -134,6 +134,41 @@ public static class DeltaTableErrorCodes
     public const string ConstraintViolated = "DELTA_VIOLATE_CONSTRAINT";
 
     /// <summary>
+    /// A CHECK constraint being added is violated by rows the table already holds. Nothing is committed; the
+    /// message carries the number of violating rows, a row whose expression evaluates to null among them.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_NEW_CHECK_CONSTRAINT_VIOLATION</c> — "&lt;numRows&gt; rows in
+    /// &lt;tableName&gt; violate the new CHECK constraint (&lt;checkConstraint&gt;)".</remarks>
+    public const string NewCheckConstraintViolation = "DELTA_NEW_CHECK_CONSTRAINT_VIOLATION";
+
+    /// <summary>
+    /// A CHECK constraint being added has the name of one the table already declares. Names compare without
+    /// regard to case, as Spark stores them lower-cased.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_CONSTRAINT_ALREADY_EXISTS</c>.</remarks>
+    public const string ConstraintAlreadyExists = "DELTA_CONSTRAINT_ALREADY_EXISTS";
+
+    /// <summary>
+    /// A CHECK constraint being dropped is not declared by the table, and the drop did not say
+    /// <c>ifExists</c>.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_CONSTRAINT_DOES_NOT_EXIST</c>.</remarks>
+    public const string ConstraintDoesNotExist = "DELTA_CONSTRAINT_DOES_NOT_EXIST";
+
+    /// <summary>
+    /// A CHECK constraint being added is an expression whose value is not a boolean, such as <c>id + 1</c>.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_NON_BOOLEAN_CHECK_CONSTRAINT</c>.</remarks>
+    public const string NonBooleanCheckConstraint = "DELTA_NON_BOOLEAN_CHECK_CONSTRAINT";
+
+    /// <summary>
+    /// A CHECK constraint being added names a column the table does not have.
+    /// </summary>
+    /// <remarks>Spark's error class is the general <c>UNRESOLVED_COLUMN</c> (its <c>WITH_SUGGESTION</c> form names
+    /// the columns it has); the prefix keeps it in this library's <c>DELTA_</c> namespace.</remarks>
+    public const string UnresolvedColumn = "DELTA_UNRESOLVED_COLUMN";
+
+    /// <summary>
     /// A row supplies a value for a generated column that its expression does not produce.
     /// </summary>
     /// <remarks>

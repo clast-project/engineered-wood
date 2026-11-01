@@ -580,6 +580,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // table-features mode. Captured before any feature escalates the versions below, because
         // switching to reader 3 / writer 7 means every capability the legacy versions IMPLIED must be
         // spelled out explicitly -- see the merge just before the ProtocolAction is built.
+        // A CHECK constraint given in the configuration needs the checkConstraints writer feature, which writer
+        // version 3 implies: raised here, before the legacy version is captured, so a table that also needs table
+        // features enumerates it with the others. Without it the table declared constraints its protocol said
+        // nothing about, and a writer that honours only the protocol would ignore them.
+        if (configurationBuilder is not null
+            && configurationBuilder.Keys.Any(k => k.StartsWith(ConstraintKeyPrefix, StringComparison.Ordinal)))
+        {
+            minWriterVersion = Math.Max(minWriterVersion, 3);
+        }
+
         int legacyReaderVersion = minReaderVersion;
         int legacyWriterVersion = minWriterVersion;
 
@@ -3225,7 +3235,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         ICommitRebaseHandler? rebase = null,
         InsertChangeDataFillIn? insertFillIn = null,
         CommitProperties? commitProperties = null,
-        Func<IReadOnlyList<DeltaAction>, IReadOnlyDictionary<string, string>?>? operationMetrics = null)
+        Func<IReadOnlyList<DeltaAction>, IReadOnlyDictionary<string, string>?>? operationMetrics = null,
+        IReadOnlyDictionary<string, string>? operationParameters = null)
     {
         ThrowIfDisposed();
 
@@ -3260,6 +3271,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 IsBlindAppend = isBlindAppend,
                 CommitProperties = commitProperties,
                 OperationMetrics = operationMetrics,
+                OperationParameters = operationParameters,
                 // Checkpoint here too. This line used to be `false`, with a comment calling it "an
                 // accident of where the call happened to sit rather than a decision" — see #86.
                 //
@@ -4130,7 +4142,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// same answer, from the file's partition values (see <see cref="MatchesEveryRow"/>). A file it does not match
     /// is left alone unread. One it matches is removed whole unread when its statistics give a row count above
     /// its deletion vector's, and read otherwise, since the count is what the delete reports. Under
-    /// <see cref="DeltaTableOptions.DeleteTrustsStatistics"/> a file whose statistics prove the whole predicate
+    /// <see cref="DeltaTableOptions.TrustStatisticsProofs"/> a file whose statistics prove the whole predicate
     /// is removed the same way (see <see cref="ProvesEveryRow"/>).</para>
     /// </summary>
     /// <param name="prunePredicate">When supplied, the predicate <paramref name="predicate"/> evaluates, not
@@ -4183,7 +4195,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool partitionOnly = prunePredicate is not null && !cdfEnabled
             && ReferencesOnlyPartitionColumns(prunePredicate, partitionColumns);
         bool statisticsProve = prunePredicate is not null && !cdfEnabled && !partitionOnly
-            && _options.DeleteTrustsStatistics && EvaluatesEverywhere(prunePredicate, snapshot.Schema);
+            && _options.TrustStatisticsProofs && EvaluatesEverywhere(prunePredicate, snapshot.Schema);
         var partitionSchema = (partitionOnly || statisticsProve) && partitionColumns.Count > 0
             ? BuildProjectedSchema(snapshot.ArrowSchema, partitionColumns)
             : null;
