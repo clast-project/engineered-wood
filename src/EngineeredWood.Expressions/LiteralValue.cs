@@ -513,7 +513,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     }
 
 #if NET6_0_OR_GREATER
-    private static bool TryAsInstant(LiteralValue v, out DateTimeOffset instant)
+    internal static bool TryAsInstant(LiteralValue v, out DateTimeOffset instant)
     {
         switch (v._kind)
         {
@@ -530,7 +530,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     }
 #endif
 
-    private static bool TryAsInt64(LiteralValue v, out long result)
+    internal static bool TryAsInt64(LiteralValue v, out long result)
     {
         switch (v._kind)
         {
@@ -561,7 +561,7 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     /// than by total order.
     /// </para>
     /// </remarks>
-    private static int CompareFloating(double a, double b)
+    internal static int CompareFloating(double a, double b)
     {
         bool aNaN = double.IsNaN(a);
         bool bNaN = double.IsNaN(b);
@@ -594,14 +594,14 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     };
 
     /// <summary>Whether a kind is floating point, and so has no exact form to compare through.</summary>
-    private static bool IsFloating(Kind kind) =>
+    internal static bool IsFloating(Kind kind) =>
 #if NET6_0_OR_GREATER
         kind is Kind.Float or Kind.Double or Kind.Half;
 #else
         kind is Kind.Float or Kind.Double;
 #endif
 
-    private static bool TryAsDouble(LiteralValue v, out double result)
+    internal static bool TryAsDouble(LiteralValue v, out double result)
     {
         switch (v._kind)
         {

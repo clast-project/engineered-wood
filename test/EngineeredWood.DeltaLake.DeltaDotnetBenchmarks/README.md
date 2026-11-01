@@ -85,7 +85,7 @@ means EW is faster.
 |---|---|---|---|
 | Full scan, 1M rows | 17.9 / 22.9 ms | DataFusion 43.6 / 62.5 ms; kernel 94 / 115 ms | 2.44 / 2.73 (DataFusion); 5.3 / 5.0 (kernel) |
 | Filtered scan, 1 file of 20 (`Selective`) | 4.1 / 6.3 ms | 8.7 / 12.0 ms | 2.1 / 1.9 |
-| Filtered scan, 1 row in 16 (`OneCategory`) | 87 / 94 ms (prune only: 14 / 18 ms) | 19.1 / 22.7 ms | **0.22 / 0.24** |
+| Filtered scan, 1 row in 16 (`OneCategory`) | 19.9 / 22.8 ms since #560 (before: 87 / 94 ms; prune only: 10 / 15 ms) | 17.9 / 26.9 ms | 0.90 / 1.18 |
 | Open latest, 100 commits, no checkpoint | 11.1 / 10.7 ms | 35.9 / 50.3 ms | 3.2 / 4.7 |
 | Open latest, 100 commits, checkpointed | 8.3 / 6.5 ms | 4.2 / 5.5 ms | **0.51 / 0.86** |
 | Open at version 50 | 12–17 ms | 29–33 ms | 1.7–2.8 |
@@ -93,9 +93,9 @@ means EW is faster.
 | Change data feed | 32 / 40 ms | 156 / 166 ms | 4.9 / 4.1 |
 | Create + write 1M rows | 182 ms (min 132, noisy) | 202 ms (default) / 177 ms (64K batches) | 1.11 / **0.97** |
 | Open + append 10K rows, no checkpoint / checkpointed | 28–34 / 18–23 ms | 56–63 / 25–27 ms | 1.9–2.0 / 1.2–1.4 |
-| DELETE 1 row in 16, copy-on-write (`DeleteAsync`, since #562) | 335 / 304 ms (host-composed before #562: 357 / 346) | 299 / 307 ms | **0.89** / 1.01 |
+| DELETE 1 row in 16, copy-on-write (`DeleteAsync`, since #562) | 236 / 228 ms since #560 (before: 335 / 304; host-composed before #562: 357 / 346) | 297 / 308 ms | 1.26 / 1.35 |
 | DELETE 1 row in 16, EW deletion vector (EW-written DV table only) | 129 ms | none (delta-rs writes no DVs) | — |
-| UPDATE 1 row in 16 | 289 / 275 ms (noisy: min 256 / 243) | 236 / 249 ms | **0.82 / 0.91** |
+| UPDATE 1 row in 16 | 196 / 250 ms since #560 (before: 289 / 275, noisy) | 239 / 251 ms | 1.22 / 1.00 |
 | Checkpoint, 100 commits | 31 / 26 ms | 90 / 96 ms | 2.9 / 3.7 |
 | Compact 100 small files | 245 / 301 ms | 468 / 466 ms | 1.9 / 1.7 |
 | Vacuum 100 removed files | 54 / 48 ms | Full 128 / 114 ms; Lite 116 / 103 ms | 2.4 / 2.4 (Full) |
@@ -111,10 +111,10 @@ file instead of 16. The filtered-scan and maintenance rows are from the second r
 
 Where delta-dotnet wins, the cause was found for one case and is suspected for the rest:
 
-- **Row-level predicate evaluation is EW's bottleneck.** Measured separately on 1M rows: reading
-  `id, amount, category` takes about 25 ms, while `ArrowRowEvaluator.EvaluatePredicate` for `category = 'cat_03'`
-  takes 90–105 ms, about 100 ns/row (#560). A naive `GetString` loop takes about 40 ms. The same evaluator drives EW's
-  own DELETE/UPDATE masks, which probably explains part of their gap too.
+- **Row-level predicate evaluation was EW's bottleneck, fixed by #560.** `ArrowRowEvaluator.EvaluatePredicate` for
+  `category = 'cat_03'` over 1M rows took 87 ms, about 100 ns/row, against about 25 ms to read the columns. A
+  column-against-constant comparison is now answered straight off the Arrow buffers: 2.4 ms. The same evaluator drives
+  EW's DELETE/UPDATE masks, and the filtered-scan, DELETE and UPDATE rows above were re-measured after it.
 - **Opening a checkpointed table:** delta-kernel-rs is up to 2× faster at reading a small checkpoint.
 - **Write:** EW is now ahead of delta-dotnet's default and level with its 64K-batch setting, but allocates about 322 MB of managed memory for 1M rows
   (286 MB before #559: joining the batches into one row group costs a copy), and its mean carries GC noise.
