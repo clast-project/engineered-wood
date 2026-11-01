@@ -103,11 +103,11 @@ public class AppendBenchmarks : MutationBenchmark
 }
 
 /// <summary>
-/// DELETE and UPDATE of one category (1 row in 16) on the one-commit 1M-row table (1 file when
-/// delta-dotnet wrote it, 16 when EW did: EW writes a file per input batch). The tables do not enable
-/// deletion vectors, so both engines copy-on-write: read the file, drop/alter the matching rows, rewrite them.
+/// DELETE and UPDATE of one category (1 row in 16) on the one-commit 1M-row table (one file, whichever
+/// engine wrote it). The tables do not enable deletion vectors, so both engines copy-on-write: read the file,
+/// drop/alter the matching rows, rewrite them.
 ///
-/// <para>EW's predicate <c>DeleteAsync</c> refuses a partial-file delete on such a table (it only writes
+/// <para>EW's predicate <c>DeleteAsync</c> refused a partial-file delete on such a table (it only wrote
 /// deletion vectors) until #562; it now rewrites, as delta-rs does. The copy-on-write a host had to compose
 /// before that (<see cref="Ew.DeleteHostComposedCopyOnWriteAsync"/>) is kept beside it as a reference. EW's own
 /// deletion-vector DELETE is measured separately, in
@@ -177,6 +177,122 @@ public class MergeBenchmarks : MutationBenchmark
 
     [BenchmarkCategory("Merge"), Benchmark(Description = "DD MergeAsync (SQL)")]
     public Task<long> DD_Merge() => Dd.MergeAsync(CurrentPath!, _source);
+}
+
+/// <summary>The two replaceWhere windows.</summary>
+public enum ReplaceWindow
+{
+    /// <summary><see cref="Sql.SelectiveRange"/> on the 20-file prunable table: one file is read and rewritten.</summary>
+    Selective,
+
+    /// <summary><see cref="Sql.OneCategory"/> on the one-commit 1M-row table: every row is evaluated, 1 in 16 replaced.</summary>
+    OneCategory,
+}
+
+/// <summary>
+/// replaceWhere on a non-partition column: delete the rows in a window and append their replacements, with
+/// <c>amount</c> doubled, in one commit. delta-rs's form is an overwrite insert with a predicate. Neither table
+/// enables deletion vectors, so both engines rewrite the files the window matches in part.
+/// </summary>
+[Config(typeof(SingleShotConfig))]
+public class ReplaceWhereBenchmarks : MutationBenchmark
+{
+    [ParamsAllValues]
+    public TableWriter Writer { get; set; }
+
+    [ParamsAllValues]
+    public ReplaceWindow Window { get; set; }
+
+    private string _template = "";
+    private string _predicate = "";
+    private IReadOnlyList<RecordBatch> _source = [];
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Fixtures.SweepScratch();
+        if (Window == ReplaceWindow.Selective)
+        {
+            _template = Fixtures.Prunable(Writer);
+            _predicate = Sql.SelectiveRange;
+            _source = Data.Generate(500_000, 10_000).Select(Data.DoubleAmount).ToList();
+        }
+        else
+        {
+            _template = Fixtures.SingleCommit(Writer);
+            _predicate = Sql.OneCategory;
+            _source = Data.WhereCategory(Data.Generate(0, Fixtures.Rows), "cat_03").Select(Data.DoubleAmount).ToList();
+        }
+    }
+
+    [IterationSetup]
+    public void Fresh() => CurrentPath = Fixtures.FreshCopy(_template);
+
+    [BenchmarkCategory("ReplaceWhere"), Benchmark(Baseline = true, Description = "EW OverwriteWhereAsync")]
+    public Task<long> EW_ReplaceWhere() => Ew.ReplaceWhereAsync(CurrentPath!, _source, _predicate);
+
+    [BenchmarkCategory("ReplaceWhere"), Benchmark(Description = "DD InsertAsync(Overwrite, Predicate)")]
+    public Task<long> DD_ReplaceWhere() => Dd.ReplaceWhereAsync(CurrentPath!, _source, _predicate);
+}
+
+/// <summary>
+/// <c>ADD CONSTRAINT amount_non_negative CHECK (amount &gt;= 0)</c> on the one-commit 1M-row table. Every row
+/// satisfies it, so both engines read the whole column before committing the metadata.
+/// </summary>
+[Config(typeof(SingleShotConfig))]
+public class ConstraintBenchmarks : MutationBenchmark
+{
+    [ParamsAllValues]
+    public TableWriter Writer { get; set; }
+
+    private string _template = "";
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Fixtures.SweepScratch();
+        _template = Fixtures.SingleCommit(Writer);
+    }
+
+    [IterationSetup]
+    public void Fresh() => CurrentPath = Fixtures.FreshCopy(_template);
+
+    [BenchmarkCategory("AddConstraint"), Benchmark(Baseline = true, Description = "EW AddConstraintAsync")]
+    public Task<long> EW_AddConstraint() => Ew.AddConstraintAsync(CurrentPath!);
+
+    [BenchmarkCategory("AddConstraint"), Benchmark(Description = "DD AddConstraintsAsync")]
+    public Task<long> DD_AddConstraint() => Dd.AddConstraintAsync(CurrentPath!);
+}
+
+/// <summary>
+/// RESTORE to the version before a compaction, on the compacted 100-commit table: undo an OPTIMIZE. The
+/// compacted files are removed and the 100 small ones re-added; no data file is read or written.
+/// </summary>
+[Config(typeof(SingleShotConfig))]
+public class RestoreBenchmarks : MutationBenchmark
+{
+    [ParamsAllValues]
+    public TableWriter Writer { get; set; }
+
+    private string _template = "";
+    private long _target;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Fixtures.SweepScratch();
+        _template = Fixtures.Compacted(Writer);
+        _target = Ew.LatestVersionAsync(_template).GetAwaiter().GetResult() - 1;
+    }
+
+    [IterationSetup]
+    public void Fresh() => CurrentPath = Fixtures.FreshCopy(_template);
+
+    [BenchmarkCategory("Restore"), Benchmark(Baseline = true, Description = "EW RestoreAsync(version)")]
+    public Task<long> EW_Restore() => Ew.RestoreAsync(CurrentPath!, _target);
+
+    [BenchmarkCategory("Restore"), Benchmark(Description = "DD RestoreAsync(Version)")]
+    public Task<long> DD_Restore() => Dd.RestoreAsync(CurrentPath!, _target);
 }
 
 /// <summary>

@@ -9,6 +9,7 @@ using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.Expressions.Arrow;
 using EngineeredWood.Expressions.Sql;
 using EngineeredWood.IO.Local;
+using DdRestoreOptions = DeltaLake.Table.RestoreOptions;
 using DdSaveMode = DeltaLake.Table.SaveMode;
 using EwDeltaTable = EngineeredWood.DeltaLake.Table.DeltaTable;
 
@@ -35,6 +36,10 @@ internal static class Sql
 
     public const string UpdateAssignmentColumn = "amount";
     public const string UpdateAssignment = "amount * 2";
+
+    /// <summary>The CHECK constraint the ADD CONSTRAINT benchmark adds: true of every row, so both engines scan all.</summary>
+    public const string ConstraintName = "amount_non_negative";
+    public const string ConstraintExpression = "amount >= 0";
 }
 
 /// <summary>EngineeredWood operations, shaped as the benchmarks call them.</summary>
@@ -216,6 +221,35 @@ internal static class Ew
         return metrics.NumTargetRowsUpdated + metrics.NumTargetRowsInserted;
     }
 
+    /// <summary>replaceWhere: delete the rows matching the predicate and append <paramref name="batches"/>, in one commit.</summary>
+    public static async Task<long> ReplaceWhereAsync(string path, IReadOnlyList<RecordBatch> batches, string predicateSql)
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Fs(path));
+        return await table.OverwriteWhereAsync(batches, SparkSqlParser.ParsePredicate(predicateSql));
+    }
+
+    /// <summary><c>ALTER TABLE … ADD CONSTRAINT … CHECK (…)</c>: checks every existing row, then commits metadata.</summary>
+    public static async Task<long> AddConstraintAsync(string path)
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Fs(path));
+        return await table.AddConstraintAsync(Sql.ConstraintName, Sql.ConstraintExpression);
+    }
+
+    /// <summary><c>RESTORE TABLE … TO VERSION AS OF</c>.</summary>
+    public static async Task<long> RestoreAsync(string path, long version)
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Fs(path));
+        var result = await table.RestoreAsync(version);
+        return result.Version;
+    }
+
+    /// <summary>The table's latest version.</summary>
+    public static async Task<long> LatestVersionAsync(string path)
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Fs(path));
+        return table.CurrentSnapshot.Version;
+    }
+
     /// <summary>Row count and sums, read back by EW: what the verify pass compares across engines.</summary>
     public static async Task<Fingerprint> FingerprintAsync(string path)
     {
@@ -313,6 +347,33 @@ internal static class Dd
             + $"WHEN MATCHED THEN UPDATE SET {set} "
             + $"WHEN NOT MATCHED THEN INSERT ({string.Join(", ", columns)}) VALUES ({values})",
             source.ToArray(), Data.Schema, CancellationToken.None);
+        return (long)(table.Version() ?? 0);
+    }
+
+    /// <summary>replaceWhere: an overwrite insert with a predicate, delta-rs's form of it.</summary>
+    public static async Task<long> ReplaceWhereAsync(string path, IReadOnlyList<RecordBatch> batches, string predicateSql)
+    {
+        using var table = await OpenAsync(path);
+        await table.InsertAsync(
+            batches.ToArray(),
+            Data.Schema,
+            new InsertOptions { SaveMode = DdSaveMode.Overwrite, Predicate = predicateSql, MaxRowsPerGroup = 65_536 },
+            CancellationToken.None);
+        return (long)(table.Version() ?? 0);
+    }
+
+    public static async Task<long> AddConstraintAsync(string path)
+    {
+        using var table = await OpenAsync(path);
+        await table.AddConstraintsAsync(
+            new Dictionary<string, string> { [Sql.ConstraintName] = Sql.ConstraintExpression }, CancellationToken.None);
+        return (long)(table.Version() ?? 0);
+    }
+
+    public static async Task<long> RestoreAsync(string path, long version)
+    {
+        using var table = await OpenAsync(path);
+        await table.RestoreAsync(new DdRestoreOptions { Version = (ulong)version }, CancellationToken.None);
         return (long)(table.Version() ?? 0);
     }
 
