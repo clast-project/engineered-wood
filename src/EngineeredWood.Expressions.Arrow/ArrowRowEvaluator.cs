@@ -24,8 +24,12 @@ namespace EngineeredWood.Expressions.Arrow;
 /// (one element per row, null = SQL null). Predicates evaluate to a
 /// <c>bool?[]</c> with the same null semantics. Both are converted to Arrow
 /// arrays at the public boundary.
+///
+/// The exception is a column compared against a constant, which is answered straight off
+/// the column's buffers when that provably gives the same answer; see
+/// <c>ArrowRowEvaluator.ColumnComparison.cs</c>.
 /// </remarks>
-public sealed class ArrowRowEvaluator : IRowEvaluator
+public sealed partial class ArrowRowEvaluator : IRowEvaluator
 {
     private readonly IFunctionRegistry? _functions;
 
@@ -224,6 +228,11 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         // decide the analysis: `CAST(s AS INT) = bl` over a row holding 'abc' would otherwise
         // report CAST_INVALID_INPUT and never reach the refusal.
         bool asked = CheckComparableFromTree(cmp, batch);
+
+        // A column against a constant -- the shape of nearly every filter and DML predicate --
+        // is compared straight off the Arrow buffers when that is provably the same answer.
+        if (TryCompareColumnToConstant(cmp, batch, asked) is { } direct)
+            return direct;
 
         var (left, leftType) = EvalOperand(cmp.Left, batch);
         var (right, rightType) = EvalOperand(cmp.Right, batch);
@@ -724,6 +733,25 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         ComparisonPredicate cmp, IArrowType? leftType, IArrowType? rightType,
         ref LiteralValue?[] left, ref LiteralValue?[] right)
     {
+        bool declined = false;
+        CoerceOperandsExcept(cmp, leftType, rightType, ref left, ref right, FixedOperand.None, ref declined);
+    }
+
+    /// <summary>
+    /// <see cref="CoerceOperands"/>,
+    /// declining rather than casting when the operand that would move is <paramref name="fixedOperand"/>.
+    /// </summary>
+    /// <remarks>
+    /// The direct column comparison asks with a one-row stand-in for the column, whose values
+    /// are never read: every rule is chosen from the column's declared type. So it can let the
+    /// constant move, but a cast of the column must go through the general path. On a decline
+    /// nothing has been cast and both arrays are as they were.
+    /// </remarks>
+    private void CoerceOperandsExcept(
+        ComparisonPredicate cmp, IArrowType? leftType, IArrowType? rightType,
+        ref LiteralValue?[] left, ref LiteralValue?[] right,
+        FixedOperand fixedOperand, ref bool declined)
+    {
         if (_coercion is null)
             return;
 
@@ -744,16 +772,26 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
             // cheap kind test comes first, as for strings.
             bool leftIsBoolean = IsBoolean(leftType, left);
             if (leftIsBoolean != IsBoolean(rightType, right)
-                && CoerceOneSide(cmp, leftIsBoolean, leftType, rightType, ref left, ref right))
+                && CoerceOneSide(
+                    cmp, leftIsBoolean, leftType, rightType, ref left, ref right,
+                    fixedOperand, ref declined))
             {
                 return;
             }
 
-            CoerceExactNumerics(cmp, leftType, rightType, ref left, ref right);
+            CoerceExactNumerics(cmp, leftType, rightType, ref left, ref right, fixedOperand, ref declined);
             return;
         }
 
-        CoerceOneSide(cmp, leftIsString, leftType, rightType, ref left, ref right);
+        CoerceOneSide(cmp, leftIsString, leftType, rightType, ref left, ref right, fixedOperand, ref declined);
+    }
+
+    /// <summary>An operand a coercion must not cast; see <see cref="CoerceOperandsExcept"/>.</summary>
+    private enum FixedOperand
+    {
+        None,
+        Left,
+        Right,
     }
 
     /// <summary>
@@ -774,7 +812,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     private bool CoerceOneSide(
         ComparisonPredicate cmp, bool leftIsCandidate,
         IArrowType? leftType, IArrowType? rightType,
-        ref LiteralValue?[] left, ref LiteralValue?[] right)
+        ref LiteralValue?[] left, ref LiteralValue?[] right,
+        FixedOperand fixedOperand, ref bool declined)
     {
         var candidate = leftIsCandidate ? left : right;
         var other = leftIsCandidate ? right : left;
@@ -791,6 +830,13 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
         if (target is null)
             return false;   // a pair the registry has no rule for; compare it as it stands
+
+        bool movingIsLeft = leftIsCandidate == castTheCandidate;
+        if (fixedOperand == (movingIsLeft ? FixedOperand.Left : FixedOperand.Right))
+        {
+            declined = true;
+            return true;
+        }
 
         var moving = castTheCandidate ? candidate : other;
         var staying = castTheCandidate ? other : candidate;
@@ -831,7 +877,8 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
     private void CoerceExactNumerics(
         ComparisonPredicate cmp,
         IArrowType? leftType, IArrowType? rightType,
-        ref LiteralValue?[] left, ref LiteralValue?[] right)
+        ref LiteralValue?[] left, ref LiteralValue?[] right,
+        FixedOperand fixedOperand, ref bool declined)
     {
         // An operand untyped and null in every row (a bare NULL literal) has no value to round.
         // A decimal on one side is what the minimum-precision rule below needs too, so nothing
@@ -858,6 +905,13 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         var rightTarget = _coercion.ComparisonTarget(cmp.Op, resolvedRight, resolvedLeft);
         if (leftTarget is null && rightTarget is null)
             return;
+
+        if ((leftTarget is not null && fixedOperand == FixedOperand.Left)
+            || (rightTarget is not null && fixedOperand == FixedOperand.Right))
+        {
+            declined = true;
+            return;
+        }
 
         // No null mask as on the string path: this cast cannot fail, so there is no refusal for
         // a null on the other side to suppress. The common type leaves max(p1 - s1, p2 - s2)
@@ -1575,6 +1629,20 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
         if (selected == batch.Length)
             return EvalPredicate(predicate, batch);
+
+        // A comparison the direct path takes reads no row it could raise on, so it is evaluated
+        // over the whole batch and the unselected rows are discarded -- far cheaper than gathering
+        // the selected ones. The analysis is asked over the whole batch, which has the same types.
+        if (predicate is ComparisonPredicate cmp
+            && TryCompareColumnToConstant(cmp, batch, CheckComparableFromTree(cmp, batch)) is { } direct)
+        {
+            for (var i = 0; i < direct.Length; i++)
+            {
+                if (!rows[i]) direct[i] = null;
+            }
+
+            return direct;
+        }
 
         var result = new bool?[batch.Length];
         var indices = Indices(rows, selected);
@@ -2372,13 +2440,38 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
 
     private static BooleanArray ToBooleanArray(bool?[] values, int length)
     {
-        var b = new BooleanArray.Builder();
+        // The bitmaps are written directly; a builder append per row was a measurable share of a
+        // simple comparison.
+        int bytes = (length + 7) / 8;
+        var valueBits = new byte[bytes];
+        byte[]? validityBits = null;
+        int nullCount = 0;
         for (int i = 0; i < length; i++)
         {
-            if (values[i].HasValue) b.Append(values[i]!.Value);
-            else b.AppendNull();
+            var value = values[i];
+            if (value is null)
+            {
+                if (validityBits is null)
+                {
+                    validityBits = new byte[bytes];
+                    for (int j = 0; j < i; j++)
+                        validityBits[j >> 3] |= (byte)(1 << (j & 7));
+                }
+
+                nullCount++;
+                continue;
+            }
+
+            if (validityBits is not null)
+                validityBits[i >> 3] |= (byte)(1 << (i & 7));
+            if (value.GetValueOrDefault())
+                valueBits[i >> 3] |= (byte)(1 << (i & 7));
         }
-        return (BooleanArray)b.Build();
+
+        return new BooleanArray(
+            new ArrowBuffer(valueBits),
+            validityBits is null ? ArrowBuffer.Empty : new ArrowBuffer(validityBits),
+            length, nullCount, 0);
     }
 
     // ── Helpers ──
