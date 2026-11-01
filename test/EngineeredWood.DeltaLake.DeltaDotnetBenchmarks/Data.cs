@@ -53,6 +53,24 @@ internal static class Data
         return new RecordBatch(batch.Schema, columns.ToList(), batch.Length);
     }
 
+    /// <summary>The rows of <paramref name="batches"/> whose <c>category</c> is <paramref name="category"/>.</summary>
+    public static List<RecordBatch> WhereCategory(IEnumerable<RecordBatch> batches, string category)
+    {
+        var result = new List<RecordBatch>();
+        foreach (var batch in batches)
+        {
+            var categories = (StringArray)batch.Column(batch.Schema.GetFieldIndex("category"));
+            var indices = new List<int>();
+            for (int i = 0; i < batch.Length; i++)
+            {
+                if (categories.GetString(i) == category)
+                    indices.Add(i);
+            }
+            result.Add(EngineeredWood.Arrow.ArrowCompute.Take(batch, batch.Schema, indices));
+        }
+        return result;
+    }
+
     private static RecordBatch Batch(long firstId, int length)
     {
         var id = new Int64Array.Builder().Reserve(length);

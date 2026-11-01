@@ -84,9 +84,9 @@ internal static class Verify
                                 result = $"READERS DISAGREE: EW {byEw} / DD kernel {byDd} / DD DataFusion {byDf}";
                             }
 
-                            // Checkpoint, compaction and vacuum all preserve the rows, so a no-op would pass the
-                            // fingerprint. Check that each did its job too.
-                            if (instance is MaintenanceBenchmarks)
+                            // Checkpoint, compaction, vacuum, ADD CONSTRAINT and this RESTORE (of a compaction) all
+                            // preserve the rows, so a no-op would pass the fingerprint. Check that each did its job too.
+                            if (instance is MaintenanceBenchmarks or ConstraintBenchmarks or RestoreBenchmarks)
                                 result += " " + await MaintenancePostconditionAsync(category, mutation.CurrentPath!, method.Name);
                         }
                         else
@@ -196,6 +196,24 @@ internal static class Verify
                 return unreferenced == 0
                     ? "vacuumed (0 unreferenced data files)"
                     : $"{PostconditionFailed}: NOT vacuumed ({unreferenced} unreferenced data files remain)";
+            }
+            case "AddConstraint":
+            {
+                // The constraint is in the table's metadata, under the name and expression it was added with.
+                string key = "delta.constraints." + Sql.ConstraintName;
+                return snapshot.Metadata.Configuration is { } configuration
+                    && configuration.TryGetValue(key, out string? expression)
+                    && expression == Sql.ConstraintExpression
+                    ? $"constraint {Sql.ConstraintName} added"
+                    : $"{PostconditionFailed}: NO constraint {key} = '{Sql.ConstraintExpression}' in the metadata";
+            }
+            case "Restore":
+            {
+                // The 100 small files the compaction removed are active again, and nothing else is.
+                int active = snapshot.FileCount;
+                return active == Fixtures.Commits
+                    ? $"restored ({active} active files)"
+                    : $"{PostconditionFailed}: NOT restored ({active} active files, expected {Fixtures.Commits})";
             }
             default:
                 return "";

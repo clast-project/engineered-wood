@@ -11,9 +11,9 @@ that nothing in the build or test gate needs. Build and run it directly.
 
 ```sh
 # 1. Check that both engines do the same work (row counts, and the table each mutation leaves behind,
-#    read back by EW, by delta-dotnet's kernel scan and by delta-rs's DataFusion scan; for maintenance, that
-#    the checkpoint was published, the file count fell, and no unreferenced data file remains). Builds the
-#    fixtures. Exits non-zero on any mismatch, or when the filter matches no class.
+#    read back by EW, by delta-dotnet's kernel scan and by delta-rs's DataFusion scan; for the operations that
+#    keep the rows, that the checkpoint was published, the file count fell, no unreferenced data file remains,
+#    the constraint is in the metadata, and the restore re-added the 100 small files). Builds the fixtures. Exits non-zero on any mismatch, or when the filter matches no class.
 dotnet run -c Release --project test/EngineeredWood.DeltaLake.DeltaDotnetBenchmarks -- --verify [ClassFilter]
 
 # 2. Benchmark (all, or e.g. --filter *FullScan*).
@@ -40,6 +40,10 @@ runs against both.
 | `WriteBenchmarks` | CreateAndWrite | create + write 1M rows in one commit |
 | `AppendBenchmarks` | Append10K | open a 100-commit table + append 10K rows |
 | `DmlBenchmarks` | Delete, Update | copy-on-write DELETE / UPDATE of 1 row in 16 on the one-commit 1M-row table |
+| `MergeBenchmarks` | Merge | upsert 10K rows on `id` into the one-commit 1M-row table: 5K matched (their `amount` doubled), 5K inserted |
+| `ReplaceWhereBenchmarks` | ReplaceWhere | replaceWhere on a non-partition column, the replacements with `amount` doubled: a 10K-row id range on the 20-file table (`Selective`), and one category in 16 on the one-commit 1M-row table (`OneCategory`). delta-dotnet: `InsertAsync` with `SaveMode.Overwrite` and a `Predicate` |
+| `ConstraintBenchmarks` | AddConstraint | `ADD CONSTRAINT … CHECK (amount >= 0)` on the one-commit 1M-row table; every row satisfies it, so both engines read the whole column |
+| `RestoreBenchmarks` | Restore | RESTORE the compacted 100-commit table to the version before its compaction: 100 small files re-added, the compacted ones removed |
 | `DeletionVectorDeleteBenchmarks` | DeleteDeletionVector | EW's own deletion-vector DELETE of the same rows, on an EW-written DV table; no writer parameter and no delta-dotnet counterpart |
 | `MaintenanceBenchmarks` | Checkpoint, Compact, Vacuum | on the 100-small-file table |
 
@@ -75,46 +79,61 @@ and never applies it. delta-rs's DataFusion path (`QueryAsync`) honours the same
 itself is fine. `--verify` reports this as a `WARN` on `EW_DeleteDeletionVector`. Filed upstream as
 [delta-dotnet#234](https://github.com/delta-incubator/delta-dotnet/issues/234).
 
-## Results, 2026-10-31
+## Results, 2026-11-01
 
-i9-12900K (16 cores / 24 threads), Windows 11, .NET 10.0.11, DeltaLake.Net 0.33.1. Mean times. The
+i9-12900K (16 cores / 24 threads), Windows 11, .NET 10.0.11, DeltaLake.Net 0.33.1, at e3092d09 (after #568). One
+full run of every class. Mean times; the ratio is delta-dotnet's mean over EW's. The
 **EW-written / DD-written** columns say which engine wrote the table being read or changed. A ratio above 1
 means EW is faster.
 
 | Operation | EW | delta-dotnet | DD/EW ratio (EW-written / DD-written) |
 |---|---|---|---|
-| Full scan, 1M rows | 17.9 / 22.9 ms | DataFusion 43.6 / 62.5 ms; kernel 94 / 115 ms | 2.44 / 2.73 (DataFusion); 5.3 / 5.0 (kernel) |
-| Filtered scan, 1 file of 20 (`Selective`) | 4.1 / 6.3 ms | 8.7 / 12.0 ms | 2.1 / 1.9 |
-| Filtered scan, 1 row in 16 (`OneCategory`) | 19.9 / 22.8 ms since #560 (before: 87 / 94 ms; prune only: 10 / 15 ms) | 17.9 / 26.9 ms | 0.90 / 1.18 |
-| Open latest, 100 commits, no checkpoint | 11.1 / 10.7 ms | 35.9 / 50.3 ms | 3.2 / 4.7 |
-| Open latest, 100 commits, checkpointed | 8.3 / 6.5 ms | 4.2 / 5.5 ms | **0.51 / 0.86** |
-| Open at version 50 | 12–17 ms | 29–33 ms | 1.7–2.8 |
-| History, no checkpoint / checkpointed | 18–20 / 14–16 ms | 36–39 / 13–16 ms | ~2 / ~1 |
-| Change data feed | 32 / 40 ms | 156 / 166 ms | 4.9 / 4.1 |
-| Create + write 1M rows | 182 ms (min 132, noisy) | 202 ms (default) / 177 ms (64K batches) | 1.11 / **0.97** |
-| Open + append 10K rows, no checkpoint / checkpointed | 28–34 / 18–23 ms | 56–63 / 25–27 ms | 1.9–2.0 / 1.2–1.4 |
-| DELETE 1 row in 16, copy-on-write (`DeleteAsync`, since #562) | 236 / 228 ms since #560 (before: 335 / 304; host-composed before #562: 357 / 346) | 297 / 308 ms | 1.26 / 1.35 |
-| DELETE 1 row in 16, EW deletion vector (EW-written DV table only) | 129 ms | none (delta-rs writes no DVs) | — |
-| UPDATE 1 row in 16 | 196 / 250 ms since #560 (before: 289 / 275, noisy) | 239 / 251 ms | 1.22 / 1.00 |
-| Checkpoint, 100 commits | 31 / 26 ms | 90 / 96 ms | 2.9 / 3.7 |
-| Compact 100 small files | 245 / 301 ms | 468 / 466 ms | 1.9 / 1.7 |
-| Vacuum 100 removed files | 54 / 48 ms | Full 128 / 114 ms; Lite 116 / 103 ms | 2.4 / 2.4 (Full) |
+| Full scan, 1M rows | 17.2 / 21.7 ms | DataFusion 42.9 / 64.1 ms; kernel 90 / 111 ms | 2.5 / 3.0 (DataFusion); 5.2 / 5.1 (kernel) |
+| Filtered scan, 1 file of 20 (`Selective`) | 4.7 / 5.0 ms | 9.9 / 11.9 ms | 2.1 / 2.4 |
+| Filtered scan, 1 row in 16 (`OneCategory`) | 23.4 / 27.6 ms (prune only: 13.4 / 18.2 ms) | 20.8 / 23.1 ms | **0.89 / 0.84** |
+| Open latest, 100 commits, no checkpoint | 18.2 / 17.8 ms | 43.7 / 62.4 ms | 2.4 / 3.5 |
+| Open latest, 100 commits, checkpointed | 8.6 / 6.9 ms | 5.4 / 7.7 ms | **0.63** / 1.11 |
+| Open at version 50, no checkpoint / checkpointed | 27–28 / 16–18 ms | 31–39 / 30–40 ms | 1.1–1.4 / 1.7–2.5 |
+| History, no checkpoint / checkpointed | 33 / 22–23 ms | 40–48 / 17 ms | 1.2–1.5 / **0.73–0.75** |
+| Change data feed | 32 / 47 ms | 159 / 182 ms | 4.9 / 3.9 |
+| Create + write 1M rows | 179 ms (min 133, noisy) | 202 ms (default) / 178 ms (64K batches) | 1.13 / **1.00** |
+| Open + append 10K rows, no checkpoint / checkpointed | 30–38 / 18–25 ms | 56–66 / 25–29 ms | 1.8 / 1.2–1.3 |
+| DELETE 1 row in 16, copy-on-write | 290 / 264 ms (min 205 / 213; host-composed: 245 / 248) | 300 / 328 ms | 1.03 / 1.24 |
+| DELETE 1 row in 16, EW deletion vector (EW-written DV table only) | 44 ms | none (delta-rs writes no DVs) | — |
+| UPDATE 1 row in 16 | 218 / 194 ms | 239 / 246 ms | 1.10 / 1.27 |
+| MERGE, upsert 10K rows (5K matched) | 225 / 232 ms | 2,466 / 2,484 ms | **11.0 / 10.7** |
+| replaceWhere, 10K-row id range (`Selective`) | 37.7 / 33.9 ms | 48.4 / 51.7 ms | 1.28 / 1.52 |
+| replaceWhere, 1 category in 16 (`OneCategory`) | 248 / 258 ms | 243 / 252 ms | **0.98 / 0.98** |
+| ADD CONSTRAINT `amount >= 0` over 1M rows | 17.2 / 16.9 ms | 50.3 / 64.0 ms | 2.9 / 3.8 |
+| RESTORE to before a compaction | 55 / 42 ms | 109 / 101 ms | 2.0 / 2.4 |
+| Checkpoint, 100 commits | 32 / 26 ms | 92 / 92 ms | 2.9 / 3.5 |
+| Compact 100 small files | 279 / 253 ms | 474 / 472 ms | 1.7 / 1.9 |
+| Vacuum 100 removed files | 60 / 48 ms | Full 128 / 112 ms; Lite 115 / 103 ms | 2.1 / 2.3 (Full) |
 
-The full-scan, write and DML rows come from a third run, after #559 made EW write the one-commit table as one
-file instead of 16. The filtered-scan and maintenance rows are from the second run, after review fixes:
-- EW's exact filter now gathers only the projected columns.
-- Evaluator masks are disposed.
-- The vacuum benchmark previously compared EW against a delta-rs no-op. delta-dotnet maps
-  `VacuumOptions.RetentionHours = 0` to "no override", so delta-rs kept its 7-day default and deleted nothing.
-  Both engines now vacuum a table whose own `delta.deletedFileRetentionDuration` is 0, and `--verify` checks
-  that no unreferenced data file remains.
+Compared with the 2026-10-31 run:
 
-Where delta-dotnet wins, the cause was found for one case and is suspected for the rest:
+- **New rows:** MERGE (#563), replaceWhere (#566), ADD CONSTRAINT (#565) and RESTORE (#567). EW's MERGE is about
+  11× faster than delta-rs's. The target is one file, so neither engine prunes anything, and the gap is in the
+  match itself. EW hashes the 10K source keys and probes them as it reads the target. delta-rs plans a DataFusion
+  join, which is suspected, not profiled, as the cost. The one-category replaceWhere is level:
+  like DELETE, it is one full-file rewrite either way.
+- **Commit metadata (#564/#577) and mergeSchema (#568) have no rows.** They add next to nothing to a commit or an
+  append, and appends are already measured.
+- **Log replay without a checkpoint is about 60% slower for EW in absolute terms than on 10-31** (open latest
+  11 to 18 ms, history 19 to 33 ms), and delta-dotnet is 20–25% slower. The code did not cause it. The same
+  benchmarks at efda508c (the 10-31 code) measure the same on the same fixtures, and the delta-dotnet-written
+  fixtures were not rebuilt. The machine did, so compare the ratios between runs, not the times.
+- **Single-shot mutations are noisy for EW.** Each iteration is one invocation, and EW's means carry GC pauses
+  (the managed heap) that delta-rs does not have. The min is printed where it differs much from the mean.
 
-- **Row-level predicate evaluation was EW's bottleneck, fixed by #560.** `ArrowRowEvaluator.EvaluatePredicate` for
-  `category = 'cat_03'` over 1M rows took 87 ms, about 100 ns/row, against about 25 ms to read the columns. A
-  column-against-constant comparison is now answered straight off the Arrow buffers: 2.4 ms. The same evaluator drives
-  EW's DELETE/UPDATE masks, and the filtered-scan, DELETE and UPDATE rows above were re-measured after it.
-- **Opening a checkpointed table:** delta-kernel-rs is up to 2× faster at reading a small checkpoint.
-- **Write:** EW is now ahead of delta-dotnet's default and level with its 64K-batch setting, but allocates about 322 MB of managed memory for 1M rows
+Where delta-dotnet wins or draws, the cause is known for some cases and suspected for the rest:
+
+- **Non-selective filtered scans.** Row-level predicate evaluation was EW's bottleneck until #560 (87 ms, about
+  100 ns/row, for `category = 'cat_03'` over 1M rows; now 2.4 ms). What remains is the scan itself: EW's prune-only
+  read is 13–18 ms, and DataFusion's parallel scan does the whole query in 21–23 ms.
+- **Opening a checkpointed table, and history on one:** delta-kernel-rs is up to 1.6× faster at reading a small
+  checkpoint.
+- **Full-file rewrites** (copy-on-write DELETE, UPDATE, one-category replaceWhere): close to level. Both engines
+  read and rewrite the one 1M-row file.
+- **Write:** level with delta-dotnet's 64K-batch setting, but EW allocates about 322 MB of managed memory for 1M rows
   (286 MB before #559: joining the batches into one row group costs a copy), and its mean carries GC noise.
