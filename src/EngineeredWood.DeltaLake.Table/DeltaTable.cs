@@ -7536,7 +7536,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 "CommitDataFilesAsync: table has identity columns or IcebergCompat — "
                 + "these require engineered-wood's own writer.");
 
-        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(CurrentSnapshot.Protocol);
+        // Against the protocol this commit PUBLISHES: a protocol upgrade fused in through extraActions that adds
+        // rowTracking obliges these adds to carry row ids, as Spark assigns them with the transaction's new protocol.
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(
+            extraActions?.OfType<ProtocolAction>().LastOrDefault() ?? CurrentSnapshot.Protocol);
 
         // Buffered-transaction commit: the caller's extraActions are snapshot-coupled (deletion-vector
         // ordinals/positions computed against expectedVersion), so a concurrent commit invalidates them —

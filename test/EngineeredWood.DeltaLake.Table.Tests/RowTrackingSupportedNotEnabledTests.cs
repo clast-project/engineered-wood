@@ -278,6 +278,34 @@ public class RowTrackingSupportedNotEnabledTests : IDisposable
         AssertRowIdsAssigned(table, version);
     }
 
+    /// <summary>A protocol upgrade fused into the same commit counts: the files it publishes alongside must carry
+    /// row ids, since the protocol they land under supports the feature.</summary>
+    [Fact]
+    public async Task CommitDataFiles_WithAFusedProtocolUpgrade_AssignsRowIds()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, Schema, new DeltaTableOptions { CheckpointInterval = 0 });
+        Assert.False(RowTrackingConfig.IsSupported(table.CurrentSnapshot.Protocol));
+
+        var files = await table.WriteDataFilesAsync([Rows(1, 2)]);
+        long version = await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, extraActions:
+        [
+            new ProtocolAction
+            {
+                MinReaderVersion = 1,
+                MinWriterVersion = 7,
+                WriterFeatures = ["domainMetadata", "rowTracking", "appendOnly", "invariants"],
+            },
+        ]);
+
+        Assert.True(RowTrackingConfig.IsSupported(table.CurrentSnapshot.Protocol));
+        var add = Assert.Single(AddsAt(table, version));
+        Assert.Equal(0, add.BaseRowId);
+        Assert.Equal(version, add.DefaultRowCommitVersion);
+        Assert.Equal(2, table.CurrentSnapshot.RowIdHighWaterMark);
+        Assert.Equal(1, RowTrackingConfig.TryReadHighWaterMark(table.CurrentSnapshot.DomainMetadata));
+    }
+
     [Fact]
     public async Task TransactionalOverwriteWhere_AssignsDisjointIdsToBothHalves()
     {
