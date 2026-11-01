@@ -3971,6 +3971,41 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     internal static void RefuseUnanalyzable(Expressions.Predicate predicate, Snapshot.Snapshot snapshot) =>
         RefuseUnanalyzable(predicate, () => EmptyBatch(snapshot.ArrowSchema));
 
+    private static readonly RecordBatch NoColumns = new(new Apache.Arrow.Schema.Builder().Build(), [], 0);
+
+    private static void RefuseUntypableLiterals(Expressions.Expression expression)
+    {
+        switch (expression)
+        {
+            case Expressions.LiteralExpression literal:
+                RowEvaluator.EvaluateExpression(literal, NoColumns);   // throws NotSupportedException
+                break;
+            case Expressions.AndPredicate and:
+                foreach (var child in and.Children) RefuseUntypableLiterals(child);
+                break;
+            case Expressions.OrPredicate or:
+                foreach (var child in or.Children) RefuseUntypableLiterals(child);
+                break;
+            case Expressions.NotPredicate not:
+                RefuseUntypableLiterals(not.Child);
+                break;
+            case Expressions.ComparisonPredicate cmp:
+                RefuseUntypableLiterals(cmp.Left);
+                RefuseUntypableLiterals(cmp.Right);
+                break;
+            case Expressions.UnaryPredicate unary:
+                RefuseUntypableLiterals(unary.Operand);
+                break;
+            case Expressions.SetPredicate set:
+                RefuseUntypableLiterals(set.Operand);
+                foreach (var value in set.Values) RefuseUntypableLiterals(value);
+                break;
+            case Expressions.FunctionCall call:
+                foreach (var argument in call.Arguments) RefuseUntypableLiterals(argument);
+                break;
+        }
+    }
+
     /// <summary>A batch of <paramref name="schema"/> with no rows.</summary>
     internal static RecordBatch EmptyBatch(Apache.Arrow.Schema schema) =>
         new(schema, schema.FieldsList.Select(f => ArrowCompute.MakeNullArray(f.DataType, 0)), 0);
@@ -3982,6 +4017,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     internal static void RefuseUnanalyzable(Expressions.Predicate predicate, Func<RecordBatch> noRows)
     {
+        // A literal the evaluator cannot type -- a Guid, a TimeOnly: Delta has no such type -- throws the moment
+        // any row reaches it, as NotSupportedException rather than an analysis refusal. Over no rows a refusal
+        // swallowed below could hide it, and the statistics never read it, so without this an empty table or a
+        // fully pruned one committed a no-op where every other table throws (#589). Typed by the evaluator
+        // itself, so the set of such kinds is its own.
+        RefuseUntypableLiterals(predicate);
+
         try
         {
             RowEvaluator.EvaluatePredicate(predicate, noRows()).Dispose();

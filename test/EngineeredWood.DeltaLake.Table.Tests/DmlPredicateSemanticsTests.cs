@@ -293,7 +293,40 @@ public class DmlPredicateSemanticsTests : IDisposable
         Assert.Equal(1, metrics.NumTargetRowsDeleted);
     }
 
+    /// <summary>
+    /// A Guid has no Delta or Spark type, so the evaluator cannot type the literal and throws. Two of them
+    /// compared folds to "no row matches" in the statistics, and an empty table hands the mask no row, so
+    /// both used to commit a no-op where a table with a readable file throws.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Delete_AGuidLiteral_ThrowsWhetherOrNotARowIsRead(bool empty)
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, true)).Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
+        if (!empty)
+            await table.WriteAsync([new RecordBatch(schema, [new Int64Array.Builder().Append(1).Build()], 1)]);
+        long before = table.CurrentSnapshot.Version;
+
+        await Assert.ThrowsAsync<NotSupportedException>(async () => await table.DeleteAsync(X.Equal(
+            X.Lit(LiteralValue.Of(Guid.Empty)), X.Lit(LiteralValue.Of(new Guid("00000000-0000-0000-0000-000000000001"))))));
+
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
 #if NET6_0_OR_GREATER
+    [Fact]
+    public async Task Update_ATimeOnlyLiteral_ThrowsOnAnEmptyTable()
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, true)).Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
+
+        await Assert.ThrowsAsync<NotSupportedException>(async () => await table.UpdateAsync(
+            X.Equal(X.Lit(LiteralValue.Of(new TimeOnly(1, 0))), X.Lit(LiteralValue.Of(new TimeOnly(2, 0)))),
+            batch => batch));
+    }
+
     [Fact]
     public async Task Delete_TypedDateOnlyLiteral_StillMatches()
     {
