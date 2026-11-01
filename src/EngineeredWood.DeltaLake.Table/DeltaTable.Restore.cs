@@ -175,6 +175,14 @@ public sealed partial class DeltaTable
         // a restore must not re-enable UniForm, whose metadata this library does not maintain.
         EnsureUniversalFormatMaintained(metadata.Configuration, _options);
 
+        // Spark records the one it was given and a null for the other; a null has no place in these string
+        // parameters, so the other is left out.
+        var parameters = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (timestampText is null)
+            parameters["version"] = Invariant(version);
+        else
+            parameters["timestamp"] = timestampText;
+
         var actions = new List<DeltaAction>(toAdd.Count + toRemove.Count + 5);
         if (InCommitTimestamp.IsEnabled(metadata.Configuration)
             && !InCommitTimestamp.IsEnabled(current.Metadata.Configuration))
@@ -192,6 +200,9 @@ public sealed partial class DeltaTable
                 new Dictionary<string, System.Text.Json.JsonElement>(StringComparer.Ordinal)
                 {
                     ["isBlindAppend"] = System.Text.Json.JsonDocument.Parse("false").RootElement.Clone(),
+                    // Here, not through the committer: it adds parameters only to a commitInfo that has none, and
+                    // this one is born with an empty object.
+                    ["operationParameters"] = StringMapJson(parameters),
                 },
                 includeInCommitTimestamp: true));
         }
@@ -245,14 +256,6 @@ public sealed partial class DeltaTable
             ["numOfFilesAfterRestore"] = Invariant(result.NumOfFilesAfterRestore),
             ["tableSizeAfterRestore"] = Invariant(result.TableSizeAfterRestore),
         };
-        // Spark records the one it was given and a null for the other; a null has no place in these string
-        // parameters, so the other is left out.
-        var parameters = new Dictionary<string, string>(StringComparer.Ordinal);
-        if (timestampText is null)
-            parameters["version"] = Invariant(version);
-        else
-            parameters["timestamp"] = timestampText;
-
         // Not rebase-safe, whatever landed: the actions are a diff against `current`, so moving them past any
         // commit that touched files would leave the table at neither version. Spark makes one attempt for the
         // same reason (commitLarge). The whole-table read set makes a concurrent data change report as the
@@ -449,4 +452,18 @@ public sealed partial class DeltaTable
             .ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture);
 
     private static string Invariant(long value) => value.ToString(CultureInfo.InvariantCulture);
+
+    private static System.Text.Json.JsonElement StringMapJson(IReadOnlyDictionary<string, string> map)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            foreach (var pair in map)
+                writer.WriteString(pair.Key, pair.Value);
+            writer.WriteEndObject();
+        }
+        using var document = System.Text.Json.JsonDocument.Parse(stream.ToArray());
+        return document.RootElement.Clone();
+    }
 }

@@ -625,6 +625,8 @@ public class RestoreTests : IDisposable
         long inCommit = commitInfo.GetProperty("inCommitTimestamp").GetInt64();
         Assert.Equal("RESTORE", commitInfo.GetProperty("operation").GetString());
         Assert.True(commitInfo.TryGetProperty("operationMetrics", out _));
+        Assert.Equal("0", commitInfo.GetProperty("operationParameters").GetProperty("version").GetString());
+        Assert.False(commitInfo.GetProperty("isBlindAppend").GetBoolean());
         var configuration = Of(actions, "metaData").Single().GetProperty("configuration");
         Assert.Equal(result.Version.ToString(), configuration.GetProperty("delta.inCommitTimestampEnablementVersion").GetString());
         Assert.Equal(inCommit.ToString(), configuration.GetProperty("delta.inCommitTimestampEnablementTimestamp").GetString());
