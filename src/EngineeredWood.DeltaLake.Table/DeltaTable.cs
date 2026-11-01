@@ -1,4 +1,4 @@
-// Copyright (c) clast-project. All rights reserved.
+﻿// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Runtime.CompilerServices;
@@ -21,7 +21,7 @@ namespace EngineeredWood.DeltaLake.Table;
 /// Supports reading and writing Arrow <see cref="RecordBatch"/> data,
 /// time travel, compaction, and vacuum.
 /// </summary>
-public sealed class DeltaTable : IAsyncDisposable, IDisposable
+public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 {
     private readonly ITableFileSystem _fs;
     private readonly DeltaTableOptions _options;
@@ -4692,16 +4692,7 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
                     // a NULL the table declares impossible refused. The partition columns in their canonical
                     // Arrow forms first, as on the write path: the rule reads only those (a StringView's empty
                     // string went through unrefused).
-                    updatedBatch = WriteTypeNormalization.NormalizeColumns(
-                        updatedBatch, snapshot.Metadata.PartitionColumns);
-                    updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
-                        updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: false);
-                    updatedBatch = generatedColumns?.Recompute(updatedBatch) ?? updatedBatch;
-                    updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
-                        updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: true,
-                        generatedColumns?.ColumnNames);
-                    constraints?.Validate(updatedBatch);
-                    DeltaNotNullEnforcer.Validate(updatedBatch, snapshot.Schema);
+                    updatedBatch = PreparePostImage(updatedBatch, snapshot, generatedColumns, constraints);
 
                     // Matched rows keep their id; their commit version advances to this commit (they changed).
                     router.Add(updatedBatch, batchIds is not null
@@ -4781,6 +4772,28 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
 
         return new UpdateActions(actions, removedPaths, totalUpdated, nextRowId);
+    }
+
+    /// <summary>
+    /// Readies the rows an UPDATE (or a MERGE's matched update) changed for the table, as the write path readies
+    /// an append's: the partition columns in their canonical Arrow forms and their values as stored, generated
+    /// columns recomputed, then a NULL the table declares impossible, a CHECK constraint and NOT NULL refused.
+    /// </summary>
+    private static RecordBatch PreparePostImage(
+        RecordBatch updatedBatch, Snapshot.Snapshot snapshot,
+        DeltaGeneratedColumns? generatedColumns, DeltaConstraintEnforcer? constraints)
+    {
+        updatedBatch = WriteTypeNormalization.NormalizeColumns(
+            updatedBatch, snapshot.Metadata.PartitionColumns);
+        updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
+            updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: false);
+        updatedBatch = generatedColumns?.Recompute(updatedBatch) ?? updatedBatch;
+        updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
+            updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: true,
+            generatedColumns?.ColumnNames);
+        constraints?.Validate(updatedBatch);
+        DeltaNotNullEnforcer.Validate(updatedBatch, snapshot.Schema);
+        return updatedBatch;
     }
 
     // Reorders/subsets a resolved row-id (or commit-version) array to match a rewritten batch's row order.
@@ -7659,9 +7672,8 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// identity UPDATE over data another engine wrote.
     /// </summary>
     private void ThrowIfUpdaterChangedTypes(
-        RecordBatch input, RecordBatch output, Schema.StructType schema)
+        RecordBatch input, RecordBatch output, Schema.StructType schema, string entryPoint = "UPDATE")
     {
-        const string entryPoint = "UPDATE";
         ThrowIfUndeclaredColumns([output], schema, entryPoint);
 
         var changedFields = new List<Field>();

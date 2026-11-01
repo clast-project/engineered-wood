@@ -499,6 +499,60 @@ public sealed class DeltaTransaction : IAsyncDisposable
         return plan.TotalUpdated;
     }
 
+    /// <summary>
+    /// Stages a key-based MERGE of <paramref name="source"/>, evaluated against this transaction's pinned read
+    /// version: see <see cref="DeltaTable.MergeAsync"/> and <see cref="MergeOptions"/>. Each file holding a row it
+    /// updates or deletes is rewritten now, once, with all of that file's changes, and the unmatched source rows
+    /// are written as an append; <see cref="AbortAsync"/> deletes them again if the transaction never commits.
+    ///
+    /// <para>What it read becomes the transaction's read set: every file it read, and the source's key range as a
+    /// read predicate, so a concurrent commit that removed a file it read, or added one that could hold a source
+    /// key, is a conflict (precise to the isolation level). With a not-matched-by-source clause it read the whole
+    /// table. Like any staged operation it refuses to touch a file an earlier one on this transaction already
+    /// rewrote.</para>
+    /// </summary>
+    /// <returns>What the MERGE did, as Spark's MERGE metrics name it.</returns>
+    public async ValueTask<MergeMetrics> MergeAsync(
+        IReadOnlyList<RecordBatch> source, MergeOptions options, CancellationToken cancellationToken = default)
+    {
+        EnsureOpen();
+
+        // The rewrite re-validates the post-image and the insert goes through the append path, so a
+        // constrained table is writable here.
+        _table.ValidateWritable(
+            _baseSnapshot, isAppend: false,
+            handling: WriteTimeExpressionHandling.ValidatedHere);
+
+        int mark = _written.Paths.Count;
+        var plan = await TakingBackOnFailureAsync(mark, () => _table.ComputeMergeActionsAsync(
+            _baseSnapshot, source, options, cancellationToken, rowIdStart: _nextRowId, written: _written),
+            cancellationToken).ConfigureAwait(false);
+        await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "MERGE", cancellationToken)
+            .ConfigureAwait(false);
+
+        if (plan.NextRowId is long nextRowId)
+            _nextRowId = nextRowId;
+        StageInternal(plan.RewriteActions);
+        StageInternal(plan.InsertActions);
+        RecordUncoveredAppends(plan.InsertActions);
+        foreach (string path in plan.RemovedPaths)
+            _removedPaths.Add(path);
+        foreach (string path in plan.ReadPaths)
+        {
+            if (!plan.RemovedPaths.Contains(path))
+                _declaredReadPaths.Add(path);
+        }
+        if (plan.ReadsWholeTable)
+            _declaredWholeTableRead = true;
+        else if (plan.ReadPredicate is { } readPredicate)
+            _readPredicates.Add(readPredicate);
+        else if (plan.ScannedTarget)
+            _opaqueReadPredicate = true;
+        _operations.Add("MERGE");
+
+        return plan.Metrics;
+    }
+
     // ── Host-staged work ───────────────────────────────────────────────────────────────────────────────
     //
     // The methods above compute their own data: they are the shape for a caller that hands engineered-wood

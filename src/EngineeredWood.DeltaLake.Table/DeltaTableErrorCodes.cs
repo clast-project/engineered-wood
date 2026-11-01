@@ -283,6 +283,16 @@ public static class DeltaTableErrorCodes
     /// </remarks>
     public const string StaleTransactionSnapshot = "DELTA_STALE_TRANSACTION_SNAPSHOT";
 
+    // ── MERGE ──
+
+    /// <summary>
+    /// A MERGE matched one target row with more than one source row, and more than one of them would act on it, so
+    /// which action applies is undefined. Nothing is committed.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE</c>. As there, an unconditional
+    /// matched DELETE is exempt: every candidate deletes the same row.</remarks>
+    public const string MultipleSourceRowsMatchingTargetRow = "DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE";
+
     // ── UniForm ──
 
     /// <summary>

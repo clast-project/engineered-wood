@@ -40,6 +40,19 @@ internal static class Data
         return batches;
     }
 
+    /// <summary><paramref name="batch"/> with every <c>amount</c> doubled: a MERGE source whose matched rows visibly
+    /// change the table.</summary>
+    public static RecordBatch DoubleAmount(RecordBatch batch)
+    {
+        int column = batch.Schema.GetFieldIndex("amount");
+        var amounts = (DoubleArray)batch.Column(column);
+        var doubled = new DoubleArray.Builder().Reserve(batch.Length);
+        for (int i = 0; i < batch.Length; i++)
+            doubled.Append(amounts.GetValue(i)!.Value * 2);
+        var columns = Enumerable.Range(0, batch.ColumnCount).Select(c => c == column ? doubled.Build() : batch.Column(c));
+        return new RecordBatch(batch.Schema, columns.ToList(), batch.Length);
+    }
+
     private static RecordBatch Batch(long firstId, int length)
     {
         var id = new Int64Array.Builder().Reserve(length);
