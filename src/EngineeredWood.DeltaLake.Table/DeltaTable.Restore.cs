@@ -212,7 +212,7 @@ public sealed partial class DeltaTable
         if (!ProtocolEquals(protocol, current.Protocol))
             actions.Add(protocol);
 
-        bool assignRowIds = protocol.WriterFeatures?.Contains("rowTracking") == true;
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(protocol);
         long nextRowId = current.RowIdHighWaterMark;
         foreach (var add in toAdd)
         {
