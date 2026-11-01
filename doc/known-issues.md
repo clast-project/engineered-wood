@@ -275,29 +275,36 @@ since it never populates `TimestampStatistics.MinimumUtc` / `MaximumUtc`
 
 ### Correctness / interop issues
 
-**Timestamps use the Unix epoch instead of the ORC 2015-01-01 epoch.**
-The ORC spec requires timestamp seconds to be stored as the offset from
-`2015-01-01T00:00:00 UTC`. `TimestampColumnWriter` in
-`src/EngineeredWood.Orc/ColumnWriters/TimestampColumnWriter.cs` writes
-raw Unix epoch seconds, and `TimestampColumnReader` reads them back
-as-is. Files round-trip with ourselves but are off by 1,420,070,400
-seconds (≈45 years) relative to any conformant reader. The same class
-also never populates the post-ORC-135 `TimestampStatistics.MinimumUtc` /
-`MaximumUtc` fields, emitting only the legacy `Minimum`/`Maximum`.
+**Timestamps use the Unix epoch instead of the ORC 2015-01-01 epoch, in
+both directions.** The ORC spec requires timestamp seconds to be stored as
+the offset from `2015-01-01T00:00:00 UTC`. `TimestampColumnWriter` writes
+raw Unix epoch seconds and `TimestampColumnReader` reads them back as-is,
+so files round-trip with ourselves and are off by 1,420,070,400 seconds
+(≈45 years) against everything else. That includes reading: EW reads
+`orc-file-11-format.orc`'s `ts` (Apache ORC's fixture) as 1955-03-13 where
+pyarrow reads 2000-03-12, so every timestamp in an ORC file from another
+writer comes back 45 years early. The writer also never populates the
+post-ORC-135 `TimestampStatistics.MinimumUtc` / `MaximumUtc` fields.
+[#584](https://github.com/clast-project/engineered-wood/issues/584).
 
-**Decimal columns are effectively Decimal64.**
-`DecimalColumnWriter.ReadDecimal128AsLong` reads only the low 8 bytes of
-each Arrow Decimal128 value. `DecimalColumnReader` decodes the varint
-into a `long`. Values whose magnitude exceeds 63 bits are silently
-corrupted in both directions. Precision > 18 is not round-trip safe.
-Decimal min/max statistics share the same truncation.
+**Decimals read wrong from other writers' files, and are effectively
+Decimal64.** ORC stores each value's scale in the SECONDARY stream, and
+`DecimalColumnReader` ignores it for precision ≤ 18 (rescaling only above
+that, in a `long`). All three decimal fixtures from Apache ORC read wrong:
+`over1k_bloom.orc` gives 4.54 where pyarrow gives 45.40, `decimal.orc`
+-0.10005 for -1000.50000, and `orc-file-11-format.orc` 12345678 for
+12345678.654745. Separately, `DecimalColumnWriter.ReadDecimal128AsLong`
+reads only the low 8 bytes of each Arrow Decimal128 value, so values beyond
+63 bits are silently corrupted in both directions, statistics included.
+[#583](https://github.com/clast-project/engineered-wood/issues/583).
 
 **Sliced / gap-containing ListArrays are written wrong.**
 `ListColumnWriter.Write` emits `listArray.Values` wholesale without
 slicing or respecting the offsets buffer. When the input list array is
 sliced or contains nulls that leave gaps in the offsets, the written
 child data includes elements that don't belong, corrupting the list
-count.
+count. `MapColumnWriter` likely shares it.
+[#585](https://github.com/clast-project/engineered-wood/issues/585).
 
 **Bloom filter v1 with `Bitset.Count == 1`.** The v1 BloomFilter reader
 path accepts a bitset only when `Utf8Bitset` is present or
@@ -1055,7 +1062,11 @@ the Avro codec):
 Manifests EngineeredWood writes are not consumable by other Iceberg
 tools (the schema is truncated and does not match the declared V2
 schema), and manifests written by other tools lose bounds and partition
-tuples when decoded here.
+tuples when decoded here. Because a commit rewrites existing manifests
+through the same codec (`TableOperations`), committing to a table another
+engine wrote also drops its delete files' `equality_ids` and
+`referenced_data_file`, which can change what a later reader treats as
+deleted. [#586](https://github.com/clast-project/engineered-wood/issues/586).
 
 **Manifest-list partition summaries written null.** `ManifestIO`
 encodes manifest-list `partitions` as null, so manifest-list-level
