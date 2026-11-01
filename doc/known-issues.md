@@ -1095,6 +1095,19 @@ TRUE`. All three refuse the commit on a violation, on an expression that
 cannot be parsed, or on one that cannot be evaluated. Phase 10 /
 [#102](https://github.com/clast-project/engineered-wood/issues/102).
 
+**CHECK constraints can be added and dropped.** `AddConstraintAsync` reads
+the table and refuses the constraint if any live row violates it (NULL
+counts as a violation, as in Spark), then declares `checkConstraints`
+(writer version 3 on a legacy protocol, the named feature on a
+table-features one). `DropConstraintAsync` removes it and leaves the
+feature. Both follow Spark 4.0 / Delta 4.0.0's names, protocol and history
+parameters ([#565](https://github.com/clast-project/engineered-wood/issues/565)).
+A constraint passed in `configuration` at creation now declares the
+feature too. Generated columns given at creation still do not declare
+`generatedColumns`, so Spark, which enforces them only when the protocol
+declares the feature, will not compute or check them on such a table
+([#582](https://github.com/clast-project/engineered-wood/issues/582)).
+
 **Constraint enforcement is per write path, not global.** Only paths
 that hand us the batches evaluate anything: `WriteAsync`, the
 transactional append, and create-with-data. `StageDataFiles`,

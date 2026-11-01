@@ -141,6 +141,9 @@ public static class InCommitTimestamp
     /// pass <c>false</c> — see <see cref="LogCommitRequest.IsBlindAppend"/>.</param>
     /// <param name="commitProperties">The caller's own commitInfo keys. Added to a commitInfo the actions
     /// already carry, too, since that is the commitInfo this commit will record.</param>
+    /// <param name="operationParameters">Written as <c>commitInfo.operationParameters</c>, a map of strings as
+    /// Spark writes it. Null writes the empty object every commit carries. A commitInfo the actions already carry
+    /// keeps its own.</param>
     /// <param name="operationMetrics">Written as <c>commitInfo.operationMetrics</c>, a map of strings as Spark
     /// writes it. A commitInfo the actions already carry keeps its own if it has one.</param>
     /// <exception cref="ArgumentException"><paramref name="commitProperties"/> names a key the commitInfo
@@ -151,21 +154,24 @@ public static class InCommitTimestamp
         string operation = "WRITE",
         bool? isBlindAppend = null,
         CommitProperties? commitProperties = null,
-        IReadOnlyDictionary<string, string>? operationMetrics = null)
+        IReadOnlyDictionary<string, string>? operationMetrics = null,
+        IReadOnlyDictionary<string, string>? operationParameters = null)
     {
         // Already has a commitInfo (any kind): leave it, apart from adding the caller's properties to it.
         for (int i = 0; i < actions.Count; i++)
         {
             if (actions[i] is not CommitInfo existing)
                 continue;
-            if (commitProperties is null && operationMetrics is null)
+            if (commitProperties is null && operationMetrics is null && operationParameters is null)
                 return actions;
 
             var values = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
             foreach (var kvp in existing.Values)
                 values[kvp.Key] = kvp.Value;
             if (operationMetrics is not null && !values.ContainsKey("operationMetrics"))
-                values["operationMetrics"] = MetricsJson(operationMetrics);
+                values["operationMetrics"] = StringMapJson(operationMetrics);
+            if (operationParameters is not null && !values.ContainsKey("operationParameters"))
+                values["operationParameters"] = StringMapJson(operationParameters);
             commitProperties?.ApplyTo(values);
             var replaced = new List<DeltaAction>(actions);
             replaced[i] = existing with { Values = values };
@@ -183,7 +189,12 @@ public static class InCommitTimestamp
         if (operationMetrics is not null)
         {
             extra ??= new Dictionary<string, JsonElement>(StringComparer.Ordinal);
-            extra["operationMetrics"] = MetricsJson(operationMetrics);
+            extra["operationMetrics"] = StringMapJson(operationMetrics);
+        }
+        if (operationParameters is not null)
+        {
+            extra ??= new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+            extra["operationParameters"] = StringMapJson(operationParameters);
         }
 
         var result = new List<DeltaAction>(actions.Count + 1);
@@ -195,8 +206,9 @@ public static class InCommitTimestamp
         return result;
     }
 
-    // A JSON object of string values, which is how Spark writes operationMetrics (a Map[String, String]).
-    private static JsonElement MetricsJson(IReadOnlyDictionary<string, string> metrics)
+    // A JSON object of string values, which is how Spark writes operationMetrics and operationParameters (each a
+    // Map[String, String]).
+    private static JsonElement StringMapJson(IReadOnlyDictionary<string, string> metrics)
     {
         using var stream = new MemoryStream();
         using (var writer = new Utf8JsonWriter(stream))

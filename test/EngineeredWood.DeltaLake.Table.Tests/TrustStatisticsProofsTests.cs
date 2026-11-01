@@ -11,7 +11,7 @@ using Ex = EngineeredWood.Expressions.Expressions;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// <see cref="DeltaTableOptions.DeleteTrustsStatistics"/>: a predicate DELETE removes a file unread when its
+/// <see cref="DeltaTableOptions.TrustStatisticsProofs"/>: a predicate DELETE removes a file unread when its
 /// statistics prove every row matches (#506, stage 2). The table is four files of ten rows:
 /// <list type="bullet">
 /// <item>F0: <c>id</c> 0..9, <c>v</c> = <c>id</c>, <c>name</c> <c>ab0</c>..</item>
@@ -23,11 +23,11 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// the point: a NULL row answers NULL, which deletes nothing, and the statistics evaluator, built for skipping,
 /// does not keep that apart from FALSE.
 /// </summary>
-public class DeleteTrustsStatisticsTests : IDisposable
+public class TrustStatisticsProofsTests : IDisposable
 {
     private readonly string _tempDir;
 
-    public DeleteTrustsStatisticsTests()
+    public TrustStatisticsProofsTests()
     {
         _tempDir = Path.Combine(Path.GetTempPath(), $"delta_deltrust_{Guid.NewGuid():N}");
         Directory.CreateDirectory(_tempDir);
@@ -59,7 +59,7 @@ public class DeleteTrustsStatisticsTests : IDisposable
             ? new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" }
             : null;
         var table = await DeltaTable.CreateAsync(
-            fs, TableSchema, new DeltaTableOptions { DeleteTrustsStatistics = shape.Trust },
+            fs, TableSchema, new DeltaTableOptions { TrustStatisticsProofs = shape.Trust },
             enableDeletionVectors: shape.Dv, configuration: configuration);
 
         // Label -> path, recorded as each file lands; the label is what the assertions name.
@@ -146,7 +146,7 @@ public class DeleteTrustsStatisticsTests : IDisposable
     [Fact]
     public async Task Default_ReadsEveryCandidate()
     {
-        Assert.False(new DeltaTableOptions().DeleteTrustsStatistics);
+        Assert.False(new DeltaTableOptions().TrustStatisticsProofs);
         var outcome = await DeleteAsync(new Shape(Trust: false), Ex.GreaterThanOrEqual("id", 100L));
 
         Assert.Equal(["F1", "F2", "F3"], outcome.Opened);
@@ -273,7 +273,7 @@ public class DeleteTrustsStatisticsTests : IDisposable
             .Build();
         await using var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(Path.Combine(_tempDir, "struct")), schema,
-            new DeltaTableOptions { DeleteTrustsStatistics = true }, enableDeletionVectors: true);
+            new DeltaTableOptions { TrustStatisticsProofs = true }, enableDeletionVectors: true);
         var s = new StructArray(inner, 2, [new Int64Array.Builder().Append(1).Append(2).Build()], ArrowBuffer.Empty, 0);
         await table.WriteAsync([new RecordBatch(schema, [new Int64Array.Builder().Append(1).Append(2).Build(), s], 2)]);
         long version = table.CurrentSnapshot.Version;
@@ -379,7 +379,7 @@ public class DeleteTrustsStatisticsTests : IDisposable
         {
             var fs = new DataFileCountingFileSystem(new LocalTableFileSystem(Path.Combine(_tempDir, name)));
             var table = await DeltaTable.CreateAsync(
-                fs, schema, new DeltaTableOptions { DeleteTrustsStatistics = true }, partitionColumns: ["part"],
+                fs, schema, new DeltaTableOptions { TrustStatisticsProofs = true }, partitionColumns: ["part"],
                 enableDeletionVectors: true);
             foreach (var (part, start) in new (string?, int)[] { ("a", 0), ("a", 100), ("b", 100), (null, 100) })
             {

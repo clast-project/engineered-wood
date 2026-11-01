@@ -312,6 +312,42 @@ internal static class SchemaChangeDependents
 
     private static string Text(IReadOnlyList<string> reference) => string.Join(".", reference);
 
+    /// <summary>
+    /// The first column path <paramref name="sql"/> reads that <paramref name="schema"/> does not have, as dotted
+    /// text, or null when every one resolves. Parts match case-insensitively, as Spark resolves them.
+    /// </summary>
+    /// <exception cref="DeltaFormatException">The expression does not parse.</exception>
+    internal static string? FirstUnresolvedReference(StructType schema, string description, string sql)
+        => FirstUnresolved(schema, References(description, sql));
+
+    /// <summary>
+    /// The top-level columns <paramref name="sql"/> reads, by their names in <paramref name="schema"/>, each
+    /// once. A reference into a struct reads the struct's column. Every reference must resolve: see
+    /// <see cref="FirstUnresolvedReference"/>.
+    /// </summary>
+    internal static IReadOnlyList<string> ReferencedTopLevelColumns(StructType schema, string description, string sql)
+    {
+        var names = new List<string>();
+        foreach (var reference in References(description, sql))
+        {
+            var field = schema.Fields.First(
+                f => string.Equals(f.Name, reference[0], StringComparison.OrdinalIgnoreCase));
+            if (!names.Contains(field.Name))
+                names.Add(field.Name);
+        }
+        return names;
+    }
+
+    private static string? FirstUnresolved(StructType schema, List<IReadOnlyList<string>> references)
+    {
+        foreach (var reference in references)
+        {
+            if (!Resolves(schema, reference))
+                return Text(reference);
+        }
+        return null;
+    }
+
     /// <summary>The column paths an expression reads.</summary>
     /// <exception cref="DeltaFormatException">
     /// The expression does not parse. Not knowing what it reads, the change is refused: the
