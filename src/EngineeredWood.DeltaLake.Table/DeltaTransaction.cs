@@ -276,6 +276,35 @@ public sealed class DeltaTransaction : IAsyncDisposable
     // one that read nothing because no source key could match (all NULL), and so recorded no read set.
     private bool _mergeStaged;
 
+    // The row counts of the staged DML, summed across staging calls, for the commit's operationMetrics.
+    private long _deletedRows;
+    private long _updatedRows;
+    private MergeMetrics? _mergeMetrics;
+
+    /// <summary>
+    /// The <c>commitInfo.operationMetrics</c> the commit records, computed from the actions an attempt writes:
+    /// Spark's metrics for a DELETE, UPDATE or MERGE. Only for a transaction whose staged work is that one kind
+    /// of operation, and whose recorded operation is that kind. Spark records one operation per commit, and the
+    /// metrics of a DELETE and an append together would describe neither. Several staging calls of the one kind
+    /// sum: no file is staged twice in a transaction, so their file counts cannot overlap.
+    /// </summary>
+    internal IReadOnlyDictionary<string, string>? OperationMetricsFor(IReadOnlyList<DeltaAction> actions)
+    {
+        if (_operations.Count != 1)
+            return null;
+        string kind = _operations.First();
+        if (EffectiveOperation != kind)
+            return null;
+
+        return kind switch
+        {
+            "DELETE" => DmlOperationMetrics.ForDelete(actions, _deletedRows),
+            "UPDATE" => DmlOperationMetrics.ForUpdate(actions, _updatedRows),
+            "MERGE" when _mergeMetrics is { } merge => DmlOperationMetrics.ForMerge(actions, merge),
+            _ => null,
+        };
+    }
+
     /// <summary>The app-transaction preconditions to re-check on every commit attempt.</summary>
     internal IReadOnlyList<AppTransactionRequirement> AppTransactions => _appTransactions;
 
@@ -435,6 +464,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         else
             _opaqueReadPredicate = true;
         _operations.Add("DELETE");
+        _deletedRows += plan.TotalDeleted;
 
         return plan.TotalDeleted;
     }
@@ -477,6 +507,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _removedPaths.Add(path);
         _opaqueReadPredicate = true;
         _operations.Add("UPDATE");
+        _updatedRows += plan.TotalUpdated;
 
         return plan.TotalUpdated;
     }
@@ -514,6 +545,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _removedPaths.Add(path);
         _readPredicates.Add(predicate);
         _operations.Add("UPDATE");
+        _updatedRows += plan.TotalUpdated;
 
         return plan.TotalUpdated;
     }
@@ -572,6 +604,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _opaqueReadPredicate = true;
         _operations.Add("MERGE");
         _mergeStaged = true;
+        _mergeMetrics = _mergeMetrics is { } earlier ? DmlOperationMetrics.Sum(earlier, plan.Metrics) : plan.Metrics;
 
         return plan.Metrics;
     }
@@ -781,6 +814,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         foreach (string path in result.TouchedPaths)
             _removedPaths.Add(path);
         _operations.Add("DELETE");
+        _deletedRows += result.RowsDeleted;
         return result.RowsDeleted;
     }
 
@@ -808,6 +842,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
         _operations.Add("DELETE");
+        _deletedRows += plan.RowsDeleted;
         return plan.RowsDeleted;
     }
 
