@@ -28,9 +28,30 @@ public static class RowTrackingConfig
     /// <see cref="RowIdColumnName"/> and emitted alongside it on the same terms.</summary>
     public const string RowCommitVersionColumnName = "_metadata.row_commit_version";
 
+    /// <summary>The row-tracking writer table feature's name (spec).</summary>
+    public const string FeatureName = "rowTracking";
+
+    /// <summary>
+    /// Returns true if the table's protocol SUPPORTS row tracking (the <c>rowTracking</c> writer feature),
+    /// whether or not <see cref="EnableKey"/> turns it on.
+    /// </summary>
+    /// <remarks>
+    /// This is the gate for ASSIGNING row ids: a writer gives every new file a <c>baseRowId</c> and
+    /// <c>defaultRowCommitVersion</c> and advances the <c>delta.rowTracking</c> high-water mark whenever the
+    /// feature is supported (delta-spark's <c>RowId.assignFreshRowIds</c> checks <c>RowTracking.isSupported</c>).
+    /// A table can be in that state without the property: a RESTORE to a version from before enablement, a
+    /// table declared with <c>delta.feature.rowTracking = supported</c>, or the property turned off.
+    /// <para>PRESERVING ids through a rewrite (the materialized columns) and READING them stay gated on
+    /// <see cref="IsEnabled"/>, as in delta-spark (<c>preserveRowIds</c>, <c>getMaterializedColumnName</c>).</para>
+    /// </remarks>
+    public static bool IsSupported(Actions.ProtocolAction? protocol) =>
+        protocol?.WriterFeatures is { } features && features.Contains(FeatureName);
+
     /// <summary>
     /// Returns true if row tracking is enabled for the table.
     /// </summary>
+    /// <remarks>Gates reading row ids and preserving them through a rewrite. Assigning them is gated on
+    /// <see cref="IsSupported"/>.</remarks>
     public static bool IsEnabled(IReadOnlyDictionary<string, string>? configuration) =>
         configuration is not null &&
         configuration.TryGetValue(EnableKey, out string? value) &&

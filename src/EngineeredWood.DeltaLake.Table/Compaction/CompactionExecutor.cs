@@ -18,11 +18,11 @@ namespace EngineeredWood.DeltaLake.Table.Compaction;
 /// <param name="Actions">The removes of every rewritten file and the adds of what replaced them, with
 /// the row-tracking high-water-mark advance when the table tracks rows. No <c>commitInfo</c> — the
 /// committer writes that.</param>
-/// <param name="RowTrackingEnabled">Whether the adds carry a <c>baseRowId</c> that a rebase has to
+/// <param name="AssignsRowIds">Whether the adds carry a <c>baseRowId</c> that a rebase has to
 /// re-derive against the version it lands on.</param>
 internal readonly record struct CompactionPlan(
     IReadOnlyList<DeltaAction> Actions,
-    bool RowTrackingEnabled);
+    bool AssignsRowIds);
 
 /// <summary>
 /// Executes file compaction: reads small files and rewrites them as larger files, returning the
@@ -121,9 +121,9 @@ internal static class CompactionExecutor
         var dvReader = new DeletionVectors.DeletionVectorReader(fs);
         var actions = new List<DeltaAction>();
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        bool rowTrackingEnabled = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-            snapshot.Metadata.Configuration);
-        long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+        bool assignRowIds = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
+        bool rowTrackingEnabled = EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
+        long nextRowId = assignRowIds ? snapshot.RowIdHighWaterMark : 0;
 
         // Row tracking through compaction: rows from several source files mix into one compacted file, so the
         // compacted add's single baseRowId / defaultRowCommitVersion cannot represent them all. Materialize each
@@ -138,7 +138,7 @@ internal static class CompactionExecutor
         {
             (bool compacted, nextRowId) = await CompactGroupAsync(
                 fs, snapshot, options, parquetOptions, parquetReadOptions, group, targetSchema, mappingMode,
-                dvReader, actions, now, rowTrackingEnabled, nextRowId, materialize, matRowIdName, matRowVerName,
+                dvReader, actions, now, assignRowIds, nextRowId, materialize, matRowIdName, matRowVerName,
                 dataFileWriter, dataFileReader, cancellationToken, written, statsSelection).ConfigureAwait(false);
             anyAdds |= compacted;
         }
@@ -148,13 +148,13 @@ internal static class CompactionExecutor
 
         // Row tracking: OPTIMIZE assigns fresh row ids to the compacted files, so it advances the
         // delta.rowTracking high-water mark too (same reasoning as the write path).
-        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        if (assignRowIds && nextRowId > snapshot.RowIdHighWaterMark)
         {
             actions.Add(EngineeredWood.DeltaLake.RowTracking.RowTrackingConfig
                 .BuildHighWaterMarkAction(nextRowId));
         }
 
-        return new CompactionPlan(actions, rowTrackingEnabled);
+        return new CompactionPlan(actions, assignRowIds);
     }
 
     /// <summary>
@@ -175,7 +175,7 @@ internal static class CompactionExecutor
         DeletionVectors.DeletionVectorReader dvReader,
         List<DeltaAction> actions,
         long now,
-        bool rowTrackingEnabled,
+        bool assignRowIds,
         long nextRowId,
         bool materialize,
         string? matRowIdName,
@@ -356,6 +356,11 @@ internal static class CompactionExecutor
             .DefaultIfEmpty(-1)
             .Min();
         if (earliestCommitVersion == -1) earliestCommitVersion = null;
+        // A file that got a baseRowId needs a defaultRowCommitVersion too. When no source has one (files
+        // written before the table supported row tracking, then restored into it), the compacted file takes
+        // this commit's version, as Spark's commit fills a missing one. The rebase moves it with the commit.
+        if (assignRowIds && earliestCommitVersion is null)
+            earliestCommitVersion = snapshot.Version + 1;
 
         // The group's Hive directory: one partition = one directory, so the compacted file joins its
         // sources' directory. The add keeps the ENCODED prefix (reused verbatim from a source path, so it
@@ -436,7 +441,7 @@ internal static class CompactionExecutor
                     fileSize = outFile.Position;
                 }
 
-                if (rowTrackingEnabled)
+                if (assignRowIds)
                     nextRowId += currentRowCount;
 
                 string? stats = Stats.StatsCollector.Collect(currentBatches, statsSelection);
@@ -449,7 +454,7 @@ internal static class CompactionExecutor
                     ModificationTime = now,
                     DataChange = false,
                     Stats = stats,
-                    BaseRowId = rowTrackingEnabled ? fileBaseRowId : null,
+                    BaseRowId = assignRowIds ? fileBaseRowId : null,
                     DefaultRowCommitVersion = earliestCommitVersion,
                 });
 

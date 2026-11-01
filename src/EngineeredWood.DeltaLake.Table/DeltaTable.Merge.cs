@@ -129,9 +129,9 @@ public sealed partial class DeltaTable
         var readPaths = new HashSet<string>(StringComparer.Ordinal);
         long updated = 0, matchedDeleted = 0, sourcelessDeleted = 0, copied = 0;
 
-        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-            snapshot.Metadata.Configuration);
-        long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
+        long nextRowId = assignRowIds ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
 
         // Without a not-matched-by-source clause only a file that can hold a source key matters, so none needs
         // reading when no source key can match; and the source's key range prunes the rest by statistics.
@@ -176,12 +176,12 @@ public sealed partial class DeltaTable
                 var (actions, insertNextRowId) = await ComputeWriteActionsAsync(
                     snapshot, [insertBatch], DeltaWriteMode.Append,
                     overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
-                    cancellationToken, rowIdStart: rowTrackingEnabled ? nextRowId : null, written: written,
+                    cancellationToken, rowIdStart: assignRowIds ? nextRowId : null, written: written,
                     identityHighWaterMarks: identityHighWaterMarks)
                     .ConfigureAwait(false);
                 insertActions.AddRange(actions);
                 inserted = rows.Count;
-                if (rowTrackingEnabled)
+                if (assignRowIds)
                     nextRowId = insertNextRowId;
             }
         }
@@ -192,7 +192,7 @@ public sealed partial class DeltaTable
             filesAdded, removedPaths.Count);
         return new MergeActions(
             rewriteActions, insertActions, removedPaths, readPaths, keyRange, readsWholeTable, scan, metrics,
-            rowTrackingEnabled ? nextRowId : null);
+            assignRowIds ? nextRowId : null);
 
         async ValueTask<long> ScanMergeTargetAsync()
         {
@@ -395,7 +395,7 @@ public sealed partial class DeltaTable
                 copied += copiedHere;
                 rowId = await WriteRewriteGroupsAsync(
                     snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
-                    rowTrackingEnabled, rowId, newVersion, rewriteActions, written, cancellationToken)
+                    assignRowIds, rowId, newVersion, rewriteActions, written, cancellationToken)
                     .ConfigureAwait(false);
                 removedPaths.Add(addFile.Path);
 

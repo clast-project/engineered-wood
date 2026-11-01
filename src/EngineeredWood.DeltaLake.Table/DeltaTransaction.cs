@@ -676,12 +676,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
                 overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
                 cancellationToken, rowIdStart: _nextRowId, written: _written, identityHighWaterMarks: _identityMarks,
                 replaceWhere: predicate).ConfigureAwait(false);
-            bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-                _baseSnapshot.Metadata.Configuration);
+            bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(_baseSnapshot.Protocol);
             var d = await _table.ComputeDeleteActionsAsync(
                 _baseSnapshot, DeltaTable.MaskFor(predicate), cancellationToken, prunePredicate: predicate,
                 written: _written, copyOnWrite: DeltaTable.DeletesByCopyOnWrite(_baseSnapshot, mode: null),
-                rowIdStart: rowTracking ? w.NextRowId : null).ConfigureAwait(false);
+                rowIdStart: assignRowIds ? w.NextRowId : null).ConfigureAwait(false);
             return (w, d);
         }, cancellationToken).ConfigureAwait(false);
         await RefuseRestagedFilesAsync(delete.RemovedPaths, mark, "replaceWhere", cancellationToken)

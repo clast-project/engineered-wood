@@ -3233,8 +3233,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         ThrowIfDisposed();
 
         bool rowLevel = rowLevelDeletes is { Count: > 0 };
-        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-            baseSnapshot.Metadata.Configuration);
+        // Against the protocol this commit PUBLISHES, which a staged upgrade can make differ from the base's.
+        var stagedProtocol = dataActions.OfType<ProtocolAction>().LastOrDefault();
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(
+            stagedProtocol ?? baseSnapshot.Protocol);
+        if (assignRowIds)
+        {
+            var assigned = AssignMissingRowIds(dataActions, baseSnapshot);
+            // The mark rides a domainMetadata action, which the staged protocol must then declare.
+            if (!ReferenceEquals(assigned, dataActions) && stagedProtocol is not null)
+                RequireDomainMetadataDeclared(stagedProtocol, assigned);
+            dataActions = assigned;
+        }
 
         var result = await _committer.CommitAsync(
             new LogCommitRequest
@@ -3252,8 +3262,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 // way from a write's (they carry dataChange=false and a defaultRowCommitVersion inherited
                 // from their sources, neither of which OccRebaseHandler's rule fits), so it brings a
                 // handler of its own rather than bend this one to two shapes.
-                Rebase = rebase ?? (rowLevel || rowTrackingEnabled
-                    ? new OccRebaseHandler(this, rowLevelDeletes, rowTrackingEnabled, written, insertFillIn)
+                Rebase = rebase ?? (rowLevel || assignRowIds
+                    ? new OccRebaseHandler(this, rowLevelDeletes, assignRowIds, written, insertFillIn)
                     : null),
                 Precondition = appTransactions is { Count: > 0 }
                     ? (snapshot, concurrent) =>
@@ -3321,7 +3331,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     {
         private readonly DeltaTable _table;
         private readonly IReadOnlyList<DeleteDvEdit>? _rowLevelDeletes;
-        private readonly bool _rowTrackingEnabled;
+        private readonly bool _assignRowIds;
         private readonly WrittenFileLedger? _written;
         private readonly InsertChangeDataFillIn? _insertFillIn;
         private ISet<string>? _priorResolvedPaths;
@@ -3329,13 +3339,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         public OccRebaseHandler(
             DeltaTable table,
             IReadOnlyList<DeleteDvEdit>? rowLevelDeletes,
-            bool rowTrackingEnabled,
+            bool assignRowIds,
             WrittenFileLedger? written,
             InsertChangeDataFillIn? insertFillIn = null)
         {
             _table = table;
             _rowLevelDeletes = rowLevelDeletes;
-            _rowTrackingEnabled = rowTrackingEnabled;
+            _assignRowIds = assignRowIds;
             _written = written;
             _insertFillIn = insertFillIn;
         }
@@ -3403,7 +3413,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // Re-derive row-tracking post-image ids against the snapshot we now land on (a concurrent commit
             // may have consumed row-id space). No-op for the row-level delete's own re-adds — they keep
             // their existing baseRowId (excluded by resolvedPaths / base-active membership).
-            if (_rowTrackingEnabled)
+            if (_assignRowIds)
             {
                 actions = RebaseRowTrackingAddIds(
                     actions, context.BaseSnapshot, context.LatestSnapshot!,
@@ -3866,7 +3876,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>delta.rowTracking</c> high-water-mark domain to match — mirroring Spark's row-id reassignment on
     /// conflict resolution.
     ///
-    /// <para>A post-image add is a data-change <see cref="AddFile"/> carrying a <c>baseRowId</c> whose path is
+    /// <para>A post-image add is an <see cref="AddFile"/> (data change or not) carrying a <c>baseRowId</c> whose path is
     /// NOT active in <paramref name="baseSnapshot"/> and was NOT produced by the row-level DELETE resolution
     /// (<paramref name="resolvedPaths"/>). Those excluded adds — a DV re-union re-add of an existing file, or a
     /// remap re-add on a concurrently-rewritten file — already carry the correct (their own) <c>baseRowId</c>
@@ -3890,13 +3900,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             switch (action)
             {
-                case AddFile add when add.DataChange && add.BaseRowId is not null
+                // Data change or not: a non-data-changing new add (one staged raw, given ids by
+                // AssignMissingRowIds) reserved its range from the same stale mark.
+                case AddFile add when add.BaseRowId is not null
                     && !baseActivePaths.Contains(add.Path)
                     && (resolvedPaths is null || !resolvedPaths.Contains(add.Path)):
                     result.Add(add with
                     {
                         BaseRowId = nextRowId,
-                        DefaultRowCommitVersion = attemptVersion,
+                        // The staged commit's own version follows the commit; one a raw caller set otherwise is
+                        // kept, as delta-spark's DefaultRowCommitVersion.assignIfMissing keeps it.
+                        DefaultRowCommitVersion = add.DefaultRowCommitVersion is null
+                            || add.DefaultRowCommitVersion == baseSnapshot.Version + 1
+                            ? attemptVersion : add.DefaultRowCommitVersion,
                     });
                     nextRowId += RowCountForRowIds(add);
                     changed = true;
@@ -4822,13 +4838,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // commit version into the declared hidden columns (a matched row's version advances to this commit; an
         // untouched-but-rewritten row keeps its original). A fresh baseRowId/defaultRowCommitVersion still goes
         // on the new add (spec: the null-materialized fallback).
-        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-            snapshot.Metadata.Configuration);
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         bool materializeIds = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
         long newVersion = snapshot.Version + 1;
-        long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
+        long nextRowId = assignRowIds ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
@@ -4952,7 +4968,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // under its new one. The remove, adds and statistics are built as the row-level rewrites build them.
             nextRowId = await WriteRewriteGroupsAsync(
                 snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
-                rowTrackingEnabled, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
+                assignRowIds, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
             removedPaths.Add(addFile.Path);
 
             // Write CDC files for update preimage/postimage
@@ -4985,7 +5001,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         // Persist the advanced row-id high-water mark (same source of truth the append path maintains).
-        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        if (assignRowIds && nextRowId > snapshot.RowIdHighWaterMark)
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
 
         return new UpdateActions(actions, removedPaths, totalUpdated, nextRowId);
@@ -6260,9 +6276,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         // Row tracking: prepare high water mark
-        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-            snapshot.Metadata.Configuration);
-        long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
+        long nextRowId = assignRowIds ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
         long newVersion = snapshot.Version + 1;
 
         // Identity columns: prepare configs
@@ -6397,7 +6412,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 // that is reserved for rows RELOCATED by a copy-on-write rewrite. Materializing one here produced
                 // a non-spec physical column a foreign reader would surface as a stray column.
                 long fileBaseRowId = nextRowId;
-                if (rowTrackingEnabled)
+                if (assignRowIds)
                     nextRowId += file.Rows;
 
                 actions.Add(new AddFile
@@ -6409,8 +6424,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                     DataChange = true,
                     Stats = file.Stats,
-                    BaseRowId = rowTrackingEnabled ? fileBaseRowId : null,
-                    DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
+                    BaseRowId = assignRowIds ? fileBaseRowId : null,
+                    DefaultRowCommitVersion = assignRowIds ? newVersion : null,
                 });
             }
         }
@@ -6476,7 +6491,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // Row tracking: persist the advanced high-water mark as the delta.rowTracking domainMetadata (the
         // spec-required source of truth; deriving it from active files alone under-counts after removes, so
         // a mixed writer could reassign already-used row ids).
-        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        if (assignRowIds && nextRowId > snapshot.RowIdHighWaterMark)
         {
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
         }
@@ -7538,7 +7553,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 "CommitDataFilesAsync: table has identity columns or IcebergCompat — "
                 + "these require engineered-wood's own writer.");
 
-        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(cfg);
+        // Against the protocol this commit PUBLISHES: a protocol upgrade fused in through extraActions that adds
+        // rowTracking obliges these adds to carry row ids, as Spark assigns them with the transaction's new protocol.
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(
+            extraActions?.OfType<ProtocolAction>().LastOrDefault() ?? CurrentSnapshot.Protocol);
 
         // Buffered-transaction commit: the caller's extraActions are snapshot-coupled (deletion-vector
         // ordinals/positions computed against expectedVersion), so a concurrent commit invalidates them —
@@ -7704,7 +7722,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 }
             }
 
-            long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+            long nextRowId = assignRowIds ? snapshot.RowIdHighWaterMark : 0;
             long newVersion = snapshot.Version + 1;
             for (int fi = 0; fi < files.Count; fi++)
             {
@@ -7724,17 +7742,17 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // numRecords is REQUIRED (row-tracking high-water mark = baseRowId + numRecords); a caller
                     // with full stats passes StatsJson, else we emit the minimal numRecords-only stats.
                     Stats = stats,
-                    BaseRowId = rowTrackingEnabled ? fileBaseRowId : null,
-                    DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
+                    BaseRowId = assignRowIds ? fileBaseRowId : null,
+                    DefaultRowCommitVersion = assignRowIds ? newVersion : null,
                     DeletionVector = dv,
                     ClusteringProvider = clusteringProvider,
                     Tags = f.Tags,
                 });
-                if (rowTrackingEnabled)
+                if (assignRowIds)
                     nextRowId += f.NumRecords;
             }
 
-            if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+            if (assignRowIds && nextRowId > snapshot.RowIdHighWaterMark)
             {
                 actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
             }
@@ -7850,6 +7868,80 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// range: the next file's ids would overlap its rows. delta-spark refuses the same file
     /// (<c>DELTA_ROW_ID_ASSIGNMENT_WITHOUT_STATS</c>).
     /// </summary>
+    /// <summary>
+    /// Gives fresh row ids to every NEW file in <paramref name="actions"/> that has none, and advances the
+    /// <c>delta.rowTracking</c> high-water mark past them. Called only when the commit's protocol supports row
+    /// tracking, as delta-spark's commit runs <c>RowId.assignFreshRowIds</c> over every action with the
+    /// transaction's protocol.
+    /// </summary>
+    /// <remarks>
+    /// <para>EngineeredWood's own writers assign ids while staging, so this normally finds nothing to do. It
+    /// catches what they cannot see: a protocol upgrade adding <c>rowTracking</c> staged in the same
+    /// transaction (before or after the files), and adds staged raw through
+    /// <see cref="DeltaTransaction.StageActions"/>. Assignment starts past both the base snapshot's mark and
+    /// every id already staged, so it cannot collide with them; the commit's rebase re-derives all of a new
+    /// file's ids against the version it lands on.</para>
+    /// <para>A re-add of a file already active at the base keeps what it has: the rebase re-derives only new
+    /// files' ids, so ids given to an existing one here could collide after a concurrent commit.</para>
+    /// <para>A file without a row count is refused (<see cref="RowCountForRowIds"/>), as delta-spark refuses
+    /// one (<c>DELTA_ROW_ID_ASSIGNMENT_WITHOUT_STATS</c>).</para>
+    /// </remarks>
+    private static IReadOnlyList<DeltaAction> AssignMissingRowIds(
+        IReadOnlyList<DeltaAction> actions, Snapshot.Snapshot baseSnapshot)
+    {
+        bool IsNew(AddFile add) => !baseSnapshot.ActiveFiles.ContainsKey(add.Path);
+
+        if (!actions.Any(a => a is AddFile { BaseRowId: null } add && IsNew(add)))
+            return actions;
+
+        long nextRowId = baseSnapshot.RowIdHighWaterMark;
+        foreach (var action in actions)
+        {
+            switch (action)
+            {
+                // A new file's staged range; an existing file's is already under the base mark. A new one without
+                // a row count has no known end to assign past, so it is refused like one being assigned.
+                case AddFile { BaseRowId: { } start } add when IsNew(add):
+                    nextRowId = Math.Max(nextRowId, start + RowCountForRowIds(add));
+                    break;
+                case DomainMetadata dm when string.Equals(
+                    dm.Domain, DeltaLake.RowTracking.RowTrackingConfig.DomainName, StringComparison.Ordinal):
+                    long? staged = DeltaLake.RowTracking.RowTrackingConfig.TryReadHighWaterMark(
+                        new Dictionary<string, DomainMetadata> { [dm.Domain] = dm });
+                    if (staged is { } mark)
+                        nextRowId = Math.Max(nextRowId, mark + 1);
+                    break;
+            }
+        }
+
+        long version = baseSnapshot.Version + 1;
+        var result = new List<DeltaAction>(actions.Count + 1);
+        foreach (var action in actions)
+        {
+            switch (action)
+            {
+                case AddFile { BaseRowId: null } add when IsNew(add):
+                    result.Add(add with
+                    {
+                        BaseRowId = nextRowId,
+                        // Filled only when missing: delta-spark's DefaultRowCommitVersion.assignIfMissing keeps
+                        // a version the add already carries, independently of assigning it a fresh baseRowId.
+                        DefaultRowCommitVersion = add.DefaultRowCommitVersion ?? version,
+                    });
+                    nextRowId += RowCountForRowIds(add);
+                    break;
+                case DomainMetadata dm when string.Equals(
+                    dm.Domain, DeltaLake.RowTracking.RowTrackingConfig.DomainName, StringComparison.Ordinal):
+                    break; // superseded by the mark below, which covers it
+                default:
+                    result.Add(action);
+                    break;
+            }
+        }
+        result.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
+        return result;
+    }
+
     private static long RowCountForRowIds(AddFile add) =>
         add.GetNumRecords() ?? throw new InvalidOperationException(
             $"Cannot assign row ids to '{add.Path}': its statistics carry no numRecords. Row tracking needs "
@@ -8068,8 +8160,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (deletedByPath is not null && deletedByPath.Values.Any(p => p.Count > 0))
             EnsureDeletionVectorsEnabled(snapshot, "Staging born-deleted rows", WithoutBornDeletedAlternative);
 
-        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
-        long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
+        long nextRowId = assignRowIds ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
         long newVersion = snapshot.Version + 1;
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         var actions = new List<DeltaAction>(files.Count + 1);
@@ -8105,18 +8197,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 ModificationTime = now,
                 DataChange = true,
                 Stats = stats,
-                BaseRowId = rowTrackingEnabled ? nextRowId : null,
-                DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
+                BaseRowId = assignRowIds ? nextRowId : null,
+                DefaultRowCommitVersion = assignRowIds ? newVersion : null,
                 DeletionVector = dv,
                 Tags = f.Tags,
             });
             // The row-id range covers every PHYSICAL row, hidden ones included: a born-deleted row still
             // occupies its position in the file, so skipping it would misalign every id after it.
-            if (rowTrackingEnabled)
+            if (assignRowIds)
                 nextRowId += f.NumRecords;
         }
 
-        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        if (assignRowIds && nextRowId > snapshot.RowIdHighWaterMark)
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
 
         return (actions, nextRowId, liveRows);
@@ -8726,15 +8818,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         RejectCopyOnWriteRowIdUnsupported("copy-on-write DELETE");
 
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
-        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-            snapshot.Metadata.Configuration);
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         bool materializeIds = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
         bool cdfEnabled = writeChangeData
             && DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         long newVersion = snapshot.Version + 1;
-        long nextRowId = rowTrackingEnabled ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
+        long nextRowId = assignRowIds ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
 
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
@@ -8816,14 +8908,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             var (remove, add, addedRows) = await RewriteRowsToNewFileAsync(
                 snapshot, addFile, mappingMode, outputBatches, outTracking, materializeIds,
-                matRowIdName, matRowVerName, rowTrackingEnabled, nextRowId, newVersion,
+                matRowIdName, matRowVerName, assignRowIds, nextRowId, newVersion,
                 cancellationToken, written).ConfigureAwait(false);
             actions.Add(remove);
             removedPaths.Add(addFile.Path);
             if (add is not null)
             {
                 actions.Add(add);
-                if (rowTrackingEnabled)
+                if (assignRowIds)
                     nextRowId += addedRows;
             }
 
@@ -8843,7 +8935,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        if (actions.Count > 0 && rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        if (actions.Count > 0 && assignRowIds && nextRowId > snapshot.RowIdHighWaterMark)
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
 
         return new CopyOnWriteDeleteActions(actions, removedPaths, totalDeleted, nextRowId);
@@ -8880,7 +8972,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<RecordBatch> outputBatches,
         IReadOnlyList<(Int64Array Ids, Int64Array Vers)?>? outTracking,
         bool materializeIds, string? matRowIdName, string? matRowVerName,
-        bool rowTrackingEnabled, long baseRowId, long newVersion,
+        bool assignRowIds, long baseRowId, long newVersion,
         CancellationToken cancellationToken,
         WrittenFileLedger? written = null,
         IReadOnlyDictionary<string, string>? targetPartition = null)
@@ -8984,8 +9076,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             DataChange = true,
             Stats = Stats.StatsCollector.Collect(
                 statsBatches, StatsSelection(snapshot.Schema, snapshot.Metadata)),
-            BaseRowId = rowTrackingEnabled ? baseRowId : null,
-            DefaultRowCommitVersion = rowTrackingEnabled ? newVersion : null,
+            BaseRowId = assignRowIds ? baseRowId : null,
+            DefaultRowCommitVersion = assignRowIds ? newVersion : null,
         };
         return (remove, add, addedRows);
     }
@@ -9116,7 +9208,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private async ValueTask<long> WriteRewriteGroupsAsync(
         Snapshot.Snapshot snapshot, Actions.AddFile source, ColumnMappingMode mappingMode, PartitionRouter router,
         bool materializeIds, string? matRowIdName, string? matRowVerName,
-        bool rowTrackingEnabled, long nextRowId, long newVersion, List<DeltaAction> actions,
+        bool assignRowIds, long nextRowId, long newVersion, List<DeltaAction> actions,
         WrittenFileLedger? written, CancellationToken cancellationToken)
     {
         RemoveFile? remove = null;
@@ -9125,13 +9217,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             var (groupRemove, add, addedRows) = await RewriteRowsToNewFileAsync(
                 snapshot, source, mappingMode, group.Batches, group.Tracking, materializeIds,
-                matRowIdName, matRowVerName, rowTrackingEnabled, nextRowId, newVersion,
+                matRowIdName, matRowVerName, assignRowIds, nextRowId, newVersion,
                 cancellationToken, written, group.Target).ConfigureAwait(false);
             remove ??= groupRemove;
             if (add is null)
                 continue;
             adds.Add(add);
-            if (rowTrackingEnabled)
+            if (assignRowIds)
                 nextRowId += addedRows;
         }
         actions.Add(remove!);
@@ -9316,14 +9408,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         RejectCopyOnWriteRowIdUnsupported("copy-on-write UPDATE");
 
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
-        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
-            snapshot.Metadata.Configuration);
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
+        bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         bool materializeIds = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         long newVersion = snapshot.Version + 1;
-        long nextRowId = rowTrackingEnabled ? snapshot.RowIdHighWaterMark : 0;
+        long nextRowId = assignRowIds ? snapshot.RowIdHighWaterMark : 0;
         long totalUpdated = 0;
 
         var actions = new List<DeltaAction>();
@@ -9455,7 +9547,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 router.Add(rewritten[bi], outTracking?[bi], mayMove: touched[bi]);
             nextRowId = await WriteRewriteGroupsAsync(
                 snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
-                rowTrackingEnabled, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
+                assignRowIds, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
             removedPaths.Add(addFile.Path);
 
             // update_preimage + update_postimage change files for the touched rows. As in the copy-on-write
@@ -9486,7 +9578,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (actions.Count == 0)
             return snapshot.Version;
 
-        if (rowTrackingEnabled && nextRowId > snapshot.RowIdHighWaterMark)
+        if (assignRowIds && nextRowId > snapshot.RowIdHighWaterMark)
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
 
         return await CommitOccAsync(
@@ -9714,8 +9806,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         foreach (var f in to.ActiveFiles.Values)
             toByPath[f.Path] = f;
 
+        bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(to.Protocol);
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(to.Metadata.Configuration);
-        long nextRowId = rowTrackingEnabled ? to.RowIdHighWaterMark : 0;
+        long nextRowId = assignRowIds ? to.RowIdHighWaterMark : 0;
         bool anyPostImage = false;
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var rebased = new List<DeltaAction>(actions.Count);
@@ -9742,7 +9835,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         // Likewise a post-image without a row count, which cannot have its row ids re-derived below.
-        if (rowTrackingEnabled)
+        if (assignRowIds)
         {
             foreach (var action in actions)
             {
@@ -9806,7 +9899,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     // Post-image add (a brand-new file): re-derive its row-id range from the snapshot we are
                     // committing onto — concurrent commits may have consumed row-id space.
-                    if (rowTrackingEnabled && add.BaseRowId is not null)
+                    if (assignRowIds && add.BaseRowId is not null)
                     {
                         long rows = RowCountForRowIds(add);
                         rebased.Add(add with
@@ -9857,7 +9950,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
             rebased.AddRange(remapped);
         }
-        if (rowTrackingEnabled && anyPostImage)
+        if (assignRowIds && anyPostImage)
         {
             rebased.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
         }
@@ -10250,7 +10343,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     snapshot, compaction.Actions, new ReadSet { Files = read },
                     IsolationLevel.WriteSerializable, "OPTIMIZE", rebaseSafe: true, cancellationToken,
                     written: written, isBlindAppend: false,
-                    rebase: compaction.RowTrackingEnabled ? new CompactionRebaseHandler() : null,
+                    rebase: compaction.AssignsRowIds ? new CompactionRebaseHandler() : null,
                     commitProperties: commitProperties)
                     .ConfigureAwait(false);
             },
@@ -10297,7 +10390,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 switch (action)
                 {
                     case AddFile add when add.BaseRowId is not null:
-                        result.Add(add with { BaseRowId = nextRowId });
+                        // A version past every source's is the staged commit's own, given to a file none of
+                        // whose sources had one (CompactionExecutor); it follows the commit to its new version.
+                        long staged = context.BaseSnapshot.Version + 1;
+                        result.Add(add with
+                        {
+                            BaseRowId = nextRowId,
+                            DefaultRowCommitVersion = add.DefaultRowCommitVersion == staged
+                                ? context.NextAttemptVersion : add.DefaultRowCommitVersion,
+                        });
                         nextRowId += RowCountForRowIds(add);
                         break;
 
