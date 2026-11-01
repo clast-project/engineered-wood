@@ -102,9 +102,12 @@ public static class StatisticsEvaluator
             return EvaluateColumnComparison(column!, op, value, stats, accessor);
         }
 
-        // Two literals — evaluate directly.
+        // Two literals — evaluate directly, when this comparison is the one a row evaluator makes.
         if (cmp.Left is LiteralExpression la && cmp.Right is LiteralExpression lb)
         {
+            if (!FoldsAsTheRowEvaluatorDoes(la.Value, lb.Value))
+                return FilterResult.Unknown;
+
             return CompareLiterals(la.Value, cmp.Op, lb.Value)
                 ? FilterResult.AlwaysTrue
                 : FilterResult.AlwaysFalse;
@@ -711,6 +714,48 @@ public static class StatisticsEvaluator
         {
             return int.MinValue;
         }
+    }
+
+    /// <summary>
+    /// Whether two literals compare here exactly as a row evaluator compares them, so the answer may be
+    /// folded into a prune.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A NULL folds: every comparison with one is NULL, or false under <c>&lt;=&gt;</c>, whatever the other
+    /// type. Two values of one kind fold, except decimals, whose common type can give up scale and round
+    /// (<c>1.005 = 1</c> compares at the rounded value in Spark).
+    /// </para>
+    /// <para>
+    /// So do two integers, compared exactly by both, and an integer against a double, which Spark compares
+    /// as doubles in either dialect as <see cref="LiteralValue.CompareTo(LiteralValue)"/> does. (Not a float:
+    /// the legacy dialect compares an integer against one as a float.)
+    /// </para>
+    /// <para>
+    /// No other pair of kinds does. A Spark-configured evaluator casts across them -- <c>'5' = 5</c> is
+    /// TRUE -- or refuses, or raises on the value, while this compares the kinds as they stand and answers
+    /// false for a pair it cannot order. Folding that false skips every file of a DELETE that matches every
+    /// row (#589).
+    /// </para>
+    /// </remarks>
+    private static bool FoldsAsTheRowEvaluatorDoes(LiteralValue a, LiteralValue b)
+    {
+        if (a.IsNull || b.IsNull)
+            return true;
+
+        // Not a Guid or a TimeOnly either: a Spark-configured evaluator cannot type one and throws, which a
+        // fold would replace with an answer.
+        if (a.Type == b.Type)
+            return a.Type is not (LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal
+                or LiteralValue.Kind.Guid or LiteralValue.Kind.TimeOnly);
+
+        bool aIntegral = IsIntegral(a.Type), bIntegral = IsIntegral(b.Type);
+        return (aIntegral && bIntegral)
+            || (aIntegral && b.Type == LiteralValue.Kind.Double)
+            || (bIntegral && a.Type == LiteralValue.Kind.Double);
+
+        static bool IsIntegral(LiteralValue.Kind kind) => kind is
+            LiteralValue.Kind.Int32 or LiteralValue.Kind.Int64 or LiteralValue.Kind.UInt32 or LiteralValue.Kind.UInt64;
     }
 
     private static bool CompareLiterals(LiteralValue a, ComparisonOperator op, LiteralValue b)

@@ -232,17 +232,13 @@ public sealed partial class DeltaTable
             : null;
         var evaluator = new ArrowRowEvaluator(new SparkFunctionRegistry());
         var proofForm = prove ? ProofForm(predicate, snapshot.Schema, partitionColumns) : predicate;
-        // A partition-only part is decided by evaluating it on a row built from the file's partition values, and that
-        // has to be the evaluator the rows are checked with: the plain one DELETE uses answers `p > 0` TRUE for a
-        // decimal(38,38) of 4E-38, which Spark's coercion (rounding to decimal(38,37) first) answers FALSE.
-        Func<Expressions.Predicate, Func<RecordBatch, BooleanArray>> mask =
-            part => batch => evaluator.EvaluatePredicate(part, batch);
 
         long violations = 0;
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
+            // A partition-only part is decided through MaskFor, configured as this evaluator is (#589).
             if (prove && ProvesEveryRow(
-                    proofForm, addFile, new DeltaFileStats(addFile), pruner!, partitionSchema, snapshot, mask))
+                    proofForm, addFile, new DeltaFileStats(addFile), pruner!, partitionSchema, snapshot))
                 continue;
 
             // A constraint that names no column (CHECK (1 = 1)) still has to see each row once. The empty projection

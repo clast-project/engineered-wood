@@ -3934,15 +3934,109 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     #region Delete and Update
 
     // The row-level predicate evaluator turning an analyzable Expressions.Predicate into the
-    // Func<RecordBatch, BooleanArray> mask the DELETE/UPDATE machinery consumes. Stateless (no function
-    // registry), so one shared instance is safe. Evaluates by LOGICAL column name, which is exactly what
-    // the compute paths hand the predicate (they rename batches to logical names first).
-    private static readonly Expressions.Arrow.ArrowRowEvaluator RowEvaluator = new();
+    // Func<RecordBatch, BooleanArray> mask the DELETE/UPDATE/MERGE machinery consumes. Evaluates by LOGICAL
+    // column name, which is exactly what the compute paths hand the predicate (they rename batches to logical
+    // names first).
+    //
+    // Spark-configured, as the constraint enforcer and generated columns are, so every predicate EW evaluates
+    // follows one set of rules (#589): a cross-type comparison casts or refuses as Spark does. The registry-free
+    // evaluator answered NULL instead -- `dt = '2026-10-03'` deleted nothing, silently -- and disagreed with the
+    // enforcer on the same text, which replaceWhere (#566) would have evaluated through both. Neither the
+    // evaluator nor the registry holds state, so one shared instance is safe.
+    private static readonly Expressions.Arrow.ArrowRowEvaluator RowEvaluator =
+        new(new Expressions.Arrow.Spark.SparkFunctionRegistry());
 
     /// <summary>Adapts an analyzable predicate to the per-row mask delegate: a row is selected when the
     /// predicate evaluates to TRUE (SQL three-valued logic — NULL/unknown is not selected).</summary>
     internal static Func<RecordBatch, BooleanArray> MaskFor(Expressions.Predicate predicate) =>
         batch => RowEvaluator.EvaluatePredicate(predicate, batch);
+
+    /// <summary>
+    /// Refuses a DML predicate whose types Spark's analyzer would refuse (<c>dt = 5</c>), before any file is
+    /// pruned or read.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The mask raises the same refusal, but only over a batch it is handed. A table with no files, or one whose
+    /// every file the statistics prune, never hands it one, so whether the operation refused would depend on the
+    /// data -- and on how the statistics happen to decode the column. Spark refuses at analysis, before reading
+    /// anything. Asking over an empty batch of the table's schema reads no value, so it raises only what the
+    /// types decide.
+    /// </para>
+    /// <para>
+    /// Only an analysis refusal is raised here. Anything else the empty evaluation trips over is left to the
+    /// operation, which reports it as it always has.
+    /// </para>
+    /// </remarks>
+    internal static void RefuseUnanalyzable(Expressions.Predicate predicate, Snapshot.Snapshot snapshot) =>
+        RefuseUnanalyzable(predicate, () => EmptyBatch(snapshot.ArrowSchema));
+
+    private static readonly RecordBatch NoColumns = new(new Apache.Arrow.Schema.Builder().Build(), [], 0);
+
+    private static void RefuseUntypableLiterals(Expressions.Expression expression)
+    {
+        switch (expression)
+        {
+            case Expressions.LiteralExpression literal:
+                RowEvaluator.EvaluateExpression(literal, NoColumns);   // throws NotSupportedException
+                break;
+            case Expressions.AndPredicate and:
+                foreach (var child in and.Children) RefuseUntypableLiterals(child);
+                break;
+            case Expressions.OrPredicate or:
+                foreach (var child in or.Children) RefuseUntypableLiterals(child);
+                break;
+            case Expressions.NotPredicate not:
+                RefuseUntypableLiterals(not.Child);
+                break;
+            case Expressions.ComparisonPredicate cmp:
+                RefuseUntypableLiterals(cmp.Left);
+                RefuseUntypableLiterals(cmp.Right);
+                break;
+            case Expressions.UnaryPredicate unary:
+                RefuseUntypableLiterals(unary.Operand);
+                break;
+            case Expressions.SetPredicate set:
+                RefuseUntypableLiterals(set.Operand);
+                foreach (var value in set.Values) RefuseUntypableLiterals(value);
+                break;
+            case Expressions.FunctionCall call:
+                foreach (var argument in call.Arguments) RefuseUntypableLiterals(argument);
+                break;
+        }
+    }
+
+    /// <summary>A batch of <paramref name="schema"/> with no rows.</summary>
+    internal static RecordBatch EmptyBatch(Apache.Arrow.Schema schema) =>
+        new(schema, schema.FieldsList.Select(f => ArrowCompute.MakeNullArray(f.DataType, 0)), 0);
+
+    /// <summary>
+    /// <see cref="RefuseUnanalyzable(Expressions.Predicate, Snapshot.Snapshot)"/> over the empty batch
+    /// <paramref name="noRows"/> builds, for a predicate evaluated over some other shape -- a MERGE condition
+    /// sees the target and source rows side by side.
+    /// </summary>
+    internal static void RefuseUnanalyzable(Expressions.Predicate predicate, Func<RecordBatch> noRows)
+    {
+        // A literal the evaluator cannot type -- a Guid, a TimeOnly: Delta has no such type -- throws the moment
+        // any row reaches it, as NotSupportedException rather than an analysis refusal. Over no rows a refusal
+        // swallowed below could hide it, and the statistics never read it, so without this an empty table or a
+        // fully pruned one committed a no-op where every other table throws (#589). Typed by the evaluator
+        // itself, so the set of such kinds is its own.
+        RefuseUntypableLiterals(predicate);
+
+        try
+        {
+            RowEvaluator.EvaluatePredicate(predicate, noRows()).Dispose();
+        }
+        catch (Expressions.Arrow.ExpressionAnalysisException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            // Not an analysis refusal; see the remarks.
+        }
+    }
 
     /// <summary>
     /// Deletes rows matching the predicate.
@@ -4166,6 +4260,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool copyOnWrite = false,
         long? rowIdStart = null)
     {
+        if (prunePredicate is not null)
+            RefuseUnanalyzable(prunePredicate, snapshot);
+
         var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
@@ -4476,6 +4573,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 .Where(g => g.Count() == 1 && g.Single().Type is Schema.PrimitiveType { TypeName: not "variant" })
                 .Select(g => g.Key),
             StringComparer.OrdinalIgnoreCase);
+        var types = schema.Fields
+            .GroupBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single().Type, StringComparer.OrdinalIgnoreCase);
         return Visit(predicate);
 
         bool Visit(Expressions.Expression expression) => expression switch
@@ -4484,13 +4585,41 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             Expressions.AndPredicate and => and.Children.All(Visit),
             Expressions.OrPredicate or => or.Children.All(Visit),
             Expressions.NotPredicate not => Visit(not.Child),
-            Expressions.ComparisonPredicate cmp => Visit(cmp.Left) && Visit(cmp.Right),
+            Expressions.ComparisonPredicate cmp =>
+                Visit(cmp.Left) && Visit(cmp.Right) && !CastsAString([cmp.Left, cmp.Right]),
             Expressions.UnaryPredicate unary => Visit(unary.Operand),
-            Expressions.SetPredicate set => Visit(set.Operand) && set.Values.All(Visit),
+            Expressions.SetPredicate set =>
+                Visit(set.Operand) && set.Values.All(Visit) && !CastsAString([set.Operand, .. set.Values]),
             Expressions.UnboundReference reference =>
                 reference.NameParts.Count == 1 && columns.Contains(reference.Name),
             _ => false,
         };
+
+        // A string compared with a non-string is cast, and under ANSI the cast raises on a value it cannot
+        // read: `s = 5` over 'abc' is CAST_INVALID_INPUT. Whether it raises depends on the rows, which a proof
+        // never reads -- `s = 5 OR id >= 0` would be proven by its second branch and the file deleted unread.
+        // So such a comparison is not proven, wherever it sits (#589).
+        bool CastsAString(IEnumerable<Expressions.Expression> operands)
+        {
+            bool anyString = false, anyOther = false;
+            foreach (var operand in operands)
+            {
+                bool? isString = operand switch
+                {
+                    Expressions.LiteralExpression { Value.IsNull: true } => null,
+                    Expressions.LiteralExpression literal => literal.Value.Type == Expressions.LiteralValue.Kind.String,
+                    Expressions.UnboundReference reference when types.TryGetValue(reference.Name, out var type) =>
+                        type is Schema.PrimitiveType p && (p.TypeName == "string"
+                            || p.TypeName.StartsWith("varchar(", StringComparison.OrdinalIgnoreCase)
+                            || p.TypeName.StartsWith("char(", StringComparison.OrdinalIgnoreCase)),
+                    _ => null,
+                };
+                if (isString == true) anyString = true;
+                else if (isString == false) anyOther = true;
+            }
+
+            return anyString && anyOther;
+        }
     }
 
     /// <summary>
@@ -4500,23 +4629,20 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="DeltaFilePruner.ProvesEveryRowTrue"/> proves. NOT and everything else is not proven, which
     /// reads the file.
     /// </summary>
-    /// <param name="mask">Evaluates a partition-only part on the row built from the file's partition values. It
-    /// must be the evaluator the operation uses on rows, or the proof answers a different question: DELETE's
-    /// <see cref="MaskFor"/> by default, and ADD CONSTRAINT passes the constraint enforcer's, whose Spark coercion
-    /// can disagree (a <c>decimal(38,38)</c> compared with an integer is rounded first).</param>
+    /// <remarks>A partition-only part is evaluated through <see cref="MaskFor"/>, which is configured as the
+    /// constraint enforcer is (#589), so DELETE and ADD CONSTRAINT prove with the rules they check rows by.</remarks>
     private static bool ProvesEveryRow(
         Expressions.Predicate predicate, AddFile addFile, DeltaFileStats stats, DeltaFilePruner pruner,
-        Apache.Arrow.Schema? partitionSchema, Snapshot.Snapshot snapshot,
-        Func<Expressions.Predicate, Func<RecordBatch, BooleanArray>>? mask = null) => predicate switch
+        Apache.Arrow.Schema? partitionSchema, Snapshot.Snapshot snapshot) => predicate switch
     {
         Expressions.TruePredicate => true,
         _ when partitionSchema is not null
             && ReferencesOnlyPartitionColumns(predicate, snapshot.Metadata.PartitionColumns)
-            => MatchesEveryRow(addFile, partitionSchema, snapshot, (mask ?? MaskFor)(predicate)),
+            => MatchesEveryRow(addFile, partitionSchema, snapshot, MaskFor(predicate)),
         Expressions.AndPredicate and => and.Children.All(
-            c => ProvesEveryRow(c, addFile, stats, pruner, partitionSchema, snapshot, mask)),
+            c => ProvesEveryRow(c, addFile, stats, pruner, partitionSchema, snapshot)),
         Expressions.OrPredicate or => or.Children.Any(
-            c => ProvesEveryRow(c, addFile, stats, pruner, partitionSchema, snapshot, mask)),
+            c => ProvesEveryRow(c, addFile, stats, pruner, partitionSchema, snapshot)),
         _ => pruner.ProvesEveryRowTrue(stats, predicate),
     };
 
@@ -4677,6 +4803,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         long? rowIdStart = null,
         WrittenFileLedger? written = null)
     {
+        if (prunePredicate is not null)
+            RefuseUnanalyzable(prunePredicate, snapshot);
+
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         long totalUpdated = 0;

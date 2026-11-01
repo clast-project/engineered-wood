@@ -634,6 +634,9 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         member.IsConstant
             ? member.Constant?.Type
                 is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal or LiteralValue.Kind.Float
+#if NET6_0_OR_GREATER
+                    or LiteralValue.Kind.Half   // typed as a float, as in MightRound
+#endif
             : MightRound(declared, member.PerRow);
 
     /// <summary>Whether a set member is a string, from its declared type or its value.</summary>
@@ -961,7 +964,11 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         declared is not null
             ? declared is Decimal128Type or Decimal256Type or FloatType
             : FirstKind(values)
-                is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal or LiteralValue.Kind.Float;
+                is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal or LiteralValue.Kind.Float
+#if NET6_0_OR_GREATER
+                    or LiteralValue.Kind.Half   // typed as a float; see MaterializeAsArray
+#endif
+                ;
 
     private LiteralValue?[] Rounded(
         LiteralValue?[] values, IArrowType type, IArrowType target, int rowCount) =>
@@ -1552,14 +1559,15 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
     private static long? IntegralLiteral(Expression expression)
     {
         if (expression is not LiteralExpression literal
-            || literal.Value.Type is not (LiteralValue.Kind.Int32 or LiteralValue.Kind.Int64))
+            || literal.Value.Type is not (LiteralValue.Kind.Int32 or LiteralValue.Kind.Int64
+                or LiteralValue.Kind.UInt32 or LiteralValue.Kind.UInt64))
         {
             return null;
         }
 
-        return literal.Value.Type == LiteralValue.Kind.Int32
-            ? literal.Value.AsInt32
-            : literal.Value.AsInt64;
+        // An unsigned literal is typed as the bigint it fits (see MaterializeAsArray), so it takes
+        // the rule as one; past long.MaxValue it is a decimal(20,0) already.
+        return LiteralValue.TryAsInt64(literal.Value, out long value) ? value : null;
     }
 
     // -- Evaluating over a selection of rows --
@@ -2258,6 +2266,32 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
                     else i64b.AppendNull();
                 }
                 return i64b.Build();
+
+            // Spark has no unsigned types, so an unsigned value takes the narrowest signed type
+            // holding every value losslessly: a bigint, or a decimal(20,0) once a ulong passes
+            // long.MaxValue -- what Spark itself types an integer literal that size as (#589).
+            case LiteralValue.Kind.UInt32:
+            case LiteralValue.Kind.UInt64:
+                bool fitsLong = true;
+                for (int i = 0; i < length && fitsLong; i++)
+                {
+                    if (values[i].HasValue && !LiteralValue.TryAsInt64(values[i]!.Value, out _))
+                        fitsLong = false;
+                }
+
+                if (!fitsLong)
+                {
+                    var wide = new Decimal128Type(20, 0);
+                    return BuildDecimalArray(values, length, 0, 16, data => new Decimal128Array(data), wide);
+                }
+
+                var ub = new Int64Array.Builder();
+                for (int i = 0; i < length; i++)
+                {
+                    if (values[i] is { } u && LiteralValue.TryAsInt64(u, out long signed)) ub.Append(signed);
+                    else ub.AppendNull();
+                }
+                return ub.Build();
             case LiteralValue.Kind.Float:
                 var fb = new FloatArray.Builder();
                 for (int i = 0; i < length; i++)
@@ -2274,6 +2308,22 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
                     else db.AppendNull();
                 }
                 return db.Build();
+#if NET6_0_OR_GREATER
+            // No half-precision type in Spark; a float holds every Half exactly (#589).
+            case LiteralValue.Kind.Half:
+                var hb = new FloatArray.Builder();
+                for (int i = 0; i < length; i++)
+                {
+                    if (values[i].HasValue) hb.Append((float)values[i]!.Value.AsHalf);
+                    else hb.AppendNull();
+                }
+                return hb.Build();
+
+            // A calendar date is a Spark DATE (#589). Before this a typed DateOnly literal could
+            // be compared by the registry-free evaluator only, and refused the analysis check here.
+            case LiteralValue.Kind.DateOnly:
+                return BuildDate32Array(values, length);
+#endif
             case LiteralValue.Kind.String:
                 var sb = new StringArray.Builder();
                 for (int i = 0; i < length; i++)
@@ -2406,6 +2456,8 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         LiteralValue.Kind.Decimal => RescaleDecimal(v.AsDecimal, targetScale),
         LiteralValue.Kind.Int32 => Rescale(v.AsInt32, 0, targetScale),
         LiteralValue.Kind.Int64 => Rescale(v.AsInt64, 0, targetScale),
+        LiteralValue.Kind.UInt32 => Rescale(v.AsUInt32, 0, targetScale),
+        LiteralValue.Kind.UInt64 => Rescale(v.AsUInt64, 0, targetScale),
         _ => throw new NotSupportedException($"Cannot materialize {v.Type} as a decimal."),
     };
 

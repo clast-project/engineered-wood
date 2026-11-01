@@ -98,6 +98,7 @@ public sealed partial class DeltaTable
 
         var plan = MergePlan.Validate(options, snapshot.Schema);
         var src = PrepareMergeSource(source, snapshot, plan);
+        RefuseUnanalyzableConditions(options, snapshot, src);
         int sourceRows = src?.Length ?? 0;
         var setColumns = plan.SetColumns(src, snapshot.Schema);
         var insertColumns = plan.InsertColumns(src, snapshot.Schema);
@@ -640,6 +641,36 @@ public sealed partial class DeltaTable
             fields.Add(new Field(field.Name, columns[c].Data.DataType, field.IsNullable, field.Metadata));
         }
         return new RecordBatch(new Apache.Arrow.Schema(fields, preimage.Schema.Metadata), columns, preimage.Length);
+    }
+
+    /// <summary>
+    /// Refuses a clause condition whose types Spark's analyzer would refuse (<c>target.d = 5</c>), before the
+    /// target is scanned.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A condition is evaluated only over the rows that reach its clause, so with an empty source, no key that
+    /// matches, or every file pruned by the key range it never runs, and the MERGE committed where Spark refuses
+    /// at analysis (#589). Each is asked over an empty batch of the shape it is evaluated over -- the
+    /// <see cref="MergeConditionBatch"/> of its clause -- which reads no value and so raises only what the
+    /// types decide; see <see cref="RefuseUnanalyzable(Expressions.Predicate, Snapshot.Snapshot)"/>.
+    /// </para>
+    /// <para>
+    /// A source with no batches has no schema of its own. Its columns can only be the table's, normalized to
+    /// the table's types (<see cref="PrepareMergeSource"/>), so the table's schema stands in for it.
+    /// </para>
+    /// </remarks>
+    private static void RefuseUnanalyzableConditions(MergeOptions options, Snapshot.Snapshot snapshot, RecordBatch? src)
+    {
+        var targetSchema = snapshot.ArrowSchema;
+        var sourceSchema = src?.Schema ?? targetSchema;
+
+        if (options.WhenMatchedCondition is { } matched)
+            RefuseUnanalyzable(matched, () => MergeConditionBatch(EmptyBatch(targetSchema), EmptyBatch(sourceSchema)));
+        if (options.WhenNotMatchedCondition is { } notMatched)
+            RefuseUnanalyzable(notMatched, () => MergeConditionBatch(null, EmptyBatch(sourceSchema)));
+        if (options.WhenNotMatchedBySourceCondition is { } sourceless)
+            RefuseUnanalyzable(sourceless, () => MergeConditionBatch(EmptyBatch(targetSchema), null));
     }
 
     /// <summary>

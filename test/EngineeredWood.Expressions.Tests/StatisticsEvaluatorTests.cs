@@ -580,7 +580,31 @@ public class StatisticsEvaluatorTests
         Assert.Equal(FilterResult.AlwaysTrue, EvalLiterals(LiteralValue.Null, LiteralValue.Null));
         Assert.Equal(FilterResult.AlwaysFalse, EvalLiterals(LiteralValue.Of(1), LiteralValue.Null));
         Assert.Equal(FilterResult.AlwaysFalse, EvalLiterals(LiteralValue.Null, LiteralValue.Of(1)));
-        Assert.Equal(FilterResult.AlwaysFalse, EvalLiterals(LiteralValue.Of("x"), LiteralValue.Of(1)));
+
+        // Not folded at all (#589): Spark casts 'x' to an int, which raises under ANSI, so false was a
+        // wrong answer; see the next test.
+        Assert.Equal(FilterResult.Unknown, EvalLiterals(LiteralValue.Of("x"), LiteralValue.Of(1)));
+    }
+
+    /// <summary>
+    /// Two literals of kinds a Spark-configured evaluator would cast between are not folded: this compares
+    /// the kinds as they stand, and a false here prunes rows the evaluator matches.
+    /// </summary>
+    /// <remarks>
+    /// <c>'5' = 5</c> is TRUE to Spark. Folded, it was <c>AlwaysFalse</c>, and a DELETE of it skipped every
+    /// file (#589). A decimal pair is not folded either, since its common type can round.
+    /// </remarks>
+    [Fact]
+    public void Comparison_TwoLiteralsSparkWouldCast_AreUnknown()
+    {
+        var stats = new TestStats();
+        Assert.Equal(FilterResult.Unknown, Eval(new ComparisonPredicate(
+            new LiteralExpression(LiteralValue.Of("5")), ComparisonOperator.Equal, new LiteralExpression(5)), stats));
+        Assert.Equal(FilterResult.Unknown, Eval(new ComparisonPredicate(
+            new LiteralExpression(LiteralValue.Of(1.5f)), ComparisonOperator.Equal, new LiteralExpression(1)), stats));
+        Assert.Equal(FilterResult.Unknown, Eval(new ComparisonPredicate(
+            new LiteralExpression(LiteralValue.Of(1.005m)), ComparisonOperator.Equal,
+            new LiteralExpression(LiteralValue.Of(1m))), stats));
     }
 
     /// <summary>
