@@ -785,9 +785,12 @@ an original one — including decimals, whose exact digits never pass through
 
 **CommitInfo.** `InCommitTimestamp.CreateCommitInfo` emits `timestamp`,
 `operation`, `inCommitTimestamp`, `engineInfo` and `operationParameters`
-(at minimum an empty object, which strict readers require). Spec-standard
-fields still never emitted: `readVersion`, `isolationLevel`,
-`operationMetrics`, `userId`, `userName`, `txnId`, `clusterId`, `notebook`.
+(at minimum an empty object, which strict readers require), plus
+`userMetadata` and any further keys a caller passes as `CommitProperties`
+(#564). A caller key may not be any field of Spark's `CommitInfo`, which Spark
+reads by type. Spec-standard fields still never emitted: `readVersion`,
+`isolationLevel`, `operationMetrics`, `userId`, `userName`, `txnId`,
+`clusterId`, `notebook`.
 
 **Post-creation protocol upgrades — partial.** `AddColumnAsync` and
 `SetClusteringColumnsAsync` upgrade the protocol as needed via

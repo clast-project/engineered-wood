@@ -319,7 +319,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool enableRowTracking = false,
         IReadOnlyDictionary<string, string>? configuration = null,
         CancellationToken cancellationToken = default,
-        Schema.StructType? preAssignedSchema = null)
+        Schema.StructType? preAssignedSchema = null,
+        CommitProperties? commitProperties = null)
         => CreateCoreAsync(
             fileSystem,
             schema,
@@ -333,7 +334,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             enableRowTracking,
             configuration,
             cancellationToken,
-            preAssignedSchema);
+            preAssignedSchema,
+            commitProperties);
 
     /// <summary>
     /// Creates a Delta table with initial data, or atomically replaces an existing table and its active
@@ -367,7 +369,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool enableRowTracking = false,
         IReadOnlyDictionary<string, string>? configuration = null,
         CancellationToken cancellationToken = default,
-        Schema.StructType? preAssignedSchema = null)
+        Schema.StructType? preAssignedSchema = null,
+        CommitProperties? commitProperties = null)
     {
         if (initialBatches is null)
             throw new ArgumentNullException(nameof(initialBatches));
@@ -385,7 +388,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             enableRowTracking,
             configuration,
             cancellationToken,
-            preAssignedSchema);
+            preAssignedSchema,
+            commitProperties);
     }
 
     private static async ValueTask<DeltaTable> CreateCoreAsync(
@@ -401,7 +405,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool enableRowTracking,
         IReadOnlyDictionary<string, string>? configuration,
         CancellationToken cancellationToken,
-        Schema.StructType? preAssignedSchema)
+        Schema.StructType? preAssignedSchema,
+        CommitProperties? commitProperties)
     {
         options ??= DeltaTableOptions.Default;
         ValidateOptions(options);
@@ -823,7 +828,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // in history. Build the snapshot from the actions already in memory instead of listing and reading
             // back the commit we just wrote.
             var createActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                actions, configurationBuilder, "CREATE TABLE");
+                actions, configurationBuilder, "CREATE TABLE", commitProperties: commitProperties);
             await log.WriteCommitAsync(0, createActions, cancellationToken).ConfigureAwait(false);
 
             var builder = new SnapshotBuilder();
@@ -880,7 +885,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 ? "CREATE TABLE AS SELECT"
                 : "CREATE OR REPLACE TABLE AS SELECT";
             var commitActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                actions, configurationBuilder, operation);
+                actions, configurationBuilder, operation, commitProperties: commitProperties);
             long version = latestVersion + 1;
 
             await log.WriteCommitAsync(version, commitActions, cancellationToken).ConfigureAwait(false);
@@ -2497,9 +2502,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// (or, without that feature, the commitInfo <c>timestamp</c> field) in epoch milliseconds — null only
     /// for a commit written before commitInfo became unconditional, or by a writer that omits it.
     /// <see cref="OperationParameters"/> is the raw JSON of <c>commitInfo.operationParameters</c>.
+    /// <see cref="UserMetadata"/> is <c>commitInfo.userMetadata</c>, the column of that name in Spark's
+    /// <c>DESCRIBE HISTORY</c>: what the writer set through <see cref="CommitProperties.UserMetadata"/>.
     /// </summary>
     public readonly record struct DeltaHistoryEntry(
-        long Version, long? TimestampMs, string? Operation, string? OperationParameters);
+        long Version, long? TimestampMs, string? Operation, string? OperationParameters,
+        string? UserMetadata = null);
 
     /// <summary>
     /// Enumerates the table's commit history — every version and its commitInfo — oldest first.
@@ -2515,6 +2523,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             long? ts = null;
             string? op = null;
             string? opParams = null;
+            string? userMetadata = null;
             foreach (var action in actions)
             {
                 if (action is CommitInfo ci)
@@ -2525,10 +2534,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         op = o.GetString();
                     var p = ci.GetValue("operationParameters");
                     opParams = p.HasValue ? p.Value.GetRawText() : null;
+                    if (ci.GetValue("userMetadata") is { ValueKind: System.Text.Json.JsonValueKind.String } u)
+                        userMetadata = u.GetString();
                     break;
                 }
             }
-            yield return new DeltaHistoryEntry(version, ts, op, opParams);
+            yield return new DeltaHistoryEntry(version, ts, op, opParams, userMetadata);
         }
     }
 
@@ -2838,7 +2849,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // records the reads made THROUGH it, and a host that scanned the table itself and staged the
             // result made one this library never saw.
             isBlindAppend: transaction.EffectiveIsBlindAppend,
-            insertFillIn: insertFillIn).ConfigureAwait(false);
+            insertFillIn: insertFillIn,
+            commitProperties: transaction.CommitProperties).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -3197,7 +3209,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         WrittenFileLedger? written = null,
         bool? isBlindAppend = null,
         ICommitRebaseHandler? rebase = null,
-        InsertChangeDataFillIn? insertFillIn = null)
+        InsertChangeDataFillIn? insertFillIn = null,
+        CommitProperties? commitProperties = null)
     {
         ThrowIfDisposed();
 
@@ -3230,6 +3243,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     : null,
                 OnCommitDurable = written is null ? null : written.Clear,
                 IsBlindAppend = isBlindAppend,
+                CommitProperties = commitProperties,
                 // Checkpoint here too. This line used to be `false`, with a comment calling it "an
                 // accident of where the call happened to sit rather than a decision" — see #86.
                 //
@@ -3916,13 +3930,30 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>A file the predicate matches entirely is removed. One it matches only in part gets a deletion
     /// vector when the table enables them (<c>delta.enableDeletionVectors</c>), and is otherwise rewritten
     /// without the matched rows (copy-on-write), as Spark and delta-rs delete;
-    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken)"/> chooses
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken, CommitProperties?)"/> chooses
     /// explicitly.</para>
     /// </summary>
     public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
         Func<RecordBatch, BooleanArray> predicate,
         CancellationToken cancellationToken = default)
-        => DeleteCoreAsync(predicate, mode: null, cancellationToken);
+        => DeleteCoreAsync(predicate, mode: null, cancellationToken, commitProperties: null);
+
+    /// <summary>
+    /// Deletes rows matching the predicate, as
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CancellationToken)"/> does, recording
+    /// <paramref name="commitProperties"/> in the commit.
+    /// </summary>
+    /// <remarks>
+    /// A separate overload, with the properties ahead of the token, rather than a trailing optional parameter
+    /// on the one above: with an optional parameter on both, <c>DeleteAsync(predicate, default)</c> would no
+    /// longer bind to the overload that chooses the mode, because C# prefers the candidate needing no default
+    /// arguments only when exactly one does.
+    /// </remarks>
+    public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
+        Func<RecordBatch, BooleanArray> predicate,
+        CommitProperties? commitProperties,
+        CancellationToken cancellationToken = default)
+        => DeleteCoreAsync(predicate, mode: null, cancellationToken, commitProperties);
 
     /// <summary>
     /// Deletes rows matching the predicate, as
@@ -3936,13 +3967,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
         Func<RecordBatch, BooleanArray> predicate,
         RowDeleteMode mode,
-        CancellationToken cancellationToken = default)
-        => DeleteCoreAsync(predicate, mode, cancellationToken);
+        CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
+        => DeleteCoreAsync(predicate, mode, cancellationToken, commitProperties);
 
     private async ValueTask<(long RowsDeleted, long Version)> DeleteCoreAsync(
         Func<RecordBatch, BooleanArray> predicate,
         RowDeleteMode? mode,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CommitProperties? commitProperties)
     {
         ThrowIfDisposed();
 
@@ -3957,6 +3990,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // its deletion vectors, rewritten files and change files, and disposal takes them back. A successful
         // commit disposes to a no-op.
         await using var transaction = StartTransaction();
+        transaction.CommitProperties = commitProperties;
         long rowsDeleted = await (mode is RowDeleteMode m
                 ? transaction.DeleteAsync(predicate, m, cancellationToken)
                 : transaction.DeleteAsync(predicate, cancellationToken))
@@ -3977,32 +4011,46 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     ///
     /// <para>A file the predicate matches only in part gets a deletion vector when the table enables them, and
     /// is otherwise rewritten without the matched rows (copy-on-write);
-    /// <see cref="DeleteAsync(Expressions.Predicate, RowDeleteMode, CancellationToken)"/> chooses explicitly.</para>
+    /// <see cref="DeleteAsync(Expressions.Predicate, RowDeleteMode, CancellationToken, CommitProperties?)"/> chooses explicitly.</para>
     /// </summary>
     public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
         Expressions.Predicate predicate,
         CancellationToken cancellationToken = default)
-        => DeleteCoreAsync(predicate, mode: null, cancellationToken);
+        => DeleteCoreAsync(predicate, mode: null, cancellationToken, commitProperties: null);
+
+    /// <summary>
+    /// Deletes rows matching the predicate, as <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/>
+    /// does, recording <paramref name="commitProperties"/> in the commit. A separate overload for the reason
+    /// given on <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CommitProperties?, CancellationToken)"/>.
+    /// </summary>
+    public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
+        Expressions.Predicate predicate,
+        CommitProperties? commitProperties,
+        CancellationToken cancellationToken = default)
+        => DeleteCoreAsync(predicate, mode: null, cancellationToken, commitProperties);
 
     /// <summary>
     /// Deletes rows matching an analyzable <see cref="Expressions.Predicate"/>, as
     /// <see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/> does, choosing how a file the predicate
     /// matches only in part is changed — see
-    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken)"/>.
+    /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, RowDeleteMode, CancellationToken, CommitProperties?)"/>.
     /// </summary>
     public ValueTask<(long RowsDeleted, long Version)> DeleteAsync(
         Expressions.Predicate predicate,
         RowDeleteMode mode,
-        CancellationToken cancellationToken = default)
-        => DeleteCoreAsync(predicate, mode, cancellationToken);
+        CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
+        => DeleteCoreAsync(predicate, mode, cancellationToken, commitProperties);
 
     private async ValueTask<(long RowsDeleted, long Version)> DeleteCoreAsync(
         Expressions.Predicate predicate,
         RowDeleteMode? mode,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CommitProperties? commitProperties)
     {
         ThrowIfDisposed();
         await using var transaction = StartTransaction(); // aborts (and cleans up) on any failure — see above
+        transaction.CommitProperties = commitProperties;
         long rowsDeleted = await (mode is RowDeleteMode m
                 ? transaction.DeleteAsync(predicate, m, cancellationToken)
                 : transaction.DeleteAsync(predicate, cancellationToken))
@@ -4490,9 +4538,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     public ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
         Func<RecordBatch, BooleanArray> predicate,
         Func<RecordBatch, RecordBatch> updater,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
         => UpdateCoreAsync(predicate, updater, prunePredicate: null, readPredicates: [],
-            opaquePredicate: true, cancellationToken);
+            opaquePredicate: true, cancellationToken, commitProperties);
 
     /// <summary>
     /// Updates rows matching an analyzable <see cref="Expressions.Predicate"/>. As with the analyzable
@@ -4504,9 +4553,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     public ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
         Expressions.Predicate predicate,
         Func<RecordBatch, RecordBatch> updater,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
         => UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
-            readPredicates: [predicate], opaquePredicate: false, cancellationToken);
+            readPredicates: [predicate], opaquePredicate: false, cancellationToken, commitProperties);
 
     private async ValueTask<(long RowsUpdated, long Version)> UpdateCoreAsync(
         Func<RecordBatch, BooleanArray> predicate,
@@ -4514,7 +4564,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         Expressions.Predicate? prunePredicate,
         IReadOnlyList<Expressions.Predicate> readPredicates,
         bool opaquePredicate,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CommitProperties? commitProperties)
     {
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
@@ -4547,7 +4598,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 },
                 IsolationFor(snapshot, plan.Actions), "UPDATE",
                 rebaseSafe: true, cancellationToken, written: written,
-                isBlindAppend: false).ConfigureAwait(false);
+                isBlindAppend: false, commitProperties: commitProperties).ConfigureAwait(false);
 
             return (plan.TotalUpdated, committed);
         }, cancellationToken).ConfigureAwait(false);
@@ -4555,7 +4606,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>The remove/add (and CDC) actions an UPDATE produces, the paths it rewrote, and the row
     /// count — everything a commit needs, without committing. Shared by the auto-committing
-    /// <see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken)"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
+    /// <see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken, CommitProperties?)"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
     internal sealed record UpdateActions(
         IReadOnlyList<DeltaAction> Actions, ISet<string> RemovedPaths, long TotalUpdated, long NextRowId);
 
@@ -5756,9 +5807,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         DeltaWriteMode mode = DeltaWriteMode.Append,
         CancellationToken cancellationToken = default,
         IReadOnlyList<string>? repartitionTo = null,
-        bool? isBlindAppend = null)
+        bool? isBlindAppend = null,
+        CommitProperties? commitProperties = null)
         => WriteCoreAsync(batches, mode, null, cancellationToken, repartitionTo: repartitionTo,
-            isBlindAppend: isBlindAppend);
+            isBlindAppend: isBlindAppend, commitProperties: commitProperties);
 
     /// <summary>
     /// Atomically overwrites one or more whole partitions in a SINGLE commit: removes exactly the active files
@@ -5771,8 +5823,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     public ValueTask<long> OverwritePartitionsAsync(
         IReadOnlyList<RecordBatch> batches,
         IReadOnlyDictionary<string, string> overwritePartitions,
-        CancellationToken cancellationToken = default)
-        => WriteCoreAsync(batches, DeltaWriteMode.Overwrite, overwritePartitions, cancellationToken);
+        CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
+        => WriteCoreAsync(batches, DeltaWriteMode.Overwrite, overwritePartitions, cancellationToken,
+            commitProperties: commitProperties);
 
     /// <summary>
     /// DYNAMIC partition overwrite (Spark <c>partitionOverwriteMode=dynamic</c>): atomically replaces exactly the
@@ -5784,9 +5838,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     public ValueTask<long> DynamicOverwriteAsync(
         IReadOnlyList<RecordBatch> batches,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
         => WriteCoreAsync(batches, DeltaWriteMode.Append, null, cancellationToken,
-                          dynamicPartitionOverwrite: true);
+                          dynamicPartitionOverwrite: true, commitProperties: commitProperties);
 
     private async ValueTask<long> WriteCoreAsync(
         IReadOnlyList<RecordBatch> batches,
@@ -5795,7 +5850,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         bool dynamicPartitionOverwrite = false,
         IReadOnlyList<string>? repartitionTo = null,
-        bool? isBlindAppend = null)
+        bool? isBlindAppend = null,
+        CommitProperties? commitProperties = null)
     {
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
@@ -5822,7 +5878,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // direct attempt and never passes the level on, so for it this is only the invalid-value refusal.
             return await CommitWriteAsync(
                 snapshot, actions, mode, dynamicPartitionOverwrite, newVersion,
-                IsolationFor(snapshot, actions), cancellationToken, written, isBlindAppend).ConfigureAwait(false);
+                IsolationFor(snapshot, actions), cancellationToken, written, isBlindAppend, commitProperties)
+                .ConfigureAwait(false);
         }, cancellationToken).ConfigureAwait(false);
     }
 
@@ -6271,7 +6328,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         IsolationLevel isolation,
         CancellationToken cancellationToken,
         WrittenFileLedger? written = null,
-        bool? isBlindAppend = null)
+        bool? isBlindAppend = null,
+        CommitProperties? commitProperties = null)
     {
         long committedVersion;
         bool blindAppend = mode == DeltaWriteMode.Append && !dynamicPartitionOverwrite;
@@ -6312,7 +6370,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             committedVersion = await CommitOccAsync(
                 snapshot, actions, ReadSet.Blind,
                 isolation, "WRITE", rebaseSafe: isBlindAppend != false,
-                cancellationToken, written: written, isBlindAppend: isBlindAppend).ConfigureAwait(false);
+                cancellationToken, written: written, isBlindAppend: isBlindAppend,
+                commitProperties: commitProperties).ConfigureAwait(false);
         }
         else
         {
@@ -6321,7 +6380,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // on files. Recording that is what lets another engine's checker examine it rather than fall
             // back to a default that happens to agree.
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                actions, snapshot.Metadata.Configuration, "WRITE", isBlindAppend: false);
+                actions, snapshot.Metadata.Configuration, "WRITE", isBlindAppend: false,
+                commitProperties: commitProperties);
             await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
                 .ConfigureAwait(false);
             // Durable: these files are the table's now, whatever the refresh below does. Same reasoning as
@@ -7251,7 +7311,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         string? clusteringProvider = null,
         bool? isBlindAppend = null,
         bool constraintsEnforcedByCaller = false,
-        IReadOnlyCollection<string>? readDomains = null)
+        IReadOnlyCollection<string>? readDomains = null,
+        CommitProperties? commitProperties = null)
     {
         ThrowIfDisposed();
         ValidateWriteSupport(CurrentSnapshot);
@@ -7396,6 +7457,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // Reads above: that is Blind here (bar declared domains) because this method cannot see a scan, which
                     // is precisely why the claim has to come from the caller. See LogCommitRequest.IsBlindAppend.
                     IsBlindAppend = isBlindAppend,
+                    CommitProperties = commitProperties,
                     // The vectors above are table data from this instant: a throw from post-commit work must
                     // not collect them.
                     OnCommitDurable = written.Clear,
@@ -8188,7 +8250,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         RowSelection selection,
         RowDeleteMode mode = RowDeleteMode.DeletionVector,
         bool rowLevelRetry = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
     {
         ThrowIfDisposed();
         if (selection is null)
@@ -8207,10 +8270,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             RowDeleteMode.DeletionVector => CollectOnFailureAsync(
                 written => DeleteRowsViaVectorsAsync(
-                    selection, rowLevelRetry, written, cancellationToken),
+                    selection, rowLevelRetry, written, cancellationToken, commitProperties),
                 cancellationToken),
             RowDeleteMode.CopyOnWrite => CollectOnFailureAsync(
-                written => DeleteRowsCopyOnWriteAsync(selection, written, cancellationToken),
+                written => DeleteRowsCopyOnWriteAsync(selection, written, cancellationToken, commitProperties),
                 cancellationToken),
             _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unknown row delete mode."),
         };
@@ -8244,7 +8307,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         RowSelection selection,
         bool rowLevelRetry,
         WrittenFileLedger written,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CommitProperties? commitProperties)
     {
         ValidateWriteSupport(CurrentSnapshot);
 
@@ -8326,7 +8390,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             new ReadSet { Files = removedPaths },
             IsolationFor(snapshot, actions), "DELETE", rebaseSafe: true, cancellationToken,
             rowLevelDeletes: rowLevelRetry ? dvEdits : null, written: written,
-            isBlindAppend: false).ConfigureAwait(false);
+            isBlindAppend: false, commitProperties: commitProperties).ConfigureAwait(false);
         return (totalDeleted, version);
     }
 
@@ -8426,7 +8490,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private async ValueTask<(long RowsDeleted, long Version)> DeleteRowsCopyOnWriteAsync(
         RowSelection selection,
         WrittenFileLedger written,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        CommitProperties? commitProperties)
     {
         ValidateWriteSupport(CurrentSnapshot);
 
@@ -8448,7 +8513,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, plan.Actions,
             new ReadSet { Files = plan.RemovedPaths },
             IsolationFor(snapshot, plan.Actions), "DELETE", rebaseSafe: false, cancellationToken,
-            written: written, isBlindAppend: false)
+            written: written, isBlindAppend: false, commitProperties: commitProperties)
             .ConfigureAwait(false);
         return (plan.RowsDeleted, version);
     }
@@ -8919,7 +8984,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     public ValueTask<long> UpdateRowsAsync(
         RowSelection selection,
         Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
     {
         ThrowIfDisposed();
         if (selection is null)
@@ -8929,7 +8995,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // The rewrite's output is written before the commit is attempted, and rebaseSafe:false means ANY
         // concurrent commit aborts it — so it collects its own files rather than orphaning a full rewrite.
         return CollectOnFailureAsync(
-            written => UpdateRowsCoreAsync(selection, rewriteFile, written, cancellationToken),
+            written => UpdateRowsCoreAsync(selection, rewriteFile, written, cancellationToken, commitProperties),
             cancellationToken);
     }
 
@@ -8947,7 +9013,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     public ValueTask<long> UpdateRowsAsync(
         RecordBatch updates,
         string metadataPrefix = RowSelection.DefaultMetadataPrefix,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
     {
         ThrowIfDisposed();
         if (updates is null)
@@ -8995,7 +9062,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 (path, sourceBatches, positionsPerBatch) =>
                     ApplyLocatorKeyedUpdates(path, sourceBatches, positionsPerBatch, updIndexByLocator, setColumns),
                 written,
-                cancellationToken),
+                cancellationToken,
+                commitProperties),
             cancellationToken);
     }
 
@@ -9058,7 +9126,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         RowSelection selection,
         Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>> rewriteFile,
         WrittenFileLedger written,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken,
+        CommitProperties? commitProperties)
     {
         ValidateWriteSupport(CurrentSnapshot);
 
@@ -9245,7 +9314,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             snapshot, actions,
             new ReadSet { Files = removedPaths },
             IsolationFor(snapshot, actions), "UPDATE", rebaseSafe: false, cancellationToken,
-            written: written, isBlindAppend: false)
+            written: written, isBlindAppend: false, commitProperties: commitProperties)
             .ConfigureAwait(false);
     }
 
@@ -9916,7 +9985,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         IAsyncEnumerable<RecordBatch> batches,
         DeltaWriteMode mode = DeltaWriteMode.Append,
         CancellationToken cancellationToken = default,
-        bool? isBlindAppend = null)
+        bool? isBlindAppend = null,
+        CommitProperties? commitProperties = null)
     {
         var batchList = new List<RecordBatch>();
         await foreach (var batch in batches.WithCancellation(cancellationToken)
@@ -9924,7 +9994,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             batchList.Add(batch);
         }
-        return await WriteAsync(batchList, mode, cancellationToken, isBlindAppend: isBlindAppend)
+        return await WriteAsync(
+                batchList, mode, cancellationToken, isBlindAppend: isBlindAppend,
+                commitProperties: commitProperties)
             .ConfigureAwait(false);
     }
 
@@ -9962,7 +10034,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </remarks>
     public async ValueTask<long?> CompactAsync(
         CompactionOptions? options = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
     {
         ThrowIfDisposed();
         ValidateWriteSupport(CurrentSnapshot);
@@ -9997,7 +10070,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     snapshot, compaction.Actions, new ReadSet { Files = read },
                     IsolationLevel.WriteSerializable, "OPTIMIZE", rebaseSafe: true, cancellationToken,
                     written: written, isBlindAppend: false,
-                    rebase: compaction.RowTrackingEnabled ? new CompactionRebaseHandler() : null)
+                    rebase: compaction.RowTrackingEnabled ? new CompactionRebaseHandler() : null,
+                    commitProperties: commitProperties)
                     .ConfigureAwait(false);
             },
             cancellationToken).ConfigureAwait(false);
@@ -10071,7 +10145,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     public async ValueTask<VacuumResult> VacuumAsync(
         TimeSpan? retentionPeriod = null,
         bool dryRun = false,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
     {
         ThrowIfDisposed();
 
@@ -10097,7 +10172,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         return await Vacuum.VacuumExecutor.ExecuteAsync(
             _fs, _log, CurrentSnapshot, retention, dryRun,
             _options.HideIcebergMetadataDirectory, cancellationToken,
-            afterCommit: AfterCommitAsync)
+            afterCommit: AfterCommitAsync, commitProperties: commitProperties)
             .ConfigureAwait(false);
     }
 

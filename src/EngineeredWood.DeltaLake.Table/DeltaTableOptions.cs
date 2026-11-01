@@ -42,7 +42,7 @@ public sealed record DeltaTableOptions
     /// Target size for the data files a write creates, in bytes. Default: 128 MB.
     /// </summary>
     /// <remarks>
-    /// <para>A write (<see cref="DeltaTable.WriteAsync(IReadOnlyList{Apache.Arrow.RecordBatch}, DeltaWriteMode, CancellationToken, IReadOnlyList{string}, bool?)"/>,
+    /// <para>A write (<see cref="DeltaTable.WriteAsync(IReadOnlyList{Apache.Arrow.RecordBatch}, DeltaWriteMode, CancellationToken, IReadOnlyList{string}, bool?, CommitProperties?)"/>,
     /// a transaction's <see cref="DeltaTransaction.WriteAsync"/>, <see cref="DeltaTable.WriteDataFilesAsync"/>)
     /// gathers each partition's rows from all of its batches, so the number of files follows the data's size and
     /// not how the caller batched it. With the built-in writer, consecutive batches are joined into row groups of up

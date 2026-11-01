@@ -32,11 +32,14 @@ public sealed partial class DeltaTable
     /// would write them by an insert.</param>
     /// <param name="options">The keys and clauses.</param>
     /// <param name="cancellationToken">Cancels the MERGE; files it already wrote are deleted again.</param>
+    /// <param name="commitProperties">The caller's own metadata for the commit.</param>
     public async ValueTask<(MergeMetrics Metrics, long Version)> MergeAsync(
-        IReadOnlyList<RecordBatch> source, MergeOptions options, CancellationToken cancellationToken = default)
+        IReadOnlyList<RecordBatch> source, MergeOptions options, CancellationToken cancellationToken = default,
+        CommitProperties? commitProperties = null)
     {
         ThrowIfDisposed();
         await using var transaction = StartTransaction(); // takes back what it wrote on any failure
+        transaction.CommitProperties = commitProperties;
         var metrics = await transaction.MergeAsync(source, options, cancellationToken).ConfigureAwait(false);
         long version = await transaction.CommitAsync(cancellationToken).ConfigureAwait(false);
         return (metrics, version);

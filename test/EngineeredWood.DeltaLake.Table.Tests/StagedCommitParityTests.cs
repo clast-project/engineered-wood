@@ -74,6 +74,8 @@ public class StagedCommitParityTests : IDisposable
         // The other commitInfo claim, and a property for exactly the same reason: whether the transaction
         // READ anything is one answer per commit, not one per staging call.
         ["isBlindAppend"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.IsBlindAppend)),
+        // The caller's own commitInfo keys: one set per commit, so a property too.
+        ["commitProperties"] = new(typeof(DeltaTransaction), nameof(DeltaTransaction.CommitProperties)),
         // First-committer-wins pinning. A transaction is pinned by construction — and, since slice 3, to a
         // version the host chooses rather than always to CurrentSnapshot, which is what makes the pinning
         // mean the same thing on both surfaces.
