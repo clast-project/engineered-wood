@@ -31,7 +31,7 @@ public class RowEvaluatorBenchmarks
     private readonly ArrowRowEvaluator _plain = new();
     private readonly ArrowRowEvaluator _spark = new(new SparkFunctionRegistry());
 
-    private static readonly DateOnly Start = new(2026, 1, 1);
+    private static readonly DateTimeOffset Start = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
     private Predicate _categoryTyped = null!;
     private Predicate _categorySql = null!;
@@ -39,6 +39,15 @@ public class RowEvaluatorBenchmarks
     private Predicate _dateRangeSql = null!;
     private Predicate _idTyped = null!;
     private Predicate _amountSql = null!;
+
+    // A typed calendar date where the target has one; .NET Framework has no DateOnly, and a UTC-midnight
+    // instant compares the same against a date column.
+    private static LiteralValue DateLiteral(int year, int month, int day) =>
+#if NET6_0_OR_GREATER
+        LiteralValue.Of(new DateOnly(year, month, day));
+#else
+        LiteralValue.Of(new DateTimeOffset(year, month, day, 0, 0, 0, TimeSpan.Zero));
+#endif
 
     [GlobalSetup]
     public void Setup()
@@ -50,7 +59,7 @@ public class RowEvaluatorBenchmarks
         for (int i = 0; i < Rows; i++)
         {
             ids.Append(i);
-            dates.Append(Start.AddDays(i % 365).ToDateTime(TimeOnly.MinValue));
+            dates.Append(Start.AddDays(i % 365));
             categories.Append($"cat_{i % 16:D2}");
             amounts.Append(i * 0.25);
         }
@@ -67,8 +76,8 @@ public class RowEvaluatorBenchmarks
         _categoryTyped = Equal("category", LiteralValue.Of("cat_03"));
         _categorySql = SparkSqlParser.ParsePredicate("category = 'cat_03'");
         _dateRangeTyped = And(
-            GreaterThanOrEqual("date", LiteralValue.Of(new DateOnly(2026, 10, 1))),
-            LessThan("date", LiteralValue.Of(new DateOnly(2026, 10, 8))));
+            GreaterThanOrEqual("date", DateLiteral(2026, 10, 1)),
+            LessThan("date", DateLiteral(2026, 10, 8)));
         _dateRangeSql = SparkSqlParser.ParsePredicate(
             "date >= DATE'2026-10-01' AND date < DATE'2026-10-08'");
         _idTyped = LessThan("id", LiteralValue.Of(500_000L));
@@ -81,7 +90,7 @@ public class RowEvaluatorBenchmarks
     [Benchmark(Description = "category = 'cat_03', Spark SQL")]
     public BooleanArray CategorySpark() => _spark.EvaluatePredicate(_categorySql, _batch);
 
-    [Benchmark(Description = "date range, plain (DateOnly literals)")]
+    [Benchmark(Description = "date range, plain (typed date literals)")]
     public BooleanArray DateRangePlain() => _plain.EvaluatePredicate(_dateRangeTyped, _batch);
 
     [Benchmark(Description = "date range, Spark SQL (DATE'...')")]

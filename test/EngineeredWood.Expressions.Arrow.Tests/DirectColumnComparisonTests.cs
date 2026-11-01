@@ -320,6 +320,50 @@ public class DirectColumnComparisonTests
         Assert.Equal([false, false, false, true, false, false, null], Enumerable.Range(0, 7).Select(i => mask.GetValue(i)));
     }
 
+    /// <summary>A registry with a row-dependent function and no promise that any call is foldable.</summary>
+    private sealed class RowIndexRegistry(bool claimFoldable) : IFunctionRegistry, IFoldableFunctions
+    {
+        public bool IsRegistered(string name) => name == "row_index";
+
+        public IArrowArray Invoke(string name, IReadOnlyList<IArrowArray> args, int rowCount) =>
+            new Int64Array.Builder().AppendRange(Enumerable.Range(0, rowCount).Select(i => (long)i)).Build();
+
+        public bool IsFoldable(string name) => claimFoldable;
+    }
+
+    [Fact]
+    public void ACallTheRegistryDoesNotCallFoldableIsEvaluatedPerRow()
+    {
+        // `row_index()` reads no column, so it is constant in structure, but not in value: evaluating it once
+        // would compare every row with 0.
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema([new Field("x", Int64Type.Default, false)], null),
+            [new Int64Array.Builder().AppendRange([0L, 1L, 2L]).Build()], 3);
+        var evaluator = new ArrowRowEvaluator(new RowIndexRegistry(claimFoldable: false));
+
+        var mask = evaluator.EvaluatePredicate(
+            Expressions.Equal(Expressions.Ref("x"), Expressions.Call("row_index")), batch);
+
+        Assert.Equal([true, true, true], Enumerable.Range(0, 3).Select(i => mask.GetValue(i)!.Value));
+        Assert.Equal(0, evaluator.DirectComparisons);
+    }
+
+    [Fact]
+    public void ACallTheRegistryCallsFoldableIsEvaluatedOnce()
+    {
+        // The other side of the contract: a registry that claims foldability is taken at its word.
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema([new Field("x", Int64Type.Default, false)], null),
+            [new Int64Array.Builder().AppendRange([0L, 1L, 2L]).Build()], 3);
+        var evaluator = new ArrowRowEvaluator(new RowIndexRegistry(claimFoldable: true));
+
+        var mask = evaluator.EvaluatePredicate(
+            Expressions.Equal(Expressions.Ref("x"), Expressions.Call("row_index")), batch);
+
+        Assert.Equal([true, false, false], Enumerable.Range(0, 3).Select(i => mask.GetValue(i)!.Value));
+        Assert.Equal(1, evaluator.DirectComparisons);
+    }
+
     [Fact]
     public void ABatchWithNoNullsHasNoValidityBitmap()
     {

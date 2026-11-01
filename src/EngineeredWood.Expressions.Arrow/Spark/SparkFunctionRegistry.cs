@@ -30,7 +30,7 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </remarks>
 public sealed class SparkFunctionRegistry
     : IFunctionRegistry, IComparisonCoercion, IShortCircuitingFunctions, INullabilityRules,
-      ILiteralPrecisionRules, IAnalysisRules, IConstantFoldedFunctions
+      ILiteralPrecisionRules, IAnalysisRules, IConstantFoldedFunctions, IFoldableFunctions
 {
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
@@ -65,6 +65,13 @@ public sealed class SparkFunctionRegistry
 
     /// <summary>The semantics this registry implements.</summary>
     public SparkDialectOptions Options => _options;
+
+    /// <summary>
+    /// Every function registered here is deterministic and reads nothing but its arguments, so a call over
+    /// constants is foldable -- Spark's <c>foldable</c>, whose non-deterministic family (<c>rand()</c>,
+    /// <c>current_date()</c>, ...) is not registered. A function added that is not must answer false here.
+    /// </summary>
+    public bool IsFoldable(string name) => IsRegistered(name);
 
     public bool IsRegistered(string name) => name switch
     {

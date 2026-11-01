@@ -307,6 +307,32 @@ public interface IConstantFoldedFunctions
 }
 
 /// <summary>
+/// A function registry that knows which of its functions are foldable: a call to one whose every
+/// argument is constant has the same value in every row.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Optional, and asked for with an <c>as</c> cast. <see cref="IFunctionRegistry.Invoke"/> only promises
+/// an array of <c>rowCount</c> values, so without this a call over constants is evaluated once per row
+/// like any other. With it, <see cref="ArrowRowEvaluator"/> may evaluate such a call once and compare a
+/// column against the single value -- <c>date &gt;= DATE'2026-10-01'</c> is a cast over a literal.
+/// </para>
+/// <para>
+/// An allow-list, like <see cref="INullabilityRules"/>: wrongly claiming a function is foldable gives
+/// every row the first row's value (<c>x = row_index()</c>, <c>rand()</c>), while under-claiming costs
+/// only the speed-up. A non-deterministic or row-dependent function must answer false.
+/// </para>
+/// </remarks>
+public interface IFoldableFunctions
+{
+    /// <summary>
+    /// Whether a call to <paramref name="name"/> whose arguments are all constant has the same value in
+    /// every row.
+    /// </summary>
+    bool IsFoldable(string name);
+}
+
+/// <summary>
 /// A function registry that knows which of its functions can never produce a null.
 /// </summary>
 /// <remarks>

@@ -177,9 +177,39 @@ public sealed partial class ArrowRowEvaluator
     private bool IsConstantOperand(Expression expression) => expression switch
     {
         LiteralExpression literal => !literal.Value.IsNull,
-        FunctionCall call => _functions is not null && _functions.IsRegistered(call.Name) && IsConstant(call),
+        FunctionCall call => IsConstant(call) && AllCallsFoldable(call),
         _ => false,
     };
+
+    /// <summary>
+    /// Whether every call in a constant expression is one the registry promises is foldable, so that it
+    /// may be evaluated once for the whole batch. <see cref="IsConstant"/> alone is structural -- it says
+    /// no column is read -- and a registered function may still differ per row (<c>row_index()</c>).
+    /// </summary>
+    private bool AllCallsFoldable(Expression expression)
+    {
+        if (_functions is null || _functions is not IFoldableFunctions foldable)
+            return false;
+
+        switch (expression)
+        {
+            case LiteralExpression:
+                return true;
+            case FunctionCall call:
+                if (!_functions.IsRegistered(call.Name) || !foldable.IsFoldable(call.Name))
+                    return false;
+                foreach (var argument in call.Arguments)
+                {
+                    if (!AllCallsFoldable(argument))
+                        return false;
+                }
+
+                return true;
+            default:
+                // A nested predicate or anything else: not worth proving, so evaluated per row.
+                return false;
+        }
+    }
 
     private static bool HasKernel(IArrowArray column) => column is
         StringArray or Int8Array or Int16Array or Int32Array or Int64Array
