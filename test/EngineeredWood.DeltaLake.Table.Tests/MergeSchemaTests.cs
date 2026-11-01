@@ -277,6 +277,25 @@ public class MergeSchemaTests : IDisposable
         Assert.Equal(before, table.CurrentSnapshot.Version);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task WideningInsideAnArrayElement_IsRefusedAsUnsupported_WhateverTheTableSetting(bool widening)
+    {
+        var schema = Schema(Long("id"), new Field("xs", new ListType(Int("element", nullable: true)), true));
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, schema, configuration: widening ? Widening : null);
+
+        var listType = new ListType(Long("element", nullable: true));
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(1).Build();
+        var list = new ListArray(listType, 1, offsets, Longs(5), ArrowBuffer.Empty);
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await table.WriteAsync(
+                [new RecordBatch(Schema(Long("id"), new Field("xs", listType, true)), [Longs(1), list], 1)],
+                mergeSchema: true));
+        Assert.Equal(DeltaTableErrorCodes.UnsupportedSchemaMerge, ex.ErrorCode);
+    }
+
     [Fact]
     public async Task CaseOnlyDifference_IsRefused()
     {
@@ -635,6 +654,30 @@ public class MergeSchemaTests : IDisposable
             await table.WriteAsync(
                 [new RecordBatch(Schema(Long("id"), new Field("s", dup, true)), [Longs(3), s], 1)], mergeSchema: true));
         Assert.Contains("'s.b' more than once", ex.Message);
+    }
+
+    [Theory]
+    [MemberData(nameof(MergeOrNot))]
+    public async Task ALogicalNameBesideItsPhysicalName_IsADuplicate(bool mergeSchema)
+    {
+        await using var table = await CreateIdLongTableAsync(ColumnMappingMode.Name);
+        string physical = table.CurrentSnapshot.Schema.Fields[0].Metadata![ColumnMapping.PhysicalNameKey];
+
+        var schema = Schema(Long("id"), Long(physical));
+        var ex = await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await table.WriteAsync([new RecordBatch(schema, [Longs(3), Longs(4)], 1)], mergeSchema: mergeSchema));
+        Assert.Contains("logical and physical names", ex.Message);
+    }
+
+    [Fact]
+    public async Task WriteDataFilesAsync_RefusesADuplicateColumn()
+    {
+        await using var table = await CreateIdLongTableAsync();
+
+        var schema = Schema(Long("id"), Long("id"));
+        var ex = await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await table.WriteDataFilesAsync([new RecordBatch(schema, [Longs(3), Longs(4)], 1)]));
+        Assert.Contains("'id' more than once", ex.Message);
     }
 
     [Fact]

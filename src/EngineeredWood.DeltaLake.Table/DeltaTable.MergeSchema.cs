@@ -52,7 +52,7 @@ public sealed partial class DeltaTable
     {
         // First, as the write itself does: once a duplicate's first copy is added, the second would match it.
         foreach (var batch in batches)
-            ThrowIfDuplicateColumns(batch.Schema, "Write");
+            ThrowIfDuplicateColumns(batch.Schema, snapshot.Schema, "Write");
 
         var merge = new SchemaMerge(this, snapshot);
         foreach (var batch in batches)
@@ -184,19 +184,20 @@ public sealed partial class DeltaTable
                 return; // added by this merge, so there is nothing to widen; the type check judges the disagreement
 
             string change = $"'{display}' is {declared.TypeName} in the table and {supplied.TypeName} in the batch";
-            if (!Schema.TypeWidening.IsEnabled(config))
-            {
-                throw new DeltaFormatException(
-                    DeltaTableErrorCodes.MergeIncompatibleDataType,
-                    $"mergeSchema: {change}. Widening the column needs type widening; set "
-                    + $"{Schema.TypeWidening.EnableKey}=true on the table, or cast the column to {declared.TypeName}.");
-            }
+            // Before the table setting: inside a collection no setting would make it work, so the error says so.
             if (inCollection)
             {
                 throw new DeltaFormatException(
                     DeltaTableErrorCodes.UnsupportedSchemaMerge,
                     $"mergeSchema: {change}, inside an array element or a map key or value, which a merge does "
                     + $"not widen. Cast the column to {declared.TypeName}.");
+            }
+            if (!Schema.TypeWidening.IsEnabled(config))
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.MergeIncompatibleDataType,
+                    $"mergeSchema: {change}. Widening the column needs type widening; set "
+                    + $"{Schema.TypeWidening.EnableKey}=true on the table, or cast the column to {declared.TypeName}.");
             }
             if (_metadata.PartitionColumns.Contains(path[0]))
             {
