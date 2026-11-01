@@ -835,8 +835,12 @@ it prunes files by the source's key range only for integer and string keys (not 
 an `INSERT *` into a table with a GENERATED ALWAYS identity column replaces the source's values for it, as an
 append does, where Spark's behavior has not been checked;
 and, like EW's other DML (only VACUUM writes them), its commit records no
-`operationMetrics`: the counts come back to the caller as `MergeMetrics` instead. Still missing: RESTORE (committing a time-travel state as the
-current version), and CLONE (shallow/deep). `ReadChangesAsync` exists for CDF but there is no raw
+`operationMetrics`: the counts come back to the caller as `MergeMetrics` instead. `RestoreAsync` (by version or
+timestamp, #567) commits an earlier version's files, metadata and clustering columns as Spark's RESTORE does (pinned
+by `RestoreInteropTests`); unlike Spark it also refuses a missing deletion-vector file, and it resolves a
+timestamp by `commitInfo.timestamp` where Spark uses the commit file's modification time (they agree unless the log
+was copied). It cannot downgrade the protocol (Spark's `RESTORE_TABLE_PROTOCOL_DOWNGRADE_ALLOWED`). Still missing:
+CLONE (shallow/deep). `ReadChangesAsync` exists for CDF but there is no raw
 incremental-by-version-range read outside of CDF.
 
 **Schema evolution API — partial.** Metadata-only commits exist for top-level

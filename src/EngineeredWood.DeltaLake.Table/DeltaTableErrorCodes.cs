@@ -338,6 +338,33 @@ public static class DeltaTableErrorCodes
     /// matched DELETE is exempt: every candidate deletes the same row.</remarks>
     public const string MultipleSourceRowsMatchingTargetRow = "DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE";
 
+    // ── RESTORE ──
+
+    /// <summary>
+    /// A RESTORE named a version the table cannot be read at: newer than its latest, negative, or older than the
+    /// oldest version its log can still reconstruct. Nothing is committed.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_CANNOT_RESTORE_TABLE_VERSION</c>, with the same message.</remarks>
+    public const string CannotRestoreTableVersion = "DELTA_CANNOT_RESTORE_TABLE_VERSION";
+
+    /// <summary>A RESTORE named a timestamp before the table's oldest readable version. Nothing is committed.</summary>
+    /// <remarks>delta-spark: <c>DELTA_CANNOT_RESTORE_TIMESTAMP_EARLIER</c>.</remarks>
+    public const string CannotRestoreTimestampEarlier = "DELTA_CANNOT_RESTORE_TIMESTAMP_EARLIER";
+
+    /// <summary>A RESTORE named a timestamp after the table's latest commit. Nothing is committed.</summary>
+    /// <remarks>delta-spark: <c>DELTA_CANNOT_RESTORE_TIMESTAMP_GREATER</c>.</remarks>
+    public const string CannotRestoreTimestampGreater = "DELTA_CANNOT_RESTORE_TIMESTAMP_GREATER";
+
+    /// <summary>
+    /// A file the RESTORE would re-add no longer exists, usually because VACUUM deleted it. Nothing is
+    /// committed. <see cref="RestoreOptions.IgnoreMissingFiles"/> skips the check.
+    /// </summary>
+    /// <remarks>delta-spark raises this condition without an error class (the message is the same:
+    /// "Not all files from version N are available in file system"), so the code is this library's. Spark checks
+    /// only data files; this library checks deletion-vector files too, since a missing one makes the restored
+    /// table just as unreadable.</remarks>
+    public const string RestoreMissingFiles = "DELTA_RESTORE_MISSING_FILES";
+
     // ── UniForm ──
 
     /// <summary>
