@@ -76,6 +76,26 @@ public class TypedLiteralKindTests
 
 #if NET6_0_OR_GREATER
     [Fact]
+    public void AHalfInAnInListRoundsTheColumnAsAFloatDoes()
+    {
+        // Legacy compares an int against a float as a float, and 16777217 is not a float: it rounds to
+        // 16777216, which the list holds. A Half is typed as a float, so it must bring the same rounding.
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema([new Field("i", Int32Type.Default, false)], null),
+            [new Int32Array.Builder().Append(16777217).Build()], 1);
+        var predicate = Expressions.In(Expressions.Ref("i"),
+            new[] { LiteralValue.Of((Half)1.5), LiteralValue.Of(16777216) });
+
+        var legacy = new ArrowRowEvaluator(new SparkFunctionRegistry(new SparkDialectOptions { Ansi = false }));
+        var withFloat = new ArrowRowEvaluator(new SparkFunctionRegistry(new SparkDialectOptions { Ansi = false }))
+            .EvaluatePredicate(Expressions.In(Expressions.Ref("i"),
+                new[] { LiteralValue.Of(1.5f), LiteralValue.Of(16777216) }), batch);
+
+        Assert.True(withFloat.GetValue(0));
+        Assert.True(legacy.EvaluatePredicate(predicate, batch).GetValue(0));
+    }
+
+    [Fact]
     public void ATimeOfDayStillHasNoSparkType()
     {
         // Delta and Spark have no TIME type, so there is nothing to compare one against.

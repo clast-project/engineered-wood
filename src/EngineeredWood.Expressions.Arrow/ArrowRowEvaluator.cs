@@ -625,6 +625,9 @@ public sealed class ArrowRowEvaluator : IRowEvaluator
         member.IsConstant
             ? member.Constant?.Type
                 is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal or LiteralValue.Kind.Float
+#if NET6_0_OR_GREATER
+                    or LiteralValue.Kind.Half   // typed as a float, as in MightRound
+#endif
             : MightRound(declared, member.PerRow);
 
     /// <summary>Whether a set member is a string, from its declared type or its value.</summary>

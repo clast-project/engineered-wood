@@ -246,9 +246,11 @@ internal static class SparkDecimalRounding
     }
 
     /// <summary>The width Spark gives an integral column, from <c>DecimalType.forType</c>.</summary>
+    // A uint is typed as a bigint, as the row evaluator materializes one (#589): Spark has no unsigned
+    // types, and int cannot hold every uint. So only an int is 10 digits wide.
     private static int IntegralWidth(LiteralValue.Kind kind) => kind switch
     {
-        LiteralValue.Kind.Int32 or LiteralValue.Kind.UInt32 => 10,
+        LiteralValue.Kind.Int32 => 10,
         _ => 20,
     };
 

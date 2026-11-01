@@ -137,6 +137,58 @@ public class DmlPredicateSemanticsTests : IDisposable
             X.Equal("d", LiteralValue.Of(5)), batch => batch));
     }
 
+    [Fact]
+    public async Task Delete_TwoLiteralsOfDifferentTypes_AreNotFoldedByTheStatistics()
+    {
+        // `'5' = 5` is TRUE to Spark (the string is cast). The statistics cannot order a string against a
+        // number, and must not read that as "no row matches" and skip every file.
+        await using var table = await TableAsync();
+
+        var (deleted, _) = await table.DeleteAsync(
+            X.Equal(X.Lit(LiteralValue.Of("5")), X.Lit(LiteralValue.Of(5))));
+
+        Assert.Equal(3, deleted);
+    }
+
+    [Fact]
+    public async Task Delete_ACastThatFailsOnARow_IsNotProvenAwayByStatistics()
+    {
+        // Under ANSI `s = 5` raises CAST_INVALID_INPUT on 'abc', and Spark's OR evaluates it first. The
+        // statistics prove `id >= 0` of every row, but trusting that proof would delete the file unread and
+        // never raise.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("s", StringType.Default, true))
+            .Field(new Field("id", Int64Type.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema, new DeltaTableOptions { TrustStatisticsProofs = true });
+        await table.WriteAsync([new RecordBatch(schema,
+            [new StringArray.Builder().Append("abc").Build(), new Int64Array.Builder().Append(1).Build()], 1)]);
+        long before = table.CurrentSnapshot.Version;
+
+        await Assert.ThrowsAsync<EngineeredWood.Expressions.Arrow.Spark.SparkEvaluationException>(async () => await table.DeleteAsync(X.Or(
+            X.Equal("s", LiteralValue.Of(5)), X.GreaterThanOrEqual("id", LiteralValue.Of(0L)))));
+
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+        Assert.Single(table.CurrentSnapshot.ActiveFiles);
+    }
+
+    [Fact]
+    public async Task Delete_UnsignedInListAgainstAWideDecimal_RoundsAsTheMaskDoes()
+    {
+        // A uint is typed as a bigint, so `IN (0u)` against decimal(38,20) compares through decimal(38,18) and
+        // 4E-19 rounds to 0: a match. The statistics must round through the same type, not skip the file.
+        var type = new Decimal128Type(38, 20);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("p", type, true)).Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
+        await table.WriteAsync([new RecordBatch(schema,
+            [new Decimal128Array.Builder(type).Append(0.0000000000000000004m).Build()], 1)]);
+
+        var (deleted, _) = await table.DeleteAsync(X.In("p", LiteralValue.Of(0u)));
+
+        Assert.Equal(1, deleted);
+    }
+
 #if NET6_0_OR_GREATER
     [Fact]
     public async Task Delete_TypedDateOnlyLiteral_StillMatches()

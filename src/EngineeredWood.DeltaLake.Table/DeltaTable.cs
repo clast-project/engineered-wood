@@ -4522,6 +4522,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 .Where(g => g.Count() == 1 && g.Single().Type is Schema.PrimitiveType { TypeName: not "variant" })
                 .Select(g => g.Key),
             StringComparer.OrdinalIgnoreCase);
+        var types = schema.Fields
+            .GroupBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Count() == 1)
+            .ToDictionary(g => g.Key, g => g.Single().Type, StringComparer.OrdinalIgnoreCase);
         return Visit(predicate);
 
         bool Visit(Expressions.Expression expression) => expression switch
@@ -4530,13 +4534,41 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             Expressions.AndPredicate and => and.Children.All(Visit),
             Expressions.OrPredicate or => or.Children.All(Visit),
             Expressions.NotPredicate not => Visit(not.Child),
-            Expressions.ComparisonPredicate cmp => Visit(cmp.Left) && Visit(cmp.Right),
+            Expressions.ComparisonPredicate cmp =>
+                Visit(cmp.Left) && Visit(cmp.Right) && !CastsAString([cmp.Left, cmp.Right]),
             Expressions.UnaryPredicate unary => Visit(unary.Operand),
-            Expressions.SetPredicate set => Visit(set.Operand) && set.Values.All(Visit),
+            Expressions.SetPredicate set =>
+                Visit(set.Operand) && set.Values.All(Visit) && !CastsAString([set.Operand, .. set.Values]),
             Expressions.UnboundReference reference =>
                 reference.NameParts.Count == 1 && columns.Contains(reference.Name),
             _ => false,
         };
+
+        // A string compared with a non-string is cast, and under ANSI the cast raises on a value it cannot
+        // read: `s = 5` over 'abc' is CAST_INVALID_INPUT. Whether it raises depends on the rows, which a proof
+        // never reads -- `s = 5 OR id >= 0` would be proven by its second branch and the file deleted unread.
+        // So such a comparison is not proven, wherever it sits (#589).
+        bool CastsAString(IEnumerable<Expressions.Expression> operands)
+        {
+            bool anyString = false, anyOther = false;
+            foreach (var operand in operands)
+            {
+                bool? isString = operand switch
+                {
+                    Expressions.LiteralExpression { Value.IsNull: true } => null,
+                    Expressions.LiteralExpression literal => literal.Value.Type == Expressions.LiteralValue.Kind.String,
+                    Expressions.UnboundReference reference when types.TryGetValue(reference.Name, out var type) =>
+                        type is Schema.PrimitiveType p && (p.TypeName == "string"
+                            || p.TypeName.StartsWith("varchar(", StringComparison.OrdinalIgnoreCase)
+                            || p.TypeName.StartsWith("char(", StringComparison.OrdinalIgnoreCase)),
+                    _ => null,
+                };
+                if (isString == true) anyString = true;
+                else if (isString == false) anyOther = true;
+            }
+
+            return anyString && anyOther;
+        }
     }
 
     /// <summary>
