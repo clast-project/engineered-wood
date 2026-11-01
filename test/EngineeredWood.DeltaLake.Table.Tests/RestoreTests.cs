@@ -618,6 +618,47 @@ public class RestoreTests : IDisposable
     }
 
     /// <summary>
+    /// After log cleanup a version may survive only as a checkpoint: readable by version, but with no commit to carry
+    /// a timestamp. As in Spark (measured: 4.0.3 / Delta 4.0.0), it takes no part in resolving a timestamp, so the
+    /// earliest restorable time is the first surviving commit's and anything earlier is refused.
+    /// </summary>
+    [Fact]
+    public async Task Restore_ByTimestamp_IgnoresACheckpointOnlyVersion()
+    {
+        await using (var table = await CreateAsync(deletionVectors: false))
+        {
+            for (long i = 1; i <= 4; i++)
+            {
+                await Task.Delay(5);
+                await table.WriteAsync([Rows(i)]);                                        // v1..v4
+            }
+            await table.CheckpointAsync();                                                // at v4
+            for (long i = 5; i <= 6; i++)
+            {
+                await Task.Delay(5);
+                await table.WriteAsync([Rows(i)]);                                        // v5, v6
+            }
+        }
+        long atV4 = await CommitTimestampAsync(4);
+        long atV5 = await CommitTimestampAsync(5);
+        for (int v = 0; v <= 4; v++)
+            File.Delete(Path.Combine(_tempDir, "_delta_log", $"{v:D20}.json"));
+
+        await using var reopened = await DeltaTable.OpenAsync(Fs);
+        var ex = await RefusedAsync(DeltaTableErrorCodes.CannotRestoreTimestampEarlier,
+            async () => await reopened.RestoreAsync(DateTimeOffset.FromUnixTimeMilliseconds(atV4)));
+        Assert.Contains(DateTimeOffset.FromUnixTimeMilliseconds(atV5)
+            .ToString("yyyy-MM-dd HH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture), ex.Message);
+
+        var result = await reopened.RestoreAsync(DateTimeOffset.FromUnixTimeMilliseconds(atV5));
+        Assert.Equal(5, result.RestoredVersion);
+        Assert.Equal(["1:v1", "2:v2", "3:v3", "4:v4", "5:v5"], await ReadAsync(reopened));
+
+        // By version, the checkpoint-only version is restorable.
+        Assert.Equal(4, (await reopened.RestoreAsync(4)).RestoredVersion);
+    }
+
+    /// <summary>
     /// A version that enabled UniForm cannot be restored while this library does not maintain UniForm's metadata:
     /// the restored properties would re-enable it, leaving Iceberg readers on stale metadata.
     /// </summary>

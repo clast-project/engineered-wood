@@ -68,7 +68,9 @@ public sealed partial class DeltaTable
     /// <summary>
     /// Restores the table to the version that was current at <paramref name="timestamp"/>: <c>RESTORE TABLE … TO
     /// TIMESTAMP AS OF timestamp</c>. That is the latest version committed at or before it, an exact match
-    /// included, resolved as <see cref="GetSnapshotAtTimestampAsync"/> resolves it. Otherwise as <see cref="RestoreAsync(long, RestoreOptions?, CancellationToken, CommitProperties?)"/>.
+    /// included, resolved as <see cref="GetSnapshotAtTimestampAsync"/> resolves it. Only versions with a commit file
+    /// count: one that log cleanup left as a checkpoint alone has no commit time, and, as in Spark, the earliest
+    /// restorable time is then the first surviving commit's (it can still be restored by version). Otherwise as <see cref="RestoreAsync(long, RestoreOptions?, CancellationToken, CommitProperties?)"/>.
     /// </summary>
     /// <exception cref="DeltaFormatException">The timestamp is before the oldest readable version
     /// (<see cref="DeltaTableErrorCodes.CannotRestoreTimestampEarlier"/>) or after the latest commit
