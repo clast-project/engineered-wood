@@ -1,4 +1,4 @@
-﻿// Copyright (c) clast-project. All rights reserved.
+// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
@@ -625,6 +625,181 @@ public class MergeTests : IDisposable
             [new Int64Array.Builder().Append(1).Build(), new Int64Array.Builder().Append(1).Build()], 1);
 
         await Assert.ThrowsAsync<ArgumentException>(() => table.MergeAsync([source], Upsert).AsTask());
+    }
+
+    private static readonly TimestampType Micros = new(TimeUnit.Microsecond, "UTC");
+    private static readonly TimestampType Millis = new(TimeUnit.Millisecond, "UTC");
+
+    private static TimestampArray Timestamps(TimestampType type, params long[] values)
+    {
+        var data = new ArrowBuffer.Builder<long>().AppendRange(values).Build();
+        return new TimestampArray(type, data, ArrowBuffer.Empty, values.Length, 0, 0);
+    }
+
+    private static RecordBatch TimestampRows(TimestampType kType, long[] k, IArrowArray v, IArrowType vType)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", kType, true)).Field(new Field("v", vType, true)).Build();
+        return new RecordBatch(schema, [Timestamps(kType, k), v], k.Length);
+    }
+
+    [Fact]
+    public async Task ATimestampKey_MatchesTheSameInstantInAnotherUnit()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", Micros, true)).Field(new Field("v", StringType.Default, true)).Build();
+        await using var table = await CreateAsync(schema: schema);
+        // One second, and one millisecond.
+        await table.WriteAsync([TimestampRows(Micros, [1_000_000, 1_000],
+            new StringArray.Builder().Append("second").Append("milli").Build(), StringType.Default)]);
+
+        // In milliseconds: 1000 is the first row's instant (not the second row's raw count), 7 neither's.
+        var (metrics, _) = await table.MergeAsync(
+            [TimestampRows(Millis, [1_000, 7], new StringArray.Builder().Append("S").Append("new").Build(), StringType.Default)],
+            new MergeOptions { Keys = ["k"], WhenMatched = MergeAction.Update, WhenNotMatched = MergeAction.Insert });
+
+        Assert.Equal(1, metrics.NumTargetRowsUpdated);
+        Assert.Equal(1, metrics.NumTargetRowsInserted);
+        var rows = new SortedDictionary<long, string?>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var k = (TimestampArray)batch.Column("k");
+            Assert.Equal(TimeUnit.Microsecond, ((TimestampType)k.Data.DataType).Unit);
+            for (int i = 0; i < batch.Length; i++)
+                rows[k.GetValue(i)!.Value] = ((StringArray)batch.Column("v")).GetString(i);
+        }
+        Assert.Equal(new Dictionary<long, string?> { [1_000] = "milli", [7_000] = "new", [1_000_000] = "S" }, rows);
+    }
+
+    [Fact]
+    public async Task AnUpdateFromAnotherArrowForm_IsWrittenBesideTheCopiedRowsInTheTablesForm()
+    {
+        // A file with one updated row and one copied: the source's millisecond timestamps and large strings
+        // must reach it as the table's microseconds and strings.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("v", StringType.Default, true))
+            .Field(new Field("at", Micros, true))
+            .Build();
+        await using var table = await CreateAsync(schema: schema);
+        await table.WriteAsync([new RecordBatch(schema,
+            [new Int64Array.Builder().Append(1).Append(2).Build(),
+             new StringArray.Builder().Append("a").Append("b").Build(),
+             Timestamps(Micros, 10, 20)], 2)]);
+
+        var sourceSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("v", LargeStringType.Default, true))
+            .Field(new Field("at", Millis, true))
+            .Build();
+        await table.MergeAsync([new RecordBatch(sourceSchema,
+            [new Int64Array.Builder().Append(1).Build(),
+             new LargeStringArray.Builder().Append("A").Build(),
+             Timestamps(Millis, 5)], 1)],
+            new MergeOptions { Keys = ["id"], WhenMatched = MergeAction.Update });
+
+        var rows = new List<(long, string?, long)>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            for (int i = 0; i < batch.Length; i++)
+            {
+                rows.Add((((Int64Array)batch.Column("id")).GetValue(i)!.Value,
+                    ((StringArray)batch.Column("v")).GetString(i),
+                    ((TimestampArray)batch.Column("at")).GetValue(i)!.Value));
+            }
+        }
+        Assert.Equal([(1L, "A", 5_000L), (2L, "b", 20L)], rows.OrderBy(r => r.Item1));
+    }
+
+    private Task<DeltaTable> CreateAppendOnlyAsync() => DeltaTable.CreateAsync(
+        new LocalTableFileSystem(_tempDir), TableSchema,
+        configuration: new Dictionary<string, string> { ["delta.appendOnly"] = "true" }).AsTask();
+
+    [Fact]
+    public async Task OnAnAppendOnlyTable_AMergeThatChangesNoRow_Lands()
+    {
+        await using var table = await CreateAppendOnlyAsync();
+        await table.WriteAsync([Rows((1, "a", 10))]);
+
+        // Insert-only, and an upsert whose matched clause matches nothing: neither removes a file (as Spark).
+        await table.MergeAsync([Rows((1, "x", 0), (2, "b", 20))], new MergeOptions
+        {
+            Keys = ["id"], WhenNotMatched = MergeAction.Insert,
+        });
+        await table.MergeAsync([Rows((3, "c", 30))], Upsert);
+
+        Assert.Equal([(1L, "a", 10L), (2L, "b", 20L), (3L, "c", 30L)],
+            (await ReadAsync(table)).Select(r => (r.Id!.Value, r.Value, r.Ts!.Value)));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task OnAnAppendOnlyTable_AMergeThatUpdatesOrDeletes_IsRefused(bool update)
+    {
+        await using var table = await CreateAppendOnlyAsync();
+        await table.WriteAsync([Rows((1, "a", 10))]);
+        var before = Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories).Length;
+
+        var e = await Assert.ThrowsAsync<DeltaFormatException>(() => table.MergeAsync(
+            [Rows((1, "A", 11), (2, "b", 20))], new MergeOptions
+            {
+                Keys = ["id"],
+                WhenMatched = update ? MergeAction.Update : MergeAction.Delete,
+                WhenNotMatched = MergeAction.Insert,
+            }).AsTask());
+
+        Assert.Equal(DeltaTableErrorCodes.CannotModifyAppendOnly, e.ErrorCode);
+        Assert.Equal([(1L, "a", 10L)], (await ReadAsync(table)).Select(r => (r.Id!.Value, r.Value, r.Ts!.Value)));
+        Assert.Equal(before, Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories).Length);
+    }
+
+    [Fact]
+    public async Task TwoInsertingMergesInATransaction_TakeDistinctIdentityValues()
+    {
+        var idMeta = Schema.IdentityColumn.CreateMetadata(start: 1, step: 1, allowExplicitInsert: false);
+        string schemaString = "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":"
+            + System.Text.Json.JsonSerializer.Serialize(idMeta) + "},"
+            + "{\"name\":\"value\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}";
+        var fs = new LocalTableFileSystem(_tempDir);
+        await new Log.TransactionLog(fs).WriteCommitAsync(0, new List<Actions.DeltaAction>
+        {
+            new Actions.ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["identityColumns"] },
+            new Actions.MetadataAction
+            {
+                Id = "merge-identity", Format = Actions.Format.Parquet, SchemaString = schemaString, PartitionColumns = [],
+            },
+        });
+        await using var table = await DeltaTable.OpenAsync(fs);
+
+        static RecordBatch Values(params string[] values)
+        {
+            var builder = new StringArray.Builder();
+            foreach (string v in values)
+                builder.Append(v);
+            return new RecordBatch(
+                new Apache.Arrow.Schema.Builder().Field(new Field("value", StringType.Default, true)).Build(),
+                [builder.Build()], values.Length);
+        }
+
+        var insert = new MergeOptions { Keys = ["value"], WhenNotMatched = MergeAction.InsertColumns("value") };
+        await using (var txn = table.StartTransaction())
+        {
+            await txn.MergeAsync([Values("a", "b")], insert);
+            await txn.MergeAsync([Values("c")], insert);
+            await txn.CommitAsync();
+        }
+        // The committed mark carries both: the next write continues after them.
+        await table.MergeAsync([Values("d")], insert);
+
+        var ids = new Dictionary<string, long>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            for (int i = 0; i < batch.Length; i++)
+                ids[((StringArray)batch.Column("value")).GetString(i)] = ((Int64Array)batch.Column("id")).GetValue(i)!.Value;
+        }
+        Assert.Equal(new long[] { 1, 2, 3, 4 }, ids.OrderBy(kv => kv.Key).Select(kv => kv.Value));
     }
 
     [Theory]

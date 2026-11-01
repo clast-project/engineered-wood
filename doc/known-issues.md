@@ -817,6 +817,9 @@ DELETE), each with an optional condition, with Spark's rules for duplicated sour
 keys and for `SET *` / `INSERT *` (pinned by `MergeInteropTests`). It does not take
 an arbitrary ON condition, several clauses of one kind, SET or VALUES expressions
 (only source columns, all of them or a named list), or schema evolution (#568); it always copy-on-writes, never writing deletion vectors;
+it prunes files by the source's key range only for integer and string keys (not date, timestamp or decimal);
+an `INSERT *` into a table with a GENERATED ALWAYS identity column replaces the source's values for it, as an
+append does, where Spark's behavior has not been checked;
 and, like EW's other DML (only VACUUM writes them), its commit records no
 `operationMetrics`: the counts come back to the caller as `MergeMetrics` instead. Still missing: RESTORE (committing a time-travel state as the
 current version), and CLONE (shallow/deep). `ReadChangesAsync` exists for CDF but there is no raw

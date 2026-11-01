@@ -1,4 +1,4 @@
-﻿// Copyright (c) clast-project. All rights reserved.
+// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
@@ -77,13 +77,16 @@ public sealed partial class DeltaTable
     /// <param name="rowIdStart">Where the rewrite and the insert reserve stable row ids. Null starts at the
     /// snapshot's mark.</param>
     /// <param name="written">Records the rewritten, inserted and change-data files this MERGE writes.</param>
+    /// <param name="identityHighWaterMarks">The identity marks a transaction's earlier appends left pending, for
+    /// the insert to continue from (see <see cref="ComputeWriteActionsAsync"/>).</param>
     internal async ValueTask<MergeActions> ComputeMergeActionsAsync(
         Snapshot.Snapshot snapshot,
         IReadOnlyList<RecordBatch> source,
         MergeOptions options,
         CancellationToken cancellationToken,
         long? rowIdStart = null,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        IReadOnlyDictionary<string, long>? identityHighWaterMarks = null)
     {
         if (source is null)
             throw new ArgumentNullException(nameof(source));
@@ -169,7 +172,8 @@ public sealed partial class DeltaTable
                 var (actions, insertNextRowId) = await ComputeWriteActionsAsync(
                     snapshot, [insertBatch], DeltaWriteMode.Append,
                     overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
-                    cancellationToken, rowIdStart: rowTrackingEnabled ? nextRowId : null, written: written)
+                    cancellationToken, rowIdStart: rowTrackingEnabled ? nextRowId : null, written: written,
+                    identityHighWaterMarks: identityHighWaterMarks)
                     .ConfigureAwait(false);
                 insertActions.AddRange(actions);
                 inserted = rows.Count;
@@ -336,6 +340,7 @@ public sealed partial class DeltaTable
                     {
                         // Before this file writes anything. (The transaction takes back what earlier files wrote.)
                         RejectCopyOnWriteRowIdUnsupported("MERGE");
+                        ThrowIfAppendOnly(snapshot, "MERGE");
                         fileModified = true;
                     }
 
@@ -478,12 +483,120 @@ public sealed partial class DeltaTable
             }
         }
 
-        if (source.Count == 1)
-            return source[0];
-        var columns = new IArrowArray[schema.FieldsList.Count];
-        for (int c = 0; c < columns.Length; c++)
-            columns[c] = ArrowCompute.Concatenate(source.Select(b => b.Column(c)).ToList());
-        return new RecordBatch(schema, columns, source.Sum(b => b.Length));
+        var combined = source[0];
+        if (source.Count > 1)
+        {
+            var columns = new IArrowArray[schema.FieldsList.Count];
+            for (int c = 0; c < columns.Length; c++)
+                columns[c] = ArrowCompute.Concatenate(source.Select(b => b.Column(c)).ToList());
+            combined = new RecordBatch(schema, columns, source.Sum(b => b.Length));
+        }
+        return HostOwnsBytes ? combined : ConformToTable(combined, snapshot.ArrowSchema);
+    }
+
+    /// <summary>
+    /// <paramref name="source"/> with each column the normalization leaves in another Arrow form of its Delta type
+    /// (large strings and binaries, timestamps in seconds or milliseconds or under another zone name) converted to
+    /// the table's. A MERGE puts source values into the files it rewrites beside rows it only copies, and one
+    /// file holds one Arrow type per column. A timestamp out of the microsecond range is refused.
+    /// </summary>
+    private static RecordBatch ConformToTable(RecordBatch source, Apache.Arrow.Schema table)
+    {
+        IArrowArray[]? columns = null;
+        Field[]? fields = null;
+        for (int c = 0; c < source.ColumnCount; c++)
+        {
+            var field = source.Schema.FieldsList[c];
+            var target = table.GetFieldByName(field.Name)?.DataType;
+            var column = source.Column(c);
+            IArrowArray? converted = (column, target) switch
+            {
+                (LargeStringArray large, Apache.Arrow.Types.StringType) => ToString(large),
+                (LargeBinaryArray large, Apache.Arrow.Types.BinaryType) when target.TypeId == Apache.Arrow.Types.ArrowTypeId.Binary
+                    => ToBinary(large),
+                (TimestampArray ts, Apache.Arrow.Types.TimestampType to)
+                    when !ts.Data.DataType.Equals(to) => ToTimestamp(ts, to, field.Name),
+                _ => null,
+            };
+            if (converted is null)
+                continue;
+            columns ??= Enumerable.Range(0, source.ColumnCount).Select(source.Column).ToArray();
+            fields ??= source.Schema.FieldsList.ToArray();
+            columns[c] = converted;
+            fields[c] = new Field(field.Name, converted.Data.DataType, field.IsNullable, field.Metadata);
+        }
+        return columns is null
+            ? source
+            : new RecordBatch(new Apache.Arrow.Schema(fields!, source.Schema.Metadata), columns, source.Length);
+
+        static StringArray ToString(LargeStringArray large)
+        {
+            var builder = new StringArray.Builder();
+            for (int i = 0; i < large.Length; i++)
+            {
+                if (large.IsNull(i))
+                    builder.AppendNull();
+                else
+                    builder.Append(large.GetString(i));
+            }
+            return builder.Build();
+        }
+
+        static BinaryArray ToBinary(LargeBinaryArray large)
+        {
+            var builder = new BinaryArray.Builder();
+            for (int i = 0; i < large.Length; i++)
+            {
+                if (large.IsNull(i))
+                    builder.AppendNull();
+                else
+                    builder.Append(large.GetBytes(i));
+            }
+            return builder.Build();
+        }
+
+        static TimestampArray ToTimestamp(TimestampArray ts, Apache.Arrow.Types.TimestampType to, string name)
+        {
+            var from = (Apache.Arrow.Types.TimestampType)ts.Data.DataType;
+            long scale = Scale(to.Unit) / Scale(from.Unit);
+            if (scale == 0)
+            {
+                // Narrowing (nanoseconds): never on this path, which refuses the unit before it gets here.
+                throw new ArgumentException(
+                    $"MERGE: column '{name}' supplies timestamps in {from.Unit}, finer than the table's {to.Unit}.");
+            }
+            var values = new long[ts.Length];
+            var validity = new ArrowBuffer.BitmapBuilder(ts.Length);
+            for (int i = 0; i < ts.Length; i++)
+            {
+                bool valid = !ts.IsNull(i);
+                validity.Append(valid);
+                if (!valid)
+                    continue;
+                long value = ts.GetValue(i)!.Value;
+                try
+                {
+                    values[i] = checked(value * scale);
+                }
+                catch (OverflowException)
+                {
+                    throw new ArgumentException(
+                        $"MERGE: column '{name}' holds the timestamp {value} ({from.Unit}), which is outside the "
+                        + "range of a Delta timestamp.");
+                }
+            }
+            return new TimestampArray(
+                to, new ArrowBuffer.Builder<long>().AppendRange(values).Build(), validity.Build(),
+                ts.Length, ts.NullCount, 0);
+        }
+
+        static long Scale(Apache.Arrow.Types.TimeUnit unit) => unit switch
+        {
+            Apache.Arrow.Types.TimeUnit.Second => 1,
+            Apache.Arrow.Types.TimeUnit.Millisecond => 1_000,
+            Apache.Arrow.Types.TimeUnit.Microsecond => 1_000_000,
+            _ => 1_000_000_000,
+        };
     }
 
     /// <summary>The columns of <paramref name="batch"/> <paramref name="columns"/> names, in the batch's order.</summary>
@@ -769,12 +882,15 @@ public sealed partial class DeltaTable
 internal static class MergeKeys
 {
     /// <summary>Row <paramref name="row"/>'s key across <paramref name="columns"/>, or null when any part is NULL
-    /// (a NULL key matches nothing). Both sides of a MERGE hold each key in the same Delta type, so a value's bytes
-    /// are the comparison: floating-point zeros and NaNs are canonicalized first, since SQL takes
-    /// <c>-0.0 = 0.0</c> and Spark <c>NaN = NaN</c>.</summary>
+    /// (a NULL key matches nothing). Both sides of a MERGE hold each key in the same Delta type, but not always in
+    /// the same Arrow type: a source may supply a <c>timestamp</c> in milliseconds against the table's
+    /// microseconds, or (under a host's codec) a decimal or integer at another width. So each value is encoded in
+    /// one form per Delta type: integers as 64 bits, dates as milliseconds, timestamps as microseconds plus any
+    /// nanoseconds, decimals sign-extended to 256 bits. Floating-point zeros and NaNs are canonicalized too,
+    /// since SQL takes <c>-0.0 = 0.0</c> and Spark <c>NaN = NaN</c>.</summary>
     public static byte[]? Encode(IArrowArray[] columns, int row)
     {
-        Span<byte> scratch = stackalloc byte[8];
+        Span<byte> scratch = stackalloc byte[32];
         int length = 0;
         foreach (var column in columns)
         {
@@ -799,6 +915,61 @@ internal static class MergeKeys
     {
         switch (column)
         {
+            case Int8Array i8:
+                return Int64(i8.GetValue(row)!.Value, scratch);
+            case Int16Array i16:
+                return Int64(i16.GetValue(row)!.Value, scratch);
+            case Int32Array i32:
+                return Int64(i32.GetValue(row)!.Value, scratch);
+            case Int64Array i64:
+                return Int64(i64.GetValue(row)!.Value, scratch);
+            case Date32Array d32:
+                return Int64(d32.GetValue(row)!.Value * 86_400_000L, scratch);
+            case Date64Array d64:
+                return Int64(d64.GetValue(row)!.Value, scratch);
+            case TimestampArray ts:
+            {
+                long value = ts.GetValue(row)!.Value;
+                long micros, nanos = 0;
+                try
+                {
+                    switch (((Apache.Arrow.Types.TimestampType)ts.Data.DataType).Unit)
+                    {
+                        case Apache.Arrow.Types.TimeUnit.Second: micros = checked(value * 1_000_000); break;
+                        case Apache.Arrow.Types.TimeUnit.Millisecond: micros = checked(value * 1_000); break;
+                        case Apache.Arrow.Types.TimeUnit.Microsecond: micros = value; break;
+                        default:
+                            micros = value / 1_000;
+                            nanos = value % 1_000;
+                            if (nanos < 0)
+                            {
+                                micros--;
+                                nanos += 1_000;
+                            }
+                            break;
+                    }
+                }
+                catch (OverflowException)
+                {
+                    throw new ArgumentException(
+                        $"MERGE: the key timestamp {value} ({ts.Data.DataType.Name}) is outside the range of "
+                        + "a Delta timestamp.");
+                }
+                System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(scratch, micros);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(scratch.Slice(8), nanos);
+                return scratch.Slice(0, 16);
+            }
+            case Apache.Arrow.Arrays.FixedSizeBinaryArray dec when dec.Data.DataType is
+                Apache.Arrow.Types.Decimal32Type or Apache.Arrow.Types.Decimal64Type
+                or Apache.Arrow.Types.Decimal128Type or Apache.Arrow.Types.Decimal256Type:
+            {
+                // Little-endian two's complement at the type's width; sign-extended, the widths agree.
+                var bytes = dec.GetBytes(row);
+                bytes.CopyTo(scratch);
+                byte sign = (bytes[bytes.Length - 1] & 0x80) != 0 ? (byte)0xFF : (byte)0;
+                scratch.Slice(bytes.Length, 32 - bytes.Length).Fill(sign);
+                return scratch.Slice(0, 32);
+            }
             case BooleanArray b:
                 scratch[0] = b.GetValue(row) == true ? (byte)1 : (byte)0;
                 return scratch.Slice(0, 1);
@@ -834,6 +1005,12 @@ internal static class MergeKeys
         }
         throw new NotSupportedException(
             $"MERGE cannot compare keys of Arrow type {column.Data.DataType.Name}.");
+    }
+
+    private static ReadOnlySpan<byte> Int64(long value, Span<byte> scratch)
+    {
+        System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(scratch, value);
+        return scratch.Slice(0, 8);
     }
 }
 

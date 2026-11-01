@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.Schema;
 
 namespace EngineeredWood.DeltaLake.Table;
 
@@ -96,6 +97,12 @@ public sealed class DeltaTransaction : IAsyncDisposable
     // otherwise reserve the SAME ids, and the duplicate is invisible until a spec reader resolves two rows
     // to one identity. Null until the first row-tracking stage reads the base mark.
     private long? _nextRowId;
+    // The same for identity columns: the high-water marks the appends staged so far left pending, and the one
+    // metaData action that carries them. A later append generates values from these marks, not from the base
+    // snapshot's (which would repeat values), and its metaData action replaces the earlier one, since a
+    // commit must not carry two.
+    private Dictionary<string, long>? _identityMarks;
+    private MetadataAction? _stagedIdentityMetadata;
     // Preconditions: facts about the base version that must hold on EVERY commit attempt. Distinct from
     // staged effects, which are rebased and retried — a precondition cannot become true by retrying.
     private readonly List<AppTransactionRequirement> _appTransactions = [];
@@ -301,10 +308,12 @@ public sealed class DeltaTransaction : IAsyncDisposable
         var (actions, nextRowId) = await TakingBackOnFailureAsync(_written.Paths.Count, () => _table.ComputeWriteActionsAsync(
             _baseSnapshot, batches, DeltaWriteMode.Append,
             overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
-            cancellationToken, rowIdStart: _nextRowId, written: _written), cancellationToken).ConfigureAwait(false);
+            cancellationToken, rowIdStart: _nextRowId, written: _written, identityHighWaterMarks: _identityMarks),
+            cancellationToken).ConfigureAwait(false);
 
         _nextRowId = nextRowId;
         StageInternal(actions);
+        ChainIdentityMarks(actions);
         RecordUncoveredAppends(actions);
         _operations.Add("WRITE");
 
@@ -518,15 +527,17 @@ public sealed class DeltaTransaction : IAsyncDisposable
         EnsureOpen();
 
         // The rewrite re-validates the post-image and the insert goes through the append path, so a
-        // constrained table is writable here.
+        // constrained table is writable here. An append-only table is refused only when a row is updated or
+        // deleted, before any file is rewritten: as Spark, whose MERGE fails on such a table only if it removes
+        // a file, so one that only inserts lands.
         _table.ValidateWritable(
             _baseSnapshot, isAppend: false,
-            handling: WriteTimeExpressionHandling.ValidatedHere);
+            handling: WriteTimeExpressionHandling.ValidatedHere, appendOnlyCheckedLater: true);
 
         int mark = _written.Paths.Count;
         var plan = await TakingBackOnFailureAsync(mark, () => _table.ComputeMergeActionsAsync(
-            _baseSnapshot, source, options, cancellationToken, rowIdStart: _nextRowId, written: _written),
-            cancellationToken).ConfigureAwait(false);
+            _baseSnapshot, source, options, cancellationToken, rowIdStart: _nextRowId, written: _written,
+            identityHighWaterMarks: _identityMarks), cancellationToken).ConfigureAwait(false);
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "MERGE", cancellationToken)
             .ConfigureAwait(false);
 
@@ -534,6 +545,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _nextRowId = nextRowId;
         StageInternal(plan.RewriteActions);
         StageInternal(plan.InsertActions);
+        ChainIdentityMarks(plan.InsertActions);
         RecordUncoveredAppends(plan.InsertActions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
@@ -1201,6 +1213,27 @@ public sealed class DeltaTransaction : IAsyncDisposable
                 continue;
             }
             _dataActions.Add(action);
+        }
+    }
+
+    /// <summary>
+    /// After an append was staged: when it advanced identity marks (the metaData action it emitted, already
+    /// staged), records them for the next append and drops the metaData action an earlier append staged, which
+    /// the new one supersedes (it carries the earlier marks too).
+    /// </summary>
+    private void ChainIdentityMarks(IEnumerable<DeltaAction> actions)
+    {
+        if (actions.OfType<MetadataAction>().LastOrDefault() is not { } metadata)
+            return;
+        if (_stagedIdentityMetadata is not null)
+            _dataActions.Remove(_stagedIdentityMetadata);
+        _stagedIdentityMetadata = metadata;
+
+        _identityMarks ??= new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var field in DeltaSchemaSerializer.Parse(metadata.SchemaString).Fields)
+        {
+            if (IdentityColumn.GetConfig(field) is { HighWaterMark: { } mark })
+                _identityMarks[field.Name] = mark;
         }
     }
 

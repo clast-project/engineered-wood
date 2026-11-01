@@ -1,4 +1,4 @@
-﻿// Copyright (c) clast-project. All rights reserved.
+// Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Runtime.CompilerServices;
@@ -5610,10 +5610,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="WriteTimeExpressionHandling.Refuse"/>, so a path that cannot see the rows keeps
     /// refusing a table that declares any rather than committing it unchecked.
     /// </param>
+    /// <param name="appendOnlyCheckedLater">The path refuses an append-only table itself, once it knows whether it
+    /// removes anything (MERGE: Spark refuses only a commit that removes a file).</param>
     internal void ValidateWritable(
         Snapshot.Snapshot snapshot,
         bool isAppend,
-        WriteTimeExpressionHandling handling = WriteTimeExpressionHandling.Refuse)
+        WriteTimeExpressionHandling handling = WriteTimeExpressionHandling.Refuse,
+        bool appendOnlyCheckedLater = false)
     {
         ValidateWriteSupport(snapshot);
         // Appends to a row-tracking table are spec-conformant (baseRowId + position). A copy-on-write rewrite
@@ -5622,7 +5625,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // row-tracking table missing them (spec-invalid) cannot materialize, so a rewrite is still refused.
         if (!isAppend)
             RejectRowTrackingWrite(snapshot);
-        HonorWriterFeatures(snapshot, isAppend, handling);
+        HonorWriterFeatures(snapshot, isAppend || appendOnlyCheckedLater, handling);
+    }
+
+    /// <summary>Refuses to remove data from a <c>delta.appendOnly=true</c> table.</summary>
+    internal static void ThrowIfAppendOnly(Snapshot.Snapshot snapshot, string entryPoint)
+    {
+        if (snapshot.Metadata.Configuration is { } cfg
+            && cfg.TryGetValue("delta.appendOnly", out var ao)
+            && string.Equals(ao, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.CannotModifyAppendOnly,
+                $"Table is append-only (delta.appendOnly=true): this {entryPoint} would update or delete rows, "
+                + "which is not permitted. A MERGE that only inserts, or whose matched and not-matched-by-source "
+                + "clauses change no row, is.");
+        }
     }
 
     /// <summary>
@@ -5822,6 +5840,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// Null starts at the snapshot's mark, which is right for a single-shot commit.</param>
     /// <param name="written">Records the data files this write creates, so a transaction that never commits
     /// can take them back (<see cref="DeltaTransaction.AbortAsync"/>). Null on the auto-committing path.</param>
+    /// <param name="identityHighWaterMarks">The identity high-water marks earlier appends staged against the same
+    /// snapshot left pending, for a transaction: generation continues from them, and the metaData action this
+    /// write emits carries them, so it supersedes the earlier one. Null starts at the snapshot's marks.</param>
     internal async ValueTask<(IReadOnlyList<DeltaAction> Actions, long NextRowId)> ComputeWriteActionsAsync(
         Snapshot.Snapshot snapshot,
         IReadOnlyList<RecordBatch> batches,
@@ -5831,7 +5852,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? repartitionTo,
         CancellationToken cancellationToken,
         long? rowIdStart = null,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        IReadOnlyDictionary<string, long>? identityHighWaterMarks = null)
     {
         // The shared chokepoint for both the auto-committing path and a transaction's append. This path
         // converts no schema, so a column the table does not declare would ride into the data file unnoticed.
@@ -6025,7 +6047,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             var config = IdentityColumn.GetConfig(field);
             if (config is not null)
-                identityConfigs[field.Name] = config;
+            {
+                identityConfigs[field.Name] = identityHighWaterMarks is not null
+                    && identityHighWaterMarks.TryGetValue(field.Name, out long chained)
+                        ? config with { HighWaterMark = chained }
+                        : config;
+            }
         }
         var allIdentityUpdates = new List<(string Name, long HighWaterMark)>();
 
@@ -6190,7 +6217,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (allIdentityUpdates.Count > 0)
         {
             var updatedSchema = snapshot.Schema;
-            foreach (var (name, hwm) in allIdentityUpdates)
+            // The pending marks first, so a column this write left alone keeps the earlier write's mark.
+            var marks = (identityHighWaterMarks ?? new Dictionary<string, long>())
+                .Select(kv => (kv.Key, kv.Value)).Concat(allIdentityUpdates);
+            foreach (var (name, hwm) in marks)
             {
                 var updatedFields = updatedSchema.Fields.Select(f =>
                     f.Name == name ? IdentityColumn.UpdateHighWaterMark(f, hwm) : f).ToList();
