@@ -1104,7 +1104,9 @@ feature. Both follow Spark 4.0 / Delta 4.0.0's names, protocol and history
 parameters ([#565](https://github.com/clast-project/engineered-wood/issues/565)).
 A constraint passed in `configuration` at creation now declares the
 feature too. Generated columns given at creation still do not declare
-`generatedColumns`.
+`generatedColumns`, so Spark, which enforces them only when the protocol
+declares the feature, will not compute or check them on such a table
+([#582](https://github.com/clast-project/engineered-wood/issues/582)).
 
 **Constraint enforcement is per write path, not global.** Only paths
 that hand us the batches evaluate anything: `WriteAsync`, the
