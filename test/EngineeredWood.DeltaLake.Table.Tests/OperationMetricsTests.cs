@@ -240,6 +240,56 @@ public class OperationMetricsTests : IDisposable
         Assert.Null(await MetricsAsync(table, renamed));
     }
 
+    /// <summary>
+    /// Work staged as raw actions is not one of the operation's counts. A data-changing add staged beside a DELETE
+    /// would otherwise turn up as copied rows, and a commitInfo naming another operation is what the commit
+    /// records, so DELETE metrics would misdescribe it. Either records none. A raw action that changes no data
+    /// leaves the metrics alone.
+    /// </summary>
+    [Fact]
+    public async Task RawStagedWork_TheMetricsCannotDescribe_RecordsNone()
+    {
+        await using var table = await CreateAsync();
+
+        // A data-changing add of a new file (a copy of an existing one): its rows are no staging call's.
+        var donor = table.CurrentSnapshot.ActiveFiles.Values.Single(f => f.GetNumRecords() == 2);
+        string copy = "raw-" + Path.GetFileName(donor.Path);
+        File.Copy(Path.Combine(_tempDir, donor.Path), Path.Combine(_tempDir, copy));
+        long withRawAdd;
+        await using (var txn = table.StartTransaction())
+        {
+            await txn.DeleteAsync(Ex.Equal("id", 1L));
+            txn.StageActions([donor with { Path = copy, DataChange = true }]);
+            withRawAdd = await txn.CommitAsync();
+        }
+        Assert.Null(await MetricsAsync(table, withRawAdd));
+
+        long withHostCommitInfo;
+        await using (var txn = table.StartTransaction())
+        {
+            await txn.DeleteAsync(Ex.Equal("id", 4L));
+            txn.StageActions([new Actions.CommitInfo
+            {
+                Values = new Dictionary<string, JsonElement>
+                {
+                    ["operation"] = JsonDocument.Parse("\"PURGE\"").RootElement.Clone(),
+                },
+            }]);
+            withHostCommitInfo = await txn.CommitAsync();
+        }
+        Assert.Null(await MetricsAsync(table, withHostCommitInfo));
+
+        long withTxnId;
+        await using (var txn = table.StartTransaction())
+        {
+            // id 2 is in no file but the first one's rewrite; the raw copy above holds another 4 and 5.
+            await txn.DeleteAsync(Ex.Equal("id", 2L));
+            txn.StageActions([new Actions.TransactionId { AppId = "app", Version = 1, LastUpdated = 0 }]);
+            withTxnId = await txn.CommitAsync();
+        }
+        AssertCounts(await MetricsAsync(table, withTxnId), ("numDeletedRows", 1));
+    }
+
     /// <summary>Every value is a JSON string, as Spark writes its <c>Map[String, String]</c>; a plain write records none.</summary>
     [Fact]
     public async Task MetricsAreStrings_AndAWriteRecordsNone()

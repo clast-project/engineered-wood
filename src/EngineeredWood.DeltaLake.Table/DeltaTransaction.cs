@@ -281,20 +281,37 @@ public sealed class DeltaTransaction : IAsyncDisposable
     private long _updatedRows;
     private MergeMetrics? _mergeMetrics;
 
+    // Whether StageActions staged a data-changing add or remove. Its rows are not counted by any staging call,
+    // so the commit's metrics would fold them into the DML's (an added file's rows into copied rows).
+    private bool _rawDataActionsStaged;
+
     /// <summary>
     /// The <c>commitInfo.operationMetrics</c> the commit records, computed from the actions an attempt writes:
     /// Spark's metrics for a DELETE, UPDATE or MERGE. Only for a transaction whose staged work is that one kind
     /// of operation, and whose recorded operation is that kind. Spark records one operation per commit, and the
     /// metrics of a DELETE and an append together would describe neither. Several staging calls of the one kind
     /// sum: no file is staged twice in a transaction, so their file counts cannot overlap.
+    ///
+    /// <para>None either when <see cref="StageActions"/> staged a data-changing add or remove, whose rows no
+    /// staging call counted, or when a commitInfo staged there names a different operation: that commitInfo is
+    /// the one the commit records, and the DML's metrics would misdescribe it.</para>
     /// </summary>
     internal IReadOnlyDictionary<string, string>? OperationMetricsFor(IReadOnlyList<DeltaAction> actions)
     {
-        if (_operations.Count != 1)
+        if (_operations.Count != 1 || _rawDataActionsStaged)
             return null;
         string kind = _operations.First();
         if (EffectiveOperation != kind)
             return null;
+        foreach (var action in actions)
+        {
+            if (action is CommitInfo info
+                && !(info.GetValue("operation") is { ValueKind: System.Text.Json.JsonValueKind.String } op
+                    && op.GetString() == kind))
+            {
+                return null;
+            }
+        }
 
         return kind switch
         {
@@ -914,6 +931,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
         if (actions is null)
             throw new ArgumentNullException(nameof(actions));
         StageInternal(actions);
+        foreach (var action in actions)
+        {
+            if (action is AddFile { DataChange: true } or RemoveFile { DataChange: true })
+                _rawDataActionsStaged = true;
+        }
     }
 
     // ── Preconditions ──────────────────────────────────────────────────────────────────────────────────
