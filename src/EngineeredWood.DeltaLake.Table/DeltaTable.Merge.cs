@@ -447,6 +447,7 @@ public sealed partial class DeltaTable
         {
             if (batch is null)
                 throw new ArgumentException("A source batch is null.", nameof(source));
+            ThrowIfDuplicateColumns(batch.Schema, "MERGE");
             foreach (var field in batch.Schema.FieldsList)
             {
                 // By logical name: a condition names columns the way the table's schema does.

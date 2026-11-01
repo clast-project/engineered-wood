@@ -50,6 +50,10 @@ public sealed partial class DeltaTable
     internal DeferredSchemaChange? ComputeSchemaMerge(
         Snapshot.Snapshot snapshot, IReadOnlyList<RecordBatch> batches)
     {
+        // First, as the write itself does: once a duplicate's first copy is added, the second would match it.
+        foreach (var batch in batches)
+            ThrowIfDuplicateColumns(batch.Schema, "Write");
+
         var merge = new SchemaMerge(this, snapshot);
         foreach (var batch in batches)
         {

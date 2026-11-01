@@ -580,4 +580,71 @@ public class MergeSchemaTests : IDisposable
         Assert.Equal(10L, rows[1]["a.b"]);
         Assert.Equal(5_000_000_000L, rows[2]["a.b"]);
     }
+
+    // ── Duplicate names in the batch ──
+
+    public static TheoryData<bool> MergeOrNot => new() { false, true };
+
+    [Theory]
+    [MemberData(nameof(MergeOrNot))]
+    public async Task ADuplicateDeclaredColumn_IsRefused(bool mergeSchema)
+    {
+        await using var table = await CreateIdLongTableAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        var schema = Schema(Long("id"), Long("id"));
+        var ex = await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await table.WriteAsync([new RecordBatch(schema, [Longs(3), Longs(4)], 1)], mergeSchema: mergeSchema));
+        Assert.Contains("'id' more than once", ex.Message);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task ADuplicateNewColumn_IsRefused_AndNothingIsAdded()
+    {
+        await using var table = await CreateIdLongTableAsync();
+
+        var schema = Schema(Long("id"), Str("extra"), Str("extra"));
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await table.WriteAsync(
+                [new RecordBatch(schema, [Longs(3), Strings("a"), Strings("b")], 1)], mergeSchema: true));
+        Assert.DoesNotContain(table.CurrentSnapshot.Schema.Fields, f => f.Name == "extra");
+    }
+
+    [Fact]
+    public async Task ADuplicateThatDiffersOnlyInCase_IsRefused()
+    {
+        await using var table = await CreateIdLongTableAsync();
+
+        var schema = Schema(Long("id"), Str("extra"), Str("EXTRA"));
+        var ex = await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await table.WriteAsync(
+                [new RecordBatch(schema, [Longs(3), Strings("a"), Strings("b")], 1)], mergeSchema: true));
+        Assert.Contains("case-insensitive", ex.Message);
+    }
+
+    [Fact]
+    public async Task ADuplicateNestedField_IsRefused()
+    {
+        var inner = new Apache.Arrow.Types.StructType([Int("a", nullable: true)]);
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(Long("id"), new Field("s", inner, true)));
+
+        var dup = new Apache.Arrow.Types.StructType([Int("a", nullable: true), Int("b", nullable: true), Int("b", nullable: true)]);
+        var s = new StructArray(dup, 1, [Ints(1), Ints(2), Ints(3)], ArrowBuffer.Empty);
+        var ex = await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await table.WriteAsync(
+                [new RecordBatch(Schema(Long("id"), new Field("s", dup, true)), [Longs(3), s], 1)], mergeSchema: true));
+        Assert.Contains("'s.b' more than once", ex.Message);
+    }
+
+    [Fact]
+    public async Task AMergeSourceWithADuplicateColumn_IsRefused()
+    {
+        await using var table = await CreateIdLongTableAsync();
+
+        var source = new RecordBatch(Schema(Long("id"), Long("id")), [Longs(3), Longs(4)], 1);
+        var ex = await Assert.ThrowsAsync<ArgumentException>(async () =>
+            await table.MergeAsync([source], new MergeOptions { Keys = ["id"], WhenNotMatched = MergeAction.Insert }));
+        Assert.Contains("'id' more than once", ex.Message);
+    }
 }

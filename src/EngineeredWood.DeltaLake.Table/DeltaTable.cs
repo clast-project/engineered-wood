@@ -6136,6 +6136,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // merged snapshot.) Names and types are checked FIRST, against the batch as the caller
         // built it: a conversion below can itself refuse a value, and must not pre-empt the real problem, and a
         // type error should describe what the caller supplied rather than what it was converted to.
+        foreach (var batch in batches)
+            ThrowIfDuplicateColumns(batch.Schema, "Write");
         ThrowIfUndeclaredColumns(batches, snapshot.Schema, "Write");
         if (!HostOwnsBytes)
             ThrowIfMistypedColumns(batches, snapshot.Schema, "Write");
@@ -6946,6 +6948,53 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// struct representation of one (a variant as metadata/value binaries) is not mistaken for extra
     /// fields.</para>
     /// </summary>
+    /// <summary>
+    /// Refuses a batch that names one column twice, at the top level or among the fields of any struct, nested
+    /// in arrays and maps too. Delta column names are case-insensitive, so <c>id</c> and <c>ID</c> are one name.
+    /// Every other check matches a batch column to a table column by name, so a duplicate matches the same one
+    /// twice and passes them, and the write then puts both into one column, keeping only one of the values.
+    /// </summary>
+    internal static void ThrowIfDuplicateColumns(Apache.Arrow.Schema schema, string entryPoint) =>
+        ThrowIfDuplicateFields(schema.FieldsList, path: null, entryPoint);
+
+    private static void ThrowIfDuplicateFields(IReadOnlyList<Field> fields, string? path, string entryPoint)
+    {
+        var seen = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var field in fields)
+        {
+            string display = path is null ? field.Name : path + "." + field.Name;
+            if (seen.TryGetValue(field.Name, out var first))
+            {
+                throw new ArgumentException(
+                    $"{entryPoint}: the batch has the column '{display}' more than once"
+                    + (string.Equals(first, field.Name, StringComparison.Ordinal)
+                        ? ""
+                        : $" ('{first}' and '{field.Name}': Delta column names are case-insensitive)")
+                    + ". Each column must appear once.",
+                    "batches");
+            }
+            seen.Add(field.Name, field.Name);
+            ThrowIfDuplicateNested(field.DataType, display, entryPoint);
+        }
+    }
+
+    private static void ThrowIfDuplicateNested(Apache.Arrow.Types.IArrowType type, string display, string entryPoint)
+    {
+        switch (type)
+        {
+            case Apache.Arrow.Types.StructType st:
+                ThrowIfDuplicateFields(st.Fields, display, entryPoint);
+                break;
+            case Apache.Arrow.Types.MapType mt:
+                ThrowIfDuplicateNested(mt.KeyField.DataType, display + ".key", entryPoint);
+                ThrowIfDuplicateNested(mt.ValueField.DataType, display + ".value", entryPoint);
+                break;
+            case Apache.Arrow.Types.NestedType { Fields.Count: 1 } list:
+                ThrowIfDuplicateNested(list.Fields[0].DataType, display + ".element", entryPoint);
+                break;
+        }
+    }
+
     private static void ThrowIfUndeclaredColumns(
         IReadOnlyList<RecordBatch> batches, Schema.StructType writeSchema, string entryPoint)
     {
