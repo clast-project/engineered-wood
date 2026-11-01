@@ -38,7 +38,8 @@ internal static class VacuumExecutor
         bool dryRun,
         bool hideIcebergMetadataDir,
         CancellationToken cancellationToken,
-        Func<long, CancellationToken, ValueTask>? afterCommit = null)
+        Func<long, CancellationToken, ValueTask>? afterCommit = null,
+        CommitProperties? commitProperties = null)
     {
         // ── Mark: the keep-set is the CURRENT version's files, plus their deletion vectors. ──
         //
@@ -110,7 +111,7 @@ internal static class VacuumExecutor
                         $"{{\"numFilesToDelete\":\"{filesToDelete.Count}\",\"sizeOfDataToDelete\":\"{bytesToDelete}\"}}"),
                 },
                 firstCandidateVersion: snapshot.Version + 1,
-                cancellationToken).ConfigureAwait(false);
+                commitProperties, cancellationToken).ConfigureAwait(false);
 
             // Before the deletions, not after them. The commit is durable here, and the work the hook
             // does — summarising a version, possibly checkpointing it — belongs beside the commit rather
@@ -133,7 +134,7 @@ internal static class VacuumExecutor
                         $"{{\"numDeletedFiles\":\"{deleted}\",\"numVacuumedDirectories\":\"0\"}}"),
                 },
                 firstCandidateVersion: startVersion + 1,
-                cancellationToken).ConfigureAwait(false);
+                commitProperties, cancellationToken).ConfigureAwait(false);
 
             if (afterCommit is not null)
                 await afterCommit(endVersion.Value, cancellationToken).ConfigureAwait(false);
@@ -274,11 +275,14 @@ internal static class VacuumExecutor
     private static async ValueTask<long> WriteCommitInfoAsync(
         TransactionLog log, DeltaSnapshot snapshot, string operation,
         IDictionary<string, JsonElement> additionalValues, long firstCandidateVersion,
-        CancellationToken cancellationToken)
+        CommitProperties? commitProperties, CancellationToken cancellationToken)
     {
+        // Both bookend commits carry the caller's properties, as Spark's do: its userMetadata is set per
+        // session, and VACUUM START and VACUUM END are two commits of that session.
         var commitInfo = InCommitTimestamp.CreateCommitInfo(
             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), operation, additionalValues,
-            includeInCommitTimestamp: InCommitTimestamp.IsEnabled(snapshot.Metadata.Configuration));
+            includeInCommitTimestamp: InCommitTimestamp.IsEnabled(snapshot.Metadata.Configuration),
+            commitProperties: commitProperties);
         IReadOnlyList<DeltaAction> actions = new DeltaAction[] { commitInfo };
 
         const int maxAttempts = 16;

@@ -8,7 +8,7 @@ namespace EngineeredWood.DeltaLake.Table;
 /// <summary>
 /// The row-level DML boundary key: per data file, keyed by its <c>add.path</c> exactly as the snapshot
 /// records it, the ABSOLUTE in-file positions selected. Every row-level entry point takes one —
-/// <see cref="DeltaTable.DeleteRowsAsync"/>, <see cref="DeltaTable.UpdateRowsAsync(RowSelection, Func{string, IReadOnlyList{RecordBatch}, IReadOnlyList{Int64Array}, IReadOnlyList{RecordBatch}}, CancellationToken)"/>,
+/// <see cref="DeltaTable.DeleteRowsAsync"/>, <see cref="DeltaTable.UpdateRowsAsync(RowSelection, Func{string, IReadOnlyList{RecordBatch}, IReadOnlyList{Int64Array}, IReadOnlyList{RecordBatch}}, CancellationToken, CommitProperties?)"/>,
 /// <see cref="DeltaTable.ReadRowsAsync"/>, <see cref="DeltaTransaction.StageRowDeletesAsync(RowSelection, CancellationToken)"/> — so there is
 /// one spelling of "which row is this" at the boundary rather than one per method.
 ///

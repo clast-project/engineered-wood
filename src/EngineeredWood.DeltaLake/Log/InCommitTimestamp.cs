@@ -48,7 +48,8 @@ public static class InCommitTimestamp
         long timestampMs,
         string operation = "WRITE",
         IDictionary<string, JsonElement>? additionalValues = null,
-        bool includeInCommitTimestamp = true)
+        bool includeInCommitTimestamp = true,
+        CommitProperties? commitProperties = null)
     {
         var values = new Dictionary<string, JsonElement>();
 
@@ -83,6 +84,9 @@ public static class InCommitTimestamp
             values["inCommitTimestamp"] = JsonDocument.Parse(
                 timestampMs.ToString()).RootElement.Clone();
         }
+
+        // Last, so a collision with anything this layer wrote is refused rather than overwritten.
+        commitProperties?.ApplyTo(values);
 
         return new CommitInfo { Values = values };
     }
@@ -135,17 +139,32 @@ public static class InCommitTimestamp
     /// back to inferring from the commit's shape and reads an adds-only commit as blind. So silence is the
     /// honest answer for a caller that does not track its reads, but a caller that KNOWS it read should
     /// pass <c>false</c> — see <see cref="LogCommitRequest.IsBlindAppend"/>.</param>
+    /// <param name="commitProperties">The caller's own commitInfo keys. Added to a commitInfo the actions
+    /// already carry, too, since that is the commitInfo this commit will record.</param>
+    /// <exception cref="ArgumentException"><paramref name="commitProperties"/> names a key the commitInfo
+    /// already records.</exception>
     public static IReadOnlyList<DeltaAction> EnsureCommitInfo(
         IReadOnlyList<DeltaAction> actions,
         IReadOnlyDictionary<string, string>? configuration,
         string operation = "WRITE",
-        bool? isBlindAppend = null)
+        bool? isBlindAppend = null,
+        CommitProperties? commitProperties = null)
     {
-        // Already has a commitInfo (any kind) — leave it.
-        foreach (var action in actions)
+        // Already has a commitInfo (any kind): leave it, apart from adding the caller's properties to it.
+        for (int i = 0; i < actions.Count; i++)
         {
-            if (action is CommitInfo)
+            if (actions[i] is not CommitInfo existing)
+                continue;
+            if (commitProperties is null)
                 return actions;
+
+            var values = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+            foreach (var kvp in existing.Values)
+                values[kvp.Key] = kvp.Value;
+            commitProperties.ApplyTo(values);
+            var replaced = new List<DeltaAction>(actions);
+            replaced[i] = existing with { Values = values };
+            return replaced;
         }
 
         Dictionary<string, JsonElement>? extra = null;
@@ -160,7 +179,8 @@ public static class InCommitTimestamp
         var result = new List<DeltaAction>(actions.Count + 1);
         result.Add(CreateCommitInfo(
             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), operation,
-            additionalValues: extra, includeInCommitTimestamp: IsEnabled(configuration)));
+            additionalValues: extra, includeInCommitTimestamp: IsEnabled(configuration),
+            commitProperties: commitProperties));
         result.AddRange(actions);
         return result;
     }

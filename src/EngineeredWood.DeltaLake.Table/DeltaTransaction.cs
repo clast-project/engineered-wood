@@ -243,6 +243,12 @@ public sealed class DeltaTransaction : IAsyncDisposable
     public bool? IsBlindAppend { get; set; }
 
     /// <summary>
+    /// The caller's own metadata for this transaction's commit: <c>commitInfo.userMetadata</c> and any other
+    /// keys. Read when <see cref="CommitAsync"/> runs, so it can be set at any point before then.
+    /// </summary>
+    public CommitProperties? CommitProperties { get; set; }
+
+    /// <summary>
     /// What the commit records: the host's claim if it made one, else <c>false</c> when this transaction
     /// itself recorded a read, else nothing.
     /// </summary>

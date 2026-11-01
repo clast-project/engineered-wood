@@ -171,4 +171,10 @@ public sealed record LogCommitRequest
     /// </summary>
     public Snapshot.Snapshot? RefreshFrom { get; init; }
 
+    /// <summary>
+    /// The caller's own <c>commitInfo</c> keys (<c>userMetadata</c> and any others), written on every
+    /// attempt. Null adds nothing.
+    /// </summary>
+    public CommitProperties? CommitProperties { get; init; }
+
 }
