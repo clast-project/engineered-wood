@@ -32,6 +32,11 @@ internal struct EngineeredWoodAllocationTracker : INativeAllocationTracker
 internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
 {
     private Apache.Arrow.Memory.NativeBuffer<T, EngineeredWoodAllocationTracker>? _inner;
+#if NET8_0_OR_GREATER
+    // EXPERIMENT: set instead of _inner when NativeBufferPool.Enabled at construction.
+    private PooledMemoryManager? _pooled;
+    private int _pooledLength;
+#endif
 
     /// <summary>
     /// Most <typeparamref name="T"/> elements a buffer can hold. Not a policy of ours: the buffer is
@@ -47,24 +52,58 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
     /// will overwrite all bytes (e.g. value buffers for non-nullable columns).</param>
     public NativeBuffer(int elementCount, bool zeroFill = true)
     {
+#if NET8_0_OR_GREATER
+        if (NativeBufferPool.Enabled)
+        {
+            if (elementCount < 0)
+                throw new ArgumentOutOfRangeException(nameof(elementCount));
+            _pooled = new PooledMemoryManager(checked(elementCount * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()));
+            _pooledLength = elementCount;
+            if (zeroFill)
+                _pooled.GetSpan().Clear();
+            return;
+        }
+#endif
         _inner = new Apache.Arrow.Memory.NativeBuffer<T, EngineeredWoodAllocationTracker>(
             elementCount, zeroFill, default);
     }
 
     /// <summary>Number of <typeparamref name="T"/> elements that fit in the buffer.</summary>
+#if NET8_0_OR_GREATER
+    public int Length => _pooled != null ? _pooledLength : _inner!.Length;
+#else
     public int Length => _inner!.Length;
+#endif
 
     /// <summary>Gets a <see cref="Span{T}"/> over the native buffer.</summary>
+#if NET8_0_OR_GREATER
+    public Span<T> Span => _pooled != null
+        ? System.Runtime.InteropServices.MemoryMarshal.Cast<byte, T>(_pooled.GetSpan())
+        : _inner!.Span;
+#else
     public Span<T> Span => _inner!.Span;
+#endif
 
     /// <summary>Gets a <see cref="Span{T}"/> over the raw bytes of the native buffer.</summary>
+#if NET8_0_OR_GREATER
+    public Span<byte> ByteSpan => _pooled != null ? _pooled.GetSpan() : _inner!.ByteSpan;
+#else
     public Span<byte> ByteSpan => _inner!.ByteSpan;
+#endif
 
     /// <summary>
     /// Transfers ownership to an <see cref="ArrowBuffer"/>. This instance becomes unusable.
     /// </summary>
     public ArrowBuffer Build(int usedBytes = -1)
     {
+#if NET8_0_OR_GREATER
+        if (_pooled != null)
+        {
+            var owner = _pooled;
+            _pooled = null;
+            return NativeBufferPool.CreateOwnedArrowBuffer(owner);
+        }
+#endif
         var inner = _inner ?? throw new ObjectDisposedException(nameof(NativeBuffer<T>));
         _inner = null;
         return inner.Build();
@@ -77,6 +116,17 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
     /// </summary>
     public void Grow(int newElementCount)
     {
+#if NET8_0_OR_GREATER
+        if (_pooled != null)
+        {
+            if (newElementCount <= _pooledLength)
+                return;
+            long target = Math.Max(newElementCount, Math.Min((long)_pooledLength * 2, MaxElements));
+            _pooled.Reallocate(checked((int)target * System.Runtime.CompilerServices.Unsafe.SizeOf<T>()));
+            _pooledLength = (int)target;
+            return;
+        }
+#endif
         var inner = _inner ?? throw new ObjectDisposedException(nameof(NativeBuffer<T>));
         if (newElementCount <= inner.Length)
             return;
@@ -110,6 +160,10 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
 
     public void Dispose()
     {
+#if NET8_0_OR_GREATER
+        ((IDisposable?)_pooled)?.Dispose();
+        _pooled = null;
+#endif
         _inner?.Dispose();
         _inner = null;
     }
