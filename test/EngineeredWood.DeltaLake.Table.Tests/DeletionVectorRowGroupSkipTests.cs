@@ -168,6 +168,51 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
     }
 
     /// <summary>
+    /// Through a host's <see cref="IDataFileReader"/>, which cannot skip, OPTIMIZE positions the source's batches by
+    /// counting them: a fully deleted batch (row group 1) still counts towards the next, partly deleted one (row 250
+    /// of group 2), so every survivor keeps its own row id.
+    /// </summary>
+    [Fact]
+    public async Task OptimizeThroughTheCodecSeamCountsAFullyDeletedBatchTowardsTheNext()
+    {
+        GroupPerBatchReader? seam = null;
+        var (table, _) = await CreateAsync("t", 100, 200, seam: fs => seam = new GroupPerBatchReader(fs));
+        await using (table)
+        {
+            var (deleted, _) = await table.DeleteAsync(DeltaTable.MaskFor(Ex.Equal("id", 250L)));
+            Assert.Equal(1, deleted);
+            await table.WriteAsync([Batch(Rows, 10)]); // a second small file, so the group has two to compact
+
+            seam!.Batches.Clear();
+            Assert.NotNull(await table.CompactAsync());
+            Assert.True(seam.Batches.Count >= 5, $"the seam returned {seam.Batches.Count} batches");
+            Assert.Contains(seam.Batches, b => b == RowsPerGroup); // one per row group, the deleted one too
+
+            var expected = Survivors(100, 200).Where(id => id != 250).Concat(Enumerable.Range(Rows, 10).Select(i => (long)i));
+            Assert.Equal(expected, await ReadAsync(table, filter: null, positionsAreIds: false));
+        }
+    }
+
+    /// <summary>A host codec returning each row group as its own batch, recording the batch lengths.</summary>
+    private sealed class GroupPerBatchReader(IO.ITableFileSystem fs) : IDataFileReader
+    {
+        public List<int> Batches { get; } = [];
+
+        public async IAsyncEnumerable<RecordBatch> ReadAsync(
+            string relativePath, IReadOnlyList<string>? physicalColumns,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await using var file = await fs.OpenReadAsync(relativePath, cancellationToken);
+            using var reader = new ParquetFileReader(file, ownsFile: false);
+            await foreach (var batch in reader.ReadAllAsync(physicalColumns, cancellationToken))
+            {
+                Batches.Add(batch.Length);
+                yield return batch;
+            }
+        }
+    }
+
+    /// <summary>
     /// The inferred feed of a vector edit with no change file reads only the groups holding the rows the edit
     /// deleted: here one group of the four live ones (the old vector already deletes group 1 in full).
     /// </summary>
@@ -238,9 +283,10 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
     private static IEnumerable<long> Survivors(int from, int to) =>
         Enumerable.Range(0, Rows).Where(i => i < from || i >= to).Select(i => (long)i);
 
-    /// <summary>One file, row tracking on, with the rows [from, to) deleted by a vector.</summary>
+    /// <summary>One file, row tracking on, with the rows [from, to) deleted by a vector; <paramref name="seam"/>, when
+    /// given, builds the host codec every data file is read through.</summary>
     private async Task<(DeltaTable Table, DataFileCountingFileSystem Fs)> CreateAsync(
-        string name, int from, int to, bool cdf = false)
+        string name, int from, int to, bool cdf = false, Func<IO.ITableFileSystem, IDataFileReader>? seam = null)
     {
         var fs = new DataFileCountingFileSystem(new LocalTableFileSystem(Path.Combine(_tempDir, name)));
         var table = await DeltaTable.CreateAsync(
@@ -253,6 +299,7 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
                     DataPageRowCountLimit = 10,
                 },
                 ParquetReadOptions = ParquetReadOptions.Default with { BatchSize = 32 },
+                DataFileReader = seam?.Invoke(fs),
             },
             enableDeletionVectors: true, enableRowTracking: true,
             configuration: cdf ? new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" } : null);
