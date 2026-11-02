@@ -23,7 +23,7 @@ namespace EngineeredWood.Arrow;
 internal static class SelectionMask
 {
     /// <summary>Words needed for <paramref name="rows"/> rows.</summary>
-    public static int WordCount(int rows) => (rows + 63) >> 6;
+    public static int WordCount(int rows) => (int)(((long)rows + 63) >> 6);
 
     /// <summary>Selects rows [0, <paramref name="rows"/>) and clears the rest of the last word.</summary>
     public static void SelectAll(Span<ulong> words, int rows)

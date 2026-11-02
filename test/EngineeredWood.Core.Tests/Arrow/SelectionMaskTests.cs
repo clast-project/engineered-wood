@@ -24,6 +24,12 @@ public class SelectionMaskTests
         Assert.Equal(rows, SelectionMask.Count(words)); // nothing past the last row
     }
 
+    [Theory]
+    [InlineData(int.MaxValue, 33554432)]
+    [InlineData(int.MaxValue - 63, 33554431)]
+    [InlineData(int.MaxValue - 64, 33554431)]
+    public void WordCountDoesNotOverflow(int rows, int words) => Assert.Equal(words, SelectionMask.WordCount(rows));
+
     [Fact]
     public void ClearRangeMatchesPerRowClearing()
     {

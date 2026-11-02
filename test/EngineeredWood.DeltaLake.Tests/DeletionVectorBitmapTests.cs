@@ -119,6 +119,38 @@ public class DeletionVectorBitmapTests
     }
 
     [Fact]
+    public void AWindowStartingFarBelowZeroSeesNoRow()
+    {
+        var bitmap = RoaringBitmapReader.Deserialize(TestRoaringWriter.Serialize([0, 5], RunMode.Never));
+        Assert.False(bitmap.Intersects(long.MinValue, 1));
+        Assert.False(bitmap.Intersects(long.MinValue + 1, long.MaxValue)); // [MinValue + 1, 0): no row 0
+        Assert.True(bitmap.Intersects(long.MinValue + 2, long.MaxValue));  // [MinValue + 2, 1): holds row 0
+    }
+
+    [Theory]
+    [InlineData(RunMode.Never)]
+    [InlineData(RunMode.Always)]
+    public void AContainerAtTheTopOfTheRangeDoesNotHideTheOthers(RunMode mode)
+    {
+        // The last container's base is long.MaxValue - 65535: base + 65536 would wrap negative and break the
+        // container search, hiding row 0 from a scan.
+        long top = long.MaxValue - 1;
+        var bitmap = RoaringBitmapReader.Deserialize(TestRoaringWriter.Serialize([0, 70000, top], mode));
+        Assert.True(bitmap.Contains(0));
+        Assert.True(bitmap.Intersects(0, 1));
+        Assert.True(bitmap.Contains(70000));
+        Assert.True(bitmap.Contains(top));
+        Assert.True(bitmap.TryGetNext(1, out long next));
+        Assert.Equal(70000, next);
+        Assert.True(bitmap.TryGetNext(70001, out next));
+        Assert.Equal(top, next);
+        var selection = new[] { ulong.MaxValue, ulong.MaxValue };
+        bitmap.ClearDeleted(0, 128, selection.AsSpan());
+        Assert.Equal(new[] { ulong.MaxValue - 1, ulong.MaxValue }, selection);
+        Assert.Equal(new long[] { 0, 70000, top }, bitmap.ToArray());
+    }
+
+    [Fact]
     public void ClearDeletedValidatesArguments()
     {
         var bitmap = RoaringBitmapReader.Deserialize(TestRoaringWriter.Serialize([3], RunMode.Never));

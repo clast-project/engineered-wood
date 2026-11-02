@@ -124,8 +124,17 @@ public sealed class DeletionVectorBitmap : IEnumerable<long>
 
     /// <summary>True when any row in [<paramref name="start"/>, <paramref name="start"/> +
     /// <paramref name="length"/>) is deleted.</summary>
-    public bool Intersects(long start, long length) =>
-        length > 0 && TryGetNext(start, out long next) && next - start < length;
+    public bool Intersects(long start, long length)
+    {
+        if (start < 0)
+        {
+            // No row is negative: keep only the window's non-negative part. (start + length cannot overflow
+            // here, and next - start could.)
+            length += start;
+            start = 0;
+        }
+        return length > 0 && TryGetNext(start, out long next) && next - start < length;
+    }
 
     /// <summary>
     /// Deselects, in <paramref name="selection"/>, every deleted row of [<paramref name="start"/>,
@@ -300,7 +309,9 @@ public sealed class DeletionVectorBitmap : IEnumerable<long>
         while (lo < hi)
         {
             int mid = (int)((uint)(lo + hi) >> 1);
-            if (_base[mid] + ContainerSpan <= position) lo = mid + 1; else hi = mid;
+            // position - base, not base + span: the last possible base is long.MaxValue - 65535, and adding the span
+            // to it would wrap negative and break the search's ordering. Both are non-negative, so this cannot.
+            if (position - _base[mid] >= ContainerSpan) lo = mid + 1; else hi = mid;
         }
         return lo;
     }

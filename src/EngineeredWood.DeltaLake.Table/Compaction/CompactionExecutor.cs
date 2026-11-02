@@ -239,6 +239,11 @@ internal static class CompactionExecutor
                     ? default
                     : DeletionVectors.KeptRows.For(deletedRows, batchStartRow, batch.Length);
                 int survivors = deletedRows is null ? batch.Length : kept.Count;
+                if (survivors == 0)
+                {
+                    batchStartRow += physicalRows;
+                    continue; // every row in this batch was deleted: nothing to map, gather or write
+                }
 
                 Int64Array? survivorIds = null, survivorVers = null;
                 if (materialize)
