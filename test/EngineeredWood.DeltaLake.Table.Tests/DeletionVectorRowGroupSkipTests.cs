@@ -269,6 +269,106 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
         }
     }
 
+    // ---- runs inside one row group (#618 step 4) ----------------------------------------------------------
+
+    private const int OneGroupRows = 20_000;
+
+    /// <summary>
+    /// A long deleted run inside the file's one row group is cut out of the scan: each survivor still comes back
+    /// at its own position, with its own row id. The run in the middle, from the start, and to the end.
+    /// </summary>
+    [Theory]
+    [InlineData(3_000, 12_000)]
+    [InlineData(0, 15_000)]
+    [InlineData(5_000, OneGroupRows)]
+    public async Task AScanInsideOneGroupReturnsEachSurvivorAtItsPositionAndRowId(int from, int to)
+    {
+        var (table, _) = await CreateOneGroupAsync("t", from, to);
+        await using (table)
+            Assert.Equal(Survivors(from, to, OneGroupRows), await ReadAsync(table, filter: null));
+    }
+
+    /// <summary>
+    /// The cut run's pages are not read: against a twin deleting as many rows in runs too short to cut (500 rows,
+    /// under a 1,024-row probe block), the scan reads at least 10% fewer bytes.
+    /// </summary>
+    [Fact]
+    public async Task ALongRunInsideOneGroupIsNotRead()
+    {
+        var shortRuns = Ex.Or(Enumerable.Range(0, 18).Select(k => (Predicate)Ex.And(
+            Ex.GreaterThanOrEqual("id", k * 1_000L), Ex.LessThan("id", k * 1_000L + 500))).ToArray());
+        var (run, runFs) = await CreateOneGroupAsync("run", 3_000, 12_000);
+        var (scattered, scatteredFs) = await CreateOneGroupAsync("scattered", 0, 0, deleted: (shortRuns, 9_000));
+        await using (run)
+        await using (scattered)
+        {
+            runFs.Reset();
+            scatteredFs.Reset();
+            Assert.Equal(Survivors(3_000, 12_000, OneGroupRows), await ReadAsync(run, filter: null));
+            Assert.Equal(OneGroupRows - 9_000, (await ReadAsync(scattered, filter: null)).Count);
+            AssertFewerBytes(runFs, scatteredFs);
+        }
+    }
+
+    /// <summary>
+    /// A predicate DELETE over a group whose vector already deletes a long run inside it deletes exactly the live
+    /// rows that match, keeping the vector's.
+    /// </summary>
+    [Fact]
+    public async Task APredicateDeleteInsideOneGroupDeletesOnlyLiveRows()
+    {
+        var (table, _) = await CreateOneGroupAsync("t", 3_000, 12_000);
+        await using (table)
+        {
+            var (deleted, _) = await table.DeleteAsync(Ex.GreaterThanOrEqual("id", 10_000L));
+            Assert.Equal(OneGroupRows - 12_000, deleted);
+            Assert.Equal(Enumerable.Range(0, 3_000).Select(i => (long)i), await ReadAsync(table, filter: null));
+        }
+    }
+
+    /// <summary>OPTIMIZE over a group with a long deleted run keeps exactly the survivors, each with its row id.</summary>
+    [Fact]
+    public async Task OptimizeInsideOneGroupKeepsEachSurvivorsRowId()
+    {
+        var (table, _) = await CreateOneGroupAsync("t", 3_000, 12_000);
+        await using (table)
+        {
+            await table.WriteAsync([Batch(OneGroupRows, 10)]);
+            Assert.NotNull(await table.CompactAsync());
+            Assert.Null(Assert.Single(table.CurrentSnapshot.ActiveFiles).Value.DeletionVector);
+            Assert.Equal(
+                Survivors(3_000, 12_000, OneGroupRows).Concat(Enumerable.Range(OneGroupRows, 10).Select(i => (long)i)),
+                await ReadAsync(table, filter: null, positionsAreIds: false));
+        }
+    }
+
+    /// <summary>
+    /// The inferred feed of a vector edit inside one row group reads only around the rows the edit deleted: the
+    /// rest of the group is a run it needs none of, and is cut.
+    /// </summary>
+    [Fact]
+    public async Task AVectorEditsInferredFeedInsideOneGroupReadsAroundTheRowsItTouched()
+    {
+        var (table, fs) = await CreateOneGroupAsync("t", 3_000, 12_000, cdf: true);
+        await using (table)
+        {
+            string path = Assert.Single(table.CurrentSnapshot.ActiveFiles).Value.Path;
+            var txn = table.StartTransaction();
+            await txn.StageRowDeletesAsync(RowSelection.ByPath(
+                new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal) { [path] = new long[] { 15_000, 15_001 } }));
+            long version = await txn.CommitAsync();
+            await AssertNoChangeFileAsync(fs, version);
+
+            fs.Reset();
+            await ReadAsync(table, filter: null);
+            long scanBytes = fs.DataBytesRead;
+
+            fs.Reset();
+            Assert.Equal(new[] { (15_000L, "delete"), (15_001L, "delete") }, await ReadFeedAsync(table, version));
+            Assert.True(fs.DataBytesRead * 4 < scanBytes, $"the feed read {fs.DataBytesRead} bytes, a scan {scanBytes}");
+        }
+    }
+
     // ---- helpers -----------------------------------------------------------------------------------------
 
     /// <summary>
@@ -280,13 +380,22 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
         Assert.True(skipped.DataBytesRead * 10 < read.DataBytesRead * 9,
             $"skipped read {skipped.DataBytesRead} bytes, the unskipped one {read.DataBytesRead}");
 
-    private static IEnumerable<long> Survivors(int from, int to) =>
-        Enumerable.Range(0, Rows).Where(i => i < from || i >= to).Select(i => (long)i);
+    private static IEnumerable<long> Survivors(int from, int to, int rows = Rows) =>
+        Enumerable.Range(0, rows).Where(i => i < from || i >= to).Select(i => (long)i);
+
+    /// <summary>
+    /// One file of <see cref="OneGroupRows"/> rows in ONE row group of 100-row pages, with [from, to) deleted by a
+    /// vector (or <paramref name="deleted"/>), so the probe's blocks are 1,024 rows.
+    /// </summary>
+    private Task<(DeltaTable Table, DataFileCountingFileSystem Fs)> CreateOneGroupAsync(
+        string name, int from, int to, bool cdf = false, (Predicate Rows, int Count)? deleted = null) =>
+        CreateAsync(name, from, to, cdf, rows: OneGroupRows, groupRows: OneGroupRows, pageRows: 100, deleted: deleted);
 
     /// <summary>One file, row tracking on, with the rows [from, to) deleted by a vector; <paramref name="seam"/>, when
     /// given, builds the host codec every data file is read through.</summary>
     private async Task<(DeltaTable Table, DataFileCountingFileSystem Fs)> CreateAsync(
-        string name, int from, int to, bool cdf = false, Func<IO.ITableFileSystem, IDataFileReader>? seam = null)
+        string name, int from, int to, bool cdf = false, Func<IO.ITableFileSystem, IDataFileReader>? seam = null,
+        int rows = Rows, int groupRows = RowsPerGroup, int pageRows = 10, (Predicate Rows, int Count)? deleted = null)
     {
         var fs = new DataFileCountingFileSystem(new LocalTableFileSystem(Path.Combine(_tempDir, name)));
         var table = await DeltaTable.CreateAsync(
@@ -295,20 +404,20 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
             {
                 ParquetWriteOptions = ParquetWriteOptions.Default with
                 {
-                    RowGroupMaxRows = RowsPerGroup,
-                    DataPageRowCountLimit = 10,
+                    RowGroupMaxRows = groupRows,
+                    DataPageRowCountLimit = pageRows,
                 },
                 ParquetReadOptions = ParquetReadOptions.Default with { BatchSize = 32 },
                 DataFileReader = seam?.Invoke(fs),
             },
             enableDeletionVectors: true, enableRowTracking: true,
             configuration: cdf ? new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" } : null);
-        await table.WriteAsync([Batch(0, Rows)]);
+        await table.WriteAsync([Batch(0, rows)]);
         Assert.Single(table.CurrentSnapshot.ActiveFiles);
 
-        var range = Ex.And(Ex.GreaterThanOrEqual("id", (long)from), Ex.LessThan("id", (long)to));
-        var (deleted, _) = await table.DeleteAsync(DeltaTable.MaskFor(range));
-        Assert.Equal(to - from, deleted);
+        var (doomed, count) = deleted ?? (Ex.And(Ex.GreaterThanOrEqual("id", (long)from), Ex.LessThan("id", (long)to)), to - from);
+        var (deletedCount, _) = await table.DeleteAsync(DeltaTable.MaskFor(doomed));
+        Assert.Equal(count, deletedCount);
         Assert.NotNull(Assert.Single(table.CurrentSnapshot.ActiveFiles).Value.DeletionVector);
         return (table, fs);
     }

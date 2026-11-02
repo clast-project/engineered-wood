@@ -241,6 +241,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// chunks, and not its dictionary pages, Bloom filters or page indexes, which the read-ahead for the kept
     /// groups leaves out. Its rows still count towards the positions after it, as a group pruned by statistics
     /// does.</para>
+    /// <para>Inside a group it keeps, long runs <paramref name="skipRows"/> skips are cut out of the read too, when
+    /// every projected column is flat and has an OffsetIndex: the group is probed in 64 blocks (of at least 1,024
+    /// rows), each run covering a whole block is widened to its exact ends, and only the pages of the rows outside
+    /// the runs are fetched. Shorter runs, and scattered rows, are read and left to the caller to drop. Batches
+    /// never span a cut run, and positions stay exact.</para>
     /// <para>Its bytes can still be read when they lie in a small gap between two ranges that ARE requested, and
     /// the read merges across the gap rather than pay another request: page indexes are read so across gaps up
     /// to 64 KiB, and the cloud readers' <see cref="EngineeredWood.IO.CoalescingFileReader"/> merges across
@@ -327,6 +332,20 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     .ConfigureAwait(false);
                 if (ranges.Count == 0)
                     continue;
+            }
+
+            // Within a kept row group, long runs of rows the caller needs none of (a deletion vector's
+            // deleted runs) are cut out too, so that pages wholly inside them are not read (#618).
+            if (skipRows is not null
+                && SkippedRuns(skipRows, groupStart, metadata.RowGroups[i].NumRows) is { } runs)
+            {
+                schema ??= await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+                if (CanReadRowRanges(schema, metadata.RowGroups[i], columnNames))
+                {
+                    ranges = SubtractRanges(ranges ?? [new RowRange(0, metadata.RowGroups[i].NumRows)], runs);
+                    if (ranges.Count == 0)
+                        continue;
+                }
             }
 
             // Batches follow the ranges in order and never span the gap between two, so a cursor over
@@ -2369,6 +2388,120 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             start += rows;
         }
         return skipped;
+    }
+
+    /// <summary>A kept row group is probed for skippable runs in this many blocks.</summary>
+    internal const int SkipProbeBlocks = 64;
+
+    /// <summary>
+    /// ...but in blocks of no fewer rows than this: a run shorter than a page frees no page, and cutting it
+    /// only splits batches.
+    /// </summary>
+    internal const long MinSkipProbeBlockRows = 1024;
+
+    /// <summary>
+    /// The runs of rows, within a row group of <paramref name="rows"/> rows starting at file row
+    /// <paramref name="groupStart"/>, that <paramref name="skipRows"/> says the caller needs none of, as
+    /// ascending, disjoint ranges relative to the group; null when there are none worth cutting.
+    /// </summary>
+    /// <remarks>
+    /// <para>The group is probed in <see cref="SkipProbeBlocks"/> blocks, so a run is found only when it covers
+    /// a whole block (a run of at least two blocks' rows always does), and a read with scattered skips pays
+    /// those few calls and nothing else: it needs no page index. Each run found is then widened to its true
+    /// ends, by binary search within the blocks either side of it.</para>
+    /// <para>Rows skipped but not cut are still returned; the caller drops them as it would without this.</para>
+    /// </remarks>
+    internal static List<RowRange>? SkippedRuns(RowSkipPredicate skipRows, long groupStart, long rows)
+    {
+        long block = Math.Max(MinSkipProbeBlockRows, (rows + SkipProbeBlocks - 1) / SkipProbeBlocks);
+        if (rows <= block)
+            return null;
+
+        List<RowRange>? runs = null;
+        for (long start = 0; start < rows; start += block)
+        {
+            long end = Math.Min(rows, start + block);
+            if (!skipRows(groupStart + start, end - start))
+                continue;
+
+            if (runs is { Count: > 0 } && runs[^1].End == start)
+                runs[^1] = runs[^1] with { End = end };
+            else
+                (runs ??= []).Add(new RowRange(start, end));
+        }
+
+        if (runs is null)
+            return null;
+
+        for (int r = 0; r < runs.Count; r++)
+        {
+            var run = runs[r];
+
+            // The run's first row: the lowest s, in the block before it, with [s, run.Start) all skipped.
+            long lo = Math.Max(0, run.Start - block + 1), hi = run.Start;
+            while (lo < hi)
+            {
+                long mid = lo + ((hi - lo) >> 1);
+                if (skipRows(groupStart + mid, run.Start - mid))
+                    hi = mid;
+                else
+                    lo = mid + 1;
+            }
+
+            // The run's end: the highest e, in the block after it, with [run.End, e) all skipped.
+            long lo2 = run.End, hi2 = Math.Min(rows, run.End + block - 1);
+            while (lo2 < hi2)
+            {
+                long mid = lo2 + ((hi2 - lo2 + 1) >> 1);
+                if (skipRows(groupStart + run.End, mid - run.End))
+                    lo2 = mid;
+                else
+                    hi2 = mid - 1;
+            }
+
+            runs[r] = new RowRange(lo, lo2);
+        }
+
+        return runs;
+    }
+
+    /// <summary>
+    /// Whether a read of <paramref name="projection"/> can take row ranges of <paramref name="rowGroup"/> and
+    /// fetch only their pages: every projected column flat, with an OffsetIndex to find its pages by. Without
+    /// one, a ranged read scans the chunk's headers, reading it whole (#625), and a nested column is decoded
+    /// whole anyway, so cutting rows would only cost.
+    /// </summary>
+    private bool CanReadRowRanges(SchemaDescriptor schema, RowGroup rowGroup, IReadOnlyList<string>? projection)
+    {
+        var (_, chunks) = ResolveColumns(schema, rowGroup, projection);
+        return chunks.Count > 0 && ProjectedOffsetIndexRanges(schema, rowGroup, projection).Count() == chunks.Count;
+    }
+
+    /// <summary>
+    /// <paramref name="ranges"/> less <paramref name="cut"/>; both ascending and disjoint, and so is the result.
+    /// </summary>
+    internal static List<RowRange> SubtractRanges(IReadOnlyList<RowRange> ranges, IReadOnlyList<RowRange> cut)
+    {
+        var result = new List<RowRange>(ranges.Count + cut.Count);
+        int c = 0;
+        foreach (var range in ranges)
+        {
+            long start = range.Start;
+            while (c < cut.Count && cut[c].End <= start)
+                c++;
+
+            for (int k = c; k < cut.Count && cut[k].Start < range.End; k++)
+            {
+                if (cut[k].Start > start)
+                    result.Add(new RowRange(start, cut[k].Start));
+                start = Math.Max(start, cut[k].End);
+            }
+
+            if (start < range.End)
+                result.Add(new RowRange(start, range.End));
+        }
+
+        return result;
     }
 
     /// <summary>
