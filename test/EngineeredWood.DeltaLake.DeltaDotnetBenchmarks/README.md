@@ -35,6 +35,7 @@ runs against both.
 |---|---|---|
 | `FullScanBenchmarks` | FullScan | open + scan all of a 1M-row, one-commit table. delta-dotnet both ways: kernel `ReadAsArrowTableAsync` and DataFusion `SELECT *` |
 | `FilteredScanBenchmarks` | FilteredScan | `SELECT id, amount WHERE …` on a 20-file table: a 1-file id range (`Selective`), and 1-in-16 rows spread everywhere (`OneCategory`) |
+| `ScanWindowBenchmarks` | ScanWindowFull, ScanWindowOneCategory | EW only: the 20-file table read whole, and its `OneCategory` filtered scan, at `MaxConcurrentFileReads` 1, 2, 4 and 8 (#607). 1 is the serial read. `FullScan` cannot show this, because its table is one file |
 | `SnapshotBenchmarks` | OpenLatest, OpenAtVersion, History | log replay of a 100-commit table, with and without a checkpoint |
 | `ChangeFeedBenchmarks` | ChangeFeed | the whole CDF of a table with 10 appends + UPDATE + DELETE |
 | `WriteBenchmarks` | CreateAndWrite | create + write 1M rows in one commit |
