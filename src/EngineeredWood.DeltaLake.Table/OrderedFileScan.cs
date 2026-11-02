@@ -74,7 +74,9 @@ internal sealed class OrderedFileScan<T>
         _maxConcurrentFiles = maxConcurrentFiles;
         // Files whose producers finished but whose items the consumer has not reached still hold channels;
         // the budget bounds their bytes, this bounds how many of them there are.
-        _maxFilesAhead = 2 * maxConcurrentFiles;
+        // In long, and capped at the file count: doubling a window near int.MaxValue would overflow to a
+        // negative lookahead, and the scan would never start a file.
+        _maxFilesAhead = (int)Math.Min(2L * maxConcurrentFiles, fileCount);
         _budget = budget;
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _channels = new Channel<(T, long)>?[fileCount];
@@ -178,7 +180,7 @@ internal sealed class OrderedFileScan<T>
                    && _running < _maxConcurrentFiles
                    && _next < _fileCount
                    && _next <= _stopAfter
-                   && _next < _head + _maxFilesAhead)
+                   && _next - _head < _maxFilesAhead)
             {
                 int file = _next++;
                 _running++;
@@ -287,7 +289,6 @@ internal sealed class ScanReservation
     private readonly int _file;
     private long _pending;
     private long _estimate;
-    private bool _observed;
 
     internal ScanReservation(ScanMemoryBudget? budget, int file)
     {
@@ -298,12 +299,21 @@ internal sealed class ScanReservation
     /// <summary>A reservation that reserves nothing, for a read that is not part of a parallel scan.</summary>
     internal static ScanReservation None { get; } = new(null, 0);
 
-    /// <summary>The size to reserve for the next item until one has been measured — for a Parquet file, its
-    /// largest row group's uncompressed size over the projected columns.</summary>
-    internal void SetInitialEstimate(long bytes)
+    /// <summary>A lower bound for every reservation of this file — for a Parquet file, its largest row
+    /// group's uncompressed size over the projected columns.</summary>
+    internal void SetInitialEstimate(long bytes) => Observe(bytes);
+
+    /// <summary>
+    /// A size this file's reads have been seen to reach — a RAW decoded batch, before a deletion vector or a
+    /// row selection shrinks it. Reservations are the LARGEST size seen, never the last one: reserving the
+    /// last would let a small batch (a deletion vector's survivors, a short final row group) set up an
+    /// underestimate of the full-size batch after it. So a reservation can only fall short on a file's
+    /// first batch, or on one larger than any before it.
+    /// </summary>
+    internal void Observe(long bytes)
     {
-        if (!_observed)
-            _estimate = Math.Max(0, bytes);
+        if (bytes > _estimate)
+            _estimate = bytes;
     }
 
     /// <summary>Waits until the budget can take the next item, then reserves for it. A reservation still
@@ -324,15 +334,15 @@ internal sealed class ScanReservation
     }
 
     /// <summary>The decoded item measured <paramref name="actual"/> bytes: its charge replaces the pending
-    /// reservation, and becomes the estimate for the next item.</summary>
+    /// reservation. An item LARGER than its reservation is charged in full without waiting — it already
+    /// exists — which is the one way the budget can be exceeded (see <see cref="ScanMemoryBudget"/>).</summary>
     internal void Settle(long actual)
     {
         if (_budget is null)
             return;
         _budget.Adjust(actual - _pending);
         _pending = 0;
-        _estimate = actual;
-        _observed = true;
+        Observe(actual);
     }
 
     internal void ReleasePending()
@@ -354,6 +364,12 @@ internal sealed class ScanReservation
 /// making it wait for the files behind it to drain would deadlock (they drain only after it). It may run
 /// over the budget by the one item it is decoding.</item>
 /// </list>
+/// <para><b>Underestimates.</b> A reservation is an estimate made before the decode, and an item that comes
+/// out larger is charged in full without waiting (it already exists). Each file reserves the largest size it
+/// has seen (<see cref="ScanReservation.Observe"/>), so this happens only on a file's first item — reserved
+/// from the Parquet footer, which UNDERestimates dictionary-encoded strings — or on an item larger than any
+/// before it. The peak is therefore about the budget, plus one item, plus each in-flight file's shortfall on
+/// its first item: up to the window's worth of first batches when every footer estimate is badly low.</para>
 /// </summary>
 internal sealed class ScanMemoryBudget
 {

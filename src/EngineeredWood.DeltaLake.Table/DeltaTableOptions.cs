@@ -91,12 +91,18 @@ public sealed record DeltaTableOptions
     /// (<see cref="MaxConcurrentFileReads"/>) may hold that the caller has not yet received. Default: 256 MiB.
     /// </summary>
     /// <remarks>
-    /// <para>A file reserves budget BEFORE it decodes each batch — with the built-in reader, an estimate from
-    /// the Parquet footer for the first batch and the previous batch's size after that — and the reservation
-    /// is released when the caller takes the batch. A file waits while the budget is full, so a slow consumer
-    /// holds the reads back. Two exceptions keep the scan from stalling: a batch is always admitted when
-    /// nothing else is held, even if it alone is larger than the budget; and the file the caller is waiting
-    /// on may decode one batch over the budget. So the peak is about this budget plus one batch.</para>
+    /// <para>A file reserves budget BEFORE it decodes each batch, and the reservation is released when the
+    /// caller takes the batch. A file waits while the budget is full, so a slow consumer holds the reads back.
+    /// Two exceptions keep the scan from stalling: a batch is always admitted when nothing else is held, even
+    /// if it alone is larger than the budget; and the file the caller is waiting on may decode one batch over
+    /// the budget.</para>
+    /// <para>A reservation is an estimate: the largest batch the file has produced so far, and for its first
+    /// batch, with the built-in reader, its largest row group's uncompressed size from the Parquet footer. A
+    /// batch that comes out larger is charged in full without waiting. Since the estimate only grows, that
+    /// happens on a file's first batch (the footer UNDERestimates dictionary-encoded strings) or on one larger
+    /// than any before it. So the peak is this budget, plus one batch, plus how far each file in flight
+    /// overran its first reservation. Through a <see cref="DataFileReader"/> there is no footer, and a file's
+    /// first batch is not reserved for at all.</para>
     /// <para>Not counted: each file's open reader and footer, a deletion vector's row set (#610), and the
     /// transient copies a batch goes through on its way out. A serial read (<see cref="MaxConcurrentFileReads"/>
     /// of 1) does not use the budget at all.</para>

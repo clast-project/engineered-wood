@@ -5689,18 +5689,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             yield break;
         }
 
+        var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes);
+        LastScanBudget = budget;
         await foreach (var batch in OrderedFileScan<RecordBatch>.RunAsync(
                            fileCount,
                            readFile,
                            RollingDataFileWriter.EstimatedBytes,
                            static b => b.Dispose(),
                            concurrency,
-                           _options.MaxBufferedReadBytes,
+                           budget,
                            cancellationToken).ConfigureAwait(false))
         {
             yield return batch;
         }
     }
+
+    /// <summary>The memory budget of the most recent parallel scan, for tests to read its
+    /// <see cref="ScanMemoryBudget.Peak"/>.</summary>
+    internal ScanMemoryBudget? LastScanBudget { get; private set; }
 
     /// <summary>The files a scan reads at once: <see cref="DeltaTableOptions.MaxConcurrentFileReads"/>, or by
     /// default up to 4 with the built-in reader and 1 through the codec seam, whose contract never promised that
@@ -9855,8 +9861,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             new DeltaReadOptions(), metadataFields, wantAddress, wantLocator, wantTracking);
         await foreach (var batch in ReadFilesInOrderAsync(
                            files.Count,
-                           (i, _, ct) => ReadSelectedRowsOfFileAsync(
-                               snapshot, shape, files[i].File, files[i].Targets, files[i].Ordinal, ct),
+                           (i, reservation, ct) => ReadSelectedRowsOfFileAsync(
+                               snapshot, shape, files[i].File, files[i].Targets, files[i].Ordinal,
+                               reservation, ct),
                            cancellationToken).ConfigureAwait(false))
         {
             yield return batch;
@@ -9871,6 +9878,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         AddFile addFile,
         IReadOnlyCollection<long> selected,
         int fileOrdinal,
+        ScanReservation reservation,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var metadataFields = shape.MetadataFields;
@@ -9882,20 +9890,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
 
         // The per-file read reports each surviving row's ABSOLUTE in-file position (DV-inclusive) and its
-        // RESOLVED stable id/version out-of-band, having stripped the materialized id columns from the
-        // emitted batch — so the position to match on, and the identity to report, both come from here
-        // rather than from a column of `batch`.
-        var absOut = new List<Int64Array?>();
-        var idsOut = wantTracking ? new List<Int64Array?>() : null;
-        var versOut = wantTracking ? new List<Int64Array?>() : null;
-        int bi = -1;
-        await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
-                                                  strippedRowIdsOut: idsOut,
-                                                  strippedVersionsOut: versOut,
-                                                  strippedAbsPositionsOut: absOut).ConfigureAwait(false))
+        // RESOLVED stable id/version alongside the batch, having stripped the materialized id columns from it
+        // — so the position to match on, and the identity to report, both come from here rather than from a
+        // column of `batch`. The reservation makes a parallel read wait for the byte budget before each decode,
+        // exactly as a scan does: the whole file is decoded whatever the selection keeps.
+        await foreach (var fb in ReadFileBatchesAsync(
+                           addFile, null, snapshot, wantPositions: true, wantTracking, rowGroupFilter: null,
+                           reservation, cancellationToken).ConfigureAwait(false))
         {
-            bi++;
-            var absPos = bi < absOut.Count ? absOut[bi] : null;
+            var batch = fb.Batch;
+            var absPos = fb.Positions;
             if (absPos is null)
                 continue;
             var rows = new List<int>();
@@ -9933,8 +9937,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
             if (wantTracking)
             {
-                var matI = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
-                var matV = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
+                var matI = fb.RowIds;
+                var matV = fb.Versions;
                 var ib = new Int64Array.Builder().Reserve(rows.Count);
                 var vb = new Int64Array.Builder().Reserve(rows.Count);
                 foreach (int i in rows)
@@ -10735,8 +10739,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                            addFile, columns, snapshot, wantPositions, wantTracking, rowGroupFilter,
                            ScanReservation.None, cancellationToken).ConfigureAwait(false))
         {
-            strippedRowIdsOut?.Add(fb.RowIds);
-            strippedVersionsOut?.Add(fb.Versions);
+            // Row ids and versions are built together, so a caller asking for only one of them gets the other
+            // built too: release it here, since nothing else holds it.
+            if (strippedRowIdsOut is not null) strippedRowIdsOut.Add(fb.RowIds); else fb.RowIds?.Dispose();
+            if (strippedVersionsOut is not null) strippedVersionsOut.Add(fb.Versions); else fb.Versions?.Dispose();
             strippedAbsPositionsOut?.Add(fb.Positions);
             yield return fb.Batch;
         }
@@ -11205,6 +11211,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 await reservation.ReserveNextAsync(cancellationToken).ConfigureAwait(false);
                 if (!await e.MoveNextAsync().ConfigureAwait(false))
                     break;
+                // The raw batch, before a deletion vector or a selection shrinks it, is what the NEXT decode
+                // will produce, so it is what the next reservation should cover.
+                reservation.Observe(RollingDataFileWriter.EstimatedBytes(e.Current.Batch));
                 yield return e.Current;
             }
         }

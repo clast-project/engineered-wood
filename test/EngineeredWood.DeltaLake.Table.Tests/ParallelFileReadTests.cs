@@ -184,6 +184,74 @@ public class ParallelFileReadTests : IDisposable
         Assert.Equal(expected, await RenderAsync(parallel.ReadRowsAsync(everySeventh, options)));
     }
 
+    /// <summary>The largest batch a full read of the table yields, in the bytes the budget counts.</summary>
+    private async Task<long> LargestBatchBytesAsync()
+    {
+        await using var serial = await OpenAsync(1);
+        long largest = 0;
+        var options = new DeltaReadOptions
+        {
+            Metadata = DeltaRowMetadata.RowAddress | DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking,
+        };
+        await foreach (var b in serial.ReadAsync(options))
+        {
+            largest = Math.Max(largest, RollingDataFileWriter.EstimatedBytes(b));
+            b.Dispose();
+        }
+        return largest;
+    }
+
+    /// <summary>A slow consumer with a budget smaller than one batch: the reads must wait for it, so only a
+    /// couple of batches are ever held, not every file's channel full (4 files x 4 queued + 1 decoding).</summary>
+    [Fact]
+    public async Task ASlowConsumer_HoldsTheScanToTheBudget()
+    {
+        await CreateTableAsync();
+        long largest = await LargestBatchBytesAsync();
+        await using var table = await OpenAsync(4, budget: 1);
+
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
+        {
+            b.Dispose();
+            await Task.Delay(2);
+        }
+
+        Assert.NotNull(table.LastScanBudget);
+        Assert.InRange(table.LastScanBudget!.Peak, 1, 3 * largest);
+        Assert.Equal(0, table.LastScanBudget.Used);
+    }
+
+    /// <summary>The same for ReadRowsAsync, whose per-file read at first did not reserve at all: its producers
+    /// filled their channels whatever the budget.</summary>
+    [Fact]
+    public async Task ReadRowsAsync_HoldsTheScanToTheBudget_Too()
+    {
+        await CreateTableAsync();
+        long largest = await LargestBatchBytesAsync();
+        await using var serial = await OpenAsync(1);
+
+        // Every row, so each batch read is kept whole.
+        var locators = new List<RecordBatch>();
+        await foreach (var b in serial.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
+            locators.Add(b);
+        var everyRow = RowSelection.FromLocatorColumns(locators);
+
+        await using var table = await OpenAsync(4, budget: 1);
+        int rows = 0;
+        var options = new DeltaRowReadOptions { Metadata = DeltaRowMetadata.Locator };
+        await foreach (var b in table.ReadRowsAsync(everyRow, options))
+        {
+            rows += b.Length;
+            b.Dispose();
+            await Task.Delay(2);
+        }
+
+        Assert.Equal(Files * RowsPerFile - 210, rows);
+        Assert.NotNull(table.LastScanBudget);
+        Assert.InRange(table.LastScanBudget!.Peak, 1, 3 * largest);
+        Assert.Equal(0, table.LastScanBudget.Used);
+    }
+
     [Fact]
     public async Task ReadAtTimestampAsync_ReadsInPathOrder_AndInParallel()
     {

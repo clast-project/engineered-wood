@@ -33,24 +33,27 @@ public class OrderedFileScanTests
         public readonly ConcurrentDictionary<int, bool> Cancelled = new();
         public readonly ConcurrentDictionary<int, bool> Started = new();
 
-        /// <summary>A file of <paramref name="items"/> items of <paramref name="size"/> bytes, each preceded by a
-        /// reservation, with <paramref name="delay"/> before each item. <paramref name="failAt"/> throws instead
-        /// of producing that item.</summary>
+        /// <summary>A file of <paramref name="items"/> items, item <c>i</c> of <c>size(file, i)</c> bytes, each
+        /// preceded by a reservation (the first estimated at <paramref name="estimate"/>), with
+        /// <paramref name="delay"/> before each item. <paramref name="failAt"/> throws instead of producing that
+        /// item.</summary>
         public async IAsyncEnumerable<Item> Read(
-            int file, ScanReservation reservation, int items, long size, Func<int, int, TimeSpan>? delay,
-            int failAt, [EnumeratorCancellation] CancellationToken ct)
+            int file, ScanReservation reservation, int items, Func<int, int, long> size, long estimate,
+            Func<int, int, TimeSpan>? delay, int failAt, [EnumeratorCancellation] CancellationToken ct)
         {
             Started[file] = true;
             int now = Interlocked.Increment(ref Running);
             InterlockedMax(ref MaxRunning, now);
             try
             {
-                reservation.SetInitialEstimate(size);
+                reservation.SetInitialEstimate(estimate);
                 for (int i = 0; i < items; i++)
                 {
-                    await reservation.ReserveNextAsync(ct);
                     try
                     {
+                        // Inside the try: a file the scheduler starts just as the scan shuts down is cancelled
+                        // HERE, waiting for budget, before it ever reaches its delay.
+                        await reservation.ReserveNextAsync(ct);
                         if (delay?.Invoke(file, i) is { } d && d > TimeSpan.Zero)
                             await Task.Delay(d, ct);
                         else
@@ -63,7 +66,7 @@ public class OrderedFileScanTests
                     }
                     if (i == failAt)
                         throw new InvalidOperationException($"file {file} failed at item {i}");
-                    var item = new Item(file, i, size);
+                    var item = new Item(file, i, size(file, i));
                     Produced.Add(item);
                     yield return item;
                 }
@@ -96,10 +99,12 @@ public class OrderedFileScanTests
     private static IAsyncEnumerable<Item> Scan(
         Files files, int fileCount, int itemsPerFile, int window, long budget, long itemSize = 10,
         Func<int, int, TimeSpan>? delay = null, int failFile = -1, int failAt = -1,
-        ScanMemoryBudget? memory = null, CancellationToken ct = default) =>
+        ScanMemoryBudget? memory = null, CancellationToken ct = default,
+        Func<int, int, long>? sizes = null, long? estimate = null) =>
         OrderedFileScan<Item>.RunAsync(
             fileCount,
-            (f, r, t) => files.Read(f, r, itemsPerFile, itemSize, delay, f == failFile ? failAt : -1, t),
+            (f, r, t) => files.Read(f, r, itemsPerFile, sizes ?? ((_, _) => itemSize), estimate ?? itemSize,
+                delay, f == failFile ? failAt : -1, t),
             i => i.Size,
             i => Interlocked.Increment(ref i.Disposals),
             window,
@@ -272,6 +277,60 @@ public class OrderedFileScanTests
         for (int k = 0; k < got.Count; k++)
             Assert.Equal(k / 4, got[k].File);
         Assert.Equal(0, memory.Used);
+    }
+
+    [Fact]
+    public async Task AnUnderestimatedFirstItem_OverrunsTheBudgetOnlyOncePerFile()
+    {
+        // Every file's first reservation is 10 bytes for items of 1,000 (a footer that underestimates
+        // dictionary-encoded strings). The first item of each file in flight is charged in full without
+        // waiting; after that every reservation is the 1,000 bytes observed, and waits.
+        const long size = 1000;
+        const long budget = 2500;
+        const int window = 4;
+        var files = new Files();
+        var memory = new ScanMemoryBudget(budget);
+        int count = 0;
+        await foreach (var item in Scan(files, fileCount: 12, itemsPerFile: 5, window: window, budget: 0,
+                           itemSize: size, estimate: 10, memory: memory))
+        {
+            item.Delivered = true;
+            count++;
+            await Task.Delay(1);
+        }
+
+        Assert.Equal(60, count);
+        // The budget, one item over it (the front file), and each other file in flight's first-item shortfall.
+        Assert.InRange(memory.Peak, size, budget + size + (window - 1) * (size - 10));
+        Assert.Equal(0, memory.Used);
+        files.AssertNothingLeaked();
+    }
+
+    [Fact]
+    public async Task ASmallItem_DoesNotLowerTheNextReservation()
+    {
+        // Items alternate 1,000 and 100 bytes (a deletion vector's survivors, then a full batch). Reserving the
+        // LAST size seen would underestimate every large item; reserving the largest underestimates none.
+        const long budget = 2500;
+        var files = new Files();
+        var memory = new ScanMemoryBudget(budget);
+        var got = await CollectAsync(Scan(files, fileCount: 8, itemsPerFile: 8, window: 4, budget: 0,
+            sizes: (_, i) => i % 2 == 0 ? 1000 : 100, estimate: 1000, memory: memory)).WaitAsync(Timeout);
+
+        Assert.Equal(64, got.Count);
+        // No reservation is smaller than its item, so nothing is charged without waiting: the budget plus the
+        // front file's one admitted item at most.
+        Assert.InRange(memory.Peak, 1000, budget + 1000);
+    }
+
+    [Fact]
+    public async Task AHugeWindow_DoesNotOverflow()
+    {
+        // 2 x int.MaxValue overflowed the lookahead to a negative number, so no file ever started.
+        var files = new Files();
+        var got = await CollectAsync(Scan(files, fileCount: 3, itemsPerFile: 2, window: int.MaxValue,
+            budget: 1 << 20)).WaitAsync(Timeout);
+        Assert.Equal(6, got.Count);
     }
 
     [Fact]
