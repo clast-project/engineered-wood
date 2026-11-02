@@ -52,6 +52,34 @@ internal static class SelectionMask
         words[lw] &= ~last;
     }
 
+    /// <summary>Selects exactly the rows of [0, <paramref name="rows"/>) that were not selected.</summary>
+    public static void Invert(Span<ulong> words, int rows)
+    {
+        int n = WordCount(rows);
+        for (int w = 0; w < n; w++)
+            words[w] = ~words[w];
+        if ((rows & 63) != 0)
+            words[n - 1] &= ulong.MaxValue >> (64 - (rows & 63));
+    }
+
+    /// <summary>Selects rows [<paramref name="from"/>, <paramref name="to"/>).</summary>
+    public static void SetRange(Span<ulong> words, int from, int to)
+    {
+        if (from >= to)
+            return;
+        int fw = from >> 6, lw = (to - 1) >> 6;
+        ulong first = ulong.MaxValue << (from & 63);
+        ulong last = ulong.MaxValue >> (63 - ((to - 1) & 63));
+        if (fw == lw)
+        {
+            words[fw] |= first & last;
+            return;
+        }
+        words[fw] |= first;
+        words.Slice(fw + 1, lw - fw - 1).Fill(ulong.MaxValue);
+        words[lw] |= last;
+    }
+
     /// <summary>
     /// Keeps selected only the rows <paramref name="mask"/> selects: those whose value is true. A null
     /// deselects its row, as a SQL <c>WHERE</c> treats an unknown condition.

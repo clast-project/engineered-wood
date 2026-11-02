@@ -133,6 +133,21 @@ def cmd_read(args):
     }
 
 
+def cmd_read_id_digest(args):
+    """Read an EW-written table and digest its bigint `id` column: count, sum and sum of squares. For tables
+    too large to ship back row by row."""
+    from pyspark.sql import functions as F
+
+    spark = _spark()
+    df = spark.read.format("delta").load(_uri(args["path"]))
+    row = df.agg(
+        F.count(F.lit(1)).alias("n"),
+        F.sum("id").alias("s"),
+        F.sum(F.col("id") * F.col("id")).alias("q"),
+    ).collect()[0]
+    return {"row_count": row["n"], "sum": row["s"], "sum_squares": row["q"]}
+
+
 def cmd_read_row_ids(args):
     """Read an EW row-tracking table via Delta's generated row-tracking metadata columns.
 
@@ -1135,6 +1150,7 @@ COMMANDS = {
     "expr_oracle": cmd_expr_oracle,
     "read": cmd_read,
     "read_row_ids": cmd_read_row_ids,
+    "read_id_digest": cmd_read_id_digest,
     "read_changes": cmd_read_changes,
     "read_variant": cmd_read_variant,
     "read_parquet_variant": cmd_read_parquet_variant,

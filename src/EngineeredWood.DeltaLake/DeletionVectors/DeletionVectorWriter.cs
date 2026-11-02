@@ -7,7 +7,7 @@ using EngineeredWood.IO;
 namespace EngineeredWood.DeltaLake.DeletionVectors;
 
 /// <summary>
-/// Creates deletion vectors from sets of deleted row indices.
+/// Stores deletion vectors.
 /// Small DVs are stored inline (Base85-encoded); large DVs are written to files.
 /// </summary>
 public sealed class DeletionVectorWriter
@@ -26,21 +26,38 @@ public sealed class DeletionVectorWriter
     }
 
     /// <summary>
-    /// Creates a deletion vector from the given deleted row indices.
-    /// Returns the DV descriptor to include in the <see cref="AddFile"/> action.
+    /// Stores <paramref name="deletedRows"/> (inline when its serialized form is at most
+    /// <see cref="InlineThreshold"/> bytes, otherwise in a new file) and returns the descriptor to put on the
+    /// <see cref="AddFile"/>. The descriptor's cardinality is the vector's own count.
     /// </summary>
     public async ValueTask<DeletionVector> CreateAsync(
-        IEnumerable<long> deletedRowIndices,
-        long cardinality,
+        DeletionVectorBitmap deletedRows,
         CancellationToken cancellationToken = default)
     {
-        byte[] dvBlob = RoaringBitmapWriter.Serialize(deletedRowIndices);
+        if (deletedRows is null)
+            throw new ArgumentNullException(nameof(deletedRows));
+        byte[] dvBlob = deletedRows.SerializedBytes();
 
         if (dvBlob.Length <= InlineThreshold)
-            return CreateInline(dvBlob, cardinality);
+            return CreateInline(dvBlob, deletedRows.Count);
 
-        return await CreateFileAsync(dvBlob, cardinality, cancellationToken)
+        return await CreateFileAsync(dvBlob, deletedRows.Count, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// As <see cref="CreateAsync(DeletionVectorBitmap, CancellationToken)"/> for the vector deleting
+    /// <paramref name="deletedRowIndices"/> (any order; duplicates count once).
+    /// </summary>
+    public ValueTask<DeletionVector> CreateAsync(
+        IEnumerable<long> deletedRowIndices,
+        CancellationToken cancellationToken = default)
+    {
+        if (deletedRowIndices is null)
+            throw new ArgumentNullException(nameof(deletedRowIndices));
+        var bitmap = DeletionVectorBuilder.Build(
+            null, DeletionVectorBuilder.SortedDistinct(deletedRowIndices, nameof(deletedRowIndices)), null);
+        return CreateAsync(bitmap, cancellationToken);
     }
 
     private DeletionVector CreateInline(byte[] dvBlob, long cardinality)

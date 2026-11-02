@@ -29,14 +29,18 @@ public sealed class DeletionVectorBitmap : IEnumerable<long>
     private readonly int[] _offset;     // payload offset in _data
     private readonly int[] _length;     // array values / runs / 1024 bitmap words
     private readonly RoaringContainerKind[] _kind;
+    private readonly int _serializedLength; // the RoaringBitmapArray's length in _data, from offset 0
 
     /// <summary>A deletion vector that deletes nothing.</summary>
-    public static DeletionVectorBitmap Empty { get; } = new([], [], [], [], [], 0);
+    public static DeletionVectorBitmap Empty { get; } = new(
+        DeletionVectorBuilder.EmptyBlob(), [], [], [], [], 0, DeletionVectorBuilder.EmptyBlobLength);
 
     private DeletionVectorBitmap(
-        byte[] data, long[] bases, int[] offsets, int[] lengths, RoaringContainerKind[] kinds, long count)
+        byte[] data, long[] bases, int[] offsets, int[] lengths, RoaringContainerKind[] kinds, long count,
+        int serializedLength)
     {
         _data = data;
+        _serializedLength = serializedLength;
         _base = bases;
         _offset = offsets;
         _length = lengths;
@@ -110,7 +114,90 @@ public sealed class DeletionVectorBitmap : IEnumerable<long>
         return count == 0
             ? Empty
             : new DeletionVectorBitmap(
-                data, bases.ToArray(), offsets.ToArray(), lengths.ToArray(), kinds.ToArray(), count);
+                data, bases.ToArray(), offsets.ToArray(), lengths.ToArray(), kinds.ToArray(), count, position);
+    }
+
+    /// <summary>
+    /// The deletion vector deleting exactly <paramref name="positions"/> (in any order; duplicates count once).
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">A position is negative or past the largest one a Delta
+    /// deletion vector can hold.</exception>
+    public static DeletionVectorBitmap FromPositions(IEnumerable<long> positions)
+    {
+        if (positions is null)
+            throw new ArgumentNullException(nameof(positions));
+        return DeletionVectorBuilder.Build(null, DeletionVectorBuilder.SortedDistinct(positions, nameof(positions)), null);
+    }
+
+    /// <summary>
+    /// The deletion vector deleting every row this one does and <paramref name="positions"/> too (in any order;
+    /// duplicates, and rows already deleted, count once). This instance is unchanged.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">A position is negative or past the largest one a Delta
+    /// deletion vector can hold.</exception>
+    public DeletionVectorBitmap Union(IEnumerable<long> positions)
+    {
+        if (positions is null)
+            throw new ArgumentNullException(nameof(positions));
+        return DeletionVectorBuilder.Build(this, DeletionVectorBuilder.SortedDistinct(positions, nameof(positions)), null);
+    }
+
+    /// <summary>The rows this vector deletes and <paramref name="other"/> does not. This instance is
+    /// unchanged.</summary>
+    public DeletionVectorBitmap Except(DeletionVectorBitmap other)
+    {
+        if (other is null)
+            throw new ArgumentNullException(nameof(other));
+        return DeletionVectorBuilder.Difference(this, other);
+    }
+
+    /// <summary>
+    /// As <see cref="Union(IEnumerable{long})"/> for positions already ascending and distinct, appending to
+    /// <paramref name="newlyDeleted"/> (when given), in ascending order, each one this vector did not already
+    /// delete.
+    /// </summary>
+    internal DeletionVectorBitmap Union(ReadOnlySpan<long> ascendingDistinct, List<long>? newlyDeleted) =>
+        DeletionVectorBuilder.Build(this, ascendingDistinct, newlyDeleted);
+
+    /// <summary>
+    /// The serialized RoaringBitmapArray (magic, sub-bitmap count, sub-bitmaps), as a deletion vector's storage
+    /// holds it. Shares this instance's buffer when it is exactly that long; callers must not change it.
+    /// </summary>
+    internal byte[] SerializedBytes() =>
+        _data.Length == _serializedLength ? _data : _data.AsSpan(0, _serializedLength).ToArray();
+
+    // ---- container access, for DeletionVectorBuilder ----
+
+    internal int ContainerCount => _base.Length;
+
+    internal long ContainerBase(int c) => _base[c];
+
+    /// <summary>Sets, in <paramref name="words"/> (1024 words, bit <c>v</c> = container value <c>v</c>), every
+    /// value container <paramref name="c"/> holds.</summary>
+    internal void OrContainerInto(int c, Span<ulong> words)
+    {
+        int off = _offset[c];
+        switch (_kind[c])
+        {
+            case RoaringContainerKind.Array:
+                for (int i = 0; i < _length[c]; i++)
+                {
+                    int v = U16(off + 2 * i);
+                    words[v >> 6] |= 1UL << (v & 63);
+                }
+                break;
+            case RoaringContainerKind.Run:
+                for (int r = 0; r < _length[c]; r++)
+                {
+                    int s = U16(off + 4 * r);
+                    Arrow.SelectionMask.SetRange(words, s, s + U16(off + 4 * r + 2) + 1);
+                }
+                break;
+            default:
+                for (int w = 0; w < 1024; w++)
+                    words[w] |= U64(off + 8 * w);
+                break;
+        }
     }
 
     /// <summary>True when row <paramref name="position"/> is deleted.</summary>

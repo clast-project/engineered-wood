@@ -31,6 +31,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private readonly DeletionVectorReader _dvReader;
 
     /// <summary>
+    /// The size, in bytes, up to which a deletion vector this table writes is stored inline in the log rather
+    /// than in a file of its own. Tests lower it to exercise vector files with few rows.
+    /// </summary>
+    internal int DeletionVectorInlineThreshold { get; set; } = 1024;
+
+    private DeletionVectors.DeletionVectorWriter NewDeletionVectorWriter() =>
+        new(_fs) { InlineThreshold = DeletionVectorInlineThreshold };
+
+    /// <summary>
     /// The optimistic-concurrency commit loop, in the log layer. Every commit this table makes goes through
     /// it; what stays up here is the part that needs a data plane — re-deriving version-coupled actions on
     /// a rebase, and collecting the files a losing attempt left behind.
@@ -3646,31 +3655,25 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             result.Add(action);
         }
 
-        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var dvWriter = NewDeletionVectorWriter();
 
         foreach (var edit in unionEdits)
         {
             var latestAdd = activeByPath[edit.Path];
 
             var concurrentDeleted = latestAdd.DeletionVector is not null
-                ? new HashSet<long>(await _dvReader.ReadAsync(latestAdd.DeletionVector, cancellationToken)
-                    .ConfigureAwait(false))
-                : new HashSet<long>();
+                ? await _dvReader.ReadAsync(latestAdd.DeletionVector, cancellationToken).ConfigureAwait(false)
+                : DeletionVectorBitmap.Empty;
 
             // If any row this delete removed is already deleted in the file's current DV, the same row was
             // deleted concurrently — a real row-level conflict.
-            foreach (long row in edit.NewlyDeletedRows)
-            {
-                if (concurrentDeleted.Contains(row))
-                    return null;
-            }
+            long[] ours = DeletionVectors.DeletionVectorBuilder.SortedDistinct(edit.NewlyDeletedRows);
+            var added = new List<long>(ours.Length);
+            var union = concurrentDeleted.Union(ours, added);
+            if (added.Count != ours.Length)
+                return null;
 
-            var union = new HashSet<long>(concurrentDeleted);
-            foreach (long row in edit.NewlyDeletedRows)
-                union.Add(row);
-
-            var unionDv = await dvWriter.CreateAsync(union, union.Count, cancellationToken)
-                .ConfigureAwait(false);
+            var unionDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
             written?.RecordDeletionVector(unionDv);
 
             result.Add(new RemoveFile
@@ -3789,7 +3792,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         //    DV-deleted in latest is filtered out on read, so it never appears here → falls to the not-found
         //    conflict below.
         var remaining = new HashSet<long>(targetVersions.Keys);
-        var assignments = new Dictionary<string, (AddFile File, HashSet<long> Positions)>(StringComparer.Ordinal);
+        var assignments = new Dictionary<string, (AddFile File, List<long> Positions)>(StringComparer.Ordinal);
         var candidates = latestSnapshot.ActiveFiles.Values
             .Where(f => !baseByPath.ContainsKey(f.Path))
             .OrderBy(f => f.DataChange) // false (compaction) first
@@ -3826,7 +3829,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     if (newVer != targetVersions[stable])
                         return null; // the row was concurrently updated (its commit version advanced)
                     if (!assignments.TryGetValue(cand.Path, out var slot))
-                        assignments[cand.Path] = slot = (cand, new HashSet<long>());
+                        assignments[cand.Path] = slot = (cand, new List<long>());
                     slot.Positions.Add(pA.GetValue(i)!.Value);
                     remaining.Remove(stable);
                 }
@@ -3836,7 +3839,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             return null; // some rows were not found after the rewrite — concurrently deleted
 
         // 3. Build remove/add deletion-vector pairs on the new files.
-        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var dvWriter = NewDeletionVectorWriter();
         var result = new List<DeltaAction>(assignments.Count * 2);
         foreach (var kv in assignments)
         {
@@ -3844,12 +3847,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             resolvedPaths.Add(cand.Path); // checker: this new file's concurrent add is reconciled, not foreign
 
             var deleted = cand.DeletionVector is not null
-                ? new HashSet<long>(await _dvReader.ReadAsync(cand.DeletionVector, cancellationToken)
-                    .ConfigureAwait(false))
-                : new HashSet<long>();
-            foreach (long p in positions)
-                deleted.Add(p);
-            var newDv = await dvWriter.CreateAsync(deleted, deleted.Count, cancellationToken)
+                ? await _dvReader.ReadAsync(cand.DeletionVector, cancellationToken).ConfigureAwait(false)
+                : DeletionVectorBitmap.Empty;
+            var newDv = await dvWriter.CreateAsync(deleted.Union(positions), cancellationToken)
                 .ConfigureAwait(false);
             written?.RecordDeletionVector(newDv);
 
@@ -4280,7 +4280,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (prunePredicate is not null)
             RefuseUnanalyzable(prunePredicate, snapshot);
 
-        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var dvWriter = NewDeletionVectorWriter();
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         var dvEdits = new List<DeleteDvEdit>();
@@ -4362,11 +4362,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
 
             var rawDeletedRows = addFile.DeletionVector is not null
-                ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
-                    .ConfigureAwait(false))
-                : new HashSet<long>();
+                ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
+                : DeletionVectorBitmap.Empty;
 
-            var newDeletedIndices = new List<long>();
+            var newDeletedIndices = new List<long>(); // ascending: batches come in file order
             var deletedRowBatches = new List<RecordBatch>(); // For CDC
             // Paired 1:1 with deletedRowBatches: each deleted row's STABLE id + commit version, for the change
             // file. A deletion vector moves no row, so a row's identity here is exactly what it already was.
@@ -4425,21 +4424,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     logicalBatch, snapshot, addFile.PartitionValues, columns: null, partitionColumns, partitionColumns.Count > 0,
                     logicalToPhysical, addFile.Path);
 
+                // The rows this delete removes: those the predicate is TRUE for (a NULL deletes nothing) that the
+                // existing vector does not already hide — the vector and the predicate mask merged word by word.
                 var mask = predicate(logicalBatch);
-                var matchRows = new List<int>();
-
-                for (int i = 0; i < batch.Length; i++)
-                {
-                    long absIdx = firstRow + i;
-                    if (rawDeletedRows.Contains(absIdx))
-                        continue;
-
-                    if (!mask.IsNull(i) && mask.GetValue(i) == true)
-                    {
-                        newDeletedIndices.Add(absIdx);
-                        matchRows.Add(i);
-                    }
-                }
+                var matchRows = MatchingLiveRows(rawDeletedRows, firstRow, batch.Length, mask);
+                foreach (int i in matchRows)
+                    newDeletedIndices.Add(firstRow + i);
 
                 // Collect deleted row data for CDC
                 if (cdfEnabled && matchRows.Count > 0)
@@ -4457,10 +4447,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (newDeletedIndices.Count == 0)
                 continue;
 
-            var allDeleted = new HashSet<long>(rawDeletedRows);
-            foreach (long idx in newDeletedIndices)
-                allDeleted.Add(idx);
-
             totalDeleted += newDeletedIndices.Count;
 
             // Whole-file delete: every physical row is now gone, so the file can be dropped outright — a
@@ -4468,7 +4454,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // matched is either rewritten without the matched rows (copy-on-write) or soft-deleted with a vector,
             // which needs DVs enabled; asked for vectors on a table without them, the delete is refused rather
             // than writing a vector a foreign reader would ignore.
-            bool wholeFile = allDeleted.Count == fileRows;
+            // The new rows exclude every row the vector already hid, so the two counts add.
+            bool wholeFile = rawDeletedRows.Count + newDeletedIndices.Count == fileRows;
 
             if (!wholeFile && copyOnWrite)
             {
@@ -4499,7 +4486,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 if (!wholeFile)
                 {
                     var newDv = await dvWriter.CreateAsync(
-                        allDeleted, allDeleted.Count, cancellationToken).ConfigureAwait(false);
+                        rawDeletedRows.Union(newDeletedIndices.ToArray(), null), cancellationToken).ConfigureAwait(false);
                     // The vector is ours; the file it masks is not — the re-add below names the SOURCE data file,
                     // which is live table data whatever becomes of this transaction.
                     written?.RecordDeletionVector(newDv);
@@ -7784,13 +7771,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             if (deletedPositionsByFileIndex is not null)
             {
-                var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+                var dvWriter = NewDeletionVectorWriter();
                 for (int fi = 0; fi < files.Count; fi++)
                 {
                     if (!deletedPositionsByFileIndex.TryGetValue(fi, out var deletedPositions)
                         || deletedPositions.Count == 0)
                         continue;
-                    var dv = await dvWriter.CreateAsync(deletedPositions, deletedPositions.Count, cancellationToken)
+                    var dv = await dvWriter.CreateAsync(deletedPositions, cancellationToken)
                         .ConfigureAwait(false);
                     // Uncommitted until the log says otherwise: collected if the commit does not land.
                     written.RecordDeletionVector(dv);
@@ -8370,8 +8357,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (deletedByPath is not null
                 && deletedByPath.TryGetValue(f.RelativePath, out var positions) && positions.Count > 0)
             {
-                var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
-                dv = await dvWriter.CreateAsync(positions, positions.Count, cancellationToken)
+                var dvWriter = NewDeletionVectorWriter();
+                dv = await dvWriter.CreateAsync(positions, cancellationToken)
                     .ConfigureAwait(false);
                 written?.RecordDeletionVector(dv);
                 stats = StatsWithLooseBounds(stats);
@@ -8619,7 +8606,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (!selection.IsEmpty)
             EnsureDeletionVectorsEnabled(snapshot, "Deleting rows by position", CopyOnWriteAlternative);
 
-        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var dvWriter = NewDeletionVectorWriter();
         var byPath = ActiveFilesByPath(snapshot);
         var actions = new List<DeltaAction>();
         var edits = new List<DeleteDvEdit>();
@@ -8633,31 +8620,23 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (!byPath.TryGetValue(kvp.Key, out var addFile))
                 throw StaleSelectionPath(kvp.Key, snapshot);
 
-            var allDeleted = addFile.DeletionVector is not null
-                ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
-                    .ConfigureAwait(false))
-                : new HashSet<long>();
+            var existing = addFile.DeletionVector is not null
+                ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
+                : DeletionVectorBitmap.Empty;
 
-            long newlyDeleted = 0;
+            // Only the rows NEWLY hidden are this delete's intent — a position the file's existing vector already
+            // covered was deleted by an earlier commit, and replaying it as ours would make a concurrent writer's
+            // overlapping delete look like a row-level conflict.
             var newRows = new List<long>();
-            foreach (long p in kvp.Value)
-            {
-                if (allDeleted.Add(p))
-                {
-                    newlyDeleted++;
-                    // Only the rows NEWLY hidden are this delete's intent — a position the file's existing
-                    // vector already covered was deleted by an earlier commit, and replaying it as ours would
-                    // make a concurrent writer's overlapping delete look like a row-level conflict.
-                    newRows.Add(p);
-                }
-            }
+            var allDeleted = existing.Union(DeletionVectors.DeletionVectorBuilder.SortedDistinct(kvp.Value), newRows);
+            long newlyDeleted = newRows.Count;
             if (newlyDeleted == 0)
                 continue;
             totalDeleted += newlyDeleted;
             edits.Add(new DeleteDvEdit(addFile.Path, newRows));
             touched.Add(addFile.Path);
 
-            var newDv = await dvWriter.CreateAsync(allDeleted, allDeleted.Count, cancellationToken)
+            var newDv = await dvWriter.CreateAsync(allDeleted, cancellationToken)
                 .ConfigureAwait(false);
             written?.RecordDeletionVector(newDv);
 
@@ -8779,7 +8758,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 + "DeltaTable.CreateAsync(..., enableDeletionVectors: true), or pass "
                 + "RowDeleteMode.CopyOnWrite.");
 
-        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var dvWriter = NewDeletionVectorWriter();
         var byPath = ActiveFilesByPath(snapshot);
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         var actions = new List<DeltaAction>();
@@ -8792,19 +8771,17 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (!byPath.TryGetValue(kvp.Key, out var addFile))
                 throw StaleSelectionPath(kvp.Key, snapshot);
 
-            var allDeleted = addFile.DeletionVector is not null
-                ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
-                    .ConfigureAwait(false))
-                : new HashSet<long>();
+            var existing = addFile.DeletionVector is not null
+                ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
+                : DeletionVectorBitmap.Empty;
             var newPositions = new List<long>();
-            foreach (long p in kvp.Value)
-                if (allDeleted.Add(p))
-                    newPositions.Add(p);
+            var allDeleted = existing.Union(
+                DeletionVectors.DeletionVectorBuilder.SortedDistinct(kvp.Value), newPositions);
             if (newPositions.Count == 0)
                 continue;
             totalDeleted += newPositions.Count;
 
-            var newDv = await dvWriter.CreateAsync(allDeleted, allDeleted.Count, cancellationToken)
+            var newDv = await dvWriter.CreateAsync(allDeleted, cancellationToken)
                 .ConfigureAwait(false);
             // The vector is ours; the file it masks is not — the re-add below names live table data.
             written.RecordDeletionVector(newDv);
@@ -8867,7 +8844,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         WrittenFileLedger? written)
     {
         bool rowTracking = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
-        var newSet = new HashSet<long>(newPositions);
+        // Positions come back in ascending file order, so a cursor over the sorted targets finds them all in one
+        // pass, and the read stops once the last one is found.
+        long[] targets = DeletionVectors.DeletionVectorBuilder.SortedDistinct(newPositions);
+        int next = 0, found = 0;
         var absOut = new List<Int64Array?>();
         // The deleted rows' stable identity, for the change file. ReadFileAsync resolves it (materialized
         // else baseRowId + position) on the same batches the positions come from, so they stay aligned.
@@ -8886,8 +8866,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 continue;
             var delRows = new List<int>();
             for (int i = 0; i < batch.Length; i++)
-                if (!absPos.IsNull(i) && newSet.Contains(absPos.GetValue(i)!.Value))
+            {
+                if (absPos.IsNull(i))
+                    continue;
+                long position = absPos.GetValue(i)!.Value;
+                while (next < targets.Length && targets[next] < position)
+                    next++;
+                if (next < targets.Length && targets[next] == position)
                     delRows.Add(i);
+            }
             if (delRows.Count > 0)
             {
                 var batchIds = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
@@ -8899,6 +8886,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     batchIds is not null ? TakeIds(batchIds, delRows) : null,
                     batchVers is not null ? TakeIds(batchVers, delRows) : null,
                     written).ConfigureAwait(false));
+                found += delRows.Count;
+                if (found == targets.Length)
+                    break; // every deleted row is written; the rest of the file holds none
             }
         }
         return files;
@@ -10067,7 +10057,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(to.Metadata.Configuration);
         long nextRowId = assignRowIds ? to.RowIdHighWaterMark : 0;
         bool anyPostImage = false;
-        var dvWriter = new DeletionVectors.DeletionVectorWriter(_fs);
+        var dvWriter = NewDeletionVectorWriter();
         var rebased = new List<DeltaAction>(actions.Count);
 
         // Touched files REWRITTEN AWAY concurrently (compaction / copy-on-write UPDATE): their staged DV pairs
@@ -10126,13 +10116,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // The DV-pair re-add: union OUR positions with the CURRENT deletion vector, after the
                     // row-level disjointness check against the concurrent deletions.
                     var currentDeleted = current.DeletionVector is not null
-                        ? new HashSet<long>(await _dvReader.ReadAsync(current.DeletionVector, cancellationToken)
-                            .ConfigureAwait(false))
-                        : new HashSet<long>();
-                    int overlap = 0;
-                    foreach (long p in ours)
-                        if (currentDeleted.Contains(p))
-                            overlap++;
+                        ? await _dvReader.ReadAsync(current.DeletionVector, cancellationToken).ConfigureAwait(false)
+                        : DeletionVectorBitmap.Empty;
+                    long[] oursSorted = DeletionVectors.DeletionVectorBuilder.SortedDistinct(ours);
+                    var added = new List<long>(oursSorted.Length);
+                    var union = currentDeleted.Union(oursSorted, added);
+                    int overlap = oursSorted.Length - added.Count;
                     if (overlap > 0)
                     {
                         throw new DeltaConflictException(
@@ -10140,10 +10129,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                             $"row-level conflict on file '{add.Path}': {overlap} row(s) this transaction "
                             + "deletes/updates were concurrently deleted or updated — retry the transaction");
                     }
-                    foreach (long p in ours)
-                        currentDeleted.Add(p);
-                    var newDv = await dvWriter.CreateAsync(currentDeleted, currentDeleted.Count, cancellationToken)
-                        .ConfigureAwait(false);
+                    var newDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
                     rebased.Add(current with
                     {
                         DeletionVector = newDv,
@@ -11297,6 +11283,32 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             yield return (batch, next);
             next += batch.Length;
+        }
+    }
+
+    /// <summary>
+    /// The batch-relative indices, ascending, of the rows of a batch starting at file position
+    /// <paramref name="firstRow"/> that <paramref name="mask"/> holds TRUE for (NULL selects nothing) and
+    /// <paramref name="deleted"/> does not already delete.
+    /// </summary>
+    internal static List<int> MatchingLiveRows(
+        DeletionVectorBitmap deleted, long firstRow, int rows, BooleanArray mask)
+    {
+        int words = SelectionMask.WordCount(rows);
+        var rented = System.Buffers.ArrayPool<ulong>.Shared.Rent(Math.Max(words, 1));
+        try
+        {
+            var selection = rented.AsSpan(0, words);
+            SelectionMask.SelectAll(selection, rows);
+            deleted.ClearDeleted(firstRow, rows, selection);
+            SelectionMask.And(selection, rows, mask);
+            var indices = new int[SelectionMask.Count(selection)];
+            SelectionMask.ToIndices(selection, indices);
+            return new List<int>(indices);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<ulong>.Shared.Return(rented);
         }
     }
 

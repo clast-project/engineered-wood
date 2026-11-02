@@ -118,8 +118,10 @@ internal static class RoaringBitmap
     /// payload lies inside <paramref name="data"/>, keys strictly ascend, array values strictly ascend, runs
     /// ascend without overlapping and stay inside their container. (Touching runs, which CRoaring would have
     /// merged, are accepted: they name no row twice, and Java's RoaringBitmap reads them too.) Each container's
-    /// <see cref="RoaringContainer.Cardinality"/> is counted from its payload, not taken from the descriptive
-    /// header, so a header that disagrees with its payload cannot skew a count.
+    /// <see cref="RoaringContainer.Cardinality"/> is counted from its payload and must equal the descriptive
+    /// header's: a reader that trusts the header (Java's RoaringBitmap takes a bitmap container's count from it)
+    /// would otherwise see a different set size than one that counts, and the bytes, written back unchanged,
+    /// would carry the disagreement on. CRoaring's own validation refuses the same mismatch.
     /// </remarks>
     /// <exception cref="InvalidDataException">The bitmap is truncated or malformed.</exception>
     public static int ParseContainers(
@@ -199,6 +201,9 @@ internal static class RoaringBitmap
                     nextFree = start + lengthMinus1 + 1; // a following run starts past this one's last value
                     cardinality += lengthMinus1 + 1;
                 }
+                if (cardinality != headerCardinality)
+                    throw Malformed(
+                        $"run container {key} holds {cardinality} values; its header says {headerCardinality}");
                 containers.Add(new RoaringContainer(key, RoaringContainerKind.Run, payload, runs, cardinality));
             }
             else if (headerCardinality > 4096)
@@ -209,6 +214,9 @@ internal static class RoaringBitmap
                 int cardinality = 0;
                 for (int w = 0; w < 1024; w++)
                     cardinality += PopCount(BinaryPrimitives.ReadUInt64LittleEndian(data.Slice(payload + 8 * w, 8)));
+                if (cardinality != headerCardinality)
+                    throw Malformed(
+                        $"bitmap container {key} holds {cardinality} values; its header says {headerCardinality}");
                 containers.Add(new RoaringContainer(key, RoaringContainerKind.Bitmap, payload, 1024, cardinality));
             }
             else

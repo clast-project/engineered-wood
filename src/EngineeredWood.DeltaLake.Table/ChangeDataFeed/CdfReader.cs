@@ -141,7 +141,7 @@ internal static class CdfReader
                     if (vectorEdits.TryGetValue(remove.Path, out var edit))
                     {
                         // The rows the new vector hides that the old one did not.
-                        if (edit.NewlyDeleted.Count == 0)
+                        if (edit.NewlyDeleted.IsEmpty)
                             continue;
                         filter = RowFilter.KeepOnly(edit.NewlyDeleted);
                     }
@@ -171,7 +171,7 @@ internal static class CdfReader
                     {
                         // The rows the old vector hid that the new one no longer does — a RESTORE un-deleting
                         // them. An ordinary vector DELETE has none.
-                        if (edit.Reinserted.Count == 0)
+                        if (edit.Reinserted.IsEmpty)
                             continue;
                         filter = RowFilter.KeepOnly(edit.Reinserted);
                     }
@@ -249,7 +249,7 @@ internal static class CdfReader
     }
 
     /// <summary>A remove/add pair of one file whose vectors differ, reduced to the positions that changed.</summary>
-    private sealed record VectorEdit(AddFile Add, HashSet<long> NewlyDeleted, HashSet<long> Reinserted);
+    private sealed record VectorEdit(AddFile Add, DeletionVectorBitmap NewlyDeleted, DeletionVectorBitmap Reinserted);
 
     /// <summary>
     /// The version's vector edits by path: each file both removed and added in it, with a deletion vector on
@@ -278,22 +278,18 @@ internal static class CdfReader
             if (!await fs.ExistsAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(path), cancellationToken)
                     .ConfigureAwait(false))
             {
-                edits[path] = new VectorEdit(add, new HashSet<long>(), new HashSet<long>());
+                edits[path] = new VectorEdit(add, DeletionVectorBitmap.Empty, DeletionVectorBitmap.Empty);
                 continue;
             }
 
             var oldRows = remove.DeletionVector is null
-                ? new HashSet<long>()
-                : new HashSet<long>(await dvReader.ReadAsync(remove.DeletionVector, cancellationToken).ConfigureAwait(false));
+                ? DeletionVectorBitmap.Empty
+                : await dvReader.ReadAsync(remove.DeletionVector, cancellationToken).ConfigureAwait(false);
             var newRows = add.DeletionVector is null
-                ? new HashSet<long>()
-                : new HashSet<long>(await dvReader.ReadAsync(add.DeletionVector, cancellationToken).ConfigureAwait(false));
+                ? DeletionVectorBitmap.Empty
+                : await dvReader.ReadAsync(add.DeletionVector, cancellationToken).ConfigureAwait(false);
 
-            var newlyDeleted = new HashSet<long>(newRows);
-            newlyDeleted.ExceptWith(oldRows);
-            var reinserted = new HashSet<long>(oldRows);
-            reinserted.ExceptWith(newRows);
-            edits[path] = new VectorEdit(add, newlyDeleted, reinserted);
+            edits[path] = new VectorEdit(add, newRows.Except(oldRows), oldRows.Except(newRows));
         }
         return edits;
     }
@@ -314,10 +310,10 @@ internal static class CdfReader
     /// vector is read only by <see cref="ResolveAsync"/>, once the data file is known to exist — VACUUM removes
     /// a file's vector along with it.</summary>
     private readonly record struct RowFilter(
-        HashSet<long>? Positions, bool KeepOnlyPositions,
+        DeletionVectorBitmap? Positions, bool KeepOnlyPositions,
         EngineeredWood.DeltaLake.Actions.DeletionVector? Unread = null)
     {
-        public static RowFilter KeepOnly(HashSet<long> positions) => new(positions, true);
+        public static RowFilter KeepOnly(DeletionVectorBitmap positions) => new(positions, true);
 
         public static RowFilter Exclude(EngineeredWood.DeltaLake.Actions.DeletionVector? deletionVector) =>
             new(null, false, deletionVector);
@@ -326,10 +322,42 @@ internal static class CdfReader
             DeletionVectorReader dvReader, CancellationToken cancellationToken) =>
             Unread is null
                 ? this
-                : new(new HashSet<long>(await dvReader.ReadAsync(Unread, cancellationToken).ConfigureAwait(false)), false);
+                : new(await dvReader.ReadAsync(Unread, cancellationToken).ConfigureAwait(false), false);
 
-        public bool Includes(long position) =>
-            Positions is null ? !KeepOnlyPositions : Positions.Contains(position) == KeepOnlyPositions;
+        /// <summary>The batch-relative indices, ascending, of the rows of [<paramref name="start"/>,
+        /// <paramref name="start"/> + <paramref name="rows"/>) the filter keeps.</summary>
+        public List<int> Selected(long start, int rows)
+        {
+            var selected = new List<int>(rows);
+            if (Positions is null)
+            {
+                if (!KeepOnlyPositions)
+                    for (int i = 0; i < rows; i++)
+                        selected.Add(i);
+                return selected;
+            }
+
+            int words = SelectionMask.WordCount(rows);
+            var rented = System.Buffers.ArrayPool<ulong>.Shared.Rent(Math.Max(words, 1));
+            var indices = System.Buffers.ArrayPool<int>.Shared.Rent(Math.Max(rows, 1));
+            try
+            {
+                var selection = rented.AsSpan(0, words);
+                SelectionMask.SelectAll(selection, rows);
+                Positions.ClearDeleted(start, rows, selection); // now: the rows the vector does NOT hold
+                if (KeepOnlyPositions)
+                    SelectionMask.Invert(selection, rows);
+                int n = SelectionMask.ToIndices(selection, indices);
+                for (int k = 0; k < n; k++)
+                    selected.Add(indices[k]);
+                return selected;
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<int>.Shared.Return(indices);
+                System.Buffers.ArrayPool<ulong>.Shared.Return(rented);
+            }
+        }
     }
 
     private static async IAsyncEnumerable<RecordBatch> ReadDataFileAsChangesAsync(
@@ -383,13 +411,9 @@ internal static class CdfReader
             // Source indices of the rows the filter keeps, in emit order — the map back to the raw arrays above,
             // and to each row's absolute in-file position.
             bool filtered = filter.Positions is not null;
-            List<int>? survivorSrc = ctx.EmitRowTracking || filtered ? new List<int>(rawBatch2.Length) : null;
-            if (survivorSrc is not null)
-            {
-                for (int i = 0; i < rawBatch2.Length; i++)
-                    if (filter.Includes(thisBatchStart + i))
-                        survivorSrc.Add(i);
-            }
+            List<int>? survivorSrc = ctx.EmitRowTracking || filtered
+                ? filter.Selected(thisBatchStart, rawBatch2.Length)
+                : null;
 
             var batch = rawBatch2;
             if (filtered && survivorSrc!.Count < rawBatch2.Length)

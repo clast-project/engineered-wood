@@ -211,6 +211,29 @@ public class BufferedTransactionTests : IDisposable
         Assert.Equal(new long[] { 1, 3, 4, 5, 6, 8, 9, 10 }, await ReadIdsFreshAsync());
     }
 
+    /// <summary>The union rebase's disjointness check: a concurrent writer DV-deleted the SAME row this
+    /// transaction deletes, on a file still active, so the rebase refuses rather than silently unioning.</summary>
+    [Fact]
+    public async Task BufferedFlow_ConcurrentDeleteOfTheSameRow_RebaseRefuses()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), BuildSchema(), enableDeletionVectors: true);
+        await table.WriteAsync([BuildBatch(1, 10)]);
+        var pinned = table.CurrentSnapshot;
+
+        var positions = new Dictionary<int, IReadOnlyCollection<long>> { [0] = new long[] { 1, 4 } }; // ids 2, 5
+        var (actions, _) = await table.ComputeDeletionVectorActionsAsync(positions, resolveAgainst: pinned);
+
+        await using (var racer = await OpenAsync())
+            await racer.DeleteAsync(IdEquals(5)); // one of ours
+
+        await using var committer = await OpenAsync();
+        var ex = await Assert.ThrowsAsync<DeltaConflictException>(async () =>
+            await committer.RebaseDvDmlActionsAsync(actions, positions, pinned, committer.CurrentSnapshot));
+        Assert.Contains("1 row(s)", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(new long[] { 1, 2, 3, 4, 6, 7, 8, 9, 10 }, await ReadIdsFreshAsync());
+    }
+
     /// <summary>
     /// A snapshot-coupled commit whose pin went stale reports it as its OWN condition, not as a generic
     /// concurrent write. The distinction is load-bearing for a host: everything else that collides here

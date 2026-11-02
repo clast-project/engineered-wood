@@ -53,6 +53,30 @@ public class SelectionMaskTests
     }
 
     [Fact]
+    public void SetRangeAndInvertMatchPerRowEdits()
+    {
+        var rng = new Random(7);
+        for (int trial = 0; trial < 2000; trial++)
+        {
+            int rows = rng.Next(0, 300);
+            var words = new ulong[SelectionMask.WordCount(rows) + 1]; // + a guard word
+            var expected = new bool[rows];
+            for (int r = 0; r < 4; r++)
+            {
+                int from = rng.Next(0, rows + 1), to = rng.Next(0, rows + 1);
+                SelectionMask.SetRange(words, from, to);
+                for (int i = from; i < to; i++) expected[i] = true;
+            }
+            Assert.Equal(expected, ToBools(words, rows));
+
+            SelectionMask.Invert(words, rows);
+            Assert.Equal(expected.Select(b => !b), ToBools(words, rows));
+            Assert.Equal(expected.Count(b => !b), SelectionMask.Count(words)); // nothing past the last row
+            Assert.Equal(0UL, words[SelectionMask.WordCount(rows)]);
+        }
+    }
+
+    [Fact]
     public void ToIndicesListsSelectedRowsInOrder()
     {
         var rng = new Random(2);

@@ -3,6 +3,7 @@
 
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Buffers.Binary;
 using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -10,6 +11,7 @@ using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
 using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Schema;
+using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.IO.Local;
 
@@ -1013,6 +1015,97 @@ public class SparkInteropTests : IDisposable
             .Select(e => e.GetInt64()).OrderBy(x => x).ToList();
         Assert.Equal([0L, 1L, 2L], rowIds); // contiguous + unique -> the rebased file's baseRowId was re-derived
     }
+
+    /// <summary>
+    /// <para>EW writes deletion vectors with RUN containers (#610): each 65,536-row container takes its smallest
+    /// form, as CRoaring's <c>runOptimize</c> picks it, where Delta Spark itself never runs that and so writes
+    /// arrays and bitmaps only. A conformant reader must still decode runs: the portable format has them, and
+    /// Spark reads through Java's RoaringBitmap. This is the measurement that says it does.</para>
+    ///
+    /// <para>Two files. The first (400,000 rows) ends with a seven-container vector mixing all three forms
+    /// under the run cookie: a range across containers 0-3 makes 0-2 runs, a dense stripe makes 3-4 bitmaps,
+    /// and scattered points alone leave 5-6 arrays. That is past the four containers from which the run cookie
+    /// carries an offset header, and the vector is stored in a <c>.bin</c>. The second file ends with a single
+    /// range: a few bytes of runs, stored inline in the log. The forms are asserted, not assumed.</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task EwWritten_RunContainerDeletionVectors_SparkAppliesThem()
+    {
+        Spark.Require();
+
+        const long Big = 400_000, SmallStart = 1_000_000, Small = 100_000;
+        static bool DeletedFromBig(long id) =>
+            (id >= 60_000 && id < 200_000)                   // a range: runs in containers 0-2
+            || id % 1000 == 7                                // points everywhere: arrays where alone (5-6)
+            || (id >= 250_000 && id < 300_000 && id % 3 == 0); // a dense stripe: bitmaps in containers 3-4
+        static bool DeletedFromSmall(long id) => id >= SmallStart + 10_000 && id < SmallStart + 90_000;
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var table = await DeltaTable.CreateAsync(fs, IdRegionSchema, enableDeletionVectors: true))
+        {
+            await table.WriteAsync([IdRegionBatch(Ids(0, Big), Regions(Big))]);
+            await table.WriteAsync([IdRegionBatch(Ids(SmallStart, Small), Regions(Small))]);
+            Assert.Equal(2, table.CurrentSnapshot.ActiveFiles.Count);
+
+            // Three deletes on the big file, so its vector is a union of unions; one on the small file.
+            await table.DeleteAsync(IdWhere(id => id >= 60_000 && id < 200_000));
+            await table.DeleteAsync(IdWhere(id => id < Big && id % 1000 == 7));
+            await table.DeleteAsync(IdWhere(id => id >= 250_000 && id < 300_000 && id % 3 == 0));
+            await table.DeleteAsync(IdWhere(DeletedFromSmall));
+
+            // The vectors are what this test claims: the big file's in a .bin with every form under the run
+            // cookie, the small file's inline and all runs.
+            var reader = new DeletionVectorReader(fs);
+            var dvs = table.CurrentSnapshot.ActiveFiles.Values.Select(f => f.DeletionVector!).ToList();
+            var fileDv = Assert.Single(dvs, dv => dv.StorageType == "u");
+            var inlineDv = Assert.Single(dvs, dv => dv.StorageType == "i");
+            Assert.Equal(
+                ["run", "run", "run", "bitmap", "bitmap", "array", "array"],
+                await ContainerKinds(reader, fileDv));
+            Assert.Equal(["run", "run"], await ContainerKinds(reader, inlineDv));
+        }
+
+        var survivors = Ids(0, Big).Where(id => !DeletedFromBig(id))
+            .Concat(Ids(SmallStart, Small).Where(id => !DeletedFromSmall(id)))
+            .ToList();
+        await using (var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir)))
+        {
+            var ewIds = (await ReadAllViaEw(reopened)).Select(r => r.Id).ToList();
+            Assert.Equal(survivors, ewIds);
+        }
+
+        var digest = Spark.Invoke("read_id_digest", new { path = _tempDir });
+        Assert.Equal(survivors.Count, digest.GetProperty("row_count").GetInt64());
+        Assert.Equal(survivors.Sum(), digest.GetProperty("sum").GetInt64());
+        Assert.Equal(survivors.Sum(id => id * id), digest.GetProperty("sum_squares").GetInt64());
+    }
+
+    // The form of each container in a deletion vector's single sub-bitmap, after checking it uses the run cookie.
+    private static async Task<List<string>> ContainerKinds(DeletionVectorReader reader, DeletionVector dv)
+    {
+        byte[] blob = (await reader.ReadAsync(dv)).SerializedBytes();
+        Assert.Equal(1L, BinaryPrimitives.ReadInt64LittleEndian(blob.AsSpan(4)));                  // one sub-bitmap
+        Assert.Equal(12347u, BinaryPrimitives.ReadUInt32LittleEndian(blob.AsSpan(16)) & 0xFFFFu);  // run cookie
+        var containers = new List<EngineeredWood.Encodings.RoaringContainer>();
+        EngineeredWood.Encodings.RoaringBitmap.ParseContainers(
+            blob.AsSpan(16), EngineeredWood.Encodings.RoaringBitmap.RoaringFormat.CRoaring, containers);
+        return containers.Select(c => c.Kind.ToString().ToLowerInvariant()).ToList();
+    }
+
+    private static long[] Ids(long start, long count) =>
+        Enumerable.Range(0, (int)count).Select(i => start + i).ToArray();
+
+    private static string[] Regions(long count) =>
+        Enumerable.Range(0, (int)count).Select(i => i % 2 == 0 ? "us" : "eu").ToArray();
+
+    private static Func<RecordBatch, BooleanArray> IdWhere(Func<long, bool> deleted) => batch =>
+    {
+        var ids = (Int64Array)batch.Column("id");
+        var mask = new BooleanArray.Builder().Reserve(ids.Length);
+        for (int i = 0; i < ids.Length; i++)
+            mask.Append(deleted(ids.GetValue(i)!.Value));
+        return mask.Build();
+    };
 
     /// <summary>"delete the row(s) with this id" as the functional predicate DeleteAsync takes.</summary>
     private static Func<RecordBatch, BooleanArray> DeleteId(long target) => batch =>

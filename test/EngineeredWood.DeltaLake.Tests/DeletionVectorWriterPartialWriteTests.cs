@@ -41,7 +41,7 @@ public class DeletionVectorWriterPartialWriteTests : IDisposable
         var positions = Sparse();
 
         await Assert.ThrowsAsync<IOException>(async () =>
-            await new DeletionVectorWriter(fs).CreateAsync(positions, positions.Length));
+            await new DeletionVectorWriter(fs).CreateAsync(positions));
 
         Assert.True(fs.BytesReachedStorage);
         Assert.Empty(VectorFiles());
@@ -55,7 +55,7 @@ public class DeletionVectorWriterPartialWriteTests : IDisposable
         var positions = Sparse();
 
         var ex = await Assert.ThrowsAsync<IOException>(async () =>
-            await new DeletionVectorWriter(fs).CreateAsync(positions, positions.Length));
+            await new DeletionVectorWriter(fs).CreateAsync(positions));
 
         Assert.Contains("after its bytes landed", ex.Message);
         Assert.Single(VectorFiles()); // the status quo when nothing could be done about it
@@ -67,7 +67,7 @@ public class DeletionVectorWriterPartialWriteTests : IDisposable
         var fs = new LocalTableFileSystem(_tempDir);
         var positions = Sparse();
 
-        var dv = await new DeletionVectorWriter(fs).CreateAsync(positions, positions.Length);
+        var dv = await new DeletionVectorWriter(fs).CreateAsync(positions);
 
         Assert.Equal("u", dv.StorageType);
         Assert.Single(VectorFiles());
