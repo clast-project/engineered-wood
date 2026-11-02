@@ -223,11 +223,17 @@ internal static class Verify
     private static IEnumerable<List<(PropertyInfo Property, object Value)>> Combinations(Type type)
     {
         IEnumerable<List<(PropertyInfo, object)>> result = [[]];
-        foreach (var property in type.GetProperties().Where(p => p.GetCustomAttribute<ParamsAllValuesAttribute>() != null))
+        foreach (var property in type.GetProperties())
         {
-            object[] values = property.PropertyType == typeof(bool)
-                ? [false, true]
-                : Enum.GetValues(property.PropertyType).Cast<object>().ToArray();
+            object[] values;
+            if (property.GetCustomAttribute<ParamsAttribute>() is { } explicitValues)
+                values = explicitValues.Values;
+            else if (property.GetCustomAttribute<ParamsAllValuesAttribute>() is not null)
+                values = property.PropertyType == typeof(bool)
+                    ? [false, true]
+                    : Enum.GetValues(property.PropertyType).Cast<object>().ToArray();
+            else
+                continue;
             result = result.SelectMany(prefix => values.Select(v => prefix.Append((property, v)).ToList())).ToList();
         }
         return result;

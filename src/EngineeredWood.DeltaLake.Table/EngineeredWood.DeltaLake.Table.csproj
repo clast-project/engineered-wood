@@ -34,6 +34,8 @@
     <PackageReference Include="System.Memory" />
     <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" VersionOverride="9.*" />
     <PackageReference Include="System.Threading.Tasks.Extensions" />
+    <!-- In-box on net8.0+; the package supplies it for netstandard2.0. -->
+    <PackageReference Include="System.Threading.Channels" />
   </ItemGroup>
 
   <ItemGroup>

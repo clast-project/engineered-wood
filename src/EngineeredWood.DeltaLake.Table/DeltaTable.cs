@@ -2496,13 +2496,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var snapshot = await GetSnapshotAtTimestampAsync(timestamp, cancellationToken)
             .ConfigureAwait(false);
 
-        foreach (var addFile in snapshot.ActiveFiles.Values)
+        // The one read path, so this reads the files in path-sorted order like every other read (it used to
+        // walk the active-file dictionary) and in parallel like them.
+        await foreach (var batch in ReadCoreAsync(
+                           snapshot, new DeltaReadOptions { Columns = columns }, cancellationToken)
+                           .ConfigureAwait(false))
         {
-            await foreach (var batch in ReadFileAsync(
-                addFile, columns, snapshot, cancellationToken).ConfigureAwait(false))
-            {
-                yield return batch;
-            }
+            yield return batch;
         }
     }
 
@@ -5637,76 +5637,155 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool wantAddress = (metadata & DeltaRowMetadata.RowAddress) != 0;
         bool wantLocator = (metadata & DeltaRowMetadata.Locator) != 0;
         bool wantTracking = (metadata & DeltaRowMetadata.RowTracking) != 0;
-        bool wantPositions = wantAddress || wantLocator;
 
         var metadataFields = MetadataFields(metadata, options.MetadataPrefix);
         var pruner = options.Filter is null ? null : new DeltaFilePruner(
             snapshot.Schema, snapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
 
+        // The files to read, with the ordinal each has in the UNPRUNED path-sorted active set: RowAddress packs
+        // that ordinal, so it is fixed here, before any file is skipped and whatever order the reads finish in.
         var ordered = OrderedActiveFiles(snapshot);
+        var included = new List<(int Ordinal, AddFile File)>(ordered.Count);
         for (int ordinal = 0; ordinal < ordered.Count; ordinal++)
         {
-            var addFile = ordered[ordinal];
-            if (pruner is not null && !pruner.ShouldInclude(addFile, options.Filter!))
-                continue;
+            if (pruner is null || pruner.ShouldInclude(ordered[ordinal], options.Filter!))
+                included.Add((ordinal, ordered[ordinal]));
+        }
 
-            // Only ask ReadFileAsync for the out-params this read actually needs: each one costs a
-            // per-row builder pass inside the pipeline.
-            var absOut = wantPositions ? new List<Int64Array?>() : null;
-            var idsOut = wantTracking ? new List<Int64Array?>() : null;
-            var versOut = wantTracking ? new List<Int64Array?>() : null;
-            byte[]? pathBytes = wantLocator
-                ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
-
-            int bi = -1;
-            // The scan forwards its predicate to the row-group level: it promises only a superset of the
-            // matching rows (so does a predicate DELETE, which prunes in ComputeDeleteActionsAsync).
-            // Compaction, CDF and the copy-on-write rewrites must see every row of a file they read, and
-            // never pass one.
-            await foreach (var batch in ReadFileAsync(
-                               addFile, options.Columns, snapshot, cancellationToken,
-                               strippedRowIdsOut: idsOut, strippedVersionsOut: versOut,
-                               strippedAbsPositionsOut: absOut,
-                               rowGroupFilter: options.Filter).ConfigureAwait(false))
-            {
-                bi++;
-                if (metadataFields.Count == 0)
-                {
-                    yield return batch;
-                    continue;
-                }
-
-                var absPos = absOut is not null && bi < absOut.Count ? absOut[bi] : null;
-                var columns = new List<IArrowArray>(metadataFields.Count);
-
-                if (wantAddress)
-                {
-                    var b = new Int64Array.Builder().Reserve(batch.Length);
-                    for (int i = 0; i < batch.Length; i++)
-                        b.Append(TransientRowAddress.Pack(ordinal, AbsoluteAt(absPos, i)));
-                    columns.Add(b.Build());
-                }
-                if (wantLocator)
-                {
-                    columns.Add(ArrowCompute.Repeat(Apache.Arrow.Types.StringType.Default, pathBytes!, batch.Length));
-                    var b = new Int64Array.Builder().Reserve(batch.Length);
-                    for (int i = 0; i < batch.Length; i++)
-                        b.Append(AbsoluteAt(absPos, i));
-                    columns.Add(b.Build());
-                }
-                if (wantTracking)
-                {
-                    var ids = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
-                    var vers = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
-                    columns.Add(ids ?? AllNullInt64(batch.Length));
-                    columns.Add(vers ?? AllNullInt64(batch.Length));
-                }
-
-                yield return AppendColumns(batch, metadataFields, columns);
-            }
+        var scan = new ScanFileShape(options, metadataFields, wantAddress, wantLocator, wantTracking);
+        await foreach (var batch in ReadFilesInOrderAsync(
+                           included.Count,
+                           (i, reservation, ct) => ScanFileAsync(
+                               snapshot, scan, included[i].Ordinal, included[i].File, reservation, ct),
+                           cancellationToken).ConfigureAwait(false))
+        {
+            yield return batch;
         }
     }
+
+    /// <summary>
+    /// Yields the batches of <paramref name="fileCount"/> files, file after file, reading up to
+    /// <see cref="EffectiveConcurrentFileReads"/> of them at once (#607) within
+    /// <see cref="DeltaTableOptions.MaxBufferedReadBytes"/>. With a window of 1, or one file, it is a plain
+    /// serial loop with no pipeline in between — exactly the read before #607.
+    /// </summary>
+    private async IAsyncEnumerable<RecordBatch> ReadFilesInOrderAsync(
+        int fileCount,
+        Func<int, ScanReservation, CancellationToken, IAsyncEnumerable<RecordBatch>> readFile,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        int concurrency = EffectiveConcurrentFileReads;
+        if (concurrency <= 1 || fileCount <= 1)
+        {
+            for (int i = 0; i < fileCount; i++)
+            {
+                await foreach (var batch in readFile(i, ScanReservation.None, cancellationToken)
+                                   .WithCancellation(cancellationToken).ConfigureAwait(false))
+                {
+                    yield return batch;
+                }
+            }
+            yield break;
+        }
+
+        await foreach (var batch in OrderedFileScan<RecordBatch>.RunAsync(
+                           fileCount,
+                           readFile,
+                           RollingDataFileWriter.EstimatedBytes,
+                           static b => b.Dispose(),
+                           concurrency,
+                           _options.MaxBufferedReadBytes,
+                           cancellationToken).ConfigureAwait(false))
+        {
+            yield return batch;
+        }
+    }
+
+    /// <summary>The files a scan reads at once: <see cref="DeltaTableOptions.MaxConcurrentFileReads"/>, or by
+    /// default up to 4 with the built-in reader and 1 through the codec seam, whose contract never promised that
+    /// two files may be read at once.</summary>
+    private int EffectiveConcurrentFileReads =>
+        _options.MaxConcurrentFileReads
+        ?? (_options.DataFileReader is null ? Math.Min(4, Environment.ProcessorCount) : 1);
+
+    /// <summary>What a scan asks of every file it reads.</summary>
+    private sealed record ScanFileShape(
+        DeltaReadOptions Options,
+        IReadOnlyList<Field> MetadataFields,
+        bool WantAddress,
+        bool WantLocator,
+        bool WantTracking);
+
+    /// <summary>
+    /// One file of a scan, as the caller receives it: the file's batches with the requested metadata columns
+    /// appended. Everything per file happens here — including building the metadata columns — so that in a
+    /// parallel scan it all runs on the file's own producer, and each batch's metadata comes from the
+    /// <see cref="FileBatch"/> it was decoded with rather than from a list shared with the consumer.
+    /// </summary>
+    private async IAsyncEnumerable<RecordBatch> ScanFileAsync(
+        Snapshot.Snapshot snapshot,
+        ScanFileShape scan,
+        int ordinal,
+        AddFile addFile,
+        ScanReservation reservation,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        bool wantPositions = scan.WantAddress || scan.WantLocator;
+        byte[]? pathBytes = scan.WantLocator ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
+
+        // The scan forwards its predicate to the row-group level: it promises only a superset of the
+        // matching rows (so does a predicate DELETE, which prunes in ComputeDeleteActionsAsync).
+        // Compaction, CDF and the copy-on-write rewrites must see every row of a file they read, and
+        // never pass one.
+        await foreach (var fb in ReadFileBatchesAsync(
+                           addFile, scan.Options.Columns, snapshot, wantPositions, scan.WantTracking,
+                           scan.Options.Filter, reservation, cancellationToken).ConfigureAwait(false))
+        {
+            var batch = fb.Batch;
+            if (scan.MetadataFields.Count == 0)
+            {
+                yield return batch;
+                continue;
+            }
+
+            var absPos = fb.Positions;
+            var columns = new List<IArrowArray>(scan.MetadataFields.Count);
+
+            if (scan.WantAddress)
+            {
+                var b = new Int64Array.Builder().Reserve(batch.Length);
+                for (int i = 0; i < batch.Length; i++)
+                    b.Append(TransientRowAddress.Pack(ordinal, AbsoluteAt(absPos, i)));
+                columns.Add(b.Build());
+            }
+            if (scan.WantLocator)
+            {
+                columns.Add(ArrowCompute.Repeat(Apache.Arrow.Types.StringType.Default, pathBytes!, batch.Length));
+                var b = new Int64Array.Builder().Reserve(batch.Length);
+                for (int i = 0; i < batch.Length; i++)
+                    b.Append(AbsoluteAt(absPos, i));
+                columns.Add(b.Build());
+            }
+            if (scan.WantTracking)
+            {
+                columns.Add(fb.RowIds ?? AllNullInt64(batch.Length));
+                columns.Add(fb.Versions ?? AllNullInt64(batch.Length));
+            }
+            absPos?.Dispose();
+
+            yield return AppendColumns(batch, scan.MetadataFields, columns);
+        }
+    }
+
+    /// <summary>
+    /// A batch of one data file as a scan returns it, with the per-row metadata the read asked for, aligned
+    /// row for row: <see cref="Positions"/> each surviving row's ABSOLUTE in-file position (DV-inclusive),
+    /// <see cref="RowIds"/> and <see cref="Versions"/> its resolved stable row id and commit version. A null
+    /// array was not asked for.
+    /// </summary>
+    private readonly record struct FileBatch(
+        RecordBatch Batch, Int64Array? Positions, Int64Array? RowIds, Int64Array? Versions);
 
     /// <summary>A row's ABSOLUTE in-file position: the out-param value where the read surfaced one, else the
     /// batch offset — which is the same number for a file with no deletion vector, the only case where the
@@ -9762,88 +9841,118 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 ordinalByPath[ordered[i].Path] = i;
         }
 
+        // Resolve every path BEFORE reading any: a stale selection is refused up front rather than after some
+        // files' rows have already been returned (and, read in parallel, after later files were started).
+        var files = new List<(AddFile File, IReadOnlyCollection<long> Targets, int Ordinal)>();
         foreach (var kvp in selection.Entries.OrderBy(k => k.Key, StringComparer.Ordinal))
         {
             if (!byPath.TryGetValue(kvp.Key, out var addFile))
                 throw StaleSelectionPath(kvp.Key, snapshot);
-            var targets = RowSelection.AsSet(kvp.Value);
-            int fileOrdinal = ordinalByPath is not null ? ordinalByPath[kvp.Key] : -1;
-            byte[]? pathBytes = wantLocator
-                ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
+            files.Add((addFile, kvp.Value, ordinalByPath is not null ? ordinalByPath[kvp.Key] : -1));
+        }
 
-            // The per-file read reports each surviving row's ABSOLUTE in-file position (DV-inclusive) and its
-            // RESOLVED stable id/version out-of-band, having stripped the materialized id columns from the
-            // emitted batch — so the position to match on, and the identity to report, both come from here
-            // rather than from a column of `batch`.
-            var absOut = new List<Int64Array?>();
-            var idsOut = wantTracking ? new List<Int64Array?>() : null;
-            var versOut = wantTracking ? new List<Int64Array?>() : null;
-            int bi = -1;
-            await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
-                                                      strippedRowIdsOut: idsOut,
-                                                      strippedVersionsOut: versOut,
-                                                      strippedAbsPositionsOut: absOut).ConfigureAwait(false))
+        var shape = new ScanFileShape(
+            new DeltaReadOptions(), metadataFields, wantAddress, wantLocator, wantTracking);
+        await foreach (var batch in ReadFilesInOrderAsync(
+                           files.Count,
+                           (i, _, ct) => ReadSelectedRowsOfFileAsync(
+                               snapshot, shape, files[i].File, files[i].Targets, files[i].Ordinal, ct),
+                           cancellationToken).ConfigureAwait(false))
+        {
+            yield return batch;
+        }
+    }
+
+    /// <summary>The rows of one file that <see cref="ReadRowsAsync"/>' selection names, with the requested
+    /// metadata columns. Runs on the file's own producer when the files are read in parallel.</summary>
+    private async IAsyncEnumerable<RecordBatch> ReadSelectedRowsOfFileAsync(
+        Snapshot.Snapshot snapshot,
+        ScanFileShape shape,
+        AddFile addFile,
+        IReadOnlyCollection<long> selected,
+        int fileOrdinal,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var metadataFields = shape.MetadataFields;
+        bool wantAddress = shape.WantAddress;
+        bool wantLocator = shape.WantLocator;
+        bool wantTracking = shape.WantTracking;
+        var targets = RowSelection.AsSet(selected);
+        byte[]? pathBytes = wantLocator
+            ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
+
+        // The per-file read reports each surviving row's ABSOLUTE in-file position (DV-inclusive) and its
+        // RESOLVED stable id/version out-of-band, having stripped the materialized id columns from the
+        // emitted batch — so the position to match on, and the identity to report, both come from here
+        // rather than from a column of `batch`.
+        var absOut = new List<Int64Array?>();
+        var idsOut = wantTracking ? new List<Int64Array?>() : null;
+        var versOut = wantTracking ? new List<Int64Array?>() : null;
+        int bi = -1;
+        await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
+                                                  strippedRowIdsOut: idsOut,
+                                                  strippedVersionsOut: versOut,
+                                                  strippedAbsPositionsOut: absOut).ConfigureAwait(false))
+        {
+            bi++;
+            var absPos = bi < absOut.Count ? absOut[bi] : null;
+            if (absPos is null)
+                continue;
+            var rows = new List<int>();
+            for (int i = 0; i < batch.Length; i++)
+                if (!absPos.IsNull(i) && targets.Contains(absPos.GetValue(i)!.Value))
+                    rows.Add(i);
+            if (rows.Count == 0)
+                continue;
+
+            var taken = TakeRowsFromBatch(batch, rows);
+            if (metadataFields.Count == 0)
             {
-                bi++;
-                var absPos = bi < absOut.Count ? absOut[bi] : null;
-                if (absPos is null)
-                    continue;
-                var rows = new List<int>();
-                for (int i = 0; i < batch.Length; i++)
-                    if (!absPos.IsNull(i) && targets.Contains(absPos.GetValue(i)!.Value))
-                        rows.Add(i);
-                if (rows.Count == 0)
-                    continue;
-
-                var taken = TakeRowsFromBatch(batch, rows);
-                if (metadataFields.Count == 0)
-                {
-                    yield return taken;
-                    continue;
-                }
-
-                // Built over the TAKEN rows, in the same flag order ReadCoreAsync uses — the columns describe
-                // what is yielded, not what was scanned, so `rows` indexes every builder below.
-                var columns = new List<IArrowArray>(metadataFields.Count);
-                if (wantAddress)
-                {
-                    var b = new Int64Array.Builder().Reserve(rows.Count);
-                    foreach (int i in rows)
-                        b.Append(TransientRowAddress.Pack(fileOrdinal, AbsoluteAt(absPos, i)));
-                    columns.Add(b.Build());
-                }
-                if (wantLocator)
-                {
-                    columns.Add(ArrowCompute.Repeat(
-                        Apache.Arrow.Types.StringType.Default, pathBytes!, rows.Count));
-                    var b = new Int64Array.Builder().Reserve(rows.Count);
-                    foreach (int i in rows)
-                        b.Append(AbsoluteAt(absPos, i));
-                    columns.Add(b.Build());
-                }
-                if (wantTracking)
-                {
-                    var matI = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
-                    var matV = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
-                    var ib = new Int64Array.Builder().Reserve(rows.Count);
-                    var vb = new Int64Array.Builder().Reserve(rows.Count);
-                    foreach (int i in rows)
-                    {
-                        if (matI is not null && i < matI.Length && !matI.IsNull(i))
-                            ib.Append(matI.GetValue(i)!.Value);
-                        else
-                            ib.AppendNull();
-                        if (matV is not null && i < matV.Length && !matV.IsNull(i))
-                            vb.Append(matV.GetValue(i)!.Value);
-                        else
-                            vb.AppendNull();
-                    }
-                    columns.Add(ib.Build());
-                    columns.Add(vb.Build());
-                }
-
-                yield return AppendColumns(taken, metadataFields, columns);
+                yield return taken;
+                continue;
             }
+
+            // Built over the TAKEN rows, in the same flag order ReadCoreAsync uses — the columns describe
+            // what is yielded, not what was scanned, so `rows` indexes every builder below.
+            var columns = new List<IArrowArray>(metadataFields.Count);
+            if (wantAddress)
+            {
+                var b = new Int64Array.Builder().Reserve(rows.Count);
+                foreach (int i in rows)
+                    b.Append(TransientRowAddress.Pack(fileOrdinal, AbsoluteAt(absPos, i)));
+                columns.Add(b.Build());
+            }
+            if (wantLocator)
+            {
+                columns.Add(ArrowCompute.Repeat(
+                    Apache.Arrow.Types.StringType.Default, pathBytes!, rows.Count));
+                var b = new Int64Array.Builder().Reserve(rows.Count);
+                foreach (int i in rows)
+                    b.Append(AbsoluteAt(absPos, i));
+                columns.Add(b.Build());
+            }
+            if (wantTracking)
+            {
+                var matI = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
+                var matV = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
+                var ib = new Int64Array.Builder().Reserve(rows.Count);
+                var vb = new Int64Array.Builder().Reserve(rows.Count);
+                foreach (int i in rows)
+                {
+                    if (matI is not null && i < matI.Length && !matI.IsNull(i))
+                        ib.Append(matI.GetValue(i)!.Value);
+                    else
+                        ib.AppendNull();
+                    if (matV is not null && i < matV.Length && !matV.IsNull(i))
+                        vb.Append(matV.GetValue(i)!.Value);
+                    else
+                        vb.AppendNull();
+                }
+                columns.Add(ib.Build());
+                columns.Add(vb.Build());
+            }
+
+            yield return AppendColumns(taken, metadataFields, columns);
         }
     }
 
@@ -10617,6 +10726,38 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         List<Int64Array?>? strippedAbsPositionsOut = null,
         Expressions.Predicate? rowGroupFilter = null)
     {
+        // The out-list form, for the DML callers that read one file at a time and correlate by batch index.
+        // A scan reads files concurrently and uses ReadFileBatchesAsync directly, where each batch carries its
+        // own metadata arrays and no list is shared between the read and its consumer.
+        bool wantTracking = strippedRowIdsOut is not null || strippedVersionsOut is not null;
+        bool wantPositions = strippedAbsPositionsOut is not null;
+        await foreach (var fb in ReadFileBatchesAsync(
+                           addFile, columns, snapshot, wantPositions, wantTracking, rowGroupFilter,
+                           ScanReservation.None, cancellationToken).ConfigureAwait(false))
+        {
+            strippedRowIdsOut?.Add(fb.RowIds);
+            strippedVersionsOut?.Add(fb.Versions);
+            strippedAbsPositionsOut?.Add(fb.Positions);
+            yield return fb.Batch;
+        }
+    }
+
+    /// <summary>
+    /// One data file's batches as a scan returns them, each paired with the per-row metadata asked for:
+    /// <paramref name="wantPositions"/> fills <see cref="FileBatch.Positions"/>, <paramref name="wantTracking"/>
+    /// fills <see cref="FileBatch.RowIds"/> and <see cref="FileBatch.Versions"/>. <paramref name="reservation"/>
+    /// is reserved against before each raw batch is decoded, when the read is part of a parallel scan.
+    /// </summary>
+    private async IAsyncEnumerable<FileBatch> ReadFileBatchesAsync(
+        AddFile addFile,
+        IReadOnlyList<string>? columns,
+        Snapshot.Snapshot snapshot,
+        bool wantPositions,
+        bool wantTracking,
+        Expressions.Predicate? rowGroupFilter,
+        ScanReservation reservation,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         // rowGroupFilter: a LOGICAL-name predicate; row groups whose statistics prove no row matches are
         // skipped. Only a read that promises a superset of the matching rows may pass one. The pluggable
         // codec path ignores it (the seam hides the footer).
@@ -10693,14 +10834,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (seamColumns is not null && MaterializedRowTrackingColumnNames(snapshot).Count > 0)
                 seamColumns = null;
 
-            var seamBatches = InFileOrder(dataFileReader.ReadAsync(
+            var seamBatches = Reserving(InFileOrder(dataFileReader.ReadAsync(
                 EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), seamColumns, cancellationToken),
-                cancellationToken);
+                cancellationToken), reservation, cancellationToken);
             await foreach (var processed in ProcessFileBatchesAsync(
                 seamBatches, addFile, snapshot, columns, mappingMode, physicalToLogical,
                 logicalToPhysical, deletedRows, partitionColumns,
-                hasPartitions, cancellationToken, strippedRowIdsOut, strippedVersionsOut,
-                strippedAbsPositionsOut).ConfigureAwait(false))
+                hasPartitions, wantPositions, wantTracking, cancellationToken).ConfigureAwait(false))
             {
                 yield return processed;
             }
@@ -10818,12 +10958,21 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 rowGroupFilter, snapshot.Schema, mappingMode, parquetSchema, snapshot.Metadata.PartitionColumns);
         }
 
-        var builtinBatches = ReadPositionedAsync(reader, filePredicate, fileColumns, cancellationToken);
+        if (reservation != ScanReservation.None)
+        {
+            // Reserve for the first batch before decoding it: the largest row group's uncompressed size over
+            // the columns read. Later batches reserve what the previous one measured.
+            var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+            reservation.SetInitialEstimate(LargestRowGroupBytes(footer, fileColumns));
+        }
+
+        var builtinBatches = Reserving(
+            ReadPositionedAsync(reader, filePredicate, fileColumns, cancellationToken),
+            reservation, cancellationToken);
         await foreach (var processed in ProcessFileBatchesAsync(
             builtinBatches, addFile, snapshot, columns, mappingMode, physicalToLogical,
             logicalToPhysical, deletedRows, partitionColumns,
-            hasPartitions, cancellationToken, strippedRowIdsOut, strippedVersionsOut,
-            strippedAbsPositionsOut).ConfigureAwait(false))
+            hasPartitions, wantPositions, wantTracking, cancellationToken).ConfigureAwait(false))
         {
             yield return processed;
         }
@@ -10837,7 +10986,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// schema-evolution backfill. Position-keyed steps (DV filtering) depend on the source preserving
     /// file order, which is part of the <see cref="IDataFileReader"/> contract.
     /// </summary>
-    private async IAsyncEnumerable<RecordBatch> ProcessFileBatchesAsync(
+    private async IAsyncEnumerable<FileBatch> ProcessFileBatchesAsync(
         IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> source,
         AddFile addFile,
         Snapshot.Snapshot snapshot,
@@ -10848,10 +10997,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         HashSet<long>? deletedRows,
         IReadOnlyList<string> partitionColumns,
         bool hasPartitions,
-        [EnumeratorCancellation] CancellationToken cancellationToken,
-        List<Int64Array?>? strippedRowIdsOut = null,
-        List<Int64Array?>? strippedVersionsOut = null,
-        List<Int64Array?>? strippedAbsPositionsOut = null)
+        bool wantPositions,
+        bool wantTracking,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         // Hidden materialized row-tracking columns (a copy-on-write rewrite wrote each moved row's original id +
         // commit version under these declared physical names). Stripped from every emitted batch so a reader
@@ -10859,8 +11007,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         bool hasMaterialized = matRowIdName is not null || matRowVerName is not null;
-        bool wantRowIds = strippedRowIdsOut is not null || strippedVersionsOut is not null
-            || strippedAbsPositionsOut is not null;
+        bool wantRowIds = wantPositions || wantTracking;
 
         await foreach (var (batch, firstRow) in source.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
@@ -10912,11 +11059,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // Surface each surviving row's RESOLVED id + commit version (row-aligned with cleanResult): the
             // materialized value where present, else add.baseRowId + absolute position / defaultRowCommitVersion
             // (null when the file carries neither — a pre-row-tracking source). The rewrite path preserves ids.
-            if (wantRowIds)
+            Int64Array? positions = null, rowIds = null, versions = null;
+            if (wantTracking)
             {
                 var idb = new Int64Array.Builder().Reserve(survivorSrc!.Count);
                 var vrb = new Int64Array.Builder().Reserve(survivorSrc.Count);
-                var pb = new Int64Array.Builder().Reserve(survivorSrc.Count);
                 foreach (int i in survivorSrc)
                 {
                     long? mid = rawMatIds is not null && !rawMatIds.IsNull(i) ? rawMatIds.GetValue(i) : null;
@@ -10926,15 +11073,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     long? mv = rawMatVers is not null && !rawMatVers.IsNull(i) ? rawMatVers.GetValue(i) : null;
                     long? ver = mv ?? addFile.DefaultRowCommitVersion;
                     if (ver is { } vv) vrb.Append(vv); else vrb.AppendNull();
-
-                    pb.Append(thisBatchStart + i); // absolute in-file position (DV-inclusive), for the remap
                 }
-                strippedRowIdsOut?.Add(idb.Build());
-                strippedVersionsOut?.Add(vrb.Build());
-                strippedAbsPositionsOut?.Add(pb.Build());
+                rowIds = idb.Build();
+                versions = vrb.Build();
+            }
+            if (wantPositions)
+            {
+                var pb = new Int64Array.Builder().Reserve(survivorSrc!.Count);
+                foreach (int i in survivorSrc)
+                    pb.Append(thisBatchStart + i); // absolute in-file position (DV-inclusive), for the remap
+                positions = pb.Build();
             }
 
-            yield return cleanResult;
+            yield return new FileBatch(cleanResult, positions, rowIds, versions);
         }
     }
 
@@ -11028,6 +11179,69 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         return mappingMode == ColumnMappingMode.Id || ColumnMappingRecursive.HasNestedFields(schema)
             ? ColumnMappingRecursive.ToLogical(batch, schema, mappingMode)
             : ColumnMapping.RenameColumns(batch, physicalToLogical);
+    }
+
+    /// <summary>
+    /// Reserves scan memory before pulling each raw batch from <paramref name="source"/>, i.e. before it is
+    /// decoded. A read outside a parallel scan passes <see cref="ScanReservation.None"/>, which reserves nothing.
+    /// </summary>
+    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> Reserving(
+        IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> source,
+        ScanReservation reservation,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        if (reservation == ScanReservation.None)
+        {
+            await foreach (var item in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+                yield return item;
+            yield break;
+        }
+
+        var e = source.GetAsyncEnumerator(cancellationToken);
+        try
+        {
+            while (true)
+            {
+                await reservation.ReserveNextAsync(cancellationToken).ConfigureAwait(false);
+                if (!await e.MoveNextAsync().ConfigureAwait(false))
+                    break;
+                yield return e.Current;
+            }
+        }
+        finally
+        {
+            await e.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// The largest row group's uncompressed size over the top-level columns <paramref name="fileColumns"/>
+    /// names (every column when null): the reservation for a file's first batch, before one has been
+    /// measured. Parquet's uncompressed size is close to the Arrow size for plain data and an UNDERestimate
+    /// for dictionary-encoded strings; the reservation is trued up to the measured size once decoded.
+    /// </summary>
+    private static long LargestRowGroupBytes(
+        Parquet.Metadata.FileMetaData footer, IReadOnlyList<string>? fileColumns)
+    {
+        HashSet<string>? wanted = fileColumns is null
+            ? null : new HashSet<string>(fileColumns, StringComparer.Ordinal);
+        long largest = 0;
+        foreach (var rowGroup in footer.RowGroups)
+        {
+            long bytes = 0;
+            foreach (var chunk in rowGroup.Columns)
+            {
+                if (chunk.MetaData is not { } meta)
+                    continue;
+                if (wanted is not null
+                    && (meta.PathInSchema is not { Count: > 0 } path || !wanted.Contains(path[0])))
+                    continue;
+                bytes += meta.TotalUncompressedSize;
+            }
+            if (bytes > largest)
+                largest = bytes;
+        }
+        return largest;
     }
 
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(

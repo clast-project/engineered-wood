@@ -58,6 +58,62 @@ public sealed record DeltaTableOptions
     public long TargetFileSize { get; init; } = 128L * 1024 * 1024;
 
     /// <summary>
+    /// How many data files a table scan reads at once. Default: null, which means
+    /// <c>min(4, Environment.ProcessorCount)</c> with the built-in reader and 1 with a
+    /// <see cref="DataFileReader"/>. 1 reads the files one after another, as before #607.
+    /// </summary>
+    /// <remarks>
+    /// <para>Batches still come out in the order a serial read gives — the snapshot's path-sorted file order,
+    /// then file order within a file — whatever order the files finish in. Applies to
+    /// <see cref="DeltaTable.ReadAsync"/> and the methods built on it (<c>ReadAllAsync</c>,
+    /// <c>ReadAtVersionAsync</c>, <c>ReadAtTimestampAsync</c>, <c>ReadRowsAsync</c>). DML, the change feed,
+    /// compaction and copy-on-write rewrites still read their files one at a time.</para>
+    /// <para>A <see cref="DataFileReader"/> reads serially unless this is set explicitly, because its
+    /// contract never promised that two files may be read at once. Setting it above 1 declares that it may:
+    /// its <see cref="IDataFileReader.ReadAsync"/> is then called for several files concurrently, each
+    /// enumerated from a thread-pool thread.</para>
+    /// <para>The memory a scan holds is bounded by <see cref="MaxBufferedReadBytes"/>, not by this.</para>
+    /// </remarks>
+    public int? MaxConcurrentFileReads
+    {
+        get => _maxConcurrentFileReads;
+        init
+        {
+            if (value is < 1)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Must be at least 1, or null for the default.");
+            _maxConcurrentFileReads = value;
+        }
+    }
+    private readonly int? _maxConcurrentFileReads;
+
+    /// <summary>
+    /// The decoded data, in bytes of Arrow buffers, a scan reading several files at once
+    /// (<see cref="MaxConcurrentFileReads"/>) may hold that the caller has not yet received. Default: 256 MiB.
+    /// </summary>
+    /// <remarks>
+    /// <para>A file reserves budget BEFORE it decodes each batch — with the built-in reader, an estimate from
+    /// the Parquet footer for the first batch and the previous batch's size after that — and the reservation
+    /// is released when the caller takes the batch. A file waits while the budget is full, so a slow consumer
+    /// holds the reads back. Two exceptions keep the scan from stalling: a batch is always admitted when
+    /// nothing else is held, even if it alone is larger than the budget; and the file the caller is waiting
+    /// on may decode one batch over the budget. So the peak is about this budget plus one batch.</para>
+    /// <para>Not counted: each file's open reader and footer, a deletion vector's row set (#610), and the
+    /// transient copies a batch goes through on its way out. A serial read (<see cref="MaxConcurrentFileReads"/>
+    /// of 1) does not use the budget at all.</para>
+    /// </remarks>
+    public long MaxBufferedReadBytes
+    {
+        get => _maxBufferedReadBytes;
+        init
+        {
+            if (value < 1)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Must be at least 1.");
+            _maxBufferedReadBytes = value;
+        }
+    }
+    private readonly long _maxBufferedReadBytes = 256L * 1024 * 1024;
+
+    /// <summary>
     /// Number of commits between automatic checkpoints, used when the table declares no interval of its
     /// own. Set to 0 to disable automatic checkpointing. Default: 10.
     /// </summary>

@@ -113,6 +113,48 @@ public class FilteredScanBenchmarks
 }
 
 /// <summary>
+/// EW alone: how a scan of the 20-file table scales with the number of files read at once
+/// (<c>DeltaTableOptions.MaxConcurrentFileReads</c>, #607). 1 is the serial read. Both a full read of every
+/// column and the <c>OneCategory</c> filtered scan of <see cref="FilteredScanBenchmarks"/>, which reads every
+/// file. <see cref="FullScanBenchmarks"/> cannot show this: its table is one file.
+/// </summary>
+[Config(typeof(ReadConfig))]
+public class ScanWindowBenchmarks
+{
+    private static readonly string[] Columns = ["id", "amount"];
+
+    [ParamsAllValues]
+    public TableWriter Writer { get; set; }
+
+    [Params(1, 2, 4, 8)]
+    public int Window { get; set; }
+
+    private string _path = "";
+    private EngineeredWood.DeltaLake.Table.DeltaTableOptions _options = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _path = Fixtures.Prunable(Writer);
+        _options = new EngineeredWood.DeltaLake.Table.DeltaTableOptions { MaxConcurrentFileReads = Window };
+    }
+
+    [BenchmarkCategory("ScanWindowFull"), Benchmark(Description = "EW ReadAllAsync, 20 files")]
+    public async Task<long> EW_FullRead()
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), _options);
+        return await Ew.CountAsync(table.ReadAllAsync());
+    }
+
+    [BenchmarkCategory("ScanWindowOneCategory"), Benchmark(Description = "EW ReadAsync + row filter, OneCategory")]
+    public async Task<long> EW_OneCategory()
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), _options);
+        return await Ew.FilteredCountAsync(table, Sql.OneCategory, Columns, exact: true);
+    }
+}
+
+/// <summary>
 /// Log replay: open a 100-commit table at its latest version, open it at version 50 (time travel), and list
 /// its history; each with and without a checkpoint at the last version.
 ///
