@@ -29,7 +29,10 @@ namespace EngineeredWood.Benchmarks;
 /// 65,536-row <see cref="ParquetReadOptions.BatchSize"/>; a 4 MiB
 /// <see cref="ParquetReadOptions.MaxBatchByteSize"/>; and the whole row group in one batch, which must
 /// not change.</para>
-/// Run with: dotnet run -c Release -f net10.0 -- batchwindow-ab [rounds] [latencyMs] [direct|cloud] [MB/s] [window MiB]
+/// <para><c>headerscan</c> as the seventh argument measures #625 instead: the file is written without a page
+/// index, so every page map comes from a header scan, and "per batch" is a scan budget of one byte (each chunk
+/// read in its own request and let go, its pages fetched again by the windows), the read before #625.</para>
+/// Run with: dotnet run -c Release -f net10.0 -- batchwindow-ab [rounds] [latencyMs] [direct|cloud] [MB/s] [window MiB, 0 default] [headerscan]
 /// </remarks>
 internal static class BatchWindowAb
 {
@@ -44,7 +47,9 @@ internal static class BatchWindowAb
         int latencyMs = args.Length > 2 ? int.Parse(args[2], CultureInfo.InvariantCulture) : 0;
         bool cloud = args.Length > 3 && args[3] == "cloud";
         double mbps = args.Length > 4 ? double.Parse(args[4], CultureInfo.InvariantCulture) : 0;
-        s_windowBytes = args.Length > 5 ? long.Parse(args[5], CultureInfo.InvariantCulture) << 20 : null;
+        long windowMiB = args.Length > 5 ? long.Parse(args[5], CultureInfo.InvariantCulture) : 0;
+        s_windowBytes = windowMiB > 0 ? windowMiB << 20 : null;
+        s_headerScan = args.Length > 6 && args[6] == "headerscan";
         string dir = Path.Combine(Path.GetTempPath(), "ew-batchwindow-ab-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(dir);
 
@@ -154,7 +159,7 @@ internal static class BatchWindowAb
     {
         await using var file = new LocalSequentialFile(path);
         await using var writer = new ParquetFileWriter(file, ownsFile: false,
-            ParquetWriteOptions.Default with { RowGroupMaxRows = Rows });
+            ParquetWriteOptions.Default with { RowGroupMaxRows = Rows, WritePageIndex = !s_headerScan });
         await writer.WriteRowGroupAsync(batch);
         await writer.CloseAsync();
     }
@@ -163,6 +168,9 @@ internal static class BatchWindowAb
 
     /// <summary>The windowed side's budget, when not the default.</summary>
     private static long? s_windowBytes;
+
+    /// <summary>Whether this run measures the header scan (#625) rather than the windows (#622).</summary>
+    private static bool s_headerScan;
 
     private static async Task<Result> ReadAsync(string path, Case c, bool windowed, int latencyMs, double mbps, bool cloud)
     {
@@ -174,7 +182,12 @@ internal static class BatchWindowAb
         int batches = 0;
         using (var reader = new ParquetFileReader(file, ownsFile: false, c.Options))
         {
-            if (!windowed)
+            if (s_headerScan)
+            {
+                if (!windowed)
+                    reader.HeaderScanBudgetBytes = 1;
+            }
+            else if (!windowed)
                 reader.BatchPageWindowBudgetBytes = 1;
             else if (s_windowBytes is { } budget)
                 reader.BatchPageWindowBudgetBytes = budget;
