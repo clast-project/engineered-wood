@@ -13,7 +13,7 @@ using Ex = EngineeredWood.Expressions.Expressions;
 namespace EngineeredWood.Tests.Parquet;
 
 /// <summary>
-/// <see cref="ParquetFileReader.ReadWithPositionsAsync"/>:
+/// <see cref="ParquetFileReader.ReadWithPositionsAsync(Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken)"/>:
 /// the row groups a <see cref="RowSkipPredicate"/> skips are never read, not even their dictionaries or page
 /// indexes for pruning, and the rows after them keep their file positions.
 /// </summary>
@@ -147,14 +147,17 @@ public class RowSkipReadTests : IDisposable
 
         var before = new RequestCountingFile(new LocalRandomAccessFile(path));
         using (var reader = new ParquetFileReader(before, ownsFile: true))
-            // (filter, columns, default) must keep compiling: an overload taking the skip predicate third
-            // made it ambiguous between the predicate and the token.
+            // The token-taking overload keeps both three-argument shapes, positional token and `default`:
+            // the skip overload must not make either ambiguous or move the token.
+            await foreach (var positioned in reader.ReadWithPositionsAsync(filter, null, CancellationToken.None))
+                positioned.Batch.Dispose();
+        using (var reader = new ParquetFileReader(new LocalRandomAccessFile(path), ownsFile: true))
             await foreach (var positioned in reader.ReadWithPositionsAsync(filter, null, default))
                 positioned.Batch.Dispose();
 
         var after = new RequestCountingFile(new LocalRandomAccessFile(path));
         using (var reader = new ParquetFileReader(after, ownsFile: true))
-            await foreach (var positioned in reader.ReadWithPositionsAsync(filter, null, skipRows: (_, _) => false))
+            await foreach (var positioned in reader.ReadWithPositionsAsync(filter, null, (_, _) => false, CancellationToken.None))
                 positioned.Batch.Dispose();
 
         Assert.Equal(before.Requests, after.Requests);
@@ -201,7 +204,7 @@ public class RowSkipReadTests : IDisposable
         var metadata = await reader.ReadMetadataAsync();
         var positions = new List<long>();
         await foreach (var positioned in reader.ReadWithPositionsAsync(
-            filter, null, (first, _) => skippedGroups.Contains((int)(first / GroupRows))))
+            filter, null, (first, _) => skippedGroups.Contains((int)(first / GroupRows)), CancellationToken.None))
         {
             using var batch = positioned.Batch;
             var sorted = (Int64Array)batch.Column("sorted");
@@ -220,7 +223,7 @@ public class RowSkipReadTests : IDisposable
     {
         using var reader = new ParquetFileReader(new LocalRandomAccessFile(path), ownsFile: true, options);
         var positions = new List<long>();
-        await foreach (var positioned in reader.ReadWithPositionsAsync(filter, null, skip))
+        await foreach (var positioned in reader.ReadWithPositionsAsync(filter, null, skip, CancellationToken.None))
         {
             using var batch = positioned.Batch;
             var sorted = (Int64Array)batch.Column("sorted");

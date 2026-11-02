@@ -218,6 +218,24 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <see cref="ParquetReadOptions.FilterUsePageIndex"/>, rows within a kept row group are pruned by
     /// the page index too. The result is a superset: rows are not filtered. Batches come in file order
     /// and never span skipped rows.</para>
+    /// </remarks>
+    /// <param name="filter">The predicate; null reads every row under
+    /// <see cref="ParquetReadOptions.Filter"/> instead, as <see cref="ReadAllAsync"/> does.</param>
+    /// <param name="columnNames">Optional list of column names to read. If null, reads all columns.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public IAsyncEnumerable<PositionedRecordBatch> ReadWithPositionsAsync(
+        EngineeredWood.Expressions.Predicate? filter,
+        IReadOnlyList<string>? columnNames = null,
+        CancellationToken cancellationToken = default) =>
+        ReadPositionedAsync(filter ?? _options.Filter, columnNames, skipRows: null, cancellationToken);
+
+    /// <summary>
+    /// As <see cref="ReadWithPositionsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, CancellationToken)"/>,
+    /// also skipping, unread, the row groups <paramref name="skipRows"/> says the caller needs none of.
+    /// </summary>
+    /// <remarks>
+    /// <para>Every argument is required, so that a three-argument call, <c>default</c> third included, still
+    /// means the overload above.</para>
     /// <para><paramref name="skipRows"/> is asked once per non-empty row group, with the group's first row and
     /// row count, before anything is read for it. Nothing of a skipped group is requested: not its column
     /// chunks, and not its dictionary pages, Bloom filters or page indexes, which the read-ahead for the kept
@@ -231,15 +249,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </remarks>
     /// <param name="filter">The predicate; null reads every row under
     /// <see cref="ParquetReadOptions.Filter"/> instead, as <see cref="ReadAllAsync"/> does.</param>
-    /// <param name="columnNames">Optional list of column names to read. If null, reads all columns.</param>
-    /// <param name="skipRows">Row groups to skip unread, beyond what pruning skips; null skips none. See the
-    /// remarks.</param>
+    /// <param name="columnNames">The columns to read; null reads all of them.</param>
+    /// <param name="skipRows">The row groups to skip; null skips none beyond what pruning skips.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     public IAsyncEnumerable<PositionedRecordBatch> ReadWithPositionsAsync(
         EngineeredWood.Expressions.Predicate? filter,
-        IReadOnlyList<string>? columnNames = null,
-        RowSkipPredicate? skipRows = null,
-        CancellationToken cancellationToken = default) =>
+        IReadOnlyList<string>? columnNames,
+        RowSkipPredicate? skipRows,
+        CancellationToken cancellationToken) =>
         ReadPositionedAsync(filter ?? _options.Filter, columnNames, skipRows, cancellationToken);
 
     private async IAsyncEnumerable<PositionedRecordBatch> ReadPositionedAsync(

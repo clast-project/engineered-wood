@@ -11325,7 +11325,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? columns,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await foreach (var positioned in reader.ReadWithPositionsAsync(filter, columns, cancellationToken: cancellationToken)
+        await foreach (var positioned in reader.ReadWithPositionsAsync(filter, columns, cancellationToken)
             .ConfigureAwait(false))
         {
             yield return (positioned.Batch, positioned.FirstRow);
