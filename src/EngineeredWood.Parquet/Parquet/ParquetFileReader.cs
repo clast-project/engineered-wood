@@ -198,7 +198,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         [System.Runtime.CompilerServices.EnumeratorCancellation]
         CancellationToken cancellationToken = default)
     {
-        await foreach (var positioned in ReadPositionedAsync(_options.Filter, columnNames, cancellationToken)
+        await foreach (var positioned in ReadPositionedAsync(_options.Filter, columnNames, skipRows: null, cancellationToken)
             .ConfigureAwait(false))
         {
             yield return positioned.Batch;
@@ -227,15 +227,50 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         EngineeredWood.Expressions.Predicate? filter,
         IReadOnlyList<string>? columnNames = null,
         CancellationToken cancellationToken = default) =>
-        ReadPositionedAsync(filter ?? _options.Filter, columnNames, cancellationToken);
+        ReadPositionedAsync(filter ?? _options.Filter, columnNames, skipRows: null, cancellationToken);
+
+    /// <summary>
+    /// As <see cref="ReadWithPositionsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, CancellationToken)"/>,
+    /// also skipping, unread, the row groups <paramref name="skipRows"/> says the caller needs none of.
+    /// </summary>
+    /// <remarks>
+    /// <para>Every argument is required, so that a three-argument call, <c>default</c> third included, still
+    /// means the overload above.</para>
+    /// <para><paramref name="skipRows"/> is asked once per non-empty row group, with the group's first row and
+    /// row count, before anything is read for it. Nothing of a skipped group is requested: not its column
+    /// chunks, and not its dictionary pages, Bloom filters or page indexes, which the read-ahead for the kept
+    /// groups leaves out. Its rows still count towards the positions after it, as a group pruned by statistics
+    /// does.</para>
+    /// <para>Its bytes can still be read when they lie in a small gap between two ranges that ARE requested, and
+    /// the read merges across the gap rather than pay another request: page indexes are read so across gaps up
+    /// to 64 KiB, and the cloud readers' <see cref="EngineeredWood.IO.CoalescingFileReader"/> merges across
+    /// <see cref="EngineeredWood.IO.CoalescingOptions.MaxGapBytes"/> (1 MiB by default), as they do for any
+    /// pruned group or unprojected column. A skipped group larger than the gap is never read.</para>
+    /// </remarks>
+    /// <param name="filter">The predicate; null reads every row under
+    /// <see cref="ParquetReadOptions.Filter"/> instead, as <see cref="ReadAllAsync"/> does.</param>
+    /// <param name="columnNames">The columns to read; null reads all of them.</param>
+    /// <param name="skipRows">The row groups to skip; null skips none beyond what pruning skips.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public IAsyncEnumerable<PositionedRecordBatch> ReadWithPositionsAsync(
+        EngineeredWood.Expressions.Predicate? filter,
+        IReadOnlyList<string>? columnNames,
+        RowSkipPredicate? skipRows,
+        CancellationToken cancellationToken) =>
+        ReadPositionedAsync(filter ?? _options.Filter, columnNames, skipRows, cancellationToken);
 
     private async IAsyncEnumerable<PositionedRecordBatch> ReadPositionedAsync(
         EngineeredWood.Expressions.Predicate? filter,
         IReadOnlyList<string>? columnNames,
+        RowSkipPredicate? skipRows,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
         CancellationToken cancellationToken)
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+
+        // Decided for every group up front, from the footer alone, so that the read-ahead below can leave the
+        // skipped groups out too: it would otherwise fetch their dictionaries or page indexes for nothing.
+        var skipped = SkippedRowGroups(metadata, skipRows);
 
         ParquetStatisticsAccessor? accessor = null;
         SchemaDescriptor? schema = null;
@@ -244,7 +279,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         {
             schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
             accessor = new ParquetStatisticsAccessor(schema);
-            prefetch = CreatePrefetches(filter, metadata, schema, accessor);
+            prefetch = CreatePrefetches(filter, metadata, schema, accessor, skipped);
         }
 
         // Page indexes are read a window of row groups at a time: one request, where one per row group
@@ -260,6 +295,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             // A skipped row group's rows still count towards the positions after it.
             long groupStart = nextGroupStart;
             nextGroupStart += metadata.RowGroups[i].NumRows;
+
+            if (skipped is not null && skipped[i])
+                continue;
 
             if (accessor is not null
                 && !await MightMatchAsync(filter!, i, metadata, schema!, accessor, prefetch, cancellationToken)
@@ -278,7 +316,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 if (i >= readAheadEnd)
                 {
                     readAheadEnd = await ReadPageIndexesAheadAsync(
-                            filter!, i, metadata, schema!, accessor!, columnNames, indexReadAhead, cancellationToken)
+                            filter!, i, metadata, schema!, accessor!, columnNames, skipped, indexReadAhead,
+                            cancellationToken)
                         .ConfigureAwait(false);
                 }
 
@@ -2183,8 +2222,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </remarks>
     private async ValueTask<int> ReadPageIndexesAheadAsync(
         EngineeredWood.Expressions.Predicate filter, int first, FileMetaData metadata, SchemaDescriptor schema,
-        ParquetStatisticsAccessor accessor, IReadOnlyList<string>? projection, Dictionary<long, byte[]> readAhead,
-        CancellationToken cancellationToken)
+        ParquetStatisticsAccessor accessor, IReadOnlyList<string>? projection, bool[]? skipped,
+        Dictionary<long, byte[]> readAhead, CancellationToken cancellationToken)
     {
         readAhead.Clear();
         var ranges = new List<FileRange>();
@@ -2212,7 +2251,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             groupBytes = 0;
 
             var rowGroup = metadata.RowGroups[end];
-            if (rowGroup.NumRows <= 0)
+            if (rowGroup.NumRows <= 0 || (skipped is not null && skipped[end]))
                 continue;
             var verdict = EngineeredWood.Expressions.StatisticsEvaluator.Evaluate(filter, rowGroup, accessor);
             if (verdict != EngineeredWood.Expressions.FilterResult.Unknown)
@@ -2267,7 +2306,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
     private Prefetches CreatePrefetches(
         EngineeredWood.Expressions.Predicate filter, FileMetaData metadata, SchemaDescriptor schema,
-        ParquetStatisticsAccessor accessor)
+        ParquetStatisticsAccessor accessor, bool[]? skipped = null)
     {
         return new Prefetches(
             _options.FilterUseDictionaries ? Create(MembershipSource.Dictionary) : null,
@@ -2276,7 +2315,28 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         MembershipPrefetch Create(MembershipSource source) =>
             new(source, filter, metadata, schema, accessor, _file, _fileLength,
                 _options.ColumnChunkFilePath, _options.PageChecksumValidation, MembershipPrefetchBudgetBytes,
-                _options.MaxPageUncompressedSize);
+                _options.MaxPageUncompressedSize, skipped);
+    }
+
+    /// <summary>
+    /// Which row groups <paramref name="skipRows"/> skips, by index; null when <paramref name="skipRows"/> is null or
+    /// skips none, so the common read pays nothing. Empty groups are never asked about: they hold no rows to skip.
+    /// </summary>
+    private static bool[]? SkippedRowGroups(FileMetaData metadata, RowSkipPredicate? skipRows)
+    {
+        if (skipRows is null)
+            return null;
+
+        bool[]? skipped = null;
+        long start = 0;
+        for (int i = 0; i < metadata.RowGroups.Count; i++)
+        {
+            long rows = metadata.RowGroups[i].NumRows;
+            if (rows > 0 && skipRows(start, rows))
+                (skipped ??= new bool[metadata.RowGroups.Count])[i] = true;
+            start += rows;
+        }
+        return skipped;
     }
 
     /// <summary>

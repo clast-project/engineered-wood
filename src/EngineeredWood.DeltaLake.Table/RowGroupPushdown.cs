@@ -11,7 +11,7 @@ namespace EngineeredWood.DeltaLake.Table;
 /// <summary>
 /// Translates a scan predicate, written against the table's LOGICAL column names, into one over a single
 /// data file's own leaf columns, for row-group and page pruning by
-/// <see cref="ParquetFileReader.ReadWithPositionsAsync"/>.
+/// <see cref="ParquetFileReader.ReadWithPositionsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, CancellationToken)"/>.
 /// <para>
 /// The Parquet statistics accessor resolves a reference by the file's dotted leaf path. Under column mapping
 /// that is <c>col-&lt;uuid&gt;</c>, not the logical name, so an untranslated predicate would miss every

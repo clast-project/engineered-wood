@@ -60,6 +60,7 @@ internal sealed class MembershipPrefetch
     private readonly bool _validateChecksums;
     private readonly long _budgetBytes;
     private readonly int? _maxPageUncompressedSize;
+    private readonly bool[]? _skipped;
     private readonly List<(int Index, ColumnDescriptor Descriptor)> _columns;
 
     /// <summary>The current window: each covered row group's value sets by column index.</summary>
@@ -72,7 +73,7 @@ internal sealed class MembershipPrefetch
         MembershipSource source,
         Predicate filter, FileMetaData metadata, SchemaDescriptor schema, ParquetStatisticsAccessor accessor,
         IRandomAccessFile file, long fileLength, ColumnChunkFilePathKind filePath, bool validateChecksums,
-        long budgetBytes, int? maxPageUncompressedSize = null)
+        long budgetBytes, int? maxPageUncompressedSize = null, bool[]? skipped = null)
     {
         _source = source;
         _filter = filter;
@@ -84,6 +85,7 @@ internal sealed class MembershipPrefetch
         _validateChecksums = validateChecksums;
         _budgetBytes = budgetBytes;
         _maxPageUncompressedSize = maxPageUncompressedSize;
+        _skipped = skipped;
         _columns = MembershipPredicateEvaluator.MembershipColumns(filter, schema);
     }
 
@@ -116,9 +118,11 @@ internal sealed class MembershipPrefetch
         {
             var rowGroup = _metadata.RowGroups[group];
 
-            // Groups statistics decide never reach a membership step, so they cost nothing here. The
-            // caller has already found the first group undecided.
-            if (group != first && StatisticsEvaluator.Evaluate(_filter, rowGroup, _accessor) != FilterResult.Unknown)
+            // Groups statistics decide never reach a membership step, so they cost nothing here, and nor do
+            // groups the caller skips unread. The caller has already found the first group undecided.
+            if (group != first
+                && ((_skipped is not null && _skipped[group])
+                    || StatisticsEvaluator.Evaluate(_filter, rowGroup, _accessor) != FilterResult.Unknown))
                 continue;
 
             var sets = new Dictionary<int, MembershipPredicateEvaluator.IValueSet?>();

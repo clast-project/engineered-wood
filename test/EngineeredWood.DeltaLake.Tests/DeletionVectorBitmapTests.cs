@@ -336,6 +336,87 @@ public class DeletionVectorBitmapTests
         Assert.Equal(3, bitmap.Count);
     }
 
+    [Theory]
+    [InlineData(RunMode.Never)]
+    [InlineData(RunMode.Optimal)]
+    [InlineData(RunMode.Always)]
+    public void ContainsRangeAtTheEdgesOfDeletedSpans(RunMode mode)
+    {
+        // Spans that end mid-word, on a word, on a container boundary, across containers and across a
+        // sub-bitmap; a short span an array container holds; and one gap of a single row inside a long span.
+        var spans = new (long Start, long End)[]
+        {
+            (10, 75), (128, 192), (65000, 200000), (300000, 300040),
+            ((1L << 32) - 70000, (1L << 32) + 70000), ((3L << 32) + 5, (3L << 32) + 140000),
+        };
+        long gap = (3L << 32) + 70000;
+        var deleted = new List<long>();
+        foreach (var (start, end) in spans)
+            for (long v = start; v < end; v++)
+                if (v != gap)
+                    deleted.Add(v);
+        long[] sorted = deleted.ToArray();
+        var bitmap = RoaringBitmapReader.Deserialize(TestRoaringWriter.Serialize(sorted, mode));
+        var rng = new Random(618);
+
+        foreach (var (start, end) in spans)
+        {
+            long length = end - start;
+            bool hasGap = start <= gap && gap < end;
+            Assert.Equal(!hasGap, bitmap.ContainsRange(start, length));
+            Assert.False(bitmap.ContainsRange(start - 1, length + 1));
+            Assert.False(bitmap.ContainsRange(start, length + 1));
+            if (length > 2)
+                Assert.Equal(!hasGap, bitmap.ContainsRange(start + 1, length - 2));
+            CheckWindow(bitmap, sorted, start, (int)length, rng);
+            CheckWindow(bitmap, sorted, start + 1, (int)length - 1, rng);
+            CheckWindow(bitmap, sorted, start, (int)length - 1, rng);
+        }
+
+        Assert.True(bitmap.ContainsRange(gap + 1, 1000));
+        Assert.True(bitmap.ContainsRange(gap - 1000, 1000));
+        Assert.False(bitmap.ContainsRange(gap - 1000, 1001));
+        Assert.True(bitmap.ContainsRange(0, 0));
+        Assert.True(bitmap.ContainsRange(5, -3));
+        Assert.False(bitmap.ContainsRange(-1, 2));
+        Assert.False(bitmap.ContainsRange(10, long.MaxValue));
+        Assert.False(DeletionVectorBitmap.Empty.ContainsRange(0, 1));
+    }
+
+    [Theory]
+    [InlineData(RunMode.Never)]
+    [InlineData(RunMode.Always)]
+    public void ContainsRangeRefusesAMissingContainer(RunMode mode)
+    {
+        // Containers 0 and 2 full, container 1 absent: the window over all three is not covered, even though
+        // every container the bitmap does hold covers its part.
+        var deleted = new List<long>();
+        for (long v = 0; v < 65536; v++) deleted.Add(v);
+        for (long v = 131072; v < 196608; v++) deleted.Add(v);
+        var bitmap = RoaringBitmapReader.Deserialize(TestRoaringWriter.Serialize(deleted.ToArray(), mode));
+        Assert.True(bitmap.ContainsRange(0, 65536));
+        Assert.True(bitmap.ContainsRange(131072, 65536));
+        Assert.False(bitmap.ContainsRange(0, 196608));
+        Assert.False(bitmap.ContainsRange(65535, 65538));
+
+        // A window starting in a container the bitmap lacks, with nothing held before it.
+        var later = RoaringBitmapReader.Deserialize(TestRoaringWriter.Serialize(deleted.Skip(65536).ToArray(), mode));
+        Assert.False(later.ContainsRange(65536, 65546));
+        Assert.True(later.ContainsRange(131072, 65536));
+    }
+
+    [Fact]
+    public void ContainsRangeAcrossTouchingRuns()
+    {
+        // [5,6] then [7,7], unmerged: together they cover [5, 8).
+        var bitmap = RoaringBitmapReader.Deserialize(
+            Array((0, Hex("3b30000001" + "0000" + "0200" + "0200" + "05000100" + "07000000"))));
+        Assert.True(bitmap.ContainsRange(5, 3));
+        Assert.True(bitmap.ContainsRange(6, 2));
+        Assert.False(bitmap.ContainsRange(5, 4));
+        Assert.False(bitmap.ContainsRange(4, 2));
+    }
+
     // ---- helpers -----------------------------------------------------------------------------------------
 
     // `sorted` is the truth: the deleted positions in ascending order.
@@ -343,6 +424,8 @@ public class DeletionVectorBitmapTests
     {
         int first = LowerBound(sorted, start), end = LowerBound(sorted, start + length);
         Assert.Equal(end > first, bitmap.Intersects(start, length));
+        // Positions are distinct, so the window is covered exactly when it holds `length` of them.
+        Assert.Equal(end - first == length, bitmap.ContainsRange(start, length));
 
         // Prefill with noise: ClearDeleted must only clear deleted rows' bits and leave every other bit alone,
         // including the bits past `length` in the last word and the guard word after it.

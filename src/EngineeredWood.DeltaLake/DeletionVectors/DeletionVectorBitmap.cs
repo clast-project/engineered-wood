@@ -228,6 +228,86 @@ public sealed class DeletionVectorBitmap : IEnumerable<long>
     }
 
     /// <summary>
+    /// True when EVERY row in [<paramref name="start"/>, <paramref name="start"/> + <paramref name="length"/>) is
+    /// deleted, so a reader can skip those rows without reading them. An empty window is trivially covered; a
+    /// non-empty one reaching below row 0 never is, since no negative row is deleted.
+    /// </summary>
+    /// <remarks>Stops at the first row that is not deleted: a run container answers from its run bounds, a bitmap
+    /// container from whole words, and an array container from its first and last value in the window (its values
+    /// are sorted and distinct, so the window is covered exactly when they are consecutive).</remarks>
+    public bool ContainsRange(long start, long length)
+    {
+        if (length <= 0)
+            return true;
+        if (start < 0 || length > Count)
+            return false;
+
+        // length <= Count keeps this far from overflow in practice; clamp anyway rather than wrap.
+        long end = length > long.MaxValue - start ? long.MaxValue : start + length;
+        long cursor = start; // the first row not yet shown deleted
+        for (int c = FirstContainerEndingAfter(start); c < _base.Length; c++)
+        {
+            long b = _base[c];
+            if (b > cursor)
+                return false; // no container holds row `cursor`
+            int lo = (int)(cursor - b);
+            int hi = end - b >= ContainerSpan ? ContainerSpan : (int)(end - b);
+            if (!ContainerCovers(c, lo, hi))
+                return false;
+            cursor = b + hi;
+            if (cursor >= end)
+                return true;
+        }
+        return false;
+    }
+
+    // Whether container c holds every value of [lo, hi), lo < hi.
+    private bool ContainerCovers(int c, int lo, int hi)
+    {
+        int off = _offset[c];
+        switch (_kind[c])
+        {
+            case RoaringContainerKind.Array:
+            {
+                int n = _length[c], need = hi - lo;
+                int i = LowerBound(off, n, lo);
+                return i + need <= n && U16(off + 2 * i) == lo && U16(off + 2 * (i + need - 1)) == hi - 1;
+            }
+            case RoaringContainerKind.Run:
+            {
+                // Touching runs are valid input, so the window may take several of them back to back.
+                int runs = _length[c], cursor = lo;
+                for (int r = FirstRunEndingAtOrAfter(off, runs, lo); r < runs; r++)
+                {
+                    int s = U16(off + 4 * r);
+                    if (s > cursor)
+                        return false;
+                    int e = s + U16(off + 4 * r + 2) + 1; // exclusive
+                    if (e >= hi)
+                        return true;
+                    cursor = e;
+                }
+                return false;
+            }
+            default:
+            {
+                int first = lo >> 6, last = (hi - 1) >> 6;
+                for (int w = first; w <= last; w++)
+                {
+                    ulong mask = ulong.MaxValue;
+                    if (w == first)
+                        mask &= ulong.MaxValue << (lo & 63);
+                    if (w == last)
+                        mask &= ulong.MaxValue >> (63 - ((hi - 1) & 63));
+                    if ((U64(off + 8 * w) & mask) != mask)
+                        return false;
+                }
+                return true;
+            }
+        }
+    }
+
+    /// <summary>
     /// Deselects, in <paramref name="selection"/>, every deleted row of [<paramref name="start"/>,
     /// <paramref name="start"/> + <paramref name="length"/>). Bit <c>i</c> of the selection (LSB-first, word
     /// <c>i / 64</c>, Arrow's bitmap layout) stands for row <c>start + i</c>; bits for rows that are not deleted
