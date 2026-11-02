@@ -22,6 +22,7 @@ namespace EngineeredWood.DeltaLake.DeletionVectors;
 public sealed class DeletionVectorBitmap : IEnumerable<long>
 {
     private const int ContainerSpan = 1 << 16;
+    private const uint MaxHighKey = int.MaxValue - 1;
 
     private readonly byte[] _data;
     private readonly long[] _base;      // absolute position of each container's value 0, strictly ascending
@@ -69,9 +70,12 @@ public sealed class DeletionVectorBitmap : IEnumerable<long>
                 throw Invalid("Deletion vector truncated: missing sub-bitmap key.");
             uint key = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(position, 4));
             position += 4;
-            // Positions are non-negative longs, so a key at or past 2^31 cannot name one; ascending keys make the
-            // container bases ascend, which every lookup's binary search relies on.
-            if (key > int.MaxValue || key <= previousHigh)
+            // Delta's RoaringBitmapArray tops out at high key int.MaxValue - 1 (MAX_REPRESENTABLE_VALUE is
+            // composeFromHighLowBytes(Int.MaxValue - 1, Int.MinValue)), so no position here comes within 2^32 of
+            // long.MaxValue: that value is free to mean "none" below, and a window that runs off the end of the
+            // long range holds no deleted row. Ascending keys make the container bases ascend, which every
+            // lookup's binary search relies on.
+            if (key > MaxHighKey || key <= previousHigh)
                 throw Invalid($"Deletion vector sub-bitmap key {key} is out of range or out of order.");
             previousHigh = key;
 

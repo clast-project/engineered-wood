@@ -132,9 +132,9 @@ public class DeletionVectorBitmapTests
     [InlineData(RunMode.Always)]
     public void AContainerAtTheTopOfTheRangeDoesNotHideTheOthers(RunMode mode)
     {
-        // The last container's base is long.MaxValue - 65535: base + 65536 would wrap negative and break the
-        // container search, hiding row 0 from a scan.
-        long top = long.MaxValue - 1;
+        // The highest position a Delta DV can hold (high key int.MaxValue - 1, low bits all set): the container
+        // search must still find the rows far below it.
+        long top = ((long)(int.MaxValue - 1) << 32) | 0xFFFFFFFFL;
         var bitmap = RoaringBitmapReader.Deserialize(TestRoaringWriter.Serialize([0, 70000, top], mode));
         Assert.True(bitmap.Contains(0));
         Assert.True(bitmap.Intersects(0, 1));
@@ -148,6 +148,23 @@ public class DeletionVectorBitmapTests
         bitmap.ClearDeleted(0, 128, selection.AsSpan());
         Assert.Equal(new[] { ulong.MaxValue - 1, ulong.MaxValue }, selection);
         Assert.Equal(new long[] { 0, 70000, top }, bitmap.ToArray());
+    }
+
+    [Fact]
+    public void AWindowRunningOffTheEndOfTheLongRange()
+    {
+        // start + length wraps; no Delta position lies there, so nothing is cleared and nothing intersects.
+        long top = ((long)(int.MaxValue - 1) << 32) | 0xFFFFFFFFL;
+        var bitmap = RoaringBitmapReader.Deserialize(TestRoaringWriter.Serialize([0, top], RunMode.Never));
+        var selection = new[] { ulong.MaxValue };
+        bitmap.ClearDeleted(long.MaxValue - 10, 64, selection);
+        Assert.Equal(ulong.MaxValue, selection[0]);
+        Assert.False(bitmap.Intersects(long.MaxValue - 10, 64));
+        Assert.False(bitmap.TryGetNext(top + 1, out _));
+
+        selection[0] = ulong.MaxValue;
+        bitmap.ClearDeleted(top - 3, 64, selection);
+        Assert.Equal(ulong.MaxValue & ~(1UL << 3), selection[0]);
     }
 
     [Fact]
@@ -259,6 +276,10 @@ public class DeletionVectorBitmapTests
         Assert.Throws<DeltaFormatException>(() => RoaringBitmapReader.Deserialize(Array((1, sub), (1, sub))));
         Assert.Throws<DeltaFormatException>(() => RoaringBitmapReader.Deserialize(Array((2, sub), (1, sub))));
         Assert.Throws<DeltaFormatException>(() => RoaringBitmapReader.Deserialize(Array((0x80000000u, sub))));
+        // int.MaxValue is past Delta's MAX_REPRESENTABLE_VALUE; int.MaxValue - 1 is the top key it uses.
+        Assert.Throws<DeltaFormatException>(() => RoaringBitmapReader.Deserialize(Array(((uint)int.MaxValue, sub))));
+        Assert.Equal([((long)(int.MaxValue - 1) << 32) | 1],
+            RoaringBitmapReader.Deserialize(Array(((uint)(int.MaxValue - 1), sub))).ToArray());
         Assert.Equal([1L, (3L << 32) | 1], RoaringBitmapReader.Deserialize(Array((0, sub), (3, sub))).ToArray());
     }
 
