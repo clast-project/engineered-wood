@@ -33,6 +33,10 @@ internal static class RoaringBitmap
     private const ushort NoRunCookie = 12346;
     private const ushort RunCookie = 12347;
 
+    // The spec's NO_OFFSET_THRESHOLD: below this many containers, a bitmap that is not using the CRoaring
+    // no-run variant carries no offset header.
+    private const int NoOffsetThreshold = 4;
+
     public enum RoaringFormat
     {
         /// <summary>
@@ -87,13 +91,15 @@ internal static class RoaringBitmap
             // Offset header only when N >= 4.
             containerCount = (int)((cookie >> 16) + 1);
             hasRunContainers = false;
-            hasOffsetHeader = containerCount >= 4;
+            hasOffsetHeader = containerCount >= NoOffsetThreshold;
         }
         else if ((cookie & 0xFFFF) == RunCookie)
         {
             containerCount = (int)((cookie >> 16) + 1);
             hasRunContainers = true;
-            hasOffsetHeader = false;
+            // The spec (and CRoaring / Java, which agree here) writes the offset header after the run cookie
+            // once there are NO_OFFSET_THRESHOLD (4) or more containers. Skipping it misreads every container.
+            hasOffsetHeader = containerCount >= NoOffsetThreshold;
             int runBitmapBytes = (containerCount + 7) / 8;
             runBitmap = data.Slice(pos, runBitmapBytes).ToArray();
             pos += runBitmapBytes;
