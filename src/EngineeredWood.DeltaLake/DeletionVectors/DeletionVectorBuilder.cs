@@ -41,6 +41,22 @@ internal static class DeletionVectorBuilder
         return blob; // the int64 count after it is zero
     }
 
+    /// <summary>
+    /// <paramref name="positions"/> sorted ascending with duplicates removed, refusing (under
+    /// <paramref name="paramName"/>, the caller's own argument) any a Delta deletion vector cannot hold.
+    /// </summary>
+    internal static long[] SortedDistinct(IEnumerable<long> positions, string paramName)
+    {
+        long[] sorted = SortedDistinct(positions);
+        if (sorted.Length > 0 && (sorted[0] < 0 || sorted[sorted.Length - 1] > MaxPosition))
+        {
+            long bad = sorted[0] < 0 ? sorted[0] : sorted[sorted.Length - 1];
+            throw new ArgumentOutOfRangeException(
+                paramName, bad, $"A deleted row position must be in [0, {MaxPosition}].");
+        }
+        return sorted;
+    }
+
     /// <summary><paramref name="positions"/> sorted ascending with duplicates removed.</summary>
     internal static long[] SortedDistinct(IEnumerable<long> positions)
     {

@@ -126,7 +126,7 @@ public sealed class DeletionVectorBitmap : IEnumerable<long>
     {
         if (positions is null)
             throw new ArgumentNullException(nameof(positions));
-        return DeletionVectorBuilder.Build(null, DeletionVectorBuilder.SortedDistinct(positions), null);
+        return DeletionVectorBuilder.Build(null, DeletionVectorBuilder.SortedDistinct(positions, nameof(positions)), null);
     }
 
     /// <summary>
@@ -139,7 +139,7 @@ public sealed class DeletionVectorBitmap : IEnumerable<long>
     {
         if (positions is null)
             throw new ArgumentNullException(nameof(positions));
-        return DeletionVectorBuilder.Build(this, DeletionVectorBuilder.SortedDistinct(positions), null);
+        return DeletionVectorBuilder.Build(this, DeletionVectorBuilder.SortedDistinct(positions, nameof(positions)), null);
     }
 
     /// <summary>The rows this vector deletes and <paramref name="other"/> does not. This instance is

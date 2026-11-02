@@ -53,8 +53,8 @@ public class DeletionVectorBuilderTests
 
     [Theory]
     [InlineData(0, 1)]            // one value
-    [InlineData(0, 4096)]         // the largest array
-    [InlineData(0, 4097)]         // the smallest bitmap
+    [InlineData(0, 4096)]         // a range is a run whatever its length:
+    [InlineData(0, 4097)]         //   6 bytes, against 8 KB as an array or a bitmap
     [InlineData(65535, 2)]        // a run across a container boundary
     [InlineData(0, 65536)]        // a full container: one run
     [InlineData(0, 3 * 65536)]    // three full containers
@@ -69,6 +69,25 @@ public class DeletionVectorBuilderTests
         // (+ offsets from 4 containers): a range costs bytes per container, not per row.
         Assert.True(bitmap.SerializedBytes().Length <= 16 + 4 + 1 + containers * (4 + 2 + 4 + 4),
             $"{bitmap.SerializedBytes().Length} bytes for a {count}-row range");
+    }
+
+    [Theory]
+    [InlineData(1, "array")]
+    [InlineData(4096, "array")]   // the largest array
+    [InlineData(4097, "bitmap")]  // the smallest bitmap
+    [InlineData(30000, "bitmap")]
+    public void ScatteredValuesCrossFromArrayToBitmapAt4096(int count, string kind)
+    {
+        // Every other value: no two adjacent, so runs never win and the array/bitmap boundary decides.
+        long[] positions = Enumerable.Range(0, count).Select(i => 2L * i).ToArray();
+        byte[] blob = RoaringBitmapWriter.Serialize(positions);
+        Assert.Equal(12346u, BinaryPrimitives.ReadUInt32LittleEndian(blob.AsSpan(16))); // no runs at all
+
+        var containers = new List<EngineeredWood.Encodings.RoaringContainer>();
+        EngineeredWood.Encodings.RoaringBitmap.ParseContainers(
+            blob.AsSpan(16), EngineeredWood.Encodings.RoaringBitmap.RoaringFormat.CRoaring, containers);
+        Assert.Equal(kind, Assert.Single(containers).Kind.ToString().ToLowerInvariant());
+        Assert.Equal(positions, RoaringBitmapReader.Deserialize(blob).ToArray());
     }
 
     public static TheoryData<int, bool> Seeds()
@@ -143,9 +162,16 @@ public class DeletionVectorBuilderTests
     {
         long max = ((long)(int.MaxValue - 1) << 32) | 0xFFFFFFFFL;
         Assert.Equal([max], DeletionVectorBitmap.FromPositions([max]).ToArray());
-        Assert.Throws<ArgumentOutOfRangeException>(() => DeletionVectorBitmap.FromPositions([max + 1]));
-        Assert.Throws<ArgumentOutOfRangeException>(() => DeletionVectorBitmap.FromPositions([-1]));
-        Assert.Throws<ArgumentOutOfRangeException>(() => DeletionVectorBitmap.Empty.Union([5, -1]));
+        // Each names the argument its caller passed, not an internal one.
+        Assert.Equal("positions",
+            Assert.Throws<ArgumentOutOfRangeException>(() => DeletionVectorBitmap.FromPositions([max + 1])).ParamName);
+        Assert.Equal("positions",
+            Assert.Throws<ArgumentOutOfRangeException>(() => DeletionVectorBitmap.FromPositions([-1])).ParamName);
+        Assert.Equal("positions",
+            Assert.Throws<ArgumentOutOfRangeException>(() => DeletionVectorBitmap.Empty.Union([5, -1])).ParamName);
+        var writer = new DeletionVectorWriter(new EngineeredWood.IO.Local.LocalTableFileSystem(Path.GetTempPath()));
+        Assert.Equal("deletedRowIndices", Assert.Throws<ArgumentOutOfRangeException>(
+            () => writer.CreateAsync(new long[] { -1 }).AsTask().GetAwaiter().GetResult()).ParamName);
     }
 
     [Fact]

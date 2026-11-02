@@ -51,8 +51,14 @@ public sealed class DeletionVectorWriter
     /// </summary>
     public ValueTask<DeletionVector> CreateAsync(
         IEnumerable<long> deletedRowIndices,
-        CancellationToken cancellationToken = default) =>
-        CreateAsync(DeletionVectorBitmap.FromPositions(deletedRowIndices), cancellationToken);
+        CancellationToken cancellationToken = default)
+    {
+        if (deletedRowIndices is null)
+            throw new ArgumentNullException(nameof(deletedRowIndices));
+        var bitmap = DeletionVectorBuilder.Build(
+            null, DeletionVectorBuilder.SortedDistinct(deletedRowIndices, nameof(deletedRowIndices)), null);
+        return CreateAsync(bitmap, cancellationToken);
+    }
 
     private DeletionVector CreateInline(byte[] dvBlob, long cardinality)
     {
