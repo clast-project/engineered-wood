@@ -296,9 +296,34 @@ public class DeletionVectorBitmapTests
     [InlineData("3b30000001" + "0000" + "0300" + "0200" + "08000100" + "05000100")]
     // run container: a run past 65535.
     [InlineData("3b30000001" + "0000" + "0100" + "0100" + "ffff0100")]
+    // run container: one run [5,7] (3 values) under a header claiming 100.
+    [InlineData("3b30000001" + "0000" + "6300" + "0100" + "05000200")]
     public void MalformedContainersAreFormatErrors(string hex)
     {
         Assert.Throws<DeltaFormatException>(() => RoaringBitmapReader.Deserialize(Array((0, Hex(hex)))));
+    }
+
+    [Theory]
+    [InlineData(5000, 4999)] // a header one short of the payload
+    [InlineData(5000, 5001)] // and one over
+    public void ABitmapContainerMustHoldWhatItsHeaderSays(int values, int headerCardinality)
+    {
+        // A bitmap's count is what Java's RoaringBitmap reports for it, so a header that disagrees with the
+        // payload is refused rather than read one way here and another there.
+        var words = new ulong[1024];
+        for (int v = 0; v < values; v++)
+            words[v >> 6] |= 1UL << (v & 63);
+        using var ms = new MemoryStream();
+        using (var bw = new BinaryWriter(ms))
+        {
+            bw.Write(12346u);                           // no-run cookie
+            bw.Write(1u);                               // one container
+            bw.Write((ushort)0);                        // key
+            bw.Write((ushort)(headerCardinality - 1));  // header cardinality - 1
+            bw.Write(16u);                              // offset of the payload
+            foreach (ulong w in words) bw.Write(w);
+        }
+        Assert.Throws<DeltaFormatException>(() => RoaringBitmapReader.Deserialize(Array((0, ms.ToArray()))));
     }
 
     [Fact]
