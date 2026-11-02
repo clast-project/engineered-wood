@@ -3653,8 +3653,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var latestAdd = activeByPath[edit.Path];
 
             var concurrentDeleted = latestAdd.DeletionVector is not null
-                ? await _dvReader.ReadAsync(latestAdd.DeletionVector, cancellationToken)
-                    .ConfigureAwait(false)
+                ? new HashSet<long>(await _dvReader.ReadAsync(latestAdd.DeletionVector, cancellationToken)
+                    .ConfigureAwait(false))
                 : new HashSet<long>();
 
             // If any row this delete removed is already deleted in the file's current DV, the same row was
@@ -4362,8 +4362,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
 
             var rawDeletedRows = addFile.DeletionVector is not null
-                ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
-                    .ConfigureAwait(false)
+                ? new HashSet<long>(await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken)
+                    .ConfigureAwait(false))
                 : new HashSet<long>();
 
             var newDeletedIndices = new List<long>();
@@ -10835,7 +10835,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
             snapshot.Schema, mappingMode);
         // Load the deletion vector first — it is independent of the byte source.
-        HashSet<long>? deletedRows = null;
+        DeletionVectorBitmap? deletedRows = null;
         if (addFile.DeletionVector is not null)
         {
             deletedRows = await _dvReader.ReadAsync(
@@ -11039,7 +11039,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         ColumnMappingMode mappingMode,
         Dictionary<string, string> physicalToLogical,
         Dictionary<string, string> logicalToPhysical,
-        HashSet<long>? deletedRows,
+        DeletionVectorBitmap? deletedRows,
         IReadOnlyList<string> partitionColumns,
         bool hasPartitions,
         bool wantPositions,
@@ -11052,7 +11052,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         bool hasMaterialized = matRowIdName is not null || matRowVerName is not null;
-        bool wantRowIds = wantPositions || wantTracking;
 
         await foreach (var (batch, firstRow) in source.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
@@ -11077,58 +11076,55 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     .StripMaterializedColumns(result, matRowIdName, matRowVerName);
             }
 
-            // Source indices (into this raw batch) of rows that survive DV filtering, in emit order — captured
-            // before the filter drops them, so the rowid out-params stay row-aligned with the emitted batch.
-            List<int>? survivorSrc = wantRowIds ? new List<int>(batch.Length) : null;
-            if (survivorSrc is not null)
+            // The raw batch's rows that survive the deletion vector, in emit order: computed ONCE, from a selection
+            // mask, and used both to drop the deleted rows and to keep the rowid out-params row-aligned with the
+            // emitted batch. A batch the DV does not touch allocates nothing and passes through untouched.
+            Int64Array? positions = null, rowIds = null, versions = null;
+            using (var kept = deletedRows is null
+                ? default
+                : KeptRows.For(deletedRows, thisBatchStart, batch.Length))
             {
-                for (int i = 0; i < batch.Length; i++)
-                    if (deletedRows is null || !deletedRows.Contains(thisBatchStart + i))
-                        survivorSrc.Add(i);
-            }
-
-            // Apply deletion vector filtering
-            if (deletedRows is not null)
-            {
-                result = DeletionVectorFilter.Filter(result, deletedRows, thisBatchStart);
-
-                if (result.Length == 0)
+                int survivors = deletedRows is null ? batch.Length : kept.Count;
+                if (survivors == 0)
                     continue; // All rows in this batch were deleted (no surviving ids to emit either)
+                if (deletedRows is not null && !kept.AllKept)
+                    result = ArrowCompute.Take(result, result.Schema, kept.Indices);
+
+                // Surface each surviving row's RESOLVED id + commit version (row-aligned with the emitted batch):
+                // the materialized value where present, else add.baseRowId + absolute position /
+                // defaultRowCommitVersion (null when the file carries neither — a pre-row-tracking source). The
+                // rewrite path preserves ids.
+                if (wantTracking)
+                {
+                    var idb = new Int64Array.Builder().Reserve(survivors);
+                    var vrb = new Int64Array.Builder().Reserve(survivors);
+                    for (int n = 0; n < survivors; n++)
+                    {
+                        int i = deletedRows is null ? n : kept[n];
+                        long? mid = rawMatIds is not null && !rawMatIds.IsNull(i) ? rawMatIds.GetValue(i) : null;
+                        long? id = mid ?? (addFile.BaseRowId is { } ab ? ab + thisBatchStart + i : (long?)null);
+                        if (id is { } iv) idb.Append(iv); else idb.AppendNull();
+
+                        long? mv = rawMatVers is not null && !rawMatVers.IsNull(i) ? rawMatVers.GetValue(i) : null;
+                        long? ver = mv ?? addFile.DefaultRowCommitVersion;
+                        if (ver is { } vv) vrb.Append(vv); else vrb.AppendNull();
+                    }
+                    rowIds = idb.Build();
+                    versions = vrb.Build();
+                }
+                if (wantPositions)
+                {
+                    var pb = new Int64Array.Builder().Reserve(survivors);
+                    for (int n = 0; n < survivors; n++)
+                        pb.Append(thisBatchStart + (deletedRows is null ? n : kept[n])); // absolute in-file position (DV-inclusive), for the remap
+                    positions = pb.Build();
+                }
             }
 
             // The materialized row-tracking columns were already stripped up front (above).
             var cleanResult = ReconcileToTableShape(
                 result, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions, logicalToPhysical,
                 addFile.Path);
-
-            // Surface each surviving row's RESOLVED id + commit version (row-aligned with cleanResult): the
-            // materialized value where present, else add.baseRowId + absolute position / defaultRowCommitVersion
-            // (null when the file carries neither — a pre-row-tracking source). The rewrite path preserves ids.
-            Int64Array? positions = null, rowIds = null, versions = null;
-            if (wantTracking)
-            {
-                var idb = new Int64Array.Builder().Reserve(survivorSrc!.Count);
-                var vrb = new Int64Array.Builder().Reserve(survivorSrc.Count);
-                foreach (int i in survivorSrc)
-                {
-                    long? mid = rawMatIds is not null && !rawMatIds.IsNull(i) ? rawMatIds.GetValue(i) : null;
-                    long? id = mid ?? (addFile.BaseRowId is { } ab ? ab + thisBatchStart + i : (long?)null);
-                    if (id is { } iv) idb.Append(iv); else idb.AppendNull();
-
-                    long? mv = rawMatVers is not null && !rawMatVers.IsNull(i) ? rawMatVers.GetValue(i) : null;
-                    long? ver = mv ?? addFile.DefaultRowCommitVersion;
-                    if (ver is { } vv) vrb.Append(vv); else vrb.AppendNull();
-                }
-                rowIds = idb.Build();
-                versions = vrb.Build();
-            }
-            if (wantPositions)
-            {
-                var pb = new Int64Array.Builder().Reserve(survivorSrc!.Count);
-                foreach (int i in survivorSrc)
-                    pb.Append(thisBatchStart + i); // absolute in-file position (DV-inclusive), for the remap
-                positions = pb.Build();
-            }
 
             yield return new FileBatch(cleanResult, positions, rowIds, versions);
         }

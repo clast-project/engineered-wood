@@ -140,7 +140,7 @@ public class RoaringBitmapReaderTests
 
         var expected = RunContainerValues(0, true, false, true, false).ToList();
         Assert.Equal(expected.Count, result.Count);
-        Assert.True(result.SetEquals(expected));
+        Assert.Equal(expected, result); // ascending, so order-sensitive equality
     }
 
     [Fact]
@@ -154,7 +154,7 @@ public class RoaringBitmapReaderTests
             .Concat(RunContainerValues(1L << 32, true, false, true))
             .ToList();
         Assert.Equal(expected.Count, result.Count);
-        Assert.True(result.SetEquals(expected));
+        Assert.Equal(expected, result); // ascending, so order-sensitive equality
     }
 
     [Fact]

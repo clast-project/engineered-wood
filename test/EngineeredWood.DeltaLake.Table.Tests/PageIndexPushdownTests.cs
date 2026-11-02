@@ -121,6 +121,25 @@ public class PageIndexPushdownTests : IDisposable
         Assert.Equal(expected, await ReadIds(table, TwoPages));
     }
 
+    /// <summary>
+    /// A DV that deletes every row of the first kept range (dropping whole batches) and rows mid-batch in the
+    /// second: each surviving row keeps its own row index and row id, with nothing shifted by the dropped
+    /// batches or the rows gathered out.
+    /// </summary>
+    [Fact]
+    public async Task DeletionVector_WholeKeptRangeDeleted_MetadataStaysAligned()
+    {
+        await using var table = await CreateOneFileTable(dv: true, rowTracking: true);
+        var deleted = new long[] { 3, 50, 71, 74, 75, 76, 79, 150 }.Concat(Range(10, RowsPerPage)).ToList();
+        await table.DeleteAsync(Ex.In("id", deleted.Select(LiteralValue.Of).ToArray()));
+        Assert.NotNull(table.CurrentSnapshot.ActiveFiles.Values.Single().DeletionVector);
+
+        var rows = await RowsWithMetadata(table, Ex.Or(TwoPages, Ex.Equal("id", 10L)));
+        Assert.Equal(new long[] { 70, 72, 73, 77, 78 }, rows.Select(r => r.Id));
+        Assert.All(rows, row => Assert.Equal(row.Id, row.RowIndex));
+        Assert.All(rows, row => Assert.Equal(row.Id, row.RowId)); // baseRowId 0 + position
+    }
+
     [Fact]
     public async Task MetadataColumns_CarryTheFilePosition_AfterASkippedPageRange()
     {
