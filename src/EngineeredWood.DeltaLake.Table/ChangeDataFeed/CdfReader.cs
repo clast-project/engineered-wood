@@ -284,10 +284,10 @@ internal static class CdfReader
 
             var oldRows = remove.DeletionVector is null
                 ? new HashSet<long>()
-                : await dvReader.ReadAsync(remove.DeletionVector, cancellationToken).ConfigureAwait(false);
+                : new HashSet<long>(await dvReader.ReadAsync(remove.DeletionVector, cancellationToken).ConfigureAwait(false));
             var newRows = add.DeletionVector is null
                 ? new HashSet<long>()
-                : await dvReader.ReadAsync(add.DeletionVector, cancellationToken).ConfigureAwait(false);
+                : new HashSet<long>(await dvReader.ReadAsync(add.DeletionVector, cancellationToken).ConfigureAwait(false));
 
             var newlyDeleted = new HashSet<long>(newRows);
             newlyDeleted.ExceptWith(oldRows);
@@ -326,7 +326,7 @@ internal static class CdfReader
             DeletionVectorReader dvReader, CancellationToken cancellationToken) =>
             Unread is null
                 ? this
-                : new(await dvReader.ReadAsync(Unread, cancellationToken).ConfigureAwait(false), false);
+                : new(new HashSet<long>(await dvReader.ReadAsync(Unread, cancellationToken).ConfigureAwait(false)), false);
 
         public bool Includes(long position) =>
             Positions is null ? !KeepOnlyPositions : Positions.Contains(position) == KeepOnlyPositions;

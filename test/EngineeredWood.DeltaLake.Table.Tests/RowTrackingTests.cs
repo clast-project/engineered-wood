@@ -72,7 +72,7 @@ public class RowTrackingTests : IDisposable
 
         foreach (var addFile in table.CurrentSnapshot.ActiveFiles.Values)
         {
-            HashSet<long>? deleted = null;
+            DeletionVectors.DeletionVectorBitmap? deleted = null;
             if (addFile.DeletionVector is not null)
                 deleted = await new DeletionVectors.DeletionVectorReader(fs)
                     .ReadAsync(addFile.DeletionVector, default);

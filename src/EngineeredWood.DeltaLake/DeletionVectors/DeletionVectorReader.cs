@@ -21,9 +21,9 @@ public sealed class DeletionVectorReader
     }
 
     /// <summary>
-    /// Reads a deletion vector and returns the set of deleted row indices.
+    /// Reads a deletion vector and returns the rows it deletes.
     /// </summary>
-    public async ValueTask<HashSet<long>> ReadAsync(
+    public async ValueTask<DeletionVectorBitmap> ReadAsync(
         DeletionVector dv,
         CancellationToken cancellationToken = default)
     {

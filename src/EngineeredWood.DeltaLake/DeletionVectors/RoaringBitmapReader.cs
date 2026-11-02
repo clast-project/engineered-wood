@@ -20,12 +20,20 @@ internal static class RoaringBitmapReader
     private const uint RoaringBitmapArrayMagic = 1681511377; // 0x6431544D "MT1d"
 
     /// <summary>
-    /// Deserializes a RoaringBitmapArray (Delta Lake DV format) into a set
-    /// of deleted row indices. The format is 4-byte magic + portable
-    /// Roaring serialization.
+    /// Deserializes a RoaringBitmapArray (Delta Lake DV format: 4-byte magic + portable Roaring serialization)
+    /// into the rows it deletes. Copies <paramref name="data"/>; the <see cref="Deserialize(byte[])"/> overload
+    /// does not.
     /// </summary>
-    public static HashSet<long> Deserialize(ReadOnlySpan<byte> data)
+    public static DeletionVectorBitmap Deserialize(ReadOnlySpan<byte> data) => Deserialize(data.ToArray());
+
+    /// <summary>
+    /// Deserializes a RoaringBitmapArray into the rows it deletes, reading <paramref name="data"/> in place:
+    /// the result keeps it, so the caller must not change it afterwards.
+    /// </summary>
+    public static DeletionVectorBitmap Deserialize(byte[] data)
     {
+        if (data is null)
+            throw new ArgumentNullException(nameof(data));
         if (data.Length < 4)
             throw new DeltaFormatException(
                 DeltaErrorCodes.InvalidDeletionVector, "Deletion vector data too short.");
@@ -45,33 +53,13 @@ internal static class RoaringBitmapReader
                 DeltaErrorCodes.InvalidDeletionVector,
                 "Deletion vector truncated: missing RoaringBitmapArray sub-bitmap count.");
 
-        long subBitmaps = BinaryPrimitives.ReadInt64LittleEndian(data.Slice(pos, 8));
+        long subBitmaps = BinaryPrimitives.ReadInt64LittleEndian(data.AsSpan(pos, 8));
         pos += 8;
         if (subBitmaps < 0 || subBitmaps > int.MaxValue)
             throw new DeltaFormatException(
                 DeltaErrorCodes.InvalidDeletionVector,
                 $"Deletion vector has an invalid sub-bitmap count: {subBitmaps}.");
 
-        var result = new HashSet<long>();
-        for (long s = 0; s < subBitmaps; s++)
-        {
-            if (data.Length < pos + 4)
-                throw new DeltaFormatException(
-                    DeltaErrorCodes.InvalidDeletionVector,
-                    "Deletion vector truncated: missing sub-bitmap key.");
-            uint key = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(pos, 4));
-            pos += 4;
-            long highBits = (long)key << 32;
-            int consumed = EngineeredWood.Encodings.RoaringBitmap.DeserializePortable(
-                data.Slice(pos), v => result.Add(highBits | v),
-                EngineeredWood.Encodings.RoaringBitmap.RoaringFormat.CRoaring);
-            if (consumed <= 0)
-                throw new DeltaFormatException(
-                    DeltaErrorCodes.InvalidDeletionVector,
-                    "Deletion vector sub-bitmap could not be decoded.");
-            pos += consumed;
-        }
-
-        return result;
+        return DeletionVectorBitmap.Parse(data, pos, subBitmaps);
     }
 }

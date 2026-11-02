@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.Schema;
 using DeltaSnapshot = EngineeredWood.DeltaLake.Snapshot.Snapshot;
@@ -232,19 +233,26 @@ internal static class CompactionExecutor
                     : (batch, null, null);
                 long physicalRows = batch.Length;
 
-                // Build the survivor id/version arrays in the SAME order DeletionVectorFilter keeps (ascending
-                // physical index, skipping DV-deleted rows) so they stay aligned with the filtered batch.
+                // The rows the deletion vector leaves, computed once from a selection mask: they drive both the
+                // filter below and the survivor id/version arrays, which therefore stay aligned with it.
+                using var kept = deletedRows is null
+                    ? default
+                    : DeletionVectors.KeptRows.For(deletedRows, batchStartRow, batch.Length);
+                int survivors = deletedRows is null ? batch.Length : kept.Count;
+                if (survivors == 0)
+                {
+                    batchStartRow += physicalRows;
+                    continue; // every row in this batch was deleted: nothing to map, gather or write
+                }
+
                 Int64Array? survivorIds = null, survivorVers = null;
                 if (materialize)
                 {
-                    // physicalRows is an upper bound — DV-deleted rows are skipped below — so this reserves
-                    // once rather than growing, without over-trimming when nothing is deleted.
-                    var idb = new Int64Array.Builder().Reserve((int)physicalRows);
-                    var vrb = new Int64Array.Builder().Reserve((int)physicalRows);
-                    for (int i = 0; i < physicalRows; i++)
+                    var idb = new Int64Array.Builder().Reserve(survivors);
+                    var vrb = new Int64Array.Builder().Reserve(survivors);
+                    for (int n = 0; n < survivors; n++)
                     {
-                        if (deletedRows is not null && deletedRows.Contains(batchStartRow + i))
-                            continue;
+                        int i = deletedRows is null ? n : kept[n];
                         long id = srcMatIds is not null && !srcMatIds.IsNull(i)
                             ? srcMatIds.GetValue(i)!.Value
                             : baseId + batchStartRow + i;
@@ -271,11 +279,8 @@ internal static class CompactionExecutor
                         snapshot.Schema, mappingMode);
                 }
                 var liveBatch = ColumnMappingRecursive.StripParquetFieldIds(userBatch);
-                if (deletedRows is not null)
-                {
-                    liveBatch = DeletionVectors.DeletionVectorFilter.Filter(
-                        liveBatch, deletedRows, batchStartRow);
-                }
+                if (deletedRows is not null && !kept.AllKept)
+                    liveBatch = ArrowCompute.Take(liveBatch, liveBatch.Schema, kept.Indices);
                 batchStartRow += physicalRows;
                 if (liveBatch.Length == 0)
                     continue; // every row in this batch was deleted
