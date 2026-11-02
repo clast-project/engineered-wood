@@ -89,6 +89,74 @@ public class RoaringBitmapReaderTests
         Assert.Throws<DeltaFormatException>(() => RoaringBitmapReader.Deserialize(data));
     }
 
+    // CRoaring (pyroaring 1.2.0) portable bitmaps with RUN containers; generator and values documented on
+    // EngineeredWood.Core.Tests.Encodings.RoaringBitmapTests. Runs4 = [run, array, run, array] (4 containers:
+    // the run cookie then carries an offset header); Runs3 = [run, array, run] (no offset header).
+    private const string Runs4 =
+        "3b300300050000ea03010002000200ea0303000200250000002f000000350000003f00000002006400e7038813020007002c01ffff02006400e7038813020007002c01ffff";
+    private const string Runs3 =
+        "3b300200050000ea03010002000200ea0302006400e7038813020007002c01ffff02006400e70388130200";
+
+    private static byte[] RoaringBitmapArray(params (uint HighKey, string Hex)[] subBitmaps)
+    {
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+        bw.Write((uint)1681511377);
+        bw.Write((long)subBitmaps.Length);
+        foreach (var (key, hex) in subBitmaps)
+        {
+            bw.Write(key);
+            for (int i = 0; i < hex.Length; i += 2)
+                bw.Write(Convert.ToByte(hex.Substring(i, 2), 16));
+        }
+        bw.Flush();
+        return ms.ToArray();
+    }
+
+    private static IEnumerable<long> RunContainerValues(long highBits, params bool[] isRun)
+    {
+        for (int c = 0; c < isRun.Length; c++)
+        {
+            long b = highBits | (c * 65536L);
+            if (isRun[c])
+            {
+                for (long v = b + 100; v < b + 1100; v++) yield return v;
+                for (long v = b + 5000; v < b + 5003; v++) yield return v;
+            }
+            else
+            {
+                yield return b + 7;
+                yield return b + 300;
+                yield return b + 65535;
+            }
+        }
+    }
+
+    [Fact]
+    public void Deserialize_RunContainers_FourOrMoreContainers()
+    {
+        // Used to throw ArgumentOutOfRangeException: the reader skipped no offset header after the run cookie.
+        var result = RoaringBitmapReader.Deserialize(RoaringBitmapArray((0, Runs4)));
+
+        var expected = RunContainerValues(0, true, false, true, false).ToList();
+        Assert.Equal(expected.Count, result.Count);
+        Assert.True(result.SetEquals(expected));
+    }
+
+    [Fact]
+    public void Deserialize_RunContainers_SecondSubBitmapStillAligned()
+    {
+        // A run sub-bitmap with an offset header FIRST: the next sub-bitmap is only found if the bytes consumed
+        // by the first are counted exactly.
+        var result = RoaringBitmapReader.Deserialize(RoaringBitmapArray((0, Runs4), (1, Runs3)));
+
+        var expected = RunContainerValues(0, true, false, true, false)
+            .Concat(RunContainerValues(1L << 32, true, false, true))
+            .ToList();
+        Assert.Equal(expected.Count, result.Count);
+        Assert.True(result.SetEquals(expected));
+    }
+
     [Fact]
     public void Deserialize_ConsecutiveValues()
     {
