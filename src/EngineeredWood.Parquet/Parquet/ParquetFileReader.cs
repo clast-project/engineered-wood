@@ -559,15 +559,19 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // Multi-batch path (flat columns): build page maps, then read only the pages needed per batch.
         //
         // Phase 1: Build each column's page map, from its OffsetIndex where it has one, otherwise by
-        //          reading the whole chunk to scan its page headers.
+        //          reading the whole chunk to scan its page headers, which is then kept to decode from
+        //          while the chunks so read fit a budget.
         // Phase 2: Fetch the pages of as many batches as a byte budget allows in one request (a window),
         //          then for each batch decode only the pages no earlier batch has decoded, and take
         //          the batch's rows from what is decoded.
         //
         // An OffsetIndex map estimates each page's uncompressed size, which the implicit budget
         // cannot use: it exists to keep a batch under the Arrow limit, so it reads the headers.
-        var pageMaps = await BuildPageMapsAsync(ctx, useOffsetIndex: !implicitBudget, offsetIndexes, cancellationToken)
+        var (pageMaps, held) = await BuildPageMapsAsync(ctx, useOffsetIndex: !implicitBudget, offsetIndexes, cancellationToken)
             .ConfigureAwait(false);
+        var heldColumns = new bool[ctx.Count];
+        for (int i = 0; i < ctx.Count; i++)
+            heldColumns[i] = held[i] is not null;
 
         // Pages are not cut where batches are, so a page usually holds rows for more than one batch.
         // Each column keeps the decoded rows that it has not yet returned, so a page is fetched and
@@ -608,7 +612,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 window = null;
                 window = await BatchPageWindow.ReadAsync(
                         _file, pageMaps, chunkOffsets, spans, nextSpan, nextRow, endRows, nextPages, batchRows,
-                        BatchPageWindowBudgetBytes, cancellationToken)
+                        BatchPageWindowBudgetBytes, heldColumns, cancellationToken)
                     .ConfigureAwait(false);
                 if (window.Batches.Count == 0)
                     break;
@@ -659,13 +663,25 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                         }
                     }
 
-                    // The window holds every page the batch can ask for; anything it does not is read
-                    // here, so a planning slip costs a round trip rather than a wrong answer.
+                    // A column whose chunk is held is decoded from it; the window holds every page the
+                    // others can ask for. Anything neither holds is read here, so a planning slip costs a
+                    // round trip rather than a wrong answer.
                     var pageBytes = new ReadOnlyMemory<byte>[pageRanges.Count];
+                    var resolved = new bool[pageRanges.Count];
+                    for (int i = 0; i < ctx.Count; i++)
+                    {
+                        if (held[i] is not { } chunk || dataSlots[i] < 0)
+                            continue;
+                        var range = pageRanges[dataSlots[i]];
+                        pageBytes[dataSlots[i]] = chunk.Memory.Slice(
+                            checked((int)(range.Offset - ctx.Ranges[i].Offset)), checked((int)range.Length));
+                        resolved[dataSlots[i]] = true;
+                    }
+
                     List<int>? missing = null;
                     for (int r = 0; r < pageRanges.Count; r++)
                     {
-                        if (!window.TryGet(pageRanges[r], out pageBytes[r]))
+                        if (!resolved[r] && !window.TryGet(pageRanges[r], out pageBytes[r]))
                             (missing ??= []).Add(r);
                     }
 
@@ -733,6 +749,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         finally
         {
             window?.Dispose();
+            foreach (var chunk in held)
+                chunk?.Dispose();
 
             // Rows decoded but not returned, when the caller stops early.
             foreach (var cursor in cursors)
@@ -894,16 +912,41 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// How many bytes of chunks read whole to scan their page headers one request may ask for, unless a
+    /// single chunk is larger; and how many of them a batched read keeps to decode from, rather than
+    /// fetching their pages again (#625). Tests lower it.
+    /// </summary>
+    internal long HeaderScanBudgetBytes { get; set; } = DefaultHeaderScanBudgetBytes;
+
+    /// <summary>The default <see cref="HeaderScanBudgetBytes"/>.</summary>
+    internal const long DefaultHeaderScanBudgetBytes = 64L * 1024 * 1024;
+
+    /// <summary>
+    /// The gap between two chunks of one scan request that a coalescing reader is taken to fetch with
+    /// them, and so counted against the request's budget: <see cref="CoalescingOptions.MaxGapBytes"/>'s default.
+    /// </summary>
+    private static readonly long s_scanGapBytes = new CoalescingOptions().MaxGapBytes;
+
+    /// <summary>
     /// Builds the page map of each of a flat row group's columns. Where
     /// <paramref name="useOffsetIndex"/> is set and a chunk has a usable OffsetIndex, the map comes
     /// from that, so the data pages are not read to find them. Every other chunk is read whole to
     /// scan its page headers.
     /// </summary>
+    /// <remarks>
+    /// The chunks to scan are read together, in requests of up to <see cref="HeaderScanBudgetBytes"/>
+    /// and <see cref="BatchPageWindow.MaxRangesPerWindow"/> chunks, not one request after another per
+    /// column (#625). A request's bytes include the gaps between its chunks that a coalescing reader
+    /// would fetch with them (unprojected columns), as its merged buffers hold those too. As long as their total stays within that budget
+    /// they are also returned, by column, for the batches to decode from: their pages are already in
+    /// hand, and fetching them again read every byte twice. The caller disposes them. A chunk past the
+    /// budget is released once scanned, and its pages are fetched as a column with an index's are.
+    /// </remarks>
     /// <param name="offsetIndexes">
     /// OffsetIndex bytes already read, by the index's file offset, as the page-index filter reads them
     /// with the ColumnIndexes it prunes by; the rest are read here.
     /// </param>
-    private async ValueTask<ColumnPageMap[]> BuildPageMapsAsync(
+    private async ValueTask<(ColumnPageMap[] Maps, IMemoryOwner<byte>?[] Held)> BuildPageMapsAsync(
         RowGroupContext ctx, bool useOffsetIndex, IReadOnlyDictionary<long, byte[]>? offsetIndexes,
         CancellationToken cancellationToken)
     {
@@ -911,22 +954,92 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         if (useOffsetIndex)
             await BuildPageMapsFromOffsetIndexesAsync(ctx, pageMaps, offsetIndexes, cancellationToken).ConfigureAwait(false);
 
-        for (int i = 0; i < ctx.Count; i++)
+        var held = new IMemoryOwner<byte>?[ctx.Count];
+        long budget = HeaderScanBudgetBytes;
+        long heldBytes = 0;
+        try
         {
-            if (pageMaps[i] is not null)
-                continue;
+            // The chunks to scan, in file order rather than the projection's, as a coalescing reader
+            // merges them: a request then spans only the gaps between its own chunks, which it counts.
+            var toScan = new List<int>();
+            for (int i = 0; i < ctx.Count; i++)
+            {
+                if (pageMaps[i] is null)
+                    toScan.Add(i);
+            }
 
-            using var buffer = await _file.ReadAsync(ctx.Ranges[i], cancellationToken)
-                .ConfigureAwait(false);
-            pageMaps[i] = PageMapBuilder.Build(
-                buffer.Memory.Span,
-                ctx.Columns[i],
-                ctx.Chunks[i].MetaData!,
-                _options.PageChecksumValidation,
-                _options.MaxPageUncompressedSize);
+            toScan.Sort((a, b) => ctx.Ranges[a].Offset.CompareTo(ctx.Ranges[b].Offset));
+
+            int next = 0;
+            while (true)
+            {
+                // The next request: the chunks still to scan, up to the budget and the range cap, but at
+                // least one. A gap a coalescing reader would fill counts toward the budget.
+                var columns = new List<int>();
+                long bytes = 0;
+                for (; next < toScan.Count; next++)
+                {
+                    var range = ctx.Ranges[toScan[next]];
+                    long cost = range.Length;
+                    if (columns.Count > 0)
+                    {
+                        var previous = ctx.Ranges[columns[^1]];
+                        long gap = range.Offset - (previous.Offset + previous.Length);
+                        if (gap > 0 && gap <= s_scanGapBytes)
+                            cost += gap;
+                        if (bytes + cost > budget || columns.Count >= BatchPageWindow.MaxRangesPerWindow)
+                            break;
+                    }
+
+                    columns.Add(toScan[next]);
+                    bytes += cost;
+                }
+
+                if (columns.Count == 0)
+                    break;
+
+                var buffers = await _file.ReadRangesAsync(columns.ConvertAll(i => ctx.Ranges[i]), cancellationToken)
+                    .ConfigureAwait(false);
+                for (int k = 0; k < columns.Count; k++)
+                {
+                    int i = columns[k];
+                    var buffer = buffers[k];
+                    try
+                    {
+                        pageMaps[i] = PageMapBuilder.Build(
+                            buffer.Memory.Span,
+                            ctx.Columns[i],
+                            ctx.Chunks[i].MetaData!,
+                            _options.PageChecksumValidation,
+                            _options.MaxPageUncompressedSize);
+                    }
+                    catch
+                    {
+                        for (int j = k; j < columns.Count; j++)
+                            buffers[j].Dispose();
+                        throw;
+                    }
+
+                    if (heldBytes + buffer.Memory.Length <= budget)
+                    {
+                        held[i] = buffer;
+                        heldBytes += buffer.Memory.Length;
+                    }
+                    else
+                    {
+                        buffer.Dispose();
+                    }
+                }
+            }
+        }
+        catch
+        {
+            foreach (var buffer in held)
+                buffer?.Dispose();
+            throw;
         }
 
-        return pageMaps!;
+        return ((ColumnPageMap[])pageMaps!, held);
     }
 
     /// <summary>

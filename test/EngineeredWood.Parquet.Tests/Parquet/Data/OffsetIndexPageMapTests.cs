@@ -77,7 +77,10 @@ public class OffsetIndexPageMapTests : IDisposable
 
     /// <summary>
     /// The point of the change: with an OffsetIndex, no read fetches a whole chunk's data pages to
-    /// find them. Without one, the header scan does exactly that.
+    /// find them. Without one, the header scan does exactly that, but once: the batches decode from
+    /// the chunks it read rather than fetching their pages again (#625), so the read asks for about
+    /// what the file holds (a dictionary chunk's read runs 100 bytes past it, PARQUET-816), where
+    /// reading the pages again asked for about twice that.
     /// </summary>
     [Fact]
     public async Task WithAnIndex_TheDataPagesAreNotReadWhole()
@@ -85,12 +88,13 @@ public class OffsetIndexPageMapTests : IDisposable
         string indexed = await WriteAsync(DataPageVersion.V2, CompressionCodec.Snappy, true, ByteArrayEncoding.DeltaLengthByteArray, writePageIndex: true);
         string plain = await WriteAsync(DataPageVersion.V2, CompressionCodec.Snappy, true, ByteArrayEncoding.DeltaLengthByteArray, writePageIndex: false);
 
-        var (indexedWhole, indexedBytes) = await CountWholeChunkReadsAsync(indexed);
+        var (indexedWhole, _) = await CountWholeChunkReadsAsync(indexed);
         var (plainWhole, plainBytes) = await CountWholeChunkReadsAsync(plain);
 
         Assert.Equal(0, indexedWhole);
         Assert.Equal(4, plainWhole);
-        Assert.True(indexedBytes < plainBytes, $"indexed read {indexedBytes} bytes, header scan {plainBytes}");
+        long fileLength = new FileInfo(plain).Length;
+        Assert.True(plainBytes < fileLength * 11 / 10, $"the header-scanned read asked for {plainBytes} bytes of a {fileLength}-byte file");
     }
 
     /// <summary>

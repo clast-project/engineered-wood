@@ -525,6 +525,185 @@ public class PageIndexRowRangeReadTests : IDisposable
         });
     }
 
+    // ───── Header-scanned page maps (#625) ─────
+
+    /// <summary>
+    /// Without an OffsetIndex, a read of many batches reads every chunk in one request to scan its headers,
+    /// then decodes the batches from those chunks: one request, not one per column, and each byte once.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NoPageIndex_ManyBatches_ReadTheChunksOnceInOneRequest(bool ranged)
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            WritePageIndex = false,
+            DataPageRowCountLimit = 250,
+        });
+        RowRange[] ranges = [.. Enumerable.Range(0, 10).Select(k => new RowRange(k * 500 + 10, k * 500 + 260))];
+
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true,
+            ranged ? ParquetReadOptions.Default : new ParquetReadOptions { BatchSize = 97 });
+        var metadata = await reader.ReadMetadataAsync();
+        int before = counting.Requests.Count;
+        long bytesBefore = counting.Bytes;
+
+        await foreach (var batch in ranged ? reader.ReadRowRangesAsync(0, ranges) : reader.ReadRowGroupBatchesAsync(0))
+            batch.Dispose();
+
+        var columns = metadata.RowGroups[0].Columns;
+        Assert.Equal([columns.Count], counting.Requests.Skip(before));
+        long chunkBytes = columns.Sum(c => c.MetaData!.TotalCompressedSize);
+        long read = counting.Bytes - bytesBefore;
+        Assert.True(read < chunkBytes * 11 / 10, $"read {read:N0} bytes of {chunkBytes:N0} in the chunks");
+    }
+
+    /// <summary>
+    /// A budget smaller than the chunks splits the scan into several requests, and the chunks past it are let
+    /// go once scanned, their pages fetched by the windows: the rows are the same however the budget falls,
+    /// for ranges, row and byte batch limits.
+    /// </summary>
+    /// <param name="parts">The budget as a fraction of the row group's bytes; 0 for a budget of one byte, -1
+    /// for the default, which holds the whole row group here.</param>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(3)]
+    [InlineData(-1)]
+    public async Task NoPageIndex_ScanBudget_RowsUnchanged(int parts)
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            WritePageIndex = false,
+            DataPageRowCountLimit = 250,
+        });
+        long budget = parts < 0 ? ParquetFileReader.DefaultHeaderScanBudgetBytes : 1;
+        int columns;
+        using (var probe = Open(path))
+        {
+            var metadata = await probe.ReadMetadataAsync();
+            columns = metadata.RowGroups[0].Columns.Count;
+            if (parts > 0)
+                budget = metadata.RowGroups[0].Columns.Sum(c => c.MetaData!.TotalCompressedSize) / parts;
+        }
+
+        var expected = await FullRowsAsync(path, 0);
+        foreach (var ranges in RangeSets(Rows))
+        {
+            await AssertRangeReadAsync(path, ParquetReadOptions.Default, 0, ranges, expected, batchSize: null, headerScanBudget: budget);
+            await AssertRangeReadAsync(path, new ParquetReadOptions { BatchSize = 97 }, 0, ranges, expected, batchSize: 97, headerScanBudget: budget);
+            await AssertRangeReadAsync(path, new ParquetReadOptions { MaxBatchByteSize = 4096 }, 0, ranges, expected, batchSize: null, headerScanBudget: budget);
+        }
+
+        // The scan's own requests: one per chunk with a one-byte budget, as before #625; one in all when
+        // the budget holds the row group.
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true, new ParquetReadOptions { BatchSize = 97 });
+        reader.HeaderScanBudgetBytes = budget;
+        await reader.ReadMetadataAsync();
+        int before = counting.Requests.Count;
+        await foreach (var batch in reader.ReadRowGroupBatchesAsync(0))
+            batch.Dispose();
+        var requests = counting.Requests.Skip(before).ToList();
+        _output.WriteLine($"budget {budget:N0}: requests of {string.Join(", ", requests)} ranges");
+        if (parts == 0)
+            Assert.Equal(columns, requests.TakeWhile(r => r == 1).Count());
+        else if (parts < 0)
+            Assert.Equal([columns], requests);
+    }
+
+    /// <summary>
+    /// A wide row group's scan is cut at <see cref="BatchPageWindow.MaxRangesPerWindow"/> chunks a request,
+    /// so a coalescing reader never issues more GETs at once than a page window would.
+    /// </summary>
+    [Fact]
+    public async Task NoPageIndex_WideRowGroup_ScanRequestsAreCappedInRanges()
+    {
+        const int columns = 100, rows = 1000;
+        var schema = new Apache.Arrow.Schema.Builder();
+        var arrays = new List<IArrowArray>();
+        for (int c = 0; c < columns; c++)
+        {
+            schema.Field(new Field("c" + c, Int32Type.Default, false));
+            var builder = new Int32Array.Builder();
+            for (int r = 0; r < rows; r++)
+                builder.Append(r * columns + c);
+            arrays.Add(builder.Build());
+        }
+
+        string path = await WriteAsync(new RecordBatch(schema.Build(), arrays, rows),
+            ParquetWriteOptions.Default with { WritePageIndex = false, DataPageRowCountLimit = 100 });
+
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true, new ParquetReadOptions { BatchSize = 97 });
+        await reader.ReadMetadataAsync();
+        int before = counting.Requests.Count;
+        long read = 0, sum = 0;
+        await foreach (var batch in reader.ReadRowGroupBatchesAsync(0))
+        {
+            read += batch.Length;
+            var last = (Int32Array)batch.Column(columns - 1);
+            for (int i = 0; i < last.Length; i++)
+                sum += last.GetValue(i)!.Value;
+            batch.Dispose();
+        }
+
+        var requests = counting.Requests.Skip(before).ToList();
+        _output.WriteLine($"requests of {string.Join(", ", requests)} ranges");
+        Assert.Equal([BatchPageWindow.MaxRangesPerWindow, columns - BatchPageWindow.MaxRangesPerWindow], requests.Take(2));
+        Assert.All(requests, count => Assert.True(count <= BatchPageWindow.MaxRangesPerWindow, $"a request of {count} ranges"));
+        Assert.Equal(rows, read);
+        Assert.Equal(Enumerable.Range(0, rows).Sum(r => (long)r * columns + columns - 1), sum);
+    }
+
+    /// <summary>
+    /// A projection's chunks are separated by the unprojected ones, which a coalescing reader fetches with
+    /// them: those gaps count toward the scan budget, so a budget that holds the projected chunks alone
+    /// takes more than one request, none of whose coalesced span exceeds it. The same when the projection
+    /// names the columns in reverse: the gaps are those of file order, in which the coalescer merges.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NoPageIndex_ScanBudget_CountsTheGapsBetweenChunks(bool reversed)
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            WritePageIndex = false,
+            DataPageRowCountLimit = 250,
+        });
+        string[] projected = ["sorted", "low", "doubles", "times"];
+        if (reversed)
+            System.Array.Reverse(projected);
+
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true, new ParquetReadOptions { BatchSize = 97 });
+        var metadata = await reader.ReadMetadataAsync();
+        long budget = metadata.RowGroups[0].Columns
+            .Where(c => projected.Contains(c.MetaData!.PathInSchema[0]))
+            .Sum(c => c.MetaData!.TotalCompressedSize);
+        reader.HeaderScanBudgetBytes = budget;
+        int before = counting.Requests.Count;
+        long read = 0, sum = 0;
+        await foreach (var batch in reader.ReadRowGroupBatchesAsync(0, projected))
+        {
+            read += batch.Length;
+            var sorted = (Int64Array)batch.Column("sorted");
+            for (int i = 0; i < sorted.Length; i++)
+                sum += sorted.GetValue(i)!.Value;
+            batch.Dispose();
+        }
+
+        var first = counting.RequestRanges[before].OrderBy(r => r.Offset).ToList();
+        long span = first[^1].Offset + first[^1].Length - first[0].Offset;
+        _output.WriteLine($"budget {budget:N0}: first request of {first.Count} chunks spanning {span:N0} bytes");
+        Assert.InRange(first.Count, 1, projected.Length - 1);
+        Assert.True(first.Count == 1 || span <= budget, $"a request spanning {span:N0} bytes");
+        Assert.Equal(Rows, read);
+        Assert.Equal((long)Rows * (Rows - 1) / 2, sum);
+    }
+
     // ───── One request for many batches (#622) ─────
 
     /// <summary>
@@ -758,12 +937,14 @@ public class PageIndexRowRangeReadTests : IDisposable
 
     private async Task AssertRangeReadAsync(
         string path, ParquetReadOptions options, int rowGroup, IReadOnlyList<RowRange> ranges, List<string> expected, int? batchSize,
-        long? windowBudget = null)
+        long? windowBudget = null, long? headerScanBudget = null)
     {
         await using var input = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(input, ownsFile: false, options);
         if (windowBudget is { } budget)
             reader.BatchPageWindowBudgetBytes = budget;
+        if (headerScanBudget is { } scanBudget)
+            reader.HeaderScanBudgetBytes = scanBudget;
 
         var actual = new List<string>();
         int range = 0;

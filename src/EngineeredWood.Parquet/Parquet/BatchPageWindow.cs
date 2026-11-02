@@ -112,6 +112,8 @@ internal sealed class BatchPageWindow : IDisposable
     /// <param name="endRows">Where each column's decoded rows end now. Not changed.</param>
     /// <param name="nextPages">The page after each column's decoded rows now. Not changed.</param>
     /// <param name="batchRows">The rows of the batch starting at a row, given the end of its span.</param>
+    /// <param name="heldColumns">The columns whose chunks the caller already holds whole, which the window asks
+    /// nothing for; null for none.</param>
     public static async ValueTask<BatchPageWindow> ReadAsync(
         IRandomAccessFile file,
         ColumnPageMap[] pageMaps,
@@ -123,6 +125,7 @@ internal sealed class BatchPageWindow : IDisposable
         int[] nextPages,
         Func<int, int, int> batchRows,
         long budgetBytes,
+        bool[]? heldColumns,
         CancellationToken cancellationToken)
     {
         int columns = pageMaps.Length;
@@ -163,7 +166,7 @@ internal sealed class BatchPageWindow : IDisposable
                 var map = pageMaps[i];
                 planned[i] = PagesToDecode(map, Math.Max(endRows[i], start), nextPages[i], start, end);
                 var (first, last) = planned[i];
-                if (first < 0)
+                if (first < 0 || heldColumns?[i] == true)
                     continue;
 
                 var columnRuns = runs[i];
@@ -200,6 +203,12 @@ internal sealed class BatchPageWindow : IDisposable
                     continue;
                 }
 
+                // A column whose chunk the caller holds asks for nothing, but its decoded rows move on.
+                endRows[i] = pageMaps[i].CumulativeRows[last + 1];
+                nextPages[i] = last + 1;
+                if (heldColumns?[i] == true)
+                    continue;
+
                 var columnRuns = runs[i];
                 if (columnRuns.Count > 0 && first <= columnRuns[^1].Last + 1)
                 {
@@ -210,9 +219,6 @@ internal sealed class BatchPageWindow : IDisposable
                 {
                     columnRuns.Add((first, last));
                 }
-
-                endRows[i] = pageMaps[i].CumulativeRows[last + 1];
-                nextPages[i] = last + 1;
             }
 
             bytes += added;
