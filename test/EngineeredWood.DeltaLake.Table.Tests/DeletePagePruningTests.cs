@@ -17,9 +17,10 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// A predicate DELETE prunes the row groups and pages of a file it opens, as a filtered scan does (#439).
 /// Every table here starts as ONE file of 300 rows, <c>id</c> 0..299 in row groups of 100 and pages of 10,
 /// so row position equals <c>id</c>. The oracle is the same table deleted through the functional overload,
-/// which has nothing to prune by and reads every row: the two must leave the same rows, the same deletion
-/// vector and the same change rows. A byte count of the data-file reads shows the predicate's read was
-/// actually narrowed, without which every comparison would pass trivially.
+/// which has nothing to prune by and reads every row, except in row groups an existing vector deletes in full,
+/// which no read opens (#618): the two must leave the same rows, the same deletion vector and the same change
+/// rows. A byte count of the data-file reads shows the predicate's read was actually narrowed, without which
+/// every comparison would pass trivially.
 /// </summary>
 public class DeletePagePruningTests : IDisposable
 {
@@ -303,7 +304,11 @@ public class DeletePagePruningTests : IDisposable
         Assert.Empty(pruned.Table.CurrentSnapshot.ActiveFiles);
         Assert.Equal(2 * RowsPerPage, pruned.Deleted);
         await AssertSameOutcomeAsync(pruned, oracle);
-        AssertNarrowed(pruned, oracle);
+
+        // Not AssertNarrowed's third: the vector deletes row groups 1 and 2 in full, so the oracle skips them too
+        // (#618) and reads only group 0. The predicate's read must still be narrower: two pages of that group.
+        Assert.True(pruned.BytesRead < oracle.BytesRead,
+            $"pruned read {pruned.BytesRead} bytes, the oracle {oracle.BytesRead}");
     }
 
     /// <summary>The change file gets the deleted rows with the ids a whole-file read gives them.</summary>
