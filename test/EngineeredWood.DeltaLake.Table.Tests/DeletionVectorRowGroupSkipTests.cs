@@ -176,6 +176,7 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
             Metadata = DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking,
         }))
         {
+            using var owned = batch;
             var id = (Int64Array)batch.Column("id");
             var index = (Int64Array)batch.Column(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIndexSuffix);
             var rowId = (Int64Array)batch.Column(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIdSuffix);

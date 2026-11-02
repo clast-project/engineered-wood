@@ -136,7 +136,11 @@ public class RowGroupSkipBenchmarks
     {
         long rows = 0;
         await foreach (var batch in table.ReadAsync(_options))
+        {
+            // The batches own their Arrow buffers: release them here, not in a finalizer later in the run.
             rows += batch.Length;
+            batch.Dispose();
+        }
         return rows;
     }
 
