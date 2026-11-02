@@ -89,12 +89,12 @@ means EW is faster.
 | Operation | EW | delta-dotnet | DD/EW ratio (EW-written / DD-written) |
 |---|---|---|---|
 | Full scan, 1M rows | 17.2 / 21.7 ms | DataFusion 42.9 / 64.1 ms; kernel 90 / 111 ms | 2.5 / 3.0 (DataFusion); 5.2 / 5.1 (kernel) |
-| Filtered scan, 1 file of 20 (`Selective`) | 4.7 / 5.0 ms | 9.9 / 11.9 ms | 2.1 / 2.4 |
-| Filtered scan, 1 row in 16 (`OneCategory`) | 23.4 / 27.6 ms (prune only: 13.4 / 18.2 ms) | 20.8 / 23.1 ms | **0.89 / 0.84** |
-| Open latest, 100 commits, no checkpoint | 18.2 / 17.8 ms | 43.7 / 62.4 ms | 2.4 / 3.5 |
-| Open latest, 100 commits, checkpointed | 8.6 / 6.9 ms | 5.4 / 7.7 ms | **0.63** / 1.11 |
-| Open at version 50, no checkpoint / checkpointed | 27–28 / 16–18 ms | 31–39 / 30–40 ms | 1.1–1.4 / 1.7–2.5 |
-| History, no checkpoint / checkpointed | 33 / 22–23 ms | 40–48 / 17 ms | 1.2–1.5 / **0.73–0.75** |
+| Filtered scan, 1 file of 20 (`Selective`) † | 1.5 / 2.0 ms | 8.9 / 10.5 ms | 6.1 / 5.3 |
+| Filtered scan, 1 row in 16 (`OneCategory`) † | 14.9 / 17.8 ms (prune only: 8.3 / 13.2 ms) | 17.8 / 22.8 ms | 1.19 / 1.28 |
+| Open latest, 100 commits, no checkpoint † | 10.8 / 12.7 ms | 38.9 / 63.1 ms | 3.6 / 5.0 |
+| Open latest, 100 commits, checkpointed † | 1.2 / 1.0 ms | 5.4 / 7.6 ms | 4.4 / 7.9 |
+| Open at version 50, no checkpoint / checkpointed † | 17–18 / 7.0–7.4 ms | 30–39 / 31–45 ms | 1.8–2.1 / 4.4–6.0 |
+| History, no checkpoint / checkpointed † | 22–24 / 12–13 ms | 40–48 / 19 ms | 1.9–2.0 / 1.4–1.6 |
 | Change data feed | 32 / 47 ms | 159 / 182 ms | 4.9 / 3.9 |
 | Create + write 1M rows | 179 ms (min 133, noisy) | 202 ms (default) / 178 ms (64K batches) | 1.13 / **1.00** |
 | Open + append 10K rows, no checkpoint / checkpointed | 30–38 / 18–25 ms | 56–66 / 25–29 ms | 1.8 / 1.2–1.3 |
@@ -110,6 +110,14 @@ means EW is faster.
 | Compact 100 small files | 279 / 253 ms | 474 / 472 ms | 1.7 / 1.9 |
 | Vacuum 100 removed files | 60 / 48 ms | Full 128 / 112 ms; Lite 115 / 103 ms | 2.1 / 2.3 (Full) |
 
+† Re-measured after two changes, on the same machine and fixtures:
+- **The local log listing stopped reading each file's metadata twice.** `LocalTableFileSystem.ListAsync` built a
+  `FileInfo` from each path, which on Windows is a second file-system call for a length and a time the directory
+  enumeration had already returned. A 100-commit `_delta_log` holds about 200 files (commits and `.crc` files), so
+  the second call cost about 7 ms per open. Every EW row that opens a table gains; only these rows were re-run.
+- **The filtered scans pick rows with `ArrowCompute.SelectedIndices`**, which reads the predicate's mask a 64-bit word
+  at a time, instead of calling `GetValue` per row. A host gets the same from `ArrowCompute.Filter(batch, mask)`.
+
 Compared with the 2026-10-31 run:
 
 - **New rows:** MERGE (#563), replaceWhere (#566), ADD CONSTRAINT (#565) and RESTORE (#567). EW's MERGE is about
@@ -122,17 +130,19 @@ Compared with the 2026-10-31 run:
 - **Log replay without a checkpoint is about 60% slower for EW in absolute terms than on 10-31** (open latest
   11 to 18 ms, history 19 to 33 ms), and delta-dotnet is 20–25% slower. The code did not cause it. The same
   benchmarks at efda508c (the 10-31 code) measure the same on the same fixtures, and the delta-dotnet-written
-  fixtures were not rebuilt. The machine did, so compare the ratios between runs, not the times.
+  fixtures were not rebuilt. The machine did, so compare the ratios between runs, not the times. (The † rows
+  have since dropped below the 10-31 times: see the note under the table.)
 - **Single-shot mutations are noisy for EW.** Each iteration is one invocation, and EW's means carry GC pauses
   (the managed heap) that delta-rs does not have. The min is printed where it differs much from the mean.
 
 Where delta-dotnet wins or draws, the cause is known for some cases and suspected for the rest:
 
-- **Non-selective filtered scans.** Row-level predicate evaluation was EW's bottleneck until #560 (87 ms, about
-  100 ns/row, for `category = 'cat_03'` over 1M rows; now 2.4 ms). What remains is the scan itself: EW's prune-only
-  read is 13–18 ms, and DataFusion's parallel scan does the whole query in 21–23 ms.
-- **Opening a checkpointed table, and history on one:** delta-kernel-rs is up to 1.6× faster at reading a small
-  checkpoint.
+- **Opening a checkpointed table was the listing, not the checkpoint.** An earlier version of this README credited
+  delta-kernel-rs with reading a small checkpoint faster. The profile found the time in listing `_delta_log`
+  instead (see †), and EW now opens a checkpointed table 4–8× faster than delta-dotnet.
+- **Non-selective filtered scans are now EW's, narrowly.** Predicate evaluation was EW's bottleneck until #560.
+  What remains is that EW reads a table's files one after another while DataFusion reads them in parallel; a
+  prototype that keeps four files in flight halved the read.
 - **Full-file rewrites** (copy-on-write DELETE, UPDATE, one-category replaceWhere): close to level. Both engines
   read and rewrite the one 1M-row file.
 - **Write:** level with delta-dotnet's 64K-batch setting, but EW allocates about 322 MB of managed memory for 1M rows

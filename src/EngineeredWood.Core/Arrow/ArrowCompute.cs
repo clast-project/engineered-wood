@@ -164,6 +164,133 @@ public static class ArrowCompute
 #endif
 
     /// <summary>
+    /// The positions of the rows <paramref name="mask"/> selects, in ascending order: those whose value is
+    /// true. A null selects nothing, as a SQL <c>WHERE</c> treats an unknown condition.
+    /// </summary>
+    /// <remarks>
+    /// Reads the mask's bitmaps a 64-bit word at a time and visits only the set bits, which is several times
+    /// faster than testing <see cref="BooleanArray.GetValue"/> row by row. The result is sized exactly.
+    /// </remarks>
+    public static int[] SelectedIndices(BooleanArray mask)
+    {
+        if (mask is null)
+            throw new ArgumentNullException(nameof(mask));
+
+        var indices = SelectedIndicesCore(mask);
+        GC.KeepAlive(mask); // spans over its buffers are read above; see Take
+        return indices;
+    }
+
+    private static int[] SelectedIndicesCore(BooleanArray mask)
+    {
+        int length = mask.Length;
+        if (length == 0)
+            return [];
+
+        int offset = mask.Offset;
+        var values = mask.ValueBuffer.Span;
+        var validity = mask.NullCount != 0 ? mask.NullBitmapBuffer.Span : default;
+        bool hasNulls = !validity.IsEmpty;
+
+        if ((offset & 7) != 0)
+        {
+            // A slice that starts inside a byte. Rare (a sliced mask); not worth a shifting word loop.
+            var slow = new List<int>();
+            for (int i = 0; i < length; i++)
+            {
+                if (mask.GetValue(i) == true)
+                    slow.Add(i);
+            }
+            return slow.ToArray();
+        }
+
+        values = values.Slice(offset >> 3);
+        if (hasNulls)
+            validity = validity.Slice(offset >> 3);
+
+        int words = length >> 6;
+        int count = 0;
+        for (int w = 0; w < words; w++)
+            count += PopCount(Word(values, validity, hasNulls, w));
+        for (int i = words << 6; i < length; i++)
+        {
+            if (Bit(values, validity, hasNulls, i))
+                count++;
+        }
+
+        var result = new int[count];
+        int n = 0;
+        for (int w = 0; w < words; w++)
+        {
+            ulong bits = Word(values, validity, hasNulls, w);
+            int baseIndex = w << 6;
+            while (bits != 0)
+            {
+                result[n++] = baseIndex + TrailingZeroCount(bits);
+                bits &= bits - 1;
+            }
+        }
+        for (int i = words << 6; i < length; i++)
+        {
+            if (Bit(values, validity, hasNulls, i))
+                result[n++] = i;
+        }
+
+        return result;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static ulong Word(ReadOnlySpan<byte> values, ReadOnlySpan<byte> validity, bool hasNulls, int word)
+    {
+        ulong bits = BinaryPrimitives.ReadUInt64LittleEndian(values.Slice(word << 3, 8));
+        if (hasNulls)
+            bits &= BinaryPrimitives.ReadUInt64LittleEndian(validity.Slice(word << 3, 8));
+        return bits;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool Bit(ReadOnlySpan<byte> values, ReadOnlySpan<byte> validity, bool hasNulls, int i) =>
+        (values[i >> 3] & (1 << (i & 7))) != 0
+        && (!hasNulls || (validity[i >> 3] & (1 << (i & 7))) != 0);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int PopCount(ulong value)
+    {
+#if NETCOREAPP3_0_OR_GREATER
+        return System.Numerics.BitOperations.PopCount(value);
+#else
+        // netstandard2.0's BitOperations (from a polyfill package) has no PopCount: the SWAR count.
+        value -= (value >> 1) & 0x5555555555555555UL;
+        value = (value & 0x3333333333333333UL) + ((value >> 2) & 0x3333333333333333UL);
+        value = (value + (value >> 4)) & 0x0F0F0F0F0F0F0F0FUL;
+        return (int)((value * 0x0101010101010101UL) >> 56);
+#endif
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int TrailingZeroCount(ulong value) => System.Numerics.BitOperations.TrailingZeroCount(value);
+
+    /// <summary>
+    /// The rows of <paramref name="batch"/> that <paramref name="mask"/> selects, in order: what a SQL
+    /// <c>WHERE</c> keeps. A null in the mask drops its row. The result declares the batch's own schema.
+    /// </summary>
+    /// <exception cref="ArgumentException">The mask is not as long as the batch.</exception>
+    public static RecordBatch Filter(RecordBatch batch, BooleanArray mask)
+    {
+        if (batch is null)
+            throw new ArgumentNullException(nameof(batch));
+        if (mask is null)
+            throw new ArgumentNullException(nameof(mask));
+        if (mask.Length != batch.Length)
+        {
+            throw new ArgumentException(
+                $"The mask has {mask.Length} rows and the batch {batch.Length}.", nameof(mask));
+        }
+
+        return Take(batch, batch.Schema, SelectedIndices(mask));
+    }
+
+    /// <summary>
     /// Joins arrays of one type end to end. Use this in place of Apache.Arrow's
     /// <see cref="ArrowArrayConcatenator"/>, which refuses types EngineeredWood reads every day.
     /// </summary>

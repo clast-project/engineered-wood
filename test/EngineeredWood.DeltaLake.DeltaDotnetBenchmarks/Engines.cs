@@ -96,15 +96,9 @@ internal static class Ew
                 continue;
             }
 
-            var indices = new List<int>();
+            int[] indices;
             using (var mask = Evaluator.EvaluatePredicate(predicate, batch))
-            {
-                for (int i = 0; i < mask.Length; i++)
-                {
-                    if (mask.GetValue(i) == true)
-                        indices.Add(i);
-                }
-            }
+                indices = ArrowCompute.SelectedIndices(mask);
 
             // Gather only the projected columns: the predicate's own column was read to evaluate the filter,
             // but the query does not return it, and the SQL engine does not materialize it either.
