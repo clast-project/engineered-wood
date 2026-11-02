@@ -17,9 +17,10 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// A predicate DELETE prunes the row groups and pages of a file it opens, as a filtered scan does (#439).
 /// Every table here starts as ONE file of 300 rows, <c>id</c> 0..299 in row groups of 100 and pages of 10,
 /// so row position equals <c>id</c>. The oracle is the same table deleted through the functional overload,
-/// which has nothing to prune by and reads every row (bar row groups an existing vector deletes in full, which
-/// no read opens, #618): the two must leave the same rows, the same deletion vector and the same change rows. A byte count of the data-file reads shows the predicate's read was
-/// actually narrowed, without which every comparison would pass trivially.
+/// which has nothing to prune by and reads every row, except in row groups an existing vector deletes in full,
+/// which no read opens (#618): the two must leave the same rows, the same deletion vector and the same change
+/// rows. A byte count of the data-file reads shows the predicate's read was actually narrowed, without which
+/// every comparison would pass trivially.
 /// </summary>
 public class DeletePagePruningTests : IDisposable
 {

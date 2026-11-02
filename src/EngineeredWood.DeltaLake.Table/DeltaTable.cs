@@ -11265,7 +11265,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // decoded and needs no reservation.
             long start = groupStart;
             groupStart += rowGroup.NumRows;
-            if (deletedRows is not null && rowGroup.NumRows > 0 && deletedRows.ContainsRange(start, rowGroup.NumRows))
+            if (deletedRows is { IsEmpty: false } && rowGroup.NumRows > 0 && deletedRows.ContainsRange(start, rowGroup.NumRows))
                 continue;
 
             long bytes = 0;
