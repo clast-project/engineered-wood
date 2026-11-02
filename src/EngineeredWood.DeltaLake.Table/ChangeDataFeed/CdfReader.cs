@@ -324,6 +324,20 @@ internal static class CdfReader
                 ? this
                 : new(await dvReader.ReadAsync(Unread, cancellationToken).ConfigureAwait(false), false);
 
+        /// <summary>
+        /// The row groups a read can skip unread, since the filter keeps none of their rows: those the vector deletes
+        /// in full when it excludes, those holding none of its positions when it keeps only them. Null when nothing
+        /// can be skipped (no positions to exclude).
+        /// </summary>
+        public RowSkipPredicate? SkipRows => Positions switch
+        {
+            null => null,
+            { IsEmpty: true } => KeepOnlyPositions ? (_, _) => true : null,
+            var positions => KeepOnlyPositions
+                ? (start, rows) => !positions.Intersects(start, rows)
+                : positions.ContainsRange,
+        };
+
         /// <summary>The batch-relative indices, ascending, of the rows of [<paramref name="start"/>,
         /// <paramref name="start"/> + <paramref name="rows"/>) the filter keeps.</summary>
         public List<int> Selected(long start, int rows)
@@ -388,15 +402,13 @@ internal static class CdfReader
             .ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
 
-        // DV positions are absolute within the file, and batches arrive in file order. The running offset is
-        // also what a row's positional id is derived from, so it advances on every batch, not only when a
-        // deletion vector made it necessary.
-        long batchStartRow = 0;
-        await foreach (var rawBatch in reader.ReadAllAsync(
-            cancellationToken: cancellationToken).ConfigureAwait(false))
+        // DV positions are absolute within the file, and so is a row's positional id: each batch's first row comes
+        // from the reader, which counts the row groups the filter lets it skip unread (#618).
+        await foreach (var positioned in reader.ReadWithPositionsAsync(
+            null, null, filter.SkipRows, cancellationToken).ConfigureAwait(false))
         {
-            long thisBatchStart = batchStartRow;
-            batchStartRow += rawBatch.Length;
+            var rawBatch = positioned.Batch;
+            long thisBatchStart = positioned.FirstRow;
 
             // Hidden row-tracking columns off first — a data file carries them for every row a rewrite moved,
             // and they are indexed by RAW position, so they must be captured before the DV filter renumbers.

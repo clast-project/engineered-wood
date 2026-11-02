@@ -3,6 +3,8 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.Expressions;
 using EngineeredWood.IO.Local;
@@ -12,7 +14,9 @@ using Ex = EngineeredWood.Expressions.Expressions;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// A scan or a predicate DELETE skips, unread, the row groups a file's deletion vector deletes in full (#618).
+/// A scan, a predicate DELETE, OPTIMIZE and an inferred change feed skip, unread, the row groups of a file none
+/// of their rows can come from: those a deletion vector deletes in full, and for the feed of a vector edit, those
+/// the edit does not touch (#618).
 /// Every table here is ONE file of 500 rows, <c>id</c> 0..499 in row groups of 100, so a row's position, its
 /// <c>id</c> and (row tracking on, base row id 0) its row id are all the same number. The vector is set up by
 /// the functional DELETE, which reads every row. The oracle is that identity: whatever is skipped, each row read
@@ -123,8 +127,7 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
 
             Assert.Equal(300, skippedDeleted); // 200..499: 150..199 were already gone
             Assert.Equal(300, readDeleted);    // 200..499, and 100 itself is below 150
-            Assert.True(skippedFs.DataBytesRead < readFs.DataBytesRead,
-                $"skipped read {skippedFs.DataBytesRead} bytes, the unskipped one {readFs.DataBytesRead}");
+            AssertFewerBytes(skippedFs, readFs);
 
             Assert.Equal(Enumerable.Range(0, 100).Select(i => (long)i), await ReadAsync(skipped, filter: null));
             Assert.Equal(new long[] { 100 }.Concat(Enumerable.Range(0, 100).Select(i => (long)i)).OrderBy(v => v),
@@ -132,13 +135,112 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// OPTIMIZE skips the groups a source's vector deletes in full: the compacted file holds exactly the
+    /// survivors, each with the row id it had, and the rewrite reads fewer bytes than one over a vector a row
+    /// short of each group.
+    /// </summary>
+    [Fact]
+    public async Task OptimizeSkipsTheGroupAndKeepsEachSurvivorsRowId()
+    {
+        var (skipped, skippedFs) = await CreateAsync("skipped", 100, 300);
+        var (read, readFs) = await CreateAsync("read", 101, 300);
+        await using (skipped)
+        await using (read)
+        {
+            foreach (var table in new[] { skipped, read })
+            {
+                await table.WriteAsync([Batch(Rows, 10)]); // a second small file, so the group has two to compact
+                Assert.Equal(2, table.CurrentSnapshot.ActiveFiles.Count);
+            }
+
+            skippedFs.Reset();
+            readFs.Reset();
+            Assert.NotNull(await skipped.CompactAsync());
+            Assert.NotNull(await read.CompactAsync());
+            AssertFewerBytes(skippedFs, readFs);
+
+            Assert.Null(Assert.Single(skipped.CurrentSnapshot.ActiveFiles).Value.DeletionVector);
+            var appended = Enumerable.Range(Rows, 10).Select(i => (long)i);
+            Assert.Equal(Survivors(100, 300).Concat(appended), await ReadAsync(skipped, filter: null, positionsAreIds: false));
+            Assert.Equal(Survivors(101, 300).Concat(appended), await ReadAsync(read, filter: null, positionsAreIds: false));
+        }
+    }
+
+    /// <summary>
+    /// The inferred feed of a vector edit with no change file reads only the groups holding the rows the edit
+    /// deleted: here one group of the four live ones (the old vector already deletes group 1 in full).
+    /// </summary>
+    [Fact]
+    public async Task AVectorEditsInferredFeedReadsOnlyTheGroupsItTouched()
+    {
+        var (table, fs) = await CreateAsync("t", 100, 200, cdf: true);
+        await using (table)
+        {
+            string path = Assert.Single(table.CurrentSnapshot.ActiveFiles).Value.Path;
+            var txn = table.StartTransaction();
+            await txn.StageRowDeletesAsync(RowSelection.ByPath(
+                new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal) { [path] = new long[] { 350, 351 } }));
+            long version = await txn.CommitAsync();
+            await AssertNoChangeFileAsync(fs, version);
+
+            fs.Reset();
+            await ReadAsync(table, filter: null);
+            long scanBytes = fs.DataBytesRead;
+
+            fs.Reset();
+            Assert.Equal(new[] { (350L, "delete"), (351L, "delete") }, await ReadFeedAsync(table, version));
+            Assert.True(fs.DataBytesRead * 2 < scanBytes, $"the feed read {fs.DataBytesRead} bytes, a scan {scanBytes}");
+        }
+    }
+
+    /// <summary>
+    /// The inferred feed of an overwrite reports the removed file's survivors as deleted, each with its row id,
+    /// skipping the groups the file's vector deletes in full.
+    /// </summary>
+    [Fact]
+    public async Task AnOverwritesInferredFeedSkipsTheRemovedFilesDeletedGroups()
+    {
+        var (skipped, skippedFs) = await CreateAsync("skipped", 100, 300, cdf: true);
+        var (read, readFs) = await CreateAsync("read", 101, 300, cdf: true);
+        await using (skipped)
+        await using (read)
+        {
+            long skippedVersion = await skipped.WriteAsync([Batch(Rows, 1)], DeltaWriteMode.Overwrite);
+            long readVersion = await read.WriteAsync([Batch(Rows, 1)], DeltaWriteMode.Overwrite);
+            await AssertNoChangeFileAsync(skippedFs, skippedVersion);
+
+            skippedFs.Reset();
+            readFs.Reset();
+            var skippedFeed = await ReadFeedAsync(skipped, skippedVersion);
+            var readFeed = await ReadFeedAsync(read, readVersion);
+
+            var expected = Survivors(100, 300).Select(id => (id, "delete"))
+                .Append(((long)Rows, "insert"))
+                .OrderBy(c => c.Item2, StringComparer.Ordinal).ThenBy(c => c.Item1);
+            Assert.Equal(expected, skippedFeed);
+            Assert.Equal(Survivors(101, 300).Count() + 1, readFeed.Count);
+            AssertFewerBytes(skippedFs, readFs);
+        }
+    }
+
     // ---- helpers -----------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// The skipping twin read at least 10% fewer data bytes. Not merely fewer: the payloads are random, so two
+    /// twins reading the same groups differ by a few bytes either way, and a bare comparison passes half the time
+    /// without any skip at all. A skipped group here is a fifth of the file.
+    /// </summary>
+    private static void AssertFewerBytes(DataFileCountingFileSystem skipped, DataFileCountingFileSystem read) =>
+        Assert.True(skipped.DataBytesRead * 10 < read.DataBytesRead * 9,
+            $"skipped read {skipped.DataBytesRead} bytes, the unskipped one {read.DataBytesRead}");
 
     private static IEnumerable<long> Survivors(int from, int to) =>
         Enumerable.Range(0, Rows).Where(i => i < from || i >= to).Select(i => (long)i);
 
     /// <summary>One file, row tracking on, with the rows [from, to) deleted by a vector.</summary>
-    private async Task<(DeltaTable Table, DataFileCountingFileSystem Fs)> CreateAsync(string name, int from, int to)
+    private async Task<(DeltaTable Table, DataFileCountingFileSystem Fs)> CreateAsync(
+        string name, int from, int to, bool cdf = false)
     {
         var fs = new DataFileCountingFileSystem(new LocalTableFileSystem(Path.Combine(_tempDir, name)));
         var table = await DeltaTable.CreateAsync(
@@ -152,8 +254,9 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
                 },
                 ParquetReadOptions = ParquetReadOptions.Default with { BatchSize = 32 },
             },
-            enableDeletionVectors: true, enableRowTracking: true);
-        await table.WriteAsync([Batch()]);
+            enableDeletionVectors: true, enableRowTracking: true,
+            configuration: cdf ? new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" } : null);
+        await table.WriteAsync([Batch(0, Rows)]);
         Assert.Single(table.CurrentSnapshot.ActiveFiles);
 
         var range = Ex.And(Ex.GreaterThanOrEqual("id", (long)from), Ex.LessThan("id", (long)to));
@@ -164,10 +267,11 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
     }
 
     /// <summary>
-    /// The ids read, after checking each row's absolute position and row id against its id (all three are the
-    /// row's position in the one file).
+    /// The ids read, after checking each row's row id, and its absolute position unless
+    /// <paramref name="positionsAreIds"/> is false, against its id (all three are the row's position in the one
+    /// file it was written to).
     /// </summary>
-    private static async Task<List<long>> ReadAsync(DeltaTable table, Predicate? filter)
+    private static async Task<List<long>> ReadAsync(DeltaTable table, Predicate? filter, bool positionsAreIds = true)
     {
         var ids = new List<long>();
         await foreach (var batch in table.ReadAsync(new DeltaReadOptions
@@ -183,7 +287,8 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
             for (int i = 0; i < batch.Length; i++)
             {
                 long v = id.GetValue(i)!.Value;
-                Assert.Equal(v, index.GetValue(i));
+                if (positionsAreIds)
+                    Assert.Equal(v, index.GetValue(i));
                 Assert.Equal(v, rowId.GetValue(i));
                 ids.Add(v);
             }
@@ -193,16 +298,45 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
         return ids;
     }
 
+    /// <summary>The feed of one version, as (id, change type), each row's row id checked against its id.</summary>
+    private static async Task<List<(long Id, string Type)>> ReadFeedAsync(DeltaTable table, long version)
+    {
+        var changes = new List<(long, string)>();
+        await foreach (var batch in table.ReadChangesAsync(new DeltaChangeReadOptions
+        {
+            StartVersion = version, EndVersion = version, Metadata = DeltaRowMetadata.RowTracking,
+        }))
+        {
+            using var owned = batch;
+            var ids = (Int64Array)batch.Column("id");
+            var types = (StringArray)batch.Column("_change_type");
+            var rowIds = (Int64Array)batch.Column(DeltaMetadataColumns.DefaultPrefix + DeltaMetadataColumns.RowIdSuffix);
+            for (int i = 0; i < batch.Length; i++)
+            {
+                Assert.Equal(ids.GetValue(i), rowIds.GetValue(i));
+                changes.Add((ids.GetValue(i)!.Value, types.GetString(i)!));
+            }
+        }
+        return changes.OrderBy(c => c.Item2, StringComparer.Ordinal).ThenBy(c => c.Item1).ToList();
+    }
+
+    /// <summary>A version with a change file is read from it, never inferred from its data files.</summary>
+    private static async Task AssertNoChangeFileAsync(DataFileCountingFileSystem fs, long version)
+    {
+        var actions = await new TransactionLog(fs).ReadCommitAsync(version);
+        Assert.DoesNotContain(actions, a => a is CdcFile);
+    }
+
     /// <summary>Distinct, poorly compressible payloads, so the data pages outweigh the footer and indexes.</summary>
-    private static RecordBatch Batch()
+    private static RecordBatch Batch(int start, int count)
     {
         var ids = new Int64Array.Builder();
         var payloads = new StringArray.Builder();
-        for (int i = 0; i < Rows; i++)
+        for (int i = start; i < start + count; i++)
         {
             ids.Append(i);
             payloads.Append(string.Concat(Enumerable.Range(0, 6).Select(k => Guid.NewGuid().ToString("N"))));
         }
-        return new RecordBatch(TableSchema, [ids.Build(), payloads.Build()], Rows);
+        return new RecordBatch(TableSchema, [ids.Build(), payloads.Build()], count);
     }
 }
