@@ -110,6 +110,15 @@ standing between a spec divergence and shipping it.
 | 2 — DuckDB | `pip install duckdb` (1.4+) | 2 | VARIANT parquet reads through an implementation that is not delta-kernel-rs. Sub-second. |
 | 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 68 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival, variant reads, V2 checkpoints, and Delta's OWN conflict checker driven through py4j (`ConflictSemanticsInteropTests`). ~90s to run. |
 
+Each tier runs under the `python` on PATH unless its override names another
+interpreter, so the oracles can live in a venv (one venv can carry all three):
+
+```
+$env:EW_DELTA_RS_PYTHON = "…\venv\Scripts\python.exe"   # tier 1; unset -> python on PATH
+$env:EW_DUCKDB_PYTHON   = "…\venv\Scripts\python.exe"   # tier 2 (see below)
+$env:EW_SPARK_PYTHON    = "…\venv\Scripts\python.exe"   # tier 3 (see below)
+```
+
 **The `[pyarrow]` extra is not optional.** `deltalake` 1.6 made pyarrow an extra,
 and the tier-1 driver reads through pyarrow — install the bare package and the
 tier does not skip, it FAILS, ~27 tests at once with
