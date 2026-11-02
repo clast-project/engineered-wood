@@ -9898,67 +9898,106 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                            addFile, null, snapshot, wantPositions: true, wantTracking, rowGroupFilter: null,
                            reservation, cancellationToken).ConfigureAwait(false))
         {
+            // Most batches of a file hold no selected row. Every one is released here rather than left to the
+            // finalizer: its native buffers would otherwise outlive the budget reservation that covered them.
+            // The metadata arrays are copied into new builders below, so they can always go.
             var batch = fb.Batch;
             var absPos = fb.Positions;
-            if (absPos is null)
-                continue;
-            var rows = new List<int>();
-            for (int i = 0; i < batch.Length; i++)
-                if (!absPos.IsNull(i) && targets.Contains(absPos.GetValue(i)!.Value))
-                    rows.Add(i);
-            if (rows.Count == 0)
-                continue;
+            bool releaseSource = true;
+            try
+            {
+                if (absPos is null)
+                    continue;
+                var rows = new List<int>();
+                for (int i = 0; i < batch.Length; i++)
+                    if (!absPos.IsNull(i) && targets.Contains(absPos.GetValue(i)!.Value))
+                        rows.Add(i);
+                if (rows.Count == 0)
+                    continue;
 
-            var taken = TakeRowsFromBatch(batch, rows);
-            if (metadataFields.Count == 0)
-            {
-                yield return taken;
-                continue;
-            }
-
-            // Built over the TAKEN rows, in the same flag order ReadCoreAsync uses — the columns describe
-            // what is yielded, not what was scanned, so `rows` indexes every builder below.
-            var columns = new List<IArrowArray>(metadataFields.Count);
-            if (wantAddress)
-            {
-                var b = new Int64Array.Builder().Reserve(rows.Count);
-                foreach (int i in rows)
-                    b.Append(TransientRowAddress.Pack(fileOrdinal, AbsoluteAt(absPos, i)));
-                columns.Add(b.Build());
-            }
-            if (wantLocator)
-            {
-                columns.Add(ArrowCompute.Repeat(
-                    Apache.Arrow.Types.StringType.Default, pathBytes!, rows.Count));
-                var b = new Int64Array.Builder().Reserve(rows.Count);
-                foreach (int i in rows)
-                    b.Append(AbsoluteAt(absPos, i));
-                columns.Add(b.Build());
-            }
-            if (wantTracking)
-            {
-                var matI = fb.RowIds;
-                var matV = fb.Versions;
-                var ib = new Int64Array.Builder().Reserve(rows.Count);
-                var vb = new Int64Array.Builder().Reserve(rows.Count);
-                foreach (int i in rows)
+                var taken = TakeRowsFromBatch(batch, rows);
+                // The source can go once its rows are copied out, unless a view column's taken array still
+                // points into the source's data buffers (Take shares those rather than copying them).
+                releaseSource = !TakeSharesBuffers(batch.Schema);
+                if (metadataFields.Count == 0)
                 {
-                    if (matI is not null && i < matI.Length && !matI.IsNull(i))
-                        ib.Append(matI.GetValue(i)!.Value);
-                    else
-                        ib.AppendNull();
-                    if (matV is not null && i < matV.Length && !matV.IsNull(i))
-                        vb.Append(matV.GetValue(i)!.Value);
-                    else
-                        vb.AppendNull();
+                    yield return taken;
+                    continue;
                 }
-                columns.Add(ib.Build());
-                columns.Add(vb.Build());
-            }
 
-            yield return AppendColumns(taken, metadataFields, columns);
+                // Built over the TAKEN rows, in the same flag order ReadCoreAsync uses — the columns describe
+                // what is yielded, not what was scanned, so `rows` indexes every builder below.
+                var columns = new List<IArrowArray>(metadataFields.Count);
+                if (wantAddress)
+                {
+                    var b = new Int64Array.Builder().Reserve(rows.Count);
+                    foreach (int i in rows)
+                        b.Append(TransientRowAddress.Pack(fileOrdinal, AbsoluteAt(absPos, i)));
+                    columns.Add(b.Build());
+                }
+                if (wantLocator)
+                {
+                    columns.Add(ArrowCompute.Repeat(
+                        Apache.Arrow.Types.StringType.Default, pathBytes!, rows.Count));
+                    var b = new Int64Array.Builder().Reserve(rows.Count);
+                    foreach (int i in rows)
+                        b.Append(AbsoluteAt(absPos, i));
+                    columns.Add(b.Build());
+                }
+                if (wantTracking)
+                {
+                    var matI = fb.RowIds;
+                    var matV = fb.Versions;
+                    var ib = new Int64Array.Builder().Reserve(rows.Count);
+                    var vb = new Int64Array.Builder().Reserve(rows.Count);
+                    foreach (int i in rows)
+                    {
+                        if (matI is not null && i < matI.Length && !matI.IsNull(i))
+                            ib.Append(matI.GetValue(i)!.Value);
+                        else
+                            ib.AppendNull();
+                        if (matV is not null && i < matV.Length && !matV.IsNull(i))
+                            vb.Append(matV.GetValue(i)!.Value);
+                        else
+                            vb.AppendNull();
+                    }
+                    columns.Add(ib.Build());
+                    columns.Add(vb.Build());
+                }
+
+                yield return AppendColumns(taken, metadataFields, columns);
+            }
+            finally
+            {
+                if (releaseSource)
+                    batch.Dispose();
+                absPos?.Dispose();
+                fb.RowIds?.Dispose();
+                fb.Versions?.Dispose();
+            }
         }
     }
+
+    /// <summary>Whether <see cref="ArrowCompute.Take(RecordBatch, Apache.Arrow.Schema, List{int})"/> over a
+    /// batch of this schema can return arrays that share the source's buffers: a binary or string VIEW column
+    /// (at any depth) keeps the source's variadic data buffers, so the source must not be disposed under it.</summary>
+    private static bool TakeSharesBuffers(Apache.Arrow.Schema schema)
+    {
+        foreach (var field in schema.FieldsList)
+        {
+            if (TakeSharesBuffers(field.DataType))
+                return true;
+        }
+        return false;
+    }
+
+    private static bool TakeSharesBuffers(Apache.Arrow.Types.IArrowType type) => type switch
+    {
+        Apache.Arrow.Types.StringViewType or Apache.Arrow.Types.BinaryViewType => true,
+        Apache.Arrow.ExtensionType ext => TakeSharesBuffers(ext.StorageType),
+        Apache.Arrow.Types.NestedType nested => nested.Fields.Any(f => TakeSharesBuffers(f.DataType)),
+        _ => false,
+    };
 
     /// <summary>
     /// ROW-LEVEL rebase for the buffered surface: re-targets a DV DML action set computed against

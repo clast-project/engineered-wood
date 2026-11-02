@@ -66,7 +66,7 @@ public class ParallelFileReadTests : IDisposable
             {
                 long id = (long)f * RowsPerFile + r;
                 ids.Append(id);
-                if (id % 11 == 0) names.AppendNull(); else names.Append($"row-{id}");
+                if (id % 11 == 0) names.AppendNull(); else names.Append($"row-{id}-of-the-test-table"); // > 12 bytes: a view stores it out of line
             }
             await table.WriteAsync([new RecordBatch(Schema, [ids.Build(), names.Build()], RowsPerFile)]);
         }
@@ -105,6 +105,7 @@ public class ParallelFileReadTests : IDisposable
         _ when array.IsNull(i) => "null",
         Int64Array a => a.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
         StringArray s => s.GetString(i),
+        StringViewArray v => v.GetString(i),
         _ => throw new NotSupportedException(array.Data.DataType.ToString()),
     };
 
@@ -250,6 +251,54 @@ public class ParallelFileReadTests : IDisposable
         Assert.NotNull(table.LastScanBudget);
         Assert.InRange(table.LastScanBudget!.Peak, 1, 3 * largest);
         Assert.Equal(0, table.LastScanBudget.Used);
+    }
+
+    /// <summary>
+    /// ReadRowsAsync releases each batch it reads once the selected rows are copied out of it — except when a
+    /// column is a string VIEW, whose taken array still points into the source's data buffers. Read with view
+    /// output, every string must survive the source being dropped and the garbage collector running.
+    /// </summary>
+    [Fact]
+    public async Task ReadRowsAsync_WithViewColumns_KeepsTheTakenStringsIntact()
+    {
+        await CreateTableAsync();
+        var viewOptions = Options(4) with
+        {
+            ParquetReadOptions = new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.ViewType },
+        };
+        await using var serial = await OpenAsync(1);
+        await using var table = await DeltaTable.OpenAsync(_fs, viewOptions);
+
+        var locators = new List<RecordBatch>();
+        await foreach (var b in serial.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
+            locators.Add(b);
+        var everyThird = RowSelection.FromLocatorColumns(locators.Select(b =>
+        {
+            var keep = Enumerable.Range(0, b.Length).Where(i => i % 3 == 0).ToList();
+            return new RecordBatch(b.Schema,
+                Enumerable.Range(0, b.ColumnCount).Select(c => EngineeredWood.Arrow.ArrowCompute.Take(b.Column(c), keep)),
+                keep.Count);
+        }));
+
+        // Held across the whole read, then collected: anything freed under them shows up as wrong strings.
+        var held = new List<RecordBatch>();
+        await foreach (var b in table.ReadRowsAsync(everyThird))
+            held.Add(b);
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        Assert.Contains(held, b => b.Column(1) is StringViewArray);
+        foreach (var b in held)
+        {
+            var ids = (Int64Array)b.Column(0);
+            for (int i = 0; i < b.Length; i++)
+            {
+                long id = ids.GetValue(i)!.Value;
+                Assert.Equal(id % 11 == 0 ? "null" : $"row-{id}-of-the-test-table", Render(b.Column(1), i));
+            }
+            b.Dispose();
+        }
     }
 
     [Fact]
