@@ -70,19 +70,21 @@ public sealed class LocalTableFileSystem : ITableFileSystem
         if (!Directory.Exists(directory))
             yield break;
 
-        var entries = Directory.EnumerateFiles(directory, searchPattern, SearchOption.AllDirectories)
-            .OrderBy(p => p, StringComparer.Ordinal);
+        // DirectoryInfo's enumeration fills each FileInfo from the directory entry it read, so the length and
+        // time below cost no further call per file (a FileInfo built from a path stats the file again).
+        var entries = new DirectoryInfo(directory)
+            .EnumerateFiles(searchPattern, SearchOption.AllDirectories)
+            .OrderBy(f => f.FullName, StringComparer.Ordinal);
 
-        foreach (string fullPath in entries)
+        foreach (var info in entries)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // A streamed write in flight is not a file yet, as on an object store; and it can be moved or
-            // deleted between the enumeration and the FileInfo below.
-            if (LocalSequentialFile.IsTempFileName(Path.GetFileName(fullPath)))
+            // A streamed write in flight is not a file yet, as on an object store.
+            if (LocalSequentialFile.IsTempFileName(info.Name))
                 continue;
 
-            var info = new FileInfo(fullPath);
+            string fullPath = info.FullName;
             string relativePath = GetRelativePath(_rootPath, fullPath)
                 .Replace('\\', '/');
 
