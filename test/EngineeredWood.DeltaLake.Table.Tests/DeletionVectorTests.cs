@@ -146,10 +146,17 @@ public class DeletionVectorTests : IDisposable
 
         var addFile = table.CurrentSnapshot.ActiveFiles.Values.First();
 
-        // Write a file-based DV (absolute path)
+        // Write a file-based DV (absolute path) in the spec on-disk layout: a version byte, then
+        // <size BE><bitmap><CRC-32 BE>, with the descriptor's offset pointing at the size field.
         byte[] dvBlob = BuildDvBlob(0, 2); // Delete rows 0 ("10") and 2 ("30")
-        string dvFilePath = "_delta_log/dv_test.bin";
-        await fs.WriteAllBytesAsync(dvFilePath, dvBlob);
+        string dvFilePath = "dv_test.bin";
+        var dvFile = new byte[1 + 4 + dvBlob.Length + 4];
+        dvFile[0] = 1;
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32BigEndian(dvFile.AsSpan(1), dvBlob.Length);
+        dvBlob.CopyTo(dvFile, 5);
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(
+            dvFile.AsSpan(5 + dvBlob.Length), System.IO.Hashing.Crc32.HashToUInt32(dvBlob));
+        await fs.WriteAllBytesAsync(dvFilePath, dvFile);
 
         // Commit with DV
         var log = new TransactionLog(fs);
@@ -172,7 +179,7 @@ public class DeletionVectorTests : IDisposable
                 {
                     StorageType = "p",
                     PathOrInlineDv = dvFilePath,
-                    Offset = 0,
+                    Offset = 1,
                     SizeInBytes = dvBlob.Length,
                     Cardinality = 2,
                 },
