@@ -626,6 +626,62 @@ public class PageIndexRowRangeReadTests : IDisposable
             Assert.InRange(windows, parts, Math.Min(51, 2 * parts + 1));
     }
 
+    /// <summary>
+    /// A sparse read whose pages fit the byte budget many times over still asks for no more ranges per
+    /// request than a coalescing reader should send at once: 50 runs in each of the columns are cut
+    /// into several windows, and the rows are the same.
+    /// </summary>
+    [Fact]
+    public async Task SparseRead_WindowsAreCappedInRanges()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 50 });
+        RowRange[] ranges = [.. Enumerable.Range(0, 50).Select(k => new RowRange(k * 100 + 10, k * 100 + 40))];
+
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using (var reader = new ParquetFileReader(counting, ownsFile: true))
+        {
+            var metadata = await reader.ReadMetadataAsync();
+            Assert.True(metadata.RowGroups[0].Columns.Count * ranges.Length > 2 * BatchPageWindow.MaxRangesPerWindow);
+            int before = counting.Requests.Count;
+            await foreach (var batch in reader.ReadRowRangesAsync(0, ranges))
+                batch.Dispose();
+
+            var requests = counting.Requests.Skip(before).ToList();
+            _output.WriteLine($"{requests.Count} requests of {string.Join(", ", requests)} ranges");
+            Assert.All(requests, count => Assert.True(count <= BatchPageWindow.MaxRangesPerWindow, $"a request of {count} ranges"));
+            Assert.InRange(requests.Count, 3, ranges.Length);
+        }
+
+        await AssertRangeReadAsync(path, ParquetReadOptions.Default, 0, ranges, await FullRowsAsync(path, 0), batchSize: null);
+    }
+
+    /// <summary>
+    /// One-row batches over pages that fit the byte budget at once: a window plans at most
+    /// <see cref="BatchPageWindow.MaxBatchesPerWindow"/> of them rather than every batch of the row
+    /// group, and a window whose batches need no new pages asks for nothing.
+    /// </summary>
+    [Fact]
+    public async Task OneRowBatches_WindowsAreCappedInBatches()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true, new ParquetReadOptions { BatchSize = 1 });
+        await reader.ReadMetadataAsync();
+        int before = counting.Requests.Count;
+        int batches = 0;
+        await foreach (var batch in reader.ReadRowGroupBatchesAsync(0))
+        {
+            batches++;
+            batch.Dispose();
+        }
+
+        // The OffsetIndex read, then one request per window that reaches new pages.
+        int windows = counting.Requests.Count - before - 1;
+        Assert.Equal(Rows, batches);
+        Assert.InRange(windows, 2, (Rows + BatchPageWindow.MaxBatchesPerWindow - 1) / BatchPageWindow.MaxBatchesPerWindow);
+    }
+
     // ───── Arguments ─────
 
     [Theory]

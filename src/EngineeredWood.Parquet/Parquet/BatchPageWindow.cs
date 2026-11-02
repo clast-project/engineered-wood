@@ -16,7 +16,9 @@ namespace EngineeredWood.Parquet;
 /// <see cref="PagesToDecode"/> makes for every batch, so it holds exactly the pages the batches will
 /// ask for: neither the pages between ranges nor pages already decoded. A column's pages are merged
 /// into runs of adjacent pages, and a page map still waiting for its side pages gets them too.</para>
-/// <para>Windows are cut by compressed bytes, up to a budget, but always hold at least one batch.</para>
+/// <para>Windows are cut at a budget of compressed bytes (side pages and any gaps between pages
+/// included), at <see cref="MaxRangesPerWindow"/> ranges, and at <see cref="MaxBatchesPerWindow"/>
+/// batches, but always hold at least one batch.</para>
 /// </remarks>
 internal sealed class BatchPageWindow : IDisposable
 {
@@ -27,6 +29,21 @@ internal sealed class BatchPageWindow : IDisposable
     /// long before they are decoded have left the cache, and 8 MiB is within noise.
     /// </remarks>
     internal const long DefaultBudgetBytes = 8L * 1024 * 1024;
+
+    /// <summary>
+    /// How many ranges one window may ask for, unless a single batch needs more. A coalescing reader
+    /// issues a GET per range it cannot merge, all at once; this bounds how many, as
+    /// <see cref="MembershipPrefetch.MaxRangesPerWindow"/> does for its read-ahead.
+    /// </summary>
+    internal const int MaxRangesPerWindow = MembershipPrefetch.MaxRangesPerWindow;
+
+    /// <summary>
+    /// How many batches one window may plan. A batch inside pages already decoded adds no bytes, so
+    /// without this a small <see cref="ParquetReadOptions.BatchSize"/> over well-compressed pages would
+    /// plan millions of batches before returning the first. A window of such batches asks for nothing,
+    /// so cutting it costs no request.
+    /// </summary>
+    internal const int MaxBatchesPerWindow = 1024;
 
     private readonly FileRange[] _ranges;
     private readonly IReadOnlyList<IMemoryOwner<byte>> _buffers;
@@ -120,8 +137,11 @@ internal sealed class BatchPageWindow : IDisposable
         var batches = new List<(int Start, int End)>();
         var planned = new (int Start, int End)[columns];
         long bytes = 0;
-        while (nextSpan < spans.Length)
+        int rangeCount = 0;
+        while (nextSpan < spans.Length && batches.Count < MaxBatchesPerWindow)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+
             var (_, spanEnd) = spans[nextSpan];
             if (nextRow >= spanEnd)
             {
@@ -133,7 +153,11 @@ internal sealed class BatchPageWindow : IDisposable
             int start = nextRow;
             int end = start + batchRows(start, spanEnd);
 
+            // What the batch adds to the request: the bytes by which it widens the column's last run,
+            // or a new run, with the side pages when it is the column's first; any gap between pages
+            // inside a run is fetched with them, so it counts.
             long added = 0;
+            int addedRanges = 0;
             for (int i = 0; i < columns; i++)
             {
                 var map = pageMaps[i];
@@ -142,14 +166,30 @@ internal sealed class BatchPageWindow : IDisposable
                 if (first < 0)
                     continue;
 
-                int lastHeld = runs[i].Count > 0 ? runs[i][^1].Last : -1;
-                int from = Math.Max(first, lastHeld + 1);
-                if (from <= last)
-                    added += map.Pages[last].Offset + map.Pages[last].CompressedSize - map.Pages[from].Offset;
+                var columnRuns = runs[i];
+                if (columnRuns.Count > 0 && first <= columnRuns[^1].Last + 1)
+                {
+                    var held = columnRuns[^1];
+                    added += Span(map, Math.Min(held.First, first), Math.Max(held.Last, last))
+                        - Span(map, held.First, held.Last);
+                }
+                else
+                {
+                    added += Span(map, first, last);
+                    addedRanges++;
+                    if (columnRuns.Count == 0 && map.PendingPrefixLength > 0)
+                    {
+                        added += map.PendingPrefixLength;
+                        addedRanges++;
+                    }
+                }
             }
 
-            if (batches.Count > 0 && bytes + added > budgetBytes)
+            if (batches.Count > 0
+                && (bytes + added > budgetBytes || rangeCount + addedRanges > MaxRangesPerWindow))
+            {
                 break;
+            }
 
             for (int i = 0; i < columns; i++)
             {
@@ -176,6 +216,7 @@ internal sealed class BatchPageWindow : IDisposable
             }
 
             bytes += added;
+            rangeCount += addedRanges;
             batches.Add((start, end));
             nextRow = end;
         }
@@ -207,6 +248,10 @@ internal sealed class BatchPageWindow : IDisposable
             : [];
         return new BatchPageWindow(batches, sorted, buffers, nextSpan, nextRow);
     }
+
+    /// <summary>The bytes from the start of page <paramref name="first"/> to the end of page <paramref name="last"/>.</summary>
+    private static long Span(ColumnPageMap map, int first, int last) =>
+        map.Pages[last].Offset + (long)map.Pages[last].CompressedSize - map.Pages[first].Offset;
 
     /// <summary>
     /// The bytes of <paramref name="range"/>, when the window holds all of them.
