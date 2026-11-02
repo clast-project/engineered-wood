@@ -35,6 +35,12 @@ if (args.Length > 0 && args[0] == "pageindex-read-ab")
     return;
 }
 
+if (args.Length > 0 && args[0] == "batchwindow-ab")
+{
+    Environment.ExitCode = await BatchWindowAb.RunAsync(args);
+    return;
+}
+
 if (args.Length > 0 && args[0] == "rowcap-ab")
 {
     Environment.ExitCode = await RowCountLimitAb.RunAsync(args);

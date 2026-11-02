@@ -541,8 +541,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         //
         // Phase 1: Build each column's page map, from its OffsetIndex where it has one, otherwise by
         //          reading the whole chunk to scan its page headers.
-        // Phase 2: For each batch, read and decode only the pages no earlier batch has decoded, and
-        //          take the batch's rows from what is decoded.
+        // Phase 2: Fetch the pages of as many batches as a byte budget allows in one request (a window),
+        //          then for each batch decode only the pages no earlier batch has decoded, and take
+        //          the batch's rows from what is decoded.
         //
         // An OffsetIndex map estimates each page's uncompressed size, which the implicit budget
         // cannot use: it exists to keep a batch under the Arrow limit, so it reads the headers.
@@ -558,25 +559,53 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         for (int i = 0; i < ctx.Count; i++)
             cursors[i] = new DecodedRows();
 
+        // Where every batch falls, and which pages each decodes, is known from the page maps and the
+        // decoded rows alone, so the pages of many batches are fetched in one request, a window (#622):
+        // fetched batch by batch, a read returning N batches waited on N round trips one after another.
+        var chunkOffsets = new long[ctx.Count];
+        for (int i = 0; i < ctx.Count; i++)
+            chunkOffsets[i] = ctx.Ranges[i].Offset;
+        var endRows = new int[ctx.Count];
+        var nextPages = new int[ctx.Count];
+        Func<int, int, int> batchRows = (start, spanEnd) =>
+            ComputeBatchRowCount(pageMaps, start, spanEnd, batchSize, maxBytes);
+
+        int nextSpan = 0;
+        int nextRow = spans[0].Start;
+        BatchPageWindow? window = null;
         try
         {
-            foreach (var (spanStart, spanEnd) in spans)
+            while (true)
             {
-                int rowsEmitted = spanStart;
-                while (rowsEmitted < spanEnd)
+                cancellationToken.ThrowIfCancellationRequested();
+
+                for (int i = 0; i < ctx.Count; i++)
+                {
+                    endRows[i] = cursors[i].EndRow;
+                    nextPages[i] = cursors[i].NextPage;
+                }
+
+                window?.Dispose();
+                window = null;
+                window = await BatchPageWindow.ReadAsync(
+                        _file, pageMaps, chunkOffsets, spans, nextSpan, nextRow, endRows, nextPages, batchRows,
+                        BatchPageWindowBudgetBytes, cancellationToken)
+                    .ConfigureAwait(false);
+                if (window.Batches.Count == 0)
+                    break;
+                nextSpan = window.NextSpan;
+                nextRow = window.NextRow;
+
+                foreach (var (batchStartRow, batchEndRow) in window.Batches)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-
-                    int batchStartRow = rowsEmitted;
-                    int actualBatchRows = ComputeBatchRowCount(
-                        pageMaps, batchStartRow, spanEnd, batchSize, maxBytes);
-                    int batchEndRow = batchStartRow + actualBatchRows;
+                    int actualBatchRows = batchEndRow - batchStartRow;
 
                     // Rows before this batch that no batch returns: the gap since the last range.
                     foreach (var cursor in cursors)
                         cursor.SkipTo(batchStartRow);
 
-                    // The pages each column still has to decode for this batch, read in one request.
+                    // The pages each column still has to decode for this batch, served from the window.
                     var pageRanges = new List<FileRange>(ctx.Count);
                     // Each column's data range, and its side pages when the map still waits for them,
                     // as positions in pageRanges; -1 for none.
@@ -589,32 +618,13 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     for (int i = 0; i < ctx.Count; i++)
                     {
                         var cursor = cursors[i];
-                        if (cursor.EndRow >= batchEndRow)
+                        var (startPage, endPage) = BatchPageWindow.PagesToDecode(
+                            pageMaps[i], cursor.EndRow, cursor.NextPage, batchStartRow, batchEndRow);
+                        if (startPage < 0)
                             continue;
 
-                        int endPage = pageMaps[i].FindPageForRow(batchEndRow - 1);
-                        endPages[i] = endPage;
-
-                        // A batch that starts in rows already decoded and ends in pages not yet decoded
-                        // spans two runs, and would be copied. When the batch holds more rows than
-                        // decoding its first page again repeats, decode again from that page instead:
-                        // the batch then lies in one run and is returned without a copy.
-                        int startPage = cursor.NextPage;
-                        if (cursor.EndRow > batchStartRow)
-                        {
-                            int batchFirstPage = pageMaps[i].FindPageForRow(batchStartRow);
-                            if (cursor.EndRow - pageMaps[i].CumulativeRows[batchFirstPage] < actualBatchRows)
-                                startPage = batchFirstPage;
-                        }
-                        else if (startPage >= pageMaps[i].Pages.Length
-                            || pageMaps[i].CumulativeRows[startPage] != batchStartRow)
-                        {
-                            // The batch begins past the rows decoded so far, after a gap between
-                            // ranges: go straight to its page, leaving the pages between unread.
-                            startPage = pageMaps[i].FindPageForRow(batchStartRow);
-                        }
-
                         startPages[i] = startPage;
+                        endPages[i] = endPage;
                         var firstEntry = pageMaps[i].Pages[startPage];
                         var lastEntry = pageMaps[i].Pages[endPage];
                         long rangeStart = ctx.Ranges[i].Offset + firstEntry.Offset;
@@ -622,7 +632,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                         dataSlots[i] = pageRanges.Count;
                         pageRanges.Add(new FileRange(rangeStart, rangeEnd - rangeStart));
 
-                        // Side pages the map waits for come in the same request as its first pages.
+                        // Side pages the map waits for come with its first pages.
                         if (pageMaps[i].PendingPrefixLength > 0)
                         {
                             prefixSlots[i] = pageRanges.Count;
@@ -630,9 +640,25 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                         }
                     }
 
-                    var pageBuffers = pageRanges.Count > 0
-                        ? await _file.ReadRangesAsync(pageRanges, cancellationToken).ConfigureAwait(false)
-                        : [];
+                    // The window holds every page the batch can ask for; anything it does not is read
+                    // here, so a planning slip costs a round trip rather than a wrong answer.
+                    var pageBytes = new ReadOnlyMemory<byte>[pageRanges.Count];
+                    List<int>? missing = null;
+                    for (int r = 0; r < pageRanges.Count; r++)
+                    {
+                        if (!window.TryGet(pageRanges[r], out pageBytes[r]))
+                            (missing ??= []).Add(r);
+                    }
+
+                    IReadOnlyList<IMemoryOwner<byte>> pageBuffers = [];
+                    if (missing is not null)
+                    {
+                        pageBuffers = await _file.ReadRangesAsync(
+                                missing.Select(r => pageRanges[r]).ToArray(), cancellationToken)
+                            .ConfigureAwait(false);
+                        for (int m = 0; m < missing.Count; m++)
+                            pageBytes[missing[m]] = pageBuffers[m].Memory;
+                    }
 
                     try
                     {
@@ -645,15 +671,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                                 if (prefixSlots[i] >= 0)
                                 {
                                     pageMaps[i].CompleteSidePages(
-                                        pageBuffers[prefixSlots[i]].Memory.Span, ctx.Columns[i],
+                                        pageBytes[prefixSlots[i]].Span, ctx.Columns[i],
                                         ctx.Chunks[i].MetaData!, _options.PageChecksumValidation,
                                         _options.MaxPageUncompressedSize);
                                 }
 
-                                var buffer = pageBuffers[dataSlots[i]];
+                                var buffer = pageBytes[dataSlots[i]];
                                 int startPage = startPages[i];
                                 var decoded = ColumnChunkReader.ReadColumnBatchFromSlice(
-                                    buffer.Memory.Span,
+                                    buffer.Span,
                                     pageMaps[i].Pages[startPage].Offset,
                                     ctx.Columns[i],
                                     ctx.Chunks[i].MetaData!,
@@ -682,13 +708,13 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                         for (int i = 0; i < pageBuffers.Count; i++)
                             pageBuffers[i].Dispose();
                     }
-
-                    rowsEmitted += actualBatchRows;
                 }
             }
         }
         finally
         {
+            window?.Dispose();
+
             // Rows decoded but not returned, when the caller stops early.
             foreach (var cursor in cursors)
                 cursor.Dispose();
@@ -2300,6 +2326,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// file span several windows.
     /// </summary>
     internal long MembershipPrefetchBudgetBytes { get; set; } = MembershipPrefetch.DefaultBudgetBytes;
+
+    /// <summary>
+    /// How many compressed bytes one request for the pages of a row group's batches may ask for. Tests
+    /// lower it to make a read span several windows.
+    /// </summary>
+    internal long BatchPageWindowBudgetBytes { get; set; } = BatchPageWindow.DefaultBudgetBytes;
 
     /// <summary>The read-ahead for each membership source the options turn on.</summary>
     private readonly record struct Prefetches(MembershipPrefetch? Dictionary, MembershipPrefetch? BloomFilter);

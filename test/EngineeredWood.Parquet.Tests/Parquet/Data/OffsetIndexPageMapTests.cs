@@ -327,6 +327,9 @@ public class OffsetIndexPageMapTests : IDisposable
 
         await using var input = new CountingFile(new LocalRandomAccessFile(path));
         using var reader = new ParquetFileReader(input, ownsFile: false, new ParquetReadOptions { BatchSize = 1000 });
+        // One batch per request: a window holding every batch fetches each chunk's pages whole, which
+        // is not the header scan this counts.
+        reader.BatchPageWindowBudgetBytes = 1;
         await foreach (var _ in reader.ReadAllAsync()) { }
 
         int whole = input.Read.Count(r => dataRegions.Any(d => r.Offset <= d.Start && r.Offset + r.Length >= d.End));

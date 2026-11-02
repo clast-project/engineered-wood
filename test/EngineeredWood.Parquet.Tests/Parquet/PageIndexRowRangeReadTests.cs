@@ -525,6 +525,107 @@ public class PageIndexRowRangeReadTests : IDisposable
         });
     }
 
+    // ───── One request for many batches (#622) ─────
+
+    /// <summary>
+    /// A read that returns many batches fetches their pages in one request, not one per batch: ten
+    /// ranges, or a row group cut into 52 batches, cost the OffsetIndex read and one more.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ManyBatches_FetchTheirPagesInOneRequest(bool ranged)
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+        RowRange[] ranges = [.. Enumerable.Range(0, 10).Select(k => new RowRange(k * 500 + 10, k * 500 + 260))];
+
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true,
+            ranged ? ParquetReadOptions.Default : new ParquetReadOptions { BatchSize = 97 });
+        await reader.ReadMetadataAsync();
+        int before = counting.Requests.Count;
+
+        int batches = 0;
+        await foreach (var batch in ranged ? reader.ReadRowRangesAsync(0, ranges) : reader.ReadRowGroupBatchesAsync(0))
+        {
+            batches++;
+            batch.Dispose();
+        }
+
+        Assert.Equal(ranged ? 10 : 52, batches);
+        Assert.Equal(2, counting.Requests.Count - before);
+    }
+
+    /// <summary>
+    /// The skipped pages between ranges stay unread when their pages are fetched together: the request
+    /// asks for no more bytes than the per-batch requests did.
+    /// </summary>
+    [Fact]
+    public async Task ManyRanges_OneRequest_StillSkipsThePagesBetween()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+        RowRange[] ranges = [.. Enumerable.Range(0, 10).Select(k => new RowRange(k * 500 + 10, k * 500 + 240))];
+
+        long windowed = await BytesReadAsync(path, reader => reader.ReadRowRangesAsync(0, ranges));
+        long perBatch = await BytesReadAsync(path, reader =>
+        {
+            reader.BatchPageWindowBudgetBytes = 1;
+            return reader.ReadRowRangesAsync(0, ranges);
+        });
+        long whole = await BytesReadAsync(path, reader => reader.ReadRowGroupBatchesAsync(0));
+
+        _output.WriteLine($"windowed {windowed:N0}, per batch {perBatch:N0}, whole {whole:N0}");
+        Assert.Equal(perBatch, windowed);
+        Assert.True(windowed < whole * 2 / 3, $"read {windowed:N0} of {whole:N0} bytes");
+    }
+
+    /// <summary>
+    /// A budget cuts the batches into windows, each one request, and the rows are the same wherever the
+    /// windows fall, including a page shared by batches on both sides of a window's edge.
+    /// </summary>
+    /// <param name="parts">The budget as a fraction of the row group's bytes; 0 for a budget of one byte.</param>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(4)]
+    [InlineData(16)]
+    public async Task WindowBudget_CutsTheRequests_RowsUnchanged(int parts)
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 });
+        long budget = 1;
+        if (parts > 0)
+        {
+            using var probe = Open(path);
+            var metadata = await probe.ReadMetadataAsync();
+            budget = metadata.RowGroups[0].Columns.Sum(c => c.MetaData!.TotalCompressedSize) / parts;
+        }
+
+        var expected = await FullRowsAsync(path, 0);
+        foreach (var ranges in RangeSets(Rows))
+        {
+            await AssertRangeReadAsync(path, ParquetReadOptions.Default, 0, ranges, expected, batchSize: null, budget);
+            await AssertRangeReadAsync(path, new ParquetReadOptions { BatchSize = 97 }, 0, ranges, expected, batchSize: 97, budget);
+            await AssertRangeReadAsync(path, new ParquetReadOptions { MaxBatchByteSize = 4096 }, 0, ranges, expected, batchSize: null, budget);
+        }
+
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true, new ParquetReadOptions { BatchSize = 97 });
+        reader.BatchPageWindowBudgetBytes = budget;
+        await reader.ReadMetadataAsync();
+        int before = counting.Requests.Count;
+        await foreach (var batch in reader.ReadRowGroupBatchesAsync(0))
+            batch.Dispose();
+
+        // The OffsetIndex read, then the windows. A budget smaller than any batch makes a request for each
+        // batch that reaches new pages, one per 250-row page, as the reads before windows did; a batch
+        // inside rows already decoded joins the window before it, since it asks for nothing.
+        int windows = counting.Requests.Count - before - 1;
+        _output.WriteLine($"budget {budget:N0}: {windows} windows for 52 batches");
+        if (parts == 0)
+            Assert.Equal(Rows / 250, windows);
+        else
+            Assert.InRange(windows, parts, Math.Min(51, 2 * parts + 1));
+    }
+
     // ───── Arguments ─────
 
     [Theory]
@@ -600,10 +701,13 @@ public class PageIndexRowRangeReadTests : IDisposable
     }
 
     private async Task AssertRangeReadAsync(
-        string path, ParquetReadOptions options, int rowGroup, IReadOnlyList<RowRange> ranges, List<string> expected, int? batchSize)
+        string path, ParquetReadOptions options, int rowGroup, IReadOnlyList<RowRange> ranges, List<string> expected, int? batchSize,
+        long? windowBudget = null)
     {
         await using var input = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(input, ownsFile: false, options);
+        if (windowBudget is { } budget)
+            reader.BatchPageWindowBudgetBytes = budget;
 
         var actual = new List<string>();
         int range = 0;
