@@ -660,10 +660,13 @@ public class PageIndexRowRangeReadTests : IDisposable
     /// <summary>
     /// A projection's chunks are separated by the unprojected ones, which a coalescing reader fetches with
     /// them: those gaps count toward the scan budget, so a budget that holds the projected chunks alone
-    /// takes more than one request, none of whose coalesced span exceeds it.
+    /// takes more than one request, none of whose coalesced span exceeds it. The same when the projection
+    /// names the columns in reverse: the gaps are those of file order, in which the coalescer merges.
     /// </summary>
-    [Fact]
-    public async Task NoPageIndex_ScanBudget_CountsTheGapsBetweenChunks()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NoPageIndex_ScanBudget_CountsTheGapsBetweenChunks(bool reversed)
     {
         string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
         {
@@ -671,6 +674,8 @@ public class PageIndexRowRangeReadTests : IDisposable
             DataPageRowCountLimit = 250,
         });
         string[] projected = ["sorted", "low", "doubles", "times"];
+        if (reversed)
+            System.Array.Reverse(projected);
 
         var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
         using var reader = new ParquetFileReader(counting, ownsFile: true, new ParquetReadOptions { BatchSize = 97 });
@@ -684,7 +689,7 @@ public class PageIndexRowRangeReadTests : IDisposable
         await foreach (var batch in reader.ReadRowGroupBatchesAsync(0, projected))
         {
             read += batch.Length;
-            var sorted = (Int64Array)batch.Column(0);
+            var sorted = (Int64Array)batch.Column("sorted");
             for (int i = 0; i < sorted.Length; i++)
                 sum += sorted.GetValue(i)!.Value;
             batch.Dispose();

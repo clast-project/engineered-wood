@@ -959,6 +959,17 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         long heldBytes = 0;
         try
         {
+            // The chunks to scan, in file order rather than the projection's, as a coalescing reader
+            // merges them: a request then spans only the gaps between its own chunks, which it counts.
+            var toScan = new List<int>();
+            for (int i = 0; i < ctx.Count; i++)
+            {
+                if (pageMaps[i] is null)
+                    toScan.Add(i);
+            }
+
+            toScan.Sort((a, b) => ctx.Ranges[a].Offset.CompareTo(ctx.Ranges[b].Offset));
+
             int next = 0;
             while (true)
             {
@@ -966,11 +977,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 // least one. A gap a coalescing reader would fill counts toward the budget.
                 var columns = new List<int>();
                 long bytes = 0;
-                for (; next < ctx.Count; next++)
+                for (; next < toScan.Count; next++)
                 {
-                    if (pageMaps[next] is not null)
-                        continue;
-                    var range = ctx.Ranges[next];
+                    var range = ctx.Ranges[toScan[next]];
                     long cost = range.Length;
                     if (columns.Count > 0)
                     {
@@ -982,7 +991,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                             break;
                     }
 
-                    columns.Add(next);
+                    columns.Add(toScan[next]);
                     bytes += cost;
                 }
 
