@@ -218,38 +218,27 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <see cref="ParquetReadOptions.FilterUsePageIndex"/>, rows within a kept row group are pruned by
     /// the page index too. The result is a superset: rows are not filtered. Batches come in file order
     /// and never span skipped rows.</para>
+    /// <para><paramref name="skipRows"/> is asked once per non-empty row group, with the group's first row and
+    /// row count, before anything is read for it. Nothing of a skipped group is requested: not its column
+    /// chunks, and not its dictionary pages, Bloom filters or page indexes, which the read-ahead for the kept
+    /// groups leaves out. Its rows still count towards the positions after it, as a group pruned by statistics
+    /// does.</para>
+    /// <para>Its bytes can still be read when they lie in a small gap between two ranges that ARE requested, and
+    /// the read merges across the gap rather than pay another request: page indexes are read so across gaps up
+    /// to 64 KiB, and the cloud readers' <see cref="EngineeredWood.IO.CoalescingFileReader"/> merges across
+    /// <see cref="EngineeredWood.IO.CoalescingOptions.MaxGapBytes"/> (1 MiB by default), as they do for any
+    /// pruned group or unprojected column. A skipped group larger than the gap is never read.</para>
     /// </remarks>
     /// <param name="filter">The predicate; null reads every row under
     /// <see cref="ParquetReadOptions.Filter"/> instead, as <see cref="ReadAllAsync"/> does.</param>
     /// <param name="columnNames">Optional list of column names to read. If null, reads all columns.</param>
+    /// <param name="skipRows">Row groups to skip unread, beyond what pruning skips; null skips none. See the
+    /// remarks.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     public IAsyncEnumerable<PositionedRecordBatch> ReadWithPositionsAsync(
         EngineeredWood.Expressions.Predicate? filter,
         IReadOnlyList<string>? columnNames = null,
-        CancellationToken cancellationToken = default) =>
-        ReadPositionedAsync(filter ?? _options.Filter, columnNames, skipRows: null, cancellationToken);
-
-    /// <summary>
-    /// As <see cref="ReadWithPositionsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, CancellationToken)"/>,
-    /// also skipping, unread, every row group <paramref name="skipRows"/> says the caller needs none of.
-    /// </summary>
-    /// <remarks>
-    /// <para><paramref name="skipRows"/> is asked once per non-empty row group, with the group's first row and
-    /// row count, before anything else is read for it: no column chunk, dictionary page or Bloom filter of a
-    /// skipped group is read, and the page-index read-ahead does not ask for its indexes either (though page
-    /// indexes lie together at the end of a file and are read as one span across small gaps, so a skipped
-    /// group's may still arrive inside a kept group's span). Its rows still count towards the positions after
-    /// it, as a group pruned by statistics does.</para>
-    /// </remarks>
-    /// <param name="filter">The predicate; null reads every row under
-    /// <see cref="ParquetReadOptions.Filter"/> instead, as <see cref="ReadAllAsync"/> does.</param>
-    /// <param name="columnNames">Optional list of column names to read. If null, reads all columns.</param>
-    /// <param name="skipRows">Which row groups to skip; null skips none beyond what pruning does.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    public IAsyncEnumerable<PositionedRecordBatch> ReadWithPositionsAsync(
-        EngineeredWood.Expressions.Predicate? filter,
-        IReadOnlyList<string>? columnNames,
-        RowSkipPredicate? skipRows,
+        RowSkipPredicate? skipRows = null,
         CancellationToken cancellationToken = default) =>
         ReadPositionedAsync(filter ?? _options.Filter, columnNames, skipRows, cancellationToken);
 

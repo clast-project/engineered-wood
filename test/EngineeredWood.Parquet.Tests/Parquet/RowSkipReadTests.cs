@@ -13,7 +13,7 @@ using Ex = EngineeredWood.Expressions.Expressions;
 namespace EngineeredWood.Tests.Parquet;
 
 /// <summary>
-/// <see cref="ParquetFileReader.ReadWithPositionsAsync(Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken)"/>:
+/// <see cref="ParquetFileReader.ReadWithPositionsAsync"/>:
 /// the row groups a <see cref="RowSkipPredicate"/> skips are never read, not even their dictionaries or page
 /// indexes for pruning, and the rows after them keep their file positions.
 /// </summary>
@@ -147,7 +147,9 @@ public class RowSkipReadTests : IDisposable
 
         var before = new RequestCountingFile(new LocalRandomAccessFile(path));
         using (var reader = new ParquetFileReader(before, ownsFile: true))
-            await foreach (var positioned in reader.ReadWithPositionsAsync(filter))
+            // (filter, columns, default) must keep compiling: an overload taking the skip predicate third
+            // made it ambiguous between the predicate and the token.
+            await foreach (var positioned in reader.ReadWithPositionsAsync(filter, null, default))
                 positioned.Batch.Dispose();
 
         var after = new RequestCountingFile(new LocalRandomAccessFile(path));
