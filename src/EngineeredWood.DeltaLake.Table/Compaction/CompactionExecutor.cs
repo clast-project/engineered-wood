@@ -159,6 +159,36 @@ internal static class CompactionExecutor
     }
 
     /// <summary>
+    /// The file's raw batches with the position of each one's first row. A row group <paramref name="deletedRows"/>
+    /// deletes in full is skipped unread (#618): none of its rows survive the compaction, and the reader still
+    /// counts them towards the positions after it, which the survivors' row ids are derived from.
+    /// </summary>
+    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> Positioned(
+        ParquetFileReader reader, DeletionVectors.DeletionVectorBitmap? deletedRows,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        RowSkipPredicate? skip = deletedRows is { IsEmpty: false } ? deletedRows.ContainsRange : null;
+        await foreach (var positioned in reader.ReadWithPositionsAsync(null, null, skip, cancellationToken)
+            .ConfigureAwait(false))
+        {
+            yield return (positioned.Batch, positioned.FirstRow);
+        }
+    }
+
+    /// <summary>A pluggable reader's batches, which come whole and in file order, positioned by counting them.</summary>
+    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(
+        IAsyncEnumerable<RecordBatch> source,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        long next = 0;
+        await foreach (var batch in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            yield return (batch, next);
+            next += batch.Length;
+        }
+    }
+
+    /// <summary>
     /// Compacts ONE partition group's candidate files (the whole table when unpartitioned): reads the live
     /// rows, appends the group's remove + add actions (adds carry the group's partitionValues and land in
     /// the group's Hive directory), and returns whether anything was compacted plus the advanced
@@ -205,11 +235,11 @@ internal static class CompactionExecutor
             // below) — the same contract as the built-in reader.
             IRandomAccessFile? file = null;
             ParquetFileReader? reader = null;
-            IAsyncEnumerable<RecordBatch> rawBatches;
+            IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> rawBatches;
             if (dataFileReader is not null)
             {
-                rawBatches = dataFileReader.ReadAsync(
-                    EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), null, cancellationToken);
+                rawBatches = InFileOrder(dataFileReader.ReadAsync(
+                    EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), null, cancellationToken), cancellationToken);
             }
             else
             {
@@ -217,13 +247,12 @@ internal static class CompactionExecutor
                     EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
                     .ConfigureAwait(false);
                 reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
-                rawBatches = reader.ReadAllAsync(cancellationToken: cancellationToken);
+                rawBatches = Positioned(reader, deletedRows, cancellationToken);
             }
 
             try
             {
-            long batchStartRow = 0;
-            await foreach (var batch in rawBatches.ConfigureAwait(false))
+            await foreach (var (batch, batchStartRow) in rawBatches.ConfigureAwait(false))
             {
                 // Strip the hidden materialized row-tracking columns (declared physical names) before widening
                 // and column mapping, which expect only user columns. Capture the source's own materialized
@@ -231,7 +260,6 @@ internal static class CompactionExecutor
                 var (userBatch, srcMatIds, srcMatVers) = materialize
                     ? RowTracking.RowTrackingWriter.StripMaterializedColumns(batch, matRowIdName, matRowVerName)
                     : (batch, null, null);
-                long physicalRows = batch.Length;
 
                 // The rows the deletion vector leaves, computed once from a selection mask: they drive both the
                 // filter below and the survivor id/version arrays, which therefore stay aligned with it.
@@ -240,10 +268,7 @@ internal static class CompactionExecutor
                     : DeletionVectors.KeptRows.For(deletedRows, batchStartRow, batch.Length);
                 int survivors = deletedRows is null ? batch.Length : kept.Count;
                 if (survivors == 0)
-                {
-                    batchStartRow += physicalRows;
                     continue; // every row in this batch was deleted: nothing to map, gather or write
-                }
 
                 Int64Array? survivorIds = null, survivorVers = null;
                 if (materialize)
@@ -281,7 +306,6 @@ internal static class CompactionExecutor
                 var liveBatch = ColumnMappingRecursive.StripParquetFieldIds(userBatch);
                 if (deletedRows is not null && !kept.AllKept)
                     liveBatch = ArrowCompute.Take(liveBatch, liveBatch.Schema, kept.Indices);
-                batchStartRow += physicalRows;
                 if (liveBatch.Length == 0)
                     continue; // every row in this batch was deleted
 
