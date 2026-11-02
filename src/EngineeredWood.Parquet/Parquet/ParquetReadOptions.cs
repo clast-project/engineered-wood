@@ -245,6 +245,12 @@ public sealed record ParquetReadOptions
     /// larger than this limit are split across multiple batches. When <see langword="null"/>
     /// (the default), each row group produces exactly one batch.
     /// </summary>
+    /// <remarks>
+    /// The limit bounds the decoded batch, not what is read: the compressed pages of as many batches
+    /// as fit in 8 MiB are fetched in one request, so that a row group split into many batches costs
+    /// one round trip per window rather than one per batch. The same holds for
+    /// <see cref="MaxBatchByteSize"/>.
+    /// </remarks>
     public int? BatchSize { get; init; }
 
     /// <summary>
