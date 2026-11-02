@@ -142,7 +142,9 @@ public class PageSkipBenchmarks
     {
         using var reader = new ParquetFileReader(file, ownsFile: true);
         long rows = 0, sum = 0;
-        await foreach (var positioned in reader.ReadWithPositionsAsync(null, null, _deleted.ContainsRange, CancellationToken.None))
+        // No skip predicate: since #618 step 4 the reader would cut the vector's long runs itself, and this is
+        // the read without that.
+        await foreach (var positioned in reader.ReadWithPositionsAsync(null, null, CancellationToken.None))
             (rows, sum) = Keep(positioned.Batch, positioned.FirstRow, rows, sum);
         return (rows, sum);
     }

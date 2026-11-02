@@ -182,9 +182,15 @@ public class RowSkipReadTests : IDisposable
         // 100,000 rows: blocks of 1,563.
         Assert.Equal([new RowRange(40_017, 60_003)],
             ParquetFileReader.SkippedRuns(Excluding((40_017, 60_003)), 0, OneGroupRows));
-        Assert.Equal([new RowRange(0, 5_000), new RowRange(97_001, OneGroupRows)],
-            ParquetFileReader.SkippedRuns(Excluding((0, 5_000), (97_001, OneGroupRows)), 0, OneGroupRows));
+        Assert.Equal([new RowRange(0, 5_000), new RowRange(95_001, OneGroupRows)],
+            ParquetFileReader.SkippedRuns(Excluding((0, 5_000), (95_001, OneGroupRows)), 0, OneGroupRows));
         Assert.Null(ParquetFileReader.SkippedRuns(Excluding((50_000, 51_000)), 0, OneGroupRows));
+
+        // Only whole blocks are probed. The last 1,531 rows (63 blocks of 1,563 end at 98,469) are a shorter
+        // remainder: deleted alone, they are never a cut, however few the rows; a run reaching into them from a
+        // whole block is widened over them, as above.
+        Assert.Null(ParquetFileReader.SkippedRuns(Excluding((98_469, OneGroupRows)), 0, OneGroupRows));
+        Assert.Null(ParquetFileReader.SkippedRuns(Excluding((1_024, 1_025)), 0, 1_025));
 
         // Positions are the file's: the same run in a group starting at row 1,000,000.
         Assert.Equal([new RowRange(40_017, 60_003)],

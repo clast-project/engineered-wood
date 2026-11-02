@@ -2405,8 +2405,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// ascending, disjoint ranges relative to the group; null when there are none worth cutting.
     /// </summary>
     /// <remarks>
-    /// <para>The group is probed in <see cref="SkipProbeBlocks"/> blocks, so a run is found only when it covers
-    /// a whole block (a run of at least two blocks' rows always does), and a read with scattered skips pays
+    /// <para>The group is probed in <see cref="SkipProbeBlocks"/> whole blocks (a shorter remainder at the end is not
+    /// probed), so a run is found only when it covers a whole block (a run of at least two blocks' rows always
+    /// does, unless most of it lies in that remainder), and a read with scattered skips pays
     /// those few calls and nothing else: it needs no page index. Each run found is then widened to its true
     /// ends, by binary search within the blocks either side of it.</para>
     /// <para>Rows skipped but not cut are still returned; the caller drops them as it would without this.</para>
@@ -2417,11 +2418,13 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         if (rows <= block)
             return null;
 
+        // Whole blocks only: a shorter last block could find a run shorter than the minimum, a cut that frees
+        // no page but still costs the ranged read its page index. A run reaching into it is widened over it.
         List<RowRange>? runs = null;
-        for (long start = 0; start < rows; start += block)
+        for (long start = 0; start + block <= rows; start += block)
         {
-            long end = Math.Min(rows, start + block);
-            if (!skipRows(groupStart + start, end - start))
+            long end = start + block;
+            if (!skipRows(groupStart + start, block))
                 continue;
 
             if (runs is { Count: > 0 } && runs[^1].End == start)
