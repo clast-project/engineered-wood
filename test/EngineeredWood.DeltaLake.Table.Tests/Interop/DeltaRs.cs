@@ -17,6 +17,9 @@ namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 /// physical names) round-tripped perfectly beforehand. These tests use an independent
 /// implementation as the oracle.</para>
 ///
+/// <para>Runs under the <c>python</c> on PATH unless <c>EW_DELTA_RS_PYTHON</c> names another interpreter, as
+/// <c>EW_SPARK_PYTHON</c> and <c>EW_DUCKDB_PYTHON</c> do for the other tiers, so one venv can carry all three.</para>
+///
 /// <para>Cheapest tier: no JVM, one <c>pip install deltalake</c>. Cannot read column-mapped tables
 /// written with the legacy <c>minReader=2</c> numbering, and has no writer-feature/OPTIMIZE/DESCRIBE
 /// DETAIL surface — that is <see cref="Spark"/>'s job.</para>
@@ -32,7 +35,8 @@ internal static class DeltaRs
         scriptName: "delta_rs_driver.py",
         probeExpression: "import deltalake, json; print(json.dumps({'v': deltalake.__version__}))",
         requireEnvVar: "EW_REQUIRE_DELTA_INTEROP",
-        timeoutMs: 120_000);
+        timeoutMs: 120_000,
+        interpreterOverrideEnvVar: "EW_DELTA_RS_PYTHON");
 
     public static bool Available => Driver.Available;
 
