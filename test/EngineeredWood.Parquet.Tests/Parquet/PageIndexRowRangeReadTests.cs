@@ -613,6 +613,92 @@ public class PageIndexRowRangeReadTests : IDisposable
             Assert.Equal([columns], requests);
     }
 
+    /// <summary>
+    /// A wide row group's scan is cut at <see cref="BatchPageWindow.MaxRangesPerWindow"/> chunks a request,
+    /// so a coalescing reader never issues more GETs at once than a page window would.
+    /// </summary>
+    [Fact]
+    public async Task NoPageIndex_WideRowGroup_ScanRequestsAreCappedInRanges()
+    {
+        const int columns = 100, rows = 1000;
+        var schema = new Apache.Arrow.Schema.Builder();
+        var arrays = new List<IArrowArray>();
+        for (int c = 0; c < columns; c++)
+        {
+            schema.Field(new Field("c" + c, Int32Type.Default, false));
+            var builder = new Int32Array.Builder();
+            for (int r = 0; r < rows; r++)
+                builder.Append(r * columns + c);
+            arrays.Add(builder.Build());
+        }
+
+        string path = await WriteAsync(new RecordBatch(schema.Build(), arrays, rows),
+            ParquetWriteOptions.Default with { WritePageIndex = false, DataPageRowCountLimit = 100 });
+
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true, new ParquetReadOptions { BatchSize = 97 });
+        await reader.ReadMetadataAsync();
+        int before = counting.Requests.Count;
+        long read = 0, sum = 0;
+        await foreach (var batch in reader.ReadRowGroupBatchesAsync(0))
+        {
+            read += batch.Length;
+            var last = (Int32Array)batch.Column(columns - 1);
+            for (int i = 0; i < last.Length; i++)
+                sum += last.GetValue(i)!.Value;
+            batch.Dispose();
+        }
+
+        var requests = counting.Requests.Skip(before).ToList();
+        _output.WriteLine($"requests of {string.Join(", ", requests)} ranges");
+        Assert.Equal([BatchPageWindow.MaxRangesPerWindow, columns - BatchPageWindow.MaxRangesPerWindow], requests.Take(2));
+        Assert.All(requests, count => Assert.True(count <= BatchPageWindow.MaxRangesPerWindow, $"a request of {count} ranges"));
+        Assert.Equal(rows, read);
+        Assert.Equal(Enumerable.Range(0, rows).Sum(r => (long)r * columns + columns - 1), sum);
+    }
+
+    /// <summary>
+    /// A projection's chunks are separated by the unprojected ones, which a coalescing reader fetches with
+    /// them: those gaps count toward the scan budget, so a budget that holds the projected chunks alone
+    /// takes more than one request, none of whose coalesced span exceeds it.
+    /// </summary>
+    [Fact]
+    public async Task NoPageIndex_ScanBudget_CountsTheGapsBetweenChunks()
+    {
+        string path = await WriteAsync(Flat(Rows), ParquetWriteOptions.Default with
+        {
+            WritePageIndex = false,
+            DataPageRowCountLimit = 250,
+        });
+        string[] projected = ["sorted", "low", "doubles", "times"];
+
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: true, new ParquetReadOptions { BatchSize = 97 });
+        var metadata = await reader.ReadMetadataAsync();
+        long budget = metadata.RowGroups[0].Columns
+            .Where(c => projected.Contains(c.MetaData!.PathInSchema[0]))
+            .Sum(c => c.MetaData!.TotalCompressedSize);
+        reader.HeaderScanBudgetBytes = budget;
+        int before = counting.Requests.Count;
+        long read = 0, sum = 0;
+        await foreach (var batch in reader.ReadRowGroupBatchesAsync(0, projected))
+        {
+            read += batch.Length;
+            var sorted = (Int64Array)batch.Column(0);
+            for (int i = 0; i < sorted.Length; i++)
+                sum += sorted.GetValue(i)!.Value;
+            batch.Dispose();
+        }
+
+        var first = counting.RequestRanges[before].OrderBy(r => r.Offset).ToList();
+        long span = first[^1].Offset + first[^1].Length - first[0].Offset;
+        _output.WriteLine($"budget {budget:N0}: first request of {first.Count} chunks spanning {span:N0} bytes");
+        Assert.InRange(first.Count, 1, projected.Length - 1);
+        Assert.True(first.Count == 1 || span <= budget, $"a request spanning {span:N0} bytes");
+        Assert.Equal(Rows, read);
+        Assert.Equal((long)Rows * (Rows - 1) / 2, sum);
+    }
+
     // ───── One request for many batches (#622) ─────
 
     /// <summary>

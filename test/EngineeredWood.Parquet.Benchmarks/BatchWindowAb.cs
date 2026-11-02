@@ -182,14 +182,12 @@ internal static class BatchWindowAb
         int batches = 0;
         using (var reader = new ParquetFileReader(file, ownsFile: false, c.Options))
         {
-            if (s_headerScan)
-            {
-                if (!windowed)
-                    reader.HeaderScanBudgetBytes = 1;
-            }
-            else if (!windowed)
+            // In headerscan mode both sides use the same windows, and only the scan budget differs.
+            if (s_headerScan && !windowed)
+                reader.HeaderScanBudgetBytes = 1;
+            else if (!s_headerScan && !windowed)
                 reader.BatchPageWindowBudgetBytes = 1;
-            else if (s_windowBytes is { } budget)
+            if ((s_headerScan || windowed) && s_windowBytes is { } budget)
                 reader.BatchPageWindowBudgetBytes = budget;
             await foreach (var batch in c.Read(reader))
             {
