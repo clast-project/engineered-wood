@@ -58,6 +58,45 @@ public class ChangeDataFeedTests : IDisposable
         return await DeltaTable.OpenAsync(fs);
     }
 
+    /// <summary>
+    /// A deletion-vector delete by position writes its change file by reading the deleted rows back. With rows
+    /// spread across many read batches, every one is found: the read may stop early only once the last is.
+    /// </summary>
+    [Fact]
+    public async Task DeleteRows_VectorMode_ChangeFileHoldsEveryRow_AcrossReadBatches()
+    {
+        await (await CreateCdfTable()).DisposeAsync();
+        var options = new DeltaTableOptions
+        {
+            ParquetReadOptions = EngineeredWood.Parquet.ParquetReadOptions.Default with { BatchSize = 3 },
+        };
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir), options);
+        var ids = new Int64Array.Builder().AppendRange(Enumerable.Range(1, 20).Select(i => (long)i)).Build();
+        var values = new StringArray.Builder();
+        for (int i = 0; i < 20; i++) values.Append("v");
+        await table.WriteAsync([new RecordBatch(table.ArrowSchema, [ids, values.Build()], 20)]);
+
+        string path = table.CurrentSnapshot.ActiveFiles.Values.Single().Path;
+        long[] positions = [17, 1, 9, 4]; // ids 18, 2, 10, 5: four different batches of three, out of order
+        var (deleted, version) = await table.DeleteRowsAsync(RowSelection.ByPath(
+            new Dictionary<string, IReadOnlyCollection<long>> { [path] = positions }));
+        Assert.Equal(4, deleted);
+
+        var changed = new List<long>();
+        await foreach (var b in table.ReadChangesAsync(
+            new DeltaChangeReadOptions { StartVersion = version, EndVersion = version }))
+        {
+            var idCol = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
+            var ct = (StringArray)b.Column(b.Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn));
+            for (int i = 0; i < b.Length; i++)
+            {
+                Assert.Equal(CdfConfig.Delete, ct.GetString(i));
+                changed.Add(idCol.GetValue(i)!.Value);
+            }
+        }
+        Assert.Equal([2L, 5L, 10L, 18L], changed.OrderBy(x => x).ToArray());
+    }
+
     [Fact]
     public async Task ReadChanges_InsertOnly_InfersFromAddActions()
     {

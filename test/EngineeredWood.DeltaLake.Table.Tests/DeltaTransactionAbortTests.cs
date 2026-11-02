@@ -160,13 +160,13 @@ public class DeltaTransactionAbortTests : IDisposable
     {
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        table.DeletionVectorInlineThreshold = 0; // every vector a file of its own
         await table.WriteAsync([Range(1, 1000)]);
         string[] before = DataFiles();
         Assert.Single(before);
         Assert.Empty(DeletionVectorFiles());
 
         var txn = table.StartTransaction();
-        // Enough rows that the roaring bitmap exceeds the inline threshold and becomes a file of its own.
         long deleted = await txn.DeleteAsync(IdAtMost(800));
         Assert.Equal(800, deleted);
         Assert.Single(DeletionVectorFiles());
@@ -240,12 +240,13 @@ public class DeltaTransactionAbortTests : IDisposable
     {
         var fs = new LocalTableFileSystem(_tempDir);
         await using var table = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        table.DeletionVectorInlineThreshold = 0; // this table's vectors are files (the other handle's stay inline)
         await table.WriteAsync([Range(1, 1000)]); // the file the delete below rebases on
         Assert.Empty(DeletionVectorFiles());
 
         var txn = table.StartTransaction();
 
-        // (a) a host-written append whose rows are born deleted — enough of them to need a vector FILE.
+        // (a) a host-written append whose rows are born deleted.
         var appended = await table.WriteDataFilesAsync([Range(2001, 3000)]);
         var bornDeleted = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
         {
@@ -343,10 +344,12 @@ public class DeltaTransactionAbortTests : IDisposable
     {
         var fs = new LocalTableFileSystem(_tempDir);
         await using var winner = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        winner.DeletionVectorInlineThreshold = 0; // every vector a file of its own
         await winner.WriteAsync([Range(1, 1000)]);
 
         // A second handle pinned to the pre-delete version, so its delete is computed against stale state.
         await using var loser = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        loser.DeletionVectorInlineThreshold = 0;
 
         await winner.DeleteAsync(IdAtMost(800));
         string[] afterWinner = DeletionVectorFiles();

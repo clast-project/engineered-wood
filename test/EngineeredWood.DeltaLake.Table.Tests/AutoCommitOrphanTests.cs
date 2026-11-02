@@ -286,8 +286,8 @@ public class AutoCommitOrphanTests : IDisposable
     {
         var fs = new LocalTableFileSystem(_tempDir);
         await using var stale = await DeltaTable.CreateAsync(fs, IdSchema, enableDeletionVectors: true);
+        stale.DeletionVectorInlineThreshold = 0; // each attempt's vector a file of its own
         await stale.WriteAsync([Range(1, 1000)]);
-        // Enough rows that each attempt's bitmap exceeds the inline threshold and becomes a file.
         var doomed = RowSelection.FromRowAddresses(
             await RowAddressesOfAsync(stale, [.. Enumerable.Range(1, 800).Select(i => (long)i)]),
             stale.CurrentSnapshot);

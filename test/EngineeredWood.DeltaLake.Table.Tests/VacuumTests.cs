@@ -182,7 +182,7 @@ public class VacuumTests : IDisposable
 
         // InlineThreshold 0 forces a FILE-backed vector, so there is a .bin on disk to protect.
         var dvWriter = new DeletionVectorWriter(fs) { InlineThreshold = 0 };
-        var dv = await dvWriter.CreateAsync([1L, 3L], cardinality: 2);
+        var dv = await dvWriter.CreateAsync(new long[] { 1, 3 });
 
         var log = new TransactionLog(fs);
         await log.WriteCommitAsync(table.CurrentSnapshot.Version + 1, new DeltaAction[]

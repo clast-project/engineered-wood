@@ -308,7 +308,7 @@ public class CdfDeletionVectorInferenceTests : IDisposable
         string original = file.Path;
 
         // A vector this small is written inline; force a file, since that is what VACUUM can delete.
-        var vector = await new DeletionVectorWriter(Fs) { InlineThreshold = 0 }.CreateAsync([1L], 1);
+        var vector = await new DeletionVectorWriter(Fs) { InlineThreshold = 0 }.CreateAsync(new long[] { 1 });
         Assert.Equal("u", vector.StorageType);
         var txn = table.StartTransaction();
         txn.StageActions(
