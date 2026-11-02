@@ -4399,8 +4399,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     prunePredicate, snapshot.Schema, mappingMode, parquetSchema, snapshot.Metadata.PartitionColumns);
             }
 
+            // Row groups the existing vector already deletes in full hold no row this delete could remove, so
+            // they are skipped unread; positions after them are unchanged.
             await foreach (var (batch, firstRow) in ReadPositionedAsync(
-                reader, filePredicate, columns: null, cancellationToken).ConfigureAwait(false))
+                reader, filePredicate, columns: null, rawDeletedRows, cancellationToken).ConfigureAwait(false))
             {
                 // Resolved exactly as the read path resolves it: the predicate must see what a scan sees.
                 var logicalBatch = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
@@ -10994,11 +10996,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // Reserve for the first batch before decoding it: the largest row group's uncompressed size over
             // the columns read. Later batches reserve what the previous one measured.
             var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
-            reservation.SetInitialEstimate(LargestRowGroupBytes(footer, fileColumns));
+            reservation.SetInitialEstimate(LargestRowGroupBytes(footer, fileColumns, deletedRows));
         }
 
         var builtinBatches = Reserving(
-            ReadPositionedAsync(reader, filePredicate, fileColumns, cancellationToken),
+            ReadPositionedAsync(reader, filePredicate, fileColumns, deletedRows, cancellationToken),
             reservation, cancellationToken);
         await foreach (var processed in ProcessFileBatchesAsync(
             builtinBatches, addFile, snapshot, columns, mappingMode, physicalToLogical,
@@ -11251,13 +11253,21 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// for dictionary-encoded strings; the reservation is trued up to the measured size once decoded.
     /// </summary>
     private static long LargestRowGroupBytes(
-        Parquet.Metadata.FileMetaData footer, IReadOnlyList<string>? fileColumns)
+        Parquet.Metadata.FileMetaData footer, IReadOnlyList<string>? fileColumns, DeletionVectorBitmap? deletedRows)
     {
         HashSet<string>? wanted = fileColumns is null
             ? null : new HashSet<string>(fileColumns, StringComparer.Ordinal);
         long largest = 0;
+        long groupStart = 0;
         foreach (var rowGroup in footer.RowGroups)
         {
+            // A group the deletion vector deletes in full is skipped unread (ReadPositionedAsync), so it is never
+            // decoded and needs no reservation.
+            long start = groupStart;
+            groupStart += rowGroup.NumRows;
+            if (deletedRows is not null && rowGroup.NumRows > 0 && deletedRows.ContainsRange(start, rowGroup.NumRows))
+                continue;
+
             long bytes = 0;
             foreach (var chunk in rowGroup.Columns)
             {
@@ -11318,14 +11328,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="ParquetReadOptions.FilterUsePageIndex"/>, pages within one, still count towards its
     /// position, which the deletion vector and row ids are keyed by; that is why this is not a filtered
     /// <see cref="ParquetFileReader.ReadAllAsync"/>.
+    /// <para>Row groups <paramref name="deletedRows"/> deletes in full are skipped unread: every row in them would
+    /// be dropped after decoding anyway. With no vector, or an empty one, nothing is asked per row group.</para>
     /// </summary>
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> ReadPositionedAsync(
         ParquetFileReader reader,
         Expressions.Predicate? filter,
         IReadOnlyList<string>? columns,
+        DeletionVectorBitmap? deletedRows,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await foreach (var positioned in reader.ReadWithPositionsAsync(filter, columns, cancellationToken)
+        RowSkipPredicate? skip = deletedRows is { IsEmpty: false } ? deletedRows.ContainsRange : null;
+        await foreach (var positioned in reader.ReadWithPositionsAsync(filter, columns, skip, cancellationToken)
             .ConfigureAwait(false))
         {
             yield return (positioned.Batch, positioned.FirstRow);
