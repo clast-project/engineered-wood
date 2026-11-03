@@ -3,6 +3,7 @@
 
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using EngineeredWood.Scans;
 
 namespace EngineeredWood.DeltaLake.Table.Tests;
 

@@ -14,8 +14,10 @@ namespace EngineeredWood.Benchmarks;
 
 /// <summary>
 /// The baseline for reading a file's row groups in parallel (#612), and an upper bound on what that can
-/// gain. "Serial" is <see cref="ParquetFileReader.ReadAllAsync"/> as it is today: one row group after
-/// another, columns decoded in parallel within each. "Window W" reads the same row groups through
+/// gain. "Serial" is <see cref="ParquetFileReader.ReadAllAsync"/> with <c>MaxConcurrentRowGroups = 1</c>: one
+/// row group after another, columns decoded in parallel within each, the read before #612.
+/// "MaxConcurrentRowGroups = W" is the real thing, with its memory budget and its serial pruning.
+/// "Upper bound, window W" reads the same row groups through
 /// <see cref="ParquetFileReader.ReadRowGroupAsync"/>, up to W at once on ONE reader (safe since #629), and
 /// consumes them in order. It has no memory budget and no pruning, so it is an upper bound on the speed
 /// of the real thing, not a design for it.
@@ -63,8 +65,12 @@ internal static class RowGroupParallelAb
 
             foreach (var (label, columns) in new[] { ("all 6 columns", (string[]?)null), ("amount only", Narrow) })
             {
-                var sides = new List<(string Name, int Window)> { ("serial (ReadAllAsync)", 0) };
-                sides.AddRange(windows.Select(w => ($"window {w}", w)));
+                var sides = new List<Side> { new("serial (MaxConcurrentRowGroups = 1)", 0, 1) };
+                foreach (int w in windows)
+                {
+                    sides.Add(new($"MaxConcurrentRowGroups = {w}", 0, w));
+                    sides.Add(new($"upper bound, window {w}", w, 0));
+                }
 
                 // Warm-up, and the check that every side reads the same rows.
                 Result? expected = null;
@@ -72,7 +78,7 @@ internal static class RowGroupParallelAb
                 {
                     foreach (var side in sides)
                     {
-                        var r = await ReadAsync(path, columns, side.Window, 0, 0, 0);
+                        var r = await ReadAsync(path, columns, side, 0, 0, 0);
                         expected ??= r;
                         if (r.Rows != expected.Value.Rows || r.Checksum != expected.Value.Checksum)
                             throw new InvalidOperationException(
@@ -82,6 +88,7 @@ internal static class RowGroupParallelAb
                 }
 
                 var times = sides.Select(_ => new List<double>()).ToArray();
+                var peaks = new long[sides.Count];
                 var ratios = sides.Select(_ => new List<double>()).ToArray();
                 for (int round = 0; round < rounds; round++)
                 {
@@ -90,7 +97,9 @@ internal static class RowGroupParallelAb
                     {
                         // Rotate the order so that no side always runs first or last.
                         int s = (k + round) % sides.Count;
-                        ms[s] = (await ReadAsync(path, columns, sides[s].Window, latencyMs, mbps, consumerMs)).Ms;
+                        var r = await ReadAsync(path, columns, sides[s], latencyMs, mbps, consumerMs);
+                        ms[s] = r.Ms;
+                        peaks[s] = Math.Max(peaks[s], r.PeakBytes);
                     }
 
                     for (int s = 0; s < sides.Count; s++)
@@ -102,10 +111,13 @@ internal static class RowGroupParallelAb
 
                 Console.WriteLine($"**{label}**");
                 Console.WriteLine();
-                Console.WriteLine("| Read | ms | Speed-up vs serial |");
-                Console.WriteLine("|---|---|---|");
+                Console.WriteLine("| Read | ms | Speed-up vs serial | Peak budget MiB |");
+                Console.WriteLine("|---|---|---|---|");
                 for (int s = 0; s < sides.Count; s++)
-                    Console.WriteLine($"| {sides[s].Name} | {Median(times[s]):F1} | {Median(ratios[s]):F2}x |");
+                {
+                    string peak = sides[s].Option > 1 ? (peaks[s] / 1048576.0).ToString("F1", CultureInfo.InvariantCulture) : "";
+                    Console.WriteLine($"| {sides[s].Name} | {Median(times[s]):F1} | {Median(ratios[s]):F2}x | {peak} |");
+                }
                 Console.WriteLine();
             }
         }
@@ -162,21 +174,29 @@ internal static class RowGroupParallelAb
         await writer.CloseAsync();
     }
 
-    private readonly record struct Result(double Ms, long Rows, double Checksum);
+    /// <summary>One way to read: <paramref name="Manual"/> above 0 is the hand-rolled window (the upper
+    /// bound); otherwise <see cref="ParquetReadOptions.MaxConcurrentRowGroups"/> is <paramref name="Option"/>.</summary>
+    private sealed record Side(string Name, int Manual, int Option);
+
+    private readonly record struct Result(double Ms, long Rows, double Checksum, long PeakBytes);
 
     private static async Task<Result> ReadAsync(
-        string path, string[]? columns, int window, int latencyMs, double mbps, double consumerMs)
+        string path, string[]? columns, Side side, int latencyMs, double mbps, double consumerMs)
     {
         await using var file = new LatencyCountingFile(new LocalRandomAccessFile(path), latencyMs, mbps);
         var clock = Stopwatch.StartNew();
         long rows = 0;
         double checksum = 0;
-        using (var reader = new ParquetFileReader(file, ownsFile: false))
+        long peak = 0;
+        int window = side.Manual;
+        var options = new ParquetReadOptions { MaxConcurrentRowGroups = Math.Max(1, side.Option) };
+        using (var reader = new ParquetFileReader(file, ownsFile: false, options))
         {
             if (window == 0)
             {
                 await foreach (var batch in reader.ReadAllAsync(columns))
                     Consume(batch, consumerMs, ref rows, ref checksum);
+                peak = reader.LastScanBudget?.Peak ?? 0;
             }
             else
             {
@@ -215,7 +235,7 @@ internal static class RowGroupParallelAb
             }
         }
 
-        return new Result(clock.Elapsed.TotalMilliseconds, rows, checksum);
+        return new Result(clock.Elapsed.TotalMilliseconds, rows, checksum, peak);
     }
 
     private static void Consume(RecordBatch batch, double consumerMs, ref long rows, ref double checksum)

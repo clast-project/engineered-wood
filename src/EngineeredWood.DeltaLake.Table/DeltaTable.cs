@@ -13,6 +13,7 @@ using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.DeltaLake.Snapshot;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet;
+using EngineeredWood.Scans;
 
 namespace EngineeredWood.DeltaLake.Table;
 
@@ -206,9 +207,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// through the built-in ParquetFileReader takes these options: scans, CDF, compaction and the DML rewrites.
     /// A host <see cref="DeltaTableOptions.DataFileReader"/> decodes scans and compaction itself and is not
     /// given them, so its batches keep whatever decimal type it produces.
+    /// <para>Row groups are read one at a time (<see cref="ParquetReadOptions.MaxConcurrentRowGroups"/> of 1):
+    /// a scan already reads several FILES at once within its own budget
+    /// (<see cref="DeltaTableOptions.MaxConcurrentFileReads"/>), and a row-group window inside each file would
+    /// multiply both the reads and the memory held. Splitting a scan by row group is #612's second step.</para>
     /// </summary>
     private static ParquetReadOptions DataFileReadOptions(ParquetReadOptions options) =>
-        WithVariantExtension(options) with { DecimalOutput = DecimalOutputKind.Decimal128 };
+        WithVariantExtension(options) with { DecimalOutput = DecimalOutputKind.Decimal128, MaxConcurrentRowGroups = 1 };
 
     private sealed record StatsSelectionEntry(
         Schema.StructType Schema, MetadataAction Metadata, Stats.StatsColumnSelection Selection);

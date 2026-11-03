@@ -420,6 +420,65 @@ public sealed record ParquetReadOptions
     public ExtensionTypeRegistry? ExtensionRegistry { get; init; }
 
     /// <summary>
+    /// How many row groups of one file <see cref="ParquetFileReader.ReadAllAsync"/> and
+    /// <see cref="ParquetFileReader.ReadWithPositionsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, CancellationToken)"/>
+    /// read and decode at once. Default: null, which means <c>min(4, Environment.ProcessorCount)</c>. 1 reads
+    /// them one after another, as before #612.
+    /// </summary>
+    /// <remarks>
+    /// <para>Batches still come out in file order, with the same rows and positions a serial read gives,
+    /// whatever order the row groups finish in. Which row groups (and which rows of them) are read is decided
+    /// first, in order, by the same pruning as a serial read; only the reads and decodes overlap. An error
+    /// surfaces where a serial read would have thrown it, after every batch before it. However the read ends —
+    /// completion, an early <c>break</c>, an error, cancellation — everything read ahead is cancelled, and every
+    /// batch the caller did not receive is disposed.</para>
+    /// <para>Each row group's columns are decoded in parallel too, so a local read gains most from 2 to 4; a
+    /// read from cloud storage, where the time goes to requests, gains from more. The memory held is bounded
+    /// by <see cref="MaxBufferedReadBytes"/>, not by this. The entry points that read a single row group
+    /// (<c>ReadRowGroupAsync</c>, <c>ReadRowGroupBatchesAsync</c>, <c>ReadRowRangesAsync</c>) are not affected.</para>
+    /// </remarks>
+    public int? MaxConcurrentRowGroups
+    {
+        get => _maxConcurrentRowGroups;
+        init
+        {
+            if (value is < 1)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Must be at least 1, or null for the default.");
+            _maxConcurrentRowGroups = value;
+        }
+    }
+    private readonly int? _maxConcurrentRowGroups;
+
+    /// <summary>
+    /// The decoded data, in bytes of Arrow buffers, a read of several row groups at once
+    /// (<see cref="MaxConcurrentRowGroups"/>) may hold that the caller has not yet received. Default: 256 MiB.
+    /// </summary>
+    /// <remarks>
+    /// <para>A row group reserves budget BEFORE each batch is decoded, and the reservation is released when the
+    /// caller takes the batch. A row group waits while the budget is full, so a slow consumer holds the reads
+    /// back, and a row group larger than the budget is read alone. Two exceptions keep the read from stalling:
+    /// a batch is always admitted when nothing else is held, even if it alone is larger than the budget; and
+    /// the row group the caller is waiting on may decode one batch over the budget.</para>
+    /// <para>A row group's first reservation is its projected size from the footer — uncompressed, scaled up by
+    /// the largest ratio of decoded to uncompressed size seen so far in the read, plus compressed, which is
+    /// held while it decodes. A batch that comes out larger is charged in full without waiting. The footer
+    /// UNDERestimates dictionary-encoded strings, so the first row groups in flight can overrun their
+    /// reservations; once one has been decoded, the ratio corrects the rest. A serial read
+    /// (<see cref="MaxConcurrentRowGroups"/> of 1) does not use the budget at all.</para>
+    /// </remarks>
+    public long MaxBufferedReadBytes
+    {
+        get => _maxBufferedReadBytes;
+        init
+        {
+            if (value < 1)
+                throw new ArgumentOutOfRangeException(nameof(value), value, "Must be at least 1.");
+            _maxBufferedReadBytes = value;
+        }
+    }
+    private readonly long _maxBufferedReadBytes = 256L * 1024 * 1024;
+
+    /// <summary>
     /// Shorthand for <c>ByteArrayOutput == ByteArrayOutputKind.ViewType</c>.
     /// When set to <see langword="true"/>, sets <see cref="ByteArrayOutput"/> to
     /// <see cref="ByteArrayOutputKind.ViewType"/>; setting to <see langword="false"/>
