@@ -11,11 +11,34 @@ namespace EngineeredWood.DeltaLake.Table.IdentityColumns;
 
 /// <summary>
 /// Handles identity column value generation during writes.
-/// For columns with <c>allowExplicitInsert = false</c>, generates values automatically.
+/// For columns with <c>allowExplicitInsert = false</c>, generates values automatically (a committing write
+/// refuses a batch that supplies the column first, via <see cref="ThrowIfGeneratedAlwaysSupplied"/>).
 /// For columns with <c>allowExplicitInsert = true</c>, validates user-provided values.
 /// </summary>
 internal static class IdentityColumnWriter
 {
+    /// <summary>
+    /// Refuses a batch schema that carries a <c>GENERATED ALWAYS AS IDENTITY</c> column, as Spark does
+    /// (<see cref="DeltaTableErrorCodes.IdentityColumnExplicitInsertNotSupported"/>). The table assigns those
+    /// values; replacing the caller's silently would store a key other than the one they supplied, with nothing
+    /// to say so. Judged by the schema alone, exactly as Spark judges it: a column that is all NULL, or a batch with
+    /// no rows, still supplies the column.
+    /// </summary>
+    public static void ThrowIfGeneratedAlwaysSupplied(Apache.Arrow.Schema batchSchema, DeltaStructType deltaSchema)
+    {
+        foreach (var field in deltaSchema.Fields)
+        {
+            if (IdentityColumn.GetConfig(field) is { AllowExplicitInsert: false }
+                && batchSchema.GetFieldIndex(field.Name) >= 0)
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.IdentityColumnExplicitInsertNotSupported,
+                    $"Providing values for GENERATED ALWAYS AS IDENTITY column '{field.Name}' is not supported: "
+                    + "the table assigns its values. Leave the column out of the data and the table generates it.");
+            }
+        }
+    }
+
     /// <summary>
     /// Processes a RecordBatch for identity columns. For auto-generated columns,
     /// adds or replaces the column with generated values. For explicit-insert columns,
@@ -49,7 +72,6 @@ internal static class IdentityColumnWriter
 
         var columns = new List<IArrowArray>();
         var fields = new List<Field>();
-        int batchColIdx = 0;
 
         for (int schemaIdx = 0; schemaIdx < deltaSchema.Fields.Count; schemaIdx++)
         {
@@ -69,7 +91,6 @@ internal static class IdentityColumnWriter
                         var col = batch.Column(colIdx);
                         columns.Add(col);
                         fields.Add(batch.Schema.FieldsList[colIdx]);
-                        batchColIdx = colIdx + 1;
 
                         // Track high water mark from user values
                         if (col is Int64Array int64)
@@ -103,7 +124,9 @@ internal static class IdentityColumnWriter
                 }
                 else
                 {
-                    // Auto-generate values — don't use any user-provided column
+                    // Auto-generate values. A committing write has already refused a batch that carries the
+                    // column (ThrowIfGeneratedAlwaysSupplied); only a host engine's batch reaches here with it, as
+                    // the placeholder GenerateIdentityValues fills, so whatever it holds is replaced.
                     var (generated, newHwm) = GenerateColumn(config, batch.Length);
                     columns.Add(generated);
                     fields.Add(new Field(deltaField.Name, Int64Type.Default,
@@ -111,11 +134,6 @@ internal static class IdentityColumnWriter
                     updates.Add((deltaField.Name, newHwm));
                     activeConfigs[deltaField.Name] = config with
                         { HighWaterMark = newHwm };
-
-                    // Skip the user column if it was provided
-                    int colIdx = batch.Schema.GetFieldIndex(deltaField.Name);
-                    if (colIdx >= 0)
-                        batchColIdx = colIdx + 1;
                 }
             }
             else

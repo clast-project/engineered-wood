@@ -442,10 +442,11 @@ public class ReplaceWhereTests : IDisposable
         Assert.Equal(DeltaTableErrorCodes.ReplaceWhereMismatch, ex.ErrorCode);
     }
 
-    /// <summary>A value supplied for a GENERATED ALWAYS column is replaced by a generated one, so a window that the
-    /// supplied value satisfies must not let the row in: it would be stored outside the window.</summary>
+    /// <summary>A value supplied for a GENERATED ALWAYS column is refused before the window judges anything, as Spark
+    /// refuses it (#595, measured on a replaceWhere): it used to be replaced by a generated one, which a window the
+    /// supplied value satisfied could not be allowed to let in.</summary>
     [Fact]
-    public async Task ASuppliedValueAGeneratedAlwaysIdentityReplaces_CannotSlipIntoTheWindow()
+    public async Task ASuppliedValueForAGeneratedAlwaysIdentity_IsRefusedBeforeTheWindow()
     {
         await using var table = await CreateIdentityTableAsync();
         var withId = new Apache.Arrow.Schema.Builder()
@@ -456,7 +457,7 @@ public class ReplaceWhereTests : IDisposable
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(
             () => table.OverwriteWhereAsync([batch], Ex.Equal("id", 0L)).AsTask());
 
-        Assert.Equal(DeltaTableErrorCodes.ReplaceWhereMismatch, ex.ErrorCode);
+        Assert.Equal(DeltaTableErrorCodes.IdentityColumnExplicitInsertNotSupported, ex.ErrorCode);
     }
 
     // ── Transactions and concurrency ──

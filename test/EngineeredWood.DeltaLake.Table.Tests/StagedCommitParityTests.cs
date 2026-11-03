@@ -410,7 +410,9 @@ public class StagedCommitParityTests : IDisposable
 
         // And the persisted high-water mark drives the NEXT (committing) write, so nothing double-issues.
         await using var check = await DeltaTable.OpenAsync(Fs);
-        await check.WriteAsync([InsertBatch("f")]);
+        // The committing write leaves the identity column out: carrying it, even all NULL, is refused (#595).
+        var valueOnly = new Apache.Arrow.Schema.Builder().Field(new Field("value", StringType.Default, true)).Build();
+        await check.WriteAsync([new RecordBatch(valueOnly, [new StringArray.Builder().Append("f").Build()], 1)]);
         Assert.Equal(new long[] { 1, 2, 3, 4, 5, 6 }, await ReadIdsFreshAsync());
     }
 

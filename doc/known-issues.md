@@ -854,8 +854,6 @@ an arbitrary ON condition, several clauses of one kind, SET or VALUES expression
 (only source columns, all of them or a named list), or schema evolution (appends have it since #568; MERGE
 does not use it yet); it always copy-on-writes, never writing deletion vectors;
 it prunes files by the source's key range only for integer and string keys (not date, timestamp or decimal);
-an `INSERT *` into a table with a GENERATED ALWAYS identity column replaces the source's values for it, as an
-append does, where Spark's behavior has not been checked;
 and, like EW's other DML (only VACUUM writes them), its commit records no
 `operationMetrics`: the counts come back to the caller as `MergeMetrics` instead. `RestoreAsync` (by version or
 timestamp, #567) commits an earlier version's files, metadata and clustering columns as Spark's RESTORE does (pinned
