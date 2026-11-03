@@ -73,10 +73,26 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         _constantFolded = functions as IConstantFoldedFunctions;
     }
 
-    public BooleanArray EvaluatePredicate(Predicate predicate, RecordBatch batch)
+    public BooleanArray EvaluatePredicate(Predicate predicate, RecordBatch batch) =>
+        EvalPredicateAsArray(predicate, batch);
+
+    /// <summary>
+    /// <see cref="EvalPredicate"/> as a <see cref="BooleanArray"/>. A lone comparison the direct path
+    /// takes -- the commonest whole predicate -- writes the array's bitmaps itself, with no
+    /// <c>bool?[]</c> in between (#608); a compound predicate still combines <c>bool?[]</c>s.
+    /// </summary>
+    private BooleanArray EvalPredicateAsArray(Predicate predicate, RecordBatch batch)
     {
-        var result = EvalPredicate(predicate, batch);
-        return ToBooleanArray(result, batch.Length);
+        if (predicate is ComparisonPredicate cmp)
+        {
+            // In EvalComparison's order: the analysis, then the direct path, then the general one.
+            bool asked = CheckComparableFromTree(cmp, batch);
+            if (TryCompareColumnToConstant(cmp, batch, asked) is { } direct)
+                return direct.ToBooleanArray();
+            return ToBooleanArray(EvalComparisonOverRows(cmp, batch, asked), batch.Length);
+        }
+
+        return ToBooleanArray(EvalPredicate(predicate, batch), batch.Length);
     }
 
     public IArrowArray EvaluateExpression(Expression expression, RecordBatch batch)
@@ -232,8 +248,14 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         // A column against a constant -- the shape of nearly every filter and DML predicate --
         // is compared straight off the Arrow buffers when that is provably the same answer.
         if (TryCompareColumnToConstant(cmp, batch, asked) is { } direct)
-            return direct;
+            return direct.ToNullable();
 
+        return EvalComparisonOverRows(cmp, batch, asked);
+    }
+
+    /// <summary>The general path of <see cref="EvalComparison"/>: both operands as values, row by row.</summary>
+    private bool?[] EvalComparisonOverRows(ComparisonPredicate cmp, RecordBatch batch, bool asked)
+    {
         var (left, leftType) = EvalOperand(cmp.Left, batch);
         var (right, rightType) = EvalOperand(cmp.Right, batch);
         if (!asked)
@@ -1352,7 +1374,7 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
             UnboundReference u => GetColumn(batch, u),
             BoundReference b => GetColumn(batch, b.Name),
             FunctionCall fc => InvokeFunction(fc, batch),
-            Predicate p => ToBooleanArray(EvalPredicate(p, batch), batch.Length),
+            Predicate p => EvalPredicateAsArray(p, batch),
             LiteralExpression lit => ConstantArray(lit.Value, batch.Length),
             _ => MaterializeAsArray(EvalExpression(expression, batch), batch.Length),
         };
@@ -1644,12 +1666,13 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         if (predicate is ComparisonPredicate cmp
             && TryCompareColumnToConstant(cmp, batch, CheckComparableFromTree(cmp, batch)) is { } direct)
         {
-            for (var i = 0; i < direct.Length; i++)
+            var answer = direct.ToNullable();
+            for (var i = 0; i < answer.Length; i++)
             {
-                if (!rows[i]) direct[i] = null;
+                if (!rows[i]) answer[i] = null;
             }
 
-            return direct;
+            return answer;
         }
 
         var result = new bool?[batch.Length];

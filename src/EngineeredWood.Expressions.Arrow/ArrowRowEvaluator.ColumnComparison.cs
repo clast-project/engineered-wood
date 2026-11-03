@@ -50,7 +50,7 @@ public sealed partial class ArrowRowEvaluator
 
     private static readonly Schema EmptySchema = new Schema.Builder().Build();
 
-    private bool?[]? TryCompareColumnToConstant(ComparisonPredicate cmp, RecordBatch batch, bool asked)
+    private DirectAnswer? TryCompareColumnToConstant(ComparisonPredicate cmp, RecordBatch batch, bool asked)
     {
         if (!DirectColumnComparison || batch.Length == 0)
             return null;
@@ -268,12 +268,117 @@ public sealed partial class ArrowRowEvaluator
         or ComparisonOperator.LessThan or ComparisonOperator.LessThanOrEqual
         or ComparisonOperator.GreaterThan or ComparisonOperator.GreaterThanOrEqual;
 
+    // ── The answer ──
+
     /// <summary>
-    /// The answer for a null row: null, except under <c>&lt;=&gt;</c>, where a null column against
-    /// the (non-null) constant is false.
+    /// A direct comparison's answer, as the value and validity bitmaps of a <see cref="BooleanArray"/>
+    /// (#608): one bit a row where a <c>bool?[]</c> took two bytes, which for a 50K-row batch put the
+    /// mask on the large-object heap.
     /// </summary>
-    private static bool? NullRow(ComparisonOperator op) =>
-        op == ComparisonOperator.NullSafeEqual ? false : null;
+    private readonly struct DirectAnswer
+    {
+        private readonly byte[] _values;
+        private readonly byte[]? _validity;
+        private readonly int _nullCount;
+        private readonly int _length;
+
+        public DirectAnswer(byte[] values, byte[]? validity, int nullCount, int length)
+        {
+            _values = values;
+            _validity = validity;
+            _nullCount = nullCount;
+            _length = length;
+        }
+
+        public BooleanArray ToBooleanArray() => new(
+            new ArrowBuffer(_values),
+            _validity is null ? ArrowBuffer.Empty : new ArrowBuffer(_validity),
+            _length, _nullCount, 0);
+
+        /// <summary>For a compound predicate, which still combines its operands as <c>bool?[]</c>.</summary>
+        public bool?[] ToNullable()
+        {
+            var result = new bool?[_length];
+            for (int i = 0; i < _length; i++)
+            {
+                if (_validity is null || IsSet(_validity, i))
+                    result[i] = IsSet(_values, i);
+            }
+
+            return result;
+        }
+    }
+
+    private static int BitmapBytes(int length) => (length + 7) / 8;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsSet(byte[] bits, int i) => (bits[i >> 3] & (1 << (i & 7))) != 0;
+
+    /// <summary>Sets row <paramref name="i"/>'s bit, without a branch on <paramref name="value"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Set(byte[] bits, int i, bool value) =>
+        bits[i >> 3] |= (byte)((value ? 1 : 0) << (i & 7));
+
+    /// <summary>The eight bits of a bitmap that start at any bit offset.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static byte ReadByte(ReadOnlySpan<byte> bitmap, int bitOffset)
+    {
+        int index = bitOffset >> 3, shift = bitOffset & 7;
+        int bits = bitmap[index] >> shift;
+        if (shift != 0 && index + 1 < bitmap.Length)
+            bits |= bitmap[index + 1] << (8 - shift);
+        return (byte)bits;
+    }
+
+    private static int PopCount(byte value)
+    {
+#if NET6_0_OR_GREATER
+        return System.Numerics.BitOperations.PopCount(value);
+#else
+        int count = 0;
+        for (; value != 0; value &= (byte)(value - 1))
+            count++;
+        return count;
+#endif
+    }
+
+    /// <summary>
+    /// Finishes a kernel's value bits with the column's nulls. A null row is null, except under
+    /// <c>&lt;=&gt;</c>, where a null column against the (non-null) constant is false. Either way its
+    /// value bit is cleared, so a kernel may compare every row without looking at the nulls.
+    /// </summary>
+    private static DirectAnswer Answer(IArrowArray column, ComparisonOperator op, byte[] values)
+    {
+        int length = column.Length;
+        if (length == 0)
+            return new DirectAnswer(values, null, 0, 0);
+
+        int tail = length & 7;
+        byte lastMask = tail == 0 ? (byte)0xFF : (byte)((1 << tail) - 1);
+        values[values.Length - 1] &= lastMask;
+
+        // NullCount -1 is "not counted", so the bitmap decides.
+        var bitmap = column.Data.Buffers[0].Span;
+        if (column.NullCount == 0 || bitmap.IsEmpty)
+            return new DirectAnswer(values, null, 0, length);
+
+        var validity = new byte[values.Length];
+        int offset = column.Offset;
+        int valid = 0;
+        for (int b = 0; b < validity.Length; b++)
+        {
+            byte bits = ReadByte(bitmap, offset + b * 8);
+            if (b == validity.Length - 1)
+                bits &= lastMask;
+            validity[b] = bits;
+            values[b] &= bits;
+            valid += PopCount(bits);
+        }
+
+        return valid == length || op == ComparisonOperator.NullSafeEqual
+            ? new DirectAnswer(values, null, 0, length)
+            : new DirectAnswer(values, validity, length - valid, length);
+    }
 
     // ── Kernels ──
 
@@ -287,7 +392,7 @@ public sealed partial class ArrowRowEvaluator
     /// rather than as the U+FFFD the general path decodes it to. Arrow requires a string column to
     /// be valid UTF-8, and Spark compares the raw bytes too.
     /// </remarks>
-    private static bool?[]? CompareStrings(StringArray column, ComparisonOperator op, LiteralValue constant)
+    private static DirectAnswer? CompareStrings(StringArray column, ComparisonOperator op, LiteralValue constant)
     {
         if (constant.Type != LiteralValue.Kind.String)
             return null;
@@ -307,48 +412,41 @@ public sealed partial class ArrowRowEvaluator
         }
 
         int length = column.Length;
-        var result = new bool?[length];
+        var result = new byte[BitmapBytes(length)];
         var offsets = column.ValueOffsets;
         var data = column.ValueBuffer.Span;
         bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
         var target = new ReadOnlySpan<byte>(literal);
 
-        if (startsWith)
+        // Unlike a fixed-width slot, a string costs something to compare, so a null row is skipped.
+        // Answer clears its bit either way.
+        if (startsWith || op is ComparisonOperator.Equal or ComparisonOperator.NullSafeEqual or ComparisonOperator.NotEqual)
         {
-            bool want = op == ComparisonOperator.StartsWith;
+            // Equality needs no order, and SequenceEqual stops at a length mismatch.
+            bool want = op is ComparisonOperator.StartsWith or ComparisonOperator.Equal or ComparisonOperator.NullSafeEqual;
             for (int i = 0; i < length; i++)
             {
                 if (hasNulls && column.IsNull(i))
-                    continue;   // null under both
+                    continue;
 
                 int start = offsets[i];
-                result[i] = data.Slice(start, offsets[i + 1] - start).StartsWith(target) == want;
+                var value = data.Slice(start, offsets[i + 1] - start);
+                Set(result, i, (startsWith ? value.StartsWith(target) : value.SequenceEqual(target)) == want);
             }
-
-            return result;
         }
-
-        bool? nullRow = NullRow(op);
-        for (int i = 0; i < length; i++)
+        else
         {
-            if (hasNulls && column.IsNull(i))
+            for (int i = 0; i < length; i++)
             {
-                result[i] = nullRow;
-                continue;
-            }
+                if (hasNulls && column.IsNull(i))
+                    continue;
 
-            int start = offsets[i];
-            var value = data.Slice(start, offsets[i + 1] - start);
-            result[i] = op switch
-            {
-                // Equality needs no order, and SequenceEqual stops at a length mismatch.
-                ComparisonOperator.Equal or ComparisonOperator.NullSafeEqual => value.SequenceEqual(target),
-                ComparisonOperator.NotEqual => !value.SequenceEqual(target),
-                _ => Decide(op, value.SequenceCompareTo(target)),
-            };
+                int start = offsets[i];
+                Set(result, i, Decide(op, data.Slice(start, offsets[i + 1] - start).SequenceCompareTo(target)));
+            }
         }
 
-        return result;
+        return Answer(column, op, result);
     }
 
     /// <summary>
@@ -356,7 +454,11 @@ public sealed partial class ArrowRowEvaluator
     /// an integral, floating or decimal constant -- the three branches
     /// <see cref="LiteralValue.CompareTo(LiteralValue)"/> takes for those pairs, in its order.
     /// </summary>
-    private static bool?[]? CompareIntegers<T>(
+    /// <remarks>
+    /// This and the other fixed-width kernels compare every row, null or not: a null slot still holds
+    /// some value, and <see cref="Answer"/> clears its bit.
+    /// </remarks>
+    private static DirectAnswer? CompareIntegers<T>(
         IArrowArray column, ReadOnlySpan<T> values, ComparisonOperator op, LiteralValue constant)
         where T : struct
     {
@@ -364,34 +466,20 @@ public sealed partial class ArrowRowEvaluator
             return null;
 
         int length = column.Length;
-        var result = new bool?[length];
-        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
-        bool? nullRow = NullRow(op);
+        var result = new byte[BitmapBytes(length)];
 
         if (LiteralValue.TryAsInt64(constant, out long target))
         {
             for (int i = 0; i < length; i++)
-            {
-                if (hasNulls && column.IsNull(i))
-                    result[i] = nullRow;
-                else
-                    result[i] = Decide(op, ToInt64(values[i]).CompareTo(target));
-            }
-
-            return result;
+                Set(result, i, Decide(op, ToInt64(values[i]).CompareTo(target)));
+            return Answer(column, op, result);
         }
 
         if (LiteralValue.IsFloating(constant.Type) && LiteralValue.TryAsDouble(constant, out double floating))
         {
             for (int i = 0; i < length; i++)
-            {
-                if (hasNulls && column.IsNull(i))
-                    result[i] = nullRow;
-                else
-                    result[i] = Decide(op, LiteralValue.CompareFloating(ToInt64(values[i]), floating));
-            }
-
-            return result;
+                Set(result, i, Decide(op, LiteralValue.CompareFloating(ToInt64(values[i]), floating)));
+            return Answer(column, op, result);
         }
 
         if (constant.Type == LiteralValue.Kind.Decimal)
@@ -399,14 +487,8 @@ public sealed partial class ArrowRowEvaluator
             // Exact, as CompareScaledIntegers is: every long is a decimal.
             decimal exact = constant.AsDecimal;
             for (int i = 0; i < length; i++)
-            {
-                if (hasNulls && column.IsNull(i))
-                    result[i] = nullRow;
-                else
-                    result[i] = Decide(op, ((decimal)ToInt64(values[i])).CompareTo(exact));
-            }
-
-            return result;
+                Set(result, i, Decide(op, ((decimal)ToInt64(values[i])).CompareTo(exact)));
+            return Answer(column, op, result);
         }
 
         return null;
@@ -430,7 +512,7 @@ public sealed partial class ArrowRowEvaluator
     /// <see cref="LiteralValue.CompareFloating"/> through <see cref="LiteralValue.TryAsDouble"/>,
     /// the floating kinds being excluded from the exact branch.
     /// </summary>
-    private static bool?[]? CompareFloating<T>(
+    private static DirectAnswer? CompareFloating<T>(
         IArrowArray column, ReadOnlySpan<T> values, ComparisonOperator op, LiteralValue constant)
         where T : struct
     {
@@ -438,18 +520,10 @@ public sealed partial class ArrowRowEvaluator
             return null;
 
         int length = column.Length;
-        var result = new bool?[length];
-        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
-        bool? nullRow = NullRow(op);
+        var result = new byte[BitmapBytes(length)];
         for (int i = 0; i < length; i++)
-        {
-            if (hasNulls && column.IsNull(i))
-                result[i] = nullRow;
-            else
-                result[i] = Decide(op, LiteralValue.CompareFloating(ToDouble(values[i]), target));
-        }
-
-        return result;
+            Set(result, i, Decide(op, LiteralValue.CompareFloating(ToDouble(values[i]), target)));
+        return Answer(column, op, result);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -460,25 +534,30 @@ public sealed partial class ArrowRowEvaluator
         throw new NotSupportedException(typeof(T).Name);
     }
 
-    private static bool?[]? CompareBooleans(BooleanArray column, ComparisonOperator op, LiteralValue constant)
+    /// <summary>
+    /// A boolean column, eight rows at a time. A row's answer depends only on its own bit, so the
+    /// answer is the column's set bits where the answer for <c>true</c> holds and its clear bits where
+    /// the answer for <c>false</c> does.
+    /// </summary>
+    private static DirectAnswer? CompareBooleans(BooleanArray column, ComparisonOperator op, LiteralValue constant)
     {
         if (!IsOrdering(op) || constant.Type != LiteralValue.Kind.Boolean)
             return null;
 
         bool target = constant.AsBoolean;
-        int length = column.Length;
-        var result = new bool?[length];
-        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
-        bool? nullRow = NullRow(op);
-        for (int i = 0; i < length; i++)
+        int ifTrue = Decide(op, true.CompareTo(target)) ? 0xFF : 0;
+        int ifFalse = Decide(op, false.CompareTo(target)) ? 0xFF : 0;
+
+        var bits = column.ValueBuffer.Span;
+        int offset = column.Offset;
+        var result = new byte[BitmapBytes(column.Length)];
+        for (int b = 0; b < result.Length; b++)
         {
-            if (hasNulls && column.IsNull(i))
-                result[i] = nullRow;
-            else
-                result[i] = Decide(op, column.GetValue(i)!.Value.CompareTo(target));
+            int v = ReadByte(bits, offset + b * 8);
+            result[b] = (byte)((v & ifTrue) | (~v & ifFalse));
         }
 
-        return result;
+        return Answer(column, op, result);
     }
 
     /// <summary>
@@ -489,7 +568,7 @@ public sealed partial class ArrowRowEvaluator
     /// Compared in the column's own unit against the constant's offset from the epoch, split once
     /// into whole units and a remainder, so no row is scaled into ticks and nothing can overflow.
     /// </remarks>
-    private static bool?[]? CompareInstants<T>(
+    private static DirectAnswer? CompareInstants<T>(
         IArrowArray column, ReadOnlySpan<T> values, long ticksPerUnit, ComparisonOperator op, LiteralValue constant)
         where T : struct
     {
@@ -501,23 +580,15 @@ public sealed partial class ArrowRowEvaluator
         bool exact = offset - whole * ticksPerUnit == 0;
 
         int length = column.Length;
-        var result = new bool?[length];
-        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
-        bool? nullRow = NullRow(op);
+        var result = new byte[BitmapBytes(length)];
         for (int i = 0; i < length; i++)
         {
-            if (hasNulls && column.IsNull(i))
-            {
-                result[i] = nullRow;
-                continue;
-            }
-
             long v = ToInt64(values[i]);
             int sign = v < whole ? -1 : v > whole ? 1 : exact ? 0 : -1;
-            result[i] = Decide(op, sign);
+            Set(result, i, Decide(op, sign));
         }
 
-        return result;
+        return Answer(column, op, result);
     }
 
     /// <summary>
@@ -526,7 +597,7 @@ public sealed partial class ArrowRowEvaluator
     /// nanosecond case truncates the same way before comparing; the coarser units scale exactly.
     /// The column's time zone never matters: an instant compares in UTC.
     /// </summary>
-    private static bool?[]? CompareTimestamps(TimestampArray column, ComparisonOperator op, LiteralValue constant)
+    private static DirectAnswer? CompareTimestamps(TimestampArray column, ComparisonOperator op, LiteralValue constant)
     {
         var unit = ((TimestampType)column.Data.DataType).Unit;
         switch (unit)
@@ -549,18 +620,10 @@ public sealed partial class ArrowRowEvaluator
         long target = instant.UtcTicks - Epoch.UtcTicks;
         var values = column.Values;
         int length = column.Length;
-        var result = new bool?[length];
-        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
-        bool? nullRow = NullRow(op);
+        var result = new byte[BitmapBytes(length)];
         for (int i = 0; i < length; i++)
-        {
-            if (hasNulls && column.IsNull(i))
-                result[i] = nullRow;
-            else
-                result[i] = Decide(op, (values[i] / 100).CompareTo(target));
-        }
-
-        return result;
+            Set(result, i, Decide(op, (values[i] / 100).CompareTo(target)));
+        return Answer(column, op, result);
     }
 
     private static bool TryAsInstant(LiteralValue constant, out DateTimeOffset instant)

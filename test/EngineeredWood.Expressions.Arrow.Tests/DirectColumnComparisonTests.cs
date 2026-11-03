@@ -201,8 +201,9 @@ public class DirectColumnComparisonTests
         {
             var mask = evaluator.EvaluatePredicate(predicate, batch);
             directCount = evaluator.DirectComparisons;
+            // The null count too: the direct path writes the array's bitmaps itself (#608).
             return string.Join(",", Enumerable.Range(0, mask.Length)
-                .Select(i => mask.GetValue(i) is { } v ? (v ? "T" : "F") : "n"));
+                .Select(i => mask.GetValue(i) is { } v ? (v ? "T" : "F") : "n")) + $" ({mask.NullCount} null)";
         }
         catch (Exception e)
         {
