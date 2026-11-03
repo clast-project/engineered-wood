@@ -453,4 +453,224 @@ public class ParallelFileReadTests : IDisposable
         Assert.Throws<ArgumentOutOfRangeException>(() => new DeltaTableOptions { MaxBufferedReadBytes = 0 });
         Assert.Null(new DeltaTableOptions().MaxConcurrentFileReads);
     }
+
+    // ── #612: a scan split by (file, row group) ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The table's file system, counting the data files it has open and, optionally, delaying every data read
+    /// and recording how many were in flight at once, or refusing to open one file.
+    /// </summary>
+    private sealed class TrackingFileSystem(ITableFileSystem inner, int delayMs = 0, string? failOpen = null)
+        : ITableFileSystem
+    {
+        private int _open;
+        private int _reading;
+        public int Opened;
+        public int MaxReading;
+
+        public int Open => Volatile.Read(ref _open);
+
+        public PathNameConstraints PathConstraints => inner.PathConstraints;
+
+        public async ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
+        {
+            if (!path.EndsWith(".parquet", StringComparison.Ordinal) || path.Contains("_delta_log"))
+                return await inner.OpenReadAsync(path, cancellationToken);
+            if (failOpen is not null && path.Contains(failOpen))
+                throw new IOException($"cannot open {failOpen}");
+            var file = await inner.OpenReadAsync(path, cancellationToken);
+            Interlocked.Increment(ref _open);
+            Interlocked.Increment(ref Opened);
+            return new TrackedFile(file, this);
+        }
+
+        public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default)
+            => inner.ListAsync(prefix, cancellationToken);
+        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ReadAllBytesAsync(path, cancellationToken);
+        public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
+            => inner.CreateAsync(path, overwrite, cancellationToken);
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
+            => inner.DeleteAsync(path, cancellationToken);
+        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ExistsAsync(path, cancellationToken);
+        public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+        public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.WriteAllBytesAsync(path, data, cancellationToken);
+
+        private sealed class TrackedFile(IRandomAccessFile file, TrackingFileSystem owner) : IRandomAccessFile
+        {
+            private int _closed;
+
+            public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
+                => file.GetLengthAsync(cancellationToken);
+
+            public async ValueTask<System.Buffers.IMemoryOwner<byte>> ReadAsync(
+                FileRange range, CancellationToken cancellationToken = default)
+            {
+                await EnterAsync(cancellationToken);
+                try
+                {
+                    return await file.ReadAsync(range, cancellationToken);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref owner._reading);
+                }
+            }
+
+            public async ValueTask<IReadOnlyList<System.Buffers.IMemoryOwner<byte>>> ReadRangesAsync(
+                IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
+            {
+                await EnterAsync(cancellationToken);
+                try
+                {
+                    return await file.ReadRangesAsync(ranges, cancellationToken);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref owner._reading);
+                }
+            }
+
+            private async Task EnterAsync(CancellationToken cancellationToken)
+            {
+                int now = Interlocked.Increment(ref owner._reading);
+                int seen;
+                while (now > (seen = Volatile.Read(ref owner.MaxReading)))
+                    Interlocked.CompareExchange(ref owner.MaxReading, now, seen);
+                if (owner._delayMs > 0)
+                    await Task.Delay(owner._delayMs, cancellationToken);
+            }
+
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _closed, 1) == 0)
+                    Interlocked.Decrement(ref owner._open);
+                file.Dispose();
+            }
+
+            public ValueTask DisposeAsync()
+            {
+                Dispose();
+                return default;
+            }
+        }
+
+        private readonly int _delayMs = delayMs;
+    }
+
+    private static Task<DeltaTable> OpenTrackedAsync(TrackingFileSystem fs, int? window) =>
+        DeltaTable.OpenAsync(fs, Options(window)).AsTask();
+
+    [Theory]
+    [InlineData(1, 0)]
+    [InlineData(4, 0)]
+    [InlineData(4, 1)]
+    [InlineData(4, 6)]
+    public async Task EveryFileTheScanOpens_IsClosed_HoweverTheScanEnds(int window, int take)
+    {
+        await CreateTableAsync();
+        var fs = new TrackingFileSystem(_fs);
+        await using var table = await OpenTrackedAsync(fs, window);
+
+        int seen = 0;
+        await foreach (var batch in table.ReadAsync())
+        {
+            batch.Dispose();
+            if (++seen == take)
+                break;
+        }
+
+        Assert.True(fs.Opened > 0);
+        Assert.Equal(0, fs.Open);
+    }
+
+    [Fact]
+    public async Task Cancelling_ClosesEveryFileTheScanOpened()
+    {
+        await CreateTableAsync();
+        var fs = new TrackingFileSystem(_fs);
+        await using var table = await OpenTrackedAsync(fs, 4);
+        using var cts = new CancellationTokenSource();
+
+        int seen = 0;
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (var batch in table.ReadAsync(cancellationToken: cts.Token))
+            {
+                batch.Dispose();
+                if (++seen == 3)
+                    cts.Cancel();
+            }
+        });
+
+        Assert.Equal(0, fs.Open);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task AFileThatCannotBeOpened_ThrowsAtItsPosition_AndTheOthersAreClosed(int window)
+    {
+        await CreateTableAsync();
+        List<string> paths;
+        await using (var probe = await OpenAsync(1))
+            paths = DeltaTable.OrderedActiveFiles(probe.CurrentSnapshot).Select(f => f.Path).ToList();
+        string failing = paths[5];
+
+        var fs = new TrackingFileSystem(_fs, failOpen: failing);
+        await using var table = await OpenTrackedAsync(fs, window);
+        var seenPaths = new List<string>();
+        var ex = await Assert.ThrowsAsync<IOException>(async () =>
+        {
+            await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
+            {
+                var path = ((StringArray)batch.Column(batch.ColumnCount - 2)).GetString(0);
+                if (seenPaths.Count == 0 || seenPaths[^1] != path)
+                    seenPaths.Add(path);
+                batch.Dispose();
+            }
+        });
+
+        Assert.Equal($"cannot open {failing}", ex.Message);
+        // Every batch of files 0-4, in order, and nothing after: where a serial read would have thrown.
+        Assert.Equal(paths.Take(5), seenPaths);
+        Assert.Equal(0, fs.Open);
+    }
+
+    [Fact]
+    public async Task OneFile_IsReadByRowGroup_InParallel()
+    {
+        // One file of twelve row groups: a scan split by file could only read it serially.
+        await using (var create = await DeltaTable.CreateAsync(_fs, Schema, Options(1), enableDeletionVectors: true))
+        {
+            var ids = new Int64Array.Builder();
+            var names = new StringArray.Builder();
+            for (int r = 0; r < 1_200; r++)
+            {
+                ids.Append(r);
+                names.Append($"row-{r}-of-the-one-file");
+            }
+            await create.WriteAsync([new RecordBatch(Schema, [ids.Build(), names.Build()], 1_200)]);
+            await create.DeleteAsync(Ex.And(
+                Ex.GreaterThanOrEqual("id", LiteralValue.Of(250L)), Ex.LessThan("id", LiteralValue.Of(420L))));
+        }
+
+        await using var serial = await OpenAsync(1);
+        var options = new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress | DeltaRowMetadata.Locator };
+        var expected = await RenderAsync(serial.ReadAsync(options));
+        Assert.Equal(1_200 - 170, expected.Sum(b => b.Count - 1));
+
+        var fs = new TrackingFileSystem(_fs, delayMs: 20);
+        await using var parallel = await OpenTrackedAsync(fs, 4);
+        Assert.Equal(expected, await RenderAsync(parallel.ReadAsync(options)));
+        Assert.Equal(1, fs.Opened);
+        Assert.Equal(0, fs.Open);
+        // Its row groups' reads overlapped, on the one open file.
+        Assert.InRange(fs.MaxReading, 2, 4);
+        Assert.NotNull(parallel.LastScanBudget);
+        Assert.Equal(0, parallel.LastScanBudget!.Used);
+    }
 }

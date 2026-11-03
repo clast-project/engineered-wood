@@ -312,9 +312,34 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                            static b => b.Batch.Dispose(),
                            concurrency,
                            budget,
-                           cancellationToken).ConfigureAwait(false))
+                           cancellationToken: cancellationToken).ConfigureAwait(false))
         {
             yield return batch;
+        }
+    }
+
+    /// <summary>
+    /// The row groups a positioned read of <paramref name="columnNames"/> under <paramref name="filter"/> and
+    /// <paramref name="skipRows"/> reads, in file order: the plan <see cref="ReadWithPositionsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken)"/>
+    /// follows, for a caller that schedules the row groups itself (a Delta scan, #612). Each plan is read with
+    /// <see cref="ReadPlannedAsync(RowGroupPlan, IReadOnlyList{string}?, ScanReservation, DecodedGrowth, CancellationToken)"/>,
+    /// which may run concurrently for different plans; the planning itself is NOT thread-safe and must be
+    /// enumerated once, in order.
+    /// </summary>
+    internal async IAsyncEnumerable<RowGroupPlan> PlanRowGroupsAsync(
+        EngineeredWood.Expressions.Predicate? filter,
+        IReadOnlyList<string>? columnNames,
+        RowSkipPredicate? skipRows,
+        [System.Runtime.CompilerServices.EnumeratorCancellation]
+        CancellationToken cancellationToken)
+    {
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        // Built before any plan is handed out, so that concurrent reads of the plans find it cached.
+        await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        await foreach (var plan in PlanRowGroupsAsync(metadata, filter, columnNames, skipRows, cancellationToken)
+            .ConfigureAwait(false))
+        {
+            yield return plan;
         }
     }
 
@@ -335,7 +360,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// One row group a positioned read will read: which one, the file position of its first row, the rows
     /// within it (null for all of them), and the OffsetIndex bytes the pruning already read for its page maps.
     /// </summary>
-    private readonly record struct RowGroupPlan(
+    internal readonly record struct RowGroupPlan(
         int Index, long GroupStart, IReadOnlyList<RowRange>? Ranges, Dictionary<long, byte[]>? OffsetIndexes);
 
     /// <summary>
@@ -344,7 +369,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// out. NOT thread-safe — the dictionary and Bloom filter windows and the page-index read-ahead are state of
     /// this one enumeration — so it is enumerated once, in order, whether the reads it plans run serially or not.
     /// </summary>
-    private async IAsyncEnumerable<RowGroupPlan> PlanRowGroupsAsync(
+    internal async IAsyncEnumerable<RowGroupPlan> PlanRowGroupsAsync(
         FileMetaData metadata,
         EngineeredWood.Expressions.Predicate? filter,
         IReadOnlyList<string>? columnNames,
@@ -432,7 +457,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>Reads one planned row group, pairing each batch with the file position of its first row.</summary>
-    private async IAsyncEnumerable<PositionedRecordBatch> ReadPlannedAsync(
+    internal async IAsyncEnumerable<PositionedRecordBatch> ReadPlannedAsync(
         RowGroupPlan plan,
         IReadOnlyList<string>? columnNames,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
@@ -470,7 +495,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// group reserve the largest batch it has produced.</item>
     /// </list>
     /// </summary>
-    private async IAsyncEnumerable<PositionedRecordBatch> ReadPlannedAsync(
+    internal async IAsyncEnumerable<PositionedRecordBatch> ReadPlannedAsync(
         RowGroupPlan plan,
         IReadOnlyList<string>? columnNames,
         ScanReservation reservation,
@@ -555,7 +580,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// this every row group would reserve too little before its decode, not only the first. Shared by the
     /// read's producers, hence the lock.
     /// </summary>
-    private sealed class DecodedGrowth
+    internal sealed class DecodedGrowth
     {
         private readonly object _gate = new();
         private double _ratio = 1.0;

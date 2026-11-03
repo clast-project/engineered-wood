@@ -46,7 +46,10 @@ internal static class OrderedScan
     /// Reads every unit of <paramref name="units"/> through <paramref name="readUnit"/> (given the unit, its
     /// reservation and a token that fires when the scan stops), at most <paramref name="maxConcurrent"/> at
     /// once, holding what <paramref name="budget"/> allows. <paramref name="sizeOf"/> measures an item;
-    /// <paramref name="dispose"/> releases one no caller received.
+    /// <paramref name="dispose"/> releases one no caller received. <paramref name="releaseUnit"/>, when given,
+    /// is called exactly once for every unit taken from <paramref name="units"/>: when its read ends however it
+    /// ends, or, for a unit the scan stopped before reading, when the scan lets it go. A unit holding a share
+    /// of a resource (the open file several row groups are read from) releases its share there.
     /// </summary>
     public static async IAsyncEnumerable<TItem> RunAsync<TUnit, TItem>(
         IAsyncEnumerable<TUnit> units,
@@ -55,12 +58,14 @@ internal static class OrderedScan
         Action<TItem> dispose,
         int maxConcurrent,
         ScanMemoryBudget budget,
+        Action<TUnit>? releaseUnit = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (maxConcurrent < 1)
             throw new ArgumentOutOfRangeException(nameof(maxConcurrent), maxConcurrent, "Must be at least 1.");
 
-        var run = new Run<TUnit, TItem>(units, readUnit, sizeOf, dispose, maxConcurrent, budget, cancellationToken);
+        var run = new Run<TUnit, TItem>(
+            units, readUnit, sizeOf, dispose, releaseUnit, maxConcurrent, budget, cancellationToken);
         run.Start();
         try
         {
@@ -111,6 +116,7 @@ internal static class OrderedScan
         private readonly Func<TUnit, ScanReservation, CancellationToken, IAsyncEnumerable<TItem>> _readUnit;
         private readonly Func<TItem, long> _sizeOf;
         private readonly Action<TItem> _dispose;
+        private readonly Action<TUnit>? _releaseUnit;
         private readonly ScanMemoryBudget _budget;
         private readonly CancellationTokenSource _cts;
         private readonly SemaphoreSlim _running;
@@ -131,6 +137,7 @@ internal static class OrderedScan
             Func<TUnit, ScanReservation, CancellationToken, IAsyncEnumerable<TItem>> readUnit,
             Func<TItem, long> sizeOf,
             Action<TItem> dispose,
+            Action<TUnit>? releaseUnit,
             int maxConcurrent,
             ScanMemoryBudget budget,
             CancellationToken cancellationToken)
@@ -139,6 +146,7 @@ internal static class OrderedScan
             _readUnit = readUnit;
             _sizeOf = sizeOf;
             _dispose = dispose;
+            _releaseUnit = releaseUnit;
             _budget = budget;
             _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _running = new SemaphoreSlim(maxConcurrent, maxConcurrent);
@@ -192,25 +200,39 @@ internal static class OrderedScan
                             return;
                         }
 
-                        if (!more || IsStopped())
+                        if (!more)
                             return;
-
-                        var channel = NewChannel();
-                        await AddSlotAsync(ordinal, channel, token).ConfigureAwait(false);
-                        await _running.WaitAsync(token).ConfigureAwait(false);
 
                         var unit = e.Current;
                         int u = ordinal;
-                        lock (_gate)
+                        bool started = false;
+                        try
                         {
-                            // A unit before this one may have failed while this one waited for a slot: the
-                            // consumer stops there, so this one would never be read.
-                            if (_shutdown || _failed)
-                            {
-                                _running.Release();
+                            if (IsStopped())
                                 return;
+
+                            var channel = NewChannel();
+                            await AddSlotAsync(ordinal, channel, token).ConfigureAwait(false);
+                            await _running.WaitAsync(token).ConfigureAwait(false);
+
+                            lock (_gate)
+                            {
+                                // A unit before this one may have failed while this one waited for a slot: the
+                                // consumer stops there, so this one would never be read.
+                                if (_shutdown || _failed)
+                                {
+                                    _running.Release();
+                                    return;
+                                }
+                                _producers.Add(Task.Run(() => ProduceAsync(u, unit, channel.Writer)));
+                                started = true;
                             }
-                            _producers.Add(Task.Run(() => ProduceAsync(u, unit, channel.Writer)));
+                        }
+                        finally
+                        {
+                            // Taken from the units but never handed to a producer: its release is ours.
+                            if (!started)
+                                ReleaseUnit(unit);
                         }
                         ordinal++;
                     }
@@ -228,6 +250,22 @@ internal static class OrderedScan
             finally
             {
                 _slots.Writer.TryComplete();
+            }
+        }
+
+        /// <summary>The caller's release for a unit. A failure in it is not the scan's to report: the unit's
+        /// read has already ended one way or the other.</summary>
+        private void ReleaseUnit(TUnit unit)
+        {
+            if (_releaseUnit is null)
+                return;
+            try
+            {
+                _releaseUnit(unit);
+            }
+            catch
+            {
+                // Swallowed: see above.
             }
         }
 
@@ -295,6 +333,7 @@ internal static class OrderedScan
             {
                 reservation.ReleasePending();
                 reservation.ReleaseHeld();
+                ReleaseUnit(unit);
                 writer.TryComplete(error);
                 if (error is not null)
                 {

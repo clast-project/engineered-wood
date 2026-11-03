@@ -207,10 +207,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// through the built-in ParquetFileReader takes these options: scans, CDF, compaction and the DML rewrites.
     /// A host <see cref="DeltaTableOptions.DataFileReader"/> decodes scans and compaction itself and is not
     /// given them, so its batches keep whatever decimal type it produces.
-    /// <para>Row groups are read one at a time (<see cref="ParquetReadOptions.MaxConcurrentRowGroups"/> of 1):
-    /// a scan already reads several FILES at once within its own budget
-    /// (<see cref="DeltaTableOptions.MaxConcurrentFileReads"/>), and a row-group window inside each file would
-    /// multiply both the reads and the memory held. Splitting a scan by row group is #612's second step.</para>
+    /// <para>Row groups are read one at a time (<see cref="ParquetReadOptions.MaxConcurrentRowGroups"/> of 1)
+    /// wherever a whole file is read through the reader's own loop. A scan schedules each file's row groups
+    /// itself (#612), within the table's one window and budget, and <c>ReadRowsAsync</c> reads several FILES at
+    /// once; a row-group window inside each file would multiply both the reads and the memory held.</para>
     /// </summary>
     private static ParquetReadOptions DataFileReadOptions(ParquetReadOptions options) =>
         WithVariantExtension(options) with { DecimalOutput = DecimalOutputKind.Decimal128, MaxConcurrentRowGroups = 1 };
@@ -5648,14 +5648,173 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         var scan = new ScanFileShape(options, metadataFields, wantAddress, wantLocator, wantTracking);
-        await foreach (var batch in ReadFilesInOrderAsync(
-                           included.Count,
-                           (i, reservation, ct) => ScanFileAsync(
-                               snapshot, scan, included[i].Ordinal, included[i].File, reservation, ct),
-                           cancellationToken).ConfigureAwait(false))
+
+        // The scan's unit of work is one row group of one file (#612), so that a few large files, or one large
+        // file among small ones, still keep every reader busy. A file read through the codec seam is one unit:
+        // the seam hides its row groups.
+        int window = EffectiveConcurrentFileReads;
+        if (window <= 1)
+        {
+            await foreach (var unit in PlanScanUnitsAsync(snapshot, options, included, lookahead: 1, cancellationToken)
+                               .ConfigureAwait(false))
+            {
+                try
+                {
+                    await foreach (var batch in ReadScanUnitAsync(
+                                       unit, scan, included[unit.File].Ordinal, ScanReservation.None, growth: null,
+                                       cancellationToken).ConfigureAwait(false))
+                    {
+                        yield return batch;
+                    }
+                }
+                finally
+                {
+                    unit.Read.Release();
+                }
+            }
+            yield break;
+        }
+
+        var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes);
+        LastScanBudget = budget;
+        var growth = new ParquetFileReader.DecodedGrowth();
+        await foreach (var batch in OrderedScan.RunAsync(
+                           PlanScanUnitsAsync(snapshot, options, included, lookahead: window, cancellationToken),
+                           (unit, reservation, ct) => ReadScanUnitAsync(
+                               unit, scan, included[unit.File].Ordinal, reservation, growth, ct),
+                           RollingDataFileWriter.EstimatedBytes,
+                           static b => b.Dispose(),
+                           window,
+                           budget,
+                           releaseUnit: static unit => unit.Read.Release(),
+                           cancellationToken: cancellationToken).ConfigureAwait(false))
         {
             yield return batch;
         }
+    }
+
+    /// <summary>
+    /// One unit of a scan: the row group <see cref="Plan"/> plans of file <see cref="File"/> (its index among the
+    /// files the scan reads), or, through the codec seam (<see cref="Plan"/> null), the whole file. Holds one
+    /// share of the file's <see cref="DataFileRead"/>, which whoever ends the unit releases.
+    /// </summary>
+    private readonly record struct ScanUnit(int File, DataFileRead Read, ParquetFileReader.RowGroupPlan? Plan);
+
+    /// <summary>
+    /// The units of a scan of <paramref name="files"/>, file after file and, within a file, row group after row
+    /// group: the order a serial read gives. Enumerated once, in order (by the scan's dispatcher when it runs in
+    /// parallel), because a file's row-group pruning is not thread-safe.
+    /// <para>Each file is opened once (<see cref="OpenDataFileAsync"/>: its footer, deletion vector, column
+    /// resolution), and up to <paramref name="lookahead"/> files are opened ahead of the one being planned, so
+    /// that a footer's round trip overlaps the reads in flight rather than stalling the planning. A file whose
+    /// row groups are all pruned yields no unit and is closed here; otherwise its last unit to end closes it.
+    /// Files opened ahead but never planned, because the scan stopped, are closed when the enumeration ends.</para>
+    /// </summary>
+    private async IAsyncEnumerable<ScanUnit> PlanScanUnitsAsync(
+        Snapshot.Snapshot snapshot,
+        DeltaReadOptions options,
+        List<(int Ordinal, AddFile File)> files,
+        int lookahead,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var opening = new Queue<Task<DataFileRead>>();
+        int next = 0;
+        try
+        {
+            for (int f = 0; f < files.Count; f++)
+            {
+                while (next < files.Count && opening.Count < Math.Max(1, lookahead))
+                {
+                    var addFile = files[next++].File;
+                    // The scan forwards its predicate to the row-group level: it promises only a superset of the
+                    // matching rows (so does a predicate DELETE, which prunes in ComputeDeleteActionsAsync).
+                    // Compaction, CDF and the copy-on-write rewrites must see every row of a file they read, and
+                    // never pass one.
+                    opening.Enqueue(OpenDataFileAsync(
+                        addFile, options.Columns, snapshot, options.Filter, cancellationToken).AsTask());
+                }
+
+                var read = await opening.Dequeue().ConfigureAwait(false);
+                try
+                {
+                    if (read.Reader is null)
+                    {
+                        read.AddRef();
+                        yield return new ScanUnit(f, read, null);
+                    }
+                    else
+                    {
+                        await foreach (var plan in read.Reader.PlanRowGroupsAsync(
+                                           read.FilePredicate, read.FileColumns, read.SkipRows, cancellationToken)
+                                           .ConfigureAwait(false))
+                        {
+                            read.AddRef();
+                            yield return new ScanUnit(f, read, plan);
+                        }
+                    }
+                }
+                finally
+                {
+                    read.Release();
+                }
+            }
+        }
+        finally
+        {
+            // Opened ahead and never planned: close them, whatever became of their opening.
+            while (opening.Count > 0)
+            {
+                try
+                {
+                    (await opening.Dequeue().ConfigureAwait(false)).Release();
+                }
+                catch
+                {
+                    // An opening that failed has nothing to close, and its error is not this scan's to report:
+                    // the scan stopped before it reached that file.
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// One unit of a scan, as the caller receives it: its batches with the requested metadata columns appended.
+    /// Everything per batch happens here, so that in a parallel scan it runs on the unit's own producer.
+    /// <paramref name="growth"/> is the parallel scan's shared estimate of how far decoded row groups outgrow
+    /// their footer sizes; null for a serial scan, which reserves nothing.
+    /// </summary>
+    private async IAsyncEnumerable<RecordBatch> ReadScanUnitAsync(
+        ScanUnit unit,
+        ScanFileShape scan,
+        int ordinal,
+        ScanReservation reservation,
+        ParquetFileReader.DecodedGrowth? growth,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var read = unit.Read;
+        IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> source;
+        if (unit.Plan is not { } plan)
+            source = SeamSource(read, reservation, cancellationToken);
+        else if (growth is null)
+            source = Positioned(read.Reader!.ReadPlannedAsync(plan, read.FileColumns, cancellationToken), cancellationToken);
+        else
+            source = Positioned(read.Reader!.ReadPlannedAsync(plan, read.FileColumns, reservation, growth, cancellationToken), cancellationToken);
+
+        bool wantPositions = scan.WantAddress || scan.WantLocator;
+        byte[]? pathBytes = scan.WantLocator ? System.Text.Encoding.UTF8.GetBytes(read.AddFile.Path) : null;
+        await foreach (var fb in ProcessDataFileBatchesAsync(source, read, wantPositions, scan.WantTracking, cancellationToken)
+                           .ConfigureAwait(false))
+        {
+            yield return WithMetadataColumns(fb, scan, ordinal, pathBytes);
+        }
+    }
+
+    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> Positioned(
+        IAsyncEnumerable<PositionedRecordBatch> source,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (var positioned in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+            yield return (positioned.Batch, positioned.FirstRow);
     }
 
     /// <summary>
@@ -5702,9 +5861,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="ScanMemoryBudget.Peak"/>.</summary>
     internal ScanMemoryBudget? LastScanBudget { get; private set; }
 
-    /// <summary>The files a scan reads at once: <see cref="DeltaTableOptions.MaxConcurrentFileReads"/>, or by
-    /// default up to 4 with the built-in reader and 1 through the codec seam, whose contract never promised that
-    /// two files may be read at once.</summary>
+    /// <summary>The reads a scan runs at once (row groups, or whole files through the codec seam):
+    /// <see cref="DeltaTableOptions.MaxConcurrentFileReads"/>, or by default up to 4 with the built-in reader and
+    /// 1 through the codec seam, whose contract never promised that two files may be read at once.</summary>
     private int EffectiveConcurrentFileReads =>
         _options.MaxConcurrentFileReads
         ?? (_options.DataFileReader is null ? Math.Min(4, Environment.ProcessorCount) : 1);
@@ -5718,64 +5877,42 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool WantTracking);
 
     /// <summary>
-    /// One file of a scan, as the caller receives it: the file's batches with the requested metadata columns
-    /// appended. Everything per file happens here — including building the metadata columns — so that in a
-    /// parallel scan it all runs on the file's own producer, and each batch's metadata comes from the
-    /// <see cref="FileBatch"/> it was decoded with rather than from a list shared with the consumer.
+    /// A scanned batch with the metadata columns the scan asked for appended, built from the
+    /// <see cref="FileBatch"/> it was decoded with: <paramref name="ordinal"/> is the file's place in the
+    /// unpruned path-sorted active set (for RowAddress), <paramref name="pathBytes"/> its path (for Locator).
     /// </summary>
-    private async IAsyncEnumerable<RecordBatch> ScanFileAsync(
-        Snapshot.Snapshot snapshot,
-        ScanFileShape scan,
-        int ordinal,
-        AddFile addFile,
-        ScanReservation reservation,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+    private static RecordBatch WithMetadataColumns(FileBatch fb, ScanFileShape scan, int ordinal, byte[]? pathBytes)
     {
-        bool wantPositions = scan.WantAddress || scan.WantLocator;
-        byte[]? pathBytes = scan.WantLocator ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
+        var batch = fb.Batch;
+        if (scan.MetadataFields.Count == 0)
+            return batch;
 
-        // The scan forwards its predicate to the row-group level: it promises only a superset of the
-        // matching rows (so does a predicate DELETE, which prunes in ComputeDeleteActionsAsync).
-        // Compaction, CDF and the copy-on-write rewrites must see every row of a file they read, and
-        // never pass one.
-        await foreach (var fb in ReadFileBatchesAsync(
-                           addFile, scan.Options.Columns, snapshot, wantPositions, scan.WantTracking,
-                           scan.Options.Filter, reservation, cancellationToken).ConfigureAwait(false))
+        var absPos = fb.Positions;
+        var columns = new List<IArrowArray>(scan.MetadataFields.Count);
+
+        if (scan.WantAddress)
         {
-            var batch = fb.Batch;
-            if (scan.MetadataFields.Count == 0)
-            {
-                yield return batch;
-                continue;
-            }
-
-            var absPos = fb.Positions;
-            var columns = new List<IArrowArray>(scan.MetadataFields.Count);
-
-            if (scan.WantAddress)
-            {
-                var b = new Int64Array.Builder().Reserve(batch.Length);
-                for (int i = 0; i < batch.Length; i++)
-                    b.Append(TransientRowAddress.Pack(ordinal, AbsoluteAt(absPos, i)));
-                columns.Add(b.Build());
-            }
-            if (scan.WantLocator)
-            {
-                columns.Add(ArrowCompute.Repeat(Apache.Arrow.Types.StringType.Default, pathBytes!, batch.Length));
-                var b = new Int64Array.Builder().Reserve(batch.Length);
-                for (int i = 0; i < batch.Length; i++)
-                    b.Append(AbsoluteAt(absPos, i));
-                columns.Add(b.Build());
-            }
-            if (scan.WantTracking)
-            {
-                columns.Add(fb.RowIds ?? AllNullInt64(batch.Length));
-                columns.Add(fb.Versions ?? AllNullInt64(batch.Length));
-            }
-            absPos?.Dispose();
-
-            yield return AppendColumns(batch, scan.MetadataFields, columns);
+            var b = new Int64Array.Builder().Reserve(batch.Length);
+            for (int i = 0; i < batch.Length; i++)
+                b.Append(TransientRowAddress.Pack(ordinal, AbsoluteAt(absPos, i)));
+            columns.Add(b.Build());
         }
+        if (scan.WantLocator)
+        {
+            columns.Add(ArrowCompute.Repeat(Apache.Arrow.Types.StringType.Default, pathBytes!, batch.Length));
+            var b = new Int64Array.Builder().Reserve(batch.Length);
+            for (int i = 0; i < batch.Length; i++)
+                b.Append(AbsoluteAt(absPos, i));
+            columns.Add(b.Build());
+        }
+        if (scan.WantTracking)
+        {
+            columns.Add(fb.RowIds ?? AllNullInt64(batch.Length));
+            columns.Add(fb.Versions ?? AllNullInt64(batch.Length));
+        }
+        absPos?.Dispose();
+
+        return AppendColumns(batch, scan.MetadataFields, columns);
     }
 
     /// <summary>
@@ -10781,33 +10918,69 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// One data file's batches as a scan returns them, each paired with the per-row metadata asked for:
-    /// <paramref name="wantPositions"/> fills <see cref="FileBatch.Positions"/>, <paramref name="wantTracking"/>
-    /// fills <see cref="FileBatch.RowIds"/> and <see cref="FileBatch.Versions"/>. <paramref name="reservation"/>
-    /// is reserved against before each raw batch is decoded, when the read is part of a parallel scan.
+    /// What reading one data file needs, decided once per file: its deletion vector, its column mapping, the
+    /// columns and row-group predicate in the FILE's terms, and, for the built-in reader, the open file and its
+    /// <see cref="ParquetFileReader"/>. A scan split by row group (#612) shares one of these among the file's
+    /// row groups, which may be read concurrently: everything here is read-only once built, and the reader is
+    /// safe to decode different row groups from at once. Reference-counted: whoever holds a share releases it,
+    /// and the last release closes the file.
     /// </summary>
-    private async IAsyncEnumerable<FileBatch> ReadFileBatchesAsync(
+    private sealed class DataFileRead : IDisposable
+    {
+        private int _refs = 1;
+
+        internal required AddFile AddFile { get; init; }
+        internal required Snapshot.Snapshot Snapshot { get; init; }
+        internal required IReadOnlyList<string>? Columns { get; init; }
+        internal required ColumnMappingMode MappingMode { get; init; }
+        internal required Dictionary<string, string> PhysicalToLogical { get; init; }
+        internal required Dictionary<string, string> LogicalToPhysical { get; init; }
+        internal required DeletionVectorBitmap? DeletedRows { get; init; }
+        internal required IReadOnlyList<string> PartitionColumns { get; init; }
+        internal required bool HasPartitions { get; init; }
+
+        /// <summary>The built-in reader's open file and reader; null through the codec seam.</summary>
+        internal IRandomAccessFile? File { get; init; }
+        internal ParquetFileReader? Reader { get; init; }
+        internal IReadOnlyList<string>? FileColumns { get; init; }
+        internal Expressions.Predicate? FilePredicate { get; init; }
+
+        /// <summary>The codec seam's reader and the physical columns to ask it for; null for the built-in one.</summary>
+        internal IDataFileReader? Seam { get; init; }
+        internal IReadOnlyList<string>? SeamColumns { get; init; }
+
+        /// <summary>The rows the deletion vector deletes in full, for the reader to skip unread.</summary>
+        internal RowSkipPredicate? SkipRows => DeletedRows is { IsEmpty: false } d ? d.ContainsRange : null;
+
+        internal void AddRef() => Interlocked.Increment(ref _refs);
+
+        internal void Release()
+        {
+            if (Interlocked.Decrement(ref _refs) == 0)
+                Dispose();
+        }
+
+        public void Dispose()
+        {
+            Reader?.Dispose();
+            File?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Everything about reading <paramref name="addFile"/> that is decided once per file, before any of its rows
+    /// are read: see <see cref="DataFileRead"/>. The caller holds the one share it returns.
+    /// <paramref name="rowGroupFilter"/>: a LOGICAL-name predicate; row groups whose statistics prove no row
+    /// matches are skipped. Only a read that promises a superset of the matching rows may pass one. The codec
+    /// seam ignores it (the seam hides the footer).
+    /// </summary>
+    private async ValueTask<DataFileRead> OpenDataFileAsync(
         AddFile addFile,
         IReadOnlyList<string>? columns,
         Snapshot.Snapshot snapshot,
-        bool wantPositions,
-        bool wantTracking,
         Expressions.Predicate? rowGroupFilter,
-        ScanReservation reservation,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        CancellationToken cancellationToken)
     {
-        // rowGroupFilter: a LOGICAL-name predicate; row groups whose statistics prove no row matches are
-        // skipped. Only a read that promises a superset of the matching rows may pass one. The pluggable
-        // codec path ignores it (the seam hides the footer).
-        //
-        // strippedRowIdsOut/strippedVersionsOut: when non-null, each EMITTED batch appends its per-row RESOLVED
-        // row id / commit version (materialized value where present, else add.baseRowId + absolute position /
-        // add.defaultRowCommitVersion; null when underivable). A copy-on-write rewrite (UPDATE) uses these so a
-        // moved row keeps its ORIGINAL id. strippedAbsPositionsOut adds the surviving row's ABSOLUTE in-file
-        // position (parquet row index, DV-inclusive) — the row-level remap (Layer 3 B) uses it to correlate a
-        // delete's target positions with stable row ids and to place the rebased deletion vector. The hidden
-        // materialized columns are always stripped from the emitted user batches regardless (a foreign reader
-        // must never see them).
         // An empty map still goes through the partition step: a missing key is a NULL value, and in a
         // non-nullable column one the read refuses. This engine's own NULL partition is such a map.
         var partitionColumns = snapshot.Metadata.PartitionColumns;
@@ -10872,149 +11045,232 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (seamColumns is not null && MaterializedRowTrackingColumnNames(snapshot).Count > 0)
                 seamColumns = null;
 
-            var seamBatches = Reserving(InFileOrder(dataFileReader.ReadAsync(
-                EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), seamColumns, cancellationToken),
-                cancellationToken), reservation, cancellationToken);
-            await foreach (var processed in ProcessFileBatchesAsync(
-                seamBatches, addFile, snapshot, columns, mappingMode, physicalToLogical,
-                logicalToPhysical, deletedRows, partitionColumns,
-                hasPartitions, wantPositions, wantTracking, cancellationToken).ConfigureAwait(false))
+            return new DataFileRead
             {
-                yield return processed;
-            }
-            yield break;
+                AddFile = addFile, Snapshot = snapshot, Columns = columns, MappingMode = mappingMode,
+                PhysicalToLogical = physicalToLogical, LogicalToPhysical = logicalToPhysical,
+                DeletedRows = deletedRows, PartitionColumns = partitionColumns, HasPartitions = hasPartitions,
+                Seam = dataFileReader, SeamColumns = seamColumns,
+            };
         }
 
         // Open the file and read its Parquet schema for field_id resolution
-        await using var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+        var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
             .ConfigureAwait(false);
-        using var reader = new ParquetFileReader(
-            file, ownsFile: false, _dataFileReadOptions);
-
-        Parquet.Schema.SchemaDescriptor? parquetSchema = null;
-
-        // Determine which columns to request from the Parquet file
-        IReadOnlyList<string>? fileColumns = null;
-
-        if (isIdMode)
+        ParquetFileReader? reader = null;
+        try
         {
-            // In ID mode: resolve field_ids from the Parquet schema to column names
-            parquetSchema = await reader.GetSchemaAsync(cancellationToken)
-                .ConfigureAwait(false);
+            reader = new ParquetFileReader(file, ownsFile: false, _dataFileReadOptions);
 
-            if (columns is not null)
+            // The footer, read here whether or not the columns need resolving against it: every read of the file
+            // needs it, and a scan opens files AHEAD of the one it is planning, so that the footer's round trips
+            // overlap the reads in flight. Left to the planner, an unprojected read would fetch each file's footer
+            // one after another, on the one thread that plans.
+            await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+
+            Parquet.Schema.SchemaDescriptor? parquetSchema = null;
+
+            // Determine which columns to request from the Parquet file
+            IReadOnlyList<string>? fileColumns = null;
+
+            if (isIdMode)
             {
-                var partSet = hasPartitions
-                    ? new HashSet<string>(partitionColumns, StringComparer.Ordinal)
-                    : new HashSet<string>();
-                var logicalToFieldId = ColumnMapping.BuildLogicalToFieldIdMap(snapshot.Schema);
+                // In ID mode: resolve field_ids from the Parquet schema to column names
+                parquetSchema = await reader.GetSchemaAsync(cancellationToken)
+                    .ConfigureAwait(false);
 
-                // Map logical names → field_ids → Parquet column names
-                var fieldIds = columns
-                    .Where(c => !partSet.Contains(c))
-                    .Where(c => logicalToFieldId.ContainsKey(c))
-                    .Select(c => logicalToFieldId[c])
-                    .ToList();
-                var resolved = parquetSchema.ResolveFieldIds(fieldIds);
-                fileColumns = resolved.Where(n => n is not null).Select(n => n!).ToList();
+                if (columns is not null)
+                {
+                    var partSet = hasPartitions
+                        ? new HashSet<string>(partitionColumns, StringComparer.Ordinal)
+                        : new HashSet<string>();
+                    var logicalToFieldId = ColumnMapping.BuildLogicalToFieldIdMap(snapshot.Schema);
+
+                    // Map logical names → field_ids → Parquet column names
+                    var fieldIds = columns
+                        .Where(c => !partSet.Contains(c))
+                        .Where(c => logicalToFieldId.ContainsKey(c))
+                        .Select(c => logicalToFieldId[c])
+                        .ToList();
+                    var resolved = parquetSchema.ResolveFieldIds(fieldIds);
+                    fileColumns = resolved.Where(n => n is not null).Select(n => n!).ToList();
+                }
+                // else: read all columns, rename by field_id after
             }
-            // else: read all columns, rename by field_id after
-        }
-        else
-        {
-            // Name mode or None mode: translate by physical name
-            fileColumns = columns;
-            if (columns is not null)
+            else
             {
-                var partSet = hasPartitions
-                    ? new HashSet<string>(partitionColumns, StringComparer.Ordinal)
-                    : new HashSet<string>();
+                // Name mode or None mode: translate by physical name
+                fileColumns = columns;
+                if (columns is not null)
+                {
+                    var partSet = hasPartitions
+                        ? new HashSet<string>(partitionColumns, StringComparer.Ordinal)
+                        : new HashSet<string>();
 
-                fileColumns = columns
-                    .Where(c => !partSet.Contains(c))
-                    .Select(c => logicalToPhysical.TryGetValue(c, out var p) ? p : c)
-                    .ToList();
+                    fileColumns = columns
+                        .Where(c => !partSet.Contains(c))
+                        .Select(c => logicalToPhysical.TryGetValue(c, out var p) ? p : c)
+                        .ToList();
+                }
+                else if (hasPartitions)
+                {
+                    var partSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
+                    fileColumns = snapshot.Schema.Fields
+                        .Where(f => !partSet.Contains(f.Name))
+                        .Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
+                        .ToList();
+                }
             }
-            else if (hasPartitions)
+
+            // Row tracking: same omission as the seam branch above — the hidden materialized columns are not schema
+            // fields, so a PROJECTED read (either mapping mode) and an UNPROJECTED read of a PARTITIONED table both
+            // build a file-level column list without them, and every id then falls back to baseRowId + position.
+            // Here the file's own schema IS available, so name them and let the file-present intersect below drop
+            // them again for a file that carries none — which is every fresh append, the common case.
+            if (fileColumns is not null)
             {
-                var partSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
-                fileColumns = snapshot.Schema.Fields
-                    .Where(f => !partSet.Contains(f.Name))
-                    .Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
-                    .ToList();
+                var trackingColumns = MaterializedRowTrackingColumnNames(snapshot);
+                if (trackingColumns.Count > 0)
+                {
+                    var withTracking = new List<string>(fileColumns.Count + trackingColumns.Count);
+                    withTracking.AddRange(fileColumns);
+                    withTracking.AddRange(trackingColumns);
+                    fileColumns = withTracking;
+                }
             }
-        }
 
-        // Row tracking: same omission as the seam branch above — the hidden materialized columns are not schema
-        // fields, so a PROJECTED read (either mapping mode) and an UNPROJECTED read of a PARTITIONED table both
-        // build a file-level column list without them, and every id then falls back to baseRowId + position.
-        // Here the file's own schema IS available, so name them and let the file-present intersect below drop
-        // them again for a file that carries none — which is every fresh append, the common case.
-        if (fileColumns is not null)
-        {
-            var trackingColumns = MaterializedRowTrackingColumnNames(snapshot);
-            if (trackingColumns.Count > 0)
+            // Schema evolution: ADD COLUMN is a metadata-only commit, so a file written BEFORE it does not
+            // contain the new column — asking the parquet reader for it throws ("Column 'x' was not found in
+            // the schema"). Intersect the projection with the file's ACTUAL top-level columns and let the
+            // BackfillMissingColumns step downstream reconstitute the absent ones as typed NULL, exactly as it
+            // already does for an UNPROJECTED read of the same file. Without this a projected read is strictly
+            // less capable than an unprojected one over identical data, which is the wrong way round.
+            //
+            // An empty result — a projection naming ONLY later-added columns — is deliberately left empty
+            // rather than padded with some column the file does happen to have: the reader takes its row count
+            // from the row group, not from the columns it returns, so the batches still carry the lengths the
+            // backfill needs, and padding would read bytes only to discard them. Pinned by
+            // SchemaEvolutionTests.ProjectedRead_OfAColumnAddedAfterTheFile_BackfillsNull.
+            //
+            // Id mode never threw here (an unresolvable field id already drops out of ResolveFieldIds); it runs
+            // through the same reconciliation so one rule covers every mapping mode.
+            if (fileColumns is not null)
             {
-                var withTracking = new List<string>(fileColumns.Count + trackingColumns.Count);
-                withTracking.AddRange(fileColumns);
-                withTracking.AddRange(trackingColumns);
-                fileColumns = withTracking;
+                parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+                var filePresent = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var child in parquetSchema.Root.Children)
+                    filePresent.Add(child.Name);
+
+                if (fileColumns.Any(c => !filePresent.Contains(c)))
+                    fileColumns = fileColumns.Where(filePresent.Contains).ToList();
             }
+
+            Expressions.Predicate? filePredicate = null;
+            if (rowGroupFilter is not null)
+            {
+                parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+                filePredicate = RowGroupPushdown.ToFileColumns(
+                    rowGroupFilter, snapshot.Schema, mappingMode, parquetSchema, snapshot.Metadata.PartitionColumns);
+            }
+
+            return new DataFileRead
+            {
+                AddFile = addFile, Snapshot = snapshot, Columns = columns, MappingMode = mappingMode,
+                PhysicalToLogical = physicalToLogical, LogicalToPhysical = logicalToPhysical,
+                DeletedRows = deletedRows, PartitionColumns = partitionColumns, HasPartitions = hasPartitions,
+                File = file, Reader = reader, FileColumns = fileColumns, FilePredicate = filePredicate,
+            };
         }
-
-        // Schema evolution: ADD COLUMN is a metadata-only commit, so a file written BEFORE it does not
-        // contain the new column — asking the parquet reader for it throws ("Column 'x' was not found in
-        // the schema"). Intersect the projection with the file's ACTUAL top-level columns and let the
-        // BackfillMissingColumns step downstream reconstitute the absent ones as typed NULL, exactly as it
-        // already does for an UNPROJECTED read of the same file. Without this a projected read is strictly
-        // less capable than an unprojected one over identical data, which is the wrong way round.
-        //
-        // An empty result — a projection naming ONLY later-added columns — is deliberately left empty
-        // rather than padded with some column the file does happen to have: the reader takes its row count
-        // from the row group, not from the columns it returns, so the batches still carry the lengths the
-        // backfill needs, and padding would read bytes only to discard them. Pinned by
-        // SchemaEvolutionTests.ProjectedRead_OfAColumnAddedAfterTheFile_BackfillsNull.
-        //
-        // Id mode never threw here (an unresolvable field id already drops out of ResolveFieldIds); it runs
-        // through the same reconciliation so one rule covers every mapping mode.
-        if (fileColumns is not null)
+        catch
         {
-            parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-            var filePresent = new HashSet<string>(StringComparer.Ordinal);
-            foreach (var child in parquetSchema.Root.Children)
-                filePresent.Add(child.Name);
-
-            if (fileColumns.Any(c => !filePresent.Contains(c)))
-                fileColumns = fileColumns.Where(filePresent.Contains).ToList();
-        }
-
-        Expressions.Predicate? filePredicate = null;
-        if (rowGroupFilter is not null)
-        {
-            parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-            filePredicate = RowGroupPushdown.ToFileColumns(
-                rowGroupFilter, snapshot.Schema, mappingMode, parquetSchema, snapshot.Metadata.PartitionColumns);
-        }
-
-        if (reservation != ScanReservation.None)
-        {
-            // Reserve for the first batch before decoding it: the largest row group's uncompressed size over
-            // the columns read. Later batches reserve what the previous one measured.
-            var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
-            reservation.SetInitialEstimate(LargestRowGroupBytes(footer, fileColumns, deletedRows));
-        }
-
-        var builtinBatches = Reserving(
-            ReadPositionedAsync(reader, filePredicate, fileColumns, deletedRows, cancellationToken),
-            reservation, cancellationToken);
-        await foreach (var processed in ProcessFileBatchesAsync(
-            builtinBatches, addFile, snapshot, columns, mappingMode, physicalToLogical,
-            logicalToPhysical, deletedRows, partitionColumns,
-            hasPartitions, wantPositions, wantTracking, cancellationToken).ConfigureAwait(false))
-        {
-            yield return processed;
+            reader?.Dispose();
+            file.Dispose();
+            throw;
         }
     }
+
+    /// <summary>
+    /// One data file's batches as a scan returns them, each paired with the per-row metadata asked for:
+    /// <paramref name="wantPositions"/> fills <see cref="FileBatch.Positions"/>, <paramref name="wantTracking"/>
+    /// fills <see cref="FileBatch.RowIds"/> and <see cref="FileBatch.Versions"/>. <paramref name="reservation"/>
+    /// is reserved against before each raw batch is decoded, when the read is part of a parallel read of files.
+    /// </summary>
+    private async IAsyncEnumerable<FileBatch> ReadFileBatchesAsync(
+        AddFile addFile,
+        IReadOnlyList<string>? columns,
+        Snapshot.Snapshot snapshot,
+        bool wantPositions,
+        bool wantTracking,
+        Expressions.Predicate? rowGroupFilter,
+        ScanReservation reservation,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        // strippedRowIdsOut/strippedVersionsOut: when non-null, each EMITTED batch appends its per-row RESOLVED
+        // row id / commit version (materialized value where present, else add.baseRowId + absolute position /
+        // add.defaultRowCommitVersion; null when underivable). A copy-on-write rewrite (UPDATE) uses these so a
+        // moved row keeps its ORIGINAL id. strippedAbsPositionsOut adds the surviving row's ABSOLUTE in-file
+        // position (parquet row index, DV-inclusive) — the row-level remap (Layer 3 B) uses it to correlate a
+        // delete's target positions with stable row ids and to place the rebased deletion vector. The hidden
+        // materialized columns are always stripped from the emitted user batches regardless (a foreign reader
+        // must never see them).
+        var read = await OpenDataFileAsync(addFile, columns, snapshot, rowGroupFilter, cancellationToken)
+            .ConfigureAwait(false);
+        try
+        {
+            IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> source;
+            if (read.Reader is null)
+            {
+                source = SeamSource(read, reservation, cancellationToken);
+            }
+            else
+            {
+                if (reservation != ScanReservation.None)
+                {
+                    // Reserve for the first batch before decoding it: the largest row group's uncompressed size
+                    // over the columns read. Later batches reserve what the previous one measured.
+                    var footer = await read.Reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+                    reservation.SetInitialEstimate(LargestRowGroupBytes(footer, read.FileColumns, read.DeletedRows));
+                }
+
+                source = Reserving(
+                    ReadPositionedAsync(read.Reader, read.FilePredicate, read.FileColumns, read.DeletedRows, cancellationToken),
+                    reservation, cancellationToken);
+            }
+
+            await foreach (var processed in ProcessDataFileBatchesAsync(source, read, wantPositions, wantTracking, cancellationToken)
+                .ConfigureAwait(false))
+            {
+                yield return processed;
+            }
+        }
+        finally
+        {
+            read.Release();
+        }
+    }
+
+    /// <summary>A whole file's raw batches through the codec seam, with their positions, reserving before each.</summary>
+    private static IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> SeamSource(
+        DataFileRead read, ScanReservation reservation, CancellationToken cancellationToken) =>
+        Reserving(InFileOrder(read.Seam!.ReadAsync(
+            EngineeredWood.DeltaLake.DeltaPath.Decode(read.AddFile.Path), read.SeamColumns, cancellationToken),
+            cancellationToken), reservation, cancellationToken);
+
+    /// <summary>
+    /// The per-batch pipeline below, for the raw batches of <paramref name="read"/>'s file: any run of them, in file order, each with its file
+    /// position. The pipeline keeps no state from one batch to the next, so a scan split by row group runs it
+    /// once per row group.
+    /// </summary>
+    private IAsyncEnumerable<FileBatch> ProcessDataFileBatchesAsync(
+        IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> source,
+        DataFileRead read,
+        bool wantPositions,
+        bool wantTracking,
+        CancellationToken cancellationToken) =>
+        ProcessFileBatchesAsync(
+            source, read.AddFile, read.Snapshot, read.Columns, read.MappingMode, read.PhysicalToLogical,
+            read.LogicalToPhysical, read.DeletedRows, read.PartitionColumns, read.HasPartitions,
+            wantPositions, wantTracking, cancellationToken);
 
     /// <summary>
     /// The per-batch read pipeline shared by the built-in <c>ParquetFileReader</c> and a pluggable
