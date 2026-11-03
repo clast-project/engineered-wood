@@ -409,11 +409,36 @@ public class TargetFileSizeTests : IDisposable
 
     /// <summary>
     /// A batch of a different Arrow layout cannot always share the open file's Parquet schema, so it starts a new
-    /// file rather than being refused. Here the first batch declares <c>id</c> non-nullable, so the file's column
-    /// is required, and the next one holds a null in it, which a required column cannot store.
+    /// file rather than being refused. Here the middle batch leaves out the nullable <c>part</c> column, which the
+    /// table reads back as NULL.
     /// </summary>
     [Fact]
     public async Task ABatchOfADifferentLayout_StartsANewFile()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(idNullable: true));
+        var idOnly = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, true)).Build(),
+            [new Int64Array.Builder().Append(10).Append(11).Build()], 2);
+        await table.WriteAsync([Batch(0, 10, idNullable: true), idOnly, Batch(20, 10, idNullable: true)]);
+
+        Assert.Equal(3, table.CurrentSnapshot.FileCount);
+        long rows = 0, nulls = 0;
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            rows += batch.Length;
+            nulls += batch.Column("part").NullCount;
+        }
+        Assert.Equal(22, rows);
+        Assert.Equal(2, nulls);
+    }
+
+    /// <summary>
+    /// A difference in nullability flags alone is not a layout difference once the write takes the flags from the
+    /// table schema (#651). A null in a column the first batch declared non-nullable still lands, because the table
+    /// declares the column nullable.
+    /// </summary>
+    [Fact]
+    public async Task ABatchDifferingOnlyInNullability_SharesTheFile()
     {
         await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(idNullable: true));
         var withNull = new RecordBatch(BuildSchema(idNullable: true),
@@ -421,7 +446,7 @@ public class TargetFileSizeTests : IDisposable
              new StringArray.Builder().Append("p").Append("p").Build()], 2);
         await table.WriteAsync([Batch(0, 10, idNullable: false), withNull, Batch(20, 10, idNullable: true)]);
 
-        Assert.Equal(2, table.CurrentSnapshot.FileCount);
+        Assert.Equal(1, table.CurrentSnapshot.FileCount);
         long rows = 0, nulls = 0;
         await foreach (var batch in table.ReadAllAsync())
         {

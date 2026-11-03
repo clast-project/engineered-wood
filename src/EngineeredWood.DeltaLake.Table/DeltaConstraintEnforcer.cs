@@ -38,11 +38,13 @@ internal sealed class DeltaConstraintEnforcer
         new Dictionary<string, string>();
 
     private readonly IReadOnlyList<Rule> _rules;
+    private readonly Apache.Arrow.Schema _tableSchema;
     private readonly ArrowRowEvaluator _evaluator;
 
-    private DeltaConstraintEnforcer(IReadOnlyList<Rule> rules)
+    private DeltaConstraintEnforcer(IReadOnlyList<Rule> rules, Apache.Arrow.Schema tableSchema)
     {
         _rules = rules;
+        _tableSchema = tableSchema;
         _evaluator = new ArrowRowEvaluator(new SparkFunctionRegistry());
     }
 
@@ -77,7 +79,7 @@ internal sealed class DeltaConstraintEnforcer
                 $"invariant on column '{field.Name}'", UnwrapInvariant(field.Name, invariant)));
         }
 
-        return rules.Count == 0 ? null : new DeltaConstraintEnforcer(rules);
+        return rules.Count == 0 ? null : new DeltaConstraintEnforcer(rules, snapshot.ArrowSchema);
     }
 
     /// <summary>
@@ -106,15 +108,21 @@ internal sealed class DeltaConstraintEnforcer
     }
 
     /// <summary>Refuses the write if any row of <paramref name="batch"/> fails a rule.</summary>
+    /// <remarks>
+    /// A write may leave out a nullable column, or a nullable struct field, which then reads back as NULL. The rules
+    /// see it so, from a copy of <paramref name="batch"/> with what is missing backfilled, as the replaceWhere check
+    /// does: a rule reading the column used to be refused as unevaluable (#594). The batch written is not changed.
+    /// </remarks>
     /// <exception cref="DeltaFormatException">A row does not satisfy a declared rule.</exception>
     public void Validate(RecordBatch batch)
     {
+        var asStored = SchemaEvolution.BackfillMissingColumns(batch, _tableSchema.FieldsList);
         foreach (var rule in _rules)
         {
             BooleanArray result;
             try
             {
-                result = _evaluator.EvaluatePredicate(rule.Predicate, batch);
+                result = _evaluator.EvaluatePredicate(rule.Predicate, asStored);
             }
             catch (Exception ex) when (ex is not DeltaFormatException)
             {

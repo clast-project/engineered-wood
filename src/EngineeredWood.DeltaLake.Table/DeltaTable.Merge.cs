@@ -826,10 +826,10 @@ public sealed partial class DeltaTable
             var field = schema.Fields.First(f => string.Equals(f.Name, column, StringComparison.Ordinal));
             if (IdentityColumn.GetConfig(field) is not null)
             {
-                throw new ArgumentException(
-                    $"MERGE: the update would set identity column '{column}', whose values the table assigns. Set "
-                    + "the other columns with MergeAction.UpdateColumns, or drop the column from the source.",
-                    "options");
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.IdentityColumnUpdateNotSupported,
+                    $"MERGE: UPDATE on IDENTITY column {column} is not supported; the table assigns its values. Set "
+                    + "the other columns with MergeAction.UpdateColumns, or drop the column from the source.");
             }
         }
     }
