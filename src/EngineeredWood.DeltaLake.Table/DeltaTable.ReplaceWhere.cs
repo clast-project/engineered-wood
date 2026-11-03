@@ -59,61 +59,8 @@ public sealed partial class DeltaTable
     /// would refuse. Spark refuses both at analysis (<c>UNRESOLVED_COLUMN</c>,
     /// <c>DATATYPE_MISMATCH</c>), even on a table with no rows.
     /// </summary>
-    internal static void RefuseReplaceWhere(Expressions.Predicate predicate, Snapshot.Snapshot snapshot)
-    {
-        if (FirstUnknownReference(predicate, snapshot.Schema) is { } missing)
-        {
-            throw new DeltaFormatException(
-                DeltaTableErrorCodes.UnresolvedColumn,
-                $"The replaceWhere condition {predicate} reads column '{missing}', which the table does not have. "
-                + "Its columns: " + string.Join(", ", snapshot.Schema.Fields.Select(f => f.Name)) + ".");
-        }
-
+    internal static void RefuseReplaceWhere(Expressions.Predicate predicate, Snapshot.Snapshot snapshot) =>
         RefuseUnanalyzable(predicate, snapshot);
-    }
-
-    /// <summary>The first column <paramref name="expression"/> references that <paramref name="schema"/> does not
-    /// have, by the evaluator's rule (a name matches ignoring case), or null.</summary>
-    private static string? FirstUnknownReference(Expressions.Expression expression, Schema.StructType schema)
-    {
-        switch (expression)
-        {
-            case Expressions.UnboundReference reference:
-                Schema.DeltaDataType? type = schema;
-                foreach (string part in reference.NameParts)
-                {
-                    var field = type is Schema.StructType s
-                        ? s.Fields.FirstOrDefault(f => string.Equals(f.Name, part, StringComparison.OrdinalIgnoreCase))
-                        : null;
-                    if (field is null)
-                        return reference.Name;
-                    type = field.Type;
-                }
-                return null;
-            // The evaluator resolves a bound reference by its name, as it does an unbound one.
-            case Expressions.BoundReference bound:
-                return schema.Fields.Any(f => string.Equals(f.Name, bound.Name, StringComparison.OrdinalIgnoreCase))
-                    ? null
-                    : bound.Name;
-            case Expressions.AndPredicate and:
-                return and.Children.Select(c => FirstUnknownReference(c, schema)).FirstOrDefault(n => n is not null);
-            case Expressions.OrPredicate or:
-                return or.Children.Select(c => FirstUnknownReference(c, schema)).FirstOrDefault(n => n is not null);
-            case Expressions.NotPredicate not:
-                return FirstUnknownReference(not.Child, schema);
-            case Expressions.ComparisonPredicate cmp:
-                return FirstUnknownReference(cmp.Left, schema) ?? FirstUnknownReference(cmp.Right, schema);
-            case Expressions.UnaryPredicate unary:
-                return FirstUnknownReference(unary.Operand, schema);
-            case Expressions.SetPredicate set:
-                return FirstUnknownReference(set.Operand, schema)
-                    ?? set.Values.Select(v => FirstUnknownReference(v, schema)).FirstOrDefault(n => n is not null);
-            case Expressions.FunctionCall call:
-                return call.Arguments.Select(a => FirstUnknownReference(a, schema)).FirstOrDefault(n => n is not null);
-            default:
-                return null;
-        }
-    }
 
     /// <summary>
     /// Refuses replaceWhere rows the predicate is not TRUE for: false, or NULL, as a CHECK constraint refuses them
