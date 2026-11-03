@@ -470,9 +470,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // one here would refuse every later data-changing commit, so it is refused now, before anything is written.
         IsolationLevelProperty.Get(configuration);
 
-        // Set protocol versions based on column mapping mode
-        int minReaderVersion = 1;
-        int minWriterVersion = 2;
         // Caller-supplied properties seed the configuration; the feature flags below overwrite their
         // own keys, so an argument and a property that disagree resolve to the argument.
         Dictionary<string, string>? configurationBuilder = configuration is { Count: > 0 }
@@ -488,6 +485,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // consumed, as Spark consumes it: stored, it declared nothing, and a caller who asked for the feature did not
         // get it (#601). The features are added to the protocol just before it is built, below.
         var declaredFeatures = TableFeatureProperties.Extract(configurationBuilder);
+
+        // delta.minReaderVersion / delta.minWriterVersion are a protocol floor, consumed the same way (#639). Without
+        // them a table starts at (1, 2); with them, at the legacy protocol implying what they ask for, which can be
+        // lower: writer 7 alone is (1, 1). The features below raise it as they would raise the default.
+        // An explicit floor also turns the legacy-version raises below (a constraint, a generated column, column
+        // mapping) into named features, as Spark does; see ExtractProtocolFloor.
+        var (minReaderVersion, minWriterVersion, explicitFloor) =
+            TableFeatureProperties.ExtractProtocolFloor(configurationBuilder);
 
         // A feature is enabled by EITHER its dedicated argument or its table property, symmetrically — a
         // caller translating CREATE TABLE ... TBLPROPERTIES gets the same table as one passing the flags.
@@ -509,8 +514,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         if (mappingMode != ColumnMappingMode.None)
         {
-            minReaderVersion = 2;
-            minWriterVersion = 5;
+            if (explicitFloor)
+            {
+                AddDeclared(declaredFeatures, "columnMapping");
+            }
+            else
+            {
+                minReaderVersion = Math.Max(minReaderVersion, 2);
+                minWriterVersion = Math.Max(minWriterVersion, 5);
+            }
 
             int maxId;
             if (preAssignedSchema is not null)
@@ -628,7 +640,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (configurationBuilder is not null
             && configurationBuilder.Keys.Any(k => k.StartsWith(ConstraintKeyPrefix, StringComparison.Ordinal)))
         {
-            minWriterVersion = Math.Max(minWriterVersion, 3);
+            if (explicitFloor)
+                AddDeclared(declaredFeatures, "checkConstraints");
+            else
+                minWriterVersion = Math.Max(minWriterVersion, 3);
         }
 
         // A generated column needs the generatedColumns writer feature, which writer version 4 implies (#582). Raised
@@ -637,7 +652,27 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // the column. Writer 4 also implies changeDataFeed; that is what the legacy version means, and Spark's own
         // generated-column tables are writer 4.
         if (DeclaresGeneratedColumn(deltaSchema))
-            minWriterVersion = Math.Max(minWriterVersion, 4);
+        {
+            if (explicitFloor)
+                AddDeclared(declaredFeatures, "generatedColumns");
+            else
+                minWriterVersion = Math.Max(minWriterVersion, 4);
+        }
+
+        // The default floor (1, 2) already implies appendOnly and invariants; an explicit one may not, and a table
+        // that uses them must declare them (measured: a writer-1 or writer-7 floor with delta.appendOnly = true is
+        // writer 7, [appendOnly]).
+        if (explicitFloor)
+        {
+            if (configurationBuilder is not null
+                && configurationBuilder.TryGetValue("delta.appendOnly", out var appendOnly)
+                && string.Equals(appendOnly, "true", StringComparison.OrdinalIgnoreCase))
+            {
+                AddDeclared(declaredFeatures, "appendOnly");
+            }
+            if (deltaSchema.Fields.Any(f => f.Metadata is not null && f.Metadata.ContainsKey("delta.invariants")))
+                AddDeclared(declaredFeatures, "invariants");
+        }
 
         int legacyReaderVersion = minReaderVersion;
         int legacyWriterVersion = minWriterVersion;
@@ -772,7 +807,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // cosmetic, because writer v5's extra implied features only impose obligations on tables that
         // actually declare a constraint or generated column, and HonorWriterFeatures already fails
         // closed on those. See doc/known-issues.md, "Column-mapping protocol shape differs from Spark's".
-        if (mappingMode != ColumnMappingMode.None &&
+        if (mappingMode != ColumnMappingMode.None && !explicitFloor &&
             (minReaderVersion >= 3 || minWriterVersion >= 7))
         {
             minReaderVersion = 3;
@@ -792,7 +827,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // has to do it too.
         if (minWriterVersion >= 7)
         {
-            foreach (string feature in LegacyWriterFeatures(legacyWriterVersion))
+            var legacy = new ProtocolAction
+            {
+                MinReaderVersion = legacyReaderVersion,
+                MinWriterVersion = legacyWriterVersion,
+            };
+            foreach (string feature in TableFeatureProperties.LegacyWriterFeaturesAtReader(legacy, LegacyWriterFeatures))
             {
                 if (!writerFeatures.Contains(feature))
                     writerFeatures.Add(feature);
@@ -818,10 +858,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             WriterFeatures = writerFeatures.Count > 0 ? writerFeatures : null,
         };
 
-        if (declaredFeatures.Count > 0)
+        if (declaredFeatures.Count > 0 || explicitFloor)
         {
             protocolAction = TableFeatureProperties.Declare(
-                protocolAction, declaredFeatures, LegacyWriterFeatures, LegacyReaderFeatures);
+                protocolAction, declaredFeatures, LegacyWriterFeatures, LegacyReaderFeatures,
+                fromScratch: explicitFloor);
         }
 
         if (previousSnapshot is not null)
@@ -2269,6 +2310,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     private const string GenerationExpressionKey = "delta.generationExpression";
 
+    private static void AddDeclared(List<string> declaredFeatures, string feature)
+    {
+        if (!declaredFeatures.Contains(feature))
+            declaredFeatures.Add(feature);
+    }
+
     /// <summary>
     /// True when <paramref name="schema"/> has a generated column: a top-level field carrying
     /// <c>delta.generationExpression</c>, the only place Delta reads one.
@@ -2798,10 +2845,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Refuses caller-supplied <c>metaData</c> that introduces a <c>delta.feature.*</c> property. Stored there, the
-    /// property declares nothing: <see cref="CreateCoreAsync"/> consumes one into the protocol and Spark never
-    /// stores one, so a host means a <c>protocol</c> action naming the feature. A key carried through unchanged
-    /// from the base snapshot is left alone, since a table created before #601 may already hold one.
+    /// Refuses caller-supplied <c>metaData</c> that introduces a <c>delta.feature.*</c>, <c>delta.minReaderVersion</c>
+    /// or <c>delta.minWriterVersion</c> property. Stored there, the property does nothing: <see cref="CreateCoreAsync"/>
+    /// consumes one into the protocol and Spark never stores one, so a host means a <c>protocol</c> action. A key
+    /// carried through unchanged from the base snapshot is left alone, since a table created before #601 / #639 may
+    /// already hold one.
     /// </summary>
     private static void EnsureNoFeaturePropertiesIntroduced(
         Snapshot.Snapshot baseSnapshot, IEnumerable<DeltaAction> actions)
@@ -2813,7 +2861,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 continue;
             foreach (var pair in configuration)
             {
-                if (!TableFeatureProperties.IsFeatureProperty(pair.Key))
+                if (!TableFeatureProperties.IsProtocolProperty(pair.Key))
                     continue;
                 if (current is not null && current.TryGetValue(pair.Key, out var existing)
                     && string.Equals(existing, pair.Value, StringComparison.Ordinal))
@@ -2823,7 +2871,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 throw new DeltaFormatException(
                     DeltaTableErrorCodes.UnsupportedFeaturesInConfig,
                     $"A metaData action sets '{pair.Key}', which would be stored as a plain table property and "
-                    + "declare nothing. Declare the feature with a protocol action instead.");
+                    + "change nothing. Raise the protocol, or declare the feature, with a protocol action instead.");
             }
         }
     }

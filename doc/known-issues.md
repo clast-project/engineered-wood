@@ -617,13 +617,32 @@ column names, as Spark does. A replacement of a table that supports row tracking
 high-water mark. A caller-supplied `metaData` action that introduces a `delta.feature.*` key is refused, because
 stored there it declares nothing. Use a `protocol` action to declare the feature instead.
 
+*`delta.minReaderVersion` / `delta.minWriterVersion`* are a protocol floor at `CreateAsync` /
+`CreateOrReplaceAsync`, as in Spark 4.0.0 (measured, #639). They are consumed, not stored. The floor is the
+smallest legacy protocol implying exactly the features the requested versions imply, so it can be lower than
+asked:
+- Writer 7 on its own is `(1, 1)`, with no named features and none of the `appendOnly`/`invariants` a default
+  table has.
+- `columnMapping` needs reader 2 as well, so writer 5 at reader 1 is `(1, 4)`.
+- A reader version matters only with writer 5 or 6.
+
+With an explicit floor, a legacy feature the table needs (a CHECK constraint, a generated column, column mapping,
+`delta.appendOnly = true`, an invariant) is named at writer 7 instead of raising the legacy version, unless the
+whole feature set is exactly a legacy version's. So a floor of 1 with a constraint is writer 7, `[checkConstraints]`.
+Values must be 1-7 (writer) or 1-3 (reader), digits only; anything else is refused with
+`DELTA_INVALID_PROTOCOL_VERSION_PROPERTY`. Spark has no error class for this.
+
+A floor never lowers a replaced table's protocol. One deliberate difference from Spark: Spark refuses a
+REPLACE that brings a legacy writer floor to a reader-3 table (`DELTA_READ_FEATURE_PROTOCOL_REQUIRES_WRITE`). EW
+merges it, adding what the floor implies. A caller-supplied `metaData` that introduces either key is refused, as
+for `delta.feature.*`. There is no API to set a protocol version mid-life except a `protocol` action.
+
 *Not read, with consequences for a table EW writes to:*
 
 | Property | What EW does instead |
 |---|---|
 | `delta.compatibility.symlinkFormatManifest.enabled` | Symlink manifests (for Presto/Athena-style readers) are not regenerated. |
 | `delta.setTransactionRetentionDuration` | Expired `txn` (idempotent-write) identifiers are never dropped from checkpoints. |
-| `delta.minReaderVersion`, `delta.minWriterVersion` passed as CREATE `configuration` | Spark treats these as requests to raise the protocol, and does not store them; EW stores them and does not act on them. EW derives the protocol from the features a table uses. A feature is enabled through its `CreateAsync` parameter (`columnMappingMode`, `clusteringColumns`, `enableDeletionVectors`, `enableRowTracking`), a property in `configuration` (`delta.enableDeletionVectors`, `delta.enableRowTracking`, `delta.enableInCommitTimestamps`, `delta.enableChangeDataFeed`, `delta.enableIcebergCompatV1` / `V2`, `delta.checkpointPolicy`), the schema (`timestamp_ntz`, `variant`), or a `delta.feature.<name> = supported` property (below). There is **no** way to request a protocol version directly. |
 | `delta.rowTrackingSuspended` | Not read. What Spark expects of a writer while suspended is not yet verified. |
 | `delta.inCommitTimestampEnablementVersion` / `…Timestamp` | Not read. EW sets them only implicitly (in-commit timestamps enabled at creation need neither). Unverified for a table that enabled them mid-life, where timestamp time travel across the boundary depends on them. |
 | `delta.enableChangeDataCapture` | Not read. Spark defines it as a key separate from `enableChangeDataFeed`; how Spark uses it is not yet verified. |
