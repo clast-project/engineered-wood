@@ -217,145 +217,181 @@ internal static class CompactionExecutor
         WrittenFileLedger? written,
         Stats.StatsColumnSelection statsSelection)
     {
-        // Read all LIVE data from the group's files, widening types if needed. A candidate may carry a
-        // deletion vector (DELETE marks rows rather than rewriting), and those rows MUST be excluded —
-        // compacting the raw parquet would RESURRECT every deleted row.
-        var allBatches = new List<RecordBatch>();
-        var batchIds = materialize ? new List<Int64Array>() : null;   // aligned 1:1 with allBatches
-        var batchVers = materialize ? new List<Int64Array>() : null;  // aligned 1:1 with allBatches
-        foreach (var addFile in group)
+        // The group's Hive directory: one partition = one directory, so the compacted file joins its
+        // sources' directory. The add keeps the ENCODED prefix (reused verbatim from a source path, so it
+        // is never double-encoded); the physical write path is the decoded form. Empty for an
+        // unpartitioned table (files at the table root).
+        string encodedDir = "";
+        int dirSlash = group[0].Path.LastIndexOf('/');
+        if (dirSlash >= 0)
+            encodedDir = group[0].Path.Substring(0, dirSlash + 1);
+        string physicalDir = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir).TrimEnd('/');
+
+        // The live rows stream straight into the output (#572). The rolling writer joins consecutive batches into
+        // row groups of up to RowGroupMaxRows rows / RowGroupMaxBytes, however the sources were cut, and closes a
+        // file once its ACTUAL size reaches the target. Writing one row group per source batch carried every
+        // source file's row groups over unchanged, and cutting files by a bytes-per-row estimate from the sources
+        // went wrong whenever they were heavily deleted or encoded differently. Under a host writer the batches
+        // go through as they came and the host picks its own row groups. Every file is recorded in the ledger
+        // before its first byte, so a compaction that fails part-way takes back what it wrote.
+        IReadOnlyList<RolledDataFile> rolled;
+        await using (var output = new RollingDataFileWriter(
+            fs, dataFileWriter, parquetOptions, options.TargetFileSize, physicalDir, written,
+            collectStats: true, statsSelection))
         {
-            var deletedRows = addFile.DeletionVector is not null
-                ? await dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
-                : null;
-            long baseId = addFile.BaseRowId ?? 0;
-            long commitVer = addFile.DefaultRowCommitVersion ?? 0;
-
-            // Pluggable read half: raw physical batches in file order (positions drive the DV exclusion
-            // below) — the same contract as the built-in reader.
-            IRandomAccessFile? file = null;
-            ParquetFileReader? reader = null;
-            IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> rawBatches;
-            if (dataFileReader is not null)
+            // Read all LIVE data from the group's files, widening types if needed. A candidate may carry a
+            // deletion vector (DELETE marks rows rather than rewriting), and those rows MUST be excluded —
+            // compacting the raw parquet would RESURRECT every deleted row.
+            foreach (var addFile in group)
             {
-                rawBatches = InFileOrder(dataFileReader.ReadAsync(
-                    EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), null, cancellationToken), cancellationToken);
-            }
-            else
-            {
-                file = await fs.OpenReadAsync(
-                    EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
-                    .ConfigureAwait(false);
-                reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
-                rawBatches = Positioned(reader, deletedRows, cancellationToken);
-            }
+                var deletedRows = addFile.DeletionVector is not null
+                    ? await dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
+                    : null;
+                long baseId = addFile.BaseRowId ?? 0;
+                long commitVer = addFile.DefaultRowCommitVersion ?? 0;
 
-            try
-            {
-            await foreach (var (batch, batchStartRow) in rawBatches.ConfigureAwait(false))
-            {
-                // Strip the hidden materialized row-tracking columns (declared physical names) before widening
-                // and column mapping, which expect only user columns. Capture the source's own materialized
-                // ids/versions (present when the source was itself a rewrite output).
-                var (userBatch, srcMatIds, srcMatVers) = materialize
-                    ? RowTracking.RowTrackingWriter.StripMaterializedColumns(batch, matRowIdName, matRowVerName)
-                    : (batch, null, null);
-
-                // The rows the deletion vector leaves, computed once from a selection mask: they drive both the
-                // filter below and the survivor id/version arrays, which therefore stay aligned with it.
-                using var kept = deletedRows is null
-                    ? default
-                    : DeletionVectors.KeptRows.For(deletedRows, batchStartRow, batch.Length);
-                int survivors = deletedRows is null ? batch.Length : kept.Count;
-                if (survivors == 0)
-                    continue; // every row in this batch was deleted: nothing to map, gather or write
-
-                Int64Array? survivorIds = null, survivorVers = null;
-                if (materialize)
+                // Pluggable read half: raw physical batches in file order (positions drive the DV exclusion
+                // below) — the same contract as the built-in reader.
+                IRandomAccessFile? file = null;
+                ParquetFileReader? reader = null;
+                IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> rawBatches;
+                if (dataFileReader is not null)
                 {
-                    var idb = new Int64Array.Builder().Reserve(survivors);
-                    var vrb = new Int64Array.Builder().Reserve(survivors);
-                    for (int n = 0; n < survivors; n++)
+                    rawBatches = InFileOrder(dataFileReader.ReadAsync(
+                        EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), null, cancellationToken), cancellationToken);
+                }
+                else
+                {
+                    file = await fs.OpenReadAsync(
+                        EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+                        .ConfigureAwait(false);
+                    reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
+                    rawBatches = Positioned(reader, deletedRows, cancellationToken);
+                }
+
+                try
+                {
+                await foreach (var (batch, batchStartRow) in rawBatches.ConfigureAwait(false))
+                {
+                    // Strip the hidden materialized row-tracking columns (declared physical names) before widening
+                    // and column mapping, which expect only user columns. Capture the source's own materialized
+                    // ids/versions (present when the source was itself a rewrite output).
+                    var (userBatch, srcMatIds, srcMatVers) = materialize
+                        ? RowTracking.RowTrackingWriter.StripMaterializedColumns(batch, matRowIdName, matRowVerName)
+                        : (batch, null, null);
+
+                    // The rows the deletion vector leaves, computed once from a selection mask: they drive both the
+                    // filter below and the survivor id/version arrays, which therefore stay aligned with it.
+                    using var kept = deletedRows is null
+                        ? default
+                        : DeletionVectors.KeptRows.For(deletedRows, batchStartRow, batch.Length);
+                    int survivors = deletedRows is null ? batch.Length : kept.Count;
+                    if (survivors == 0)
+                        continue; // every row in this batch was deleted: nothing to map, gather or write
+
+                    Int64Array? survivorIds = null, survivorVers = null;
+                    if (materialize)
                     {
-                        int i = deletedRows is null ? n : kept[n];
-                        long id = srcMatIds is not null && !srcMatIds.IsNull(i)
-                            ? srcMatIds.GetValue(i)!.Value
-                            : baseId + batchStartRow + i;
-                        long ver = srcMatVers is not null && !srcMatVers.IsNull(i)
-                            ? srcMatVers.GetValue(i)!.Value
-                            : commitVer;
-                        idb.Append(id);
-                        vrb.Append(ver);
+                        var idb = new Int64Array.Builder().Reserve(survivors);
+                        var vrb = new Int64Array.Builder().Reserve(survivors);
+                        for (int n = 0; n < survivors; n++)
+                        {
+                            int i = deletedRows is null ? n : kept[n];
+                            long id = srcMatIds is not null && !srcMatIds.IsNull(i)
+                                ? srcMatIds.GetValue(i)!.Value
+                                : baseId + batchStartRow + i;
+                            long ver = srcMatVers is not null && !srcMatVers.IsNull(i)
+                                ? srcMatVers.GetValue(i)!.Value
+                                : commitVer;
+                            idb.Append(id);
+                            vrb.Append(ver);
+                        }
+                        survivorIds = idb.Build();
+                        survivorVers = vrb.Build();
                     }
-                    survivorIds = idb.Build();
-                    survivorVers = vrb.Build();
-                }
 
-                // The source file's own PARQUET:field_id metadata must not ride into the compacted file: a
-                // mapped table re-stamps every id from the schema below, and an unmapped one has none to write.
-                // Id mode resolves a file's columns by field id, and its physical names need not be the schema's
-                // (a converted table keeps each file's names from when it was written). Everything below matches
-                // by NAME, so first map the batch to the schema's own physical names by id: logical by id (which
-                // also drops columns whose id the table no longer has), then back to canonical physical.
-                if (mappingMode == ColumnMappingMode.Id)
-                {
-                    userBatch = ColumnMappingRecursive.ToPhysical(
-                        ColumnMappingRecursive.ToLogical(userBatch, snapshot.Schema, mappingMode),
-                        snapshot.Schema, mappingMode);
-                }
-                var liveBatch = ColumnMappingRecursive.StripParquetFieldIds(userBatch);
-                if (deletedRows is not null && !kept.AllKept)
-                    liveBatch = ArrowCompute.Take(liveBatch, liveBatch.Schema, kept.Indices);
-                if (liveBatch.Length == 0)
-                    continue; // every row in this batch was deleted
+                    // The source file's own PARQUET:field_id metadata must not ride into the compacted file: a
+                    // mapped table re-stamps every id from the schema below, and an unmapped one has none to write.
+                    // Id mode resolves a file's columns by field id, and its physical names need not be the schema's
+                    // (a converted table keeps each file's names from when it was written). Everything below matches
+                    // by NAME, so first map the batch to the schema's own physical names by id: logical by id (which
+                    // also drops columns whose id the table no longer has), then back to canonical physical.
+                    if (mappingMode == ColumnMappingMode.Id)
+                    {
+                        userBatch = ColumnMappingRecursive.ToPhysical(
+                            ColumnMappingRecursive.ToLogical(userBatch, snapshot.Schema, mappingMode),
+                            snapshot.Schema, mappingMode);
+                    }
+                    var liveBatch = ColumnMappingRecursive.StripParquetFieldIds(userBatch);
+                    if (deletedRows is not null && !kept.AllKept)
+                        liveBatch = ArrowCompute.Take(liveBatch, liveBatch.Schema, kept.Indices);
+                    if (liveBatch.Length == 0)
+                        continue; // every row in this batch was deleted
 
-                // Widen values from old files to match current schema
-                var outBatch = TypeWidening.ValueWidener.WidenBatch(liveBatch, targetSchema);
+                    // Widen values from old files to match current schema
+                    var outBatch = TypeWidening.ValueWidener.WidenBatch(liveBatch, targetSchema);
 
-                // Then reconcile the COLUMN SET. ADD/DROP COLUMN are metadata-only commits, so the files being
-                // compacted span vintages with different column sets (one predating an ADD lacks the column,
-                // one predating a DROP still carries it). Every batch must be reconciled to the current
-                // schema's (physical-named, partition-less) columns — absent ones typed all-NULL, dropped ones
-                // removed — because the parquet writer fixes the file's schema on its FIRST row group: a later
-                // batch of a different shape either fails the write or lands columns under the wrong names.
-                outBatch = SchemaEvolution.BackfillMissingColumns(outBatch, targetSchema.FieldsList);
-                if (mappingMode != ColumnMappingMode.None)
-                {
-                    // Rebuild with a CLEAN schema (drop the reader-carried field metadata, e.g. the file's own
-                    // PARQUET:field_id) before re-stamping, then apply the mapping recursively so nested struct
-                    // children keep their physical names + ids too. The batch is already physical-named, so it is
-                    // matched physical-first (a renamed column's old name may be a newer column's logical name) and
-                    // renames nothing — it only stamps the ids.
-                    var cleanFields = new List<Field>(outBatch.Schema.FieldsList.Count);
-                    foreach (var f in outBatch.Schema.FieldsList)
-                        cleanFields.Add(CleanField(f));
-                    var cleanArrays = new List<IArrowArray>(outBatch.ColumnCount);
-                    for (int c = 0; c < outBatch.ColumnCount; c++)
-                        cleanArrays.Add(outBatch.Column(c));
-                    outBatch = new RecordBatch(
-                        new Apache.Arrow.Schema(cleanFields, null), cleanArrays, outBatch.Length);
-                    outBatch = ColumnMappingRecursive.ToPhysical(
-                        outBatch, snapshot.Schema, mappingMode, inputIsPhysical: true);
+                    // Then reconcile the COLUMN SET. ADD/DROP COLUMN are metadata-only commits, so the files being
+                    // compacted span vintages with different column sets (one predating an ADD lacks the column,
+                    // one predating a DROP still carries it). Every batch must be reconciled to the current
+                    // schema's (physical-named, partition-less) columns — absent ones typed all-NULL, dropped ones
+                    // removed — because the parquet writer fixes the file's schema on its FIRST row group: a later
+                    // batch of a different shape either fails the write or lands columns under the wrong names.
+                    outBatch = SchemaEvolution.BackfillMissingColumns(outBatch, targetSchema.FieldsList);
+                    if (mappingMode != ColumnMappingMode.None)
+                    {
+                        // Rebuild with a CLEAN schema (drop the reader-carried field metadata, e.g. the file's own
+                        // PARQUET:field_id) before re-stamping, then apply the mapping recursively so nested struct
+                        // children keep their physical names + ids too. The batch is already physical-named, so it is
+                        // matched physical-first (a renamed column's old name may be a newer column's logical name) and
+                        // renames nothing — it only stamps the ids.
+                        var cleanFields = new List<Field>(outBatch.Schema.FieldsList.Count);
+                        foreach (var f in outBatch.Schema.FieldsList)
+                            cleanFields.Add(CleanField(f));
+                        var cleanArrays = new List<IArrowArray>(outBatch.ColumnCount);
+                        for (int c = 0; c < outBatch.ColumnCount; c++)
+                            cleanArrays.Add(outBatch.Column(c));
+                        outBatch = new RecordBatch(
+                            new Apache.Arrow.Schema(cleanFields, null), cleanArrays, outBatch.Length);
+                        outBatch = ColumnMappingRecursive.ToPhysical(
+                            outBatch, snapshot.Schema, mappingMode, inputIsPhysical: true);
+                    }
+
+                    // Canonical Arrow forms (WriteTypeNormalization). The rows come from several files, each read in
+                    // whatever form its own reader produced, and one row group cannot mix them; a layout that still
+                    // differs would start a new output file. Not under a host writer: the codec seam is value-blind,
+                    // and the host owns the physical representation.
+                    if (dataFileWriter is null)
+                        outBatch = WriteTypeNormalization.Normalize(outBatch);
+                    // Nullability from the table schema, so sources whose Arrow flags disagree (an EW append's
+                    // non-nullable id beside a Spark file's all-optional columns) still share a file.
+                    outBatch = TableNullability.Apply(outBatch, targetSchema.FieldsList);
+                    // The append path's guard: a foreign TIMESTAMP(NANOS) reads back as a nanosecond column, which no
+                    // writer can store under a microsecond Delta timestamp — refused under a host writer too.
+                    SchemaConverter.ThrowIfUnwritableType(outBatch.Schema, convertibleTypesAllowed: dataFileWriter is not null);
+                    // When materializing, append the ORIGINAL id + commit-version columns to the WRITTEN batch only:
+                    // the internal columns must not appear in Delta stats, which cover the user columns.
+                    var writeBatch = materialize
+                        ? RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
+                            outBatch, survivorIds!, survivorVers!, matRowIdName!, matRowVerName!)
+                        : outBatch;
+                    await output.AddAsync(writeBatch, outBatch, cancellationToken).ConfigureAwait(false);
                 }
-                allBatches.Add(outBatch);
-                if (materialize)
+                }
+                finally
                 {
-                    batchIds!.Add(survivorIds!);
-                    batchVers!.Add(survivorVers!);
+                    reader?.Dispose();
+                    if (file is not null)
+                    {
+                        await file.DisposeAsync().ConfigureAwait(false);
+                    }
                 }
             }
-            }
-            finally
-            {
-                reader?.Dispose();
-                if (file is not null)
-                {
-                    await file.DisposeAsync().ConfigureAwait(false);
-                }
-            }
+
+            rolled = await output.CompleteAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        if (allBatches.Count == 0)
+        if (rolled.Count == 0)
             return (false, nextRowId); // every live row DV-deleted — leave the group's files alone
 
         // Remove the group's old files (with dataChange: false since this is rearrangement)
@@ -391,106 +427,23 @@ internal static class CompactionExecutor
         if (assignRowIds && earliestCommitVersion is null)
             earliestCommitVersion = snapshot.Version + 1;
 
-        // The group's Hive directory: one partition = one directory, so the compacted file joins its
-        // sources' directory. The add keeps the ENCODED prefix (reused verbatim from a source path, so it
-        // is never double-encoded); the physical write path is the decoded form. Empty for an
-        // unpartitioned table (files at the table root).
-        string encodedDir = "";
-        int dirSlash = group[0].Path.LastIndexOf('/');
-        if (dirSlash >= 0)
-            encodedDir = group[0].Path.Substring(0, dirSlash + 1);
-        string physicalDir = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir);
-
-        // Write new compacted file(s)
-        // Group batches to target file size (approximate by row count)
-        long totalRows = allBatches.Sum(b => (long)b.Length);
-        long totalBytes = group.Sum(f => f.Size);
-        double bytesPerRow = totalRows > 0 ? (double)totalBytes / totalRows : 0;
-        long rowsPerFile = bytesPerRow > 0
-            ? Math.Max(1, (long)(options.TargetFileSize / bytesPerRow))
-            : totalRows;
-
-        int batchIdx = 0;
-        long currentRowCount = 0;
-        var currentBatches = new List<RecordBatch>();   // USER columns only (stats collected over these)
-        var currentWrite = new List<RecordBatch>();     // what gets written (== currentBatches unless materialize)
-
-        while (batchIdx < allBatches.Count)
+        // The compacted files, in the order they were written: each reserves the next run of row ids.
+        foreach (var file in rolled)
         {
-            // Canonical Arrow forms (WriteTypeNormalization). The rows come from several files, each read in
-            // whatever form its own reader produced, and one output file cannot mix them: the Parquet writer
-            // refuses a row group whose column type differs from the file's. Not under a host writer: the
-            // codec seam is value-blind, and the host owns the physical representation.
-            var addBatch = dataFileWriter is null
-                ? WriteTypeNormalization.Normalize(allBatches[batchIdx])
-                : allBatches[batchIdx];
-            // The append path's guard: a foreign TIMESTAMP(NANOS) reads back as a nanosecond column, which no
-            // writer can store under a microsecond Delta timestamp — refused under a host writer too.
-            SchemaConverter.ThrowIfUnwritableType(addBatch.Schema, convertibleTypesAllowed: dataFileWriter is not null);
-            currentBatches.Add(addBatch);
-            // When materializing, append the ORIGINAL id + commit-version columns to the WRITTEN batch (the
-            // internal columns must not appear in Delta stats, which cover the user columns only).
-            currentWrite.Add(materialize
-                ? RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
-                    addBatch, batchIds![batchIdx], batchVers![batchIdx], matRowIdName!, matRowVerName!)
-                : addBatch);
-            currentRowCount += addBatch.Length;
-            batchIdx++;
-
-            if (currentRowCount >= rowsPerFile || batchIdx == allBatches.Count)
+            string baseName = file.FileName.Substring(file.FileName.LastIndexOf('/') + 1);
+            actions.Add(new AddFile
             {
-                string baseName = $"{Guid.NewGuid():N}.parquet";
-                string fileName = physicalDir + baseName;
-                // Recorded before the write: a compaction that fails — including on a commit that a real
-                // conflict aborts — takes its whole rewritten output back.
-                written?.Record(fileName);
-                long fileSize;
-                long fileBaseRowId = nextRowId;
-
-                if (dataFileWriter is not null)
-                {
-                    // Keep the host codec's output quality (bloom filters, stats, footer) through an OPTIMIZE
-                    // instead of reverting to the built-in writer for compacted files.
-                    fileSize = await dataFileWriter.WriteAsync(
-                        currentWrite.ToAsyncEnumerable(), fileName, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                else
-                {
-                    await using var outFile = await fs.CreateAsync(
-                        fileName, cancellationToken: cancellationToken).ConfigureAwait(false);
-                    await using var writer = new ParquetFileWriter(
-                        outFile, ownsFile: false, parquetOptions);
-                    foreach (var batch in currentWrite)
-                    {
-                        await writer.WriteRowGroupAsync(batch, cancellationToken)
-                            .ConfigureAwait(false);
-                    }
-                    await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
-                    fileSize = outFile.Position;
-                }
-
-                if (assignRowIds)
-                    nextRowId += currentRowCount;
-
-                string? stats = Stats.StatsCollector.Collect(currentBatches, statsSelection);
-
-                actions.Add(new AddFile
-                {
-                    Path = encodedDir + baseName,
-                    PartitionValues = group[0].PartitionValues,
-                    Size = fileSize,
-                    ModificationTime = now,
-                    DataChange = false,
-                    Stats = stats,
-                    BaseRowId = assignRowIds ? fileBaseRowId : null,
-                    DefaultRowCommitVersion = earliestCommitVersion,
-                });
-
-                currentBatches.Clear();
-                currentWrite.Clear();
-                currentRowCount = 0;
-            }
+                Path = encodedDir + baseName,
+                PartitionValues = group[0].PartitionValues,
+                Size = file.Size,
+                ModificationTime = now,
+                DataChange = false,
+                Stats = file.Stats,
+                BaseRowId = assignRowIds ? nextRowId : null,
+                DefaultRowCommitVersion = earliestCommitVersion,
+            });
+            if (assignRowIds)
+                nextRowId += file.Rows;
         }
 
         return (true, nextRowId);
