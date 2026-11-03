@@ -604,6 +604,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             minWriterVersion = Math.Max(minWriterVersion, 3);
         }
 
+        // A generated column needs the generatedColumns writer feature, which writer version 4 implies (#582). Raised
+        // here for the same reason as checkConstraints above: a writer that honours only the protocol (Spark's
+        // GeneratedColumn.enforcesGeneratedColumns asks the protocol first) would otherwise neither compute nor check
+        // the column. Writer 4 also implies changeDataFeed; that is what the legacy version means, and Spark's own
+        // generated-column tables are writer 4.
+        if (DeclaresGeneratedColumn(deltaSchema))
+            minWriterVersion = Math.Max(minWriterVersion, 4);
+
         int legacyReaderVersion = minReaderVersion;
         int legacyWriterVersion = minWriterVersion;
 
@@ -1325,8 +1333,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         CommitSchemaValidation.EnsureValid(newSchema);
-        var protocolUpgrade = UpgradeProtocolForFeatures(
-            baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
+        var protocolUpgrade = DeclareGeneratedColumns(
+            baseProtocol ?? snapshot.Protocol,
+            UpgradeProtocolForFeatures(baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type)),
+            newSchema);
 
         var metadata = baseMeta with
         {
@@ -1531,8 +1541,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         CommitSchemaValidation.EnsureValid(newSchema);
-        var protocolUpgrade = UpgradeProtocolForFeatures(
-            baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type));
+        var protocolUpgrade = DeclareGeneratedColumns(
+            baseProtocol ?? snapshot.Protocol,
+            UpgradeProtocolForFeatures(baseProtocol ?? snapshot.Protocol, RequiredSchemaFeatures(newDeltaField.Type)),
+            newSchema);
 
         var metadata = baseMeta with
         {
@@ -1747,7 +1759,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         SchemaChangeDependents.EnsureReplacementResolves(snapshot.Metadata, newDeltaSchema);
         var clustering = RekeyClusteringDomain(snapshot, newDeltaSchema, mappingMode);
 
-        var protocolUpgrade = UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaSchema));
+        var protocolUpgrade = DeclareGeneratedColumns(
+            snapshot.Protocol,
+            UpgradeProtocolForFeatures(snapshot.Protocol, RequiredSchemaFeatures(newDeltaSchema)),
+            newDeltaSchema);
 
         return await CommitMetadataOnlyAsync(
             snapshot,
@@ -2214,6 +2229,36 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (SchemaUsesVariant(type))
             features.Add("variantType");
         return features;
+    }
+
+    private const string GenerationExpressionKey = "delta.generationExpression";
+
+    /// <summary>
+    /// True when <paramref name="schema"/> has a generated column: a top-level field carrying
+    /// <c>delta.generationExpression</c>, the only place Delta reads one.
+    /// </summary>
+    private static bool DeclaresGeneratedColumn(StructType schema) =>
+        schema.Fields.Any(f => f.Metadata is not null && f.Metadata.ContainsKey(GenerationExpressionKey));
+
+    /// <summary>
+    /// <paramref name="pending"/> (the upgrade already computed for a schema change, or null for none) further
+    /// raised so the protocol declares <c>generatedColumns</c> when <paramref name="schema"/> has a generated
+    /// column: a legacy protocol below writer 4 is raised to writer 4, which implies it, and a table-features
+    /// protocol gets the feature named. Returns <paramref name="pending"/> unchanged when nothing more is needed
+    /// (#582).
+    /// </summary>
+    private static ProtocolAction? DeclareGeneratedColumns(
+        ProtocolAction current, ProtocolAction? pending, StructType schema)
+    {
+        if (!DeclaresGeneratedColumn(schema))
+            return pending;
+        var basis = pending ?? current;
+        ProtocolAction? raised = basis.MinWriterVersion >= 7
+            ? UpgradeProtocolForWriterFeatures(basis, ["generatedColumns"])
+            : basis.MinWriterVersion >= 4
+                ? null
+                : basis with { MinWriterVersion = 4 };
+        return raised ?? pending;
     }
 
     /// <summary>
