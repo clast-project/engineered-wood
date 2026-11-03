@@ -1313,6 +1313,55 @@ public class SparkInteropTests : IDisposable
         Assert.Equal([(1L, "us"), (3L, "apac"), (4L, "us")], await ReadAllViaEw(table));
     }
 
+    /// <summary>
+    /// <para>Spark packs the deletion vectors of many data files into ONE <c>.bin</c>, each at its own offset,
+    /// and EW reads each by a ranged read of just its own bytes (#614). A single-file table yields a
+    /// single-DV file, where reading at the wrong offset would go unnoticed; this one has a DV per partition
+    /// file, all from one DELETE.</para>
+    ///
+    /// <para>The packing is asserted, not assumed: a Spark that wrote one file per DV would leave the
+    /// offsets untested and still pass the row check.</para>
+    /// </summary>
+    [SkippableFact]
+    public async Task SparkWritten_PackedDeletionVectors_EwReadsEachFromItsOwnOffset()
+    {
+        Spark.Require();
+
+        Spark.Invoke("write", new
+        {
+            path = _tempDir,
+            schema = "id long, region string",
+            rows = new object[]
+            {
+                new object[] { 1L, "us" }, new object[] { 2L, "us" }, new object[] { 3L, "us" },
+                new object[] { 4L, "eu" }, new object[] { 5L, "eu" }, new object[] { 6L, "eu" },
+                new object[] { 7L, "apac" }, new object[] { 8L, "apac" }, new object[] { 9L, "apac" },
+            },
+            partition_by = new[] { "region" },
+            options = new Dictionary<string, string> { ["delta.enableDeletionVectors"] = "true" },
+            // One row per file at a DIFFERENT position: the DVs are the same size but differ in content, so a
+            // read at the wrong offset passes the size check and the checksum and returns the wrong rows.
+            sql = new[] { "DELETE FROM delta.`{path}` WHERE id IN (1, 5, 9)" },
+        });
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.OpenAsync(fs);
+
+        var vectors = table.CurrentSnapshot.ActiveFiles.Values
+            .Select(a => a.DeletionVector)
+            .Where(dv => dv is { StorageType: "u" or "p" })
+            .Select(dv => dv!)
+            .ToList();
+        Assert.Equal(3, vectors.Count);
+        var packed = vectors.GroupBy(dv => (dv.StorageType, dv.PathOrInlineDv)).OrderByDescending(g => g.Count()).First();
+        Assert.True(packed.Count() >= 2, "Spark wrote one DV file per data file; the packed layout went untested.");
+        Assert.Equal(packed.Count(), packed.Select(dv => dv.Offset).Distinct().Count());
+
+        Assert.Equal(
+            [(2L, "us"), (3L, "us"), (4L, "eu"), (6L, "eu"), (7L, "apac"), (8L, "apac")],
+            await ReadAllViaEw(table));
+    }
+
     // ── Data skipping. Wrong stats lose rows silently; only a pruning engine notices. ──
 
     /// <summary>

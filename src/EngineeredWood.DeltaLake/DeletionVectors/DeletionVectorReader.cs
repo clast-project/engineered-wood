@@ -2,7 +2,8 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers;
-using System.Text;
+using System.Buffers.Binary;
+using System.IO.Hashing;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.IO;
 
@@ -27,17 +28,15 @@ public sealed class DeletionVectorReader
         DeletionVector dv,
         CancellationToken cancellationToken = default)
     {
-        byte[] data = dv.StorageType switch
+        return dv.StorageType switch
         {
-            "i" => ReadInline(dv),
+            "i" => RoaringBitmapReader.Deserialize(ReadInline(dv)),
             "u" => await ReadUuidFileAsync(dv, cancellationToken).ConfigureAwait(false),
             "p" => await ReadAbsoluteFileAsync(dv, cancellationToken).ConfigureAwait(false),
             _ => throw new DeltaFormatException(
                 DeltaErrorCodes.UnsupportedDeletionVectorStorageType,
                 $"Unknown deletion vector storage type: '{dv.StorageType}'"),
         };
-
-        return RoaringBitmapReader.Deserialize(data);
     }
 
     /// <summary>
@@ -63,7 +62,7 @@ public sealed class DeletionVectorReader
     /// <see cref="DeletionVectorPath"/> because VACUUM must resolve it identically — a divergence
     /// there means vacuum deletes a live DV and its masked rows silently reappear.
     /// </summary>
-    private async ValueTask<byte[]> ReadUuidFileAsync(
+    private async ValueTask<DeletionVectorBitmap> ReadUuidFileAsync(
         DeletionVector dv, CancellationToken cancellationToken)
     {
         string filePath = DeletionVectorPath.GetRelativePath(dv)
@@ -78,51 +77,106 @@ public sealed class DeletionVectorReader
     /// <summary>
     /// Reads a file-based DV with an absolute path.
     /// </summary>
-    private async ValueTask<byte[]> ReadAbsoluteFileAsync(
+    private async ValueTask<DeletionVectorBitmap> ReadAbsoluteFileAsync(
         DeletionVector dv, CancellationToken cancellationToken)
     {
         return await ReadDvFileAsync(dv.PathOrInlineDv, dv.Offset ?? 0, dv.SizeInBytes, cancellationToken)
             .ConfigureAwait(false);
     }
 
-    private async ValueTask<byte[]> ReadDvFileAsync(
+    private const int DataSizeLength = 4;
+    private const int ChecksumLength = 4;
+
+    /// <summary>
+    /// <para>Reads ONE stored deletion vector out of an on-disk DV file, fetching only its own bytes.</para>
+    ///
+    /// <para>Spec layout (what Spark, delta-rs and this library write): the file starts with a 1-byte format
+    /// version, then each stored DV is <c>&lt;dataSize: 4-byte big-endian&gt;&lt;bitmap: dataSize
+    /// bytes&gt;&lt;CRC-32 of the bitmap: 4-byte big-endian&gt;</c>, and the descriptor's <c>offset</c> points
+    /// at the size field with <c>sizeInBytes == dataSize</c>. Spark packs the DVs of many data files into one
+    /// file, so reading the whole file per descriptor costs O(files x file size); one ranged read of
+    /// <c>[offset, offset + 4 + size + 4)</c> costs only this DV's bytes, in one request on every backend.</para>
+    ///
+    /// <para>Like Spark's <c>DeletionVectorStore.readRangeFromStream</c>, a size field that disagrees with the
+    /// descriptor and a checksum that disagrees with the bitmap are both refused. There is no fallback to a bare
+    /// bitmap at the offset: no writer produces one, and accepting one would need a second read.</para>
+    /// </summary>
+    private async ValueTask<DeletionVectorBitmap> ReadDvFileAsync(
         string path, int offset, int size,
         CancellationToken cancellationToken)
     {
-        byte[] allBytes = await _fs.ReadAllBytesAsync(path, cancellationToken)
-            .ConfigureAwait(false);
-
-        if (offset == 0 && size == allBytes.Length)
-            return allBytes;
-
-        // Spec on-disk layout (the shape Spark writes): the file starts with a 1-byte format version,
-        // and each stored DV is "<dataSize: 4-byte BIG-ENDIAN int><bitmap: dataSize bytes><CRC-32:
-        // 4 bytes>" with the descriptor's offset pointing at the SIZE field and sizeInBytes == dataSize.
-        // Detect that shape by the size field matching, and return the bitmap bytes (skip the length
-        // prefix; the trailing checksum is not verified). Anything else falls back to a raw slice
-        // (a bare bitmap written at the offset).
-        if (offset + 4 + size <= allBytes.Length)
-        {
-            int be = (allBytes[offset] << 24) | (allBytes[offset + 1] << 16)
-                     | (allBytes[offset + 2] << 8) | allBytes[offset + 3];
-            if (be == size)
-            {
-                var bitmap = new byte[size];
-                Array.Copy(allBytes, offset + 4, bitmap, 0, size);
-                return bitmap;
-            }
-        }
-
-        // Extract the relevant slice
-        if (offset + size > allBytes.Length)
+        // The read covers the size field and checksum too, and every backend allocates it as one buffer:
+        // a size within 8 of int.MaxValue would overflow that allocation rather than read as malformed.
+        if (offset < 0 || size < 0 || size > int.MaxValue - DataSizeLength - ChecksumLength)
             throw new DeltaFormatException(
                 DeltaErrorCodes.InvalidDeletionVector,
-                $"Deletion vector at {path} offset {offset} size {size} " +
-                $"exceeds file length {allBytes.Length}.");
+                $"Deletion vector at {path} has an invalid offset ({offset}) or size ({size}).");
 
-        var result = new byte[size];
-        Array.Copy(allBytes, offset, result, 0, size);
-        return result;
+        var range = new FileRange(offset, (long)DataSizeLength + size + ChecksumLength);
+
+        IRandomAccessFile file = await _fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            IMemoryOwner<byte> owner;
+            try
+            {
+                owner = await file.ReadAsync(range, cancellationToken).ConfigureAwait(false);
+            }
+            catch (IOException ex)
+            {
+                // Every backend reports a range past the end as an IOException, as it reports other I/O
+                // failures. Ask for the length only now, so the common path stays one request.
+                long? length = await TryGetLengthAsync(file, cancellationToken).ConfigureAwait(false);
+                if (length is long fileLength && range.End > fileLength)
+                    throw new DeltaFormatException(
+                        DeltaErrorCodes.InvalidDeletionVector,
+                        $"Deletion vector at {path} offset {offset} size {size} " +
+                        $"exceeds file length {fileLength}.",
+                        ex);
+                throw;
+            }
+
+            using (owner)
+                return Decode(owner.Memory.Span.Slice(0, checked((int)range.Length)), path, offset, size);
+        }
+        finally
+        {
+            await file.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async ValueTask<long?> TryGetLengthAsync(
+        IRandomAccessFile file, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null; // the original failure is the one worth reporting
+        }
+    }
+
+    private static DeletionVectorBitmap Decode(ReadOnlySpan<byte> stored, string path, int offset, int size)
+    {
+        int dataSize = BinaryPrimitives.ReadInt32BigEndian(stored);
+        if (dataSize != size)
+            throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector,
+                $"Deletion vector at {path} offset {offset}: the stored size {dataSize} does not match " +
+                $"the descriptor's sizeInBytes {size}.");
+
+        ReadOnlySpan<byte> bitmap = stored.Slice(DataSizeLength, size);
+        uint expected = BinaryPrimitives.ReadUInt32BigEndian(stored.Slice(DataSizeLength + size));
+        uint actual = Crc32.HashToUInt32(bitmap);
+        if (actual != expected)
+            throw new DeltaFormatException(
+                DeltaErrorCodes.InvalidDeletionVector,
+                $"Deletion vector at {path} offset {offset}: checksum mismatch " +
+                $"(stored 0x{expected:X8}, computed 0x{actual:X8}).");
+
+        return RoaringBitmapReader.Deserialize(bitmap);
     }
 
 }

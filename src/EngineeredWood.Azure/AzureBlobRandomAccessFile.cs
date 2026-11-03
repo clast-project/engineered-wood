@@ -131,6 +131,16 @@ public sealed class AzureBlobRandomAccessFile : IRandomAccessFile
 
             return buffer;
         }
+        catch (global::Azure.RequestFailedException ex) when (ex.Status == 416)
+        {
+            // A range that STARTS past the end is a 416 (InvalidRange), not a short 206; report it the way
+            // the interface promises, as for a range that merely runs past the end.
+            buffer.Dispose();
+            throw new IOException(
+                $"Range starting at offset {range.Offset} ({range.Length} bytes) is past the end of blob " +
+                $"'{_blobClient.Name}'.",
+                ex);
+        }
         catch
         {
             buffer.Dispose();
