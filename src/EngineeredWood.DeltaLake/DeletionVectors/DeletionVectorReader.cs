@@ -105,10 +105,12 @@ public sealed class DeletionVectorReader
         string path, int offset, int size,
         CancellationToken cancellationToken)
     {
-        if (offset < 0 || size < 0)
+        // The read covers the size field and checksum too, and every backend allocates it as one buffer:
+        // a size within 8 of int.MaxValue would overflow that allocation rather than read as malformed.
+        if (offset < 0 || size < 0 || size > int.MaxValue - DataSizeLength - ChecksumLength)
             throw new DeltaFormatException(
                 DeltaErrorCodes.InvalidDeletionVector,
-                $"Deletion vector at {path} has a negative offset ({offset}) or size ({size}).");
+                $"Deletion vector at {path} has an invalid offset ({offset}) or size ({size}).");
 
         var range = new FileRange(offset, (long)DataSizeLength + size + ChecksumLength);
 

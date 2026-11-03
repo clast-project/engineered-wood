@@ -242,7 +242,9 @@ public class DeletionVectorReaderTests : IDisposable
     [Theory]
     [InlineData(-1, 10)]
     [InlineData(1, -1)]
-    public async Task NegativeOffsetOrSize_IsRefused(int offset, int size)
+    [InlineData(1, int.MaxValue - 7)] // + 8 framing bytes overflows one buffer
+    [InlineData(1, int.MaxValue)]
+    public async Task OutOfRangeOffsetOrSize_IsRefused(int offset, int size)
     {
         var fs = new LocalTableFileSystem(_tempDir);
         await WritePackedFileAsync(fs);
