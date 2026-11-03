@@ -72,12 +72,13 @@ internal abstract class ColumnReader
         }
         else
         {
-            // The column's own bits cover only the parent's present rows.
-            var own = new bool[CountNonNull(parent, batchSize)];
-            _presentDecoder.ReadValues(own);
-            int k = 0;
-            for (int i = 0; i < batchSize; i++)
-                present[i] = parent[i] && own[k++];
+            // The column's own bits cover only the parent's present rows. They are decoded into the front of the
+            // buffer and spread out from the back: a row's own bit is never after the row, so none is overwritten
+            // before it is read.
+            int k = CountNonNull(parent, batchSize);
+            _presentDecoder.ReadValues(present.Slice(0, k));
+            for (int i = batchSize - 1; i >= 0; i--)
+                present[i] = parent[i] && present[--k];
         }
         return _presentBuffer;
     }

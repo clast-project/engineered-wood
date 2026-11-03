@@ -29,6 +29,8 @@ public class NestedSliceTests
             // A union row renders as the value it selects.
             case DenseUnionArray union:
                 return Render(union.Fields[union.TypeIds[i]], union.ValueOffsets[i]);
+            case SparseUnionArray sparse:
+                return Render(sparse.Fields[sparse.TypeIds[i]], i);
             case MapArray map:
             {
                 var kv = map.KeyValues;
@@ -107,6 +109,14 @@ public class NestedSliceTests
     private static readonly UnionType IntOrString = new(
         [new Field("i", Int32Type.Default, true), new Field("s", StringType.Default, true)], [0, 1], UnionMode.Dense);
 
+    private static readonly UnionType SparsePairOrString = new(
+        [new Field("p", Pair, true), new Field("s", StringType.Default, true)], [0, 1], UnionMode.Sparse);
+
+    /// <summary>A sparse union of <paramref name="count"/> rows: a pair at even rows, a string at odd ones.</summary>
+    private static SparseUnionArray SparsePairsOrStrings(int count) => new(SparsePairOrString, count,
+        [Pairs(count), new StringArray.Builder().AppendRange(Enumerable.Range(0, count).Select(i => "t" + i)).Build()],
+        new ArrowBuffer.Builder<byte>().AppendRange(Enumerable.Range(0, count).Select(i => (byte)(i % 2))).Build());
+
     /// <summary>A dense union of 3 rows: 7, "x", 8.</summary>
     private static DenseUnionArray IntsAndStrings() => new(IntOrString, 3,
         [new Int32Array.Builder().Append(7).Append(8).Build(), new StringArray.Builder().Append("x").Build()],
@@ -164,6 +174,21 @@ public class NestedSliceTests
         // A union under a nullable struct: nothing to gather, whatever the field's type.
         ["NullStructRowOverAUnion"] = () => new StructArray(
             new StructType([new Field("u", IntOrString, true)]), 3, [IntsAndStrings()], Validity(true, false, true), 1),
+        // A union has no validity bitmap: every row the struct masks must still point in bounds.
+        ["LeadingNullStructRowOverAUnion"] = () => new StructArray(
+            new StructType([new Field("u", IntOrString, true)]), 3, [IntsAndStrings()], Validity(false, true, true), 1),
+        ["TrailingNullStructRowOverAUnion"] = () => new StructArray(
+            new StructType([new Field("u", IntOrString, true)]), 3, [IntsAndStrings()], Validity(true, true, false), 1),
+        ["AllNullStructRowsOverAUnion"] = () => new StructArray(
+            new StructType([new Field("u", IntOrString, true)]), 3, [IntsAndStrings()], Validity(false, false, false), 3),
+        // ("x"), null: branch 0 holds nothing, so the masked row cannot borrow from it.
+        ["NullStructRowOverAUnionWithAnEmptyBranch"] = () => new StructArray(
+            new StructType([new Field("u", IntOrString, true)]), 2, [Slice(IntsAndStrings(), 1, 2)], Validity(true, false), 1),
+        // Sparse unions: full-length children, each branch written as runs of the rows that select it.
+        ["SlicedSparseUnion"] = () => Slice(SparsePairsOrStrings(5), 1, 3),
+        ["NullStructRowOverASparseUnionOfStructs"] = () => new StructArray(
+            new StructType([new Field("u", SparsePairOrString, true)]), 4, [SparsePairsOrStrings(4)],
+            Validity(false, true, true, false), 2),
         // A sliced dense union whose second branch is a union: a branch is written in parts, never gathered.
         ["SlicedDenseUnionOfAUnion"] = () => Slice(new DenseUnionArray(
             new UnionType([new Field("i", Int32Type.Default, true), new Field("u", IntOrString, true)], [0, 1],
@@ -227,7 +252,38 @@ public class NestedSliceTests
     /// aborts on a C++ check (<c>buffers[0] == nullptr</c> in <c>array_nested.cc</c>) writing one under a struct
     /// with null rows, or nested in another union. It does so for such a table of its own, too (pyarrow 2.2).
     /// </summary>
-    private static readonly HashSet<string> PyArrowCannotWrite = ["NullStructRowOverAUnion", "SlicedDenseUnionOfAUnion"];
+    private static readonly HashSet<string> PyArrowCannotWrite =
+    [
+        "NullStructRowOverAUnion", "LeadingNullStructRowOverAUnion", "TrailingNullStructRowOverAUnion",
+        "AllNullStructRowsOverAUnion", "NullStructRowOverAUnionWithAnEmptyBranch",
+        "NullStructRowOverASparseUnionOfStructs", "SlicedDenseUnionOfAUnion",
+    ];
+
+    /// <summary>Every row of every dense union read back, masked or not, points inside its branch: a union has
+    /// no validity bitmap, so an out-of-bounds offset breaks any reader of the array.</summary>
+    private static void AssertUnionOffsetsInBounds(IArrowArray array)
+    {
+        switch (array)
+        {
+            case DenseUnionArray union:
+                for (int i = 0; i < union.Length; i++)
+                    Assert.InRange(union.ValueOffsets[i], 0, union.Fields[union.TypeIds[i]].Length - 1);
+                foreach (var f in union.Fields)
+                    AssertUnionOffsetsInBounds(f);
+                break;
+            case UnionArray other:
+                foreach (var f in other.Fields)
+                    AssertUnionOffsetsInBounds(f);
+                break;
+            case StructArray s:
+                foreach (var f in s.Fields)
+                    AssertUnionOffsetsInBounds(f);
+                break;
+            case ListArray l:
+                AssertUnionOffsetsInBounds(l.Values);
+                break;
+        }
+    }
 
     /// <summary>Writes the table in <c>argv[1]</c> back out with pyarrow, to <c>argv[1] + ".py.orc"</c>.</summary>
     private const string PyRewrite =
@@ -237,12 +293,19 @@ public class NestedSliceTests
     /// <summary>Renders column <c>c</c> as <see cref="Render"/> does.</summary>
     private const string PyRender =
         "import sys, json, pyarrow as pa, pyarrow.orc as orc\n" +
+        // A union's value comes without its branch's type, so it is rendered by its Python type.
+        "def u(v):\n" +
+        "    if v is None: return 'null'\n" +
+        "    if isinstance(v, str): return '\"' + v + '\"'\n" +
+        "    if isinstance(v, dict): return '(' + ','.join(k + '=' + u(x) for k, x in v.items()) + ')'\n" +
+        "    if isinstance(v, list): return '[' + ','.join(u(x) for x in v) + ']'\n" +
+        "    return str(v)\n" +
         "def r(v, t):\n" +
         "    if v is None: return 'null'\n" +
         "    if pa.types.is_map(t): return '{' + ','.join(r(k, t.key_type) + ':' + r(x, t.item_type) for k, x in v) + '}'\n" +
         "    if pa.types.is_list(t): return '[' + ','.join(r(x, t.value_type) for x in v) + ']'\n" +
         "    if pa.types.is_struct(t): return '(' + ','.join(t.field(i).name + '=' + r(v[t.field(i).name], t.field(i).type) for i in range(t.num_fields)) + ')'\n" +
-        "    if pa.types.is_union(t): return '\"' + v + '\"' if isinstance(v, str) else str(v)\n" +
+        "    if pa.types.is_union(t): return u(v)\n" +
         "    if pa.types.is_string(t): return '\"' + v + '\"'\n" +
         "    return str(v)\n" +
         "t = orc.read_table(sys.argv[1])\n" +
@@ -267,7 +330,10 @@ public class NestedSliceTests
             await using var reader = await OrcReader.OpenAsync(path);
             var read = new List<string>();
             await foreach (var batch in reader.CreateRowReader())
+            {
+                AssertUnionOffsetsInBounds(batch.Column(0));
                 read.AddRange(Rows(batch.Column(0)));
+            }
             return read;
         }
         finally
