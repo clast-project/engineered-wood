@@ -609,4 +609,122 @@ public class WriterFeatureEnforcementTests : IDisposable
         await using var claiming = table.StartTransaction();
         claiming.StageDataFiles([], constraintsEnforcedByCaller: true);
     }
+
+    // ── DELETE (#647) ──
+    // A delete writes no new values: a deletion vector removes rows, and a copy-on-write rewrite carries the
+    // survivors exactly as they were committed. So it is not refused for an expression it has nothing to evaluate
+    // against, as Spark's DELETE is not.
+
+    private async Task<DeltaTable> CreateExpressionTableAsync(string kind, bool appendOnly = false)
+    {
+        var id = new Field("id", Int64Type.Default, false);
+        var derived = new Field("derived", Int64Type.Default, true,
+            new Dictionary<string, string> { ["delta.generationExpression"] = "id + 1" });
+        var schema = kind == "generated"
+            ? new Apache.Arrow.Schema.Builder().Field(id).Field(derived).Build()
+            : new Apache.Arrow.Schema.Builder().Field(id).Field(new Field("derived", Int64Type.Default, true)).Build();
+        var configuration = new Dictionary<string, string>();
+        if (kind == "check")
+            configuration["delta.constraints.positive_id"] = "id > 0";
+        if (appendOnly)
+            configuration["delta.appendOnly"] = "true";
+
+        var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema, enableDeletionVectors: true, configuration: configuration);
+        var rows = new RecordBatch(
+            schema,
+            [
+                new Int64Array.Builder().Append(1).Append(2).Append(3).Build(),
+                new Int64Array.Builder().Append(2).Append(3).Append(4).Build(),
+            ],
+            3);
+        await table.WriteAsync([rows]);
+        return table;
+    }
+
+    private static BooleanArray IdIs(RecordBatch batch, long value)
+    {
+        var ids = (Int64Array)batch.Column("id");
+        var result = new BooleanArray.Builder();
+        for (int i = 0; i < ids.Length; i++)
+            result.Append(ids.GetValue(i) == value);
+        return result.Build();
+    }
+
+    private static RowSelection FirstRowOfTheOnlyFile(DeltaTable table) =>
+        RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            [table.CurrentSnapshot.ActiveFiles.Values.Single().Path] = new long[] { 0 },
+        });
+
+    [Theory]
+    [InlineData("check", RowDeleteMode.DeletionVector)]
+    [InlineData("check", RowDeleteMode.CopyOnWrite)]
+    [InlineData("generated", RowDeleteMode.DeletionVector)]
+    [InlineData("generated", RowDeleteMode.CopyOnWrite)]
+    public async Task DeleteIsNotRefusedForAWriteTimeExpression(string kind, RowDeleteMode mode)
+    {
+        await using var table = await CreateExpressionTableAsync(kind);
+
+        var (deleted, _) = await table.DeleteAsync(b => IdIs(b, 1), mode);
+
+        Assert.Equal(1, deleted);
+        // The survivors, generated values included, are exactly as they were committed.
+        Assert.Equal([(2L, (long?)3L), (3L, 4L)], (await ReadAllAsync(table)).OrderBy(r => r.Id));
+    }
+
+    [Theory]
+    [InlineData("check", RowDeleteMode.DeletionVector)]
+    [InlineData("check", RowDeleteMode.CopyOnWrite)]
+    [InlineData("generated", RowDeleteMode.DeletionVector)]
+    [InlineData("generated", RowDeleteMode.CopyOnWrite)]
+    public async Task DeleteRowsIsNotRefusedForAWriteTimeExpression(string kind, RowDeleteMode mode)
+    {
+        await using var table = await CreateExpressionTableAsync(kind);
+
+        var (deleted, _) = await table.DeleteRowsAsync(FirstRowOfTheOnlyFile(table), mode);
+
+        Assert.Equal(1, deleted);
+        Assert.Equal([(2L, (long?)3L), (3L, 4L)], (await ReadAllAsync(table)).OrderBy(r => r.Id));
+    }
+
+    [Theory]
+    [InlineData(RowDeleteMode.DeletionVector)]
+    [InlineData(RowDeleteMode.CopyOnWrite)]
+    public async Task TheTransactionalRowDeleteAgrees(RowDeleteMode mode)
+    {
+        await using var table = await CreateExpressionTableAsync("check");
+
+        await using var tx = table.StartTransaction();
+        Assert.Equal(1, await tx.StageRowDeletesAsync(FirstRowOfTheOnlyFile(table), mode));
+        await tx.CommitAsync();
+
+        Assert.Equal([2L, 3L], (await ReadAllAsync(table)).Select(r => r.Id).OrderBy(i => i));
+    }
+
+    [Fact]
+    public async Task DeleteOnAnAppendOnlyTableIsStillRefused()
+    {
+        await using var table = await CreateExpressionTableAsync("check", appendOnly: true);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.DeleteAsync(b => IdIs(b, 1), RowDeleteMode.DeletionVector));
+
+        Assert.Equal(DeltaTableErrorCodes.CannotModifyAppendOnly, ex.ErrorCode);
+    }
+
+    /// <summary>
+    /// UpdateRowsAsync writes the host's new values and does not evaluate them yet (#647's second half), so it
+    /// still refuses.
+    /// </summary>
+    [Fact]
+    public async Task UpdateRowsStillRefusesAConstrainedTable()
+    {
+        await using var table = await CreateExpressionTableAsync("check");
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.UpdateRowsAsync(
+            FirstRowOfTheOnlyFile(table), (_, batches, _) => batches));
+
+        Assert.Equal(DeltaTableErrorCodes.UnevaluableTableExpression, ex.ErrorCode);
+    }
 }

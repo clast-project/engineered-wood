@@ -1018,11 +1018,13 @@ only on a table that actually uses them, and EW never commits rows it has not
 checked against them. The paths that build the rows — `WriteAsync`,
 `CreateAsync`'s initial data, `UpdateAsync`, `MergeAsync` and
 `OverwriteWhereAsync` — enforce CHECK constraints and invariants and compute
-generated columns. The rest refuse such a table: `CommitDataFilesAsync` and
+generated columns. A DELETE (`DeleteAsync`, `DeleteRowsAsync`, and their
+transaction forms) writes no new values, so it has nothing to check and is not
+refused (#647). The rest refuse such a table: `CommitDataFilesAsync` and
 `DeltaTransaction.StageDataFiles` / `StageDataFilesAsync` unless the caller
 passes `constraintsEnforcedByCaller: true` (`WriteDataFilesAsync`, which feeds
-them, checks only NOT NULL), and `DeleteRowsAsync` / `UpdateRowsAsync` always.
-So the divergence is cosmetic.
+them, checks only NOT NULL), and `UpdateRowsAsync` always. So the divergence is
+cosmetic.
 
 The same difference shows up in another form when a second feature (type
 widening, deletion vectors, ...) puts a column-mapped table at reader 3 /

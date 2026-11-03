@@ -512,7 +512,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         EnsureOpen();
         if (predicate is null)
             throw new ArgumentNullException(nameof(predicate));
-        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+        _table.ValidateWritable(_baseSnapshot, isAppend: false, handling: WriteTimeExpressionHandling.RowsUnchanged);
         bool copyOnWrite = DeltaTable.DeletesByCopyOnWrite(_baseSnapshot, mode);
 
         int mark = _written.Paths.Count;
@@ -937,7 +937,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         EnsureOpen();
         if (selection is null)
             throw new ArgumentNullException(nameof(selection));
-        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+        _table.ValidateWritable(_baseSnapshot, isAppend: false, handling: WriteTimeExpressionHandling.RowsUnchanged);
         if (selection.IsEmpty)
             return 0;
         // The selection names its files up front, so this refusal costs no I/O and leaves nothing to collect.
@@ -966,7 +966,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         EnsureOpen();
         if (selection is null)
             throw new ArgumentNullException(nameof(selection));
-        _table.ValidateWritable(_baseSnapshot, isAppend: false);
+        _table.ValidateWritable(_baseSnapshot, isAppend: false, handling: WriteTimeExpressionHandling.RowsUnchanged);
         if (selection.IsEmpty)
             return 0;
         // Refused before the rewrite, so a refusal writes nothing that would have to be taken back.

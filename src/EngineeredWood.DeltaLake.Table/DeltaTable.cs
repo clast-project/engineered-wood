@@ -817,12 +817,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // cosmetic, because writer v5's extra implied features (checkConstraints, generatedColumns,
         // changeDataFeed) only impose obligations on a table that actually uses them, and EW meets those:
         // the paths that build the rows (WriteAsync, UpdateAsync, MergeAsync, OverwriteWhereAsync, the
-        // initial data here) enforce constraints and compute generated columns, and HonorWriterFeatures
-        // refuses the rest: the external-file commit and staging seams unless the caller asserts
-        // enforcement, and DeleteRowsAsync / UpdateRowsAsync. The same holds when another feature forces
-        // reader 3 / writer 7 below: the legacy (2, 5) implied features are then NAMED, where Spark names
-        // only [columnMapping, invariants, appendOnly]. See doc/known-issues.md, "Column-mapping protocol
-        // shape differs from Spark's".
+        // initial data here) enforce constraints and compute generated columns, a DELETE writes no new
+        // values and so has nothing to check, and HonorWriterFeatures refuses the rest: the external-file
+        // commit and staging seams unless the caller asserts enforcement, and UpdateRowsAsync. The same
+        // holds when another feature forces reader 3 / writer 7 below: the legacy (2, 5) implied features
+        // are then NAMED, where Spark names only [columnMapping, invariants, appendOnly]. See
+        // doc/known-issues.md, "Column-mapping protocol shape differs from Spark's".
         if (mappingMode != ColumnMappingMode.None && !explicitFloor &&
             (minReaderVersion >= 3 || minWriterVersion >= 7))
         {
@@ -9097,7 +9097,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (selection.IsEmpty)
             return (0, snapshot.Version);
 
-        HonorWriterFeatures(snapshot, isAppend: false);
+        HonorWriterFeatures(snapshot, isAppend: false, WriteTimeExpressionHandling.RowsUnchanged);
         if (!DeletionVectors.DeletionVectorConfig.IsEnabled(snapshot.Metadata.Configuration))
             throw new InvalidOperationException(
                 "RowDeleteMode.DeletionVector requires deletion vectors — create the table with "
@@ -9293,7 +9293,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (selection.IsEmpty)
             return (0, snapshot.Version);
 
-        HonorWriterFeatures(snapshot, isAppend: false);
+        HonorWriterFeatures(snapshot, isAppend: false, WriteTimeExpressionHandling.RowsUnchanged);
         var plan = await ComputeCopyOnWriteDeleteActionsAsync(
             selection, snapshot, cancellationToken, written: written).ConfigureAwait(false);
         if (plan.Actions.Count == 0)
