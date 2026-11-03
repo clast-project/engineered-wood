@@ -831,6 +831,90 @@ public class WriterFeatureEnforcementTests : IDisposable
         Assert.Equal((41L, (long?)42L), images["update_postimage"]);
     }
 
+    /// <summary>
+    /// A generated partition column the rewriter leaves null is recomputed before NULL is refused: the post-image
+    /// is the one stored, and its value comes from the expression (#649 review).
+    /// </summary>
+    [Fact]
+    public async Task UpdateRowsRecomputesANullGeneratedPartitionValueBeforeRefusingIt()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("derived", Int64Type.Default, false,
+                new Dictionary<string, string> { ["delta.generationExpression"] = "id + 1" }))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema, partitionColumns: ["derived"]);
+        await table.WriteAsync([new RecordBatch(
+            schema,
+            [
+                new Int64Array.Builder().Append(1).Append(2).Build(),
+                new Int64Array.Builder().Append(2).Append(3).Build(),
+            ],
+            2)]);
+        string path = table.CurrentSnapshot.ActiveFiles.Values
+            .Single(f => f.PartitionValues["derived"] == "2").Path;
+
+        await table.UpdateRowsAsync(
+            RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>> { [path] = new long[] { 0 } }),
+            (_, batches, positions) => batches.Select(batch =>
+            {
+                var nullDerived = new Int64Array.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                    nullDerived.AppendNull();
+                var columns = Enumerable.Range(0, batch.ColumnCount)
+                    .Select(c => batch.Schema.FieldsList[c].Name switch
+                    {
+                        "id" => (IArrowArray)new Int64Array.Builder().Append(41).Build(),
+                        "derived" => nullDerived.Build(),
+                        _ => batch.Column(c),
+                    })
+                    .ToArray();
+                return new RecordBatch(batch.Schema, columns, batch.Length);
+            }).ToList());
+
+        Assert.Equal([(2L, (long?)3L), (41L, 42L)], (await ReadAllAsync(table)).OrderBy(r => r.Id));
+        Assert.Contains(table.CurrentSnapshot.ActiveFiles.Values, f => f.PartitionValues["derived"] == "42");
+    }
+
+    /// <summary>A row the update does not select keeps the NOT NULL partition check it had before.</summary>
+    [Fact]
+    public async Task UpdateRowsStillRefusesANullPartitionValueInAnUnselectedRow()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("derived", Int64Type.Default, false,
+                new Dictionary<string, string> { ["delta.generationExpression"] = "id + 1" }))
+            .Field(new Field("p", Int64Type.Default, false))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema, partitionColumns: ["p"]);
+        await table.WriteAsync([new RecordBatch(
+            schema,
+            [
+                new Int64Array.Builder().Append(1).Append(2).Build(),
+                new Int64Array.Builder().Append(2).Append(3).Build(),
+                new Int64Array.Builder().Append(7).Append(7).Build(),
+            ],
+            2)]);
+        long before = table.CurrentSnapshot.Version;
+        string path = table.CurrentSnapshot.ActiveFiles.Values.Single().Path;
+
+        // Selects position 0, and (against the contract) nulls the partition value of the unselected row too.
+        await Assert.ThrowsAsync<ArgumentException>(async () => await table.UpdateRowsAsync(
+            RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>> { [path] = new long[] { 0 } }),
+            (_, batches, positions) => batches.Select(batch =>
+            {
+                var p = new Int64Array.Builder().Append(7).AppendNull().Build();
+                var columns = Enumerable.Range(0, batch.ColumnCount)
+                    .Select(c => batch.Schema.FieldsList[c].Name == "p" ? p : batch.Column(c))
+                    .ToArray();
+                return new RecordBatch(batch.Schema, columns, batch.Length);
+            }).ToList()));
+
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
     [Fact]
     public async Task UpdateRowsLeavesUntouchedRowsUnvalidated()
     {

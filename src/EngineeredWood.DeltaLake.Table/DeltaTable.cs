@@ -10014,6 +10014,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     "UpdateRowsAsync: rewriteFile must return one batch per source batch.");
             // The write path's partition rule, since a changed partition value moves its row (#519): canonical
             // Arrow forms, an empty string stored as null, and a NULL the table declares impossible refused.
+            // When the post-image is prepared below, the NULL is refused there instead, after the generated
+            // columns are recomputed: a generated partition value the rewriter left null is the expression's to
+            // fill, not a refusal. The rows the selection does not name are checked for it as they are routed.
             var partitionColumns = snapshot.Metadata.PartitionColumns;
             if (partitionColumns.Count > 0)
             {
@@ -10022,9 +10025,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 rewritten = rewritten
                     .Select(b => Partitioning.PartitionUtils.NormalizePartitionValues(
                         WriteTypeNormalization.NormalizeColumns(b, partitionColumns),
-                        partitionColumns, snapshot.Schema, refuseNulls: true))
+                        partitionColumns, snapshot.Schema, refuseNulls: !checksPostImage))
                     .ToList();
             }
+            RecordBatch RefuseNullPartitionValues(RecordBatch rows) =>
+                checksPostImage && partitionColumns.Count > 0
+                    ? Partitioning.PartitionUtils.NormalizePartitionValues(
+                        rows, partitionColumns, snapshot.Schema, refuseNulls: true)
+                    : rows;
 
             // Build the materialized id/version arrays (an UPDATED row's version advances to this commit) and
             // count the rows actually matched in this file. Each output segment is routed with its tracking and
@@ -10088,7 +10096,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     var keptRows = Complement(matchedRows, src.Length);
                     if (keptRows.Count > 0)
                     {
-                        segments.Add((TakeRowsFromBatch(rewritten[bi], keptRows), tracking is { } k
+                        var kept = RefuseNullPartitionValues(TakeRowsFromBatch(rewritten[bi], keptRows));
+                        segments.Add((kept, tracking is { } k
                             ? (TakeIds(k.Ids, keptRows), TakeIds(k.Vers, keptRows))
                             : null, MayMove: false));
                     }
@@ -10100,7 +10109,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // a null an earlier writer left behind. Read in place rather than gathered: a host writer's
                     // batch may hold a representation (a dictionary) the gather does not take.
                     DeltaNotNullEnforcer.Validate(rewritten[bi], snapshot.Schema, rows: matchedRows);
-                    segments.Add((rewritten[bi], tracking, touched[bi]));
+                    segments.Add((RefuseNullPartitionValues(rewritten[bi]), tracking, touched[bi]));
                 }
                 if (cdfEnabled && matchedRows.Count > 0)
                 {
