@@ -11,7 +11,8 @@ namespace EngineeredWood.IO.Local;
 /// <c>RandomAccess</c> API on net6.0+, where offset-based reads are fully concurrent with no
 /// shared position cursor. Not a <c>see cref</c> because <c>System.IO.RandomAccess</c> does not
 /// exist on netstandard2.0, which this assembly also targets; that leg seeks a shared
-/// <see cref="FileStream"/> instead and is therefore NOT safe for concurrent reads.
+/// <see cref="FileStream"/> instead, and serializes each seek-and-read under a lock so that concurrent
+/// reads stay correct there too (they just do not overlap).
 /// </summary>
 public sealed class LocalRandomAccessFile : IRandomAccessFile
 {
@@ -19,6 +20,10 @@ public sealed class LocalRandomAccessFile : IRandomAccessFile
     private readonly SafeFileHandle _handle;
 #else
     private readonly FileStream _stream;
+
+    // The stream has ONE position: a read is a seek then a read, and two of those interleaved would each
+    // get the other's bytes. A parallel row-group read (#612) issues concurrent reads on one file.
+    private readonly object _streamGate = new();
 #endif
     private readonly BufferAllocator _allocator;
     private long _cachedLength = -1;
@@ -45,7 +50,9 @@ public sealed class LocalRandomAccessFile : IRandomAccessFile
 #if NET6_0_OR_GREATER
         long length = RandomAccess.GetLength(_handle);
 #else
-        long length = _stream.Length;
+        long length;
+        lock (_streamGate)
+            length = _stream.Length;
 #endif
         _cachedLength = length;
         return new ValueTask<long>(length);
@@ -137,17 +144,20 @@ public sealed class LocalRandomAccessFile : IRandomAccessFile
         }
 #else
         byte[] tempBuffer = new byte[buffer.Length];
-        _stream.Seek(offset, SeekOrigin.Begin);
-        while (totalRead < tempBuffer.Length)
+        lock (_streamGate)
         {
-            int bytesRead = _stream.Read(tempBuffer, totalRead, tempBuffer.Length - totalRead);
+            _stream.Seek(offset, SeekOrigin.Begin);
+            while (totalRead < tempBuffer.Length)
+            {
+                int bytesRead = _stream.Read(tempBuffer, totalRead, tempBuffer.Length - totalRead);
 
-            if (bytesRead == 0)
-                throw new IOException(
-                    $"Unexpected end of file at offset {offset + totalRead}. " +
-                    $"Expected {buffer.Length} bytes starting at offset {offset}.");
+                if (bytesRead == 0)
+                    throw new IOException(
+                        $"Unexpected end of file at offset {offset + totalRead}. " +
+                        $"Expected {buffer.Length} bytes starting at offset {offset}.");
 
-            totalRead += bytesRead;
+                totalRead += bytesRead;
+            }
         }
         tempBuffer.AsSpan(0, totalRead).CopyTo(buffer);
 #endif

@@ -4,6 +4,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using Apache.Arrow;
 using EngineeredWood.IO;
@@ -32,10 +33,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     private readonly IRandomAccessFile _file;
     private readonly bool _ownsFile;
     private readonly ParquetReadOptions _options;
+    // The lazy caches below may be filled by one thread and read by another (row groups are decoded
+    // concurrently, #612), so each is PUBLISHED with Volatile.Write once everything it depends on is set,
+    // and read with Volatile.Read: a reader that sees the reference also sees what was written before it.
+    // _fileLength is written before _metadata and read only after _metadata has been seen.
     private FileMetaData? _metadata;
     private SchemaDescriptor? _schema;
-    private Apache.Arrow.Schema? _declaredArrowSchema;
-    private bool _declaredArrowSchemaResolved;
+    // A box rather than a value plus a "resolved" flag: the file may declare no Arrow schema (null), and
+    // two separate fields could be observed in the wrong order.
+    private StrongBox<Apache.Arrow.Schema?>? _declaredArrowSchema;
     private long _fileLength;
     private bool _disposed;
 
@@ -64,8 +70,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         if (_disposed) throw new ObjectDisposedException(GetType().FullName);
 #endif
 
-        if (_metadata != null)
-            return _metadata;
+        if (Volatile.Read(ref _metadata) is { } cached)
+            return cached;
 
         long fileLength = await _file.GetLengthAsync(cancellationToken).ConfigureAwait(false);
         if (fileLength < MinFileSize)
@@ -95,9 +101,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             new FileRange(footerOffset, footerLength),
             cancellationToken).ConfigureAwait(false);
 
+        var metadata = MetadataDecoder.DecodeFileMetaData(footerBuffer.Memory.Span);
         _fileLength = fileLength;
-        _metadata = MetadataDecoder.DecodeFileMetaData(footerBuffer.Memory.Span);
-        return _metadata;
+        Volatile.Write(ref _metadata, metadata);
+        return metadata;
     }
 
     /// <summary>
@@ -112,12 +119,13 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         if (_disposed) throw new ObjectDisposedException(GetType().FullName);
 #endif
 
-        if (_schema != null)
-            return _schema;
+        if (Volatile.Read(ref _schema) is { } cached)
+            return cached;
 
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
-        _schema = new SchemaDescriptor(metadata.Schema, metadata.ColumnOrders);
-        return _schema;
+        var schema = new SchemaDescriptor(metadata.Schema, metadata.ColumnOrders);
+        Volatile.Write(ref _schema, schema);
+        return schema;
     }
 
     /// <summary>
@@ -1524,13 +1532,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </summary>
     private Apache.Arrow.Schema? DeclaredArrowSchema(Metadata.FileMetaData metadata)
     {
-        if (!_declaredArrowSchemaResolved)
+        var box = Volatile.Read(ref _declaredArrowSchema);
+        if (box is null)
         {
-            _declaredArrowSchema = Data.ArrowSchemaMetadata.Decode(metadata.KeyValueMetadata);
-            _declaredArrowSchemaResolved = true;
+            box = new StrongBox<Apache.Arrow.Schema?>(Data.ArrowSchemaMetadata.Decode(metadata.KeyValueMetadata));
+            Volatile.Write(ref _declaredArrowSchema, box);
         }
 
-        return _declaredArrowSchema;
+        return box.Value;
     }
 
     /// <summary>
@@ -1576,7 +1585,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     private void RestoreDeclaredUnits(Field[] fields, IArrowArray[] arrays)
     {
         // Assembly always follows a metadata read, so the footer is cached by now.
-        var declared = _metadata is null ? null : DeclaredArrowSchema(_metadata);
+        var declared = Volatile.Read(ref _metadata) is { } metadata ? DeclaredArrowSchema(metadata) : null;
         if (declared is null)
             return;
 
