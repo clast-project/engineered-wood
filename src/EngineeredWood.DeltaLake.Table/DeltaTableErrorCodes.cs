@@ -339,6 +339,18 @@ public static class DeltaTableErrorCodes
     /// for.</remarks>
     public const string ReplaceWhereMismatch = "DELTA_REPLACE_WHERE_MISMATCH";
 
+    /// <summary>
+    /// A write carries a column declared <c>GENERATED ALWAYS AS IDENTITY</c> (<c>allowExplicitInsert = false</c>),
+    /// whose values only the table may assign. Leave the column out of the batch and the table generates it.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_IDENTITY_COLUMNS_EXPLICIT_INSERT_NOT_SUPPORTED</c> — "Providing values for
+    /// GENERATED ALWAYS AS IDENTITY column &lt;colName&gt; is not supported." Measured against Spark 4.0.3 /
+    /// Delta 4.0.0 (#595): the refusal is by SCHEMA, not by value — an append whose column is all NULL, an empty
+    /// append, an int column, an overwrite, a replaceWhere, a MERGE <c>INSERT *</c> and a MERGE insert naming the
+    /// column are all refused; only leaving the column out writes. EW used to replace the supplied value silently.
+    /// </remarks>
+    public const string IdentityColumnExplicitInsertNotSupported = "DELTA_IDENTITY_COLUMNS_EXPLICIT_INSERT_NOT_SUPPORTED";
+
     // ── Concurrency conditions only the table layer can raise ──
     //
     // Carried by DeltaConflictException, in the same flat namespace as DeltaErrorCodes' concurrency

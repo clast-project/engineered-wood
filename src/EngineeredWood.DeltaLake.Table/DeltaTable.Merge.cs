@@ -103,6 +103,9 @@ public sealed partial class DeltaTable
         var setColumns = plan.SetColumns(src, snapshot.Schema);
         var insertColumns = plan.InsertColumns(src, snapshot.Schema);
         ThrowIfMergeSetsIdentity(setColumns, snapshot.Schema);
+        // An insert that would write a GENERATED ALWAYS identity column, refused here rather than when its rows reach
+        // the append: Spark refuses it at analysis, whatever the source holds or the clauses match (#595).
+        IdentityColumns.IdentityColumnWriter.ThrowIfGeneratedAlwaysSupplied(insertColumns, snapshot.Schema);
 
         // The source's key index: each key's rows chained through `next`, so a duplicated key costs no list.
         // A row with a NULL key matches nothing and is not indexed.

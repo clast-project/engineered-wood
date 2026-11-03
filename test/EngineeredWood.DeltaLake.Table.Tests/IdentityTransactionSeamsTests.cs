@@ -93,6 +93,19 @@ public class IdentityTransactionSeamsTests : IDisposable
         return new RecordBatch(schema, [ids.Build(), vals.Build()], values.Length);
     }
 
+    /// <summary>What a committing write takes: the identity column left out, for the table to generate. A batch
+    /// that carries it — even all NULL, like <see cref="InsertBatch"/> — is refused there, as Spark refuses it.</summary>
+    private static RecordBatch ValuesBatch(params string[] values)
+    {
+        var vals = new StringArray.Builder();
+        foreach (var v in values)
+            vals.Append(v);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("value", StringType.Default, true))
+            .Build();
+        return new RecordBatch(schema, [vals.Build()], values.Length);
+    }
+
     private static List<long> IdsOf(IReadOnlyList<RecordBatch> batches)
     {
         var result = new List<long>();
@@ -127,11 +140,11 @@ public class IdentityTransactionSeamsTests : IDisposable
 
         await using (var txn = table.StartTransaction())
         {
-            await txn.WriteAsync([InsertBatch("a", "b")]);
-            await txn.WriteAsync([InsertBatch("c")]); // continues from the first append's pending mark
+            await txn.WriteAsync([ValuesBatch("a", "b")]);
+            await txn.WriteAsync([ValuesBatch("c")]); // continues from the first append's pending mark
             await txn.CommitAsync();
         }
-        await table.WriteAsync([InsertBatch("d")]); // and the committed mark carries both
+        await table.WriteAsync([ValuesBatch("d")]); // and the committed mark carries both
 
         var all = new List<long>();
         await foreach (var b in table.ReadAllAsync())
@@ -168,7 +181,7 @@ public class IdentityTransactionSeamsTests : IDisposable
 
         // 5 distinct ids 1..5, and the persisted high-water mark drives the NEXT (committing) write
         await using var check = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
-        await check.WriteAsync([InsertBatch("f")]); // the normal path regenerates from the stored HWM
+        await check.WriteAsync([ValuesBatch("f")]); // the normal path regenerates from the stored HWM
         var all = new List<long>();
         await foreach (var b in check.ReadAllAsync())
         {
@@ -192,6 +205,18 @@ public class IdentityTransactionSeamsTests : IDisposable
 
         var gen2 = DeltaTable.GenerateIdentityValuesForSchema(schema, [InsertBatch("d", "e")], gen1.HighWaterMarks);
         Assert.Equal(new long[] { 4, 5 }, IdsOf(gen2.Batches));
+    }
+
+    /// <summary>The seam fills a table-shaped batch's placeholder; the committing path, given the same batch,
+    /// refuses it (#595): there it can only be a value the caller supplied.</summary>
+    [Fact]
+    public async Task GenerateIdentityValues_FillsThePlaceholder_TheCommittingWriteRefuses()
+    {
+        await using var table = await CreateIdentityTableAsync();
+
+        Assert.Equal(new long[] { 1 }, IdsOf(table.GenerateIdentityValues([InsertBatch("a")]).Batches));
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(() => table.WriteAsync([InsertBatch("a")]).AsTask());
+        Assert.Equal(DeltaTableErrorCodes.IdentityColumnExplicitInsertNotSupported, ex.ErrorCode);
     }
 
     [Fact]

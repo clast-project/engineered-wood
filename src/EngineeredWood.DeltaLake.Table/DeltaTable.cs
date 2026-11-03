@@ -6556,6 +6556,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         foreach (var batch in batches)
             ThrowIfDuplicateColumns(batch.Schema, snapshot.Schema, "Write");
         ThrowIfUndeclaredColumns(batches, snapshot.Schema, "Write");
+        // A GENERATED ALWAYS identity column the caller supplied, before its type is judged (Spark refuses an int
+        // one this way too), and for EVERY batch: an empty one is skipped below, but Spark refuses it (#595).
+        foreach (var batch in batches)
+            IdentityColumns.IdentityColumnWriter.ThrowIfGeneratedAlwaysSupplied(batch.Schema, snapshot.Schema);
         if (!HostOwnsBytes)
             ThrowIfMistypedColumns(batches, snapshot.Schema, "Write");
 
@@ -6769,7 +6773,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             // A replaceWhere's rows must all lie inside the window they replace, judged on the rows exactly as they
             // will be stored: generated columns computed, identity values generated (a GENERATED ALWAYS column
-            // replaces whatever the caller supplied), and a column the caller left out as the NULL it reads back
+            // is refused when the caller supplies it), and a column the caller left out as the NULL it reads back
             // as. Still before any file is written: the files are written after this loop.
             if (replaceWhere is not null)
                 ThrowIfOutsideReplaceWhere(processedBatch, snapshot.ArrowSchema, replaceWhere);
@@ -7260,6 +7264,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// into its commit via <see cref="BuildIdentityMetadataAction"/>. Concurrency: a concurrent identity-consuming
     /// commit necessarily carries a metaData action (the HWM lives in schema metadata), so the caller's
     /// expectedVersion abort fires — values baked here never land on a moved HWM.
+    /// <para>Unlike the committing write path, which refuses a batch carrying a <c>GENERATED ALWAYS AS IDENTITY</c>
+    /// column (<see cref="DeltaTableErrorCodes.IdentityColumnExplicitInsertNotSupported"/>), this accepts one and
+    /// overwrites it: a host engine's INSERT batch is table-shaped, with the column as a placeholder to fill.
+    /// Refusing a value its USER supplied for such a column, as Spark does, is the host's job.</para>
     /// </summary>
     public (IReadOnlyList<RecordBatch> Batches, IReadOnlyDictionary<string, long> HighWaterMarks)
         GenerateIdentityValues(IReadOnlyList<RecordBatch> batches,
@@ -7538,7 +7546,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>The declared field a batch name stands for: the one with that logical name, else the one with that
     /// physical name. Logical first, as <c>ColumnMappingRecursive.ToPhysical</c> resolves a write: after a rename,
     /// a column's old physical name can be another column's logical one.</summary>
-    private static StructField? FindDeclared(IReadOnlyList<StructField> fields, string arrowName)
+    internal static StructField? FindDeclared(IReadOnlyList<StructField> fields, string arrowName)
     {
         foreach (var f in fields)
         {
