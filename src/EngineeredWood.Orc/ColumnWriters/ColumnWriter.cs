@@ -37,6 +37,11 @@ internal abstract class ColumnWriter
     /// Writes the null bitmap (PRESENT stream) for the given array.
     /// Returns the number of non-null values.
     /// </summary>
+    /// <remarks>
+    /// Every row gets a PRESENT bit, even while the stripe has seen no null: a later null needs the earlier rows'
+    /// bits too (#638). A stripe with no nulls drops the stream when it is written, and its row index drops the
+    /// PRESENT positions (see <see cref="PresentPositionCount"/>).
+    /// </remarks>
     protected int WritePresent(IArrowArray array)
     {
         int length = array.Length;
@@ -44,6 +49,7 @@ internal abstract class ColumnWriter
 
         if (array.NullCount == 0)
         {
+            PresentEncoder.WriteTrues(length);
             NonNullCount += length;
             return length;
         }
@@ -89,6 +95,14 @@ internal abstract class ColumnWriter
     /// Collects the ORC streams produced by this writer.
     /// Caller should call this after all batches for a stripe are written.
     /// </summary>
+    /// <summary>The number of row-index positions PRESENT contributes, first in every entry: (byte offset, byte
+    /// RLE remaining, bit offset). They are recorded for every row group, and removed at the end of a stripe that
+    /// writes no PRESENT stream.</summary>
+    internal const int PresentPositionCount = 3;
+
+    /// <summary>Whether this stripe writes a PRESENT stream: whether it has seen a null.</summary>
+    internal bool WritesPresentStream => StripeHasNulls;
+
     public virtual void GetStreams(List<OrcStream> streams)
     {
         if (StripeHasNulls)
@@ -110,8 +124,7 @@ internal abstract class ColumnWriter
     /// </summary>
     public virtual void FlushEncoders()
     {
-        if (StripeHasNulls)
-            PresentEncoder.Flush();
+        PresentEncoder.FlushCompletedBytes();
     }
 
     /// <summary>
@@ -121,12 +134,10 @@ internal abstract class ColumnWriter
     /// </summary>
     public virtual void GetStreamPositions(IList<ulong> positions)
     {
-        if (StripeHasNulls)
-        {
-            positions.Add((ulong)PresentStream.Length);
-            positions.Add(0); // byte RLE remaining
-            positions.Add(0); // bit offset
-        }
+        // Always: whether the stripe writes PRESENT is known only at its end. See PresentPositionCount.
+        positions.Add((ulong)PresentStream.Length);
+        positions.Add(0); // byte RLE remaining
+        positions.Add((ulong)PresentEncoder.PendingBits); // bits of the current byte that precede the row group
     }
 
     /// <summary>
@@ -180,6 +191,8 @@ internal abstract class ColumnWriter
     /// </summary>
     public virtual void Reset()
     {
+        // The encoder may hold the last bits of a stripe that wrote no PRESENT stream; drop them with the stream.
+        PresentEncoder.Flush();
         PresentStream.Reset();
         HasNulls = false;
         StripeHasNulls = false;
