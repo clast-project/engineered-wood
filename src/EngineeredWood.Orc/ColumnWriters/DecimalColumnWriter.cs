@@ -19,8 +19,8 @@ internal sealed class DecimalColumnWriter : ColumnWriter
     private readonly RleEncoderV2 _scaleEncoder;
 
     // Statistics
-    private long _minLong = long.MaxValue;
-    private long _maxLong = long.MinValue;
+    private Int128 _min = Int128.MaxValue;
+    private Int128 _max = Int128.MinValue;
     private bool _hasValues;
 
     public DecimalColumnWriter(int columnId, int precision, int scale) : base(columnId)
@@ -46,32 +46,32 @@ internal sealed class DecimalColumnWriter : ColumnWriter
         {
             if (!array.IsValid(i)) continue;
 
-            long value = ReadDecimal128AsLong(array, i);
+            var value = ReadDecimal128(array, i);
             _hasValues = true;
-            if (value < _minLong) _minLong = value;
-            if (value > _maxLong) _maxLong = value;
+            if (value < _min) _min = value;
+            if (value > _max) _max = value;
             if (BloomFilter != null)
                 BloomFilter.AddBytes(System.Text.Encoding.UTF8.GetBytes(FormatDecimal(value, _scale)));
 
-            // Zigzag encode and write as varint
-            ulong zz = (ulong)((value << 1) ^ (value >> 63));
+            // Zigzag encode and write as a varint of up to 128 bits.
+            var zz = (UInt128)((value << 1) ^ (value >> 127));
             while (zz > 0x7F)
             {
-                _dataStream.WriteByte((byte)(0x80 | (zz & 0x7F)));
+                _dataStream.WriteByte((byte)(0x80 | ((uint)zz & 0x7F)));
                 zz >>= 7;
             }
-            _dataStream.WriteByte((byte)zz);
+            _dataStream.WriteByte((byte)(uint)zz);
             _scaleEncoder.WriteValues(scales);
         }
     }
 
-    private static long ReadDecimal128AsLong(Decimal128Array array, int index)
+    /// <summary>All 128 bits of an Arrow Decimal128 value (16 bytes, little-endian two's complement).</summary>
+    private static Int128 ReadDecimal128(Decimal128Array array, int index)
     {
-        // Decimal128Array stores values as 16-byte little-endian two's complement
-        // For precision <= 38, we read the low 8 bytes as the value
-        // (high 8 bytes are sign extension for values that fit in a long)
-        var bytes = array.ValueBuffer.Span.Slice(index * 16, 16);
-        long value = BinaryPrimitives.ReadInt64LittleEndian(bytes);
+        var bytes = array.ValueBuffer.Span.Slice((array.Offset + index) * 16, 16);
+        var value = new Int128(
+            BinaryPrimitives.ReadUInt64LittleEndian(bytes.Slice(8)),
+            BinaryPrimitives.ReadUInt64LittleEndian(bytes));
         // `array` has no use past the span it produced, and the read is a call. See
         // doc/arrow-span-lifetime.md.
         GC.KeepAlive(array);
@@ -85,20 +85,21 @@ internal sealed class DecimalColumnWriter : ColumnWriter
         {
             stats.DecimalStatistics = new DecimalStatistics
             {
-                Minimum = FormatDecimal(_minLong, _scale),
-                Maximum = FormatDecimal(_maxLong, _scale),
+                Minimum = FormatDecimal(_min, _scale),
+                Maximum = FormatDecimal(_max, _scale),
             };
         }
         return stats;
     }
 
-    private static string FormatDecimal(long unscaled, int scale)
+    internal static string FormatDecimal(Int128 unscaled, int scale)
     {
-        if (scale == 0) return unscaled.ToString();
+        if (scale == 0) return unscaled.ToString(null, System.Globalization.CultureInfo.InvariantCulture);
 
         bool negative = unscaled < 0;
-        var abs = negative ? unchecked(-unscaled) : unscaled;
-        var s = abs.ToString();
+        // A decimal(38) value is far inside Int128's range, so its negation cannot overflow.
+        var abs = negative ? -unscaled : unscaled;
+        var s = abs.ToString(null, System.Globalization.CultureInfo.InvariantCulture);
 
         if (s.Length <= scale)
             s = new string('0', scale - s.Length + 1) + s;
@@ -138,8 +139,8 @@ internal sealed class DecimalColumnWriter : ColumnWriter
     public override void ResetStatistics()
     {
         base.ResetStatistics();
-        _minLong = long.MaxValue;
-        _maxLong = long.MinValue;
+        _min = Int128.MaxValue;
+        _max = Int128.MinValue;
         _hasValues = false;
     }
 
@@ -156,8 +157,8 @@ internal sealed class DecimalColumnWriter : ColumnWriter
         base.Reset();
         _dataStream.Reset();
         _secondaryStream.Reset();
-        _minLong = long.MaxValue;
-        _maxLong = long.MinValue;
+        _min = Int128.MaxValue;
+        _max = Int128.MinValue;
         _hasValues = false;
     }
 }

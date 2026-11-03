@@ -27,7 +27,11 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
     // here is not right, but changing it is an on-disk behaviour change -- see doc/known-issues.md, ORC
     // "Writer identification", including why an unknown producer id makes writer_version uninterpretable.
     private const uint WriterCode = 6;
-    private const string SoftwareVersion = "EngineeredWood.Orc 0.1";
+    // 0.1 wrote timestamps against the Unix epoch with its own nanosecond scale (#584); readers recognise it by
+    // this string and keep reading such files as they were written. Bump it with any change a reader must
+    // tell apart.
+    internal const string LegacyTimestampSoftwareVersion = "EngineeredWood.Orc 0.1";
+    private const string SoftwareVersion = "EngineeredWood.Orc 0.2";
 
     private readonly ISequentialFile _file;
     private readonly bool _ownsFile;
@@ -354,7 +358,10 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
         }
 
         // Build stripe footer
-        var stripeFooter = new StripeFooter();
+        // Timestamps are written against UTC (TIMESTAMP's wall clock as if UTC), and a stripe that names no zone
+        // leaves Java readers to assume their own. GMT rather than UTC: the C++ reader resolves GMT without a
+        // time-zone database, which it needs for any other name.
+        var stripeFooter = new StripeFooter { WriterTimezone = "GMT" };
         stripeFooter.Streams.AddRange(streamDescriptors);
 
         // Add column encodings (column 0 = root struct, then each column)
@@ -603,6 +610,10 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
                     target.TimestampStatistics.Minimum = source.TimestampStatistics.Minimum;
                 if (source.TimestampStatistics.Maximum > target.TimestampStatistics.Maximum)
                     target.TimestampStatistics.Maximum = source.TimestampStatistics.Maximum;
+                if (source.TimestampStatistics.MinimumUtc < target.TimestampStatistics.MinimumUtc)
+                    target.TimestampStatistics.MinimumUtc = source.TimestampStatistics.MinimumUtc;
+                if (source.TimestampStatistics.MaximumUtc > target.TimestampStatistics.MaximumUtc)
+                    target.TimestampStatistics.MaximumUtc = source.TimestampStatistics.MaximumUtc;
             }
         }
 
@@ -798,9 +809,11 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
                 type.Kind = Type.Types.Kind.Date;
                 return typeId + 1;
             case Apache.Arrow.Types.TimestampType ts:
-                type.Kind = ts.Timezone == "UTC"
-                    ? Type.Types.Kind.TimestampInstant
-                    : Type.Types.Kind.Timestamp;
+                // A zone-aware Arrow timestamp holds instants, whatever its zone: it is an ORC TIMESTAMP_INSTANT
+                // (read back as UTC). Only a zone-less one is a wall clock, ORC's TIMESTAMP.
+                type.Kind = string.IsNullOrEmpty(ts.Timezone)
+                    ? Type.Types.Kind.Timestamp
+                    : Type.Types.Kind.TimestampInstant;
                 return typeId + 1;
             case Apache.Arrow.Types.StructType st:
             {

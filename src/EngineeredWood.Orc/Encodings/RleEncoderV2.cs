@@ -70,17 +70,16 @@ internal sealed class RleEncoderV2
             return;
         }
 
-        // Fall back to Patched Base or Direct — both use zigzag-encoded values
-        var work = _signed ? ZigZagEncode(values) : values.ToArray();
-        var workSpan = work.AsSpan(0, _count);
-
-        if (_count >= 2 && TryEncodePatchedBase(workSpan))
+        // Patched Base works on the values themselves, signed or not: its base is their minimum, stored
+        // sign-magnitude, and every value is base + an unsigned offset. Only Direct zigzags signed values.
+        if (_count >= 2 && TryEncodePatchedBase(values))
         {
             _count = 0;
             return;
         }
 
-        EncodeDirect(workSpan);
+        var work = _signed ? ZigZagEncode(values) : values.ToArray();
+        EncodeDirect(work.AsSpan(0, _count));
         _count = 0;
     }
 
@@ -150,14 +149,18 @@ internal sealed class RleEncoderV2
 
     private bool TryEncodePatchedBase(ReadOnlySpan<long> values)
     {
-        // Values are zigzag'd (if signed) or raw unsigned — compare as unsigned
-        // Find min (base) and max
+        // The base is the values' minimum: compared signed for a signed stream, unsigned otherwise. ORC's
+        // Patched Base has no zigzag (#584: EngineeredWood once zigzagged here, which no other reader undoes).
         long minValue = values[0], maxValue = values[0];
         for (int i = 1; i < values.Length; i++)
         {
-            if ((ulong)values[i] < (ulong)minValue) minValue = values[i];
-            if ((ulong)values[i] > (ulong)maxValue) maxValue = values[i];
+            if (_signed ? values[i] < minValue : (ulong)values[i] < (ulong)minValue) minValue = values[i];
+            if (_signed ? values[i] > maxValue : (ulong)values[i] > (ulong)maxValue) maxValue = values[i];
         }
+
+        // Every offset must fit 63 bits, and a negative base needs a magnitude.
+        if (_signed && (minValue == long.MinValue || (ulong)(maxValue - minValue) > long.MaxValue))
+            return false;
 
         // Adjusted = value - base (all >= 0 as unsigned). values.Length <= MaxRunLength (512),
         // so up to 4KB for the long buffer; rent from the pool to avoid blowing the stack.
@@ -238,10 +241,12 @@ internal sealed class RleEncoderV2
 
             if (patchList.Count > 31) return false; // patchListLength is 5 bits
 
-            // Base value byte width (non-negative, but format has sign bit in MSB)
-            int baseBitsNeeded = minValue == 0 ? 1 : 64 - BitOperations.LeadingZeroCount((ulong)minValue) + 1; // +1 for sign bit
+            // The base is sign-magnitude: its magnitude, plus a sign bit in the MSB of its width.
+            bool negativeBase = _signed && minValue < 0;
+            ulong baseMagnitude = negativeBase ? (ulong)(-minValue) : (ulong)minValue;
+            int baseBitsNeeded = baseMagnitude == 0 ? 1 : 64 - BitOperations.LeadingZeroCount(baseMagnitude) + 1; // +1 for sign bit
             int baseByteWidth = (baseBitsNeeded + 7) / 8;
-            if (baseByteWidth > 8) baseByteWidth = 8;
+            if (baseByteWidth > 8) return false; // a non-negative unsigned base with its top bit set
 
             // Cost comparison
             int patchedBits = 32 + baseByteWidth * 8 + values.Length * dataWidth + patchList.Count * (patchGapWidth + patchWidth);
@@ -263,9 +268,10 @@ internal sealed class RleEncoderV2
             _output.WriteByte(b2);
             _output.WriteByte(b3);
 
-            // Write base value big-endian (sign bit in MSB; base is always >= 0 here)
+            // Write the base big-endian, its sign in the MSB.
+            ulong baseBits = negativeBase ? baseMagnitude | (1UL << (baseByteWidth * 8 - 1)) : baseMagnitude;
             for (int i = baseByteWidth - 1; i >= 0; i--)
-                _output.WriteByte((byte)((ulong)minValue >> (i * 8)));
+                _output.WriteByte((byte)(baseBits >> (i * 8)));
 
             // Write packed data values (adjusted, with outlier low bits only)
             var bw = new BitWriter(_output);

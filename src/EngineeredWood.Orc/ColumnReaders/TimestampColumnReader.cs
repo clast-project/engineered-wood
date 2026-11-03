@@ -10,8 +10,31 @@ using EngineeredWood.Orc.Proto;
 
 namespace EngineeredWood.Orc.ColumnReaders;
 
+/// <summary>
+/// Reads an ORC <c>TIMESTAMP</c> or <c>TIMESTAMP_INSTANT</c> column as nanoseconds since the Unix epoch: naive
+/// (no zone) for <c>TIMESTAMP</c>, holding the wall clock it was written with, and UTC for
+/// <c>TIMESTAMP_INSTANT</c>.
+/// </summary>
+/// <remarks>
+/// <para><b>Encoding.</b> DATA holds signed seconds since <c>2015-01-01 00:00:00</c>: in UTC for
+/// <c>TIMESTAMP_INSTANT</c>, and in the stripe's writer time zone for <c>TIMESTAMP</c> (UTC when the stripe
+/// names none). SECONDARY holds the nanoseconds, with trailing decimal zeros removed: the low three bits
+/// <c>z</c> say that the value was divided by <c>10^(z+1)</c> (0: not at all). See <see cref="ParseNanos"/>.</para>
+/// <para><b>Negative timestamps.</b> The C++ writer (pyarrow, Arrow) splits a value by truncation toward zero,
+/// so the nanoseconds carry the value's sign and adding them to the seconds is exact. The Java writer stores
+/// seconds truncated from milliseconds and always-positive nanoseconds, so a timestamp before 1970 with at least
+/// a millisecond's fraction comes out one second late. The C++ reader takes a second off exactly then (seconds
+/// below zero and nanoseconds above 999,999), and so does this one: both writers' files read as the C++ reader
+/// reads them.</para>
+/// <para><b>Files EngineeredWood wrote before this was fixed</b> (<c>software_version</c>
+/// <c>"EngineeredWood.Orc 0.1"</c>) used the Unix epoch and their own nanosecond scale (#584). They are read
+/// with those rules, so that a file read back before the fix still reads the same.</para>
+/// </remarks>
 internal sealed class TimestampColumnReader : ColumnReader
 {
+    /// <summary>2015-01-01T00:00:00Z, in seconds since the Unix epoch: the base of ORC's DATA stream.</summary>
+    internal const long OrcEpochSeconds = 1_420_070_400;
+
     private readonly ColumnEncoding.Types.Kind _encoding;
     private readonly bool _isInstant;
     private OrcByteStream? _dataStream;
@@ -21,17 +44,31 @@ internal sealed class TimestampColumnReader : ColumnReader
     private RleDecoderV2? _secondaryDecoderV2;
     private RleDecoderV1? _secondaryDecoderV1;
 
+    private bool _legacyEngineeredWood;
+    private OrcWriterTimeZone? _writerZone;
+
     public TimestampColumnReader(int columnId, ColumnEncoding.Types.Kind encoding, bool isInstant) : base(columnId)
     {
         _encoding = encoding;
         _isInstant = isInstant;
     }
 
+    /// <summary>
+    /// What the stripe's footer and the file say about how to read this column: the stripe's writer time zone
+    /// (null or empty when it names none), and whether the file was written by EngineeredWood before #584.
+    /// </summary>
+    internal void Configure(string? writerTimeZone, bool legacyEngineeredWood)
+    {
+        _legacyEngineeredWood = legacyEngineeredWood;
+        // TIMESTAMP_INSTANT is UTC by definition; only TIMESTAMP is relative to the writer's zone.
+        _writerZone = _isInstant || legacyEngineeredWood ? null : OrcWriterTimeZone.For(writerTimeZone);
+    }
+
     public void SetDataStream(OrcByteStream stream)
     {
         _dataStream = stream;
         if (_encoding is ColumnEncoding.Types.Kind.DirectV2)
-            _dataDecoderV2 = new RleDecoderV2(stream, signed: true);
+            _dataDecoderV2 = new RleDecoderV2(stream, signed: true, legacyPatchedBase: LegacyEngineeredWood);
         else
             _dataDecoderV1 = new RleDecoderV1(stream, signed: true);
     }
@@ -67,9 +104,6 @@ internal sealed class TimestampColumnReader : ColumnReader
                 else _secondaryDecoderV1?.ReadValues(nanos);
             }
 
-            for (int i = 0; i < nonNullCount; i++)
-                nanos[i] = DecodeNanos(nanos[i]);
-
             string? tz = _isInstant ? "UTC" : null;
             var arrowType = new TimestampType(TimeUnit.Nanosecond, tz);
 
@@ -86,7 +120,9 @@ internal sealed class TimestampColumnReader : ColumnReader
                     continue;
 
                 nullBits[i >> 3] |= (byte)(1 << (i & 7));
-                epochNanos[i] = seconds[rawIdx] * 1_000_000_000L + nanos[rawIdx];
+                epochNanos[i] = _legacyEngineeredWood
+                    ? LegacyValue(seconds[rawIdx], nanos[rawIdx])
+                    : Value(seconds[rawIdx], nanos[rawIdx], _writerZone);
                 rawIdx++;
             }
 
@@ -101,14 +137,132 @@ internal sealed class TimestampColumnReader : ColumnReader
         }
     }
 
-    private static readonly long[] ScaleMultipliers = [1, 1_000, 1_000_000, 1_000_000_000,
-        1_000_000_000_000, 1_000_000_000_000_000, 1_000_000_000_000_000_000, 0 /* unused */];
-
-    private static long DecodeNanos(long encoded)
+    /// <summary>
+    /// One value: <paramref name="data"/> and <paramref name="secondary"/> as stored, to nanoseconds since the
+    /// Unix epoch. With <paramref name="zone"/> (a <c>TIMESTAMP</c> written in a zone other than UTC), the result
+    /// is the wall clock in that zone, as the instant's UTC fields.
+    /// </summary>
+    internal static long Value(long data, long secondary, OrcWriterTimeZone? zone)
     {
-        if (encoded == 0) return 0;
-        int scale = (int)(encoded & 0x07);
-        long nanos = (long)((ulong)encoded >> 3);
-        return nanos * ScaleMultipliers[scale];
+        long seconds = zone is null
+            ? data + OrcEpochSeconds
+            : zone.WallClockSeconds(data);
+        long nanos = ParseNanos(secondary);
+        // The Java writer's quirk; see the remarks.
+        if (seconds < 0 && nanos > 999_999)
+            seconds--;
+        return checked(seconds * 1_000_000_000L + nanos);
+    }
+
+    private static readonly long[] PowersOfTen =
+        [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
+
+    /// <summary>
+    /// ORC's nanosecond encoding: the low three bits <c>z</c> count the trailing zeros removed, less one (0: none
+    /// were), and the rest is the value, SIGNED (the C++ writer stores a negative value's nanoseconds negative).
+    /// </summary>
+    internal static long ParseNanos(long secondary)
+    {
+        int zeros = (int)(secondary & 7);
+        long value = secondary >> 3;
+        return zeros == 0 ? value : value * PowersOfTen[zeros + 1];
+    }
+
+    private static readonly long[] LegacyScale = [1, 1_000, 1_000_000, 1_000_000_000, 0, 0, 0, 0];
+
+    /// <summary>A value as EngineeredWood wrote it before #584: Unix-epoch seconds, and nanoseconds whose low
+    /// three bits counted thousands removed.</summary>
+    private static long LegacyValue(long data, long secondary)
+    {
+        long nanos = secondary == 0 ? 0 : (long)((ulong)secondary >> 3) * LegacyScale[secondary & 7];
+        return data * 1_000_000_000L + nanos;
+    }
+}
+
+/// <summary>
+/// A stripe's writer time zone, for reading a <c>TIMESTAMP</c> column: its DATA stream counts seconds from
+/// <c>2015-01-01 00:00:00</c> in this zone, and the wall clock a value was written with is its instant in this
+/// zone. Null from <see cref="For"/> means UTC, where no conversion is needed.
+/// </summary>
+internal sealed class OrcWriterTimeZone
+{
+    private readonly TimeZoneInfo _zone;
+    private readonly long _epochSeconds;
+
+    // Offsets by 15-minute bucket, kept only for buckets with one offset at both ends; see Offset.
+    private readonly Dictionary<long, long> _offsets = [];
+
+    private OrcWriterTimeZone(TimeZoneInfo zone)
+    {
+        _zone = zone;
+        // 2015-01-01 00:00:00 in the zone, as a UTC instant.
+        var local = new DateTime(2015, 1, 1, 0, 0, 0, DateTimeKind.Unspecified);
+        _epochSeconds = TimestampColumnReader.OrcEpochSeconds - (long)zone.GetUtcOffset(local).TotalSeconds;
+    }
+
+    /// <summary>The zone named <paramref name="name"/>, or null for UTC (also when the name is empty, as when a
+    /// stripe names none: every implementation reads such a stripe as UTC).</summary>
+    internal static OrcWriterTimeZone? For(string? name)
+    {
+        if (string.IsNullOrEmpty(name) || IsUtc(name!))
+            return null;
+
+        TimeZoneInfo zone;
+        try
+        {
+            zone = TimeZoneInfo.FindSystemTimeZoneById(name!);
+        }
+        catch (Exception ex) when (ex is TimeZoneNotFoundException or InvalidTimeZoneException)
+        {
+            throw new NotSupportedException(
+                $"The ORC file's TIMESTAMP values were written in time zone '{name}', which this runtime cannot " +
+                "resolve, so their wall-clock times cannot be computed. IANA zone names need .NET 6 or later " +
+                "(on Windows, with ICU).", ex);
+        }
+
+        return zone.BaseUtcOffset == TimeSpan.Zero && !zone.SupportsDaylightSavingTime
+            && zone.GetAdjustmentRules().Length == 0
+            ? null
+            : new OrcWriterTimeZone(zone);
+    }
+
+    private static bool IsUtc(string name) =>
+        name is "UTC" or "GMT" or "Z" or "Etc/UTC" or "Etc/GMT" or "Etc/UCT" or "UCT" or "Etc/Universal"
+            or "Universal" or "Etc/Zulu" or "Zulu" or "Etc/Greenwich" or "Greenwich" or "GMT0" or "Etc/GMT0"
+            or "GMT+0" or "GMT-0" or "Etc/GMT+0" or "Etc/GMT-0";
+
+    /// <summary>The wall clock, as seconds read as UTC, of the instant <paramref name="data"/> seconds after
+    /// 2015-01-01 00:00:00 in this zone.</summary>
+    internal long WallClockSeconds(long data)
+    {
+        long instant = data + _epochSeconds;
+        return instant + Offset(instant);
+    }
+
+    private long Offset(long instant)
+    {
+        // A zone's offset changes only at its transitions, so it is cached per 15-minute bucket; a bucket is
+        // cached only when its two ends agree, so the one holding a transition is always computed exactly.
+        long bucket = FloorDiv(instant, 900);
+        if (_offsets.TryGetValue(bucket, out long cached))
+            return cached;
+
+        long start = OffsetAt(bucket * 900);
+        long end = OffsetAt(bucket * 900 + 899);
+        if (start == end)
+        {
+            _offsets[bucket] = start;
+            return start;
+        }
+        return OffsetAt(instant);
+    }
+
+    private long OffsetAt(long instant) =>
+        (long)_zone.GetUtcOffset(DateTimeOffset.FromUnixTimeSeconds(instant)).TotalSeconds;
+
+    private static long FloorDiv(long a, long b)
+    {
+        long q = a / b;
+        return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
     }
 }

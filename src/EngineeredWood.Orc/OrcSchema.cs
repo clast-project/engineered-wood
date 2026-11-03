@@ -89,9 +89,10 @@ public sealed class OrcSchema
             Type.Types.Kind.Date => Date32Type.Default,
             Type.Types.Kind.Timestamp => new TimestampType(TimeUnit.Nanosecond, (string?)null),
             Type.Types.Kind.TimestampInstant => new TimestampType(TimeUnit.Nanosecond, "UTC"),
-            Type.Types.Kind.Decimal => new Decimal128Type(
-                Precision > 0 ? (int)Precision : 38,
-                Scale > 0 ? (int)Scale : 0),
+            // Hive 0.11 wrote decimals with no precision or scale: read them as the C++ reader does.
+            Type.Types.Kind.Decimal => Precision > 0
+                ? new Decimal128Type((int)Precision, (int)Scale)
+                : new Decimal128Type(ColumnReaders.DecimalColumnReader.Hive11Precision, ColumnReaders.DecimalColumnReader.Hive11Scale),
             Type.Types.Kind.List => new ListType(Children[0].ToArrowType()),
             Type.Types.Kind.Map => new MapType(
                 Children[0].ToArrowType(),

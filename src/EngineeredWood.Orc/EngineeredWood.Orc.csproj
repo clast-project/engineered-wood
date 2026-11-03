@@ -13,6 +13,8 @@
 
   <ItemGroup>
     <PackageReference Include="Apache.Arrow" />
+    <!-- Int128 for ORC decimals (#583); on netstandard2.0 this package's polyfill is the type. -->
+    <PackageReference Include="Clast.DatabaseDecimal" />
     <PackageReference Include="Google.Protobuf" />
     <PackageReference Include="Grpc.Tools">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>

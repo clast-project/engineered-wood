@@ -26,7 +26,7 @@ internal sealed class DateColumnReader : ColumnReader
     {
         _dataStream = stream;
         if (_encoding is ColumnEncoding.Types.Kind.DirectV2)
-            _decoderV2 = new RleDecoderV2(stream, signed: true);
+            _decoderV2 = new RleDecoderV2(stream, signed: true, legacyPatchedBase: LegacyEngineeredWood);
         else
             _decoderV1 = new RleDecoderV1(stream, signed: true);
     }
