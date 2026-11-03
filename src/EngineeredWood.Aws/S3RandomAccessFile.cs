@@ -13,13 +13,14 @@ namespace EngineeredWood.IO.Aws;
 /// HTTP range requests. Concurrent requests are throttled via a semaphore.
 /// Multi-range reads automatically coalesce nearby ranges to reduce HTTP round-trips.
 /// </summary>
-public sealed class S3RandomAccessFile : IRandomAccessFile
+public sealed class S3RandomAccessFile : IRandomAccessFile, IReadConcurrencyHint
 {
     private readonly IAmazonS3 _client;
     private readonly string _bucket;
     private readonly string _key;
     private readonly BufferAllocator _allocator;
     private readonly SemaphoreSlim _semaphore;
+    private readonly int _maxConcurrency;
     private readonly CoalescingOptions _coalescingOptions;
     private long _cachedLength = -1;
 
@@ -45,6 +46,7 @@ public sealed class S3RandomAccessFile : IRandomAccessFile
         _key = key ?? throw new ArgumentNullException(nameof(key));
         _allocator = allocator ?? PooledBufferAllocator.Default;
         _semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+        _maxConcurrency = maxConcurrency;
         _coalescingOptions = coalescingOptions ?? new CoalescingOptions();
     }
 
@@ -67,6 +69,10 @@ public sealed class S3RandomAccessFile : IRandomAccessFile
     }
 
     /// <inheritdoc/>
+    /// <summary>The requests this file lets be in flight at once (its <c>maxConcurrency</c>): a reader that
+    /// can split its work sizes its default window to this rather than to the CPU (#612).</summary>
+    public int? PreferredConcurrentReads => _maxConcurrency;
+
     public async ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
     {
         if (_cachedLength >= 0)

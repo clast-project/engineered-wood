@@ -316,10 +316,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         }
     }
 
-    /// <summary>The row groups a positioned read reads at once: <see cref="ParquetReadOptions.MaxConcurrentRowGroups"/>,
-    /// or by default <c>min(4, Environment.ProcessorCount)</c>.</summary>
+    /// <summary>The row groups a positioned read reads at once: <see cref="ParquetReadOptions.MaxConcurrentRowGroups"/>;
+    /// by default what the file suggests (<see cref="IReadConcurrencyHint"/>, an object store's requests in
+    /// flight), and otherwise <c>min(4, Environment.ProcessorCount)</c>, where a local read stops gaining.</summary>
     private int EffectiveConcurrentRowGroups =>
-        _options.MaxConcurrentRowGroups ?? Math.Min(4, Environment.ProcessorCount);
+        _options.MaxConcurrentRowGroups
+        ?? ((_file as IReadConcurrencyHint)?.PreferredConcurrentReads is int hint and >= 1
+            ? hint
+            : Math.Min(4, Environment.ProcessorCount));
 
     /// <summary>The memory budget of the most recent parallel read, for tests to read its
     /// <see cref="ScanMemoryBudget.Peak"/>.</summary>

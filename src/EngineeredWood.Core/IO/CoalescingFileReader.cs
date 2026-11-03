@@ -9,7 +9,7 @@ namespace EngineeredWood.IO;
 /// Decorator over <see cref="IRandomAccessFile"/> that merges nearby byte ranges
 /// into larger requests to reduce the number of I/O operations.
 /// </summary>
-public sealed class CoalescingFileReader : IRandomAccessFile
+public sealed class CoalescingFileReader : IRandomAccessFile, IReadConcurrencyHint
 {
     private readonly IRandomAccessFile _inner;
     private readonly BufferAllocator _allocator;
@@ -24,6 +24,9 @@ public sealed class CoalescingFileReader : IRandomAccessFile
         _options = options ?? new CoalescingOptions();
         _allocator = allocator ?? PooledBufferAllocator.Default;
     }
+
+    /// <summary>The wrapped file's hint, if it gives one.</summary>
+    public int? PreferredConcurrentReads => (_inner as IReadConcurrencyHint)?.PreferredConcurrentReads;
 
     public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default) =>
         _inner.GetLengthAsync(cancellationToken);

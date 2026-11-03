@@ -422,8 +422,10 @@ public sealed record ParquetReadOptions
     /// <summary>
     /// How many row groups of one file <see cref="ParquetFileReader.ReadAllAsync"/> and
     /// <see cref="ParquetFileReader.ReadWithPositionsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, CancellationToken)"/>
-    /// read and decode at once. Default: null, which means <c>min(4, Environment.ProcessorCount)</c>. 1 reads
-    /// them one after another, as before #612.
+    /// read and decode at once. Default: null, which means what the file suggests when it implements
+    /// <see cref="EngineeredWood.IO.IReadConcurrencyHint"/> (the S3, Azure Blob and GCS files suggest the requests
+    /// they let be in flight, 16 by default), and otherwise <c>min(4, Environment.ProcessorCount)</c>. 1 reads them
+    /// one after another, as before #612.
     /// </summary>
     /// <remarks>
     /// <para>Batches still come out in file order, with the same rows and positions a serial read gives,
