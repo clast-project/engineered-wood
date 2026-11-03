@@ -12,7 +12,7 @@ namespace EngineeredWood.DeltaLake.Table.IdentityColumns;
 /// <summary>
 /// Handles identity column value generation during writes.
 /// For columns with <c>allowExplicitInsert = false</c>, generates values automatically (a committing write
-/// refuses a batch that supplies the column first, via <see cref="ThrowIfGeneratedAlwaysSupplied"/>).
+/// refuses a batch that supplies the column first, via <see cref="ThrowIfGeneratedAlwaysSupplied(Apache.Arrow.Schema, DeltaStructType)"/>).
 /// For columns with <c>allowExplicitInsert = true</c>, validates user-provided values.
 /// </summary>
 internal static class IdentityColumnWriter
@@ -25,11 +25,23 @@ internal static class IdentityColumnWriter
     /// no rows, still supplies the column.
     /// </summary>
     public static void ThrowIfGeneratedAlwaysSupplied(Apache.Arrow.Schema batchSchema, DeltaStructType deltaSchema)
+        => ThrowIfGeneratedAlwaysSupplied(batchSchema.FieldsList.Select(f => f.Name), deltaSchema);
+
+    /// <summary>
+    /// The same refusal for the column names a write will supply — a MERGE insert's resolved column list, judged
+    /// before any row is read: Spark refuses it at analysis, so an empty source, a source whose every row matches
+    /// and an insert condition no row satisfies are refused too. Each name resolves as the write path resolves it,
+    /// by logical name first and then by column-mapping physical name, so the column's physical alias is not a way
+    /// past the check.
+    /// </summary>
+    public static void ThrowIfGeneratedAlwaysSupplied(IEnumerable<string> suppliedNames, DeltaStructType deltaSchema)
     {
-        foreach (var field in deltaSchema.Fields)
+        if (!deltaSchema.Fields.Any(f => IdentityColumn.GetConfig(f) is { AllowExplicitInsert: false }))
+            return;
+        foreach (string name in suppliedNames)
         {
-            if (IdentityColumn.GetConfig(field) is { AllowExplicitInsert: false }
-                && batchSchema.GetFieldIndex(field.Name) >= 0)
+            if (DeltaTable.FindDeclared(deltaSchema.Fields, name) is { } field
+                && IdentityColumn.GetConfig(field) is { AllowExplicitInsert: false })
             {
                 throw new DeltaFormatException(
                     DeltaTableErrorCodes.IdentityColumnExplicitInsertNotSupported,

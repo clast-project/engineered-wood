@@ -7546,7 +7546,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>The declared field a batch name stands for: the one with that logical name, else the one with that
     /// physical name. Logical first, as <c>ColumnMappingRecursive.ToPhysical</c> resolves a write: after a rename,
     /// a column's old physical name can be another column's logical one.</summary>
-    private static StructField? FindDeclared(IReadOnlyList<StructField> fields, string arrowName)
+    internal static StructField? FindDeclared(IReadOnlyList<StructField> fields, string arrowName)
     {
         foreach (var f in fields)
         {

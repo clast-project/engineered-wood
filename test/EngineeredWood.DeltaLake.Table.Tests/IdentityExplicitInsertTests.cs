@@ -42,19 +42,45 @@ public class IdentityExplicitInsertTests : IDisposable
     private LocalTableFileSystem Fs => new(_tempDir);
 
     /// <summary>A table whose <c>id</c> is an identity column (start 1, step 1), holding the row ("seed", 1).</summary>
-    private async Task<DeltaTable> CreateAsync(bool allowExplicitInsert = false)
+    /// <remarks>With <paramref name="columnMapping"/>, the table is in name mode and <c>id</c>'s physical name is
+    /// <see cref="IdPhysical"/>.</remarks>
+    private async Task<DeltaTable> CreateAsync(bool allowExplicitInsert = false, bool columnMapping = false)
     {
-        string idMeta = JsonSerializer.Serialize(IdentityColumn.CreateMetadata(1, 1, allowExplicitInsert));
-        string schema = $@"{{""type"":""struct"",""fields"":[{{""name"":""id"",""type"":""long"",""nullable"":true,""metadata"":{idMeta}}},{{""name"":""value"",""type"":""string"",""nullable"":true,""metadata"":{{}}}}]}}";
+        var idMetadata = IdentityColumn.CreateMetadata(1, 1, allowExplicitInsert);
+        var valueMetadata = new Dictionary<string, string>();
+        if (columnMapping)
+        {
+            idMetadata[ColumnMapping.FieldIdKey] = "1";
+            idMetadata[ColumnMapping.PhysicalNameKey] = IdPhysical;
+            valueMetadata[ColumnMapping.FieldIdKey] = "2";
+            valueMetadata[ColumnMapping.PhysicalNameKey] = "col-value";
+        }
+        string idMeta = JsonSerializer.Serialize(idMetadata).Replace("\"delta.columnMapping.id\":\"1\"", "\"delta.columnMapping.id\":1");
+        string valueMeta = JsonSerializer.Serialize(valueMetadata).Replace("\"delta.columnMapping.id\":\"2\"", "\"delta.columnMapping.id\":2");
+        string schema = $@"{{""type"":""struct"",""fields"":[{{""name"":""id"",""type"":""long"",""nullable"":true,""metadata"":{idMeta}}},{{""name"":""value"",""type"":""string"",""nullable"":true,""metadata"":{valueMeta}}}]}}";
         await new TransactionLog(Fs).WriteCommitAsync(0, new List<DeltaAction>
         {
-            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["identityColumns"] },
-            new MetadataAction { Id = "identity", Format = Format.Parquet, SchemaString = schema, PartitionColumns = [] },
+            columnMapping
+                ? new ProtocolAction
+                {
+                    MinReaderVersion = 3, MinWriterVersion = 7,
+                    ReaderFeatures = ["columnMapping"], WriterFeatures = ["columnMapping", "identityColumns"],
+                }
+                : new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["identityColumns"] },
+            new MetadataAction
+            {
+                Id = "identity", Format = Format.Parquet, SchemaString = schema, PartitionColumns = [],
+                Configuration = columnMapping
+                    ? new Dictionary<string, string> { [ColumnMapping.ModeKey] = "name", [ColumnMapping.MaxColumnIdKey] = "2" }
+                    : null,
+            },
         });
         var table = await DeltaTable.OpenAsync(Fs);
         await table.WriteAsync([Values("seed")]);
         return table;
     }
+
+    private const string IdPhysical = "col-id";
 
     private static RecordBatch Values(params string[] values)
     {
@@ -194,6 +220,54 @@ public class IdentityExplicitInsertTests : IDisposable
             [WithIds(0)], new MergeOptions { Keys = ["value"], WhenNotMatched = MergeAction.InsertColumns("value") });
 
         Assert.Equal([(1L, "seed"), (2L, "v")], await ReadAsync(table));
+    }
+
+    /// <summary>Refused before any row is read, as Spark refuses it at analysis (measured): an insert that names the
+    /// column is refused even when no row would be inserted — an empty source, a source whose every row matches, an
+    /// insert condition no row satisfies.</summary>
+    [Theory]
+    [InlineData("emptySource")]
+    [InlineData("allMatch")]
+    [InlineData("conditionFalse")]
+    [InlineData("namedEmptySource")]
+    public async Task AMergeInsertOfTheColumn_IsRefusedEvenWhenNoRowWouldBeInserted(string shape)
+    {
+        await using var table = await CreateAsync();
+        var source = shape switch
+        {
+            "allMatch" => new RecordBatch(WithIds(0).Schema,
+                [new Int64Array.Builder().Append(0).Build(), new StringArray.Builder().Append("seed").Build()], 1),
+            "conditionFalse" => WithIds(0),
+            _ => WithIds(),
+        };
+        var options = new MergeOptions
+        {
+            Keys = ["value"],
+            WhenMatched = shape == "allMatch" ? MergeAction.Delete : null,
+            WhenNotMatched = shape == "namedEmptySource" ? MergeAction.InsertColumns("id", "value") : MergeAction.Insert,
+            WhenNotMatchedCondition = shape == "conditionFalse" ? Ex.Equal("value", "zz") : null,
+        };
+
+        await AssertRefusedAsync(() => table.MergeAsync([source], options).AsTask());
+        Assert.Equal([(1L, "seed")], await ReadAsync(table));
+    }
+
+    /// <summary>A write may name a column by its column-mapping physical name; that alias of a GENERATED ALWAYS
+    /// column supplies it just as its logical name does.</summary>
+    [Fact]
+    public async Task ThePhysicalNameOfTheColumn_IsRefusedAsSupplied()
+    {
+        await using var table = await CreateAsync(columnMapping: true);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field(IdPhysical, Int64Type.Default, true))
+            .Field(new Field("value", StringType.Default, true))
+            .Build();
+        var batch = new RecordBatch(
+            schema, [new Int64Array.Builder().Append(0).Build(), new StringArray.Builder().Append("v").Build()], 1);
+
+        await AssertRefusedAsync(() => table.WriteAsync([batch]).AsTask());
+        await table.WriteAsync([Values("a")]);
+        Assert.Equal([(1L, "seed"), (2L, "a")], await ReadAsync(table));
     }
 
     [Fact]
