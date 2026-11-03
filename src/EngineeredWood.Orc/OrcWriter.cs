@@ -31,7 +31,11 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
     // this string and keep reading such files as they were written. Bump it with any change a reader must
     // tell apart.
     internal const string LegacyTimestampSoftwareVersion = "EngineeredWood.Orc 0.1";
-    private const string SoftwareVersion = "EngineeredWood.Orc 0.2";
+    // 0.1 and 0.2 wrote a struct's children for every row, null struct rows included; the spec, and every
+    // other reader, has them only for the struct's non-null rows (#585).
+    internal static bool WroteStructChildrenForEveryRow(string softwareVersion) =>
+        softwareVersion is LegacyTimestampSoftwareVersion or "EngineeredWood.Orc 0.2";
+    private const string SoftwareVersion = "EngineeredWood.Orc 0.3";
 
     private readonly ISequentialFile _file;
     private readonly bool _ownsFile;

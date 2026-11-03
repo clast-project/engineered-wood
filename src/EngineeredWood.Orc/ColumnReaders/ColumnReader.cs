@@ -46,13 +46,39 @@ internal abstract class ColumnReader
     // Reusable present buffer to avoid per-batch allocation
     private bool[]? _presentBuffer;
 
+    /// <summary>
+    /// The present rows of the struct this column is a field of, for the batch about to be read, or null when
+    /// all are present. A struct's fields hold values only for its present rows (#585), so a row the struct does
+    /// not have is null here too and takes no PRESENT bit or value. Set by <see cref="StructColumnReader"/>
+    /// before each batch.
+    /// </summary>
+    internal bool[]? ParentPresent { get; set; }
+
     protected bool[]? ReadPresent(int batchSize)
     {
-        if (_presentDecoder == null) return null;
+        var parent = ParentPresent;
+        if (parent == null && _presentDecoder == null) return null;
         if (_presentBuffer == null || _presentBuffer.Length < batchSize)
             _presentBuffer = new bool[batchSize];
         var present = _presentBuffer.AsSpan(0, batchSize);
-        _presentDecoder.ReadValues(present);
+
+        if (parent == null)
+        {
+            _presentDecoder!.ReadValues(present);
+        }
+        else if (_presentDecoder == null)
+        {
+            parent.AsSpan(0, batchSize).CopyTo(present);
+        }
+        else
+        {
+            // The column's own bits cover only the parent's present rows.
+            var own = new bool[CountNonNull(parent, batchSize)];
+            _presentDecoder.ReadValues(own);
+            int k = 0;
+            for (int i = 0; i < batchSize; i++)
+                present[i] = parent[i] && own[k++];
+        }
         return _presentBuffer;
     }
 

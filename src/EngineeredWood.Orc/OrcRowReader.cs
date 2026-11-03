@@ -315,9 +315,13 @@ public sealed class OrcRowReader : IAsyncEnumerable<RecordBatch>
         string? writerZone = stripeData.Footer.HasWriterTimezone ? stripeData.Footer.WriterTimezone : null;
         bool legacy = _orcReader.Footer.HasSoftwareVersion
             && _orcReader.Footer.SoftwareVersion == OrcWriter.LegacyTimestampSoftwareVersion;
+        bool structChildrenForEveryRow = _orcReader.Footer.HasSoftwareVersion
+            && OrcWriter.WroteStructChildrenForEveryRow(_orcReader.Footer.SoftwareVersion);
         foreach (var columnReader in allReaders.Values)
         {
             columnReader.LegacyEngineeredWood = legacy;
+            if (columnReader is StructColumnReader structs)
+                structs.ChildrenForEveryRow = structChildrenForEveryRow;
             if (columnReader is TimestampColumnReader timestamps)
                 timestamps.Configure(writerZone, legacy);
         }

@@ -3,6 +3,7 @@
 
 using System.Runtime.InteropServices;
 using Apache.Arrow;
+using EngineeredWood.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Orc.Encodings;
 using EngineeredWood.Orc.Proto;
@@ -45,28 +46,29 @@ internal sealed class UnionColumnWriter : ColumnWriter
 
     private void WriteDenseChildren(DenseUnionArray denseUnion)
     {
-        // For dense union, each child gets a slice of values.
-        // Group values by type tag and write each child's values.
-        // ORC stores child values contiguously per tag — same as dense union offsets.
-
-        // Count values per child
-        var counts = new int[_children.Count];
+        // ORC stores each branch's values for the rows that select it, in row order. A dense union's child
+        // need not be exactly that (a sliced union's children reach past it, and a child may hold values no
+        // row points at), so each branch gets the values its rows point at, as runs of slices. Nothing is
+        // gathered, so a branch of any type, a union included, is written as is (#585).
+        var runs = new List<(int Start, int Length)>[_children.Count];
+        for (int c = 0; c < runs.Length; c++)
+            runs[c] = [];
+        var offsets = denseUnion.ValueOffsets;
         for (int i = 0; i < denseUnion.Length; i++)
         {
             if (!denseUnion.IsValid(i)) continue;
             int tag = denseUnion.TypeIds[i];
-            if (tag < counts.Length) counts[tag]++;
+            if (tag >= runs.Length) continue;
+            var branch = runs[tag];
+            int offset = offsets[i];
+            if (branch.Count > 0 && branch[branch.Count - 1].Start + branch[branch.Count - 1].Length == offset)
+                branch[branch.Count - 1] = (branch[branch.Count - 1].Start, branch[branch.Count - 1].Length + 1);
+            else
+                branch.Add((offset, 1));
         }
 
-        // Each child array in dense union already contains only its values
         for (int c = 0; c < _children.Count; c++)
-        {
-            if (counts[c] > 0)
-            {
-                var childArray = denseUnion.Fields[c];
-                _children[c].Write(childArray);
-            }
-        }
+            WriteParts(_children[c], denseUnion.Fields[c], runs[c]);
     }
 
     private void WriteSparseChildren(SparseUnionArray sparseUnion)

@@ -283,20 +283,18 @@ Base runs; no other ORC reader reads either back. Such files carry
 them as they were written, so they still round-trip. Other readers still
 misread them; rewrite them with the current writer to fix that.
 
+Likewise, until #585 the writer wrote a struct's fields for its null rows
+too, where the spec (and every other reader) has them only for the
+struct's non-null rows. Files from `"EngineeredWood.Orc 0.1"` and `"0.2"`
+are read that way, so their struct rows still read back; other readers
+shift the rows after each null struct row.
+
 **TIMESTAMP in a writer time zone on .NET Framework.** A non-instant
 `Timestamp` column in a stripe whose writer time zone is not UTC (Hive and
 Java writers record the JVM's zone, e.g. `America/Los_Angeles`) needs that
 zone's rules to recover the wall clock. On .NET Framework, which cannot
 resolve IANA zone names, reading such a column throws
 `NotSupportedException` naming the zone rather than guessing.
-
-**Sliced / gap-containing ListArrays are written wrong.**
-`ListColumnWriter.Write` emits `listArray.Values` wholesale without
-slicing or respecting the offsets buffer. When the input list array is
-sliced or contains nulls that leave gaps in the offsets, the written
-child data includes elements that don't belong, corrupting the list
-count. `MapColumnWriter` likely shares it.
-[#585](https://github.com/clast-project/engineered-wood/issues/585).
 
 **Bloom filter v1 with `Bitset.Count == 1`.** The v1 BloomFilter reader
 path accepts a bitset only when `Utf8Bitset` is present or

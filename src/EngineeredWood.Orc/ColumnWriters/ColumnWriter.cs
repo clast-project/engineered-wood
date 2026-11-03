@@ -27,6 +27,70 @@ internal abstract class ColumnWriter
     internal OrcBloomFilterBuilder? BloomFilter { get; set; }
     private List<Proto.BloomFilter>? _bloomFilterEntries;
 
+    // ── Children of nested columns (#585) ──────────────────────────────────────────────────────────────────
+    // A nested column's children hold values only for its non-null rows: a struct's fields for its valid rows,
+    // a list's or map's elements for its valid entries' ranges. Arrow's children may hold more (a sliced
+    // array's children reach past it, and a null row may still have a child range or field values), so only
+    // those parts are handed down, as slices.
+
+    /// <summary>The runs of <paramref name="array"/>'s valid rows, as (start, length).</summary>
+    protected static List<(int Start, int Length)> ValidRowRuns(IArrowArray array)
+    {
+        var runs = new List<(int, int)>();
+        int start = -1;
+        for (int i = 0; i <= array.Length; i++)
+        {
+            bool valid = i < array.Length && array.IsValid(i);
+            if (valid && start < 0)
+                start = i;
+            else if (!valid && start >= 0)
+            {
+                runs.Add((start, i - start));
+                start = -1;
+            }
+        }
+        return runs;
+    }
+
+    /// <summary>The child ranges of <paramref name="array"/>'s valid entries, merged where they adjoin, as
+    /// (start, length) into the child.</summary>
+    protected static List<(int Start, int Length)> ValidChildRanges(IArrowArray array, ReadOnlySpan<int> offsets)
+    {
+        var ranges = new List<(int, int)>();
+        int start = 0, end = 0;
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (!array.IsValid(i))
+                continue;
+            int s = offsets[i], e = offsets[i + 1];
+            if (s == e)
+                continue;
+            if (s != end)
+            {
+                if (end > start)
+                    ranges.Add((start, end - start));
+                start = s;
+            }
+            end = e;
+        }
+        if (end > start)
+            ranges.Add((start, end - start));
+        return ranges;
+    }
+
+    /// <summary>Writes the <paramref name="parts"/> of <paramref name="values"/> to <paramref name="child"/>.</summary>
+    protected static void WriteParts(ColumnWriter? child, IArrowArray values, List<(int Start, int Length)> parts)
+    {
+        if (child is null)
+            return;
+        foreach (var (start, length) in parts)
+        {
+            child.Write(start == 0 && length == values.Length
+                ? values
+                : ArrowArrayFactory.Slice(values, start, length));
+        }
+    }
+
     protected ColumnWriter(int columnId)
     {
         ColumnId = columnId;

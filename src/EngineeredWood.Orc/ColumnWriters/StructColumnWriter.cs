@@ -20,10 +20,10 @@ internal sealed class StructColumnWriter : ColumnWriter
         WritePresent(array);
         var structArray = (StructArray)array;
 
+        // Only the valid rows' fields: see ColumnWriter.ValidRowRuns.
+        var runs = ValidRowRuns(structArray);
         for (int i = 0; i < _children.Count; i++)
-        {
-            _children[i].Write(structArray.Fields[i]);
-        }
+            WriteParts(_children[i], structArray.Fields[i], runs);
     }
 
     public override ColumnEncoding GetEncoding() => new() { Kind = ColumnEncoding.Types.Kind.Direct };
