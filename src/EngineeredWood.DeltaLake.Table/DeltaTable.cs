@@ -4169,8 +4169,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         batch => RowEvaluator.EvaluatePredicate(predicate, batch);
 
     /// <summary>
-    /// Refuses a DML predicate whose types Spark's analyzer would refuse (<c>dt = 5</c>), before any file is
-    /// pruned or read.
+    /// Refuses a DML predicate Spark's analyzer would refuse -- one naming a column the table does not have
+    /// (<see cref="DeltaTableErrorCodes.UnresolvedColumn"/>), or whose types it refuses (<c>dt = 5</c>) -- before
+    /// any file is pruned or read.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -4186,7 +4187,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </para>
     /// </remarks>
     internal static void RefuseUnanalyzable(Expressions.Predicate predicate, Snapshot.Snapshot snapshot) =>
-        RefuseUnanalyzable(predicate, () => EmptyBatch(snapshot.ArrowSchema));
+        RefuseUnanalyzable(predicate, snapshot.ArrowSchema, () => EmptyBatch(snapshot.ArrowSchema));
 
     private static readonly RecordBatch NoColumns = new(new Apache.Arrow.Schema.Builder().Build(), [], 0);
 
@@ -4228,12 +4229,30 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         new(schema, schema.FieldsList.Select(f => ArrowCompute.MakeNullArray(f.DataType, 0)), 0);
 
     /// <summary>
-    /// <see cref="RefuseUnanalyzable(Expressions.Predicate, Snapshot.Snapshot)"/> over the empty batch
-    /// <paramref name="noRows"/> builds, for a predicate evaluated over some other shape -- a MERGE condition
-    /// sees the target and source rows side by side.
+    /// <see cref="RefuseUnanalyzable(Expressions.Predicate, Snapshot.Snapshot)"/> for a predicate evaluated over
+    /// some other shape -- a MERGE condition sees the target and source rows side by side. Its names are resolved
+    /// against <paramref name="names"/>; its types are asked over the empty batch <paramref name="noRows"/> builds.
     /// </summary>
-    internal static void RefuseUnanalyzable(Expressions.Predicate predicate, Func<RecordBatch> noRows)
+    /// <remarks>
+    /// The names are resolved apart from the batch on purpose. Building it can throw -- a column of a type
+    /// <see cref="ArrowCompute.MakeNullArray"/> cannot construct, which a source the host writes the bytes of may
+    /// carry -- and that is swallowed with the rest of the type check, which must not take the name check with it.
+    /// <paramref name="names"/> may also accept more than the batch has, where the shape is not known.
+    /// </remarks>
+    internal static void RefuseUnanalyzable(
+        Expressions.Predicate predicate, Apache.Arrow.Schema names, Func<RecordBatch> noRows)
     {
+        // A column the shape does not have throws ArgumentException from the evaluator, which is not an analysis
+        // refusal and so is swallowed below: only a file actually read raised it, and a table with nothing to read
+        // committed a no-op (#593). Spark refuses at analysis (UNRESOLVED_COLUMN).
+        if (FirstUnknownReference(predicate, names) is { } missing)
+        {
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.UnresolvedColumn,
+                $"The condition {predicate} reads column '{missing}', which does not exist. The columns it can "
+                + "read: " + string.Join(", ", names.FieldsList.Select(f => f.Name)) + ".");
+        }
+
         // A literal the evaluator cannot type -- a Guid, a TimeOnly: Delta has no such type -- throws the moment
         // any row reaches it, as NotSupportedException rather than an analysis refusal. Over no rows a refusal
         // swallowed below could hide it, and the statistics never read it, so without this an empty table or a
@@ -4252,6 +4271,51 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         catch (Exception)
         {
             // Not an analysis refusal; see the remarks.
+        }
+    }
+
+    /// <summary>
+    /// The first column <paramref name="expression"/> references that <paramref name="schema"/> does not have, by
+    /// the evaluator's rule, or null: each part of a name matched ignoring case, a nested part as a field of the
+    /// struct before it, and a bound reference by its name, as an unbound one.
+    /// </summary>
+    /// <remarks>A name matching twice (<c>a</c> and <c>A</c>) is not unknown; the evaluator reports it.</remarks>
+    private static string? FirstUnknownReference(Expressions.Expression expression, Apache.Arrow.Schema schema)
+    {
+        switch (expression)
+        {
+            case Expressions.UnboundReference reference:
+                IReadOnlyList<Field>? fields = schema.FieldsList;
+                foreach (string part in reference.NameParts)
+                {
+                    var field = fields?.FirstOrDefault(
+                        f => string.Equals(f.Name, part, StringComparison.OrdinalIgnoreCase));
+                    if (field is null)
+                        return reference.Name;
+                    fields = (field.DataType as Apache.Arrow.Types.StructType)?.Fields;
+                }
+                return null;
+            case Expressions.BoundReference bound:
+                return schema.FieldsList.Any(f => string.Equals(f.Name, bound.Name, StringComparison.OrdinalIgnoreCase))
+                    ? null
+                    : bound.Name;
+            case Expressions.AndPredicate and:
+                return and.Children.Select(c => FirstUnknownReference(c, schema)).FirstOrDefault(n => n is not null);
+            case Expressions.OrPredicate or:
+                return or.Children.Select(c => FirstUnknownReference(c, schema)).FirstOrDefault(n => n is not null);
+            case Expressions.NotPredicate not:
+                return FirstUnknownReference(not.Child, schema);
+            case Expressions.ComparisonPredicate cmp:
+                return FirstUnknownReference(cmp.Left, schema) ?? FirstUnknownReference(cmp.Right, schema);
+            case Expressions.UnaryPredicate unary:
+                return FirstUnknownReference(unary.Operand, schema);
+            case Expressions.SetPredicate set:
+                return FirstUnknownReference(set.Operand, schema)
+                    ?? set.Values.Select(v => FirstUnknownReference(v, schema)).FirstOrDefault(n => n is not null);
+            case Expressions.FunctionCall call:
+                return call.Arguments.Select(a => FirstUnknownReference(a, schema)).FirstOrDefault(n => n is not null);
+            default:
+                return null;
         }
     }
 

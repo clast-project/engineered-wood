@@ -661,7 +661,9 @@ public sealed partial class DeltaTable
     /// </para>
     /// <para>
     /// A source with no batches has no schema of its own. Its columns can only be the table's, normalized to
-    /// the table's types (<see cref="PrepareMergeSource"/>), so the table's schema stands in for it.
+    /// the table's types (<see cref="PrepareMergeSource"/>), so the table's schema stands in for it. Which of
+    /// them it has is not known, though, so the matched condition may name any target column bare: whether the
+    /// source shares it, which would hide the bare name, cannot be told.
     /// </para>
     /// </remarks>
     private static void RefuseUnanalyzableConditions(MergeOptions options, Snapshot.Snapshot snapshot, RecordBatch? src)
@@ -670,12 +672,68 @@ public sealed partial class DeltaTable
         var sourceSchema = src?.Schema ?? targetSchema;
 
         if (options.WhenMatchedCondition is { } matched)
-            RefuseUnanalyzable(matched, () => MergeConditionBatch(EmptyBatch(targetSchema), EmptyBatch(sourceSchema)));
+        {
+            var names = src is not null
+                ? MergeConditionSchema(targetSchema, sourceSchema)
+                : new Apache.Arrow.Schema(
+                    [SideField("source", sourceSchema), .. MergeConditionSchema(targetSchema, null).FieldsList],
+                    null);
+            RefuseUnanalyzable(
+                matched, names, () => MergeConditionBatch(EmptyBatch(targetSchema), EmptyBatch(sourceSchema)));
+        }
         if (options.WhenNotMatchedCondition is { } notMatched)
-            RefuseUnanalyzable(notMatched, () => MergeConditionBatch(null, EmptyBatch(sourceSchema)));
+        {
+            RefuseUnanalyzable(
+                notMatched, MergeConditionSchema(null, sourceSchema),
+                () => MergeConditionBatch(null, EmptyBatch(sourceSchema)));
+        }
         if (options.WhenNotMatchedBySourceCondition is { } sourceless)
-            RefuseUnanalyzable(sourceless, () => MergeConditionBatch(EmptyBatch(targetSchema), null));
+        {
+            RefuseUnanalyzable(
+                sourceless, MergeConditionSchema(targetSchema, null),
+                () => MergeConditionBatch(EmptyBatch(targetSchema), null));
+        }
     }
+
+    /// <summary>The schema of the <see cref="MergeConditionBatch"/> of these sides, built without any array.</summary>
+    private static Apache.Arrow.Schema MergeConditionSchema(Apache.Arrow.Schema? target, Apache.Arrow.Schema? source) =>
+        new(MergeConditionColumns(target, source).Select(c => c.Field), null);
+
+    /// <summary>
+    /// The columns of a <see cref="MergeConditionBatch"/>: each side as a struct named for it, then each column only
+    /// one side has under its bare name. <c>Side</c> is 0 for the target, 1 for the source; <c>Column</c> is the
+    /// side's column, or -1 for the side's struct.
+    /// </summary>
+    private static List<(Field Field, int Side, int Column)> MergeConditionColumns(
+        Apache.Arrow.Schema? target, Apache.Arrow.Schema? source)
+    {
+        var columns = new List<(Field, int, int)>();
+        if (target is not null)
+            columns.Add((SideField("target", target), 0, -1));
+        if (source is not null)
+            columns.Add((SideField("source", source), 1, -1));
+
+        var targetNames = target?.FieldsList.Select(f => f.Name) ?? [];
+        var sourceNames = source?.FieldsList.Select(f => f.Name) ?? [];
+        var shared = new HashSet<string>(targetNames.Intersect(sourceNames, StringComparer.OrdinalIgnoreCase),
+            StringComparer.OrdinalIgnoreCase) { "target", "source" };
+        var sides = new[] { target, source };
+        for (int s = 0; s < sides.Length; s++)
+        {
+            if (sides[s] is not { } side)
+                continue;
+            for (int c = 0; c < side.FieldsList.Count; c++)
+            {
+                var field = side.FieldsList[c];
+                if (!shared.Contains(field.Name))
+                    columns.Add((field, s, c));
+            }
+        }
+        return columns;
+    }
+
+    private static Field SideField(string name, Apache.Arrow.Schema side) =>
+        new(name, new Apache.Arrow.Types.StructType(side.FieldsList.ToList()), nullable: false);
 
     /// <summary>
     /// The batch a MERGE condition is evaluated over: the target row's columns under a struct <c>target</c>, the
@@ -684,39 +742,20 @@ public sealed partial class DeltaTable
     private static RecordBatch MergeConditionBatch(RecordBatch? target, RecordBatch? source)
     {
         int length = target?.Length ?? source!.Length;
-        var fields = new List<Field>();
-        var columns = new List<IArrowArray>();
-        if (target is not null)
-            AddSide("target", target);
-        if (source is not null)
-            AddSide("source", source);
-
-        var targetNames = target?.Schema.FieldsList.Select(f => f.Name) ?? [];
-        var sourceNames = source?.Schema.FieldsList.Select(f => f.Name) ?? [];
-        var shared = new HashSet<string>(targetNames.Intersect(sourceNames, StringComparer.OrdinalIgnoreCase),
-            StringComparer.OrdinalIgnoreCase) { "target", "source" };
-        foreach (var side in new[] { target, source })
+        var sides = new[] { target, source };
+        var shape = MergeConditionColumns(target?.Schema, source?.Schema);
+        var columns = new List<IArrowArray>(shape.Count);
+        foreach (var (field, s, c) in shape)
         {
-            if (side is null)
-                continue;
-            for (int c = 0; c < side.ColumnCount; c++)
-            {
-                var field = side.Schema.FieldsList[c];
-                if (shared.Contains(field.Name))
-                    continue;
-                fields.Add(field);
-                columns.Add(side.Column(c));
-            }
+            var side = sides[s]!;
+            columns.Add(c >= 0
+                ? side.Column(c)
+                : new StructArray(
+                    (Apache.Arrow.Types.StructType)field.DataType, side.Length,
+                    Enumerable.Range(0, side.ColumnCount).Select(i => side.Column(i)).ToList(),
+                    ArrowBuffer.Empty, nullCount: 0));
         }
-        return new RecordBatch(new Apache.Arrow.Schema(fields, null), columns, length);
-
-        void AddSide(string name, RecordBatch side)
-        {
-            var type = new Apache.Arrow.Types.StructType(side.Schema.FieldsList.ToList());
-            var children = Enumerable.Range(0, side.ColumnCount).Select(c => side.Column(c)).ToList();
-            fields.Add(new Field(name, type, nullable: false));
-            columns.Add(new StructArray(type, side.Length, children, ArrowBuffer.Empty, nullCount: 0));
-        }
+        return new RecordBatch(new Apache.Arrow.Schema(shape.Select(x => x.Field), null), columns, length);
     }
 
     /// <summary>

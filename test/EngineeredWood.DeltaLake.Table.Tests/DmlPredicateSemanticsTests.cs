@@ -349,4 +349,213 @@ public class DmlPredicateSemanticsTests : IDisposable
 
         Assert.Equal(1, deleted);
     }
+
+    // ── A column the table does not have is refused before anything is read (#593) ──
+
+    private static Expressions.Expression Column(string name, bool bound) =>
+        bound ? new BoundReference(99, name) : new UnboundReference(name);
+
+    /// <summary>
+    /// The evaluator raises a missing column only over a batch it is handed, so an empty table used to commit a
+    /// no-op where a table with a file threw. Spark refuses at analysis (UNRESOLVED_COLUMN), whatever the data.
+    /// </summary>
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    public async Task Delete_UnknownColumn_IsRefusedWhetherOrNotARowIsRead(bool empty, bool bound)
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, true)).Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
+        if (!empty)
+            await table.WriteAsync([new RecordBatch(schema, [new Int64Array.Builder().Append(1).Build()], 1)]);
+        long before = table.CurrentSnapshot.Version;
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.DeleteAsync(
+            X.Equal(Column("nope", bound), X.Lit(LiteralValue.Of(1L)))));
+
+        Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
+        Assert.Contains("'nope'", ex.Message);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task Delete_UnknownColumn_IsRefusedWhenEveryFileIsPruned()
+    {
+        await using var table = await TableAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.DeleteAsync(X.And(
+            X.Equal("id", LiteralValue.Of(100L)), X.Equal("nope", LiteralValue.Of(1L)))));
+
+        Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task Delete_UnknownNestedField_IsRefusedOnAnEmptyTable()
+    {
+        var point = new StructType([new Field("x", Int64Type.Default, true)]);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("p", point, true)).Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.DeleteAsync(
+            X.Equal(UnboundReference.FromParts(["p", "y"]), X.Lit(LiteralValue.Of(1L)))));
+
+        Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
+
+        // A field the struct has is not refused, matched ignoring case as the evaluator matches it.
+        var (deleted, _) = await table.DeleteAsync(
+            X.Equal(UnboundReference.FromParts(["P", "X"]), X.Lit(LiteralValue.Of(1L))));
+        Assert.Equal(0, deleted);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Update_UnknownColumn_IsRefusedOnAnEmptyTable(bool bound)
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, true)).Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
+        long before = table.CurrentSnapshot.Version;
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.UpdateAsync(
+            X.Equal(Column("nope", bound), X.Lit(LiteralValue.Of(1L))), batch => batch));
+
+        Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task Merge_MatchedConditionOnAnUnknownTargetColumn_IsRefusedWhenNoKeyMatches()
+    {
+        await using var table = await TableAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.MergeAsync(
+            [SourceRow(99, Day)],
+            new MergeOptions
+            {
+                Keys = ["id"],
+                WhenMatched = MergeAction.Update,
+                WhenMatchedCondition = X.Equal(Side("target", "nope"), X.Lit(LiteralValue.Of(1L))),
+            }));
+
+        Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task Merge_InsertConditionOnAnUnknownSourceColumn_IsRefusedForAnEmptySource()
+    {
+        await using var table = await TableAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.MergeAsync(
+            [],
+            new MergeOptions
+            {
+                Keys = ["id"],
+                WhenNotMatched = MergeAction.Insert,
+                WhenNotMatchedCondition = X.Equal(Side("source", "nope"), X.Lit(LiteralValue.Of(1L))),
+            }));
+
+        Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    /// <summary>The not-matched-by-source condition sees no source row, so <c>source.d</c> is unknown there.</summary>
+    [Fact]
+    public async Task Merge_SourcelessConditionOnTheSource_IsRefusedOnAnEmptyTable()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("d", Date32Type.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.MergeAsync(
+            [SourceRow(1, Day)],
+            new MergeOptions
+            {
+                Keys = ["id"],
+                WhenNotMatchedBySource = MergeAction.Delete,
+                WhenNotMatchedBySourceCondition = X.IsNull(Side("source", "d")),
+            }));
+
+        Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
+    }
+
+    /// <summary>
+    /// A source with no batches does not say which of the table's columns it has, so a matched condition may name
+    /// a target column bare: the source may not share it. Refusing it refused a MERGE whose other clauses are
+    /// valid.
+    /// </summary>
+    [Fact]
+    public async Task Merge_MatchedConditionOnABareTargetColumn_IsAcceptedForASourceWithNoBatches()
+    {
+        await using var table = await TableAsync();
+
+        var (metrics, _) = await table.MergeAsync(
+            [],
+            new MergeOptions
+            {
+                Keys = ["id"],
+                WhenMatched = MergeAction.Delete,
+                WhenMatchedCondition = X.IsNull("d"),
+                WhenNotMatchedBySource = MergeAction.Delete,
+            });
+
+        Assert.Equal(3, metrics.NumTargetRowsDeleted);
+    }
+
+    /// <summary>
+    /// The type check runs over an empty batch of the clause's shape, and building it can fail: a source the host
+    /// writes the bytes of is not normalized, so it may carry a dictionary column, which cannot be built empty.
+    /// That failure is swallowed with the type check; the name check must not be.
+    /// </summary>
+    [Fact]
+    public async Task Merge_UnknownSourceColumn_IsRefusedWhenTheEmptyBatchCannotBeBuilt()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("s", StringType.Default, true))
+            .Build();
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, schema, new DeltaTableOptions { DataFileWriter = new UnusedWriter() });
+        var dictionary = new DictionaryType(Int32Type.Default, StringType.Default, ordered: false);
+        var source = new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field("id", Int64Type.Default, true))
+                .Field(new Field("s", dictionary, true))
+                .Build(),
+            [
+                new Int64Array.Builder().Build(),
+                new DictionaryArray(dictionary, new Int32Array.Builder().Build(), new StringArray.Builder().Build()),
+            ],
+            0);
+        long before = table.CurrentSnapshot.Version;
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.MergeAsync(
+            [source],
+            new MergeOptions
+            {
+                Keys = ["id"],
+                WhenNotMatched = MergeAction.Insert,
+                WhenNotMatchedCondition = X.IsNull(Side("source", "nope")),
+            }));
+
+        Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    /// <summary>Makes the table one whose host writes the bytes; nothing here is written.</summary>
+    private sealed class UnusedWriter : IDataFileWriter
+    {
+        public ValueTask<long> WriteAsync(
+            IAsyncEnumerable<RecordBatch> batches, string relativePath, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("Nothing should be written.");
+    }
 }
