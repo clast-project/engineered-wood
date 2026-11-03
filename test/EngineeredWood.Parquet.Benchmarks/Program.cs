@@ -47,6 +47,12 @@ if (args.Length > 0 && args[0] == "rowcap-ab")
     return;
 }
 
+if (args.Length > 0 && args[0] == "rowgroup-parallel-ab")
+{
+    Environment.ExitCode = await RowGroupParallelAb.RunAsync(args);
+    return;
+}
+
 if (args.Length > 0 && args[0] == "dictpruning-ab")
 {
     Environment.ExitCode = await DictionaryPruningAb.RunAsync(args);
