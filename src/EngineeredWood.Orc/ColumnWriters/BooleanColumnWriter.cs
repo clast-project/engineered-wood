@@ -50,7 +50,7 @@ internal sealed class BooleanColumnWriter : ColumnWriter
     public override void FlushEncoders()
     {
         base.FlushEncoders();
-        _encoder.Flush();
+        _encoder.FlushCompletedBytes();
     }
 
     public override void GetStreamPositions(IList<ulong> positions)
@@ -58,7 +58,7 @@ internal sealed class BooleanColumnWriter : ColumnWriter
         base.GetStreamPositions(positions);
         positions.Add((ulong)_dataStream.Length);
         positions.Add(0); // byte RLE remaining
-        positions.Add(0); // bit offset
+        positions.Add((ulong)_encoder.PendingBits); // bits of the current byte that precede the row group
     }
 
     public override void GetPositionLayout(IList<int> extrasPerStream)

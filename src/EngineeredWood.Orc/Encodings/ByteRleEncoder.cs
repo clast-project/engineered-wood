@@ -104,6 +104,45 @@ internal sealed class BooleanEncoder
         }
     }
 
+    /// <summary>
+    /// <paramref name="count"/> true values: whole bytes go to the byte RLE as runs of 0xFF.
+    /// </summary>
+    public void WriteTrues(int count)
+    {
+        Span<bool> one = stackalloc bool[1];
+        one[0] = true;
+        while (count > 0 && _bitsUsed != 0)
+        {
+            WriteValues(one);
+            count--;
+        }
+
+        Span<byte> full = stackalloc byte[128];
+        full.Fill(0xFF);
+        int bytes = count / 8;
+        while (bytes > 0)
+        {
+            int n = Math.Min(bytes, full.Length);
+            _byteEncoder.WriteValues(full.Slice(0, n));
+            bytes -= n;
+        }
+
+        for (int i = count % 8; i > 0; i--)
+            WriteValues(one);
+    }
+
+    /// <summary>The bits written into the current byte, not yet emitted.</summary>
+    public int PendingBits => _bitsUsed;
+
+    /// <summary>
+    /// Emits every completed byte and ends the byte RLE run, but keeps the current byte's bits pending: a row
+    /// group may start mid-byte, and padding the byte out would insert bits a sequential reader reads as values.
+    /// A row group's position is then (stream length, 0, <see cref="PendingBits"/>): the byte that holds its
+    /// first value starts the next run, and that many of its bits belong to the previous row group.
+    /// </summary>
+    public void FlushCompletedBytes() => _byteEncoder.Flush();
+
+    /// <summary>Emits everything, padding the current byte with zeros. Only at the end of a stream.</summary>
     public void Flush()
     {
         if (_bitsUsed > 0)

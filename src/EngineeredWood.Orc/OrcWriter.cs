@@ -275,6 +275,18 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
 
         if (RowIndexEnabled && _currentStripeRowIndexes != null)
         {
+            // Every row group recorded PRESENT positions; a column whose stripe writes no PRESENT stream drops them.
+            for (int colIdx = 0; colIdx < _columnWriters.Count; colIdx++)
+            {
+                if (_columnWriters[colIdx].WritesPresentStream)
+                    continue;
+                foreach (var entry in _currentStripeRowIndexes[colIdx + 1].Entry)
+                {
+                    for (int k = 0; k < ColumnWriter.PresentPositionCount; k++)
+                        entry.Positions.RemoveAt(0);
+                }
+            }
+
             // Translate positions for compressed streams if needed
             if (_options.Compression != CompressionKind.None)
                 TranslateRowIndexPositions(streams);

@@ -102,7 +102,7 @@ public class CrossValidationTests
         return psi;
     }
 
-    private static bool IsPyArrowAvailable()
+    internal static bool IsPyArrowAvailable()
     {
         if (PythonExe == null) return false;
         try
@@ -839,7 +839,7 @@ public class CrossValidationTests
 
     /// <summary>Runs <paramref name="script"/> with <c>sys.argv[1]</c> = <paramref name="argument"/> and returns
     /// its standard output.</summary>
-    private static string RunPython(string script, string argument)
+    internal static string RunPython(string script, string argument)
     {
         var scriptPath = Path.Combine(Path.GetTempPath(), $"storc_pyarrow_{Guid.NewGuid():N}.py");
         try
