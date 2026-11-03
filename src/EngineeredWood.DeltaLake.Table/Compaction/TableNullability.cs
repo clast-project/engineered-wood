@@ -17,8 +17,12 @@ namespace EngineeredWood.DeltaLake.Table.Compaction;
 /// Taking the flags from the table schema makes every source agree.</para>
 ///
 /// <para>A column the table declares nullable is written nullable. One it declares NOT NULL is written required,
-/// unless the source has nulls in it: a file can predate the constraint, or come from a writer that did not enforce
-/// it, and a required Parquet column cannot hold them. A field the table schema does not describe keeps its
+/// unless the source has nulls in it that the Parquet writer would reach: a file can predate the constraint, or come
+/// from a writer that did not enforce it, and a required Parquet column cannot hold them. The incoming flag is not
+/// trusted for this, since a nested schema reconcile labels a passed-through child with the table's flag whatever
+/// it holds. A null the writer never reaches (a struct child's placeholder under a null parent, a value outside a
+/// list's offsets) does not count, as in the writer's own check: counting it would label two sources of the same
+/// data differently, and split them into separate files. A field the table schema does not describe keeps its
 /// flags.</para>
 /// </summary>
 internal static class TableNullability
@@ -38,8 +42,8 @@ internal static class TableNullability
             if (!byName.TryGetValue(fields[i].Name, out var target))
                 continue;
             var column = batch.Column(i);
-            var data = Align(column.Data, target.DataType);
-            bool nullable = Nullable(fields[i], target, data);
+            var data = Align(column.Data, target.DataType, AllSlots);
+            bool nullable = Nullable(target, column, AllSlots);
             if (ReferenceEquals(data, column.Data) && nullable == fields[i].IsNullable)
                 continue;
 
@@ -55,10 +59,17 @@ internal static class TableNullability
             : new RecordBatch(new Apache.Arrow.Schema(newFields, batch.Schema.Metadata), newColumns!, batch.Length);
     }
 
+    // The positions of an array the Parquet writer encodes, in the array's own logical index space (what IsNull
+    // takes); null means every position. Computed only when a null check needs it. The child mappings follow
+    // NestedLevelWriter, as RowGroupSchemaCheck's do.
+    private delegate IReadOnlyList<int>? WrittenSlots();
+
+    private static readonly WrittenSlots AllSlots = () => null;
+
     // The data with every nested field's nullability taken from the target type, or the same instance when nothing
-    // changes. Works on ArrayData throughout, whose children are unsliced: the parent keeps its offset, so the
-    // relabelled array addresses exactly the rows it did.
-    private static ArrayData Align(ArrayData data, IArrowType target)
+    // changes. Works on ArrayData, whose children are unsliced: the parent keeps its offset, so the relabelled array
+    // addresses exactly the rows it did. `slots` are the data's written positions.
+    private static ArrayData Align(ArrayData data, IArrowType target, WrittenSlots slots)
     {
         switch (data.DataType)
         {
@@ -66,10 +77,13 @@ internal static class TableNullability
             // flag follows the table.
             case MapType am when target is MapType tm:
             {
+                var map = (MapArray)ArrowArrayFactory.BuildArray(data);
                 var entries = data.Children[0];
-                var key = Align(entries.Children[0], tm.KeyField.DataType);
-                var value = Align(entries.Children[1], tm.ValueField.DataType);
-                bool valueNullable = Nullable(am.ValueField, tm.ValueField, value);
+                var entrySlots = StructChildSlots(entries, ListChildSlots(map, slots));
+                var key = Align(entries.Children[0], tm.KeyField.DataType, entrySlots);
+                var value = Align(entries.Children[1], tm.ValueField.DataType, entrySlots);
+                bool valueNullable = Nullable(
+                    tm.ValueField, ArrowArrayFactory.BuildArray(entries.Children[1]), entrySlots);
                 if (ReferenceEquals(key, entries.Children[0]) && ReferenceEquals(value, entries.Children[1])
                     && valueNullable == am.ValueField.IsNullable)
                 {
@@ -88,17 +102,22 @@ internal static class TableNullability
 
             case ListType al when Element(target) is { } te:
             {
-                var field = AlignElement(al.ValueField, te, data.Children[0], out var values);
+                var list = (ListArray)ArrowArrayFactory.BuildArray(data);
+                var field = AlignElement(al.ValueField, te, data.Children[0], ListChildSlots(list, slots), out var values);
                 return field is null ? data : Rebuilt(data, new ListType(field), values);
             }
             case LargeListType al when Element(target) is { } te:
             {
-                var field = AlignElement(al.ValueField, te, data.Children[0], out var values);
+                var list = (LargeListArray)ArrowArrayFactory.BuildArray(data);
+                var field = AlignElement(al.ValueField, te, data.Children[0], LargeListChildSlots(list, slots),
+                    out var values);
                 return field is null ? data : Rebuilt(data, new LargeListType(field), values);
             }
             case FixedSizeListType af when Element(target) is { } te:
             {
-                var field = AlignElement(af.ValueField, te, data.Children[0], out var values);
+                var list = (FixedSizeListArray)ArrowArrayFactory.BuildArray(data);
+                var field = AlignElement(af.ValueField, te, data.Children[0],
+                    FixedSizeListChildSlots(list, af.ListSize, slots), out var values);
                 return field is null ? data : Rebuilt(data, new FixedSizeListType(field, af.ListSize), values);
             }
 
@@ -108,6 +127,7 @@ internal static class TableNullability
                 foreach (var f in tst.Fields)
                     byName[f.Name] = f;
 
+                var childSlots = StructChildSlots(data, slots);
                 Field[]? fields = null;
                 ArrayData[]? children = null;
                 for (int i = 0; i < ast.Fields.Count; i++)
@@ -115,8 +135,8 @@ internal static class TableNullability
                     var actual = ast.Fields[i];
                     if (!byName.TryGetValue(actual.Name, out var t))
                         continue;
-                    var child = Align(data.Children[i], t.DataType);
-                    bool nullable = Nullable(actual, t, child);
+                    var child = Align(data.Children[i], t.DataType, childSlots);
+                    bool nullable = Nullable(t, ArrowArrayFactory.BuildArray(data.Children[i]), childSlots);
                     if (ReferenceEquals(child, data.Children[i]) && nullable == actual.IsNullable)
                         continue;
                     fields ??= [.. ast.Fields];
@@ -136,10 +156,11 @@ internal static class TableNullability
     }
 
     // The element field relabelled, or null when neither it nor its values change.
-    private static Field? AlignElement(Field actual, Field target, ArrayData child, out ArrayData values)
+    private static Field? AlignElement(
+        Field actual, Field target, ArrayData child, WrittenSlots childSlots, out ArrayData values)
     {
-        values = Align(child, target.DataType);
-        bool nullable = Nullable(actual, target, values);
+        values = Align(child, target.DataType, childSlots);
+        bool nullable = Nullable(target, ArrowArrayFactory.BuildArray(child), childSlots);
         return ReferenceEquals(values, child) && nullable == actual.IsNullable
             ? null
             : Relabel(actual, values.DataType, nullable);
@@ -157,13 +178,92 @@ internal static class TableNullability
     private static ArrayData Rebuilt(ArrayData data, IArrowType type, ArrayData child) =>
         new(type, data.Length, data.NullCount, data.Offset, data.Buffers, [child]);
 
-    private static bool Nullable(Field actual, Field target, ArrayData data) =>
-        target.IsNullable || (actual.IsNullable && HasNulls(data));
+    // Nullable when the table says so, or when the writer would reach a null in it. The incoming flag plays no
+    // part: see the class remarks.
+    private static bool Nullable(Field target, IArrowArray array, WrittenSlots slots) =>
+        target.IsNullable || HasWrittenNull(array, slots);
 
-    // Counted over the whole of an unsliced child, so a null the writers would never reach (under a null parent)
-    // still keeps the field nullable. That only costs a definition level.
-    private static bool HasNulls(ArrayData data) =>
-        data.NullCount > 0 || (data.NullCount < 0 && ArrowArrayFactory.BuildArray(data).NullCount > 0);
+    private static bool HasWrittenNull(IArrowArray array, WrittenSlots slots)
+    {
+        // A run-end encoded array has no validity of its own; its nulls are null runs in Values. Counted whole,
+        // which can only keep a field nullable.
+        if (array is RunEndEncodedArray ree)
+            return ree.Values.NullCount > 0;
+        if (array.NullCount == 0)
+            return false;
+        var written = slots();
+        if (written is null)
+            return true;
+        foreach (int slot in written)
+        {
+            if (array.IsNull(slot))
+                return true;
+        }
+        return false;
+    }
+
+    private static IEnumerable<int> Slots(int length, WrittenSlots slots) =>
+        slots() ?? Enumerable.Range(0, length);
+
+    // A struct's children are not sliced with it: written slot i of the struct is child slot offset + i, and a null
+    // struct slot writes no child.
+    private static WrittenSlots StructChildSlots(ArrayData parent, WrittenSlots slots) => () =>
+    {
+        var array = ArrowArrayFactory.BuildArray(parent);
+        var result = new List<int>();
+        foreach (int slot in Slots(array.Length, slots))
+        {
+            if (!array.IsNull(slot))
+                result.Add(parent.Offset + slot);
+        }
+        return result;
+    };
+
+    // ValueOffsets already applies the list's own offset.
+    private static WrittenSlots ListChildSlots(ListArray parent, WrittenSlots slots) => () =>
+    {
+        var result = new List<int>();
+        var offsets = parent.ValueOffsets;
+        foreach (int slot in Slots(parent.Length, slots))
+        {
+            if (parent.IsNull(slot))
+                continue;
+            for (int j = offsets[slot]; j < offsets[slot + 1]; j++)
+                result.Add(j);
+        }
+        return result;
+    };
+
+    private static WrittenSlots LargeListChildSlots(LargeListArray parent, WrittenSlots slots) => () =>
+    {
+        var result = new List<int>();
+        var offsets = parent.ValueOffsets;
+        foreach (int slot in Slots(parent.Length, slots))
+        {
+            if (parent.IsNull(slot))
+                continue;
+            for (long j = offsets[slot]; j < offsets[slot + 1]; j++)
+                result.Add(checked((int)j));
+        }
+        return result;
+    };
+
+    // A fixed-size list's child is not sliced with it either: slot i's elements start at (offset + i) * width.
+    private static WrittenSlots FixedSizeListChildSlots(FixedSizeListArray parent, int width, WrittenSlots slots) =>
+        () =>
+        {
+            var result = new List<int>();
+            int offset = parent.Data.Offset;
+            foreach (int slot in Slots(parent.Length, slots))
+            {
+                if (parent.IsNull(slot))
+                    continue;
+                int start = checked((offset + slot) * width);
+                for (int j = 0; j < width; j++)
+                    result.Add(start + j);
+            }
+            return result;
+        };
 
     private static Field Relabel(Field field, IArrowType type, bool nullable) =>
         new(field.Name, type, nullable, field.Metadata);
