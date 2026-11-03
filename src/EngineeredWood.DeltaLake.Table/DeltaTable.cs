@@ -509,6 +509,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             || DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(configurationBuilder);
         bool inCommitTimestampsEnabled = Log.InCommitTimestamp.IsEnabled(configurationBuilder);
         bool changeDataFeedEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(configurationBuilder);
+        bool typeWideningEnabled = Schema.TypeWidening.IsEnabled(configurationBuilder);
         bool v2CheckpointsEnabled = Checkpoint.CheckpointPolicy.WantsV2(configurationBuilder);
         var icebergCompatVersion = Schema.IcebergCompat.GetVersion(configurationBuilder);
 
@@ -703,6 +704,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             minWriterVersion = 7;
             readerFeatures.Add(DeletionVectors.DeletionVectorConfig.FeatureName);
             writerFeatures.Add(DeletionVectors.DeletionVectorConfig.FeatureName);
+        }
+
+        // Type widening — a READER+WRITER feature ('typeWidening', reader 3 / writer 7) that the
+        // delta.enableTypeWidening property enables, as Spark enables it (measured on 4.0.0: CREATE with the property
+        // alone is (3, 7) [typeWidening] / [typeWidening, appendOnly, invariants]). Declared from version 0 so the
+        // protocol matches the property before any column is widened; a reader that checks the feature before the
+        // property would otherwise see a table that allows widening without declaring it (#605).
+        if (typeWideningEnabled)
+        {
+            minReaderVersion = 3;
+            minWriterVersion = 7;
+            readerFeatures.Add(TypeWideningFeature);
+            writerFeatures.Add(TypeWideningFeature);
         }
 
         // Row tracking — a WRITER-only feature ('rowTracking', writer 7) that depends on the 'domainMetadata'

@@ -346,6 +346,54 @@ public class MergeSchemaTests : IDisposable
         return table;
     }
 
+    /// <summary>
+    /// <c>delta.enableTypeWidening=true</c> declares the <c>typeWidening</c> reader+writer feature from version 0, as
+    /// Spark does (#605; the Spark twins are in <c>ProtocolFloorPropertyInteropTests</c>), not only once a column is
+    /// widened.
+    /// </summary>
+    [Fact]
+    public async Task Create_WithTypeWidening_DeclaresTheFeature()
+    {
+        await using var table = await DeltaTable.CreateAsync(Fs, Schema(Int("id")), configuration: Widening);
+
+        var protocol = table.CurrentSnapshot.Protocol;
+        Assert.Equal((3, 7), (protocol.MinReaderVersion, protocol.MinWriterVersion));
+        Assert.Equal(["typeWidening"], protocol.ReaderFeatures!);
+        Assert.Equal(
+            ["appendOnly", "invariants", "typeWidening"],
+            protocol.WriterFeatures!.OrderBy(f => f, StringComparer.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("false")]
+    [InlineData("nonsense")]
+    public async Task Create_WithTypeWideningNotEnabled_DeclaresNothing(string value)
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            Fs, Schema(Int("id")),
+            configuration: new Dictionary<string, string> { [DeltaLake.Schema.TypeWidening.EnableKey] = value });
+
+        var protocol = table.CurrentSnapshot.Protocol;
+        Assert.Equal((1, 2), (protocol.MinReaderVersion, protocol.MinWriterVersion));
+        Assert.Null(protocol.ReaderFeatures);
+        Assert.Null(protocol.WriterFeatures);
+    }
+
+    [Fact]
+    public async Task Replace_WithTypeWidening_DeclaresTheFeature()
+    {
+        await using (await DeltaTable.CreateAsync(Fs, Schema(Int("id"))))
+        {
+        }
+
+        await using var table = await DeltaTable.CreateOrReplaceAsync(Fs, Schema(Int("id")), [], configuration: Widening);
+
+        var protocol = table.CurrentSnapshot.Protocol;
+        Assert.Equal((3, 7), (protocol.MinReaderVersion, protocol.MinWriterVersion));
+        Assert.Contains("typeWidening", protocol.ReaderFeatures!);
+        Assert.Contains("typeWidening", protocol.WriterFeatures!);
+    }
+
     [Fact]
     public async Task WiderType_IsWidened_WhenTheTableEnablesTypeWidening()
     {
@@ -356,7 +404,8 @@ public class MergeSchemaTests : IDisposable
             [new RecordBatch(schema, [Longs(5_000_000_000L), Strings("c")], 1)], mergeSchema: true);
 
         var kinds = ActionKinds(version);
-        Assert.Contains("protocol", kinds);
+        // The table declared typeWidening when it was created (#605), so the widening needs no protocol change.
+        Assert.DoesNotContain("protocol", kinds);
         Assert.Contains("metaData", kinds);
 
         var id = table.CurrentSnapshot.Schema.Fields[0];

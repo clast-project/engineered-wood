@@ -70,6 +70,11 @@ public class ProtocolFloorPropertyInteropTests : IDisposable
     [InlineData("delta.minWriterVersion=1;delta.appendOnly=true")]
     [InlineData("delta.minWriterVersion=1;delta.constraints.c=id > 0")]
     [InlineData("delta.minWriterVersion=7;delta.enableRowTracking=true")]
+    [InlineData("delta.enableTypeWidening=true")]
+    [InlineData("delta.enableTypeWidening=false")]
+    [InlineData("delta.minWriterVersion=7;delta.enableTypeWidening=true")]
+    [InlineData("delta.minWriterVersion=1;delta.enableTypeWidening=true")]
+    [InlineData("delta.enableTypeWidening=true;delta.enableDeletionVectors=true")]
     public async Task SameProtocolAndConfigurationAsSpark(string properties)
     {
         Spark.Require();
