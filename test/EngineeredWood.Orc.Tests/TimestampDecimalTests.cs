@@ -164,6 +164,55 @@ public class TimestampDecimalTests
         Assert.Equal(epochNanos, TimestampColumnReader.Value(data, secondary, zone: null));
     }
 
+    [Fact]
+    public void TheExtremes_ReadWithoutAnIntermediateOverflow()
+    {
+        // long.MinValue ns is -9,223,372,037 s + 145,224,192 ns; a Java writer stores -9,223,372,036 s and the
+        // reader takes the second off. seconds * 1e9 alone would underflow before the fraction is added.
+        long minData = -9_223_372_036L - TimestampColumnReader.OrcEpochSeconds;
+        Assert.Equal(long.MinValue,
+            TimestampColumnReader.Value(minData, TimestampColumnWriter.FormatNanos(145_224_192), zone: null));
+        // The C++ writer's form of the same value: truncated seconds, negative nanoseconds.
+        Assert.Equal(long.MinValue,
+            TimestampColumnReader.Value(-9_223_372_036L - TimestampColumnReader.OrcEpochSeconds,
+                TimestampColumnWriter.FormatNanos(-854_775_808), zone: null));
+        Assert.Equal(long.MaxValue,
+            TimestampColumnReader.Value(9_223_372_036L - TimestampColumnReader.OrcEpochSeconds,
+                TimestampColumnWriter.FormatNanos(854_775_807), zone: null));
+        // One past the end still overflows.
+        Assert.Throws<OverflowException>(() =>
+            TimestampColumnReader.Value(9_223_372_036L - TimestampColumnReader.OrcEpochSeconds,
+                TimestampColumnWriter.FormatNanos(854_775_808), zone: null));
+    }
+
+    [Fact]
+    public async Task CoarseUnits_AreWrittenBeyondTheNanosecondRange()
+    {
+        // 10,000,000,000 s is 2286-11-20: past what nanoseconds hold, but its seconds and milliseconds fit.
+        long[] seconds = [10_000_000_000L, -10_000_000_000L, 1];
+        var type = new TimestampType(TimeUnit.Second, "UTC");
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("ts", type, false)).Build();
+        var path = Path.Combine(Path.GetTempPath(), $"ew-coarse-{Guid.NewGuid():N}.orc");
+        try
+        {
+            await using (var writer = OrcWriter.Create(path, schema))
+            {
+                await writer.WriteBatchAsync(new RecordBatch(schema,
+                    [new TimestampArray(type, new ArrowBuffer.Builder<long>().AppendRange(seconds).Build(),
+                        ArrowBuffer.Empty, seconds.Length, 0, 0)], seconds.Length));
+                await writer.CloseAsync();
+            }
+            await using var reader = await OrcReader.OpenAsync(path);
+            var stats = reader.Footer.Statistics[1].TimestampStatistics;
+            Assert.Equal(-10_000_000_000_000L, stats.MinimumUtc);
+            Assert.Equal(10_000_000_000_000L, stats.MaximumUtc);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
     [SkippableFact]
     public void AWriterZone_GivesTheWallClockItWasWrittenWith_AcrossDaylightSaving()
     {
@@ -189,6 +238,12 @@ public class TimestampDecimalTests
 
         Assert.Equal("2015-07-01 12:00:00.0", JavaTimestamp(TimestampColumnReader.Value(summer, 0, zone)));
         Assert.Equal("2015-12-01 12:00:00.0", JavaTimestamp(TimestampColumnReader.Value(winter, 0, zone)));
+
+        // The pre-1970 correction belongs to the instant, not the wall clock: 1970-01-01 00:00:00.5Z is after
+        // the epoch, though its wall clock (1969-12-31 16:00:00.5 PST) is before it, so nothing is taken off.
+        Assert.Equal("1969-12-31 16:00:00.5", JavaTimestamp(TimestampColumnReader.Value(-epochLa, 47, zone)));
+        // 1969-12-31 23:59:58.5Z, as Java stores it (-1 s, 0.5 s), is corrected to 15:59:58.5 PST.
+        Assert.Equal("1969-12-31 15:59:58.5", JavaTimestamp(TimestampColumnReader.Value(-1 - epochLa, 47, zone)));
     }
 
     [Theory]
@@ -379,6 +434,63 @@ public class TimestampDecimalTests
         new EngineeredWood.Orc.Encodings.RleDecoderV2(
             new EngineeredWood.Orc.Encodings.OrcByteStream(bytes, 0, bytes.Length), signed: true).ReadValues(decoded);
         Assert.Equal(values, decoded);
+    }
+
+    [Fact]
+    public void UnsignedValuesWithTheTopBitSet_SurviveTheEncoder()
+    {
+        // SECONDARY is unsigned, but a negative timestamp's nanoseconds are a negative bit pattern: 0 and 1 ns
+        // alternating, with -1 ns at row 17, are 0/8 with one -8. Patched Base cannot hold that offset.
+        var values = new long[512];
+        for (int i = 0; i < values.Length; i++)
+            values[i] = TimestampColumnWriter.FormatNanos(i % 2);
+        values[17] = TimestampColumnWriter.FormatNanos(-1);
+
+        var buffer = new EngineeredWood.Buffers.GrowableBuffer();
+        var encoder = new EngineeredWood.Orc.Encodings.RleEncoderV2(buffer, signed: false);
+        encoder.WriteValues(values);
+        encoder.Flush();
+        var bytes = buffer.WrittenSpan.ToArray();
+
+        var decoded = new long[values.Length];
+        new EngineeredWood.Orc.Encodings.RleDecoderV2(
+            new EngineeredWood.Orc.Encodings.OrcByteStream(bytes, 0, bytes.Length), signed: false).ReadValues(decoded);
+        Assert.Equal(values, decoded);
+    }
+
+    [Fact]
+    public async Task NegativeNanoseconds_AmongPositiveOnes_RoundTrip()
+    {
+        var nanos = new long[512];
+        for (int i = 0; i < nanos.Length; i++)
+            nanos[i] = i % 2;
+        nanos[17] = -1;
+        var type = new TimestampType(TimeUnit.Nanosecond, "UTC");
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("ts", type, false)).Build();
+        var path = Path.Combine(Path.GetTempPath(), $"ew-negnanos-{Guid.NewGuid():N}.orc");
+        try
+        {
+            await using (var writer = OrcWriter.Create(path, schema))
+            {
+                await writer.WriteBatchAsync(new RecordBatch(schema,
+                    [new TimestampArray(type, new ArrowBuffer.Builder<long>().AppendRange(nanos).Build(),
+                        ArrowBuffer.Empty, nanos.Length, 0, 0)], nanos.Length));
+                await writer.CloseAsync();
+            }
+            await using var reader = await OrcReader.OpenAsync(path);
+            var read = new List<long>();
+            await foreach (var batch in reader.CreateRowReader())
+            {
+                var ts = (TimestampArray)batch.Column("ts");
+                for (int i = 0; i < ts.Length; i++)
+                    read.Add(ts.GetValue(i)!.Value);
+            }
+            Assert.Equal(nanos, read);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 
     [Fact]

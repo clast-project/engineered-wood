@@ -158,8 +158,9 @@ internal sealed class RleEncoderV2
             if (_signed ? values[i] > maxValue : (ulong)values[i] > (ulong)maxValue) maxValue = values[i];
         }
 
-        // Every offset must fit 63 bits, and a negative base needs a magnitude.
-        if (_signed && (minValue == long.MinValue || (ulong)(maxValue - minValue) > long.MaxValue))
+        // Every offset must fit 63 bits (for an unsigned stream too: SECONDARY holds a negative timestamp's
+        // nanoseconds as a negative bit pattern), and a negative base needs a magnitude.
+        if ((ulong)(maxValue - minValue) > long.MaxValue || (_signed && minValue == long.MinValue))
             return false;
 
         // Adjusted = value - base (all >= 0 as unsigned). values.Length <= MaxRunLength (512),
@@ -223,9 +224,9 @@ internal sealed class RleEncoderV2
             int lastPatchPos = 0;
             for (int i = 0; i < values.Length; i++)
             {
-                if (adjusted[i] > dataMask)
+                if ((ulong)adjusted[i] > (ulong)dataMask)
                 {
-                    long highBits = adjusted[i] >> dataWidth;
+                    long highBits = (long)((ulong)adjusted[i] >> dataWidth);
                     adjusted[i] &= dataMask; // keep only low bits in data
 
                     int relGap = i - lastPatchPos;

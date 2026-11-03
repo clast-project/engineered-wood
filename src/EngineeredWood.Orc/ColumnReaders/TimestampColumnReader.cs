@@ -144,13 +144,28 @@ internal sealed class TimestampColumnReader : ColumnReader
     /// </summary>
     internal static long Value(long data, long secondary, OrcWriterTimeZone? zone)
     {
-        long seconds = zone is null
-            ? data + OrcEpochSeconds
-            : zone.WallClockSeconds(data);
+        long seconds = zone is null ? data + OrcEpochSeconds : zone.InstantSeconds(data);
         long nanos = ParseNanos(secondary);
-        // The Java writer's quirk; see the remarks.
+        // The Java writer's quirk (see the remarks). It truncated the instant, so it is undone on the instant,
+        // before any zone conversion, as the Java reader does.
         if (seconds < 0 && nanos > 999_999)
             seconds--;
+        if (zone is not null)
+            seconds = zone.WallClockSeconds(seconds);
+
+        // Seconds and nanoseconds of opposite signs are brought to one sign first, so that only a result that
+        // does not fit overflows, not an intermediate product (long.MinValue nanoseconds is -9,223,372,037 s
+        // plus 145,224,192 ns).
+        if (seconds < 0 && nanos > 0)
+        {
+            seconds++;
+            nanos -= 1_000_000_000L;
+        }
+        else if (seconds > 0 && nanos < 0)
+        {
+            seconds--;
+            nanos += 1_000_000_000L;
+        }
         return checked(seconds * 1_000_000_000L + nanos);
     }
 
@@ -231,13 +246,13 @@ internal sealed class OrcWriterTimeZone
             or "Universal" or "Etc/Zulu" or "Zulu" or "Etc/Greenwich" or "Greenwich" or "GMT0" or "Etc/GMT0"
             or "GMT+0" or "GMT-0" or "Etc/GMT+0" or "Etc/GMT-0";
 
-    /// <summary>The wall clock, as seconds read as UTC, of the instant <paramref name="data"/> seconds after
+    /// <summary>The instant, in seconds since the Unix epoch, <paramref name="data"/> seconds after
     /// 2015-01-01 00:00:00 in this zone.</summary>
-    internal long WallClockSeconds(long data)
-    {
-        long instant = data + _epochSeconds;
-        return instant + Offset(instant);
-    }
+    internal long InstantSeconds(long data) => data + _epochSeconds;
+
+    /// <summary>The wall clock in this zone, as seconds read as UTC, of <paramref name="instant"/> (seconds since
+    /// the Unix epoch).</summary>
+    internal long WallClockSeconds(long instant) => instant + Offset(instant);
 
     private long Offset(long instant)
     {

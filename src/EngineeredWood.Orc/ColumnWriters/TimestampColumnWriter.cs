@@ -39,6 +39,8 @@ internal sealed class TimestampColumnWriter : ColumnWriter
     {
         WritePresent(array);
         var a = (TimestampArray)array;
+        // A value is split in its own unit, so that only its fraction of a second is scaled to nanoseconds: a
+        // second-resolution value far outside 1677-2262 still fits, as long as its milliseconds do.
         long nanosPerUnit = ((TimestampType)a.Data.DataType).Unit switch
         {
             TimeUnit.Second => 1_000_000_000L,
@@ -46,6 +48,7 @@ internal sealed class TimestampColumnWriter : ColumnWriter
             TimeUnit.Microsecond => 1_000L,
             _ => 1L,
         };
+        long unitsPerSecond = 1_000_000_000L / nanosPerUnit;
         Span<long> sec = stackalloc long[1];
         Span<long> nano = stackalloc long[1];
 
@@ -53,19 +56,21 @@ internal sealed class TimestampColumnWriter : ColumnWriter
         {
             if (!a.IsValid(i)) continue;
 
-            long epochNanos = checked(a.GetValue(i)!.Value * nanosPerUnit);
+            long value = a.GetValue(i)!.Value;
             // Statistics and the Bloom filter are in milliseconds since the Unix epoch, floored.
-            long millis = FloorDiv(epochNanos, 1_000_000L);
+            long millis = nanosPerUnit >= 1_000_000L
+                ? checked(value * (nanosPerUnit / 1_000_000L))
+                : FloorDiv(value, 1_000_000L / nanosPerUnit);
             _hasValues = true;
             if (millis < _minMillis) _minMillis = millis;
             if (millis > _maxMillis) _maxMillis = millis;
             BloomFilter?.AddLong(millis);
 
             // Truncated toward zero: the nanoseconds keep the value's sign.
-            long seconds = Math.DivRem(epochNanos, 1_000_000_000L, out long nanos);
+            long seconds = Math.DivRem(value, unitsPerSecond, out long fraction);
 
-            sec[0] = seconds - ColumnReaders.TimestampColumnReader.OrcEpochSeconds;
-            nano[0] = FormatNanos(nanos);
+            sec[0] = checked(seconds - ColumnReaders.TimestampColumnReader.OrcEpochSeconds);
+            nano[0] = FormatNanos(fraction * nanosPerUnit);
             _dataEncoder.WriteValues(sec);
             _secondaryEncoder.WriteValues(nano);
         }
