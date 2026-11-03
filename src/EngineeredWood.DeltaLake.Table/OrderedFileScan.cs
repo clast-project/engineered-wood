@@ -54,6 +54,6 @@ internal static class OrderedFileScan<T>
             throw new ArgumentOutOfRangeException(nameof(maxConcurrentFiles), maxConcurrentFiles, "Must be at least 1.");
         return OrderedScan.RunAsync(
             OrderedScan.Range(fileCount), readFile, sizeOf, dispose,
-            (int)Math.Min(maxConcurrentFiles, Math.Max(1, fileCount)), budget, cancellationToken);
+            (int)Math.Min(maxConcurrentFiles, Math.Max(1, fileCount)), budget, cancellationToken: cancellationToken);
     }
 }

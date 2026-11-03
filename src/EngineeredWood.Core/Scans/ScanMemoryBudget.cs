@@ -39,6 +39,9 @@ internal sealed class ScanReservation
     /// underestimate of the full-size batch after it. So a reservation can only fall short on a unit's
     /// first batch, or on one larger than any before it.
     /// </summary>
+    /// <summary>What this unit's next reservation will be, for tests.</summary>
+    internal long Estimate => _estimate;
+
     internal void Observe(long bytes)
     {
         if (bytes > _estimate)

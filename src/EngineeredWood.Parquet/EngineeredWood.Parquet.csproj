@@ -48,6 +48,8 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="EngineeredWood.Parquet.Tests" />
+    <!-- A Delta scan schedules each file's row groups itself (#612): PlanRowGroupsAsync / ReadPlannedAsync. -->
+    <InternalsVisibleTo Include="EngineeredWood.DeltaLake.Table" />
     <InternalsVisibleTo Include="EngineeredWood.Parquet.Benchmarks" />
     <InternalsVisibleTo Include="EngineeredWood.Parquet.TestTool" />
     <InternalsVisibleTo Include="EngineeredWood.Tests" />

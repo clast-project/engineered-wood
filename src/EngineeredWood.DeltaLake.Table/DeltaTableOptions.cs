@@ -58,37 +58,42 @@ public sealed record DeltaTableOptions
     public long TargetFileSize { get; init; } = 128L * 1024 * 1024;
 
     /// <summary>
-    /// How many data files a table scan reads at once. Default: null, which means
-    /// <c>min(4, Environment.ProcessorCount)</c> with the built-in reader and 1 with a
-    /// <see cref="DataFileReader"/>. 1 reads the files one after another, as before #607.
+    /// How many reads a table scan runs at once. With the built-in reader a read is one row group of one data
+    /// file (#612), so a few large files, or one large file among small ones, still keep every read busy;
+    /// through a <see cref="DataFileReader"/>, which hides a file's row groups, it is one whole file. Default:
+    /// null, which means <c>min(4, Environment.ProcessorCount)</c> with the built-in reader and 1 with a
+    /// <see cref="DataFileReader"/>. 1 reads everything one after another, as before #607.
     /// </summary>
     /// <remarks>
     /// <para>Batches still come out in the order a serial read gives — the snapshot's path-sorted file order,
-    /// then file order within a file — whatever order the files finish in. Applies to
-    /// <see cref="DeltaTable.ReadAsync"/> and the methods built on it (<c>ReadAllAsync</c>,
-    /// <c>ReadAtVersionAsync</c>, <c>ReadAtTimestampAsync</c>, <c>ReadRowsAsync</c>). DML, the change feed,
-    /// compaction and copy-on-write rewrites still read their files one at a time.</para>
+    /// then file order within a file — whatever order the reads finish in. Each file is opened once (its
+    /// footer, deletion vector and column resolution), up to this many files ahead of the one being planned,
+    /// and its row groups share it. Which row groups are read is decided in file order, by the same pruning as
+    /// a serial read. Applies to <see cref="DeltaTable.ReadAsync"/> and the methods built on it
+    /// (<c>ReadAllAsync</c>, <c>ReadAtVersionAsync</c>, <c>ReadAtTimestampAsync</c>). <c>ReadRowsAsync</c> reads
+    /// this many FILES at once, each whole. DML, the change feed, compaction and copy-on-write rewrites still
+    /// read their files one at a time.</para>
     /// <para>A <see cref="DataFileReader"/> reads serially unless this is set explicitly, because its
     /// contract never promised that two files may be read at once. Setting it above 1 declares that it may:
     /// its <see cref="IDataFileReader.ReadAsync"/> is then called for several files concurrently, each
     /// enumerated from a thread-pool thread.</para>
     /// <para>The memory a scan holds is bounded by <see cref="MaxBufferedReadBytes"/>, not by this.</para>
     /// </remarks>
-    public int? MaxConcurrentFileReads
+    public int? MaxConcurrentReads
     {
-        get => _maxConcurrentFileReads;
+        get => _maxConcurrentReads;
         init
         {
             if (value is < 1)
                 throw new ArgumentOutOfRangeException(nameof(value), value, "Must be at least 1, or null for the default.");
-            _maxConcurrentFileReads = value;
+            _maxConcurrentReads = value;
         }
     }
-    private readonly int? _maxConcurrentFileReads;
+    private readonly int? _maxConcurrentReads;
 
     /// <summary>
-    /// The decoded data, in bytes of Arrow buffers, a scan reading several files at once
-    /// (<see cref="MaxConcurrentFileReads"/>) may hold that the caller has not yet received. Default: 256 MiB.
+    /// The decoded data, in bytes of Arrow buffers, a scan running several reads at once
+    /// (<see cref="MaxConcurrentReads"/>) may hold that the caller has not yet received. Default: 256 MiB.
     /// </summary>
     /// <remarks>
     /// <para>A file reserves budget BEFORE it decodes each batch, and the reservation is released when the
@@ -104,7 +109,7 @@ public sealed record DeltaTableOptions
     /// overran its first reservation. Through a <see cref="DataFileReader"/> there is no footer, and a file's
     /// first batch is not reserved for at all.</para>
     /// <para>Not counted: each file's open reader and footer, a deletion vector's row set (#610), and the
-    /// transient copies a batch goes through on its way out. A serial read (<see cref="MaxConcurrentFileReads"/>
+    /// transient copies a batch goes through on its way out. A serial read (<see cref="MaxConcurrentReads"/>
     /// of 1) does not use the budget at all.</para>
     /// </remarks>
     public long MaxBufferedReadBytes
