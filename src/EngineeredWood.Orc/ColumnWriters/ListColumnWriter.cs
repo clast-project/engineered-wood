@@ -31,9 +31,8 @@ internal sealed class ListColumnWriter : ColumnWriter
         WritePresent(array);
         var listArray = (ListArray)array;
 
-        // Write lengths for each list entry and collect element arrays
+        // Write lengths for each list entry
         Span<long> len = stackalloc long[1];
-        int totalElements = 0;
 
         for (int i = 0; i < listArray.Length; i++)
         {
@@ -47,14 +46,10 @@ internal sealed class ListColumnWriter : ColumnWriter
             if (length < _minChildren) _minChildren = length;
             if (length > _maxChildren) _maxChildren = length;
             _totalChildren += length;
-            totalElements += length;
         }
 
-        // Write all element values as one batch
-        if (_elementWriter != null && totalElements > 0)
-        {
-            _elementWriter.Write(listArray.Values);
-        }
+        // Only the valid entries' elements: see ColumnWriter.ValidChildRanges.
+        WriteParts(_elementWriter, listArray.Values, ValidChildRanges(listArray, listArray.ValueOffsets));
     }
 
     public override ColumnStatistics GetStatistics()

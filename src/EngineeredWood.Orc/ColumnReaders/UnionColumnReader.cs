@@ -80,18 +80,28 @@ internal sealed class UnionColumnReader : ColumnReader
                 childArrays[i] = ArrowCompute.MakeNullArray(_schema.Children[i].ToArrowType(), 0);
         }
 
-        // Build offsets for dense union: maps each row to its index within the child array
+        // Build offsets for dense union: maps each row to its index within the child array. A union has no
+        // validity bitmap, so a null row (its own, or one its parent struct does not have) points at a null
+        // appended to branch 0 for it: in bounds, and null, whatever the branch holds.
         var offsets = new int[batchSize];
         var childOffsets = new int[_childReaders.Count];
+        int nullRows = batchSize - nonNullCount;
+        int firstNull = childOffsets.Length > 0 ? childArrays[0].Length : 0;
         for (int i = 0; i < batchSize; i++)
         {
+            if (present != null && !present[i])
+            {
+                offsets[i] = firstNull++;
+                continue;
+            }
             int tag = fullTags[i];
             if (tag < childOffsets.Length)
-            {
-                offsets[i] = childOffsets[tag];
-                if (present == null || present[i])
-                    childOffsets[tag]++;
-            }
+                offsets[i] = childOffsets[tag]++;
+        }
+        if (nullRows > 0 && childArrays.Length > 0)
+        {
+            childArrays[0] = ArrowCompute.Concatenate(
+                [childArrays[0], ArrowCompute.MakeNullArray(childArrays[0].Data.DataType, nullRows)]);
         }
 
         // Build fields for the union type

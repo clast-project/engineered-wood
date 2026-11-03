@@ -48,13 +48,11 @@ internal sealed class MapColumnWriter : ColumnWriter
             _totalChildren += length;
         }
 
-        // Write all key and value arrays
+        // Only the valid entries' keys and values: see ColumnWriter.ValidChildRanges.
         var keyValues = mapArray.KeyValues;
-        if (keyValues.Length > 0)
-        {
-            _keyWriter?.Write(keyValues.Fields[0]);
-            _valueWriter?.Write(keyValues.Fields[1]);
-        }
+        var ranges = ValidChildRanges(mapArray, mapArray.ValueOffsets);
+        WriteParts(_keyWriter, keyValues.Fields[0], ranges);
+        WriteParts(_valueWriter, keyValues.Fields[1], ranges);
     }
 
     public override ColumnStatistics GetStatistics()

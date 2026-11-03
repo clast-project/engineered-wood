@@ -20,15 +20,23 @@ internal sealed class StructColumnReader : ColumnReader
     public void AddChildReader(ColumnReader reader) => _childReaders.Add(reader);
     public IReadOnlyList<ColumnReader> ChildReaders => _childReaders;
 
+    /// <summary>The file was written by EngineeredWood 0.1 or 0.2, which wrote a struct's children for every
+    /// row, null rows included (#585).</summary>
+    internal bool ChildrenForEveryRow { get; set; }
+
     public override IArrowArray ReadBatch(int batchSize)
     {
         var present = ReadPresent(batchSize);
         int nullCount = present == null ? 0 : batchSize - CountNonNull(present, batchSize);
 
-        // Read all child arrays
+        // A struct's children hold values only for its non-null rows. Each child reads the whole batch with this
+        // struct's present rows as its parent mask: a row the struct does not have is null in the child and takes
+        // nothing from its streams, so nothing is gathered or copied (#585).
+        var parentMask = nullCount > 0 && !ChildrenForEveryRow ? present : null;
         var childArrays = new IArrowArray[_childReaders.Count];
         for (int i = 0; i < _childReaders.Count; i++)
         {
+            _childReaders[i].ParentPresent = parentMask;
             childArrays[i] = _childReaders[i].ReadBatch(batchSize);
         }
 
