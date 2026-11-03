@@ -814,9 +814,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // this is NOT what Spark writes: measured against delta-spark 4.0.0, Spark emits a hybrid --
         // reader 2 (legacy) with writer 7 and writerFeatures [columnMapping, invariants, appendOnly].
         // Both are spec-legal and Spark reads ours (SparkInteropTests covers it); the difference is
-        // cosmetic, because writer v5's extra implied features only impose obligations on tables that
-        // actually declare a constraint or generated column, and HonorWriterFeatures already fails
-        // closed on those. See doc/known-issues.md, "Column-mapping protocol shape differs from Spark's".
+        // cosmetic, because writer v5's extra implied features (checkConstraints, generatedColumns,
+        // changeDataFeed) only impose obligations on a table that actually uses them, and EW meets those:
+        // the write paths that see the rows enforce constraints and compute generated columns, and
+        // HonorWriterFeatures refuses the one that cannot. The same holds when another feature forces
+        // reader 3 / writer 7 below: the legacy (2, 5) implied features are then NAMED, where Spark names
+        // only [columnMapping, invariants, appendOnly]. See doc/known-issues.md, "Column-mapping protocol
+        // shape differs from Spark's".
         if (mappingMode != ColumnMappingMode.None && !explicitFloor &&
             (minReaderVersion >= 3 || minWriterVersion >= 7))
         {

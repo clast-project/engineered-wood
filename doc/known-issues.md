@@ -1013,10 +1013,22 @@ Both halves are measured. Spark reads EW's form
 (`EwWritten_ColumnMapping_SparkResolvesPhysicalNamesToLogical`), and delta-rs
 1.6.2 rejects reader 2 (legacy) and reader 3 + a `columnMapping` reader
 feature alike. Writer v5's extra implied features
-(`checkConstraints` / `generatedColumns`) impose obligations only on tables
-that actually declare a constraint or generated column, and
-`HonorWriterFeatures` already fails closed on those — so the divergence is
-cosmetic. **Recommendation: leave it alone.** Full v3/v7 is strictly worse,
+(`checkConstraints` / `generatedColumns` / `changeDataFeed`) impose obligations
+only on a table that actually uses them, and EW meets those obligations: every
+write path that sees the rows enforces CHECK constraints and invariants and
+computes generated columns, and `CommitDataFilesAsync`, which commits files it
+never saw, refuses such a table unless the caller passes
+`constraintsEnforcedByCaller: true`. So the divergence is cosmetic.
+
+The same difference shows up in another form when a second feature (type
+widening, deletion vectors, ...) puts a column-mapped table at reader 3 /
+writer 7. EW then names every feature the legacy (2, 5) pair implied —
+`[appendOnly, changeDataFeed, checkConstraints, columnMapping, generatedColumns,
+invariants, ...]` — where Spark names only `[appendOnly, columnMapping,
+invariants, ...]` (measured on 4.0.0 with `delta.enableTypeWidening`, #605). It
+is harmless for the same reason.
+
+**Recommendation: leave it alone.** Full v3/v7 is strictly worse,
 raising the reader bar 2→3 for no gain. The read side needs no work either
 way: EW detects column mapping from `delta.columnMapping.mode` in the
 configuration rather than from the protocol version, so it already reads
