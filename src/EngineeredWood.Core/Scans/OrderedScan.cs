@@ -294,6 +294,7 @@ internal static class OrderedScan
             finally
             {
                 reservation.ReleasePending();
+                reservation.ReleaseHeld();
                 writer.TryComplete(error);
                 if (error is not null)
                 {

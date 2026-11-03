@@ -387,6 +387,55 @@ public class ParallelRowGroupReadTests : IDisposable
         }
     }
 
+    [Fact]
+    public async Task TheEstimate_CountsTheChunksTheReadDecodes()
+    {
+        // A struct column read by a dotted path, beside a flat one.
+        var structType = new StructType([new Field("a", Int64Type.Default, false), new Field("b", StringType.Default, false)]);
+        var id = new Int64Array.Builder();
+        var a = new Int64Array.Builder();
+        var b = new StringArray.Builder();
+        for (int i = 0; i < 4_000; i++)
+        {
+            id.Append(i);
+            a.Append(i * 3);
+            b.Append($"value-{i:D6}-padding");
+        }
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("st", structType, false))
+            .Build();
+        string path = Path.Combine(_tempDir, "struct.parquet");
+        using (var batch = new RecordBatch(schema,
+            [id.Build(), new StructArray(structType, 4_000, [a.Build(), b.Build()], ArrowBuffer.Empty, 0)], 4_000))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long Uncompressed(int column) => group.Columns[column].MetaData!.TotalUncompressedSize;
+        long Compressed(int column) => group.Columns[column].MetaData!.TotalCompressedSize;
+
+        // A dotted path resolves to its own leaf, as the read resolves it — not to nothing.
+        Assert.Equal((Uncompressed(2), Compressed(2)),
+            ParquetFileReader.PlannedBytes(group, parquetSchema, ["st.b"], null));
+        Assert.Equal((Uncompressed(1) + Uncompressed(2), Compressed(1) + Compressed(2)),
+            ParquetFileReader.PlannedBytes(group, parquetSchema, ["st"], null));
+
+        // Ranges scale a flat projection by the rows they keep, but not a nested one: that row group is
+        // decoded whole and then sliced.
+        RowRange[] quarter = [new RowRange(0, 1_000)];
+        Assert.Equal(Uncompressed(0) / 4, ParquetFileReader.PlannedBytes(group, parquetSchema, ["id"], quarter).Uncompressed);
+        Assert.Equal(Uncompressed(0) + Uncompressed(1) + Uncompressed(2),
+            ParquetFileReader.PlannedBytes(group, parquetSchema, null, quarter).Uncompressed);
+    }
+
     private async Task<long> DataOffsetAsync(int rowGroup)
     {
         await using var file = new LocalRandomAccessFile(_path);

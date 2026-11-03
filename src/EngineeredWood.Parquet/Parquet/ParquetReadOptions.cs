@@ -461,11 +461,12 @@ public sealed record ParquetReadOptions
     /// back, and a row group larger than the budget is read alone. Two exceptions keep the read from stalling:
     /// a batch is always admitted when nothing else is held, even if it alone is larger than the budget; and
     /// the row group the caller is waiting on may decode one batch over the budget.</para>
-    /// <para>A row group's first reservation is its projected size from the footer — uncompressed, scaled up by
-    /// the largest ratio of decoded to uncompressed size seen so far in the read, plus compressed, which is
-    /// held while it decodes. A batch that comes out larger is charged in full without waiting. The footer
-    /// UNDERestimates dictionary-encoded strings, so the first row groups in flight can overrun their
-    /// reservations; once one has been decoded, the ratio corrects the rest. A serial read
+    /// <para>A row group holds its projected compressed size from the footer for as long as it is being read,
+    /// since its column chunks are kept across the batches it yields. Its first batch reserves the projected
+    /// uncompressed size, scaled up by the largest ratio of decoded to uncompressed size seen so far in the read
+    /// (learnt from row groups read as one batch). A batch that comes out larger is charged in full without
+    /// waiting. The footer UNDERestimates dictionary-encoded strings, so the first row groups in flight can
+    /// overrun their reservations; once one has been decoded, the ratio corrects the rest. A serial read
     /// (<see cref="MaxConcurrentRowGroups"/> of 1) does not use the budget at all.</para>
     /// </remarks>
     public long MaxBufferedReadBytes

@@ -459,10 +459,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// As above, as one unit of a parallel read: reserves scan memory before each batch is decoded. The first
-    /// reservation is the row group's footer size (<see cref="PlannedBytes"/>) grown by how far decoded row
-    /// groups have exceeded theirs so far (<paramref name="growth"/>), plus its compressed bytes, which are
-    /// held while it decodes. Later batches of the same row group reserve the largest batch it has produced.
+    /// As above, as one unit of a parallel read: reserves scan memory before each batch is decoded.
+    /// <list type="bullet">
+    /// <item>Its compressed bytes are HELD for the whole read of the row group: the read keeps its column chunks
+    /// (or page windows) across the batches it yields, not only while one decodes.</item>
+    /// <item>The first batch reserves the row group's footer size (<see cref="PlannedBytes"/>), grown by how far
+    /// decoded row groups have exceeded theirs so far (<paramref name="growth"/>). Later batches of the same row
+    /// group reserve the largest batch it has produced.</item>
+    /// </list>
     /// </summary>
     private async IAsyncEnumerable<PositionedRecordBatch> ReadPlannedAsync(
         RowGroupPlan plan,
@@ -475,52 +479,61 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
         var (uncompressed, compressed) = PlannedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges);
-        reservation.SetInitialEstimate(growth.Apply(uncompressed) + compressed);
+        reservation.SetInitialEstimate(growth.Apply(uncompressed));
 
         long decoded = 0;
+        int batches = 0;
         var e = ReadPlannedAsync(plan, columnNames, cancellationToken).GetAsyncEnumerator(cancellationToken);
         try
         {
+            await reservation.HoldAsync(compressed, cancellationToken).ConfigureAwait(false);
             while (true)
             {
                 await reservation.ReserveNextAsync(cancellationToken).ConfigureAwait(false);
                 if (!await e.MoveNextAsync().ConfigureAwait(false))
                     break;
-                decoded += EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(e.Current.Batch);
+                decoded = EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(e.Current.Batch);
+                batches++;
                 yield return e.Current;
             }
         }
         finally
         {
             await e.DisposeAsync().ConfigureAwait(false);
+            reservation.ReleaseHeld();
         }
 
-        growth.Observe(uncompressed, decoded);
+        // Learnt only from a row group read as ONE batch. Batches split from one decode (a nested row group
+        // decoded whole, then sliced; a flat run shared by the batches that slice it) each count the whole
+        // buffers they share, so summing them would count the same memory many times over.
+        if (batches == 1)
+            growth.Observe(uncompressed, decoded);
     }
 
     /// <summary>
-    /// The Parquet footer's uncompressed and compressed sizes of the column chunks <paramref name="columnNames"/>
-    /// selects in <paramref name="rowGroup"/> (every chunk when null), scaled to the share of its rows that
-    /// <paramref name="ranges"/> keeps. An estimate made before anything is read: page-index narrowing reads
-    /// only the pages it keeps, and their share of a column's bytes is taken to be their share of its rows.
+    /// The Parquet footer's uncompressed and compressed sizes of the column chunks the read decodes in
+    /// <paramref name="rowGroup"/> — resolved as the read resolves <paramref name="columnNames"/>, dotted paths
+    /// included — scaled to the share of its rows that <paramref name="ranges"/> keeps. An estimate made before
+    /// anything is read: the share of a column's bytes on the pages kept is taken to be the share of its rows.
+    /// Not scaled when a projected column is nested, because such a row group is decoded whole and then sliced.
     /// </summary>
-    private static (long Uncompressed, long Compressed) PlannedBytes(
+    internal static (long Uncompressed, long Compressed) PlannedBytes(
         RowGroup rowGroup, SchemaDescriptor schema, IReadOnlyList<string>? columnNames, IReadOnlyList<RowRange>? ranges)
     {
-        HashSet<string>? wanted = columnNames is null ? null : new HashSet<string>(columnNames, StringComparer.Ordinal);
+        var (columns, chunks) = ResolveColumns(schema, rowGroup, columnNames);
         long uncompressed = 0, compressed = 0;
-        for (int c = 0; c < rowGroup.Columns.Count && c < schema.Columns.Count; c++)
+        bool nested = false;
+        for (int c = 0; c < chunks.Count; c++)
         {
-            if (wanted is not null && !wanted.Contains(schema.Columns[c].Path[0]))
-                continue;
-            if (rowGroup.Columns[c].MetaData is { } meta)
+            if (chunks[c].MetaData is { } meta)
             {
                 uncompressed += meta.TotalUncompressedSize;
                 compressed += meta.TotalCompressedSize;
             }
+            nested |= columns[c].Path.Count > 1 || columns[c].MaxRepetitionLevel > 0;
         }
 
-        if (ranges is not null && rowGroup.NumRows > 0)
+        if (ranges is not null && !nested && rowGroup.NumRows > 0)
         {
             long rows = 0;
             foreach (var r in ranges)

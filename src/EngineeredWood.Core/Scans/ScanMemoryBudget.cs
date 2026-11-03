@@ -16,6 +16,7 @@ internal sealed class ScanReservation
     private readonly int _unit;
     private long _pending;
     private long _estimate;
+    private long _held;
 
     internal ScanReservation(ScanMemoryBudget? budget, int unit)
     {
@@ -71,6 +72,29 @@ internal sealed class ScanReservation
         _budget.Adjust(actual - _pending);
         _pending = 0;
         Observe(actual);
+    }
+
+    /// <summary>
+    /// Waits until the budget can take <paramref name="bytes"/> more, and holds them until
+    /// <see cref="ReleaseHeld"/>: memory the unit's read keeps for its whole life rather than per item — a
+    /// Parquet row group's compressed column chunks, which its read holds across the batches it yields. Unlike
+    /// a pending reservation, a hold is not replaced when an item is settled.
+    /// </summary>
+    internal async ValueTask HoldAsync(long bytes, CancellationToken cancellationToken)
+    {
+        if (_budget is null || bytes <= 0)
+            return;
+        await _budget.ReserveAsync(_unit, bytes, cancellationToken).ConfigureAwait(false);
+        _held += bytes;
+    }
+
+    /// <summary>Releases what <see cref="HoldAsync"/> held. Safe to call more than once.</summary>
+    internal void ReleaseHeld()
+    {
+        if (_budget is null || _held == 0)
+            return;
+        _budget.Adjust(-_held);
+        _held = 0;
     }
 
     internal void ReleasePending()
