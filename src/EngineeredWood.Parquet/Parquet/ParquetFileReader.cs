@@ -11,6 +11,7 @@ using EngineeredWood.IO;
 using EngineeredWood.Parquet.Data;
 using EngineeredWood.Parquet.Metadata;
 using EngineeredWood.Parquet.Schema;
+using EngineeredWood.Scans;
 
 namespace EngineeredWood.Parquet;
 
@@ -280,7 +281,77 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken)
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var plans = PlanRowGroupsAsync(metadata, filter, columnNames, skipRows, cancellationToken);
 
+        // No wider than the file: a window past the row-group count only sizes the scheduler for units that
+        // cannot exist.
+        int concurrency = Math.Min(EffectiveConcurrentRowGroups, metadata.RowGroups.Count);
+        if (concurrency <= 1 || metadata.RowGroups.Count <= 1)
+        {
+            await foreach (var plan in plans.ConfigureAwait(false))
+            {
+                await foreach (var batch in ReadPlannedAsync(plan, columnNames, cancellationToken).ConfigureAwait(false))
+                    yield return batch;
+            }
+            yield break;
+        }
+
+        // Several row groups at once (#612). The plans are still made one after another, by the scan's single
+        // dispatcher, because pruning keeps state that is not thread-safe (the dictionary and Bloom filter
+        // windows, the page-index read-ahead); only the reads and decodes of planned row groups run
+        // concurrently, on this one reader, which is safe for them.
+        // The schema is built before the fan-out, so that the decodes find it cached rather than race to.
+        await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes);
+        LastScanBudget = budget;
+        var growth = new DecodedGrowth();
+        await foreach (var batch in OrderedScan.RunAsync(
+                           plans,
+                           (plan, reservation, token) => ReadPlannedAsync(plan, columnNames, reservation, growth, token),
+                           static b => EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(b.Batch),
+                           static b => b.Batch.Dispose(),
+                           concurrency,
+                           budget,
+                           cancellationToken).ConfigureAwait(false))
+        {
+            yield return batch;
+        }
+    }
+
+    /// <summary>The row groups a positioned read reads at once: <see cref="ParquetReadOptions.MaxConcurrentRowGroups"/>;
+    /// by default what the file suggests (<see cref="IReadConcurrencyHint"/>, an object store's requests in
+    /// flight), and otherwise <c>min(4, Environment.ProcessorCount)</c>, where a local read stops gaining.</summary>
+    private int EffectiveConcurrentRowGroups =>
+        _options.MaxConcurrentRowGroups
+        ?? ((_file as IReadConcurrencyHint)?.PreferredConcurrentReads is int hint and >= 1
+            ? hint
+            : Math.Min(4, Environment.ProcessorCount));
+
+    /// <summary>The memory budget of the most recent parallel read, for tests to read its
+    /// <see cref="ScanMemoryBudget.Peak"/>.</summary>
+    internal ScanMemoryBudget? LastScanBudget { get; private set; }
+
+    /// <summary>
+    /// One row group a positioned read will read: which one, the file position of its first row, the rows
+    /// within it (null for all of them), and the OffsetIndex bytes the pruning already read for its page maps.
+    /// </summary>
+    private readonly record struct RowGroupPlan(
+        int Index, long GroupStart, IReadOnlyList<RowRange>? Ranges, Dictionary<long, byte[]>? OffsetIndexes);
+
+    /// <summary>
+    /// Decides, in file order, which row groups a positioned read reads and which rows of each: the pruning by
+    /// statistics, dictionaries, Bloom filters and page indexes, and the runs <paramref name="skipRows"/> cuts
+    /// out. NOT thread-safe — the dictionary and Bloom filter windows and the page-index read-ahead are state of
+    /// this one enumeration — so it is enumerated once, in order, whether the reads it plans run serially or not.
+    /// </summary>
+    private async IAsyncEnumerable<RowGroupPlan> PlanRowGroupsAsync(
+        FileMetaData metadata,
+        EngineeredWood.Expressions.Predicate? filter,
+        IReadOnlyList<string>? columnNames,
+        RowSkipPredicate? skipRows,
+        [System.Runtime.CompilerServices.EnumeratorCancellation]
+        CancellationToken cancellationToken)
+    {
         // Decided for every group up front, from the footer alone, so that the read-ahead below can leave the
         // skipped groups out too: it would otherwise fetch their dictionaries or page indexes for nothing.
         var skipped = SkippedRowGroups(metadata, skipRows);
@@ -356,23 +427,156 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 }
             }
 
-            // Batches follow the ranges in order and never span the gap between two, so a cursor over
-            // the ranges places each one: its first row is the cursor, and the cursor moves on to the
-            // next range once a range's rows have all been returned.
-            int range = 0;
-            long cursor = ranges is null ? 0 : ranges[0].Start;
+            yield return new RowGroupPlan(i, groupStart, ranges, offsetIndexes);
+        }
+    }
 
-            // Always via the batching entry point, even with no batch limit configured: it falls back to
-            // the single-batch read itself when there is nothing to split, and it is where the implicit
-            // cap for an over-sized chunk is decided. Routing around it here would put that decision in
-            // two places and leave ReadAllAsync unable to read a file ReadRowGroupBatchesAsync can.
-            await foreach (var batch in ReadBatchesAsync(i, columnNames, ranges, offsetIndexes, cancellationToken)
-                .ConfigureAwait(false))
+    /// <summary>Reads one planned row group, pairing each batch with the file position of its first row.</summary>
+    private async IAsyncEnumerable<PositionedRecordBatch> ReadPlannedAsync(
+        RowGroupPlan plan,
+        IReadOnlyList<string>? columnNames,
+        [System.Runtime.CompilerServices.EnumeratorCancellation]
+        CancellationToken cancellationToken)
+    {
+        var ranges = plan.Ranges;
+
+        // Batches follow the ranges in order and never span the gap between two, so a cursor over
+        // the ranges places each one: its first row is the cursor, and the cursor moves on to the
+        // next range once a range's rows have all been returned.
+        int range = 0;
+        long cursor = ranges is null ? 0 : ranges[0].Start;
+
+        // Always via the batching entry point, even with no batch limit configured: it falls back to
+        // the single-batch read itself when there is nothing to split, and it is where the implicit
+        // cap for an over-sized chunk is decided. Routing around it here would put that decision in
+        // two places and leave ReadAllAsync unable to read a file ReadRowGroupBatchesAsync can.
+        await foreach (var batch in ReadBatchesAsync(plan.Index, columnNames, ranges, plan.OffsetIndexes, cancellationToken)
+            .ConfigureAwait(false))
+        {
+            yield return new PositionedRecordBatch(batch, plan.GroupStart + cursor);
+            cursor += batch.Length;
+            if (ranges is not null && cursor == ranges[range].End && range + 1 < ranges.Count)
+                cursor = ranges[++range].Start;
+        }
+    }
+
+    /// <summary>
+    /// As above, as one unit of a parallel read: reserves scan memory before each batch is decoded.
+    /// <list type="bullet">
+    /// <item>Its compressed bytes are HELD for the whole read of the row group: the read keeps its column chunks
+    /// (or page windows) across the batches it yields, not only while one decodes.</item>
+    /// <item>The first batch reserves the row group's footer size (<see cref="PlannedBytes"/>), grown by how far
+    /// decoded row groups have exceeded theirs so far (<paramref name="growth"/>). Later batches of the same row
+    /// group reserve the largest batch it has produced.</item>
+    /// </list>
+    /// </summary>
+    private async IAsyncEnumerable<PositionedRecordBatch> ReadPlannedAsync(
+        RowGroupPlan plan,
+        IReadOnlyList<string>? columnNames,
+        ScanReservation reservation,
+        DecodedGrowth growth,
+        [System.Runtime.CompilerServices.EnumeratorCancellation]
+        CancellationToken cancellationToken)
+    {
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        var (uncompressed, compressed) = PlannedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges);
+        reservation.SetInitialEstimate(growth.Apply(uncompressed));
+
+        long decoded = 0;
+        int batches = 0;
+        var e = ReadPlannedAsync(plan, columnNames, cancellationToken).GetAsyncEnumerator(cancellationToken);
+        try
+        {
+            await reservation.HoldAsync(compressed, cancellationToken).ConfigureAwait(false);
+            while (true)
             {
-                yield return new PositionedRecordBatch(batch, groupStart + cursor);
-                cursor += batch.Length;
-                if (ranges is not null && cursor == ranges[range].End && range + 1 < ranges.Count)
-                    cursor = ranges[++range].Start;
+                await reservation.ReserveNextAsync(cancellationToken).ConfigureAwait(false);
+                if (!await e.MoveNextAsync().ConfigureAwait(false))
+                    break;
+                decoded = EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(e.Current.Batch);
+                batches++;
+                yield return e.Current;
+            }
+        }
+        finally
+        {
+            await e.DisposeAsync().ConfigureAwait(false);
+            reservation.ReleaseHeld();
+        }
+
+        // Learnt only from a row group read as ONE batch. Batches split from one decode (a nested row group
+        // decoded whole, then sliced; a flat run shared by the batches that slice it) each count the whole
+        // buffers they share, so summing them would count the same memory many times over.
+        if (batches == 1)
+            growth.Observe(uncompressed, decoded);
+    }
+
+    /// <summary>
+    /// The Parquet footer's uncompressed and compressed sizes of the column chunks the read decodes in
+    /// <paramref name="rowGroup"/>, resolved as the read resolves <paramref name="columnNames"/>, dotted paths
+    /// included. The uncompressed size, which stands for the decoded batches, is scaled to the share of rows
+    /// <paramref name="ranges"/> keeps: an estimate made before anything is read, taking the share of a column's
+    /// bytes on the pages kept to be the share of its rows. It is not scaled when a projected column is nested,
+    /// because such a row group is decoded whole and then sliced. The compressed size is never scaled: a column
+    /// with no usable OffsetIndex gets its page map from a header scan, which reads and holds the whole chunk.
+    /// </summary>
+    internal static (long Uncompressed, long Compressed) PlannedBytes(
+        RowGroup rowGroup, SchemaDescriptor schema, IReadOnlyList<string>? columnNames, IReadOnlyList<RowRange>? ranges)
+    {
+        var (columns, chunks) = ResolveColumns(schema, rowGroup, columnNames);
+        long uncompressed = 0, compressed = 0;
+        bool nested = false;
+        for (int c = 0; c < chunks.Count; c++)
+        {
+            if (chunks[c].MetaData is { } meta)
+            {
+                uncompressed += meta.TotalUncompressedSize;
+                compressed += meta.TotalCompressedSize;
+            }
+            nested |= columns[c].Path.Count > 1 || columns[c].MaxRepetitionLevel > 0;
+        }
+
+        if (ranges is not null && !nested && rowGroup.NumRows > 0)
+        {
+            long rows = 0;
+            foreach (var r in ranges)
+                rows += r.End - r.Start;
+            uncompressed = (long)(uncompressed * Math.Min(1.0, (double)rows / rowGroup.NumRows));
+        }
+
+        return (uncompressed, compressed);
+    }
+
+    /// <summary>
+    /// How much larger decoded batches have come out than their row group's Parquet uncompressed size, across
+    /// the row groups of one parallel read: the largest ratio seen, never below 1. Parquet's uncompressed size
+    /// is close to the Arrow size for plain data and an UNDERestimate for dictionary-encoded strings, so without
+    /// this every row group would reserve too little before its decode, not only the first. Shared by the
+    /// read's producers, hence the lock.
+    /// </summary>
+    private sealed class DecodedGrowth
+    {
+        private readonly object _gate = new();
+        private double _ratio = 1.0;
+
+        internal long Apply(long uncompressed)
+        {
+            double ratio;
+            lock (_gate)
+                ratio = _ratio;
+            return (long)Math.Min(long.MaxValue / 4, uncompressed * ratio);
+        }
+
+        internal void Observe(long uncompressed, long decoded)
+        {
+            if (uncompressed <= 0 || decoded <= 0)
+                return;
+            double ratio = (double)decoded / uncompressed;
+            lock (_gate)
+            {
+                if (ratio > _ratio)
+                    _ratio = ratio;
             }
         }
     }

@@ -13,11 +13,12 @@ namespace EngineeredWood.IO.Azure;
 /// Concurrent requests are throttled via a semaphore.
 /// Multi-range reads automatically coalesce nearby ranges to reduce HTTP round-trips.
 /// </summary>
-public sealed class AzureBlobRandomAccessFile : IRandomAccessFile
+public sealed class AzureBlobRandomAccessFile : IRandomAccessFile, IReadConcurrencyHint
 {
     private readonly BlobClient _blobClient;
     private readonly BufferAllocator _allocator;
     private readonly SemaphoreSlim _semaphore;
+    private readonly int _maxConcurrency;
     private readonly bool _ownsSemaphore;
     private readonly CoalescingOptions _coalescingOptions;
     private long _cachedLength = -1;
@@ -31,6 +32,7 @@ public sealed class AzureBlobRandomAccessFile : IRandomAccessFile
         _blobClient = blobClient;
         _allocator = allocator ?? PooledBufferAllocator.Default;
         _semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+        _maxConcurrency = maxConcurrency;
         _ownsSemaphore = true;
         _coalescingOptions = coalescingOptions ?? new CoalescingOptions();
     }
@@ -50,6 +52,10 @@ public sealed class AzureBlobRandomAccessFile : IRandomAccessFile
     {
         _cachedLength = knownLength;
     }
+
+    /// <summary>The requests this file lets be in flight at once (its <c>maxConcurrency</c>): a reader that
+    /// can split its work sizes its default window to this rather than to the CPU (#612).</summary>
+    public int? PreferredConcurrentReads => _maxConcurrency;
 
     public async ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
     {

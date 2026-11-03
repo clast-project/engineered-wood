@@ -15,13 +15,14 @@ namespace EngineeredWood.IO.Gcs;
 /// Concurrent requests are throttled via a semaphore.
 /// Multi-range reads automatically coalesce nearby ranges to reduce HTTP round-trips.
 /// </summary>
-public sealed class GcsRandomAccessFile : IRandomAccessFile
+public sealed class GcsRandomAccessFile : IRandomAccessFile, IReadConcurrencyHint
 {
     private readonly StorageClient _client;
     private readonly string _bucket;
     private readonly string _objectName;
     private readonly BufferAllocator _allocator;
     private readonly SemaphoreSlim _semaphore;
+    private readonly int _maxConcurrency;
     private readonly CoalescingOptions _coalescingOptions;
     private long _cachedLength = -1;
 
@@ -47,6 +48,7 @@ public sealed class GcsRandomAccessFile : IRandomAccessFile
         _objectName = objectName ?? throw new ArgumentNullException(nameof(objectName));
         _allocator = allocator ?? PooledBufferAllocator.Default;
         _semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
+        _maxConcurrency = maxConcurrency;
         _coalescingOptions = coalescingOptions ?? new CoalescingOptions();
     }
 
@@ -69,6 +71,10 @@ public sealed class GcsRandomAccessFile : IRandomAccessFile
     }
 
     /// <inheritdoc/>
+    /// <summary>The requests this file lets be in flight at once (its <c>maxConcurrency</c>): a reader that
+    /// can split its work sizes its default window to this rather than to the CPU (#612).</summary>
+    public int? PreferredConcurrentReads => _maxConcurrency;
+
     public async ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
     {
         if (_cachedLength >= 0)

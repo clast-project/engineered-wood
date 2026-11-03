@@ -310,28 +310,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
 
     /// <summary>The bytes of a batch's Arrow buffers. A sliced batch is counted whole, so this can only
     /// overestimate.</summary>
-    internal static long EstimatedBytes(RecordBatch batch)
-    {
-        long bytes = 0;
-        for (int c = 0; c < batch.ColumnCount; c++)
-            bytes += EstimatedBytes(batch.Column(c).Data);
-        return bytes;
-    }
-
-    private static long EstimatedBytes(ArrayData data)
-    {
-        long bytes = 0;
-        foreach (var buffer in data.Buffers)
-            bytes += buffer.Length;
-        if (data.Children is { } children)
-        {
-            foreach (var child in children)
-                bytes += EstimatedBytes(child);
-        }
-        if (data.Dictionary is { } dictionary)
-            bytes += EstimatedBytes(dictionary);
-        return bytes;
-    }
+    internal static long EstimatedBytes(RecordBatch batch) => EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(batch);
 
     /// <summary>
     /// Whether batches of these two layouts can share a Parquet file: the same column names in the same order, of
