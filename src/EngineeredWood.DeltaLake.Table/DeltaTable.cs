@@ -9294,6 +9294,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             return (0, snapshot.Version);
 
         HonorWriterFeatures(snapshot, isAppend: false, WriteTimeExpressionHandling.RowsUnchanged);
+        // A rewrite, so the surviving rows' stable ids need the materialized columns, as ValidateWritable requires
+        // of every other rewriting path.
+        RejectRowTrackingWrite(snapshot);
         var plan = await ComputeCopyOnWriteDeleteActionsAsync(
             selection, snapshot, cancellationToken, written: written).ConfigureAwait(false);
         if (plan.Actions.Count == 0)
@@ -9953,6 +9956,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // recomputed, then CHECK constraints, invariants and NOT NULL are evaluated. Created before anything is
         // written, so an expression this writer cannot read still refuses the update up front.
         HonorWriterFeatures(snapshot, isAppend: false, WriteTimeExpressionHandling.ValidatedHere);
+        // A rewrite: without the materialized columns every row of the file would get a fresh stable id. Refused
+        // as ValidateWritable refuses it for UpdateAsync.
+        RejectRowTrackingWrite(snapshot);
         RejectCopyOnWriteRowIdUnsupported("copy-on-write UPDATE");
         var constraints = DeltaConstraintEnforcer.Create(snapshot);
         var generatedColumns = DeltaGeneratedColumns.Create(snapshot);
