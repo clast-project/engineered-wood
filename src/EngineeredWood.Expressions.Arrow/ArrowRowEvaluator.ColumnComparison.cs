@@ -160,6 +160,11 @@ public sealed partial class ArrowRowEvaluator
             _ => null,
         };
 
+        // The kernels read raw spans over the column's buffers -- Answer reads its null bitmap after
+        // an allocation -- and a caller's array may be backed by native memory that its finalizer
+        // frees. This one root covers every kernel. See doc/arrow-span-lifetime.md.
+        GC.KeepAlive(column);
+
         if (answer is not null)
             DirectComparisons++;
         return answer;
