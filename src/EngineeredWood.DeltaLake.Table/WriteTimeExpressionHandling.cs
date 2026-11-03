@@ -36,4 +36,14 @@ internal enum WriteTimeExpressionHandling
     /// false claim commits rows every later reader will trust.
     /// </remarks>
     AssertedByCaller,
+
+    /// <summary>
+    /// The path writes no new row values, so there is nothing to evaluate: a DELETE.
+    /// </summary>
+    /// <remarks>
+    /// A deletion vector only removes rows, and a copy-on-write rewrite carries the surviving rows
+    /// exactly as they were committed, generated values included. Spark's DELETE does not re-check
+    /// them either (#647). Not for a path that changes a value, however small the change.
+    /// </remarks>
+    RowsUnchanged,
 }
