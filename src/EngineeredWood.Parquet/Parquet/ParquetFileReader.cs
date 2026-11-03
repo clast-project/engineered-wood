@@ -283,7 +283,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var plans = PlanRowGroupsAsync(metadata, filter, columnNames, skipRows, cancellationToken);
 
-        int concurrency = EffectiveConcurrentRowGroups;
+        // No wider than the file: a window past the row-group count only sizes the scheduler for units that
+        // cannot exist.
+        int concurrency = Math.Min(EffectiveConcurrentRowGroups, metadata.RowGroups.Count);
         if (concurrency <= 1 || metadata.RowGroups.Count <= 1)
         {
             await foreach (var plan in plans.ConfigureAwait(false))
@@ -512,10 +514,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// The Parquet footer's uncompressed and compressed sizes of the column chunks the read decodes in
-    /// <paramref name="rowGroup"/> — resolved as the read resolves <paramref name="columnNames"/>, dotted paths
-    /// included — scaled to the share of its rows that <paramref name="ranges"/> keeps. An estimate made before
-    /// anything is read: the share of a column's bytes on the pages kept is taken to be the share of its rows.
-    /// Not scaled when a projected column is nested, because such a row group is decoded whole and then sliced.
+    /// <paramref name="rowGroup"/>, resolved as the read resolves <paramref name="columnNames"/>, dotted paths
+    /// included. The uncompressed size, which stands for the decoded batches, is scaled to the share of rows
+    /// <paramref name="ranges"/> keeps: an estimate made before anything is read, taking the share of a column's
+    /// bytes on the pages kept to be the share of its rows. It is not scaled when a projected column is nested,
+    /// because such a row group is decoded whole and then sliced. The compressed size is never scaled: a column
+    /// with no usable OffsetIndex gets its page map from a header scan, which reads and holds the whole chunk.
     /// </summary>
     internal static (long Uncompressed, long Compressed) PlannedBytes(
         RowGroup rowGroup, SchemaDescriptor schema, IReadOnlyList<string>? columnNames, IReadOnlyList<RowRange>? ranges)
@@ -538,9 +542,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             long rows = 0;
             foreach (var r in ranges)
                 rows += r.End - r.Start;
-            double share = Math.Min(1.0, (double)rows / rowGroup.NumRows);
-            uncompressed = (long)(uncompressed * share);
-            compressed = (long)(compressed * share);
+            uncompressed = (long)(uncompressed * Math.Min(1.0, (double)rows / rowGroup.NumRows));
         }
 
         return (uncompressed, compressed);

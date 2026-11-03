@@ -128,6 +128,7 @@ public class ParallelRowGroupReadTests : IDisposable
     [InlineData(2)]
     [InlineData(4)]
     [InlineData(64)]
+    [InlineData(int.MaxValue)]
     public async Task AWholeRead_IsTheSerialRead(int window)
     {
         var serial = await ReadAsync(Options(1));
@@ -428,10 +429,12 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.Equal((Uncompressed(1) + Uncompressed(2), Compressed(1) + Compressed(2)),
             ParquetFileReader.PlannedBytes(group, parquetSchema, ["st"], null));
 
-        // Ranges scale a flat projection by the rows they keep, but not a nested one: that row group is
-        // decoded whole and then sliced.
+        // Ranges scale a flat projection's uncompressed size by the rows they keep, but not a nested one's: that
+        // row group is decoded whole and then sliced. They never scale the compressed size, since a header scan
+        // holds the whole chunk.
         RowRange[] quarter = [new RowRange(0, 1_000)];
-        Assert.Equal(Uncompressed(0) / 4, ParquetFileReader.PlannedBytes(group, parquetSchema, ["id"], quarter).Uncompressed);
+        Assert.Equal((Uncompressed(0) / 4, Compressed(0)),
+            ParquetFileReader.PlannedBytes(group, parquetSchema, ["id"], quarter));
         Assert.Equal(Uncompressed(0) + Uncompressed(1) + Uncompressed(2),
             ParquetFileReader.PlannedBytes(group, parquetSchema, null, quarter).Uncompressed);
     }
