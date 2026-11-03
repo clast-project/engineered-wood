@@ -91,4 +91,62 @@ public class TableNullabilityTests
         var result = TableNullability.Apply(batch, table);
         Assert.False(((ListType)result.Schema.FieldsList[0].DataType).ValueField.IsNullable);
     }
+
+    // A one-slot list over a run-end encoded element whose rows are [null, 1, 2] (runs ending at 1, 2, 3), the slot
+    // covering rows from..3.
+    private static RecordBatch RunEndListBatch(int from)
+    {
+        var runEnds = new Int32Array.Builder().Append(1).Append(2).Append(3).Build();
+        var values = new Int64Array.Builder().AppendNull().Append(1).Append(2).Build();
+        var ree = new RunEndEncodedArray(runEnds, values);
+        var offsets = new ArrowBuffer.Builder<int>().Append(from).Append(3).Build();
+        var type = new ListType(new Field("element", ree.Data.DataType, true));
+        var list = new ListArray(type, 1, offsets, ree, ArrowBuffer.Empty, nullCount: 0);
+        return new RecordBatch(new Apache.Arrow.Schema([new Field("l", type, true)], null), [list], 1);
+    }
+
+    /// <summary>
+    /// A run-end encoded column's nulls are its null runs, read per row: one outside the written slots does not
+    /// count, one inside does.
+    /// </summary>
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(0, true)]
+    public void ARunEndEncodedNull_CountsOnlyInsideTheWrittenSlots(int from, bool expectNullable)
+    {
+        var batch = RunEndListBatch(from);
+        var elementType = ((ListType)batch.Schema.FieldsList[0].DataType).ValueField.DataType;
+        IReadOnlyList<Field> table =
+            [new Field("l", new ListType(new Field("element", elementType, nullable: false)), nullable: true)];
+
+        var result = TableNullability.Apply(batch, table);
+        Assert.Equal(expectNullable, ((ListType)result.Schema.FieldsList[0].DataType).ValueField.IsNullable);
+    }
+
+    /// <summary>
+    /// A map key takes the table's (required) flag even when a source labelled it optional, so two sources that
+    /// differ only in the key's label share a file.
+    /// </summary>
+    [Fact]
+    public void AMapKeyLabelledOptional_TakesTheTablesRequiredFlag()
+    {
+        static RecordBatch MapBatch(bool keyNullable)
+        {
+            var type = new MapType(
+                new Field("key", StringType.Default, keyNullable), new Field("value", Int64Type.Default, true));
+            var keys = new StringArray.Builder().Append("a").Build();
+            var values = new Int64Array.Builder().Append(1).Build();
+            var entries = new StructArray(type.KeyValueType, 1, [keys, values], ArrowBuffer.Empty, nullCount: 0);
+            var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(1).Build();
+            var map = new MapArray(type, 1, offsets, entries, ArrowBuffer.Empty, nullCount: 0);
+            return new RecordBatch(new Apache.Arrow.Schema([new Field("m", type, true)], null), [map], 1);
+        }
+
+        IReadOnlyList<Field> table = [MapBatch(keyNullable: false).Schema.FieldsList[0]];
+        var optional = TableNullability.Apply(MapBatch(keyNullable: true), table);
+        var required = TableNullability.Apply(MapBatch(keyNullable: false), table);
+
+        Assert.False(((MapType)optional.Schema.FieldsList[0].DataType).KeyField.IsNullable);
+        Assert.True(RollingDataFileWriter.SameLayout(optional.Schema.FieldsList, required.Schema.FieldsList));
+    }
 }

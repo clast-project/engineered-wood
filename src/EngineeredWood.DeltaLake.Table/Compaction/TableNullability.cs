@@ -73,8 +73,9 @@ internal static class TableNullability
     {
         switch (data.DataType)
         {
-            // MapType derives from ListType, so it is matched first. Map keys are always required; only the value's
-            // flag follows the table.
+            // MapType derives from ListType, so it is matched first. The key takes the table's flag as given (keys
+            // are required, and a key null is refused by the writer whatever the label says); the value follows the
+            // usual rule.
             case MapType am when target is MapType tm:
             {
                 var map = (MapArray)ArrowArrayFactory.BuildArray(data);
@@ -84,13 +85,14 @@ internal static class TableNullability
                 var value = Align(entries.Children[1], tm.ValueField.DataType, entrySlots);
                 bool valueNullable = Nullable(
                     tm.ValueField, ArrowArrayFactory.BuildArray(entries.Children[1]), entrySlots);
+                bool keyNullable = tm.KeyField.IsNullable;
                 if (ReferenceEquals(key, entries.Children[0]) && ReferenceEquals(value, entries.Children[1])
-                    && valueNullable == am.ValueField.IsNullable)
+                    && valueNullable == am.ValueField.IsNullable && keyNullable == am.KeyField.IsNullable)
                 {
                     return data;
                 }
                 var mapType = new MapType(
-                    Relabel(am.KeyField, key.DataType, am.KeyField.IsNullable),
+                    Relabel(am.KeyField, key.DataType, keyNullable),
                     Relabel(am.ValueField, value.DataType, valueNullable),
                     am.KeySorted);
                 var newEntries = new ArrayData(mapType.KeyValueType, entries.Length, entries.NullCount,
@@ -185,10 +187,23 @@ internal static class TableNullability
 
     private static bool HasWrittenNull(IArrowArray array, WrittenSlots slots)
     {
-        // A run-end encoded array has no validity of its own; its nulls are null runs in Values. Counted whole,
-        // which can only keep a field nullable.
+        // A run-end encoded array has no validity of its own: its nulls are null runs in Values, expanded per row
+        // exactly as the writers and RowGroupSchemaCheck read them, so a null run outside the written slots does
+        // not count.
         if (array is RunEndEncodedArray ree)
-            return ree.Values.NullCount > 0;
+        {
+            if (EngineeredWood.Parquet.Data.NestedLevelWriter.RunNulls(ree) is not { } runNulls)
+                return false;
+            var writtenRuns = slots();
+            if (writtenRuns is null)
+                return System.Array.IndexOf(runNulls, true) >= 0;
+            foreach (int slot in writtenRuns)
+            {
+                if (runNulls[slot])
+                    return true;
+            }
+            return false;
+        }
         if (array.NullCount == 0)
             return false;
         var written = slots();
