@@ -247,11 +247,11 @@ columns, base/delta file concepts) are not implemented.
 `ColumnarStripeStatistics` message defined in `orc_proto.proto` is
 neither written nor parsed.
 
-**Missing footer fields.** `Footer.WriterTimezone` and `Footer.Calendar`
-are never set. The spec recommends `PROLEPTIC_GREGORIAN` for new writers;
-without `Calendar`, Date/Timestamp interpretation is ambiguous to
-conformant readers. Without `WriterTimezone`, non-instant `Timestamp`
-columns cannot be correctly localized.
+**Missing footer field.** `Footer.Calendar` is never set. The spec
+recommends `PROLEPTIC_GREGORIAN` for new writers; without `Calendar`,
+Date/Timestamp interpretation is ambiguous to conformant readers. (Every
+stripe names `GMT` as its writer time zone since #584, so a non-instant
+`Timestamp` column is localized as UTC.)
 
 **Writer identification.** `OrcWriter` sets both `Footer.Writer` and
 `PostScript.WriterVersion` to the same constant `6`. The two fields have
@@ -269,34 +269,26 @@ different meanings, and only one of the values is right:
 The consequence is worse than cosmetic, because `writer_version` is only
 interpretable *relative to the writer id*. A reader that falls back to Java
 semantics for an unknown producer reads version 6 as "ORC-135 fixed
-(timestamp statistics use utc)" — a guarantee EngineeredWood does not meet,
-since it never populates `TimestampStatistics.MinimumUtc` / `MaximumUtc`
-(see the timestamp entry below).
+(timestamp statistics use utc)". EngineeredWood meets that one since #584
+(it fills `TimestampStatistics.MinimumUtc` / `MaximumUtc`), but any other
+version-gated behaviour is a guess.
 
 ### Correctness / interop issues
 
-**Timestamps use the Unix epoch instead of the ORC 2015-01-01 epoch, in
-both directions.** The ORC spec requires timestamp seconds to be stored as
-the offset from `2015-01-01T00:00:00 UTC`. `TimestampColumnWriter` writes
-raw Unix epoch seconds and `TimestampColumnReader` reads them back as-is,
-so files round-trip with ourselves and are off by 1,420,070,400 seconds
-(≈45 years) against everything else. That includes reading: EW reads
-`orc-file-11-format.orc`'s `ts` (Apache ORC's fixture) as 1955-03-13 where
-pyarrow reads 2000-03-12, so every timestamp in an ORC file from another
-writer comes back 45 years early. The writer also never populates the
-post-ORC-135 `TimestampStatistics.MinimumUtc` / `MaximumUtc` fields.
-[#584](https://github.com/clast-project/engineered-wood/issues/584).
+**Files EngineeredWood wrote before #584 / #583 are read by their own
+rules.** Until then the writer stored timestamps against the Unix epoch
+with its own nanosecond scale, and zigzag-encoded signed RLEv2 Patched
+Base runs; no other ORC reader reads either back. Such files carry
+`software_version` `"EngineeredWood.Orc 0.1"`, and the reader keeps reading
+them as they were written, so they still round-trip. Other readers still
+misread them; rewrite them with the current writer to fix that.
 
-**Decimals read wrong from other writers' files, and are effectively
-Decimal64.** ORC stores each value's scale in the SECONDARY stream, and
-`DecimalColumnReader` ignores it for precision ≤ 18 (rescaling only above
-that, in a `long`). All three decimal fixtures from Apache ORC read wrong:
-`over1k_bloom.orc` gives 4.54 where pyarrow gives 45.40, `decimal.orc`
--0.10005 for -1000.50000, and `orc-file-11-format.orc` 12345678 for
-12345678.654745. Separately, `DecimalColumnWriter.ReadDecimal128AsLong`
-reads only the low 8 bytes of each Arrow Decimal128 value, so values beyond
-63 bits are silently corrupted in both directions, statistics included.
-[#583](https://github.com/clast-project/engineered-wood/issues/583).
+**TIMESTAMP in a writer time zone on .NET Framework.** A non-instant
+`Timestamp` column in a stripe whose writer time zone is not UTC (Hive and
+Java writers record the JVM's zone, e.g. `America/Los_Angeles`) needs that
+zone's rules to recover the wall clock. On .NET Framework, which cannot
+resolve IANA zone names, reading such a column throws
+`NotSupportedException` naming the zone rather than guessing.
 
 **Sliced / gap-containing ListArrays are written wrong.**
 `ListColumnWriter.Write` emits `listArray.Values` wholesale without

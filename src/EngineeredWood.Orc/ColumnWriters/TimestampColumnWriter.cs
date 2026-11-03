@@ -9,6 +9,16 @@ using ProtoStream = EngineeredWood.Orc.Proto.Stream;
 
 namespace EngineeredWood.Orc.ColumnWriters;
 
+/// <summary>
+/// Writes an Arrow timestamp column as ORC <c>TIMESTAMP</c> (no zone: the wall clock) or <c>TIMESTAMP_INSTANT</c>.
+/// Every stripe names <c>GMT</c> as its writer time zone, so a <c>TIMESTAMP</c>'s wall clock is stored as if UTC.
+/// </summary>
+/// <remarks>
+/// As the C++ writer (pyarrow) writes it: DATA is the seconds since <c>2015-01-01 00:00:00 UTC</c>, truncated
+/// toward zero, and SECONDARY the rest in nanoseconds, with the value's sign, its trailing decimal zeros removed
+/// (<see cref="FormatNanos"/>). The C++ reader reads that back exactly for every value; see
+/// <see cref="ColumnReaders.TimestampColumnReader"/> for the Java writer's convention and its readers.
+/// </remarks>
 internal sealed class TimestampColumnWriter : ColumnWriter
 {
     private readonly GrowableBuffer _dataStream = new();
@@ -29,6 +39,16 @@ internal sealed class TimestampColumnWriter : ColumnWriter
     {
         WritePresent(array);
         var a = (TimestampArray)array;
+        // A value is split in its own unit, so that only its fraction of a second is scaled to nanoseconds: a
+        // second-resolution value far outside 1677-2262 still fits, as long as its milliseconds do.
+        long nanosPerUnit = ((TimestampType)a.Data.DataType).Unit switch
+        {
+            TimeUnit.Second => 1_000_000_000L,
+            TimeUnit.Millisecond => 1_000_000L,
+            TimeUnit.Microsecond => 1_000L,
+            _ => 1L,
+        };
+        long unitsPerSecond = 1_000_000_000L / nanosPerUnit;
         Span<long> sec = stackalloc long[1];
         Span<long> nano = stackalloc long[1];
 
@@ -36,36 +56,50 @@ internal sealed class TimestampColumnWriter : ColumnWriter
         {
             if (!a.IsValid(i)) continue;
 
-            long epochNanos = a.GetValue(i)!.Value;
-            long millis = epochNanos / 1_000_000L;
+            long value = a.GetValue(i)!.Value;
+            // Statistics and the Bloom filter are in milliseconds since the Unix epoch, floored.
+            long millis = nanosPerUnit >= 1_000_000L
+                ? checked(value * (nanosPerUnit / 1_000_000L))
+                : FloorDiv(value, 1_000_000L / nanosPerUnit);
             _hasValues = true;
             if (millis < _minMillis) _minMillis = millis;
             if (millis > _maxMillis) _maxMillis = millis;
             BloomFilter?.AddLong(millis);
 
-            long seconds = Math.DivRem(epochNanos, 1_000_000_000L, out long nanos);
-            if (nanos < 0) { seconds--; nanos += 1_000_000_000L; }
+            // Truncated toward zero: the nanoseconds keep the value's sign.
+            long seconds = Math.DivRem(value, unitsPerSecond, out long fraction);
 
-            sec[0] = seconds;
-            nano[0] = EncodeNanos(nanos);
+            sec[0] = checked(seconds - ColumnReaders.TimestampColumnReader.OrcEpochSeconds);
+            nano[0] = FormatNanos(fraction * nanosPerUnit);
             _dataEncoder.WriteValues(sec);
             _secondaryEncoder.WriteValues(nano);
         }
     }
 
-    private static long EncodeNanos(long nanos)
+    /// <summary>
+    /// ORC's nanosecond encoding, as the Java and C++ writers produce it: a value with at least two trailing
+    /// decimal zeros is stored with up to eight of them removed, and the low three bits count them less one.
+    /// Signed, for the C++ writer's negative nanoseconds.
+    /// </summary>
+    internal static long FormatNanos(long nanos)
     {
-        if (nanos == 0) return 0;
+        if (nanos == 0 || nanos % 100 != 0)
+            return nanos << 3;
 
-        // ORC encoding: trailing zeros determine scale
-        // scale 0 = nanoseconds, 1 = microseconds, 2 = milliseconds, 3 = seconds
-        int scale = 0;
-        long value = nanos;
-        if (value % 1000 == 0) { value /= 1000; scale = 1; }
-        if (scale > 0 && value % 1000 == 0) { value /= 1000; scale = 2; }
-        if (scale > 1 && value % 1000 == 0) { value /= 1000; scale = 3; }
+        nanos /= 100;
+        int zeros = 1;
+        while (nanos % 10 == 0 && zeros < 7)
+        {
+            nanos /= 10;
+            zeros++;
+        }
+        return (nanos << 3) | (long)zeros;
+    }
 
-        return (value << 3) | (long)scale;
+    private static long FloorDiv(long a, long b)
+    {
+        long q = a / b;
+        return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
     }
 
     public override ColumnStatistics GetStatistics()
@@ -73,10 +107,13 @@ internal sealed class TimestampColumnWriter : ColumnWriter
         var stats = base.GetStatistics();
         if (_hasValues)
         {
+            // The writer zone is GMT, so the local and UTC statistics are the same milliseconds.
             stats.TimestampStatistics = new TimestampStatistics
             {
                 Minimum = _minMillis,
                 Maximum = _maxMillis,
+                MinimumUtc = _minMillis,
+                MaximumUtc = _maxMillis,
             };
         }
         return stats;

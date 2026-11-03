@@ -33,6 +33,11 @@ internal abstract class ColumnReader
     /// </summary>
     public abstract IArrowArray ReadBatch(int batchSize);
 
+    /// <summary>The file was written by EngineeredWood before #584 (<c>"EngineeredWood.Orc 0.1"</c>): its signed
+    /// RLEv2 Patched Base runs and its timestamps follow that writer's rules, not the spec. Set before any stream
+    /// is assigned.</summary>
+    internal bool LegacyEngineeredWood { get; set; }
+
     /// <summary>
     /// Reads the PRESENT (null) bitmap for the given batch size.
     /// Returns null if no PRESENT stream exists (all values are non-null).

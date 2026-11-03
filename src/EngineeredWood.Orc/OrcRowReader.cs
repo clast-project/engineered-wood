@@ -311,6 +311,17 @@ public sealed class OrcRowReader : IAsyncEnumerable<RecordBatch>
             ColumnReader.Create(col, stripeData.Footer.Columns, allReaders);
         }
 
+        // Timestamps depend on the stripe's writer zone, and on whether EngineeredWood wrote the file before #584.
+        string? writerZone = stripeData.Footer.HasWriterTimezone ? stripeData.Footer.WriterTimezone : null;
+        bool legacy = _orcReader.Footer.HasSoftwareVersion
+            && _orcReader.Footer.SoftwareVersion == OrcWriter.LegacyTimestampSoftwareVersion;
+        foreach (var columnReader in allReaders.Values)
+        {
+            columnReader.LegacyEngineeredWood = legacy;
+            if (columnReader is TimestampColumnReader timestamps)
+                timestamps.Configure(writerZone, legacy);
+        }
+
         // Assign streams to column readers
         // All streams (index + data) are listed sequentially in the stripe footer,
         // laid out starting from offset 0 within the stripe bytes.

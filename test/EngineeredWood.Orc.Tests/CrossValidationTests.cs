@@ -834,4 +834,293 @@ public class CrossValidationTests
             File.Delete(path);
         }
     }
+
+    // ── #584 / #583: timestamps and decimals, exchanged as raw integers ──────────────────────────────────
+
+    /// <summary>Runs <paramref name="script"/> with <c>sys.argv[1]</c> = <paramref name="argument"/> and returns
+    /// its standard output.</summary>
+    private static string RunPython(string script, string argument)
+    {
+        var scriptPath = Path.Combine(Path.GetTempPath(), $"storc_pyarrow_{Guid.NewGuid():N}.py");
+        try
+        {
+            File.WriteAllText(scriptPath, script);
+            var p = Process.Start(PythonPsi($"\"{scriptPath}\" \"{argument}\""))!;
+            var stdout = p.StandardOutput.ReadToEnd();
+            var stderr = p.StandardError.ReadToEnd();
+            p.WaitForExit(30000);
+            if (p.ExitCode != 0)
+                throw new Exception($"PyArrow script failed (exit {p.ExitCode}):\n{stderr}");
+            return stdout.Trim();
+        }
+        finally
+        {
+            File.Delete(scriptPath);
+        }
+    }
+
+    /// <summary>Timestamps around the ORC epoch, before 1970 with and without fractions, and the
+    /// second-boundary cases the writers' conventions differ on.</summary>
+    private static readonly long[] TimestampNanos =
+    [
+        0, 1, 999_999, 1_000_000, 500_000_000, -1, -500_000_000, -999_999, -1_000_000, -1_000_000_000,
+        -1_500_000_000, -2_000_000_001, 1_420_070_400_000_000_000, 1_420_070_399_999_999_999,
+        -86_400_000_000_123, 123_456_789_123, 1_700_000_000_123_456_789, -2_208_988_800_000_000_001,
+    ];
+
+    private const string PyReadRaw =
+        "import sys, json, decimal, pyarrow as pa, pyarrow.orc as orc\n" +
+        "decimal.getcontext().prec = 50\n" +
+        "t = orc.read_table(sys.argv[1])\n" +
+        "out = {}\n" +
+        "for name in t.column_names:\n" +
+        "    col = t.column(name)\n" +
+        "    if pa.types.is_timestamp(col.type):\n" +
+        "        out[name] = {'tz': col.type.tz, 'unit': col.type.unit, 'values': col.cast(pa.int64()).to_pylist()}\n" +
+        "    else:\n" +
+        "        s = col.type.scale\n" +
+        "        out[name] = {'precision': col.type.precision, 'scale': s, 'values': [None if v is None else str(int(v.scaleb(s))) for v in col.to_pylist()]}\n" +
+        "print(json.dumps(out))\n";
+
+    [SkippableFact]
+    public async Task CrossValidate_Timestamps_EngineeredWoodToPyArrow()
+    {
+        Skip.If(!IsPyArrowAvailable(), "PyArrow is not installed.");
+        var path = GetTempPath();
+        try
+        {
+            long[] micros = [0, 1, -1, 1_420_070_400_000_001, -1_500_001];
+            var naive = new TimestampType(TimeUnit.Nanosecond, (string?)null);
+            var utc = new TimestampType(TimeUnit.Nanosecond, "UTC");
+            var us = new TimestampType(TimeUnit.Microsecond, (string?)null);
+            TimestampArray Make(TimestampType type, long[] values) =>
+                new(type, new ArrowBuffer.Builder<long>().AppendRange(values).Build(), ArrowBuffer.Empty, values.Length, 0, 0);
+            var schema = new Schema(
+                [new Field("naive", naive, false), new Field("utc", utc, false)], null);
+            var usSchema = new Schema([new Field("us", us, false)], null);
+
+            await using (var writer = OrcWriter.Create(path, schema))
+            {
+                await writer.WriteBatchAsync(new RecordBatch(schema,
+                    [Make(naive, TimestampNanos), Make(utc, TimestampNanos)], TimestampNanos.Length));
+                await writer.CloseAsync();
+            }
+            using (var doc = JsonDocument.Parse(RunPython(PyReadRaw, path)))
+            {
+                var root = doc.RootElement;
+                Assert.Equal(TimestampNanos, root.GetProperty("naive").GetProperty("values").EnumerateArray().Select(v => v.GetInt64()));
+                Assert.Equal(JsonValueKind.Null, root.GetProperty("naive").GetProperty("tz").ValueKind);
+                Assert.Equal(TimestampNanos, root.GetProperty("utc").GetProperty("values").EnumerateArray().Select(v => v.GetInt64()));
+                Assert.Equal("UTC", root.GetProperty("utc").GetProperty("tz").GetString());
+            }
+
+            // A microsecond column is written in nanoseconds, scaled; it was written raw, 1,000x off (#584).
+            File.Delete(path);
+            await using (var writer = OrcWriter.Create(path, usSchema))
+            {
+                await writer.WriteBatchAsync(new RecordBatch(usSchema, [Make(us, micros)], micros.Length));
+                await writer.CloseAsync();
+            }
+            using (var doc = JsonDocument.Parse(RunPython(PyReadRaw, path)))
+            {
+                Assert.Equal(micros.Select(m => m * 1000),
+                    doc.RootElement.GetProperty("us").GetProperty("values").EnumerateArray().Select(v => v.GetInt64()));
+            }
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [SkippableFact]
+    public async Task CrossValidate_Timestamps_PyArrowToEngineeredWood()
+    {
+        Skip.If(!IsPyArrowAvailable(), "PyArrow is not installed.");
+        var path = GetTempPath();
+        try
+        {
+            var values = string.Join(",", TimestampNanos);
+            RunPython(
+                "import sys, pyarrow as pa, pyarrow.orc as orc\n" +
+                $"v = [{values}]\n" +
+                "orc.write_table(pa.table({'naive': pa.array(v, pa.timestamp('ns')), 'utc': pa.array(v, pa.timestamp('ns', 'UTC'))}), sys.argv[1])\n",
+                path);
+
+            await using var reader = await OrcReader.OpenAsync(path);
+            var naive = new List<long>();
+            var utc = new List<long>();
+            await foreach (var batch in reader.CreateRowReader())
+            {
+                var n = (TimestampArray)batch.Column("naive");
+                var u = (TimestampArray)batch.Column("utc");
+                Assert.Null(((TimestampType)n.Data.DataType).Timezone);
+                Assert.Equal("UTC", ((TimestampType)u.Data.DataType).Timezone);
+                for (int i = 0; i < n.Length; i++)
+                {
+                    naive.Add(n.GetValue(i)!.Value);
+                    utc.Add(u.GetValue(i)!.Value);
+                }
+            }
+            Assert.Equal(TimestampNanos, naive);
+            Assert.Equal(TimestampNanos, utc);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    /// <summary>Unscaled decimal(38, 4) values, beyond 64 bits and at decimal(38)'s limits.</summary>
+    private static readonly string[] DecimalUnscaled =
+    [
+        "0", "1", "-1", "9223372036854775807", "9223372036854775808", "-9223372036854775809",
+        "123456789012345678901234567890", "99999999999999999999999999999999999999",
+        "-99999999999999999999999999999999999999",
+    ];
+
+    private static Decimal128Array Decimals(Decimal128Type type, string[] unscaled)
+    {
+        var bytes = new byte[unscaled.Length * 16];
+        for (int i = 0; i < unscaled.Length; i++)
+        {
+            var big = System.Numerics.BigInteger.Parse(unscaled[i], System.Globalization.CultureInfo.InvariantCulture);
+            var le = big.ToByteArray();
+            var dest = bytes.AsSpan(i * 16, 16);
+            dest.Fill(big.Sign < 0 ? (byte)0xFF : (byte)0);
+            le.AsSpan(0, Math.Min(16, le.Length)).CopyTo(dest);
+        }
+        return new Decimal128Array(new ArrayData(type, unscaled.Length, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(bytes)]));
+    }
+
+    private static string UnscaledAt(Decimal128Array array, int i)
+    {
+        var bytes = array.ValueBuffer.Span.Slice((array.Offset + i) * 16, 16).ToArray();
+        return new System.Numerics.BigInteger(bytes).ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    [SkippableFact]
+    public async Task CrossValidate_Decimals_EngineeredWoodToPyArrow()
+    {
+        Skip.If(!IsPyArrowAvailable(), "PyArrow is not installed.");
+        var path = GetTempPath();
+        try
+        {
+            var wide = new Decimal128Type(38, 4);
+            var narrow = new Decimal128Type(10, 2);
+            string[] narrowValues = ["0", "4540", "-100050", "9999999999", "-9999999999"];
+            var schema = new Schema([new Field("wide", wide, false)], null);
+            var narrowSchema = new Schema([new Field("narrow", narrow, false)], null);
+
+            await using (var writer = OrcWriter.Create(path, schema))
+            {
+                await writer.WriteBatchAsync(new RecordBatch(schema, [Decimals(wide, DecimalUnscaled)], DecimalUnscaled.Length));
+                await writer.CloseAsync();
+            }
+            using (var doc = JsonDocument.Parse(RunPython(PyReadRaw, path)))
+            {
+                var col = doc.RootElement.GetProperty("wide");
+                Assert.Equal((38, 4), (col.GetProperty("precision").GetInt32(), col.GetProperty("scale").GetInt32()));
+                Assert.Equal(DecimalUnscaled, col.GetProperty("values").EnumerateArray().Select(v => v.GetString()));
+            }
+
+            File.Delete(path);
+            await using (var writer = OrcWriter.Create(path, narrowSchema))
+            {
+                await writer.WriteBatchAsync(new RecordBatch(narrowSchema, [Decimals(narrow, narrowValues)], narrowValues.Length));
+                await writer.CloseAsync();
+            }
+            using (var doc = JsonDocument.Parse(RunPython(PyReadRaw, path)))
+            {
+                Assert.Equal(narrowValues,
+                    doc.RootElement.GetProperty("narrow").GetProperty("values").EnumerateArray().Select(v => v.GetString()));
+            }
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [SkippableFact]
+    public async Task CrossValidate_Decimals_PyArrowToEngineeredWood()
+    {
+        Skip.If(!IsPyArrowAvailable(), "PyArrow is not installed.");
+        var path = GetTempPath();
+        try
+        {
+            RunPython(
+                "import sys, decimal, pyarrow as pa, pyarrow.orc as orc\n" +
+                "decimal.getcontext().prec = 50\n" +
+                $"wide = [{string.Join(",", DecimalUnscaled)}]\n" +
+                "narrow = [0, 4540, -100050, 9999999999, -9999999999]\n" +
+                "orc.write_table(pa.table({\n" +
+                "    'wide': pa.array([decimal.Decimal(v).scaleb(-4) for v in wide], pa.decimal128(38, 4)),\n" +
+                "    'narrow': pa.array([decimal.Decimal(v).scaleb(-2) for v in narrow] + [None] * (len(wide) - len(narrow)), pa.decimal128(10, 2)),\n" +
+                "}), sys.argv[1])\n",
+                path);
+
+            await using var reader = await OrcReader.OpenAsync(path);
+            var wide = new List<string>();
+            var narrow = new List<string?>();
+            await foreach (var batch in reader.CreateRowReader())
+            {
+                var w = (Decimal128Array)batch.Column("wide");
+                var n = (Decimal128Array)batch.Column("narrow");
+                for (int i = 0; i < w.Length; i++)
+                {
+                    wide.Add(UnscaledAt(w, i));
+                    narrow.Add(n.IsNull(i) ? null : UnscaledAt(n, i));
+                }
+            }
+            Assert.Equal(DecimalUnscaled, wide);
+            Assert.Equal(["0", "4540", "-100050", "9999999999", "-9999999999", null, null, null, null], narrow);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [SkippableFact]
+    public async Task CrossValidate_SignedPatchedBase_BothWays()
+    {
+        Skip.If(!IsPyArrowAvailable(), "PyArrow is not installed.");
+        var values = TimestampDecimalTests.PatchedBaseValues();
+        var path = GetTempPath();
+        try
+        {
+            var schema = new Schema([new Field("v", Int64Type.Default, false)], null);
+            await using (var writer = OrcWriter.Create(path, schema))
+            {
+                await writer.WriteBatchAsync(new RecordBatch(schema,
+                    [new Int64Array.Builder().AppendRange(values).Build()], values.Length));
+                await writer.CloseAsync();
+            }
+            var read = RunPython(
+                "import sys, json, pyarrow.orc as orc\n" +
+                "print(json.dumps(orc.read_table(sys.argv[1]).column('v').to_pylist()))\n", path);
+            using (var doc = JsonDocument.Parse(read))
+                Assert.Equal(values, doc.RootElement.EnumerateArray().Select(v => v.GetInt64()));
+
+            File.Delete(path);
+            RunPython(
+                "import sys, pyarrow as pa, pyarrow.orc as orc\n" +
+                $"v = [{string.Join(",", values)}]\n" +
+                "orc.write_table(pa.table({'v': pa.array(v, pa.int64())}), sys.argv[1])\n", path);
+            await using var reader = await OrcReader.OpenAsync(path);
+            var back = new List<long>();
+            await foreach (var batch in reader.CreateRowReader())
+            {
+                var v = (Int64Array)batch.Column("v");
+                for (int i = 0; i < v.Length; i++)
+                    back.Add(v.GetValue(i)!.Value);
+            }
+            Assert.Equal(values, back);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
 }

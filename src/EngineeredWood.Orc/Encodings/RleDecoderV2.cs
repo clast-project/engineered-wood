@@ -15,6 +15,7 @@ internal sealed class RleDecoderV2
 {
     private readonly OrcByteStream _input;
     private readonly bool _signed;
+    private readonly bool _legacyPatchedBase;
     private readonly BitReader _bitReader;
 
     // Buffer for leftover values from a run that didn't fit in the output
@@ -23,11 +24,16 @@ internal sealed class RleDecoderV2
     private int _bufferCount;
     private bool _bufferFromPool;
 
-    public RleDecoderV2(OrcByteStream input, bool signed)
+    /// <param name="input">The stream.</param>
+    /// <param name="signed">Whether the values are signed.</param>
+    /// <param name="legacyPatchedBase">The stream is from a file EngineeredWood wrote before #584, whose signed
+    /// Patched Base runs were zigzag-encoded, contrary to the spec. Read them as written.</param>
+    public RleDecoderV2(OrcByteStream input, bool signed, bool legacyPatchedBase = false)
     {
         _input = input;
         _signed = signed;
         _bitReader = new BitReader(input);
+        _legacyPatchedBase = legacyPatchedBase && signed;
     }
 
     public void ReadValues(Span<long> values)
@@ -194,7 +200,8 @@ internal sealed class RleDecoderV2
         if (patchListLength > 0)
         {
             int patchBitSize = patchGapWidth + patchWidth;
-            long patchMask = (1L << patchWidth) - 1;
+            // An entry can fill all 64 bits (a gap of 255 with a 56-bit patch), so it is split unsigned.
+            long patchMask = patchWidth >= 64 ? -1L : (1L << patchWidth) - 1;
 
             // Patch list is small (max 31), use stackalloc
             Span<long> patches = patchListLength <= 32 ? stackalloc long[patchListLength] : new long[patchListLength];
@@ -206,7 +213,7 @@ internal sealed class RleDecoderV2
 
             while (patchIdx < patchListLength)
             {
-                int gap = (int)(patches[patchIdx] >> patchWidth);
+                int gap = (int)((ulong)patches[patchIdx] >> patchWidth);
                 long patchBits = patches[patchIdx] & patchMask;
                 patchIdx++;
 
@@ -214,7 +221,7 @@ internal sealed class RleDecoderV2
                 while (gap == 255 && patchBits == 0 && patchIdx < patchListLength)
                 {
                     actualGap += 255;
-                    gap = (int)(patches[patchIdx] >> patchWidth);
+                    gap = (int)((ulong)patches[patchIdx] >> patchWidth);
                     patchBits = patches[patchIdx] & patchMask;
                     patchIdx++;
                 }
@@ -226,12 +233,13 @@ internal sealed class RleDecoderV2
             }
         }
 
-        // Apply base + zigzag, write to output or buffer
+        // Base + offset is the value itself: Patched Base has no zigzag, signed or not. Only files EngineeredWood
+        // wrote before #584 zigzagged it.
         int toWrite = Math.Min(length, output.Length);
         for (int i = 0; i < toWrite; i++)
         {
             long val = dataValues[i] + baseValue;
-            if (_signed) val = Varint.ZigzagDecode(val);
+            if (_legacyPatchedBase) val = Varint.ZigzagDecode(val);
             output[i] = val;
         }
 
@@ -241,7 +249,7 @@ internal sealed class RleDecoderV2
             for (int i = toWrite; i < length; i++)
             {
                 long val = dataValues[i] + baseValue;
-                if (_signed) val = Varint.ZigzagDecode(val);
+                if (_legacyPatchedBase) val = Varint.ZigzagDecode(val);
                 dataValues[i] = val;
             }
             BufferExcess(dataValues, toWrite, length - toWrite, true);
