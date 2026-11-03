@@ -108,6 +108,43 @@ internal sealed class DecimalColumnWriter : ColumnWriter
         return negative ? "-" + result : result;
     }
 
+    /// <summary>
+    /// Compares two plain decimal strings (an optional <c>-</c>, digits, an optional fraction) by value, of any
+    /// length and with any scales, as the statistics' minimum and maximum are stored.
+    /// </summary>
+    internal static int CompareDecimalStrings(string a, string b)
+    {
+        bool negativeA = a.StartsWith("-", StringComparison.Ordinal);
+        bool negativeB = b.StartsWith("-", StringComparison.Ordinal);
+        int magnitude = CompareMagnitudes(negativeA ? a.Substring(1) : a, negativeB ? b.Substring(1) : b);
+        if (magnitude == 0)
+            return 0; // also -0 against 0
+        if (negativeA != negativeB)
+            return negativeA ? -1 : 1;
+        return negativeA ? -magnitude : magnitude;
+    }
+
+    private static int CompareMagnitudes(string a, string b)
+    {
+        Split(a, out string intA, out string fracA);
+        Split(b, out string intB, out string fracB);
+        // The longer whole part (without leading zeros) is the larger; then digit by digit.
+        if (intA.Length != intB.Length)
+            return intA.Length < intB.Length ? -1 : 1;
+        int c = string.CompareOrdinal(intA, intB);
+        if (c != 0)
+            return Math.Sign(c);
+        int width = Math.Max(fracA.Length, fracB.Length);
+        return Math.Sign(string.CompareOrdinal(fracA.PadRight(width, '0'), fracB.PadRight(width, '0')));
+    }
+
+    private static void Split(string s, out string whole, out string fraction)
+    {
+        int dot = s.IndexOf('.');
+        whole = (dot < 0 ? s : s.Substring(0, dot)).TrimStart('0');
+        fraction = dot < 0 ? "" : s.Substring(dot + 1).TrimEnd('0');
+    }
+
     public override long EstimateBufferedBytes() => base.EstimateBufferedBytes() + _dataStream.Length + _secondaryStream.Length + _scaleEncoder.BufferedCount * 8L;
 
     public override ColumnEncoding GetEncoding()

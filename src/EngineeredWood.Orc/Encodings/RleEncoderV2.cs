@@ -241,6 +241,8 @@ internal sealed class RleEncoderV2
             }
 
             if (patchList.Count > 31) return false; // patchListLength is 5 bits
+            // Each patch entry (gap and patch together) is written, and read, as one 64-bit word.
+            if (patchGapWidth + patchWidth > 64) return false;
 
             // The base is sign-magnitude: its magnitude, plus a sign bit in the MSB of its width.
             bool negativeBase = _signed && minValue < 0;

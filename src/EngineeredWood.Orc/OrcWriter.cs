@@ -631,9 +631,10 @@ public sealed class OrcWriter : IAsyncDisposable, IDisposable
                 target.DecimalStatistics = source.DecimalStatistics.Clone();
             else
             {
-                if (string.Compare(source.DecimalStatistics.Minimum, target.DecimalStatistics.Minimum, StringComparison.Ordinal) < 0)
+                // Numerically: as strings, "10" sorts before "9" and "-1" before "-2".
+                if (DecimalColumnWriter.CompareDecimalStrings(source.DecimalStatistics.Minimum, target.DecimalStatistics.Minimum) < 0)
                     target.DecimalStatistics.Minimum = source.DecimalStatistics.Minimum;
-                if (string.Compare(source.DecimalStatistics.Maximum, target.DecimalStatistics.Maximum, StringComparison.Ordinal) > 0)
+                if (DecimalColumnWriter.CompareDecimalStrings(source.DecimalStatistics.Maximum, target.DecimalStatistics.Maximum) > 0)
                     target.DecimalStatistics.Maximum = source.DecimalStatistics.Maximum;
             }
         }

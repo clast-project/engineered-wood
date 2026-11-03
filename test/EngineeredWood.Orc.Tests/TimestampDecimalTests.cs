@@ -507,4 +507,69 @@ public class TimestampDecimalTests
         }
         Assert.Equal(PatchedBaseValues(), read);
     }
+
+    [Fact]
+    public void APatchTooWideForOneWord_FallsBackToDirect()
+    {
+        // 511 zeros and one 2^62: one data bit, and a 62-bit patch padded to 64, which with the 8-bit gap is
+        // 72 bits, more than the one 64-bit word a patch entry is written in.
+        var values = new long[512];
+        values[300] = 1L << 62;
+        var buffer = new EngineeredWood.Buffers.GrowableBuffer();
+        var encoder = new EngineeredWood.Orc.Encodings.RleEncoderV2(buffer, signed: false);
+        encoder.WriteValues(values);
+        encoder.Flush();
+        var bytes = buffer.WrittenSpan.ToArray();
+
+        var decoded = new long[values.Length];
+        new EngineeredWood.Orc.Encodings.RleDecoderV2(
+            new EngineeredWood.Orc.Encodings.OrcByteStream(bytes, 0, bytes.Length), signed: false).ReadValues(decoded);
+        Assert.Equal(values, decoded);
+    }
+
+    [Theory]
+    [InlineData("9", "10", -1)]
+    [InlineData("-1", "-2", 1)]
+    [InlineData("-10", "-9", -1)]
+    [InlineData("-0.5", "0.25", -1)]
+    [InlineData("1.50", "1.5", 0)]
+    [InlineData("0.001", "0.01", -1)]
+    [InlineData("-0", "0", 0)]
+    [InlineData("99999999999999999999999999999999999999", "100000000000000000000000000000000000000", -1)]
+    [InlineData("12.345", "12.34", 1)]
+    public void DecimalStatistics_CompareByValue(string a, string b, int expected)
+    {
+        Assert.Equal(expected, DecimalColumnWriter.CompareDecimalStrings(a, b));
+        Assert.Equal(-expected, DecimalColumnWriter.CompareDecimalStrings(b, a));
+    }
+
+    [Fact]
+    public async Task DecimalStatistics_MergeAcrossStripesByValue()
+    {
+        var type = new Decimal128Type(10, 0);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("d", type, false)).Build();
+        var path = Path.Combine(Path.GetTempPath(), $"ew-decstats-{Guid.NewGuid():N}.orc");
+        try
+        {
+            // One stripe per batch: as strings, 9 > 10 and -1 < -2.
+            await using (var writer = OrcWriter.Create(path, schema, new OrcWriterOptions { StripeSize = 1 }))
+            {
+                foreach (var v in new[] { 9m, 10m, -1m, -2m })
+                {
+                    var array = new Decimal128Array.Builder(type).Append(v).Build();
+                    await writer.WriteBatchAsync(new RecordBatch(schema, [array], 1));
+                }
+                await writer.CloseAsync();
+            }
+            await using var reader = await OrcReader.OpenAsync(path);
+            Assert.True(reader.NumberOfStripes > 1);
+            var stats = reader.Footer.Statistics[1].DecimalStatistics;
+            Assert.Equal("-2", stats.Minimum);
+            Assert.Equal("10", stats.Maximum);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
 }
