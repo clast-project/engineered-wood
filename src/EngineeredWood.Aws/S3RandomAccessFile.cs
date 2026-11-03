@@ -155,6 +155,16 @@ public sealed class S3RandomAccessFile : IRandomAccessFile
 
             return buffer;
         }
+        catch (AmazonS3Exception ex) when (ex.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
+        {
+            // A range that STARTS at or past the end is a 416, not a short 206; report it the way the
+            // interface promises, as for a range that merely runs past the end.
+            buffer.Dispose();
+            throw new IOException(
+                $"Range starting at offset {range.Offset} ({range.Length} bytes) is past the end of S3 " +
+                $"object '{_bucket}/{_key}'.",
+                ex);
+        }
         catch
         {
             buffer.Dispose();

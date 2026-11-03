@@ -156,6 +156,17 @@ public sealed class GcsRandomAccessFile : IRandomAccessFile
 
             return buffer;
         }
+        catch (global::Google.GoogleApiException ex)
+            when (ex.HttpStatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable)
+        {
+            // A range that STARTS at or past the end is a 416, not a short 206; report it the way the
+            // interface promises, as for a range that merely runs past the end.
+            buffer.Dispose();
+            throw new IOException(
+                $"Range starting at offset {range.Offset} ({range.Length} bytes) is past the end of GCS " +
+                $"object '{_bucket}/{_objectName}'.",
+                ex);
+        }
         catch
         {
             buffer.Dispose();

@@ -185,19 +185,32 @@ public class DeletionVectorReaderTests : IDisposable
         Assert.Equal(Vectors[2], (await new DeletionVectorReader(fs).ReadAsync(descriptors[2])).ToArray());
     }
 
-    [Fact]
-    public async Task RangePastTheEndOfTheFile_IsAnInvalidVector()
+    /// <summary>
+    /// A range that runs past the end, and one that STARTS at or past it. Object stores answer the second with
+    /// HTTP 416 rather than a short read; the backends report both as <see cref="IOException"/> (held for every
+    /// backend by the storage conformance suite), and the reader reports both as an invalid vector.
+    /// </summary>
+    [Theory]
+    [InlineData("straddles the end")]
+    [InlineData("starts at the end")]
+    [InlineData("starts beyond the end")]
+    public async Task RangePastTheEndOfTheFile_IsAnInvalidVector(string shape)
     {
         var fs = new RecordingFileSystem(new LocalTableFileSystem(_tempDir));
         DeletionVector[] descriptors = await WritePackedFileAsync(fs);
-        long fileLength = new FileInfo(Path.Combine(_tempDir, PackedPath)).Length;
+        int fileLength = checked((int)new FileInfo(Path.Combine(_tempDir, PackedPath)).Length);
         DeletionVector last = descriptors[^1];
         var dv = new DeletionVector
         {
             StorageType = "p",
             PathOrInlineDv = PackedPath,
-            Offset = last.Offset,
-            SizeInBytes = last.SizeInBytes + 100,
+            Offset = shape switch
+            {
+                "straddles the end" => last.Offset,
+                "starts at the end" => fileLength,
+                _ => fileLength + 100,
+            },
+            SizeInBytes = shape == "straddles the end" ? last.SizeInBytes + 100 : last.SizeInBytes,
             Cardinality = last.Cardinality,
         };
 
