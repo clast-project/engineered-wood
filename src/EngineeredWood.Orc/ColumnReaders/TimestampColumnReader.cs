@@ -25,7 +25,9 @@ namespace EngineeredWood.Orc.ColumnReaders;
 /// seconds truncated from milliseconds and always-positive nanoseconds, so a timestamp before 1970 with at least
 /// a millisecond's fraction comes out one second late. The C++ reader takes a second off exactly then (seconds
 /// below zero and nanoseconds above 999,999), and so does this one: both writers' files read as the C++ reader
-/// reads them.</para>
+/// reads them. In a writer time zone other than UTC (only Java writers name one), the test is made on the
+/// instant before converting to the wall clock, as the Java reader makes it; the C++ reader makes it on the
+/// wall clock, which takes a second off values between the epoch and the zone's offset from it.</para>
 /// <para><b>Files EngineeredWood wrote before this was fixed</b> (<c>software_version</c>
 /// <c>"EngineeredWood.Orc 0.1"</c>) used the Unix epoch and their own nanosecond scale (#584). They are read
 /// with those rules, so that a file read back before the fix still reads the same.</para>
