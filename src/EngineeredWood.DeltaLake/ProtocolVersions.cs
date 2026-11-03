@@ -35,10 +35,13 @@ public static class ProtocolVersions
         // ENFORCEMENT features a writer must honor when ACTIVE; they are almost always LISTED (not active),
         // because enabling a real feature (columnMapping/deletionVectors/…) upgrades the table to writer-v7
         // "table features", which enumerates the legacy writer-v2/v3 features explicitly. The writer honors
-        // them per-table (DeltaTable.HonorWriterFeatures): appendOnly is enforced only when
-        // delta.appendOnly=true; invariants / checkConstraints / generatedColumns carry arbitrary SQL this
-        // writer cannot evaluate, so an ACTIVE one REJECTS the write rather than committing possibly-violating
-        // data. Merely LISTING them (the common v7 case) writes normally.
+        // them per-table: appendOnly is enforced only when delta.appendOnly=true. An ACTIVE invariant, CHECK
+        // constraint or generated column is evaluated against the rows by the paths that build them
+        // (WriteAsync and the predicate DML, via DeltaConstraintEnforcer / DeltaGeneratedColumns). Every other
+        // path refuses the write (DeltaTable.HonorWriterFeatures): CommitDataFilesAsync and the transaction's
+        // StageDataFiles / StageDataFilesAsync unless the caller asserts it enforced them itself (the files
+        // WriteDataFilesAsync produces are checked for NOT NULL only), and DeleteRowsAsync / UpdateRowsAsync.
+        // Merely LISTING them (the common v7 case) writes normally.
         "appendOnly",
         "invariants",
         "checkConstraints",
