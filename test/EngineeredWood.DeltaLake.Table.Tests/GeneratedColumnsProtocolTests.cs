@@ -9,8 +9,9 @@ using EngineeredWood.IO.Local;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// A table with a generated column declares the <c>generatedColumns</c> writer feature (#582): writer version 4 on a
-/// legacy protocol, the named feature on a table-features one. A writer that honours only the protocol, as Spark
+/// A table with a generated column declares the <c>generatedColumns</c> writer feature (#582), named at writer 7 as
+/// Spark 4.0.0 names it (measured: <c>[generatedColumns, invariants, appendOnly]</c> for a default table), or implied
+/// by a legacy writer version of 4 to 6 the table already has. A writer that honours only the protocol, as Spark
 /// does, otherwise neither computes nor checks the column.
 /// </summary>
 public class GeneratedColumnsProtocolTests : IDisposable
@@ -64,14 +65,14 @@ public class GeneratedColumnsProtocolTests : IDisposable
     }
 
     [Fact]
-    public async Task Create_GeneratedColumn_LegacyProtocolIsWriterFour()
+    public async Task Create_GeneratedColumn_NamesTheFeatureAsSparkDoes()
     {
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), GeneratedSchema());
 
         var protocol = table.CurrentSnapshot.Protocol;
-        Assert.Equal((1, 4), (protocol.MinReaderVersion, protocol.MinWriterVersion));
+        Assert.Equal((1, 7), (protocol.MinReaderVersion, protocol.MinWriterVersion));
         Assert.Null(protocol.ReaderFeatures);
-        Assert.Null(protocol.WriterFeatures);
+        AssertSet(["generatedColumns", "invariants", "appendOnly"], protocol.WriterFeatures);
 
         // EW still computes the column on the raised protocol.
         await table.WriteAsync([Ids(1, 2)]);
@@ -86,14 +87,52 @@ public class GeneratedColumnsProtocolTests : IDisposable
 
         var protocol = table.CurrentSnapshot.Protocol;
         Assert.Equal((3, 7), (protocol.MinReaderVersion, protocol.MinWriterVersion));
-        // Writer 4's implied features, as the legacy version would have carried them.
-        Assert.Contains("generatedColumns", protocol.WriterFeatures!);
-        Assert.Contains("changeDataFeed", protocol.WriterFeatures!);
-        Assert.Contains("checkConstraints", protocol.WriterFeatures!);
-        Assert.DoesNotContain("generatedColumns", protocol.ReaderFeatures!);
+        // Named, without the changeDataFeed / checkConstraints a raise to writer 4 would have implied.
+        AssertSet(["deletionVectors", "generatedColumns", "invariants", "appendOnly"], protocol.WriterFeatures);
+        AssertSet(["deletionVectors"], protocol.ReaderFeatures);
 
         await table.WriteAsync([Ids(3)]);
         Assert.Equal(new long[] { 6 }, await DoubledAsync(table));
+    }
+
+    private static void AssertSet(string[] expected, IReadOnlyCollection<string>? actual)
+    {
+        Assert.NotNull(actual);
+        Assert.Equal(expected.OrderBy(f => f, StringComparer.Ordinal), actual!.OrderBy(f => f, StringComparer.Ordinal));
+    }
+
+    // Measured on Spark 4.0.0 through the DeltaTable builder: with an explicit floor the feature is named, and nothing
+    // the floor does not imply comes with it.
+    [Theory]
+    [InlineData("1", false, 1, null, "generatedColumns")]
+    [InlineData("7", false, 1, null, "generatedColumns")]
+    [InlineData("3", false, 1, null, "generatedColumns,checkConstraints,invariants,appendOnly")]
+    [InlineData("7", true, 3, "deletionVectors", "deletionVectors,generatedColumns")]
+    public async Task Create_GeneratedColumn_WithAWriterFloor_NamesOnlyWhatIsNeeded(
+        string floor, bool deletionVectors, int reader, string? readerFeatures, string writerFeatures)
+    {
+        // A nullable id: a NOT NULL one would also need invariants.
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(Generated("doubled", "id * 2"))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema, enableDeletionVectors: deletionVectors,
+            configuration: new Dictionary<string, string> { ["delta.minWriterVersion"] = floor });
+
+        var protocol = table.CurrentSnapshot.Protocol;
+        Assert.Equal((reader, 7), (protocol.MinReaderVersion, protocol.MinWriterVersion));
+        if (readerFeatures is null)
+            Assert.Null(protocol.ReaderFeatures);
+        else
+            AssertSet(readerFeatures.Split(','), protocol.ReaderFeatures);
+        AssertSet(writerFeatures.Split(','), protocol.WriterFeatures);
+
+        // EW still computes the column.
+        var ids = new Int64Array.Builder().Append(5).Build();
+        var idOnly = new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, true)).Build();
+        await table.WriteAsync([new RecordBatch(idOnly, [ids], 1)]);
+        Assert.Equal(new long[] { 10 }, await DoubledAsync(table));
     }
 
     [Fact]
@@ -116,15 +155,29 @@ public class GeneratedColumnsProtocolTests : IDisposable
     }
 
     [Fact]
-    public async Task AddColumn_GeneratedColumn_RaisesLegacyProtocolInTheSameCommit()
+    public async Task AddColumn_GeneratedColumn_NamesTheFeatureInTheSameCommit()
     {
         await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), PlainSchema());
 
         long version = await table.AddColumnAsync(Generated("doubled", "id * 2"));
 
         var atVersion = await table.GetSnapshotAtVersionAsync(version);
-        Assert.Equal((1, 4), (atVersion.Protocol.MinReaderVersion, atVersion.Protocol.MinWriterVersion));
-        Assert.Null(atVersion.Protocol.WriterFeatures);
+        Assert.Equal((1, 7), (atVersion.Protocol.MinReaderVersion, atVersion.Protocol.MinWriterVersion));
+        AssertSet(["generatedColumns", "invariants", "appendOnly"], atVersion.Protocol.WriterFeatures);
+    }
+
+    [Fact]
+    public async Task AddColumn_GeneratedColumn_OnALegacyWriterFourTable_NoUpgrade()
+    {
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), PlainSchema(),
+            configuration: new Dictionary<string, string> { ["delta.minWriterVersion"] = "4" });
+        var before = table.CurrentSnapshot.Protocol;
+        Assert.Equal(4, before.MinWriterVersion);
+
+        await table.AddColumnAsync(Generated("doubled", "id * 2"));
+
+        Assert.Equal(before, table.CurrentSnapshot.Protocol);
     }
 
     [Fact]
@@ -186,6 +239,6 @@ public class GeneratedColumnsProtocolTests : IDisposable
 
         await table.SetSchemaAsync(GeneratedSchema());
 
-        Assert.Equal(4, table.CurrentSnapshot.Protocol.MinWriterVersion);
+        Assert.Contains("generatedColumns", table.CurrentSnapshot.Protocol.WriterFeatures!);
     }
 }

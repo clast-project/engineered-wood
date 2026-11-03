@@ -66,6 +66,13 @@ public static class DeltaTableErrorCodes
     public const string UnsupportedFeaturesInConfig = "DELTA_UNSUPPORTED_FEATURES_IN_CONFIG";
 
     /// <summary>
+    /// A <c>delta.minReaderVersion</c> / <c>delta.minWriterVersion</c> table property that is not one of 1-3 / 1-7.
+    /// </summary>
+    /// <remarks>No delta-spark error class: Spark 4.0.0 refuses it with a bare <c>IllegalArgumentException</c>
+    /// ("delta.minWriterVersion needs to be one of 1, 2, 3, 4, 5, 6, 7."), measured.</remarks>
+    public const string InvalidProtocolVersionProperty = "DELTA_INVALID_PROTOCOL_VERSION_PROPERTY";
+
+    /// <summary>
     /// A caller-supplied <c>preAssignedSchema</c> cannot be used: it carries no column-mapping field
     /// ids for a table being created with column mapping, or it reuses ids the existing table has
     /// already spent.
