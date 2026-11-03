@@ -310,6 +310,86 @@ public class DirectColumnComparisonTests
         }
     }
 
+    /// <summary>
+    /// A 37-row batch whose nulls sit either side of byte boundaries, so the direct path's bitmaps
+    /// (#608) are read and written across bytes. <see cref="Batch"/> has at most eight rows.
+    /// </summary>
+    private static RecordBatch LongBatch(bool withNulls)
+    {
+        const int rows = 37;
+        bool IsNull(int i) => withNulls && (i % 8 is 0 or 7 || i == rows - 1);
+
+        var b = new BooleanArray.Builder();
+        var i32 = new Int32Array.Builder();
+        var f64 = new DoubleArray.Builder();
+        var s = new StringArray.Builder();
+        var d32 = new Date32Array.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            if (IsNull(i))
+            {
+                b.AppendNull();
+                i32.AppendNull();
+                f64.AppendNull();
+                s.AppendNull();
+                d32.AppendNull();
+                continue;
+            }
+
+            b.Append(i % 3 != 0);
+            i32.Append(i % 5);
+            f64.Append(i % 4 == 0 ? double.NaN : i * 0.5);
+            s.Append(i % 2 == 0 ? "abc" : "ab");
+            d32.Append(new DateTime(2026, 10, 1).AddDays(i % 3 - 1));
+        }
+
+        IArrowArray[] columns = [b.Build(), i32.Build(), f64.Build(), s.Build(), d32.Build()];
+        var fields = new[] { "b", "i32", "f64", "s", "d32" }
+            .Select((name, k) => new Field(name, columns[k].Data.DataType, true));
+        return new RecordBatch(new Apache.Arrow.Schema(fields, null), columns, rows);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void BitmapsAcrossByteBoundariesAnswerAsTheGeneralPathDoes(bool withNulls)
+    {
+        var full = LongBatch(withNulls);
+        string[] predicates =
+        [
+            "b = true", "b <=> false", "b <> true", "b < true", "b >= false",
+            "i32 = 2", "i32 <=> 2", "i32 > 2", "i32 <= 2.5",
+            "f64 = 1.5", "f64 <=> 1.5", "f64 > 3",
+            "s = 'abc'", "s <=> 'abc'", "s < 'abc'", "s <> 'ab'",
+            "d32 = DATE'2026-10-01'", "d32 <=> DATE'2026-10-01'", "d32 >= DATE'2026-10-01'",
+        ];
+
+        var mismatches = new List<string>();
+        int direct = 0;
+
+        // Unaligned and aligned starts, with lengths ending mid-byte and on a byte.
+        foreach (var (offset, length) in new[] { (0, 37), (1, 35), (3, 17), (7, 9), (8, 24), (9, 28), (13, 1) })
+        {
+            var columns = full.Arrays.Select(a => ArrowArrayFactory.Slice(a, offset, length)).ToList();
+            var batch = new RecordBatch(full.Schema, columns, length);
+            foreach (var sql in predicates)
+            {
+                var predicate = SparkSqlParser.ParsePredicate(sql);
+                for (int e = 0; e < Evaluators.Length; e++)
+                {
+                    var expected = Outcome(Evaluators[e], false, predicate, batch, out _);
+                    var actual = Outcome(Evaluators[e], true, predicate, batch, out int used);
+                    direct += used;
+                    if (!Equals(expected, actual))
+                        mismatches.Add($"[{EvaluatorNames[e]}] {sql} @{offset}+{length}\n  general: {expected}\n  direct:  {actual}");
+                }
+            }
+        }
+
+        Assert.True(mismatches.Count == 0, string.Join("\n", mismatches.Take(25)));
+        Assert.True(direct > 0);
+    }
+
     [Fact]
     public void ALaterAndOperandIsComparedDirectlyOverTheWholeBatch()
     {
