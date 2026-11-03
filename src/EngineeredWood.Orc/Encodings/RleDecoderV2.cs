@@ -200,7 +200,8 @@ internal sealed class RleDecoderV2
         if (patchListLength > 0)
         {
             int patchBitSize = patchGapWidth + patchWidth;
-            long patchMask = (1L << patchWidth) - 1;
+            // An entry can fill all 64 bits (a gap of 255 with a 56-bit patch), so it is split unsigned.
+            long patchMask = patchWidth >= 64 ? -1L : (1L << patchWidth) - 1;
 
             // Patch list is small (max 31), use stackalloc
             Span<long> patches = patchListLength <= 32 ? stackalloc long[patchListLength] : new long[patchListLength];
@@ -212,7 +213,7 @@ internal sealed class RleDecoderV2
 
             while (patchIdx < patchListLength)
             {
-                int gap = (int)(patches[patchIdx] >> patchWidth);
+                int gap = (int)((ulong)patches[patchIdx] >> patchWidth);
                 long patchBits = patches[patchIdx] & patchMask;
                 patchIdx++;
 
@@ -220,7 +221,7 @@ internal sealed class RleDecoderV2
                 while (gap == 255 && patchBits == 0 && patchIdx < patchListLength)
                 {
                     actualGap += 255;
-                    gap = (int)(patches[patchIdx] >> patchWidth);
+                    gap = (int)((ulong)patches[patchIdx] >> patchWidth);
                     patchBits = patches[patchIdx] & patchMask;
                     patchIdx++;
                 }

@@ -527,6 +527,26 @@ public class TimestampDecimalTests
         Assert.Equal(values, decoded);
     }
 
+    [Fact]
+    public void APatchEntryFillingAll64Bits_IsReadBack()
+    {
+        // 511 zeros and 2^49 at row 300: a 56-bit patch with the 8-bit gap is exactly 64 bits, and the
+        // continuation entry's gap of 255 sets the top bit.
+        var values = new long[512];
+        values[300] = 1L << 49;
+        var buffer = new EngineeredWood.Buffers.GrowableBuffer();
+        var encoder = new EngineeredWood.Orc.Encodings.RleEncoderV2(buffer, signed: false);
+        encoder.WriteValues(values);
+        encoder.Flush();
+        var bytes = buffer.WrittenSpan.ToArray();
+        Assert.Equal(2, bytes[0] >> 6); // Patched Base
+
+        var decoded = new long[values.Length];
+        new EngineeredWood.Orc.Encodings.RleDecoderV2(
+            new EngineeredWood.Orc.Encodings.OrcByteStream(bytes, 0, bytes.Length), signed: false).ReadValues(decoded);
+        Assert.Equal(values, decoded);
+    }
+
     [Theory]
     [InlineData("9", "10", -1)]
     [InlineData("-1", "-2", 1)]
