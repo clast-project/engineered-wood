@@ -520,6 +520,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 if (!await e.MoveNextAsync().ConfigureAwait(false))
                     break;
                 decoded = EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(e.Current.Batch);
+                // The RAW batch is what the next decode of this row group will produce, so it is what the next
+                // reservation must cover. The scheduler also learns from the item it is handed, but a caller
+                // may shrink a batch before handing it on (a Delta scan drops a deletion vector's rows), and
+                // a shrunken size must not lower the reservation for the full-size batch after it.
+                reservation.Observe(decoded);
                 batches++;
                 yield return e.Current;
             }

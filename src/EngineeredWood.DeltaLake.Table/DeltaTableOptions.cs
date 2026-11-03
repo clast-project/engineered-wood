@@ -79,21 +79,21 @@ public sealed record DeltaTableOptions
     /// enumerated from a thread-pool thread.</para>
     /// <para>The memory a scan holds is bounded by <see cref="MaxBufferedReadBytes"/>, not by this.</para>
     /// </remarks>
-    public int? MaxConcurrentFileReads
+    public int? MaxConcurrentReads
     {
-        get => _maxConcurrentFileReads;
+        get => _maxConcurrentReads;
         init
         {
             if (value is < 1)
                 throw new ArgumentOutOfRangeException(nameof(value), value, "Must be at least 1, or null for the default.");
-            _maxConcurrentFileReads = value;
+            _maxConcurrentReads = value;
         }
     }
-    private readonly int? _maxConcurrentFileReads;
+    private readonly int? _maxConcurrentReads;
 
     /// <summary>
     /// The decoded data, in bytes of Arrow buffers, a scan running several reads at once
-    /// (<see cref="MaxConcurrentFileReads"/>) may hold that the caller has not yet received. Default: 256 MiB.
+    /// (<see cref="MaxConcurrentReads"/>) may hold that the caller has not yet received. Default: 256 MiB.
     /// </summary>
     /// <remarks>
     /// <para>A file reserves budget BEFORE it decodes each batch, and the reservation is released when the
@@ -109,7 +109,7 @@ public sealed record DeltaTableOptions
     /// overran its first reservation. Through a <see cref="DataFileReader"/> there is no footer, and a file's
     /// first batch is not reserved for at all.</para>
     /// <para>Not counted: each file's open reader and footer, a deletion vector's row set (#610), and the
-    /// transient copies a batch goes through on its way out. A serial read (<see cref="MaxConcurrentFileReads"/>
+    /// transient copies a batch goes through on its way out. A serial read (<see cref="MaxConcurrentReads"/>
     /// of 1) does not use the budget at all.</para>
     /// </remarks>
     public long MaxBufferedReadBytes

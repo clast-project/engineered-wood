@@ -5652,7 +5652,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // The scan's unit of work is one row group of one file (#612), so that a few large files, or one large
         // file among small ones, still keep every reader busy. A file read through the codec seam is one unit:
         // the seam hides its row groups.
-        int window = EffectiveConcurrentFileReads;
+        int window = EffectiveConcurrentReads;
         if (window <= 1)
         {
             await foreach (var unit in PlanScanUnitsAsync(snapshot, options, included, lookahead: 1, cancellationToken)
@@ -5719,6 +5719,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     {
         var opening = new Queue<Task<DataFileRead>>();
         int next = 0;
+        // The files opened ahead are the planner's: when it stops (an error, an early exit, the scan's own
+        // cancellation) it cancels them BEFORE waiting for them, so that a stalled footer read on a later file
+        // cannot hold back the error or the exit that stopped it.
+        using var openingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         try
         {
             for (int f = 0; f < files.Count; f++)
@@ -5731,7 +5735,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // Compaction, CDF and the copy-on-write rewrites must see every row of a file they read, and
                     // never pass one.
                     opening.Enqueue(OpenDataFileAsync(
-                        addFile, options.Columns, snapshot, options.Filter, cancellationToken).AsTask());
+                        addFile, options.Columns, snapshot, options.Filter, openingCts.Token).AsTask());
                 }
 
                 var read = await opening.Dequeue().ConfigureAwait(false);
@@ -5762,6 +5766,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         finally
         {
             // Opened ahead and never planned: close them, whatever became of their opening.
+            if (opening.Count > 0)
+                openingCts.Cancel();
             while (opening.Count > 0)
             {
                 try
@@ -5819,7 +5825,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// Yields the batches of <paramref name="fileCount"/> files, file after file, reading up to
-    /// <see cref="EffectiveConcurrentFileReads"/> of them at once (#607) within
+    /// <see cref="EffectiveConcurrentReads"/> of them at once (#607) within
     /// <see cref="DeltaTableOptions.MaxBufferedReadBytes"/>. With a window of 1, or one file, it is a plain
     /// serial loop with no pipeline in between — exactly the read before #607.
     /// </summary>
@@ -5828,7 +5834,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         Func<int, ScanReservation, CancellationToken, IAsyncEnumerable<RecordBatch>> readFile,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        int concurrency = EffectiveConcurrentFileReads;
+        int concurrency = EffectiveConcurrentReads;
         if (concurrency <= 1 || fileCount <= 1)
         {
             for (int i = 0; i < fileCount; i++)
@@ -5862,10 +5868,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     internal ScanMemoryBudget? LastScanBudget { get; private set; }
 
     /// <summary>The reads a scan runs at once (row groups, or whole files through the codec seam):
-    /// <see cref="DeltaTableOptions.MaxConcurrentFileReads"/>, or by default up to 4 with the built-in reader and
+    /// <see cref="DeltaTableOptions.MaxConcurrentReads"/>, or by default up to 4 with the built-in reader and
     /// 1 through the codec seam, whose contract never promised that two files may be read at once.</summary>
-    private int EffectiveConcurrentFileReads =>
-        _options.MaxConcurrentFileReads
+    private int EffectiveConcurrentReads =>
+        _options.MaxConcurrentReads
         ?? (_options.DataFileReader is null ? Math.Min(4, Environment.ProcessorCount) : 1);
 
     /// <summary>What a scan asks of every file it reads.</summary>

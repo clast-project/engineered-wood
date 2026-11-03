@@ -26,7 +26,7 @@ public enum RgLayout
 /// <summary>
 /// #612 step 2: a Delta scan split by <c>(file, row group)</c> rather than by file. Each table's files hold
 /// several row groups, which every older fixture lacks (all are one row group per file).
-/// <see cref="DeltaTableOptions.MaxConcurrentFileReads"/> is the scan's window, 1 being the serial read; before
+/// <see cref="DeltaTableOptions.MaxConcurrentReads"/> is the scan's window, 1 being the serial read; before
 /// step 2 it counts files, after it row groups. Both a full read and a one-column read.
 ///
 /// <para><c>Cloud</c> reads each data file through a <see cref="CoalescingFileReader"/> over 20 ms per GET and
@@ -64,7 +64,7 @@ public class RowGroupUnitScanBenchmarks
         if (!Directory.Exists(Path.Combine(root, "_delta_log")))
             Build(root, Layout).GetAwaiter().GetResult();
 
-        var options = new DeltaTableOptions { MaxConcurrentFileReads = Window };
+        var options = new DeltaTableOptions { MaxConcurrentReads = Window };
         _table = DeltaTable.OpenAsync(
                 new SimulatedFileSystem(new LocalTableFileSystem(root), Cloud, latencyMs: 20), options)
             .AsTask().GetAwaiter().GetResult();

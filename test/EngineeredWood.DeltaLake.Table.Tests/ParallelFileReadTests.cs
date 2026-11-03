@@ -47,7 +47,7 @@ public class ParallelFileReadTests : IDisposable
     {
         // Several row groups per file, so a file is several batches and the budget has something to bound.
         ParquetWriteOptions = new ParquetWriteOptions { RowGroupMaxRows = 100 },
-        MaxConcurrentFileReads = window,
+        MaxConcurrentReads = window,
         MaxBufferedReadBytes = budget,
     };
 
@@ -449,9 +449,9 @@ public class ParallelFileReadTests : IDisposable
     [Fact]
     public void TheOptions_RefuseANonPositiveWindowOrBudget()
     {
-        Assert.Throws<ArgumentOutOfRangeException>(() => new DeltaTableOptions { MaxConcurrentFileReads = 0 });
+        Assert.Throws<ArgumentOutOfRangeException>(() => new DeltaTableOptions { MaxConcurrentReads = 0 });
         Assert.Throws<ArgumentOutOfRangeException>(() => new DeltaTableOptions { MaxBufferedReadBytes = 0 });
-        Assert.Null(new DeltaTableOptions().MaxConcurrentFileReads);
+        Assert.Null(new DeltaTableOptions().MaxConcurrentReads);
     }
 
     // ── #612: a scan split by (file, row group) ──────────────────────────────────────────────────────────────
@@ -460,7 +460,8 @@ public class ParallelFileReadTests : IDisposable
     /// The table's file system, counting the data files it has open and, optionally, delaying every data read
     /// and recording how many were in flight at once, or refusing to open one file.
     /// </summary>
-    private sealed class TrackingFileSystem(ITableFileSystem inner, int delayMs = 0, string? failOpen = null)
+    private sealed class TrackingFileSystem(
+        ITableFileSystem inner, int delayMs = 0, string? failOpen = null, string? stallOpen = null)
         : ITableFileSystem
     {
         private int _open;
@@ -478,6 +479,8 @@ public class ParallelFileReadTests : IDisposable
                 return await inner.OpenReadAsync(path, cancellationToken);
             if (failOpen is not null && path.Contains(failOpen))
                 throw new IOException($"cannot open {failOpen}");
+            if (stallOpen is not null && path.Contains(stallOpen))
+                await Task.Delay(Timeout.Infinite, cancellationToken); // until the scan gives up on it
             var file = await inner.OpenReadAsync(path, cancellationToken);
             Interlocked.Increment(ref _open);
             Interlocked.Increment(ref Opened);
@@ -637,6 +640,29 @@ public class ParallelFileReadTests : IDisposable
         Assert.Equal($"cannot open {failing}", ex.Message);
         // Every batch of files 0-4, in order, and nothing after: where a serial read would have thrown.
         Assert.Equal(paths.Take(5), seenPaths);
+        Assert.Equal(0, fs.Open);
+    }
+
+    [Fact]
+    public async Task AStalledOpeningAhead_DoesNotHoldBackAnEarlierError()
+    {
+        await CreateTableAsync();
+        List<string> paths;
+        await using (var probe = await OpenAsync(1))
+            paths = DeltaTable.OrderedActiveFiles(probe.CurrentSnapshot).Select(f => f.Path).ToList();
+
+        // With a window of 4, file 4 is opened ahead, and stalls, before the planner reaches file 3, which fails.
+        var fs = new TrackingFileSystem(_fs, failOpen: paths[3], stallOpen: paths[4]);
+        await using var table = await OpenTrackedAsync(fs, 4);
+        var read = Assert.ThrowsAsync<IOException>(async () =>
+        {
+            await foreach (var batch in table.ReadAsync())
+                batch.Dispose();
+        });
+
+        var finished = await Task.WhenAny(read, Task.Delay(TimeSpan.FromSeconds(30)));
+        Assert.True(finished == read, "the scan waited on the stalled opening instead of reporting the error");
+        Assert.Equal($"cannot open {paths[3]}", (await read).Message);
         Assert.Equal(0, fs.Open);
     }
 

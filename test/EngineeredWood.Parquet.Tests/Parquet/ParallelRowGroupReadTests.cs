@@ -439,6 +439,56 @@ public class ParallelRowGroupReadTests : IDisposable
             ParquetFileReader.PlannedBytes(group, parquetSchema, null, quarter).Uncompressed);
     }
 
+    [Fact]
+    public async Task APlannedRead_ReservesForItsRawBatches_WhateverTheCallerDoesWithThem()
+    {
+        // One row group of dictionary-encoded strings, read in four batches: each DECODED batch is far larger
+        // than the footer's uncompressed size, which counts the dictionary once and the indices.
+        var strings = Enumerable.Range(0, 50).Select(i => new string((char)('a' + i % 26), 200) + i).ToArray();
+        var values = new StringArray.Builder();
+        for (int i = 0; i < 40_000; i++)
+            values.Append(strings[i % strings.Length]);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("s", StringType.Default, false)).Build();
+        string path = Path.Combine(_tempDir, "dictionary.parquet");
+        using (var batch = new RecordBatch(schema, [values.Build()], 40_000))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 10_000 });
+        ParquetFileReader.RowGroupPlan? first = null;
+        await foreach (var p in reader.PlanRowGroupsAsync(null, null, null, default))
+        {
+            first ??= p;
+        }
+        var plan = first!.Value;
+        var budget = new EngineeredWood.Scans.ScanMemoryBudget(1L << 30);
+        var reservation = new EngineeredWood.Scans.ScanReservation(budget, 0);
+
+        long largest = 0;
+        int batches = 0;
+        await foreach (var positioned in reader.ReadPlannedAsync(
+                           plan, null, reservation, new ParquetFileReader.DecodedGrowth(), default))
+        {
+            using (positioned.Batch)
+                largest = Math.Max(largest, EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(positioned.Batch));
+            batches++;
+            // The caller hands the scheduler nothing here, as a Delta scan hands it only what survives a
+            // deletion vector: the read itself must have learnt the raw size.
+        }
+        reservation.ReleasePending();
+
+        Assert.Equal(4, batches);
+        Assert.True(largest > ParquetFileReader.PlannedBytes(
+            (await reader.ReadMetadataAsync()).RowGroups[0], await reader.GetSchemaAsync(), null, null).Uncompressed);
+        Assert.True(reservation.Estimate >= largest, $"reserves {reservation.Estimate}, raw batches reach {largest}");
+        Assert.Equal(0, budget.Used);
+    }
+
     private async Task<long> DataOffsetAsync(int rowGroup)
     {
         await using var file = new LocalRandomAccessFile(_path);

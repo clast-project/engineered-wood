@@ -114,7 +114,7 @@ public class FilteredScanBenchmarks
 
 /// <summary>
 /// EW alone: how a scan of the 20-file table scales with the number of files read at once
-/// (<c>DeltaTableOptions.MaxConcurrentFileReads</c>, #607). 1 is the serial read. Both a full read of every
+/// (<c>DeltaTableOptions.MaxConcurrentReads</c>, #607). 1 is the serial read. Both a full read of every
 /// column and the <c>OneCategory</c> filtered scan of <see cref="FilteredScanBenchmarks"/>, which reads every
 /// file. <see cref="FullScanBenchmarks"/> cannot show this: its table is one file.
 /// </summary>
@@ -136,7 +136,7 @@ public class ScanWindowBenchmarks
     public void Setup()
     {
         _path = Fixtures.Prunable(Writer);
-        _options = new EngineeredWood.DeltaLake.Table.DeltaTableOptions { MaxConcurrentFileReads = Window };
+        _options = new EngineeredWood.DeltaLake.Table.DeltaTableOptions { MaxConcurrentReads = Window };
     }
 
     [BenchmarkCategory("ScanWindowFull"), Benchmark(Description = "EW ReadAllAsync, 20 files")]
