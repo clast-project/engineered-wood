@@ -1014,11 +1014,15 @@ Both halves are measured. Spark reads EW's form
 1.6.2 rejects reader 2 (legacy) and reader 3 + a `columnMapping` reader
 feature alike. Writer v5's extra implied features
 (`checkConstraints` / `generatedColumns` / `changeDataFeed`) impose obligations
-only on a table that actually uses them, and EW meets those obligations: every
-write path that sees the rows enforces CHECK constraints and invariants and
-computes generated columns, and `CommitDataFilesAsync`, which commits files it
-never saw, refuses such a table unless the caller passes
-`constraintsEnforcedByCaller: true`. So the divergence is cosmetic.
+only on a table that actually uses them, and EW never commits rows it has not
+checked against them. The paths that build the rows — `WriteAsync`,
+`CreateAsync`'s initial data, `UpdateAsync`, `MergeAsync` and
+`OverwriteWhereAsync` — enforce CHECK constraints and invariants and compute
+generated columns. The rest refuse such a table: `CommitDataFilesAsync` and
+`DeltaTransaction.StageDataFiles` / `StageDataFilesAsync` unless the caller
+passes `constraintsEnforcedByCaller: true` (`WriteDataFilesAsync`, which feeds
+them, checks only NOT NULL), and `DeleteRowsAsync` / `UpdateRowsAsync` always.
+So the divergence is cosmetic.
 
 The same difference shows up in another form when a second feature (type
 widening, deletion vectors, ...) puts a column-mapped table at reader 3 /

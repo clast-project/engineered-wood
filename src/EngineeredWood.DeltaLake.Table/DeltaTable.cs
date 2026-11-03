@@ -816,8 +816,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // Both are spec-legal and Spark reads ours (SparkInteropTests covers it); the difference is
         // cosmetic, because writer v5's extra implied features (checkConstraints, generatedColumns,
         // changeDataFeed) only impose obligations on a table that actually uses them, and EW meets those:
-        // the write paths that see the rows enforce constraints and compute generated columns, and
-        // HonorWriterFeatures refuses the one that cannot. The same holds when another feature forces
+        // the paths that build the rows (WriteAsync, UpdateAsync, MergeAsync, OverwriteWhereAsync, the
+        // initial data here) enforce constraints and compute generated columns, and HonorWriterFeatures
+        // refuses the rest: the external-file commit and staging seams unless the caller asserts
+        // enforcement, and DeleteRowsAsync / UpdateRowsAsync. The same holds when another feature forces
         // reader 3 / writer 7 below: the legacy (2, 5) implied features are then NAMED, where Spark names
         // only [columnMapping, invariants, appendOnly]. See doc/known-issues.md, "Column-mapping protocol
         // shape differs from Spark's".
