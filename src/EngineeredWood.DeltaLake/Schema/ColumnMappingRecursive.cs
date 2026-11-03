@@ -59,7 +59,20 @@ public static class ColumnMappingRecursive
     /// names need not be the ones the table schema records. A field without an id falls back to name matching.
     /// </remarks>
     public static RecordBatch ToLogical(RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode)
+        => ToLogical(batch, deltaSchema, mode, inputIsPhysical: true);
+
+    /// <summary>
+    /// <see cref="ToLogical(RecordBatch, StructType, ColumnMappingMode)"/> for a batch whose names are
+    /// <paramref name="inputIsPhysical"/> or not. A batch a caller is WRITING passes false: it is matched
+    /// logical-first, physical-second at every level, the same binding <see cref="ToPhysical(RecordBatch, StructType, ColumnMappingMode)"/>
+    /// gives it, so an expression evaluated over the logical copy reads the columns that will be stored.
+    /// </summary>
+    public static RecordBatch ToLogical(
+        RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode, bool inputIsPhysical)
     {
+        if (!inputIsPhysical)
+            return Transform(batch, deltaSchema, mode, toPhysical: false, preferPhysical: false);
+
         // Id mode: a field whose id the schema no longer has (a dropped column) is removed BEFORE any name is
         // looked at. Passed through, it would keep its physical name, and once its id is stripped a later
         // name-based step (backfill) could bind it to a column re-added under that name. Ids identify a FILE's
@@ -84,7 +97,7 @@ public static class ColumnMappingRecursive
     /// </list>
     /// A field matching neither rule is kept: hidden columns such as the materialized row-tracking ones are no
     /// table column at all. Pass a batch exactly as read from a data file: in name mode an already-LOGICAL field
-    /// whose name is no physical name would be taken for a dropped column's. <see cref="ToLogical"/> applies the
+    /// whose name is no physical name would be taken for a dropped column's. <see cref="ToLogical(RecordBatch, StructType, ColumnMappingMode)"/> applies the
     /// id-mode rule itself but not the name-mode one, since it accepts already-logical input.
     /// </summary>
     public static RecordBatch DropStaleFields(RecordBatch batch, StructType deltaSchema, ColumnMappingMode mode)
@@ -348,8 +361,9 @@ public static class ColumnMappingRecursive
         if (mode == ColumnMappingMode.None)
             return batch;
 
-        // Only the read direction resolves by id: a write batch's ids, if any, are the ones being replaced.
-        bool byId = !toPhysical && mode == ColumnMappingMode.Id;
+        // Only the read direction resolves by id: a write batch's ids, if any, are the ones being replaced. A write
+        // batch renamed to logical (preferPhysical false) is bound as ToPhysical binds it, by name.
+        bool byId = !toPhysical && preferPhysical && mode == ColumnMappingMode.Id;
         var fields = new List<Field>(batch.Schema.FieldsList.Count);
         var arrays = new List<IArrowArray>(batch.ColumnCount);
         bool changed = false;

@@ -38,13 +38,13 @@ internal sealed class DeltaConstraintEnforcer
         new Dictionary<string, string>();
 
     private readonly IReadOnlyList<Rule> _rules;
-    private readonly Apache.Arrow.Schema _tableSchema;
+    private readonly Snapshot.Snapshot _snapshot;
     private readonly ArrowRowEvaluator _evaluator;
 
-    private DeltaConstraintEnforcer(IReadOnlyList<Rule> rules, Apache.Arrow.Schema tableSchema)
+    private DeltaConstraintEnforcer(IReadOnlyList<Rule> rules, Snapshot.Snapshot snapshot)
     {
         _rules = rules;
-        _tableSchema = tableSchema;
+        _snapshot = snapshot;
         _evaluator = new ArrowRowEvaluator(new SparkFunctionRegistry());
     }
 
@@ -79,7 +79,7 @@ internal sealed class DeltaConstraintEnforcer
                 $"invariant on column '{field.Name}'", UnwrapInvariant(field.Name, invariant)));
         }
 
-        return rules.Count == 0 ? null : new DeltaConstraintEnforcer(rules, snapshot.ArrowSchema);
+        return rules.Count == 0 ? null : new DeltaConstraintEnforcer(rules, snapshot);
     }
 
     /// <summary>
@@ -111,12 +111,14 @@ internal sealed class DeltaConstraintEnforcer
     /// <remarks>
     /// A write may leave out a nullable column, or a nullable struct field, which then reads back as NULL. The rules
     /// see it so, from a copy of <paramref name="batch"/> with what is missing backfilled, as the replaceWhere check
-    /// does: a rule reading the column used to be refused as unevaluable (#594). The batch written is not changed.
+    /// does: a rule reading the column used to be refused as unevaluable (#594). The copy takes logical names first
+    /// (see <see cref="DeltaTable.AsStored"/>), so a column the batch names by its column-mapping physical name is
+    /// judged on its values rather than backfilled as NULL. The batch written is not changed.
     /// </remarks>
     /// <exception cref="DeltaFormatException">A row does not satisfy a declared rule.</exception>
     public void Validate(RecordBatch batch)
     {
-        var asStored = SchemaEvolution.BackfillMissingColumns(batch, _tableSchema.FieldsList);
+        var asStored = DeltaTable.AsStored(batch, _snapshot);
         foreach (var rule in _rules)
         {
             BooleanArray result;

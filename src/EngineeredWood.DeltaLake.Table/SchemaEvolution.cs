@@ -151,8 +151,15 @@ internal static class SchemaEvolution
         for (int i = 0; i < actualStruct.Fields.Count; i++)
             childIndex[actualStruct.Fields[i].Name] = i;
 
+        // The UNSLICED children, from Data.Children: the rebuilt struct keeps sa's offset, and StructArray.Fields
+        // returns each child already sliced by that offset, so building from Fields applied it twice and a sliced
+        // struct read its siblings shifted (or past their end).
+        var unsliced = new IArrowArray[sa.Data.Children.Length];
+        for (int i = 0; i < unsliced.Length; i++)
+            unsliced[i] = ArrowArrayFactory.BuildArray(sa.Data.Children[i]);
+
         int physicalLength = sa.Data.Offset + sa.Length;
-        foreach (var child in sa.Fields)
+        foreach (var child in unsliced)
             physicalLength = System.Math.Max(physicalLength, child.Length);
 
         bool changed = actualStruct.Fields.Count != expectedStruct.Fields.Count;
@@ -165,7 +172,7 @@ internal static class SchemaEvolution
             {
                 if (idx != i)
                     changed = true; // reordered relative to the expected layout
-                var child = sa.Fields[idx];
+                var child = unsliced[idx];
                 reconciled = ReconcileColumn(child, expectedChild.DataType, child.Length);
                 if (!ReferenceEquals(reconciled, child))
                     changed = true;
