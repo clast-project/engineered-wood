@@ -646,18 +646,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 minWriterVersion = Math.Max(minWriterVersion, 3);
         }
 
-        // A generated column needs the generatedColumns writer feature, which writer version 4 implies (#582). Raised
-        // here for the same reason as checkConstraints above: a writer that honours only the protocol (Spark's
-        // GeneratedColumn.enforcesGeneratedColumns asks the protocol first) would otherwise neither compute nor check
-        // the column. Writer 4 also implies changeDataFeed; that is what the legacy version means, and Spark's own
-        // generated-column tables are writer 4.
+        // A generated column needs the generatedColumns writer feature (#582): a writer that honours only the protocol
+        // (Spark's GeneratedColumn.enforcesGeneratedColumns asks the protocol first) would otherwise neither compute
+        // nor check the column. It is NAMED, as Spark names it (measured on 4.0.0: a default table with a generated
+        // column is writer 7, [generatedColumns, invariants, appendOnly]), rather than implied by raising to writer 4,
+        // which would also claim changeDataFeed and checkConstraints. Declare reduces it to writer 4 where the rest of
+        // the table already implies that version's other features.
         if (DeclaresGeneratedColumn(deltaSchema))
-        {
-            if (explicitFloor)
-                AddDeclared(declaredFeatures, "generatedColumns");
-            else
-                minWriterVersion = Math.Max(minWriterVersion, 4);
-        }
+            AddDeclared(declaredFeatures, "generatedColumns");
 
         // The default floor (1, 2) already implies appendOnly and invariants; an explicit one may not, and a table
         // that uses them must declare them (measured: a writer-1 or writer-7 floor with delta.appendOnly = true is
@@ -670,7 +666,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 AddDeclared(declaredFeatures, "appendOnly");
             }
-            if (deltaSchema.Fields.Any(f => f.Metadata is not null && f.Metadata.ContainsKey("delta.invariants")))
+            if (HasInvariants(deltaSchema))
                 AddDeclared(declaredFeatures, "invariants");
         }
 
@@ -1066,14 +1062,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         if (minWriterVersion >= 7)
         {
-            foreach (int legacyWriterVersion in
-                new[] { existing.MinWriterVersion, replacement.MinWriterVersion })
+            foreach (var side in new[] { existing, replacement })
             {
-                if (legacyWriterVersion >= 7)
+                if (side.MinWriterVersion >= 7)
                     continue;
 
                 writerFeatures ??= [];
-                foreach (string feature in LegacyWriterFeatures(legacyWriterVersion))
+                foreach (string feature in LegacyWriterFeatures(side))
                 {
                     if (!writerFeatures.Contains(feature))
                         writerFeatures.Add(feature);
@@ -2255,7 +2250,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             return null;
 
         var writerFeatures = new List<string>(
-            current.WriterFeatures ?? LegacyWriterFeatures(current.MinWriterVersion));
+            current.WriterFeatures ?? LegacyWriterFeatures(current));
         foreach (var feature in missing)
         {
             if (!writerFeatures.Contains(feature))
@@ -2310,6 +2305,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     private const string GenerationExpressionKey = "delta.generationExpression";
 
+    /// <summary>
+    /// True when <paramref name="schema"/> carries an invariant as Spark's <c>Invariants.getFromSchema</c> counts one: a
+    /// <c>delta.invariants</c> expression, or a NOT NULL field, at any depth through structs (not into array elements
+    /// or map values). Measured on 4.0.0: a writer-7 floor with a NOT NULL column, top-level or inside a struct, is
+    /// writer 7, <c>[invariants]</c>.
+    /// </summary>
+    private static bool HasInvariants(StructType schema) =>
+        schema.Fields.Any(f =>
+            !f.Nullable
+            || (f.Metadata is not null && f.Metadata.ContainsKey("delta.invariants"))
+            || (f.Type is StructType nested && HasInvariants(nested)));
+
     private static void AddDeclared(List<string> declaredFeatures, string feature)
     {
         if (!declaredFeatures.Contains(feature))
@@ -2326,9 +2333,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// <paramref name="pending"/> (the upgrade already computed for a schema change, or null for none) further
     /// raised so the protocol declares <c>generatedColumns</c> when <paramref name="schema"/> has a generated
-    /// column: a legacy protocol below writer 4 is raised to writer 4, which implies it, and a table-features
-    /// protocol gets the feature named. Returns <paramref name="pending"/> unchanged when nothing more is needed
-    /// (#582).
+    /// column: a legacy protocol at writer 4 to 6 already implies it, and any other gets the feature named at writer 7,
+    /// with what its legacy version implied listed alongside, as Spark names it. Returns <paramref name="pending"/>
+    /// unchanged when nothing more is needed (#582).
     /// </summary>
     private static ProtocolAction? DeclareGeneratedColumns(
         ProtocolAction current, ProtocolAction? pending, StructType schema)
@@ -2336,11 +2343,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (!DeclaresGeneratedColumn(schema))
             return pending;
         var basis = pending ?? current;
-        ProtocolAction? raised = basis.MinWriterVersion >= 7
-            ? UpgradeProtocolForWriterFeatures(basis, ["generatedColumns"])
-            : basis.MinWriterVersion >= 4
-                ? null
-                : basis with { MinWriterVersion = 4 };
+        ProtocolAction? raised = basis.MinWriterVersion is >= 4 and < 7
+            ? null
+            : UpgradeProtocolForWriterFeatures(basis, ["generatedColumns"]);
         return raised ?? pending;
     }
 
@@ -2360,7 +2365,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             return null;
 
         var writerFeatures = new List<string>(
-            current.WriterFeatures ?? LegacyWriterFeatures(current.MinWriterVersion));
+            current.WriterFeatures ?? LegacyWriterFeatures(current));
         var readerFeatures = new List<string>(
             current.ReaderFeatures ?? LegacyReaderFeatures(current.MinReaderVersion));
         foreach (var feature in missing)
@@ -2379,6 +2384,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             WriterFeatures = writerFeatures,
         };
     }
+
+    /// <summary>
+    /// Writer features a legacy <paramref name="protocol"/> implies, read with its reader version: <c>columnMapping</c>
+    /// needs reader 2, so a <c>(1, 5)</c> or <c>(1, 6)</c> table does not support it. Listing it when such a table moves
+    /// to writer 7 would claim a reader-writer feature with no reader side. Spark 4.0.0 leaves it out (measured on a
+    /// <c>(1, 6)</c> table through ALTER and REPLACE).
+    /// </summary>
+    private static List<string> LegacyWriterFeatures(ProtocolAction protocol) =>
+        TableFeatureProperties.LegacyWriterFeaturesAtReader(protocol, LegacyWriterFeatures);
 
     /// <summary>Writer features implied by a legacy writer version (Delta spec upgrade table).</summary>
     private static List<string> LegacyWriterFeatures(int minWriterVersion)

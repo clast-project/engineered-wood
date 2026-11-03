@@ -1153,8 +1153,11 @@ feature. Both follow Spark 4.0 / Delta 4.0.0's names, protocol and history
 parameters ([#565](https://github.com/clast-project/engineered-wood/issues/565)).
 A constraint passed in `configuration` at creation now declares the
 feature too. So does a generated column, at creation or when ADD COLUMN /
-`SetSchemaAsync` introduces one: writer version 4 on a legacy protocol, the
-named `generatedColumns` feature on a table-features one. Spark enforces
+`SetSchemaAsync` introduces one. The `generatedColumns` feature is named at
+writer 7, as Spark 4.0.0 names it (measured: `[generatedColumns, invariants,
+appendOnly]` for a default table). It is not implied by raising to writer 4,
+which would also claim `changeDataFeed` and `checkConstraints`. A table already
+at legacy writer 4 to 6 implies it as it is (#639). Spark enforces
 generated columns only when the protocol declares the feature, and before
 this it committed rows that contradicted the expression on a table EW had
 created ([#582](https://github.com/clast-project/engineered-wood/issues/582)).

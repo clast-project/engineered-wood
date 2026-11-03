@@ -412,18 +412,23 @@ def cmd_create(args):
     Needed for generated columns specifically: `CREATE TABLE delta.`path`` rejects GENERATED ALWAYS AS
     with UNSUPPORTED_FEATURE.TABLE_OPERATION, so the builder API is the only path-based way to make one.
 
-    `columns` entries are {name, type, generated_always_as?, nullable?}.
+    `columns` entries are {name, type, generated_always_as?, nullable?}; `properties` is an optional
+    map of table properties.
     """
     from delta.tables import DeltaTable
 
     spark = _spark()
     builder = DeltaTable.create(spark).location(_uri(args["path"]))
     for col in args["columns"]:
+        nullable = col.get("nullable", True)
         if col.get("generated_always_as"):
             builder = builder.addColumn(
-                col["name"], col["type"], generatedAlwaysAs=col["generated_always_as"])
+                col["name"], col["type"], nullable=nullable,
+                generatedAlwaysAs=col["generated_always_as"])
         else:
-            builder = builder.addColumn(col["name"], col["type"])
+            builder = builder.addColumn(col["name"], col["type"], nullable=nullable)
+    for key, value in (args.get("properties") or {}).items():
+        builder = builder.property(key, value)
     builder.execute()
     return {"detail": _detail(spark, args["path"])}
 

@@ -96,6 +96,104 @@ public class ProtocolFloorPropertyInteropTests : IDisposable
             Sorted(ours.Metadata.Configuration?.Keys) ?? []);
     }
 
+    private async Task AssertSameProtocolAsync()
+    {
+        var ours = (await SnapshotAsync(_ours)).Protocol;
+        var theirs = (await SnapshotAsync(_theirs)).Protocol;
+        Assert.Equal((theirs.MinReaderVersion, theirs.MinWriterVersion), (ours.MinReaderVersion, ours.MinWriterVersion));
+        Assert.Equal(Sorted(theirs.ReaderFeatures), Sorted(ours.ReaderFeatures));
+        Assert.Equal(Sorted(theirs.WriterFeatures), Sorted(ours.WriterFeatures));
+    }
+
+    /// <summary>A NOT NULL column is an invariant: a floor that does not imply invariants names the feature.</summary>
+    [SkippableTheory]
+    [InlineData(null)]
+    [InlineData("1")]
+    [InlineData("7")]
+    public async Task NotNullColumn_SameProtocolAsSpark(string? floor)
+    {
+        Spark.Require();
+        var configuration = floor is null ? null : new Dictionary<string, string> { ["delta.minWriterVersion"] = floor };
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, false)).Build();
+
+        await using (await DeltaTable.CreateAsync(new LocalTableFileSystem(_ours), schema, configuration: configuration))
+        {
+        }
+        string tblProperties = floor is null ? "" : $" TBLPROPERTIES ('delta.minWriterVersion' = '{floor}')";
+        var created = Sql(_theirs, $"CREATE TABLE delta.`{{path}}` (id BIGINT NOT NULL) USING delta{tblProperties}");
+        Assert.True(created.GetProperty("ok").GetBoolean(), created.ToString());
+
+        await AssertSameProtocolAsync();
+    }
+
+    /// <summary>
+    /// A generated column's feature is named as Spark names it, with a floor and without one (#582's table was writer 4,
+    /// which also claimed changeDataFeed and checkConstraints).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(null, false)]
+    [InlineData("1", false)]
+    [InlineData("3", false)]
+    [InlineData("7", true)]
+    public async Task GeneratedColumn_SameProtocolAsSpark(string? floor, bool deletionVectors)
+    {
+        Spark.Require();
+        var properties = new Dictionary<string, string>();
+        if (floor is not null)
+            properties["delta.minWriterVersion"] = floor;
+        if (deletionVectors)
+            properties["delta.enableDeletionVectors"] = "true";
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("d", Int64Type.Default, true,
+                new Dictionary<string, string> { ["delta.generationExpression"] = "id * 2" }))
+            .Build();
+
+        await using (await DeltaTable.CreateAsync(new LocalTableFileSystem(_ours), schema, configuration: properties))
+        {
+        }
+        Spark.Invoke("create", new
+        {
+            path = _theirs,
+            columns = new object[]
+            {
+                new { name = "id", type = "BIGINT" },
+                new { name = "d", type = "BIGINT", generated_always_as = "id * 2" },
+            },
+            properties,
+        });
+
+        await AssertSameProtocolAsync();
+    }
+
+    /// <summary>
+    /// A <c>(1, 6)</c> table replaced by one needing table features lists writer 6's features without
+    /// <c>columnMapping</c>, which needs reader 2.
+    /// </summary>
+    [SkippableFact]
+    public async Task ReplacingAWriterSixTable_SameProtocolAsSpark()
+    {
+        Spark.Require();
+        var floor = new Dictionary<string, string> { ["delta.minWriterVersion"] = "6" };
+
+        await using (await DeltaTable.CreateAsync(new LocalTableFileSystem(_ours), IdSchema, configuration: floor))
+        {
+        }
+        var ids = new Int64Array.Builder().Append(1).Build();
+        await using (await DeltaTable.CreateOrReplaceAsync(
+                         new LocalTableFileSystem(_ours), IdSchema, [new RecordBatch(IdSchema, [ids], 1)],
+                         enableDeletionVectors: true))
+        {
+        }
+
+        var replaced = Sql(_theirs,
+            "CREATE TABLE delta.`{path}` (id BIGINT) USING delta TBLPROPERTIES ('delta.minWriterVersion' = '6')",
+            "REPLACE TABLE delta.`{path}` (id BIGINT) USING delta TBLPROPERTIES ('delta.enableDeletionVectors' = 'true')");
+        Assert.True(replaced.GetProperty("ok").GetBoolean(), replaced.ToString());
+
+        await AssertSameProtocolAsync();
+    }
+
     /// <summary>Spark writes to a table this library created with a floor below its default, and reads it back.</summary>
     [SkippableFact]
     public async Task SparkWritesToAnEwTableWithAWriterOneFloor()

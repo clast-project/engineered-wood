@@ -33,8 +33,10 @@ public class ProtocolFloorPropertyTests : IDisposable
 
     private LocalTableFileSystem Fs() => new(_tempDir);
 
+    // Nullable, as in the Spark measurements: a NOT NULL column is an invariant, which an explicit floor must declare
+    // (see Create_NotNullColumn_DeclaresInvariants).
     private static readonly Apache.Arrow.Schema IdSchema = new Apache.Arrow.Schema.Builder()
-        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("id", Int64Type.Default, true))
         .Build();
 
     private static RecordBatch Ids(params long[] ids)
@@ -124,6 +126,81 @@ public class ProtocolFloorPropertyTests : IDisposable
 
         // And the table is one this library goes on writing.
         await table.WriteAsync([Ids(1)]);
+    }
+
+    // Measured on Spark 4.0.0: a NOT NULL column, top-level or inside a struct, is an invariant (Invariants.getFromSchema
+    // counts it), so a floor that does not imply invariants gets the feature named. The default floor implies it.
+    [Theory]
+    [InlineData("7", false, 1, 7, "invariants")]
+    [InlineData("1", false, 1, 7, "invariants")]
+    [InlineData("7", true, 1, 7, "invariants")]
+    [InlineData(null, false, 1, 2, null)]
+    public async Task Create_NotNullColumn_DeclaresInvariants(
+        string? floor, bool nested, int reader, int writer, string? writerFeatures)
+    {
+        var field = nested
+            ? new Field("s", new Apache.Arrow.Types.StructType([new Field("a", Int64Type.Default, false)]), true)
+            : new Field("id", Int64Type.Default, false);
+        var schema = new Apache.Arrow.Schema.Builder().Field(field).Build();
+        var configuration = floor is null ? null : new Dictionary<string, string> { ["delta.minWriterVersion"] = floor };
+
+        await using var table = await DeltaTable.CreateAsync(Fs(), schema, configuration: configuration);
+
+        var protocol = table.CurrentSnapshot.Protocol;
+        Assert.Equal((reader, writer), (protocol.MinReaderVersion, protocol.MinWriterVersion));
+        AssertFeatures(Split(writerFeatures), protocol.WriterFeatures);
+    }
+
+    /// <summary>
+    /// A <c>(1, 6)</c> table does not support <c>columnMapping</c> (it needs reader 2), so moving it to writer 7, by an
+    /// ALTER or a REPLACE, lists writer 6's other features and not that one. Measured on Spark 4.0.0 for both.
+    /// </summary>
+    [Fact]
+    public async Task WriterSixFloor_ThroughAlterAndReplace_NeverListsColumnMapping()
+    {
+        string[] writerSix =
+            ["appendOnly", "invariants", "checkConstraints", "changeDataFeed", "generatedColumns", "identityColumns"];
+        await using (var created = await DeltaTable.CreateAsync(Fs(), IdSchema, configuration: Parse("delta.minWriterVersion=6")))
+        {
+            Assert.Equal((1, 6), (created.CurrentSnapshot.Protocol.MinReaderVersion, created.CurrentSnapshot.Protocol.MinWriterVersion));
+
+            // ALTER: a schema change that needs a reader-writer feature.
+            await created.AddColumnAsync(new Field("ts", new TimestampType(TimeUnit.Microsecond, (string?)null), true));
+            var altered = created.CurrentSnapshot.Protocol;
+            AssertFeatures(["timestampNtz"], altered.ReaderFeatures);
+            AssertFeatures([.. writerSix, "timestampNtz"], altered.WriterFeatures);
+        }
+
+        // REPLACE of a (1, 6) table with one that needs table features.
+        var other = Path.Combine(_tempDir, "other");
+        Directory.CreateDirectory(other);
+        var otherFs = new LocalTableFileSystem(other);
+        await using (await DeltaTable.CreateAsync(otherFs, IdSchema, configuration: Parse("delta.minWriterVersion=6")))
+        {
+        }
+        await using var replaced = await DeltaTable.CreateOrReplaceAsync(
+            otherFs, IdSchema, [Ids(1)], enableDeletionVectors: true);
+        AssertFeatures(["deletionVectors"], replaced.CurrentSnapshot.Protocol.ReaderFeatures);
+        AssertFeatures([.. writerSix, "deletionVectors"], replaced.CurrentSnapshot.Protocol.WriterFeatures);
+    }
+
+    /// <summary>The other direction, which Spark refuses (see the class remarks on REPLACE): a deletion-vector table
+    /// replaced with a writer-6 floor gets writer 6's features, without <c>columnMapping</c>.</summary>
+    [Fact]
+    public async Task Replace_OfATableFeaturesTable_WithAWriterSixFloor_LeavesOutColumnMapping()
+    {
+        await using (await DeltaTable.CreateAsync(Fs(), IdSchema, enableDeletionVectors: true))
+        {
+        }
+
+        await using var table = await DeltaTable.CreateOrReplaceAsync(
+            Fs(), IdSchema, [Ids(1)], configuration: Parse("delta.minWriterVersion=6"));
+
+        AssertFeatures(["deletionVectors"], table.CurrentSnapshot.Protocol.ReaderFeatures);
+        AssertFeatures(
+            ["deletionVectors", "appendOnly", "invariants", "checkConstraints", "changeDataFeed", "generatedColumns",
+                "identityColumns"],
+            table.CurrentSnapshot.Protocol.WriterFeatures);
     }
 
     [Theory]
