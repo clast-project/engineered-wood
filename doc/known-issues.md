@@ -605,13 +605,25 @@ the conversion itself, or accepts the lag until another engine's next commit, se
 Its companions `delta.universalFormat.iceberg.atomicConversion.supported` and `delta.universalformat.config.*` are not
 read; they matter only to a converter. #473
 
+*`delta.feature.<name>`* declares a table feature as supported at `CreateAsync` / `CreateOrReplaceAsync`, as
+Spark 4.0.0 does (measured, #601). The property is consumed, not stored. The feature is added along with the
+features it requires (`rowTracking` brings `domainMetadata`, `icebergCompatV1`/`V2` bring `columnMapping`). The
+result stays on a legacy protocol version when one describes the feature set exactly, so `checkConstraints` alone
+is writer 3. Key and value are matched without regard to case, and the value may be `supported` or `enabled`.
+Anything else is refused with `DELTA_UNSUPPORTED_FEATURE_STATUS`. A feature this library cannot write is refused
+with `DELTA_UNSUPPORTED_FEATURES_IN_CONFIG`, and `clustering` with
+`DELTA_CREATE_TABLE_SET_CLUSTERING_TABLE_FEATURE_NOT_ALLOWED`. Declaring `rowTracking` assigns the materialized
+column names, as Spark does. A replacement of a table that supports row tracking keeps those names and the row-id
+high-water mark. A caller-supplied `metaData` action that introduces a `delta.feature.*` key is refused, because
+stored there it declares nothing. Use a `protocol` action to declare the feature instead.
+
 *Not read, with consequences for a table EW writes to:*
 
 | Property | What EW does instead |
 |---|---|
 | `delta.compatibility.symlinkFormatManifest.enabled` | Symlink manifests (for Presto/Athena-style readers) are not regenerated. |
 | `delta.setTransactionRetentionDuration` | Expired `txn` (idempotent-write) identifiers are never dropped from checkpoints. |
-| `delta.feature.*`, `delta.minReaderVersion`, `delta.minWriterVersion` passed as CREATE `configuration` | Spark treats these as requests to enable a feature or raise the protocol; EW does not act on them. EW derives the protocol from the features a table uses. A feature is enabled through its `CreateAsync` parameter (`columnMappingMode`, `clusteringColumns`, `enableDeletionVectors`, `enableRowTracking`), a property in `configuration` (`delta.enableDeletionVectors`, `delta.enableRowTracking`, `delta.enableInCommitTimestamps`, `delta.enableChangeDataFeed`, `delta.enableIcebergCompatV1` / `V2`, `delta.checkpointPolicy`), or the schema (`timestamp_ntz`, `variant`). There is **no** way to request a protocol version directly, or a feature that has none of these. |
+| `delta.minReaderVersion`, `delta.minWriterVersion` passed as CREATE `configuration` | Spark treats these as requests to raise the protocol, and does not store them; EW stores them and does not act on them. EW derives the protocol from the features a table uses. A feature is enabled through its `CreateAsync` parameter (`columnMappingMode`, `clusteringColumns`, `enableDeletionVectors`, `enableRowTracking`), a property in `configuration` (`delta.enableDeletionVectors`, `delta.enableRowTracking`, `delta.enableInCommitTimestamps`, `delta.enableChangeDataFeed`, `delta.enableIcebergCompatV1` / `V2`, `delta.checkpointPolicy`), the schema (`timestamp_ntz`, `variant`), or a `delta.feature.<name> = supported` property (below). There is **no** way to request a protocol version directly. |
 | `delta.rowTrackingSuspended` | Not read. What Spark expects of a writer while suspended is not yet verified. |
 | `delta.inCommitTimestampEnablementVersion` / `…Timestamp` | Not read. EW sets them only implicitly (in-commit timestamps enabled at creation need neither). Unverified for a table that enabled them mid-life, where timestamp time travel across the boundary depends on them. |
 | `delta.enableChangeDataCapture` | Not read. Spark defines it as a key separate from `enableChangeDataFeed`; how Spark uses it is not yet verified. |

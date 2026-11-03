@@ -484,6 +484,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 configurationBuilder[kvp.Key] = kvp.Value;
         }
 
+        // delta.feature.<name> = supported declares a feature in the protocol without enabling it. The property is
+        // consumed, as Spark consumes it: stored, it declared nothing, and a caller who asked for the feature did not
+        // get it (#601). The features are added to the protocol just before it is built, below.
+        var declaredFeatures = TableFeatureProperties.Extract(configurationBuilder);
+
         // A feature is enabled by EITHER its dedicated argument or its table property, symmetrically — a
         // caller translating CREATE TABLE ... TBLPROPERTIES gets the same table as one passing the flags.
         // Enablement is one-directional (a property turns a feature on, never off), so the argument stays
@@ -571,13 +576,35 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // Caller-supplied names (in `configuration`) WIN — a table being recreated, or one whose files were
         // already written against known names, must keep them; only an absent name is generated.
         // The rowTracking + domainMetadata writer features are declared below.
+        //
+        // The names are assigned whenever the table will SUPPORT row tracking, enabled or not, as Spark's
+        // MaterializedRowTrackingColumn.updateMaterializedColumnName does: a table declared with
+        // delta.feature.rowTracking = supported gets them, and so does a replacement of a table that supported it,
+        // whose protocol keeps the feature. A replacement keeps the replaced table's names, as Spark's REPLACE does.
+        bool rowTrackingSupported = rowTrackingEnabled
+            || declaredFeatures.Contains("rowTracking")
+            || DeltaLake.RowTracking.RowTrackingConfig.IsSupported(previousSnapshot?.Protocol);
         if (rowTrackingEnabled)
         {
             configurationBuilder ??= new Dictionary<string, string>();
             configurationBuilder[DeltaLake.RowTracking.RowTrackingConfig.EnableKey] = "true";
+        }
+        if (rowTrackingSupported)
+        {
+            configurationBuilder ??= new Dictionary<string, string>();
             string rowIdKey = DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowIdColumnNameKey;
             string rowVersionKey =
                 DeltaLake.RowTracking.RowTrackingConfig.MaterializedRowCommitVersionColumnNameKey;
+            var previousConfiguration = previousSnapshot?.Metadata.Configuration;
+            foreach (string key in new[] { rowIdKey, rowVersionKey })
+            {
+                if (!configurationBuilder.ContainsKey(key)
+                    && previousConfiguration is not null
+                    && previousConfiguration.TryGetValue(key, out var previousName))
+                {
+                    configurationBuilder[key] = previousName;
+                }
+            }
             if (!configurationBuilder.ContainsKey(rowIdKey)
                 || !configurationBuilder.ContainsKey(rowVersionKey))
             {
@@ -791,6 +818,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             WriterFeatures = writerFeatures.Count > 0 ? writerFeatures : null,
         };
 
+        if (declaredFeatures.Count > 0)
+        {
+            protocolAction = TableFeatureProperties.Declare(
+                protocolAction, declaredFeatures, LegacyWriterFeatures, LegacyReaderFeatures);
+        }
+
         if (previousSnapshot is not null)
             protocolAction = MergeReplacementProtocol(previousSnapshot.Protocol, protocolAction);
 
@@ -822,7 +855,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var replacementDomains = new HashSet<string>(
                 actions.OfType<DomainMetadata>().Select(static action => action.Domain),
                 StringComparer.Ordinal);
-            if (rowTrackingEnabled)
+            // The row-id high-water mark stays while the table supports row tracking, enabled or not, as Spark's
+            // REPLACE keeps it: a fresh one would hand out row ids the replaced table already used.
+            if (DeltaLake.RowTracking.RowTrackingConfig.IsSupported(protocolAction))
                 replacementDomains.Add(DeltaLake.RowTracking.RowTrackingConfig.DomainName);
 
             foreach (string domain in previousSnapshot.DomainMetadata.Keys)
@@ -2009,6 +2044,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             EnsureUniversalFormatMaintained(extraActions, _options);
             EnsureNoInvalidIsolationLevelIntroduced(snapshot, extraActions);
+            EnsureNoFeaturePropertiesIntroduced(snapshot, extraActions);
             actions.AddRange(extraActions);
         }
         if (actions.Count == 0)
@@ -2762,6 +2798,37 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Refuses caller-supplied <c>metaData</c> that introduces a <c>delta.feature.*</c> property. Stored there, the
+    /// property declares nothing: <see cref="CreateCoreAsync"/> consumes one into the protocol and Spark never
+    /// stores one, so a host means a <c>protocol</c> action naming the feature. A key carried through unchanged
+    /// from the base snapshot is left alone, since a table created before #601 may already hold one.
+    /// </summary>
+    private static void EnsureNoFeaturePropertiesIntroduced(
+        Snapshot.Snapshot baseSnapshot, IEnumerable<DeltaAction> actions)
+    {
+        var current = baseSnapshot.Metadata.Configuration;
+        foreach (var action in actions)
+        {
+            if (action is not MetadataAction { Configuration: { } configuration })
+                continue;
+            foreach (var pair in configuration)
+            {
+                if (!TableFeatureProperties.IsFeatureProperty(pair.Key))
+                    continue;
+                if (current is not null && current.TryGetValue(pair.Key, out var existing)
+                    && string.Equals(existing, pair.Value, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.UnsupportedFeaturesInConfig,
+                    $"A metaData action sets '{pair.Key}', which would be stored as a plain table property and "
+                    + "declare nothing. Declare the feature with a protocol action instead.");
+            }
+        }
+    }
+
+    /// <summary>
     /// Refuses caller-supplied <c>metaData</c> that SETS <c>delta.isolationLevel</c> to a value naming no level,
     /// as <see cref="CreateCoreAsync"/> refuses it at create and Spark refuses it on any property update. Only a
     /// value that differs from the base snapshot's is judged: one carried through unchanged was already the
@@ -2841,6 +2908,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         EnsureUniversalFormatMaintained(baseSnapshot.Metadata.Configuration, _options);
         EnsureUniversalFormatMaintained(transaction.DataActions, _options);
         EnsureNoInvalidIsolationLevelIntroduced(baseSnapshot, transaction.DataActions);
+        EnsureNoFeaturePropertiesIntroduced(baseSnapshot, transaction.DataActions);
 
         // Every transactional operation is now rebase-safe under row tracking: a DELETE only edits deletion
         // vectors on EXISTING files (its re-add keeps that file's own baseRowId), or — when a file was
@@ -7881,6 +7949,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             EnsureUniversalFormatMaintained(extraActions, _options);
             EnsureNoInvalidIsolationLevelIntroduced(CurrentSnapshot, extraActions);
+            EnsureNoFeaturePropertiesIntroduced(CurrentSnapshot, extraActions);
         }
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
         // extraActions (a buffered transaction's deletion-vector remove/add pairs) likewise make this a

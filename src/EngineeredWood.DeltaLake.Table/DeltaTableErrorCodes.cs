@@ -41,6 +41,31 @@ public static class DeltaTableErrorCodes
     public const string ClusteringWithPartitioning = "DELTA_CLUSTERING_WITH_PARTITIONING";
 
     /// <summary>
+    /// A <c>delta.feature.clustering</c> table property: the clustering feature is declared by creating the table
+    /// with clustering columns, which also records which columns those are.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_CREATE_TABLE_SET_CLUSTERING_TABLE_FEATURE_NOT_ALLOWED</c>, measured on
+    /// 4.0.0.</remarks>
+    public const string ClusteringFeatureViaProperty = "DELTA_CREATE_TABLE_SET_CLUSTERING_TABLE_FEATURE_NOT_ALLOWED";
+
+    /// <summary>
+    /// A <c>delta.feature.&lt;name&gt;</c> table property whose value is not <c>supported</c> (or <c>enabled</c>,
+    /// which Spark also accepts).
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_UNSUPPORTED_FEATURE_STATUS</c>, measured on 4.0.0.</remarks>
+    public const string UnsupportedFeatureStatus = "DELTA_UNSUPPORTED_FEATURE_STATUS";
+
+    /// <summary>
+    /// A <c>delta.feature.&lt;name&gt;</c> table property naming no feature this implementation can write, or a
+    /// <c>delta.feature.*</c> key in a caller-supplied <c>metaData</c> action, where it would be stored as a plain
+    /// property and declare nothing.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_UNSUPPORTED_FEATURES_IN_CONFIG</c>, measured on 4.0.0 for an unknown name.
+    /// Spark never stores such a key, so a <c>metaData</c> carrying one has no Spark counterpart; a host declares
+    /// a feature with a <c>protocol</c> action instead.</remarks>
+    public const string UnsupportedFeaturesInConfig = "DELTA_UNSUPPORTED_FEATURES_IN_CONFIG";
+
+    /// <summary>
     /// A caller-supplied <c>preAssignedSchema</c> cannot be used: it carries no column-mapping field
     /// ids for a table being created with column mapping, or it reuses ids the existing table has
     /// already spent.
