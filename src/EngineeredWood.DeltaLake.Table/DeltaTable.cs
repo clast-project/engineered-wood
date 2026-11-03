@@ -816,11 +816,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // Both are spec-legal and Spark reads ours (SparkInteropTests covers it); the difference is
         // cosmetic, because writer v5's extra implied features (checkConstraints, generatedColumns,
         // changeDataFeed) only impose obligations on a table that actually uses them, and EW meets those:
-        // the paths that build the rows (WriteAsync, UpdateAsync, MergeAsync, OverwriteWhereAsync, the
-        // initial data here) enforce constraints and compute generated columns, a DELETE writes no new
-        // values and so has nothing to check, and HonorWriterFeatures refuses the rest: the external-file
-        // commit and staging seams unless the caller asserts enforcement, and UpdateRowsAsync. The same
-        // holds when another feature forces reader 3 / writer 7 below: the legacy (2, 5) implied features
+        // the paths that build or receive the rows (WriteAsync, UpdateAsync, UpdateRowsAsync, MergeAsync,
+        // OverwriteWhereAsync, the initial data here) enforce constraints and compute generated columns, a
+        // DELETE writes no new values and so has nothing to check, and HonorWriterFeatures refuses the rest:
+        // the external-file commit and staging seams unless the caller asserts enforcement. The same holds
+        // when another feature forces reader 3 / writer 7 below: the legacy (2, 5) implied features
         // are then NAMED, where Spark names only [columnMapping, invariants, appendOnly]. See
         // doc/known-issues.md, "Column-mapping protocol shape differs from Spark's".
         if (mappingMode != ColumnMappingMode.None && !explicitFloor &&
@@ -9768,6 +9768,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>delta.enableChangeDataFeed</c> each touched row's before/after values are written as
     /// <c>update_preimage</c>/<c>update_postimage</c> change files. IcebergCompat is not yet supported on this
     /// path. Returns the committed version (or the current version if nothing matched).
+    /// <para>The selected rows are the post-image, checked as <see cref="UpdateAsync(Func{RecordBatch, BooleanArray}, Func{RecordBatch, RecordBatch}, CancellationToken, CommitProperties)"/>
+    /// checks its own: generated columns are recomputed from the new values (whatever <paramref name="rewriteFile"/>
+    /// put in them), then CHECK constraints, invariants and NOT NULL are evaluated. The other rows are copied
+    /// through unchecked. A selected row may land later in the rewritten file than it was.</para>
     /// </summary>
     /// <param name="rewriteFile">Receives <c>(path, sourceBatches, absolutePositionsPerBatch)</c>. The PATH is
     /// the file's <c>add.path</c> — the same key the selection is built on, so a host that computed its new
@@ -9910,6 +9914,21 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         return result;
     }
 
+    // The row indices in [0, length) that `rows` (ascending) does not hold.
+    private static List<int> Complement(List<int> rows, int length)
+    {
+        var result = new List<int>(length - rows.Count);
+        int next = 0;
+        for (int i = 0; i < length; i++)
+        {
+            if (next < rows.Count && rows[next] == i)
+                next++;
+            else
+                result.Add(i);
+        }
+        return result;
+    }
+
     private static List<int> BuildIdentity(int n)
     {
         var list = new List<int>(n);
@@ -9930,8 +9949,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (selection.IsEmpty)
             return snapshot.Version;
 
-        HonorWriterFeatures(snapshot, isAppend: false);
+        // The updated rows are checked here, as UpdateAsync checks its post-image (#647): generated columns are
+        // recomputed, then CHECK constraints, invariants and NOT NULL are evaluated. Created before anything is
+        // written, so an expression this writer cannot read still refuses the update up front.
+        HonorWriterFeatures(snapshot, isAppend: false, WriteTimeExpressionHandling.ValidatedHere);
         RejectCopyOnWriteRowIdUnsupported("copy-on-write UPDATE");
+        var constraints = DeltaConstraintEnforcer.Create(snapshot);
+        var generatedColumns = DeltaGeneratedColumns.Create(snapshot);
+        bool checksPostImage = constraints is not null || generatedColumns is not null;
 
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
@@ -10002,8 +10027,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
 
             // Build the materialized id/version arrays (an UPDATED row's version advances to this commit) and
-            // count the rows actually matched in this file.
-            var outTracking = materializeIds ? new List<(Int64Array Ids, Int64Array Vers)?>() : null;
+            // count the rows actually matched in this file. Each output segment is routed with its tracking and
+            // whether it may move partition.
+            var segments = new List<(RecordBatch Rows, (Int64Array Ids, Int64Array Vers)? Tracking, bool MayMove)>();
             // Change Data Feed: the pre/post image of exactly the rows this update touched, paired per source
             // batch (the rewriter preserves batch structure and row order, so index i means the same row in both).
             var changePairs = cdfEnabled
@@ -10044,19 +10070,45 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         if (ver is { } vv) vdb!.Append(vv); else vdb!.AppendNull();
                     }
                 }
-                outTracking?.Add(materializeIds ? (idb!.Build(), vdb!.Build()) : ((Int64Array, Int64Array)?)null);
-                // The post-image's NOT NULL columns (#514). Only the selected rows, as UPDATE checks only its
-                // post-image: the rest are copied through, and re-checking them would refuse this update over a
-                // null an earlier writer left behind. Read in place rather than gathered: a host writer's batch
-                // may hold a representation (a dictionary) the gather does not take.
-                DeltaNotNullEnforcer.Validate(rewritten[bi], snapshot.Schema, rows: matchedRows);
+                (Int64Array Ids, Int64Array Vers)? tracking =
+                    materializeIds ? (idb!.Build(), vdb!.Build()) : null;
+                RecordBatch? postImage = null;
+                if (checksPostImage && matchedRows.Count > 0)
+                {
+                    // The selected rows go through UpdateAsync's post-image preparation: generated columns
+                    // recomputed from the new values (the host's copy still carries the old ones, and Spark does
+                    // not let an UPDATE assign one), then the constraints, invariants and NOT NULL checked. Only
+                    // these rows: the rest are copied through, as UpdateAsync copies the rows its predicate did
+                    // not match, so they are routed separately and keep their partition.
+                    postImage = PreparePostImage(
+                        TakeRowsFromBatch(rewritten[bi], matchedRows), snapshot, generatedColumns, constraints);
+                    segments.Add((postImage, tracking is { } t
+                        ? (TakeIds(t.Ids, matchedRows), TakeIds(t.Vers, matchedRows))
+                        : null, MayMove: true));
+                    var keptRows = Complement(matchedRows, src.Length);
+                    if (keptRows.Count > 0)
+                    {
+                        segments.Add((TakeRowsFromBatch(rewritten[bi], keptRows), tracking is { } k
+                            ? (TakeIds(k.Ids, keptRows), TakeIds(k.Vers, keptRows))
+                            : null, MayMove: false));
+                    }
+                }
+                else
+                {
+                    // The post-image's NOT NULL columns (#514). Only the selected rows, as UPDATE checks only its
+                    // post-image: the rest are copied through, and re-checking them would refuse this update over
+                    // a null an earlier writer left behind. Read in place rather than gathered: a host writer's
+                    // batch may hold a representation (a dictionary) the gather does not take.
+                    DeltaNotNullEnforcer.Validate(rewritten[bi], snapshot.Schema, rows: matchedRows);
+                    segments.Add((rewritten[bi], tracking, touched[bi]));
+                }
                 if (cdfEnabled && matchedRows.Count > 0)
                 {
                     // Both images are the same rows, so one id array serves both; the pre-image keeps the
                     // version that last wrote the row, the post-image takes this commit's.
                     changePairs!.Add((
                         TakeRowsFromBatch(src, matchedRows),
-                        TakeRowsFromBatch(rewritten[bi], matchedRows),
+                        postImage ?? TakeRowsFromBatch(rewritten[bi], matchedRows),
                         batchIds is not null ? TakeIds(batchIds, matchedRows) : null,
                         batchVers is not null ? TakeIds(batchVers, matchedRows) : null));
                 }
@@ -10069,8 +10121,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // Only a batch holding an updated row can have moved one: the rest are the rows as read.
             var router = new PartitionRouter(
                 snapshot, mappingMode, userBatches.FirstOrDefault(b => b.Length > 0), materializeIds);
-            for (int bi = 0; bi < rewritten.Count; bi++)
-                router.Add(rewritten[bi], outTracking?[bi], mayMove: touched[bi]);
+            foreach (var segment in segments)
+                router.Add(segment.Rows, segment.Tracking, mayMove: segment.MayMove);
             nextRowId = await WriteRewriteGroupsAsync(
                 snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
                 assignRowIds, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
