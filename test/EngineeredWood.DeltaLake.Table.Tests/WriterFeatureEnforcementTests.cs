@@ -713,18 +713,281 @@ public class WriterFeatureEnforcementTests : IDisposable
         Assert.Equal(DeltaTableErrorCodes.CannotModifyAppendOnly, ex.ErrorCode);
     }
 
-    /// <summary>
-    /// UpdateRowsAsync writes the host's new values and does not evaluate them yet (#647's second half), so it
-    /// still refuses.
-    /// </summary>
+    // ── UpdateRowsAsync (#647) ──
+    // The host returns the new rows, so they are checked as UpdateAsync checks its post-image: generated columns
+    // recomputed, then constraints and invariants evaluated, on the selected rows only.
+
+    /// <summary>The (path, position) locator of each row whose id is in <paramref name="ids"/>.</summary>
+    private static async Task<List<(string Path, long Position)>> LocatorsOfAsync(DeltaTable table, params long[] ids)
+    {
+        var wanted = new HashSet<long>(ids);
+        var result = new List<(string, long)>();
+        string pathName = RowSelection.DefaultMetadataPrefix + RowSelection.FilePathColumnSuffix;
+        string indexName = RowSelection.DefaultMetadataPrefix + RowSelection.RowIndexColumnSuffix;
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
+        {
+            var id = (Int64Array)batch.Column("id");
+            var path = (StringArray)batch.Column(pathName);
+            var index = (Int64Array)batch.Column(indexName);
+            for (int i = 0; i < batch.Length; i++)
+                if (wanted.Contains(id.GetValue(i)!.Value))
+                    result.Add((path.GetString(i), index.GetValue(i)!.Value));
+        }
+        return result;
+    }
+
+    /// <summary>The locator-keyed update setting <c>id</c> of the row at <paramref name="locator"/>.</summary>
+    private static RecordBatch SetIdAt((string Path, long Position) locator, long id) =>
+        new(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field(RowSelection.DefaultMetadataPrefix + RowSelection.FilePathColumnSuffix, StringType.Default, false))
+                .Field(new Field(RowSelection.DefaultMetadataPrefix + RowSelection.RowIndexColumnSuffix, Int64Type.Default, false))
+                .Field(new Field("id", Int64Type.Default, false))
+                .Build(),
+            [
+                new StringArray.Builder().Append(locator.Path).Build(),
+                new Int64Array.Builder().Append(locator.Position).Build(),
+                new Int64Array.Builder().Append(id).Build(),
+            ],
+            1);
+
+    /// <summary>A rewriter (the delegate overload) that sets <c>id</c> at file position 0 and leaves every other
+    /// column, the stale generated value included, as it was read.</summary>
+    private static Func<string, IReadOnlyList<RecordBatch>, IReadOnlyList<Int64Array>, IReadOnlyList<RecordBatch>>
+        SetFirstId(long id) => (_, batches, positions) => batches.Select((batch, b) =>
+        {
+            var source = (Int64Array)batch.Column("id");
+            var ids = new Int64Array.Builder();
+            for (int i = 0; i < batch.Length; i++)
+                ids.Append(positions[b].GetValue(i) == 0 ? id : source.GetValue(i)!.Value);
+            var newIds = ids.Build();
+            var columns = Enumerable.Range(0, batch.ColumnCount)
+                .Select(c => batch.Schema.FieldsList[c].Name == "id" ? newIds : batch.Column(c))
+                .ToArray();
+            return new RecordBatch(batch.Schema, columns, batch.Length);
+        }).ToList();
+
     [Fact]
-    public async Task UpdateRowsStillRefusesAConstrainedTable()
+    public async Task UpdateRowsRefusesAPostImageThatViolatesAConstraint()
     {
         await using var table = await CreateExpressionTableAsync("check");
+        long before = table.CurrentSnapshot.Version;
+        var locator = (await LocatorsOfAsync(table, 1)).Single();
 
-        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.UpdateRowsAsync(
-            FirstRowOfTheOnlyFile(table), (_, batches, _) => batches));
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.UpdateRowsAsync(SetIdAt(locator, -1)));
+
+        Assert.Equal(DeltaTableErrorCodes.ConstraintViolated, ex.ErrorCode);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task UpdateRowsAdmitsAPostImageThatSatisfiesTheConstraint()
+    {
+        await using var table = await CreateExpressionTableAsync("check");
+        var locator = (await LocatorsOfAsync(table, 1)).Single();
+
+        await table.UpdateRowsAsync(SetIdAt(locator, 7));
+
+        Assert.Equal([2L, 3L, 7L], (await ReadAllAsync(table)).Select(r => r.Id).OrderBy(i => i));
+    }
+
+    [Fact]
+    public async Task UpdateRowsRecomputesAGeneratedColumnForTheUpdatedRowsOnly()
+    {
+        await using var table = await CreateExpressionTableAsync("generated");
+
+        // The rewriter hands back the old derived value; the updated row gets id + 1, the others keep theirs.
+        await table.UpdateRowsAsync(FirstRowOfTheOnlyFile(table), SetFirstId(41));
+
+        Assert.Equal([(2L, (long?)3L), (3L, 4L), (41L, 42L)], (await ReadAllAsync(table)).OrderBy(r => r.Id));
+    }
+
+    [Fact]
+    public async Task UpdateRowsRecordsTheRecomputedValueInTheChangeFeed()
+    {
+        var id = new Field("id", Int64Type.Default, false);
+        var derived = new Field("derived", Int64Type.Default, true,
+            new Dictionary<string, string> { ["delta.generationExpression"] = "id + 1" });
+        var schema = new Apache.Arrow.Schema.Builder().Field(id).Field(derived).Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" });
+        await table.WriteAsync([IdAndDerived(1, 2)]);
+
+        long version = await table.UpdateRowsAsync(FirstRowOfTheOnlyFile(table), SetFirstId(41));
+
+        var images = new Dictionary<string, (long Id, long? Derived)>();
+        await foreach (var batch in table.ReadChangesAsync(
+            new DeltaChangeReadOptions { StartVersion = version, EndVersion = version }))
+        {
+            var types = (StringArray)batch.Column("_change_type");
+            var ids = (Int64Array)batch.Column("id");
+            var values = (Int64Array)batch.Column("derived");
+            for (int i = 0; i < batch.Length; i++)
+                images[types.GetString(i)] = (ids.GetValue(i)!.Value, values.GetValue(i));
+        }
+        Assert.Equal((1L, (long?)2L), images["update_preimage"]);
+        Assert.Equal((41L, (long?)42L), images["update_postimage"]);
+    }
+
+    /// <summary>
+    /// A generated partition column the rewriter leaves null is recomputed before NULL is refused: the post-image
+    /// is the one stored, and its value comes from the expression (#649 review).
+    /// </summary>
+    [Fact]
+    public async Task UpdateRowsRecomputesANullGeneratedPartitionValueBeforeRefusingIt()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("derived", Int64Type.Default, false,
+                new Dictionary<string, string> { ["delta.generationExpression"] = "id + 1" }))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema, partitionColumns: ["derived"]);
+        await table.WriteAsync([new RecordBatch(
+            schema,
+            [
+                new Int64Array.Builder().Append(1).Append(2).Build(),
+                new Int64Array.Builder().Append(2).Append(3).Build(),
+            ],
+            2)]);
+        string path = table.CurrentSnapshot.ActiveFiles.Values
+            .Single(f => f.PartitionValues["derived"] == "2").Path;
+
+        await table.UpdateRowsAsync(
+            RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>> { [path] = new long[] { 0 } }),
+            (_, batches, positions) => batches.Select(batch =>
+            {
+                var nullDerived = new Int64Array.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                    nullDerived.AppendNull();
+                var columns = Enumerable.Range(0, batch.ColumnCount)
+                    .Select(c => batch.Schema.FieldsList[c].Name switch
+                    {
+                        "id" => (IArrowArray)new Int64Array.Builder().Append(41).Build(),
+                        "derived" => nullDerived.Build(),
+                        _ => batch.Column(c),
+                    })
+                    .ToArray();
+                return new RecordBatch(batch.Schema, columns, batch.Length);
+            }).ToList());
+
+        Assert.Equal([(2L, (long?)3L), (41L, 42L)], (await ReadAllAsync(table)).OrderBy(r => r.Id));
+        Assert.Contains(table.CurrentSnapshot.ActiveFiles.Values, f => f.PartitionValues["derived"] == "42");
+    }
+
+    /// <summary>A row the update does not select keeps the NOT NULL partition check it had before.</summary>
+    [Fact]
+    public async Task UpdateRowsStillRefusesANullPartitionValueInAnUnselectedRow()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("derived", Int64Type.Default, false,
+                new Dictionary<string, string> { ["delta.generationExpression"] = "id + 1" }))
+            .Field(new Field("p", Int64Type.Default, false))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema, partitionColumns: ["p"]);
+        await table.WriteAsync([new RecordBatch(
+            schema,
+            [
+                new Int64Array.Builder().Append(1).Append(2).Build(),
+                new Int64Array.Builder().Append(2).Append(3).Build(),
+                new Int64Array.Builder().Append(7).Append(7).Build(),
+            ],
+            2)]);
+        long before = table.CurrentSnapshot.Version;
+        string path = table.CurrentSnapshot.ActiveFiles.Values.Single().Path;
+
+        // Selects position 0, and (against the contract) nulls the partition value of the unselected row too.
+        await Assert.ThrowsAsync<ArgumentException>(async () => await table.UpdateRowsAsync(
+            RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>> { [path] = new long[] { 0 } }),
+            (_, batches, positions) => batches.Select(batch =>
+            {
+                var p = new Int64Array.Builder().Append(7).AppendNull().Build();
+                var columns = Enumerable.Range(0, batch.ColumnCount)
+                    .Select(c => batch.Schema.FieldsList[c].Name == "p" ? p : batch.Column(c))
+                    .ToArray();
+                return new RecordBatch(batch.Schema, columns, batch.Length);
+            }).ToList()));
+
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task UpdateRowsLeavesUntouchedRowsUnvalidated()
+    {
+        // As UpdateLeavesUntouchedRowsUnvalidated: the violating row predates the constraint and shares the file.
+        await using (var unconstrained = await CreateTableAsync())
+        {
+            await unconstrained.WriteAsync([Rows(-5, 10)]);
+        }
+        await AddConstraintAsync(version: 2, "positive_id", "id > 0");
+
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        await table.UpdateRowsAsync(SetIdAt((await LocatorsOfAsync(table, 10)).Single(), 11));
+
+        var ids = new List<long>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var column = (Int64Array)batch.Column("id");
+            for (var i = 0; i < batch.Length; i++)
+                ids.Add(column.GetValue(i)!.Value);
+        }
+        Assert.Equal([-5L, 11L], ids.OrderBy(x => x).ToArray());
+    }
+
+    [Fact]
+    public async Task UpdateRowsStillRefusesAConstraintThisWriterCannotParse()
+    {
+        // Fail-closed: a constraint outside the grammar refuses the update before anything is written.
+        await using (var unconstrained = await CreateTableAsync())
+        {
+            await unconstrained.WriteAsync([Rows(1)]);
+        }
+        await AddConstraintAsync(version: 2, "exotic", "id > INTERVAL 1 DAY");
+
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        long before = table.CurrentSnapshot.Version;
+        var locator = (await LocatorsOfAsync(table, 1)).Single();
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.UpdateRowsAsync(SetIdAt(locator, 2)));
 
         Assert.Equal(DeltaTableErrorCodes.UnevaluableTableExpression, ex.ErrorCode);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task UpdateRowsKeepsEveryRowsStableIdOnAConstrainedTable()
+    {
+        // The updated rows are routed apart from the rest of their file, so each row's id must travel with it.
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, false)).Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), schema, enableRowTracking: true,
+            configuration: new Dictionary<string, string> { ["delta.constraints.positive_id"] = "id > 0" });
+        await table.WriteAsync([Rows(1, 2, 3)]);
+        var before = await StableIdsAsync(table);
+
+        await table.UpdateRowsAsync(SetIdAt((await LocatorsOfAsync(table, 2)).Single(), 20));
+
+        var after = await StableIdsAsync(table);
+        Assert.Equal(before[1], after[1]);
+        Assert.Equal(before[2], after[20]);
+        Assert.Equal(before[3], after[3]);
+    }
+
+    private static async Task<Dictionary<long, long>> StableIdsAsync(DeltaTable table)
+    {
+        var result = new Dictionary<long, long>();
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.RowTracking }))
+        {
+            var id = (Int64Array)batch.Column("id");
+            var rowId = (Int64Array)batch.Column(RowSelection.DefaultMetadataPrefix + "row_id");
+            for (int i = 0; i < batch.Length; i++)
+                result[id.GetValue(i)!.Value] = rowId.GetValue(i)!.Value;
+        }
+        return result;
     }
 }

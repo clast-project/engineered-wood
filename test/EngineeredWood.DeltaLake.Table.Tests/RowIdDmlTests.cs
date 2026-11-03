@@ -545,4 +545,81 @@ public class RowIdDmlTests : IDisposable
 
         Assert.Equal(["delete|id=3|region=east|val=103"], await FeedRowsAsync(version, version));
     }
+
+    // ── Row tracking without materialized column names (#649 review) ──
+    // A copy-on-write rewrite keeps a row's stable id only by writing it into the materialized row-id column. A
+    // table that enables row tracking without naming those columns cannot have it kept, so every rewriting path
+    // refuses it, as UpdateAsync does.
+
+    /// <summary>A row-tracking table whose metadata names no materialized columns, with ids 1..3 in one file.</summary>
+    private async Task<DeltaTable> CreateRowTrackingTableWithoutColumnNamesAsync()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await new DeltaLake.Log.TransactionLog(fs).WriteCommitAsync(0, new List<DeltaLake.Actions.DeltaAction>
+        {
+            new DeltaLake.Actions.ProtocolAction
+            {
+                MinReaderVersion = 1,
+                MinWriterVersion = 7,
+                WriterFeatures = ["rowTracking", "domainMetadata", "appendOnly", "invariants"],
+            },
+            new DeltaLake.Actions.MetadataAction
+            {
+                Id = "rt-no-names",
+                Format = DeltaLake.Actions.Format.Parquet,
+                SchemaString = @"{""type"":""struct"",""fields"":[{""name"":""id"",""type"":""long"",""nullable"":false,""metadata"":{}}]}",
+                PartitionColumns = [],
+                Configuration = new Dictionary<string, string> { ["delta.enableRowTracking"] = "true" },
+            },
+        });
+        var table = await DeltaTable.OpenAsync(fs);
+        await table.WriteAsync([Batch(1, 3)]);
+        return table;
+    }
+
+    [Fact]
+    public async Task RowTrackingWithoutColumnNames_PredicateUpdateIsRefused()
+    {
+        await using var table = await CreateRowTrackingTableWithoutColumnNamesAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        await Assert.ThrowsAsync<NotSupportedException>(async () => await table.UpdateAsync(
+            batch =>
+            {
+                var ids = (Int64Array)batch.Column("id");
+                var mask = new BooleanArray.Builder();
+                for (int i = 0; i < ids.Length; i++)
+                    mask.Append(ids.GetValue(i) == 2);
+                return mask.Build();
+            },
+            batch => batch));
+
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task RowTrackingWithoutColumnNames_UpdateRowsIsRefused()
+    {
+        await using var table = await CreateRowTrackingTableWithoutColumnNamesAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        await Assert.ThrowsAsync<NotSupportedException>(async () =>
+            await table.UpdateRowsAsync(await SelectionOf(table, 2), AddToIds(1000, 2)));
+
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+        Assert.Equal(new long[] { 1, 2, 3 }, await ReadIdsFresh());
+    }
+
+    [Fact]
+    public async Task RowTrackingWithoutColumnNames_CopyOnWriteDeleteRowsIsRefused()
+    {
+        await using var table = await CreateRowTrackingTableWithoutColumnNamesAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        await Assert.ThrowsAsync<NotSupportedException>(async () =>
+            await table.DeleteRowsAsync(await SelectionOf(table, 2), RowDeleteMode.CopyOnWrite));
+
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+        Assert.Equal(new long[] { 1, 2, 3 }, await ReadIdsFresh());
+    }
 }
