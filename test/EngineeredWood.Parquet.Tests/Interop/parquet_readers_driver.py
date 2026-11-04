@@ -177,6 +177,14 @@ def cmd_duckdb_write_variant(args):
     module, error = _import("duckdb")
     if module is None:
         return {"available": False, "error": error}
+    # A DuckDB-written file is the oracle from 2.0. VARIANT arrived in 1.4 and 1.5 shreds it on COPY,
+    # but 1.5 writes a SQL NULL as a present group holding a variant null and its reader calls that
+    # SQL NULL, so it disagrees with the spec (and EW) about NULLs. Below 2.0 the capability is
+    # missing, which is a skip, not a failure. See DuckDb.WritesShreddedVariantOracle in the Delta tests.
+    version = tuple(int(x) for x in module.__version__.split(".")[:2])
+    if version < (2, 0):
+        return {"available": False,
+                "error": f"DuckDB {module.__version__} is too old to be the shredded-VARIANT oracle (needs 2.0+)"}
 
     path = args["path"]
     col = args.get("col", "v")

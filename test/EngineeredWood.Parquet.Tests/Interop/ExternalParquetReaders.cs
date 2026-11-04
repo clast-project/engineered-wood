@@ -180,10 +180,10 @@ internal static class ExternalParquetReaders
     /// reports the file's column-chunk paths and DuckDB's own reading of <paramref name="column"/>,
     /// ordered by <paramref name="orderBy"/>. DuckDB is the WRITER here, the reverse of the other
     /// calls: it shreds a VARIANT column by default, so its files are an independent source of
-    /// shredded variants for EW's reader. <c>File</c> is null when DuckDB is absent (<c>Installed</c>
-    /// false) or failed; the error says why.
+    /// shredded variants for EW's reader. <c>File</c> is null when DuckDB is absent or older than 2.0
+    /// (<c>Supported</c> false, a skip), or when it failed (a failure); the error says why.
     /// </summary>
-    public static (DuckDbVariantFile? File, bool Installed, string? Error) DuckDbWriteVariant(
+    public static (DuckDbVariantFile? File, bool Supported, string? Error) DuckDbWriteVariant(
         string path, string query, string orderBy, string column = "v", string? copyOptions = null)
     {
         var result = Driver.InvokeRaw("duckdb_write_variant", new { path, query, order_by = orderBy, col = column, copy_options = copyOptions });

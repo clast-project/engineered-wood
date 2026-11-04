@@ -150,7 +150,7 @@ public class VariantShreddingInteropTests : IDisposable
     {
         DuckDb.Require();
         // < 1.4 has no VARIANT; it would read a bare struct.
-        Skip.IfNot(DuckDb.HasVariantType, $"DuckDB VARIANT needs 1.4+; resolved {DuckDb.Version}");
+        Skip.IfNot(DuckDb.ReadsVariantParquet, $"DuckDB reads EW's VARIANT from 1.5; resolved {DuckDb.Version}");
 
         string path = await WriteAsync(shredded);
         var result = DuckDb.Invoke("read_parquet_variant", new { path, col = "v", order_by = "id" });
@@ -181,7 +181,8 @@ public class VariantShreddingInteropTests : IDisposable
     public async Task DuckDbWrittenShredded_CommittedToATable_EwReadsIt()
     {
         DuckDb.Require();
-        Skip.IfNot(DuckDb.HasVariantType, $"DuckDB VARIANT needs 1.4+; resolved {DuckDb.Version}");
+        Skip.IfNot(DuckDb.WritesShreddedVariantOracle,
+            $"a DuckDB-written shredded file is the oracle from 2.0; resolved {DuckDb.Version}");
 
         string tableDir = Path.Combine(_tempDir, "table");
         Directory.CreateDirectory(tableDir);

@@ -18,9 +18,10 @@ import json
 import sys
 import traceback
 
-# VARIANT is not in older DuckDB at all — a file EW shreds would read as a bare struct there, which
-# would look like a conformance failure rather than a missing feature.
-MIN_DUCKDB = (1, 4, 0)
+# The first DuckDB measured to read EW's variant files. VARIANT arrived in 1.4, but 1.4.5 cannot
+# decode them, which would look like a conformance failure rather than a missing feature. See
+# DuckDb.ReadsVariantParquet.
+MIN_DUCKDB = (1, 5, 0)
 
 
 def cmd_probe(args):

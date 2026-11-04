@@ -181,9 +181,11 @@ public class DuckDbShreddedVariantTests : IDisposable
         string path = Path.Combine(_tempDir, name + ".parquet");
         // ORDER BY inside the COPY fixes the file's row order, so EW's file order matches DuckDB's
         // ORDER BY id row for row. ROW_GROUP_SIZE keeps the several-row-group case small.
-        var (duck, installed, error) = ExternalParquetReaders.DuckDbWriteVariant(
+        var (duck, supported, error) = ExternalParquetReaders.DuckDbWriteVariant(
             path, query + " ORDER BY id", orderBy: "id", copyOptions: "ROW_GROUP_SIZE 2048");
-        Skip.IfNot(installed, $"DuckDB is not installed in the parquet-readers interpreter: {error}");
+        // Absent, or too old to shred on write: a missing capability. A write that fails or a layout
+        // that differs on a supported version stays a failure (below).
+        Skip.IfNot(supported, $"DuckDB cannot write shredded VARIANT here: {error}");
         Assert.True(duck is not null, $"DuckDB failed to write the {name} file: {error}");
         Assert.True(duck!.Leaves.Contains(typedLeaf),
             $"DuckDB {duck.Version} did not shred the {name} column as expected; leaves: {string.Join(" | ", duck.Leaves)}");

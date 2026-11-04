@@ -107,7 +107,7 @@ standing between a spec divergence and shipping it.
 | Tier | Install | Tests | Reaches |
 |---|---|---|---|
 | 1 — delta-rs | `pip install "deltalake[pyarrow]"` | 28 | Log/checkpoint replay, path encoding, per-file stats, filtered reads, and (through pyarrow) the on-disk layout of a shredded variant column. Seconds to run. |
-| 2 — DuckDB | `pip install duckdb` (1.4+) | 3 | VARIANT parquet reads through an implementation that is not delta-kernel-rs, and shredded files DuckDB writes committed to a table EW reads. Sub-second. |
+| 2 — DuckDB | `pip install duckdb` (2.0; reads need 1.5+) | 3 | VARIANT parquet reads through an implementation that is not delta-kernel-rs, and shredded files DuckDB writes committed to a table EW reads. Sub-second. |
 | 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 68 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival, variant reads, V2 checkpoints, and Delta's OWN conflict checker driven through py4j (`ConflictSemanticsInteropTests`). ~90s to run. |
 
 Each tier runs under the `python` on PATH unless its override names another
@@ -150,11 +150,12 @@ files with no Delta log involved, and in the other direction: DuckDB writes a
 shredded file, which is committed to a table that EW then reads. (The
 Parquet suite's `DuckDbShreddedVariantTests` covers the same direction across
 many shapes and types, through the parquet-readers tier's
-`EW_PARQUET_READERS_PYTHON`.) The pinned version is 2.0.0; it needs DuckDB
-**1.4+** (VARIANT does not exist
-before that; an older one reads a shredded column as a bare struct, which would
-read as a conformance failure rather than a missing feature), so it takes its
-own interpreter override:
+`EW_PARQUET_READERS_PYTHON`.) The pinned version is 2.0.0. Reading EW's
+files needs DuckDB **1.5+**: VARIANT arrived in 1.4, but 1.4.5 cannot decode
+them, which would read as a conformance failure rather than a missing feature.
+The DuckDB-written cases need **2.0+**, because 1.5 writes a SQL NULL variant as
+a variant null and then reads it back as SQL NULL. Below either version the
+cases skip. The tier takes its own interpreter override:
 
 ```
 $env:EW_DUCKDB_PYTHON = "…\ew-duckdb\Scripts\python.exe"   # unset -> python on PATH
@@ -510,7 +511,7 @@ entire tier and pass. So you still want both defences:
 Skips are not only about a missing toolchain, and this is the part worth
 internalising: **seven tests skip on a fully-configured machine**, because
 the *feature* is newer than the oracle — GA `VARIANT` needs Spark
-4.1+ and DuckDB 1.4+, `add.stats_parsed` needs delta-spark 4.1+, and the two
+4.1+ and DuckDB 1.5+, `add.stats_parsed` needs delta-spark 4.1+, and the two
 shredded-table cases (#671) need Spark 4.1 to shred at all. So the
 healthy result on the 4.0 pairing (the nightly's `spark-4.0` lane) is:
 

@@ -14,9 +14,9 @@ namespace EngineeredWood.DeltaLake.Table.Tests.Interop;
 /// from a broken one, and <see cref="Spark"/> costs a JVM per run.
 /// </summary>
 /// <remarks>
-/// <para><b>Setup.</b> <c>pip install duckdb</c> (1.4+; VARIANT does not exist before that, so an
-/// older DuckDB would read a shredded column as a bare struct and look like a conformance failure
-/// rather than a missing feature). Point <c>EW_DUCKDB_PYTHON</c> at an interpreter that has it —
+/// <para><b>Setup.</b> <c>pip install duckdb</c> (1.5+ to read EW's variant files, 2.0+ for the cases
+/// DuckDB writes; see <see cref="ReadsVariantParquet"/> and <see cref="WritesShreddedVariantOracle"/>).
+/// Point <c>EW_DUCKDB_PYTHON</c> at an interpreter that has it —
 /// on this project's dev boxes an isolated venv, since the base interpreter's DuckDB is pinned older
 /// for unrelated reasons. <c>EW_REQUIRE_DUCKDB_INTEROP=1</c> turns unavailability into a hard failure
 /// so a green run proves the tier actually ran.</para>
@@ -50,20 +50,30 @@ internal static class DuckDb
     public static JsonElement InvokeRaw(string command, object? args = null) => Driver.InvokeRaw(command, args);
 
     /// <summary>
-    /// True when the resolved DuckDB predates <c>VARIANT</c> (&lt; 1.4), where a shredded column reads
-    /// as a bare struct. Tests that assert variant semantics skip on it rather than fail.
+    /// True when the resolved DuckDB can read EW's variant parquet: 1.5+, measured on 1.5.5 and 2.0.0.
+    /// <c>VARIANT</c> arrived in 1.4, but 1.4.5 cannot decode EW's files ("Corrupted VARIANT 'metadata'
+    /// buffer" unshredded, "found version: 8" shredded), and before 1.4 there is no VARIANT at all.
+    /// Tests that read a variant through DuckDB skip below it rather than fail.
     /// </summary>
-    public static bool HasVariantType
+    public static bool ReadsVariantParquet => AtLeast(1, 5);
+
+    /// <summary>
+    /// True when a DuckDB-WRITTEN shredded file can be the oracle: 2.0+. DuckDB 1.5 already shreds on
+    /// <c>COPY … TO parquet</c>, but it writes a SQL NULL variant as a present group holding a variant
+    /// null (<c>value</c> = <c>0x00</c>), and its own reader reports that as SQL NULL. By the spec it is
+    /// a variant null, which is what EW reads, so on 1.5 DuckDB and EW disagree about NULLs and DuckDB
+    /// is the one that is wrong. 2.0 writes a SQL NULL as a null group.
+    /// </summary>
+    public static bool WritesShreddedVariantOracle => AtLeast(2, 0);
+
+    private static bool AtLeast(int wantMajor, int wantMinor)
     {
-        get
-        {
-            string? version = Version;
-            if (string.IsNullOrEmpty(version)) return false;
-            var parts = version!.Split('.');
-            return parts.Length >= 2
-                && int.TryParse(parts[0], out int major)
-                && int.TryParse(parts[1], out int minor)
-                && (major > 1 || (major == 1 && minor >= 4));
-        }
+        string? version = Version;
+        if (string.IsNullOrEmpty(version)) return false;
+        var parts = version!.Split('.');
+        return parts.Length >= 2
+            && int.TryParse(parts[0], out int major)
+            && int.TryParse(parts[1], out int minor)
+            && (major > wantMajor || (major == wantMajor && minor >= wantMinor));
     }
 }
