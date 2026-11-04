@@ -105,4 +105,50 @@ public class WriteNullabilityTests : IDisposable
 
         Assert.Single(files);
     }
+
+    /// <summary>
+    /// A copy-on-write rewrite takes the table's flags too. The updated rows are written first, so an updater that
+    /// declares <c>v</c> NOT NULL made the rewritten file's <c>v</c> required, and the untouched row's NULL after it
+    /// was refused as a NULL in a required column.
+    /// </summary>
+    [Fact]
+    public async Task AnUpdatersFlags_DoNotRefuseTheUntouchedRowsNull()
+    {
+        var schema = new Apache.Arrow.Schema(
+            [new Field("id", Int64Type.Default, true), new Field("v", Int64Type.Default, true)], null);
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
+        await table.WriteAsync([new RecordBatch(schema,
+            [new Int64Array.Builder().Append(1).Append(2).Build(),
+             new Int64Array.Builder().AppendNull().Append(5).Build()], 2)]);
+
+        var notNull = new Apache.Arrow.Schema(
+            [new Field("id", Int64Type.Default, false), new Field("v", Int64Type.Default, false)], null);
+        var (updated, _) = await table.UpdateAsync(
+            batch =>
+            {
+                var ids = (Int64Array)batch.Column("id");
+                var mask = new BooleanArray.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                    mask.Append(ids.GetValue(i) == 2);
+                return mask.Build();
+            },
+            batch =>
+            {
+                var v = new Int64Array.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                    v.Append(6);
+                return new RecordBatch(notNull, [batch.Column("id"), v.Build()], batch.Length);
+            });
+
+        Assert.Equal(1, updated);
+        var rows = new SortedDictionary<long, long?>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var ids = (Int64Array)batch.Column("id");
+            var v = (Int64Array)batch.Column("v");
+            for (int i = 0; i < batch.Length; i++)
+                rows[ids.GetValue(i)!.Value] = v.GetValue(i);
+        }
+        Assert.Equal([new KeyValuePair<long, long?>(1, null), new KeyValuePair<long, long?>(2, 6)], rows);
+    }
 }

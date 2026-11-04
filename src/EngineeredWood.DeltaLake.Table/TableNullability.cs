@@ -65,6 +65,96 @@ internal static class TableNullability
             : new RecordBatch(new Apache.Arrow.Schema(newFields, batch.Schema.Metadata), newColumns!, batch.Length);
     }
 
+    /// <summary>
+    /// <see cref="Apply"/> for batches written as the row groups of ONE file, whose schema the first row group fixes.
+    /// A NOT NULL column is written required only when no batch reaches a null in it. Batch by batch, an updater's
+    /// rows (no nulls) came out required and the copied rows after them (an old null) optional, and the file refused
+    /// the second row group.
+    /// </summary>
+    public static IReadOnlyList<RecordBatch> ApplyToOneFile(
+        IReadOnlyList<RecordBatch> batches, IReadOnlyList<Field> tableFields)
+    {
+        var relabeled = new RecordBatch[batches.Count];
+        for (int i = 0; i < relabeled.Length; i++)
+            relabeled[i] = Apply(batches[i], tableFields);
+        if (relabeled.Length < 2)
+            return relabeled;
+
+        // Every batch's flags, merged: optional wherever any batch is. Applying the merged fields then gives each batch
+        // the same flags, since a field merged as required has no written null in any batch.
+        var merged = new Dictionary<string, Field>(StringComparer.Ordinal);
+        foreach (var batch in relabeled)
+        {
+            foreach (var field in batch.Schema.FieldsList)
+                merged[field.Name] = merged.TryGetValue(field.Name, out var seen) ? Union(seen, field) : field;
+        }
+        var mergedFields = merged.Values.ToList();
+        for (int i = 0; i < relabeled.Length; i++)
+            relabeled[i] = Apply(relabeled[i], mergedFields);
+        return relabeled;
+    }
+
+    // One field optional where either is, at every depth the two have the same shape; `a`'s otherwise.
+    private static Field Union(Field a, Field b)
+    {
+        var type = UnionType(a.DataType, b.DataType);
+        bool nullable = a.IsNullable || b.IsNullable;
+        return ReferenceEquals(type, a.DataType) && nullable == a.IsNullable
+            ? a
+            : new Field(a.Name, type, nullable, a.Metadata);
+    }
+
+    private static IArrowType UnionType(IArrowType a, IArrowType b)
+    {
+        switch (a, b)
+        {
+            // MapType derives from ListType, so it is matched first.
+            case (MapType am, MapType bm):
+            {
+                var key = Union(am.KeyField, bm.KeyField);
+                var value = Union(am.ValueField, bm.ValueField);
+                return ReferenceEquals(key, am.KeyField) && ReferenceEquals(value, am.ValueField)
+                    ? a
+                    : new MapType(key, value, am.KeySorted);
+            }
+            case (MapType, _):
+            case (_, MapType):
+                return a;
+            case (ListType al, ListType bl):
+            {
+                var element = Union(al.ValueField, bl.ValueField);
+                return ReferenceEquals(element, al.ValueField) ? a : new ListType(element);
+            }
+            case (LargeListType al, LargeListType bl):
+            {
+                var element = Union(al.ValueField, bl.ValueField);
+                return ReferenceEquals(element, al.ValueField) ? a : new LargeListType(element);
+            }
+            case (FixedSizeListType al, FixedSizeListType bl) when al.ListSize == bl.ListSize:
+            {
+                var element = Union(al.ValueField, bl.ValueField);
+                return ReferenceEquals(element, al.ValueField) ? a : new FixedSizeListType(element, al.ListSize);
+            }
+            case (StructType ast, StructType bst) when ast.Fields.Count == bst.Fields.Count:
+            {
+                Field[]? fields = null;
+                for (int i = 0; i < ast.Fields.Count; i++)
+                {
+                    if (ast.Fields[i].Name != bst.Fields[i].Name)
+                        return a;
+                    var child = Union(ast.Fields[i], bst.Fields[i]);
+                    if (ReferenceEquals(child, ast.Fields[i]))
+                        continue;
+                    fields ??= [.. ast.Fields];
+                    fields[i] = child;
+                }
+                return fields is null ? a : new StructType(fields);
+            }
+            default:
+                return a;
+        }
+    }
+
     // The data with each nested field's name, nullability and metadata taken from `declared`, where the two are the
     // same kind of container with the same number of children; leaf types are always the array's own, so the result
     // describes its buffers. The same instance when nothing differs.

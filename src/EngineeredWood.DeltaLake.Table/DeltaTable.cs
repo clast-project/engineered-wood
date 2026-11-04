@@ -9765,13 +9765,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 ob, snapshot.Metadata.PartitionColumns));
         }
 
+        // Canonical Arrow forms, as in the UPDATE rewrite: these rows were read back from a file. Nullability from the
+        // table schema, as the append path takes it (#651), but across the whole file: every batch here is a row group
+        // of one file, whose schema the first fixes. An updater's rows come first and may declare a column NOT NULL
+        // that the copied rows after them hold NULLs in (a NOT NULL column with an old null is written optional).
+        var physicalBatches = new List<RecordBatch>(dataBatches.Count);
+        foreach (var dataBatch in dataBatches)
+        {
+            physicalBatches.Add(NormalizeUnlessHostOwnsBytes(
+                ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode)));
+        }
+        var relabeled = TableNullability.ApplyToOneFile(
+            physicalBatches, PhysicalArrowFields(snapshot.Schema, mappingMode));
+
         var writeBatches = new List<RecordBatch>(dataBatches.Count);
         var statsBatches = new List<RecordBatch>(dataBatches.Count);
-        for (int k = 0; k < dataBatches.Count; k++)
+        for (int k = 0; k < relabeled.Count; k++)
         {
-            // Canonical Arrow forms, as in the UPDATE rewrite: these rows were read back from a file.
-            var physicalBatch = NormalizeUnlessHostOwnsBytes(
-                ColumnMappingRecursive.ToPhysical(dataBatches[k], snapshot.Schema, mappingMode));
+            var physicalBatch = relabeled[k];
             SchemaConverter.ThrowIfUnwritableType(physicalBatch.Schema, convertibleTypesAllowed: HostOwnsBytes);
             // Statistics are keyed by PHYSICAL name, as the append path keys them (see the UPDATE rewrite).
             statsBatches.Add(physicalBatch);

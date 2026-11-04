@@ -173,4 +173,32 @@ public class TableNullabilityTests
         Assert.False(list.ValueField.IsNullable);
         Assert.Equal("element", ((ListType)result.Column(0).Data.DataType).ValueField.Name);
     }
+
+    /// <summary>
+    /// Batches for one file take one set of flags: a NOT NULL child that one batch holds a reachable null in is
+    /// optional in every batch, or the file's schema (fixed by the first row group) refuses the batch with the null.
+    /// </summary>
+    [Fact]
+    public void ApplyToOneFile_MakesAChildOptionalInEveryBatch_WhenAnyBatchReachesANull()
+    {
+        var clean = StructBatch([true], [1], childNullable: false);
+        var withNull = StructBatch([true], [null], childNullable: false);
+
+        var batchwise = new[]
+        {
+            TableNullability.Apply(clean, TableWithStruct()), TableNullability.Apply(withNull, TableWithStruct()),
+        };
+        Assert.False(ChildNullable(batchwise[0]));
+        Assert.True(ChildNullable(batchwise[1]));
+
+        var oneFile = TableNullability.ApplyToOneFile([clean, withNull], TableWithStruct());
+        Assert.True(ChildNullable(oneFile[0]));
+        Assert.True(ChildNullable(oneFile[1]));
+        Assert.True(RollingDataFileWriter.SameLayout(oneFile[0].Schema.FieldsList, oneFile[1].Schema.FieldsList));
+
+        // With no null anywhere, the table's NOT NULL stands.
+        var bothClean = TableNullability.ApplyToOneFile([clean, clean], TableWithStruct());
+        Assert.False(ChildNullable(bothClean[0]));
+        Assert.False(ChildNullable(bothClean[1]));
+    }
 }
