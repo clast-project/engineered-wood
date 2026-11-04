@@ -24,7 +24,7 @@ namespace EngineeredWood.Arrow;
 /// relax that into passing the column through unfiltered: an unfiltered column has the wrong length for
 /// the batch it lands in, which mispairs rows and overruns read buffers downstream.</para>
 /// </summary>
-public static class ArrowCompute
+public static partial class ArrowCompute
 {
     /// <summary>
     /// Builds a new array holding <paramref name="indices"/> — logical row positions in
@@ -310,6 +310,10 @@ public static class ArrowCompute
     /// only a problem for a caller that disposes the inputs before the result.</para>
     /// <para>As with Arrow's, a single input (after the empty ones are dropped) is returned as it is,
     /// not copied.</para>
+    /// <para>String, binary and struct columns (their large forms too, and VARIANT, which is a struct of
+    /// binaries) are joined here rather than by Arrow, into buffers sized exactly once. Arrow 23 grows the
+    /// value buffer of a string column from empty, doubling as it goes, and then copies every buffer it
+    /// built once more: a string column cost several times its own size to join (#667).</para>
     /// </remarks>
     /// <exception cref="ArgumentException"><paramref name="arrays"/> is empty.</exception>
     public static IArrowArray Concatenate(IReadOnlyList<IArrowArray> arrays)
@@ -335,7 +339,14 @@ public static class ArrowCompute
         if (type is NullType)
             return new NullArray(inputs.Sum(a => a.Length));
         if (!HasExtensionType(type))
-            return ArrowArrayConcatenator.Concatenate(inputs);
+        {
+            if (!ConcatenatesItself(type))
+                return ArrowArrayConcatenator.Concatenate(inputs);
+            var data = new List<ArrayData>(inputs.Count);
+            foreach (var array in inputs)
+                data.Add(array.Data);
+            return ArrowArrayFactory.BuildArray(ConcatenateData(data));
+        }
 
         // Arrow checks that the inputs' storage agrees, which is all it will see. The extension types
         // are ours to check: relabelling gives every input the first one's.
@@ -352,7 +363,7 @@ public static class ArrowCompute
         var storage = new List<ArrayData>(inputs.Count);
         foreach (var array in inputs)
             storage.Add(AsStorage(array.Data));
-        var joined = ArrayDataConcatenator.Concatenate(storage);
+        var joined = ConcatenateData(storage);
         return ArrowArrayFactory.BuildArray(Relabel(joined, inputs[0].Data));
     }
 
