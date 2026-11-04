@@ -258,8 +258,10 @@ internal static class VariantFooterStats
             if (min is null || max is null || !WellFormed(min) || !WellFormed(max))
                 return false;
             // A NaN is left out of the float min/max and counted apart, but it sorts above every number in Delta's
-            // ordering: a max that ignores it is not an upper bound (#676 review).
-            if (kind is BoundKind.Float or BoundKind.Double && stats!.NanCount > 0)
+            // ordering: a max that ignores it is not an upper bound. So a float path is bounded only when the footer
+            // says it holds NO NaN; a writer that did not record the count (null) may have skipped one (#676 review).
+            // EW's own writer always records it.
+            if (kind is BoundKind.Float or BoundKind.Double && stats!.NanCount != 0)
                 return false;
             return !(kind is BoundKind.Float && (float.IsNaN(ReadFloat(min)) || float.IsNaN(ReadFloat(max))))
                 && !(kind is BoundKind.Double && (double.IsNaN(ReadDouble(min)) || double.IsNaN(ReadDouble(max))));

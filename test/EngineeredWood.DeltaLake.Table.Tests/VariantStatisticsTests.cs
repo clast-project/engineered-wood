@@ -456,4 +456,35 @@ public class VariantStatisticsTests : IDisposable
         Assert.Equal("\"\"", min["$['s']"]);
         Assert.Equal(JsonSerializer.Serialize("\U0010FFFF"), max["$['s']"]);
     }
+
+    [Fact]
+    public async Task AFloatingPointPathWhoseNaNCountIsUnknown_IsLeftOut()
+    {
+        // EW's writer always records the count; another writer may not, and then a NaN may hide behind the max.
+        await WriteAndReadStatsAsync(
+            Shredding(Fields(("x", ShredType.Double), ("a", ShredType.Int64))), Enabled(),
+            Obj(("x", VariantValue.FromDouble(1.0)), ("a", VariantValue.FromInt64(1))));
+        var file = Directory.GetFiles(_tempDir, "*.parquet").Single();
+        Parquet.Metadata.FileMetaData footer;
+        await using (var raf = new LocalRandomAccessFile(file))
+        await using (var reader = new ParquetFileReader(raf, ownsFile: false))
+            footer = await reader.ReadMetadataAsync();
+
+        var known = Stats.VariantFooterStats.Compute(footer, ["v"], stringPrefixLength: 32);
+        Assert.Equal(["$['a']", "$['x']"], Decode(JsonSerializer.SerializeToElement(known["v"].Min)).Keys.OrderBy(k => k, StringComparer.Ordinal));
+
+        foreach (var chunk in footer.RowGroups.SelectMany(g => g.Columns))
+        {
+            if (chunk.MetaData is { Statistics: { NanCount: not null } s } meta)
+            {
+                meta.Statistics = new Parquet.Metadata.Statistics
+                {
+                    Min = s.Min, Max = s.Max, MinValue = s.MinValue, MaxValue = s.MaxValue, NullCount = s.NullCount,
+                    IsMinValueExact = s.IsMinValueExact, IsMaxValueExact = s.IsMaxValueExact, NanCount = null,
+                };
+            }
+        }
+        var unknown = Stats.VariantFooterStats.Compute(footer, ["v"], stringPrefixLength: 32);
+        Assert.Equal(["$['a']"], Decode(JsonSerializer.SerializeToElement(unknown["v"].Min)).Keys);
+    }
 }

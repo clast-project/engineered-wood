@@ -137,6 +137,7 @@ public class VariantStatisticsInteropTests : IDisposable
         Assert.Equal(2, adds.Count);
 
         var sawPaths = new HashSet<string>(StringComparer.Ordinal);
+        bool sawFloating = false;
         foreach (var add in adds)
         {
             using var stats = JsonDocument.Parse(add.Stats!);
@@ -147,15 +148,29 @@ public class VariantStatisticsInteropTests : IDisposable
             var footer = await FooterAsync(Path.Combine(_tempDir, add.Path));
             var ew = VariantFooterStats.Compute(footer, ["v"], stringPrefixLength: 32);
             Assert.True(ew.ContainsKey("v"), $"EW derived no bounds for {add.Path}; Spark: {Format(sparkMin)}");
-            Assert.Equal(Format(sparkMin), Format(Paths(ew["v"].Min)));
-            Assert.Equal(Format(sparkMax), Format(Paths(ew["v"].Max)));
+
+            // The one deliberate difference. parquet-mr 1.16 records no nan_count, and EW bounds a float path only
+            // when the footer says it holds no NaN (#676 review). Spark bounds it anyway, which is safe for its own
+            // files because parquet-mr puts a NaN INTO the min/max (measured: [1.5, NaN, 0.5] gives (0.5, NaN), and
+            // Spark then leaves the path out), but would not be for a writer that skips NaNs without counting them.
+            bool nanCountsUnknown = footer.RowGroups.SelectMany(g => g.Columns).All(c =>
+                c.MetaData is not { Type: Parquet.PhysicalType.Float or Parquet.PhysicalType.Double } m
+                || m.Statistics?.NanCount is null);
+            Assert.True(nanCountsUnknown, "parquet-mr now records nan_count: compare the float paths with Spark again");
+            static bool Floating((string Type, string Json) v) => v.Type is "Float" or "Double";
+            var expectedMin = sparkMin.Where(p => !Floating(p.Value)).ToDictionary(p => p.Key, p => p.Value);
+            var expectedMax = sparkMax.Where(p => !Floating(p.Value)).ToDictionary(p => p.Key, p => p.Value);
+            Assert.Equal(Format(expectedMin), Format(Paths(ew["v"].Min)));
+            Assert.Equal(Format(expectedMax), Format(Paths(ew["v"].Max)));
             sawPaths.UnionWith(sparkMin.Keys);
+            sawFloating |= sparkMin.Values.Any(Floating);
         }
 
         // The cases are the ones claimed: a nested path and a cut string bounded, a mixed and an array path not.
         Assert.Contains("$['c']['d']", sawPaths);
         Assert.Contains("$['str']", sawPaths);
         Assert.Contains("$['big']", sawPaths);
+        Assert.True(sawFloating, "Spark bounded no float path, so the difference above was not exercised");
         Assert.DoesNotContain("$['m']", sawPaths);
         Assert.DoesNotContain(sawPaths, p => p.StartsWith("$['arr']", StringComparison.Ordinal));
     }
