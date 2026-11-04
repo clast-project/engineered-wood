@@ -200,9 +200,10 @@ py -3.11 -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.1 delta-spa
 $env:EW_SPARK_PYTHON = "…\spark41\Scripts\python.exe"   # tier 3 uses this interpreter; unset -> PATH
 ```
 
-Both are measured at **109 passed / 0 skipped**. The `Skipped: 0` is the
-point: it is what proves the GA-variant and `stats_parsed` cases actually
-ran, which the default 4.0.x lane reports as 7 skips.
+Both are measured at **216 passed / 0 skipped** across the interop tier
+(2026-11-04, with delta-rs and DuckDB present too). The `Skipped: 0` is the
+point: it is what proves the GA-variant, shredded-table and `stats_parsed`
+cases actually ran, which the default 4.0.x lane reports as 7 skips.
 
 **Why the versions differ by interpreter.** On Python 3.13, `pyspark` must be
 ≥ 4.1.2 for SPARK-53759 (the Windows worker crash above), but `delta-spark`
@@ -503,7 +504,7 @@ shredded-table cases (#671) need Spark 4.1 to shred at all. So the
 healthy result on the pinned 4.0 pairing is:
 
 ```
-Passed!  - Failed: 0, Passed: 104, Skipped: 7, Total: 111
+Passed!  - Failed: 0, Passed: 209, Skipped: 7, Total: 216
 ```
 
 `EW_REQUIRE_*` does **not** turn these into failures, and should not: the
@@ -520,7 +521,7 @@ it looked like it did.
 
 Note that the per-commit `build` job on windows-latest has **no JDK** and
 deliberately leaves `EW_REQUIRE_SPARK_INTEROP` unset, so its healthy result
-for this suite is `849 passed, 73 skipped` of 922. Those 73 are the
+for this suite is `2283 passed, 177 skipped` of 2460. Those 177 are the
 Spark-dependent cases; before they reported real skips they were counted as
 passes on every commit. A non-zero skip count there is correct, not a
 regression.
@@ -533,7 +534,7 @@ Measured on net10.0, 2026-08-08, with every optional toolchain present:
 |---|---|
 | **Parquet** | 807 |
 | **Core** | 452 |
-| **DeltaLake.Table** | 922 (109 of them interop) — re-measured 2026-08-22 |
+| **DeltaLake.Table** | 2460 (216 of them interop) — re-measured 2026-11-04 |
 | **DeltaLake** | 484 |
 | **Vortex** | 1175 (737 of them upstream fixtures) — re-measured 2026-09-17 |
 | **Avro** | 301 |
@@ -553,15 +554,15 @@ be 0 — it depends on what the machine can reach:
 
 | environment | expected |
 |---|---|
-| every toolchain present, 4.0 oracles | 917 passed / 7 skipped |
-| the same, Spark pointed at a 4.1 venv | 922 passed / 0 skipped |
-| no JDK (the per-commit `build` job) | 849 passed / 73 skipped |
+| every toolchain present, 4.0 oracles | 2453 passed / 7 skipped |
+| the same, Spark pointed at a 4.1 venv | 2460 passed / 0 skipped |
+| no JDK (the per-commit `build` job) | 2283 passed / 177 skipped |
 
 See [Skipped tests](#skipped-tests) for what each of those means.
 
-Of its **109 interop cases** (94 test methods; theories expand the rest),
-**73 need PySpark** and **2 need DuckDB**; the remaining **34** need
-delta-rs. Re-measured 2026-08-22 by making each tier unreachable and counting
+Of its **216 interop cases** (142 test methods; theories expand the rest),
+**177 need PySpark**, **37 need delta-rs** and **2 need DuckDB**.
+Re-measured 2026-11-04 by making each tier unreachable and counting
 the skips — which is also the quick way to re-derive these after adding
 tests. Note these are *cases*, matching what `dotnet test` prints; an earlier
 version of this section counted methods and gave 98/68/2/28.
