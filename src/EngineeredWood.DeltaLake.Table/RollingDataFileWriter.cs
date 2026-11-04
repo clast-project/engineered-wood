@@ -257,6 +257,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             // CloseAsync writes the footer and publishes the file before Position is read.
             await _writer!.CloseAsync(cancellationToken).ConfigureAwait(false);
             size = _file!.Position;
+            AddVariantBounds(_writer.WrittenMetadata);
             await DisposeOpenFileAsync().ConfigureAwait(false);
         }
 
@@ -264,6 +265,28 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         _fileSchema = null;
         _fileRows = 0;
         _fileStats = null;
+    }
+
+    /// <summary>
+    /// Variant min/max for a file this writer shredded, from the footer it just wrote, as delta-spark derives them
+    /// (see <see cref="Stats.VariantFooterStats"/>). Only a shredded file has paths to bound, and a shredded write
+    /// is refused on a table that does not support variant shredding, so the protocol's gate (min/max only under
+    /// shredding) holds here without a check. A host writer's file has no footer here and gets nullCount only.
+    /// </summary>
+    private void AddVariantBounds(EngineeredWood.Parquet.Metadata.FileMetaData? footer)
+    {
+        if (_fileStats is null || footer is null || _fileSchema is null)
+            return;
+        List<string>? variants = null;
+        foreach (var field in _fileSchema.FieldsList)
+        {
+            if (field.DataType is VariantType)
+                (variants ??= []).Add(field.Name);
+        }
+        if (variants is null)
+            return;
+        _fileStats.AddVariantBounds(Stats.VariantFooterStats.Compute(
+            footer, variants, (_statsSelection ?? Stats.StatsColumnSelection.All).StringPrefixLength));
     }
 
     private void ClearPending()

@@ -70,6 +70,7 @@ def cmd_write_parquet_variant(args):
     The reverse of read_parquet_variant: here DuckDB is the producer and EW the reader. DuckDB 1.5+
     shreds a VARIANT column on COPY by default, so this is an independent source of shredded files.
     `leaves` lists every column chunk's path so the caller can prove the file is really shredded.
+    `copy_options` (optional) is appended to the COPY options.
     """
     import duckdb
 
@@ -80,7 +81,9 @@ def cmd_write_parquet_variant(args):
     # threads it can pick a different layout from one run to the next.
     con.sql("SET threads TO 1")
     escaped = path.replace("'", "''")
-    con.sql(f"COPY ({args['query']}) TO '{escaped}' (FORMAT parquet)")
+    # `copy_options` adds COPY options (ROW_GROUP_SIZE, say) after FORMAT.
+    extra = f", {args['copy_options']}" if args.get("copy_options") else ""
+    con.sql(f"COPY ({args['query']}) TO '{escaped}' (FORMAT parquet{extra})")
 
     leaves = sorted({r[0] for r in con.sql(
         "SELECT path_in_schema FROM parquet_metadata(?)", params=[path]).fetchall()})
@@ -95,10 +98,29 @@ def cmd_write_parquet_variant(args):
     }
 
 
+def cmd_variant_path_bounds(args):
+    """DuckDB's own min and max of expressions over a parquet file: the oracle for EW's footer-derived bounds.
+
+    `exprs` is a list of {key, sql}; each `sql` is evaluated per row (`v.a::BIGINT`, say) and its min and max
+    come back as text. DuckDB computes them from the values, not from the footer statistics EW reads.
+    """
+    import duckdb
+
+    con = duckdb.connect()
+    out = {}
+    for e in args["exprs"]:
+        lo, hi = con.sql(
+            f"SELECT CAST(min({e['sql']}) AS VARCHAR), CAST(max({e['sql']}) AS VARCHAR) FROM read_parquet(?)",
+            params=[args["path"]]).fetchall()[0]
+        out[e["key"]] = {"min": lo, "max": hi}
+    return {"duckdb": duckdb.__version__, "bounds": out}
+
+
 COMMANDS = {
     "probe": cmd_probe,
     "read_parquet_variant": cmd_read_parquet_variant,
     "write_parquet_variant": cmd_write_parquet_variant,
+    "variant_path_bounds": cmd_variant_path_bounds,
 }
 
 

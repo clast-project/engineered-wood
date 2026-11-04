@@ -563,6 +563,12 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// The footer this writer wrote: its schema and every row group's column statistics. Null until
+    /// <see cref="CloseAsync"/> has written it.
+    /// </summary>
+    public FileMetaData? WrittenMetadata => _assembler.WrittenMetadata;
+
+    /// <summary>
     /// Finalizes the file by writing the footer and closing magic, then completes the underlying
     /// <see cref="ISequentialFile"/>, which is what publishes it.
     /// </summary>

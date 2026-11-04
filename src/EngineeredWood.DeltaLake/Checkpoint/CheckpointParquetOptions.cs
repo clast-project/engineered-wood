@@ -30,9 +30,9 @@ internal static class CheckpointParquetOptions
         {
             FloatingPointEncoding = FloatingPointEncoding.Plain,
             // Checkpoints are never shredded, as delta-spark's are not (Checkpoints.scala writes them with
-            // shredding off). No checkpoint column is a variant today -- stats_parsed carries no variant
-            // bounds -- so this is a guarantee rather than a fix: a data-file shredding option set on the
-            // table must not reach the transaction log if one ever is (#671).
+            // shredding off). stats_parsed carries variant bounds on a table that supports shredding (#675),
+            // and a data-file shredding option set on the table must not shred them: each bound is one Variant
+            // value, which readers expect as the plain metadata/value group (#671).
             ShredVariants = null,
             VariantShredSchemas = null,
         };

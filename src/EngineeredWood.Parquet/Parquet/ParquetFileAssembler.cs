@@ -42,6 +42,9 @@ internal sealed class ParquetFileAssembler
     /// <summary>Whether the leading magic has been written.</summary>
     public bool HeaderWritten { get; private set; }
 
+    /// <summary>The footer <see cref="WriteFooterAsync"/> wrote, or null before it has.</summary>
+    public FileMetaData? WrittenMetadata { get; private set; }
+
     /// <summary>Writes the leading magic, unless it has been written already.</summary>
     public async ValueTask WriteHeaderAsync(CancellationToken cancellationToken)
     {
@@ -166,6 +169,7 @@ internal sealed class ParquetFileAssembler
         byte[] footerBytes = MetadataEncoder.EncodeFileMetaData(fileMetaData, writePathInSchema: !_options.OmitPathInSchema);
 #pragma warning restore EWPARQUET0002
         await _file.WriteAsync(footerBytes, cancellationToken).ConfigureAwait(false);
+        WrittenMetadata = fileMetaData;
 
         var footerLengthBytes = new byte[4];
         BinaryPrimitives.WriteInt32LittleEndian(footerLengthBytes, footerBytes.Length);

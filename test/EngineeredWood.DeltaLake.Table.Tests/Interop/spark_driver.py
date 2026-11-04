@@ -706,53 +706,119 @@ def cmd_write_variant(args):
     return {"spark": spark.version, "written": len(values)}
 
 
-def cmd_write_shredded_variant(args):
-    """Write a variant table with SHREDDING enabled (#671): TBLPROPERTIES delta.enableVariantShredding = true.
+def _variant_stats_confs(preview=False):
+    """Session confs under which delta-spark 4.3 shreds and writes REAL variant bounds.
 
-    Delta 4.1+ declares `variantShredding` from the property (`variantShredding-preview` when `preview` is set,
-    through delta's forceUsePreviewTableFeature conf), and Spark 4.1 infers a shredding schema per file, so
-    the data files carry `typed_value`. Variant data-skipping stats are asked for too: delta-spark 4.3+ then
-    writes z85-encoded minValues/maxValues for `v` (a string in the JSON stats), which EW must tolerate. Older
-    deltas ignore the unknown confs. Rows are {id, json} as in write_variant. Returns the protocol as Spark committed it.
+    All three stats confs are needed (measured from 4.3.1): collectVariantDataSkippingStats (on by default)
+    lets a variant into the stats schema; parseFooterForStats (off by default) re-reads the written footer;
+    and stats.limitPerVariant, internal and 0 by default, caps the paths kept: at 0 every bound is the
+    empty object `{}`. Older deltas ignore the unknown confs.
     """
-    spark = _spark()
-    path = _uri(args["path"])
-    confs = {
+    return {
         "spark.sql.variant.writeShredding.enabled": "true",
         "spark.sql.variant.inferShreddingSchema": "true",
-        "spark.databricks.delta.variantShredding.forceUsePreviewTableFeature":
-            "true" if args.get("preview") else "false",
+        "spark.databricks.delta.variantShredding.forceUsePreviewTableFeature": "true" if preview else "false",
         "spark.databricks.delta.variantShredding.collectVariantDataSkippingStats": "true",
-        # Without this, 4.3.1 still writes only nullCount for `v` (measured): the bounds come from re-reading
-        # the written file's footer.
         "spark.databricks.delta.variantShredding.parseFooterForStats": "true",
+        "spark.databricks.delta.stats.limitPerVariant": "100",
     }
+
+
+def _with_confs(spark, confs, action):
     previous = {k: spark.conf.get(k, None) for k in confs}
     for k, v in confs.items():
         spark.conf.set(k, v)
     try:
-        spark.sql(
-            f"CREATE OR REPLACE TABLE delta.`{path}` (id BIGINT, v VARIANT) USING delta "
-            "TBLPROPERTIES ('delta.enableVariantShredding' = 'true')")
-        values = []
-        for r in args["rows"]:
-            if r.get("json") is None:
-                values.append(f"({r['id']}, NULL)")
-            else:
-                lit = r["json"].replace("'", "''")
-                values.append(f"({r['id']}, parse_json('{lit}'))")
-        spark.sql(f"INSERT INTO delta.`{path}` VALUES {', '.join(values)}")
-        detail = spark.sql(f"DESCRIBE DETAIL delta.`{path}`").collect()[0].asDict()
+        return action()
     finally:
         for k, v in previous.items():
             if v is None:
                 spark.conf.unset(k)
             else:
                 spark.conf.set(k, v)
+
+
+def _variant_values(rows):
+    """VALUES tuples for {id, json} / {id, sql} rows: json is parse_json'd, sql is a raw expression, neither is NULL."""
+    values = []
+    for r in rows:
+        if r.get("sql") is not None:
+            values.append(f"({r['id']}, {r['sql']})")
+        elif r.get("json") is None:
+            values.append(f"({r['id']}, NULL)")
+        else:
+            lit = r["json"].replace("'", "''")
+            values.append(f"({r['id']}, parse_json('{lit}'))")
+    return values
+
+
+def cmd_write_shredded_variant(args):
+    """Write a variant table with SHREDDING enabled (#671): TBLPROPERTIES delta.enableVariantShredding = true.
+
+    Delta 4.1+ declares `variantShredding` from the property (`variantShredding-preview` when `preview` is set,
+    through delta's forceUsePreviewTableFeature conf), and Spark 4.1 infers a shredding schema per file, so
+    the data files carry `typed_value`. Variant data-skipping stats are asked for too (see _variant_stats_confs):
+    delta-spark 4.3+ then writes z85-encoded per-path minValues/maxValues for `v` (#675).
+
+    Rows are {id, json} as in write_variant, or {id, sql} for a raw SQL expression (a typed scalar inside
+    to_variant_object, say). `batches`, a list of row lists, writes one INSERT (so one file) per list instead
+    of `rows`. Returns the protocol as Spark committed it.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    batches = args.get("batches") or [args["rows"]]
+
+    def run():
+        spark.sql(
+            f"CREATE OR REPLACE TABLE delta.`{path}` (id BIGINT, v VARIANT) USING delta "
+            "TBLPROPERTIES ('delta.enableVariantShredding' = 'true')")
+        written = 0
+        for rows in batches:
+            values = _variant_values(rows)
+            spark.sql(f"INSERT INTO delta.`{path}` VALUES {', '.join(values)}")
+            written += len(values)
+        detail = spark.sql(f"DESCRIBE DETAIL delta.`{path}`").collect()[0].asDict()
+        return written, detail
+
+    written, detail = _with_confs(spark, _variant_stats_confs(bool(args.get("preview"))), run)
     return {
         "spark": spark.version,
-        "written": len(values),
+        "written": written,
         "tableFeatures": sorted(detail.get("tableFeatures") or []),
+    }
+
+
+def cmd_checkpoint_variant_bounds(args):
+    """Have Spark write a checkpoint of a variant table, then report each file's typed variant bounds from it.
+
+    A Spark checkpoint's stats_parsed carries a variant column's bounds as Variant values that delta-spark
+    DECODES from the z85 strings of the JSON stats, so for a file EW wrote this is Spark's reading of EW's
+    encoding: a malformed bound comes back null or fails the checkpoint. `rows` (optional) are appended
+    first, under the shredding and stats confs, so the checkpoint is Spark's own and not left from EW.
+    Returns, per add, the path and to_json of stats_parsed.minValues.<col> / maxValues.<col>.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    col = args.get("col", "v")
+
+    def run():
+        if args.get("rows"):
+            spark.sql(f"INSERT INTO delta.`{path}` VALUES {', '.join(_variant_values(args['rows']))}")
+        jvm = spark._jvm
+        jvm.org.apache.spark.sql.delta.DeltaLog.forTable(spark._jsparkSession, path).checkpoint()
+
+    _with_confs(spark, _variant_stats_confs(), run)
+    cp = _checkpoint_file(args["path"])
+    if not cp:
+        return {"ok": False, "error": "Spark wrote no checkpoint"}
+    df = spark.read.parquet(_uri(cp)).where("add IS NOT NULL").selectExpr(
+        "add.path AS path",
+        f"to_json(add.stats_parsed.minValues.`{col}`) AS min",
+        f"to_json(add.stats_parsed.maxValues.`{col}`) AS max")
+    return {
+        "spark": spark.version,
+        "checkpoint": os.path.basename(cp),
+        "files": [{"path": r["path"], "min": r["min"], "max": r["max"]} for r in df.collect()],
     }
 
 
@@ -1228,6 +1294,7 @@ COMMANDS = {
     "write_variant": cmd_write_variant,
     "write_nested_variant": cmd_write_nested_variant,
     "write_shredded_variant": cmd_write_shredded_variant,
+    "checkpoint_variant_bounds": cmd_checkpoint_variant_bounds,
     "write": cmd_write,
     "partition_paths": cmd_partition_paths,
     "v2_checkpoint": cmd_v2_checkpoint,

@@ -244,8 +244,11 @@ public sealed class CheckpointWriter
         // column held that other column's bounds.
         var statsSchema = Schema.ColumnMapping.ToPhysicalSchema(
             snapshot.Schema, Schema.ColumnMapping.GetMode(snapshot.Metadata.Configuration));
+        // Variant bounds exist only on a table that supports shredding (the protocol's gate), so only there does
+        // stats_parsed carry a column for them.
+        bool variantBounds = VariantShreddingConfig.IsSupported(snapshot.Protocol);
         var statsParsedType = statsMode.WriteStruct
-            ? StatsParsedBuilder.BuildStatsType(statsSchema)
+            ? StatsParsedBuilder.BuildStatsType(statsSchema, variantBounds)
             : null;
 
         // Build the struct-based checkpoint schema
@@ -256,7 +259,7 @@ public sealed class CheckpointWriter
         {
             BuildProtocolColumn(allActions, count),
             BuildMetadataColumn(allActions, count),
-            BuildAddColumn(allActions, count, statsMode, statsSchema, statsParsedType),
+            BuildAddColumn(allActions, count, statsMode, statsSchema, statsParsedType, variantBounds),
             BuildRemoveColumn(allActions, count),
             BuildTxnColumn(allActions, count),
             BuildDomainMetadataColumn(allActions, count),
@@ -701,7 +704,8 @@ public sealed class CheckpointWriter
         int count,
         CheckpointStatsMode statsMode,
         Schema.StructType deltaSchema,
-        ArrowStructType? statsParsedType)
+        ArrowStructType? statsParsedType,
+        bool variantBounds)
     {
         using var pathBuilder = new StringColumn(count, bytesPerValueHint: 64);
         using var sizeBuilder = new FixedWidthColumn<long>(count);
@@ -866,7 +870,7 @@ public sealed class CheckpointWriter
         children.Add(defaultRcvBuilder.Build(Int64Type.Default));
         if (statsParsedType is not null)
         {
-            var statsParsed = StatsParsedBuilder.BuildStatsColumn(actions, count, deltaSchema)
+            var statsParsed = StatsParsedBuilder.BuildStatsColumn(actions, count, deltaSchema, variantBounds)
                 ?? throw new InvalidOperationException(
                     "stats_parsed type was resolved but the column could not be built.");
             children.Add(statsParsed);
