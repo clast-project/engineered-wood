@@ -532,4 +532,108 @@ public class VariantShreddingFeatureTests : IDisposable
         Assert.Equal(3, (await ReadJsonAsync(reopened)).Count);
         Assert.Contains("variantShredding", reopened.CurrentSnapshot.Protocol.WriterFeatures!);
     }
+
+    // ── Shredding without the VARIANT annotation ──
+
+    private static readonly DeltaTableOptions ShreddingUnannotated = Shredding with { EmitVariantLogicalType = false };
+
+    [Fact]
+    public async Task ShreddedWrite_WithoutTheVariantAnnotation_IsRefusedAndWritesNothing()
+    {
+        // The unannotated layout is the bare storage struct, which the writer never shreds: the options would be
+        // ignored and every file written unshredded, so the write is refused instead.
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, VariantSchema(), configuration: Enabled(), options: ShreddingUnannotated);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([ObjectBatch()]));
+        Assert.Equal(DeltaTableErrorCodes.ShreddingWithoutVariantAnnotation, ex.ErrorCode);
+        Assert.Contains(nameof(DeltaTableOptions.EmitVariantLogicalType), ex.Message);
+        Assert.Empty(DataFiles());
+        Assert.Equal(0, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task VariantShredSchemas_WithoutTheVariantAnnotation_IsRefused()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var options = DeltaTableOptions.Default with
+        {
+            EmitVariantLogicalType = false,
+            ParquetWriteOptions = ParquetWriteOptions.Default with
+            {
+                VariantShredSchemas = new Dictionary<string, ShredSchema>
+                {
+                    ["v"] = ShredSchema.ForObject(new Dictionary<string, ShredSchema>
+                    {
+                        ["a"] = ShredSchema.Primitive(ShredType.Int32),
+                    }),
+                },
+            },
+        };
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled(), options: options);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([ObjectBatch()]));
+        Assert.Equal(DeltaTableErrorCodes.ShreddingWithoutVariantAnnotation, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task ShreddedWrite_WithoutTheVariantAnnotation_AsTheCreationData_IsRefused()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await DeltaTable.CreateOrReplaceAsync(
+                fs, VariantSchema(), [ObjectBatch()], configuration: Enabled(), options: ShreddingUnannotated));
+        Assert.Equal(DeltaTableErrorCodes.ShreddingWithoutVariantAnnotation, ex.ErrorCode);
+        Assert.Empty(DataFiles());
+    }
+
+    [Fact]
+    public async Task ShreddedWrite_WithoutTheAnnotationOrTheProperty_ReportsTheMissingProperty()
+    {
+        // The protocol's refusal comes first: setting the annotation alone would not make the write legal.
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), options: ShreddingUnannotated);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([ObjectBatch()]));
+        Assert.Equal(DeltaTableErrorCodes.ShreddingTablePropertyDisabled, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task UnannotatedWrite_WithoutShreddingOptions_IsUnchanged()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled(),
+            options: DeltaTableOptions.Default with { EmitVariantLogicalType = false });
+        await table.WriteAsync([ObjectBatch()]);
+
+        var file = Assert.Single(DataFiles());
+        Assert.False(await IsShreddedAsync(file));
+        Assert.Equal(["{\"a\":1,\"b\":\"x\"}", "{\"a\":2,\"b\":\"y\"}", null], await ReadJsonAsync(table));
+    }
+
+    [Fact]
+    public async Task VariantShredSchemas_NamingNoVariantColumn_WithoutTheAnnotation_IsNotRefused()
+    {
+        // A layout for a column that is not a variant shreds nothing, so there is nothing to ignore.
+        var fs = new LocalTableFileSystem(_tempDir);
+        var options = DeltaTableOptions.Default with
+        {
+            EmitVariantLogicalType = false,
+            ParquetWriteOptions = ParquetWriteOptions.Default with
+            {
+                VariantShredSchemas = new Dictionary<string, ShredSchema>
+                {
+                    ["id"] = ShredSchema.Primitive(ShredType.Int64),
+                },
+            },
+        };
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled(), options: options);
+        await table.WriteAsync([ObjectBatch()]);
+
+        Assert.False(await IsShreddedAsync(Assert.Single(DataFiles())));
+    }
 }

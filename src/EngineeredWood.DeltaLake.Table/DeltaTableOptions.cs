@@ -357,6 +357,9 @@ public sealed record DeltaTableOptions
     /// throws a <c>NullPointerException</c> on an annotated group. Set false only when targeting a
     /// reader stuck on that experimental-variant era; it costs nothing with modern readers but also
     /// buys nothing there.</para>
+    /// <para>The unannotated layout is never shredded, so false cannot be combined with
+    /// <see cref="ParquetWriteOptions"/>' <c>ShredVariants</c> or <c>VariantShredSchemas</c>: a write that would shred
+    /// a variant column is refused with <see cref="DeltaTableErrorCodes.ShreddingWithoutVariantAnnotation"/>.</para>
     /// </summary>
     public bool EmitVariantLogicalType { get; init; } = true;
 

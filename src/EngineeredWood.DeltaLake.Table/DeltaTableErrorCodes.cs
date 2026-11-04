@@ -478,4 +478,12 @@ public static class DeltaTableErrorCodes
     /// <remarks>delta-spark's own code for the same refusal (<c>DeltaErrors.variantShreddingUnsupported</c>, checked in
     /// delta-spark 4.3.1's <c>error/delta-error-classes.json</c>).</remarks>
     public const string ShreddingTablePropertyDisabled = "DELTA_SHREDDING_TABLE_PROPERTY_DISABLED";
+
+    /// <summary>
+    /// A write would shred a variant column on a table that allows it, but <see cref="DeltaTableOptions.EmitVariantLogicalType"/>
+    /// is false. The unannotated layout is written as the bare storage struct, which is never shredded, so the
+    /// shredding options would be ignored without a word. Nothing is written.
+    /// </summary>
+    /// <remarks>This library's own code: delta-spark has no such option, so no refusal to borrow one from.</remarks>
+    public const string ShreddingWithoutVariantAnnotation = "DELTA_SHREDDING_WITHOUT_VARIANT_ANNOTATION";
 }
