@@ -257,6 +257,10 @@ internal static class VariantFooterStats
             }
             if (min is null || max is null || !WellFormed(min) || !WellFormed(max))
                 return false;
+            // A NaN is left out of the float min/max and counted apart, but it sorts above every number in Delta's
+            // ordering: a max that ignores it is not an upper bound (#676 review).
+            if (kind is BoundKind.Float or BoundKind.Double && stats!.NanCount > 0)
+                return false;
             return !(kind is BoundKind.Float && (float.IsNaN(ReadFloat(min)) || float.IsNaN(ReadFloat(max))))
                 && !(kind is BoundKind.Double && (double.IsNaN(ReadDouble(min)) || double.IsNaN(ReadDouble(max))));
         }
@@ -293,20 +297,46 @@ internal static class VariantFooterStats
                 return null;
             if (kind is BoundKind.String)
             {
-                string lo = System.Text.Encoding.UTF8.GetString(_min);
-                string hi = System.Text.Encoding.UTF8.GetString(_max);
+                // A footer bound cut at a byte limit can end inside a character, and a replacement character in its
+                // place sorts above what was cut: only a bound that decodes cleanly is kept (#676 review).
+                if (!TryDecodeUtf8(_min, out string lo) || !TryDecodeUtf8(_max, out string hi))
+                    return null;
                 if (lo.Length > stringPrefixLength)
                     lo = Prefix(lo, stringPrefixLength);
                 if (hi.Length > stringPrefixLength)
+                {
                     hi = Prefix(hi, stringPrefixLength) + MaxStringSuffix;
+                    // The suffix does not bound a maximum that continues past the cut with that same code point:
+                    // "abcd" + U+10FFFF is below "abcd" + U+10FFFF + "x". No bound is safer than a low one.
+                    if (System.Text.Encoding.UTF8.GetBytes(hi).AsSpan().SequenceCompareTo(_max) < 0)
+                        return null;
+                }
                 return (VariantValue.FromString(lo), VariantValue.FromString(hi));
             }
             return (ToVariant(_min), ToVariant(_max));
         }
 
-        // A cut never splits a surrogate pair: half a character is not a string the bound can hold.
+        // A cut never splits a surrogate pair: half a character is not a string the bound can hold. A prefix length of
+        // 0 is a valid table setting and gives the empty string.
         private static string Prefix(string s, int length) =>
-            char.IsHighSurrogate(s[length - 1]) ? s.Substring(0, length - 1) : s.Substring(0, length);
+            length > 0 && char.IsHighSurrogate(s[length - 1]) ? s.Substring(0, length - 1) : s.Substring(0, length);
+
+        private static readonly System.Text.UTF8Encoding StrictUtf8 =
+            new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+        private static bool TryDecodeUtf8(byte[] bytes, out string text)
+        {
+            try
+            {
+                text = StrictUtf8.GetString(bytes);
+                return true;
+            }
+            catch (System.Text.DecoderFallbackException)
+            {
+                text = "";
+                return false;
+            }
+        }
 
         private VariantValue ToVariant(byte[] bytes) => kind switch
         {

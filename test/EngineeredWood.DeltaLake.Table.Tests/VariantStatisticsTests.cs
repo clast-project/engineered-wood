@@ -395,4 +395,65 @@ public class VariantStatisticsTests : IDisposable
             rebuilt.RootElement.GetProperty("minValues").GetProperty("v").GetString());
         Assert.Equal("9", Bounds(rebuilt.RootElement).Max["$['a']"]);
     }
+
+    // ── Bounds that would not bound (#676 review) ────────────────────────────────────────────────────
+
+    private static ShredSchema Fields(params (string Name, ShredType Type)[] fields) =>
+        ShredSchema.ForObject(fields.ToDictionary(f => f.Name, f => ShredSchema.Primitive(f.Type)));
+
+    [Fact]
+    public async Task AFloatingPointPathHoldingANaN_IsLeftOut()
+    {
+        // The footer's min/max skip the NaN (it is counted apart), but NaN sorts above every number.
+        var stats = await WriteAndReadStatsAsync(
+            Shredding(Fields(("x", ShredType.Double), ("a", ShredType.Int64))), Enabled(),
+            Obj(("x", VariantValue.FromDouble(1.0)), ("a", VariantValue.FromInt64(1))),
+            Obj(("x", VariantValue.FromDouble(double.NaN)), ("a", VariantValue.FromInt64(2))));
+
+        var (min, _) = Bounds(stats);
+        Assert.Equal(["$['a']"], min.Keys);
+    }
+
+    [Fact]
+    public async Task AStringBoundCutInsideACharacter_IsLeftOut()
+    {
+        // 22 three-byte characters: the Parquet writer cuts its statistics at 64 bytes, inside the 22nd.
+        string euros = new('€', 22);
+        var config = Enabled();
+        config["delta.dataSkippingStringPrefixLength"] = "100";
+        var stats = await WriteAndReadStatsAsync(
+            Shredding(Fields(("s", ShredType.String), ("a", ShredType.Int64))), config,
+            Obj(("s", VariantValue.FromString(euros)), ("a", VariantValue.FromInt64(1))));
+
+        var (min, _) = Bounds(stats);
+        Assert.Equal(["$['a']"], min.Keys);
+    }
+
+    [Fact]
+    public async Task ACutMaximumThatContinuesWithTheLargestCodePoint_IsLeftOut()
+    {
+        // Cut to "abcd" + U+10FFFF, the maximum "abcd" + U+10FFFF + "x" would sit ABOVE its own bound.
+        var config = Enabled();
+        config["delta.dataSkippingStringPrefixLength"] = "4";
+        var stats = await WriteAndReadStatsAsync(
+            Shredding(Fields(("s", ShredType.String), ("a", ShredType.Int64))), config,
+            Obj(("s", VariantValue.FromString("abcd\U0010FFFFx")), ("a", VariantValue.FromInt64(1))));
+
+        var (_, max) = Bounds(stats);
+        Assert.Equal(["$['a']"], max.Keys);
+    }
+
+    [Fact]
+    public async Task AZeroStringPrefix_BoundsStringsWithTheEmptyPrefix()
+    {
+        var config = Enabled();
+        config["delta.dataSkippingStringPrefixLength"] = "0";
+        var stats = await WriteAndReadStatsAsync(
+            Shredding(Fields(("s", ShredType.String))), config,
+            Obj(("s", VariantValue.FromString("abc"))), Obj(("s", VariantValue.FromString("xyz"))));
+
+        var (min, max) = Bounds(stats);
+        Assert.Equal("\"\"", min["$['s']"]);
+        Assert.Equal(JsonSerializer.Serialize("\U0010FFFF"), max["$['s']"]);
+    }
 }
