@@ -148,6 +148,30 @@ public class LogCleanupInCommitTimestampTests : IDisposable
         Assert.Equal(6, snapshot.FileCount);
     }
 
+    /// <summary>
+    /// #660 review: in-commit timestamps date commits, not sidecars. With a listing that could not date a commit, a
+    /// sidecar's own modification time is no age either, and an unreferenced one may be about to be named by a
+    /// concurrent checkpoint, so the sidecar sweep does not run.
+    /// </summary>
+    [Fact]
+    public async Task UndatedListing_LeavesUnreferencedSidecars()
+    {
+        var config = Config();
+        await WriteAsync([DaysAgo(10), DaysAgo(9), DaysAgo(8), DaysAgo(2), DaysAgo(0.5), DaysAgo(0.1)], config);
+        await CheckpointAtAsync(5);
+        UndateEverything();
+        string sidecars = Path.Combine(_tempDir, "_delta_log", "_sidecars");
+        Directory.CreateDirectory(sidecars);
+        string orphan = Path.Combine(sidecars, "unreferenced.parquet");
+        File.WriteAllText(orphan, "");
+        File.SetLastWriteTimeUtc(orphan, Now.UtcDateTime.AddDays(-30));
+
+        int deleted = await LogCleanup.RunAsync(_log, config, latestCheckpointVersion: 5, Now);
+
+        Assert.Equal(4, deleted);
+        Assert.True(File.Exists(orphan));
+    }
+
     [Fact]
     public async Task ACommitAtTheHorizon_Stays()
     {

@@ -1015,7 +1015,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var commitActions = Log.InCommitTimestamp.EnsureCommitInfo(
                 actions, previousSnapshot?.Metadata.Configuration, version, operation,
                 commitProperties: commitProperties,
-                previousCommitTimestamp: previousSnapshot?.InCommitTimestamp);
+                previousCommitTimestamp: await Log.InCommitTimestamp.ResolvePreviousTimestampAsync(
+                    log, previousSnapshot, actions, cancellationToken).ConfigureAwait(false));
 
             await log.WriteCommitAsync(version, commitActions, cancellationToken).ConfigureAwait(false);
             written.Clear();
@@ -7162,7 +7163,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // back to a default that happens to agree.
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
                 actions, snapshot.Metadata.Configuration, newVersion, "WRITE", isBlindAppend: false,
-                commitProperties: commitProperties, previousCommitTimestamp: snapshot.InCommitTimestamp);
+                commitProperties: commitProperties,
+                previousCommitTimestamp: await Log.InCommitTimestamp.ResolvePreviousTimestampAsync(
+                    _log, snapshot, actions, cancellationToken).ConfigureAwait(false));
             await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
                 .ConfigureAwait(false);
             // Durable: these files are the table's now, whatever the refresh below does. Same reasoning as

@@ -296,4 +296,41 @@ public class InCommitTimestampEnablementTests : IDisposable
         });
         Assert.Equal(ahead + 1, InCommitTimestamp.GetTimestampFromActions(await log.ReadCommitAsync(2)));
     }
+
+    /// <summary>
+    /// #660 review: the same, for a table whose checkpoint comes BEFORE in-commit timestamps are turned on. The
+    /// snapshot builder reads a timestamp only for a table that already has them, so the enabling commit resolves
+    /// its floor itself, from the commit before it, as Spark floors it by <c>snapshot.timestamp</c>.
+    /// </summary>
+    [Fact]
+    public async Task EnablingAfterACheckpoint_StillFollowsThePreviousCommit()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+        long ahead = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 3_600_000;
+        await log.WriteCommitAsync(0,
+        [
+            InCommitTimestamp.CreateCommitInfo(ahead - 10, includeInCommitTimestamp: false),
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["inCommitTimestamp"] },
+            Metadata(new Dictionary<string, string>()),
+        ]);
+        await log.WriteCommitAsync(1,
+            [InCommitTimestamp.CreateCommitInfo(ahead, includeInCommitTimestamp: false), Add("a.parquet")]);
+        var atOne = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs), atVersion: null);
+        await new CheckpointWriter(fs).WriteCheckpointAsync(atOne);
+
+        var opened = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs), atVersion: null);
+        Assert.Null(opened.InCommitTimestamp);
+
+        await new LogCommitter(log).CommitAsync(new LogCommitRequest
+        {
+            BaseSnapshot = opened,
+            Actions = [Metadata(Enabled)],
+        });
+        var committed = await log.ReadCommitAsync(2);
+        Assert.Equal(ahead + 1, InCommitTimestamp.GetTimestampFromActions(committed));
+        Assert.Equal(
+            (2L, ahead + 1),
+            InCommitTimestamp.GetEnablement(committed.OfType<MetadataAction>().Single().Configuration));
+    }
 }

@@ -156,6 +156,45 @@ public static class InCommitTimestamp
     }
 
     /// <summary>
+    /// The timestamp a commit of <paramref name="actions"/> on <paramref name="baseSnapshot"/> must stay after: the
+    /// snapshot's own, or, when it has none and the commit will be timestamped, read from the base version's commit.
+    /// </summary>
+    /// <remarks>
+    /// A snapshot that ends on a checkpoint has no timestamp unless the table already had in-commit timestamps (the
+    /// snapshot builder reads one only then). A commit that turns them on is the case left: its floor is the commit
+    /// before it, as Spark's is (<c>snapshot.timestamp</c>). Read only when the commit will carry a timestamp, so
+    /// no other commit pays for it. Null when it cannot be read; the timestamp is then the clock's alone.
+    /// </remarks>
+    internal static async ValueTask<long?> ResolvePreviousTimestampAsync(
+        TransactionLog log, Snapshot.Snapshot? baseSnapshot, IReadOnlyList<DeltaAction> actions,
+        CancellationToken cancellationToken)
+    {
+        if (baseSnapshot is null)
+            return null;
+        if (baseSnapshot.InCommitTimestamp is { } known)
+            return known;
+
+        MetadataAction? installed = null;
+        foreach (var action in actions)
+        {
+            if (action is MetadataAction metadata)
+                installed = metadata;
+        }
+        if (!IsEnabled(installed is null ? baseSnapshot.Metadata.Configuration : installed.Configuration))
+            return null;
+
+        try
+        {
+            var previous = await log.ReadCommitAsync(baseSnapshot.Version, cancellationToken).ConfigureAwait(false);
+            return GetTimestampFromActions(previous);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Prepends a <see cref="CommitInfo"/> (the first action) to a commit, recording <c>operation</c> and a
     /// <c>timestamp</c> — standard, feature-free fields written on EVERY commit so the table has a usable
     /// history (the snapshots/versions view) even on a plain writer-v2 table.

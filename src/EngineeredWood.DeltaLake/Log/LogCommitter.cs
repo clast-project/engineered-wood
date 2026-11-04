@@ -103,7 +103,8 @@ public sealed class LogCommitter
         long attemptVersion = baseSnapshot.Version + 1;
         // The timestamp of the commit just below `attemptVersion`, which an in-commit timestamp must come after.
         // Moves with each rebase to the newest concurrent commit, as Spark's resolveTimestampOrderingConflicts does.
-        long? previousTimestamp = baseSnapshot.InCommitTimestamp;
+        long? previousTimestamp = await InCommitTimestamp.ResolvePreviousTimestampAsync(
+            _log, baseSnapshot, stagedActions, cancellationToken).ConfigureAwait(false);
         for (int attempt = 0; ; attempt++)
         {
             // Prepared again on every attempt, from the actions as staged or rebased: the in-commit timestamp and a

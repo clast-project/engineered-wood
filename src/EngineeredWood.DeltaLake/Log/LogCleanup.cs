@@ -202,8 +202,14 @@ internal static class LogCleanup
 
         // Deletion above is a strict prefix that stops at the first failure, so candidates[deleted..] is
         // exactly what is still on the log — which is what the sweeps below key off.
-        deleted += await SweepUnreferencedSidecarsAsync(
-            log, candidates, firstSurvivor: deleted, cutoff, onFailure, cancellationToken).ConfigureAwait(false);
+        // Only when the listing dated everything. The sweep's age guard is the sidecar's own modification time, and
+        // a listing that could not date a commit is no source for that: an unreferenced sidecar may be one a
+        // concurrent checkpoint is about to name. In-commit timestamps date commits, not sidecars, so these stay.
+        if (listingDatesEverything)
+        {
+            deleted += await SweepUnreferencedSidecarsAsync(
+                log, candidates, firstSurvivor: deleted, cutoff, onFailure, cancellationToken).ConfigureAwait(false);
+        }
 
         // long.MaxValue when nothing survived: every commit this log had is gone, so every checksum
         // describes a version that is gone. Reachable only when the caller names a checkpoint version above
