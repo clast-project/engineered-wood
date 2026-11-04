@@ -187,6 +187,31 @@ public class InCommitTimestampMidLifeTests : IDisposable
         Assert.Equal(3L, InCommitTimestamp.GetEnablement(replaced.CurrentSnapshot.Metadata.Configuration)?.Version);
     }
 
+    /// <summary>
+    /// #660 review: both VACUUM bookends were floored against the snapshot VACUUM started from, so with the previous
+    /// commit's timestamp ahead of this clock, START and END got the same one.
+    /// </summary>
+    [Fact]
+    public async Task VacuumBookends_EachFollowTheCommitBeforeThem()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        long ahead = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 3_600_000;
+        await using (var created = await DeltaTable.CreateAsync(
+            fs, IdSchema, configuration: new Dictionary<string, string> { [InCommitTimestamp.EnableKey] = "true" }))
+        {
+            // v1, stamped by a writer whose clock runs an hour ahead.
+            await new TransactionLog(fs).WriteCommitAsync(1, [InCommitTimestamp.CreateCommitInfo(ahead, "WRITE")]);
+        }
+        await using var table = await DeltaTable.OpenAsync(fs);
+
+        await table.VacuumAsync(TimeSpan.FromDays(7));
+
+        long start = Of(CommitOnDisk(2), "commitInfo").Single().GetProperty("inCommitTimestamp").GetInt64();
+        long end = Of(CommitOnDisk(3), "commitInfo").Single().GetProperty("inCommitTimestamp").GetInt64();
+        Assert.Equal(ahead + 1, start);
+        Assert.Equal(start + 1, end);
+    }
+
     [Fact]
     public async Task CreatingWithThem_RecordsNoEnablementPoint()
     {

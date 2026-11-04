@@ -282,9 +282,21 @@ public static class InCommitTimestamp
                 changed |= ApplyMetadataStamp(
                     replaced, metadataIndex, installed, configuration, enables, version, timestamp);
             }
-            if (!changed)
+            // With in-commit timestamps the commitInfo must be the commit's FIRST action: a reader may look for the
+            // timestamp there and nowhere else.
+            bool move = timestamped && i != 0;
+            if (!changed && !move)
                 return actions;
-            replaced[i] = existing with { Values = values };
+            var updated = changed ? existing with { Values = values } : existing;
+            if (move)
+            {
+                replaced.RemoveAt(i);
+                replaced.Insert(0, updated);
+            }
+            else
+            {
+                replaced[i] = updated;
+            }
             return replaced;
         }
 

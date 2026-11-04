@@ -230,6 +230,27 @@ public sealed class SnapshotBuilder
         if (firstMissing is long missing)
             throw ReplayGap(listing, unreadable, missing, firstNeeded, targetVersion);
 
+        // A checkpoint, or a compacted range, carries no commitInfo, so a snapshot that ENDS on one has no timestamp
+        // for its own version. On a table with in-commit timestamps that is the floor the next commit's timestamp
+        // must stay above, and the field a version checksum needs (#660 review), so it is read from the version's
+        // own commit when that is still on the log. Only then: elsewhere nothing depends on it, and the read costs
+        // a request. A commit that cannot be read leaves it unknown, as before.
+        if (builder._inCommitTimestamp is null
+            && builder._version == targetVersion
+            && Log.InCommitTimestamp.IsEnabled(builder._metadata?.Configuration)
+            && listing.CommitsInRange(targetVersion, targetVersion).Any())
+        {
+            try
+            {
+                var own = await log.ReadCommitAsync(targetVersion, cancellationToken).ConfigureAwait(false);
+                builder._inCommitTimestamp = Log.InCommitTimestamp.GetTimestampFromActions(own);
+            }
+            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Unknown, as it was before this read.
+            }
+        }
+
         return builder.Build();
     }
 

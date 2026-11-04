@@ -205,6 +205,28 @@ public class InCommitTimestampEnablementTests : IDisposable
         Assert.Equal(Now + 1, InCommitTimestampOf(raised));
     }
 
+    [Fact]
+    public void ACommitInfoAfterOtherActions_IsMovedFirst_WhenTimestamped()
+    {
+        // #660 review: a host's [metaData, commitInfo] got its timestamp but kept the commitInfo second, where a
+        // reader looking at the first action finds none.
+        var own = InCommitTimestamp.CreateCommitInfo(Now, "SET TBLPROPERTIES");
+        var result = InCommitTimestamp.EnsureCommitInfo(
+            [Metadata(Enabled), own], new Dictionary<string, string>(), version: 6, nowMs: Now);
+
+        Assert.Equal(Now, InCommitTimestampOf(result));
+        Assert.IsType<MetadataAction>(result[1]);
+
+        // Even when nothing else about it changes.
+        IReadOnlyList<DeltaAction> late = [Add("a.parquet"), own];
+        var moved = InCommitTimestamp.EnsureCommitInfo(late, Enabled, version: 6, nowMs: Now);
+        Assert.Same(own, moved[0]);
+        Assert.IsType<AddFile>(moved[1]);
+
+        // Without in-commit timestamps there is no such rule, and the actions are left alone.
+        Assert.Same(late, InCommitTimestamp.EnsureCommitInfo(late, configuration: null, version: 6, nowMs: Now));
+    }
+
     // ── through LogCommitter ────────────────────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -241,5 +263,37 @@ public class InCommitTimestampEnablementTests : IDisposable
         Assert.Equal(
             (2L, stamp),
             InCommitTimestamp.GetEnablement(committed.OfType<MetadataAction>().Single().Configuration));
+    }
+
+    /// <summary>
+    /// #660 review: a table opened exactly at a checkpoint replays nothing, and a checkpoint carries no commitInfo,
+    /// so the snapshot had no timestamp and the next commit lost its floor. A previous writer whose clock ran ahead
+    /// then let this commit's timestamp go backwards.
+    /// </summary>
+    [Fact]
+    public async Task OpenedAtACheckpoint_TheNextCommitStillFollowsThePreviousTimestamp()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var log = new TransactionLog(fs);
+        long ahead = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() + 3_600_000;
+        await log.WriteCommitAsync(0,
+        [
+            InCommitTimestamp.CreateCommitInfo(ahead - 10),
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 7, WriterFeatures = ["inCommitTimestamp"] },
+            Metadata(Enabled),
+        ]);
+        await log.WriteCommitAsync(1, [InCommitTimestamp.CreateCommitInfo(ahead), Add("a.parquet")]);
+        var atOne = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs), atVersion: null);
+        await new CheckpointWriter(fs).WriteCheckpointAsync(atOne);
+
+        var opened = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs), atVersion: null);
+        Assert.Equal(ahead, opened.InCommitTimestamp);
+
+        await new LogCommitter(log).CommitAsync(new LogCommitRequest
+        {
+            BaseSnapshot = opened,
+            Actions = [Add("b.parquet")],
+        });
+        Assert.Equal(ahead + 1, InCommitTimestamp.GetTimestampFromActions(await log.ReadCommitAsync(2)));
     }
 }
