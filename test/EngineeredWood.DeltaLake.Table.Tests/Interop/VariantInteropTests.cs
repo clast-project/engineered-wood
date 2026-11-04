@@ -2,6 +2,8 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Operations.Shredding;
+using Apache.Arrow.Operations.VariantJson;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.IO.Local;
@@ -264,5 +266,133 @@ public class VariantInteropTests : IDisposable
         Assert.Equal(3, values.Count);
         Assert.Contains(values, x => x is null);              // the SQL-NULL nested variant
         Assert.Equal(2, values.Count(x => x is not null));    // the two real nested variants round-tripped
+    }
+
+    // ── Tier 3, SHREDDED Spark tables (#671). ──
+    //
+    // delta.enableVariantShredding makes delta-spark 4.1+ declare variantShredding (or, with its force conf, the
+    // preview name) and Spark 4.1 shred each file. Before #671 EW refused to open either table. GA-only: Spark
+    // 4.0 shreds only under a test-only forced schema, and delta-spark 4.0.0 knows only the preview name.
+
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SparkWrittenShredded_EwReadsAndAppends(bool preview)
+    {
+        Spark.Require();
+        Skip.IfNot(SparkHasGaVariant(out string sparkVersion),
+            $"Shredded Delta writes need Spark 4.1+ / delta-spark 4.1+; resolved {sparkVersion}");
+
+        string[] json = ["{\"a\":1,\"b\":\"x\"}", "{\"a\":2,\"b\":\"y\"}", "{\"a\":3,\"b\":\"z\"}"];
+        var result = Spark.Invoke("write_shredded_variant", new
+        {
+            path = _tempDir,
+            preview,
+            rows = new object[]
+            {
+                new { id = 1L, json = json[0] },
+                new { id = 2L, json = json[1] },
+                new { id = 3L, json = json[2] },
+                new { id = 4L, json = (string?)null },
+            },
+        });
+
+        string feature = preview ? "variantShredding-preview" : "variantShredding";
+        var features = result.GetProperty("tableFeatures").EnumerateArray().Select(e => e.GetString()).ToList();
+        Assert.Contains(feature, features);
+
+        // Spark shredded at least one file, or this would not be testing the shredded read.
+        bool anyShredded = false;
+        foreach (string file in Directory.GetFiles(_tempDir, "*.parquet", SearchOption.TopDirectoryOnly))
+        {
+            await using var raf = new LocalRandomAccessFile(file);
+            await using var reader = new Parquet.ParquetFileReader(raf, ownsFile: false);
+            anyShredded |= (await reader.ReadMetadataAsync()).Schema.Any(s => s.Name == "typed_value");
+        }
+        Assert.True(anyShredded, "Spark wrote no shredded data file");
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.OpenAsync(fs);
+        Assert.Contains(feature, table.CurrentSnapshot.Protocol.ReaderFeatures!);
+
+        async Task<List<string?>> ReadAsync()
+        {
+            var values = new List<(long Id, string? Json)>();
+            await foreach (var b in table.ReadAllAsync())
+            {
+                var ids = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
+                var v = Assert.IsType<VariantArray>(b.Column(b.Schema.GetFieldIndex("v")));
+                for (int i = 0; i < v.Length; i++)
+                {
+                    values.Add((ids.GetValue(i)!.Value,
+                        v.IsNull(i) ? null : VariantJsonWriter.ToJson(v.GetLogicalVariantValue(i), indented: false)));
+                }
+            }
+            return values.OrderBy(x => x.Id).Select(x => x.Json).ToList();
+        }
+
+        // The values come back reassembled from typed_value, not empty.
+        Assert.Equal([json[0], json[1], json[2], null], await ReadAsync());
+
+        // delta-spark 4.3+ also writes z85-encoded variant bounds, a STRING under minValues.v in the JSON stats.
+        // A filtered read parses those stats for pruning, and must neither throw nor prune on the variant bound.
+        var add = (await new DeltaLake.Log.TransactionLog(fs).ReadCommitAsync(1)).OfType<DeltaLake.Actions.AddFile>().First();
+        using (var stats = System.Text.Json.JsonDocument.Parse(add.Stats!))
+        {
+            bool variantBounds = stats.RootElement.TryGetProperty("minValues", out var min)
+                && min.TryGetProperty("v", out var vMin) && vMin.ValueKind == System.Text.Json.JsonValueKind.String;
+            if (DeltaSparkAtLeast(4, 3))
+                Assert.True(variantBounds, $"delta-spark 4.3+ wrote no variant bounds: {add.Stats}");
+        }
+        // The filter prunes FILES (there is no row-level post-filter), so: every id bound excludes the file
+        // (0 rows), and one that admits it keeps all four.
+        async Task<long> CountAsync(EngineeredWood.Expressions.Predicate filter)
+        {
+            long n = 0;
+            await foreach (var b in table.ReadAsync(new DeltaReadOptions { Filter = filter }))
+                n += b.Length;
+            return n;
+        }
+        Assert.Equal(0, await CountAsync(EngineeredWood.Expressions.Expressions.GreaterThan("id", 10L)));
+        Assert.Equal(4, await CountAsync(EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", 2L)));
+
+        // Writable too: EW appends unshredded, which a shredding table permits, and Spark reads the mix.
+        var appendIds = new Int64Array.Builder().Append(5).Build();
+        var appendVariants = new VariantArray.Builder();
+        appendVariants.Append(Apache.Arrow.Scalars.Variant.VariantValue.FromInt32(7));
+        var appendSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("v", VariantType.Default, true))
+            .Build();
+        await table.WriteAsync([new RecordBatch(appendSchema, [appendIds, appendVariants.Build(allocator: null)], 1)]);
+        Assert.Equal([json[0], json[1], json[2], null, "7"], await ReadAsync());
+
+        var sparkRead = Spark.Invoke("read_variant", new { path = _tempDir, col = "v", id_col = "id" });
+        Assert.Equal(5, sparkRead.GetProperty("rows").GetArrayLength());
+
+        // An EW checkpoint over those stats: stats_parsed has no variant bounds, and both engines still read it.
+        await table.CheckpointAsync();
+        await using (var fromCheckpoint = await DeltaTable.OpenAsync(fs))
+        {
+            long rows = 0;
+            await foreach (var b in fromCheckpoint.ReadAllAsync())
+                rows += b.Length;
+            Assert.Equal(5, rows);
+        }
+        sparkRead = Spark.Invoke("read_variant", new { path = _tempDir, col = "v", id_col = "id" });
+        Assert.Equal(5, sparkRead.GetProperty("rows").GetArrayLength());
+    }
+
+    /// <summary>True when the resolved delta-spark is at least <paramref name="major"/>.<paramref name="minor"/>.</summary>
+    private static bool DeltaSparkAtLeast(int major, int minor)
+    {
+        // Spark.Version is "<pyspark>/<delta-spark>", e.g. "4.1.2/4.3.1" (Spark.cs's probe).
+        string version = Spark.Version ?? "";
+        int i = version.IndexOf('/');
+        if (i < 0) return false;
+        var parts = version.Substring(i + 1).Trim().Split('.');
+        return parts.Length >= 2
+            && int.TryParse(parts[0], out int ma) && int.TryParse(parts[1], out int mi)
+            && (ma > major || (ma == major && mi >= minor));
     }
 }

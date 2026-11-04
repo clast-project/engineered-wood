@@ -51,6 +51,10 @@ internal static class TableFeatureProperties
             ["typeWidening"] = (true, []),
             ["vacuumProtocolCheck"] = (true, []),
             ["variantType"] = (true, []),
+            // Only the GA name requires variantType (delta-spark 4.3.1's VariantShreddingTableFeature.requiredFeatures;
+            // the preview feature declares none).
+            [VariantShreddingConfig.FeatureName] = (true, ["variantType"]),
+            [VariantShreddingConfig.PreviewFeatureName] = (true, []),
             [ClusteringFeature] = (false, ["domainMetadata"]),
         };
 

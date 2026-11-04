@@ -24,6 +24,11 @@ namespace EngineeredWood.DeltaLake.Table;
 /// <see cref="VariantArray"/> so downstream consumers see a uniform type regardless of how the file was
 /// written.</para>
 ///
+/// <para>An unannotated file can also be SHREDDED (a Spark 4.0-era writer under <c>variantShredding-preview</c>):
+/// the struct then carries a <c>typed_value</c> child holding the data the <c>value</c> child left out. That
+/// child must survive, so such a column is wrapped as the parquet reader wraps an annotated one and reassembled
+/// into the canonical unshredded form (#671). Dropping it would read every shredded row as empty.</para>
+///
 /// <para>Two things it is careful about:</para>
 /// <list type="bullet">
 /// <item>Child order. <see cref="VariantType"/>'s array factory is POSITIONAL (child 0 = metadata,
@@ -70,7 +75,9 @@ internal static class VariantColumnCoercion
             }
 
             rewritten ??= CopyColumns(batch);
-            rewritten[i] = variantType.CreateArray(ToCanonicalStorage(storage));
+            rewritten[i] = HasField((StructType)storage.Data.DataType, "typed_value")
+                ? ReassembleShredded(storage, batch.Schema.FieldsList[i].Name)
+                : variantType.CreateArray(ToCanonicalStorage(storage));
         }
 
         if (rewritten is null)
@@ -125,15 +132,59 @@ internal static class VariantColumnCoercion
         if (metaIdx == 0 && valueIdx == 1 && type.Fields.Count == 2)
             return storage;
 
-        var canonicalType = new StructType(new[] { type.Fields[metaIdx], type.Fields[valueIdx] });
-        return new StructArray(
-            canonicalType,
-            storage.Length,
-            new[] { storage.Fields[metaIdx], storage.Fields[valueIdx] },
-            GetValidityBuffer(storage),
-            storage.NullCount,
-            storage.Offset);
+        return Reordered(storage, [metaIdx, valueIdx]);
     }
+
+    /// <summary>
+    /// <paramref name="storage"/> with only the children at <paramref name="order"/>, in that order, keeping its
+    /// offset, length and validity.
+    /// </summary>
+    /// <remarks>
+    /// Built from the RAW children (<c>Data.Children</c>), which Arrow C# does not slice with their parent: parent
+    /// slot i is child slot <c>Offset + i</c>, so the parent's offset is applied once, here. <see cref="StructArray.Fields"/>
+    /// returns children already sliced to the parent, and pairing those with the parent's offset applied it twice,
+    /// reading the wrong rows of any sliced column.
+    /// </remarks>
+    private static StructArray Reordered(StructArray storage, IReadOnlyList<int> order)
+    {
+        var type = (StructType)storage.Data.DataType;
+        var data = storage.Data;
+        return new StructArray(new ArrayData(
+            new StructType(order.Select(i => type.Fields[i]).ToList()),
+            data.Length,
+            data.NullCount,
+            data.Offset,
+            data.Buffers,
+            order.Select(i => data.Children[i]).ToArray()));
+    }
+
+    /// <summary>
+    /// Wraps a SHREDDED storage struct (<c>metadata</c>, optional <c>value</c>, <c>typed_value</c>) as a
+    /// <see cref="VariantArray"/> and reassembles it, exactly as the parquet reader does for an annotated file. The
+    /// children are put in the order this library writes them, resolved by name, since writers disagree.
+    /// </summary>
+    private static VariantArray ReassembleShredded(StructArray storage, string columnName)
+    {
+        var type = (StructType)storage.Data.DataType;
+        var order = new List<int> { IndexOf(type, "metadata") };
+        if (HasField(type, "value"))
+            order.Add(IndexOf(type, "value"));
+        order.Add(IndexOf(type, "typed_value"));
+
+        var canonical = Reordered(storage, order);
+
+        if (!VariantExtensionDefinition.Instance.TryCreateType(canonical.Data.DataType, string.Empty, out var ext)
+            || ext.CreateArray(canonical) is not VariantArray shredded)
+        {
+            throw new InvalidOperationException(
+                $"Column '{columnName}' is declared variant and carries a typed_value child, but its storage "
+                + $"[{string.Join(", ", type.Fields.Select(f => f.Name))}] is not a shredded variant layout.");
+        }
+        return EngineeredWood.Parquet.VariantShredding.Reassemble(shredded);
+    }
+
+    private static bool HasField(StructType type, string fieldName) =>
+        type.Fields.Any(f => f.Name == fieldName);
 
     private static int IndexOf(StructType type, string fieldName)
     {
@@ -146,9 +197,6 @@ internal static class VariantColumnCoercion
             $"Variant storage struct is missing the required '{fieldName}' field; it has "
             + $"[{string.Join(", ", System.Linq.Enumerable.Select(type.Fields, f => f.Name))}].");
     }
-
-    private static ArrowBuffer GetValidityBuffer(StructArray storage) =>
-        storage.Data.Buffers.Length > 0 ? storage.Data.Buffers[0] : ArrowBuffer.Empty;
 
     private static IArrowArray[] CopyColumns(RecordBatch batch)
     {

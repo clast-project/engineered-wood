@@ -180,23 +180,70 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// translation is redone when a RENAME COLUMN changes the logical names.
     /// </summary>
     private ParquetWriteOptions DataFileWriteOptions(Snapshot.Snapshot snapshot) =>
-        DataFileWriteOptions(snapshot.Schema, ColumnMapping.GetMode(snapshot.Metadata.Configuration));
+        DataFileWriteOptions(snapshot.Schema, ColumnMapping.GetMode(snapshot.Metadata.Configuration), snapshot);
 
     /// <summary>
     /// As above, against a schema that need not be committed: a buffered transaction's pending schema
     /// carries added columns and their fresh physical names, which the committed snapshot does not.
+    /// <paramref name="table"/> supplies the protocol and configuration that decide whether shredding is allowed.
     /// </summary>
-    private ParquetWriteOptions DataFileWriteOptions(Schema.StructType schema, ColumnMappingMode mode)
+    private ParquetWriteOptions DataFileWriteOptions(
+        Schema.StructType schema, ColumnMappingMode mode, Snapshot.Snapshot table)
     {
+        ParquetWriteOptions options;
         if (_dataFileWriteOptions is { } cached
             && ReferenceEquals(cached.Schema, schema) && cached.Mode == mode)
         {
-            return cached.Options;
+            options = cached.Options;
+        }
+        else
+        {
+            options = ColumnMappingWriteOptions.ToPhysical(_options.ParquetWriteOptions, schema, mode);
+            _dataFileWriteOptions = (schema, mode, options);
         }
 
-        var options = ColumnMappingWriteOptions.ToPhysical(_options.ParquetWriteOptions, schema, mode);
-        _dataFileWriteOptions = (schema, mode, options);
+        // Against the TRANSLATED options, the ones the writer will use: a key that names a physical column directly
+        // passes through the translation unchanged and still shreds that column.
+        ThrowIfShreddingDisallowed(options, schema, mode, table);
         return options;
+    }
+
+    /// <summary>
+    /// Refuses a data-file write that would shred a variant column of a table that does not enable shredding (#671).
+    /// PROTOCOL.md: without <c>delta.enableVariantShredding</c>, "a variant column must not be written as a shredded
+    /// Variant". delta-spark refuses the same write (<c>OptimisticTransaction.assertShreddingStateConsistent</c>) with
+    /// the code reused here. Nothing is refused when the options would shred nothing: the writer shreds only top-level
+    /// variant columns, all of them under <see cref="ParquetWriteOptions.ShredVariants"/> and only the ones it names
+    /// under <see cref="ParquetWriteOptions.VariantShredSchemas"/>. <paramref name="physical"/> is the option set
+    /// AFTER column-mapping translation, so its keys are compared with each variant column's PHYSICAL name, which is
+    /// what the writer matches them against. A logical key has been translated by then; a key that already named the
+    /// physical column passed through unchanged.
+    /// </summary>
+    private static void ThrowIfShreddingDisallowed(
+        ParquetWriteOptions physical, Schema.StructType schema, ColumnMappingMode mode, Snapshot.Snapshot table)
+    {
+        var parquet = physical;
+        if (parquet.ShredVariants is null && parquet.VariantShredSchemas is not { Count: > 0 })
+            return;
+
+        var variantColumns = schema.Fields
+            .Where(static f => f.Type is Schema.PrimitiveType { TypeName: "variant" })
+            .Select(f => ColumnMapping.GetPhysicalName(f, mode));
+        bool shredsSomething = parquet.ShredVariants is not null
+            ? variantColumns.Any()
+            : variantColumns.Any(name => parquet.VariantShredSchemas!.ContainsKey(name));
+        if (!shredsSomething
+            || VariantShreddingConfig.AllowsShreddedWrites(table.Protocol, table.Metadata.Configuration))
+        {
+            return;
+        }
+
+        throw new DeltaFormatException(
+            DeltaTableErrorCodes.ShreddingTablePropertyDisabled,
+            "Attempted to write shredded Variants but the table does not support shredded writes: "
+            + "DeltaTableOptions.ParquetWriteOptions sets ShredVariants or VariantShredSchemas, and the table does not "
+            + $"enable '{VariantShreddingConfig.EnableKey}' with the '{VariantShreddingConfig.FeatureName}' table "
+            + "feature. Create the table with that property set to true, or clear the shredding options.");
     }
 
     /// <summary>
@@ -306,7 +353,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>The <c>delta.enable*</c> / mode properties in it ENABLE their feature exactly like the
     /// dedicated arguments do, and each is declared in the commit-0 protocol: column mapping
     /// (<c>delta.columnMapping.mode</c>), deletion vectors, row tracking, in-commit timestamps
-    /// (<c>delta.enableInCommitTimestamps</c>), change data feed (<c>delta.enableChangeDataFeed</c>) and
+    /// (<c>delta.enableInCommitTimestamps</c>), change data feed (<c>delta.enableChangeDataFeed</c>), variant
+    /// shredding (<c>delta.enableVariantShredding</c>, without which a shredded write is refused) and
     /// Iceberg compatibility (<c>delta.enableIcebergCompatV1</c> / <c>…V2</c>). Enablement is
     /// one-directional — a property can turn a feature on, never off — so an argument and a property that
     /// disagree resolve to the argument. Internally-derived keys (the column-mapping mode and max id)
@@ -511,6 +559,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool changeDataFeedEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(configurationBuilder);
         bool typeWideningEnabled = Schema.TypeWidening.IsEnabled(configurationBuilder);
         bool v2CheckpointsEnabled = Checkpoint.CheckpointPolicy.WantsV2(configurationBuilder);
+        bool variantShreddingEnabled = VariantShreddingConfig.IsEnabled(configurationBuilder);
         var icebergCompatVersion = Schema.IcebergCompat.GetVersion(configurationBuilder);
 
         if (mappingMode != ColumnMappingMode.None)
@@ -769,6 +818,26 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             minWriterVersion = 7;
             readerFeatures.Add(Checkpoint.CheckpointPolicy.FeatureName);
             writerFeatures.Add(Checkpoint.CheckpointPolicy.FeatureName);
+        }
+
+        // Variant shredding — a READER+WRITER feature that delta.enableVariantShredding enables, as delta-spark 4.1+
+        // enables it (#671): the GA 'variantShredding', with 'variantType' as the dependency it declares, unless the
+        // table being replaced already has the preview name, which then stands for it (Spark's
+        // metadataRequiresFeatureToBeEnabled skips the GA feature when the preview one is supported, and the replaced
+        // protocol's features carry over below). The feature is what a strict reader checks before it accepts a
+        // shredded file, and the property is what permits a writer to produce one.
+        if (variantShreddingEnabled
+            && !(previousSnapshot?.Protocol.WriterFeatures?.Contains(VariantShreddingConfig.PreviewFeatureName) ?? false))
+        {
+            minReaderVersion = 3;
+            minWriterVersion = 7;
+            foreach (string feature in new[] { "variantType", VariantShreddingConfig.FeatureName })
+            {
+                if (!readerFeatures.Contains(feature))
+                    readerFeatures.Add(feature);
+                if (!writerFeatures.Contains(feature))
+                    writerFeatures.Add(feature);
+            }
         }
 
         // Iceberg compatibility — WRITER-only features ('icebergCompatV1' / 'icebergCompatV2'); readers see
@@ -7986,7 +8055,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             IReadOnlyList<RolledDataFile> rolled;
             await using (var writer = new RollingDataFileWriter(
-                _fs, _options.DataFileWriter, DataFileWriteOptions(writeSchema, mappingMode), _options.TargetFileSize,
+                _fs, _options.DataFileWriter, DataFileWriteOptions(writeSchema, mappingMode, snapshot), _options.TargetFileSize,
                 BuildPartitionPath(trackedPartValues), written: null, _options.CollectStats, statsSelection))
             {
                 foreach (var splitBatch in group.Batches)

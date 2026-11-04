@@ -425,6 +425,28 @@ Note the domain stores PHYSICAL column names, because OSS Delta
 `EwWritten_Clustered_SparkResolvesClusteringColumns`, which asserts Spark's
 `DESCRIBE DETAIL` resolves the declaration back to the logical names.
 
+**Variant shredding: the feature, not the statistics.** `variantShredding` and
+`variantShredding-preview` are supported reader and writer features (#671).
+`delta.enableVariantShredding = true` at creation declares `variantShredding`
+(with `variantType`), as delta-spark 4.1+ does, and only such a table accepts
+a shredded write: `ParquetWriteOptions.ShredVariants` / `VariantShredSchemas`
+on any other table with a top-level variant column is refused with
+`DELTA_SHREDDING_TABLE_PROPERTY_DISABLED`. Checkpoints are never shredded.
+What is not done:
+
+- *No variant min/max statistics.* EW writes `nullCount` only for a variant
+  column, which the spec allows. delta-spark 4.3+ derives z85-encoded
+  per-path `minValues`/`maxValues` from a shredded file's footer; EW neither
+  computes them nor prunes with Spark's. They are carried through untouched
+  in a commit's JSON `stats`, and dropped from the `stats_parsed` EW writes.
+- *Files a host writes are not inspected.* `CommitDataFilesAsync`, the
+  transaction's `StageDataFiles*`, and an `IDataFileWriter` that ignores the
+  parquet options can still commit a shredded file to a table that does not
+  enable shredding. Checking would mean reading every footer, so it is the
+  host's obligation. DuckDB's parquet writer shreds by default.
+- *No ALTER.* There is no table-property API, so the property can only be
+  set at creation (or on replace).
+
 **Row tracking (`delta.enableRowTracking=true`) — one residual limitation.**
 Row tracking is otherwise fully supported: `CreateAsync(enableRowTracking: true)`
 enables it (generating the materialized column-name properties + declaring the
@@ -653,7 +675,7 @@ for `delta.feature.*`. There is no API to set a protocol version mid-life except
 *Moot because EW refuses the table:* each of these belongs to a table feature missing from
 `ProtocolVersions.SupportedWriterFeatures`, so EW will not write the table at all:
 `delta.coordinatedCommits.*-preview`, `delta.redirectReaderWriter-preview`,
-`delta.redirectWriterOnly-preview`, `delta.enableIcebergCompatV3`, `delta.enableVariantShredding`,
+`delta.redirectWriterOnly-preview`, `delta.enableIcebergCompatV3`,
 `delta.enableMaterializePartitionColumnsFeature` / `delta.writePartitionColumnsToParquet`, and
 `delta.requireCheckpointProtectionBeforeVersion`.
 
