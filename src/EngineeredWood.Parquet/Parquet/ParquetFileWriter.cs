@@ -232,12 +232,13 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     ///
     /// <para>Returns the batch unchanged when no column carries an offset, which is the common case: arrays
     /// built by a builder, read back by the parquet reader, or gathered by <c>ArrowCompute.Take</c> all start
-    /// at 0. Only a caller that sliced its own data pays for the copy.</para>
+    /// at 0.</para>
     ///
-    /// <para><c>Take</c> with the identity selection is the compaction: it applies the source's offset in
-    /// every one of its per-type gathers, so the result is a genuine copy of the rows the view designates.
-    /// A type it cannot gather raises <see cref="NotSupportedException"/> from there rather than being
-    /// written wrong.</para>
+    /// <para>Most columns are re-based by <see cref="ZeroOffsetView"/>, which views the same value buffers from
+    /// the slice's first row and rebuilds only offsets and unaligned bitmaps (#667). The rest are gathered by
+    /// <c>Take</c> with the identity selection, which applies the source's offset in every one of its per-type
+    /// gathers. A type it cannot gather raises <see cref="NotSupportedException"/> from there rather than
+    /// being written wrong.</para>
     /// </summary>
     private static RecordBatch CompactSlicedColumns(RecordBatch batch)
     {
@@ -254,17 +255,31 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
         if (!anySliced)
             return batch;
 
-        var identity = new int[batch.Length];
-        for (int i = 0; i < identity.Length; i++)
-            identity[i] = i;
-
+        int[]? identity = null;
         var columns = new IArrowArray[batch.ColumnCount];
         for (int i = 0; i < batch.ColumnCount; i++)
         {
             var column = batch.Column(i);
-            columns[i] = column.Data.Offset == 0
-                ? column
-                : EngineeredWood.Arrow.ArrowCompute.Take(column, identity);
+            if (column.Data.Offset == 0)
+            {
+                columns[i] = column;
+                continue;
+            }
+
+            // A view at offset 0 where the type allows one, copying no values (#667); a gather otherwise.
+            if (ZeroOffsetView.TrySlice(column, 0, column.Length) is { } view)
+            {
+                columns[i] = view;
+                continue;
+            }
+
+            if (identity is null)
+            {
+                identity = new int[batch.Length];
+                for (int r = 0; r < identity.Length; r++)
+                    identity[r] = r;
+            }
+            columns[i] = EngineeredWood.Arrow.ArrowCompute.Take(column, identity);
         }
 
         return new RecordBatch(batch.Schema, columns, batch.Length);
@@ -372,6 +387,11 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
     private static IArrowArray MaterializeSliceCore(IArrowArray array, int offset, int length)
     {
+        // Most types are re-based in place, copying no values, with every child cut to the slice's rows: the
+        // layout the cases below build by copying (#667). They remain for the types it declines.
+        if (ZeroOffsetView.TrySlice(array, offset, length) is { } view)
+            return view;
+
         // A NESTED column is gathered rather than sliced, and — unlike the flat cases below — it is gathered
         // even at offset zero.
         //
