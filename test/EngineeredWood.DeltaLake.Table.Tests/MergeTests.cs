@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Text;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
@@ -398,6 +399,60 @@ public class MergeTests : IDisposable
 
         Assert.Contains(far.Path, table.CurrentSnapshot.ActiveFiles.Keys);
         Assert.Equal([1L, 2L, 3L, 100L, 200L], (await ReadAsync(table)).Select(r => r.Id!.Value));
+    }
+
+    // #663: the source key range is found over UTF-8 bytes, and an ill-formed key decodes to U+FFFD, which can sort
+    // on the other side of a bound than its bytes do. Such a key must not narrow the range.
+    [Fact]
+    public async Task AnIllFormedSourceKey_ThatWinsOnBytes_DoesNotInvertTheKeyRange()
+    {
+        await using var table = await CreateAsync();
+        await table.WriteAsync([RawRows((1, Encoding.UTF8.GetBytes("\U0001F600"), 10))]);
+
+        // On bytes FF is the max, but it decodes to U+FFFD, below the emoji: the range would be emoji..U+FFFD,
+        // which is empty, and the file holding the emoji would be pruned.
+        await table.MergeAsync([RawRows((1, Encoding.UTF8.GetBytes("\U0001F600"), 11), (2, [0xFF], 20))], UpsertByValue);
+
+        Assert.Equal([(1L, 11L), (2L, 20L)], (await ReadAsync(table)).Select(r => (r.Id!.Value, r.Ts!.Value)));
+    }
+
+    [Fact]
+    public async Task AnIllFormedSourceKey_ThatLosesOnBytes_StillReachesItsTargetFile()
+    {
+        await using var table = await CreateAsync();
+        // The target's stats for 0x80 are the decoded U+FFFD.
+        await table.WriteAsync([RawRows((1, [0x80], 10))]);
+
+        // On bytes the source range is "a".."é" (80 < C3), which refutes U+FFFD, though 0x80 matches 0x80.
+        await table.MergeAsync(
+            [RawRows((2, [0x61], 20), (3, [0xC3, 0xA9], 30), (1, [0x80], 11))], UpsertByValue);
+
+        Assert.Equal([(1L, 11L), (2L, 20L), (3L, 30L)], (await ReadAsync(table)).Select(r => (r.Id!.Value, r.Ts!.Value)));
+    }
+
+    private static MergeOptions UpsertByValue => new()
+    {
+        Keys = ["value"],
+        WhenMatched = MergeAction.Update,
+        WhenNotMatched = MergeAction.Insert,
+    };
+
+    // Rows whose value column is built from raw (possibly ill-formed) UTF-8 bytes.
+    private static RecordBatch RawRows(params (long Id, byte[] Value, long Ts)[] rows)
+    {
+        var ids = new Int64Array.Builder();
+        var ts = new Int64Array.Builder();
+        var offsets = new ArrowBuffer.Builder<int>().Append(0);
+        var data = new List<byte>();
+        foreach (var (id, value, t) in rows)
+        {
+            ids.Append(id);
+            ts.Append(t);
+            data.AddRange(value);
+            offsets.Append(data.Count);
+        }
+        var values = new StringArray(rows.Length, offsets.Build(), new ArrowBuffer(data.ToArray()), ArrowBuffer.Empty);
+        return new RecordBatch(TableSchema, [ids.Build(), values, ts.Build()], rows.Length);
     }
 
     [Fact]
