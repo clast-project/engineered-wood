@@ -534,7 +534,7 @@ it looked like it did.
 
 Note that the per-commit `build` job on windows-latest has **no JDK** and
 deliberately leaves `EW_REQUIRE_SPARK_INTEROP` unset, so its healthy result
-for this suite is `2301 passed, 180 skipped` of 2481. Those 180 are the
+for this suite is `2312 passed, 180 skipped` of 2492. Those 180 are the
 Spark-dependent cases; before they reported real skips they were counted as
 passes on every commit. A non-zero skip count there is correct, not a
 regression.
@@ -547,7 +547,7 @@ Measured on net10.0, 2026-08-08, with every optional toolchain present:
 |---|---|
 | **Parquet** | 807 |
 | **Core** | 452 |
-| **DeltaLake.Table** | 2481 (221 of them interop) — re-measured 2026-11-04 |
+| **DeltaLake.Table** | 2492 (221 of them interop) — re-measured 2026-11-04 |
 | **DeltaLake** | 484 |
 | **Vortex** | 1175 (737 of them upstream fixtures) — re-measured 2026-09-17 |
 | **Avro** | 301 |
@@ -567,9 +567,9 @@ be 0 — it depends on what the machine can reach:
 
 | environment | expected |
 |---|---|
-| every toolchain present, 4.0 oracles | 2471 passed / 10 skipped |
-| the same, Spark pointed at a 4.1 venv | 2481 passed / 0 skipped |
-| no JDK (the per-commit `build` job) | 2301 passed / 180 skipped |
+| every toolchain present, 4.0 oracles | 2482 passed / 10 skipped |
+| the same, Spark pointed at a 4.1 venv | 2492 passed / 0 skipped |
+| no JDK (the per-commit `build` job) | 2312 passed / 180 skipped |
 
 See [Skipped tests](#skipped-tests) for what each of those means.
 
