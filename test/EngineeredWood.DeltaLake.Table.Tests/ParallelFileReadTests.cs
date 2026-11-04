@@ -699,4 +699,301 @@ public class ParallelFileReadTests : IDisposable
         Assert.NotNull(parallel.LastScanBudget);
         Assert.Equal(0, parallel.LastScanBudget!.Used);
     }
+
+    // ── #632: the table file system suggests the window ────────────────────────────────────────────────────
+
+    /// <summary>The table's file system, suggesting a window through <see cref="IReadConcurrencyHint"/>.</summary>
+    private sealed class HintingFileSystem(ITableFileSystem inner, int? hint) : ITableFileSystem, IReadConcurrencyHint
+    {
+        public int? PreferredConcurrentReads => hint;
+        public PathNameConstraints PathConstraints => inner.PathConstraints;
+        public ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
+            => inner.OpenReadAsync(path, cancellationToken);
+        public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default)
+            => inner.ListAsync(prefix, cancellationToken);
+        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ReadAllBytesAsync(path, cancellationToken);
+        public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
+            => inner.CreateAsync(path, overwrite, cancellationToken);
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
+            => inner.DeleteAsync(path, cancellationToken);
+        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ExistsAsync(path, cancellationToken);
+        public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+        public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.WriteAllBytesAsync(path, data, cancellationToken);
+    }
+
+    /// <summary>
+    /// The default window is the file system's hint; an explicit <see cref="DeltaTableOptions.MaxConcurrentReads"/>
+    /// wins over it, and the codec seam stays serial unless the host opts in. No hint, or one below 1, leaves the
+    /// CPU-based default (-1 here).
+    /// </summary>
+    [Theory]
+    [InlineData(9, null, false, 9)]
+    [InlineData(9, 2, false, 2)]
+    [InlineData(9, null, true, 1)]
+    [InlineData(9, 3, true, 3)]
+    [InlineData(0, null, false, -1)]
+    [InlineData(null, null, false, -1)]
+    public async Task TheFileSystemsHint_SetsTheDefaultWindow_AndAnExplicitSettingWins(
+        int? hint, int? option, bool seam, int expected)
+    {
+        await CreateTableAsync();
+        var options = Options(option);
+        if (seam)
+        {
+#pragma warning disable EWDELTA0001
+            options = options with { DataFileReader = new FlakyReader(_fs, failOn: null) };
+#pragma warning restore EWDELTA0001
+        }
+        await using var table = await DeltaTable.OpenAsync(new HintingFileSystem(_fs, hint), options);
+
+        Assert.Equal(expected == -1 ? Math.Min(4, Environment.ProcessorCount) : expected, table.EffectiveConcurrentReads);
+    }
+
+    /// <summary>
+    /// The hint reaches the scheduler, not just <see cref="DeltaTable.EffectiveConcurrentReads"/>: with every data
+    /// read delayed, a hint of 16 keeps more reads in flight than the CPU default ever can (its window of at most 4
+    /// row groups, plus at most 4 footers of files opened ahead), and a hint of 1 reads one thing at a time.
+    /// Either way the batches equal a serial read's. Measured: 16 in flight for a hint of 16, 6 for the default.
+    /// </summary>
+    [Theory]
+    [InlineData(16)]
+    [InlineData(1)]
+    public async Task AHintedScan_KeepsTheHintedReadsInFlight_AndEqualsTheSerialRead(int hint)
+    {
+        await CreateTableAsync();
+        await using var serial = await OpenAsync(1);
+        var tracking = new TrackingFileSystem(_fs, delayMs: 20);
+        await using var hinted = await DeltaTable.OpenAsync(new HintingFileSystem(tracking, hint), Options(null));
+        var options = new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress | DeltaRowMetadata.Locator };
+
+        Assert.Equal(await RenderAsync(serial.ReadAsync(options)), await RenderAsync(hinted.ReadAsync(options)));
+        if (hint == 1)
+        {
+            Assert.Equal(1, tracking.MaxReading);
+            Assert.Null(hinted.LastScanBudget);
+        }
+        else
+        {
+            Assert.InRange(tracking.MaxReading, 2 * 4 + 1, 2 * hint);
+            Assert.NotNull(hinted.LastScanBudget);
+        }
+        Assert.Equal(0, tracking.Open);
+    }
+
+    // ── #633: ReadRowsAsync by row group ───────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// ReadRowsAsync reads only the row groups that hold a selected row: no byte of any other row group's column
+    /// chunks is requested, and a file with no selected row is never opened. File 0's row group 1 is cut by its
+    /// deletion vector (rows 150..259; position 160 is selected but deleted), and file 2's row group 1 is deleted
+    /// whole (position 150 selected): neither may change what comes back.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task ReadRowsAsync_NeverRequestsARowGroupHoldingNoSelectedRow(int window)
+    {
+        await CreateTableAsync();
+        // The data files by the order they were written (file w holds ids w * RowsPerFile and on), not by path.
+        var paths = new string[Files];
+        await using (var t = await OpenAsync(1))
+        {
+            await foreach (var b in t.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
+            {
+                long firstId = ((Int64Array)b.Column(0)).GetValue(0)!.Value;
+                paths[firstId / RowsPerFile] = ((StringArray)b.Column(b.ColumnCount - 2)).GetString(0);
+                b.Dispose();
+            }
+        }
+
+        // File -> selected positions; row groups hold 100 rows each.
+        var selected = new Dictionary<int, long[]>
+        {
+            [0] = [120, 130, 160],
+            [2] = [150],
+            [3] = [310, 349],
+            [5] = [0],
+        };
+        var selection = RowSelection.ByPath(selected.ToDictionary(
+            kv => paths[kv.Key], kv => (IReadOnlyCollection<long>)kv.Value));
+
+        var fs = new DataFileCountingFileSystem(_fs);
+        await using var table = await DeltaTable.OpenAsync(fs, Options(window));
+        var ids = new List<long>();
+        await foreach (var b in table.ReadRowsAsync(selection))
+        {
+            var col = (Int64Array)b.Column(0);
+            for (int i = 0; i < b.Length; i++)
+                ids.Add(col.GetValue(i)!.Value);
+            b.Dispose();
+        }
+
+        // Files come back in path order, which is not the order they were written in.
+        Assert.Equal(new long[] { 120, 130, 3 * RowsPerFile + 310, 3 * RowsPerFile + 349, 5 * RowsPerFile }, ids.OrderBy(i => i));
+        // File 2's only selected row group is deleted whole, so it is opened (for its footer and vector) but none
+        // of its row groups is read; files 1, 4 and 6-9 are never opened.
+        Assert.Equal(
+            new[] { paths[0], paths[2], paths[3], paths[5] }.OrderBy(p => p, StringComparer.Ordinal),
+            fs.OpenedDataFiles.OrderBy(p => p, StringComparer.Ordinal));
+
+        var reads = fs.DataReads;
+        foreach (var (f, positions) in selected)
+        {
+            var kept = new HashSet<int>(f == 2 ? [] : positions.Select(p => (int)(p / 100)));
+            var fileReads = reads.Where(r => r.Path == paths[f]).Select(r => r.Range).ToList();
+
+            await using var file = await _fs.OpenReadAsync(paths[f]);
+            using var reader = new ParquetFileReader(file, ownsFile: false);
+            var footer = await reader.ReadMetadataAsync();
+            for (int g = 0; g < footer.RowGroups.Count; g++)
+            {
+                bool touched = footer.RowGroups[g].Columns.Any(c => fileReads.Any(r => Overlaps(c.MetaData!, r)));
+                Assert.True(kept.Contains(g) == touched,
+                    $"file {f}, row group {g}: read {touched}, expected {kept.Contains(g)}");
+            }
+        }
+
+        static bool Overlaps(EngineeredWood.Parquet.Metadata.ColumnMetaData chunk, FileRange range)
+        {
+            long start = chunk.DictionaryPageOffset is long d && d > 0 && d < chunk.DataPageOffset
+                ? d : chunk.DataPageOffset;
+            long end = start + chunk.TotalCompressedSize;
+            return range.Offset < end && start < range.End;
+        }
+    }
+
+    /// <summary>
+    /// Inside a kept row group, ReadRowsAsync also cuts out long runs holding no selected row, so that pages wholly
+    /// inside them are never requested, and the rows after each cut keep their absolute positions. One file of
+    /// 10,000 rows in ONE row group of 100-row pages, with a page index; ids equal positions equal row ids. A
+    /// deletion vector deletes 4000..4099, and the selected 4050 lies in it. The selection {5, 1500, 4050, 4100,
+    /// 9999} leaves two long gaps, (1500, 4050) and (4100, 9999), with targets on both sides of each.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task ReadRowsAsync_SkipsThePagesOfALongUnselectedRun_AndKeepsAbsolutePositions(int window)
+    {
+        const int rows = 10_000;
+        const int rowsPerPage = 100;
+        var options = new DeltaTableOptions
+        {
+            ParquetWriteOptions = new ParquetWriteOptions
+            {
+                RowGroupMaxRows = rows,
+                DataPageRowCountLimit = rowsPerPage,
+                WritePageIndex = true,
+            },
+            MaxConcurrentReads = window,
+        };
+        var root = new LocalTableFileSystem(Path.Combine(_tempDir, "pages"));
+        await using (var create = await DeltaTable.CreateAsync(
+                         root, Schema, options, enableDeletionVectors: true, enableRowTracking: true))
+        {
+            var ids = new Int64Array.Builder();
+            var names = new StringArray.Builder();
+            for (int r = 0; r < rows; r++)
+            {
+                ids.Append(r);
+                names.Append($"row-{r}-of-the-one-file");
+            }
+            await create.WriteAsync([new RecordBatch(Schema, [ids.Build(), names.Build()], rows)]);
+            await create.DeleteAsync(Ex.And(
+                Ex.GreaterThanOrEqual("id", LiteralValue.Of(4000L)), Ex.LessThan("id", LiteralValue.Of(4100L))));
+        }
+
+        var fs = new DataFileCountingFileSystem(root);
+        await using var table = await DeltaTable.OpenAsync(fs, options);
+        var addFile = Assert.Single(table.CurrentSnapshot.ActiveFiles).Value;
+        Assert.NotNull(addFile.DeletionVector);
+        long[] targets = [5, 1500, 4050, 4100, 9999];
+        var selection = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            [addFile.Path] = targets,
+        });
+
+        var got = new List<(long Id, long Position, long RowId)>();
+        var rowOptions = new DeltaRowReadOptions { Metadata = DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking };
+        await foreach (var b in table.ReadRowsAsync(selection, rowOptions))
+        {
+            var id = (Int64Array)b.Column(0);
+            var position = (Int64Array)b.Column(b.Schema.GetFieldIndex(rowOptions.MetadataPrefix + RowSelection.RowIndexColumnSuffix));
+            var rowId = (Int64Array)b.Column(b.Schema.GetFieldIndex(rowOptions.MetadataPrefix + DeltaMetadataColumns.RowIdSuffix));
+            for (int i = 0; i < b.Length; i++)
+                got.Add((id.GetValue(i)!.Value, position.GetValue(i)!.Value, rowId.GetValue(i)!.Value));
+            b.Dispose();
+        }
+
+        // 4050 is deleted; every other target comes back at its own position, with its own row id.
+        Assert.Equal(new long[] { 5, 1500, 4100, 9999 }.Select(v => (v, v, v)), got);
+
+        // No page wholly inside a gap is requested; every page holding a returned row is.
+        var reads = fs.DataReads.Where(r => r.Path == addFile.Path).Select(r => r.Range).ToList();
+        await using var file = await root.OpenReadAsync(addFile.Path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var chunks = await reader.ReadPageIndexAsync(0);
+        Assert.Equal(2, chunks.Count); // id and name: a fresh file materializes no row-tracking columns
+        foreach (var chunk in chunks)
+        {
+            var pages = chunk.OffsetIndex!.PageLocations;
+            Assert.True(pages.Count >= rows / rowsPerPage / 2, $"{pages.Count} pages");
+            // Counted per column: with 100-row pages, 24 lie wholly in (1500, 4050) and 57 in (4100, 9999).
+            int gapPages = 0;
+            for (int p = 0; p < pages.Count; p++)
+            {
+                long first = pages[p].FirstRowIndex;
+                long end = p + 1 < pages.Count ? pages[p + 1].FirstRowIndex : rows;
+                bool read = reads.Any(r => r.Offset < pages[p].Offset + pages[p].CompressedPageSize && pages[p].Offset < r.End);
+                bool inGap = (first > 1500 && end <= 4050) || (first > 4100 && end <= 9999);
+                bool holdsReturned = new long[] { 5, 1500, 4100, 9999 }.Any(t => first <= t && t < end);
+                if (inGap)
+                {
+                    gapPages++;
+                    Assert.False(read, $"{string.Join(".", chunk.Path)} page {p} (rows {first}..{end}) lies in a gap but was read");
+                }
+                if (holdsReturned)
+                    Assert.True(read, $"{string.Join(".", chunk.Path)} page {p} (rows {first}..{end}) holds a target but was not read");
+            }
+            Assert.True(gapPages > 40, $"only {gapPages} pages of {string.Join(".", chunk.Path)} lie in the gaps");
+        }
+    }
+
+    /// <summary>Point lookups in every file, read by row group in parallel, equal the serial read.</summary>
+    [Fact]
+    public async Task ReadRowsAsync_PointLookups_InParallel_EqualSerial()
+    {
+        await CreateTableAsync();
+        await using var serial = await OpenAsync(1);
+        await using var parallel = await OpenAsync(4);
+        var paths = DeltaTable.OrderedActiveFiles(serial.CurrentSnapshot).Select(f => f.Path).ToList();
+        var selection = RowSelection.ByPath(Enumerable.Range(0, paths.Count).ToDictionary(
+            f => paths[f], f => (IReadOnlyCollection<long>)new long[] { f * 37L % RowsPerFile, RowsPerFile - 1 }));
+
+        var options = new DeltaRowReadOptions
+        {
+            Metadata = DeltaRowMetadata.RowAddress | DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking,
+        };
+        var expected = await RenderAsync(serial.ReadRowsAsync(selection, options));
+        Assert.NotEmpty(expected);
+        Assert.Equal(expected, await RenderAsync(parallel.ReadRowsAsync(selection, options)));
+    }
+
+    [Theory]
+    [InlineData(0, 5, true)]
+    [InlineData(0, 6, false)]
+    [InlineData(6, 4, true)]
+    [InlineData(6, 5, false)]
+    [InlineData(10, 1, false)]
+    [InlineData(11, 9, true)]
+    [InlineData(20, 1, false)]
+    [InlineData(21, 1000, true)]
+    public void NoTargetIn_SkipsExactlyTheSpansHoldingNoTarget(long first, long count, bool skip)
+    {
+        Assert.Equal(skip, DeltaTable.NoTargetIn(new HashSet<long> { 20, 5, 10 })(first, count));
+        Assert.True(DeltaTable.NoTargetIn(new HashSet<long>())(first, count));
+    }
 }

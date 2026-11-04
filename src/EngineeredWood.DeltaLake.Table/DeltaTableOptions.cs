@@ -61,8 +61,12 @@ public sealed record DeltaTableOptions
     /// How many reads a table scan runs at once. With the built-in reader a read is one row group of one data
     /// file (#612), so a few large files, or one large file among small ones, still keep every read busy;
     /// through a <see cref="DataFileReader"/>, which hides a file's row groups, it is one whole file. Default:
-    /// null, which means <c>min(4, Environment.ProcessorCount)</c> with the built-in reader and 1 with a
-    /// <see cref="DataFileReader"/>. 1 reads everything one after another, as before #607.
+    /// null, which means, with the built-in reader, what the table's file system suggests through
+    /// <see cref="EngineeredWood.IO.IReadConcurrencyHint"/> (the S3, Azure Blob and GCS file systems suggest
+    /// their <c>maxConcurrency</c>, 16 by default, since against an object store the time goes to waiting on
+    /// requests), or <c>min(4, Environment.ProcessorCount)</c> for one that suggests nothing (a local file
+    /// system, where decoding is the bottleneck); and 1 with a <see cref="DataFileReader"/>. 1 reads everything
+    /// one after another, as before #607.
     /// </summary>
     /// <remarks>
     /// <para>Batches still come out in the order a serial read gives — the snapshot's path-sorted file order,
@@ -70,9 +74,9 @@ public sealed record DeltaTableOptions
     /// footer, deletion vector and column resolution), up to this many files ahead of the one being planned,
     /// and its row groups share it. Which row groups are read is decided in file order, by the same pruning as
     /// a serial read. Applies to <see cref="DeltaTable.ReadAsync"/> and the methods built on it
-    /// (<c>ReadAllAsync</c>, <c>ReadAtVersionAsync</c>, <c>ReadAtTimestampAsync</c>). <c>ReadRowsAsync</c> reads
-    /// this many FILES at once, each whole. DML, the change feed, compaction and copy-on-write rewrites still
-    /// read their files one at a time.</para>
+    /// (<c>ReadAllAsync</c>, <c>ReadAtVersionAsync</c>, <c>ReadAtTimestampAsync</c>), and to <c>ReadRowsAsync</c>,
+    /// which reads only the row groups holding a selected row (#633). DML, the change feed, compaction and
+    /// copy-on-write rewrites still read their files one at a time.</para>
     /// <para>A <see cref="DataFileReader"/> reads serially unless this is set explicitly, because its
     /// contract never promised that two files may be read at once. Setting it above 1 declares that it may:
     /// its <see cref="IDataFileReader.ReadAsync"/> is then called for several files concurrently, each
