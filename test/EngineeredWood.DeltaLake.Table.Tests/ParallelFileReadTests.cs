@@ -753,16 +753,35 @@ public class ParallelFileReadTests : IDisposable
         Assert.Equal(expected == -1 ? Math.Min(4, Environment.ProcessorCount) : expected, table.EffectiveConcurrentReads);
     }
 
-    [Fact]
-    public async Task AHintedScan_RunsInParallel_AndEqualsTheSerialRead()
+    /// <summary>
+    /// The hint reaches the scheduler, not just <see cref="DeltaTable.EffectiveConcurrentReads"/>: with every data
+    /// read delayed, a hint of 16 keeps more reads in flight than the CPU default ever can (its window of at most 4
+    /// row groups, plus at most 4 footers of files opened ahead), and a hint of 1 reads one thing at a time.
+    /// Either way the batches equal a serial read's. Measured: 16 in flight for a hint of 16, 6 for the default.
+    /// </summary>
+    [Theory]
+    [InlineData(16)]
+    [InlineData(1)]
+    public async Task AHintedScan_KeepsTheHintedReadsInFlight_AndEqualsTheSerialRead(int hint)
     {
         await CreateTableAsync();
         await using var serial = await OpenAsync(1);
-        await using var hinted = await DeltaTable.OpenAsync(new HintingFileSystem(_fs, 8), Options(null));
+        var tracking = new TrackingFileSystem(_fs, delayMs: 20);
+        await using var hinted = await DeltaTable.OpenAsync(new HintingFileSystem(tracking, hint), Options(null));
         var options = new DeltaReadOptions { Metadata = DeltaRowMetadata.RowAddress | DeltaRowMetadata.Locator };
 
         Assert.Equal(await RenderAsync(serial.ReadAsync(options)), await RenderAsync(hinted.ReadAsync(options)));
-        Assert.NotNull(hinted.LastScanBudget);
+        if (hint == 1)
+        {
+            Assert.Equal(1, tracking.MaxReading);
+            Assert.Null(hinted.LastScanBudget);
+        }
+        else
+        {
+            Assert.InRange(tracking.MaxReading, 2 * 4 + 1, 2 * hint);
+            Assert.NotNull(hinted.LastScanBudget);
+        }
+        Assert.Equal(0, tracking.Open);
     }
 
     // ── #633: ReadRowsAsync by row group ───────────────────────────────────────────────────────────────────
