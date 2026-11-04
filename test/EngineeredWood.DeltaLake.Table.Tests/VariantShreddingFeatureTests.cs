@@ -139,6 +139,57 @@ public class VariantShreddingFeatureTests : IDisposable
         Assert.Equal(6, (await ReadJsonAsync(reopened)).Count);
     }
 
+    [Fact]
+    public async Task UnannotatedShreddedFile_ReadsItsTypedValues()
+    {
+        // A writer that shreds but omits the VARIANT annotation (Spark 4.0 era, under the preview feature): the
+        // parquet reader hands back a plain struct carrying typed_value, and the schema-driven fallback must keep it.
+        // Before the fix it kept only (metadata, value), and every shredded row read as an empty value.
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled())) { }
+
+        var source = ObjectBatch();
+        var variants = (VariantArray)source.Column(1);
+        var shredded = EngineeredWood.Parquet.VariantShredding.Shred(
+            variants, EngineeredWood.Parquet.VariantShredding.InferSchema(variants, ShredOptions.Default)!);
+        var storage = shredded.Storage;
+        Assert.Contains(((StructType)storage.Data.DataType).Fields, f => f.Name == "typed_value");
+        var fileSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("v", storage.Data.DataType, true))
+            .Build();
+
+        string name = "part-00000-unannotated.parquet";
+        string path = Path.Combine(_tempDir, name);
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, ParquetWriteOptions.Default))
+        {
+            await writer.WriteRowGroupAsync(new RecordBatch(fileSchema, [source.Column(0), storage], source.Length));
+            await writer.CloseAsync();
+        }
+        await using (var raf = new LocalRandomAccessFile(path))
+        await using (var reader = new ParquetFileReader(raf, ownsFile: false))
+        {
+            var meta = await reader.ReadMetadataAsync();
+            Assert.Null(meta.Schema.First(e => e.Name == "v").LogicalType);
+        }
+
+        await new TransactionLog(fs).WriteCommitAsync(1,
+        [
+            new AddFile
+            {
+                Path = name,
+                PartitionValues = new Dictionary<string, string>(),
+                Size = new FileInfo(path).Length,
+                ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = true,
+            },
+        ]);
+
+        await using var table = await DeltaTable.OpenAsync(fs);
+        Assert.Equal(["{\"a\":1,\"b\":\"x\"}", "{\"a\":2,\"b\":\"y\"}", null], await ReadJsonAsync(table));
+    }
+
     // ── Enabling it ──
 
     [Fact]
@@ -288,6 +339,30 @@ public class VariantShreddingFeatureTests : IDisposable
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(
             async () => await table.WriteAsync([ObjectBatch()]));
         Assert.Equal(DeltaTableErrorCodes.ShreddingTablePropertyDisabled, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task VariantShredSchemas_NamingNoVariantColumn_WritesUnshreddedWithoutRefusal()
+    {
+        // With ShredVariants unset, only the columns VariantShredSchemas names are shredded. A layout for some
+        // other column shreds nothing here, so there is nothing for the protocol to forbid.
+        var fs = new LocalTableFileSystem(_tempDir);
+        var options = DeltaTableOptions.Default with
+        {
+            ParquetWriteOptions = ParquetWriteOptions.Default with
+            {
+                VariantShredSchemas = new Dictionary<string, ShredSchema>
+                {
+                    ["other"] = ShredSchema.Primitive(ShredType.Int32),
+                },
+            },
+        };
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), options: options);
+
+        await table.WriteAsync([ObjectBatch()]);
+
+        Assert.False(await IsShreddedAsync(DataFiles().Single()));
+        Assert.Equal(3, (await ReadJsonAsync(table)).Count);
     }
 
     [Fact]

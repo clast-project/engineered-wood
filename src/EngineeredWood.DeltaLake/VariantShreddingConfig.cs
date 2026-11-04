@@ -38,10 +38,16 @@ public static class VariantShreddingConfig
         configuration.TryGetValue(EnableKey, out string? value) &&
         string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>True when <paramref name="protocol"/> lists either feature name as a writer feature.</summary>
+    /// <summary>
+    /// True when <paramref name="protocol"/> lists one of the two names in BOTH <c>readerFeatures</c> and
+    /// <c>writerFeatures</c>. It is a reader-writer feature, so a protocol naming it on the writer side alone has
+    /// not told readers to expect a shredded file, and does not count.
+    /// </summary>
     public static bool IsSupported(ProtocolAction? protocol) =>
-        protocol?.WriterFeatures is { } features
-        && (features.Contains(FeatureName) || features.Contains(PreviewFeatureName));
+        protocol?.ReaderFeatures is { } reader
+        && protocol.WriterFeatures is { } writer
+        && ((reader.Contains(FeatureName) && writer.Contains(FeatureName))
+            || (reader.Contains(PreviewFeatureName) && writer.Contains(PreviewFeatureName)));
 
     /// <summary>
     /// True when a writer may shred a variant column of this table: the protocol supports the feature AND the

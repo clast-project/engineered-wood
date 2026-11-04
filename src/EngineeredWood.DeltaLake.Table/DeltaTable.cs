@@ -207,14 +207,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// PROTOCOL.md: without <c>delta.enableVariantShredding</c>, "a variant column must not be written as a shredded
     /// Variant". delta-spark refuses the same write (<c>OptimisticTransaction.assertShreddingStateConsistent</c>) with
     /// the code reused here. Nothing is refused when the options would shred nothing: the writer shreds only top-level
-    /// variant columns, so a table without one is written the same either way.
+    /// variant columns, all of them under <see cref="ParquetWriteOptions.ShredVariants"/> and only the ones it names
+    /// under <see cref="ParquetWriteOptions.VariantShredSchemas"/>. Those keys are LOGICAL names, matched as
+    /// <see cref="ColumnMappingWriteOptions"/> matches them before translating, so they are compared with the logical
+    /// schema here.
     /// </summary>
     private void ThrowIfShreddingDisallowed(Schema.StructType schema, Snapshot.Snapshot table)
     {
         var parquet = _options.ParquetWriteOptions;
-        bool requestsShredding = parquet.ShredVariants is not null || parquet.VariantShredSchemas is { Count: > 0 };
-        if (!requestsShredding
-            || !schema.Fields.Any(static f => f.Type is Schema.PrimitiveType { TypeName: "variant" })
+        if (parquet.ShredVariants is null && parquet.VariantShredSchemas is not { Count: > 0 })
+            return;
+
+        var variantColumns = schema.Fields
+            .Where(static f => f.Type is Schema.PrimitiveType { TypeName: "variant" })
+            .Select(static f => f.Name);
+        bool shredsSomething = parquet.ShredVariants is not null
+            ? variantColumns.Any()
+            : variantColumns.Any(name => parquet.VariantShredSchemas!.ContainsKey(name));
+        if (!shredsSomething
             || VariantShreddingConfig.AllowsShreddedWrites(table.Protocol, table.Metadata.Configuration))
         {
             return;

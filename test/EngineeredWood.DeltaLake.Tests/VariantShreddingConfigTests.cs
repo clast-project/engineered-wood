@@ -42,6 +42,37 @@ public class VariantShreddingConfigTests
     }
 
     [Fact]
+    public void AllowsShreddedWrites_WriterSideOnly_IsFalse()
+    {
+        // A reader-writer feature named only among the writer features has not told readers to expect shredding.
+        var protocol = new ProtocolAction
+        {
+            MinReaderVersion = 3,
+            MinWriterVersion = 7,
+            ReaderFeatures = ["variantType"],
+            WriterFeatures = ["variantType", "variantShredding"],
+        };
+        var configuration = new Dictionary<string, string> { [VariantShreddingConfig.EnableKey] = "true" };
+
+        Assert.False(VariantShreddingConfig.AllowsShreddedWrites(protocol, configuration));
+    }
+
+    [Fact]
+    public void AllowsShreddedWrites_DifferentNamesOnEachSide_IsFalse()
+    {
+        var protocol = new ProtocolAction
+        {
+            MinReaderVersion = 3,
+            MinWriterVersion = 7,
+            ReaderFeatures = ["variantType", "variantShredding-preview"],
+            WriterFeatures = ["variantType", "variantShredding"],
+        };
+        var configuration = new Dictionary<string, string> { [VariantShreddingConfig.EnableKey] = "true" };
+
+        Assert.False(VariantShreddingConfig.AllowsShreddedWrites(protocol, configuration));
+    }
+
+    [Fact]
     public void AllowsShreddedWrites_FeatureWithoutTheProperty_IsFalse()
     {
         Assert.False(VariantShreddingConfig.AllowsShreddedWrites(Features("variantShredding"), configuration: null));
