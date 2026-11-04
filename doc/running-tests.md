@@ -107,7 +107,7 @@ standing between a spec divergence and shipping it.
 | Tier | Install | Tests | Reaches |
 |---|---|---|---|
 | 1 — delta-rs | `pip install "deltalake[pyarrow]"` | 28 | Log/checkpoint replay, path encoding, per-file stats, filtered reads, and (through pyarrow) the on-disk layout of a shredded variant column. Seconds to run. |
-| 2 — DuckDB | `pip install duckdb` (1.4+) | 2 | VARIANT parquet reads through an implementation that is not delta-kernel-rs. Sub-second. |
+| 2 — DuckDB | `pip install duckdb` (1.4+) | 3 | VARIANT parquet reads through an implementation that is not delta-kernel-rs, and shredded files DuckDB writes committed to a table EW reads. Sub-second. |
 | 3 — PySpark | `pip install pyspark delta-spark` + JDK 17+ | 68 | Writer features, DESCRIBE DETAIL, clustering, OPTIMIZE, column mapping, data skipping, VACUUM survival, variant reads, V2 checkpoints, and Delta's OWN conflict checker driven through py4j (`ConflictSemanticsInteropTests`). ~90s to run. |
 
 Each tier runs under the `python` on PATH unless its override names another
@@ -146,7 +146,12 @@ It came back for one thing that reasoning does not cover: **VARIANT**. DuckDB's
 variant type and parquet reader are its own code, not delta-kernel-rs, so for a
 shredded variant column it is a genuinely independent implementation — and it
 costs no JVM. `VariantShreddingInteropTests` uses it that way, on raw parquet
-files with no Delta log involved. Needs DuckDB **1.4+** (VARIANT does not exist
+files with no Delta log involved, and in the other direction: DuckDB writes a
+shredded file, which is committed to a table that EW then reads. (The
+Parquet suite's `DuckDbShreddedVariantTests` covers the same direction across
+many shapes and types, through the parquet-readers tier's
+`EW_PARQUET_READERS_PYTHON`.) The pinned version is 2.0.0; it needs DuckDB
+**1.4+** (VARIANT does not exist
 before that; an older one reads a shredded column as a bare struct, which would
 read as a conformance failure rather than a missing feature), so it takes its
 own interpreter override:
@@ -203,7 +208,7 @@ py -3.11 -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.1 delta-spa
 $env:EW_SPARK_PYTHON = "…\spark41\Scripts\python.exe"   # tier 3 uses this interpreter; unset -> PATH
 ```
 
-Both are measured at **216 passed / 0 skipped** across the interop tier
+Both are measured at **217 passed / 0 skipped** across the interop tier
 (2026-11-04, with delta-rs and DuckDB present too). The `Skipped: 0` is the
 point: it is what proves the GA-variant, shredded-table and `stats_parsed`
 cases actually ran, which the 4.0.x lane reports as 7 skips.
@@ -510,7 +515,7 @@ shredded-table cases (#671) need Spark 4.1 to shred at all. So the
 healthy result on the 4.0 pairing (the nightly's `spark-4.0` lane) is:
 
 ```
-Passed!  - Failed: 0, Passed: 209, Skipped: 7, Total: 216
+Passed!  - Failed: 0, Passed: 210, Skipped: 7, Total: 217
 ```
 
 `EW_REQUIRE_*` does **not** turn these into failures, and should not: the
@@ -527,7 +532,7 @@ it looked like it did.
 
 Note that the per-commit `build` job on windows-latest has **no JDK** and
 deliberately leaves `EW_REQUIRE_SPARK_INTEROP` unset, so its healthy result
-for this suite is `2283 passed, 177 skipped` of 2460. Those 177 are the
+for this suite is `2284 passed, 177 skipped` of 2461. Those 177 are the
 Spark-dependent cases; before they reported real skips they were counted as
 passes on every commit. A non-zero skip count there is correct, not a
 regression.
@@ -540,7 +545,7 @@ Measured on net10.0, 2026-08-08, with every optional toolchain present:
 |---|---|
 | **Parquet** | 807 |
 | **Core** | 452 |
-| **DeltaLake.Table** | 2460 (216 of them interop) — re-measured 2026-11-04 |
+| **DeltaLake.Table** | 2461 (217 of them interop) — re-measured 2026-11-04 |
 | **DeltaLake** | 484 |
 | **Vortex** | 1175 (737 of them upstream fixtures) — re-measured 2026-09-17 |
 | **Avro** | 301 |
@@ -560,14 +565,14 @@ be 0 — it depends on what the machine can reach:
 
 | environment | expected |
 |---|---|
-| every toolchain present, 4.0 oracles | 2453 passed / 7 skipped |
-| the same, Spark pointed at a 4.1 venv | 2460 passed / 0 skipped |
-| no JDK (the per-commit `build` job) | 2283 passed / 177 skipped |
+| every toolchain present, 4.0 oracles | 2454 passed / 7 skipped |
+| the same, Spark pointed at a 4.1 venv | 2461 passed / 0 skipped |
+| no JDK (the per-commit `build` job) | 2284 passed / 177 skipped |
 
 See [Skipped tests](#skipped-tests) for what each of those means.
 
-Of its **216 interop cases** (142 test methods; theories expand the rest),
-**177 need PySpark**, **37 need delta-rs** and **2 need DuckDB**.
+Of its **217 interop cases** (143 test methods; theories expand the rest),
+**177 need PySpark**, **37 need delta-rs** and **3 need DuckDB**.
 Re-measured 2026-11-04 by making each tier unreachable and counting
 the skips — which is also the quick way to re-derive these after adding
 tests. Note these are *cases*, matching what `dotnet test` prints; an earlier

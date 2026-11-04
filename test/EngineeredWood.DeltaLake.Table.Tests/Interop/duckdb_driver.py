@@ -63,9 +63,41 @@ def cmd_read_parquet_variant(args):
     }
 
 
+def cmd_write_parquet_variant(args):
+    """Have DuckDB WRITE a query's rows to parquet, then report its own reading of the file.
+
+    The reverse of read_parquet_variant: here DuckDB is the producer and EW the reader. DuckDB 1.5+
+    shreds a VARIANT column on COPY by default, so this is an independent source of shredded files.
+    `leaves` lists every column chunk's path so the caller can prove the file is really shredded.
+    """
+    import duckdb
+
+    path = args["path"]
+    col = args.get("col", "v")
+    con = duckdb.connect()
+    # One thread, so the shredding DuckDB infers comes from the same rows on every run; with several
+    # threads it can pick a different layout from one run to the next.
+    con.sql("SET threads TO 1")
+    escaped = path.replace("'", "''")
+    con.sql(f"COPY ({args['query']}) TO '{escaped}' (FORMAT parquet)")
+
+    leaves = sorted({r[0] for r in con.sql(
+        "SELECT path_in_schema FROM parquet_metadata(?)", params=[path]).fetchall()})
+    rows = con.sql(
+        f"SELECT {col} IS NULL, CAST({col} AS JSON) FROM read_parquet(?) ORDER BY {args['order_by']}",
+        params=[path]).fetchall()
+
+    return {
+        "duckdb": duckdb.__version__,
+        "leaves": leaves,
+        "rows": [{"null": bool(r[0]), "vjson": None if r[0] else r[1]} for r in rows],
+    }
+
+
 COMMANDS = {
     "probe": cmd_probe,
     "read_parquet_variant": cmd_read_parquet_variant,
+    "write_parquet_variant": cmd_write_parquet_variant,
 }
 
 

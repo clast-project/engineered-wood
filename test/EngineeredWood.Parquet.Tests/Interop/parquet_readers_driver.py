@@ -161,6 +161,47 @@ def _count(number, suffix):
     return int(round(float(number) * _SUFFIX[suffix]))
 
 
+def cmd_duckdb_write_variant(args):
+    """DuckDB writes a query's rows to parquet, then reports the file's leaves and its own reading.
+
+    This is the other direction from every other command here: DuckDB is the WRITER, and EW reads
+    the file. DuckDB 1.5+ shreds a VARIANT column on COPY by default, so its files are the
+    independent source of shredded variants this suite otherwise lacks; EW's own writer cannot be
+    the only producer of the files EW's reader is tested on.
+
+    `leaves` is every column chunk's path, so the caller can prove the file really is shredded
+    (a `typed_value` leaf) rather than validating an unshredded file by accident. `rows` is
+    DuckDB's own decoding of the file it wrote, ordered by `order_by`: the value EW must agree
+    with. A NULL variant reports `json` as None.
+    """
+    module, error = _import("duckdb")
+    if module is None:
+        return {"available": False, "error": error}
+
+    path = args["path"]
+    col = args.get("col", "v")
+    con = module.connect()
+    # One thread, so the shredding DuckDB infers comes from the same rows on every run; with several
+    # threads it can pick a different layout from one run to the next.
+    con.sql("SET threads TO 1")
+    escaped = path.replace("'", "''")
+    options = args.get("copy_options")
+    con.sql(f"COPY ({args['query']}) TO '{escaped}' (FORMAT parquet{', ' + options if options else ''})")
+
+    leaves = sorted({r[0] for r in con.sql(
+        "SELECT path_in_schema FROM parquet_metadata(?)", params=[path]).fetchall()})
+    rows = con.sql(
+        f"SELECT {col} IS NULL, CAST({col} AS JSON) FROM read_parquet(?) ORDER BY {args['order_by']}",
+        params=[path]).fetchall()
+
+    return {
+        "available": True,
+        "leaves": leaves,
+        "rows": [{"null": bool(r[0]), "json": None if r[0] else r[1]} for r in rows],
+        "version": module.__version__,
+    }
+
+
 def cmd_page_index_metrics(args):
     """Runs a filtered count in DataFusion under EXPLAIN ANALYZE and reports what its page index did.
 
@@ -219,6 +260,7 @@ COMMANDS = {
     "probe": cmd_probe,
     "read_digest": cmd_read_digest,
     "count_where": cmd_count_where,
+    "duckdb_write_variant": cmd_duckdb_write_variant,
     "page_index_metrics": cmd_page_index_metrics,
     "page_index_presence": cmd_page_index_presence,
 }
