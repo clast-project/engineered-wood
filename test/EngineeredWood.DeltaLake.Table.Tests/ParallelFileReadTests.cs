@@ -916,11 +916,14 @@ public class ParallelFileReadTests : IDisposable
         var reads = fs.DataReads.Where(r => r.Path == addFile.Path).Select(r => r.Range).ToList();
         await using var file = await root.OpenReadAsync(addFile.Path);
         using var reader = new ParquetFileReader(file, ownsFile: false);
-        int gapPages = 0;
-        foreach (var chunk in await reader.ReadPageIndexAsync(0))
+        var chunks = await reader.ReadPageIndexAsync(0);
+        Assert.Equal(2, chunks.Count); // id and name: a fresh file materializes no row-tracking columns
+        foreach (var chunk in chunks)
         {
             var pages = chunk.OffsetIndex!.PageLocations;
             Assert.True(pages.Count >= rows / rowsPerPage / 2, $"{pages.Count} pages");
+            // Counted per column: with 100-row pages, 24 lie wholly in (1500, 4050) and 57 in (4100, 9999).
+            int gapPages = 0;
             for (int p = 0; p < pages.Count; p++)
             {
                 long first = pages[p].FirstRowIndex;
@@ -936,8 +939,8 @@ public class ParallelFileReadTests : IDisposable
                 if (holdsReturned)
                     Assert.True(read, $"{string.Join(".", chunk.Path)} page {p} (rows {first}..{end}) holds a target but was not read");
             }
+            Assert.True(gapPages > 40, $"only {gapPages} pages of {string.Join(".", chunk.Path)} lie in the gaps");
         }
-        Assert.True(gapPages > 100, $"only {gapPages} pages lie in the gaps");
     }
 
     /// <summary>Point lookups in every file, read by row group in parallel, equal the serial read.</summary>
