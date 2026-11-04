@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Operations.Shredding;
+using VariantJson = Apache.Arrow.Operations.VariantJson;
 using Apache.Arrow.Scalars.Variant;
 using Apache.Arrow.Types;
 using EngineeredWood.IO.Local;
@@ -149,7 +150,7 @@ public class VariantShreddingInteropTests : IDisposable
     {
         DuckDb.Require();
         // < 1.4 has no VARIANT; it would read a bare struct.
-        Skip.IfNot(DuckDb.HasVariantType, $"DuckDB VARIANT needs 1.4+; resolved {DuckDb.Version}");
+        Skip.IfNot(DuckDb.ReadsVariantParquet, $"DuckDB reads EW's VARIANT from 1.5; resolved {DuckDb.Version}");
 
         string path = await WriteAsync(shredded);
         var result = DuckDb.Invoke("read_parquet_variant", new { path, col = "v", order_by = "id" });
@@ -168,6 +169,62 @@ public class VariantShreddingInteropTests : IDisposable
             Assert.False(rows[i].GetProperty("null").GetBoolean());
             Assert.Equal(ExpectedJson[i], rows[i].GetProperty("vjson").GetString());
         }
+    }
+
+    /// <summary>
+    /// The reverse direction: DuckDB WRITES a shredded file, a host commits it to a Delta table through
+    /// <see cref="DeltaTable.CommitDataFilesAsync"/>, and EW reads it back through the table. Every other
+    /// shredded file the Delta read path is tested on came from EW's own writer or from Spark; DuckDB's
+    /// shredder is a third, independent producer. The values must match DuckDB's own reading of its file.
+    /// </summary>
+    [SkippableFact]
+    public async Task DuckDbWrittenShredded_CommittedToATable_EwReadsIt()
+    {
+        DuckDb.Require();
+        Skip.IfNot(DuckDb.WritesShreddedVariantOracle,
+            $"a DuckDB-written shredded file is the oracle from 2.0; resolved {DuckDb.Version}");
+
+        string tableDir = Path.Combine(_tempDir, "table");
+        Directory.CreateDirectory(tableDir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, true))
+            .Field(new Field("v", VariantType.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(tableDir), schema,
+            configuration: new Dictionary<string, string> { ["delta.enableVariantShredding"] = "true" });
+
+        // Objects are the common shape, so DuckDB shreds them (a nested list included); the strings stay
+        // in the residual, and every fourth row is SQL NULL.
+        const string query =
+            "SELECT i AS id, CASE WHEN i % 4 = 3 THEN NULL WHEN i % 4 = 2 THEN ('s' || i)::VARIANT "
+            + "ELSE {'a': i, 'b': {'c': [i, i + 1]}}::VARIANT END AS v FROM range(8) t(i) ORDER BY id";
+        const string fileName = "duckdb-part-00000.parquet";
+        string path = Path.Combine(tableDir, fileName);
+        var written = DuckDb.Invoke("write_parquet_variant", new { path, query, order_by = "id" });
+
+        var leaves = written.GetProperty("leaves").EnumerateArray().Select(l => l.GetString()).ToList();
+        Assert.True(leaves.Contains("v, typed_value, b, typed_value, c, typed_value, list, element, typed_value"),
+            $"DuckDB {DuckDb.Version} did not shred as expected; leaves: {string.Join(" | ", leaves)}");
+        var expected = written.GetProperty("rows").EnumerateArray()
+            .Select(r => r.GetProperty("null").GetBoolean() ? null : r.GetProperty("vjson").GetString())
+            .ToList();
+
+        await table.CommitDataFilesAsync([new WrittenDataFile(fileName, new FileInfo(path).Length, expected.Count, null, null)]);
+
+        var read = new List<(long Id, string? Json)>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var ids = (Int64Array)batch.Column("id");
+            var v = Assert.IsType<VariantArray>(batch.Column("v"));
+            for (int i = 0; i < v.Length; i++)
+            {
+                read.Add((ids.GetValue(i)!.Value,
+                    v.IsNull(i) ? null : VariantJson.VariantJsonWriter.ToJson(v.GetLogicalVariantValue(i), indented: false)));
+            }
+        }
+
+        Assert.Equal(expected, read.OrderBy(r => r.Id).Select(r => r.Json).ToList());
+        Assert.Contains(expected, j => j is null);
     }
 
     /// <summary>

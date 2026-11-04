@@ -34,7 +34,7 @@ internal static class ExternalParquetReaders
     /// <summary>The versions these assertions were established against — recorded rather than
     /// enforced, so that a reader upgrade which changes behaviour reads as "the oracle moved" and
     /// this is the first number to check.</summary>
-    public const string ValidatedAgainstVersions = "duckdb 1.5.5, datafusion 54.0.0 (arrow-rs)";
+    public const string ValidatedAgainstVersions = "duckdb 2.0.0, datafusion 54.0.0 (arrow-rs)";
 
     public const string DuckDb = "duckdb";
     public const string DataFusion = "datafusion";
@@ -174,6 +174,34 @@ internal static class ExternalParquetReaders
 
         return (chunks, null);
     }
+
+    /// <summary>
+    /// Has DuckDB write the rows of the SQL <paramref name="query"/> to <paramref name="path"/>, then
+    /// reports the file's column-chunk paths and DuckDB's own reading of <paramref name="column"/>,
+    /// ordered by <paramref name="orderBy"/>. DuckDB is the WRITER here, the reverse of the other
+    /// calls: it shreds a VARIANT column by default, so its files are an independent source of
+    /// shredded variants for EW's reader. <c>File</c> is null when DuckDB is absent or older than 2.0
+    /// (<c>Supported</c> false, a skip), or when it failed (a failure); the error says why.
+    /// </summary>
+    public static (DuckDbVariantFile? File, bool Supported, string? Error) DuckDbWriteVariant(
+        string path, string query, string orderBy, string column = "v", string? copyOptions = null)
+    {
+        var result = Driver.InvokeRaw("duckdb_write_variant", new { path, query, order_by = orderBy, col = column, copy_options = copyOptions });
+        if (!result.GetProperty("ok").GetBoolean())
+            return (null, true, result.TryGetProperty("error", out var e) ? e.GetString() : "(no message)");
+        if (!result.GetProperty("available").GetBoolean())
+            return (null, false, result.TryGetProperty("error", out var a) ? a.GetString() : "duckdb is not installed");
+
+        var leaves = result.GetProperty("leaves").EnumerateArray().Select(l => l.GetString()!).ToList();
+        var rows = result.GetProperty("rows").EnumerateArray()
+            .Select(r => r.GetProperty("null").GetBoolean() ? null : r.GetProperty("json").GetString())
+            .ToList();
+        return (new DuckDbVariantFile(leaves, rows, result.GetProperty("version").GetString()), true, null);
+    }
+
+    /// <summary>What DuckDB wrote: every column chunk's dotted path, and each row's variant as
+    /// DuckDB's JSON (null for a NULL variant).</summary>
+    internal sealed record DuckDbVariantFile(IReadOnlyList<string> Leaves, IReadOnlyList<string?> Json, string? Version);
 
     internal sealed record PageIndexMetrics(bool Found, long RowsTotal, long RowsMatched);
 

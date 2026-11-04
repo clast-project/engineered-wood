@@ -128,7 +128,7 @@ and `ListViewType`.
 
 ### Correctness / interop issues
 
-**VARIANT — three caveats, none affecting the common annotated path.**
+**VARIANT — four caveats, none affecting the common annotated path.**
 
 - *The shredded layout is not preserved on read.* A shredded column is
   reassembled into an ordinary unshredded `VariantArray` — correct and
@@ -148,6 +148,20 @@ and `ListViewType`.
   loops are ours to carry
   ([#399](https://github.com/apache/arrow-dotnet/issues/399)). If both land,
   `VariantShredding.cs` shrinks to a few calls.
+- *A shredded narrow DECIMAL loses its trailing zeros.* A decimal held in a
+  `typed_value` column of precision 18 or less reads back with the right
+  value but a normalised scale: DuckDB's `12.30::DECIMAL(9,2)` comes back as
+  `12.3`. EW reads the column itself correctly, as a Decimal32/Decimal64 of
+  the declared scale; the scale is lost in Apache.Arrow 23's
+  `Decimal32Array.GetValue` / `Decimal64Array.GetValue`, which the
+  reassembly calls, because their decode divides and `decimal` division drops
+  trailing zeros. A 16-byte decimal keeps its scale on .NET 7+, and so does
+  any decimal in the residual `value`. The `decimal`-returning accessors are
+  not the path to fix: `System.Decimal` cannot hold every Parquet decimal
+  anyway, and the intended direction is for decimal reads to go through
+  `SqlDecimal` instead. Pinned by
+  `DuckDbWritten_NarrowDecimal_KeepsItsValueButLosesTrailingZeros`, which
+  fails once the reassembly stops losing the scale.
 
 **Deprecated `min`/`max` restricted to signed-order types.** The
 deprecated `Statistics.min`/`max` fields (defined with signed byte

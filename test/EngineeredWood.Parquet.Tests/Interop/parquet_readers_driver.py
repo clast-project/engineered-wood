@@ -139,8 +139,9 @@ def cmd_count_where(args):
 
     predicate = args["predicate"]
     if reader == "duckdb":
+        # fetchall, not fetchone: DuckDB 2.0 removed Relation.fetchone.
         count = module.sql(
-            f"SELECT count(*) FROM read_parquet(?) WHERE {predicate}", params=[args["path"]]).fetchone()[0]
+            f"SELECT count(*) FROM read_parquet(?) WHERE {predicate}", params=[args["path"]]).fetchall()[0][0]
     else:
         ctx = module.SessionContext()
         ctx.register_parquet("t", args["path"])
@@ -158,6 +159,55 @@ _SUFFIX = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
 
 def _count(number, suffix):
     return int(round(float(number) * _SUFFIX[suffix]))
+
+
+def cmd_duckdb_write_variant(args):
+    """DuckDB writes a query's rows to parquet, then reports the file's leaves and its own reading.
+
+    This is the other direction from every other command here: DuckDB is the WRITER, and EW reads
+    the file. DuckDB 1.5+ shreds a VARIANT column on COPY by default, so its files are the
+    independent source of shredded variants this suite otherwise lacks; EW's own writer cannot be
+    the only producer of the files EW's reader is tested on.
+
+    `leaves` is every column chunk's path, so the caller can prove the file really is shredded
+    (a `typed_value` leaf) rather than validating an unshredded file by accident. `rows` is
+    DuckDB's own decoding of the file it wrote, ordered by `order_by`: the value EW must agree
+    with. A NULL variant reports `json` as None.
+    """
+    module, error = _import("duckdb")
+    if module is None:
+        return {"available": False, "error": error}
+    # A DuckDB-written file is the oracle from 2.0. VARIANT arrived in 1.4 and 1.5 shreds it on COPY,
+    # but 1.5 writes a SQL NULL as a present group holding a variant null and its reader calls that
+    # SQL NULL, so it disagrees with the spec (and EW) about NULLs. Below 2.0 the capability is
+    # missing, which is a skip, not a failure. See DuckDb.WritesShreddedVariantOracle in the Delta tests.
+    version = tuple(int(x) for x in module.__version__.split(".")[:2])
+    if version < (2, 0):
+        return {"available": False,
+                "error": f"DuckDB {module.__version__} is too old to be the shredded-VARIANT oracle (needs 2.0+)"}
+
+    path = args["path"]
+    col = args.get("col", "v")
+    con = module.connect()
+    # One thread, so the shredding DuckDB infers comes from the same rows on every run; with several
+    # threads it can pick a different layout from one run to the next.
+    con.sql("SET threads TO 1")
+    escaped = path.replace("'", "''")
+    options = args.get("copy_options")
+    con.sql(f"COPY ({args['query']}) TO '{escaped}' (FORMAT parquet{', ' + options if options else ''})")
+
+    leaves = sorted({r[0] for r in con.sql(
+        "SELECT path_in_schema FROM parquet_metadata(?)", params=[path]).fetchall()})
+    rows = con.sql(
+        f"SELECT {col} IS NULL, CAST({col} AS JSON) FROM read_parquet(?) ORDER BY {args['order_by']}",
+        params=[path]).fetchall()
+
+    return {
+        "available": True,
+        "leaves": leaves,
+        "rows": [{"null": bool(r[0]), "json": None if r[0] else r[1]} for r in rows],
+        "version": module.__version__,
+    }
 
 
 def cmd_page_index_metrics(args):
@@ -218,6 +268,7 @@ COMMANDS = {
     "probe": cmd_probe,
     "read_digest": cmd_read_digest,
     "count_where": cmd_count_where,
+    "duckdb_write_variant": cmd_duckdb_write_variant,
     "page_index_metrics": cmd_page_index_metrics,
     "page_index_presence": cmd_page_index_presence,
 }

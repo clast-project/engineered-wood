@@ -117,7 +117,7 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check \
             pyspark==${{ matrix.pyspark }} importlib_metadata==8.7.1 \
-            deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5
+            deltalake==1.6.2 pyarrow==24.0.0 duckdb==2.0.0
           python -m pip install --disable-pip-version-check --no-deps \
             delta-spark==${{ matrix.delta-spark }}
 
