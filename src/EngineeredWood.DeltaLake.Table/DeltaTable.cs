@@ -335,7 +335,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>The <c>delta.enable*</c> / mode properties in it ENABLE their feature exactly like the
     /// dedicated arguments do, and each is declared in the commit-0 protocol: column mapping
     /// (<c>delta.columnMapping.mode</c>), deletion vectors, row tracking, in-commit timestamps
-    /// (<c>delta.enableInCommitTimestamps</c>), change data feed (<c>delta.enableChangeDataFeed</c>) and
+    /// (<c>delta.enableInCommitTimestamps</c>), change data feed (<c>delta.enableChangeDataFeed</c>), variant
+    /// shredding (<c>delta.enableVariantShredding</c>, without which a shredded write is refused) and
     /// Iceberg compatibility (<c>delta.enableIcebergCompatV1</c> / <c>…V2</c>). Enablement is
     /// one-directional — a property can turn a feature on, never off — so an argument and a property that
     /// disagree resolve to the argument. Internally-derived keys (the column-mapping mode and max id)

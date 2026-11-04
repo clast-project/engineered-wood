@@ -202,7 +202,7 @@ $env:EW_SPARK_PYTHON = "…\spark41\Scripts\python.exe"   # tier 3 uses this int
 
 Both are measured at **109 passed / 0 skipped**. The `Skipped: 0` is the
 point: it is what proves the GA-variant and `stats_parsed` cases actually
-ran, which the default 4.0.x lane reports as 5 skips.
+ran, which the default 4.0.x lane reports as 7 skips.
 
 **Why the versions differ by interpreter.** On Python 3.13, `pyspark` must be
 ≥ 4.1.2 for SPARK-53759 (the Windows worker crash above), but `delta-spark`
@@ -488,7 +488,7 @@ entire tier and pass. So you still want both defences:
 
 - **Read `Skipped:`.** It now tells you *which* tests did not run and why,
   instead of hiding them in the Passed column. On the pinned oracles the
-  expected count is **5**, not 0 — see the note below. More than that means
+  expected count is **7**, not 0 — see the note below. More than that means
   something went dark.
 - **Set the `EW_REQUIRE_*` variables** ([above](#making-a-missing-toolchain-fail-loudly)). They turn an unreachable
   tier into a loud failure, which is the only thing that makes a green run
@@ -496,18 +496,19 @@ entire tier and pass. So you still want both defences:
   whether this job was allowed to tolerate it.
 
 Skips are not only about a missing toolchain, and this is the part worth
-internalising: **five tests skip on a fully-configured machine**, because
+internalising: **seven tests skip on a fully-configured machine**, because
 the *feature* is newer than the pinned oracle — GA `VARIANT` needs Spark
-4.1+ and DuckDB 1.4+, and `add.stats_parsed` needs delta-spark 4.1+. So the
+4.1+ and DuckDB 1.4+, `add.stats_parsed` needs delta-spark 4.1+, and the two
+shredded-table cases (#671) need Spark 4.1 to shred at all. So the
 healthy result on the pinned 4.0 pairing is:
 
 ```
-Passed!  - Failed: 0, Passed: 104, Skipped: 5, Total: 109
+Passed!  - Failed: 0, Passed: 104, Skipped: 7, Total: 111
 ```
 
 `EW_REQUIRE_*` does **not** turn these into failures, and should not: the
 toolchain is present and working, the feature simply does not exist in it.
-Those five used to report Passed as well, which is why "109/109" on the 4.0
+Five of those used to report Passed as well, which is why "109/109" on the 4.0
 pairing never meant what it appeared to. Point the Spark tier at a 4.1 venv
 (above) and they run.
 
@@ -552,7 +553,7 @@ be 0 — it depends on what the machine can reach:
 
 | environment | expected |
 |---|---|
-| every toolchain present, 4.0 oracles | 917 passed / 5 skipped |
+| every toolchain present, 4.0 oracles | 917 passed / 7 skipped |
 | the same, Spark pointed at a 4.1 venv | 922 passed / 0 skipped |
 | no JDK (the per-commit `build` job) | 849 passed / 73 skipped |
 

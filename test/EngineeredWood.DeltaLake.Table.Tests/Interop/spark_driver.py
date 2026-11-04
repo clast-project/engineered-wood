@@ -706,6 +706,56 @@ def cmd_write_variant(args):
     return {"spark": spark.version, "written": len(values)}
 
 
+def cmd_write_shredded_variant(args):
+    """Write a variant table with SHREDDING enabled (#671): TBLPROPERTIES delta.enableVariantShredding = true.
+
+    Delta 4.1+ declares `variantShredding` from the property (`variantShredding-preview` when `preview` is set,
+    through delta's forceUsePreviewTableFeature conf), and Spark 4.1 infers a shredding schema per file, so
+    the data files carry `typed_value`. Variant data-skipping stats are asked for too: delta-spark 4.3+ then
+    writes z85-encoded minValues/maxValues for `v` (a string in the JSON stats), which EW must tolerate. Older
+    deltas ignore the unknown confs. Rows are {id, json} as in write_variant. Returns the protocol as Spark committed it.
+    """
+    spark = _spark()
+    path = _uri(args["path"])
+    confs = {
+        "spark.sql.variant.writeShredding.enabled": "true",
+        "spark.sql.variant.inferShreddingSchema": "true",
+        "spark.databricks.delta.variantShredding.forceUsePreviewTableFeature":
+            "true" if args.get("preview") else "false",
+        "spark.databricks.delta.variantShredding.collectVariantDataSkippingStats": "true",
+        # Without this, 4.3.1 still writes only nullCount for `v` (measured): the bounds come from re-reading
+        # the written file's footer.
+        "spark.databricks.delta.variantShredding.parseFooterForStats": "true",
+    }
+    previous = {k: spark.conf.get(k, None) for k in confs}
+    for k, v in confs.items():
+        spark.conf.set(k, v)
+    try:
+        spark.sql(
+            f"CREATE OR REPLACE TABLE delta.`{path}` (id BIGINT, v VARIANT) USING delta "
+            "TBLPROPERTIES ('delta.enableVariantShredding' = 'true')")
+        values = []
+        for r in args["rows"]:
+            if r.get("json") is None:
+                values.append(f"({r['id']}, NULL)")
+            else:
+                lit = r["json"].replace("'", "''")
+                values.append(f"({r['id']}, parse_json('{lit}'))")
+        spark.sql(f"INSERT INTO delta.`{path}` VALUES {', '.join(values)}")
+        detail = spark.sql(f"DESCRIBE DETAIL delta.`{path}`").collect()[0].asDict()
+    finally:
+        for k, v in previous.items():
+            if v is None:
+                spark.conf.unset(k)
+            else:
+                spark.conf.set(k, v)
+    return {
+        "spark": spark.version,
+        "written": len(values),
+        "tableFeatures": sorted(detail.get("tableFeatures") or []),
+    }
+
+
 def cmd_write_nested_variant(args):
     """Write a table whose VARIANT is NESTED inside a struct: `s STRUCT<v: VARIANT, tag: STRING>`.
 
@@ -1177,6 +1227,7 @@ COMMANDS = {
     "read_parquet_variant": cmd_read_parquet_variant,
     "write_variant": cmd_write_variant,
     "write_nested_variant": cmd_write_nested_variant,
+    "write_shredded_variant": cmd_write_shredded_variant,
     "write": cmd_write,
     "partition_paths": cmd_partition_paths,
     "v2_checkpoint": cmd_v2_checkpoint,
