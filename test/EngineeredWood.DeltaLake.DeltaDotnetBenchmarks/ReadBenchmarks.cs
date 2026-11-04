@@ -8,12 +8,13 @@ using EwDeltaTable = EngineeredWood.DeltaLake.Table.DeltaTable;
 namespace DeltaDotnetComparison;
 
 /// <summary>
-/// Open the latest snapshot and scan every row of a 1M-row, single-commit table into Arrow
-/// (1 file when delta-dotnet wrote it, 16 when EW did).
+/// Open the latest snapshot and scan every row of a 1M-row, single-commit table into Arrow (one file, whichever
+/// engine wrote it).
 ///
 /// <para>delta-dotnet has two scan paths, and both are measured: <c>ReadAsArrowTableAsync</c> is the
-/// delta-kernel-rs scan (materializes the whole table), and <c>QueryAsync("SELECT *")</c> is delta-rs's
-/// DataFusion path (streams batches).</para>
+/// delta-kernel-rs scan, and <c>QueryAsync("SELECT *")</c> is delta-rs's DataFusion path, at DataFusion's default
+/// batch size and at <see cref="Dd.TunedBatchSize"/>. Both materialize the whole result before .NET sees a row:
+/// delta-dotnet's bridge collects a query's batches before returning them.</para>
 /// </summary>
 [Config(typeof(ReadConfig))]
 public class FullScanBenchmarks
@@ -47,6 +48,9 @@ public class FullScanBenchmarks
         using var table = await Dd.OpenAsync(_path);
         return await Dd.CountAsync(table.QueryAsync(new SelectQuery("SELECT * FROM deltatable"), CancellationToken.None));
     }
+
+    [BenchmarkCategory("FullScan"), Benchmark(Description = "DD QueryAsync SELECT * (DataFusion, 64K batches)")]
+    public Task<long> DD_DataFusionTuned() => Dd.QueryCountAsync(_path, "SELECT * FROM deltatable", Dd.TunedEngine);
 }
 
 /// <summary>
@@ -110,6 +114,58 @@ public class FilteredScanBenchmarks
         return await Dd.CountAsync(table.QueryAsync(
             new SelectQuery($"SELECT id, amount FROM deltatable WHERE {_sql}"), CancellationToken.None));
     }
+
+    [BenchmarkCategory("FilteredScan"), Benchmark(Description = "DD QueryAsync SELECT … WHERE (64K batches)")]
+    public Task<long> DD_DataFusionTuned() =>
+        Dd.QueryCountAsync(_path, $"SELECT id, amount FROM deltatable WHERE {_sql}", Dd.TunedEngine);
+}
+
+/// <summary>
+/// The full scan and the <c>OneCategory</c> filtered scan at ten times the scale: 10M rows in 20 files of 500K.
+/// At 1M rows delta-dotnet's fixed cost per query (a DataFusion session per call, and opening the table), measured
+/// at 2.5–9 ms, is a large share of its time. Here it is not. delta-dotnet runs at DataFusion's default batch size
+/// and at <see cref="Dd.TunedBatchSize"/>, which is worth far more at this scale.
+/// </summary>
+[Config(typeof(ReadConfig))]
+public class LargeScanBenchmarks
+{
+    private static readonly string[] Columns = ["id", "amount"];
+    private const string All = "SELECT * FROM deltatable";
+    private static readonly string OneCategory = $"SELECT id, amount FROM deltatable WHERE {Sql.OneCategory}";
+
+    [ParamsAllValues]
+    public TableWriter Writer { get; set; }
+
+    private string _path = "";
+
+    [GlobalSetup]
+    public void Setup() => _path = Fixtures.Large(Writer);
+
+    [BenchmarkCategory("LargeFullScan"), Benchmark(Baseline = true, Description = "EW ReadAllAsync, 10M rows")]
+    public async Task<long> EW_Full()
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path));
+        return await Ew.CountAsync(table.ReadAllAsync());
+    }
+
+    [BenchmarkCategory("LargeFullScan"), Benchmark(Description = "DD QueryAsync SELECT *, 10M rows")]
+    public Task<long> DD_Full() => Dd.QueryCountAsync(_path, All, Dd.Engine);
+
+    [BenchmarkCategory("LargeFullScan"), Benchmark(Description = "DD QueryAsync SELECT *, 10M rows (64K batches)")]
+    public Task<long> DD_FullTuned() => Dd.QueryCountAsync(_path, All, Dd.TunedEngine);
+
+    [BenchmarkCategory("LargeOneCategory"), Benchmark(Baseline = true, Description = "EW ReadAsync + row filter, 10M rows")]
+    public async Task<long> EW_OneCategory()
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path));
+        return await Ew.FilteredCountAsync(table, Sql.OneCategory, Columns, exact: true);
+    }
+
+    [BenchmarkCategory("LargeOneCategory"), Benchmark(Description = "DD QueryAsync SELECT … WHERE, 10M rows")]
+    public Task<long> DD_OneCategory() => Dd.QueryCountAsync(_path, OneCategory, Dd.Engine);
+
+    [BenchmarkCategory("LargeOneCategory"), Benchmark(Description = "DD QueryAsync SELECT … WHERE, 10M rows (64K batches)")]
+    public Task<long> DD_OneCategoryTuned() => Dd.QueryCountAsync(_path, OneCategory, Dd.TunedEngine);
 }
 
 /// <summary>

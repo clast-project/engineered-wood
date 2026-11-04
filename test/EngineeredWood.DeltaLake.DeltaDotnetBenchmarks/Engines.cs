@@ -267,11 +267,21 @@ internal static class Dd
     /// </summary>
     public static readonly DeltaEngine Engine = new(EngineOptions.Default);
 
+    /// <summary>
+    /// <see cref="Engine"/> with DataFusion's execution batch size raised from its default of 8,192 rows to
+    /// <see cref="TunedBatchSize"/>: the one delta-dotnet setting found to change a scan's time. It matters at scale.
+    /// A 10M-row scan hands .NET an eighth as many batches and runs about 2.7x faster, while a scan of one 1M-row
+    /// file does not change. The scan benchmarks measure delta-dotnet both ways.
+    /// </summary>
+    public static readonly DeltaEngine TunedEngine = new(new EngineOptions { DataFusionExecutionBatchSize = TunedBatchSize });
+
+    public const ulong TunedBatchSize = 65_536;
+
     /// <summary>delta-dotnet's own default for <see cref="InsertOptions.MaxRowsPerGroup"/>.</summary>
     public const ulong DefaultMaxRowsPerGroup = 100;
 
-    public static async Task<ITable> OpenAsync(string path, ulong? version = null) =>
-        await Engine.LoadTableAsync(
+    public static async Task<ITable> OpenAsync(string path, ulong? version = null, DeltaEngine? engine = null) =>
+        await (engine ?? Engine).LoadTableAsync(
             new TableOptions { TableLocation = path, Version = version }, CancellationToken.None);
 
     public static async Task CreateAndInsertAsync(
@@ -312,6 +322,13 @@ internal static class Dd
             batch.Dispose();
         }
         return rows;
+    }
+
+    /// <summary>Opens the table on <paramref name="engine"/> and counts the rows of a DataFusion query.</summary>
+    public static async Task<long> QueryCountAsync(string path, string sql, DeltaEngine engine)
+    {
+        using var table = await OpenAsync(path, engine: engine);
+        return await CountAsync(table.QueryAsync(new SelectQuery(sql), CancellationToken.None));
     }
 
     public static async Task<long> DeleteAsync(string path, string predicateSql)

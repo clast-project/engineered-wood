@@ -33,8 +33,9 @@ runs against both.
 
 | Class | Category | Operation |
 |---|---|---|
-| `FullScanBenchmarks` | FullScan | open + scan all of a 1M-row, one-commit table. delta-dotnet both ways: kernel `ReadAsArrowTableAsync` and DataFusion `SELECT *` |
-| `FilteredScanBenchmarks` | FilteredScan | `SELECT id, amount WHERE …` on a 20-file table: a 1-file id range (`Selective`), and 1-in-16 rows spread everywhere (`OneCategory`) |
+| `FullScanBenchmarks` | FullScan | open + scan all of a 1M-row, one-commit table. delta-dotnet both ways: kernel `ReadAsArrowTableAsync` and DataFusion `SELECT *`, the latter at DataFusion's default batch size and at 64K |
+| `FilteredScanBenchmarks` | FilteredScan | `SELECT id, amount WHERE …` on a 20-file table: a 1-file id range (`Selective`), and 1-in-16 rows spread everywhere (`OneCategory`). delta-dotnet at both batch sizes |
+| `LargeScanBenchmarks` | LargeFullScan, LargeOneCategory | the full scan and the `OneCategory` scan at 10M rows (20 files of 500K), where delta-dotnet's fixed costs no longer dominate. delta-dotnet at both batch sizes |
 | `ScanWindowBenchmarks` | ScanWindowFull, ScanWindowOneCategory | EW only: the 20-file table read whole, and its `OneCategory` filtered scan, at `MaxConcurrentReads` 1, 2, 4 and 8 (#607). 1 is the serial read. `FullScan` cannot show this, because its table is one file |
 | `SnapshotBenchmarks` | OpenLatest, OpenAtVersion, History | log replay of a 100-commit table, with and without a checkpoint |
 | `ChangeFeedBenchmarks` | ChangeFeed | the whole CDF of a table with 10 appends + UPDATE + DELETE |
@@ -71,6 +72,31 @@ runs against both.
   `write_batch_size`. The write benchmark measures it at that default and at 64K.
 - Construction of the delta-dotnet `DeltaEngine` (its tokio runtime) is a one-time host cost and is not
   measured.
+- **At 1M rows, delta-dotnet's fixed costs are a large share of its time.** It builds a DataFusion session for
+  every query and collects the whole result before returning it. A query that matches nothing costs it 2.6 ms on a
+  one-file table and 7.5–8.8 ms on a 20-file one, against EW's 0.24–2.5 ms. The 10M-row scans
+  (`LargeScanBenchmarks`) show the gap with less of that in it, and it is narrower there.
+
+## Is delta-dotnet configured fairly?
+
+An audit on 2026-11-04 asked whether any delta-dotnet setting would make it look better. delta-dotnet 0.33.1
+exposes few: the DataFusion execution batch size and spill limits (`EngineOptions`), `WithoutFiles` and
+`LogBufferSize` (`TableOptions`), `MaxRowsPerGroup` (`InsertOptions`), and the optimize options. It exposes no
+Parquet writer properties (so no compression choice), and no MERGE, DELETE or UPDATE options beyond the SQL text.
+Each was tried against the suite's defaults:
+
+| Setting | Effect |
+|---|---|
+| `DataFusionExecutionBatchSize` 64K (default 8,192) | **The one that matters, at scale.** 10M-row full scan 3.2–3.8× to 1.3–1.4×; 10M-row one-category scan 1.5–2.0× to 1.2–1.4×. No change on the 1M-row scans. A batch of 1M rows was a little faster still at 10M rows (1.1–1.2×) but slower on the 20-file 1M-row table, so 64K is the one measured. Now measured in every scan benchmark (`Dd.TunedEngine`) |
+| `WithoutFiles` on open, open-at-version and history | delta-dotnet's no-checkpoint open falls from 37 to 25 ms. EW stays 1.9–8× faster. Not adopted: EW's open loads the file list, so this would compare unlike work |
+| `LogBufferSize` 8 or 128 | no effect |
+| `MaxRowsPerGroup` 1M on write (suite: 100 and 64K) | no effect (176 vs 178 ms) |
+| Fixtures written at `MaxRowsPerGroup` 64K instead of the default 100 | no effect: the same file sizes (35.4 MB for one file, 42.3 MB for 20), and the same read times for both engines |
+
+What no setting reaches, and so remains in the numbers: the per-query session and collect, MERGE's join, and
+delta-rs's log replay. What the suite does not measure at all: SQL beyond filtered projections (aggregates,
+joins, sorts, DataFusion's strengths, which EW has no counterpart for), object stores (only the local file system),
+and tables much larger than 10M rows.
 
 ## A delta-dotnet correctness bug the verify pass found
 
@@ -92,9 +118,11 @@ runs and EW's changes are the code's.
 
 | Operation | EW | delta-dotnet | DD/EW ratio (EW-written / DD-written) |
 |---|---|---|---|
-| Full scan, 1M rows | 18.0 / 22.6 ms | DataFusion 41.0 / 62.1 ms; kernel 89 / 110 ms | 2.3 / 2.8 (DataFusion); 5.0 / 4.9 (kernel) |
-| Filtered scan, 1 file of 20 (`Selective`) | 1.6 / 2.1 ms | 9.1 / 10.7 ms | 5.7 / 5.0 |
-| Filtered scan, 1 row in 16 (`OneCategory`) | 6.4 / 8.4 ms (prune only: 3.8 / 6.7 ms) | 17.8 / 21.4 ms | **2.8 / 2.5** |
+| Full scan, 1M rows ‡ | 17.8 / 23.4 ms | DataFusion 40.7 / 60.3 ms (64K batches: 42.7 / 58.0); kernel 87 / 108 ms | 2.3 / 2.6 (DataFusion; 64K: 2.4 / 2.5); 4.9 / 4.6 (kernel) |
+| Filtered scan, 1 file of 20 (`Selective`) ‡ | 1.6 / 2.1 ms | 8.6 / 10.4 ms (64K: 8.7 / 10.5) | 5.4 / 5.0 (64K: the same) |
+| Filtered scan, 1 row in 16 (`OneCategory`) ‡ | 6.3 / 7.4 ms (prune only: 3.6 / 6.0 ms) | 15.6 / 18.7 ms (64K: 14.9 / 17.7) | **2.5 / 2.5** (64K: 2.4 / 2.4) |
+| **Full scan, 10M rows in 20 files** ‡ | 77 / 104 ms | 290 / 334 ms; **64K batches: 103 / 144 ms** | 3.8 / 3.2; **64K: 1.34 / 1.39** |
+| **Filtered scan, 1 row in 16, 10M rows** ‡ | 62 / 60 ms | 90 / 118 ms; **64K batches: 72 / 86 ms** | 1.47 / 1.95; **64K: 1.18 / 1.42** |
 | Open latest, 100 commits, no checkpoint | 4.0 / 5.1 ms | 36.6 / 50.9 ms | **9.3 / 10.0** |
 | Open latest, 100 commits, checkpointed | 1.0 / 0.75 ms | 4.3 / 5.6 ms | 4.1 / 7.5 |
 | Open at version 50, no checkpoint / checkpointed | 6.0–7.5 / 3.2–3.5 ms | 28–33 / 28–33 ms | 4.4–4.8 / 8.8–9.6 |
@@ -114,11 +142,15 @@ runs and EW's changes are the code's.
 | Compact 100 small files | 190 / 261 ms | 468 / 461 ms | 2.5 / 1.9 |
 | Vacuum 100 removed files | 34 / 36 ms (median) | Full 130 / 115 ms; Lite 119 / 104 ms | 3.9 / 3.2 (Full, on EW's median) |
 
+‡ From a second run of the three scan classes, after the 64K-batch variants and `LargeScanBenchmarks` were added.
+Its default-batch numbers are within about 13% of the full run's.
+
 Two EW means carry a single outlier, so the table gives their medians: the append to the checkpointed DD-written
 table (mean 64 ms, median 11 ms) and the vacuum of the EW-written table (mean 74 ms, median 34 ms).
 
 Compared with the 2026-11-01 run, **EW is now faster on every row**, including all the rows delta-dotnet won or
-drew:
+drew. The margin is smallest where delta-dotnet is at its best: on the 10M-row scans with 64K batches, EW leads by
+1.2–1.4×, not the 2–4× of the 1M-row scans (see [Is delta-dotnet configured fairly?](#is-delta-dotnet-configured-fairly)).
 
 - **Non-selective filtered scans: 1.2–1.3× to 2.5–2.8×.** EW now reads a table's data files in parallel (#607,
   #611) and splits a scan by (file, row group) (#612, #631). The 11-01 run named reading one file after another as
