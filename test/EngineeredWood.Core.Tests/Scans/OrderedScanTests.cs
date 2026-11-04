@@ -5,13 +5,14 @@ using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using EngineeredWood.Scans;
 
-namespace EngineeredWood.DeltaLake.Table.Tests;
+namespace EngineeredWood.Core.Tests.Scans;
 
 /// <summary>
-/// The parallel file read's pipeline on its own (#607): order, errors, early exit, cancellation, the memory
-/// budget and the concurrency window, against synthetic files whose timing the tests control.
+/// The parallel read's pipeline on its own (#607, #612): order, errors, early exit, cancellation, the memory
+/// budget and the concurrency window. The units here are synthetic "files" <c>0 .. n-1</c> whose timing the
+/// tests control; a Delta scan's units are (file, row group) pairs, a Parquet read's row groups.
 /// </summary>
-public class OrderedFileScanTests
+public class OrderedScanTests
 {
     private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(30);
 
@@ -102,15 +103,15 @@ public class OrderedFileScanTests
         Func<int, int, TimeSpan>? delay = null, int failFile = -1, int failAt = -1,
         ScanMemoryBudget? memory = null, CancellationToken ct = default,
         Func<int, int, long>? sizes = null, long? estimate = null) =>
-        OrderedFileScan<Item>.RunAsync(
-            fileCount,
+        OrderedScan.RunAsync(
+            OrderedScan.Range(fileCount),
             (f, r, t) => files.Read(f, r, itemsPerFile, sizes ?? ((_, _) => itemSize), estimate ?? itemSize,
                 delay, f == failFile ? failAt : -1, t),
             i => i.Size,
             i => Interlocked.Increment(ref i.Disposals),
             window,
             memory ?? new ScanMemoryBudget(budget),
-            ct);
+            cancellationToken: ct);
 
     private static async Task<List<Item>> CollectAsync(IAsyncEnumerable<Item> source, int take = int.MaxValue)
     {
@@ -327,11 +328,14 @@ public class OrderedFileScanTests
     [Fact]
     public async Task AHugeWindow_DoesNotOverflow()
     {
-        // 2 x int.MaxValue overflowed the lookahead to a negative number, so no file ever started.
+        // 2 x int.MaxValue overflows the lookahead to a negative number. The slot channel's floor of 1 keeps the
+        // scan completing even then, but with a lookahead of ~1 instead of every unit at once, so the check is
+        // that all four files are read together, as a window that wide allows.
         var files = new Files();
-        var got = await CollectAsync(Scan(files, fileCount: 3, itemsPerFile: 2, window: int.MaxValue,
-            budget: 1 << 20)).WaitAsync(Timeout);
-        Assert.Equal(6, got.Count);
+        var got = await CollectAsync(Scan(files, fileCount: 4, itemsPerFile: 2, window: int.MaxValue,
+            budget: 1 << 20, delay: (_, _) => TimeSpan.FromMilliseconds(20))).WaitAsync(Timeout);
+        Assert.Equal(8, got.Count);
+        Assert.Equal(4, files.MaxRunning);
     }
 
     [Fact]
