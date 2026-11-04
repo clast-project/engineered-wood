@@ -4245,12 +4245,25 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // A column the shape does not have throws ArgumentException from the evaluator, which is not an analysis
         // refusal and so is swallowed below: only a file actually read raised it, and a table with nothing to read
         // committed a no-op (#593). Spark refuses at analysis (UNRESOLVED_COLUMN).
-        if (FirstUnknownReference(predicate, names) is { } missing)
+        // A name that matches two fields differing only in case is refused the same way, for the same reason: the
+        // evaluator refuses it with an ArgumentException too (#656). EW never commits such a schema, but it opens a
+        // table another engine wrote with one.
+        foreach (var (name, resolution) in ReferenceResolutions(predicate, names))
         {
-            throw new DeltaFormatException(
-                DeltaTableErrorCodes.UnresolvedColumn,
-                $"The condition {predicate} reads column '{missing}', which does not exist. The columns it can "
-                + "read: " + string.Join(", ", names.FieldsList.Select(f => f.Name)) + ".");
+            if (resolution == ReferenceResolution.Missing)
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.UnresolvedColumn,
+                    $"The condition {predicate} reads column '{name}', which does not exist. The columns it can "
+                    + "read: " + string.Join(", ", names.FieldsList.Select(f => f.Name)) + ".");
+            }
+            if (resolution == ReferenceResolution.Ambiguous)
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.AmbiguousReference,
+                    $"The condition {predicate} reads column '{name}', which is ambiguous: column names are compared "
+                    + "ignoring case, and more than one field matches it.");
+            }
         }
 
         // A literal the evaluator cannot type -- a Guid, a TimeOnly: Delta has no such type -- throws the moment
@@ -4274,49 +4287,65 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    private enum ReferenceResolution { Found, Missing, Ambiguous }
+
     /// <summary>
-    /// The first column <paramref name="expression"/> references that <paramref name="schema"/> does not have, by
-    /// the evaluator's rule, or null: each part of a name matched ignoring case, a nested part as a field of the
-    /// struct before it, and a bound reference by its name, as an unbound one.
+    /// Each column <paramref name="expression"/> references, in order, with how it resolves against
+    /// <paramref name="schema"/> by the evaluator's rule: each part of a name matched ignoring case, a nested part as
+    /// a field of the struct before it, and a bound reference by its name, as an unbound one. A part that matches
+    /// more than one field (<c>a</c> and <c>A</c>) is ambiguous, at any level.
     /// </summary>
-    /// <remarks>A name matching twice (<c>a</c> and <c>A</c>) is not unknown; the evaluator reports it.</remarks>
-    private static string? FirstUnknownReference(Expressions.Expression expression, Apache.Arrow.Schema schema)
+    private static IEnumerable<(string Name, ReferenceResolution Resolution)> ReferenceResolutions(
+        Expressions.Expression expression, Apache.Arrow.Schema schema)
     {
         switch (expression)
         {
             case Expressions.UnboundReference reference:
-                IReadOnlyList<Field>? fields = schema.FieldsList;
-                foreach (string part in reference.NameParts)
-                {
-                    var field = fields?.FirstOrDefault(
-                        f => string.Equals(f.Name, part, StringComparison.OrdinalIgnoreCase));
-                    if (field is null)
-                        return reference.Name;
-                    fields = (field.DataType as Apache.Arrow.Types.StructType)?.Fields;
-                }
-                return null;
+                yield return (reference.Name, Resolve(reference.NameParts, schema.FieldsList));
+                break;
             case Expressions.BoundReference bound:
-                return schema.FieldsList.Any(f => string.Equals(f.Name, bound.Name, StringComparison.OrdinalIgnoreCase))
-                    ? null
-                    : bound.Name;
-            case Expressions.AndPredicate and:
-                return and.Children.Select(c => FirstUnknownReference(c, schema)).FirstOrDefault(n => n is not null);
-            case Expressions.OrPredicate or:
-                return or.Children.Select(c => FirstUnknownReference(c, schema)).FirstOrDefault(n => n is not null);
-            case Expressions.NotPredicate not:
-                return FirstUnknownReference(not.Child, schema);
-            case Expressions.ComparisonPredicate cmp:
-                return FirstUnknownReference(cmp.Left, schema) ?? FirstUnknownReference(cmp.Right, schema);
-            case Expressions.UnaryPredicate unary:
-                return FirstUnknownReference(unary.Operand, schema);
-            case Expressions.SetPredicate set:
-                return FirstUnknownReference(set.Operand, schema)
-                    ?? set.Values.Select(v => FirstUnknownReference(v, schema)).FirstOrDefault(n => n is not null);
-            case Expressions.FunctionCall call:
-                return call.Arguments.Select(a => FirstUnknownReference(a, schema)).FirstOrDefault(n => n is not null);
+                yield return (bound.Name, Resolve([bound.Name], schema.FieldsList));
+                break;
             default:
-                return null;
+                foreach (var child in Children(expression))
+                {
+                    foreach (var resolved in ReferenceResolutions(child, schema))
+                        yield return resolved;
+                }
+                break;
         }
+
+        static ReferenceResolution Resolve(IReadOnlyList<string> parts, IReadOnlyList<Field>? fields)
+        {
+            foreach (string part in parts)
+            {
+                Field? match = null;
+                foreach (var f in fields ?? [])
+                {
+                    if (!string.Equals(f.Name, part, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    if (match is not null)
+                        return ReferenceResolution.Ambiguous;
+                    match = f;
+                }
+                if (match is null)
+                    return ReferenceResolution.Missing;
+                fields = (match.DataType as Apache.Arrow.Types.StructType)?.Fields;
+            }
+            return ReferenceResolution.Found;
+        }
+
+        static IEnumerable<Expressions.Expression> Children(Expressions.Expression expression) => expression switch
+        {
+            Expressions.AndPredicate and => and.Children,
+            Expressions.OrPredicate or => or.Children,
+            Expressions.NotPredicate not => [not.Child],
+            Expressions.ComparisonPredicate cmp => [cmp.Left, cmp.Right],
+            Expressions.UnaryPredicate unary => [unary.Operand],
+            Expressions.SetPredicate set => [set.Operand, .. set.Values],
+            Expressions.FunctionCall call => call.Arguments,
+            _ => [],
+        };
     }
 
     /// <summary>
@@ -5177,6 +5206,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     var matchBatch = TakeRowsFromBatch(batch, matchRows);
                     var updatedBatch = updater(matchBatch);
                     ThrowIfUpdaterChangedTypes(matchBatch, updatedBatch, snapshot.Schema);
+                    ThrowIfUpdaterChangedIdentity(matchBatch, updatedBatch, snapshot.Schema);
                     ThrowIfPartitionColumnsRetyped(updatedBatch, snapshot, "UPDATE");
 
                     // Only the post-image. Rows the predicate did not match are copied through
@@ -6664,15 +6694,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 b, splitColumns, snapshot.Schema, refuseNulls: true, generated?.ColumnNames))
             .ToList();
 
-        // Beside the other per-batch guard, and before anything is written: a constraint
-        // violation must leave the table untouched rather than half-written. Create parses, so an
-        // expression this writer cannot read refuses here exactly as it did before evaluation
-        // existed.
+        // Create parses, so an expression this writer cannot read refuses here exactly as it did before evaluation
+        // existed. The rows are validated in the loop below, once identity values are generated, and still before
+        // anything is written: a constraint violation must leave the table untouched rather than half-written. An
+        // empty batch never reaches that loop, so it is asked here, which still refuses a rule that cannot be
+        // evaluated at all.
         var enforcer = DeltaConstraintEnforcer.Create(snapshot);
         if (enforcer is not null)
         {
             foreach (var batch in batches)
-                enforcer.Validate(batch);
+            {
+                if (batch.Length == 0)
+                    enforcer.Validate(batch);
+            }
         }
 
         // And the table's NOT NULL columns, against the table's schema rather than the batch's own fields
@@ -6759,6 +6793,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
             snapshot.Schema, mappingMode);
+        // The table's columns as the physical batch names them, for the nullability relabel below.
+        var physicalTableFields = PhysicalArrowFields(snapshot.Schema, mappingMode);
 
         // Dynamic partition overwrite: collect the canonical partition keys the INPUT touches while writing;
         // the matching active files are removed after the write loop (one atomic commit).
@@ -6835,12 +6871,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 allIdentityUpdates.AddRange(updates);
             }
 
+            // CHECK constraints and invariants on the rows as they will be stored: a constraint on an identity column
+            // judges the value the table generates, as Spark's does, not the caller's input (#594).
+            enforcer?.Validate(processedBatch);
+
             // A replaceWhere's rows must all lie inside the window they replace, judged on the rows exactly as they
             // will be stored: generated columns computed, identity values generated (a GENERATED ALWAYS column
             // is refused when the caller supplies it), and a column the caller left out as the NULL it reads back
             // as. Still before any file is written: the files are written after this loop.
             if (replaceWhere is not null)
-                ThrowIfOutsideReplaceWhere(processedBatch, snapshot.ArrowSchema, replaceWhere);
+                ThrowIfOutsideReplaceWhere(processedBatch, snapshot, replaceWhere);
 
             var partitions = Partitioning.PartitionUtils.SplitByPartition(
                 processedBatch, partitionColumns);
@@ -6900,7 +6940,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // children included — the top-level-only pair left them logical-named/id-less). The file's
                     // stats are collected over this batch: keyed PHYSICAL at every level under mapping, matching
                     // what spec readers use for data skipping.
-                    var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode);
+                    // Nullability from the table schema, so batches that differ only in their flags (a caller's
+                    // non-nullable key beside rows read back from a Spark-written table) share a file (#651).
+                    var physicalBatch = TableNullability.Apply(
+                        ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode),
+                        physicalTableFields);
 
                     // IcebergCompat: materialize partition columns into the Parquet file (physical-named by
                     // AppendPartitionColumns, and carrying no mapping ids of their own).
@@ -7843,6 +7887,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             DeltaNotNullEnforcer.Validate(b, notNullSchema);
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(writeSchema, mappingMode);
+        var physicalTableFields = PhysicalArrowFields(notNullSchema, mappingMode);
         // The committed properties: a pending schema change's rewrite of delta.dataSkippingStatsColumns is not
         // visible here, so a column renamed in the same transaction may go without statistics until the next
         // write, which is never wrong.
@@ -7941,7 +7986,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
                     // Rename logical columns to physical names + stamp field ids at every nesting level. Stats are
                     // collected over this batch, keyed PHYSICAL at every level, matching spec readers.
-                    var physicalBatch = ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode);
+                    // Nullability from the pending schema's NOT NULL rules, as on the committing path (#651).
+                    var physicalBatch = TableNullability.Apply(
+                        ColumnMappingRecursive.ToPhysical(dataBatch, writeSchema, mappingMode),
+                        physicalTableFields);
 
                     // Same variant logical-type policy as the committing write path (Spark 4.0.x tables drop the
                     // annotation; the read path recovers the type from the Delta schema).
@@ -8674,6 +8722,93 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             ThrowIfMistypedColumns(
                 [new RecordBatch(new Apache.Arrow.Schema(fields, null), columns, rewritten.Length)],
                 snapshot.Schema, entryPoint);
+        }
+    }
+
+    /// <summary>
+    /// The columns of <paramref name="schema"/> named as a physical batch names them, at every depth, for
+    /// <see cref="TableNullability"/>.
+    /// </summary>
+    private static IReadOnlyList<Field> PhysicalArrowFields(Schema.StructType schema, ColumnMappingMode mappingMode) =>
+        SchemaConverter.ToArrowSchema(ColumnMapping.ToPhysicalSchema(schema, mappingMode)).FieldsList;
+
+    /// <summary>
+    /// Refuses an UPDATE whose updater changed an identity column's value in any matched row, as Spark refuses
+    /// <c>UPDATE t SET id = …</c> (<see cref="DeltaTableErrorCodes.IdentityColumnUpdateNotSupported"/>). The table's
+    /// high-water mark does not move with the new value, so a later insert would issue it again (#654).
+    /// </summary>
+    /// <remarks>
+    /// The updater returns whole rows, so there is no SET list to inspect: each row's identity value is compared with
+    /// its pre-image instead. A row whose value is unchanged passes, so this allows <c>SET id = id</c>, which Spark's
+    /// analyzer refuses. Leaving the column out of the returned batch makes it NULL, which changes it unless it
+    /// already was (a GENERATED BY DEFAULT column can hold an explicit NULL). A value is read through run-end and
+    /// dictionary encoding, which a host reader may hand back, so an unchanged column passes in any of them.
+    /// </remarks>
+    private static void ThrowIfUpdaterChangedIdentity(RecordBatch input, RecordBatch output, Schema.StructType schema)
+    {
+        foreach (var field in schema.Fields)
+        {
+            if (IdentityColumn.GetConfig(field) is null)
+                continue;
+
+            int before = input.Schema.GetFieldIndex(field.Name);
+            int after = output.Schema.GetFieldIndex(field.Name);
+            if (before < 0)
+                continue;   // not read, so nothing to compare against; the write path judges the column as supplied
+            if (!SameIntegerValues(input.Column(before), after < 0 ? null : output.Column(after)))
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.IdentityColumnUpdateNotSupported,
+                    $"UPDATE on IDENTITY column {field.Name} is not supported: the updater changed its value. The "
+                    + "table assigns identity values, and the next insert would issue the new one again. Return the "
+                    + "matched rows with the column unchanged.");
+            }
+        }
+    }
+
+    /// <summary>Whether two integer arrays of one length hold the same values, NULLs included; a null
+    /// <paramref name="b"/> stands for all NULL. Plain, run-end encoded and dictionary-encoded integers are read by
+    /// value; any other array type is reported as different, unless the two are one instance.</summary>
+    private static bool SameIntegerValues(IArrowArray a, IArrowArray? b)
+    {
+        if (ReferenceEquals(a, b))
+            return true;
+        if (b is not null && a.Length != b.Length)
+            return false;
+        for (int i = 0; i < a.Length; i++)
+        {
+            if (IntegerAt(a, i, out long x) is not { } hasA)
+                return false;
+            long y = 0;
+            bool? hasB = b is null ? false : IntegerAt(b, i, out y);
+            if (hasB is null || hasA != hasB || (hasA && x != y))
+                return false;
+        }
+        return true;
+
+        // True for a value, false for NULL, null for an array type this does not read. A run-end encoded array has no
+        // validity of its own: a NULL is a NULL run in its values.
+        static bool? IntegerAt(IArrowArray array, int index, out long value)
+        {
+            value = 0;
+            switch (array)
+            {
+                case RunEndEncodedArray ree:
+                    return IntegerAt(ree.Values, ree.FindPhysicalIndex(index), out value);
+                case DictionaryArray dictionary:
+                    if (dictionary.IsNull(index))
+                        return false;
+                    return IntegerAt(dictionary.Indices, index, out long key) is true
+                        ? IntegerAt(dictionary.Dictionary, checked((int)key), out value)
+                        : null;
+                case Int64Array or Int32Array or Int16Array or Int8Array when array.IsNull(index):
+                    return false;
+                case Int64Array l: value = l.GetValue(index)!.Value; return true;
+                case Int32Array n: value = n.GetValue(index)!.Value; return true;
+                case Int16Array s: value = s.GetValue(index)!.Value; return true;
+                case Int8Array t: value = t.GetValue(index)!.Value; return true;
+                default: return null;
+            }
         }
     }
 
@@ -9630,13 +9765,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 ob, snapshot.Metadata.PartitionColumns));
         }
 
+        // Canonical Arrow forms, as in the UPDATE rewrite: these rows were read back from a file. Nullability from the
+        // table schema, as the append path takes it (#651), but across the whole file: every batch here is a row group
+        // of one file, whose schema the first fixes. An updater's rows come first and may declare a column NOT NULL
+        // that the copied rows after them hold NULLs in (a NOT NULL column with an old null is written optional).
+        var physicalBatches = new List<RecordBatch>(dataBatches.Count);
+        foreach (var dataBatch in dataBatches)
+        {
+            physicalBatches.Add(NormalizeUnlessHostOwnsBytes(
+                ColumnMappingRecursive.ToPhysical(dataBatch, snapshot.Schema, mappingMode)));
+        }
+        var relabeled = TableNullability.ApplyToOneFile(
+            physicalBatches, PhysicalArrowFields(snapshot.Schema, mappingMode));
+
         var writeBatches = new List<RecordBatch>(dataBatches.Count);
         var statsBatches = new List<RecordBatch>(dataBatches.Count);
-        for (int k = 0; k < dataBatches.Count; k++)
+        for (int k = 0; k < relabeled.Count; k++)
         {
-            // Canonical Arrow forms, as in the UPDATE rewrite: these rows were read back from a file.
-            var physicalBatch = NormalizeUnlessHostOwnsBytes(
-                ColumnMappingRecursive.ToPhysical(dataBatches[k], snapshot.Schema, mappingMode));
+            var physicalBatch = relabeled[k];
             SchemaConverter.ThrowIfUnwritableType(physicalBatch.Schema, convertibleTypesAllowed: HostOwnsBytes);
             // Statistics are keyed by PHYSICAL name, as the append path keys them (see the UPDATE rewrite).
             statsBatches.Add(physicalBatch);
@@ -9847,6 +9993,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// checks its own: generated columns are recomputed from the new values (whatever <paramref name="rewriteFile"/>
     /// put in them), then CHECK constraints, invariants and NOT NULL are evaluated. The other rows are copied
     /// through unchecked. A selected row may land later in the rewritten file than it was.</para>
+    /// <para>Unlike <c>UpdateAsync</c>, a changed identity value is not refused: the host owns the statement's
+    /// semantics, including whether its UPDATE may set an identity column (#654). The table's high-water mark does
+    /// not follow a value the host sets, so a later insert can issue it again.</para>
     /// </summary>
     /// <param name="rewriteFile">Receives <c>(path, sourceBatches, absolutePositionsPerBatch)</c>. The PATH is
     /// the file's <c>add.path</c> — the same key the selection is built on, so a host that computed its new
@@ -9883,6 +10032,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <paramref name="updates"/> (type-agnostic, via concat + take — no per-type code); all other columns and
     /// rows pass through. A duplicated locator is a caller error (last one wins). Returns the committed version
     /// (or the current version if nothing matched).
+    /// <para>An identity column among the SET columns is not refused, as for the other overload: the host owns the
+    /// statement's semantics (#654).</para>
     /// </summary>
     public ValueTask<long> UpdateRowsAsync(
         RecordBatch updates,

@@ -63,15 +63,33 @@ public sealed partial class DeltaTable
         RefuseUnanalyzable(predicate, snapshot);
 
     /// <summary>
+    /// A copy of a batch being written, as an expression over the table's logical columns should see it: renamed to
+    /// logical names (logical-first, physical-second at every level, the binding the write itself gives it, so a
+    /// column the caller named by its column-mapping physical name keeps its values), then with every column or
+    /// nullable struct field it leaves out backfilled as the NULL it reads back as. The batch written is not changed.
+    /// </summary>
+    /// <remarks>
+    /// The rename has to come first: the backfill drops a column the schema does not name, and backfills the logical
+    /// one as NULL, so a physical alias of <c>v = -1</c> passed <c>v IS NULL OR v &gt; 0</c>.
+    /// </remarks>
+    internal static RecordBatch AsStored(RecordBatch batch, Snapshot.Snapshot snapshot)
+    {
+        var logical = DeltaLake.Schema.ColumnMappingRecursive.ToLogical(
+            batch, snapshot.Schema, DeltaLake.Schema.ColumnMapping.GetMode(snapshot.Metadata.Configuration),
+            inputIsPhysical: false);
+        return SchemaEvolution.BackfillMissingColumns(logical, snapshot.ArrowSchema.FieldsList);
+    }
+
+    /// <summary>
     /// Refuses replaceWhere rows the predicate is not TRUE for: false, or NULL, as a CHECK constraint refuses them
     /// and as Spark's replaceWhere constraint check does. A write may leave out a nullable column, or a nullable
-    /// struct field, which then reads back as NULL; the predicate sees it so, from a copy of
-    /// <paramref name="batch"/> with what is missing backfilled. The batch written is not changed.
+    /// struct field, which then reads back as NULL; the predicate sees it so, from <see cref="AsStored"/>'s copy of
+    /// <paramref name="batch"/>. The batch written is not changed.
     /// </summary>
     private static void ThrowIfOutsideReplaceWhere(
-        RecordBatch batch, Apache.Arrow.Schema tableSchema, Expressions.Predicate predicate)
+        RecordBatch batch, Snapshot.Snapshot snapshot, Expressions.Predicate predicate)
     {
-        var asStored = SchemaEvolution.BackfillMissingColumns(batch, tableSchema.FieldsList);
+        var asStored = AsStored(batch, snapshot);
         long outside = 0;
         using (var mask = RowEvaluator.EvaluatePredicate(predicate, asStored))
         {

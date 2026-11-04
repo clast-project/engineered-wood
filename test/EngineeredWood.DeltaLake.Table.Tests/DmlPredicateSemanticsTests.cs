@@ -551,6 +551,74 @@ public class DmlPredicateSemanticsTests : IDisposable
         Assert.Equal(before, table.CurrentSnapshot.Version);
     }
 
+    // ── A name two fields share ignoring case is refused before anything is read (#656) ──
+
+    /// <summary>
+    /// A table whose schema has <c>a</c> and <c>A</c>, and a struct <c>p</c> with <c>x</c> and <c>X</c>, written by
+    /// hand: EW refuses to commit such a schema, but it opens one another engine wrote. It holds no files.
+    /// </summary>
+    private async Task<DeltaTable> CaseCollidingTableAsync()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        const string schema = """
+            {"type":"struct","fields":[
+              {"name":"a","type":"long","nullable":true,"metadata":{}},
+              {"name":"A","type":"long","nullable":true,"metadata":{}},
+              {"name":"b","type":"long","nullable":true,"metadata":{}},
+              {"name":"p","type":{"type":"struct","fields":[
+                {"name":"x","type":"long","nullable":true,"metadata":{}},
+                {"name":"X","type":"long","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}
+            """;
+        await new DeltaLake.Log.TransactionLog(fs).WriteCommitAsync(0, new List<DeltaLake.Actions.DeltaAction>
+        {
+            new DeltaLake.Actions.ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            new DeltaLake.Actions.MetadataAction
+            {
+                Id = "case-collision", Format = DeltaLake.Actions.Format.Parquet, SchemaString = schema,
+                PartitionColumns = [],
+            },
+        });
+        return await DeltaTable.OpenAsync(fs);
+    }
+
+    [Theory]
+    [InlineData("a")]
+    [InlineData("A")]
+    public async Task Delete_ACaseAmbiguousColumn_IsRefusedOnAnEmptyTable(string name)
+    {
+        await using var table = await CaseCollidingTableAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.DeleteAsync(
+            X.Equal(name, LiteralValue.Of(1L))));
+
+        Assert.Equal(DeltaTableErrorCodes.AmbiguousReference, ex.ErrorCode);
+        Assert.Contains($"'{name}'", ex.Message);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task Update_ACaseAmbiguousNestedField_IsRefusedOnAnEmptyTable()
+    {
+        await using var table = await CaseCollidingTableAsync();
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await table.UpdateAsync(
+            X.Equal(UnboundReference.FromParts(["p", "x"]), X.Lit(LiteralValue.Of(1L))), batch => batch));
+
+        Assert.Equal(DeltaTableErrorCodes.AmbiguousReference, ex.ErrorCode);
+    }
+
+    /// <summary>A column only one field matches is still read on such a table.</summary>
+    [Fact]
+    public async Task Delete_AnUnambiguousColumnOfThatTable_IsAccepted()
+    {
+        await using var table = await CaseCollidingTableAsync();
+
+        var (deleted, _) = await table.DeleteAsync(X.Equal("B", LiteralValue.Of(1L)));
+
+        Assert.Equal(0, deleted);
+    }
+
     /// <summary>Makes the table one whose host writes the bytes; nothing here is written.</summary>
     private sealed class UnusedWriter : IDataFileWriter
     {

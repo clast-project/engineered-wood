@@ -4,17 +4,18 @@
 using Apache.Arrow;
 using Apache.Arrow.Types;
 
-namespace EngineeredWood.DeltaLake.Table.Compaction;
+namespace EngineeredWood.DeltaLake.Table;
 
 /// <summary>
 /// Relabels a batch's field nullability, at every depth, to the table schema's. Only the labels change: the buffers,
 /// offsets and children are the batch's own.
 ///
-/// <para>Compaction joins rows from files of different vintages, and their Arrow nullability need not agree: an EW
-/// append keeps the caller's flags (an <c>id</c> declared non-nullable), while Spark writes every column optional.
-/// Values and types match, so the rows belong in one file and one row group, but
-/// <see cref="RollingDataFileWriter"/> starts a new file at any layout difference, nullability included (#572).
-/// Taking the flags from the table schema makes every source agree.</para>
+/// <para>Rows that belong in one file can arrive with Arrow nullability that disagrees. Compaction joins files of
+/// different vintages: an EW append keeps the caller's flags (an <c>id</c> declared non-nullable), while Spark writes
+/// every column optional. A write can join batches from different producers. Values and types match, so the rows
+/// belong in one file and one row group, but <see cref="RollingDataFileWriter"/> starts a new file at any layout
+/// difference, nullability included (#572, #651). Taking the flags from the table schema makes every source
+/// agree.</para>
 ///
 /// <para>A column the table declares nullable is written nullable. One it declares NOT NULL is written required,
 /// unless the source has nulls in it that the Parquet writer would reach: a file can predate the constraint, or come
@@ -42,9 +43,14 @@ internal static class TableNullability
             if (!byName.TryGetValue(fields[i].Name, out var target))
                 continue;
             var column = batch.Column(i);
-            var data = Align(column.Data, target.DataType, AllSlots);
+            // The relabel builds the field from the array's type, so the array first takes the nested names the
+            // schema declares, where the two disagree: an array built with ListArray.Builder names its element
+            // "item" under a schema field that says "element", and the writer, which names columns from the schema,
+            // would have switched to "item" (and lost a bloom filter configured on the declared path).
+            var declared = Declared(column.Data, fields[i].DataType);
+            var data = Align(declared, target.DataType, AllSlots);
             bool nullable = Nullable(target, column, AllSlots);
-            if (ReferenceEquals(data, column.Data) && nullable == fields[i].IsNullable)
+            if (ReferenceEquals(data, declared) && nullable == fields[i].IsNullable)
                 continue;
 
             newFields ??= [.. fields];
@@ -58,6 +64,175 @@ internal static class TableNullability
             ? batch
             : new RecordBatch(new Apache.Arrow.Schema(newFields, batch.Schema.Metadata), newColumns!, batch.Length);
     }
+
+    /// <summary>
+    /// <see cref="Apply"/> for batches written as the row groups of ONE file, whose schema the first row group fixes.
+    /// A NOT NULL column is written required only when no batch reaches a null in it. Batch by batch, an updater's
+    /// rows (no nulls) came out required and the copied rows after them (an old null) optional, and the file refused
+    /// the second row group.
+    /// </summary>
+    public static IReadOnlyList<RecordBatch> ApplyToOneFile(
+        IReadOnlyList<RecordBatch> batches, IReadOnlyList<Field> tableFields)
+    {
+        var relabeled = new RecordBatch[batches.Count];
+        for (int i = 0; i < relabeled.Length; i++)
+            relabeled[i] = Apply(batches[i], tableFields);
+        if (relabeled.Length < 2)
+            return relabeled;
+
+        // Every batch's flags, merged: optional wherever any batch is. Applying the merged fields then gives each batch
+        // the same flags, since a field merged as required has no written null in any batch.
+        var merged = new Dictionary<string, Field>(StringComparer.Ordinal);
+        foreach (var batch in relabeled)
+        {
+            foreach (var field in batch.Schema.FieldsList)
+                merged[field.Name] = merged.TryGetValue(field.Name, out var seen) ? Union(seen, field) : field;
+        }
+        var mergedFields = merged.Values.ToList();
+        for (int i = 0; i < relabeled.Length; i++)
+            relabeled[i] = Apply(relabeled[i], mergedFields);
+        return relabeled;
+    }
+
+    // One field optional where either is, at every depth the two have the same shape; `a`'s otherwise.
+    private static Field Union(Field a, Field b)
+    {
+        var type = UnionType(a.DataType, b.DataType);
+        bool nullable = a.IsNullable || b.IsNullable;
+        return ReferenceEquals(type, a.DataType) && nullable == a.IsNullable
+            ? a
+            : new Field(a.Name, type, nullable, a.Metadata);
+    }
+
+    private static IArrowType UnionType(IArrowType a, IArrowType b)
+    {
+        switch (a, b)
+        {
+            // MapType derives from ListType, so it is matched first.
+            case (MapType am, MapType bm):
+            {
+                var key = Union(am.KeyField, bm.KeyField);
+                var value = Union(am.ValueField, bm.ValueField);
+                return ReferenceEquals(key, am.KeyField) && ReferenceEquals(value, am.ValueField)
+                    ? a
+                    : new MapType(key, value, am.KeySorted);
+            }
+            case (MapType, _):
+            case (_, MapType):
+                return a;
+            case (ListType al, ListType bl):
+            {
+                var element = Union(al.ValueField, bl.ValueField);
+                return ReferenceEquals(element, al.ValueField) ? a : new ListType(element);
+            }
+            case (LargeListType al, LargeListType bl):
+            {
+                var element = Union(al.ValueField, bl.ValueField);
+                return ReferenceEquals(element, al.ValueField) ? a : new LargeListType(element);
+            }
+            case (FixedSizeListType al, FixedSizeListType bl) when al.ListSize == bl.ListSize:
+            {
+                var element = Union(al.ValueField, bl.ValueField);
+                return ReferenceEquals(element, al.ValueField) ? a : new FixedSizeListType(element, al.ListSize);
+            }
+            case (StructType ast, StructType bst) when ast.Fields.Count == bst.Fields.Count:
+            {
+                Field[]? fields = null;
+                for (int i = 0; i < ast.Fields.Count; i++)
+                {
+                    if (ast.Fields[i].Name != bst.Fields[i].Name)
+                        return a;
+                    var child = Union(ast.Fields[i], bst.Fields[i]);
+                    if (ReferenceEquals(child, ast.Fields[i]))
+                        continue;
+                    fields ??= [.. ast.Fields];
+                    fields[i] = child;
+                }
+                return fields is null ? a : new StructType(fields);
+            }
+            default:
+                return a;
+        }
+    }
+
+    // The data with each nested field's name, nullability and metadata taken from `declared`, where the two are the
+    // same kind of container with the same number of children; leaf types are always the array's own, so the result
+    // describes its buffers. The same instance when nothing differs.
+    private static ArrayData Declared(ArrayData data, IArrowType declared)
+    {
+        if (ReferenceEquals(data.DataType, declared))
+            return data;
+
+        switch (declared, data.DataType)
+        {
+            // MapType derives from ListType, so it is matched first.
+            case (MapType dm, MapType am):
+            {
+                var entries = data.Children[0];
+                var key = Declared(entries.Children[0], dm.KeyField.DataType);
+                var value = Declared(entries.Children[1], dm.ValueField.DataType);
+                var keyField = Retyped(dm.KeyField, key.DataType);
+                var valueField = Retyped(dm.ValueField, value.DataType);
+                if (SameField(keyField, am.KeyField) && SameField(valueField, am.ValueField))
+                    return data;
+                var mapType = new MapType(keyField, valueField, am.KeySorted);
+                var newEntries = new ArrayData(mapType.KeyValueType, entries.Length, entries.NullCount,
+                    entries.Offset, entries.Buffers, [key, value]);
+                return new ArrayData(mapType, data.Length, data.NullCount, data.Offset, data.Buffers, [newEntries]);
+            }
+            case (MapType, _):
+            case (_, MapType):
+                return data;
+            case (ListType dl, ListType al):
+            {
+                var child = Declared(data.Children[0], dl.ValueDataType);
+                var field = Retyped(dl.ValueField, child.DataType);
+                return SameField(field, al.ValueField) ? data : Rebuilt(data, new ListType(field), child);
+            }
+            case (LargeListType dl, LargeListType al):
+            {
+                var child = Declared(data.Children[0], dl.ValueDataType);
+                var field = Retyped(dl.ValueField, child.DataType);
+                return SameField(field, al.ValueField) ? data : Rebuilt(data, new LargeListType(field), child);
+            }
+            case (FixedSizeListType dl, FixedSizeListType al) when dl.ListSize == al.ListSize:
+            {
+                var child = Declared(data.Children[0], dl.ValueDataType);
+                var field = Retyped(dl.ValueField, child.DataType);
+                return SameField(field, al.ValueField)
+                    ? data
+                    : Rebuilt(data, new FixedSizeListType(field, al.ListSize), child);
+            }
+            case (StructType ds, StructType ast) when ds.Fields.Count == ast.Fields.Count:
+            {
+                var children = new ArrayData[ast.Fields.Count];
+                var fields = new Field[ast.Fields.Count];
+                bool changed = false;
+                for (int i = 0; i < children.Length; i++)
+                {
+                    children[i] = Declared(data.Children[i], ds.Fields[i].DataType);
+                    fields[i] = Retyped(ds.Fields[i], children[i].DataType);
+                    changed |= !SameField(fields[i], ast.Fields[i]);
+                }
+                return changed
+                    ? new ArrayData(new StructType(fields), data.Length, data.NullCount, data.Offset, data.Buffers,
+                        children)
+                    : data;
+            }
+            default:
+                return data;
+        }
+    }
+
+    // `declared`'s name, nullability and metadata over `type`.
+    private static Field Retyped(Field declared, IArrowType type) =>
+        ReferenceEquals(declared.DataType, type) ? declared : new Field(declared.Name, type, declared.IsNullable, declared.Metadata);
+
+    // Whether two fields have one name, nullability, metadata and type instance: enough to keep the array's own type.
+    private static bool SameField(Field a, Field b) =>
+        ReferenceEquals(a, b)
+        || (a.Name == b.Name && a.IsNullable == b.IsNullable && ReferenceEquals(a.DataType, b.DataType)
+            && ReferenceEquals(a.Metadata, b.Metadata));
 
     // The positions of an array the Parquet writer encodes, in the array's own logical index space (what IsNull
     // takes); null means every position. Computed only when a null check needs it. The child mappings follow
