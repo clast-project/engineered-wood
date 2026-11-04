@@ -38,7 +38,53 @@ public class VariantShreddingConfigTests
     public void AllowsShreddedWrites_NeedsTheFeatureAndTheProperty(string feature, string value, bool expected)
     {
         var configuration = new Dictionary<string, string> { [VariantShreddingConfig.EnableKey] = value };
-        Assert.Equal(expected, VariantShreddingConfig.AllowsShreddedWrites(Features(feature), configuration));
+        Assert.Equal(expected, VariantShreddingConfig.AllowsShreddedWrites(Features("variantType", feature), configuration));
+    }
+
+    private static readonly Dictionary<string, string> Enabled = new() { [VariantShreddingConfig.EnableKey] = "true" };
+
+    [Fact]
+    public void AllowsShreddedWrites_GaNameWithoutVariantType_IsFalse()
+    {
+        // variantShredding depends on variantType; a protocol missing it is one a strict reader rejects.
+        Assert.False(VariantShreddingConfig.AllowsShreddedWrites(Features("variantShredding"), Enabled));
+    }
+
+    [Fact]
+    public void AllowsShreddedWrites_GaNameWithVariantTypeOnOneSideOnly_IsFalse()
+    {
+        var protocol = new ProtocolAction
+        {
+            MinReaderVersion = 3,
+            MinWriterVersion = 7,
+            ReaderFeatures = ["variantShredding"],
+            WriterFeatures = ["variantType", "variantShredding"],
+        };
+
+        Assert.False(VariantShreddingConfig.AllowsShreddedWrites(protocol, Enabled));
+    }
+
+    [Fact]
+    public void AllowsShreddedWrites_PreviewNameWithoutVariantType_IsTrue()
+    {
+        // The preview name has no dependency (delta-spark 4.0's VariantShreddingPreviewTableFeature).
+        Assert.True(VariantShreddingConfig.AllowsShreddedWrites(Features("variantShredding-preview"), Enabled));
+    }
+
+    [Theory]
+    [InlineData(2, 7)]
+    [InlineData(3, 6)]
+    public void AllowsShreddedWrites_BelowTheTableFeaturesVersions_IsFalse(int reader, int writer)
+    {
+        var protocol = new ProtocolAction
+        {
+            MinReaderVersion = reader,
+            MinWriterVersion = writer,
+            ReaderFeatures = ["variantType", "variantShredding"],
+            WriterFeatures = ["variantType", "variantShredding"],
+        };
+
+        Assert.False(VariantShreddingConfig.AllowsShreddedWrites(protocol, Enabled));
     }
 
     [Fact]

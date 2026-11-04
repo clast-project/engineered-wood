@@ -32,6 +32,9 @@ public static class VariantShreddingConfig
     /// <summary>The preview reader-writer feature name, which delta-spark 4.0 wrote.</summary>
     public const string PreviewFeatureName = "variantShredding-preview";
 
+    /// <summary>The <c>variantType</c> feature that <see cref="FeatureName"/> depends on.</summary>
+    private const string VariantTypeFeatureName = "variantType";
+
     /// <summary>True when <see cref="EnableKey"/> is <c>true</c> (any case).</summary>
     public static bool IsEnabled(IReadOnlyDictionary<string, string>? configuration) =>
         configuration is not null &&
@@ -39,15 +42,22 @@ public static class VariantShreddingConfig
         string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
-    /// True when <paramref name="protocol"/> lists one of the two names in BOTH <c>readerFeatures</c> and
-    /// <c>writerFeatures</c>. It is a reader-writer feature, so a protocol naming it on the writer side alone has
-    /// not told readers to expect a shredded file, and does not count.
+    /// True when <paramref name="protocol"/> is a table-features protocol (reader 3, writer 7) that lists one of
+    /// the two names in BOTH <c>readerFeatures</c> and <c>writerFeatures</c>. It is a reader-writer feature, so a
+    /// protocol naming it on the writer side alone has not told readers to expect a shredded file, and does not
+    /// count. The GA name also needs its <c>variantType</c> dependency on both sides: a protocol that names
+    /// <c>variantShredding</c> without it is one a strict reader rejects, so EW must not shred into it. The preview
+    /// name has no dependency.
     /// </summary>
-    public static bool IsSupported(ProtocolAction? protocol) =>
-        protocol?.ReaderFeatures is { } reader
-        && protocol.WriterFeatures is { } writer
-        && ((reader.Contains(FeatureName) && writer.Contains(FeatureName))
-            || (reader.Contains(PreviewFeatureName) && writer.Contains(PreviewFeatureName)));
+    public static bool IsSupported(ProtocolAction? protocol)
+    {
+        if (protocol is not { MinReaderVersion: >= 3, MinWriterVersion: >= 7, ReaderFeatures: { } reader, WriterFeatures: { } writer })
+            return false;
+
+        bool BothSides(string feature) => reader.Contains(feature) && writer.Contains(feature);
+
+        return (BothSides(FeatureName) && BothSides(VariantTypeFeatureName)) || BothSides(PreviewFeatureName);
+    }
 
     /// <summary>
     /// True when a writer may shred a variant column of this table: the protocol supports the feature AND the
