@@ -27,6 +27,10 @@ namespace EngineeredWood.DeltaLake.Checkpoint;
 /// arrays, maps) are absent from <c>minValues</c>/<c>maxValues</c> while still counted in
 /// <c>nullCount</c>, exactly as delta-spark writes them.</para>
 ///
+/// <para>A variant column is bounded only when the table supports variant shredding, which is the only
+/// table the protocol lets carry variant min/max: its bound is the Z85 binary Variant of the JSON stats,
+/// split into the Parquet Variant group (<c>metadata</c>, <c>value</c>) delta-spark 4.3 writes there.</para>
+///
 /// <para>Values are decoded from the JSON stats string, so this inherits its precision: decimal
 /// bounds go through <see cref="DecimalText"/> rather than <c>System.Decimal</c>, and a bound that
 /// cannot be represented in the column's own type is written as null (no bound) rather than as a
@@ -38,9 +42,9 @@ internal static class StatsParsedBuilder
     /// Builds the Arrow type for <c>stats_parsed</c>, or null when the schema yields no statistics
     /// at all (a table of nothing but arrays, say) and the column should be omitted.
     /// </summary>
-    public static ArrowStructType? BuildStatsType(DeltaStructType deltaSchema)
+    public static ArrowStructType? BuildStatsType(DeltaStructType deltaSchema, bool variantBounds = false)
     {
-        var fields = BuildStatsFields(deltaSchema);
+        var fields = BuildStatsFields(deltaSchema, variantBounds);
         return fields.Count > 0 ? new ArrowStructType(fields) : null;
     }
 
@@ -49,13 +53,13 @@ internal static class StatsParsedBuilder
     /// <see cref="AddFile"/> rows that carry stats. Null when the schema yields no statistics.
     /// </summary>
     public static StructArray? BuildStatsColumn(
-        List<DeltaAction> actions, int count, DeltaStructType deltaSchema)
+        List<DeltaAction> actions, int count, DeltaStructType deltaSchema, bool variantBounds = false)
     {
-        var statsType = BuildStatsType(deltaSchema);
+        var statsType = BuildStatsType(deltaSchema, variantBounds);
         if (statsType is null)
             return null;
 
-        var boundFields = BuildBoundFields(deltaSchema);
+        var boundFields = BuildBoundFields(deltaSchema, variantBounds);
         var nullCountFields = BuildNullCountFields(deltaSchema);
 
         var numRecords = new FixedStatColumn<long>(count, Int64Type.Default, TryReadInt64);
@@ -105,11 +109,11 @@ internal static class StatsParsedBuilder
 
     #region Schema
 
-    private static List<Field> BuildStatsFields(DeltaStructType deltaSchema)
+    private static List<Field> BuildStatsFields(DeltaStructType deltaSchema, bool variantBounds)
     {
         var fields = new List<Field> { new("numRecords", Int64Type.Default, true) };
 
-        var boundFields = BuildBoundFields(deltaSchema);
+        var boundFields = BuildBoundFields(deltaSchema, variantBounds);
         if (boundFields.Count > 0)
         {
             fields.Add(new Field("minValues", new ArrowStructType(boundFields), true));
@@ -126,23 +130,24 @@ internal static class StatsParsedBuilder
 
     /// <summary>
     /// One field per orderable column, carrying that column's own Arrow type; struct columns recurse
-    /// and are dropped when nothing inside them is orderable.
+    /// and are dropped when nothing inside them is orderable. A variant gets its Variant-typed bound when
+    /// <paramref name="variantBounds"/> (the table supports shredding).
     /// </summary>
-    private static List<Field> BuildBoundFields(DeltaStructType deltaSchema)
+    private static List<Field> BuildBoundFields(DeltaStructType deltaSchema, bool variantBounds)
     {
         var fields = new List<Field>();
         foreach (var field in deltaSchema.Fields)
         {
             if (field.Type is DeltaStructType nested)
             {
-                var nestedFields = BuildBoundFields(nested);
+                var nestedFields = BuildBoundFields(nested, variantBounds);
                 if (nestedFields.Count > 0)
                     fields.Add(new Field(field.Name, new ArrowStructType(nestedFields), true));
                 continue;
             }
 
             var arrowType = TryConvert(field.Type);
-            if (arrowType is not null && IsOrderable(arrowType))
+            if (arrowType is not null && (IsOrderable(arrowType) || (variantBounds && arrowType is VariantType)))
                 fields.Add(new Field(field.Name, arrowType, true));
         }
         return fields;
@@ -332,6 +337,7 @@ internal static class StatsParsedBuilder
         Date32Type => new FixedStatColumn<int>(rowCount, Date32Type.Default, TryReadDate32),
         TimestampType t => new FixedStatColumn<long>(rowCount, t, TryReadTimestamp),
         StringType => new StringStatColumn(rowCount),
+        VariantType v => new VariantStatColumn(rowCount, v),
         // Nothing else reaches here: BuildBoundFields/BuildNullCountFields only emit the above.
         _ => new StringStatColumn(rowCount),
     };
@@ -511,6 +517,64 @@ internal static class StatsParsedBuilder
             byte[] bytes = value.ToByteArray();
             bytes.AsSpan(0, Math.Min(bytes.Length, destination.Length)).CopyTo(destination);
 #endif
+        }
+    }
+
+    /// <summary>
+    /// A variant bound: the JSON stats' Z85 string, split into the Variant's metadata and value. A string that does
+    /// not decode is a null (no bound), never a guess.
+    /// </summary>
+    private sealed class VariantStatColumn(int rowCount, VariantType type) : IStatColumn
+    {
+        private readonly BinaryArray.Builder _metadata = new BinaryArray.Builder().Reserve(rowCount);
+        private readonly BinaryArray.Builder _value = new BinaryArray.Builder().Reserve(rowCount);
+        private readonly ArrowBuffer.BitmapBuilder _validity = new(rowCount);
+        private int _count;
+
+        public void AppendValue(JsonElement value)
+        {
+            if (value.ValueKind == JsonValueKind.String
+                && VariantStatsEncoding.TryDecode(value.GetString()!, out byte[] metadata, out byte[] bytes))
+            {
+                _metadata.Append(metadata.AsSpan());
+                _value.Append(bytes.AsSpan());
+                _validity.Append(true);
+                _count++;
+            }
+            else
+            {
+                AppendNull();
+            }
+        }
+
+        public void AppendNull()
+        {
+            // The children are required in the Variant group: a null bound is the group's null, over empty bytes.
+            _metadata.Append(ReadOnlySpan<byte>.Empty);
+            _value.Append(ReadOnlySpan<byte>.Empty);
+            _validity.Append(false);
+            _count++;
+        }
+
+        public void PadTo(int rowCount)
+        {
+            while (_count < rowCount)
+                AppendNull();
+        }
+
+        public IArrowArray Build()
+        {
+            var storageType = (ArrowStructType)type.StorageType;
+            var children = new IArrowArray[storageType.Fields.Count];
+            for (int i = 0; i < children.Length; i++)
+                children[i] = storageType.Fields[i].Name == "metadata" ? _metadata.Build() : _value.Build();
+            int nulls = _validity.UnsetBitCount;
+            var storage = new StructArray(storageType, _count, children, _validity.Build(), nulls);
+            return type.CreateArray(storage);
+        }
+
+        public void Dispose()
+        {
         }
     }
 

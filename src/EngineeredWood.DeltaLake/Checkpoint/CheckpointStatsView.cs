@@ -186,7 +186,15 @@ internal sealed class CheckpointStatsView
                 continue;
 
             string fieldName = type.Fields[i].Name;
-            if (child is StructArray nested)
+            if (VariantBound(child, row) is { } bound)
+            {
+                writer.WriteString(fieldName, bound);
+            }
+            else if (IsVariantGroup(child))
+            {
+                // A variant bound that does not encode: omitted, a missing bound rather than a wrong one.
+            }
+            else if (child is StructArray nested)
             {
                 writer.WritePropertyName(fieldName);
                 WriteStruct(writer, nested, row);
@@ -277,11 +285,41 @@ internal sealed class CheckpointStatsView
             string name = type.Fields[i].Name;
             string path = prefix is null ? name : prefix + "." + name;
             var child = group.Fields[i];
-            if (child is StructArray)
+            if (child is StructArray && !IsVariantGroup(child))
                 Flatten(child, path, into);
             else
                 into[path] = child;
         }
+    }
+
+    /// <summary>
+    /// Whether a bounds child is a variant column's bound: the Parquet Variant group delta-spark writes (and EW, see
+    /// <c>StatsParsedBuilder</c>), read back as a struct of two binaries, or still typed as a variant. No other
+    /// column's bound has that shape: binary columns get no bounds, so a struct of two binaries is not a user's.
+    /// </summary>
+    private static bool IsVariantGroup(IArrowArray array)
+    {
+        if ((array is VariantArray variant ? variant.Storage : array) is not StructArray st)
+            return false;
+        var type = (ArrowStructType)st.Data.DataType;
+        return type.Fields.Count == 2
+            && FieldIndex(type, "metadata") is int m and >= 0 && type.Fields[m].DataType is Apache.Arrow.Types.BinaryType
+            && FieldIndex(type, "value") is int v and >= 0 && type.Fields[v].DataType is Apache.Arrow.Types.BinaryType;
+    }
+
+    /// <summary>The Z85 JSON form of the variant bound at <paramref name="row"/>, or null when the child is not
+    /// a variant group or the row has no bound.</summary>
+    private static string? VariantBound(IArrowArray array, int row)
+    {
+        var storage = (array is VariantArray variant ? variant.Storage : array) as StructArray;
+        if (storage is null || !IsVariantGroup(array) || storage.IsNull(row))
+            return null;
+        var type = (ArrowStructType)storage.Data.DataType;
+        var metadata = (BinaryArray)storage.Fields[FieldIndex(type, "metadata")];
+        var value = (BinaryArray)storage.Fields[FieldIndex(type, "value")];
+        if (metadata.IsNull(row) || value.IsNull(row))
+            return null;
+        return VariantStatsEncoding.Encode(metadata.GetBytes(row), value.GetBytes(row));
     }
 
     private static IArrowArray? Child(StructArray parent, ArrowStructType type, string name)

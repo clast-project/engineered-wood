@@ -92,6 +92,21 @@ internal static class StatsCollector
             }
         }
 
+        /// <summary>
+        /// Adds the Z85 variant bounds <see cref="VariantFooterStats"/> derived from the written file's footer, for
+        /// the columns the selection takes bounds for. Batches cannot give these: they hold the unshredded value.
+        /// </summary>
+        public void AddVariantBounds(IReadOnlyDictionary<string, (string Min, string Max)> bounds)
+        {
+            foreach (var (name, (min, max)) in bounds)
+            {
+                if (!_selection.Includes(name, out _))
+                    continue;
+                _minValues[name] = new EncodedBound(min);
+                _maxValues[name] = new EncodedBound(max);
+            }
+        }
+
         /// <summary>The stats JSON, or null when no row was added.</summary>
         public string? Serialize() => _totalRows == 0
             ? null
@@ -253,6 +268,13 @@ internal static class StatsCollector
                 writer.WriteStringValue(iso);
                 continue;
             }
+            if (value is EncodedBound encoded)
+            {
+                // Already a complete bound (a variant's Z85 string): never truncated as a string column is.
+                writer.WritePropertyName(kvp.Key);
+                writer.WriteStringValue(encoded.Text);
+                continue;
+            }
             if (value is DecimalStat dec)
             {
                 // A high-precision decimal bound is written as a raw JSON number to preserve full precision.
@@ -274,6 +296,9 @@ internal static class StatsCollector
         }
         writer.WriteEndObject();
     }
+
+    /// <summary>A bound written as the string it already is, such as a variant's Z85 bound.</summary>
+    private sealed record EncodedBound(string Text);
 
     private static void WriteNullCountObject(Utf8JsonWriter writer, Dictionary<string, object> counts)
     {
