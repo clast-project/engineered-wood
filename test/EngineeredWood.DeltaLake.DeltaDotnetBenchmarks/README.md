@@ -28,6 +28,9 @@ Delete a `<name>.ready` marker, or the folder, to rebuild them.
 ## What is measured
 
 Every category has EW as the baseline, so **Ratio = delta-dotnet time / EW time** (above 1 means EW is faster).
+BenchmarkDotNet's own Ratio column is the mean of the per-iteration ratios, which on the noisy single-shot
+mutations can differ from the ratio of the means by 10% or more. The results table below reports the ratio of
+the means it shows, so each ratio can be checked against its row.
 Fixtures are written by *each* engine with its own default writer settings (`Writer` param), and every reader
 runs against both.
 
@@ -109,12 +112,21 @@ itself is fine. `--verify` reports this as a `WARN` on `EW_DeleteDeletionVector`
 ## Results, 2026-11-04
 
 i9-12900K (16 cores / 24 threads), Windows 11, .NET 10.0.11, DeltaLake.Net 0.33.1, at 9b3acc95 (after #669). One
-full run of every class. Mean times; the ratio is delta-dotnet's mean over EW's. The
+full run of every class. Mean times; the ratio is delta-dotnet's mean over EW's (over EW's median where the EW
+column says median), computed from the BenchmarkDotNet CSVs, not taken from its Ratio column. The
 **EW-written / DD-written** columns say which engine wrote the table being read or changed. A ratio above 1
 means EW is faster.
 
-delta-dotnet's own times are within about 5% of the 2026-11-01 run, so the machine did not drift between the two
-runs and EW's changes are the code's.
+How much of EW's change since 2026-11-01 is the code depends on the operation, as delta-dotnet's own times show:
+
+- **Scans, writes, DML and maintenance:** in the full run delta-dotnet is within about 7% of 11-01, so the machine
+  did not drift for these, and EW's changes are its code's. The one exception is the append, 5–12% slower for
+  delta-dotnet (56–66 to 63–68 ms), which only narrows EW's lead.
+- **Log replay** (open, open at version, history, the change feed): delta-dotnet is 6–30% faster than on 11-01
+  (no-checkpoint open 38.9 / 63.1 to 36.6 / 50.9 ms, checkpointed open 5.4 / 7.6 to 4.3 / 5.6 ms, checkpointed
+  history 19 to 13–14 ms). The machine state that slowed small-file opens on 11-01 has passed, for both engines.
+  For these rows only an A/B on today's machine separates EW's code from the machine, and only the open has one
+  (see the log-replay note below).
 
 | Operation | EW | delta-dotnet | DD/EW ratio (EW-written / DD-written) |
 |---|---|---|---|
@@ -122,24 +134,24 @@ runs and EW's changes are the code's.
 | Filtered scan, 1 file of 20 (`Selective`) ‡ | 1.6 / 2.1 ms | 8.6 / 10.4 ms (64K: 8.7 / 10.5) | 5.4 / 5.0 (64K: the same) |
 | Filtered scan, 1 row in 16 (`OneCategory`) ‡ | 6.3 / 7.4 ms (prune only: 3.6 / 6.0 ms) | 15.6 / 18.7 ms (64K: 14.9 / 17.7) | **2.5 / 2.5** (64K: 2.4 / 2.4) |
 | **Full scan, 10M rows in 20 files** ‡ | 77 / 104 ms | 290 / 334 ms; **64K batches: 103 / 144 ms** | 3.8 / 3.2; **64K: 1.34 / 1.39** |
-| **Filtered scan, 1 row in 16, 10M rows** ‡ | 62 / 60 ms | 90 / 118 ms; **64K batches: 72 / 86 ms** | 1.47 / 1.95; **64K: 1.18 / 1.42** |
+| **Filtered scan, 1 row in 16, 10M rows** ‡ | 62 / 60 ms | 90 / 118 ms; **64K batches: 72 / 86 ms** | 1.46 / 1.95; **64K: 1.18 / 1.42** |
 | Open latest, 100 commits, no checkpoint | 4.0 / 5.1 ms | 36.6 / 50.9 ms | **9.3 / 10.0** |
 | Open latest, 100 commits, checkpointed | 1.0 / 0.75 ms | 4.3 / 5.6 ms | 4.1 / 7.5 |
 | Open at version 50, no checkpoint / checkpointed | 6.0–7.5 / 3.2–3.5 ms | 28–33 / 28–33 ms | 4.4–4.8 / 8.8–9.6 |
 | History, no checkpoint / checkpointed | 7.7–9.8 / 5.0–5.8 ms | 35–39 / 13–14 ms | 4.0–4.6 / 2.3–2.8 |
 | Change data feed | 26 / 40 ms | 142 / 167 ms | 5.4 / 4.2 |
-| Create + write 1M rows | 136 ms (min 125) | 201 ms (default) / 176 ms (64K batches) | 1.49 / **1.30** |
-| Open + append 10K rows, no checkpoint / checkpointed | 24 / 11 ms (median) | 63–68 / 25–29 ms | 2.7–2.8 / 2.1–2.8 |
-| DELETE 1 row in 16, copy-on-write | 188 / 187 ms (host-composed: 215 / 223) | 298 / 306 ms | **1.62 / 1.63** |
+| Create + write 1M rows | 136 ms (min 125) | 201 ms (default) / 176 ms (64K batches) | 1.48 / **1.30** |
+| Open + append 10K rows, no checkpoint / checkpointed | 24 / 11 ms (median) | 63–68 / 25–29 ms | 2.6–2.8 / 2.3–2.7 |
+| DELETE 1 row in 16, copy-on-write | 188 / 187 ms (host-composed: 215 / 223) | 298 / 306 ms | **1.59 / 1.63** |
 | DELETE 1 row in 16, EW deletion vector (EW-written DV table only) | 25 ms | none (delta-rs writes no DVs) | — |
-| UPDATE 1 row in 16 | 165 / 157 ms | 234 / 248 ms | 1.43 / 1.60 |
-| MERGE, upsert 10K rows (5K matched) | 183 / 200 ms | 2,366 / 2,425 ms | 13.0 / 12.3 |
-| replaceWhere, 10K-row id range (`Selective`) | 24.1 / 25.4 ms | 48.4 / 51.5 ms | 2.0 / 2.1 |
-| replaceWhere, 1 category in 16 (`OneCategory`) | 214 / 207 ms | 244 / 252 ms | **1.16 / 1.24** |
-| ADD CONSTRAINT `amount >= 0` over 1M rows | 15.6 / 16.0 ms | 49.0 / 64.1 ms | 3.2 / 4.0 |
+| UPDATE 1 row in 16 | 165 / 157 ms | 234 / 248 ms | 1.42 / 1.58 |
+| MERGE, upsert 10K rows (5K matched) | 183 / 200 ms | 2,366 / 2,425 ms | 13.0 / 12.2 |
+| replaceWhere, 10K-row id range (`Selective`) | 24.1 / 25.4 ms | 48.4 / 51.5 ms | 2.0 / 2.0 |
+| replaceWhere, 1 category in 16 (`OneCategory`) | 214 / 207 ms | 244 / 252 ms | **1.14 / 1.22** |
+| ADD CONSTRAINT `amount >= 0` over 1M rows | 15.6 / 16.0 ms | 49.0 / 64.1 ms | 3.1 / 4.0 |
 | RESTORE to before a compaction | 32 / 35 ms | 114 / 101 ms | 3.6 / 2.9 |
-| Checkpoint, 100 commits | 20 / 23 ms | 94 / 92 ms | 4.8 / 4.6 |
-| Compact 100 small files | 190 / 261 ms | 468 / 461 ms | 2.5 / 1.9 |
+| Checkpoint, 100 commits | 20 / 23 ms | 94 / 92 ms | 4.7 / 4.0 |
+| Compact 100 small files | 190 / 261 ms | 468 / 461 ms | 2.5 / 1.8 |
 | Vacuum 100 removed files | 34 / 36 ms (median) | Full 130 / 115 ms; Lite 119 / 104 ms | 3.9 / 3.2 (Full, on EW's median) |
 
 ‡ From a second run of the three scan classes, after the 64K-batch variants and `LargeScanBenchmarks` were added.
@@ -152,25 +164,31 @@ Compared with the 2026-11-01 run, **EW is now faster on every row**, including a
 drew. The margin is smallest where delta-dotnet is at its best: on the 10M-row scans with 64K batches, EW leads by
 1.2–1.4×, not the 2–4× of the 1M-row scans (see [Is delta-dotnet configured fairly?](#is-delta-dotnet-configured-fairly)).
 
+What each change below rests on is said with it: an A/B on today's machine, an EW-only measurement of the feature,
+or only the code that changed in between.
+
 - **Non-selective filtered scans: 1.2–1.3× to 2.5–2.8×.** EW now reads a table's data files in parallel (#607,
   #611) and splits a scan by (file, row group) (#612, #631). The 11-01 run named reading one file after another as
   what remained of delta-dotnet's lead. `ScanWindowBenchmarks` shows the window's effect alone: the 20-file
-  `OneCategory` scan takes 13.8 ms at `MaxConcurrentReads = 1` and 6.5 ms at 2 or 4.
+  `OneCategory` scan takes 13.8 ms at `MaxConcurrentReads = 1` and 6.5 ms at 2 or 4. That isolates the read window
+  (#607/#611) on today's code; the commits were not bisected.
 - **Write: level to 1.3–1.5×,** and EW allocates 206 MB of managed memory for 1M rows where it allocated 322 MB.
   The changes on this path are string statistics that compare UTF-8 bytes instead of decoding every value (#665)
   and joining a row group's batches into exactly-sized buffers (#668); neither was A/B'd here.
-- **Full-file rewrites: about level to 1.2–1.6×.** Copy-on-write DELETE 1.0–1.2× to 1.6×, UPDATE 1.1–1.3× to
-  1.4–1.6×, the one-category replaceWhere 0.98× to 1.16–1.24×. Each writes a 1M-row file, so the write-path changes
+- **Full-file rewrites: about level to 1.1–1.6×.** Copy-on-write DELETE 1.0–1.2× to 1.6×, UPDATE 1.1–1.3× to
+  1.4–1.6×, the one-category replaceWhere 0.98× to 1.14–1.22×. Each writes a 1M-row file, so the write-path changes
   above are the likely cause, not measured separately. The one-category replaceWhere is still the closest row.
-- **Log replay without a checkpoint: 3.6–5.0× to 9–10×.** This is #609's listing fix, which the 11-01 re-measure
-  under-stated. Run today, #609's own commit (60182540) opens the 100-commit table in 4.0 ms, as main does, and
-  the code before it (e3092d09) takes 11.5 ms. The 11-01 re-measure of the same #609 code got 10.8 ms, in the
-  drifted machine state that run notes: unchanged code went from 11 to 18 ms then. delta-dotnet's times
-  for the same rows barely moved, so whatever slowed the machine hit EW's opening of many small files far
-  harder than delta-rs's.
+- **Log replay without a checkpoint: 3.6–5.0× to 9–10×. A/B'd: this is #609's listing fix.** Run today, #609's
+  own commit (60182540) opens the 100-commit table in 4.0 ms, as main does, and the code before it (e3092d09) takes
+  11.5 ms. The 11-01 re-measure of the same #609 code got 10.8 ms, in the drifted machine state that run notes
+  (unchanged code went from 11 to 18 ms then). That state slowed delta-dotnet's opens too, but by far less: its
+  no-checkpoint open is 6–19% faster today, where EW's same code is 63% faster. So the 11-01 ratio understated EW,
+  and today's is the one to use. Open at version and history have no A/B; they replay the same log through the
+  same listing, which is the likely, unmeasured, cause of their gains.
 
 Unchanged: the full scan and the `Selective` filtered scan each read one file, so parallel file reads have
-nothing to work on there, and ADD CONSTRAINT and the change feed are within noise of 11-01.
+nothing to work on there, and ADD CONSTRAINT is within noise of 11-01. The change feed's ratio rose a little (4.9 /
+3.9 to 5.4 / 4.2), but delta-dotnet's own time fell 8–11% with it, so that is the machine as much as the code.
 
 Notes that still hold:
 
