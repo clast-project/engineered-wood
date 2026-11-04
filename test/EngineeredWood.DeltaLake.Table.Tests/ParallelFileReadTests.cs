@@ -15,7 +15,8 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// <summary>
 /// A table scan reading several data files at once (#607) must return exactly what a serial read returns —
 /// the same batches, in the same order, with the same metadata columns — and must stop cleanly on an error,
-/// an early exit or cancellation. The pipeline's own guarantees are tested in <see cref="OrderedFileScanTests"/>.
+/// an early exit or cancellation. The pipeline's own guarantees are tested in <c>OrderedScanTests</c>, in
+/// EngineeredWood.Core.Tests.
 /// </summary>
 public class ParallelFileReadTests : IDisposable
 {
