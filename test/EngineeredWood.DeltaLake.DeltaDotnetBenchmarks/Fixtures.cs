@@ -76,6 +76,19 @@ internal static class Fixtures
                 Enumerable.Range(0, PrunableFiles).Select(i => Data.Generate((long)i * per, per)).ToList());
         });
 
+    /// <summary>The large tables: <see cref="LargeFiles"/> appends of <see cref="LargeRowsPerFile"/>, sorted and disjoint.</summary>
+    public const int LargeFiles = 20;
+    public const int LargeRowsPerFile = 500_000;
+
+    /// <summary>
+    /// <see cref="Prunable"/>'s shape at ten times its rows. Each file's rows are generated just before they are
+    /// written, so building it never holds all 10M rows.
+    /// </summary>
+    public static string Large(TableWriter writer) =>
+        Ensure($"large-{writer}-{LargeFiles}x{LargeRowsPerFile}", path =>
+            Write(writer, path, Enumerable.Range(0, LargeFiles)
+                .Select(i => (IReadOnlyList<Apache.Arrow.RecordBatch>)Data.Generate((long)i * LargeRowsPerFile, LargeRowsPerFile))));
+
     /// <summary><see cref="Commits"/> small appends; a checkpoint at the last version when asked.</summary>
     public static string ManyCommits(TableWriter writer, bool checkpointed) =>
         Ensure($"commits-{writer}-{Commits}x{RowsPerCommit}-{(checkpointed ? "ckpt" : "nockpt")}", async path =>
@@ -264,7 +277,7 @@ internal static class Fixtures
     private static async Task Write(
         TableWriter writer,
         string path,
-        IReadOnlyList<IReadOnlyList<Apache.Arrow.RecordBatch>> commits,
+        IEnumerable<IReadOnlyList<Apache.Arrow.RecordBatch>> commits,
         IReadOnlyDictionary<string, string>? configuration = null)
     {
         configuration ??= NoAutoCheckpoint;
