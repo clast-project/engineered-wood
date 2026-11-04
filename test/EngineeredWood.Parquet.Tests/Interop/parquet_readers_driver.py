@@ -139,8 +139,9 @@ def cmd_count_where(args):
 
     predicate = args["predicate"]
     if reader == "duckdb":
+        # fetchall, not fetchone: DuckDB 2.0 removed Relation.fetchone.
         count = module.sql(
-            f"SELECT count(*) FROM read_parquet(?) WHERE {predicate}", params=[args["path"]]).fetchone()[0]
+            f"SELECT count(*) FROM read_parquet(?) WHERE {predicate}", params=[args["path"]]).fetchall()[0][0]
     else:
         ctx = module.SessionContext()
         ctx.register_parquet("t", args["path"])

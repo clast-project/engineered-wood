@@ -34,7 +34,7 @@ internal static class ExternalParquetReaders
     /// <summary>The versions these assertions were established against — recorded rather than
     /// enforced, so that a reader upgrade which changes behaviour reads as "the oracle moved" and
     /// this is the first number to check.</summary>
-    public const string ValidatedAgainstVersions = "duckdb 1.5.5, datafusion 54.0.0 (arrow-rs)";
+    public const string ValidatedAgainstVersions = "duckdb 2.0.0, datafusion 54.0.0 (arrow-rs)";
 
     public const string DuckDb = "duckdb";
     public const string DataFusion = "datafusion";

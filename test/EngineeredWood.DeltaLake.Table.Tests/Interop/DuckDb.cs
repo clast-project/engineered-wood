@@ -30,7 +30,7 @@ internal static class DuckDb
     /// enforced, for the reason given on <see cref="DeltaRs.ValidatedAgainstVersion"/>: a DuckDB
     /// upgrade that changes behaviour should read as "the oracle moved", and this is the first
     /// number to check.</summary>
-    public const string ValidatedAgainstVersion = "1.5.5";
+    public const string ValidatedAgainstVersion = "2.0.0";
 
     private static readonly InteropDriver Driver = new(
         scriptName: "duckdb_driver.py",
