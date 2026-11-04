@@ -12,6 +12,11 @@ namespace EngineeredWood.Arrow;
 // binary column it starts the value builder empty, so it doubles its way up to the column's size: joining a
 // 23 MB string column allocated 78 MB of builders before the final copy. Here each buffer is allocated once,
 // at its exact size, and written in place.
+//
+// A STOPGAP: apache/arrow-dotnet#463 (merged 2026-10-18, after 23.0.0) fixes this in Arrow itself, for every
+// type. Once EngineeredWood depends on an Apache.Arrow release that includes it, delete this file and the
+// ConcatenatesItself branch in ArrowCompute.Concatenate; ArrayDataConcatenator will then do as well or better
+// (it also stops building fixed-width buffers twice, which this file never touched).
 public static partial class ArrowCompute
 {
     /// <summary>
