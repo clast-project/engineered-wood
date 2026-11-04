@@ -461,18 +461,121 @@ internal static class StatsCollector
         }
     }
 
+    // String min/max is found over the UTF-8 BYTES, decoding only the two winners: for well-formed UTF-8, byte
+    // order IS the code point order CompareStrings defines, so the result is identical to comparing decoded
+    // strings, without a .NET string per cell (#661). The array is validated first. One ill-formed cell sends
+    // the whole array down the decoding path instead. GetString turns a bad sequence into U+FFFD, and the
+    // decoded value can sort on the other side of a bound than its bytes do: cells "a", "é", 0x80 have byte
+    // max "é", but 0x80 decodes to U+FFFD, above it. Fixing up only the winners cannot catch that, because
+    // the offending cell is not one of them.
     private static void CollectStringMinMax(
         string name, StringArray array,
+        Dictionary<string, object?> minValues,
+        Dictionary<string, object?> maxValues)
+    {
+        ReadOnlySpan<int> offsets = array.ValueOffsets;
+        if (!AllCellsWellFormed(array.ValueBuffer.Span, offsets, array.Length))
+        {
+            CollectDecodedStringMinMax(name, array.Length, j => array.IsNull(j), j => array.GetString(j), minValues, maxValues);
+            return;
+        }
+
+        int min = -1, max = -1;
+        ReadOnlySpan<byte> minBytes = default, maxBytes = default;
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (array.IsNull(i)) continue;
+            ReadOnlySpan<byte> val = array.GetBytes(i);
+            if (min < 0)
+            {
+                min = max = i;
+                minBytes = maxBytes = val;
+                continue;
+            }
+            if (val.SequenceCompareTo(minBytes) < 0) { min = i; minBytes = val; }
+            else if (val.SequenceCompareTo(maxBytes) > 0) { max = i; maxBytes = val; }
+        }
+
+        if (min >= 0)
+            MergeStringMinMax(name, array.GetString(min), array.GetString(max), minValues, maxValues);
+    }
+
+    private static void CollectLargeStringMinMax(
+        string name, LargeStringArray array,
+        Dictionary<string, object?> minValues,
+        Dictionary<string, object?> maxValues)
+    {
+        ReadOnlySpan<long> offsets = array.ValueOffsets;
+        if (!AllCellsWellFormed(array.ValueBuffer.Span, offsets, array.Length))
+        {
+            CollectDecodedStringMinMax(name, array.Length, j => array.IsNull(j), j => array.GetString(j), minValues, maxValues);
+            return;
+        }
+
+        int min = -1, max = -1;
+        ReadOnlySpan<byte> minBytes = default, maxBytes = default;
+        for (int i = 0; i < array.Length; i++)
+        {
+            if (array.IsNull(i)) continue;
+            ReadOnlySpan<byte> val = array.GetBytes(i);
+            if (min < 0)
+            {
+                min = max = i;
+                minBytes = maxBytes = val;
+                continue;
+            }
+            if (val.SequenceCompareTo(minBytes) < 0) { min = i; minBytes = val; }
+            else if (val.SequenceCompareTo(maxBytes) > 0) { max = i; maxBytes = val; }
+        }
+
+        if (min >= 0)
+            MergeStringMinMax(name, array.GetString(min), array.GetString(max), minValues, maxValues);
+    }
+
+    // True when every cell of a string array is well-formed UTF-8, checked in ONE pass over the bytes the cells
+    // span rather than a call per (usually short) cell: the span is well-formed, and no cell boundary falls inside
+    // a character (a boundary byte is never a continuation byte). Together these mean every cell is a run of
+    // whole, valid characters. Bytes under a null slot are checked too, which can only cause a needless fallback.
+    private static bool AllCellsWellFormed(ReadOnlySpan<byte> data, ReadOnlySpan<int> offsets, int length)
+    {
+        if (length == 0) return true;
+        int start = offsets[0], end = offsets[length];
+        if (!IsWellFormedUtf8(data.Slice(start, end - start))) return false;
+        for (int i = 1; i < length; i++)
+        {
+            int p = offsets[i];
+            if (p < end && (data[p] & 0xC0) == 0x80) return false;
+        }
+        return true;
+    }
+
+    private static bool AllCellsWellFormed(ReadOnlySpan<byte> data, ReadOnlySpan<long> offsets, int length)
+    {
+        if (length == 0) return true;
+        int start = checked((int)offsets[0]), end = checked((int)offsets[length]);
+        if (!IsWellFormedUtf8(data.Slice(start, end - start))) return false;
+        for (int i = 1; i < length; i++)
+        {
+            long p = offsets[i];
+            if (p < end && (data[(int)p] & 0xC0) == 0x80) return false;
+        }
+        return true;
+    }
+
+    // The fallback for an array holding ill-formed UTF-8: order the DECODED values (bad sequences as U+FFFD),
+    // so the bounds hold for every value as GetString reads it back.
+    private static void CollectDecodedStringMinMax(
+        string name, int length, Func<int, bool> isNull, Func<int, string> getString,
         Dictionary<string, object?> minValues,
         Dictionary<string, object?> maxValues)
     {
         string? min = null;
         string? max = null;
 
-        for (int i = 0; i < array.Length; i++)
+        for (int i = 0; i < length; i++)
         {
-            if (array.IsNull(i)) continue;
-            string val = array.GetString(i);
+            if (isNull(i)) continue;
+            string val = getString(i);
 
             if (min is null || CompareStrings(val, min) < 0) min = val;
             if (max is null || CompareStrings(val, max) > 0) max = val;
@@ -481,24 +584,49 @@ internal static class StatsCollector
         MergeStringMinMax(name, min, max, minValues, maxValues);
     }
 
-    private static void CollectLargeStringMinMax(
-        string name, LargeStringArray array,
-        Dictionary<string, object?> minValues,
-        Dictionary<string, object?> maxValues)
+    /// <summary>
+    /// True when <paramref name="bytes"/> is well-formed UTF-8 (no overlong forms, surrogates, or code points
+    /// above U+10FFFF), the condition under which UTF-8 byte order equals code point order and decoding is lossless.
+    /// </summary>
+    internal static bool IsWellFormedUtf8(ReadOnlySpan<byte> bytes) =>
+#if NET8_0_OR_GREATER
+        System.Text.Unicode.Utf8.IsValid(bytes);
+#else
+        IsWellFormedUtf8Scalar(bytes);
+#endif
+
+    // The netstandard2.0 validator (no Utf8.IsValid there). Always compiled so the tests can check it against
+    // Utf8.IsValid on the modern targets. Ranges follow the Unicode well-formed byte sequences table (Table 3-7).
+    internal static bool IsWellFormedUtf8Scalar(ReadOnlySpan<byte> bytes)
     {
-        string? min = null;
-        string? max = null;
-
-        for (int i = 0; i < array.Length; i++)
+        int i = 0;
+        while (i < bytes.Length)
         {
-            if (array.IsNull(i)) continue;
-            string val = array.GetString(i);
+            byte b = bytes[i];
+            if (b < 0x80) { i++; continue; }
 
-            if (min is null || CompareStrings(val, min) < 0) min = val;
-            if (max is null || CompareStrings(val, max) > 0) max = val;
+            int need;
+            byte lo = 0x80, hi = 0xBF;   // allowed range of the FIRST continuation byte
+            if (b >= 0xC2 && b <= 0xDF) need = 1;
+            else if (b == 0xE0) { need = 2; lo = 0xA0; }
+            else if (b == 0xED) { need = 2; hi = 0x9F; }   // excludes surrogates
+            else if (b >= 0xE1 && b <= 0xEF) need = 2;
+            else if (b == 0xF0) { need = 3; lo = 0x90; }
+            else if (b == 0xF4) { need = 3; hi = 0x8F; }   // caps at U+10FFFF
+            else if (b >= 0xF1 && b <= 0xF3) need = 3;
+            else return false;   // 0x80..0xC1 or 0xF5..0xFF
+
+            if (i + need >= bytes.Length)
+                return false;   // truncated sequence
+            byte c = bytes[i + 1];
+            if (c < lo || c > hi) return false;
+            for (int k = 2; k <= need; k++)
+            {
+                if ((bytes[i + k] & 0xC0) != 0x80) return false;
+            }
+            i += need + 1;
         }
-
-        MergeStringMinMax(name, min, max, minValues, maxValues);
+        return true;
     }
 
     // String bounds are ordered in CODE POINT order (UTF-8 byte order), as Delta specifies and as the pruner
