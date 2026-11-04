@@ -156,12 +156,13 @@ $env:EW_DUCKDB_PYTHON = "…\ew-duckdb\Scripts\python.exe"   # unset -> python o
 $env:EW_REQUIRE_DUCKDB_INTEROP = "1"
 ```
 
-**Version pairing matters.** `delta-spark`'s major version must match
-`pyspark`'s — 4.x with Spark 4.0, 3.x with Spark 3.5. The assertions were
-established against `deltalake` 1.6.2 and `pyspark` 4.0.4 /
+**Version pairing matters.** `delta-spark` must be built for the `pyspark` it
+runs on (below). The assertions were established against `deltalake` 1.6.2 and
+two Spark pairings, `pyspark` 4.1.2 / `delta-spark` 4.3.1 and `pyspark` 4.0.4 /
 `delta-spark` 4.0.0; those are recorded in `DeltaRs.ValidatedAgainstVersion`
-and `Spark.ValidatedAgainstVersion`. If these tests fail after an upgrade,
-check the tool version before assuming an EngineeredWood regression.
+and `Spark.ValidatedAgainstVersion`, and the nightly `Interop` workflow runs
+one lane per Spark pairing. If these tests fail after an upgrade, check the
+tool version before assuming an EngineeredWood regression.
 
 **On Windows, `pyspark` 4.0.3 is a hard floor under Python 3.12+.** Earlier
 4.0.x hit [SPARK-53759](https://issues.apache.org/jira/browse/SPARK-53759) — a
@@ -182,17 +183,19 @@ reader throws an NPE on an annotated group (which is why the writer has
 `DeltaTableOptions.EmitVariantLogicalType`). `VariantInteropTests` is
 version-aware — it writes whichever layout the running Spark reads — so the
 tier stays green under either. It also covers **nested** variant (a variant
-inside a struct); those cases require GA variant and self-skip on 4.0.x. To run
-the GA + nested cases against a Spark 4.1 build without disturbing the 4.0.x
-install the rest of tier 3 is pinned to, put 4.1 in its own venv (`pyspark`
-bundles its JARs, so two versions cannot share one environment) and point the
-tier at it:
+inside a struct); those cases require GA variant and self-skip on 4.0.x. The
+nightly runs both: its `spark-4.1` lane is the primary one and runs every case,
+and its `spark-4.0` lane keeps the unannotated layout and the
+`variantShredding-preview` feature covered. To do the same locally, give each
+Spark its own venv (`pyspark` bundles its JARs, so two versions cannot share
+one environment) and point the tier at the one you want:
 
 The pairing depends on your Python, and neither one is the "obvious" latest:
 
 ```
-# Python 3.13 (what CI uses). --no-deps is REQUIRED; see below.
-py -3.13 -m venv spark41 && spark41\Scripts\pip install --no-deps pyspark==4.1.2 delta-spark==4.3.1
+# Python 3.13 (what CI uses). --no-deps on delta-spark is REQUIRED; see below.
+py -3.13 -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.2 importlib_metadata==8.7.1
+spark41\Scripts\pip install --no-deps delta-spark==4.3.1
 
 # Python 3.11
 py -3.11 -m venv spark41 && spark41\Scripts\pip install pyspark==4.1.1 delta-spark==4.1.0
@@ -203,7 +206,7 @@ $env:EW_SPARK_PYTHON = "…\spark41\Scripts\python.exe"   # tier 3 uses this int
 Both are measured at **216 passed / 0 skipped** across the interop tier
 (2026-11-04, with delta-rs and DuckDB present too). The `Skipped: 0` is the
 point: it is what proves the GA-variant, shredded-table and `stats_parsed`
-cases actually ran, which the default 4.0.x lane reports as 7 skips.
+cases actually ran, which the 4.0.x lane reports as 7 skips.
 
 **Why the versions differ by interpreter.** On Python 3.13, `pyspark` must be
 ≥ 4.1.2 for SPARK-53759 (the Windows worker crash above), but `delta-spark`
@@ -220,7 +223,10 @@ not apply, so the older, self-consistent 4.1.1 / 4.1.0 pairing is fine — and
 `Requires-Dist: pyspark<=4.1.1,>=4.0.1` — it caps *below* the 4.1.2 that
 carries the Windows fix, so pip refuses the combination with
 `ResolutionImpossible`. The pairing works anyway; treat it as
-unsupported-but-measured and re-verify on any bump.
+unsupported-but-measured and re-verify on any bump. Only `delta-spark` takes
+`--no-deps`: `pyspark` needs its `py4j`, and `delta-spark`'s one other
+dependency, `importlib_metadata`, is installed by hand within its declared
+range (`<=8.7.1`).
 
 **Do not "fix" that by moving to `delta-spark` 4.4.0.** It is the first to
 widen the cap (`pyspark<=4.2.0`) so `pyspark 4.2.0 + delta-spark 4.4.0`
@@ -488,9 +494,9 @@ A skip is honest, but an honest green is still a green — a job can skip an
 entire tier and pass. So you still want both defences:
 
 - **Read `Skipped:`.** It now tells you *which* tests did not run and why,
-  instead of hiding them in the Passed column. On the pinned oracles the
-  expected count is **7**, not 0 — see the note below. More than that means
-  something went dark.
+  instead of hiding them in the Passed column. On the Spark 4.1 pairing the
+  expected count is **0**; on the 4.0 pairing it is **7** — see the note
+  below. More than that means something went dark.
 - **Set the `EW_REQUIRE_*` variables** ([above](#making-a-missing-toolchain-fail-loudly)). They turn an unreachable
   tier into a loud failure, which is the only thing that makes a green run
   *prove* the tier ran. The skip says what happened; the variable says
@@ -498,10 +504,10 @@ entire tier and pass. So you still want both defences:
 
 Skips are not only about a missing toolchain, and this is the part worth
 internalising: **seven tests skip on a fully-configured machine**, because
-the *feature* is newer than the pinned oracle — GA `VARIANT` needs Spark
+the *feature* is newer than the oracle — GA `VARIANT` needs Spark
 4.1+ and DuckDB 1.4+, `add.stats_parsed` needs delta-spark 4.1+, and the two
 shredded-table cases (#671) need Spark 4.1 to shred at all. So the
-healthy result on the pinned 4.0 pairing is:
+healthy result on the 4.0 pairing (the nightly's `spark-4.0` lane) is:
 
 ```
 Passed!  - Failed: 0, Passed: 209, Skipped: 7, Total: 216
@@ -515,7 +521,7 @@ pairing never meant what it appeared to. Point the Spark tier at a 4.1 venv
 
 CI does this for you now: the delta-rs and DuckDB tiers run on every commit
 with their require-variables set, and the full matrix including Spark runs
-in the nightly `Interop` workflow. So a tier going dark locally no longer
+in the nightly `Interop` workflow, once per Spark pairing. So a tier going dark locally no longer
 means it is dark everywhere — but it does mean *your* run proved less than
 it looked like it did.
 
