@@ -951,8 +951,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // The creation commit gets a commitInfo like every other commit, so version 0 is dated and named
             // in history. Build the snapshot from the actions already in memory instead of listing and reading
             // back the commit we just wrote.
+            // Based on no table: the configuration the commit installs is its own metaData's.
             var createActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                actions, configurationBuilder, "CREATE TABLE", commitProperties: commitProperties);
+                actions, configuration: null, version: 0, "CREATE TABLE", commitProperties: commitProperties);
             await log.WriteCommitAsync(0, createActions, cancellationToken).ConfigureAwait(false);
 
             var builder = new SnapshotBuilder();
@@ -1008,9 +1009,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             string operation = previousSnapshot is null
                 ? "CREATE TABLE AS SELECT"
                 : "CREATE OR REPLACE TABLE AS SELECT";
-            var commitActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                actions, configurationBuilder, operation, commitProperties: commitProperties);
             long version = latestVersion + 1;
+            // Based on the replaced table, if any: a REPLACE that turns in-commit timestamps on mid-life records
+            // where they begin, as any other commit that enables them does (#598).
+            var commitActions = Log.InCommitTimestamp.EnsureCommitInfo(
+                actions, previousSnapshot?.Metadata.Configuration, version, operation,
+                commitProperties: commitProperties,
+                previousCommitTimestamp: await Log.InCommitTimestamp.ResolvePreviousTimestampAsync(
+                    log, previousSnapshot, actions, cancellationToken).ConfigureAwait(false));
 
             await log.WriteCommitAsync(version, commitActions, cancellationToken).ConfigureAwait(false);
             written.Clear();
@@ -2101,7 +2107,28 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             EnsureUniversalFormatMaintained(extraActions, _options);
             EnsureNoInvalidIsolationLevelIntroduced(snapshot, extraActions);
             EnsureNoFeaturePropertiesIntroduced(snapshot, extraActions);
-            actions.AddRange(extraActions);
+            // One commit carries at most one protocol action. A caller's protocol replaces the table's, so the
+            // clustering upgrade is applied to it rather than committed beside it (#598).
+            if (extraActions.OfType<ProtocolAction>().LastOrDefault() is { } callerProtocol)
+            {
+                actions.RemoveAll(static action => action is ProtocolAction);
+                if (logicalColumns is { Count: > 0 })
+                {
+                    callerProtocol = UpgradeProtocolForWriterFeatures(
+                        callerProtocol, ["clustering", DomainMetadataFeature]) ?? callerProtocol;
+                }
+                foreach (var action in extraActions)
+                {
+                    if (action is ProtocolAction)
+                        continue;
+                    actions.Add(action);
+                }
+                actions.Add(callerProtocol);
+            }
+            else
+            {
+                actions.AddRange(extraActions);
+            }
         }
         if (actions.Count == 0)
             return snapshot.Version; // nothing to change
@@ -7135,8 +7162,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // on files. Recording that is what lets another engine's checker examine it rather than fall
             // back to a default that happens to agree.
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
-                actions, snapshot.Metadata.Configuration, "WRITE", isBlindAppend: false,
-                commitProperties: commitProperties);
+                actions, snapshot.Metadata.Configuration, newVersion, "WRITE", isBlindAppend: false,
+                commitProperties: commitProperties,
+                previousCommitTimestamp: await Log.InCommitTimestamp.ResolvePreviousTimestampAsync(
+                    _log, snapshot, actions, cancellationToken).ConfigureAwait(false));
             await _log.WriteCommitAsync(newVersion, finalActions, cancellationToken)
                 .ConfigureAwait(false);
             // Durable: these files are the table's now, whatever the refresh below does. Same reasoning as

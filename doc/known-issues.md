@@ -577,8 +577,12 @@ delta-spark jar and collect the first argument of each `buildConfig` call.
 `delta.checkpoint.writeStatsAsJson` / `writeStatsAsStruct`; `delta.columnMapping.mode` /
 `maxColumnId`; `delta.constraints.*`; `delta.deletedFileRetentionDuration` (checkpoint tombstones and
 VACUUM); `delta.enableChangeDataFeed`; `delta.enableDeletionVectors`; `delta.enableExpiredLogCleanup`
-and `delta.logRetentionDuration` (`LogCleanup`); `delta.enableIcebergCompatV1` / `V2`;
-`delta.enableInCommitTimestamps`; `delta.enableRowTracking` and its two materialized-column names;
+and `delta.logRetentionDuration` (`LogCleanup`: by the listing's modification times, as delta-spark does, or, where the
+file system cannot date its files, by the commits' in-commit timestamps when the table has them, #115; without either
+it deletes nothing); `delta.enableIcebergCompatV1` / `V2`;
+`delta.enableInCommitTimestamps`, and `delta.inCommitTimestampEnablementVersion` / `…Timestamp`, which any commit that
+turns in-commit timestamps on for an existing table records as Spark does (#598; pinned by
+`InCommitTimestampMidLifeInteropTests`), and which log cleanup reads (below); `delta.enableRowTracking` and its two materialized-column names;
 `delta.enableTypeWidening`; `delta.isolationLevel` (DML, appends and transactions started without a level run at
 the table's level; asking for a weaker one is refused, and a value naming no level refuses data-changing commits
 with `DELTA_INVALID_ISOLATION_LEVEL`, #472). An ABSENT property reads as `WriteSerializable`, which is Databricks'
@@ -642,7 +646,6 @@ for `delta.feature.*`. There is no API to set a protocol version mid-life except
 | `delta.compatibility.symlinkFormatManifest.enabled` | Symlink manifests (for Presto/Athena-style readers) are not regenerated. |
 | `delta.setTransactionRetentionDuration` | Expired `txn` (idempotent-write) identifiers are never dropped from checkpoints. |
 | `delta.rowTrackingSuspended` | Not read. What Spark expects of a writer while suspended is not yet verified. |
-| `delta.inCommitTimestampEnablementVersion` / `…Timestamp` | Not read. EW sets them only implicitly (in-commit timestamps enabled at creation need neither). Unverified for a table that enabled them mid-life, where timestamp time travel across the boundary depends on them. |
 | `delta.enableChangeDataCapture` | Not read. Spark defines it as a key separate from `enableChangeDataFeed`; how Spark uses it is not yet verified. |
 | `delta.randomizeFilePrefixes`, `delta.randomPrefixLength` | Data files are not given random prefixes (layout only). |
 | `delta.checkpointRetentionDuration` | Not read; log cleanup goes by `delta.logRetentionDuration`. |

@@ -279,16 +279,30 @@ internal static class VacuumExecutor
     {
         // Both bookend commits carry the caller's properties, as Spark's do: its userMetadata is set per
         // session, and VACUUM START and VACUUM END are two commits of that session.
-        var commitInfo = InCommitTimestamp.CreateCommitInfo(
-            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), operation, additionalValues,
-            includeInCommitTimestamp: InCommitTimestamp.IsEnabled(snapshot.Metadata.Configuration),
-            commitProperties: commitProperties);
-        IReadOnlyList<DeltaAction> actions = new DeltaAction[] { commitInfo };
+        bool timestamped = InCommitTimestamp.IsEnabled(snapshot.Metadata.Configuration);
 
         const int maxAttempts = 16;
         long version = firstCandidateVersion;
         for (int attempt = 0; ; attempt++, version++)
         {
+            // Prepared per attempt: an in-commit timestamp must come after the commit just below THIS version,
+            // whatever the clocks say, and that is START for END, or whatever a concurrent writer just landed.
+            long timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            if (timestamped
+                && await PreviousTimestampAsync(log, snapshot, version, cancellationToken).ConfigureAwait(false)
+                    is { } previous
+                && timestamp <= previous)
+            {
+                timestamp = previous + 1;
+            }
+            IReadOnlyList<DeltaAction> actions =
+            [
+                InCommitTimestamp.CreateCommitInfo(
+                    timestamp, operation, additionalValues,
+                    includeInCommitTimestamp: timestamped,
+                    commitProperties: commitProperties),
+            ];
+
             try
             {
                 await log.WriteCommitAsync(version, actions, cancellationToken).ConfigureAwait(false);
@@ -298,6 +312,24 @@ internal static class VacuumExecutor
             {
                 // A concurrent writer took this version — try the next one.
             }
+        }
+    }
+
+    // The timestamp of the commit at `version` - 1: the snapshot's own when that is the snapshot's version and it
+    // knows it, else read from the log. Null when it cannot be read; the timestamp is then the clock's alone.
+    private static async ValueTask<long?> PreviousTimestampAsync(
+        TransactionLog log, DeltaSnapshot snapshot, long version, CancellationToken cancellationToken)
+    {
+        if (version - 1 == snapshot.Version && snapshot.InCommitTimestamp is { } known)
+            return known;
+        try
+        {
+            var actions = await log.ReadCommitAsync(version - 1, cancellationToken).ConfigureAwait(false);
+            return InCommitTimestamp.GetTimestampFromActions(actions);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null;
         }
     }
 

@@ -135,57 +135,49 @@ internal static class LogCleanup
             ? a.Version.CompareTo(b.Version)
             : string.CompareOrdinal(a.Path, b.Path));
 
-        // ⚠ A FILESYSTEM THAT CANNOT DATE ITS FILES GETS NO CLEANUP, and this guard is not theoretical:
-        // an ITableFileSystem is free to return a placeholder when its backing listing carries no
+        // ⚠ A FILESYSTEM THAT CANNOT DATE ITS FILES GETS NO AGE FROM THE LISTING, and this guard is not
+        // theoretical: an ITableFileSystem is free to return a placeholder when its backing listing carries no
         // modification time, and one host was found reporting a constant epoch for every file. Under that
-        // value every commit looks decades old and is therefore expired the instant it is written.
-        // Deleting by age is only safe where the age is real, so an absent timestamp declines the whole
-        // pass rather than defaulting to one — the opposite choice silently deletes live history.
-        //
-        // "No cleanup" is the safe answer here, not the only possible one. A table with
-        // `delta.enableInCommitTimestamps` carries an authoritative, monotonic per-commit timestamp INSIDE
-        // the commit, which is exactly the fact this pass is missing — and the spec already treats file
-        // modification time as the unreliable one, requiring in-commit timestamps on catalog-managed
-        // tables because "the file modification timestamp of the published file will not accurately
-        // reflect the original commit time". Using it would make cleanup work where the listing cannot
-        // date anything, at the cost of reading commits rather than only listing them. See upstream #115;
-        // it is a bigger change than it looks (checkpoint files carry no such timestamp, and a mid-life
-        // enablement leaves the commits before it with none), which is why this pass declines instead.
+        // value every commit looks decades old and is therefore expired the instant it is written. Deleting
+        // by age is only safe where the age is real, so an absent timestamp never defaults to one — the
+        // opposite choice silently deletes live history.
+        bool listingDatesEverything = true;
         foreach (var candidate in candidates)
         {
             if (candidate.Modified <= UnknownModifiedThreshold)
+            {
+                listingDatesEverything = false;
+                break;
+            }
+        }
+
+        int cut;
+        if (listingDatesEverything)
+        {
+            // The common case, and delta-spark's rule (MetadataCleanup.listExpiredDeltaLogs ages files by their
+            // modification time even on a table with in-commit timestamps), so it is kept exactly.
+            cut = CutByModificationTime(candidates, maxDeletableVersion, cutoff);
+        }
+        else if (InCommitTimestamp.IsEnabled(configuration))
+        {
+            // The table dates its own commits (#115). Only where the listing cannot: preferring them everywhere
+            // would make this library expire a different set from delta-spark's on the same table.
+            try
+            {
+                cut = await CutByInCommitTimestampAsync(
+                    log, configuration, candidates, maxDeletableVersion, cutoff, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                onFailure?.Invoke(ex);
                 return 0;
+            }
         }
-
-        int cut = 0;
-        while (cut < candidates.Count
-               && candidates[cut].Version <= maxDeletableVersion
-               && candidates[cut].Modified < cutoff)
+        else
         {
-            cut++;
-        }
-        if (cut == 0)
+            // No age from either source: the safe answer is to keep everything.
             return 0;
-
-        // ⚠ THE ADJUSTMENT ANCHOR, and it is the one part not obvious from the rule above.
-        //
-        // Delta presents commit timestamps as strictly increasing with version, adjusting a file whose
-        // modification time is not GREATER than its predecessor's to predecessor + 1 ms. A reader doing
-        // time-travel-BY-TIMESTAMP therefore depends on the file its answer was adjusted from: delete that
-        // and the same timestamp query starts answering with a different version.
-        //
-        // This library's own time travel is immune — GetSnapshotAtTimestampAsync reads the IN-COMMIT
-        // timestamp out of the actions and never consults file metadata — but a Delta reader on the same
-        // table is not, so the anchor is not ours to break.
-        //
-        // ⚠ It only matters for a SURVIVOR: if a file's dependent is ALSO being deleted, no reader can ask
-        // about it. So rather than reproduce Delta's buffering iterator, walk the cut BACK over the chain
-        // the first survivor depends on. Uniform timestamps therefore retain everything, which is the safe
-        // direction and self-correcting — the next checkpoint retries with a different boundary.
-        while (cut > 0 && cut < candidates.Count
-               && candidates[cut].Modified <= candidates[cut - 1].Modified)
-        {
-            cut--;
         }
         if (cut == 0)
             return 0;
@@ -210,8 +202,14 @@ internal static class LogCleanup
 
         // Deletion above is a strict prefix that stops at the first failure, so candidates[deleted..] is
         // exactly what is still on the log — which is what the sweeps below key off.
-        deleted += await SweepUnreferencedSidecarsAsync(
-            log, candidates, firstSurvivor: deleted, cutoff, onFailure, cancellationToken).ConfigureAwait(false);
+        // Only when the listing dated everything. The sweep's age guard is the sidecar's own modification time, and
+        // a listing that could not date a commit is no source for that: an unreferenced sidecar may be one a
+        // concurrent checkpoint is about to name. In-commit timestamps date commits, not sidecars, so these stay.
+        if (listingDatesEverything)
+        {
+            deleted += await SweepUnreferencedSidecarsAsync(
+                log, candidates, firstSurvivor: deleted, cutoff, onFailure, cancellationToken).ConfigureAwait(false);
+        }
 
         // long.MaxValue when nothing survived: every commit this log had is gone, so every checksum
         // describes a version that is gone. Reachable only when the caller names a checkpoint version above
@@ -222,9 +220,146 @@ internal static class LogCleanup
             : long.MaxValue;
 
         deleted += await SweepExpiredChecksumsAsync(
-            log, checksums, firstSurvivingVersion, cutoff, onFailure, cancellationToken).ConfigureAwait(false);
+            log, checksums, firstSurvivingVersion, cutoff, agedByListing: listingDatesEverything, onFailure,
+            cancellationToken).ConfigureAwait(false);
 
         return deleted;
+    }
+
+    /// <summary>
+    /// How many of <paramref name="candidates"/> (sorted by version) may go, by the listing's modification times.
+    /// </summary>
+    private static int CutByModificationTime(
+        List<(long Version, string Path, DateTimeOffset Modified)> candidates,
+        long maxDeletableVersion,
+        DateTimeOffset cutoff)
+    {
+        int cut = 0;
+        while (cut < candidates.Count
+               && candidates[cut].Version <= maxDeletableVersion
+               && candidates[cut].Modified < cutoff)
+        {
+            cut++;
+        }
+
+        // ⚠ THE ADJUSTMENT ANCHOR, and it is the one part not obvious from the rule above.
+        //
+        // Delta presents commit timestamps as strictly increasing with version, adjusting a file whose
+        // modification time is not GREATER than its predecessor's to predecessor + 1 ms. A reader doing
+        // time-travel-BY-TIMESTAMP therefore depends on the file its answer was adjusted from: delete that
+        // and the same timestamp query starts answering with a different version.
+        //
+        // This library's own time travel is immune — GetSnapshotAtTimestampAsync reads the IN-COMMIT
+        // timestamp out of the actions and never consults file metadata — but a Delta reader on the same
+        // table is not, so the anchor is not ours to break.
+        //
+        // ⚠ It only matters for a SURVIVOR: if a file's dependent is ALSO being deleted, no reader can ask
+        // about it. So rather than reproduce Delta's buffering iterator, walk the cut BACK over the chain
+        // the first survivor depends on. Uniform timestamps therefore retain everything, which is the safe
+        // direction and self-correcting — the next checkpoint retries with a different boundary.
+        while (cut > 0 && cut < candidates.Count
+               && candidates[cut].Modified <= candidates[cut - 1].Modified)
+        {
+            cut--;
+        }
+        return cut;
+    }
+
+    /// <summary>
+    /// How many of <paramref name="candidates"/> (sorted by version) may go, by the in-commit timestamps the commits
+    /// carry, for a table whose listing cannot date its files (#115).
+    /// </summary>
+    /// <remarks>
+    /// <para><b>The boundary.</b> The newest commit B at or below <paramref name="maxDeletableVersion"/> whose
+    /// <c>inCommitTimestamp</c> is before <paramref name="cutoff"/>. Everything at or below B goes, commits and
+    /// checkpoints alike. A commit below B was written before B was (version N+1 cannot exist until N does), and B's
+    /// timestamp is at least the clock when B was written, so B's timestamp bounds the age of everything below it.
+    /// That makes the answer sound whatever the commits between the probes hold.</para>
+    ///
+    /// <para><b>Binary-searched</b>, because in-commit timestamps increase with version — the property the feature
+    /// exists to provide. So a pass reads O(log N) commits, not N. A probe that carries no
+    /// <c>inCommitTimestamp</c> (a commit from before the feature, or from a writer that never stamped where it
+    /// began) ends the pass with nothing deleted, rather than guessing.</para>
+    ///
+    /// <para><b>A mid-life enablement</b> (<see cref="InCommitTimestamp.EnablementVersionKey"/>) leaves the commits
+    /// before it with no timestamp, so the search starts at the enablement version. Those earlier commits still go
+    /// once the enablement commit has expired, by the bound above. Until then they stay, the safe direction.</para>
+    ///
+    /// <para><b>A checkpoint is dated by its version's commit.</b> It carries no timestamp of its own, and was written
+    /// at or after that commit, so this can delete a checkpoint younger than the horizon. That is a policy choice,
+    /// not a correctness risk: only checkpoints older than the newest one are candidates, so a newer checkpoint
+    /// always covers the table.</para>
+    ///
+    /// <para><b>No adjustment anchor.</b> The walk-back by modification time exists because file times have to be
+    /// adjusted into an increasing order. In-commit timestamps already increase, so there is nothing to anchor.</para>
+    /// </remarks>
+    private static async ValueTask<int> CutByInCommitTimestampAsync(
+        TransactionLog log,
+        IReadOnlyDictionary<string, string>? configuration,
+        List<(long Version, string Path, DateTimeOffset Modified)> candidates,
+        long maxDeletableVersion,
+        DateTimeOffset cutoff,
+        CancellationToken cancellationToken)
+    {
+        long firstTimestamped = InCommitTimestamp.GetEnablement(configuration) is { } enablement
+            ? enablement.Version
+            : long.MinValue;
+
+        // The commits the search may probe, ascending. Distinct, though a listing should not repeat a name.
+        var probes = new List<long>();
+        foreach (var (version, path, _) in candidates)
+        {
+            if (version < firstTimestamped || version > maxDeletableVersion)
+                continue;
+            if (!DeltaVersion.TryParseCommitVersion(FileName(path), out _))
+                continue;
+            if (probes.Count == 0 || probes[probes.Count - 1] != version)
+                probes.Add(version);
+        }
+        if (probes.Count == 0)
+            return 0;
+
+        long cutoffMs = cutoff.ToUnixTimeMilliseconds();
+        long? boundary = null;
+        int lo = 0, hi = probes.Count - 1;
+        while (lo <= hi)
+        {
+            int mid = lo + ((hi - lo) / 2);
+            var actions = await log.ReadCommitAsync(probes[mid], cancellationToken).ConfigureAwait(false);
+            if (StrictInCommitTimestamp(actions) is not { } timestamp)
+                return 0;
+            if (timestamp < cutoffMs)
+            {
+                boundary = probes[mid];
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+        if (boundary is not { } b)
+            return 0;
+
+        int cut = 0;
+        while (cut < candidates.Count && candidates[cut].Version <= b)
+            cut++;
+        return cut;
+    }
+
+    // The commit's own inCommitTimestamp. Not InCommitTimestamp.GetTimestamp, which falls back to commitInfo's
+    // informational `timestamp`: that one is not promised to increase, and this decides what gets deleted.
+    private static long? StrictInCommitTimestamp(IReadOnlyList<Actions.DeltaAction> actions)
+    {
+        foreach (var action in actions)
+        {
+            if (action is Actions.CommitInfo commitInfo
+                && commitInfo.GetValue("inCommitTimestamp") is { ValueKind: System.Text.Json.JsonValueKind.Number } ts)
+            {
+                return ts.GetInt64();
+            }
+        }
+        return null;
     }
 
     /// <summary>
@@ -256,12 +391,17 @@ internal static class LogCleanup
     /// <para>Order does not matter here — a missing checksum reads as "no checksum", which is what every
     /// version without one already looks like — so a file that will not delete is skipped rather than
     /// ending the pass.</para>
+    ///
+    /// <para>When the commits were aged by their in-commit timestamps (<paramref name="agedByListing"/> false), the
+    /// listing has no usable age for a checksum either, so the version alone decides: a checksum for a commit that
+    /// is gone describes nothing.</para>
     /// </remarks>
     private static async ValueTask<int> SweepExpiredChecksumsAsync(
         TransactionLog log,
         List<(long Version, string Path, DateTimeOffset Modified)> checksums,
         long firstSurvivingVersion,
         DateTimeOffset cutoff,
+        bool agedByListing,
         Action<Exception>? onFailure,
         CancellationToken cancellationToken)
     {
@@ -273,7 +413,7 @@ internal static class LogCleanup
             if (version >= firstSurvivingVersion)
                 continue;
             // Same reasoning as the commit pass: an age we cannot trust is not an age.
-            if (modified <= UnknownModifiedThreshold || modified >= cutoff)
+            if (agedByListing && (modified <= UnknownModifiedThreshold || modified >= cutoff))
                 continue;
 
             try

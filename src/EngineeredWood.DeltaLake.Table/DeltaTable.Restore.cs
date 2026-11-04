@@ -13,8 +13,6 @@ namespace EngineeredWood.DeltaLake.Table;
 
 public sealed partial class DeltaTable
 {
-    private const string InCommitTimestampEnablementVersionKey = "delta.inCommitTimestampEnablementVersion";
-    private const string InCommitTimestampEnablementTimestampKey = "delta.inCommitTimestampEnablementTimestamp";
     private const int MissingFilesReported = 100;
     private const int ExistenceChecksInFlight = 32;
 
@@ -186,28 +184,9 @@ public sealed partial class DeltaTable
             parameters["timestamp"] = timestampText;
 
         var actions = new List<DeltaAction>(toAdd.Count + toRemove.Count + 5);
-        if (InCommitTimestamp.IsEnabled(metadata.Configuration)
-            && !InCommitTimestamp.IsEnabled(current.Metadata.Configuration))
-        {
-            // The restore turns in-commit timestamps back on, so it is where they begin again: this commit carries
-            // one, and the metadata records it as the enablement point, as Spark's commit stamps a mid-life
-            // enablement. The committer would otherwise judge by the current metadata and write none.
-            long timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            var configuration = metadata.Configuration!.ToDictionary(p => p.Key, p => p.Value, StringComparer.Ordinal);
-            configuration[InCommitTimestampEnablementVersionKey] = Invariant(restoreVersion);
-            configuration[InCommitTimestampEnablementTimestampKey] = Invariant(timestamp);
-            metadata = metadata with { Configuration = configuration };
-            actions.Add(InCommitTimestamp.CreateCommitInfo(
-                timestamp, "RESTORE",
-                new Dictionary<string, System.Text.Json.JsonElement>(StringComparer.Ordinal)
-                {
-                    ["isBlindAppend"] = System.Text.Json.JsonDocument.Parse("false").RootElement.Clone(),
-                    // Here, not through the committer: it adds parameters only to a commitInfo that has none, and
-                    // this one is born with an empty object.
-                    ["operationParameters"] = StringMapJson(parameters),
-                },
-                includeInCommitTimestamp: true));
-        }
+        // A restore that turns in-commit timestamps back on is where they begin again. The committer sees that this
+        // metadata enables them and the current one does not, so it timestamps the commit and stamps the enablement
+        // point, as it does for any commit that enables them (#598).
         actions.Add(metadata);
         if (!ProtocolEquals(protocol, current.Protocol))
             actions.Add(protocol);
@@ -455,17 +434,4 @@ public sealed partial class DeltaTable
 
     private static string Invariant(long value) => value.ToString(CultureInfo.InvariantCulture);
 
-    private static System.Text.Json.JsonElement StringMapJson(IReadOnlyDictionary<string, string> map)
-    {
-        using var stream = new MemoryStream();
-        using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
-        {
-            writer.WriteStartObject();
-            foreach (var pair in map)
-                writer.WriteString(pair.Key, pair.Value);
-            writer.WriteEndObject();
-        }
-        using var document = System.Text.Json.JsonDocument.Parse(stream.ToArray());
-        return document.RootElement.Clone();
-    }
 }

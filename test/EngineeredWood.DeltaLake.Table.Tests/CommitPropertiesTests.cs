@@ -255,7 +255,7 @@ public class CommitPropertiesTests : IDisposable
         IReadOnlyList<DeltaAction> actions = [existing];
 
         var merged = InCommitTimestamp.EnsureCommitInfo(
-            actions, configuration: null, commitProperties: Tagged("run-1"));
+            actions, configuration: null, version: 1, commitProperties: Tagged("run-1"));
         var info = Assert.IsType<CommitInfo>(Assert.Single(merged));
         Assert.Equal("run-1", info.GetValue("userMetadata")!.Value.GetString());
         Assert.Equal("host", info.GetValue("jobId")!.Value.GetString());
@@ -268,7 +268,7 @@ public class CommitPropertiesTests : IDisposable
             },
         };
         var ex = Assert.Throws<ArgumentException>(() => InCommitTimestamp.EnsureCommitInfo(
-            actions, configuration: null, commitProperties: colliding));
+            actions, configuration: null, version: 1, commitProperties: colliding));
         Assert.Contains("commitInfo.jobId", ex.Message);
     }
 }

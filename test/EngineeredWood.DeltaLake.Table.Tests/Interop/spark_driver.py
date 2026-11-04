@@ -133,6 +133,21 @@ def cmd_read(args):
     }
 
 
+def cmd_read_as_of(args):
+    """Time travel BY TIMESTAMP: read the table as of `timestamp_ms` (epoch millis), as Spark resolves it.
+
+    `delta.`path` TIMESTAMP AS OF ...` is not available on a path (UNSUPPORTED_DATASOURCE_FOR_DIRECT_QUERY),
+    so this is the reader option. The option takes a string parsed in the session zone, so the JVM renders
+    the instant in that same zone rather than Python guessing at it.
+    """
+    spark = _spark()
+    rendered = spark.sql(
+        f"SELECT date_format(timestamp_millis({int(args['timestamp_ms'])}), 'yyyy-MM-dd HH:mm:ss.SSS') AS t"
+    ).first()["t"]
+    df = spark.read.format("delta").option("timestampAsOf", rendered).load(_uri(args["path"]))
+    return {"timestamp": rendered, "row_count": df.count()}
+
+
 def cmd_read_id_digest(args):
     """Read an EW-written table and digest its bigint `id` column: count, sum and sum of squares. For tables
     too large to ship back row by row."""
@@ -1156,6 +1171,7 @@ COMMANDS = {
     "read": cmd_read,
     "read_row_ids": cmd_read_row_ids,
     "read_id_digest": cmd_read_id_digest,
+    "read_as_of": cmd_read_as_of,
     "read_changes": cmd_read_changes,
     "read_variant": cmd_read_variant,
     "read_parquet_variant": cmd_read_parquet_variant,

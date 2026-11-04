@@ -96,7 +96,7 @@ public class InCommitTimestampTests
             },
         };
 
-        var result = InCommitTimestamp.EnsureCommitInfo(actions, config);
+        var result = InCommitTimestamp.EnsureCommitInfo(actions, config, version: 1);
 
         Assert.Equal(2, result.Count);
         Assert.IsType<CommitInfo>(result[0]); // CommitInfo is first
@@ -119,7 +119,7 @@ public class InCommitTimestampTests
             },
         };
 
-        var result = InCommitTimestamp.EnsureCommitInfo(actions, null);
+        var result = InCommitTimestamp.EnsureCommitInfo(actions, null, version: 1);
         Assert.Equal(2, result.Count);
         var ci = Assert.IsType<CommitInfo>(result[0]);
         Assert.False(ci.Values.ContainsKey("inCommitTimestamp"));
@@ -145,7 +145,7 @@ public class InCommitTimestampTests
             },
         };
 
-        var result = InCommitTimestamp.EnsureCommitInfo(actions, config);
+        var result = InCommitTimestamp.EnsureCommitInfo(actions, config, version: 1);
         Assert.Same(actions, result); // No modification needed
     }
 }
