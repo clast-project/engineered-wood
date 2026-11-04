@@ -35,8 +35,28 @@ jobs:
     # assemblies), so this runs net10.0 only. That is not a real gap: the interop
     # drivers are subprocesses and the assertions are framework-independent — net472
     # coverage of the same tests comes from the per-commit build on Windows.
+    #
+    # Two Spark lanes, because the two Spark lines write different VARIANT layouts and EW
+    # must keep both working (see Spark.ValidatedAgainstVersion):
+    #   spark-4.1  primary. VARIANT is GA and shredding works, so every interop case runs;
+    #              the healthy result is 0 skipped.
+    #   spark-4.0  Spark 4.0's UNANNOTATED variant layout and the preview shredding name.
+    #              The cases that need 4.1 skip honestly; the healthy result is 7 skipped.
+    # The delta-rs and DuckDB tiers run in both lanes. They are cheap, and keeping the lanes
+    # identical except for the two Spark pins means a difference between them is Spark's.
+    name: interop (${{ matrix.lane }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lane: spark-4.1
+            pyspark: '4.1.2'
+            delta-spark: '4.3.1'
+          - lane: spark-4.0
+            pyspark: '4.0.4'
+            delta-spark: '4.0.0'
 
     steps:
       - name: Checkout
@@ -51,7 +71,7 @@ jobs:
             8.0.x
             10.0.x
 
-      # Spark 4.0 needs Java 17+.
+      # Spark 4.0 and 4.1 need Java 17+.
       - name: Setup JDK
         uses: actions/setup-java@v4
         with:
@@ -73,14 +93,22 @@ jobs:
       # were established against, so a behaviour change in one of them must arrive as
       # a considered bump here rather than as a nightly that turned red on its own.
       #
-      # delta-spark's major version must match pyspark's: 4.x pairs with Spark 4.0.
+      # delta-spark must be built for the pyspark it runs on. The two pairings are the
+      # ones measured against the full tier (doc/running-tests.md).
       #
-      # pyspark is 4.0.4 rather than 4.0.1 because 4.0.1 predates the SPARK-53759
-      # fix (see the Setup Python step). The bug is Windows-only, so 4.0.1 would
-      # still pass HERE — but the dev-box instructions have to name a version that
-      # works on Windows, and there is no reason for the oracle this job pins and
-      # the oracle a contributor installs to be different builds. 4.0.4 is the
-      # latest 4.0.x and the pairing measured against the full tier.
+      # The pyspark versions are the first with the SPARK-53759 fix (see the Setup
+      # Python step): 4.0.4 rather than 4.0.1, 4.1.2 rather than 4.1.1. The bug is
+      # Windows-only, so the older builds would still pass HERE, but the dev-box
+      # instructions have to name versions that work on Windows, and there is no reason
+      # for the oracle this job pins and the one a contributor installs to differ.
+      #
+      # delta-spark goes in with --no-deps. Every release through 4.3.1 declares
+      # pyspark<=4.1.1, so pip refuses 4.1.2 + 4.3.1 with ResolutionImpossible. The
+      # pairing works (4.3.1 is the first delta-spark whose jars match Spark 4.1.2;
+      # 4.1.0 hits a NoSuchMethodError on checkpointed tables). Its one other
+      # dependency is installed explicitly, within its declared range. Do NOT move to
+      # delta-spark 4.4.x to lose the --no-deps: it fails every ConflictSemantics case
+      # until spark_driver.py learns Delta 4.4's conflict exception class.
       #
       # pyarrow is listed EXPLICITLY: deltalake 1.6.2 made it an optional extra, so
       # without it every delta-rs read raises "Pyarrow is required" — invisible on a
@@ -88,8 +116,10 @@ jobs:
       - name: Install interop oracles (Spark, delta-rs, DuckDB)
         run: |
           python -m pip install --disable-pip-version-check \
-            pyspark==4.0.4 delta-spark==4.0.0 \
+            pyspark==${{ matrix.pyspark }} importlib_metadata==8.7.1 \
             deltalake==1.6.2 pyarrow==24.0.0 duckdb==1.5.5
+          python -m pip install --disable-pip-version-check --no-deps \
+            delta-spark==${{ matrix.delta-spark }}
 
       # Warms the Ivy cache so the first test does not pay jar resolution inside its
       # own timeout, and fails here — with a readable error — rather than deep inside
@@ -131,5 +161,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: interop-results
+          name: interop-results-${{ matrix.lane }}
           path: '**/interop-results.trx'
