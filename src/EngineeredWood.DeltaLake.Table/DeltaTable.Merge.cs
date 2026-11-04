@@ -800,9 +800,16 @@ public sealed partial class DeltaTable
             return any ? (min, max) : null;
         }
 
-        // Ordered as UTF-8 bytes, as the statistics are.
+        // Ordered as UTF-8 bytes, as the statistics are: for well-formed UTF-8 that is code point order. An
+        // ill-formed key leaves the key unbounded (#663). It decodes to U+FFFD, which can sort on the other side
+        // of a bound than its bytes do, and checking only the winners is not enough. Keys "😀" and FF give the
+        // empty range "😀"..U+FFFD; keys "a", "é", 80 give "a".."é", which refutes a target file holding 80, whose
+        // statistics are the decoded U+FFFD. Either way a file holding a match would be pruned.
         static (Expressions.LiteralValue, Expressions.LiteralValue)? StringRange(StringArray a)
         {
+            if (!Stats.StatsCollector.AllCellsWellFormed(a.ValueBuffer.Span, a.ValueOffsets, a.Length))
+                return null;
+
             int min = -1, max = -1;
             for (int i = 0; i < a.Length; i++)
             {

@@ -536,7 +536,7 @@ internal static class StatsCollector
     // span rather than a call per (usually short) cell: the span is well-formed, and no cell boundary falls inside
     // a character (a boundary byte is never a continuation byte). Together these mean every cell is a run of
     // whole, valid characters. Bytes under a null slot are checked too, which can only cause a needless fallback.
-    private static bool AllCellsWellFormed(ReadOnlySpan<byte> data, ReadOnlySpan<int> offsets, int length)
+    internal static bool AllCellsWellFormed(ReadOnlySpan<byte> data, ReadOnlySpan<int> offsets, int length)
     {
         if (length == 0) return true;
         int start = offsets[0], end = offsets[length];
