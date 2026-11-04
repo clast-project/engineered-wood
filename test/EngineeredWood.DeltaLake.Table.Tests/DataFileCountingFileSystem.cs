@@ -12,6 +12,7 @@ internal sealed class DataFileCountingFileSystem(ITableFileSystem inner) : ITabl
     private long _dataBytesRead;
     private int _dataFileOpens;
     private readonly System.Collections.Concurrent.ConcurrentQueue<string> _opened = new();
+    private readonly System.Collections.Concurrent.ConcurrentQueue<(string Path, FileRange Range)> _reads = new();
 
     public long DataBytesRead => Interlocked.Read(ref _dataBytesRead);
 
@@ -20,11 +21,16 @@ internal sealed class DataFileCountingFileSystem(ITableFileSystem inner) : ITabl
     /// <summary>The data files opened since the last <see cref="Reset"/>, in order, as the paths passed in.</summary>
     public IReadOnlyList<string> OpenedDataFiles => _opened.ToArray();
 
+    /// <summary>Every range read from a data file since the last <see cref="Reset"/>, with the path it was
+    /// opened by.</summary>
+    public IReadOnlyList<(string Path, FileRange Range)> DataReads => _reads.ToArray();
+
     public void Reset()
     {
         Interlocked.Exchange(ref _dataBytesRead, 0);
         Interlocked.Exchange(ref _dataFileOpens, 0);
         while (_opened.TryDequeue(out _)) { }
+        while (_reads.TryDequeue(out _)) { }
     }
 
     public PathNameConstraints PathConstraints => inner.PathConstraints;
@@ -38,7 +44,7 @@ internal sealed class DataFileCountingFileSystem(ITableFileSystem inner) : ITabl
             return file;
         Interlocked.Increment(ref _dataFileOpens);
         _opened.Enqueue(path);
-        return new CountingFile(file, this);
+        return new CountingFile(file, this, path);
     }
 
     public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default)
@@ -62,7 +68,7 @@ internal sealed class DataFileCountingFileSystem(ITableFileSystem inner) : ITabl
     public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
         => inner.WriteAllBytesAsync(path, data, cancellationToken);
 
-    private sealed class CountingFile(IRandomAccessFile inner, DataFileCountingFileSystem owner) : IRandomAccessFile
+    private sealed class CountingFile(IRandomAccessFile inner, DataFileCountingFileSystem owner, string path) : IRandomAccessFile
     {
         public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
             => inner.GetLengthAsync(cancellationToken);
@@ -71,6 +77,7 @@ internal sealed class DataFileCountingFileSystem(ITableFileSystem inner) : ITabl
             FileRange range, CancellationToken cancellationToken = default)
         {
             Interlocked.Add(ref owner._dataBytesRead, range.Length);
+            owner._reads.Enqueue((path, range));
             return inner.ReadAsync(range, cancellationToken);
         }
 
@@ -78,7 +85,10 @@ internal sealed class DataFileCountingFileSystem(ITableFileSystem inner) : ITabl
             IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
         {
             foreach (var range in ranges)
+            {
                 Interlocked.Add(ref owner._dataBytesRead, range.Length);
+                owner._reads.Enqueue((path, range));
+            }
             return inner.ReadRangesAsync(ranges, cancellationToken);
         }
 

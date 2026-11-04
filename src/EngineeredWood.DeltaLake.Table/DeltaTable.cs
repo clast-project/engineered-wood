@@ -5937,6 +5937,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         var scan = new ScanFileShape(options, metadataFields, wantAddress, wantLocator, wantTracking);
+        var includedFiles = included.ConvertAll(i => i.File);
 
         // The scan's unit of work is one row group of one file (#612), so that a few large files, or one large
         // file among small ones, still keep every reader busy. A file read through the codec seam is one unit:
@@ -5944,7 +5945,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         int window = EffectiveConcurrentReads;
         if (window <= 1)
         {
-            await foreach (var unit in PlanScanUnitsAsync(snapshot, options, included, lookahead: 1, cancellationToken)
+            await foreach (var unit in PlanScanUnitsAsync(snapshot, options, includedFiles, lookahead: 1, cancellationToken)
                                .ConfigureAwait(false))
             {
                 try
@@ -5968,7 +5969,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         LastScanBudget = budget;
         var growth = new ParquetFileReader.DecodedGrowth();
         await foreach (var batch in OrderedScan.RunAsync(
-                           PlanScanUnitsAsync(snapshot, options, included, lookahead: window, cancellationToken),
+                           PlanScanUnitsAsync(snapshot, options, includedFiles, lookahead: window, cancellationToken),
                            (unit, reservation, ct) => ReadScanUnitAsync(
                                unit, scan, included[unit.File].Ordinal, reservation, growth, ct),
                            RollingDataFileWriter.EstimatedBytes,
@@ -5998,13 +5999,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// that a footer's round trip overlaps the reads in flight rather than stalling the planning. A file whose
     /// row groups are all pruned yields no unit and is closed here; otherwise its last unit to end closes it.
     /// Files opened ahead but never planned, because the scan stopped, are closed when the enumeration ends.</para>
+    /// <para><paramref name="skipRows"/>, when given, names for each file (by its index in
+    /// <paramref name="files"/>) further rows the caller needs none of, on top of those its deletion vector
+    /// deletes: <see cref="ReadRowsAsync"/> skips every row group, and every long run within one, that holds no
+    /// selected row (#633). It is called in file order, by the planner, once per file.</para>
     /// </summary>
     private async IAsyncEnumerable<ScanUnit> PlanScanUnitsAsync(
         Snapshot.Snapshot snapshot,
         DeltaReadOptions options,
-        List<(int Ordinal, AddFile File)> files,
+        IReadOnlyList<AddFile> files,
         int lookahead,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        [EnumeratorCancellation] CancellationToken cancellationToken,
+        Func<int, RowSkipPredicate?>? skipRows = null)
     {
         var opening = new Queue<Task<DataFileRead>>();
         int next = 0;
@@ -6018,7 +6024,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 while (next < files.Count && opening.Count < Math.Max(1, lookahead))
                 {
-                    var addFile = files[next++].File;
+                    var addFile = files[next++];
                     // The scan forwards its predicate to the row-group level: it promises only a superset of the
                     // matching rows (so does a predicate DELETE, which prunes in ComputeDeleteActionsAsync).
                     // Compaction, CDF and the copy-on-write rewrites must see every row of a file they read, and
@@ -6037,8 +6043,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     }
                     else
                     {
+                        var skip = read.SkipRows;
+                        if (skipRows?.Invoke(f) is { } extra)
+                        {
+                            var deleted = skip;
+                            skip = deleted is null ? extra : (first, count) => extra(first, count) || deleted(first, count);
+                        }
                         await foreach (var plan in read.Reader.PlanRowGroupsAsync(
-                                           read.FilePredicate, read.FileColumns, read.SkipRows, cancellationToken)
+                                           read.FilePredicate, read.FileColumns, skip, cancellationToken)
                                            .ConfigureAwait(false))
                         {
                             read.AddRef();
@@ -6087,13 +6099,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var read = unit.Read;
-        IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> source;
-        if (unit.Plan is not { } plan)
-            source = SeamSource(read, reservation, cancellationToken);
-        else if (growth is null)
-            source = Positioned(read.Reader!.ReadPlannedAsync(plan, read.FileColumns, cancellationToken), cancellationToken);
-        else
-            source = Positioned(read.Reader!.ReadPlannedAsync(plan, read.FileColumns, reservation, growth, cancellationToken), cancellationToken);
+        var source = UnitSource(unit, reservation, growth, cancellationToken);
 
         bool wantPositions = scan.WantAddress || scan.WantLocator;
         byte[]? pathBytes = scan.WantLocator ? System.Text.Encoding.UTF8.GetBytes(read.AddFile.Path) : null;
@@ -6104,6 +6110,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    /// <summary>One unit's raw batches, each with the file position of its first row: its planned row group, or
+    /// through the codec seam the whole file. <paramref name="growth"/> null reads without reserving.</summary>
+    private static IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> UnitSource(
+        ScanUnit unit,
+        ScanReservation reservation,
+        ParquetFileReader.DecodedGrowth? growth,
+        CancellationToken cancellationToken)
+    {
+        var read = unit.Read;
+        if (unit.Plan is not { } plan)
+            return SeamSource(read, reservation, cancellationToken);
+        if (growth is null)
+            return Positioned(read.Reader!.ReadPlannedAsync(plan, read.FileColumns, cancellationToken), cancellationToken);
+        return Positioned(read.Reader!.ReadPlannedAsync(plan, read.FileColumns, reservation, growth, cancellationToken), cancellationToken);
+    }
+
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> Positioned(
         IAsyncEnumerable<PositionedRecordBatch> source,
         [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -6112,56 +6134,20 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             yield return (positioned.Batch, positioned.FirstRow);
     }
 
-    /// <summary>
-    /// Yields the batches of <paramref name="fileCount"/> files, file after file, reading up to
-    /// <see cref="EffectiveConcurrentReads"/> of them at once (#607) within
-    /// <see cref="DeltaTableOptions.MaxBufferedReadBytes"/>. With a window of 1, or one file, it is a plain
-    /// serial loop with no pipeline in between — exactly the read before #607.
-    /// </summary>
-    private async IAsyncEnumerable<RecordBatch> ReadFilesInOrderAsync(
-        int fileCount,
-        Func<int, ScanReservation, CancellationToken, IAsyncEnumerable<RecordBatch>> readFile,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
-    {
-        int concurrency = EffectiveConcurrentReads;
-        if (concurrency <= 1 || fileCount <= 1)
-        {
-            for (int i = 0; i < fileCount; i++)
-            {
-                await foreach (var batch in readFile(i, ScanReservation.None, cancellationToken)
-                                   .WithCancellation(cancellationToken).ConfigureAwait(false))
-                {
-                    yield return batch;
-                }
-            }
-            yield break;
-        }
-
-        var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes);
-        LastScanBudget = budget;
-        await foreach (var batch in OrderedFileScan<RecordBatch>.RunAsync(
-                           fileCount,
-                           readFile,
-                           RollingDataFileWriter.EstimatedBytes,
-                           static b => b.Dispose(),
-                           concurrency,
-                           budget,
-                           cancellationToken).ConfigureAwait(false))
-        {
-            yield return batch;
-        }
-    }
-
     /// <summary>The memory budget of the most recent parallel scan, for tests to read its
     /// <see cref="ScanMemoryBudget.Peak"/>.</summary>
     internal ScanMemoryBudget? LastScanBudget { get; private set; }
 
     /// <summary>The reads a scan runs at once (row groups, or whole files through the codec seam):
-    /// <see cref="DeltaTableOptions.MaxConcurrentReads"/>, or by default up to 4 with the built-in reader and
-    /// 1 through the codec seam, whose contract never promised that two files may be read at once.</summary>
-    private int EffectiveConcurrentReads =>
+    /// <see cref="DeltaTableOptions.MaxConcurrentReads"/>; by default, with the built-in reader, what the table's
+    /// file system suggests (<see cref="IReadConcurrencyHint"/>: an object store's requests in flight, #632) or
+    /// else up to 4, where a local read stops gaining; and 1 through the codec seam, whose contract never
+    /// promised that two files may be read at once.</summary>
+    internal int EffectiveConcurrentReads =>
         _options.MaxConcurrentReads
-        ?? (_options.DataFileReader is null ? Math.Min(4, Environment.ProcessorCount) : 1);
+        ?? (_options.DataFileReader is not null ? 1
+            : (_fs as IReadConcurrencyHint)?.PreferredConcurrentReads is int hint and >= 1 ? hint
+            : Math.Min(4, Environment.ProcessorCount));
 
     /// <summary>What a scan asks of every file it reads.</summary>
     private sealed record ScanFileShape(
@@ -10475,54 +10461,117 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         // Resolve every path BEFORE reading any: a stale selection is refused up front rather than after some
         // files' rows have already been returned (and, read in parallel, after later files were started).
-        var files = new List<(AddFile File, IReadOnlyCollection<long> Targets, int Ordinal)>();
+        var files = new List<AddFile>();
+        var targets = new List<HashSet<long>>();
+        var ordinals = new List<int>();
         foreach (var kvp in selection.Entries.OrderBy(k => k.Key, StringComparer.Ordinal))
         {
             if (!byPath.TryGetValue(kvp.Key, out var addFile))
                 throw StaleSelectionPath(kvp.Key, snapshot);
-            files.Add((addFile, kvp.Value, ordinalByPath is not null ? ordinalByPath[kvp.Key] : -1));
+            files.Add(addFile);
+            targets.Add(RowSelection.AsSet(kvp.Value));
+            ordinals.Add(ordinalByPath is not null ? ordinalByPath[kvp.Key] : -1);
         }
 
-        var shape = new ScanFileShape(
-            new DeltaReadOptions(), metadataFields, wantAddress, wantLocator, wantTracking);
-        await foreach (var batch in ReadFilesInOrderAsync(
-                           files.Count,
-                           (i, reservation, ct) => ReadSelectedRowsOfFileAsync(
-                               snapshot, shape, files[i].File, files[i].Targets, files[i].Ordinal,
-                               reservation, ct),
-                           cancellationToken).ConfigureAwait(false))
+        // Read as a scan reads (#633): one unit per (file, row group), up to the scan's window at once within its
+        // budget, batches in file order. A row group holding no selected row is skipped unread, and so is a long
+        // run of rows inside a kept one wherever its pages can be read alone: the same skip a deletion vector
+        // drives. For a point lookup that is most of the file.
+        var scanOptions = new DeltaReadOptions();
+        var shape = new ScanFileShape(scanOptions, metadataFields, wantAddress, wantLocator, wantTracking);
+        RowSkipPredicate? SkipUnselected(int f) => NoTargetIn(targets[f]);
+
+        int window = EffectiveConcurrentReads;
+        if (window <= 1)
+        {
+            await foreach (var unit in PlanScanUnitsAsync(
+                               snapshot, scanOptions, files, lookahead: 1, cancellationToken, SkipUnselected)
+                               .ConfigureAwait(false))
+            {
+                try
+                {
+                    await foreach (var batch in ReadSelectedRowsOfUnitAsync(
+                                       unit, shape, targets[unit.File], ordinals[unit.File], ScanReservation.None,
+                                       growth: null, cancellationToken).ConfigureAwait(false))
+                    {
+                        yield return batch;
+                    }
+                }
+                finally
+                {
+                    unit.Read.Release();
+                }
+            }
+            yield break;
+        }
+
+        var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes);
+        LastScanBudget = budget;
+        var growth = new ParquetFileReader.DecodedGrowth();
+        await foreach (var batch in OrderedScan.RunAsync(
+                           PlanScanUnitsAsync(snapshot, scanOptions, files, lookahead: window, cancellationToken, SkipUnselected),
+                           (unit, reservation, ct) => ReadSelectedRowsOfUnitAsync(
+                               unit, shape, targets[unit.File], ordinals[unit.File], reservation, growth, ct),
+                           RollingDataFileWriter.EstimatedBytes,
+                           static b => b.Dispose(),
+                           window,
+                           budget,
+                           releaseUnit: static unit => unit.Read.Release(),
+                           cancellationToken: cancellationToken).ConfigureAwait(false))
         {
             yield return batch;
         }
     }
 
-    /// <summary>The rows of one file that <see cref="ReadRowsAsync"/>' selection names, with the requested
-    /// metadata columns. Runs on the file's own producer when the files are read in parallel.</summary>
-    private async IAsyncEnumerable<RecordBatch> ReadSelectedRowsOfFileAsync(
-        Snapshot.Snapshot snapshot,
+    /// <summary>
+    /// Skips a span of a file holding none of <paramref name="targets"/>, the file positions
+    /// <see cref="ReadRowsAsync"/> selects in it: a binary search of them, sorted, for the first at or after the
+    /// span's start.
+    /// </summary>
+    internal static RowSkipPredicate NoTargetIn(IReadOnlyCollection<long> targets)
+    {
+        var sorted = new long[targets.Count];
+        int n = 0;
+        foreach (long t in targets)
+            sorted[n++] = t;
+        System.Array.Sort(sorted);
+        return (first, count) =>
+        {
+            int i = System.Array.BinarySearch(sorted, first);
+            if (i < 0)
+                i = ~i;
+            return i == sorted.Length || sorted[i] >= first + count;
+        };
+    }
+
+    /// <summary>The rows of one unit (a row group, or through the codec seam a whole file) that
+    /// <see cref="ReadRowsAsync"/>' selection names, with the requested metadata columns. Runs on the unit's own
+    /// producer when the units are read in parallel.</summary>
+    private async IAsyncEnumerable<RecordBatch> ReadSelectedRowsOfUnitAsync(
+        ScanUnit unit,
         ScanFileShape shape,
-        AddFile addFile,
-        IReadOnlyCollection<long> selected,
+        HashSet<long> targets,
         int fileOrdinal,
         ScanReservation reservation,
+        ParquetFileReader.DecodedGrowth? growth,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var metadataFields = shape.MetadataFields;
         bool wantAddress = shape.WantAddress;
         bool wantLocator = shape.WantLocator;
         bool wantTracking = shape.WantTracking;
-        var targets = RowSelection.AsSet(selected);
+        var read = unit.Read;
         byte[]? pathBytes = wantLocator
-            ? System.Text.Encoding.UTF8.GetBytes(addFile.Path) : null;
+            ? System.Text.Encoding.UTF8.GetBytes(read.AddFile.Path) : null;
 
-        // The per-file read reports each surviving row's ABSOLUTE in-file position (DV-inclusive) and its
-        // RESOLVED stable id/version alongside the batch, having stripped the materialized id columns from it
-        // — so the position to match on, and the identity to report, both come from here rather than from a
-        // column of `batch`. The reservation makes a parallel read wait for the byte budget before each decode,
-        // exactly as a scan does: the whole file is decoded whatever the selection keeps.
-        await foreach (var fb in ReadFileBatchesAsync(
-                           addFile, null, snapshot, wantPositions: true, wantTracking, rowGroupFilter: null,
-                           reservation, cancellationToken).ConfigureAwait(false))
+        // The pipeline reports each surviving row's ABSOLUTE in-file position (DV-inclusive) and its RESOLVED
+        // stable id/version alongside the batch, having stripped the materialized id columns from it — so the
+        // position to match on, and the identity to report, both come from here rather than from a column of
+        // `batch`. The reservation makes a parallel read wait for the byte budget before each decode, exactly as
+        // a scan does. Only the rows the planner kept are decoded, but a kept run still holds unselected ones.
+        var source = UnitSource(unit, reservation, growth, cancellationToken);
+        await foreach (var fb in ProcessDataFileBatchesAsync(
+                           source, read, wantPositions: true, wantTracking, cancellationToken).ConfigureAwait(false))
         {
             // Most batches of a file hold no selected row. Every one is released here rather than left to the
             // finalizer: its native buffers would otherwise outlive the budget reservation that covered them.

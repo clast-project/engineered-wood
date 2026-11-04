@@ -26,11 +26,12 @@ namespace EngineeredWood.IO.Azure;
 /// or not at all.
 /// </para>
 /// </remarks>
-public sealed class AzureTableFileSystem : ITableFileSystem
+public sealed class AzureTableFileSystem : ITableFileSystem, IReadConcurrencyHint
 {
     private readonly BlobContainerClient _container;
     private readonly string _rootPrefix;
     private readonly BufferAllocator? _allocator;
+    private readonly int _maxConcurrency;
 
     /// <summary>
     /// Creates a new filesystem rooted at <paramref name="container"/> and, optionally, a
@@ -44,13 +45,21 @@ public sealed class AzureTableFileSystem : ITableFileSystem
     /// <param name="allocator">
     /// Buffer allocator passed to files opened via <see cref="OpenReadAsync"/>.
     /// </param>
+    /// <param name="maxConcurrency">
+    /// The range requests each file opened via <see cref="OpenReadAsync"/> lets be in flight at once, and
+    /// the reads this filesystem suggests a table scan run at once (<see cref="PreferredConcurrentReads"/>).
+    /// </param>
     public AzureTableFileSystem(
         BlobContainerClient container,
         string? rootPath = null,
-        BufferAllocator? allocator = null)
+        BufferAllocator? allocator = null,
+        int maxConcurrency = 16)
     {
+        if (maxConcurrency < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxConcurrency), maxConcurrency, "Must be at least 1.");
         _container = container ?? throw new ArgumentNullException(nameof(container));
         _allocator = allocator;
+        _maxConcurrency = maxConcurrency;
 
         string normalized = (rootPath ?? string.Empty).Replace('\\', '/').Trim('/');
         _rootPrefix = normalized.Length == 0 ? string.Empty : normalized + "/";
@@ -65,6 +74,13 @@ public sealed class AzureTableFileSystem : ITableFileSystem
     /// </summary>
     public PathNameConstraints PathConstraints =>
         PathNameConstraints.NoControlCharacters | PathNameConstraints.NoTrailingDot;
+
+    /// <summary>
+    /// The requests a file of this filesystem lets be in flight at once (its <c>maxConcurrency</c>): a table
+    /// scan sizes its default window to it, since against an object store the time goes to waiting on
+    /// requests rather than to decoding.
+    /// </summary>
+    public int? PreferredConcurrentReads => _maxConcurrency;
 
     /// <inheritdoc/>
     public async IAsyncEnumerable<TableFileInfo> ListAsync(
@@ -95,7 +111,7 @@ public sealed class AzureTableFileSystem : ITableFileSystem
     {
         cancellationToken.ThrowIfCancellationRequested();
         return new ValueTask<IRandomAccessFile>(
-            new AzureBlobRandomAccessFile(_container.GetBlobClient(Resolve(path)), _allocator));
+            new AzureBlobRandomAccessFile(_container.GetBlobClient(Resolve(path)), _allocator, _maxConcurrency));
     }
 
     /// <inheritdoc/>

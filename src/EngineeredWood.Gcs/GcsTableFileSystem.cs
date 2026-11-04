@@ -28,12 +28,13 @@ namespace EngineeredWood.IO.Gcs;
 /// not at all.
 /// </para>
 /// </remarks>
-public sealed class GcsTableFileSystem : ITableFileSystem
+public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint
 {
     private readonly StorageClient _client;
     private readonly string _bucket;
     private readonly string _rootPrefix;
     private readonly BufferAllocator? _allocator;
+    private readonly int _maxConcurrency;
 
     /// <summary>
     /// Creates a new filesystem rooted at <paramref name="bucket"/> and, optionally, an
@@ -48,15 +49,23 @@ public sealed class GcsTableFileSystem : ITableFileSystem
     /// <param name="allocator">
     /// Buffer allocator passed to files opened via <see cref="OpenReadAsync"/>.
     /// </param>
+    /// <param name="maxConcurrency">
+    /// The range requests each file opened via <see cref="OpenReadAsync"/> lets be in flight at once, and
+    /// the reads this filesystem suggests a table scan run at once (<see cref="PreferredConcurrentReads"/>).
+    /// </param>
     public GcsTableFileSystem(
         StorageClient client,
         string bucket,
         string? rootPath = null,
-        BufferAllocator? allocator = null)
+        BufferAllocator? allocator = null,
+        int maxConcurrency = 16)
     {
+        if (maxConcurrency < 1)
+            throw new ArgumentOutOfRangeException(nameof(maxConcurrency), maxConcurrency, "Must be at least 1.");
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _bucket = bucket ?? throw new ArgumentNullException(nameof(bucket));
         _allocator = allocator;
+        _maxConcurrency = maxConcurrency;
 
         string normalized = (rootPath ?? string.Empty).Replace('\\', '/').Trim('/');
         _rootPrefix = normalized.Length == 0 ? string.Empty : normalized + "/";
@@ -71,6 +80,13 @@ public sealed class GcsTableFileSystem : ITableFileSystem
     /// </summary>
     public PathNameConstraints PathConstraints =>
         PathNameConstraints.NoControlCharacters | PathNameConstraints.NoDotOnlySegments;
+
+    /// <summary>
+    /// The requests a file of this filesystem lets be in flight at once (its <c>maxConcurrency</c>): a table
+    /// scan sizes its default window to it, since against an object store the time goes to waiting on
+    /// requests rather than to decoding.
+    /// </summary>
+    public int? PreferredConcurrentReads => _maxConcurrency;
 
     /// <inheritdoc/>
     public async IAsyncEnumerable<TableFileInfo> ListAsync(
@@ -149,7 +165,7 @@ public sealed class GcsTableFileSystem : ITableFileSystem
     {
         cancellationToken.ThrowIfCancellationRequested();
         return new ValueTask<IRandomAccessFile>(
-            new GcsRandomAccessFile(_client, _bucket, Resolve(path), _allocator));
+            new GcsRandomAccessFile(_client, _bucket, Resolve(path), _allocator, _maxConcurrency));
     }
 
     /// <inheritdoc/>
