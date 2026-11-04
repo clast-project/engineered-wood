@@ -847,6 +847,99 @@ public class ParallelFileReadTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Inside a kept row group, ReadRowsAsync also cuts out long runs holding no selected row, so that pages wholly
+    /// inside them are never requested, and the rows after each cut keep their absolute positions. One file of
+    /// 10,000 rows in ONE row group of 100-row pages, with a page index; ids equal positions equal row ids. A
+    /// deletion vector deletes 4000..4099, and the selected 4050 lies in it. The selection {5, 1500, 4050, 4100,
+    /// 9999} leaves two long gaps, (1500, 4050) and (4100, 9999), with targets on both sides of each.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task ReadRowsAsync_SkipsThePagesOfALongUnselectedRun_AndKeepsAbsolutePositions(int window)
+    {
+        const int rows = 10_000;
+        const int rowsPerPage = 100;
+        var options = new DeltaTableOptions
+        {
+            ParquetWriteOptions = new ParquetWriteOptions
+            {
+                RowGroupMaxRows = rows,
+                DataPageRowCountLimit = rowsPerPage,
+                WritePageIndex = true,
+            },
+            MaxConcurrentReads = window,
+        };
+        var root = new LocalTableFileSystem(Path.Combine(_tempDir, "pages"));
+        await using (var create = await DeltaTable.CreateAsync(
+                         root, Schema, options, enableDeletionVectors: true, enableRowTracking: true))
+        {
+            var ids = new Int64Array.Builder();
+            var names = new StringArray.Builder();
+            for (int r = 0; r < rows; r++)
+            {
+                ids.Append(r);
+                names.Append($"row-{r}-of-the-one-file");
+            }
+            await create.WriteAsync([new RecordBatch(Schema, [ids.Build(), names.Build()], rows)]);
+            await create.DeleteAsync(Ex.And(
+                Ex.GreaterThanOrEqual("id", LiteralValue.Of(4000L)), Ex.LessThan("id", LiteralValue.Of(4100L))));
+        }
+
+        var fs = new DataFileCountingFileSystem(root);
+        await using var table = await DeltaTable.OpenAsync(fs, options);
+        var addFile = Assert.Single(table.CurrentSnapshot.ActiveFiles).Value;
+        Assert.NotNull(addFile.DeletionVector);
+        long[] targets = [5, 1500, 4050, 4100, 9999];
+        var selection = RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>>
+        {
+            [addFile.Path] = targets,
+        });
+
+        var got = new List<(long Id, long Position, long RowId)>();
+        var rowOptions = new DeltaRowReadOptions { Metadata = DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking };
+        await foreach (var b in table.ReadRowsAsync(selection, rowOptions))
+        {
+            var id = (Int64Array)b.Column(0);
+            var position = (Int64Array)b.Column(b.Schema.GetFieldIndex(rowOptions.MetadataPrefix + RowSelection.RowIndexColumnSuffix));
+            var rowId = (Int64Array)b.Column(b.Schema.GetFieldIndex(rowOptions.MetadataPrefix + DeltaMetadataColumns.RowIdSuffix));
+            for (int i = 0; i < b.Length; i++)
+                got.Add((id.GetValue(i)!.Value, position.GetValue(i)!.Value, rowId.GetValue(i)!.Value));
+            b.Dispose();
+        }
+
+        // 4050 is deleted; every other target comes back at its own position, with its own row id.
+        Assert.Equal(new long[] { 5, 1500, 4100, 9999 }.Select(v => (v, v, v)), got);
+
+        // No page wholly inside a gap is requested; every page holding a returned row is.
+        var reads = fs.DataReads.Where(r => r.Path == addFile.Path).Select(r => r.Range).ToList();
+        await using var file = await root.OpenReadAsync(addFile.Path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        int gapPages = 0;
+        foreach (var chunk in await reader.ReadPageIndexAsync(0))
+        {
+            var pages = chunk.OffsetIndex!.PageLocations;
+            Assert.True(pages.Count >= rows / rowsPerPage / 2, $"{pages.Count} pages");
+            for (int p = 0; p < pages.Count; p++)
+            {
+                long first = pages[p].FirstRowIndex;
+                long end = p + 1 < pages.Count ? pages[p + 1].FirstRowIndex : rows;
+                bool read = reads.Any(r => r.Offset < pages[p].Offset + pages[p].CompressedPageSize && pages[p].Offset < r.End);
+                bool inGap = (first > 1500 && end <= 4050) || (first > 4100 && end <= 9999);
+                bool holdsReturned = new long[] { 5, 1500, 4100, 9999 }.Any(t => first <= t && t < end);
+                if (inGap)
+                {
+                    gapPages++;
+                    Assert.False(read, $"{string.Join(".", chunk.Path)} page {p} (rows {first}..{end}) lies in a gap but was read");
+                }
+                if (holdsReturned)
+                    Assert.True(read, $"{string.Join(".", chunk.Path)} page {p} (rows {first}..{end}) holds a target but was not read");
+            }
+        }
+        Assert.True(gapPages > 100, $"only {gapPages} pages lie in the gaps");
+    }
+
     /// <summary>Point lookups in every file, read by row group in parallel, equal the serial read.</summary>
     [Fact]
     public async Task ReadRowsAsync_PointLookups_InParallel_EqualSerial()
