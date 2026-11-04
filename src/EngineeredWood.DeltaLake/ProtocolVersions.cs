@@ -27,6 +27,11 @@ public static class ProtocolVersions
         // struct<metadata, value>. Shredded layouts (Spark and DuckDB shred by default) are
         // reassembled by the parquet layer, so a shredded table reads correctly here.
         "variantType",
+        // Tables whose files MAY be shredded (#671). The reader obligation is the one above: accept the
+        // shredded and unshredded layouts alike, which the parquet layer already does. The preview name
+        // is what delta-spark 4.0 wrote; see VariantShreddingConfig.
+        VariantShreddingConfig.FeatureName,
+        VariantShreddingConfig.PreviewFeatureName,
     };
 
     /// <summary>Named writer features supported by this implementation.</summary>
@@ -72,6 +77,12 @@ public static class ProtocolVersions
         // specification_version = 1, which Spark requires). Values are written UNSHREDDED, which is
         // spec-legal — shredding is a writer optimisation, not a compatibility requirement.
         "variantType",
+        // A writer shreds only where the table enables it (delta.enableVariantShredding); without it every
+        // variant column must be written unshredded, which DeltaTable's data-file write options enforce by
+        // refusing ParquetWriteOptions.ShredVariants / VariantShredSchemas. A table that enables it may mix
+        // shredded and unshredded files, so writing unshredded is always conformant.
+        VariantShreddingConfig.FeatureName,
+        VariantShreddingConfig.PreviewFeatureName,
     };
 
     /// <summary>

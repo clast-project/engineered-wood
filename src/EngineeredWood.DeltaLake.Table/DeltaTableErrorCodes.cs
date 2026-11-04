@@ -465,4 +465,17 @@ public static class DeltaTableErrorCodes
     /// case here: the table is valid, and no conversion runs at all.
     /// </remarks>
     public const string UniversalFormatNotMaintained = "DELTA_UNIVERSAL_FORMAT_NOT_MAINTAINED";
+
+    // ── Variant shredding ──
+
+    /// <summary>
+    /// A write would shred a variant column (<see cref="EngineeredWood.Parquet.ParquetWriteOptions.ShredVariants"/> or
+    /// <see cref="EngineeredWood.Parquet.ParquetWriteOptions.VariantShredSchemas"/> on
+    /// <see cref="DeltaTableOptions.ParquetWriteOptions"/>), and the table does not enable
+    /// <c>delta.enableVariantShredding</c> with the <c>variantShredding</c> feature. The protocol requires an
+    /// unshredded variant there. Nothing is written.
+    /// </summary>
+    /// <remarks>delta-spark's own code for the same refusal (<c>DeltaErrors.variantShreddingUnsupported</c>, checked in
+    /// delta-spark 4.3.1's <c>error/delta-error-classes.json</c>).</remarks>
+    public const string ShreddingTablePropertyDisabled = "DELTA_SHREDDING_TABLE_PROPERTY_DISABLED";
 }
