@@ -31,7 +31,7 @@ public class StringStatsBenchmarks
         var random = new Random(661);
         string[] pieces = Text == "ascii"
             ? ["a", "b", "c", "x", "0", "7", "-"]
-            : ["a", "é", "中", "�", "\U0001F600", " "];
+            : ["a", "é", "中", "\uFFFD", "\U0001F600", " "];
         var builder = new StringArray.Builder();
         var sb = new System.Text.StringBuilder();
         for (int i = 0; i < Length; i++)

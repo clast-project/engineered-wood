@@ -20,7 +20,7 @@ public class StringStatsTests
     public void SupplementaryCharacter_SortsAbove_E000ToFFFF()
     {
         // UTF-16 code-unit order would put the emoji (a surrogate pair) BELOW U+E000 and U+FFFF.
-        var (min, max) = Bounds(Strings("￿", "\U0001F600", "", "z"));
+        var (min, max) = Bounds(Strings("\uFFFF", "\U0001F600", "\uE000", "z"));
         Assert.Equal("z", min);
         Assert.Equal("\U0001F600", max);
     }
@@ -29,7 +29,7 @@ public class StringStatsTests
     public void RandomMixedStrings_MatchCodePointOrder()
     {
         var random = new Random(661);
-        string[] alphabet = ["a", "Z", "é", "߿", "ࠀ", "퟿", "", "�", "￿",
+        string[] alphabet = ["a", "Z", "é", "\u07FF", "\u0800", "\uD7FF", "\uE000", "\uFFFD", "\uFFFF",
             "\U00010000", "\U0001F600", "\U0010FFFF"];
 
         for (int round = 0; round < 200; round++)
@@ -85,37 +85,54 @@ public class StringStatsTests
         Assert.Null(max);
     }
 
-    [Fact]
-    public void IllFormedCell_ThatLosesOnBytes_StillBoundedWhenDecoded()
+    // Each ill-formed case runs on StringArray (int offsets) and LargeStringArray (long offsets), which have
+    // separate validators, and on a slice with a nonzero offset, so the validated span starts mid-buffer.
+    public static TheoryData<bool, bool> Layouts() => new()
+    {
+        { false, false }, { false, true }, { true, false }, { true, true },
+    };
+
+    [Theory]
+    [MemberData(nameof(Layouts))]
+    public void IllFormedCell_ThatLosesOnBytes_StillBoundedWhenDecoded(bool large, bool sliced)
     {
         // Byte max is "é" (C3 A9 > 80), but 0x80 decodes to U+FFFD, which sorts above "é". The bound has to
         // cover the decoded value even though the bad cell wins neither comparison on bytes.
-        var array = RawStrings([0x61], [0xC3, 0xA9], [0x80]);
-        var (min, max) = Bounds(array);
+        var (min, max) = Bounds(Raw(large, sliced, [0x61], [0xC3, 0xA9], [0x80]), large);
         Assert.Equal("a", min);
-        Assert.Equal("�", max);
+        Assert.Equal("\uFFFD", max);
     }
 
-    [Fact]
-    public void IllFormedWinner_DecodedBoundsHold()
+    [Theory]
+    [MemberData(nameof(Layouts))]
+    public void IllFormedWinner_DecodedBoundsHold(bool large, bool sliced)
     {
         // On bytes, 0xFF beats the emoji; decoded it is U+FFFD, which the emoji beats.
-        var array = RawStrings([0xFF], Encoding.UTF8.GetBytes("\U0001F600"), [0x62]);
-        var (min, max) = Bounds(array);
+        var (min, max) = Bounds(Raw(large, sliced, [0xFF], Encoding.UTF8.GetBytes("\U0001F600"), [0x62]), large);
         Assert.Equal("b", min);
         Assert.Equal("\U0001F600", max);
     }
 
-    [Fact]
-    public void CharacterSplitAcrossCells_IsIllFormed()
+    [Theory]
+    [MemberData(nameof(Layouts))]
+    public void CharacterSplitAcrossCells_IsIllFormed(bool large, bool sliced)
     {
-        // The value buffer "aé" (61 C3 A9) is well-formed as a whole, but the cells are [61 C3] and [A9]: each
-        // half of "é" decodes to U+FFFD. The one-pass validation has to catch the boundary inside the character.
-        // "中" (E4 B8 AD) wins on bytes, but the halves decode to U+FFFD, which sorts above it.
-        var array = RawStrings([0xE4, 0xB8, 0xAD], [0x61, 0xC3], [0xA9]);
-        var (min, max) = Bounds(array);
-        Assert.Equal("a�", min);
-        Assert.Equal("�", max);
+        // The bytes "中aé" (E4 B8 AD 61 C3 A9) are well-formed as a whole, but the cells are [E4 B8 AD], [61 C3]
+        // and [A9]: each half of "é" decodes to U+FFFD. "中" wins on bytes, but U+FFFD sorts above it, so the
+        // one-pass validation has to catch the cell boundary inside the character.
+        var (min, max) = Bounds(Raw(large, sliced, [0xE4, 0xB8, 0xAD], [0x61, 0xC3], [0xA9]), large);
+        Assert.Equal("a\uFFFD", min);
+        Assert.Equal("\uFFFD", max);
+    }
+
+    [Theory]
+    [MemberData(nameof(Layouts))]
+    public void WellFormedRaw_UsesTheSliceOnly(bool large, bool sliced)
+    {
+        // When sliced, the cells outside the slice (an emoji before, a space after) would be the max and the min.
+        var (min, max) = Bounds(Raw(large, sliced, [0x6D], [0xC3, 0xA9], [0x63]), large);
+        Assert.Equal("c", min);
+        Assert.Equal("é", max);
     }
 
     [Fact]
@@ -150,7 +167,7 @@ public class StringStatsTests
         }
 
         // Boundary code points round-trip as valid.
-        foreach (var s in new[] { "\u007F", "\u0080", "߿", "ࠀ", "퟿", "", "￿",
+        foreach (var s in new[] { "\u007F", "\u0080", "\u07FF", "\u0800", "\uD7FF", "\uE000", "\uFFFF",
             "\U00010000", "\U0010FFFF" })
             Assert.True(StatsCollector.IsWellFormedUtf8Scalar(Encoding.UTF8.GetBytes(s)), s);
 
@@ -165,18 +182,39 @@ public class StringStatsTests
         return builder.Build();
     }
 
-    private static StringArray RawStrings(params byte[][] cells)
+    // A string array over raw bytes. When sliced, a cell is added on each side and sliced off: an emoji before
+    // (it would be the max) and a space after (it would be the min), so reading outside the slice changes the bounds.
+    private static IArrowArray Raw(bool large, bool sliced, params byte[][] cells)
     {
-        var offsets = new ArrowBuffer.Builder<int>();
+        var all = sliced
+            ? new[] { Encoding.UTF8.GetBytes("\U0001F600") }.Concat(cells).Append(new byte[] { 0x20 }).ToArray()
+            : cells;
         var data = new List<byte>();
-        offsets.Append(0);
-        foreach (var cell in cells)
+        var ends = new List<int> { 0 };
+        foreach (var cell in all)
         {
             data.AddRange(cell);
-            offsets.Append(data.Count);
+            ends.Add(data.Count);
         }
-        return new StringArray(cells.Length, offsets.Build(), new ArrowBuffer(data.ToArray()), ArrowBuffer.Empty);
+
+        IArrowArray array;
+        if (large)
+        {
+            var offsets = new ArrowBuffer.Builder<long>();
+            foreach (int end in ends) offsets.Append(end);
+            array = new LargeStringArray(all.Length, offsets.Build(), new ArrowBuffer(data.ToArray()), ArrowBuffer.Empty);
+        }
+        else
+        {
+            var offsets = new ArrowBuffer.Builder<int>();
+            foreach (int end in ends) offsets.Append(end);
+            array = new StringArray(all.Length, offsets.Build(), new ArrowBuffer(data.ToArray()), ArrowBuffer.Empty);
+        }
+        return sliced ? ArrowArrayFactory.Slice(array, 1, cells.Length) : array;
     }
+
+    private static (string? Min, string? Max) Bounds(IArrowArray array, bool large) =>
+        Bounds(array, large ? LargeStringType.Default : StringType.Default);
 
     private static (string? Min, string? Max) Bounds(IArrowArray array, IArrowType? type = null)
     {
