@@ -279,8 +279,12 @@ internal static class VacuumExecutor
     {
         // Both bookend commits carry the caller's properties, as Spark's do: its userMetadata is set per
         // session, and VACUUM START and VACUUM END are two commits of that session.
+        // An in-commit timestamp must come after the previous commit's, whatever the clocks say.
+        long timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        if (snapshot.InCommitTimestamp is { } previous && timestamp <= previous)
+            timestamp = previous + 1;
         var commitInfo = InCommitTimestamp.CreateCommitInfo(
-            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), operation, additionalValues,
+            timestamp, operation, additionalValues,
             includeInCommitTimestamp: InCommitTimestamp.IsEnabled(snapshot.Metadata.Configuration),
             commitProperties: commitProperties);
         IReadOnlyList<DeltaAction> actions = new DeltaAction[] { commitInfo };

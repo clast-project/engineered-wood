@@ -101,12 +101,18 @@ public sealed class LogCommitter
         var pruner = request.Pruner;
 
         long attemptVersion = baseSnapshot.Version + 1;
+        // The timestamp of the commit just below `attemptVersion`, which an in-commit timestamp must come after.
+        // Moves with each rebase to the newest concurrent commit, as Spark's resolveTimestampOrderingConflicts does.
+        long? previousTimestamp = baseSnapshot.InCommitTimestamp;
         for (int attempt = 0; ; attempt++)
         {
+            // Prepared again on every attempt, from the actions as staged or rebased: the in-commit timestamp and a
+            // mid-life enablement point both depend on the version this attempt lands at.
             var finalActions = InCommitTimestamp.EnsureCommitInfo(
-                currentActions, baseSnapshot.Metadata.Configuration, request.Operation,
+                currentActions, baseSnapshot.Metadata.Configuration, attemptVersion, request.Operation,
                 request.IsBlindAppend, request.CommitProperties,
-                request.OperationMetrics?.Invoke(currentActions), request.OperationParameters);
+                request.OperationMetrics?.Invoke(currentActions), request.OperationParameters,
+                previousTimestamp);
             try
             {
                 await _log.WriteCommitAsync(attemptVersion, finalActions, cancellationToken)
@@ -256,6 +262,11 @@ public sealed class LogCommitter
                         attemptedVersion: attemptVersion);
                 }
 
+                if (concurrent.Count > 0
+                    && InCommitTimestamp.GetTimestampFromActions(concurrent[concurrent.Count - 1].Item2) is { } newest)
+                {
+                    previousTimestamp = previousTimestamp is { } p && p > newest ? p : newest;
+                }
                 attemptVersion = latest + 1; // no conflict — rebase and retry
             }
         }

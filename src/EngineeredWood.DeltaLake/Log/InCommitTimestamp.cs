@@ -18,6 +18,15 @@ public static class InCommitTimestamp
     public const string EnableKey = "delta.enableInCommitTimestamps";
 
     /// <summary>
+    /// The version of the commit that turned in-commit timestamps on, when that was not the table's creation. Commits
+    /// before it carry no <c>inCommitTimestamp</c>; without it a reader assumes every commit does.
+    /// </summary>
+    public const string EnablementVersionKey = "delta.inCommitTimestampEnablementVersion";
+
+    /// <summary>The <c>inCommitTimestamp</c> of the commit named by <see cref="EnablementVersionKey"/>.</summary>
+    public const string EnablementTimestampKey = "delta.inCommitTimestampEnablementTimestamp";
+
+    /// <summary>
     /// Returns true if in-commit timestamps are enabled for the table.
     /// </summary>
     public static bool IsEnabled(IReadOnlyDictionary<string, string>? configuration)
@@ -127,11 +136,52 @@ public static class InCommitTimestamp
     }
 
     /// <summary>
+    /// The enablement point recorded in <paramref name="configuration"/>, or null when it records none (in-commit
+    /// timestamps were on from the table's creation, or are off). Both properties are required; one without the
+    /// other, or a value that is not a number, reads as none.
+    /// </summary>
+    public static (long Version, long Timestamp)? GetEnablement(IReadOnlyDictionary<string, string>? configuration)
+    {
+        if (configuration is null
+            || !configuration.TryGetValue(EnablementVersionKey, out string? version)
+            || !configuration.TryGetValue(EnablementTimestampKey, out string? timestamp)
+            || !long.TryParse(version, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out long v)
+            || !long.TryParse(timestamp, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out long t))
+        {
+            return null;
+        }
+        return (v, t);
+    }
+
+    /// <summary>
     /// Prepends a <see cref="CommitInfo"/> (the first action) to a commit, recording <c>operation</c> and a
     /// <c>timestamp</c> — standard, feature-free fields written on EVERY commit so the table has a usable
-    /// history (the snapshots/versions view) even on a plain writer-v2 table. The opt-in <c>inCommitTimestamp</c>
-    /// field is added only when the table has in-commit timestamps enabled. No-op if a commitInfo is already present.
+    /// history (the snapshots/versions view) even on a plain writer-v2 table.
+    ///
+    /// <para><b>In-commit timestamps follow the metadata the commit INSTALLS</b>, as delta-spark's do: a commit whose
+    /// <c>metaData</c> enables them carries an <c>inCommitTimestamp</c> even though the table it is based on does
+    /// not, and one whose <c>metaData</c> disables them carries none. A commit without <c>metaData</c> follows
+    /// <paramref name="configuration"/>. The timestamp is the current time, raised where needed to one past
+    /// <paramref name="previousCommitTimestamp"/> so the sequence never goes backwards.</para>
+    ///
+    /// <para><b>A mid-life enablement is stamped.</b> When the commit's <c>metaData</c> turns in-commit timestamps on,
+    /// <paramref name="configuration"/> has them off, and <paramref name="version"/> is not 0, the metadata gets
+    /// <see cref="EnablementVersionKey"/> = <paramref name="version"/> and <see cref="EnablementTimestampKey"/> = the
+    /// commit's timestamp. Without them a reader assumes every earlier commit carries a timestamp, and Spark's
+    /// history and time travel then fail with <c>DELTA_MISSING_COMMIT_TIMESTAMP</c>. Both depend on the version, so
+    /// a commit retried at a later version must be prepared again from its staged actions.</para>
+    ///
+    /// <para>A commitInfo the actions already carry is kept, apart from the caller's properties, metrics and
+    /// parameters, and, when in-commit timestamps apply, its <c>inCommitTimestamp</c>: one it lacks is added,
+    /// and one at or before <paramref name="previousCommitTimestamp"/> is raised past it.</para>
     /// </summary>
+    /// <param name="actions">The commit's actions.</param>
+    /// <param name="configuration">The configuration of the table the commit is BASED on: null for a new table.
+    /// Not the configuration the commit installs; that comes from its own <c>metaData</c>.</param>
+    /// <param name="version">The version the commit is about to be attempted at.</param>
+    /// <param name="operation">The commitInfo's <c>operation</c>.</param>
     /// <param name="isBlindAppend">The transaction's own claim about whether it READ anything — Delta's
     /// <c>commitInfo.isBlindAppend</c>. <c>null</c> writes NO field, which is not the same as <c>false</c>,
     /// and which readers do not all resolve the same way: delta-spark takes an absent flag as "not blind"
@@ -146,23 +196,65 @@ public static class InCommitTimestamp
     /// keeps its own.</param>
     /// <param name="operationMetrics">Written as <c>commitInfo.operationMetrics</c>, a map of strings as Spark
     /// writes it. A commitInfo the actions already carry keeps its own if it has one.</param>
+    /// <param name="previousCommitTimestamp">The timestamp of the commit at <paramref name="version"/> - 1, when
+    /// known: its in-commit timestamp, or its <c>commitInfo.timestamp</c> if it has none. The in-commit timestamp
+    /// written here is kept strictly after it.</param>
     /// <exception cref="ArgumentException"><paramref name="commitProperties"/> names a key the commitInfo
     /// already records.</exception>
     public static IReadOnlyList<DeltaAction> EnsureCommitInfo(
         IReadOnlyList<DeltaAction> actions,
         IReadOnlyDictionary<string, string>? configuration,
+        long version,
         string operation = "WRITE",
         bool? isBlindAppend = null,
         CommitProperties? commitProperties = null,
         IReadOnlyDictionary<string, string>? operationMetrics = null,
-        IReadOnlyDictionary<string, string>? operationParameters = null)
+        IReadOnlyDictionary<string, string>? operationParameters = null,
+        long? previousCommitTimestamp = null) =>
+        EnsureCommitInfo(
+            actions, configuration, version, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), operation,
+            isBlindAppend, commitProperties, operationMetrics, operationParameters, previousCommitTimestamp);
+
+    /// <summary>
+    /// <see cref="EnsureCommitInfo(IReadOnlyList{DeltaAction}, IReadOnlyDictionary{string, string}?, long, string, bool?, CommitProperties?, IReadOnlyDictionary{string, string}?, IReadOnlyDictionary{string, string}?, long?)"/>
+    /// with the clock injected.
+    /// </summary>
+    internal static IReadOnlyList<DeltaAction> EnsureCommitInfo(
+        IReadOnlyList<DeltaAction> actions,
+        IReadOnlyDictionary<string, string>? configuration,
+        long version,
+        long nowMs,
+        string operation = "WRITE",
+        bool? isBlindAppend = null,
+        CommitProperties? commitProperties = null,
+        IReadOnlyDictionary<string, string>? operationMetrics = null,
+        IReadOnlyDictionary<string, string>? operationParameters = null,
+        long? previousCommitTimestamp = null)
     {
-        // Already has a commitInfo (any kind): leave it, apart from adding the caller's properties to it.
+        // The metadata this commit installs, if any: it decides whether the commit is timestamped, not the base's.
+        int metadataIndex = -1;
+        for (int i = 0; i < actions.Count; i++)
+        {
+            if (actions[i] is MetadataAction)
+                metadataIndex = i;
+        }
+        var installed = metadataIndex >= 0 ? (MetadataAction)actions[metadataIndex] : null;
+        bool timestamped = IsEnabled(installed is null ? configuration : installed.Configuration);
+        // Spark's InCommitTimestampUtils.didCurrentTransactionEnableICT, and its rule that the creating commit
+        // (version 0) records no enablement point: every commit of such a table carries a timestamp.
+        bool enables = timestamped && installed is not null && !IsEnabled(configuration) && version != 0;
+
+        long Floor(long candidate) =>
+            previousCommitTimestamp is { } previous && candidate <= previous ? previous + 1 : candidate;
+
+        // Already has a commitInfo (any kind): keep it, apart from the caller's additions and the timestamp.
         for (int i = 0; i < actions.Count; i++)
         {
             if (actions[i] is not CommitInfo existing)
                 continue;
-            if (commitProperties is null && operationMetrics is null && operationParameters is null)
+            bool additions = commitProperties is not null || operationMetrics is not null
+                || operationParameters is not null;
+            if (!timestamped && !additions)
                 return actions;
 
             var values = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
@@ -173,10 +265,33 @@ public static class InCommitTimestamp
             if (operationParameters is not null && !values.ContainsKey("operationParameters"))
                 values["operationParameters"] = StringMapJson(operationParameters);
             commitProperties?.ApplyTo(values);
+
             var replaced = new List<DeltaAction>(actions);
+            bool changed = additions;
+            if (timestamped)
+            {
+                long? given = values.TryGetValue("inCommitTimestamp", out var raw) && raw.ValueKind == JsonValueKind.Number
+                    ? raw.GetInt64()
+                    : null;
+                long timestamp = Floor(given ?? nowMs);
+                if (given != timestamp)
+                {
+                    values["inCommitTimestamp"] = NumberJson(timestamp);
+                    changed = true;
+                }
+                changed |= ApplyMetadataStamp(
+                    replaced, metadataIndex, installed, configuration, enables, version, timestamp);
+            }
+            if (!changed)
+                return actions;
             replaced[i] = existing with { Values = values };
             return replaced;
         }
+
+        var stamped = new List<DeltaAction>(actions);
+        long commitTimestamp = timestamped ? Floor(nowMs) : nowMs;
+        if (timestamped)
+            ApplyMetadataStamp(stamped, metadataIndex, installed, configuration, enables, version, commitTimestamp);
 
         Dictionary<string, JsonElement>? extra = null;
         if (isBlindAppend is { } blind)
@@ -199,11 +314,53 @@ public static class InCommitTimestamp
 
         var result = new List<DeltaAction>(actions.Count + 1);
         result.Add(CreateCommitInfo(
-            DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), operation,
-            additionalValues: extra, includeInCommitTimestamp: IsEnabled(configuration),
+            commitTimestamp, operation,
+            additionalValues: extra, includeInCommitTimestamp: timestamped,
             commitProperties: commitProperties));
-        result.AddRange(actions);
+        result.AddRange(stamped);
         return result;
+    }
+
+    // The enablement pair on the installed metadata. A commit that enables in-commit timestamps names itself, over
+    // whatever pair its metadata brought along (RESTORE brings back an older version's). A commit that keeps them on
+    // and installs metadata without the pair keeps the base's: the commits before the enablement still have no
+    // timestamp, and replacing the metadata does not give them one.
+    // Returns whether it changed the metadata.
+    private static bool ApplyMetadataStamp(
+        List<DeltaAction> actions, int metadataIndex, MetadataAction? installed,
+        IReadOnlyDictionary<string, string>? baseConfiguration, bool enables, long version, long timestamp)
+    {
+        if (installed is null)
+            return false;
+
+        (long Version, long Timestamp)? pair;
+        if (enables)
+            pair = (version, timestamp);
+        else if (GetEnablement(installed.Configuration) is null && GetEnablement(baseConfiguration) is { } kept)
+            pair = kept;
+        else
+            return false;
+        if (GetEnablement(installed.Configuration) == pair)
+            return false;
+
+        var configuration = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (installed.Configuration is not null)
+        {
+            foreach (var kvp in installed.Configuration)
+                configuration[kvp.Key] = kvp.Value;
+        }
+        configuration[EnablementVersionKey] =
+            pair.Value.Version.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        configuration[EnablementTimestampKey] =
+            pair.Value.Timestamp.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        actions[metadataIndex] = installed with { Configuration = configuration };
+        return true;
+    }
+
+    private static JsonElement NumberJson(long value)
+    {
+        using var document = JsonDocument.Parse(value.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        return document.RootElement.Clone();
     }
 
     // A JSON object of string values, which is how Spark writes operationMetrics and operationParameters (each a
