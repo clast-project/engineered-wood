@@ -148,7 +148,9 @@ public class DuckDbShreddedVariantTests : IDisposable
     /// <c>Decimal32Array.GetValue</c> and <c>Decimal64Array.GetValue</c>, which the reassembly calls,
     /// return a scale-normalised <c>decimal</c>: their decode divides, and <c>decimal</c> division drops
     /// trailing zeros. The same values in the residual keep their scale, as does a 16-byte decimal on
-    /// .NET 7+. This pins today's behaviour, so a fixed Arrow shows up here; see doc/known-issues.md.
+    /// .NET 7+. The intended fix is not in those accessors: decimal reads are meant to move to
+    /// <c>SqlDecimal</c>, since <c>System.Decimal</c> cannot hold every Parquet decimal. This pins today's
+    /// behaviour, so the change shows up here when it lands; see doc/known-issues.md.
     /// </summary>
     [SkippableTheory]
     [InlineData("decimal9", "12.30::DECIMAL(9,2)", "12.30", "12.3")]

@@ -156,9 +156,12 @@ and `ListViewType`.
   `Decimal32Array.GetValue` / `Decimal64Array.GetValue`, which the
   reassembly calls, because their decode divides and `decimal` division drops
   trailing zeros. A 16-byte decimal keeps its scale on .NET 7+, and so does
-  any decimal in the residual `value`. Pinned by
+  any decimal in the residual `value`. The `decimal`-returning accessors are
+  not the path to fix: `System.Decimal` cannot hold every Parquet decimal
+  anyway, and the intended direction is for decimal reads to go through
+  `SqlDecimal` instead. Pinned by
   `DuckDbWritten_NarrowDecimal_KeepsItsValueButLosesTrailingZeros`, which
-  fails once Arrow is fixed.
+  fails once the reassembly stops losing the scale.
 
 **Deprecated `min`/`max` restricted to signed-order types.** The
 deprecated `Statistics.min`/`max` fields (defined with signed byte
