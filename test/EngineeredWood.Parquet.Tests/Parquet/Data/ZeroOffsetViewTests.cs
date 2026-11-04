@@ -76,6 +76,9 @@ public class ZeroOffsetViewTests : IDisposable
 
         var gathered = ArrowCompute.Take(array, Enumerable.Range(offset, length).ToArray());
         Assert.Equal(await WriteAsync(name, gathered), await WriteAsync(name, view));
+        // The view does not keep its source alive; unrooted, Arrow's finalizer frees the source's buffers
+        // under the write (seen on net472). The writer roots its caller's batch the same way.
+        GC.KeepAlive(array);
     }
 
     /// <summary>
@@ -97,6 +100,58 @@ public class ZeroOffsetViewTests : IDisposable
 
         Assert.Equal(await WriteBatchAsync("gathered", gathered, options), await WriteBatchAsync("sliced", sliced, options));
     }
+
+    /// <summary>
+    /// A caller need not hold the batch it writes. The writer hands its encoders views onto that batch's
+    /// buffers, and a view does not keep them alive, so the writer must root the batch itself: unrooted,
+    /// Arrow 23's finalizer frees the buffers mid-write. Collections are forced throughout to make that likely.
+    /// </summary>
+    [Theory]
+    [InlineData(1000)] // compacted in place
+    [InlineData(16)]   // split into row groups
+    public async Task AnUnheldBatch_StaysAliveForTheWrite(int rowGroupRows)
+    {
+        var names = Columns.Keys.ToArray();
+        var options = ParquetWriteOptions.Default with { RowGroupMaxRows = rowGroupRows };
+        var expected = await WriteBatchAsync("gathered", GatheredBatch(names), options);
+
+        using var stop = new CancellationTokenSource();
+        var collector = Task.Run(() =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
+        });
+        try
+        {
+            for (int i = 0; i < 5; i++)
+            {
+                // Built inside the call, so nothing here (not even a parameter on a state machine) holds it.
+                string path = Path.Combine(_tempDir, "unheld-" + Guid.NewGuid().ToString("N") + ".parquet");
+                await using (var file = new LocalSequentialFile(path))
+                await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+                {
+                    await writer.WriteRowGroupAsync(SlicedBatch(names));
+                    await writer.CloseAsync();
+                }
+                Assert.Equal(expected, File.ReadAllBytes(path));
+            }
+        }
+        finally
+        {
+            stop.Cancel();
+            await collector;
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static RecordBatch SlicedBatch(string[] names) =>
+        Batch(names, names.Select(n => Columns[n]()).ToArray()).Slice(5, 50);
+
+    private static RecordBatch GatheredBatch(string[] names) =>
+        Batch(names, names.Select(n => ArrowCompute.Take(Columns[n](), Enumerable.Range(5, 50).ToArray())).ToArray());
 
     [Fact]
     public void FixedWidthValues_AreViewedNotCopied()

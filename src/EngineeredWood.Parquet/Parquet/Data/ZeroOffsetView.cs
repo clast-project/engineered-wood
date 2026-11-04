@@ -21,9 +21,13 @@ namespace EngineeredWood.Parquet.Data;
 /// into one (1 bit a row).</item>
 /// </list>
 ///
-/// <para>The result shares the source's memory without owning it, so it is valid only while the source is.
-/// The write path encodes it and drops it within one row group. It never disposes it, and disposing it would
-/// free nothing.</para>
+/// <para>The result shares the source's memory without owning it, so it is valid only while the source is,
+/// and the CALLER must keep the source reachable until it is done with the view: a view holds the memory but
+/// not Arrow's reference count on it. In Apache.Arrow 23 that count is released by a finalizer, so a source
+/// the GC collects frees its native buffers under a live view (apache/arrow-dotnet#397). Seen on .NET
+/// Framework as a NullReferenceException out of a read of the freed buffer. The write path roots the caller's
+/// batch for the whole write; see <c>ParquetFileWriter.WriteRowGroupAsync</c>. It never disposes a view, and
+/// disposing one would free nothing.</para>
 /// </summary>
 internal static class ZeroOffsetView
 {

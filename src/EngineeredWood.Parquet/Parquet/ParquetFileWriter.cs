@@ -89,6 +89,23 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
 
         cancellationToken.ThrowIfCancellationRequested();
 
+        // The caller's batch, rooted until every row group of it is written: CompactSlicedColumns and
+        // SliceBatch can hand the encoders ZeroOffsetView views onto its buffers, and a view does not keep
+        // them alive (see ZeroOffsetView). The reassignments of `batch` below would otherwise leave the
+        // caller's arrays unreachable mid-write.
+        var source = batch;
+        try
+        {
+            await WriteRowGroupCoreAsync(batch, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            GC.KeepAlive(source);
+        }
+    }
+
+    private async ValueTask WriteRowGroupCoreAsync(RecordBatch batch, CancellationToken cancellationToken)
+    {
         // A SLICED column (Arrow's zero-copy sub-range view: Data.Offset != 0) must be compacted before
         // anything reads its buffers. The encoders below index the raw value buffer from slot 0, so a view
         // starting at row N silently writes rows 0..len instead of N..N+len — and the def levels, which come
