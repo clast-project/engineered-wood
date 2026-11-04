@@ -204,7 +204,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         // Against the TRANSLATED options, the ones the writer will use: a key that names a physical column directly
         // passes through the translation unchanged and still shreds that column.
-        ThrowIfShreddingDisallowed(options, schema, mode, table);
+        ThrowIfShreddingDisallowed(options, schema, mode, table, _options.EmitVariantLogicalType);
         return options;
     }
 
@@ -218,9 +218,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// AFTER column-mapping translation, so its keys are compared with each variant column's PHYSICAL name, which is
     /// what the writer matches them against. A logical key has been translated by then; a key that already named the
     /// physical column passed through unchanged.
+    /// <para>A shredded write is also refused when <paramref name="emitVariantLogicalType"/> is false, on any table:
+    /// without the annotation the writer is handed the bare storage struct, which it never shreds, so the shredding
+    /// options would be ignored silently and every file written unshredded.</para>
     /// </summary>
     private static void ThrowIfShreddingDisallowed(
-        ParquetWriteOptions physical, Schema.StructType schema, ColumnMappingMode mode, Snapshot.Snapshot table)
+        ParquetWriteOptions physical, Schema.StructType schema, ColumnMappingMode mode, Snapshot.Snapshot table,
+        bool emitVariantLogicalType)
     {
         var parquet = physical;
         if (parquet.ShredVariants is null && parquet.VariantShredSchemas is not { Count: > 0 })
@@ -232,10 +236,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool shredsSomething = parquet.ShredVariants is not null
             ? variantColumns.Any()
             : variantColumns.Any(name => parquet.VariantShredSchemas!.ContainsKey(name));
-        if (!shredsSomething
-            || VariantShreddingConfig.AllowsShreddedWrites(table.Protocol, table.Metadata.Configuration))
-        {
+        if (!shredsSomething)
             return;
+        if (VariantShreddingConfig.AllowsShreddedWrites(table.Protocol, table.Metadata.Configuration))
+        {
+            if (emitVariantLogicalType)
+                return;
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.ShreddingWithoutVariantAnnotation,
+                "Attempted to write shredded Variants without the VARIANT annotation: "
+                + "DeltaTableOptions.ParquetWriteOptions sets ShredVariants or VariantShredSchemas, and "
+                + "DeltaTableOptions.EmitVariantLogicalType is false. The unannotated layout (for Spark 4.0.x readers) is "
+                + "written unshredded, so the shredding options would be ignored. Set EmitVariantLogicalType to true to "
+                + "shred, or clear the shredding options to write the unannotated layout.");
         }
 
         throw new DeltaFormatException(

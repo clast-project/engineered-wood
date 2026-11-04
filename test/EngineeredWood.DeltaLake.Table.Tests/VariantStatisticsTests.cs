@@ -487,20 +487,4 @@ public class VariantStatisticsTests : IDisposable
         var unknown = Stats.VariantFooterStats.Compute(footer, ["v"], stringPrefixLength: 32);
         Assert.Equal(["$['a']"], Decode(JsonSerializer.SerializeToElement(unknown["v"].Min)).Keys);
     }
-
-    [Fact]
-    public async Task WithoutTheVariantAnnotation_TheFileIsNotShredded_SoThereAreNoPathsToBound()
-    {
-        // EmitVariantLogicalType = false hands the writer the bare storage struct, which it does not shred: the
-        // footer has no typed_value leaf, so nullCount alone describes the file (#676 review).
-        var options = Shredding() with { EmitVariantLogicalType = false };
-        var stats = await WriteAndReadStatsAsync(options, Enabled(), Obj(("a", VariantValue.FromInt32(1))), null);
-
-        var file = Directory.GetFiles(_tempDir, "*.parquet").Single();
-        await using (var raf = new LocalRandomAccessFile(file))
-        await using (var reader = new ParquetFileReader(raf, ownsFile: false))
-            Assert.DoesNotContain((await reader.ReadMetadataAsync()).Schema, e => e.Name == "typed_value");
-        Assert.False(stats.GetProperty("minValues").TryGetProperty("v", out _));
-        Assert.Equal(1, stats.GetProperty("nullCount").GetProperty("v").GetInt64());
-    }
 }
