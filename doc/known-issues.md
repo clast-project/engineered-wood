@@ -439,20 +439,36 @@ Note the domain stores PHYSICAL column names, because OSS Delta
 `EwWritten_Clustered_SparkResolvesClusteringColumns`, which asserts Spark's
 `DESCRIBE DETAIL` resolves the declaration back to the logical names.
 
-**Variant shredding: the feature, not the statistics.** `variantShredding` and
+**Variant shredding: the feature, the statistics, but no pruning.** `variantShredding` and
 `variantShredding-preview` are supported reader and writer features (#671).
 `delta.enableVariantShredding = true` at creation declares `variantShredding`
-(with `variantType`), as delta-spark 4.1+ does, and only such a table accepts
-a shredded write: `ParquetWriteOptions.ShredVariants` / `VariantShredSchemas`
-on any other table with a top-level variant column is refused with
-`DELTA_SHREDDING_TABLE_PROPERTY_DISABLED`. Checkpoints are never shredded.
-What is not done:
+(with `variantType`), as delta-spark 4.1.0 does; delta-spark 4.3.1 declares
+`variantShredding-preview` instead, because its
+`variantShredding.forceUsePreviewTableFeature` now defaults to true. Only such a
+table accepts a shredded write: `ParquetWriteOptions.ShredVariants` /
+`VariantShredSchemas` on any other table with a top-level variant column is
+refused with `DELTA_SHREDDING_TABLE_PROPERTY_DISABLED`. Checkpoints are never
+shredded.
 
-- *No variant min/max statistics.* EW writes `nullCount` only for a variant
-  column, which the spec allows. delta-spark 4.3+ derives z85-encoded
-  per-path `minValues`/`maxValues` from a shredded file's footer; EW neither
-  computes them nor prunes with Spark's. They are carried through untouched
-  in a commit's JSON `stats`, and dropped from the `stats_parsed` EW writes.
+A file EW shreds gets per-path variant `minValues`/`maxValues` (#675), derived
+from the footer it just wrote exactly as delta-spark 4.3 derives them (the
+`SparksBounds_AreWhatEwDerivesFromTheSameFooter` interop test compares the two
+path for path and type for type). A checkpoint's `stats_parsed` carries
+variant bounds as a Variant group on a table that supports shredding, and
+writes them back out when the JSON stats are rebuilt. What is not done:
+
+- *No pruning with variant bounds.* A predicate cannot name a variant path
+  yet: the expression library has no `variant_get`. Nothing to copy either:
+  delta-spark 4.3.1 and DuckDB's delta extension both read every file for a
+  predicate on a variant path (measured), whatever the bounds say.
+- *delta-spark writes none by default.* Its bounds need
+  `spark.databricks.delta.variantShredding.parseFooterForStats=true` (off by
+  default) and `spark.databricks.delta.stats.limitPerVariant` above its
+  default of 0, which otherwise writes the empty object `{}`. EW's have no cap
+  on the number of paths.
+- *Only top-level variant columns, and only files EW's own writer wrote.* A
+  host's `IDataFileWriter` returns no footer, so its files (like those
+  committed with `CommitDataFilesAsync`) get `nullCount` only.
 - *Files a host writes are not inspected.* `CommitDataFilesAsync`, the
   transaction's `StageDataFiles*`, and an `IDataFileWriter` that ignores the
   parquet options can still commit a shredded file to a table that does not

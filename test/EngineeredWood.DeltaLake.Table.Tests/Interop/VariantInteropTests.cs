@@ -334,15 +334,23 @@ public class VariantInteropTests : IDisposable
         // The values come back reassembled from typed_value, not empty.
         Assert.Equal([json[0], json[1], json[2], null], await ReadAsync());
 
-        // delta-spark 4.3+ also writes z85-encoded variant bounds, a STRING under minValues.v in the JSON stats.
-        // A filtered read parses those stats for pruning, and must neither throw nor prune on the variant bound.
+        // delta-spark 4.3+ also writes z85-encoded variant bounds, a STRING under minValues.v in the JSON stats,
+        // with real paths only because the driver raises stats.limitPerVariant from its default of 0 (which
+        // writes the empty object). A filtered read parses those stats for pruning, and must neither throw nor
+        // prune on the variant bound.
         var add = (await new DeltaLake.Log.TransactionLog(fs).ReadCommitAsync(1)).OfType<DeltaLake.Actions.AddFile>().First();
         using (var stats = System.Text.Json.JsonDocument.Parse(add.Stats!))
         {
             bool variantBounds = stats.RootElement.TryGetProperty("minValues", out var min)
                 && min.TryGetProperty("v", out var vMin) && vMin.ValueKind == System.Text.Json.JsonValueKind.String;
             if (DeltaSparkAtLeast(4, 3))
+            {
                 Assert.True(variantBounds, $"delta-spark 4.3+ wrote no variant bounds: {add.Stats}");
+                Assert.True(DeltaLake.VariantStatsEncoding.TryDecode(
+                    stats.RootElement.GetProperty("minValues").GetProperty("v").GetString()!, out var metadata, out var value));
+                string bound = VariantJsonWriter.ToJson(metadata, value, indented: false);
+                Assert.True(bound.Contains("$[", StringComparison.Ordinal), $"delta-spark wrote an empty variant bound: {bound}");
+            }
         }
         // The filter prunes FILES (there is no row-level post-filter), so: every id bound excludes the file
         // (0 rows), and one that admits it keeps all four.

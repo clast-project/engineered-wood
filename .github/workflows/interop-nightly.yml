@@ -41,7 +41,7 @@ jobs:
     #   spark-4.1  primary. VARIANT is GA and shredding works, so every interop case runs;
     #              the healthy result is 0 skipped.
     #   spark-4.0  Spark 4.0's UNANNOTATED variant layout and the preview shredding name.
-    #              The cases that need 4.1 skip honestly; the healthy result is 7 skipped.
+    #              The cases that need 4.1 (or delta-spark 4.3) skip honestly; the healthy result is 10 skipped.
     # The delta-rs and DuckDB tiers run in both lanes. They are cheap, and keeping the lanes
     # identical except for the two Spark pins means a difference between them is Spark's.
     name: interop (${{ matrix.lane }})
