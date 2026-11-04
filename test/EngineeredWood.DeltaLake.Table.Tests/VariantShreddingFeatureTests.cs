@@ -190,6 +190,72 @@ public class VariantShreddingFeatureTests : IDisposable
         Assert.Equal(["{\"a\":1,\"b\":\"x\"}", "{\"a\":2,\"b\":\"y\"}", null], await ReadJsonAsync(table));
     }
 
+    [Fact]
+    public void UnannotatedShreddedColumn_SlicedToANonZeroOffset_ReadsTheSlicedRows()
+    {
+        // Arrow C# does not slice a struct's children with it: parent slot i is child slot Offset + i. The rebuilt
+        // wrapper therefore takes the unsliced children with the parent's offset, applied once. Rows 1-2 of four.
+        var ids = new Int64Array.Builder().Append(1).Append(2).Append(3).Append(4).Build();
+        var vb = new VariantArray.Builder();
+        vb.Append(Obj(1, "w"));
+        vb.Append(Obj(2, "x"));
+        vb.AppendNull();
+        vb.Append(Obj(4, "z"));
+        var variants = vb.Build(allocator: null);
+        var storage = (StructArray)EngineeredWood.Parquet.VariantShredding.Shred(
+            variants, EngineeredWood.Parquet.VariantShredding.InferSchema(variants, ShredOptions.Default)!).Storage;
+
+        var sliced = (StructArray)storage.Slice(1, 2);
+        Assert.Equal(1, sliced.Offset);
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field("id", Int64Type.Default, false))
+                .Field(new Field("v", sliced.Data.DataType, true))
+                .Build(),
+            [ids.Slice(1, 2), sliced],
+            2);
+
+        var coerced = VariantColumnCoercion.Coerce(batch, VariantSchema());
+
+        var v = Assert.IsType<VariantArray>(coerced.Column(1));
+        Assert.Equal(2, v.Length);
+        Assert.Equal("{\"a\":2,\"b\":\"x\"}", VariantJsonWriter.ToJson(v.GetLogicalVariantValue(0), indented: false));
+        Assert.True(v.IsNull(1));
+    }
+
+    [Fact]
+    public void UnannotatedSparkOrderColumn_SlicedToANonZeroOffset_ReadsTheSlicedRows()
+    {
+        // The unshredded twin: Spark writes (value, metadata), so the fallback rebuilds the struct in canonical order.
+        // It used to pair StructArray.Fields -- already sliced -- with the parent's offset, reading the wrong rows.
+        var vb = new VariantArray.Builder();
+        vb.Append(Obj(1, "w"));
+        vb.Append(Obj(2, "x"));
+        vb.AppendNull();
+        vb.Append(Obj(4, "z"));
+        var canonical = (StructArray)vb.Build(allocator: null).Storage;
+        var type = (StructType)canonical.Data.DataType;
+        var sparkOrder = new StructArray(new ArrayData(
+            new StructType([type.Fields[1], type.Fields[0]]),
+            canonical.Length, canonical.NullCount, 0, canonical.Data.Buffers,
+            [canonical.Data.Children[1], canonical.Data.Children[0]]));
+
+        var sliced = (StructArray)sparkOrder.Slice(1, 2);
+        var ids = new Int64Array.Builder().Append(1).Append(2).Append(3).Append(4).Build();
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field("id", Int64Type.Default, false))
+                .Field(new Field("v", sliced.Data.DataType, true))
+                .Build(),
+            [ids.Slice(1, 2), sliced],
+            2);
+
+        var v = Assert.IsType<VariantArray>(VariantColumnCoercion.Coerce(batch, VariantSchema()).Column(1));
+        Assert.Equal(2, v.Length);
+        Assert.Equal("{\"a\":2,\"b\":\"x\"}", VariantJsonWriter.ToJson(v.GetLogicalVariantValue(0), indented: false));
+        Assert.True(v.IsNull(1));
+    }
+
     // ── Enabling it ──
 
     [Fact]
@@ -363,6 +429,43 @@ public class VariantShreddingFeatureTests : IDisposable
 
         Assert.False(await IsShreddedAsync(DataFiles().Single()));
         Assert.Equal(3, (await ReadJsonAsync(table)).Count);
+    }
+
+    [Theory]
+    [InlineData(true)]   // the column's physical name, which the translation passes through unchanged
+    [InlineData(false)]  // its logical name, which the translation maps to the physical one
+    public async Task VariantShredSchemas_OnAColumnMappedTable_IsRefusedByEitherName(bool physicalKey)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (await DeltaTable.CreateAsync(fs, VariantSchema(), columnMappingMode: EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name)) { }
+        string physical;
+        await using (var created = await DeltaTable.OpenAsync(fs))
+        {
+            physical = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(
+                created.CurrentSnapshot.Schema.Fields.Single(f => f.Name == "v"),
+                EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name);
+        }
+        Assert.NotEqual("v", physical);
+
+        var options = DeltaTableOptions.Default with
+        {
+            ParquetWriteOptions = ParquetWriteOptions.Default with
+            {
+                VariantShredSchemas = new Dictionary<string, ShredSchema>
+                {
+                    [physicalKey ? physical : "v"] = ShredSchema.ForObject(new Dictionary<string, ShredSchema>
+                    {
+                        ["a"] = ShredSchema.Primitive(ShredType.Int32),
+                    }),
+                },
+            },
+        };
+        await using var table = await DeltaTable.OpenAsync(fs, options);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.WriteAsync([ObjectBatch()]));
+        Assert.Equal(DeltaTableErrorCodes.ShreddingTablePropertyDisabled, ex.ErrorCode);
+        Assert.Empty(DataFiles());
     }
 
     [Fact]

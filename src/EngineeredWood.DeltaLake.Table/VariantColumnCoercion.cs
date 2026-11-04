@@ -132,14 +132,30 @@ internal static class VariantColumnCoercion
         if (metaIdx == 0 && valueIdx == 1 && type.Fields.Count == 2)
             return storage;
 
-        var canonicalType = new StructType(new[] { type.Fields[metaIdx], type.Fields[valueIdx] });
-        return new StructArray(
-            canonicalType,
-            storage.Length,
-            new[] { storage.Fields[metaIdx], storage.Fields[valueIdx] },
-            GetValidityBuffer(storage),
-            storage.NullCount,
-            storage.Offset);
+        return Reordered(storage, [metaIdx, valueIdx]);
+    }
+
+    /// <summary>
+    /// <paramref name="storage"/> with only the children at <paramref name="order"/>, in that order, keeping its
+    /// offset, length and validity.
+    /// </summary>
+    /// <remarks>
+    /// Built from the RAW children (<c>Data.Children</c>), which Arrow C# does not slice with their parent: parent
+    /// slot i is child slot <c>Offset + i</c>, so the parent's offset is applied once, here. <see cref="StructArray.Fields"/>
+    /// returns children already sliced to the parent, and pairing those with the parent's offset applied it twice,
+    /// reading the wrong rows of any sliced column.
+    /// </remarks>
+    private static StructArray Reordered(StructArray storage, IReadOnlyList<int> order)
+    {
+        var type = (StructType)storage.Data.DataType;
+        var data = storage.Data;
+        return new StructArray(new ArrayData(
+            new StructType(order.Select(i => type.Fields[i]).ToList()),
+            data.Length,
+            data.NullCount,
+            data.Offset,
+            data.Buffers,
+            order.Select(i => data.Children[i]).ToArray()));
     }
 
     /// <summary>
@@ -155,13 +171,7 @@ internal static class VariantColumnCoercion
             order.Add(IndexOf(type, "value"));
         order.Add(IndexOf(type, "typed_value"));
 
-        var canonical = new StructArray(
-            new StructType(order.Select(i => type.Fields[i]).ToList()),
-            storage.Length,
-            order.Select(i => storage.Fields[i]).ToArray(),
-            GetValidityBuffer(storage),
-            storage.NullCount,
-            storage.Offset);
+        var canonical = Reordered(storage, order);
 
         if (!VariantExtensionDefinition.Instance.TryCreateType(canonical.Data.DataType, string.Empty, out var ext)
             || ext.CreateArray(canonical) is not VariantArray shredded)
@@ -187,9 +197,6 @@ internal static class VariantColumnCoercion
             $"Variant storage struct is missing the required '{fieldName}' field; it has "
             + $"[{string.Join(", ", System.Linq.Enumerable.Select(type.Fields, f => f.Name))}].");
     }
-
-    private static ArrowBuffer GetValidityBuffer(StructArray storage) =>
-        storage.Data.Buffers.Length > 0 ? storage.Data.Buffers[0] : ArrowBuffer.Empty;
 
     private static IArrowArray[] CopyColumns(RecordBatch batch)
     {

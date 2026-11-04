@@ -190,15 +190,21 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private ParquetWriteOptions DataFileWriteOptions(
         Schema.StructType schema, ColumnMappingMode mode, Snapshot.Snapshot table)
     {
-        ThrowIfShreddingDisallowed(schema, table);
+        ParquetWriteOptions options;
         if (_dataFileWriteOptions is { } cached
             && ReferenceEquals(cached.Schema, schema) && cached.Mode == mode)
         {
-            return cached.Options;
+            options = cached.Options;
+        }
+        else
+        {
+            options = ColumnMappingWriteOptions.ToPhysical(_options.ParquetWriteOptions, schema, mode);
+            _dataFileWriteOptions = (schema, mode, options);
         }
 
-        var options = ColumnMappingWriteOptions.ToPhysical(_options.ParquetWriteOptions, schema, mode);
-        _dataFileWriteOptions = (schema, mode, options);
+        // Against the TRANSLATED options, the ones the writer will use: a key that names a physical column directly
+        // passes through the translation unchanged and still shreds that column.
+        ThrowIfShreddingDisallowed(options, schema, mode, table);
         return options;
     }
 
@@ -208,19 +214,21 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// Variant". delta-spark refuses the same write (<c>OptimisticTransaction.assertShreddingStateConsistent</c>) with
     /// the code reused here. Nothing is refused when the options would shred nothing: the writer shreds only top-level
     /// variant columns, all of them under <see cref="ParquetWriteOptions.ShredVariants"/> and only the ones it names
-    /// under <see cref="ParquetWriteOptions.VariantShredSchemas"/>. Those keys are LOGICAL names, matched as
-    /// <see cref="ColumnMappingWriteOptions"/> matches them before translating, so they are compared with the logical
-    /// schema here.
+    /// under <see cref="ParquetWriteOptions.VariantShredSchemas"/>. <paramref name="physical"/> is the option set
+    /// AFTER column-mapping translation, so its keys are compared with each variant column's PHYSICAL name, which is
+    /// what the writer matches them against. A logical key has been translated by then; a key that already named the
+    /// physical column passed through unchanged.
     /// </summary>
-    private void ThrowIfShreddingDisallowed(Schema.StructType schema, Snapshot.Snapshot table)
+    private static void ThrowIfShreddingDisallowed(
+        ParquetWriteOptions physical, Schema.StructType schema, ColumnMappingMode mode, Snapshot.Snapshot table)
     {
-        var parquet = _options.ParquetWriteOptions;
+        var parquet = physical;
         if (parquet.ShredVariants is null && parquet.VariantShredSchemas is not { Count: > 0 })
             return;
 
         var variantColumns = schema.Fields
             .Where(static f => f.Type is Schema.PrimitiveType { TypeName: "variant" })
-            .Select(static f => f.Name);
+            .Select(f => ColumnMapping.GetPhysicalName(f, mode));
         bool shredsSomething = parquet.ShredVariants is not null
             ? variantColumns.Any()
             : variantColumns.Any(name => parquet.VariantShredSchemas!.ContainsKey(name));
