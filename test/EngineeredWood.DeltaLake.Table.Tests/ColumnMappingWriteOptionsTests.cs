@@ -196,6 +196,44 @@ public class ColumnMappingWriteOptionsTests : IDisposable
     }
 
     /// <summary>
+    /// A change-data file is written under the table's nested names too: an element the caller's builder named
+    /// <c>item</c> lands at <c>.list.element</c>, where the Bloom filter keyed by the table's path reaches it.
+    /// </summary>
+    [Theory]
+    [InlineData(ColumnMappingMode.None)]
+    [InlineData(ColumnMappingMode.Name)]
+    public async Task ChangeDataFile_CallerNestedNames_FollowTheTable(ColumnMappingMode mode)
+    {
+        var tableSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("tags", new ListType(new Field("element", StringType.Default, true)), true))
+            .Build();
+        var options = new DeltaTableOptions
+        {
+            ParquetWriteOptions = ParquetWriteOptions.Default with
+            {
+                BloomFilterColumns = new HashSet<string> { "tags.list.element" },
+            },
+        };
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), tableSchema, options, columnMappingMode: mode,
+            configuration: new Dictionary<string, string> { [EngineeredWood.DeltaLake.ChangeDataFeed.CdfConfig.EnableKey] = "true" });
+
+        var builder = new ListArray.Builder(StringType.Default);
+        builder.Append();
+        ((StringArray.Builder)builder.ValueBuilder).Append("a");
+        var tags = builder.Build();
+        Assert.Equal("item", ((ListType)tags.Data.DataType).ValueField.Name);
+        var batchSchema = new Apache.Arrow.Schema.Builder().Field(new Field("tags", tags.Data.DataType, true)).Build();
+
+        await table.WriteChangeDataFileAsync(new RecordBatch(batchSchema, [tags], 1), "insert");
+
+        var chunks = (await Chunks()).Where(c => !c.Path.StartsWith("_change_type", StringComparison.Ordinal)).ToList();
+        var (path, meta) = Assert.Single(chunks);
+        Assert.EndsWith(".list.element", path);
+        Assert.NotNull(meta.BloomFilterOffset);
+    }
+
+    /// <summary>
     /// The translation follows the schema at each write: an option naming "renamed" matches nothing until
     /// the column is renamed to it, and then reaches the same physical leaf.
     /// </summary>
