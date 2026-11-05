@@ -29,7 +29,9 @@ internal sealed class BooleanColumnReader : ColumnReader
         var rawValues = new bool[nonNullCount];
         if (nonNullCount > 0)
         {
-            _decoder?.ReadValues(rawValues);
+            if (_decoder == null)
+                throw MissingStream("boolean", "DATA");
+            _decoder.ReadValues(rawValues);
         }
 
         int byteCount = (batchSize + 7) / 8;

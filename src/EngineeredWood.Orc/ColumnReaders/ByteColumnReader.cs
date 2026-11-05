@@ -29,7 +29,9 @@ internal sealed class ByteColumnReader : ColumnReader
         var rawValues = new byte[nonNullCount];
         if (nonNullCount > 0)
         {
-            _decoder?.ReadValues(rawValues);
+            if (_decoder == null)
+                throw MissingStream("byte", "DATA");
+            _decoder.ReadValues(rawValues);
         }
 
         using var buf = new NativeBuffer<sbyte>(batchSize, zeroFill: nullCount > 0);

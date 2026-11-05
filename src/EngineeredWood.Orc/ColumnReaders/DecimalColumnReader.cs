@@ -95,7 +95,7 @@ internal sealed class DecimalColumnReader : ColumnReader
 
             nullBits[i >> 3] |= (byte)(1 << (i & 7));
             if (_dataStream == null)
-                throw new InvalidDataException($"ORC decimal column {ColumnId} has values but no DATA stream.");
+                throw MissingStream("decimal", "DATA");
             var value = Rescale(ReadVarInt128(_dataStream), (int)scales[rawIdx++], _scale, ColumnId);
             var dest = valueBytes.Slice(i * byteWidth, byteWidth);
             BinaryPrimitives.WriteUInt64LittleEndian(dest, (ulong)value);

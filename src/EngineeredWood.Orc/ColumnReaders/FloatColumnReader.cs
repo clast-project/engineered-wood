@@ -24,6 +24,8 @@ internal sealed class FloatColumnReader : ColumnReader
         int nullCount = present == null ? 0 : batchSize - nonNullCount;
 
         using var buf = new NativeBuffer<float>(batchSize, zeroFill: nullCount > 0);
+        if (nonNullCount > 0 && _dataStream == null)
+            throw MissingStream("float", "DATA");
         if (_dataStream != null)
         {
             var values = buf.Span;
@@ -58,6 +60,8 @@ internal sealed class DoubleColumnReader : ColumnReader
         int nullCount = present == null ? 0 : batchSize - nonNullCount;
 
         using var buf = new NativeBuffer<double>(batchSize, zeroFill: nullCount > 0);
+        if (nonNullCount > 0 && _dataStream == null)
+            throw MissingStream("double", "DATA");
         if (_dataStream != null)
         {
             var values = buf.Span;

@@ -74,7 +74,8 @@ internal sealed class StringColumnReader : ColumnReader
             if (nonNullCount > 0)
             {
                 if (_lengthDecoderV2 != null) _lengthDecoderV2.ReadValues(lengths);
-                else _lengthDecoderV1?.ReadValues(lengths);
+                else if (_lengthDecoderV1 != null) _lengthDecoderV1.ReadValues(lengths);
+                else throw MissingStream("string", "LENGTH");
             }
 
             // Compute total bytes and offsets
@@ -98,8 +99,13 @@ internal sealed class StringColumnReader : ColumnReader
 
             // Read all string bytes contiguously from the data stream
             using var dataBuf = new NativeBuffer<byte>(currentOffset > 0 ? currentOffset : 1, zeroFill: false);
-            if (currentOffset > 0 && _dataStream != null)
+            if (currentOffset > 0)
+            {
+                // Only values with bytes need DATA: a column of empty values may rightly have none.
+                if (_dataStream == null)
+                    throw MissingStream("string", "DATA");
                 _dataStream.ReadExactly(dataBuf.Span.Slice(0, currentOffset));
+            }
 
             int nullCount = present == null ? 0 : batchSize - nonNullCount;
             var nullBuffer = CreateValidityBuffer(present, batchSize);
@@ -125,7 +131,8 @@ internal sealed class StringColumnReader : ColumnReader
             if (nonNullCount > 0)
             {
                 if (_dataDecoderV2 != null) _dataDecoderV2.ReadValues(indices);
-                else _dataDecoderV1?.ReadValues(indices);
+                else if (_dataDecoderV1 != null) _dataDecoderV1.ReadValues(indices);
+                else throw MissingStream("string", "DATA");
             }
 
             // Compute total bytes needed
@@ -176,7 +183,8 @@ internal sealed class StringColumnReader : ColumnReader
 
     private void BuildDictionary()
     {
-        if (_dictionaryDataStream == null || _lengthStream == null)
+        // An empty dictionary needs no streams; any index into it is then refused as out of range.
+        if (_dictionarySize == 0)
         {
             _dictUtf8 = [];
             return;
@@ -185,7 +193,9 @@ internal sealed class StringColumnReader : ColumnReader
         // Read dictionary entry lengths
         var lengths = new long[_dictionarySize];
         if (_lengthDecoderV2 != null) _lengthDecoderV2.ReadValues(lengths);
-        else _lengthDecoderV1?.ReadValues(lengths);
+        else if (_lengthDecoderV1 != null) _lengthDecoderV1.ReadValues(lengths);
+        else throw new InvalidDataException(
+            $"ORC string column {ColumnId} has a dictionary of {_dictionarySize} entries but no LENGTH stream.");
 
         // Read all dictionary bytes at once
         long totalBytes = 0;
@@ -194,7 +204,13 @@ internal sealed class StringColumnReader : ColumnReader
 
         var allBytes = new byte[totalBytes];
         if (totalBytes > 0)
+        {
+            // A dictionary of empty strings may rightly have no DICTIONARY_DATA.
+            if (_dictionaryDataStream == null)
+                throw new InvalidDataException(
+                    $"ORC string column {ColumnId} has a dictionary of {_dictionarySize} entries but no DICTIONARY_DATA stream.");
             _dictionaryDataStream.ReadExactly(allBytes);
+        }
 
         // Slice into per-entry byte arrays
         _dictUtf8 = new byte[_dictionarySize][];

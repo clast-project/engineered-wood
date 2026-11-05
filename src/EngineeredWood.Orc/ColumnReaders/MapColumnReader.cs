@@ -52,7 +52,8 @@ internal sealed class MapColumnReader : ColumnReader
             if (nonNullCount > 0)
             {
                 if (_lengthDecoderV2 != null) _lengthDecoderV2.ReadValues(lengths);
-                else _lengthDecoderV1?.ReadValues(lengths);
+                else if (_lengthDecoderV1 != null) _lengthDecoderV1.ReadValues(lengths);
+                else throw MissingStream("map", "LENGTH");
             }
 
             using var offsetBuf = new NativeBuffer<int>(batchSize + 1, zeroFill: false);
