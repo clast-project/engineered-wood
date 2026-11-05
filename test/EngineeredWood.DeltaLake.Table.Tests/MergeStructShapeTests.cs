@@ -360,4 +360,54 @@ public class MergeStructShapeTests : IDisposable
                 : ["id=1, col=[{a=10, c=null}]", "id=2, col=[{a=2, c=k2}]"],
             await RowsAsync(table));
     }
+
+    // ── Sliced children ──
+
+    /// <summary>
+    /// #701 review: a list's or map's offsets index its child from the child's own offset (Arrow offsets add up), and
+    /// <see cref="DeltaTable.FitStruct"/> rebuilds a struct at offset 0 from its windowed <c>Fields</c>, so element i
+    /// of the fitted child is element i of the supplied one and the offsets still line up. Built so the two readings
+    /// disagree: the struct child is a slice starting at 1, and its elements are told apart by value.
+    /// </summary>
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void AListOrMapOverASlicedStructChild_IsFittedElementForElement(bool map, bool sliceContainer)
+    {
+        var full = Struct(("c", Strings("x0", "x1", "x2", "x3")), ("a", Ints(0, 1, 2, 3)));
+        var child = (StructArray)full.Slice(1, 3);                                          // x1, x2, x3
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(1).Append(3).Build();
+        IArrowArray supplied = map
+            ? new MapArray(
+                new MapType(new Field("key", StringType.Default, false), new Field("value", child.Data.DataType, true)), 2,
+                offsets,
+                (StructArray)new StructArray(
+                    new StructType([new Field("key", StringType.Default, false), new Field("value", full.Data.DataType, true)]),
+                    4, [Strings("k0", "k1", "k2", "k3"), full], ArrowBuffer.Empty).Slice(1, 3),
+                ArrowBuffer.Empty)
+            : new ListArray(new ListType(new Field("element", child.Data.DataType, true)), 2, offsets, child, ArrowBuffer.Empty);
+        if (sliceContainer)
+            supplied = ArrowArrayFactory.Slice(supplied, 1, 1);
+        IArrowType target = map
+            ? new MapType(new Field("key", StringType.Default, false), new Field("value", AC, true))
+            : new ListType(new Field("element", AC, true));
+
+        // What the supplied array holds, read through its own offsets: the test is only as good as this.
+        string[] expected = (map, sliceContainer) switch
+        {
+            (false, false) => ["[{c=x1, a=1}]", "[{c=x2, a=2}, {c=x3, a=3}]"],
+            (false, true) => ["[{c=x2, a=2}, {c=x3, a=3}]"],
+            (true, false) => ["{k1->{c=x1, a=1}}", "{k2->{c=x2, a=2}, k3->{c=x3, a=3}}"],
+            _ => ["{k2->{c=x2, a=2}, k3->{c=x3, a=3}}"],
+        };
+        Assert.Equal(expected, Enumerable.Range(0, supplied.Length).Select(i => Format(supplied, i)));
+
+        var fitted = DeltaTable.FitStruct(supplied, target, kept: null);
+
+        Assert.Equal(
+            expected.Select(e => System.Text.RegularExpressions.Regex.Replace(e, @"\{c=(x\d), a=(\d)\}", "{a=$2, c=$1}")),
+            Enumerable.Range(0, fitted.Length).Select(i => Format(fitted, i)));
+    }
 }
