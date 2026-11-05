@@ -10072,11 +10072,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// Writes each of <paramref name="router"/>'s groups as its own file and adds the source's remove followed by
     /// their adds to <paramref name="actions"/>. Returns the next free row id.
     /// </summary>
+    /// <param name="removeSource">False adds only the new files: the caller keeps the source, masking the rows it
+    /// replaced with a deletion vector (a MERGE that writes them).</param>
     private async ValueTask<long> WriteRewriteGroupsAsync(
         Snapshot.Snapshot snapshot, Actions.AddFile source, ColumnMappingMode mappingMode, PartitionRouter router,
         bool materializeIds, string? matRowIdName, string? matRowVerName,
         bool assignRowIds, long nextRowId, long newVersion, List<DeltaAction> actions,
-        WrittenFileLedger? written, CancellationToken cancellationToken)
+        WrittenFileLedger? written, CancellationToken cancellationToken, bool removeSource = true)
     {
         RemoveFile? remove = null;
         var adds = new List<DeltaAction>();
@@ -10093,7 +10095,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (assignRowIds)
                 nextRowId += addedRows;
         }
-        actions.Add(remove!);
+        if (removeSource)
+            actions.Add(remove!);
         actions.AddRange(adds);
         return nextRowId;
     }

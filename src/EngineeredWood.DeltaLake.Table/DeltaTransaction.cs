@@ -624,8 +624,9 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// <summary>
     /// Stages a key-based MERGE of <paramref name="source"/>, evaluated against this transaction's pinned read
     /// version: see <see cref="DeltaTable.MergeAsync"/> and <see cref="MergeOptions"/>. Each file holding a row it
-    /// updates or deletes is rewritten now, once, with all of that file's changes, and the unmatched source rows
-    /// are written as an append; <see cref="AbortAsync"/> deletes them again if the transaction never commits.
+    /// updates or deletes is changed now, once, with all of that file's changes (rewritten, or given a deletion
+    /// vector and its post-images written to a new file; see <see cref="MergeOptions.DeleteMode"/>), and the
+    /// unmatched source rows are written as an append; <see cref="AbortAsync"/> deletes them again if the transaction never commits.
     ///
     /// <para>What it read becomes the transaction's read set: every file it read, and the source's key range as a
     /// read predicate, so a concurrent commit that removed a file it read, or added one that could hold a source
