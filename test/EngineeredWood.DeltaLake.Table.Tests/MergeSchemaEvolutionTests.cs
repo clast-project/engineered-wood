@@ -655,6 +655,39 @@ public class MergeSchemaEvolutionTests : IDisposable
     }
 
     /// <summary>
+    /// The evolution takes every source batch, in order, as a merging write takes its batches, so the two agree
+    /// where the batches type a column differently: a later batch's long widens an existing int column, and then the
+    /// first batch's int is not the declared type; a new column typed differently is not a widening at all. Both
+    /// refuse, alike, before anything is committed.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SourceBatchesTypingAColumnDifferently_AreRefused_AsAMergingWriteRefusesThem(bool newColumn)
+    {
+        await using var table = await CreateNumbersAsync(TypeWidening);
+        long before = table.CurrentSnapshot.Version;
+        string column = newColumn ? "extra" : "n";
+        RecordBatch[] source = newColumn
+            ?
+            [
+                Batch(("id", Ints(1)), ("n", Ints(10)), ("extra", Ints(1))),
+                Batch(("id", Ints(2)), ("n", Ints(20)), ("extra", Longs(5_000_000_000L))),
+            ]
+            : [Batch(("id", Ints(1)), ("n", Ints(10))), Batch(("id", Ints(2)), ("n", Longs(5_000_000_000L)))];
+
+        var write = await Assert.ThrowsAnyAsync<Exception>(() => table.WriteAsync(source, mergeSchema: true).AsTask());
+        var merge = await Assert.ThrowsAnyAsync<Exception>(() =>
+            table.MergeAsync(source, Upsert(mergeSchema: true)).AsTask());
+
+        Assert.Equal(write.GetType(), merge.GetType());
+        Assert.Contains($"column '{column}' is declared", write.Message);
+        Assert.Equal(write.Message.Replace("Write: ", "MERGE: "), merge.Message);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+        Assert.Equal("id:integer, n:integer", Columns(table));
+    }
+
+    /// <summary>
     /// Measured: the column is widened by the type of the SOURCE column of its name, not by the assigned value's.
     /// <c>SET n = 5000000000L</c> widens <c>n</c> when the source has a <c>long n</c>; <c>SET n = s.m</c> does not,
     /// and its value overflows the <c>int</c>.

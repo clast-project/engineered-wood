@@ -586,8 +586,15 @@ public sealed partial class DeltaTable
         var plan = MergePlan.Validate(options, snapshot.Schema, columnsMayBeAdded: true);
         if (source.Count == 0)
             return null; // no schema to evolve to: as an empty source, the MERGE writes nothing
-        if (source[0] is not { } first)
+        if (source.Any(b => b is null))
             throw new ArgumentException("A source batch is null.", nameof(source));
+        var first = source[0];
+        // PrepareMergeSource refuses these too, but the evolution reads each batch's fields by the first's positions.
+        if (source.Any(b => !b.Schema.FieldsList.Select(f => f.Name).SequenceEqual(first.Schema.FieldsList.Select(f => f.Name))))
+        {
+            throw new ArgumentException(
+                "MERGE: every source batch must have the same columns in the same order.", nameof(source));
+        }
 
         var sourceFields = first.Schema.FieldsList;
         var written = new HashSet<int>();
@@ -607,8 +614,13 @@ public sealed partial class DeltaTable
         if (written.Count == 0)
             return null;
 
-        var fields = written.OrderBy(i => i).Select(i => sourceFields[i]).ToList();
-        return ComputeSchemaMerge(snapshot, [new Apache.Arrow.Schema(fields, null)], "MERGE");
+        // Every batch, in order, as a merging write takes them: a later batch's wider type widens an existing column
+        // on a table that enables it.
+        var columns = written.OrderBy(i => i).ToList();
+        var schemas = source
+            .Select(b => new Apache.Arrow.Schema(columns.Select(i => b.Schema.FieldsList[i]).ToList(), null))
+            .ToList();
+        return ComputeSchemaMerge(snapshot, schemas, "MERGE");
 
         // By name, then ignoring case when that names one column: an assignment names its column as Spark resolves
         // it.
