@@ -49,6 +49,9 @@ internal enum TokenKind
     /// <summary><c>::</c> — Spark's cast shorthand, as in <c>a::bigint</c>.</summary>
     ColonColon,
 
+    /// <summary><c>:</c> — Spark's variant path extraction, as in <c>v:a.b</c>.</summary>
+    Colon,
+
     /// <summary><c>+</c></summary>
     Plus,
 

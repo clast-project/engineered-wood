@@ -266,7 +266,8 @@ internal sealed class DeltaFileStats
 /// look up min/max from the parsed stats and decode the JSON element using
 /// the column's Delta primitive type.
 /// </summary>
-internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStats>
+internal sealed class DeltaFileStatsAccessor
+    : IStatisticsAccessor<DeltaFileStats>, IVariantStatisticsAccessor<DeltaFileStats>
 {
     private readonly IReadOnlyDictionary<string, string> _columnTypes;
     private readonly HashSet<string> _partitionColumns;
@@ -276,6 +277,8 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
     private readonly HashSet<string> _unattributable;
     private readonly HashSet<string> _noBounds;
     private readonly HashSet<string> _nonNullablePartitions;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<VariantGetCall, VariantPathStatsAccessor?>
+        _variantPaths = new();
 
     public DeltaFileStatsAccessor(
         IReadOnlyDictionary<string, string> columnTypes,
@@ -447,6 +450,76 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
         return isMin ? bound : WidenTimestampMax(bound, typeName);
     }
 
+    /// <summary>
+    /// Statistics for a path of a variant column, read from the column's variant <c>minValues</c> /
+    /// <c>maxValues</c>: an object keyed by normalized path (<c>$['a']['b']</c>) whose values bound that path.
+    /// </summary>
+    /// <remarks>
+    /// <para>Sound because of what the protocol lets a writer bound: only a path whose type is the same in every
+    /// row of the file where it holds a value (EW's <c>VariantFooterStats</c> and delta-spark's
+    /// <c>VariantStatsData</c> both take the path's footer bounds only when its residual <c>value</c> column is
+    /// null throughout). Every other row is one where the path is missing, the variant (or a value on the way)
+    /// is not an object, or the variant is NULL, and <c>variant_get</c> answers NULL for all of those whether or
+    /// not it is the <c>try_</c> form. So the bounds hold for every row whose result is not NULL, provided the
+    /// bound's type converts to the target type exactly (<see cref="DeltaLiteralDecoder.FromVariantField"/>),
+    /// which also means no row between them fails to convert.</para>
+    /// <para>A path with no bound in the file gives no bound, never an excluded file. A path through an array
+    /// element is never bounded (its rows are elements).</para>
+    /// </remarks>
+    public IStatisticsAccessor<DeltaFileStats>? ForVariantGet(VariantGetCall call) =>
+        _variantPaths.GetOrAdd(call, c => CreateVariantPathAccessor(c));
+
+    private VariantPathStatsAccessor? CreateVariantPathAccessor(VariantGetCall call)
+    {
+        string column = call.Column.Name;
+        if (!_columnTypes.TryGetValue(column, out string? typeName) || typeName != "variant"
+            || _partitionColumns.Contains(column) || _noBounds.Contains(column)
+            || !call.Path.IsFieldsOnly || DeltaTypeName(call.TargetType) is not { } target)
+        {
+            return null;
+        }
+        string key = VariantStatsEncoding.NormalizedPath(call.Path.Segments.Select(s => s.Key!).ToList());
+        return new VariantPathStatsAccessor(this, key, target);
+    }
+
+    // The Delta type name of a canonical Spark one (VariantGetCall.TryNormalizeTypeName); null for one no variant
+    // bound answers.
+    private static string? DeltaTypeName(string sparkType) => sparkType switch
+    {
+        "tinyint" => "byte",
+        "smallint" => "short",
+        "int" => "integer",
+        "bigint" => "long",
+        "float" or "double" or "string" or "boolean" or "date" or "timestamp" or "timestamp_ntz" => sparkType,
+        _ when sparkType.StartsWith("decimal(", StringComparison.Ordinal) => sparkType,
+        _ => null,
+    };
+
+    internal LiteralValue? GetVariantPathBound(
+        DeltaFileStats stats, string column, string key, string typeName, bool isMin)
+    {
+        byte[] metadata, value;
+        if (TypedFor(stats.AddFile) is { } typed
+            && TryResolveTyped(typed, column, typed.View.HasBound, out string resolved))
+        {
+            if (!typed.View.TryGetVariantBound(resolved, typed.Row, isMin, out metadata, out value))
+                return null;
+        }
+        else
+        {
+            var bounds = isMin ? stats.ColumnStats?.MinValues : stats.ColumnStats?.MaxValues;
+            if (!TryGetStat(bounds, column, out var element)
+                || element.ValueKind != System.Text.Json.JsonValueKind.String
+                || !VariantStatsEncoding.TryDecode(element.GetString()!, out metadata, out value))
+            {
+                return null;
+            }
+        }
+
+        var bound = DeltaLiteralDecoder.FromVariantField(metadata, value, key, typeName);
+        return isMin ? bound : WidenTimestampMax(bound, typeName);
+    }
+
     // Spark writes timestamp bounds TRUNCATED to the millisecond, so a file's true maximum can lie up to 999
     // microseconds above its recorded one; delta-spark and delta-kernel add 1 ms to every timestamp max they read
     // for the same reason. The min, truncated downwards, is already a valid lower bound. A max this engine wrote
@@ -463,4 +536,33 @@ internal sealed class DeltaFileStatsAccessor : IStatisticsAccessor<DeltaFileStat
             ? (LiteralValue?)LiteralValue.Of(value.AddMilliseconds(1))
             : null;
     }
+}
+
+/// <summary>
+/// The statistics of one <c>variant_get</c> result, for <see cref="StatisticsEvaluator"/>: bounds from the
+/// variant column's per-path bounds (see <see cref="DeltaFileStatsAccessor.ForVariantGet"/>), asked for under the
+/// variant column's name.
+/// </summary>
+internal sealed class VariantPathStatsAccessor(DeltaFileStatsAccessor owner, string key, string typeName)
+    : IStatisticsAccessor<DeltaFileStats>
+{
+    public LiteralValue? GetMinValue(DeltaFileStats stats, string column) =>
+        owner.GetVariantPathBound(stats, column, key, typeName, isMin: true);
+
+    public LiteralValue? GetMaxValue(DeltaFileStats stats, string column) =>
+        owner.GetVariantPathBound(stats, column, key, typeName, isMin: false);
+
+    // The result is NULL in at least the rows where the variant is, and in an unknown number more (a missing
+    // path), so the count is known only when the column is NULL throughout.
+    public long? GetNullCount(DeltaFileStats stats, string column) =>
+        owner.GetNullCount(stats, column) is long nulls && owner.GetValueCount(stats, column) is long rows
+            && nulls == rows
+            ? nulls
+            : null;
+
+    public long? GetValueCount(DeltaFileStats stats, string column) => owner.GetValueCount(stats, column);
+
+    public bool IsMinExact(DeltaFileStats stats, string column) => true;
+
+    public bool IsMaxExact(DeltaFileStats stats, string column) => true;
 }

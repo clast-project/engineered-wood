@@ -96,10 +96,10 @@ public static class StatisticsEvaluator
         ComparisonPredicate cmp, TStats stats, IStatisticsAccessor<TStats> accessor)
     {
         // Try to extract (column, op, value). The value may be on either side.
-        if (TryExtractColumnAndLiteral(cmp.Left, cmp.Right, cmp.Op,
-                out string? column, out LiteralValue value, out var op))
+        if (TryExtractColumnAndLiteral(cmp.Left, cmp.Right, cmp.Op, accessor,
+                out string? column, out LiteralValue value, out var op, out var columnAccessor))
         {
-            return EvaluateColumnComparison(column!, op, value, stats, accessor);
+            return EvaluateColumnComparison(column!, op, value, stats, columnAccessor);
         }
 
         // Two literals — evaluate directly, when this comparison is the one a row evaluator makes.
@@ -429,7 +429,7 @@ public static class StatisticsEvaluator
     private static FilterResult EvaluateUnary<TStats>(
         UnaryPredicate unary, TStats stats, IStatisticsAccessor<TStats> accessor)
     {
-        if (!TryGetColumnName(unary.Operand, out string? column))
+        if (!TryResolveColumn(unary.Operand, accessor, out string? column, out accessor))
             return FilterResult.Unknown;
 
         switch (unary.Op)
@@ -507,7 +507,7 @@ public static class StatisticsEvaluator
     private static FilterResult EvaluateSet<TStats>(
         SetPredicate set, TStats stats, IStatisticsAccessor<TStats> accessor)
     {
-        if (!TryGetColumnName(set.Operand, out string? column))
+        if (!TryResolveColumn(set.Operand, accessor, out string? column, out accessor))
             return FilterResult.Unknown;
 
         if (set.Values.Count == 0)
@@ -575,11 +575,12 @@ public static class StatisticsEvaluator
     /// Returns true if the comparison can be reduced to (column, op, value),
     /// flipping the operator if the value is on the left.
     /// </summary>
-    private static bool TryExtractColumnAndLiteral(
-        Expression left, Expression right, ComparisonOperator op,
-        out string? column, out LiteralValue value, out ComparisonOperator effectiveOp)
+    private static bool TryExtractColumnAndLiteral<TStats>(
+        Expression left, Expression right, ComparisonOperator op, IStatisticsAccessor<TStats> accessor,
+        out string? column, out LiteralValue value, out ComparisonOperator effectiveOp,
+        out IStatisticsAccessor<TStats> columnAccessor)
     {
-        if (TryGetColumnName(left, out column) && right is LiteralExpression rl)
+        if (right is LiteralExpression rl && TryResolveColumn(left, accessor, out column, out columnAccessor))
         {
             value = rl.Value;
             effectiveOp = op;
@@ -590,7 +591,7 @@ public static class StatisticsEvaluator
         // the bounds of name do not answer. Read as name STARTS WITH 'ab', a file holding 'a' was pruned.
         if (left is LiteralExpression ll
             && op is not (ComparisonOperator.StartsWith or ComparisonOperator.NotStartsWith)
-            && TryGetColumnName(right, out column))
+            && TryResolveColumn(right, accessor, out column, out columnAccessor))
         {
             value = ll.Value;
             effectiveOp = FlipOperator(op);
@@ -600,6 +601,33 @@ public static class StatisticsEvaluator
         column = null;
         value = LiteralValue.Null;
         effectiveOp = op;
+        columnAccessor = accessor;
+        return false;
+    }
+
+    /// <summary>
+    /// The column an operand's statistics are read under, and the accessor to read them with: the operand's
+    /// own for a reference, and for a variant extraction (<see cref="VariantGetCall"/>) the one the accessor
+    /// gives for that path, when it implements <see cref="IVariantStatisticsAccessor{TStats}"/> and has one.
+    /// </summary>
+    private static bool TryResolveColumn<TStats>(
+        Expression expr, IStatisticsAccessor<TStats> accessor,
+        out string? column, out IStatisticsAccessor<TStats> columnAccessor)
+    {
+        columnAccessor = accessor;
+        if (TryGetColumnName(expr, out column))
+            return true;
+
+        if (accessor is IVariantStatisticsAccessor<TStats> variants
+            && VariantGetCall.TryMatch(expr, out var call)
+            && variants.ForVariantGet(call) is { } pathAccessor)
+        {
+            column = call.Column.Name;
+            columnAccessor = pathAccessor;
+            return true;
+        }
+
+        column = null;
         return false;
     }
 

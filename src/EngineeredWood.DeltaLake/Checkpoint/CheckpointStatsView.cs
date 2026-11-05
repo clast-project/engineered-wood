@@ -117,6 +117,17 @@ internal sealed class CheckpointStatsView
     }
 
     /// <summary>
+    /// One variant bound for one column, as the Variant's metadata and value, or false when the view carries
+    /// none for the file at <paramref name="row"/>.
+    /// </summary>
+    public bool TryGetVariantBound(string column, int row, bool isMin, out byte[] metadata, out byte[] value)
+    {
+        metadata = value = [];
+        var arrays = isMin ? _minValues : _maxValues;
+        return arrays.TryGetValue(column, out var array) && TryVariantBytes(array, row, out metadata, out value);
+    }
+
+    /// <summary>
     /// True when the view carries min/max for this column. Asked separately from
     /// <see cref="HasNullCount"/> because the two cover different column sets: stats_parsed counts
     /// nulls for every column but bounds only the orderable ones, so a boolean is present in one and
@@ -309,17 +320,25 @@ internal sealed class CheckpointStatsView
 
     /// <summary>The Z85 JSON form of the variant bound at <paramref name="row"/>, or null when the child is not
     /// a variant group or the row has no bound.</summary>
-    private static string? VariantBound(IArrowArray array, int row)
+    private static string? VariantBound(IArrowArray array, int row) =>
+        TryVariantBytes(array, row, out byte[] metadata, out byte[] value)
+            ? VariantStatsEncoding.Encode(metadata, value)
+            : null;
+
+    private static bool TryVariantBytes(IArrowArray array, int row, out byte[] metadata, out byte[] value)
     {
+        metadata = value = [];
         var storage = (array is VariantArray variant ? variant.Storage : array) as StructArray;
         if (storage is null || !IsVariantGroup(array) || storage.IsNull(row))
-            return null;
+            return false;
         var type = (ArrowStructType)storage.Data.DataType;
-        var metadata = (BinaryArray)storage.Fields[FieldIndex(type, "metadata")];
-        var value = (BinaryArray)storage.Fields[FieldIndex(type, "value")];
-        if (metadata.IsNull(row) || value.IsNull(row))
-            return null;
-        return VariantStatsEncoding.Encode(metadata.GetBytes(row), value.GetBytes(row));
+        var metadataArray = (BinaryArray)storage.Fields[FieldIndex(type, "metadata")];
+        var valueArray = (BinaryArray)storage.Fields[FieldIndex(type, "value")];
+        if (metadataArray.IsNull(row) || valueArray.IsNull(row))
+            return false;
+        metadata = metadataArray.GetBytes(row).ToArray();
+        value = valueArray.GetBytes(row).ToArray();
+        return true;
     }
 
     private static IArrowArray? Child(StructArray parent, ArrowStructType type, string name)

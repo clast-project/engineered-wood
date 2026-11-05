@@ -439,7 +439,7 @@ Note the domain stores PHYSICAL column names, because OSS Delta
 `EwWritten_Clustered_SparkResolvesClusteringColumns`, which asserts Spark's
 `DESCRIBE DETAIL` resolves the declaration back to the logical names.
 
-**Variant shredding: the feature, the statistics, but no pruning.** `variantShredding` and
+**Variant shredding: the feature, the statistics, and file pruning.** `variantShredding` and
 `variantShredding-preview` are supported reader and writer features (#671).
 `delta.enableVariantShredding = true` at creation declares `variantShredding`
 (with `variantType`), as delta-spark 4.1.0 does; delta-spark 4.3.1 declares
@@ -455,12 +455,34 @@ from the footer it just wrote exactly as delta-spark 4.3 derives them (the
 `SparksBounds_AreWhatEwDerivesFromTheSameFooter` interop test compares the two
 path for path and type for type). A checkpoint's `stats_parsed` carries
 variant bounds as a Variant group on a table that supports shredding, and
-writes them back out when the JSON stats are rebuilt. What is not done:
+writes them back out when the JSON stats are rebuilt.
 
-- *No pruning with variant bounds.* A predicate cannot name a variant path
-  yet: the expression library has no `variant_get`. Nothing to copy either:
-  delta-spark 4.3.1 and DuckDB's delta extension both read every file for a
-  predicate on a variant path (measured), whatever the bounds say.
+A scan's filter skips files with those bounds (#677). The predicate names the
+path as Spark does: `variant_get(v, '$.a', 'int')`, `try_variant_get`, or
+the `v:a::int` shorthand (`cast` / `try_cast` of `v:a`), all parsed by
+`SparkSqlParser` and read by `VariantGetCall`. A file is skipped only when the
+path's bound converts EXACTLY to the predicate's type (an integer to an
+integer or decimal it fits, a decimal to a decimal of at least its scale, a
+float to `float`/`double`, a string, date, timestamp or `timestamp_ntz` to its
+own type), and a path the file did not bound keeps it. This is sound because a
+writer bounds only a path whose type is uniform in the file, and every row the
+bound leaves out (path missing, not an object, NULL variant) answers NULL.
+delta-spark 4.3.1 and DuckDB's delta extension do not prune on these bounds
+(measured), so `VariantPruningInteropTests` takes Spark as the oracle for the
+answer only: every row Spark selects must come from a file EW kept, over EW's
+bounds and over Spark's. What is not done:
+
+- *No row-level `variant_get`.* The row evaluator has no `variant_get`, so a
+  DML predicate (DELETE, UPDATE, MERGE), CHECK constraint or generated column
+  on a variant path is refused, and Parquet row groups and pages inside a kept
+  file are not pruned by the `typed_value` footer statistics.
+- *Floats prune one way only.* Delta keeps no NaN count, so a variant float
+  bound skips a file for `<` and `=` but not for `>`, as for a float column.
+- *Spark refuses EW's shredding of an object that lacks a shredded field.*
+  EW writes each field group under `typed_value` as `OPTIONAL`, where the
+  shredding spec says `required group`; Spark 4.1 reads such a file as
+  `MALFORMED_VARIANT` once a row omits the field (measured). Files whose
+  object rows all carry every shredded field read fine (#679).
 - *delta-spark writes none by default.* Its bounds need
   `spark.databricks.delta.variantShredding.parseFooterForStats=true` (off by
   default) and `spark.databricks.delta.stats.limitPerVariant` above its
