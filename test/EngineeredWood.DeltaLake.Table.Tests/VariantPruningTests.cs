@@ -245,6 +245,10 @@ public class VariantPruningTests : IDisposable
         Assert.False(Keeps("v:a::int > 20 AND id = 5"));
         Assert.True(Keeps("v:a::int IS NULL"));
         Assert.True(Keeps("v:a::int IS NOT NULL"));
+        // `<=> NULL` is IS NULL: a row without the path matches it, whatever the path's bounds (#680 review).
+        Assert.True(Keeps("v:a::int <=> NULL"));
+        Assert.True(Keeps("NULL <=> v:a::int"));
+        Assert.False(Keeps("v:a::int <=> 25"));
     }
 
     [Fact]

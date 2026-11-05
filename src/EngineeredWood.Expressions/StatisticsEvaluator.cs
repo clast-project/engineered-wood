@@ -125,11 +125,15 @@ public static class StatisticsEvaluator
         IStatisticsAccessor<TStats> accessor)
     {
         // Comparing against null? With Spark semantics, normal comparisons against
-        // null produce null (treated as Unknown). Only NullSafeEqual handles null.
+        // null produce null (treated as Unknown). Only NullSafeEqual handles null, and
+        // `x <=> NULL` is `x IS NULL`: a question for the null count, which the bounds
+        // cannot answer. Read through them, NULL sorts below every minimum, and a file
+        // holding NULL rows beside its bounded values was skipped (#680 review).
         if (value.IsNull)
         {
-            if (op != ComparisonOperator.NullSafeEqual)
-                return FilterResult.Unknown;
+            return op == ComparisonOperator.NullSafeEqual
+                ? EvaluateIsNull(column, stats, accessor)
+                : FilterResult.Unknown;
         }
 
         var min = accessor.GetMinValue(stats, column);
@@ -435,16 +439,7 @@ public static class StatisticsEvaluator
         switch (unary.Op)
         {
             case UnaryOperator.IsNull:
-            {
-                long? nullCount = accessor.GetNullCount(stats, column!);
-                long? valueCount = accessor.GetValueCount(stats, column!);
-                if (nullCount.HasValue && nullCount.Value == 0)
-                    return FilterResult.AlwaysFalse;
-                if (nullCount.HasValue && valueCount.HasValue
-                    && nullCount.Value == valueCount.Value)
-                    return FilterResult.AlwaysTrue;
-                return FilterResult.Unknown;
-            }
+                return EvaluateIsNull(column!, stats, accessor);
             case UnaryOperator.IsNotNull:
             {
                 long? nullCount = accessor.GetNullCount(stats, column!);
@@ -462,6 +457,19 @@ public static class StatisticsEvaluator
             default:
                 return FilterResult.Unknown;
         }
+    }
+
+    private static FilterResult EvaluateIsNull<TStats>(
+        string column, TStats stats, IStatisticsAccessor<TStats> accessor)
+    {
+        long? nullCount = accessor.GetNullCount(stats, column);
+        long? valueCount = accessor.GetValueCount(stats, column);
+        if (nullCount.HasValue && nullCount.Value == 0)
+            return FilterResult.AlwaysFalse;
+        if (nullCount.HasValue && valueCount.HasValue
+            && nullCount.Value == valueCount.Value)
+            return FilterResult.AlwaysTrue;
+        return FilterResult.Unknown;
     }
 
     /// <summary>
