@@ -236,6 +236,34 @@ public class DeletionVectorRowCountTests : IDisposable
         Assert.Empty(Directory.GetFiles(_tempDir, "*.bin", SearchOption.AllDirectories));
     }
 
+    /// <summary>A count only the checkpoint's typed statistics carry (another writer's <c>stats_parsed</c> with one,
+    /// its <c>stats</c> string without) reaches the JSON that is committed, and costs no read of the file.</summary>
+    [Fact]
+    public async Task ACountOnlyTheTypedStatisticsCarry_ReachesTheJson()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var reader = new CountingReader(fs);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, TableSchema, new DeltaTableOptions { CheckpointInterval = 0, DataFileReader = reader },
+            enableDeletionVectors: true,
+            configuration: new Dictionary<string, string> { ["delta.checkpoint.writeStatsAsStruct"] = "true" });
+        await table.WriteAsync([Ids(1, 2, 3, 4, 5)]);
+        await table.CheckpointAsync();
+        var checkpoints = new Checkpoint.CheckpointReader(fs);
+        var typed = (await checkpoints.ReadCheckpointAsync((await checkpoints.ReadLastCheckpointAsync())!))
+            .OfType<AddFile>().Single();
+        Assert.NotNull(typed.TypedStats);
+        var file = typed with { Stats = "{\"minValues\":{\"id\":1}}" };
+        Assert.Equal(5, file.GetNumRecords());
+        reader.Reads = 0;
+
+        string? stats = await table.VectorStatsAsync(file, CancellationToken.None);
+
+        Assert.Equal(5, (file with { Stats = stats, TypedStats = null }).GetNumRecords());
+        Assert.Contains("\"tightBounds\":false", stats);
+        Assert.Equal(0, reader.Reads);
+    }
+
     /// <summary>A codec-seam reader that counts the files it decodes, delegating to the built-in codec.</summary>
     private sealed class CountingReader(ITableFileSystem fs) : IDataFileReader
     {

@@ -8612,12 +8612,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// count comes from the file's footer (or, through the codec seam, which hides it, from reading the file), so a
     /// file whose statistics have it costs nothing more.
     /// </summary>
-    private async ValueTask<string?> VectorStatsAsync(AddFile file, CancellationToken cancellationToken)
+    internal async ValueTask<string?> VectorStatsAsync(AddFile file, CancellationToken cancellationToken)
     {
         string? stats = file.GetStatsJson();
-        if (file.GetNumRecords() is not null)
-            return StatsWithLooseBounds(stats);
-        long rows = await PhysicalRowCountAsync(file, cancellationToken).ConfigureAwait(false);
+        // A count either copy of the statistics carries is passed on, so the JSON committed gets it even when only
+        // the checkpoint's typed copy had it (another writer's stats_parsed with a count, its stats string without).
+        long rows = file.GetNumRecords()
+            ?? await PhysicalRowCountAsync(file, cancellationToken).ConfigureAwait(false);
         return StatsWithLooseBounds(stats, rows);
     }
 
