@@ -312,7 +312,8 @@ public static class VariantShredding
     /// that to an <c>OPTIONAL</c> group with a null at the group's level, which the spec has no room
     /// for — Spark 4.1 reads it as <c>MALFORMED_VARIANT</c>. Here each group's nulls are pushed down
     /// into its two children and the group itself loses its validity, so the footer declares
-    /// <c>required group</c> and a missing field is written with both children null.
+    /// <c>required group</c> and a missing field is written with both children null. Remove once
+    /// apache/arrow-dotnet#499 ships.
     /// </remarks>
     private static VariantArray RequireFieldGroups(VariantArray variant)
     {
