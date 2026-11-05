@@ -84,6 +84,9 @@ public sealed partial class DeltaTable
     /// <param name="written">Records the rewritten, inserted and change-data files this MERGE writes.</param>
     /// <param name="identityHighWaterMarks">The identity marks a transaction's earlier appends left pending, for
     /// the insert to continue from (see <see cref="ComputeWriteActionsAsync"/>).</param>
+    /// <param name="addedColumns">The columns <see cref="MergeOptions.MergeSchema"/> added to
+    /// <paramref name="snapshot"/>'s schema for this MERGE. Its conditions and values read the target row without
+    /// them, as Spark binds them before evolving: a bare name only the source had stays the source's.</param>
     internal async ValueTask<MergeActions> ComputeMergeActionsAsync(
         Snapshot.Snapshot snapshot,
         IReadOnlyList<RecordBatch> source,
@@ -91,7 +94,8 @@ public sealed partial class DeltaTable
         CancellationToken cancellationToken,
         long? rowIdStart = null,
         WrittenFileLedger? written = null,
-        IReadOnlyDictionary<string, long>? identityHighWaterMarks = null)
+        IReadOnlyDictionary<string, long>? identityHighWaterMarks = null,
+        IReadOnlyCollection<string>? addedColumns = null)
     {
         if (source is null)
             throw new ArgumentNullException(nameof(source));
@@ -99,6 +103,7 @@ public sealed partial class DeltaTable
             throw new ArgumentNullException(nameof(options));
 
         var plan = MergePlan.Validate(options, snapshot.Schema);
+        plan.AddedColumns = addedColumns ?? [];
         var src = PrepareMergeSource(source, snapshot, plan);
         plan.Resolve(src, snapshot.Schema);
         RefuseUnanalyzableClauses(plan, snapshot, src);
@@ -291,7 +296,7 @@ public sealed partial class DeltaTable
                         {
                             var pending = remaining;
                             var taken = TakeClause(plan.Matched[c], pending, () => MergeConditionBatch(
-                                TakeRowsFromBatch(batch, pending.Select(p => pairTarget[p]).ToList()),
+                                plan.AsBound(TakeRowsFromBatch(batch, pending.Select(p => pairTarget[p]).ToList())),
                                 TakeRowsFromBatch(src!, pending.Select(p => pairSource[p]).ToList())), out remaining);
                             byte kind = plan.Matched[c].Kind == MergeActionKind.Delete ? MergeMatchedDelete : MergeUpdate;
                             foreach (int p in taken)
@@ -321,7 +326,7 @@ public sealed partial class DeltaTable
                             var pending = remaining;
                             var taken = TakeClause(plan.NotMatchedBySource[c], pending,
                                 () => MergeConditionBatch(
-                                    pending.Count == n ? batch : TakeRowsFromBatch(batch, pending), null),
+                                    plan.AsBound(pending.Count == n ? batch : TakeRowsFromBatch(batch, pending)), null),
                                 out remaining);
                             byte kind = plan.NotMatchedBySource[c].Kind == MergeActionKind.Delete
                                 ? MergeSourcelessDelete : MergeSourcelessUpdate;
@@ -528,6 +533,19 @@ public sealed partial class DeltaTable
                 throw new ArgumentException(
                     "MERGE: every source batch must have the same columns in the same order.", nameof(source));
             }
+            // The batches are concatenated column by column, and a struct's children by position, so a struct
+            // whose fields come in another order would put one field's values under another's name.
+            for (int c = 0; c < schema.FieldsList.Count; c++)
+            {
+                if (!SameLayout(schema.FieldsList[c].DataType, other.FieldsList[c].DataType))
+                {
+                    throw new ArgumentException(
+                        $"MERGE: source batch {b} has column '{schema.FieldsList[c].Name}' with its nested fields "
+                        + "named or ordered differently from the first batch's. Every source batch must have the "
+                        + "same fields in the same order, at every depth.",
+                        nameof(source));
+                }
+            }
         }
         foreach (string key in plan.Keys)
         {
@@ -612,6 +630,21 @@ public sealed partial class DeltaTable
             return found;
         }
     }
+
+    /// <summary>Whether two Arrow types name the same nested fields in the same order, at every depth.</summary>
+    private static bool SameLayout(Apache.Arrow.Types.IArrowType a, Apache.Arrow.Types.IArrowType b) => (a, b) switch
+    {
+        (Apache.Arrow.Types.StructType x, Apache.Arrow.Types.StructType y) =>
+            x.Fields.Count == y.Fields.Count
+            && x.Fields.Zip(y.Fields, (f, g) =>
+                string.Equals(f.Name, g.Name, StringComparison.Ordinal) && SameLayout(f.DataType, g.DataType)).All(ok => ok),
+        (Apache.Arrow.Types.MapType x, Apache.Arrow.Types.MapType y) =>
+            SameLayout(x.KeyField.DataType, y.KeyField.DataType) && SameLayout(x.ValueField.DataType, y.ValueField.DataType),
+        (Apache.Arrow.Types.NestedType { Fields.Count: 1 } x, Apache.Arrow.Types.NestedType { Fields.Count: 1 } y)
+            when x is not Apache.Arrow.Types.StructType && y is not Apache.Arrow.Types.StructType =>
+            SameLayout(x.Fields[0].DataType, y.Fields[0].DataType),
+        _ => true,
+    };
 
     /// <summary>
     /// <paramref name="source"/> with each column the normalization leaves in another Arrow form of its Delta type
@@ -718,6 +751,13 @@ public sealed partial class DeltaTable
         };
     }
 
+    /// <summary><paramref name="batch"/> without the columns <paramref name="hidden"/> names.</summary>
+    private static RecordBatch WithoutColumns(RecordBatch batch, IReadOnlyCollection<string> hidden) =>
+        hidden.Count == 0
+            ? batch
+            : ProjectColumns(
+                batch, batch.Schema.FieldsList.Select(f => f.Name).Where(n => !hidden.Contains(n)).ToList());
+
     /// <summary>The columns of <paramref name="batch"/> <paramref name="columns"/> names, in the batch's order.</summary>
     private static RecordBatch ProjectColumns(RecordBatch batch, IReadOnlyList<string> columns)
     {
@@ -778,7 +818,9 @@ public sealed partial class DeltaTable
             }
             columns[c] = value is null
                 ? CopiedColumn(sources!, field.Name, field.DataType, clause, preimage.Column(c))
-                : AssignedValue(value, field.Name, pairs ??= MergeConditionBatch(preimage, sources), snapshot);
+                : AssignedValue(
+                    value, field.Name,
+                    pairs ??= MergeConditionBatch(clause.AsBound(preimage), sources), snapshot, clause.FitsStructs);
             fields.Add(new Field(field.Name, columns[c].Data.DataType, field.IsNullable, field.Metadata));
         }
         return new RecordBatch(new Apache.Arrow.Schema(fields, preimage.Schema.Metadata), columns, preimage.Length);
@@ -805,7 +847,7 @@ public sealed partial class DeltaTable
     /// evolution an update keeps the target's value of a struct field its source lacks and an insert writes NULL.
     /// A struct NULL in the source stays NULL. Anything but a struct is returned as it is; the type checks judge it.
     /// </summary>
-    private static IArrowArray FitStruct(IArrowArray supplied, Apache.Arrow.Types.IArrowType target, IArrowArray? kept)
+    internal static IArrowArray FitStruct(IArrowArray supplied, Apache.Arrow.Types.IArrowType target, IArrowArray? kept)
     {
         if (supplied is not StructArray structs || target is not Apache.Arrow.Types.StructType targetType
             || supplied.Data.DataType.Equals(target))
@@ -822,7 +864,8 @@ public sealed partial class DeltaTable
         {
             int k = keptType?.GetFieldIndex(field.Name) ?? -1;
             // StructArray.Fields are the children as sliced to the struct's own window.
-            var keptChild = k >= 0 ? keptStructs!.Fields[k] : null;
+            // A NULL target struct may hold values in its children that its validity hides: masked, they read NULL.
+            var keptChild = k >= 0 ? MaskedBy(keptStructs!.Fields[k], keptStructs) : null;
             int s = suppliedType.GetFieldIndex(field.Name);
             var child = s >= 0
                 ? FitStruct(structs.Fields[s], field.DataType, keptChild)
@@ -846,6 +889,32 @@ public sealed partial class DeltaTable
     }
 
     /// <summary>
+    /// <paramref name="child"/> (a child of <paramref name="parent"/>, windowed as its <c>Fields</c> are) NULL
+    /// wherever <paramref name="parent"/> is: the values a NULL struct's validity hides, made NULL.
+    /// </summary>
+    private static IArrowArray MaskedBy(IArrowArray child, StructArray parent)
+    {
+        if (parent.NullCount == 0 || child.Data.DataType.TypeId == Apache.Arrow.Types.ArrowTypeId.Null)
+            return child;
+        var data = child.Data;
+        var bits = new ArrowBuffer.BitmapBuilder(data.Offset + data.Length);
+        for (int i = 0; i < data.Offset; i++)
+            bits.Append(false);
+        int nulls = 0;
+        for (int i = 0; i < data.Length; i++)
+        {
+            bool valid = !child.IsNull(i) && !parent.IsNull(i);
+            bits.Append(valid);
+            if (!valid)
+                nulls++;
+        }
+        var buffers = data.Buffers.ToArray();
+        buffers[0] = bits.Build();
+        return ArrowArrayFactory.BuildArray(
+            new ArrayData(data.DataType, data.Length, nulls, data.Offset, buffers, data.Children, data.Dictionary));
+    }
+
+    /// <summary>
     /// The rows <paramref name="clause"/> inserts for the source rows <paramref name="rows"/>: the source columns it
     /// copies, or the values it assigns, computed from the source row. The append fills in the columns it omits.
     /// </summary>
@@ -862,7 +931,8 @@ public sealed partial class DeltaTable
             var value = clause.Writes[column];
             var array = value is null
                 ? CopiedColumn(rows, column, snapshot.ArrowSchema.GetFieldByName(column)!.DataType, clause, kept: null)
-                : AssignedValue(value, column, pairs ??= MergeConditionBatch(null, rows), snapshot);
+                : AssignedValue(
+                    value, column, pairs ??= MergeConditionBatch(null, rows), snapshot, clause.FitsStructs);
             fields.Add(new Field(column, array.Data.DataType, nullable: true));
             columns.Add(array);
         }
@@ -882,13 +952,19 @@ public sealed partial class DeltaTable
     /// <para>A type the cast cannot target (<c>timestamp_ntz</c>, a struct, array or map) takes only a value of its
     /// own Delta type, in any Arrow form of it; anything else is refused as a mistyped column. NULL goes anywhere.</para>
     /// </remarks>
+    /// <param name="fitStructs">Under schema evolution a struct value is fitted to the column's struct by name
+    /// (<see cref="FitStruct"/>), a field it lacks NULL: measured, Spark's <c>SET st = s.st</c> writes NULL for a
+    /// field the source's struct lacks, where its <c>SET *</c> keeps the target's value.</param>
     private static IArrowArray AssignedValue(
-        Expressions.Expression value, string column, RecordBatch pairs, Snapshot.Snapshot snapshot)
+        Expressions.Expression value, string column, RecordBatch pairs, Snapshot.Snapshot snapshot,
+        bool fitStructs = false)
     {
         var target = snapshot.ArrowSchema.GetFieldByName(column)!;
         var array = RowEvaluator.EvaluateExpression(value, pairs);
         if (array is NullArray || array.Data.DataType.TypeId == Apache.Arrow.Types.ArrowTypeId.Null)
             return ArrowCompute.MakeNullArray(target.DataType, array.Length);
+        if (fitStructs)
+            array = FitStruct(array, target.DataType, kept: null);
 
         if (!SameDeltaType(array.Data.DataType, target.DataType))
         {
@@ -991,7 +1067,7 @@ public sealed partial class DeltaTable
     /// </remarks>
     private static void RefuseUnanalyzableClauses(MergePlan plan, Snapshot.Snapshot snapshot, RecordBatch? src)
     {
-        var targetSchema = snapshot.ArrowSchema;
+        var targetSchema = plan.AsBound(snapshot.ArrowSchema);
         var sourceSchema = src?.Schema ?? targetSchema;
 
         var matchedNames = src is not null
@@ -1013,7 +1089,7 @@ public sealed partial class DeltaTable
                 foreach (var entry in clause.Writes)
                 {
                     if (entry.Value is { } value)
-                        RefuseUnanalyzableValue(entry.Key, value, names, noRows, snapshot);
+                        RefuseUnanalyzableValue(entry.Key, value, names, noRows, snapshot, clause.FitsStructs);
                 }
             }
         }
@@ -1027,7 +1103,7 @@ public sealed partial class DeltaTable
     /// </summary>
     private static void RefuseUnanalyzableValue(
         string column, Expressions.Expression value, Apache.Arrow.Schema names, Func<RecordBatch> noRows,
-        Snapshot.Snapshot snapshot)
+        Snapshot.Snapshot snapshot, bool fitStructs)
     {
         foreach (var (name, resolution) in ReferenceResolutions(value, names))
         {
@@ -1050,7 +1126,7 @@ public sealed partial class DeltaTable
         RefuseUntypableLiterals(value);
         try
         {
-            AssignedValue(value, column, noRows(), snapshot);
+            AssignedValue(value, column, noRows(), snapshot, fitStructs);
         }
         catch (Expressions.Arrow.ExpressionAnalysisException)
         {
@@ -1318,6 +1394,12 @@ public sealed partial class DeltaTable
         /// <see cref="MergePlan.Resolve"/>.
         /// </summary>
         public bool FitsStructs { get; set; }
+
+        /// <summary><see cref="MergePlan.AddedColumns"/>.</summary>
+        public IReadOnlyCollection<string> AddedColumns { get; set; } = [];
+
+        /// <summary>The target row's columns as conditions and values are bound to them.</summary>
+        public RecordBatch AsBound(RecordBatch target) => WithoutColumns(target, AddedColumns);
     }
 
     /// <summary>The MERGE options, checked against the table.</summary>
@@ -1342,6 +1424,19 @@ public sealed partial class DeltaTable
         /// struct field the source lacks is left to the row instead of refused.</summary>
         public bool Evolving { get; private init; }
 
+        /// <summary>The columns the evolution added, which conditions and values do not see on the target row.
+        /// Set before <see cref="Resolve"/>, which hands them to each clause.</summary>
+        public IReadOnlyCollection<string> AddedColumns { get; set; } = [];
+
+        /// <summary>The target row's columns as conditions and values are bound to them.</summary>
+        public RecordBatch AsBound(RecordBatch target) => WithoutColumns(target, AddedColumns);
+
+        /// <inheritdoc cref="AsBound(RecordBatch)"/>
+        public Apache.Arrow.Schema AsBound(Apache.Arrow.Schema target) => AddedColumns.Count == 0
+            ? target
+            : new Apache.Arrow.Schema(
+                target.FieldsList.Where(f => !AddedColumns.Contains(f.Name)).ToList(), target.Metadata);
+
         /// <summary>Every column some update writes. Set by <see cref="Resolve"/>.</summary>
         public IReadOnlyList<string> UpdatedColumns { get; private set; } = [];
 
@@ -1354,6 +1449,8 @@ public sealed partial class DeltaTable
         /// </summary>
         public void Resolve(RecordBatch? source, Schema.StructType schema)
         {
+            foreach (var clause in Matched.Concat(NotMatchedBySource).Concat(NotMatched))
+                clause.AddedColumns = AddedColumns;
             foreach (var clause in Matched.Concat(NotMatchedBySource))
             {
                 ResolveClause(

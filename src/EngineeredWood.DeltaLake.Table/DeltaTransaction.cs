@@ -657,12 +657,15 @@ public sealed class DeltaTransaction : IAsyncDisposable
         // written with them.
         var mergeSnapshot = options.MergeSchema ? PendingWriteSnapshot() : _baseSnapshot;
         DeltaTable.DeferredSchemaChange? evolution = null;
+        IReadOnlyCollection<string> added = [];
         if (options.MergeSchema)
         {
             evolution = _table.ComputeMergeSchemaEvolution(mergeSnapshot, source, options);
             if (evolution is { } change)
             {
                 RefuseSchemaMergeAfterOtherMetadata();
+                var before = new HashSet<string>(mergeSnapshot.Schema.Fields.Select(f => f.Name), StringComparer.Ordinal);
+                added = change.NewSchema.Fields.Select(f => f.Name).Where(n => !before.Contains(n)).ToList();
                 mergeSnapshot = DeltaTable.WithStagedMetadata(mergeSnapshot, change.Actions);
             }
         }
@@ -670,7 +673,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         int mark = _written.Paths.Count;
         var plan = await TakingBackOnFailureAsync(mark, () => _table.ComputeMergeActionsAsync(
             mergeSnapshot, source, options, cancellationToken, rowIdStart: _nextRowId, written: _written,
-            identityHighWaterMarks: _identityMarks), cancellationToken).ConfigureAwait(false);
+            identityHighWaterMarks: _identityMarks, addedColumns: added), cancellationToken).ConfigureAwait(false);
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "MERGE", cancellationToken)
             .ConfigureAwait(false);
 

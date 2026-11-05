@@ -445,6 +445,124 @@ public class MergeSchemaEvolutionTests : IDisposable
         Assert.Equal(["id=1, st=null", "id=2, st={a=2, c=c2}"], await RowsAsync(table));
     }
 
+    /// <summary>
+    /// Measured: an explicit <c>SET st = s.st</c> fits the source's struct to the evolved one by name, with NULL for
+    /// a field the source lacks, where <c>SET *</c> keeps the target's value; an explicit insert does the same.
+    /// </summary>
+    [Fact]
+    public async Task AnAssignedStruct_IsFittedToTheEvolvedStruct_ItsMissingFieldsNull()
+    {
+        await using var table = await CreateNestedAsync();
+        var source = Batch(("id", Ints(1, 3)), ("st", Struct(("a", Ints(10, 30)), ("b", Strings("x", "z")))));
+
+        await table.MergeAsync([source], new MergeOptions
+        {
+            Keys = ["id"],
+            WhenMatched = [MergeAction.UpdateSet(("st", E("source.st")))],
+            WhenNotMatched = [MergeAction.InsertValues(("id", E("source.id")), ("st", E("source.st")))],
+            MergeSchema = true,
+        });
+
+        Assert.Equal("id:integer, st:struct<a:integer, c:string, b:string>", Columns(table));
+        Assert.Equal(
+        [
+            "id=1, st={a=10, c=null, b=x}",
+            "id=2, st={a=2, c=c2, b=null}",
+            "id=3, st={a=30, c=null, b=z}",
+        ], await RowsAsync(table));
+    }
+
+    [Fact]
+    public async Task ANullTargetStruct_GivesNullForTheFieldsTheSourceLacks()
+    {
+        // Measured: target st NULL, source st {a: 10} under SET * -> {a: 10, c: NULL}.
+        await using var table = await CreateAsync(Nested, seed: Batch(("id", Ints(1)), ("st", new StructArray(
+            new StructType([new Field("a", Int32Type.Default, true), new Field("c", StringType.Default, true)]), 1,
+            [Ints(1), Strings("c1")], new ArrowBuffer.BitmapBuilder().Append(false).Build(), nullCount: 1))));
+
+        await table.MergeAsync([Batch(("id", Ints(1)), ("st", Struct(("a", Ints(10)))))], Upsert(mergeSchema: true));
+
+        Assert.Equal(["id=1, st={a=10, c=null}"], await RowsAsync(table));
+    }
+
+    [Fact]
+    public void AFieldKeptFromANullStruct_IsNull_ThoughItsSlotHoldsAValue()
+    {
+        // A NULL struct may hold values under its validity (in memory; a Parquet read gives NULL children): kept
+        // into a struct the source does supply, they must read NULL, at every depth.
+        var innerType = new StructType([new Field("x", StringType.Default, true)]);
+        var keptType = new StructType([new Field("a", Int32Type.Default, true), new Field("c", StringType.Default, true),
+            new Field("inner", innerType, true)]);
+        var kept = new StructArray(keptType, 2,
+            [Ints(1, 2), Strings("hidden", "c2"), new StructArray(innerType, 2, [Strings("deep", "x2")], ArrowBuffer.Empty)],
+            new ArrowBuffer.BitmapBuilder().Append(false).Append(true).Build(), nullCount: 1);
+        var fitted = (StructArray)DeltaTable.FitStruct(Struct(("a", Ints(10, 20))), keptType, kept);
+
+        Assert.Equal("{a=10, c=null, inner=null}", Format(fitted, 0));
+        Assert.Equal("{a=20, c=c2, inner={x=x2}}", Format(fitted, 1));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SourceBatchesWhoseStructFieldsComeInAnotherOrder_AreRefused(bool mergeSchema)
+    {
+        // Concatenated by position, the second batch's b would land under a.
+        await using var table = await CreateAsync(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field("id", Int32Type.Default, true))
+                .Field(new Field("st", new StructType([new Field("a", Int32Type.Default, true), new Field("b", Int32Type.Default, true)]), true))
+                .Build(),
+            seed: Batch(("id", Ints(1)), ("st", Struct(("a", Ints(1)), ("b", Ints(2))))));
+        long before = table.CurrentSnapshot.Version;
+
+        var e = await Assert.ThrowsAsync<ArgumentException>(() => table.MergeAsync(
+            [Batch(("id", Ints(1)), ("st", Struct(("a", Ints(10)), ("b", Ints(100))))),
+             Batch(("id", Ints(2)), ("st", Struct(("b", Ints(200)), ("a", Ints(20)))))],
+            Upsert(mergeSchema)).AsTask());
+
+        Assert.Contains("ordered differently", e.Message);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    /// <summary>
+    /// Measured: Spark binds conditions and values before it evolves, so a bare name only the source has stays the
+    /// source's (<c>WHEN MATCHED AND extra &gt; 5</c>, <c>SET v = cast(extra AS STRING)</c>) though the evolution adds
+    /// a column of that name, and <c>t.extra</c> is unresolved.
+    /// </summary>
+    [Fact]
+    public async Task ABareSourceOnlyName_StillReadsTheSource_ThoughTheEvolutionAddsItsColumn()
+    {
+        await using var table = await CreateAsync();
+
+        await table.MergeAsync([WithExtra()], new MergeOptions
+        {
+            Keys = ["id"],
+            WhenMatched =
+            [
+                MergeAction.UpdateSet(("v", E("cast(extra AS STRING)")), ("extra", E("source.extra"))).When(P("extra > 5")),
+            ],
+            WhenNotMatched = [MergeAction.Insert.When(P("extra > 5"))],
+            MergeSchema = true,
+        });
+
+        Assert.Equal(["id=1, v=10, extra=10", "id=2, v=b, extra=null", "id=3, v=z, extra=30"], await RowsAsync(table));
+    }
+
+    [Fact]
+    public async Task TheTargetsNewColumn_IsNotReadable_InACondition()
+    {
+        await using var table = await CreateAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        await Assert.ThrowsAnyAsync<Exception>(() => table.MergeAsync([WithExtra()], new MergeOptions
+        {
+            Keys = ["id"], WhenMatched = [MergeAction.Update.When(P("target.extra IS NULL"))], MergeSchema = true,
+        }).AsTask());
+
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
     [Fact]
     public async Task ANewFieldInsideAnArrayElement_IsRefused()
     {
