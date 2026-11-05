@@ -239,8 +239,8 @@ public class RowTrackingSupportedNotEnabledTests : IDisposable
         var (_, version) = await table.MergeAsync([Rows(2, 9)], new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = MergeAction.Update,
-            WhenNotMatched = MergeAction.Insert,
+            WhenMatched = [MergeAction.Update],
+            WhenNotMatched = [MergeAction.Insert],
         });
 
         Assert.True(AddsAt(table, version).Count >= 2);

@@ -5415,13 +5415,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     private static RecordBatch PreparePostImage(
         RecordBatch updatedBatch, Snapshot.Snapshot snapshot,
-        DeltaGeneratedColumns? generatedColumns, DeltaConstraintEnforcer? constraints)
+        DeltaGeneratedColumns? generatedColumns, DeltaConstraintEnforcer? constraints,
+        IReadOnlyCollection<string>? assignedColumns = null)
     {
         updatedBatch = WriteTypeNormalization.NormalizeColumns(
             updatedBatch, snapshot.Metadata.PartitionColumns);
         updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
             updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: false);
-        updatedBatch = generatedColumns?.Recompute(updatedBatch) ?? updatedBatch;
+        updatedBatch = generatedColumns?.Recompute(updatedBatch, assignedColumns) ?? updatedBatch;
         updatedBatch = Partitioning.PartitionUtils.NormalizePartitionValues(
             updatedBatch, snapshot.Metadata.PartitionColumns, snapshot.Schema, refuseNulls: true,
             generatedColumns?.ColumnNames);

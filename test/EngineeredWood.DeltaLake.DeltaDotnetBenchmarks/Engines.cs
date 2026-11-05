@@ -209,8 +209,8 @@ internal static class Ew
         var (metrics, _) = await table.MergeAsync(source, new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = MergeAction.Update,
-            WhenNotMatched = MergeAction.Insert,
+            WhenMatched = [MergeAction.Update],
+            WhenNotMatched = [MergeAction.Insert],
         });
         return metrics.NumTargetRowsUpdated + metrics.NumTargetRowsInserted;
     }

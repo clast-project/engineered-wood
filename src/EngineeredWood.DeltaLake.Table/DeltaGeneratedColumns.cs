@@ -128,7 +128,21 @@ internal sealed class DeltaGeneratedColumns
     /// would persist a generated column that disagrees with its own definition. Spark recomputes
     /// for the same reason, and does not let an UPDATE assign a generated column at all.
     /// </remarks>
-    public RecordBatch Recompute(RecordBatch batch)
+    public RecordBatch Recompute(RecordBatch batch) => Recompute(batch, assigned: null);
+
+    /// <summary>
+    /// Returns <paramref name="batch"/> with every generated column the update did not assign recomputed from it,
+    /// and every one it did assign checked against its expression.
+    /// </summary>
+    /// <remarks>
+    /// A MERGE update may assign a generated column (<c>UPDATE SET g = ...</c>, or <c>UPDATE SET *</c> from a
+    /// source that carries it). Spark then checks the assigned value as a constraint
+    /// (<c>g &lt;=&gt; expression</c>) rather than overwriting it, measured against Spark 4.0 / Delta 4.0: a wrong
+    /// value is refused and the right one accepted. A column the update leaves alone still holds the target row's
+    /// old value, so it is recomputed, as <see cref="Recompute(RecordBatch)"/> explains.
+    /// </remarks>
+    /// <param name="assigned">The columns the update assigned, by the table's names; null for none.</param>
+    public RecordBatch Recompute(RecordBatch batch, IReadOnlyCollection<string>? assigned)
     {
         var result = batch;
 
@@ -136,6 +150,12 @@ internal sealed class DeltaGeneratedColumns
         {
             var computed = Compute(column, result);
             var existing = IndexOf(result, column.Name);
+
+            if (existing >= 0 && assigned is not null && assigned.Contains(column.Name))
+            {
+                ValidateSupplied(column, result, computed);
+                continue;
+            }
 
             result = existing >= 0
                 ? Replace(result, existing, computed)

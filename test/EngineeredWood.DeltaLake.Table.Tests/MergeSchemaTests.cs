@@ -616,7 +616,7 @@ public class MergeSchemaTests : IDisposable
         // cannot carry beside the merge's. Its insert file is written before that is known, and must go again.
         var source = new RecordBatch(Schema(Str("value")), [Strings("b")], 1);
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await txn.MergeAsync([source], new MergeOptions { Keys = ["value"], WhenNotMatched = MergeAction.InsertColumns("value") }));
+            await txn.MergeAsync([source], new MergeOptions { Keys = ["value"], WhenNotMatched = [MergeAction.InsertColumns("value")] }));
         Assert.Equal(files, DataFileCount());
 
         // The earlier work still commits.
@@ -736,7 +736,7 @@ public class MergeSchemaTests : IDisposable
 
         var source = new RecordBatch(Schema(Long("id"), Long("id")), [Longs(3), Longs(4)], 1);
         var ex = await Assert.ThrowsAsync<ArgumentException>(async () =>
-            await table.MergeAsync([source], new MergeOptions { Keys = ["id"], WhenNotMatched = MergeAction.Insert }));
+            await table.MergeAsync([source], new MergeOptions { Keys = ["id"], WhenNotMatched = [MergeAction.Insert] }));
         Assert.Contains("'id' more than once", ex.Message);
     }
 }

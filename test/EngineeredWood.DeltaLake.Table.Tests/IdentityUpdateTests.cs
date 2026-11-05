@@ -271,10 +271,10 @@ public class IdentityUpdateTests : IDisposable
         await using var table = await CreateAsync(byDefault);
 
         await AssertRefusedAsync(() => table.MergeAsync(
-            [Row(5, "a")], new MergeOptions { Keys = ["value"], WhenMatched = MergeAction.Update }).AsTask());
+            [Row(5, "a")], new MergeOptions { Keys = ["value"], WhenMatched = [MergeAction.Update] }).AsTask());
         await AssertRefusedAsync(() => table.MergeAsync(
             [Row(5, "a")],
-            new MergeOptions { Keys = ["value"], WhenMatched = MergeAction.UpdateColumns("id") }).AsTask());
+            new MergeOptions { Keys = ["value"], WhenMatched = [MergeAction.UpdateColumns("id")] }).AsTask());
 
         Assert.Equal([(1L, "a")], await ReadAsync(table));
     }
@@ -285,7 +285,7 @@ public class IdentityUpdateTests : IDisposable
         await using var table = await CreateAsync(allowExplicitInsert: true);
 
         await table.MergeAsync(
-            [Row(5, "a")], new MergeOptions { Keys = ["value"], WhenMatched = MergeAction.UpdateColumns("value") });
+            [Row(5, "a")], new MergeOptions { Keys = ["value"], WhenMatched = [MergeAction.UpdateColumns("value")] });
 
         Assert.Equal([(1L, "a")], await ReadAsync(table));
     }

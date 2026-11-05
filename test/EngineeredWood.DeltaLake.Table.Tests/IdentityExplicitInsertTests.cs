@@ -201,7 +201,7 @@ public class IdentityExplicitInsertTests : IDisposable
     public async Task AMergeInsertStar_IsRefused()
     {
         await using var table = await CreateAsync();
-        var options = new MergeOptions { Keys = ["value"], WhenNotMatched = MergeAction.Insert };
+        var options = new MergeOptions { Keys = ["value"], WhenNotMatched = [MergeAction.Insert] };
 
         await AssertRefusedAsync(() => table.MergeAsync([WithIds(0)], options).AsTask());
         await AssertRefusedAsync(() => table.MergeAsync([WithIds((long?)null)], options).AsTask());
@@ -215,9 +215,9 @@ public class IdentityExplicitInsertTests : IDisposable
 
         await AssertRefusedAsync(() => table.MergeAsync(
             [WithIds(0)],
-            new MergeOptions { Keys = ["value"], WhenNotMatched = MergeAction.InsertColumns("id", "value") }).AsTask());
+            new MergeOptions { Keys = ["value"], WhenNotMatched = [MergeAction.InsertColumns("id", "value")] }).AsTask());
         await table.MergeAsync(
-            [WithIds(0)], new MergeOptions { Keys = ["value"], WhenNotMatched = MergeAction.InsertColumns("value") });
+            [WithIds(0)], new MergeOptions { Keys = ["value"], WhenNotMatched = [MergeAction.InsertColumns("value")] });
 
         Assert.Equal([(1L, "seed"), (2L, "v")], await ReadAsync(table));
     }
@@ -243,9 +243,16 @@ public class IdentityExplicitInsertTests : IDisposable
         var options = new MergeOptions
         {
             Keys = ["value"],
-            WhenMatched = shape == "allMatch" ? MergeAction.Delete : null,
-            WhenNotMatched = shape == "namedEmptySource" ? MergeAction.InsertColumns("id", "value") : MergeAction.Insert,
-            WhenNotMatchedCondition = shape == "conditionFalse" ? Ex.Equal("value", "zz") : null,
+            WhenMatched = shape == "allMatch" ? [MergeAction.Delete] : [],
+            WhenNotMatched =
+            [
+                shape switch
+                {
+                    "namedEmptySource" => MergeAction.InsertColumns("id", "value"),
+                    "conditionFalse" => MergeAction.Insert.When(Ex.Equal("value", "zz")),
+                    _ => MergeAction.Insert,
+                },
+            ],
         };
 
         await AssertRefusedAsync(() => table.MergeAsync([source], options).AsTask());

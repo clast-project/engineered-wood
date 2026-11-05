@@ -82,8 +82,8 @@ public class MergeTests : IDisposable
     private static MergeOptions Upsert => new()
     {
         Keys = ["id"],
-        WhenMatched = MergeAction.Update,
-        WhenNotMatched = MergeAction.Insert,
+        WhenMatched = [MergeAction.Update],
+        WhenNotMatched = [MergeAction.Insert],
     };
 
     private static Predicate Source(string column, string op, string targetColumn) => op switch
@@ -128,7 +128,7 @@ public class MergeTests : IDisposable
         await table.MergeAsync([Rows((2, "B", 99))], new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = MergeAction.UpdateColumns("value"),
+            WhenMatched = [MergeAction.UpdateColumns("value")],
         });
 
         Assert.Equal([(1L, "a", 10L), (2L, "B", 20L)], (await ReadAsync(table)).Select(r => (r.Id!.Value, r.Value, r.Ts!.Value)));
@@ -143,8 +143,8 @@ public class MergeTests : IDisposable
         await table.MergeAsync([NarrowSource()], new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = MergeAction.UpdateColumns("value"),
-            WhenNotMatched = MergeAction.InsertColumns("id", "value"),
+            WhenMatched = [MergeAction.UpdateColumns("value")],
+            WhenNotMatched = [MergeAction.InsertColumns("id", "value")],
         });
 
         Assert.Equal([(1L, "A", (long?)10L), (2L, "B", null)], (await ReadAsync(table)).Select(r => (r.Id!.Value, r.Value, r.Ts)));
@@ -163,8 +163,8 @@ public class MergeTests : IDisposable
         var ex = await Assert.ThrowsAsync<ArgumentException>(() => table.MergeAsync([NarrowSource()], new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = update ? MergeAction.Update : null,
-            WhenNotMatched = update ? null : MergeAction.Insert,
+            WhenMatched = update ? [MergeAction.Update] : [],
+            WhenNotMatched = update ? [] : [MergeAction.Insert],
         }).AsTask());
 
         Assert.Contains("'ts'", ex.Message);
@@ -190,7 +190,7 @@ public class MergeTests : IDisposable
         var (metrics, _) = await table.MergeAsync([Rows((1, null, null), (3, null, null))], new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = MergeAction.Delete,
+            WhenMatched = [MergeAction.Delete],
         });
 
         Assert.Equal([2L], (await ReadAsync(table)).Select(r => r.Id!.Value));
@@ -208,9 +208,9 @@ public class MergeTests : IDisposable
         var (metrics, _) = await table.MergeAsync([Rows((2, "B", 20), (4, "d", 40))], new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = MergeAction.Update,
-            WhenNotMatched = MergeAction.Insert,
-            WhenNotMatchedBySource = MergeAction.Delete,
+            WhenMatched = [MergeAction.Update],
+            WhenNotMatched = [MergeAction.Insert],
+            WhenNotMatchedBySource = [MergeAction.Delete],
         });
 
         Assert.Equal([(2L, "B"), (4L, "d")], (await ReadAsync(table)).Select(r => (r.Id!.Value, r.Value)));
@@ -228,9 +228,8 @@ public class MergeTests : IDisposable
         await table.MergeAsync([Rows((2, "b", 20))], new MergeOptions
         {
             Keys = ["id"],
-            WhenNotMatchedBySource = MergeAction.Delete,
-            WhenNotMatchedBySourceCondition = Ex.GreaterThan(
-                UnboundReference.FromParts(["target", "ts"]), Ex.Lit(LiteralValue.Of(15L))),
+            WhenNotMatchedBySource = [MergeAction.Delete.When(Ex.GreaterThan(
+                UnboundReference.FromParts(["target", "ts"]), Ex.Lit(LiteralValue.Of(15L))))],
         });
 
         Assert.Equal([1L, 2L], (await ReadAsync(table)).Select(r => r.Id!.Value));
@@ -282,19 +281,17 @@ public class MergeTests : IDisposable
         {
             "conditionHoldsForOne" => new MergeOptions
             {
-                Keys = ["id"], WhenMatched = MergeAction.Update, WhenMatchedCondition = Source("ts", ">", "ts"),
+                Keys = ["id"], WhenMatched = [MergeAction.Update.When(Source("ts", ">", "ts"))],
             },
             "conditionHoldsForNone" => new MergeOptions
             {
-                Keys = ["id"], WhenMatched = MergeAction.Update,
-                WhenMatchedCondition = Ex.GreaterThan(UnboundReference.FromParts(["source", "ts"]), Ex.Lit(LiteralValue.Of(100L))),
+                Keys = ["id"], WhenMatched = [MergeAction.Update.When(Ex.GreaterThan(UnboundReference.FromParts(["source", "ts"]), Ex.Lit(LiteralValue.Of(100L))))],
             },
             "conditionalDelete" => new MergeOptions
             {
-                Keys = ["id"], WhenMatched = MergeAction.Delete,
-                WhenMatchedCondition = Ex.GreaterThan(UnboundReference.FromParts(["source", "ts"]), Ex.Lit(LiteralValue.Of(0L))),
+                Keys = ["id"], WhenMatched = [MergeAction.Delete.When(Ex.GreaterThan(UnboundReference.FromParts(["source", "ts"]), Ex.Lit(LiteralValue.Of(0L))))],
             },
-            _ => new MergeOptions { Keys = ["id"], WhenNotMatchedBySource = MergeAction.Delete },
+            _ => new MergeOptions { Keys = ["id"], WhenNotMatchedBySource = [MergeAction.Delete] },
         };
 
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(() =>
@@ -313,7 +310,7 @@ public class MergeTests : IDisposable
         await table.MergeAsync([Rows((1, "x", 1), (1, "y", 2), (3, "c", 3))], new MergeOptions
         {
             Keys = ["id"],
-            WhenNotMatched = MergeAction.Insert,
+            WhenNotMatched = [MergeAction.Insert],
         });
 
         Assert.Equal([(1L, "a"), (3L, "c")], (await ReadAsync(table)).Select(r => (r.Id!.Value, r.Value)));
@@ -328,7 +325,7 @@ public class MergeTests : IDisposable
         var (metrics, _) = await table.MergeAsync([Rows((1, null, null), (1, null, null))], new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = MergeAction.Delete,
+            WhenMatched = [MergeAction.Delete],
         });
 
         Assert.Equal(1, metrics.NumTargetRowsDeleted);
@@ -345,9 +342,8 @@ public class MergeTests : IDisposable
         var (metrics, _) = await table.MergeAsync([Rows((1, "A", 11), (2, "B", 19))], new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = MergeAction.Update,
-            WhenMatchedCondition = Source("ts", ">", "ts"),
-            WhenNotMatched = MergeAction.Insert,
+            WhenMatched = [MergeAction.Update.When(Source("ts", ">", "ts"))],
+            WhenNotMatched = [MergeAction.Insert],
         });
 
         Assert.Equal(1, metrics.NumTargetRowsUpdated);
@@ -364,9 +360,8 @@ public class MergeTests : IDisposable
         await table.MergeAsync([Rows((2, "keep", 1), (3, "drop", -1))], new MergeOptions
         {
             Keys = ["id"],
-            WhenNotMatched = MergeAction.Insert,
-            WhenNotMatchedCondition = Ex.GreaterThan(
-                UnboundReference.FromParts(["source", "ts"]), Ex.Lit(LiteralValue.Of(0L))),
+            WhenNotMatched = [MergeAction.Insert.When(Ex.GreaterThan(
+                UnboundReference.FromParts(["source", "ts"]), Ex.Lit(LiteralValue.Of(0L))))],
         });
 
         Assert.Equal([1L, 2L], (await ReadAsync(table)).Select(r => r.Id!.Value));
@@ -510,7 +505,7 @@ public class MergeTests : IDisposable
         var (metrics, _) = await table.MergeAsync(
             [TimestampRows(Micros, [1_000_000, 1_844_674_407_370_955_162],
                 new StringArray.Builder().Append("A").Append("far").Build(), StringType.Default)],
-            new MergeOptions { Keys = ["k"], WhenMatched = MergeAction.Update });
+            new MergeOptions { Keys = ["k"], WhenMatched = [MergeAction.Update] });
 
         Assert.Equal(1, metrics.NumTargetRowsUpdated);
     }
@@ -559,7 +554,7 @@ public class MergeTests : IDisposable
         string far = table.CurrentSnapshot.ActiveFiles.Keys.Single(p => !near.Contains(p));
 
         await using var txn = table.StartTransaction();
-        var options = new MergeOptions { Keys = ["k"], WhenMatched = MergeAction.Update, WhenNotMatched = MergeAction.Insert };
+        var options = new MergeOptions { Keys = ["k"], WhenMatched = [MergeAction.Update], WhenNotMatched = [MergeAction.Insert] };
         var source = sliced
             ? new RecordBatch(schema,
                 Batch([500, 50, -2, 3], "p", "q", "A", "c").Arrays.Select(a => ArrowArrayFactory.Slice(a, 2, 2)), 2)
@@ -585,8 +580,8 @@ public class MergeTests : IDisposable
     private static MergeOptions UpsertByValue => new()
     {
         Keys = ["value"],
-        WhenMatched = MergeAction.Update,
-        WhenNotMatched = MergeAction.Insert,
+        WhenMatched = [MergeAction.Update],
+        WhenNotMatched = [MergeAction.Insert],
     };
 
     // Rows whose value column is built from raw (possibly ill-formed) UTF-8 bytes.
@@ -616,8 +611,7 @@ public class MergeTests : IDisposable
         var (metrics, version) = await table.MergeAsync([Rows((1, "A", 0))], new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = MergeAction.Update,
-            WhenMatchedCondition = Source("ts", ">", "ts"),
+            WhenMatched = [MergeAction.Update.When(Source("ts", ">", "ts"))],
         });
 
         Assert.Equal(1, version);
@@ -633,8 +627,8 @@ public class MergeTests : IDisposable
         await table.MergeAsync([Rows((1, "b", 99), (1, "c", 30))], new MergeOptions
         {
             Keys = ["id", "value"],
-            WhenMatched = MergeAction.Update,
-            WhenNotMatched = MergeAction.Insert,
+            WhenMatched = [MergeAction.Update],
+            WhenNotMatched = [MergeAction.Insert],
         });
 
         Assert.Equal([(1L, "a", 10L), (1L, "b", 99L), (1L, "c", 30L)], (await ReadAsync(table)).Select(r => (r.Id!.Value, r.Value, r.Ts!.Value)));
@@ -649,10 +643,9 @@ public class MergeTests : IDisposable
         var (_, version) = await table.MergeAsync([Rows((1, "A", 11), (4, "d", 40))], new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = MergeAction.Update,
-            WhenNotMatched = MergeAction.Insert,
-            WhenNotMatchedBySource = MergeAction.Delete,
-            WhenNotMatchedBySourceCondition = Ex.Equal("id", LiteralValue.Of(3L)),
+            WhenMatched = [MergeAction.Update],
+            WhenNotMatched = [MergeAction.Insert],
+            WhenNotMatchedBySource = [MergeAction.Delete.When(Ex.Equal("id", LiteralValue.Of(3L)))],
         });
 
         var changes = new List<(string Type, long Id, string Value)>();
@@ -721,9 +714,8 @@ public class MergeTests : IDisposable
         var (metrics, _) = await table.MergeAsync([Rows((2, "B", 21), (3, "c", 30))], new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = MergeAction.Update,
-            WhenMatchedCondition = Source("ts", ">", "ts"),
-            WhenNotMatched = MergeAction.Insert,
+            WhenMatched = [MergeAction.Update.When(Source("ts", ">", "ts"))],
+            WhenNotMatched = [MergeAction.Insert],
         });
 
         Assert.Equal(1, metrics.NumTargetFilesRemoved); // the id=50 file is outside the key range
@@ -743,8 +735,8 @@ public class MergeTests : IDisposable
         await txn.MergeAsync([Rows((1, "p", 11), (3, "p", 30))], new MergeOptions
         {
             Keys = ["value", "id"],
-            WhenMatched = MergeAction.Update,
-            WhenNotMatched = MergeAction.Insert,
+            WhenMatched = [MergeAction.Update],
+            WhenNotMatched = [MergeAction.Insert],
         });
         Assert.DoesNotContain(other.Path, txn.DeclaredReadPaths);
         Assert.DoesNotContain(other.Path, txn.RemovedPaths);
@@ -863,7 +855,7 @@ public class MergeTests : IDisposable
         // In milliseconds: 1000 is the first row's instant (not the second row's raw count), 7 neither's.
         var (metrics, _) = await table.MergeAsync(
             [TimestampRows(Millis, [1_000, 7], new StringArray.Builder().Append("S").Append("new").Build(), StringType.Default)],
-            new MergeOptions { Keys = ["k"], WhenMatched = MergeAction.Update, WhenNotMatched = MergeAction.Insert });
+            new MergeOptions { Keys = ["k"], WhenMatched = [MergeAction.Update], WhenNotMatched = [MergeAction.Insert] });
 
         Assert.Equal(1, metrics.NumTargetRowsUpdated);
         Assert.Equal(1, metrics.NumTargetRowsInserted);
@@ -903,7 +895,7 @@ public class MergeTests : IDisposable
             [new Int64Array.Builder().Append(1).Build(),
              new LargeStringArray.Builder().Append("A").Build(),
              Timestamps(Millis, 5)], 1)],
-            new MergeOptions { Keys = ["id"], WhenMatched = MergeAction.Update });
+            new MergeOptions { Keys = ["id"], WhenMatched = [MergeAction.Update] });
 
         var rows = new List<(long, string?, long)>();
         await foreach (var batch in table.ReadAllAsync())
@@ -932,7 +924,7 @@ public class MergeTests : IDisposable
                 TimestampRows(Millis, [1_000], new LargeStringArray.Builder().Append("A").Build(), LargeStringType.Default),
                 TimestampRows(Micros, [2_000_000], new StringArray.Builder().Append("b").Build(), StringType.Default),
             ],
-            new MergeOptions { Keys = ["k"], WhenMatched = MergeAction.Update, WhenNotMatched = MergeAction.Insert });
+            new MergeOptions { Keys = ["k"], WhenMatched = [MergeAction.Update], WhenNotMatched = [MergeAction.Insert] });
 
         Assert.Equal(1, metrics.NumTargetRowsUpdated);
         Assert.Equal(1, metrics.NumTargetRowsInserted);
@@ -953,7 +945,7 @@ public class MergeTests : IDisposable
 
         await Assert.ThrowsAsync<ArgumentException>(() => table.MergeAsync([source], new MergeOptions
         {
-            Keys = ["k"], WhenMatched = MergeAction.Update, WhenNotMatched = MergeAction.Insert,
+            Keys = ["k"], WhenMatched = [MergeAction.Update], WhenNotMatched = [MergeAction.Insert],
         }).AsTask());
     }
 
@@ -1004,7 +996,7 @@ public class MergeTests : IDisposable
         // Insert-only, and an upsert whose matched clause matches nothing: neither removes a file (as Spark).
         await table.MergeAsync([Rows((1, "x", 0), (2, "b", 20))], new MergeOptions
         {
-            Keys = ["id"], WhenNotMatched = MergeAction.Insert,
+            Keys = ["id"], WhenNotMatched = [MergeAction.Insert],
         });
         await table.MergeAsync([Rows((3, "c", 30))], Upsert);
 
@@ -1025,8 +1017,8 @@ public class MergeTests : IDisposable
             [Rows((1, "A", 11), (2, "b", 20))], new MergeOptions
             {
                 Keys = ["id"],
-                WhenMatched = update ? MergeAction.Update : MergeAction.Delete,
-                WhenNotMatched = MergeAction.Insert,
+                WhenMatched = [update ? MergeAction.Update : MergeAction.Delete],
+                WhenNotMatched = [MergeAction.Insert],
             }).AsTask());
 
         Assert.Equal(DeltaTableErrorCodes.CannotModifyAppendOnly, e.ErrorCode);
@@ -1063,7 +1055,7 @@ public class MergeTests : IDisposable
                 [builder.Build()], values.Length);
         }
 
-        var insert = new MergeOptions { Keys = ["value"], WhenNotMatched = MergeAction.InsertColumns("value") };
+        var insert = new MergeOptions { Keys = ["value"], WhenNotMatched = [MergeAction.InsertColumns("value")] };
         await using (var txn = table.StartTransaction())
         {
             await txn.MergeAsync([Values("a", "b")], insert);
@@ -1086,19 +1078,33 @@ public class MergeTests : IDisposable
     [InlineData("noKeys")]
     [InlineData("noClauses")]
     [InlineData("insertWhenMatched")]
-    [InlineData("conditionWithoutClause")]
+    [InlineData("unconditionalBeforeAnother")]
+    [InlineData("updateStarWhenNotMatchedBySource")]
+    [InlineData("insertWhenNotMatchedBySource")]
+    [InlineData("nullClauseList")]
+    [InlineData("nullClause")]
     public async Task InvalidOptions_AreRefused(string which)
     {
         await using var table = await CreateAsync();
         var options = which switch
         {
-            "noKeys" => new MergeOptions { WhenNotMatched = MergeAction.Insert },
+            "noKeys" => new MergeOptions { WhenNotMatched = [MergeAction.Insert] },
             "noClauses" => new MergeOptions { Keys = ["id"] },
-            "insertWhenMatched" => new MergeOptions { Keys = ["id"], WhenMatched = MergeAction.Insert },
-            _ => new MergeOptions
+            "insertWhenMatched" => new MergeOptions { Keys = ["id"], WhenMatched = [MergeAction.Insert] },
+            "unconditionalBeforeAnother" => new MergeOptions
             {
-                Keys = ["id"], WhenNotMatched = MergeAction.Insert, WhenMatchedCondition = Ex.True,
+                Keys = ["id"], WhenMatched = [MergeAction.Delete, MergeAction.Update.When(Ex.True)],
             },
+            "updateStarWhenNotMatchedBySource" => new MergeOptions
+            {
+                Keys = ["id"], WhenNotMatchedBySource = [MergeAction.Update],
+            },
+            "insertWhenNotMatchedBySource" => new MergeOptions
+            {
+                Keys = ["id"], WhenNotMatchedBySource = [MergeAction.Insert],
+            },
+            "nullClauseList" => new MergeOptions { Keys = ["id"], WhenMatched = null! },
+            _ => new MergeOptions { Keys = ["id"], WhenMatched = [null!] },
         };
 
         await Assert.ThrowsAsync<ArgumentException>(() => table.MergeAsync([Rows((1, "a", 1))], options).AsTask());
