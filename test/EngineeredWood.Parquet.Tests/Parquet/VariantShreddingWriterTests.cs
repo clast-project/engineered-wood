@@ -55,6 +55,12 @@ public class VariantShreddingWriterTests : IDisposable
 
     private static string Json(VariantValue v) => VariantJsonWriter.ToJson(v, indented: false);
 
+    private static VariantValue FromJson(string json)
+    {
+        var (metadata, value) = VariantJsonReader.Parse(json);
+        return new VariantReader(metadata, value).ToVariantValue();
+    }
+
     private static RecordBatch Batch(params VariantValue[] values)
     {
         var builder = new VariantArray.Builder();
@@ -250,5 +256,65 @@ public class VariantShreddingWriterTests : IDisposable
         Assert.Equal(values.Length, read.Count);
         for (int i = 0; i < values.Length; i++)
             Assert.Equal(Json(values[i]), Json(read[i]));
+    }
+    /// <summary>
+    /// The shredding spec makes every field group under an object's <c>typed_value</c> (and every array
+    /// element group) a <c>required group</c>: an object that lacks the field writes the group with
+    /// both <c>value</c> and <c>typed_value</c> null. Writing the group OPTIONAL and null instead is
+    /// what Spark 4.1 reads as MALFORMED_VARIANT (#679).
+    /// </summary>
+    [Fact]
+    public async Task ShreddedFieldGroups_AreRequired_AndAMissingFieldRoundTrips()
+    {
+        var declared = ShredSchema.ForObject(new Dictionary<string, ShredSchema>
+        {
+            ["a"] = ShredSchema.Primitive(ShredType.Int8),
+            ["c"] = ShredSchema.ForObject(new Dictionary<string, ShredSchema>
+            {
+                ["d"] = ShredSchema.Primitive(ShredType.Int32),
+            }),
+            ["l"] = ShredSchema.ForArray(ShredSchema.Primitive(ShredType.Int32)),
+        });
+        var options = ParquetWriteOptions.Default with
+        {
+            VariantShredSchemas = new Dictionary<string, ShredSchema> { ["v"] = declared },
+        };
+        string[] json =
+        [
+            "{\"a\":1,\"c\":{\"d\":2},\"l\":[1,2]}",
+            "{\"b\":1}",
+            "{\"a\":2}",
+            "{\"c\":{\"e\":3}}",
+            "{\"a\":\"str\",\"l\":[3,\"x\"]}",
+            "7",
+        ];
+        var builder = new VariantArray.Builder();
+        foreach (var j in json)
+            builder.Append(FromJson(j));
+        builder.AppendNull();
+        var array = builder.Build(allocator: null);
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema(new[] { new Field("v", array.Data.DataType, nullable: true) }, metadata: null),
+            new IArrowArray[] { array }, array.Length);
+
+        string path = await WriteAsync(options, batch);
+
+        var (meta, values, nulls) = await ReadAsync(path);
+        foreach (var name in new[] { "a", "c", "d", "l" })
+        {
+            var group = meta.Schema.Single(s => s.Name == name);
+            Assert.Equal(FieldRepetitionType.Required, group.RepetitionType);
+        }
+        // The array's element group: the one child of the repeated "list" group.
+        int list = meta.Schema.ToList().FindIndex(s => s.RepetitionType == FieldRepetitionType.Repeated);
+        Assert.True(list >= 0);
+        Assert.Equal(FieldRepetitionType.Required, meta.Schema[list + 1].RepetitionType);
+
+        for (int i = 0; i < json.Length; i++)
+        {
+            Assert.False(nulls[i]);
+            Assert.Equal(Json(FromJson(json[i])), Json(values[i]));
+        }
+        Assert.True(nulls[json.Length]);
     }
 }

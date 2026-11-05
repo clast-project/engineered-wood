@@ -140,14 +140,18 @@ and `ListViewType`.
   struct/list/map that carries no logical-type annotation — Spark 4.0.x
   output, or EW's own with `EmitVariantLogicalType=false` — reads back as a
   bare struct. The Delta-layer coercion that repairs this is top-level only.
-- *Two upstream Arrow gaps are worked around in `VariantShredding`.* The
+- *Three upstream Arrow gaps are worked around in `VariantShredding`.* The
   shred pipeline has no validity, so a SQL-null row cannot be expressed and
   `VariantShredding.WithValidity` exists to repair the result
   ([apache/arrow-dotnet#398](https://github.com/apache/arrow-dotnet/issues/398));
   and there are no array-level entry points, so `Reassemble` and the decode
   loops are ours to carry
-  ([#399](https://github.com/apache/arrow-dotnet/issues/399)). If both land,
-  `VariantShredding.cs` shrinks to a few calls.
+  ([#399](https://github.com/apache/arrow-dotnet/issues/399)). The upstream builder
+  also declares each shredded field group nullable and nulls the group for a
+  field an object lacks, where the spec says `required group` with both
+  children null (Spark 4.1 reads that as `MALFORMED_VARIANT`), so
+  `VariantShredding.RequireFieldGroups` rewrites the groups (#679). If these
+  land upstream, `VariantShredding.cs` shrinks to a few calls.
 - *A shredded narrow DECIMAL loses its trailing zeros.* A decimal held in a
   `typed_value` column of precision 18 or less reads back with the right
   value but a normalised scale: DuckDB's `12.30::DECIMAL(9,2)` comes back as
@@ -478,11 +482,6 @@ bounds and over Spark's. What is not done:
   file are not pruned by the `typed_value` footer statistics.
 - *Floats prune one way only.* Delta keeps no NaN count, so a variant float
   bound skips a file for `<` and `=` but not for `>`, as for a float column.
-- *Spark refuses EW's shredding of an object that lacks a shredded field.*
-  EW writes each field group under `typed_value` as `OPTIONAL`, where the
-  shredding spec says `required group`; Spark 4.1 reads such a file as
-  `MALFORMED_VARIANT` once a row omits the field (measured). Files whose
-  object rows all carry every shredded field read fine (#679).
 - *delta-spark writes none by default.* Its bounds need
   `spark.databricks.delta.variantShredding.parseFooterForStats=true` (off by
   default) and `spark.databricks.delta.stats.limitPerVariant` above its

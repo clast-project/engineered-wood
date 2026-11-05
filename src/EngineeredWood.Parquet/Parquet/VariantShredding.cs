@@ -4,6 +4,7 @@
 using System.Diagnostics.CodeAnalysis;
 
 using Apache.Arrow;
+using Apache.Arrow.Types;
 using Apache.Arrow.Operations.Shredding;
 using Apache.Arrow.Scalars.Variant;
 
@@ -181,7 +182,7 @@ public static class VariantShredding
         ValidateMask(isSqlNull, values.Count);
 
         var (metadata, rows) = VariantShredder.Shred(values, schema);
-        var array = ShreddedVariantArrayBuilder.Build(schema, metadata, rows);
+        var array = RequireFieldGroups(ShreddedVariantArrayBuilder.Build(schema, metadata, rows));
 
         int nulls = 0;
         for (int r = 0; r < isSqlNull.Length; r++)
@@ -299,6 +300,135 @@ public static class VariantShredding
         }
 
         return (values, isNull, anyNull);
+    }
+
+    /// <summary>
+    /// Makes every shredded field group non-nullable, as the spec requires: a field an object row
+    /// lacks is a PRESENT group whose <c>value</c> and <c>typed_value</c> are both null (#679).
+    /// </summary>
+    /// <remarks>
+    /// Upstream's builder declares each group under an object's <c>typed_value</c> (and each array
+    /// element group) nullable, and marks a missing field by nulling the group itself. The writer maps
+    /// that to an <c>OPTIONAL</c> group with a null at the group's level, which the spec has no room
+    /// for — Spark 4.1 reads it as <c>MALFORMED_VARIANT</c>. Here each group's nulls are pushed down
+    /// into its two children and the group itself loses its validity, so the footer declares
+    /// <c>required group</c> and a missing field is written with both children null.
+    /// </remarks>
+    private static VariantArray RequireFieldGroups(VariantArray variant)
+    {
+        var storage = variant.StorageArray;
+        var type = (StructType)storage.Data.DataType;
+        int typedIndex = type.GetFieldIndex("typed_value");
+        if (typedIndex < 0)
+        {
+            return variant;
+        }
+
+        RequireUnsliced(storage.Data);
+        var children = storage.Data.Children.ToArray();
+        var fields = type.Fields.ToArray();
+        children[typedIndex] = RequireGroupsUnder(children[typedIndex]);
+        var typedField = fields[typedIndex];
+        fields[typedIndex] = new Field(
+            typedField.Name, children[typedIndex].DataType, typedField.IsNullable, typedField.Metadata);
+
+        var newStorage = new ArrayData(
+            new StructType(fields), storage.Length, storage.Data.NullCount, 0,
+            storage.Data.Buffers, children, storage.Data.Dictionary);
+        return new VariantArray(Apache.Arrow.ArrowArrayFactory.BuildArray(newStorage));
+    }
+
+    // A typed_value: an object's fields and an array's elements are groups; a primitive has none.
+    private static ArrayData RequireGroupsUnder(ArrayData typed)
+    {
+        switch (typed.DataType)
+        {
+            case StructType obj:
+            {
+                RequireUnsliced(typed);
+                var children = new ArrayData[obj.Fields.Count];
+                var fields = new Field[obj.Fields.Count];
+                for (int i = 0; i < children.Length; i++)
+                {
+                    children[i] = RequireGroup(typed.Children[i]);
+                    var f = obj.Fields[i];
+                    fields[i] = new Field(f.Name, children[i].DataType, nullable: false, f.Metadata);
+                }
+                return new ArrayData(
+                    new StructType(fields), typed.Length, typed.NullCount, 0, typed.Buffers, children,
+                    typed.Dictionary);
+            }
+
+            case ListType list:
+            {
+                RequireUnsliced(typed);
+                var element = RequireGroup(typed.Children[0]);
+                var f = list.ValueField;
+                var newType = new ListType(new Field(f.Name, element.DataType, nullable: false, f.Metadata));
+                return new ArrayData(
+                    newType, typed.Length, typed.NullCount, 0, typed.Buffers, new[] { element },
+                    typed.Dictionary);
+            }
+
+            default:
+                return typed;
+        }
+    }
+
+    // A {value, typed_value} group: its nulls move into both children, and it keeps no validity.
+    private static ArrayData RequireGroup(ArrayData group)
+    {
+        RequireUnsliced(group);
+        var type = (StructType)group.DataType;
+        var children = new ArrayData[type.Fields.Count];
+        var fields = new Field[type.Fields.Count];
+        for (int i = 0; i < children.Length; i++)
+        {
+            var child = group.NullCount == 0 ? group.Children[i] : MaskedBy(group.Children[i], group);
+            var f = type.Fields[i];
+            if (f.Name == "typed_value")
+            {
+                child = RequireGroupsUnder(child);
+            }
+            children[i] = child;
+            fields[i] = new Field(f.Name, child.DataType, f.IsNullable, f.Metadata);
+        }
+
+        var buffers = group.Buffers.ToArray();
+        buffers[0] = ArrowBuffer.Empty;
+        return new ArrayData(new StructType(fields), group.Length, 0, 0, buffers, children, group.Dictionary);
+    }
+
+    // Returns child with every row the group marks null also null.
+    private static ArrayData MaskedBy(ArrayData child, ArrayData group)
+    {
+        RequireUnsliced(child);
+        var groupValidity = group.Buffers[0].Span;
+        var childValidity = child.Buffers[0].IsEmpty ? default : child.Buffers[0].Span;
+        var validity = new ArrowBuffer.BitmapBuilder(child.Length);
+        int nulls = 0;
+        for (int i = 0; i < child.Length; i++)
+        {
+            bool valid = BitUtility.GetBit(groupValidity, i)
+                && (childValidity.IsEmpty || BitUtility.GetBit(childValidity, i));
+            validity.Append(valid);
+            if (!valid) nulls++;
+        }
+
+        var buffers = child.Buffers.ToArray();
+        buffers[0] = validity.Build();
+        return new ArrayData(child.DataType, child.Length, nulls, 0, buffers, child.Children, child.Dictionary);
+    }
+
+    // The rebuilds above index buffers from bit 0. ShreddedVariantArrayBuilder returns fresh, unsliced
+    // arrays; fail loudly rather than misplace a null if that ever changes.
+    private static void RequireUnsliced(ArrayData data)
+    {
+        if (data.Offset != 0)
+        {
+            throw new NotSupportedException(
+                $"Cannot normalize a sliced shredded variant array (offset {data.Offset}).");
+        }
     }
 
     private static void ValidateMask(ReadOnlySpan<bool> isSqlNull, int rowCount)
