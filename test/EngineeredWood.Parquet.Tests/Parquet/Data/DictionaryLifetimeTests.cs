@@ -41,16 +41,18 @@ public class DictionaryLifetimeTests : IDisposable
             Directory.Delete(_tempDir, recursive: true);
     }
 
-    public static TheoryData<DataPageVersion, CompressionCodec, int?, long?> Reads()
+    public static TheoryData<DataPageVersion, CompressionCodec, bool, int?, long?> Reads()
     {
-        var data = new TheoryData<DataPageVersion, CompressionCodec, int?, long?>();
+        var data = new TheoryData<DataPageVersion, CompressionCodec, bool, int?, long?>();
         foreach (var version in new[] { DataPageVersion.V1, DataPageVersion.V2 })
         foreach (var codec in new[] { CompressionCodec.Uncompressed, CompressionCodec.Snappy })
+        foreach (bool pageIndex in new[] { true, false })
         {
-            // A row-count batch builds its page maps from the OffsetIndex, whose dictionary arrives
-            // with the first data read; a byte budget scans the page headers instead.
-            data.Add(version, codec, 7_777, null);
-            data.Add(version, codec, null, 64 * 1024);
+            // With an OffsetIndex the page map is built from it, and the dictionary page is read with
+            // the first data pages (ColumnPageMap.CompleteSidePages). Without one the map is built by
+            // scanning the page headers, which reads the dictionary page then (PageMapBuilder.Build).
+            data.Add(version, codec, pageIndex, 7_777, null);
+            data.Add(version, codec, pageIndex, null, 64 * 1024);
         }
 
         return data;
@@ -59,14 +61,14 @@ public class DictionaryLifetimeTests : IDisposable
     [Theory]
     [MemberData(nameof(Reads))]
     public async Task BatchedRead_DecodesEveryBatch_FromALiveDictionary(
-        DataPageVersion version, CompressionCodec codec, int? batchSize, long? maxBytes)
+        DataPageVersion version, CompressionCodec codec, bool pageIndex, int? batchSize, long? maxBytes)
     {
-        string path = await WriteAsync("main.parquet", version, codec, seed: 1);
-        string other = await WriteAsync("other.parquet", version, codec, seed: 2);
+        string path = await WriteAsync("main.parquet", version, codec, seed: 1, pageIndex);
+        string other = await WriteAsync("other.parquet", version, codec, seed: 2, pageIndex);
         await using var file = new LocalRandomAccessFile(path);
         await using var reader = new ParquetFileReader(
             file, ownsFile: false, new ParquetReadOptions { BatchSize = batchSize, MaxBatchByteSize = maxBytes });
-        AssertDictionaryEncoded(await reader.ReadMetadataAsync());
+        AssertLayout(await reader.ReadMetadataAsync(), pageIndex);
 
         int row = 0;
         int batches = 0;
@@ -150,7 +152,8 @@ public class DictionaryLifetimeTests : IDisposable
 
     private static string NameAt(int row, int seed) => $"name-{row * 31L % Distinct:D6}-{seed}";
 
-    private async Task<string> WriteAsync(string name, DataPageVersion version, CompressionCodec codec, int seed)
+    private async Task<string> WriteAsync(
+        string name, DataPageVersion version, CompressionCodec codec, int seed, bool pageIndex = true)
     {
         var ids = new Int64Array.Builder();
         var amounts = new DoubleArray.Builder();
@@ -177,6 +180,7 @@ public class DictionaryLifetimeTests : IDisposable
             DataPageVersion = version,
             DictionaryEnabled = true,
             DataPageSize = 8 * 1024, // many pages, so a batch rarely ends where a page does
+            WritePageIndex = pageIndex,
         });
         await writer.WriteRowGroupAsync(batch);
         await writer.CloseAsync();
@@ -191,10 +195,13 @@ public class DictionaryLifetimeTests : IDisposable
         AssertRows(batch, 0, seed);
     }
 
-    private static void AssertDictionaryEncoded(FileMetaData metadata)
+    private static void AssertLayout(FileMetaData metadata, bool pageIndex)
     {
         foreach (var chunk in metadata.RowGroups[0].Columns)
+        {
             Assert.NotNull(chunk.MetaData!.DictionaryPageOffset);
+            Assert.Equal(pageIndex, chunk.OffsetIndexOffset is not null);
+        }
     }
 
     private static void AssertRows(RecordBatch batch, int firstRow, int seed)

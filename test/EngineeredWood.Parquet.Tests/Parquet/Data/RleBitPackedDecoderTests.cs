@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.Data;
 
 namespace EngineeredWood.Tests.Parquet.Data;
@@ -17,6 +18,36 @@ public class RleBitPackedDecoderTests
         var result = new int[3];
         decoder.ReadBatch(result);
         Assert.Equal([5, 5, 5], result);
+    }
+
+    /// <summary>
+    /// An RLE value is stored in whole bytes, so a byte can hold more than the declared width. Such a
+    /// value is refused: a dictionary trusts an index's width to keep it inside its entries, and its
+    /// rented arrays reach past them, so index 3 of a three-entry dictionary read whatever was left
+    /// there (#688).
+    /// </summary>
+    [Theory]
+    [InlineData(1, new byte[] { 6, 3 })]
+    [InlineData(3, new byte[] { 6, 8 })]
+    [InlineData(9, new byte[] { 6, 0x00, 0x02 })]
+    [InlineData(31, new byte[] { 6, 0x00, 0x00, 0x00, 0x80 })]
+    public void RleRun_ValueWiderThanItsBitWidth_IsRefused(int bitWidth, byte[] data)
+    {
+        var ex = Assert.Throws<ParquetFormatException>(() => new RleBitPackedDecoder(data, bitWidth).ReadBatch(new int[3]));
+        Assert.Contains($"bit width of {bitWidth}", ex.Message);
+    }
+
+    [Theory]
+    [InlineData(1, new byte[] { 6, 1 }, 1)]
+    [InlineData(3, new byte[] { 6, 7 }, 7)]
+    [InlineData(9, new byte[] { 6, 0xFF, 0x01 }, 511)]
+    [InlineData(32, new byte[] { 6, 0xFF, 0xFF, 0xFF, 0xFF }, -1)]
+    public void RleRun_WidestValueOfItsBitWidth_Decodes(int bitWidth, byte[] data, int expected)
+    {
+        var decoder = new RleBitPackedDecoder(data, bitWidth);
+        var result = new int[3];
+        decoder.ReadBatch(result);
+        Assert.Equal([expected, expected, expected], result);
     }
 
     [Fact]
