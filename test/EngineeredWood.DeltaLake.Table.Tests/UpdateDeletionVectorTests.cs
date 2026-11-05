@@ -320,15 +320,24 @@ public class UpdateDeletionVectorTests : IDisposable
     public async Task DeletionVectorsAskedForOnATableWithoutThem_AreRefusedAndWriteNothing()
     {
         await using var table = await CreateAsync(deletionVectors: false);
-        // Two files, so that the refusal on the second takes back the post-images written for the first.
-        await table.WriteAsync([Rows((1, "a"), (2, "b"))]);
-        await table.WriteAsync([Rows((3, "c"), (4, "d"), (5, "e"))]);
+        // The first file is wholly updated, so it is removed and its post-images written; the second only in part,
+        // which is refused. The refusal must take back the first file's post-images.
+        await table.WriteAsync([Rows((2, "b"), (3, "c"))]);
+        await table.WriteAsync([Rows((1, "a"), (4, "d"), (5, "e"))]);
         long version = table.CurrentSnapshot.Version;
         int parquet = FileCount("*.parquet");
 
-        await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            table.UpdateAsync(TwoAndThree, Upper, mode: RowDeleteMode.DeletionVector).AsTask());
+        // The data files on disk at each call of the updater: one per file the UPDATE reaches.
+        var seen = new List<int>();
+        var twoThreeFour = Ex.In("id", LiteralValue.Of(2L), LiteralValue.Of(3L), LiteralValue.Of(4L));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => table.UpdateAsync(twoThreeFour, batch =>
+        {
+            seen.Add(FileCount("*.parquet"));
+            return Upper(batch);
+        }, mode: RowDeleteMode.DeletionVector).AsTask());
 
+        // The wholly updated file came first and its post-image was written before the refusal.
+        Assert.Equal([parquet, parquet + 1], seen);
         Assert.Equal(version, table.CurrentSnapshot.Version);
         Assert.Equal(parquet, FileCount("*.parquet"));
         Assert.Equal(0, FileCount("*.bin"));
@@ -538,16 +547,23 @@ public class UpdateDeletionVectorTests : IDisposable
         Assert.Equal([(1, "a"), (2, "B"), (3, "C"), (5, "e")], await ReadAsync(table));
     }
 
-    [Fact]
-    public async Task AConcurrentAppend_IsRebasedPast()
+    /// <summary>
+    /// A blind append touches no file the UPDATE read, so the auto-committing UPDATE rebases past it and lands one
+    /// version later than it first tried. The updated rows' commit version is the version it LANDS at, in the table
+    /// and in the change feed: it follows the post-image file's defaultRowCommitVersion, which the rebase re-derives.
+    /// </summary>
+    [Theory]
+    [InlineData(RowDeleteMode.DeletionVector)]
+    [InlineData(RowDeleteMode.CopyOnWrite)]
+    public async Task AConcurrentAppend_IsRebasedPast_AndTheUpdatedRowsTakeTheLandingVersion(RowDeleteMode mode)
     {
-        // A blind append touches no file the UPDATE read: the auto-committing UPDATE rebases and lands.
-        await using var table = await CreateAsync(rowTracking: true);
+        await using var table = await CreateAsync(cdf: true, rowTracking: true);
         await table.WriteAsync([Five]);
+        long written = table.CurrentSnapshot.Version;
         await using var other = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
 
         bool appended = false;
-        await table.UpdateAsync(TwoAndThree, batch =>
+        var (_, version) = await table.UpdateAsync(TwoAndThree, batch =>
         {
             if (!appended)
             {
@@ -555,10 +571,31 @@ public class UpdateDeletionVectorTests : IDisposable
                 other.WriteAsync([Rows((6, "f"))]).AsTask().GetAwaiter().GetResult();
             }
             return Upper(batch);
-        });
+        }, mode: mode);
 
+        Assert.Equal(written + 2, version); // the append took written + 1
         Assert.Equal([(1, "a"), (2, "B"), (3, "C"), (4, "d"), (5, "e"), (6, "f")], await ReadAsync(table));
         var ids = await RowTrackingAsync(table);
         Assert.Equal(6, ids.Values.Select(v => v.RowId).Distinct().Count());
+        Assert.Equal(version, ids[2].Version);
+        Assert.Equal(version, ids[3].Version);
+        Assert.Equal(written, ids[1].Version);
+        Assert.Equal(written + 1, ids[6].Version);
+
+        var postImageVersions = new List<long>();
+        await foreach (var batch in table.ReadChangesAsync(new DeltaChangeReadOptions
+        {
+            StartVersion = version, EndVersion = version, Metadata = DeltaRowMetadata.RowTracking,
+        }))
+        {
+            var types = (StringArray)batch.Column("_change_type");
+            var versions = (Int64Array)batch.Column(batch.Schema.GetFieldIndex(RowTrackingConfig.RowCommitVersionColumnName));
+            for (int i = 0; i < batch.Length; i++)
+            {
+                if (types.GetString(i) == CdfConfig.UpdatePostimage)
+                    postImageVersions.Add(versions.GetValue(i)!.Value);
+            }
+        }
+        Assert.Equal([version, version], postImageVersions);
     }
 }

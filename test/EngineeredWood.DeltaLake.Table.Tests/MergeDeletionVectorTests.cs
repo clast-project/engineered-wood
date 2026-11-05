@@ -321,6 +321,54 @@ public class MergeDeletionVectorTests : IDisposable
         Assert.DoesNotContain(after[9].RowId, before.Values.Select(v => v.RowId));
     }
 
+    /// <summary>
+    /// A MERGE that rebases past a concurrent append lands one version later than it first tried; its updated row's
+    /// commit version is the version it LANDS at, in the table and in the change feed (#707 review).
+    /// </summary>
+    [Theory]
+    [InlineData(RowDeleteMode.DeletionVector)]
+    [InlineData(RowDeleteMode.CopyOnWrite)]
+    public async Task AConcurrentAppend_IsRebasedPast_AndTheUpdatedRowTakesTheLandingVersion(RowDeleteMode mode)
+    {
+        await using var table = await CreateAsync(cdf: true, rowTracking: true);
+        await table.WriteAsync([Five]);
+        long written = table.CurrentSnapshot.Version;
+        await using var other = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+
+        long version;
+        await using (var txn = table.StartTransaction())
+        {
+            await txn.MergeAsync([Rows((2, "B"))], new MergeOptions
+            {
+                Keys = ["id"], WhenMatched = [MergeAction.Update], DeleteMode = mode,
+            });
+            await other.WriteAsync([Rows((6, "f"))]);
+            version = await txn.CommitAsync();
+        }
+
+        Assert.Equal(written + 2, version); // the append took written + 1
+        var after = await RowTrackingAsync(table);
+        Assert.Equal(version, after[2].Version);
+        Assert.Equal(written, after[1].Version);
+        Assert.Equal(written + 1, after[6].Version);
+
+        var postImageVersions = new List<long>();
+        await foreach (var batch in table.ReadChangesAsync(new DeltaChangeReadOptions
+        {
+            StartVersion = version, EndVersion = version, Metadata = DeltaRowMetadata.RowTracking,
+        }))
+        {
+            var types = (StringArray)batch.Column("_change_type");
+            var versions = (Int64Array)batch.Column(batch.Schema.GetFieldIndex(RowTrackingConfig.RowCommitVersionColumnName));
+            for (int i = 0; i < batch.Length; i++)
+            {
+                if (types.GetString(i) == CdfConfig.UpdatePostimage)
+                    postImageVersions.Add(versions.GetValue(i)!.Value);
+            }
+        }
+        Assert.Equal([version], postImageVersions);
+    }
+
     private static async Task<Dictionary<long, (long RowId, long Version)>> RowTrackingAsync(DeltaTable table)
     {
         var result = new Dictionary<long, (long, long)>();

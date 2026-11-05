@@ -457,10 +457,11 @@ public sealed partial class DeltaTable
                         postimage = PreparePostImage(
                             postimage, snapshot, generatedColumns, constraints, clause.WrittenColumns);
 
-                        // An updated row keeps its id; its commit version advances to this commit.
+                        // An updated row keeps its id; its commit version advances to this commit, materialized as
+                        // NULL so it follows the new file's defaultRowCommitVersion through a rebase (see UPDATE).
                         var ids = batchIds is not null ? TakeIds(batchIds, updateRows) : null;
                         router.Add(postimage, ids is not null
-                            ? (ids, ConstInt64(newVersion, updateRows.Count))
+                            ? (ids, AllNullInt64(updateRows.Count))
                             : ((Int64Array, Int64Array)?)null, mayMove: true);
 
                         if (cdfEnabled)
@@ -568,7 +569,8 @@ public sealed partial class DeltaTable
                         cancellationToken, ids, vers, written).ConfigureAwait(false));
 
                     // A post-image row belongs to the partition the row now lives in.
-                    var postVers = ids is not null ? ConstInt64(newVersion, postimages[b].Length) : null;
+                    // NULL: the change file's reader resolves it to the commit that wrote it, wherever a rebase lands it.
+                    var postVers = ids is not null ? AllNullInt64(postimages[b].Length) : null;
                     foreach (var (target, _, post, aligned) in router.Split(postimages[b], ids, postVers))
                     {
                         rewriteActions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(

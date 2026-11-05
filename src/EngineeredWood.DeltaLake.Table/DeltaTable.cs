@@ -5283,9 +5283,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         // Row tracking through the copy-on-write rewrite: an UPDATE moves every row of a modified file to a new
         // file, so a row's id can no longer be derived from position. Materialize each row's ORIGINAL id +
-        // commit version into the declared hidden columns (a matched row's version advances to this commit; an
-        // untouched-but-rewritten row keeps its original). A fresh baseRowId/defaultRowCommitVersion still goes
-        // on the new add (spec: the null-materialized fallback).
+        // commit version into the declared hidden columns (a matched row's version is left NULL, so it takes the
+        // new add's defaultRowCommitVersion: this commit's, re-derived if it rebases; an untouched-but-rewritten
+        // row keeps its original). A fresh baseRowId/defaultRowCommitVersion still goes on the new add (spec: the
+        // null-materialized fallback).
         bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
@@ -5325,8 +5326,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // The output rows by destination: an updated row whose partition values changed moves to its new
             // partition (#519). Each output batch carries the ORIGINAL id + commit version to materialize (null =
             // no tracking). An UPDATE keeps EVERY row (matched rows updated in place, the rest copied), so each
-            // output row carries its source id; a matched row's version becomes newVersion, an untouched row keeps
-            // its original.
+            // output row carries its source id; a matched row's version is NULL (the new add's default, so this
+            // commit's), an untouched row keeps its original.
             var router = new PartitionRouter(
                 snapshot, mappingMode, batches.FirstOrDefault(b => b.Length > 0), materializeIds);
             var preimages = new List<RecordBatch>();
@@ -5406,14 +5407,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // string went through unrefused).
                     updatedBatch = PreparePostImage(updatedBatch, snapshot, generatedColumns, constraints);
 
-                    // Matched rows keep their id; their commit version advances to this commit (they changed).
+                    // Matched rows keep their id; their commit version advances to this commit (they changed). It is
+                    // materialized as NULL, so a reader takes the new file's defaultRowCommitVersion, as Spark's
+                    // UPDATE leaves it: a commit that rebases past a concurrent one re-derives that default for the
+                    // version it lands at, and a materialized value would keep the version first attempted.
                     router.Add(updatedBatch, batchIds is not null
-                        ? (TakeIds(batchIds, matchRows), ConstInt64(newVersion, matchRows.Count))
+                        ? (TakeIds(batchIds, matchRows), AllNullInt64(matchRows.Count))
                         : ((Int64Array, Int64Array)?)null, mayMove: true);
 
                     // Collect preimage and postimage for CDC, each with the touched rows' identity. Both images
                     // are the SAME rows, so both carry the same ids; only the commit version differs — the
-                    // pre-image belongs to the version that last wrote it, the post-image to this one.
+                    // pre-image belongs to the version that last wrote it, the post-image to this one (NULL, which
+                    // a change file's reader resolves to the commit that wrote it, wherever a rebase lands it).
                     if (cdfEnabled)
                     {
                         preimages.Add(matchBatch);
@@ -5426,7 +5431,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                                 ids,
                                 batchVers is not null ? TakeIds(batchVers, matchRows) : AllNullInt64(matchRows.Count),
                                 ids,
-                                ConstInt64(newVersion, matchRows.Count)));
+                                AllNullInt64(matchRows.Count)));
                         }
                     }
                 }
