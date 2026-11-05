@@ -539,7 +539,7 @@ internal static class LogCleanup
     /// unparseable. Unparseable falls back rather than throwing, and a NON-POSITIVE value is refused the
     /// same way: an odd property must not become an instruction to delete a table's whole log.
     /// </summary>
-    private static TimeSpan Retention(IReadOnlyDictionary<string, string>? configuration)
+    internal static TimeSpan Retention(IReadOnlyDictionary<string, string>? configuration)
     {
         if (configuration is not null
             && configuration.TryGetValue("delta.logRetentionDuration", out string? raw)

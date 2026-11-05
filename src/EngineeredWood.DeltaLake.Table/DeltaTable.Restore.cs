@@ -138,8 +138,9 @@ public sealed partial class DeltaTable
         CancellationToken cancellationToken)
     {
         // From the latest version, as Spark restores: the commit diffs against the state it lands on, and cannot
-        // be rebased past anything, so a stale handle could only ever fail.
-        var current = await SnapshotBuilder.UpdateAsync(CurrentSnapshot, _log, cancellationToken)
+        // be rebased past anything, so a stale handle could only ever fail. From the latest checkpoint where log
+        // cleanup removed commits after this handle's version (#697); the restore then commits on that fresh base.
+        var current = await SnapshotBuilder.UpdateOrRebuildAsync(CurrentSnapshot, _log, _checkpointReader, cancellationToken)
             .ConfigureAwait(false);
         ValidateWriteSupport(current);
 
@@ -469,7 +470,8 @@ public sealed partial class DeltaTable
     /// <para><b>Incrementally where it can, from a checkpoint where it must</b> (#690 review). The incremental update
     /// is the cheap path, but it refuses a gap after the handle's version, which is what log cleanup leaves once a
     /// checkpoint covers the commits it removed. That table is still readable, so time travel on it must not fail
-    /// because this handle predates the cleanup: the latest snapshot is then built from the checkpoint.</para>
+    /// because this handle predates the cleanup: the latest snapshot is then built from the checkpoint
+    /// (<see cref="SnapshotBuilder.UpdateOrRebuildAsync"/>).</para>
     /// </remarks>
     private async ValueTask<IReadOnlyDictionary<string, string>?> LatestConfigurationAsync(
         List<(long Version, long Modified)> commits, CancellationToken cancellationToken)
@@ -478,15 +480,8 @@ public sealed partial class DeltaTable
         if (commits.Count == 0 || commits[commits.Count - 1].Version <= snapshot.Version)
             return snapshot.Metadata.Configuration;
 
-        try
-        {
-            snapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken).ConfigureAwait(false);
-        }
-        catch (DeltaFormatException ex) when (ex.ErrorCode == DeltaErrorCodes.TruncatedTransactionLog)
-        {
-            snapshot = await SnapshotBuilder.BuildAsync(_log, _checkpointReader, atVersion: null, cancellationToken)
-                .ConfigureAwait(false);
-        }
+        snapshot = await SnapshotBuilder.UpdateOrRebuildAsync(snapshot, _log, _checkpointReader, cancellationToken)
+            .ConfigureAwait(false);
         return snapshot.Metadata.Configuration;
     }
 

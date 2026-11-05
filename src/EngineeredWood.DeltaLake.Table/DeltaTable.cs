@@ -500,7 +500,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 + "declare clustering columns.");
         }
 
-        // Check that the table doesn't already exist
+        // Check that the table doesn't already exist. The clock is read first, so the version the listing finds was
+        // the latest at or after this moment (the replace's freshness window, #698).
+        var latestListedAt = DateTimeOffset.UtcNow;
         long latestVersion = await log.GetLatestVersionAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -1100,6 +1102,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 previousCommitTimestamp: await Log.InCommitTimestamp.ResolvePreviousTimestampAsync(
                     log, previousSnapshot, actions, cancellationToken).ConfigureAwait(false));
 
+            // #698 review: a replace commits at the replaced version + 1 directly, after staging its data, which can
+            // outlast the log retention. Refused like the other direct writers when cleanup has removed the commits
+            // after that version; its actions are derived from the replaced snapshot, so it cannot move past them.
+            if (previousSnapshot is not null)
+            {
+                await Log.CleanedBaseGuard.EnsureBaseNotOvertakenAsync(
+                    log, latestVersion, latestListedAt, previousSnapshot.Metadata.Configuration, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
             await log.WriteCommitAsync(version, commitActions, cancellationToken).ConfigureAwait(false);
             written.Clear();
 
@@ -1377,13 +1389,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Refreshes the snapshot to the latest version.
+    /// Refreshes the snapshot to the latest version: by replaying the commits since this handle's version, or, when
+    /// log cleanup has removed some of them, from the latest checkpoint (#697).
     /// </summary>
     public async ValueTask RefreshAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
+        _currentSnapshot = await SnapshotBuilder.UpdateOrRebuildAsync(
+            CurrentSnapshot, _log, _checkpointReader, cancellationToken).ConfigureAwait(false);
     }
 
     #region Schema Evolution
@@ -3623,8 +3636,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 // is already true; this stops opting out.
                 WriteCheckpointOnInterval = true,
                 // Incremental: this handle's snapshot is usually newer than the transaction's base, so
-                // refreshing from it replays fewer versions for the same result.
-                RefreshFrom = CurrentSnapshot,
+                // refreshing from it replays fewer versions for the same result. But not always: RESTORE commits
+                // on a base it brought up to date itself, from the checkpoint when log cleanup removed commits
+                // after this handle's version, and refreshing from the handle would then replay across that gap
+                // and throw after a durable commit (#698 review). So from whichever is newer.
+                RefreshFrom = CurrentSnapshot.Version >= baseSnapshot.Version ? CurrentSnapshot : baseSnapshot,
             },
             cancellationToken).ConfigureAwait(false);
 
@@ -7232,6 +7248,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // Declared FALSE: it reads the active-file set to decide what to remove, so it plainly depends
             // on files. Recording that is what lets another engine's checker examine it rather than fall
             // back to a default that happens to agree.
+            await Log.CleanedBaseGuard.EnsureBaseNotOvertakenAsync(_log, snapshot, cancellationToken)
+                .ConfigureAwait(false); // #697: never commit below versions log cleanup removed
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
                 actions, snapshot.Metadata.Configuration, newVersion, "WRITE", isBlindAppend: false,
                 commitProperties: commitProperties,
@@ -8162,7 +8180,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // and a host that passes a committed file would destroy live data with one call. So the paths are
         // checked against the log instead. Read fresh rather than trusting CurrentSnapshot: these files are
         // uncommitted precisely until someone commits them, and that someone may be another handle.
-        var latest = await SnapshotBuilder.UpdateAsync(CurrentSnapshot, _log, cancellationToken)
+        // From the latest checkpoint where log cleanup removed commits after this handle's version (#697): the
+        // active files are what matter here, and the checkpoint has them.
+        var latest = await SnapshotBuilder.UpdateOrRebuildAsync(CurrentSnapshot, _log, _checkpointReader, cancellationToken)
             .ConfigureAwait(false);
         // Deliberately NOT assigned to _currentSnapshot: discarding files is not a reason to move a snapshot
         // the caller may be planning against.
@@ -11475,6 +11495,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
 
+        // From the LATEST version, as Spark vacuums (#697). VACUUM deletes every file the snapshot does not name, so
+        // a stale snapshot misses the files later commits added, and deletes them once they are older than the
+        // retention (measured: a live file deleted, the table unreadable). The handle moves to the VACUUM END
+        // version anyway, so it moves here too.
+        _currentSnapshot = await SnapshotBuilder.UpdateOrRebuildAsync(
+            CurrentSnapshot, _log, _checkpointReader, cancellationToken).ConfigureAwait(false);
+
         // When vacuumProtocolCheck is enabled, validate we understand ALL features
         // before deleting any files — prevents deleting files needed by
         // features this implementation doesn't recognize.
@@ -11497,8 +11524,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         return await Vacuum.VacuumExecutor.ExecuteAsync(
             _fs, _log, CurrentSnapshot, retention, dryRun,
             _options.HideIcebergMetadataDirectory, cancellationToken,
-            afterCommit: AfterCommitAsync, commitProperties: commitProperties)
+            afterCommit: AfterVacuumCommitAsync, commitProperties: commitProperties)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// <see cref="AfterCommitAsync"/> for VACUUM's two commits, whose refresh may start from the checkpoint. VACUUM
+    /// END moves past versions log cleanup removed during the deletes (#698 review), so the strict replay from START
+    /// would fail on the gap after END is durable. The strict replay is there to catch a write lost below the
+    /// checkpoint, and VACUUM's commits carry only a commitInfo, so none of them is a write that can be lost.
+    /// </summary>
+    private async ValueTask AfterVacuumCommitAsync(long committedVersion, CancellationToken cancellationToken)
+    {
+        if (_currentSnapshot is { } current && current.Version < committedVersion)
+        {
+            _currentSnapshot = await SnapshotBuilder.UpdateOrRebuildAsync(
+                current, _log, _checkpointReader, cancellationToken).ConfigureAwait(false);
+        }
+        await AfterCommitAsync(committedVersion, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

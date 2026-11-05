@@ -101,6 +101,11 @@ internal static class VacuumExecutor
         long? endVersion = null;
         if (!dryRun)
         {
+            // #697: VACUUM START is committed at the snapshot's version + 1, so it must not land below versions log
+            // cleanup removed. Free for the snapshot DeltaTable.VacuumAsync has just refreshed.
+            await CleanedBaseGuard.EnsureBaseNotOvertakenAsync(log, snapshot, cancellationToken).ConfigureAwait(false);
+            // START is the latest version from the moment it is created, which is after this.
+            var startLatestAt = DateTimeOffset.UtcNow;
             long startVersion = await WriteCommitInfoAsync(
                 log, snapshot, "VACUUM START",
                 new Dictionary<string, JsonElement>
@@ -125,6 +130,18 @@ internal static class VacuumExecutor
                 deleted++;
             }
 
+            // #698 review: the deletes can outlast the log retention, and other writers' commits after START can be
+            // checkpointed and cleaned up meanwhile, so END at START + 1 would land below the checkpoint. END carries
+            // only a commitInfo, so it needs no base: it moves to after the latest version rather than being refused
+            // once the deletes are done. Free when the deletes were quick.
+            long firstEndVersion = startVersion + 1;
+            if (await CleanedBaseGuard.FindOvertakingVersionAsync(
+                    log, startVersion, startLatestAt, snapshot.Metadata.Configuration, cancellationToken)
+                    .ConfigureAwait(false) is { } latestVersion)
+            {
+                firstEndVersion = latestVersion + 1;
+            }
+
             endVersion = await WriteCommitInfoAsync(
                 log, snapshot, "VACUUM END",
                 new Dictionary<string, JsonElement>
@@ -133,7 +150,7 @@ internal static class VacuumExecutor
                     ["operationMetrics"] = ParseJson(
                         $"{{\"numDeletedFiles\":\"{deleted}\",\"numVacuumedDirectories\":\"0\"}}"),
                 },
-                firstCandidateVersion: startVersion + 1,
+                firstCandidateVersion: firstEndVersion,
                 commitProperties, cancellationToken).ConfigureAwait(false);
 
             if (afterCommit is not null)

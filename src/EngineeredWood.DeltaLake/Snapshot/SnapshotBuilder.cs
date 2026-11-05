@@ -38,6 +38,7 @@ public sealed class SnapshotBuilder
         // One classified pass over _delta_log answers everything below: the target version, the newest
         // checkpoint, the compaction files, and the commits to replay. They used to be four separate
         // walks of the same directory, which also let them disagree about a concurrent commit.
+        var listedAt = DateTimeOffset.UtcNow; // before the listing, so it errs early (#697)
         var listing = await log.ReadListingAsync(cancellationToken).ConfigureAwait(false);
 
         long targetVersion = atVersion ?? listing.LatestVersion;
@@ -251,7 +252,7 @@ public sealed class SnapshotBuilder
             }
         }
 
-        return builder.Build();
+        return builder.Build(atVersion is null ? listedAt : null);
     }
 
     /// <summary>
@@ -379,11 +380,12 @@ public sealed class SnapshotBuilder
     {
         // One listing here too: the newest version and the commits to reach it came from two separate
         // walks that a concurrent commit could land between.
+        var listedAt = DateTimeOffset.UtcNow; // before the listing, so it errs early (#697)
         var listing = await log.ReadListingAsync(cancellationToken).ConfigureAwait(false);
         long latestVersion = listing.LatestVersion;
 
         if (latestVersion <= current.Version)
-            return current;
+            return current.WithListedLatestAt(listedAt);
 
         var builder = SnapshotBuilder.FromSnapshot(current);
 
@@ -408,7 +410,52 @@ public sealed class SnapshotBuilder
             builder.ApplyCommit(v, actions);
         }
 
-        return builder.Build();
+        return builder.Build(listedAt);
+    }
+
+    /// <summary>
+    /// Brings <paramref name="current"/> to the latest version for a READER: incrementally where it can, and from
+    /// the latest checkpoint where log cleanup has removed commits after it (#697).
+    /// </summary>
+    /// <remarks>
+    /// <para><see cref="UpdateAsync"/> refuses such a gap, which is right for it: an incremental replay that skips a
+    /// version produces a state that never existed. But the gap is what log cleanup leaves once a checkpoint covers
+    /// the commits it removed, and the table is still perfectly readable from that checkpoint, so a reader holding an
+    /// old snapshot need not fail.</para>
+    ///
+    /// <para><b>⚠ Not for a committer's own refresh.</b> A commit based on a snapshot whose successors were cleaned
+    /// up would land below the checkpoint, where no reader looks, and be lost; jumping over the gap after committing
+    /// would hide exactly that. A commit path refuses such a base before writing
+    /// (<see cref="Log.CleanedBaseGuard"/>), and refreshes after committing with <see cref="UpdateAsync"/>, which
+    /// still throws.</para>
+    ///
+    /// <para><b>Cleanup can also land mid-replay</b> (#698 review): the listing names a commit that is deleted before
+    /// it is read. That surfaces as the file system's own not-found error, which differs by backend, so it is not
+    /// recognised by type. Any other failure re-lists the log instead: if commits after <paramref name="current"/>
+    /// are now missing, the snapshot is built from the checkpoint; otherwise the original error is rethrown.</para>
+    /// </remarks>
+    public static async ValueTask<Snapshot> UpdateOrRebuildAsync(
+        Snapshot current,
+        TransactionLog log,
+        CheckpointReader? checkpointReader,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            return await UpdateAsync(current, log, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DeltaFormatException ex) when (ex.ErrorCode == DeltaErrorCodes.TruncatedTransactionLog)
+        {
+            return await BuildAsync(log, checkpointReader, atVersion: null, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            var listing = await log.ReadListingAsync(cancellationToken).ConfigureAwait(false);
+            long missing = listing.LatestVersion - current.Version;
+            if (missing <= 0 || listing.CommitsInRange(current.Version + 1, listing.LatestVersion).Count() == missing)
+                throw;
+            return await BuildAsync(log, checkpointReader, atVersion: null, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -490,7 +537,13 @@ public sealed class SnapshotBuilder
     /// <summary>
     /// Builds the final immutable <see cref="Snapshot"/> from the current state.
     /// </summary>
-    public Snapshot Build()
+    public Snapshot Build() => Build(listedLatestAt: null);
+
+    /// <summary>
+    /// As <see cref="Build()"/>, recording when a listing showed this version to be the latest
+    /// (<see cref="Snapshot.ListedLatestAt"/>).
+    /// </summary>
+    internal Snapshot Build(DateTimeOffset? listedLatestAt)
     {
         if (_metadata is null)
             throw new DeltaFormatException(
@@ -516,6 +569,7 @@ public sealed class SnapshotBuilder
             DomainMetadata = new Dictionary<string, DomainMetadata>(_domainMetadata),
             Tombstones = new Dictionary<string, RemoveFile>(_tombstones),
             InCommitTimestamp = _inCommitTimestamp,
+            ListedLatestAt = listedLatestAt,
             // The delta.rowTracking domainMetadata is the spec source of truth for the high-water mark;
             // the active-file derivation alone under-counts after removes (a later writer could then
             // reassign used row ids). Take the max so either source protects the invariant.
