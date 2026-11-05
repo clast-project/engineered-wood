@@ -108,6 +108,7 @@ public sealed partial class DeltaTable
         var src = PrepareMergeSource(source, snapshot, plan);
         plan.Resolve(src, snapshot.Schema);
         RefuseUnanalyzableClauses(plan, snapshot, src);
+        RefuseMisshapenStructs(plan, snapshot, src);
         int sourceRows = src?.Length ?? 0;
         ThrowIfMergeSetsIdentity(plan.UpdatedColumns, snapshot.Schema);
         // An insert that would write a GENERATED ALWAYS identity column, refused here rather than when its rows reach
@@ -886,43 +887,57 @@ public sealed partial class DeltaTable
                 continue;
             }
             columns[c] = value is null
-                ? CopiedColumn(sources!, field.Name, field.DataType, clause, preimage.Column(c))
+                ? CopiedColumn(sources!, field.Name, field.DataType, preimage.Column(c))
                 : AssignedValue(
                     value, field.Name,
-                    pairs ??= MergeConditionBatch(clause.AsBound(preimage), sources), snapshot, clause.FitsStructs);
+                    pairs ??= MergeConditionBatch(clause.AsBound(preimage), sources), snapshot, clause.Evolving);
             fields.Add(new Field(field.Name, columns[c].Data.DataType, field.IsNullable, field.Metadata));
         }
         return new RecordBatch(new Apache.Arrow.Schema(fields, preimage.Schema.Metadata), columns, preimage.Length);
     }
 
     /// <summary>
-    /// The source column <paramref name="column"/> of <paramref name="sources"/> as <paramref name="clause"/> writes
-    /// it into the table column of Arrow type <paramref name="target"/>: as it is, or with a struct fitted to the
-    /// table's (<see cref="FitStruct"/>), taking a field the source lacks from <paramref name="kept"/> (the target
-    /// row an update changes) or NULL.
+    /// The source column <paramref name="column"/> of <paramref name="sources"/> as a clause writes it into the table
+    /// column of Arrow type <paramref name="target"/>, its structs fitted to the table's by name
+    /// (<see cref="FitStruct"/>): under schema evolution a field the source lacks comes from <paramref name="kept"/>
+    /// (the target row an update changes) or is NULL; without it a struct whose names differ was refused at analysis
+    /// (<see cref="RefuseMisshapenStructs"/>), so only the order changes.
     /// </summary>
     private static IArrowArray CopiedColumn(
-        RecordBatch sources, string column, Apache.Arrow.Types.IArrowType target, MergeClausePlan clause,
-        IArrowArray? kept)
-    {
-        var supplied = sources.Column(sources.Schema.GetFieldIndex(column));
-        return clause.FitsStructs ? FitStruct(supplied, target, kept) : supplied;
-    }
+        RecordBatch sources, string column, Apache.Arrow.Types.IArrowType target, IArrowArray? kept) =>
+        FitStruct(sources.Column(sources.Schema.GetFieldIndex(column)), target, kept);
 
     /// <summary>
-    /// <paramref name="supplied"/> with each struct in it, at any depth of structs, given the fields of
-    /// <paramref name="target"/> by name and in its order: a field the source lacks comes from
-    /// <paramref name="kept"/>, or is NULL without one. Measured against Spark 4.0 / Delta 4.0, under schema
-    /// evolution an update keeps the target's value of a struct field its source lacks and an insert writes NULL.
-    /// A struct NULL in the source stays NULL. Anything but a struct is returned as it is; the type checks judge it.
+    /// <paramref name="supplied"/> with each struct in it, at any depth (a struct field, an array element, a map key
+    /// or value), given the fields of <paramref name="target"/> by name and in its order: a field the source lacks
+    /// comes from <paramref name="kept"/>, or is NULL without one. Measured against Spark 4.0 / Delta 4.0, under
+    /// schema evolution an update keeps the target's value of a struct field its source lacks and an insert writes
+    /// NULL; inside an array or a map, where the elements do not line up with the target's, it is NULL. A struct NULL
+    /// in the source stays NULL. Anything else is returned as it is; the type checks judge it.
     /// </summary>
     internal static IArrowArray FitStruct(IArrowArray supplied, Apache.Arrow.Types.IArrowType target, IArrowArray? kept)
     {
-        if (supplied is not StructArray structs || target is not Apache.Arrow.Types.StructType targetType
-            || supplied.Data.DataType.Equals(target))
-        {
+        if (supplied.Data.DataType.Equals(target))
             return supplied;
+        switch (supplied, target)
+        {
+            case (MapArray map, Apache.Arrow.Types.MapType mapType):
+                return FitMap(map, mapType);
+            case (ListArray list, Apache.Arrow.Types.ListType listType):
+            {
+                // The offsets index the values array as it is, so the fitted values keep its length.
+                var values = FitStruct(list.Values, listType.ValueDataType, kept: null);
+                if (ReferenceEquals(values, list.Values))
+                    return supplied;
+                var element = listType.ValueField;
+                return new ListArray(
+                    new Apache.Arrow.Types.ListType(
+                        new Field(element.Name, values.Data.DataType, element.IsNullable, element.Metadata)),
+                    list.Length, list.ValueOffsetsBuffer, values, list.NullBitmapBuffer, list.NullCount, list.Offset);
+            }
         }
+        if (supplied is not StructArray structs || target is not Apache.Arrow.Types.StructType targetType)
+            return supplied;
 
         var suppliedType = (Apache.Arrow.Types.StructType)structs.Data.DataType;
         var keptStructs = kept as StructArray;
@@ -957,6 +972,117 @@ public sealed partial class DeltaTable
             new Apache.Arrow.Types.StructType(fields), structs.Length, children, validity, nulls, offset: 0);
     }
 
+    /// <summary><see cref="FitStruct"/> for a map: its keys and values fitted in place, the entries matched by
+    /// position (key, then value) whatever the producer named them.</summary>
+    private static IArrowArray FitMap(MapArray map, Apache.Arrow.Types.MapType target)
+    {
+        var entries = map.KeyValues;
+        var entriesType = (Apache.Arrow.Types.StructType)entries.Data.DataType;
+        var keys = FitStruct(entries.Fields[0], target.KeyField.DataType, kept: null);
+        var values = FitStruct(entries.Fields[1], target.ValueField.DataType, kept: null);
+        if (ReferenceEquals(keys, entries.Fields[0]) && ReferenceEquals(values, entries.Fields[1]))
+            return map;
+
+        var keyField = new Field(entriesType.Fields[0].Name, keys.Data.DataType, false, entriesType.Fields[0].Metadata);
+        var valueField = new Field(
+            entriesType.Fields[1].Name, values.Data.DataType, entriesType.Fields[1].IsNullable, entriesType.Fields[1].Metadata);
+        // The fitted children are windowed to the entries, so the entries are rebuilt at offset 0.
+        ArrowBuffer validity = ArrowBuffer.Empty;
+        if (entries.NullCount > 0)
+        {
+            var bits = new ArrowBuffer.BitmapBuilder(entries.Length);
+            for (int i = 0; i < entries.Length; i++)
+                bits.Append(!entries.IsNull(i));
+            validity = bits.Build();
+        }
+        var fitted = new StructArray(
+            new Apache.Arrow.Types.StructType([keyField, valueField]), entries.Length, [keys, values], validity,
+            entries.NullCount, offset: 0);
+        var mapType = (Apache.Arrow.Types.MapType)map.Data.DataType;
+        return new MapArray(
+            new Apache.Arrow.Types.MapType(keyField, valueField, mapType.KeySorted),
+            map.Length, map.ValueOffsetsBuffer, fitted, map.NullBitmapBuffer, map.NullCount, map.Offset);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="supplied"/> differs from <paramref name="target"/> in the field names of a struct,
+    /// at any depth (a struct field, an array element, a map key or value): a field missing, extra or renamed.
+    /// Fields that only come in another order do not differ (<see cref="FitStruct"/> matches them by name), and
+    /// leaf types are left to the type checks.
+    /// </summary>
+    private static bool StructNamesDiffer(Apache.Arrow.Types.IArrowType supplied, Apache.Arrow.Types.IArrowType target) =>
+        (supplied, target) switch
+        {
+            (Apache.Arrow.Types.StructType s, Apache.Arrow.Types.StructType t) =>
+                s.Fields.Count != t.Fields.Count
+                || t.Fields.Any(f => s.GetFieldIndex(f.Name) is var k && (k < 0 || StructNamesDiffer(s.Fields[k].DataType, f.DataType))),
+            (Apache.Arrow.Types.MapType s, Apache.Arrow.Types.MapType t) =>
+                StructNamesDiffer(s.KeyField.DataType, t.KeyField.DataType)
+                || StructNamesDiffer(s.ValueField.DataType, t.ValueField.DataType),
+            (Apache.Arrow.Types.ListType s, Apache.Arrow.Types.ListType t) => StructNamesDiffer(s.ValueDataType, t.ValueDataType),
+            _ => false,
+        };
+
+    /// <summary>
+    /// Refuses, without <see cref="MergeOptions.MergeSchema"/>, a struct written to <paramref name="column"/> whose
+    /// field names differ from the column's (<see cref="StructNamesDiffer"/>), as Spark's
+    /// <c>DELTA_UPDATE_SCHEMA_MISMATCH_EXPRESSION</c> (measured, Spark 4.0 / Delta 4.0).
+    /// </summary>
+    private static void RefuseMisshapenStruct(
+        string column, Apache.Arrow.Types.IArrowType supplied, Apache.Arrow.Types.IArrowType target)
+    {
+        if (!StructNamesDiffer(supplied, target))
+            return;
+        throw new DeltaFormatException(
+            DeltaTableErrorCodes.UpdateSchemaMismatchExpression,
+            $"MERGE: the value written to column '{column}' does not fit it: Cannot cast {SparkTypeName(supplied)} to "
+            + $"{SparkTypeName(target)}. All nested columns must match. Set MergeOptions.MergeSchema to evolve the "
+            + "column's struct to take it.");
+    }
+
+    /// <summary>
+    /// Refuses, without <see cref="MergeOptions.MergeSchema"/>, a source column an update or insert copies whose
+    /// structs' field names differ from its table column's (<see cref="RefuseMisshapenStruct"/>): decided from the
+    /// types alone, so even a clause no row reaches is refused, as Spark's analysis refuses it. An assigned value is
+    /// judged where it is typed (<see cref="AssignedValue"/>).
+    /// </summary>
+    private static void RefuseMisshapenStructs(MergePlan plan, Snapshot.Snapshot snapshot, RecordBatch? source)
+    {
+        if (plan.Evolving || source is null)
+            return;
+        foreach (var clause in plan.Matched.Concat(plan.NotMatched))
+        {
+            foreach (var entry in clause.Writes)
+            {
+                int index = source.Schema.GetFieldIndex(entry.Key);
+                if (entry.Value is null && index >= 0 && snapshot.ArrowSchema.GetFieldByName(entry.Key) is { } target)
+                    RefuseMisshapenStruct(entry.Key, source.Schema.FieldsList[index].DataType, target.DataType);
+            }
+        }
+    }
+
+    /// <summary>An Arrow type as Spark's <c>simpleString</c> spells it, for a refusal that quotes Spark's.</summary>
+    private static string SparkTypeName(Apache.Arrow.Types.IArrowType type) => type switch
+    {
+        Apache.Arrow.Types.StructType s =>
+            "struct<" + string.Join(",", s.Fields.Select(f => f.Name + ":" + SparkTypeName(f.DataType))) + ">",
+        Apache.Arrow.Types.MapType m => $"map<{SparkTypeName(m.KeyField.DataType)},{SparkTypeName(m.ValueField.DataType)}>",
+        Apache.Arrow.Types.ListType l => $"array<{SparkTypeName(l.ValueDataType)}>",
+        Apache.Arrow.Types.Int8Type => "tinyint",
+        Apache.Arrow.Types.Int16Type => "smallint",
+        Apache.Arrow.Types.Int32Type => "int",
+        Apache.Arrow.Types.Int64Type => "bigint",
+        Apache.Arrow.Types.FloatType => "float",
+        Apache.Arrow.Types.DoubleType => "double",
+        Apache.Arrow.Types.BooleanType => "boolean",
+        Apache.Arrow.Types.StringType or Apache.Arrow.Types.LargeStringType or Apache.Arrow.Types.StringViewType => "string",
+        Apache.Arrow.Types.BinaryType or Apache.Arrow.Types.LargeBinaryType or Apache.Arrow.Types.BinaryViewType => "binary",
+        Apache.Arrow.Types.Date32Type or Apache.Arrow.Types.Date64Type => "date",
+        Apache.Arrow.Types.TimestampType t => string.IsNullOrEmpty(t.Timezone) ? "timestamp_ntz" : "timestamp",
+        Apache.Arrow.Types.Decimal128Type d => $"decimal({d.Precision},{d.Scale})",
+        _ => type.Name,
+    };
+
     /// <summary>
     /// <paramref name="child"/> (a child of <paramref name="parent"/>, windowed as its <c>Fields</c> are) NULL
     /// wherever <paramref name="parent"/> is: the values a NULL struct's validity hides, made NULL.
@@ -989,8 +1115,12 @@ public sealed partial class DeltaTable
     /// </summary>
     private static RecordBatch MergeInsertBatch(RecordBatch rows, MergeClausePlan clause, Snapshot.Snapshot snapshot)
     {
-        if (clause.Writes.Values.All(v => v is null) && !clause.FitsStructs)
+        if (clause.Writes.Values.All(v => v is null)
+            && clause.WrittenColumns.All(c => rows.Schema.GetFieldByName(c)!.DataType.Equals(
+                snapshot.ArrowSchema.GetFieldByName(c)!.DataType)))
+        {
             return ProjectColumns(rows, clause.WrittenColumns);
+        }
 
         RecordBatch? pairs = null;
         var fields = new List<Field>(clause.Writes.Count);
@@ -999,9 +1129,9 @@ public sealed partial class DeltaTable
         {
             var value = clause.Writes[column];
             var array = value is null
-                ? CopiedColumn(rows, column, snapshot.ArrowSchema.GetFieldByName(column)!.DataType, clause, kept: null)
+                ? CopiedColumn(rows, column, snapshot.ArrowSchema.GetFieldByName(column)!.DataType, kept: null)
                 : AssignedValue(
-                    value, column, pairs ??= MergeConditionBatch(null, rows), snapshot, clause.FitsStructs);
+                    value, column, pairs ??= MergeConditionBatch(null, rows), snapshot, clause.Evolving);
             fields.Add(new Field(column, array.Data.DataType, nullable: true));
             columns.Add(array);
         }
@@ -1021,19 +1151,22 @@ public sealed partial class DeltaTable
     /// <para>A type the cast cannot target (<c>timestamp_ntz</c>, a struct, array or map) takes only a value of its
     /// own Delta type, in any Arrow form of it; anything else is refused as a mistyped column. NULL goes anywhere.</para>
     /// </remarks>
-    /// <param name="fitStructs">Under schema evolution a struct value is fitted to the column's struct by name
+    /// <param name="evolving">Under schema evolution a struct value is fitted to the column's struct by name
     /// (<see cref="FitStruct"/>), a field it lacks NULL: measured, Spark's <c>SET st = s.st</c> writes NULL for a
-    /// field the source's struct lacks, where its <c>SET *</c> keeps the target's value.</param>
+    /// field the source's struct lacks, where its <c>SET *</c> keeps the target's value. Without it a struct whose
+    /// field names differ from the column's is refused (<see cref="RefuseMisshapenStruct"/>), and one whose fields
+    /// only come in another order is fitted.</param>
     private static IArrowArray AssignedValue(
         Expressions.Expression value, string column, RecordBatch pairs, Snapshot.Snapshot snapshot,
-        bool fitStructs = false)
+        bool evolving = false)
     {
         var target = snapshot.ArrowSchema.GetFieldByName(column)!;
         var array = RowEvaluator.EvaluateExpression(value, pairs);
         if (array is NullArray || array.Data.DataType.TypeId == Apache.Arrow.Types.ArrowTypeId.Null)
             return ArrowCompute.MakeNullArray(target.DataType, array.Length);
-        if (fitStructs)
-            array = FitStruct(array, target.DataType, kept: null);
+        if (!evolving)
+            RefuseMisshapenStruct(column, array.Data.DataType, target.DataType);
+        array = FitStruct(array, target.DataType, kept: null);
 
         if (!SameDeltaType(array.Data.DataType, target.DataType))
         {
@@ -1158,7 +1291,7 @@ public sealed partial class DeltaTable
                 foreach (var entry in clause.Writes)
                 {
                     if (entry.Value is { } value)
-                        RefuseUnanalyzableValue(entry.Key, value, names, noRows, snapshot, clause.FitsStructs);
+                        RefuseUnanalyzableValue(entry.Key, value, names, noRows, snapshot, clause.Evolving);
                 }
             }
         }
@@ -1172,7 +1305,7 @@ public sealed partial class DeltaTable
     /// </summary>
     private static void RefuseUnanalyzableValue(
         string column, Expressions.Expression value, Apache.Arrow.Schema names, Func<RecordBatch> noRows,
-        Snapshot.Snapshot snapshot, bool fitStructs)
+        Snapshot.Snapshot snapshot, bool evolving)
     {
         foreach (var (name, resolution) in ReferenceResolutions(value, names))
         {
@@ -1195,11 +1328,15 @@ public sealed partial class DeltaTable
         RefuseUntypableLiterals(value);
         try
         {
-            AssignedValue(value, column, noRows(), snapshot, fitStructs);
+            AssignedValue(value, column, noRows(), snapshot, evolving);
         }
         catch (Expressions.Arrow.ExpressionAnalysisException)
         {
             throw;
+        }
+        catch (DeltaFormatException e) when (e.ErrorCode == DeltaTableErrorCodes.UpdateSchemaMismatchExpression)
+        {
+            throw; // a struct whose fields differ from the column's
         }
         catch (ArgumentException e) when (e.Message.StartsWith("MERGE:", StringComparison.Ordinal))
         {
@@ -1458,11 +1595,11 @@ public sealed partial class DeltaTable
         public IReadOnlyList<string>? SourceColumns { get; set; }
 
         /// <summary>
-        /// Whether a struct column copied from the source is fitted to the table's struct (<see cref="FitStruct"/>):
-        /// under schema evolution a field the source lacks is kept from the target row, or NULL in an insert. Set by
-        /// <see cref="MergePlan.Resolve"/>.
+        /// <see cref="MergeOptions.MergeSchema"/>: a struct the clause writes may lack fields of its column's, kept
+        /// from the target row or NULL (<see cref="FitStruct"/>); without it one whose field names differ is refused.
+        /// Set by <see cref="MergePlan.Resolve"/>.
         /// </summary>
-        public bool FitsStructs { get; set; }
+        public bool Evolving { get; set; }
 
         /// <summary><see cref="MergePlan.BoundSchema"/>.</summary>
         public Apache.Arrow.Schema? BoundSchema { get; set; }
@@ -1547,7 +1684,7 @@ public sealed partial class DeltaTable
             MergeClausePlan clause, RecordBatch? source, Schema.StructType schema, bool evolving, string verb,
             string star, string listed)
         {
-            clause.FitsStructs = evolving;
+            clause.Evolving = evolving;
             if (clause.Kind == MergeActionKind.Delete)
                 return;
 

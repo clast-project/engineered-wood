@@ -944,7 +944,10 @@ Spark's MERGE does. `MergeOptions.MergeSchema` (#604) evolves the schema as Spar
 `MergeSchemaEvolutionInteropTests` (Spark 4.0's SQL `MERGE WITH SCHEMA EVOLUTION` evolves nothing): only the
 source columns an update or insert writes (by `*`, a column list, or an assignment to their own name) are added
 or widened, with the source column's type, even when no row reaches the clause; a table column or struct field
-the source lacks is kept by the update and NULL in the insert. It shares the `mergeSchema` write's limits below,
+the source lacks is kept by the update and NULL in the insert. Without it, a struct written to a column (at any
+depth, in an array or map too) must have exactly the column's field names, as Spark requires
+(`DELTA_UPDATE_SCHEMA_MISMATCH_EXPRESSION`, #700, pinned by `MergeStructShapeInteropTests`); fields in another
+order are matched by name. It shares the `mergeSchema` write's limits below,
 and refuses a source column differing from a table column only in case, which Spark matches to it.
 `RestoreAsync` (by version or
 timestamp, #567) commits an earlier version's files, metadata and clustering columns as Spark's RESTORE does (pinned

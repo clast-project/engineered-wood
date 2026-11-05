@@ -268,7 +268,13 @@ public sealed class MergeOptions
     /// the new schema alone.</item>
     /// <item>A column the table has and the source lacks is left as it is by an update that copies every column,
     /// and is written as an append writes it by such an insert; a field of a struct column the source lacks is kept
-    /// by an update and NULL in an insert. Without evolution such a MERGE is refused.</item>
+    /// by an update and NULL in an insert; inside an array element or a map value, where the elements do not line
+    /// up with the target's, it is NULL.</item>
+    /// <item>Without evolution, an insert that copies every column refuses a source lacking a table column, and a
+    /// struct written to a column, at any depth (a struct field, an array element, a map key or value), must have
+    /// exactly the column's field names: one missing, extra or renamed is refused with
+    /// <c>DELTA_UPDATE_SCHEMA_MISMATCH_EXPRESSION</c> before anything is written, even when no row reaches the
+    /// clause. Fields that only come in another order are matched by name, with or without evolution.</item>
     /// </list>
     /// <para>Inside a transaction it composes with merging appends, and when it changes the schema it is refused
     /// alongside a schema change staged any other way, as <see cref="DeltaTransaction.WriteAsync"/> with
