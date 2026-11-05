@@ -126,6 +126,76 @@ public class ColumnMappingWriteOptionsTests : IDisposable
     }
 
     /// <summary>
+    /// #658: a batch whose own schema names the list element <c>item</c> (as <see cref="ListArray.Builder"/> does) and
+    /// the map's key and value <c>keys</c>/<c>values</c> is written under the TABLE's nested names, so options keyed by
+    /// the table's paths reach the leaves. Before, the file's columns followed the batch and the Bloom filters were
+    /// silently dropped.
+    /// </summary>
+    [Theory]
+    [InlineData(ColumnMappingMode.None)]
+    [InlineData(ColumnMappingMode.Name)]
+    [InlineData(ColumnMappingMode.Id)]
+    public async Task CallerNestedNames_FollowTheTable(ColumnMappingMode mode)
+    {
+        var tableSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("tags", new ListType(new Field("element", StringType.Default, true)), true))
+            .Field(new Field("m", new Apache.Arrow.Types.MapType(
+                new Field("key", StringType.Default, false), new Field("value", Int64Type.Default, true)), true))
+            .Build();
+        var options = new DeltaTableOptions
+        {
+            ParquetWriteOptions = ParquetWriteOptions.Default with
+            {
+                BloomFilterColumns = new HashSet<string> { "tags.list.element", "m.key_value.key", "m.key_value.value" },
+            },
+        };
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), tableSchema, options, columnMappingMode: mode);
+
+        var tagsBuilder = new ListArray.Builder(StringType.Default);
+        var tagValues = (StringArray.Builder)tagsBuilder.ValueBuilder;
+        tagsBuilder.Append(); tagValues.Append("a"); tagValues.Append("b");
+        tagsBuilder.AppendNull();
+        var tags = tagsBuilder.Build();
+        Assert.Equal("item", ((ListType)tags.Data.DataType).ValueField.Name);
+
+        var mapType = new Apache.Arrow.Types.MapType(
+            new Field("keys", StringType.Default, false), new Field("values", Int64Type.Default, true));
+        var entries = new StructArray(mapType.KeyValueType, 1,
+            [new StringArray.Builder().Append("k").Build(), new Int64Array.Builder().Append(7).Build()],
+            ArrowBuffer.Empty);
+        var map = new MapArray(mapType, 2, new ArrowBuffer.Builder<int>().Append(0).Append(1).Append(1).Build(),
+            entries, ArrowBuffer.Empty);
+
+        // The batch's schema says what its arrays say, so nothing but the table can supply "element"/"key"/"value".
+        var batchSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("tags", tags.Data.DataType, true))
+            .Field(new Field("m", mapType, true))
+            .Build();
+        await table.WriteAsync([new RecordBatch(batchSchema, [tags, map], 2)]);
+
+        var chunks = await Chunks();
+        Assert.Equal(3, chunks.Count);
+        Assert.All(chunks, c => Assert.NotNull(c.Meta.BloomFilterOffset));
+        Assert.Single(chunks, c => c.Path.EndsWith(".list.element", StringComparison.Ordinal));
+        Assert.Single(chunks, c => c.Path.EndsWith(".key_value.key", StringComparison.Ordinal));
+        Assert.Single(chunks, c => c.Path.EndsWith(".key_value.value", StringComparison.Ordinal));
+
+        var read = new List<RecordBatch>();
+        await foreach (var batch in table.ReadAllAsync())
+            read.Add(batch);
+        var row = Assert.Single(read);
+        var readTags = (ListArray)row.Column(0);
+        var readValues = (StringArray)readTags.GetSlicedValues(0);
+        Assert.Equal(["a", "b"], Enumerable.Range(0, readValues.Length).Select(i => readValues.GetString(i)));
+        Assert.True(readTags.IsNull(1));
+        var readMap = (MapArray)row.Column(1);
+        Assert.Equal("k", ((StringArray)readMap.Keys).GetString(0));
+        Assert.Equal(7L, ((Int64Array)readMap.Values).GetValue(0));
+        Assert.Equal(0, readMap.GetValueLength(1));
+    }
+
+    /// <summary>
     /// The translation follows the schema at each write: an option naming "renamed" matches nothing until
     /// the column is renamed to it, and then reaches the same physical leaf.
     /// </summary>
