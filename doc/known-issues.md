@@ -146,12 +146,15 @@ and `ListViewType`.
   ([apache/arrow-dotnet#398](https://github.com/apache/arrow-dotnet/issues/398));
   and there are no array-level entry points, so `Reassemble` and the decode
   loops are ours to carry
-  ([#399](https://github.com/apache/arrow-dotnet/issues/399)). The upstream builder
-  also declares each shredded field group nullable and nulls the group for a
-  field an object lacks, where the spec says `required group` with both
-  children null (Spark 4.1 reads that as `MALFORMED_VARIANT`), so
-  `VariantShredding.RequireFieldGroups` rewrites the groups (#679). If these
-  land upstream, `VariantShredding.cs` shrinks to a few calls.
+  ([#399](https://github.com/apache/arrow-dotnet/issues/399)). Both are fixed
+  on upstream `main` (apache/arrow-dotnet#445 and #447) but not in a release
+  as of Apache.Arrow 23.0.0. The upstream builder also declares each shredded
+  field group nullable and nulls the group for a field an object lacks, where
+  the spec says `required group` with both children null (Spark 4.1 reads
+  that as `MALFORMED_VARIANT`), so `VariantShredding.RequireFieldGroups`
+  rewrites the groups (#679;
+  [apache/arrow-dotnet#499](https://github.com/apache/arrow-dotnet/issues/499),
+  open). Once all three ship, `VariantShredding.cs` shrinks to a few calls.
 - *A shredded narrow DECIMAL loses its trailing zeros.* A decimal held in a
   `typed_value` column of precision 18 or less reads back with the right
   value but a normalised scale: DuckDB's `12.30::DECIMAL(9,2)` comes back as
