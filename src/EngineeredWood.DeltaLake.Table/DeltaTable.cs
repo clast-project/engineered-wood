@@ -500,7 +500,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 + "declare clustering columns.");
         }
 
-        // Check that the table doesn't already exist
+        // Check that the table doesn't already exist. The clock is read first, so the version the listing finds was
+        // the latest at or after this moment (the replace's freshness window, #698).
+        var latestListedAt = DateTimeOffset.UtcNow;
         long latestVersion = await log.GetLatestVersionAsync(cancellationToken)
             .ConfigureAwait(false);
 
@@ -1099,6 +1101,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 commitProperties: commitProperties,
                 previousCommitTimestamp: await Log.InCommitTimestamp.ResolvePreviousTimestampAsync(
                     log, previousSnapshot, actions, cancellationToken).ConfigureAwait(false));
+
+            // #698 review: a replace commits at the replaced version + 1 directly, after staging its data, which can
+            // outlast the log retention. Refused like the other direct writers when cleanup has removed the commits
+            // after that version; its actions are derived from the replaced snapshot, so it cannot move past them.
+            if (previousSnapshot is not null)
+            {
+                await Log.CleanedBaseGuard.EnsureBaseNotOvertakenAsync(
+                    log, latestVersion, latestListedAt, previousSnapshot.Metadata.Configuration, cancellationToken)
+                    .ConfigureAwait(false);
+            }
 
             await log.WriteCommitAsync(version, commitActions, cancellationToken).ConfigureAwait(false);
             written.Clear();
@@ -11509,8 +11521,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         return await Vacuum.VacuumExecutor.ExecuteAsync(
             _fs, _log, CurrentSnapshot, retention, dryRun,
             _options.HideIcebergMetadataDirectory, cancellationToken,
-            afterCommit: AfterCommitAsync, commitProperties: commitProperties)
+            afterCommit: AfterVacuumCommitAsync, commitProperties: commitProperties)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// <see cref="AfterCommitAsync"/> for VACUUM's two commits, whose refresh may start from the checkpoint. VACUUM
+    /// END moves past versions log cleanup removed during the deletes (#698 review), so the strict replay from START
+    /// would fail on the gap after END is durable. The strict replay is there to catch a write lost below the
+    /// checkpoint, and VACUUM's commits carry only a commitInfo, so none of them is a write that can be lost.
+    /// </summary>
+    private async ValueTask AfterVacuumCommitAsync(long committedVersion, CancellationToken cancellationToken)
+    {
+        if (_currentSnapshot is { } current && current.Version < committedVersion)
+        {
+            _currentSnapshot = await SnapshotBuilder.UpdateOrRebuildAsync(
+                current, _log, _checkpointReader, cancellationToken).ConfigureAwait(false);
+        }
+        await AfterCommitAsync(committedVersion, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>

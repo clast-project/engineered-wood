@@ -46,35 +46,64 @@ internal static class CleanedBaseGuard
     /// Throws <see cref="DeltaFormatException"/> (<see cref="DeltaErrorCodes.TruncatedTransactionLog"/>) when a commit
     /// of version <paramref name="baseSnapshot"/>.Version + 1 would land below versions log cleanup has removed.
     /// </summary>
-    internal static async ValueTask EnsureBaseNotOvertakenAsync(
+    internal static ValueTask EnsureBaseNotOvertakenAsync(
         TransactionLog log, Snapshot.Snapshot baseSnapshot, CancellationToken cancellationToken)
+        => EnsureBaseNotOvertakenAsync(
+            log, baseSnapshot.Version, baseSnapshot.ListedLatestAt, baseSnapshot.Metadata.Configuration,
+            cancellationToken);
+
+    /// <summary>
+    /// As the snapshot overload, for a base known only by its version: <paramref name="latestAt"/> is a moment at
+    /// or before which <paramref name="baseVersion"/> was the latest version (null when unknown), and
+    /// <paramref name="configuration"/> supplies the retention.
+    /// </summary>
+    internal static async ValueTask EnsureBaseNotOvertakenAsync(
+        TransactionLog log, long baseVersion, DateTimeOffset? latestAt,
+        IReadOnlyDictionary<string, string>? configuration, CancellationToken cancellationToken)
     {
-        if (baseSnapshot.ListedLatestAt is { } listedAt)
+        if (await FindOvertakingVersionAsync(log, baseVersion, latestAt, configuration, cancellationToken)
+                .ConfigureAwait(false) is not { } latestVersion)
         {
-            var age = DateTimeOffset.UtcNow - listedAt;
-            var window = LogCleanup.Retention(baseSnapshot.Metadata.Configuration);
+            return;
+        }
+
+        throw new DeltaFormatException(
+            DeltaErrorCodes.TruncatedTransactionLog,
+            $"Cannot commit on version {baseVersion}: the table is at version {latestVersion}, and log "
+            + $"cleanup has removed the commits after version {baseVersion}, so this commit would land below the "
+            + "latest checkpoint where no reader would see it. Nothing was written. Refresh the table (or reopen it) "
+            + "and retry.");
+    }
+
+    /// <summary>
+    /// The table's latest version when log cleanup has removed the commits after <paramref name="baseVersion"/>,
+    /// so a commit at <paramref name="baseVersion"/> + 1 would land below them; null when it would not. For a
+    /// commit that needs no base (a commitInfo-only one) and can move to after the returned version instead of
+    /// being refused.
+    /// </summary>
+    internal static async ValueTask<long?> FindOvertakingVersionAsync(
+        TransactionLog log, long baseVersion, DateTimeOffset? latestAt,
+        IReadOnlyDictionary<string, string>? configuration, CancellationToken cancellationToken)
+    {
+        if (latestAt is { } seenAt)
+        {
+            var age = DateTimeOffset.UtcNow - seenAt;
+            var window = LogCleanup.Retention(configuration);
             if (window > MaxFreshWindow)
                 window = MaxFreshWindow;
             if (age >= TimeSpan.Zero && age < window)
-                return;
+                return null;
         }
 
-        long baseVersion = baseSnapshot.Version;
         if (await log.FileSystem.ExistsAsync(DeltaVersion.CommitPath(baseVersion), cancellationToken)
                 .ConfigureAwait(false))
         {
-            return;
+            return null;
         }
 
         var listing = await log.ReadListingAsync(cancellationToken).ConfigureAwait(false);
         if (listing.LatestVersion <= baseVersion || listing.CommitsInRange(baseVersion + 1, baseVersion + 1).Any())
-            return;
-
-        throw new DeltaFormatException(
-            DeltaErrorCodes.TruncatedTransactionLog,
-            $"Cannot commit on version {baseVersion}: the table is at version {listing.LatestVersion}, and log "
-            + $"cleanup has removed the commits after version {baseVersion}, so this commit would land below the "
-            + "latest checkpoint where no reader would see it. Nothing was written. Refresh the table (or reopen it) "
-            + "and retry.");
+            return null;
+        return listing.LatestVersion;
     }
 }

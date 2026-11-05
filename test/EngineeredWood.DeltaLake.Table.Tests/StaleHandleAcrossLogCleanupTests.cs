@@ -94,27 +94,39 @@ public class StaleHandleAcrossLogCleanupTests : IDisposable
     {
         await CreateAsync(ShortRetention);
         var stale = await DeltaTable.OpenAsync(fs ?? Fs, Options);
+        Assert.Equal(19, await OvertakeAsync());
+        Assert.Equal(9, stale.CurrentSnapshot.Version);
+        return stale;
+    }
+
+    /// <summary>
+    /// Another writer appends ids 10..19 in ten commits and checkpoints the last; every commit before the checkpoint
+    /// is then removed, as log cleanup leaves them once they expire, and the table's (short) retention is outwaited.
+    /// Returns the checkpoint version.
+    /// </summary>
+    private async Task<long> OvertakeAsync()
+    {
+        long checkpoint;
         await using (var writer = await DeltaTable.OpenAsync(Fs, Options))
         {
             for (long i = 10; i <= 19; i++)
-                await writer.WriteAsync([Rows(i)]);                                         // v10..v19
-            Assert.Equal(19, await writer.CheckpointAsync());
+                await writer.WriteAsync([Rows(i)]);
+            checkpoint = await writer.CheckpointAsync();
         }
-        for (int v = 0; v < 19; v++)
+        for (long v = 0; v < checkpoint; v++)
         {
             File.Delete(Path.Combine(LogDir, $"{v:D20}.json"));
             File.Delete(Path.Combine(LogDir, $"{v:D20}.crc"));
         }
         await Task.Delay(1200);
-        Assert.Equal(9, stale.CurrentSnapshot.Version);
-        return stale;
+        return checkpoint;
     }
 
     private static readonly List<long> AllNineteen = Enumerable.Range(1, 19).Select(i => (long)i).ToList();
 
-    private void AssertNothingWrittenBelowTheCheckpoint()
+    private void AssertNothingWrittenBelowTheCheckpoint(long checkpoint = 19)
     {
-        for (int v = 0; v < 19; v++)
+        for (long v = 0; v < checkpoint; v++)
             Assert.False(File.Exists(Path.Combine(LogDir, $"{v:D20}.json")), $"a commit was written at v{v}");
     }
 
@@ -313,6 +325,116 @@ public class StaleHandleAcrossLogCleanupTests : IDisposable
         Assert.True(racing.Raced);
         Assert.Equal(19, stale.CurrentSnapshot.Version);
         Assert.Equal(AllNineteen, await IdsAsync(stale));
+    }
+
+    /// <summary>
+    /// #698 review: create-or-replace commits at the replaced version + 1 directly, after staging its data. Another
+    /// writer overtakes it and cleanup runs while it stages; it used to create v10 below the v19 checkpoint. It is
+    /// refused, and the data it staged is taken back.
+    /// </summary>
+    [Fact]
+    public async Task CreateOrReplace_OvertakenWhileStaging_IsRefusedAndWritesNothing()
+    {
+        await CreateAsync(ShortRetention);
+        var racing = new RaceOnDataFileFileSystem(Fs, OvertakeAsync, onDelete: false);
+
+        await AssertRefusedAsync(async () => await DeltaTable.CreateOrReplaceAsync(
+            racing, TableSchema, [Rows(100)], Options,
+            configuration: new Dictionary<string, string> { ["delta.logRetentionDuration"] = ShortRetention }));
+
+        Assert.True(racing.Raced);
+        AssertNothingWrittenBelowTheCheckpoint();
+        Assert.Equal(AllNineteen, await FreshIdsAsync());
+        Assert.Equal(19, DataFiles().Length);
+    }
+
+    /// <summary>
+    /// #698 review: VACUUM END follows the deletes, which can outlast the retention. Another writer overtakes START
+    /// and cleanup runs while VACUUM deletes; END used to be created at START + 1, below the checkpoint. It carries
+    /// only a commitInfo, so it lands after the checkpoint instead, and the handle moves there.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_OvertakenWhileDeleting_CommitsEndAfterTheCheckpoint()
+    {
+        await CreateAsync(ShortRetention);                                                  // v0..v9
+        string orphan = Path.Combine(_tempDir, "orphan.parquet");
+        File.WriteAllBytes(orphan, [1, 2, 3]);
+        File.SetLastWriteTimeUtc(orphan, DateTime.UtcNow.AddDays(-30));
+        var racing = new RaceOnDataFileFileSystem(Fs, OvertakeAsync, onDelete: true);
+        await using var table = await DeltaTable.OpenAsync(racing, Options);
+
+        var result = await table.VacuumAsync(TimeSpan.FromDays(7));                         // START at v10
+
+        Assert.True(racing.Raced);                                                          // v11..v20, checkpoint v20
+        Assert.Equal(1, result.FilesDeleted);
+        Assert.False(File.Exists(orphan));
+        Assert.Equal(21, result.LastCommittedVersion);
+        Assert.Equal(21, table.CurrentSnapshot.Version);
+        AssertNothingWrittenBelowTheCheckpoint(20);
+        Assert.Equal(AllNineteen, await FreshIdsAsync());
+    }
+
+    private string[] DataFiles() => Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories)
+        .Where(f => !f.StartsWith(LogDir, StringComparison.Ordinal))
+        .ToArray();
+
+    /// <summary>
+    /// Runs <c>race</c> once, the first time a file outside the log is created (or, with <c>onDelete</c>, deleted):
+    /// the moment a replace is staging its data, or VACUUM is deleting.
+    /// </summary>
+    private sealed class RaceOnDataFileFileSystem(ITableFileSystem inner, Func<Task<long>> race, bool onDelete)
+        : ITableFileSystem
+    {
+        private int _raced;
+
+        public bool Raced => Volatile.Read(ref _raced) == 1;
+
+        public PathNameConstraints PathConstraints => inner.PathConstraints;
+
+        private async ValueTask RaceOnceAsync(string path, bool deleting)
+        {
+            if (deleting == onDelete && !path.Replace('\\', '/').Contains("_delta_log")
+                && Interlocked.Exchange(ref _raced, 1) == 0)
+            {
+                await race();
+            }
+        }
+
+        public async ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
+        {
+            await RaceOnceAsync(path, deleting: false);
+            return await inner.CreateAsync(path, overwrite, cancellationToken);
+        }
+
+        public async ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+        {
+            await RaceOnceAsync(path, deleting: false);
+            return await inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+        }
+
+        public async ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+        {
+            await RaceOnceAsync(path, deleting: false);
+            await inner.WriteAllBytesAsync(path, data, cancellationToken);
+        }
+
+        public async ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
+        {
+            await RaceOnceAsync(path, deleting: true);
+            await inner.DeleteAsync(path, cancellationToken);
+        }
+
+        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ReadAllBytesAsync(path, cancellationToken);
+
+        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ExistsAsync(path, cancellationToken);
+
+        public ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
+            => inner.OpenReadAsync(path, cancellationToken);
+
+        public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default)
+            => inner.ListAsync(prefix, cancellationToken);
     }
 
     /// <summary>
