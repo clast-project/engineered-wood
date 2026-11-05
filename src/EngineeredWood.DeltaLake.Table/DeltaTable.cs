@@ -11477,6 +11477,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     {
         ThrowIfDisposed();
 
+        // From the LATEST version, as Spark vacuums (#697). VACUUM deletes every file the snapshot does not name, so
+        // a stale snapshot misses the files later commits added, and deletes them once they are older than the
+        // retention (measured: a live file deleted, the table unreadable). The handle moves to the VACUUM END
+        // version anyway, so it moves here too.
+        _currentSnapshot = await SnapshotBuilder.UpdateOrRebuildAsync(
+            CurrentSnapshot, _log, _checkpointReader, cancellationToken).ConfigureAwait(false);
+
         // When vacuumProtocolCheck is enabled, validate we understand ALL features
         // before deleting any files — prevents deleting files needed by
         // features this implementation doesn't recognize.

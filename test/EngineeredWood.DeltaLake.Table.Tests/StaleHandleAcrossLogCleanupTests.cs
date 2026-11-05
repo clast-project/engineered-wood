@@ -189,6 +189,28 @@ public class StaleHandleAcrossLogCleanupTests : IDisposable
     }
 
     /// <summary>
+    /// VACUUM deletes what its snapshot does not name, so from a stale snapshot it deleted the files later commits
+    /// added once they were older than the retention, leaving the table unreadable. It now works from the latest
+    /// version. No log cleanup is needed for this one; only another writer's commit.
+    /// </summary>
+    [Fact]
+    public async Task Vacuum_FromAStaleHandle_KeepsFilesLaterCommitsAdded()
+    {
+        await using (var writer = await DeltaTable.CreateAsync(Fs, TableSchema, Options))
+            await writer.WriteAsync([Rows(1)]);
+        await using var stale = await DeltaTable.OpenAsync(Fs, Options);
+        await using (var writer = await DeltaTable.OpenAsync(Fs, Options))
+            await writer.WriteAsync([Rows(2)]);
+        foreach (string file in Directory.GetFiles(_tempDir, "*.parquet", SearchOption.AllDirectories))
+            File.SetLastWriteTimeUtc(file, DateTime.UtcNow.AddDays(-30));
+
+        var result = await stale.VacuumAsync(TimeSpan.FromDays(7));
+
+        Assert.Equal(0, result.FilesDeleted);
+        Assert.Equal([1L, 2L], await FreshIdsAsync());
+    }
+
+    /// <summary>
     /// A base whose own commit is gone but which nothing follows (a handle opened on a checkpoint whose commit was
     /// cleaned up) is not overtaken: the commit proceeds.
     /// </summary>
