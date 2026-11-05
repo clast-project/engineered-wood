@@ -51,16 +51,29 @@ internal static class VariantFooterStats
     }
 
     /// <summary>
-    /// The bounds of a file whose footer EW did not see (a host <see cref="IDataFileWriter"/>'s), from the footer
-    /// read back once the file is written. Delta allows variant bounds only on a table that supports shredding
-    /// (<paramref name="tableAllowsShredding"/>), and EW does not refuse a host's shredded file on a table that does
-    /// not, so the check is made here. Nothing is read when the file has no variant column.
+    /// The bounds of a data file just written, the one way every write path takes them (append, compaction, the
+    /// copy-on-write DML rewrite): from <paramref name="writtenFooter"/> when EW wrote the file, else from the footer
+    /// of the host <see cref="IDataFileWriter"/>'s file, read back through <paramref name="fs"/>. Null when the file
+    /// has no variant column, or when a host's file is on a table that does not support shredding.
     /// </summary>
-    public static async ValueTask<Dictionary<string, (string Min, string Max)>?> ReadFromWrittenFileAsync(
-        EngineeredWood.IO.ITableFileSystem fs, string path, Apache.Arrow.Schema fileSchema, bool tableAllowsShredding,
-        int stringPrefixLength, CancellationToken cancellationToken)
+    /// <remarks>
+    /// <para>The shredding gate applies to a host's file only. Delta allows variant bounds only on a table that
+    /// supports shredding; EW refuses its own shredded write on a table that does not (so its footer needs no check),
+    /// but it does not refuse a host's shredded file.</para>
+    /// <para>A failure to read a host's footer back fails the write, deliberately: the file is in the written-file
+    /// ledger, so nothing leaks, and the write can be retried. Committing it with <c>nullCount</c> only would make the
+    /// file's bounds, and whether a scan prunes it, depend on a transient error; and a footer EW's reader rejects is
+    /// a file EW cannot read either.</para>
+    /// </remarks>
+    public static async ValueTask<Dictionary<string, (string Min, string Max)>?> OfWrittenFileAsync(
+        FileMetaData? writtenFooter, EngineeredWood.IO.ITableFileSystem fs, string path, Apache.Arrow.Schema fileSchema,
+        bool tableAllowsShredding, int stringPrefixLength, CancellationToken cancellationToken)
     {
-        if (!tableAllowsShredding || VariantColumns(fileSchema) is not { } variants)
+        if (VariantColumns(fileSchema) is not { } variants)
+            return null;
+        if (writtenFooter is not null)
+            return Compute(writtenFooter, variants, stringPrefixLength);
+        if (!tableAllowsShredding)
             return null;
         await using var file = await fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false);
@@ -79,7 +92,8 @@ internal static class VariantFooterStats
         if (variantColumns.Count == 0 || footer.RowGroups.Count == 0)
             return result;
 
-        var schema = new SchemaDescriptor(footer.Schema);
+        // With the file's column_orders: a min_value / max_value is a bound only under an order this reader knows.
+        var schema = new SchemaDescriptor(footer.Schema, footer.ColumnOrders);
         var columnIndex = new Dictionary<string, int>(StringComparer.Ordinal);
         for (int c = 0; c < schema.Columns.Count; c++)
             columnIndex[Key(schema.Columns[c].Path)] = c;
@@ -91,7 +105,7 @@ internal static class VariantFooterStats
             var column = schema.Columns[c];
             if (!variantColumns.Contains(column.Path[0]) || !TryFieldPath(column.Path, out var fieldPath))
                 continue;
-            if (column.MaxRepetitionLevel > 0 || Kind(column) is not BoundKind kind)
+            if (column.MaxRepetitionLevel > 0 || Kind(column) is not BoundKind kind || !Ordered(column, kind))
                 continue;
 
             var siblingPath = new List<string>(column.Path) { [column.Path.Count - 1] = "value" };
@@ -129,6 +143,20 @@ internal static class VariantFooterStats
     }
 
     private static string Key(IReadOnlyList<string> path) => string.Join("\u0000", path);
+
+    /// <summary>
+    /// Whether the column's min_value / max_value are ordered as the bound needs: the type-defined order, or for a
+    /// float IEEE 754 total order (which differs only in placing -0 below +0 and in NaN, which a float path with a
+    /// NaN does not get a bound for). An order this reader does not know (<see cref="ColumnOrder.Undefined"/>) leaves
+    /// the statistics unusable; a bound taken from them could make Delta pruning skip a file holding a match. A file
+    /// with no column_orders at all is read as type-defined, as EW reads its statistics everywhere else.
+    /// </summary>
+    private static bool Ordered(ColumnDescriptor column, BoundKind kind) => column.ColumnOrder switch
+    {
+        ColumnOrder.TypeDefined => true,
+        ColumnOrder.Ieee754TotalOrder => kind is BoundKind.Float or BoundKind.Double,
+        _ => false,
+    };
 
     /// <summary>
     /// The object field names a <c>typed_value</c> leaf is the shredding of: <c>v.typed_value.a.typed_value</c>

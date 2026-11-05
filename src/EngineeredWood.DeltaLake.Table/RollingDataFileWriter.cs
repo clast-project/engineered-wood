@@ -253,13 +253,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             ClearPending();
             size = await _host.WriteAsync(batches.ToAsyncEnumerable(), fileName, cancellationToken)
                 .ConfigureAwait(false);
-            if (_fileStats is not null && _fileSchema is not null
-                && await Stats.VariantFooterStats.ReadFromWrittenFileAsync(
-                    _fs, fileName, _fileSchema, _tableAllowsShredding, StringPrefixLength, cancellationToken)
-                    .ConfigureAwait(false) is { } bounds)
-            {
-                _fileStats.AddVariantBounds(bounds);
-            }
+            await AddVariantBoundsAsync(writtenFooter: null, fileName, cancellationToken).ConfigureAwait(false);
         }
         else
         {
@@ -268,7 +262,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             // CloseAsync writes the footer and publishes the file before Position is read.
             await _writer!.CloseAsync(cancellationToken).ConfigureAwait(false);
             size = _file!.Position;
-            AddVariantBounds(_writer.WrittenMetadata);
+            await AddVariantBoundsAsync(_writer.WrittenMetadata, fileName, cancellationToken).ConfigureAwait(false);
             await DisposeOpenFileAsync().ConfigureAwait(false);
         }
 
@@ -279,18 +273,20 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     }
 
     /// <summary>
-    /// Variant min/max for a file this writer shredded, from the footer it just wrote, as delta-spark derives them
-    /// (see <see cref="Stats.VariantFooterStats"/>). Only a shredded file has paths to bound, and a shredded write
-    /// is refused on a table that does not support variant shredding, so the protocol's gate (min/max only under
-    /// shredding) holds here without a check. A host writer's file is bounded from its footer read back
-    /// (<see cref="Stats.VariantFooterStats.ReadFromWrittenFileAsync"/>), where the check is made.
+    /// Variant min/max for the file just closed, as delta-spark derives them: from the footer this writer wrote, or a
+    /// host writer's read back (see <see cref="Stats.VariantFooterStats.OfWrittenFileAsync"/>).
     /// </summary>
-    private void AddVariantBounds(EngineeredWood.Parquet.Metadata.FileMetaData? footer)
+    private async ValueTask AddVariantBoundsAsync(
+        EngineeredWood.Parquet.Metadata.FileMetaData? writtenFooter, string fileName, CancellationToken cancellationToken)
     {
-        if (_fileStats is null || footer is null || _fileSchema is null
-            || Stats.VariantFooterStats.VariantColumns(_fileSchema) is not { } variants)
+        if (_fileStats is null || _fileSchema is null)
             return;
-        _fileStats.AddVariantBounds(Stats.VariantFooterStats.Compute(footer, variants, StringPrefixLength));
+        if (await Stats.VariantFooterStats.OfWrittenFileAsync(
+                writtenFooter, _fs, fileName, _fileSchema, _tableAllowsShredding, StringPrefixLength, cancellationToken)
+                .ConfigureAwait(false) is { } bounds)
+        {
+            _fileStats.AddVariantBounds(bounds);
+        }
     }
 
     private int StringPrefixLength => (_statsSelection ?? Stats.StatsColumnSelection.All).StringPrefixLength;

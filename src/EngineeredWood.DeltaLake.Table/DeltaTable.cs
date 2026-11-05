@@ -9904,17 +9904,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var fileSchema = writeBatches[0].Schema;
 
         long fileSize;
+        EngineeredWood.Parquet.Metadata.FileMetaData? writtenFooter = null;
         if (_options.DataFileWriter is { } rewriteWriter)
         {
             fileSize = await rewriteWriter.WriteAsync(
                 writeBatches.ToAsyncEnumerable(), newFileName, cancellationToken).ConfigureAwait(false);
-            if (await Stats.VariantFooterStats.ReadFromWrittenFileAsync(
-                    _fs, newFileName, fileSchema,
-                    VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration),
-                    statsSelection.StringPrefixLength, cancellationToken).ConfigureAwait(false) is { } bounds)
-            {
-                fileStats.AddVariantBounds(bounds);
-            }
         }
         else
         {
@@ -9926,12 +9920,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
             await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
             fileSize = file.Position;
-            if (writer.WrittenMetadata is { } footer
-                && Stats.VariantFooterStats.VariantColumns(fileSchema) is { } variants)
-            {
-                fileStats.AddVariantBounds(Stats.VariantFooterStats.Compute(
-                    footer, variants, statsSelection.StringPrefixLength));
-            }
+            writtenFooter = writer.WrittenMetadata;
+        }
+        if (await Stats.VariantFooterStats.OfWrittenFileAsync(
+                writtenFooter, _fs, newFileName, fileSchema,
+                VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration),
+                statsSelection.StringPrefixLength, cancellationToken).ConfigureAwait(false) is { } bounds)
+        {
+            fileStats.AddVariantBounds(bounds);
         }
 
         var add = new AddFile

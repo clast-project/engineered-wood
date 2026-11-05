@@ -496,7 +496,12 @@ bounds and over Spark's. What is not done:
   read per file with a variant column, on a table that supports shredding).
   Files committed with `CommitDataFilesAsync` or the transaction's
   `StageDataFiles*` carry the host's stats, so they get `nullCount` only
-  unless the host supplies the bounds.
+  unless the host supplies the bounds. A host's file is found to hold a variant
+  by the batches it was handed, so with `EmitVariantLogicalType=false` (the
+  batches lose the variant annotation) it stays unbounded even if the host
+  shredded it. A footer that cannot be read back fails the write rather than
+  committing the file with `nullCount` only. Statistics under a column order EW
+  does not know give no bound.
 - *Files a host writes are not inspected.* `CommitDataFilesAsync`, the
   transaction's `StageDataFiles*`, and an `IDataFileWriter` that ignores the
   parquet options can still commit a shredded file to a table that does not

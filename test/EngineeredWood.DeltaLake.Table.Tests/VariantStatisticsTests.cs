@@ -10,8 +10,10 @@ using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.Checkpoint;
 using EngineeredWood.DeltaLake.Log;
+using EngineeredWood.DeltaLake.Table.Stats;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
+using EngineeredWood.Parquet.Metadata;
 using ParquetLogicalType = EngineeredWood.Parquet.Metadata.LogicalType;
 
 namespace EngineeredWood.DeltaLake.Table.Tests;
@@ -656,5 +658,107 @@ public class VariantStatisticsTests : IDisposable
 
         Assert.NotNull(version);
         AssertBounds(await AddedStatsAsync(fs, version!.Value), (-2, "w"), (9, "y"));
+    }
+
+    // ── A footer EW did not write (#695 review). A host IDataFileWriter's file is bounded from its footer read back,
+    // and the footer that matters is DuckDB's: the writer behind fabricator's IDataFileWriter. ──
+
+    /// <summary>
+    /// DuckDB 2.0's footer, from a file it wrote and shredded:
+    /// <c>COPY (SELECT {'a': i::INTEGER, 'b': repeat('x', 300) || i::VARCHAR, 'c': i * 0.5, 'd': (i * 0.25)::DOUBLE}::VARIANT
+    /// AS v FROM range(1, 4) t(i)) TO 'duckdb_shredded_variant.parquet' (FORMAT parquet)</c>. Its string statistics are
+    /// cut at 256 bytes with the max's last byte rounded up and <c>max_is_exact = false</c>; it writes
+    /// <c>column_orders</c>, the deprecated min/max beside min_value/max_value, and a NaN count for the double.
+    /// </summary>
+    private static async Task<FileMetaData> DuckDbFooterAsync()
+    {
+        string path = Path.Combine(AppContext.BaseDirectory, "TestData", "duckdb_shredded_variant.parquet");
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        return await reader.ReadMetadataAsync();
+    }
+
+    private static (Dictionary<string, string> Min, Dictionary<string, string> Max)? BoundsOf(FileMetaData footer)
+    {
+        var result = VariantFooterStats.Compute(footer, ["v"], stringPrefixLength: 32);
+        return result.TryGetValue("v", out var bounds)
+            ? (Decode(JsonDocument.Parse($"\"{bounds.Min}\"").RootElement), Decode(JsonDocument.Parse($"\"{bounds.Max}\"").RootElement))
+            : null;
+    }
+
+    /// <summary>The footer with each leaf column's statistics passed through <paramref name="change"/> (the
+    /// metadata types are init-only, so a test copies them).</summary>
+    private static FileMetaData WithStatistics(FileMetaData footer, Func<string, Statistics, Statistics> change) =>
+        Copy(footer, nameof(FileMetaData.RowGroups), footer.RowGroups.Select(rowGroup =>
+            Copy(rowGroup, nameof(RowGroup.Columns), rowGroup.Columns.Select(chunk =>
+                chunk.MetaData?.Statistics is not { } stats ? chunk
+                : Copy(chunk, nameof(ColumnChunk.MetaData), Copy(chunk.MetaData, nameof(ColumnMetaData.Statistics),
+                    change(string.Join(".", chunk.MetaData.PathInSchema!), stats)))).ToList())).ToList());
+
+    private static T Copy<T>(T value, string property, object? propertyValue)
+    {
+        var copy = (T)typeof(object).GetMethod("MemberwiseClone",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.Invoke(value, null)!;
+        typeof(T).GetProperty(property)!.SetValue(copy, propertyValue);
+        return copy;
+    }
+
+    private static readonly string Xs = new('x', 32);
+
+    [Fact]
+    public async Task ADuckDbFooter_GetsBoundsThatHoldItsRows()
+    {
+        var (min, max) = BoundsOf(await DuckDbFooterAsync())!.Value;
+
+        Assert.Equal(new Dictionary<string, string>
+        {
+            ["$['a']"] = "1", ["$['b']"] = $"\"{Xs}\"", ["$['c']"] = "0.5", ["$['d']"] = "0.25",
+        }, min);
+        // the string max is DuckDB's inexact, rounded-up maximum cut to the prefix; a cut maximum continues with the
+        // largest code point (U+10FFFF, escaped in the JSON), so it stays above every value that starts with the prefix
+        Assert.Equal(new Dictionary<string, string>
+        {
+            ["$['a']"] = "3", ["$['b']"] = $"\"{Xs}\\uDBFF\\uDFFF\"", ["$['c']"] = "1.5", ["$['d']"] = "0.75",
+        }, max);
+    }
+
+    [Fact]
+    public async Task AStringMaxRoundedUpIntoInvalidUtf8_IsLeftOut_AndTheOtherPathsKeepTheirBounds()
+    {
+        // A writer that rounds the last kept byte up can turn 0x7F into 0x80, a continuation byte with nothing before
+        // it. DuckDB 2.0 avoids it (it cuts before such a byte), another writer may not.
+        byte[] invalid = [.. new byte[255].Select(_ => (byte)'x'), 0x80];
+        var footer = WithStatistics(await DuckDbFooterAsync(), (path, stats) =>
+            path == "v.typed_value.b.typed_value" ? Copy(stats, nameof(Statistics.MaxValue), invalid) : stats);
+
+        var (min, max) = BoundsOf(footer)!.Value;
+
+        Assert.Equal(["$['a']", "$['c']", "$['d']"], min.Keys.OrderBy(k => k, StringComparer.Ordinal));
+        Assert.Equal(["$['a']", "$['c']", "$['d']"], max.Keys.OrderBy(k => k, StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task OnlyTheDeprecatedMinMax_BoundsNumbers_AndNotStringsOrDecimals()
+    {
+        // The deprecated min/max were written under signed ordering, the right one only for numbers.
+        var footer = WithStatistics(await DuckDbFooterAsync(), (_, stats) =>
+            Copy(Copy(stats, nameof(Statistics.MinValue), null), nameof(Statistics.MaxValue), null));
+
+        var (min, max) = BoundsOf(footer)!.Value;
+
+        Assert.Equal(new Dictionary<string, string> { ["$['a']"] = "1", ["$['d']"] = "0.25" }, min);
+        Assert.Equal(new Dictionary<string, string> { ["$['a']"] = "3", ["$['d']"] = "0.75" }, max);
+    }
+
+    [Fact]
+    public async Task AColumnOrderEwDoesNotKnow_GivesNoBounds()
+    {
+        var footer = await DuckDbFooterAsync();
+        var unknown = Copy(footer, nameof(FileMetaData.ColumnOrders),
+            footer.ColumnOrders!.Select(_ => ColumnOrder.Undefined).ToList());
+
+        Assert.Null(BoundsOf(unknown));
+        // without the list EW reads statistics as type-defined, as everywhere else
+        Assert.Equal(BoundsOf(footer), BoundsOf(Copy(footer, nameof(FileMetaData.ColumnOrders), null)));
     }
 }
