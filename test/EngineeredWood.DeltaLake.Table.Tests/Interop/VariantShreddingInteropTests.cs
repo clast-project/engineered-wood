@@ -254,6 +254,10 @@ public class VariantShreddingInteropTests : IDisposable
             leaves.GetProperty("v.typed_value.b.typed_value").GetProperty("physical_type").GetString());
         Assert.True(nullable.GetProperty("v.typed_value.a.value").GetBoolean());
         Assert.True(nullable.GetProperty("v.typed_value.b.value").GetBoolean());
+        // Each field's group is REQUIRED: a field an object lacks is spelled by both children being null,
+        // never by a null group, which Spark reads as MALFORMED_VARIANT (#679).
+        Assert.False(nullable.GetProperty("v.typed_value.a").GetBoolean());
+        Assert.False(nullable.GetProperty("v.typed_value.b").GetBoolean());
 
         var rows = result.GetProperty("rows").EnumerateArray().ToList();
         Assert.Equal(3, rows.Count);

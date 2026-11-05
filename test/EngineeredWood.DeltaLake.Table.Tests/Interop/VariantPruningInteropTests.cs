@@ -49,20 +49,16 @@ public class VariantPruningInteropTests : IDisposable
 
     // One file per batch. `a` is bounded [1, 3], [10, 12] and not at all (mixed types); `s` and `c.d` are
     // bounded in each. A scalar variant and a NULL variant answer NULL for every path, and `b` lands in the
-    // residual. (An object that lacks a shredded field is in SparkFiles only: Spark refuses EW's encoding of a
-    // missing field, which writes the field's group OPTIONAL where the shredding spec says required: #679.)
+    // residual. Rows 13 and 14 lack `a`, `s` and `c.d`: an object missing a shredded field, which Spark refused
+    // in EW's encoding until the field groups were written required (#679). (Spark bounds nothing in the third
+    // file: its shredding inference gives up on a file whose top level is mixed.)
     private static readonly (long Id, string? Json)[][] Files =
     [
         [(1, "{\"a\":1,\"s\":\"p\",\"c\":{\"d\":1.5}}"), (2, "{\"a\":3,\"s\":\"q\",\"c\":{\"d\":2.5}}")],
         [(10, "{\"a\":10,\"s\":\"x\",\"c\":{\"d\":10.5}}"), (11, "{\"a\":12,\"s\":\"y\",\"c\":{\"d\":11.5}}"),
-            (12, "{\"a\":11,\"s\":\"z\",\"c\":{\"d\":12.5},\"b\":1}")],
+            (12, "{\"a\":11,\"s\":\"z\",\"c\":{\"d\":12.5},\"b\":1}"), (13, "{\"b\":1}"), (14, "{\"c\":{\"e\":1}}")],
         [(20, "{\"a\":5,\"s\":\"m\",\"c\":{\"d\":5.5}}"), (21, "{\"a\":\"str\",\"s\":\"n\",\"c\":{\"d\":6.5}}"), (22, "7"), (23, null)],
     ];
-
-    // Spark's table adds rows without the paths to the bounded file. (Spark bounds nothing in the third file: its
-    // shredding inference gives up on a file whose top level is mixed.)
-    private static readonly (long Id, string? Json)[][] SparkFiles =
-        [Files[0], [.. Files[1], (13, "{\"b\":1}"), (14, "{\"c\":{\"e\":1}}")], Files[2]];
 
     /// <summary>Predicates Spark answers without an error on these rows, and whether EW must skip a file for each
     /// (one whose bounds rule it out, on both tables). The others are there for the answer alone.</summary>
@@ -204,7 +200,7 @@ public class VariantPruningInteropTests : IDisposable
         Spark.Invoke("write_shredded_variant", new
         {
             path = _tempDir,
-            batches = SparkFiles.Select(f => f.Select(r => new { id = r.Id, json = r.Json }).ToArray()).ToArray(),
+            batches = Files.Select(f => f.Select(r => new { id = r.Id, json = r.Json }).ToArray()).ToArray(),
         });
 
         // The premise: Spark bounded the paths these cases prune on, in the files they prune.
@@ -217,6 +213,6 @@ public class VariantPruningInteropTests : IDisposable
             Assert.Contains("a", bound, StringComparison.Ordinal);
         }
 
-        await AssertSparksRowsAreKeptAsync(SparkFiles);
+        await AssertSparksRowsAreKeptAsync(Files);
     }
 }
