@@ -17,8 +17,10 @@ namespace EngineeredWood.DeltaLake.Table;
 /// change, by those files' <c>numRecords</c>.</para>
 ///
 /// <para>An <c>add</c> and a <c>remove</c> of the same path are one file given a new deletion vector, not a file
-/// removed and another added, which is how Spark counts a deletion-vector DELETE: no file added or removed,
-/// one vector added (or updated, when the file already had one).</para>
+/// removed and another added, which is how Spark counts a deletion-vector DELETE or MERGE: no file added or
+/// removed, one vector added (or updated, when the file already had one). Spark's deletion-vector UPDATE counts
+/// such a file as removed as well, with its bytes (measured on Spark 4.0.1 / Delta 4.0.0), and so does
+/// <see cref="ForUpdate"/>.</para>
 ///
 /// <para>Spark's timing metrics (<c>executionTimeMs</c>, <c>scanTimeMs</c>, <c>rewriteTimeMs</c>, and MERGE's
 /// <c>materializeSourceTimeMs</c>) are not recorded.</para>
@@ -35,7 +37,9 @@ internal static class DmlOperationMetrics
         long DeletionVectorsAdded,
         long DeletionVectorsRemoved,
         long DeletionVectorsUpdated,
-        long? RowsInAddedFiles);
+        long? RowsInAddedFiles,
+        long ReaddedFiles,
+        long ReaddedBytes);
 
     private static FileCounts Count(IReadOnlyList<DeltaAction> actions)
     {
@@ -50,13 +54,15 @@ internal static class DmlOperationMetrics
         long dvAdded = 0, dvRemoved = 0, dvUpdated = 0;
         long? rowsInAdded = 0;
         var readded = new HashSet<string>(StringComparer.Ordinal);
+        long readdedBytes = 0;
         foreach (var action in actions)
         {
             switch (action)
             {
                 case AddFile { DataChange: true } add when removes.TryGetValue(add.Path, out var replaced):
                     // The same file under a new deletion vector.
-                    readded.Add(add.Path);
+                    if (readded.Add(add.Path))
+                        readdedBytes += replaced.Size ?? add.Size;
                     if (add.DeletionVector is not null)
                     {
                         if (replaced.DeletionVector is null)
@@ -95,7 +101,7 @@ internal static class DmlOperationMetrics
 
         return new FileCounts(
             addedFiles, removedFiles, addedChangeFiles, addedBytes, removedBytes, dvAdded, dvRemoved, dvUpdated,
-            rowsInAdded);
+            rowsInAdded, readded.Count, readdedBytes);
     }
 
     /// <summary>A DELETE's metrics. Its added files hold only rows it kept, so all of them are copied rows.</summary>
@@ -112,10 +118,12 @@ internal static class DmlOperationMetrics
         return metrics;
     }
 
-    /// <summary>An UPDATE's metrics. Its added files hold the rows it changed and the rows it copied.</summary>
+    /// <summary>An UPDATE's metrics. Its added files hold the rows it changed and the rows it copied. A file it
+    /// gave a deletion vector counts as removed, as Spark's UPDATE counts it (#704).</summary>
     public static IReadOnlyDictionary<string, string> ForUpdate(IReadOnlyList<DeltaAction> actions, long updatedRows)
     {
         var c = Count(actions);
+        c = c with { RemovedFiles = c.RemovedFiles + c.ReaddedFiles, RemovedBytes = c.RemovedBytes + c.ReaddedBytes };
         var metrics = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["numUpdatedRows"] = Text(updatedRows),

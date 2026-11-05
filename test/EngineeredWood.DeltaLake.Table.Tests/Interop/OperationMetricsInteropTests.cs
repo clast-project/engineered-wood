@@ -160,11 +160,15 @@ public class OperationMetricsInteropTests : IDisposable
             unsetBySpark: deletionVectors ? ["numRemovedBytes"] : []);
     }
 
-    [SkippableFact]
-    public async Task AnUpdate_RecordsSparksMetrics()
+    /// <summary>With deletion vectors the file keeps its unchanged rows (#704): the vector masks the updated row 3 and
+    /// its post-image goes to a new file, so no file is removed and no row copied.</summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AnUpdate_RecordsSparksMetrics(bool deletionVectors)
     {
         Spark.Require();
-        await CreateTwinsAsync(deletionVectors: false, changeDataFeed: true);
+        await CreateTwinsAsync(deletionVectors, changeDataFeed: true);
 
         long version;
         await using (var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_ours)))

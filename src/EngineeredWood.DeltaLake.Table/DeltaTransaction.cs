@@ -33,7 +33,7 @@ namespace EngineeredWood.DeltaLake.Table;
 /// passes — a crash-looping producer's whole batch, on every restart.</para>
 ///
 /// <para><b>Scope.</b> Appends (<see cref="WriteAsync"/>), deletes (<see cref="DeleteAsync(Expressions.Predicate, CancellationToken)"/>), and
-/// updates (<see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken)"/>) can be staged, including several on one transaction — so long as no two of them delete
+/// updates (<see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken, RowDeleteMode?)"/>) can be staged, including several on one transaction — so long as no two of them delete
 /// from or rewrite the same data file. Each is computed against the base snapshot rather than against what
 /// earlier ones staged, so a second operation on a file is refused; combine them into one. An append is
 /// a blind write with no read dependency, so two concurrent transactional appends both land; a
@@ -551,11 +551,16 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// now — and deleted again by <see cref="AbortAsync"/> if this transaction never commits. The files this
     /// update REPLACES are untouched by an abort: they are the table's data until the commit lands. Returns
     /// the number of rows this update matched.</para>
+    /// <para><paramref name="mode"/> chooses how a file holding an updated row is changed, as for
+    /// <see cref="DeltaTable.UpdateAsync(Func{RecordBatch, BooleanArray}, Func{RecordBatch, RecordBatch}, CancellationToken, CommitProperties?, RowDeleteMode?)"/>:
+    /// null lets the table decide (deletion vectors where it enables them, copy-on-write where it does not). With
+    /// deletion vectors the vector and the post-image file are written now and deleted again by an abort.</para>
     /// </summary>
     public async ValueTask<long> UpdateAsync(
         Func<RecordBatch, BooleanArray> predicate,
         Func<RecordBatch, RecordBatch> updater,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        RowDeleteMode? mode = null)
     {
         EnsureOpen();
 
@@ -567,7 +572,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
 
         int mark = _written.Paths.Count;
         var plan = await TakingBackOnFailureAsync(mark, () => _table.ComputeUpdateActionsAsync(
-            _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId, written: _written),
+            _baseSnapshot, predicate, updater, cancellationToken, rowIdStart: _nextRowId, written: _written,
+            mode: mode),
             cancellationToken).ConfigureAwait(false);
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "UPDATE", cancellationToken)
             .ConfigureAwait(false);
@@ -587,12 +593,14 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// Stages an update of the rows matching an analyzable <see cref="Expressions.Predicate"/> via
     /// <paramref name="updater"/>. Like the analyzable delete, the predicate is recorded as a read
     /// dependency (concurrentAppend precision) and files that cannot match are skipped. Returns the rows
-    /// matched.
+    /// matched. <paramref name="mode"/> chooses how a file holding an updated row is changed, as for
+    /// <see cref="UpdateAsync(Func{RecordBatch, BooleanArray}, Func{RecordBatch, RecordBatch}, CancellationToken, RowDeleteMode?)"/>.
     /// </summary>
     public async ValueTask<long> UpdateAsync(
         Expressions.Predicate predicate,
         Func<RecordBatch, RecordBatch> updater,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        RowDeleteMode? mode = null)
     {
         EnsureOpen();
 
@@ -605,7 +613,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         int mark = _written.Paths.Count;
         var plan = await TakingBackOnFailureAsync(mark, () => _table.ComputeUpdateActionsAsync(
             _baseSnapshot, DeltaTable.MaskFor(predicate), updater, cancellationToken,
-            prunePredicate: predicate, rowIdStart: _nextRowId, written: _written), cancellationToken)
+            prunePredicate: predicate, rowIdStart: _nextRowId, written: _written, mode: mode), cancellationToken)
             .ConfigureAwait(false);
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "UPDATE", cancellationToken)
             .ConfigureAwait(false);

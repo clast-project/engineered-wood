@@ -934,6 +934,10 @@ writer, so today the caller must wire those primitives together by hand.
 overload and an analyzable-`Expressions.Predicate` overload (the predicate form
 feeds file pruning + concurrency read-set analysis); `DeleteRowsAsync` /
 `UpdateRowsAsync` do row-level DML keyed by a path-keyed `RowSelection`.
+On a table with deletion vectors `UpdateAsync` (table and transaction) masks the rows it updates with the
+file's deletion vector and writes their post-images to a new file, as Spark's UPDATE does (#704, pinned by
+`UpdateDeletionVectorInteropTests`); its `mode` (`RowDeleteMode?`) chooses copy-on-write or deletion vectors
+explicitly. `UpdateRowsAsync` always copy-on-writes.
 `MergeAsync` (table and transaction) is a key-equality MERGE (#563): any number of
 clauses of each kind (matched UPDATE/DELETE, not-matched INSERT, not-matched-by-source
 UPDATE/DELETE), each with an optional condition and tried in order (#575), with `UPDATE SET` /
