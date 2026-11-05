@@ -183,11 +183,15 @@ public class OperationMetricsInteropTests : IDisposable
             TheirMetrics("UPDATE delta.`{path}` SET value = 'x' WHERE id = 3", version));
     }
 
-    [SkippableFact]
-    public async Task AMerge_RecordsSparksMetrics()
+    /// <summary>With deletion vectors both files keep their unchanged rows (#574): the vector masks the updated row 2
+    /// in the one and the deleted row 5 in the other, so no file is removed and no row copied.</summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AMerge_RecordsSparksMetrics(bool deletionVectors)
     {
         Spark.Require();
-        await CreateTwinsAsync(deletionVectors: false, changeDataFeed: true);
+        await CreateTwinsAsync(deletionVectors, changeDataFeed: true);
 
         long version;
         await using (var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_ours)))

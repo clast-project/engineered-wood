@@ -284,6 +284,26 @@ public sealed class MergeOptions
     /// matched or added.</para>
     /// </remarks>
     public bool MergeSchema { get; init; }
+
+    /// <summary>
+    /// How a data file holding a row the MERGE updates or deletes is changed. Null (the default) lets the table
+    /// decide, as a DELETE does: deletion vectors where it enables <c>delta.enableDeletionVectors</c>, as Spark's
+    /// MERGE writes them, and copy-on-write where it does not.
+    /// </summary>
+    /// <remarks>
+    /// <para><see cref="RowDeleteMode.DeletionVector"/> leaves the file's unchanged rows where they are: the rows the
+    /// MERGE updated or deleted are added to the file's deletion vector (the file is removed and re-added under the
+    /// new vector, with loose statistics), and the updated rows' post-images are written to a new file, keeping their
+    /// stable row ids on a row-tracking table. Asked for on a table without deletion vectors, a MERGE that would mask
+    /// part of a file is refused rather than writing a vector a reader could ignore.</para>
+    /// <para><see cref="RowDeleteMode.CopyOnWrite"/> rewrites each such file with its changed rows applied and the
+    /// rest copied.</para>
+    /// <para>In both modes a file whose every live row the MERGE updates or deletes is removed whole, its post-images
+    /// written to a new file, as Spark does. The change data feed is the same either way. A MERGE that writes
+    /// deletion vectors still conflicts with a concurrent commit that changed a file it changed, as one that rewrites
+    /// does: an update cannot be rebased row by row.</para>
+    /// </remarks>
+    public RowDeleteMode? DeleteMode { get; init; }
 }
 
 /// <summary>
@@ -296,8 +316,10 @@ public sealed class MergeOptions
 /// <param name="NumTargetRowsMatchedDeleted">Target rows a matched clause deleted.</param>
 /// <param name="NumTargetRowsNotMatchedBySourceDeleted">Target rows a not-matched-by-source clause deleted.</param>
 /// <param name="NumTargetRowsCopied">Unchanged target rows rewritten because their file held a changed row.</param>
-/// <param name="NumTargetFilesAdded">Data files the MERGE added: rewrites and inserts.</param>
-/// <param name="NumTargetFilesRemoved">Data files the MERGE removed.</param>
+/// <param name="NumTargetFilesAdded">Data files the MERGE added: rewrites, post-images and inserts. A file given a
+/// deletion vector is not counted, as Spark does not count it.</param>
+/// <param name="NumTargetFilesRemoved">Data files the MERGE removed. A file given a deletion vector is not counted,
+/// as Spark does not count it.</param>
 public sealed record MergeMetrics(
     long NumSourceRows,
     long NumTargetRowsInserted,

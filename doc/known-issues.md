@@ -934,8 +934,11 @@ keys, for `SET *` / `INSERT *` and for an assigned generated column (pinned by `
 take an arbitrary ON condition; an assignment names a top-level column (not a nested struct field), and a
 `timestamp_ntz`, struct, array or map column takes only a value already of its type, since the expression
 library cannot cast to those; a column copied from the source (`*`, a column list) must already have the
-table's type, where Spark casts it; it always copy-on-writes, never writing deletion vectors;
-it prunes files by the source's key range only for `byte`, `short`, `integer`, `long`, `date`, `timestamp`,
+table's type, where Spark casts it. On a table with deletion vectors it masks the rows it updates or deletes
+with the file's deletion vector and writes the post-images to a new file, as Spark's MERGE does (#574, pinned by
+`MergeDeletionVectorInteropTests`); `MergeOptions.DeleteMode` chooses copy-on-write or deletion vectors
+explicitly. It
+prunes files by the source's key range only for `byte`, `short`, `integer`, `long`, `date`, `timestamp`,
 `timestamp_ntz`, `decimal` and `string` keys (#578), not `float`, `double`, `boolean` or `binary` ones.
 Its commit records Spark's MERGE `operationMetrics`, and the counts also come back to the caller as
 `MergeMetrics`. A source column the table lacks may be read by a condition or value, and `*` leaves it out, as

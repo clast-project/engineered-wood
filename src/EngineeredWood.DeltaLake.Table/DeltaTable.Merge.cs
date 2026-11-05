@@ -4,6 +4,7 @@
 using Apache.Arrow;
 using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.DeletionVectors;
 using EngineeredWood.DeltaLake.Schema;
 
 namespace EngineeredWood.DeltaLake.Table;
@@ -16,9 +17,11 @@ public sealed partial class DeltaTable
     /// MATCHED BY SOURCE ...</c>. <paramref name="options"/> names the keys and the clauses; see
     /// <see cref="MergeOptions"/> for how rows match and how conditions name their columns.
     ///
-    /// <para>Every file holding a row the MERGE updates or deletes is rewritten once, with the matched rows changed
-    /// and the rest copied (copy-on-write, as delta-rs merges; no deletion vectors are written). Unmatched source
-    /// rows are appended. All of it commits as one version, through the same conflict check, rebase and retry as
+    /// <para>Every file holding a row the MERGE updates or deletes is changed once. On a table with deletion vectors
+    /// the changed rows are masked by the file's deletion vector and the updated rows written to a new file, as
+    /// Spark's MERGE does; otherwise the file is rewritten with the changed rows applied and the rest copied
+    /// (copy-on-write, as delta-rs merges). <see cref="MergeOptions.DeleteMode"/> chooses explicitly. Unmatched
+    /// source rows are appended. All of it commits as one version, through the same conflict check, rebase and retry as
     /// <see cref="DeltaTransaction.CommitAsync"/>; a MERGE that changes nothing commits nothing and returns the
     /// unchanged version.</para>
     ///
@@ -47,10 +50,12 @@ public sealed partial class DeltaTable
     }
 
     /// <summary>The actions a MERGE produces and what it read, without committing.</summary>
-    /// <param name="RewriteActions">The removes and adds of the files it rewrote, and their change files.</param>
+    /// <param name="RewriteActions">The removes and adds of the files it rewrote or gave a deletion vector, the
+    /// post-images it wrote, and their change files.</param>
     /// <param name="InsertActions">The appended source rows' actions, kept apart so a transaction can record them as
     /// rows no change file covers.</param>
-    /// <param name="RemovedPaths">The files it rewrote: its planned removes, and part of its read set.</param>
+    /// <param name="RemovedPaths">The files it rewrote or gave a deletion vector: its planned removes, and part of
+    /// its read set.</param>
     /// <param name="ReadPaths">Every file it read, rewritten or not.</param>
     /// <param name="ReadPredicate">The key-range predicate every file it could have matched satisfies, or null when
     /// it has none (no key type it can bound, or no scan).</param>
@@ -75,9 +80,10 @@ public sealed partial class DeltaTable
         MergeSourcelessUpdate = 4;
 
     /// <summary>
-    /// Computes a MERGE against <paramref name="snapshot"/> WITHOUT committing: each touched file rewritten once
-    /// with its updates and deletes applied together (a transaction refuses a second operation on a file, so they
-    /// cannot be staged apart), then the unmatched source rows appended.
+    /// Computes a MERGE against <paramref name="snapshot"/> WITHOUT committing: each touched file changed once
+    /// (rewritten, or masked by a deletion vector) with its updates and deletes applied together (a transaction
+    /// refuses a second operation on a file, so they cannot be staged apart), then the unmatched source rows
+    /// appended.
     /// </summary>
     /// <param name="rowIdStart">Where the rewrite and the insert reserve stable row ids. Null starts at the
     /// snapshot's mark.</param>
@@ -138,6 +144,8 @@ public sealed partial class DeltaTable
         var rewriteActions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         var readPaths = new HashSet<string>(StringComparer.Ordinal);
+        // The files the MERGE masked rows of with a deletion vector, rather than rewriting or removing them.
+        var maskedPaths = new HashSet<string>(StringComparer.Ordinal);
         long matchedUpdated = 0, sourcelessUpdated = 0, matchedDeleted = 0, sourcelessDeleted = 0, copied = 0;
 
         bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
@@ -197,10 +205,12 @@ public sealed partial class DeltaTable
             }
         }
 
-        long filesAdded = rewriteActions.Concat(insertActions).Count(a => a is AddFile);
+        // A file given a deletion vector is re-added under its own path: neither added nor removed, as Spark counts it.
+        long filesAdded = rewriteActions.Concat(insertActions)
+            .Count(a => a is AddFile add && !maskedPaths.Contains(add.Path));
         var metrics = new MergeMetrics(
             sourceRows, inserted, matchedUpdated, sourcelessUpdated, matchedDeleted, sourcelessDeleted, copied,
-            filesAdded, removedPaths.Count);
+            filesAdded, removedPaths.Count - maskedPaths.Count);
         return new MergeActions(
             rewriteActions, insertActions, removedPaths, readPaths, keyRange, readsWholeTable, scan, metrics,
             assignRowIds ? nextRowId : null);
@@ -228,6 +238,15 @@ public sealed partial class DeltaTable
                 && plan.Matched[0].Kind == MergeActionKind.Delete && plan.Matched[0].Condition is null;
             bool refuseMultipleMatches = (anyMatched || plan.NotMatchedBySource.Count > 0) && !unconditionalDelete;
 
+            // As a DELETE decides it (see DeletesByCopyOnWrite): deletion vectors where the table enables them, unless
+            // the options say otherwise. With them, a file the MERGE changes keeps its unchanged rows where they are:
+            // the rows it updated or deleted are masked by the file's deletion vector and the post-images written to a
+            // new file, as Spark's MERGE writes them. A file it changes every live row of is removed whole either way.
+            bool copyOnWrite = DeletesByCopyOnWrite(snapshot, options.DeleteMode);
+            bool deletionVectorsEnabled = DeletionVectors.DeletionVectorConfig.IsEnabled(
+                snapshot.Metadata.Configuration);
+            var dvWriter = copyOnWrite ? null : NewDeletionVectorWriter();
+
             foreach (var addFile in snapshot.ActiveFiles.Values)
             {
                 if (pruner is not null && !pruner.ShouldInclude(addFile, keyRange!))
@@ -237,16 +256,22 @@ public sealed partial class DeltaTable
                 var batches = new List<RecordBatch>();
                 var srcIds = materializeIds ? new List<Int64Array?>() : null;
                 var srcVers = materializeIds ? new List<Int64Array?>() : null;
+                // A deletion vector addresses rows by their position in the file.
+                var srcPositions = copyOnWrite ? null : new List<Int64Array?>();
                 await foreach (var batch in ReadFileAsync(
-                    addFile, null, snapshot, cancellationToken, srcIds, srcVers).ConfigureAwait(false))
+                    addFile, null, snapshot, cancellationToken, srcIds, srcVers, srcPositions).ConfigureAwait(false))
                 {
                     batches.Add(batch);
                 }
 
+                long liveRows = batches.Sum(b => (long)b.Length);
                 var router = new PartitionRouter(
                     snapshot, mappingMode, batches.FirstOrDefault(b => b.Length > 0), materializeIds);
                 bool fileModified = false;
                 long copiedHere = 0;
+                // With deletion vectors: how many live rows the MERGE left alone, and the positions of those it changed.
+                long keptHere = 0;
+                var changedPositions = copyOnWrite ? null : new List<long>();
                 var preimages = new List<RecordBatch>();
                 var postimages = new List<RecordBatch>();
                 var deletes = new List<RecordBatch>();
@@ -371,10 +396,35 @@ public sealed partial class DeltaTable
 
                     if (updateGroups.Count == 0 && deleteRows.Count == 0)
                     {
-                        router.Add(batch, batchIds is not null && batchVers is not null
-                            ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null, mayMove: false);
-                        copiedHere += n;
+                        if (copyOnWrite)
+                        {
+                            router.Add(batch, batchIds is not null && batchVers is not null
+                                ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null, mayMove: false);
+                            copiedHere += n;
+                        }
+                        else
+                        {
+                            keptHere += n;
+                        }
                         continue;
+                    }
+
+                    if (changedPositions is not null)
+                    {
+                        var positions = bi < srcPositions!.Count ? srcPositions[bi] : null;
+                        for (int i = 0; i < n; i++)
+                        {
+                            if (fate[i] == MergeCopy)
+                                continue;
+                            if (positions is null || positions.IsNull(i))
+                            {
+                                throw new InvalidOperationException(
+                                    $"MERGE could not resolve the position of a row it changed in '{addFile.Path}', "
+                                    + "which a deletion vector needs. Pass RowDeleteMode.CopyOnWrite in "
+                                    + "MergeOptions.DeleteMode to rewrite the file instead.");
+                            }
+                            changedPositions.Add(positions.GetValue(i)!.Value);
+                        }
                     }
 
                     if (!fileModified)
@@ -429,7 +479,12 @@ public sealed partial class DeltaTable
                             batchVers is not null ? TakeIds(batchVers, deleteRows) : null));
                     }
 
-                    if (keepRows.Count > 0)
+                    if (keepRows.Count > 0 && !copyOnWrite)
+                    {
+                        // They stay in the file, whose deletion vector masks only the changed rows.
+                        keptHere += keepRows.Count;
+                    }
+                    else if (keepRows.Count > 0)
                     {
                         // Unchanged rows of a changed file: original id and commit version.
                         router.Add(TakeRowsFromBatch(batch, keepRows), batchIds is not null && batchVers is not null
@@ -442,11 +497,53 @@ public sealed partial class DeltaTable
                 if (!fileModified)
                     continue;
 
-                copied += copiedHere;
-                rowId = await WriteRewriteGroupsAsync(
-                    snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
-                    assignRowIds, rowId, newVersion, rewriteActions, written, cancellationToken)
-                    .ConfigureAwait(false);
+                if (copyOnWrite || keptHere == 0)
+                {
+                    // Rewritten without its changed rows; or, with none of its live rows left alone, removed, with the
+                    // post-images written to a new file, as Spark removes such a file even with deletion vectors.
+                    copied += copiedHere;
+                    rowId = await WriteRewriteGroupsAsync(
+                        snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
+                        assignRowIds, rowId, newVersion, rewriteActions, written, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                else
+                {
+                    // Before anything of this file is written: a vector a foreign reader would ignore is never
+                    // written into a table that does not enable them (#524).
+                    if (!deletionVectorsEnabled)
+                    {
+                        throw new InvalidOperationException(
+                            "MERGE was asked to mask rows of a data file with a deletion vector, and this table does not "
+                            + "have deletion vectors enabled. Pass RowDeleteMode.CopyOnWrite (or no mode) in "
+                            + "MergeOptions.DeleteMode to rewrite the affected files instead, or create the table with "
+                            + "DeltaTable.CreateAsync(..., enableDeletionVectors: true).");
+                    }
+
+                    // The post-images alone: the unchanged rows stay where they are.
+                    rowId = await WriteRewriteGroupsAsync(
+                        snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
+                        assignRowIds, rowId, newVersion, rewriteActions, written, cancellationToken,
+                        removeSource: false).ConfigureAwait(false);
+
+                    var existing = addFile.DeletionVector is not null
+                        ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
+                        : DeletionVectorBitmap.Empty;
+                    var newDv = await dvWriter!.CreateAsync(
+                        existing.Union(DeletionVectors.DeletionVectorBuilder.SortedDistinct(changedPositions!), null),
+                        cancellationToken).ConfigureAwait(false);
+                    // The vector is ours; the file it masks is not: the re-add names live table data.
+                    written?.RecordDeletionVector(newDv);
+                    rewriteActions.Add(RemoveOf(addFile));
+                    rewriteActions.Add(addFile with
+                    {
+                        DeletionVector = newDv,
+                        DataChange = true,
+                        // The read skipped only the rows the existing vector hid, so the two give the physical count.
+                        Stats = StatsWithLooseBounds(addFile.GetStatsJson(), liveRows + existing.Count),
+                    });
+                    maskedPaths.Add(addFile.Path);
+                }
                 removedPaths.Add(addFile.Path);
 
                 if (!cdfEnabled)
