@@ -97,6 +97,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     private readonly WrittenFileLedger? _written;
     private readonly Stats.StatsColumnSelection? _statsSelection;
     private readonly bool _collectStats;
+    private readonly bool _tableAllowsShredding;
     private readonly List<RolledDataFile> _files = new();
 
     // The file being filled: its layout, rows and stats so far. Its Parquet writer is opened by the first row group.
@@ -115,10 +116,12 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     /// <param name="partitionDirectory">The file's Hive-style directory relative to the table root, or empty.</param>
     /// <param name="collectStats">Whether to collect per-file stats, over the batches <see cref="AddAsync"/> is
     /// given for them, under <paramref name="statsSelection"/>.</param>
+    /// <param name="tableAllowsShredding">Whether the table supports variant shredding, which a host's file needs
+    /// for variant bounds (EW's own shredded write is refused on a table that does not).</param>
     public RollingDataFileWriter(
         ITableFileSystem fs, IDataFileWriter? host, ParquetWriteOptions options, long targetFileSize,
         string partitionDirectory, WrittenFileLedger? written, bool collectStats,
-        Stats.StatsColumnSelection? statsSelection)
+        Stats.StatsColumnSelection? statsSelection, bool tableAllowsShredding)
     {
         _fs = fs;
         _host = host;
@@ -128,6 +131,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         _written = written;
         _collectStats = collectStats;
         _statsSelection = statsSelection;
+        _tableAllowsShredding = tableAllowsShredding;
     }
 
     /// <summary>
@@ -249,6 +253,13 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             ClearPending();
             size = await _host.WriteAsync(batches.ToAsyncEnumerable(), fileName, cancellationToken)
                 .ConfigureAwait(false);
+            if (_fileStats is not null && _fileSchema is not null
+                && await Stats.VariantFooterStats.ReadFromWrittenFileAsync(
+                    _fs, fileName, _fileSchema, _tableAllowsShredding, StringPrefixLength, cancellationToken)
+                    .ConfigureAwait(false) is { } bounds)
+            {
+                _fileStats.AddVariantBounds(bounds);
+            }
         }
         else
         {
@@ -271,23 +282,18 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     /// Variant min/max for a file this writer shredded, from the footer it just wrote, as delta-spark derives them
     /// (see <see cref="Stats.VariantFooterStats"/>). Only a shredded file has paths to bound, and a shredded write
     /// is refused on a table that does not support variant shredding, so the protocol's gate (min/max only under
-    /// shredding) holds here without a check. A host writer's file has no footer here and gets nullCount only.
+    /// shredding) holds here without a check. A host writer's file is bounded from its footer read back
+    /// (<see cref="Stats.VariantFooterStats.ReadFromWrittenFileAsync"/>), where the check is made.
     /// </summary>
     private void AddVariantBounds(EngineeredWood.Parquet.Metadata.FileMetaData? footer)
     {
-        if (_fileStats is null || footer is null || _fileSchema is null)
+        if (_fileStats is null || footer is null || _fileSchema is null
+            || Stats.VariantFooterStats.VariantColumns(_fileSchema) is not { } variants)
             return;
-        List<string>? variants = null;
-        foreach (var field in _fileSchema.FieldsList)
-        {
-            if (field.DataType is VariantType)
-                (variants ??= []).Add(field.Name);
-        }
-        if (variants is null)
-            return;
-        _fileStats.AddVariantBounds(Stats.VariantFooterStats.Compute(
-            footer, variants, (_statsSelection ?? Stats.StatsColumnSelection.All).StringPrefixLength));
+        _fileStats.AddVariantBounds(Stats.VariantFooterStats.Compute(footer, variants, StringPrefixLength));
     }
+
+    private int StringPrefixLength => (_statsSelection ?? Stats.StatsColumnSelection.All).StringPrefixLength;
 
     private void ClearPending()
     {

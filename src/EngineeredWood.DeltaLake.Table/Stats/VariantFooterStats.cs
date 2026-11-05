@@ -37,6 +37,37 @@ internal static class VariantFooterStats
     /// <summary>delta-spark's suffix for a truncated string maximum: the largest code point.</summary>
     private const string MaxStringSuffix = "\U0010FFFF";
 
+    /// <summary>The top-level variant columns of a file's Arrow schema, by the name they have in the file;
+    /// null when it has none.</summary>
+    public static List<string>? VariantColumns(Apache.Arrow.Schema fileSchema)
+    {
+        List<string>? variants = null;
+        foreach (var field in fileSchema.FieldsList)
+        {
+            if (field.DataType is Apache.Arrow.VariantType)
+                (variants ??= []).Add(field.Name);
+        }
+        return variants;
+    }
+
+    /// <summary>
+    /// The bounds of a file whose footer EW did not see (a host <see cref="IDataFileWriter"/>'s), from the footer
+    /// read back once the file is written. Delta allows variant bounds only on a table that supports shredding
+    /// (<paramref name="tableAllowsShredding"/>), and EW does not refuse a host's shredded file on a table that does
+    /// not, so the check is made here. Nothing is read when the file has no variant column.
+    /// </summary>
+    public static async ValueTask<Dictionary<string, (string Min, string Max)>?> ReadFromWrittenFileAsync(
+        EngineeredWood.IO.ITableFileSystem fs, string path, Apache.Arrow.Schema fileSchema, bool tableAllowsShredding,
+        int stringPrefixLength, CancellationToken cancellationToken)
+    {
+        if (!tableAllowsShredding || VariantColumns(fileSchema) is not { } variants)
+            return null;
+        await using var file = await fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        return Compute(footer, variants, stringPrefixLength);
+    }
+
     /// <summary>
     /// The Z85 bounds of each of <paramref name="variantColumns"/> that has at least one bounded path in
     /// <paramref name="footer"/>; a column with none is absent.

@@ -7027,7 +7027,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             IReadOnlyList<RolledDataFile> files;
             await using (var writer = new RollingDataFileWriter(
                 _fs, _options.DataFileWriter, DataFileWriteOptions(snapshot), _options.TargetFileSize,
-                BuildPartitionPath(trackedPartValues), written, collectStats, statsSelection))
+                BuildPartitionPath(trackedPartValues), written, collectStats, statsSelection,
+                VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration)))
             {
                 foreach (var dataBatch in group.Batches)
                 {
@@ -8069,7 +8070,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             IReadOnlyList<RolledDataFile> rolled;
             await using (var writer = new RollingDataFileWriter(
                 _fs, _options.DataFileWriter, DataFileWriteOptions(writeSchema, mappingMode, snapshot), _options.TargetFileSize,
-                BuildPartitionPath(trackedPartValues), written: null, _options.CollectStats, statsSelection))
+                BuildPartitionPath(trackedPartValues), written: null, _options.CollectStats, statsSelection,
+                VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration)))
             {
                 foreach (var splitBatch in group.Batches)
                 {
@@ -9893,11 +9895,26 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             writeBatches.Add(physicalBatch);
         }
 
+        var statsSelection = StatsSelection(snapshot.Schema, snapshot.Metadata);
+        var fileStats = new Stats.StatsCollector.Accumulator(statsSelection);
+        foreach (var batch in statsBatches)
+            fileStats.Add(batch);
+        // Variant bounds come from the written file's footer, as the append path takes them (#675): from the
+        // footer EW just wrote, or read back from a host writer's file.
+        var fileSchema = writeBatches[0].Schema;
+
         long fileSize;
         if (_options.DataFileWriter is { } rewriteWriter)
         {
             fileSize = await rewriteWriter.WriteAsync(
                 writeBatches.ToAsyncEnumerable(), newFileName, cancellationToken).ConfigureAwait(false);
+            if (await Stats.VariantFooterStats.ReadFromWrittenFileAsync(
+                    _fs, newFileName, fileSchema,
+                    VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration),
+                    statsSelection.StringPrefixLength, cancellationToken).ConfigureAwait(false) is { } bounds)
+            {
+                fileStats.AddVariantBounds(bounds);
+            }
         }
         else
         {
@@ -9909,6 +9926,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 await writer.WriteRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
             await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
             fileSize = file.Position;
+            if (writer.WrittenMetadata is { } footer
+                && Stats.VariantFooterStats.VariantColumns(fileSchema) is { } variants)
+            {
+                fileStats.AddVariantBounds(Stats.VariantFooterStats.Compute(
+                    footer, variants, statsSelection.StringPrefixLength));
+            }
         }
 
         var add = new AddFile
@@ -9918,8 +9941,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             Size = fileSize,
             ModificationTime = now,
             DataChange = true,
-            Stats = Stats.StatsCollector.Collect(
-                statsBatches, StatsSelection(snapshot.Schema, snapshot.Metadata)),
+            Stats = fileStats.Serialize(),
             BaseRowId = assignRowIds ? baseRowId : null,
             DefaultRowCommitVersion = assignRowIds ? newVersion : null,
         };

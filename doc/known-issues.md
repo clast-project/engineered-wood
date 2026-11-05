@@ -490,9 +490,13 @@ bounds and over Spark's. What is not done:
   default) and `spark.databricks.delta.stats.limitPerVariant` above its
   default of 0, which otherwise writes the empty object `{}`. EW's have no cap
   on the number of paths.
-- *Only top-level variant columns, and only files EW's own writer wrote.* A
-  host's `IDataFileWriter` returns no footer, so its files (like those
-  committed with `CommitDataFilesAsync`) get `nullCount` only.
+- *Only top-level variant columns, and only files whose footer EW can read.*
+  EW's own files take their bounds from the footer it writes, a host
+  `IDataFileWriter`'s from its footer read back after the write (one footer
+  read per file with a variant column, on a table that supports shredding).
+  Files committed with `CommitDataFilesAsync` or the transaction's
+  `StageDataFiles*` carry the host's stats, so they get `nullCount` only
+  unless the host supplies the bounds.
 - *Files a host writes are not inspected.* `CommitDataFilesAsync`, the
   transaction's `StageDataFiles*`, and an `IDataFileWriter` that ignores the
   parquet options can still commit a shredded file to a table that does not
