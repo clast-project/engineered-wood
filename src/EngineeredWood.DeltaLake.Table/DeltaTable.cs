@@ -4416,7 +4416,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 yield return (bound.Name, Resolve([bound.Name], schema.FieldsList));
                 break;
             default:
-                foreach (var child in Children(expression))
+                foreach (var child in ExpressionChildren(expression))
                 {
                     foreach (var resolved in ReferenceResolutions(child, schema))
                         yield return resolved;
@@ -4443,8 +4443,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
             return ReferenceResolution.Found;
         }
+    }
 
-        static IEnumerable<Expressions.Expression> Children(Expressions.Expression expression) => expression switch
+    /// <summary>The operands of <paramref name="expression"/>: none for a reference or a literal.</summary>
+    private static IEnumerable<Expressions.Expression> ExpressionChildren(Expressions.Expression expression) =>
+        expression switch
         {
             Expressions.AndPredicate and => and.Children,
             Expressions.OrPredicate or => or.Children,
@@ -4455,7 +4458,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             Expressions.FunctionCall call => call.Arguments,
             _ => [],
         };
-    }
 
     /// <summary>
     /// Deletes rows matching the predicate.

@@ -388,7 +388,12 @@ public sealed partial class DeltaTable
                             sourcelessUpdated += updateRows.Count;
                         var preimage = TakeRowsFromBatch(batch, updateRows);
                         var postimage = MergePostImage(
-                            preimage, isMatched ? TakeRowsFromBatch(src!, updateSources) : null, clause, snapshot);
+                            preimage,
+                            isMatched
+                                ? TakeRowsFromBatch(
+                                    clause.SourceColumns is { } read ? ProjectColumns(src!, read) : src!, updateSources)
+                                : null,
+                            clause, snapshot);
                         ThrowIfUpdaterChangedTypes(preimage, postimage, snapshot.Schema, "MERGE");
                         ThrowIfPartitionColumnsRetyped(postimage, snapshot, "MERGE");
                         postimage = PreparePostImage(
@@ -769,13 +774,21 @@ public sealed partial class DeltaTable
                     + $"cannot be converted to the column's type {declared.Type}.");
             }
 
+            // A value that reads no column is cast as itself, not as the column it evaluated to, so the cast sees a
+            // constant operand as Spark's does: its SpecialDatetimeValues rule reads `'epoch'` assigned to a DATE
+            // column as 1970-01-01, where the same word read from a row is CAST_INVALID_INPUT. Evaluating a
+            // constant again costs nothing; a value that reads a column is not evaluated twice.
             const string valueName = "__ew_assigned";
+            bool constant = !ReferenceResolutions(value, NoColumns.Schema).Any();
             var cast = new Expressions.FunctionCall(
                 "cast",
-                [new Expressions.UnboundReference(valueName),
+                [constant ? value : new Expressions.UnboundReference(valueName),
                  new Expressions.LiteralExpression(Expressions.LiteralValue.Of(castTo))]);
-            var batch = new RecordBatch(
-                new Apache.Arrow.Schema([new Field(valueName, array.Data.DataType, true)], null), [array], array.Length);
+            var batch = constant
+                ? pairs
+                : new RecordBatch(
+                    new Apache.Arrow.Schema([new Field(valueName, array.Data.DataType, true)], null), [array],
+                    array.Length);
             try
             {
                 array = RowEvaluator.EvaluateExpression(cast, batch);
@@ -785,8 +798,17 @@ public sealed partial class DeltaTable
             {
                 throw new DeltaFormatException(
                     DeltaTableErrorCodes.CastOverflowInTableWrite,
-                    $"MERGE: failed to write a value of Arrow type {batch.Column(0).Data.DataType.Name} into the "
+                    $"MERGE: failed to write a value of Arrow type {array.Data.DataType.Name} into the "
                     + $"{declared.Type} column '{column}' due to an overflow. {e.Message}",
+                    e);
+            }
+            catch (NotSupportedException e)
+            {
+                // Refused by the types alone -- an integer to BINARY, say -- so over no rows too, which is how the
+                // check before the scan sees it (RefuseUnanalyzableValue).
+                throw new ArgumentException(
+                    $"MERGE: the value assigned to column '{column}' is Arrow {array.Data.DataType.Name}, "
+                    + $"which cannot be converted to the column's type {declared.Type}: {e.Message}",
                     e);
             }
         }
@@ -1154,6 +1176,12 @@ public sealed partial class DeltaTable
 
         /// <summary>The keys of <see cref="Writes"/>, in the order the action names them.</summary>
         public IReadOnlyList<string> WrittenColumns { get; set; } = [];
+
+        /// <summary>
+        /// The source columns an update needs gathered for its rows: those it copies, and those whose names its
+        /// assigned values read. Null for all of them. Set by <see cref="MergePlan.Resolve"/>.
+        /// </summary>
+        public IReadOnlyList<string>? SourceColumns { get; set; }
     }
 
     /// <summary>The MERGE options, checked against the table.</summary>
@@ -1193,6 +1221,11 @@ public sealed partial class DeltaTable
             UpdatedColumns = Matched.Concat(NotMatchedBySource).SelectMany(c => c.WrittenColumns)
                 .Distinct(StringComparer.Ordinal).ToList();
             InsertedColumns = NotMatched.SelectMany(c => c.WrittenColumns).Distinct(StringComparer.Ordinal).ToList();
+            if (source is not null)
+            {
+                foreach (var clause in Matched.Where(c => c.Kind == MergeActionKind.Update))
+                    clause.SourceColumns = SourceColumnsRead(clause.Writes, source.Schema, Keys);
+            }
         }
 
         // A `*` action takes every table column from the source, and Spark refuses one whose source lacks any
@@ -1244,11 +1277,52 @@ public sealed partial class DeltaTable
             clause.WrittenColumns = order;
         }
 
+        // Keeping every source column a value names, at any level of any reference, keeps how each of its
+        // references resolves: a dropped column is one no reference names, so it can neither be read nor be the
+        // reason a bare name is hidden. The keys stay too, so that the source keeps a column (Arrow has no empty
+        // struct) even for values that read none.
+        private static List<string>? SourceColumnsRead(
+            IReadOnlyDictionary<string, Expressions.Expression?> writes, Apache.Arrow.Schema source,
+            IReadOnlyList<string> keys)
+        {
+            var named = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var value in writes.Values)
+            {
+                if (value is not null && !AddNames(value, named))
+                    return null;
+            }
+            return source.FieldsList.Select(f => f.Name)
+                .Where(n => (writes.TryGetValue(n, out var value) && value is null) || named.Contains(n)
+                    || keys.Contains(n, StringComparer.Ordinal))
+                .ToList();
+
+            // False for an expression of a kind it cannot see into.
+            static bool AddNames(Expressions.Expression expression, HashSet<string> names)
+            {
+                switch (expression)
+                {
+                    case Expressions.UnboundReference reference:
+                        names.UnionWith(reference.NameParts);
+                        return true;
+                    case Expressions.BoundReference bound:
+                        names.Add(bound.Name);
+                        return true;
+                    case Expressions.LiteralExpression or Expressions.TruePredicate or Expressions.FalsePredicate:
+                        return true;
+                    case Expressions.FunctionCall or Expressions.AndPredicate or Expressions.OrPredicate
+                        or Expressions.NotPredicate or Expressions.ComparisonPredicate or Expressions.UnaryPredicate
+                        or Expressions.SetPredicate:
+                        return ExpressionChildren(expression).All(child => AddNames(child, names));
+                    default:
+                        return false;
+                }
+            }
+        }
+
         private static string TableColumn(string name, Schema.StructType schema, string verb)
         {
-            var exact = schema.Fields.FirstOrDefault(f => string.Equals(f.Name, name, StringComparison.Ordinal));
-            if (exact is not null)
-                return exact.Name;
+            // No exact-match shortcut: in a table with both `a` and `A` (a schema Spark refuses to write, but one
+            // written elsewhere opens), `a` is ambiguous, as a reference to it in an expression is.
             var folded = schema.Fields.Where(f => string.Equals(f.Name, name, StringComparison.OrdinalIgnoreCase))
                 .ToList();
             if (folded.Count == 1)

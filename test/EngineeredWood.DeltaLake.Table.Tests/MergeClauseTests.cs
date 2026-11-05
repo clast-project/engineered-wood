@@ -381,6 +381,10 @@ public class MergeClauseTests : IDisposable
     [InlineData("f", "'1.5'", "1.5")]
     [InlineData("i", "NULL", "")]
     [InlineData("s", "NULL", "")]
+    // A constant cast to DATE reads Spark's special words (its SpecialDatetimeValues rule): measured, Spark 4.0 sets
+    // both to 1970-01-01.
+    [InlineData("d", "'epoch'", "1970-01-01")]
+    [InlineData("d", "concat('epo', 'ch')", "1970-01-01")]
     public async Task AnAssignedValue_IsCastToTheColumnsType(string column, string value, string expected)
     {
         await using var table = await CreateTypedAsync();
@@ -434,6 +438,130 @@ public class MergeClauseTests : IDisposable
         }).AsTask());
 
         Assert.Equal("CAST_INVALID_INPUT", e.ErrorClass);
+    }
+
+    [Fact]
+    public async Task ASpecialDateWordReadFromARow_IsCastInvalidInput()
+    {
+        // Measured: Spark folds 'epoch' only in a constant; from the source row it is malformed.
+        await using var table = await CreateTypedAsync();
+        var source = new RecordBatch(
+            new Apache.Arrow.Schema.Builder()
+                .Field(new Field("id", Int32Type.Default, true)).Field(new Field("s", StringType.Default, true)).Build(),
+            [new Int32Array.Builder().Append(1).Build(), new StringArray.Builder().Append("epoch").Build()], 1);
+
+        var e = await Assert.ThrowsAsync<SparkEvaluationException>(() => table.MergeAsync([source], new MergeOptions
+        {
+            Keys = ["id"], WhenMatched = [MergeAction.UpdateSet(("d", E("source.s")))],
+        }).AsTask());
+
+        Assert.Equal("CAST_INVALID_INPUT", e.ErrorClass);
+    }
+
+    [Fact]
+    public async Task AnInsertedSpecialDateWord_IsFolded()
+    {
+        await using var table = await CreateTypedAsync();
+
+        await table.MergeAsync([IdOnly(2)], new MergeOptions
+        {
+            Keys = ["id"], WhenNotMatched = [MergeAction.InsertValues(("id", E("source.id")), ("d", E("'epoch'")))],
+        });
+
+        var dates = new List<string>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var ids = (Int32Array)batch.Column("id");
+            var d = (Date32Array)batch.Column("d");
+            for (int i = 0; i < batch.Length; i++)
+            {
+                if (ids.GetValue(i) == 2)
+                    dates.Add(d.GetDateTime(i)!.Value.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture));
+            }
+        }
+        Assert.Equal(["1970-01-01"], dates);
+    }
+
+    /// <summary>
+    /// Spark refuses <c>SET bin = 1</c> at analysis (DATATYPE_MISMATCH.CAST_WITH_CONF_SUGGESTION: no ANSI cast from
+    /// INT to BINARY), so no row need reach the clause: measured with a source that matches nothing and an insert
+    /// that would otherwise commit.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(99)]
+    public async Task AValueOfATypeTheColumnCannotBeCastFrom_IsRefusedBeforeAnyRowIsRead(int id)
+    {
+        await using var table = await CreateTypedAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        var e = await Assert.ThrowsAsync<ArgumentException>(() => table.MergeAsync([IdOnly(id)], new MergeOptions
+        {
+            Keys = ["id"],
+            WhenMatched = [MergeAction.UpdateSet(("bin", E("1")))],
+            WhenNotMatched = [MergeAction.InsertValues(("id", E("source.id")))],
+        }).AsTask());
+
+        Assert.Contains("'bin'", e.Message);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Theory]
+    [InlineData("a")]
+    [InlineData("A")]
+    public async Task AnAssignmentToACaseAmbiguousColumn_IsRefused(string name)
+    {
+        // A schema Spark will not write, but one written elsewhere opens; `a` names both columns, exact match or not.
+        var fs = new LocalTableFileSystem(_tempDir);
+        const string schema = """
+            {"type":"struct","fields":[
+              {"name":"id","type":"long","nullable":true,"metadata":{}},
+              {"name":"a","type":"long","nullable":true,"metadata":{}},
+              {"name":"A","type":"long","nullable":true,"metadata":{}}]}
+            """;
+        await new TransactionLog(fs).WriteCommitAsync(0, new List<DeltaAction>
+        {
+            new ProtocolAction { MinReaderVersion = 1, MinWriterVersion = 2 },
+            new MetadataAction { Id = "case-collision", Format = Format.Parquet, SchemaString = schema, PartitionColumns = [] },
+        });
+        await using var table = await DeltaTable.OpenAsync(fs);
+        var source = new RecordBatch(
+            new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, true)).Build(),
+            [new Int64Array.Builder().Append(1).Build()], 1);
+
+        var e = await Assert.ThrowsAsync<DeltaFormatException>(() => table.MergeAsync([source], new MergeOptions
+        {
+            Keys = ["id"], WhenMatched = [MergeAction.UpdateSet((name, E("1")))],
+        }).AsTask());
+
+        Assert.Equal(DeltaTableErrorCodes.AmbiguousReference, e.ErrorCode);
+        Assert.Equal(0, table.CurrentSnapshot.Version);
+    }
+
+    /// <summary>
+    /// An update gathers only the source columns it copies or its values name (and the keys); leaving the others
+    /// behind changes nothing it reads, a name in another case included.
+    /// </summary>
+    [Fact]
+    public async Task AnUpdate_ReadsTheSourceColumnsItNames_AmongOthersItDoesNot()
+    {
+        await using var table = await CreateAsync();
+        await table.WriteAsync([Rows((1, "a", 10), (2, "b", 20), (3, "c", 30))]);
+
+        await table.MergeAsync([Rows((1, "x", 11), (2, "y", 21), (3, "z", 31))], new MergeOptions
+        {
+            Keys = ["id"],
+            WhenMatched =
+            [
+                MergeAction.UpdateSet(("value", E("concat(upper(SOURCE.Value), '!')"))).When(P("target.id = 1")),
+                MergeAction.UpdateColumns("ts").When(P("target.id = 2")),
+                MergeAction.UpdateSet(("value", E("'k'"))),
+            ],
+        });
+
+        Assert.Equal(
+            [(1L, "X!", 10L), (2L, "b", 21L), (3L, "k", 30L)],
+            (await ReadAsync(table)).Select(r => (r.Id!.Value, r.Value, r.Ts!.Value)));
     }
 
     [Fact]
@@ -708,6 +836,7 @@ public class MergeClauseTests : IDisposable
         .Field(new Field("dec", new Decimal128Type(10, 2), true))
         .Field(new Field("b", BooleanType.Default, true))
         .Field(new Field("f", DoubleType.Default, true))
+        .Field(new Field("bin", BinaryType.Default, true))
         .Build();
 
     private async Task<DeltaTable> CreateTypedAsync()
@@ -723,6 +852,7 @@ public class MergeClauseTests : IDisposable
             new Decimal128Array.Builder(new Decimal128Type(10, 2)).Append(1.00m).Build(),
             new BooleanArray.Builder().Append(false).Build(),
             new DoubleArray.Builder().Append(1.0).Build(),
+            new BinaryArray.Builder().Append((byte)1).Build(),
         ], 1)]);
         return table;
     }
