@@ -324,6 +324,10 @@ public sealed class OrcRowReader : IAsyncEnumerable<RecordBatch>
                 structs.ChildrenForEveryRow = structChildrenForEveryRow;
             if (columnReader is TimestampColumnReader timestamps)
                 timestamps.Configure(writerZone, legacy);
+            // From the encoding, not with DICTIONARY_DATA: a dictionary of empty strings has no bytes, so no
+            // such stream, and still has entries (#636).
+            if (columnReader is StringColumnReader strings && strings.ColumnId < stripeData.Footer.Columns.Count)
+                strings.SetDictionarySize((int)stripeData.Footer.Columns[strings.ColumnId].DictionarySize);
         }
 
         // Assign streams to column readers
@@ -417,13 +421,7 @@ public sealed class OrcRowReader : IAsyncEnumerable<RecordBatch>
                 if (streamKind == Proto.Stream.Types.Kind.Present) sc.SetPresentStream(stream);
                 else if (streamKind == Proto.Stream.Types.Kind.Data) sc.SetDataStream(stream);
                 else if (streamKind == Proto.Stream.Types.Kind.Length) sc.SetLengthStream(stream);
-                else if (streamKind == Proto.Stream.Types.Kind.DictionaryData)
-                {
-                    sc.SetDictionaryDataStream(stream);
-                    // Set dictionary size from column encoding
-                    if (columnId < footer.Columns.Count)
-                        sc.SetDictionarySize((int)footer.Columns[columnId].DictionarySize);
-                }
+                else if (streamKind == Proto.Stream.Types.Kind.DictionaryData) sc.SetDictionaryDataStream(stream);
                 break;
 
             case BinaryColumnReader bc:

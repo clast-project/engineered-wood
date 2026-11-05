@@ -100,10 +100,12 @@ internal sealed class TimestampColumnReader : ColumnReader
             if (nonNullCount > 0)
             {
                 if (_dataDecoderV2 != null) _dataDecoderV2.ReadValues(seconds);
-                else _dataDecoderV1?.ReadValues(seconds);
+                else if (_dataDecoderV1 != null) _dataDecoderV1.ReadValues(seconds);
+                else throw MissingStream("timestamp", "DATA");
 
                 if (_secondaryDecoderV2 != null) _secondaryDecoderV2.ReadValues(nanos);
-                else _secondaryDecoderV1?.ReadValues(nanos);
+                else if (_secondaryDecoderV1 != null) _secondaryDecoderV1.ReadValues(nanos);
+                else throw MissingStream("timestamp", "SECONDARY");
             }
 
             string? tz = _isInstant ? "UTC" : null;

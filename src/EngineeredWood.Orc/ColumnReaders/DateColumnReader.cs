@@ -44,7 +44,8 @@ internal sealed class DateColumnReader : ColumnReader
             if (nonNullCount > 0)
             {
                 if (_decoderV2 != null) _decoderV2.ReadValues(rawValues);
-                else _decoderV1?.ReadValues(rawValues);
+                else if (_decoderV1 != null) _decoderV1.ReadValues(rawValues);
+                else throw MissingStream("date", "DATA");
             }
 
             using var buf = new NativeBuffer<int>(batchSize, zeroFill: nullCount > 0);

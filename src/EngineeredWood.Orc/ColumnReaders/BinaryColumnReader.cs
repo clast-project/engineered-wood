@@ -46,7 +46,8 @@ internal sealed class BinaryColumnReader : ColumnReader
             if (nonNullCount > 0)
             {
                 if (_lengthDecoderV2 != null) _lengthDecoderV2.ReadValues(lengths);
-                else _lengthDecoderV1?.ReadValues(lengths);
+                else if (_lengthDecoderV1 != null) _lengthDecoderV1.ReadValues(lengths);
+                else throw MissingStream("binary", "LENGTH");
             }
 
             // Compute total bytes and offsets
@@ -69,8 +70,13 @@ internal sealed class BinaryColumnReader : ColumnReader
 
             // Read all binary data contiguously
             using var dataBuf = new NativeBuffer<byte>(currentOffset > 0 ? currentOffset : 1, zeroFill: false);
-            if (currentOffset > 0 && _dataStream != null)
+            if (currentOffset > 0)
+            {
+                // Only values with bytes need DATA: a column of empty values may rightly have none.
+                if (_dataStream == null)
+                    throw MissingStream("binary", "DATA");
                 _dataStream.ReadExactly(dataBuf.Span.Slice(0, currentOffset));
+            }
 
             var nullBuffer = CreateValidityBuffer(present, batchSize);
             var arrayData = new ArrayData(Apache.Arrow.Types.BinaryType.Default, batchSize, nullCount, 0,

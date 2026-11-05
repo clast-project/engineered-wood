@@ -35,8 +35,12 @@ internal sealed class UnionColumnReader : ColumnReader
 
         // Read tags for non-null values
         var tags = new byte[nonNullCount];
-        if (nonNullCount > 0 && _tagDecoder != null)
+        if (nonNullCount > 0)
+        {
+            if (_tagDecoder == null)
+                throw MissingStream("union", "DATA");
             _tagDecoder.ReadValues(tags);
+        }
 
         // Expand tags to full batch size (nulls get tag 0)
         var fullTags = new byte[batchSize];

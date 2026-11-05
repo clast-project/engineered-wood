@@ -46,8 +46,10 @@ internal sealed class IntegerColumnReader : ColumnReader
             {
                 if (_decoderV2 != null)
                     _decoderV2.ReadValues(rawValues);
+                else if (_decoderV1 != null)
+                    _decoderV1.ReadValues(rawValues);
                 else
-                    _decoderV1?.ReadValues(rawValues);
+                    throw MissingStream("integer", "DATA");
             }
 
             return BuildArrowArray(rawValues, present, batchSize, nonNullCount);

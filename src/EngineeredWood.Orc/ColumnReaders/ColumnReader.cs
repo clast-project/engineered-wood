@@ -83,6 +83,14 @@ internal abstract class ColumnReader
         return _presentBuffer;
     }
 
+    /// <summary>
+    /// The error for a stream this column needs to read its values but the stripe does not have. A conforming
+    /// writer never leaves one out (even all-zero values take bytes to encode), so only a corrupt, truncated or
+    /// misassembled file gets here; reading on would return zeros or, from a pooled buffer, stale memory (#636).
+    /// </summary>
+    protected InvalidDataException MissingStream(string type, string stream) =>
+        new($"ORC {type} column {ColumnId} has values but no {stream} stream.");
+
     protected static int CountNonNull(bool[]? present, int batchSize)
     {
         if (present == null) return batchSize;
