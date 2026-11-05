@@ -241,6 +241,17 @@ public static class DeltaTableErrorCodes
     public const string MergeIncompatibleDataType = "DELTA_MERGE_INCOMPATIBLE_DATATYPE";
 
     /// <summary>
+    /// A MERGE without <see cref="MergeOptions.MergeSchema"/> writes a struct whose field names differ from its
+    /// column's (a field missing, extra or renamed), at any depth: a struct field, an array element, a map key or
+    /// value. Refused before anything is written, even when no row reaches the clause. Fields that only come in
+    /// another order are matched by name.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_UPDATE_SCHEMA_MISMATCH_EXPRESSION</c> — "Cannot cast &lt;fromType&gt; to
+    /// &lt;toType&gt;. All nested columns must match.", measured on Spark 4.0 / Delta 4.0 for every such MERGE
+    /// clause.</remarks>
+    public const string UpdateSchemaMismatchExpression = "DELTA_UPDATE_SCHEMA_MISMATCH_EXPRESSION";
+
+    /// <summary>
     /// A <c>mergeSchema</c> write would need a change this library's merge does not make: a new field, or a
     /// widening, inside an array element or a map key or value. Nothing is written.
     /// </summary>

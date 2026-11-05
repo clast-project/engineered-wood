@@ -76,11 +76,15 @@ public class StaleHandleAcrossLogCleanupTests : IDisposable
         return await IdsAsync(fresh);
     }
 
-    private async Task CreateAsync(string retention)
+    /// <param name="cleanUpLog">False sets <c>delta.enableExpiredLogCleanup = false</c>, so a checkpoint removes no
+    /// commit on its own: under the one-second retention which commits it would remove depends on how fast the
+    /// machine wrote them.</param>
+    private async Task CreateAsync(string retention, bool cleanUpLog = true)
     {
-        await using var writer = await DeltaTable.CreateAsync(
-            Fs, TableSchema, Options,
-            configuration: new Dictionary<string, string> { ["delta.logRetentionDuration"] = retention });
+        var configuration = new Dictionary<string, string> { ["delta.logRetentionDuration"] = retention };
+        if (!cleanUpLog)
+            configuration["delta.enableExpiredLogCleanup"] = "false";
+        await using var writer = await DeltaTable.CreateAsync(Fs, TableSchema, Options, configuration: configuration);
         for (long i = 1; i <= 9; i++)
             await writer.WriteAsync([Rows(i)]);                                             // v1..v9
     }
@@ -310,7 +314,9 @@ public class StaleHandleAcrossLogCleanupTests : IDisposable
     [Fact]
     public async Task Refresh_WhenCleanupDeletesAListedCommitMidReplay_BuildsFromTheCheckpoint()
     {
-        await CreateAsync(ShortRetention);
+        // The race deletes the commits; the writer's checkpoint must not, or on a slow machine v10 has expired and
+        // is gone before the refresh lists, and the refresh never reads it (seen on CI, net472).
+        await CreateAsync(ShortRetention, cleanUpLog: false);
         var racing = new CleanupMidReplayFileSystem(Fs, firstRead: 10, deleteBelow: 19, LogDir);
         await using var stale = await DeltaTable.OpenAsync(racing, Options);
         await using (var writer = await DeltaTable.OpenAsync(Fs, Options))
