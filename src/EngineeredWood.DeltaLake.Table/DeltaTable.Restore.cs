@@ -462,14 +462,31 @@ public sealed partial class DeltaTable
     /// The table configuration as of the newest of <paramref name="commits"/> or later: the handle's own when it is
     /// that current, else that of a snapshot brought up to date for the purpose (the handle does not move).
     /// </summary>
-    /// <remarks>A later configuration than the listing's is harmless: one that turns in-commit timestamps off makes the
-    /// caller walk, and one that turns them on past the listing leaves it no commit to search.</remarks>
+    /// <remarks>
+    /// <para>A later configuration than the listing's is harmless: one that turns in-commit timestamps off makes the
+    /// caller walk, and one that turns them on past the listing leaves it no commit to search.</para>
+    ///
+    /// <para><b>Incrementally where it can, from a checkpoint where it must</b> (#690 review). The incremental update
+    /// is the cheap path, but it refuses a gap after the handle's version, which is what log cleanup leaves once a
+    /// checkpoint covers the commits it removed. That table is still readable, so time travel on it must not fail
+    /// because this handle predates the cleanup: the latest snapshot is then built from the checkpoint.</para>
+    /// </remarks>
     private async ValueTask<IReadOnlyDictionary<string, string>?> LatestConfigurationAsync(
         List<(long Version, long Modified)> commits, CancellationToken cancellationToken)
     {
         var snapshot = CurrentSnapshot;
-        if (commits.Count > 0 && commits[commits.Count - 1].Version > snapshot.Version)
+        if (commits.Count == 0 || commits[commits.Count - 1].Version <= snapshot.Version)
+            return snapshot.Metadata.Configuration;
+
+        try
+        {
             snapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DeltaFormatException ex) when (ex.ErrorCode == DeltaErrorCodes.TruncatedTransactionLog)
+        {
+            snapshot = await SnapshotBuilder.BuildAsync(_log, _checkpointReader, atVersion: null, cancellationToken)
+                .ConfigureAwait(false);
+        }
         return snapshot.Metadata.Configuration;
     }
 

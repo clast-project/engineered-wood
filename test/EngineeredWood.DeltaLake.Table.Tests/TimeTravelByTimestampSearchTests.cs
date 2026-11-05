@@ -263,6 +263,35 @@ public class TimeTravelByTimestampSearchTests : IDisposable
     }
 
     /// <summary>
+    /// #690 review: a handle opened before log cleanup removed the commits after its version, which a checkpoint now
+    /// covers. The table is still readable, so time travel through that handle must still resolve, taking the latest
+    /// configuration from the checkpoint where an incremental update would refuse the gap.
+    /// </summary>
+    [Fact]
+    public async Task StaleHandle_AfterLogCleanupPastItsVersion_StillResolves()
+    {
+        const int opened = 10, count = 20;
+        await WriteTableAsync(opened, ictFrom: 0);
+        await using var stale = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+
+        var log = new TransactionLog(new LocalTableFileSystem(_tempDir));
+        for (int v = opened; v < count; v++)
+            await log.WriteCommitAsync(v, CommitActions(v, ictFrom: 0));
+        await using (var writer = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir)))
+            Assert.Equal(count - 1, await writer.CheckpointAsync());
+        for (int v = opened; v < count - 1; v++)
+            File.Delete(Path.Combine(_tempDir, "_delta_log", $"{v:D20}.json"));
+
+        Assert.Equal(opened - 1, stale.CurrentSnapshot.Version);
+        var early = await stale.GetSnapshotAtTimestampAsync(DateTimeOffset.FromUnixTimeMilliseconds(TimestampOf(5) + 1));
+        Assert.Equal(5, early.Version);
+        var latest = await stale.GetSnapshotAtTimestampAsync(
+            DateTimeOffset.FromUnixTimeMilliseconds(TimestampOf(count - 1) + 1));
+        Assert.Equal(count - 1, latest.Version);
+        Assert.Equal(opened - 1, stale.CurrentSnapshot.Version);
+    }
+
+    /// <summary>
     /// The point of #662: on an in-commit-timestamp table, resolving a timestamp reads O(log N) commits beyond what
     /// building the snapshot at the answer reads, where the walk reads every commit up to the answer.
     /// </summary>
