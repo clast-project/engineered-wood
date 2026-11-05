@@ -392,13 +392,25 @@ public class MergeSchemaEvolutionTests : IDisposable
         Assert.Equal(["id=1, v=x, w=7", "id=2, v=b, w=8", "id=3, v=z, w=null"], await RowsAsync(table));
     }
 
-    [Fact]
-    public async Task WithoutMergeSchema_ATableColumnTheSourceLacks_IsRefusedByAnUpsert()
+    /// <summary>Measured: without autoMerge Spark refuses <c>UPDATE SET *</c> and <c>INSERT *</c> alike when the source
+    /// lacks a table column, even when no row reaches the clause.</summary>
+    [Theory]
+    [InlineData(true, "UPDATE SET *")]
+    [InlineData(false, "INSERT *")]
+    public async Task WithoutMergeSchema_ATableColumnTheSourceLacks_IsRefusedByAnUpdateOrInsertOfEveryColumn(
+        bool update, string star)
     {
         await using var table = await CreateAsync();
+        long before = table.CurrentSnapshot.Version;
 
-        await Assert.ThrowsAsync<ArgumentException>(() => table.MergeAsync(
-            [Batch(("id", Ints(1, 3)))], Upsert(mergeSchema: false)).AsTask());
+        var e = await Assert.ThrowsAsync<ArgumentException>(() => table.MergeAsync(
+            [Batch(("id", Ints(9)))],
+            update
+                ? new MergeOptions { Keys = ["id"], WhenMatched = [MergeAction.Update] }
+                : new MergeOptions { Keys = ["id"], WhenNotMatched = [MergeAction.Insert] }).AsTask());
+
+        Assert.Contains($"{star} takes every column of the table from the source, which has no 'v'", e.Message);
+        Assert.Equal(before, table.CurrentSnapshot.Version);
     }
 
     // ── Struct columns ──
