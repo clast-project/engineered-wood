@@ -336,6 +336,9 @@ public class VariantShreddingWriterTests : IDisposable
             new ParquetReadOptions { ExtensionRegistry = VariantRegistry() }))
         {
             batch = await reader.ReadRowGroupAsync(0);
+            // The schema-only API reports what a batch carries, storage included (it is the only way to see the
+            // schema of a file with no row groups).
+            Assert.Equal(Describe(batch.Schema), Describe(await reader.GetArrowSchemaAsync()));
         }
 
         var fieldType = Assert.IsAssignableFrom<ExtensionType>(batch.Schema.FieldsList[0].DataType);
@@ -350,4 +353,52 @@ public class VariantShreddingWriterTests : IDisposable
             Assert.Equal([Json(Obj(1, "x")), Json(Obj(2, "y"))], values.Select(Json));
         }
     }
+
+    /// <summary>
+    /// The schema-only API and a batch agree for a shredded and an unshredded file, a variant nested in a struct and a
+    /// list included. An unshredded variant keeps the type its file declares; a shredded one reads back reassembled.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task TheArrowSchema_IsWhatABatchCarries(bool shredded)
+    {
+        var options = shredded ? ParquetWriteOptions.Default with { ShredVariants = ShredOptions.Default } : ParquetWriteOptions.Default;
+        var top = Batch(Obj(1, "x"), Obj(2, "y"));
+        var variant = top.Column(0);
+        var inStruct = new StructArray(new StructType([new Field("v", variant.Data.DataType, true)]), 2, [variant], ArrowBuffer.Empty, 0);
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(1).Append(2).Build();
+        var inList = new ListArray(new ListType(new Field("item", variant.Data.DataType, true)), 2, offsets, variant, ArrowBuffer.Empty, 0);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(top.Schema.FieldsList[0])
+            .Field(new Field("s", inStruct.Data.DataType, true))
+            .Field(new Field("l", inList.Data.DataType, true))
+            .Build();
+        string path = await WriteAsync(options, new RecordBatch(schema, [variant, inStruct, inList], 2));
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false,
+            new ParquetReadOptions { ExtensionRegistry = VariantRegistry() });
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.Equal(Describe(batch.Schema), Describe(await reader.GetArrowSchemaAsync()));
+        // and the batch's fields describe its arrays
+        for (int i = 0; i < batch.ColumnCount; i++)
+            Assert.Equal(Describe(batch.Schema.FieldsList[i].DataType), Describe(batch.Column(i).Data.DataType));
+    }
+
+    /// <summary>A schema with every type spelled out, an extension's storage included: <c>ToString</c> shows neither
+    /// the storage nor nullability, so it cannot tell a shredded variant from a reassembled one.</summary>
+    private static string Describe(Apache.Arrow.Schema schema) => string.Join(", ", schema.FieldsList.Select(Describe));
+
+    private static string Describe(Field field) => $"{field.Name}:{Describe(field.DataType)}{(field.IsNullable ? "" : " not null")}";
+
+    private static string Describe(IArrowType type) => type switch
+    {
+        ExtensionType e => $"{e.Name}<{Describe(e.StorageType)}>",
+        StructType s => $"struct<{string.Join(", ", s.Fields.Select(Describe))}>",
+        MapType m => $"map<{Describe(m.KeyField)}, {Describe(m.ValueField)}>",
+        ListType l => $"list<{Describe(l.ValueField)}>",
+        _ => type.TypeId.ToString(),
+    };
 }
