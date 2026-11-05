@@ -10,8 +10,10 @@ using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.Checkpoint;
 using EngineeredWood.DeltaLake.Log;
+using EngineeredWood.DeltaLake.Table.Stats;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
+using EngineeredWood.Parquet.Metadata;
 using ParquetLogicalType = EngineeredWood.Parquet.Metadata.LogicalType;
 
 namespace EngineeredWood.DeltaLake.Table.Tests;
@@ -486,5 +488,277 @@ public class VariantStatisticsTests : IDisposable
         }
         var unknown = Stats.VariantFooterStats.Compute(footer, ["v"], stringPrefixLength: 32);
         Assert.Equal(["$['a']"], Decode(JsonSerializer.SerializeToElement(unknown["v"].Min)).Keys);
+    }
+
+    // Files EW did not write with its own appending writer: a host IDataFileWriter's, and the files a copy-on-write
+    // DML rewrites. Each is bounded from its footer as EW's appended files are, on a table that supports shredding.
+
+    /// <summary>
+    /// A host writer with its own codec, as EW sees one: it is handed the batches and returns a size, and EW never
+    /// sees the footer. It writes with EW's Parquet writer under <paramref name="options"/>, which decide whether
+    /// it shreds.
+    /// </summary>
+    private sealed class HostWriter(EngineeredWood.IO.ITableFileSystem fs, ParquetWriteOptions options) : IDataFileWriter
+    {
+        public async ValueTask<long> WriteAsync(
+            IAsyncEnumerable<RecordBatch> batches, string relativePath, CancellationToken cancellationToken)
+        {
+            await using var file = await fs.CreateAsync(relativePath, cancellationToken: cancellationToken);
+            await using var writer = new ParquetFileWriter(file, ownsFile: false, options);
+            await foreach (var batch in batches.WithCancellation(cancellationToken))
+                await writer.WriteRowGroupAsync(batch, cancellationToken);
+            await writer.CloseAsync(cancellationToken);
+            return file.Position;
+        }
+    }
+
+    private static ParquetWriteOptions HostShreds =>
+        ParquetWriteOptions.Default with { ShredVariants = ShredOptions.Default };
+
+    /// <summary>EW's own shredding writer, or a host writer that shreds while EW's options shred nothing.</summary>
+    private static DeltaTableOptions Writer(EngineeredWood.IO.ITableFileSystem fs, bool host) =>
+        host ? DeltaTableOptions.Default with { DataFileWriter = new HostWriter(fs, HostShreds) } : Shredding();
+
+    private static VariantValue Row(int a, string b) =>
+        Obj(("a", VariantValue.FromInt32(a)), ("b", VariantValue.FromString(b)));
+
+    private static readonly VariantValue?[] ThreeRows = [Row(5, "x"), Row(-2, "y"), Row(9, "w")];
+
+    private static Func<RecordBatch, BooleanArray> IdIs(long id) => batch =>
+    {
+        var ids = (Int64Array)batch.Column("id");
+        var result = new BooleanArray.Builder();
+        for (int i = 0; i < ids.Length; i++)
+            result.Append(ids.GetValue(i) == id);
+        return result.Build();
+    };
+
+    private LocalTableFileSystem NewTableDir(string name)
+    {
+        string dir = Path.Combine(_tempDir, name);
+        Directory.CreateDirectory(dir);
+        return new LocalTableFileSystem(dir);
+    }
+
+    /// <summary>The stats of the single file the commit at <paramref name="version"/> added.</summary>
+    private static async Task<JsonElement> AddedStatsAsync(LocalTableFileSystem fs, long version)
+    {
+        var add = (await new TransactionLog(fs).ReadCommitAsync(version)).OfType<AddFile>().Single();
+        return JsonDocument.Parse(add.Stats!).RootElement.Clone();
+    }
+
+    private static void AssertBounds(JsonElement stats, (int A, string B) min, (int A, string B) max)
+    {
+        var (lo, hi) = Bounds(stats);
+        Assert.Equal(new Dictionary<string, string> { ["$['a']"] = $"{min.A}", ["$['b']"] = $"\"{min.B}\"" }, lo);
+        Assert.Equal(new Dictionary<string, string> { ["$['a']"] = $"{max.A}", ["$['b']"] = $"\"{max.B}\"" }, hi);
+    }
+
+    private static void AssertNoBounds(JsonElement stats)
+    {
+        Assert.False(stats.GetProperty("minValues").TryGetProperty("v", out _));
+        Assert.False(stats.GetProperty("maxValues").TryGetProperty("v", out _));
+    }
+
+    [Fact]
+    public async Task HostWrittenShreddedFile_GetsTheBoundsEwsOwnFileGets()
+    {
+        var ewFs = NewTableDir("ew");
+        await using (var table = await DeltaTable.CreateAsync(
+            ewFs, VariantSchema(), configuration: Enabled(), options: Writer(ewFs, host: false)))
+            await table.WriteAsync([Batch(ThreeRows)]);
+        var hostFs = NewTableDir("host");
+        await using (var table = await DeltaTable.CreateAsync(
+            hostFs, VariantSchema(), configuration: Enabled(), options: Writer(hostFs, host: true)))
+            await table.WriteAsync([Batch(ThreeRows)]);
+
+        var host = await AddedStatsAsync(hostFs, 1);
+        AssertBounds(host, (-2, "w"), (9, "y"));
+        // The same Z85 bounds, byte for byte, as EW's own file gets.
+        var ew = await AddedStatsAsync(ewFs, 1);
+        foreach (string side in new[] { "minValues", "maxValues" })
+            Assert.Equal(ew.GetProperty(side).GetProperty("v").GetString(), host.GetProperty(side).GetProperty("v").GetString());
+    }
+
+    [Fact]
+    public async Task HostWrittenShreddedFile_OnATableWithoutShredding_GetsNullCountOnly()
+    {
+        // The host shreds although the table does not allow it. EW does not inspect a host's files (that is the
+        // host's obligation), but it must not add bounds the protocol allows only under shredding.
+        var fs = NewTableDir("t");
+        await using (var table = await DeltaTable.CreateAsync(fs, VariantSchema(), options: Writer(fs, host: true)))
+            await table.WriteAsync([Batch(ThreeRows)]);
+
+        AssertNoBounds(await AddedStatsAsync(fs, 1));
+    }
+
+    [Fact]
+    public async Task HostWrittenUnshreddedFile_GetsNullCountOnly()
+    {
+        var fs = NewTableDir("t");
+        var options = DeltaTableOptions.Default with { DataFileWriter = new HostWriter(fs, ParquetWriteOptions.Default) };
+        await using (var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled(), options: options))
+            await table.WriteAsync([Batch(ThreeRows)]);
+
+        var stats = await AddedStatsAsync(fs, 1);
+        AssertNoBounds(stats);
+        Assert.Equal(0, stats.GetProperty("nullCount").GetProperty("v").GetInt64());
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CopyOnWriteDelete_BoundsTheRewrittenFile(bool host)
+    {
+        var fs = NewTableDir("t");
+        await using var table = await DeltaTable.CreateAsync(
+            fs, VariantSchema(), configuration: Enabled(), options: Writer(fs, host));
+        await table.WriteAsync([Batch(ThreeRows)]);
+
+        var (deleted, version) = await table.DeleteAsync(IdIs(0), RowDeleteMode.CopyOnWrite);
+
+        Assert.Equal(1, deleted);
+        AssertBounds(await AddedStatsAsync(fs, version), (-2, "w"), (9, "y"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CopyOnWriteUpdate_BoundsTheRewrittenFile(bool host)
+    {
+        var fs = NewTableDir("t");
+        await using var table = await DeltaTable.CreateAsync(
+            fs, VariantSchema(), configuration: Enabled(), options: Writer(fs, host));
+        await table.WriteAsync([Batch(ThreeRows)]);
+
+        var (updated, version) = await table.UpdateAsync(IdIs(0), batch =>
+        {
+            var vb = new VariantArray.Builder();
+            for (int i = 0; i < batch.Length; i++)
+                vb.Append(Row(100, "z"));
+            return new RecordBatch(batch.Schema, [batch.Column("id"), vb.Build(allocator: null)], batch.Length);
+        });
+
+        Assert.Equal(1, updated);
+        AssertBounds(await AddedStatsAsync(fs, version), (-2, "w"), (100, "z"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Compaction_BoundsTheCompactedFile(bool host)
+    {
+        var fs = NewTableDir("t");
+        await using var table = await DeltaTable.CreateAsync(
+            fs, VariantSchema(), configuration: Enabled(), options: Writer(fs, host));
+        await table.WriteAsync([Batch(Row(5, "x"), Row(-2, "y"))]);
+        await table.WriteAsync([Batch(Row(9, "w"))]);
+
+        long? version = await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+
+        Assert.NotNull(version);
+        AssertBounds(await AddedStatsAsync(fs, version!.Value), (-2, "w"), (9, "y"));
+    }
+
+    // ── A footer EW did not write (#695 review). A host IDataFileWriter's file is bounded from its footer read back,
+    // and the footer that matters is DuckDB's: the writer behind fabricator's IDataFileWriter. ──
+
+    /// <summary>
+    /// DuckDB 2.0's footer, from a file it wrote and shredded:
+    /// <c>COPY (SELECT {'a': i::INTEGER, 'b': repeat('x', 300) || i::VARCHAR, 'c': i * 0.5, 'd': (i * 0.25)::DOUBLE}::VARIANT
+    /// AS v FROM range(1, 4) t(i)) TO 'duckdb_shredded_variant.parquet' (FORMAT parquet)</c>. Its string statistics are
+    /// cut at 256 bytes with the max's last byte rounded up and <c>max_is_exact = false</c>; it writes
+    /// <c>column_orders</c>, the deprecated min/max beside min_value/max_value, and a NaN count for the double.
+    /// </summary>
+    private static async Task<FileMetaData> DuckDbFooterAsync()
+    {
+        string path = Path.Combine(AppContext.BaseDirectory, "TestData", "duckdb_shredded_variant.parquet");
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        return await reader.ReadMetadataAsync();
+    }
+
+    private static (Dictionary<string, string> Min, Dictionary<string, string> Max)? BoundsOf(FileMetaData footer)
+    {
+        var result = VariantFooterStats.Compute(footer, ["v"], stringPrefixLength: 32);
+        return result.TryGetValue("v", out var bounds)
+            ? (Decode(JsonDocument.Parse($"\"{bounds.Min}\"").RootElement), Decode(JsonDocument.Parse($"\"{bounds.Max}\"").RootElement))
+            : null;
+    }
+
+    /// <summary>The footer with each leaf column's statistics passed through <paramref name="change"/> (the
+    /// metadata types are init-only, so a test copies them).</summary>
+    private static FileMetaData WithStatistics(FileMetaData footer, Func<string, Statistics, Statistics> change) =>
+        Copy(footer, nameof(FileMetaData.RowGroups), footer.RowGroups.Select(rowGroup =>
+            Copy(rowGroup, nameof(RowGroup.Columns), rowGroup.Columns.Select(chunk =>
+                chunk.MetaData?.Statistics is not { } stats ? chunk
+                : Copy(chunk, nameof(ColumnChunk.MetaData), Copy(chunk.MetaData, nameof(ColumnMetaData.Statistics),
+                    change(string.Join(".", chunk.MetaData.PathInSchema!), stats)))).ToList())).ToList());
+
+    private static T Copy<T>(T value, string property, object? propertyValue)
+    {
+        var copy = (T)typeof(object).GetMethod("MemberwiseClone",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!.Invoke(value, null)!;
+        typeof(T).GetProperty(property)!.SetValue(copy, propertyValue);
+        return copy;
+    }
+
+    private static readonly string Xs = new('x', 32);
+
+    [Fact]
+    public async Task ADuckDbFooter_GetsBoundsThatHoldItsRows()
+    {
+        var (min, max) = BoundsOf(await DuckDbFooterAsync())!.Value;
+
+        Assert.Equal(new Dictionary<string, string>
+        {
+            ["$['a']"] = "1", ["$['b']"] = $"\"{Xs}\"", ["$['c']"] = "0.5", ["$['d']"] = "0.25",
+        }, min);
+        // the string max is DuckDB's inexact, rounded-up maximum cut to the prefix; a cut maximum continues with the
+        // largest code point (U+10FFFF, escaped in the JSON), so it stays above every value that starts with the prefix
+        Assert.Equal(new Dictionary<string, string>
+        {
+            ["$['a']"] = "3", ["$['b']"] = $"\"{Xs}\\uDBFF\\uDFFF\"", ["$['c']"] = "1.5", ["$['d']"] = "0.75",
+        }, max);
+    }
+
+    [Fact]
+    public async Task AStringMaxRoundedUpIntoInvalidUtf8_IsLeftOut_AndTheOtherPathsKeepTheirBounds()
+    {
+        // A writer that rounds the last kept byte up can turn 0x7F into 0x80, a continuation byte with nothing before
+        // it. DuckDB 2.0 avoids it (it cuts before such a byte), another writer may not.
+        byte[] invalid = [.. new byte[255].Select(_ => (byte)'x'), 0x80];
+        var footer = WithStatistics(await DuckDbFooterAsync(), (path, stats) =>
+            path == "v.typed_value.b.typed_value" ? Copy(stats, nameof(Statistics.MaxValue), invalid) : stats);
+
+        var (min, max) = BoundsOf(footer)!.Value;
+
+        Assert.Equal(["$['a']", "$['c']", "$['d']"], min.Keys.OrderBy(k => k, StringComparer.Ordinal));
+        Assert.Equal(["$['a']", "$['c']", "$['d']"], max.Keys.OrderBy(k => k, StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task OnlyTheDeprecatedMinMax_BoundsNumbers_AndNotStringsOrDecimals()
+    {
+        // The deprecated min/max were written under signed ordering, the right one only for numbers.
+        var footer = WithStatistics(await DuckDbFooterAsync(), (_, stats) =>
+            Copy(Copy(stats, nameof(Statistics.MinValue), null), nameof(Statistics.MaxValue), null));
+
+        var (min, max) = BoundsOf(footer)!.Value;
+
+        Assert.Equal(new Dictionary<string, string> { ["$['a']"] = "1", ["$['d']"] = "0.25" }, min);
+        Assert.Equal(new Dictionary<string, string> { ["$['a']"] = "3", ["$['d']"] = "0.75" }, max);
+    }
+
+    [Fact]
+    public async Task AColumnOrderEwDoesNotKnow_GivesNoBounds()
+    {
+        var footer = await DuckDbFooterAsync();
+        var unknown = Copy(footer, nameof(FileMetaData.ColumnOrders),
+            footer.ColumnOrders!.Select(_ => ColumnOrder.Undefined).ToList());
+
+        Assert.Null(BoundsOf(unknown));
+        // without the list EW reads statistics as type-defined, as everywhere else
+        Assert.Equal(BoundsOf(footer), BoundsOf(Copy(footer, nameof(FileMetaData.ColumnOrders), null)));
     }
 }
