@@ -127,6 +127,20 @@ internal sealed class ColumnPageMap
     }
 
     /// <summary>
+    /// Returns <see cref="Dictionary"/>'s arrays to the pool (#644). Call it once no page of this
+    /// chunk will be decoded again: a page decoded after it would resolve its indices against arrays
+    /// handed out again, so the dictionary throws instead.
+    /// </summary>
+    public void ReleaseDictionary() => Dictionary?.Dispose();
+
+    /// <summary>Releases the dictionary of every map that was built.</summary>
+    public static void ReleaseDictionaries(IEnumerable<ColumnPageMap?> maps)
+    {
+        foreach (var map in maps)
+            map?.ReleaseDictionary();
+    }
+
+    /// <summary>
     /// Finds the page index that contains the given row (0-based within the row group).
     /// </summary>
     public int FindPageForRow(int row)
@@ -177,56 +191,65 @@ internal static class PageMapBuilder
         var reader = new PageReader(data, column, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
         long valuesRead = 0;
 
-        while (valuesRead < columnMeta.NumValues && reader.TryRead(out var page))
+        try
         {
-            var pageHeader = page.Header;
-            var pageData = page.Payload;
-
-            try
+            while (valuesRead < columnMeta.NumValues && reader.TryRead(out var page))
             {
-                switch (pageHeader.Type)
+                var pageHeader = page.Header;
+                var pageData = page.Payload;
+
+                try
                 {
-                    case PageType.DictionaryPage:
-                        if (validateCrc)
-                            ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                        dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
-                        break;
-
-                    case PageType.SymbolTablePage:
-                        if (validateCrc)
-                            ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                        symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
-                        break;
-
-                    case PageType.DataPage:
-                    case PageType.DataPageV2:
+                    switch (pageHeader.Type)
                     {
-                        // As ColumnChunkReader.ReadColumn does: the map sizes the batch buffers, so a
-                        // page may not claim more values than the chunk's metadata has left.
-                        if (page.NumValues > columnMeta.NumValues - valuesRead)
-                            throw ColumnChunkReader.TooManyValues(column, page, columnMeta.NumValues - valuesRead);
+                        case PageType.DictionaryPage:
+                            if (validateCrc)
+                                ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
+                            dictionary?.Dispose(); // a second dictionary page replaces the first
+                            dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+                            break;
 
-                        var entry = EntryFromHeader(
-                            pageHeader, page.PayloadOffset, pageData, page.Ordinal, column, columnMeta);
-                        pages.Add(entry);
-                        valuesRead += entry.NumValues;
-                        break;
+                        case PageType.SymbolTablePage:
+                            if (validateCrc)
+                                ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
+                            symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                            break;
+
+                        case PageType.DataPage:
+                        case PageType.DataPageV2:
+                        {
+                            // As ColumnChunkReader.ReadColumn does: the map sizes the batch buffers, so a
+                            // page may not claim more values than the chunk's metadata has left.
+                            if (page.NumValues > columnMeta.NumValues - valuesRead)
+                                throw ColumnChunkReader.TooManyValues(column, page, columnMeta.NumValues - valuesRead);
+
+                            var entry = EntryFromHeader(
+                                pageHeader, page.PayloadOffset, pageData, page.Ordinal, column, columnMeta);
+                            pages.Add(entry);
+                            valuesRead += entry.NumValues;
+                            break;
+                        }
+
+                        default:
+                            // Skip index pages and unknown page types
+                            break;
                     }
-
-                    default:
-                        // Skip index pages and unknown page types
-                        break;
+                }
+                catch (Exception ex) when (ColumnChunkReader.IsDecodeFailure(ex))
+                {
+                    // A dictionary, or a V1 page of a repeated column, whose levels are read for its rows.
+                    throw ColumnChunkReader.UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
                 }
             }
-            catch (Exception ex) when (ColumnChunkReader.IsDecodeFailure(ex))
-            {
-                // A dictionary, or a V1 page of a repeated column, whose levels are read for its rows.
-                throw ColumnChunkReader.UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
-            }
-        }
 
-        if (valuesRead < columnMeta.NumValues)
-            throw ColumnChunkReader.TooFewValues(column, columnMeta.NumValues, valuesRead);
+            if (valuesRead < columnMeta.NumValues)
+                throw ColumnChunkReader.TooFewValues(column, columnMeta.NumValues, valuesRead);
+        }
+        catch
+        {
+            dictionary?.Dispose();
+            throw;
+        }
 
         var pagesArray = pages.ToArray();
         var cumulativeRows = new int[pagesArray.Length + 1];
@@ -384,6 +407,7 @@ internal static class PageMapBuilder
             catch (ParquetFormatException ex)
             {
                 unread = ex;
+                Discard(ref dictionary);
                 return false;
             }
 
@@ -397,6 +421,7 @@ internal static class PageMapBuilder
                     case PageType.DictionaryPage:
                         if (validateCrc)
                             ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
+                        dictionary?.Dispose(); // a second dictionary page replaces the first
                         dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
                         break;
                     case PageType.SymbolTablePage:
@@ -407,16 +432,26 @@ internal static class PageMapBuilder
                     case PageType.DataPage:
                     case PageType.DataPageV2:
                         // A data page the index does not list, whose rows the map would lose.
+                        Discard(ref dictionary);
                         return false;
                 }
             }
-            catch (Exception ex) when (ColumnChunkReader.IsDecodeFailure(ex))
+            catch (Exception ex)
             {
-                throw ColumnChunkReader.UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
+                Discard(ref dictionary);
+                if (ColumnChunkReader.IsDecodeFailure(ex))
+                    throw ColumnChunkReader.UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
+                throw;
             }
         }
 
         return true;
+
+        static void Discard(ref DictionaryDecoder? dictionary)
+        {
+            dictionary?.Dispose();
+            dictionary = null;
+        }
     }
 
     /// <summary>
