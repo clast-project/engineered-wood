@@ -3998,6 +3998,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (added.Count != ours.Length)
                 return null;
 
+            // Before the vector is written: a failed or cancelled read of the row count must leave no
+            // vector behind.
+            string? reAddStats = await VectorStatsAsync(latestAdd, cancellationToken).ConfigureAwait(false);
             var unionDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
             written?.RecordDeletionVector(unionDv);
 
@@ -4022,7 +4025,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = unionDv,
                 DataChange = true,
-                Stats = await VectorStatsAsync(latestAdd, cancellationToken).ConfigureAwait(false),
+                Stats = reAddStats,
             });
         }
 
@@ -4174,6 +4177,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var deleted = cand.DeletionVector is not null
                 ? await _dvReader.ReadAsync(cand.DeletionVector, cancellationToken).ConfigureAwait(false)
                 : DeletionVectorBitmap.Empty;
+            // Before the vector is written: a failed or cancelled read of the row count must leave no
+            // vector behind.
+            string? reAddStats = await VectorStatsAsync(cand, cancellationToken).ConfigureAwait(false);
             var newDv = await dvWriter.CreateAsync(deleted.Union(positions), cancellationToken)
                 .ConfigureAwait(false);
             written?.RecordDeletionVector(newDv);
@@ -4194,7 +4200,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
-                Stats = await VectorStatsAsync(cand, cancellationToken).ConfigureAwait(false),
+                Stats = reAddStats,
             });
         }
         return result;
@@ -9402,6 +9408,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             edits.Add(new DeleteDvEdit(addFile.Path, newRows));
             touched.Add(addFile.Path);
 
+            // Before the vector is written: a failed or cancelled read of the row count must leave no
+            // vector behind.
+            string? reAddStats = await VectorStatsAsync(addFile, cancellationToken).ConfigureAwait(false);
             var newDv = await dvWriter.CreateAsync(allDeleted, cancellationToken)
                 .ConfigureAwait(false);
             written?.RecordDeletionVector(newDv);
@@ -9422,7 +9431,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
-                Stats = await VectorStatsAsync(addFile, cancellationToken).ConfigureAwait(false),
+                Stats = reAddStats,
             });
         }
 
@@ -9547,6 +9556,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 continue;
             totalDeleted += newPositions.Count;
 
+            // Before the vector is written: a failed or cancelled read of the row count must leave no
+            // vector behind.
+            string? reAddStats = await VectorStatsAsync(addFile, cancellationToken).ConfigureAwait(false);
             var newDv = await dvWriter.CreateAsync(allDeleted, cancellationToken)
                 .ConfigureAwait(false);
             // The vector is ours; the file it masks is not — the re-add below names live table data.
@@ -9568,7 +9580,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
-                Stats = await VectorStatsAsync(addFile, cancellationToken).ConfigureAwait(false),
+                Stats = reAddStats,
             });
             removedPaths.Add(addFile.Path);
             dvEdits.Add(new DeleteDvEdit(addFile.Path, newPositions));
@@ -11044,12 +11056,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                             $"row-level conflict on file '{add.Path}': {overlap} row(s) this transaction "
                             + "deletes/updates were concurrently deleted or updated — retry the transaction");
                     }
+                    // Before the vector is written: a failed or cancelled read of the row count must leave no
+                    // vector behind.
+                    string? reAddStats = await VectorStatsAsync(current, cancellationToken).ConfigureAwait(false);
                     var newDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
                     rebased.Add(current with
                     {
                         DeletionVector = newDv,
                         DataChange = true,
-                        Stats = await VectorStatsAsync(current, cancellationToken).ConfigureAwait(false),
+                        Stats = reAddStats,
                     });
                     break;
                 }

@@ -175,16 +175,37 @@ public class DeletionVectorRowCountTests : IDisposable
         Assert.Equal(1, reader.Reads);
     }
 
+    /// <summary>The count is resolved before the vector is written, so a read that fails leaves no vector file behind,
+    /// even through the host-driven API that keeps no ledger of what it wrote.</summary>
+    [Fact]
+    public async Task AFailedCountRead_LeavesNoVectorBehind()
+    {
+        var reader = new CountingReader(new LocalTableFileSystem(_tempDir));
+        await using var table = await CreateAsync(
+            stats: null, options: new DeltaTableOptions { CheckpointInterval = 0, DataFileReader = reader });
+        table.DeletionVectorInlineThreshold = 0; // a vector file of its own
+        reader.Fail = true;
+
+        await Assert.ThrowsAsync<IOException>(() => table.ComputeDeletionVectorActionsAsync(
+            new Dictionary<int, IReadOnlyCollection<long>> { [0] = [1L] }).AsTask());
+
+        Assert.Empty(Directory.GetFiles(_tempDir, "*.bin", SearchOption.AllDirectories));
+    }
+
     /// <summary>A codec-seam reader that counts the files it decodes, delegating to the built-in codec.</summary>
     private sealed class CountingReader(ITableFileSystem fs) : IDataFileReader
     {
         public int Reads { get; set; }
+
+        public bool Fail { get; set; }
 
         public async IAsyncEnumerable<RecordBatch> ReadAsync(
             string relativePath, IReadOnlyList<string>? physicalColumns,
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             Reads++;
+            if (Fail)
+                throw new IOException("The codec failed.");
             await using var file = await fs.OpenReadAsync(relativePath, cancellationToken);
             using var reader = new ParquetFileReader(file, ownsFile: false);
             await foreach (var b in reader.ReadAllAsync(columnNames: physicalColumns, cancellationToken: cancellationToken))
