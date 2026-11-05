@@ -156,6 +156,67 @@ public static class InCommitTimestamp
     }
 
     /// <summary>
+    /// The commit's own <c>inCommitTimestamp</c>, or null when it carries none. Not <see cref="GetTimestampFromActions"/>,
+    /// which falls back to commitInfo's informational <c>timestamp</c>: that one is not promised to increase, so a
+    /// search over it is unsound.
+    /// </summary>
+    internal static long? GetStrictTimestamp(IReadOnlyList<DeltaAction> actions)
+    {
+        foreach (var action in actions)
+        {
+            if (action is CommitInfo commitInfo
+                && commitInfo.GetValue("inCommitTimestamp") is { ValueKind: JsonValueKind.Number } ts)
+            {
+                return ts.GetInt64();
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Binary-searches <paramref name="versions"/> (commit versions, ascending, each with a commit file) for the
+    /// greatest whose <c>inCommitTimestamp</c> is at or before <paramref name="maxTimestampMs"/>, reading O(log N)
+    /// commits.
+    /// </summary>
+    /// <remarks>
+    /// <para>Sound because in-commit timestamps strictly increase with version, the property the feature exists to
+    /// provide. A <see cref="InCommitTimestampSearchOutcome.Found"/> answer at version b has read b and, unless b is
+    /// the last, the version after it, so it is exact whatever the commits the search skipped hold.</para>
+    ///
+    /// <para>A probe that carries no <c>inCommitTimestamp</c> (a commit from before the feature, after it was turned
+    /// off, or from a writer that never stamped where it began) ends the search as
+    /// <see cref="InCommitTimestampSearchOutcome.Unsearchable"/>, for the caller to fall back to reading every commit,
+    /// rather than guessing.</para>
+    /// </remarks>
+    internal static async ValueTask<InCommitTimestampSearch> SearchAsync(
+        TransactionLog log, IReadOnlyList<long> versions, long maxTimestampMs, CancellationToken cancellationToken)
+    {
+        int found = -1;
+        long foundTimestamp = 0;
+        int lo = 0, hi = versions.Count - 1;
+        while (lo <= hi)
+        {
+            int mid = lo + ((hi - lo) / 2);
+            var actions = await log.ReadCommitAsync(versions[mid], cancellationToken).ConfigureAwait(false);
+            if (GetStrictTimestamp(actions) is not { } timestamp)
+                return InCommitTimestampSearch.Unsearchable;
+            if (timestamp <= maxTimestampMs)
+            {
+                found = mid;
+                foundTimestamp = timestamp;
+                lo = mid + 1;
+            }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+        return found < 0
+            ? InCommitTimestampSearch.BeforeFirst
+            : new InCommitTimestampSearch(InCommitTimestampSearchOutcome.Found, versions[found], foundTimestamp);
+    }
+
+    /// <summary>
     /// The timestamp a commit of <paramref name="actions"/> on <paramref name="baseSnapshot"/> must stay after: the
     /// snapshot's own, or, when it has none and the commit will be timestamped, read from the base version's commit.
     /// </summary>
@@ -429,4 +490,27 @@ public static class InCommitTimestamp
         using var document = JsonDocument.Parse(stream.ToArray());
         return document.RootElement.Clone();
     }
+}
+
+/// <summary>How an <see cref="InCommitTimestamp.SearchAsync"/> ended.</summary>
+internal enum InCommitTimestampSearchOutcome
+{
+    /// <summary>The greatest version at or before the limit was found.</summary>
+    Found,
+
+    /// <summary>Every version searched (possibly none) is after the limit.</summary>
+    BeforeFirst,
+
+    /// <summary>A probed commit carries no <c>inCommitTimestamp</c>, so the search cannot answer.</summary>
+    Unsearchable,
+}
+
+/// <summary>The result of <see cref="InCommitTimestamp.SearchAsync"/>: for <see cref="InCommitTimestampSearchOutcome.Found"/>,
+/// the version and its <c>inCommitTimestamp</c>.</summary>
+internal readonly record struct InCommitTimestampSearch(
+    InCommitTimestampSearchOutcome Outcome, long Version, long Timestamp)
+{
+    internal static InCommitTimestampSearch BeforeFirst => new(InCommitTimestampSearchOutcome.BeforeFirst, 0, 0);
+
+    internal static InCommitTimestampSearch Unsearchable => new(InCommitTimestampSearchOutcome.Unsearchable, 0, 0);
 }
