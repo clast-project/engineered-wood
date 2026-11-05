@@ -152,6 +152,48 @@ public class MergeDeletionVectorTests : IDisposable
         Assert.Equal("0", committed["numTargetRowsCopied"]);
     }
 
+    /// <summary>Re-adds the table's only file with <paramref name="stats"/> as its statistics.</summary>
+    private static async Task ReplaceStatsAsync(DeltaTable table, string? stats)
+    {
+        var file = table.CurrentSnapshot.ActiveFiles.Values.Single();
+        await using var transaction = table.StartTransaction();
+        transaction.StageActions(
+        [
+            new Actions.RemoveFile
+            {
+                Path = file.Path,
+                DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                DataChange = false,
+            },
+            file with { Stats = stats, TypedStats = null, DataChange = false },
+        ]);
+        await transaction.CommitAsync();
+    }
+
+    /// <summary>The protocol requires a file with a deletion vector to carry its physical row count, so a file whose
+    /// statistics lack one gets it from the read: its live rows and the rows its existing vector already hid.</summary>
+    [Theory]
+    [InlineData(null, false)]
+    [InlineData("{\"minValues\":{\"id\":1}}", false)]
+    [InlineData(null, true)]
+    public async Task AMaskedFileWithoutARowCount_IsGivenOne(string? stats, bool existingVector)
+    {
+        await using var table = await CreateAsync();
+        await table.WriteAsync([Five]);
+        if (existingVector)
+            await table.DeleteAsync(Ex.Equal("id", LiteralValue.Of(5L)));
+        await ReplaceStatsAsync(table, stats);
+        Assert.Null(table.CurrentSnapshot.ActiveFiles.Values.Single().GetNumRecords());
+
+        await table.MergeAsync([Source], UpsertWithDelete());
+
+        var masked = table.CurrentSnapshot.ActiveFiles.Values.Single(f => f.DeletionVector is not null);
+        Assert.Equal(5, masked.GetNumRecords());
+        Assert.Contains("\"tightBounds\":false", masked.Stats);
+        if (stats is not null)
+            Assert.Contains("\"minValues\":{\"id\":1}", masked.Stats);
+    }
+
     [Fact]
     public async Task AFileWhoseEveryLiveRowChanges_IsRemovedWhole()
     {

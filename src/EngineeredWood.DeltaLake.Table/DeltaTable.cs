@@ -8543,6 +8543,60 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// when the file is written and never recomputes them, so an all-null column's count already equals
     /// the physical <c>numRecords</c> that the wide reading tests against.
     /// </remarks>
+    /// <summary>
+    /// <see cref="StatsWithLooseBounds(string?)"/> for a file re-added under a deletion vector whose physical row count
+    /// the caller knows: the protocol requires such a file to carry a correct <c>numRecords</c>, so statistics that
+    /// lack one, or a file with none at all, are given <paramref name="physicalRows"/>. A count already there is kept.
+    /// </summary>
+    private static string StatsWithLooseBounds(string? stats, long physicalRows)
+    {
+        System.Text.Json.JsonDocument? doc = null;
+        if (!string.IsNullOrEmpty(stats))
+        {
+            try
+            {
+                doc = System.Text.Json.JsonDocument.Parse(stats!);
+                if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+                {
+                    doc.Dispose();
+                    doc = null;
+                }
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                doc = null; // unreadable statistics are replaced by the count alone
+            }
+        }
+
+        using (doc)
+        {
+            using var stream = new MemoryStream();
+            using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
+            {
+                writer.WriteStartObject();
+                if (doc is null || !doc.RootElement.TryGetProperty("numRecords", out var count)
+                    || count.ValueKind != System.Text.Json.JsonValueKind.Number)
+                {
+                    writer.WriteNumber("numRecords", physicalRows);
+                }
+                writer.WriteBoolean("tightBounds", false);
+                if (doc is not null)
+                {
+                    foreach (var prop in doc.RootElement.EnumerateObject())
+                    {
+                        if (prop.NameEquals("tightBounds"))
+                            continue;
+                        if (prop.NameEquals("numRecords") && prop.Value.ValueKind != System.Text.Json.JsonValueKind.Number)
+                            continue; // replaced above
+                        prop.WriteTo(writer);
+                    }
+                }
+                writer.WriteEndObject();
+            }
+            return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        }
+    }
+
     private static string? StatsWithLooseBounds(string? stats)
     {
         if (string.IsNullOrEmpty(stats))

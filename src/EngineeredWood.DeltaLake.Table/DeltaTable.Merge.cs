@@ -264,6 +264,7 @@ public sealed partial class DeltaTable
                     batches.Add(batch);
                 }
 
+                long liveRows = batches.Sum(b => (long)b.Length);
                 var router = new PartitionRouter(
                     snapshot, mappingMode, batches.FirstOrDefault(b => b.Length > 0), materializeIds);
                 bool fileModified = false;
@@ -538,7 +539,8 @@ public sealed partial class DeltaTable
                     {
                         DeletionVector = newDv,
                         DataChange = true,
-                        Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
+                        // The read skipped only the rows the existing vector hid, so the two give the physical count.
+                        Stats = StatsWithLooseBounds(addFile.GetStatsJson(), liveRows + existing.Count),
                     });
                     maskedPaths.Add(addFile.Path);
                 }
