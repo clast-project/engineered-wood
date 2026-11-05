@@ -1377,13 +1377,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Refreshes the snapshot to the latest version.
+    /// Refreshes the snapshot to the latest version: by replaying the commits since this handle's version, or, when
+    /// log cleanup has removed some of them, from the latest checkpoint (#697).
     /// </summary>
     public async ValueTask RefreshAsync(CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        _currentSnapshot = await SnapshotBuilder.UpdateAsync(
-            CurrentSnapshot, _log, cancellationToken).ConfigureAwait(false);
+        _currentSnapshot = await SnapshotBuilder.UpdateOrRebuildAsync(
+            CurrentSnapshot, _log, _checkpointReader, cancellationToken).ConfigureAwait(false);
     }
 
     #region Schema Evolution
@@ -7229,6 +7230,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // Declared FALSE: it reads the active-file set to decide what to remove, so it plainly depends
             // on files. Recording that is what lets another engine's checker examine it rather than fall
             // back to a default that happens to agree.
+            await Log.CleanedBaseGuard.EnsureBaseNotOvertakenAsync(_log, snapshot, cancellationToken)
+                .ConfigureAwait(false); // #697: never commit below versions log cleanup removed
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
                 actions, snapshot.Metadata.Configuration, newVersion, "WRITE", isBlindAppend: false,
                 commitProperties: commitProperties,
@@ -8159,7 +8162,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // and a host that passes a committed file would destroy live data with one call. So the paths are
         // checked against the log instead. Read fresh rather than trusting CurrentSnapshot: these files are
         // uncommitted precisely until someone commits them, and that someone may be another handle.
-        var latest = await SnapshotBuilder.UpdateAsync(CurrentSnapshot, _log, cancellationToken)
+        // From the latest checkpoint where log cleanup removed commits after this handle's version (#697): the
+        // active files are what matter here, and the checkpoint has them.
+        var latest = await SnapshotBuilder.UpdateOrRebuildAsync(CurrentSnapshot, _log, _checkpointReader, cancellationToken)
             .ConfigureAwait(false);
         // Deliberately NOT assigned to _currentSnapshot: discarding files is not a reason to move a snapshot
         // the caller may be planning against.

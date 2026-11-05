@@ -101,6 +101,9 @@ internal static class VacuumExecutor
         long? endVersion = null;
         if (!dryRun)
         {
+            // #697: VACUUM START is committed at the snapshot's version + 1, so it must not land below versions log
+            // cleanup removed. Free for the snapshot DeltaTable.VacuumAsync has just refreshed.
+            await CleanedBaseGuard.EnsureBaseNotOvertakenAsync(log, snapshot, cancellationToken).ConfigureAwait(false);
             long startVersion = await WriteCommitInfoAsync(
                 log, snapshot, "VACUUM START",
                 new Dictionary<string, JsonElement>

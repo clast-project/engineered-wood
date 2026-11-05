@@ -90,6 +90,13 @@ public sealed class LogCommitter
         if (stagedActions.Count == 0)
             return new LogCommitResult(baseSnapshot.Version, baseSnapshot, Committed: false);
 
+        // Before anything is written: a base that log cleanup has overtaken would put this commit below the
+        // checkpoint, invisible (#697). Usually free; see the guard. It is also why the refresh after the commit
+        // below stays the strict SnapshotBuilder.UpdateAsync, never the checkpoint fallback readers use: a gap
+        // there means a commit no reader will see, and jumping over it would report that lost write as a success.
+        await CleanedBaseGuard.EnsureBaseNotOvertakenAsync(_log, baseSnapshot, cancellationToken)
+            .ConfigureAwait(false);
+
         // The actions actually written this attempt. Starts as the staged actions; a rebase replaces it
         // with the handler's re-derivation against the latest snapshot. Always sourced from the ORIGINAL
         // staged actions (the handler is given both), never from a prior rebase, so each retry rebases the
