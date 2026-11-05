@@ -925,17 +925,20 @@ writer, so today the caller must wire those primitives together by hand.
 overload and an analyzable-`Expressions.Predicate` overload (the predicate form
 feeds file pruning + concurrency read-set analysis); `DeleteRowsAsync` /
 `UpdateRowsAsync` do row-level DML keyed by a path-keyed `RowSelection`.
-`MergeAsync` (table and transaction) is a key-equality MERGE (#563): at most one
-clause of each kind (matched UPDATE/DELETE, not-matched INSERT, not-matched-by-source
-DELETE), each with an optional condition, with Spark's rules for duplicated source
-keys and for `SET *` / `INSERT *` (pinned by `MergeInteropTests`). It does not take
-an arbitrary ON condition, several clauses of one kind, SET or VALUES expressions
-(only source columns, all of them or a named list), or schema evolution (appends have it since #568; MERGE
-does not use it yet); it always copy-on-writes, never writing deletion vectors;
+`MergeAsync` (table and transaction) is a key-equality MERGE (#563): any number of
+clauses of each kind (matched UPDATE/DELETE, not-matched INSERT, not-matched-by-source
+UPDATE/DELETE), each with an optional condition and tried in order (#575), with `UPDATE SET` /
+`INSERT VALUES` assignments of expressions that read the target and source rows (#576), converted to the
+column's type by an ANSI cast as Spark's MERGE converts them, and with Spark's rules for duplicated source
+keys, for `SET *` / `INSERT *` and for an assigned generated column (pinned by `MergeInteropTests`). It does not
+take an arbitrary ON condition; an assignment names a top-level column (not a nested struct field), and a
+`timestamp_ntz`, struct, array or map column takes only a value already of its type, since the expression
+library cannot cast to those; nor does MERGE evolve the schema (appends have it since #568; MERGE does not use
+it yet); it always copy-on-writes, never writing deletion vectors;
 it prunes files by the source's key range only for `byte`, `short`, `integer`, `long`, `date`, `timestamp`,
-`timestamp_ntz`, `decimal` and `string` keys (#578), not `float`, `double`, `boolean` or `binary` ones;
-and, like EW's other DML (only VACUUM writes them), its commit records no
-`operationMetrics`: the counts come back to the caller as `MergeMetrics` instead. `RestoreAsync` (by version or
+`timestamp_ntz`, `decimal` and `string` keys (#578), not `float`, `double`, `boolean` or `binary` ones.
+Its commit records Spark's MERGE `operationMetrics`, and the counts also come back to the caller as
+`MergeMetrics`. `RestoreAsync` (by version or
 timestamp, #567) commits an earlier version's files, metadata and clustering columns as Spark's RESTORE does (pinned
 by `RestoreInteropTests`); unlike Spark it also refuses a missing deletion-vector file, and it resolves a
 timestamp by `commitInfo.timestamp` where Spark uses the commit file's modification time (they agree unless the log

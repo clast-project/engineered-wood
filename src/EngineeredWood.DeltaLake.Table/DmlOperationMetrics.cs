@@ -163,8 +163,7 @@ internal static class DmlOperationMetrics
             ["numTargetRowsInserted"] = Text(m.NumTargetRowsInserted),
             ["numTargetRowsUpdated"] = Text(m.NumTargetRowsUpdated),
             ["numTargetRowsMatchedUpdated"] = Text(m.NumTargetRowsMatchedUpdated),
-            // This library's not-matched-by-source clause can only delete.
-            ["numTargetRowsNotMatchedBySourceUpdated"] = "0",
+            ["numTargetRowsNotMatchedBySourceUpdated"] = Text(m.NumTargetRowsNotMatchedBySourceUpdated),
             ["numTargetRowsDeleted"] = Text(m.NumTargetRowsDeleted),
             ["numTargetRowsMatchedDeleted"] = Text(m.NumTargetRowsMatchedDeleted),
             ["numTargetRowsNotMatchedBySourceDeleted"] = Text(m.NumTargetRowsNotMatchedBySourceDeleted),
@@ -185,7 +184,8 @@ internal static class DmlOperationMetrics
     public static MergeMetrics Sum(MergeMetrics a, MergeMetrics b) => new(
         a.NumSourceRows + b.NumSourceRows,
         a.NumTargetRowsInserted + b.NumTargetRowsInserted,
-        a.NumTargetRowsUpdated + b.NumTargetRowsUpdated,
+        a.NumTargetRowsMatchedUpdated + b.NumTargetRowsMatchedUpdated,
+        a.NumTargetRowsNotMatchedBySourceUpdated + b.NumTargetRowsNotMatchedBySourceUpdated,
         a.NumTargetRowsMatchedDeleted + b.NumTargetRowsMatchedDeleted,
         a.NumTargetRowsNotMatchedBySourceDeleted + b.NumTargetRowsNotMatchedBySourceDeleted,
         a.NumTargetRowsCopied + b.NumTargetRowsCopied,

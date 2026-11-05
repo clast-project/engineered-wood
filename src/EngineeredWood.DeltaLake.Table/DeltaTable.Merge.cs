@@ -23,7 +23,7 @@ public sealed partial class DeltaTable
     /// unchanged version.</para>
     ///
     /// <para>Files whose key statistics cannot overlap the source's key range are not read, unless
-    /// <see cref="MergeOptions.WhenNotMatchedBySource"/> is set. Updated and inserted rows go through the table's
+    /// <see cref="MergeOptions.WhenNotMatchedBySource"/> has a clause. Updated and inserted rows go through the table's
     /// generated columns, identity columns, CHECK constraints and NOT NULL, and a Change Data Feed table records
     /// <c>update_preimage</c>/<c>update_postimage</c>, <c>delete</c> and <c>insert</c> rows.</para>
     /// </summary>
@@ -70,7 +70,8 @@ public sealed partial class DeltaTable
         long? NextRowId);
 
     // A target row's fate in a MERGE.
-    private const byte MergeCopy = 0, MergeUpdate = 1, MergeMatchedDelete = 2, MergeSourcelessDelete = 3;
+    private const byte MergeCopy = 0, MergeUpdate = 1, MergeMatchedDelete = 2, MergeSourcelessDelete = 3,
+        MergeSourcelessUpdate = 4;
 
     /// <summary>
     /// Computes a MERGE against <paramref name="snapshot"/> WITHOUT committing: each touched file rewritten once
@@ -98,14 +99,13 @@ public sealed partial class DeltaTable
 
         var plan = MergePlan.Validate(options, snapshot.Schema);
         var src = PrepareMergeSource(source, snapshot, plan);
-        RefuseUnanalyzableConditions(options, snapshot, src);
+        plan.Resolve(src, snapshot.Schema);
+        RefuseUnanalyzableClauses(plan, snapshot, src);
         int sourceRows = src?.Length ?? 0;
-        var setColumns = plan.SetColumns(src, snapshot.Schema);
-        var insertColumns = plan.InsertColumns(src, snapshot.Schema);
-        ThrowIfMergeSetsIdentity(setColumns, snapshot.Schema);
+        ThrowIfMergeSetsIdentity(plan.UpdatedColumns, snapshot.Schema);
         // An insert that would write a GENERATED ALWAYS identity column, refused here rather than when its rows reach
         // the append: Spark refuses it at analysis, whatever the source holds or the clauses match (#595).
-        IdentityColumns.IdentityColumnWriter.ThrowIfGeneratedAlwaysSupplied(insertColumns, snapshot.Schema);
+        IdentityColumns.IdentityColumnWriter.ThrowIfGeneratedAlwaysSupplied(plan.InsertedColumns, snapshot.Schema);
 
         // The source's key index: each key's rows chained through `next`, so a duplicated key costs no list.
         // A row with a NULL key matches nothing and is not indexed.
@@ -130,7 +130,7 @@ public sealed partial class DeltaTable
         var rewriteActions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         var readPaths = new HashSet<string>(StringComparer.Ordinal);
-        long updated = 0, matchedDeleted = 0, sourcelessDeleted = 0, copied = 0;
+        long matchedUpdated = 0, sourcelessUpdated = 0, matchedDeleted = 0, sourcelessDeleted = 0, copied = 0;
 
         bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
@@ -138,7 +138,7 @@ public sealed partial class DeltaTable
 
         // Without a not-matched-by-source clause only a file that can hold a source key matters, so none needs
         // reading when no source key can match; and the source's key range prunes the rest by statistics.
-        bool readsWholeTable = plan.WhenNotMatchedBySource is not null;
+        bool readsWholeTable = plan.NotMatchedBySource.Count > 0;
         bool scan = readsWholeTable || head.Count > 0;
         Expressions.Predicate? keyRange = !readsWholeTable && head.Count > 0
             ? KeyRangePredicate(plan.Keys, sourceKeys!, snapshot.Schema)
@@ -149,41 +149,41 @@ public sealed partial class DeltaTable
             nextRowId = await ScanMergeTargetAsync().ConfigureAwait(false);
         }
 
-        // The unmatched source rows, the not-matched condition holding.
+        // The unmatched source rows, each inserted by the first not-matched clause whose condition holds.
         var insertActions = new List<DeltaAction>();
         long inserted = 0;
-        if (plan.WhenNotMatched is not null && src is not null && sourceRows > 0)
+        if (plan.NotMatched.Count > 0 && src is not null && sourceRows > 0)
         {
-            var rows = new List<int>();
+            var remaining = new List<int>();
             for (int i = 0; i < sourceRows; i++)
             {
                 if (!sourceMatched[i])
-                    rows.Add(i);
-            }
-            if (rows.Count > 0 && options.WhenNotMatchedCondition is { } insertCondition)
-            {
-                var candidates = rows.Count == sourceRows ? src : TakeRowsFromBatch(src, rows);
-                var mask = MaskFor(insertCondition)(MergeConditionBatch(null, candidates));
-                var kept = new List<int>(rows.Count);
-                for (int r = 0; r < rows.Count; r++)
-                {
-                    if (!mask.IsNull(r) && mask.GetValue(r) == true)
-                        kept.Add(rows[r]);
-                }
-                rows = kept;
+                    remaining.Add(i);
             }
 
-            if (rows.Count > 0)
+            var insertBatches = new List<RecordBatch>();
+            foreach (var clause in plan.NotMatched)
             {
-                var insertBatch = ProjectColumns(rows.Count == sourceRows ? src : TakeRowsFromBatch(src, rows), insertColumns);
+                if (remaining.Count == 0)
+                    break;
+                var candidates = remaining.Count == sourceRows ? src : TakeRowsFromBatch(src, remaining);
+                var taken = TakeClause(clause, remaining, () => MergeConditionBatch(null, candidates), out remaining);
+                if (taken.Count == 0)
+                    continue;
+                var rows = taken.Count == candidates.Length ? candidates : TakeRowsFromBatch(src, taken);
+                insertBatches.Add(MergeInsertBatch(rows, clause, snapshot));
+                inserted += taken.Count;
+            }
+
+            if (insertBatches.Count > 0)
+            {
                 var (actions, insertNextRowId) = await ComputeWriteActionsAsync(
-                    snapshot, [insertBatch], DeltaWriteMode.Append,
+                    snapshot, insertBatches, DeltaWriteMode.Append,
                     overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
                     cancellationToken, rowIdStart: assignRowIds ? nextRowId : null, written: written,
                     identityHighWaterMarks: identityHighWaterMarks)
                     .ConfigureAwait(false);
                 insertActions.AddRange(actions);
-                inserted = rows.Count;
                 if (assignRowIds)
                     nextRowId = insertNextRowId;
             }
@@ -191,7 +191,7 @@ public sealed partial class DeltaTable
 
         long filesAdded = rewriteActions.Concat(insertActions).Count(a => a is AddFile);
         var metrics = new MergeMetrics(
-            sourceRows, inserted, updated, matchedDeleted, sourcelessDeleted, copied,
+            sourceRows, inserted, matchedUpdated, sourcelessUpdated, matchedDeleted, sourcelessDeleted, copied,
             filesAdded, removedPaths.Count);
         return new MergeActions(
             rewriteActions, insertActions, removedPaths, readPaths, keyRange, readsWholeTable, scan, metrics,
@@ -212,13 +212,13 @@ public sealed partial class DeltaTable
             long rowId = nextRowId;
             var pruner = keyRange is null ? null : new DeltaFilePruner(
                 snapshot.Schema, snapshot.Metadata.PartitionColumns, _options.PreferTypedCheckpointStats);
-            var matched = plan.WhenMatched;
-            bool unconditionalDelete = matched?.Kind == MergeActionKind.Delete && options.WhenMatchedCondition is null;
+            bool anyMatched = plan.Matched.Count > 0;
             // As delta-spark decides it: a target row two source rows' keys equal is refused whatever the clause
-            // conditions say (it counts ON matches alone), unless the only matched clause is an unconditional
+            // conditions say (it counts ON matches alone), unless the only matched clause is one unconditional
             // DELETE, which every candidate applies identically. An insert-only MERGE changes no target row.
-            bool refuseMultipleMatches = (matched is not null || plan.WhenNotMatchedBySource is not null)
-                && !unconditionalDelete;
+            bool unconditionalDelete = plan.Matched.Count == 1
+                && plan.Matched[0].Kind == MergeActionKind.Delete && plan.Matched[0].Condition is null;
+            bool refuseMultipleMatches = (anyMatched || plan.NotMatchedBySource.Count > 0) && !unconditionalDelete;
 
             foreach (var addFile in snapshot.ActiveFiles.Values)
             {
@@ -251,7 +251,10 @@ public sealed partial class DeltaTable
                     var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
                     var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
                     int n = batch.Length;
+                    // Each row's fate; for an update or delete, the clause that took it (an index into its kind's
+                    // clauses); and for a matched row, the source row that matched it.
                     var fate = new byte[n];
+                    var fateClause = new int[n];
                     var fateSource = new int[n];
                     var hit = new bool[n];
 
@@ -269,7 +272,7 @@ public sealed partial class DeltaTable
                         for (; s >= 0; s = next[s])
                         {
                             sourceMatched[s] = true;
-                            if (matched is not null)
+                            if (anyMatched)
                             {
                                 pairTarget.Add(i);
                                 pairSource.Add(s);
@@ -277,49 +280,72 @@ public sealed partial class DeltaTable
                         }
                     }
 
-                    // WHEN MATCHED [AND condition]. Only an unconditional DELETE can see a row twice here.
-                    if (matched is not null && pairTarget.Count > 0)
+                    // WHEN MATCHED [AND condition], in order: a pair takes the first clause whose condition holds,
+                    // and a clause sees only the pairs no earlier one took. Only an unconditional DELETE can see a
+                    // target row twice here.
+                    if (pairTarget.Count > 0)
                     {
-                        BooleanArray? holds = options.WhenMatchedCondition is { } matchedCondition
-                            ? MaskFor(matchedCondition)(MergeConditionBatch(
-                                TakeRowsFromBatch(batch, pairTarget), TakeRowsFromBatch(src!, pairSource)))
-                            : null;
-                        for (int p = 0; p < pairTarget.Count; p++)
+                        var remaining = Enumerable.Range(0, pairTarget.Count).ToList();
+                        for (int c = 0; c < plan.Matched.Count && remaining.Count > 0; c++)
                         {
-                            if (holds is not null && (holds.IsNull(p) || holds.GetValue(p) != true))
-                                continue;
-                            int t = pairTarget[p];
-                            if (fate[t] != MergeCopy)
-                                continue;
-                            fate[t] = matched.Kind == MergeActionKind.Delete ? MergeMatchedDelete : MergeUpdate;
-                            fateSource[t] = pairSource[p];
+                            var pending = remaining;
+                            var taken = TakeClause(plan.Matched[c], pending, () => MergeConditionBatch(
+                                TakeRowsFromBatch(batch, pending.Select(p => pairTarget[p]).ToList()),
+                                TakeRowsFromBatch(src!, pending.Select(p => pairSource[p]).ToList())), out remaining);
+                            byte kind = plan.Matched[c].Kind == MergeActionKind.Delete ? MergeMatchedDelete : MergeUpdate;
+                            foreach (int p in taken)
+                            {
+                                int t = pairTarget[p];
+                                if (fate[t] != MergeCopy)
+                                    continue;
+                                fate[t] = kind;
+                                fateClause[t] = c;
+                                fateSource[t] = pairSource[p];
+                            }
                         }
                     }
 
-                    // WHEN NOT MATCHED BY SOURCE [AND condition]: a target row no source row's keys equal.
-                    if (plan.WhenNotMatchedBySource is not null)
+                    // WHEN NOT MATCHED BY SOURCE [AND condition], in order, over the target rows no source row's
+                    // keys equal.
+                    if (plan.NotMatchedBySource.Count > 0)
                     {
-                        BooleanArray? holds = options.WhenNotMatchedBySourceCondition is { } sourcelessCondition
-                            ? MaskFor(sourcelessCondition)(MergeConditionBatch(batch, null))
-                            : null;
+                        var remaining = new List<int>();
                         for (int i = 0; i < n; i++)
                         {
-                            if (!hit[i] && (holds is null || (!holds.IsNull(i) && holds.GetValue(i) == true)))
-                                fate[i] = MergeSourcelessDelete;
+                            if (!hit[i])
+                                remaining.Add(i);
+                        }
+                        for (int c = 0; c < plan.NotMatchedBySource.Count && remaining.Count > 0; c++)
+                        {
+                            var pending = remaining;
+                            var taken = TakeClause(plan.NotMatchedBySource[c], pending,
+                                () => MergeConditionBatch(
+                                    pending.Count == n ? batch : TakeRowsFromBatch(batch, pending), null),
+                                out remaining);
+                            byte kind = plan.NotMatchedBySource[c].Kind == MergeActionKind.Delete
+                                ? MergeSourcelessDelete : MergeSourcelessUpdate;
+                            foreach (int t in taken)
+                            {
+                                fate[t] = kind;
+                                fateClause[t] = c;
+                            }
                         }
                     }
 
                     var keepRows = new List<int>();
-                    var updateRows = new List<int>();
-                    var updateSources = new List<int>();
                     var deleteRows = new List<int>();
+                    // The updated rows, grouped by the clause that took them: each clause sets its own columns.
+                    var updateGroups = new SortedDictionary<(byte Fate, int Clause), (List<int> Rows, List<int> Sources)>();
                     for (int i = 0; i < n; i++)
                     {
                         switch (fate[i])
                         {
                             case MergeUpdate:
-                                updateRows.Add(i);
-                                updateSources.Add(fateSource[i]);
+                            case MergeSourcelessUpdate:
+                                if (!updateGroups.TryGetValue((fate[i], fateClause[i]), out var group))
+                                    updateGroups[(fate[i], fateClause[i])] = group = (new List<int>(), new List<int>());
+                                group.Rows.Add(i);
+                                group.Sources.Add(fateSource[i]);
                                 break;
                             case MergeMatchedDelete:
                                 matchedDeleted++;
@@ -335,7 +361,7 @@ public sealed partial class DeltaTable
                         }
                     }
 
-                    if (updateRows.Count == 0 && deleteRows.Count == 0)
+                    if (updateGroups.Count == 0 && deleteRows.Count == 0)
                     {
                         router.Add(batch, batchIds is not null && batchVers is not null
                             ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null, mayMove: false);
@@ -351,14 +377,27 @@ public sealed partial class DeltaTable
                         fileModified = true;
                     }
 
-                    if (updateRows.Count > 0)
+                    foreach (var entry in updateGroups)
                     {
-                        updated += updateRows.Count;
+                        bool isMatched = entry.Key.Fate == MergeUpdate;
+                        var clause = isMatched ? plan.Matched[entry.Key.Clause] : plan.NotMatchedBySource[entry.Key.Clause];
+                        var (updateRows, updateSources) = entry.Value;
+                        if (isMatched)
+                            matchedUpdated += updateRows.Count;
+                        else
+                            sourcelessUpdated += updateRows.Count;
                         var preimage = TakeRowsFromBatch(batch, updateRows);
-                        var postimage = MergePostImage(preimage, src!, updateSources, setColumns);
+                        var postimage = MergePostImage(
+                            preimage,
+                            isMatched
+                                ? TakeRowsFromBatch(
+                                    clause.SourceColumns is { } read ? ProjectColumns(src!, read) : src!, updateSources)
+                                : null,
+                            clause, snapshot);
                         ThrowIfUpdaterChangedTypes(preimage, postimage, snapshot.Schema, "MERGE");
                         ThrowIfPartitionColumnsRetyped(postimage, snapshot, "MERGE");
-                        postimage = PreparePostImage(postimage, snapshot, generatedColumns, constraints);
+                        postimage = PreparePostImage(
+                            postimage, snapshot, generatedColumns, constraints, clause.WrittenColumns);
 
                         // An updated row keeps its id; its commit version advances to this commit.
                         var ids = batchIds is not null ? TakeIds(batchIds, updateRows) : null;
@@ -623,75 +662,278 @@ public sealed partial class DeltaTable
     }
 
     /// <summary>
-    /// The target rows <paramref name="preimage"/> as the update leaves them: each of
-    /// <paramref name="setColumns"/> taken from the source row that matched it, the rest as they were.
+    /// The rows of <paramref name="pending"/> <paramref name="clause"/> takes: all of them when it is unconditional,
+    /// else those its condition holds for over <paramref name="rows"/> (one row per entry of
+    /// <paramref name="pending"/>, built only when asked). <paramref name="rest"/> is the rows it leaves for the next
+    /// clause.
+    /// </summary>
+    private static List<int> TakeClause(
+        MergeClausePlan clause, List<int> pending, Func<RecordBatch> rows, out List<int> rest)
+    {
+        if (clause.Condition is not { } condition)
+        {
+            rest = [];
+            return pending;
+        }
+        var holds = MaskFor(condition)(rows());
+        var taken = new List<int>();
+        rest = new List<int>();
+        for (int r = 0; r < pending.Count; r++)
+        {
+            if (!holds.IsNull(r) && holds.GetValue(r) == true)
+                taken.Add(pending[r]);
+            else
+                rest.Add(pending[r]);
+        }
+        return taken;
+    }
+
+    /// <summary>
+    /// The target rows <paramref name="preimage"/> as <paramref name="clause"/>'s update leaves them: each column it
+    /// writes taken from the matching source row (<paramref name="sources"/>, aligned with the preimage; null for a
+    /// not-matched-by-source update) or computed from both rows, the rest as they were.
     /// </summary>
     private static RecordBatch MergePostImage(
-        RecordBatch preimage, RecordBatch source, List<int> sourceRows, IReadOnlyList<string> setColumns)
+        RecordBatch preimage, RecordBatch? sources, MergeClausePlan clause, Snapshot.Snapshot snapshot)
     {
+        RecordBatch? pairs = null;
         var fields = new List<Field>(preimage.ColumnCount);
         var columns = new IArrowArray[preimage.ColumnCount];
         for (int c = 0; c < preimage.ColumnCount; c++)
         {
             var field = preimage.Schema.FieldsList[c];
-            int s = setColumns.Contains(field.Name) ? source.Schema.GetFieldIndex(field.Name) : -1;
-            if (s < 0)
+            if (!clause.Writes.TryGetValue(field.Name, out var value))
             {
                 fields.Add(field);
                 columns[c] = preimage.Column(c);
                 continue;
             }
-            columns[c] = ArrowCompute.Take(source.Column(s), sourceRows);
+            columns[c] = value is null
+                ? sources!.Column(sources.Schema.GetFieldIndex(field.Name))
+                : AssignedValue(value, field.Name, pairs ??= MergeConditionBatch(preimage, sources), snapshot);
             fields.Add(new Field(field.Name, columns[c].Data.DataType, field.IsNullable, field.Metadata));
         }
         return new RecordBatch(new Apache.Arrow.Schema(fields, preimage.Schema.Metadata), columns, preimage.Length);
     }
 
     /// <summary>
-    /// Refuses a clause condition whose types Spark's analyzer would refuse (<c>target.d = 5</c>), before the
-    /// target is scanned.
+    /// The rows <paramref name="clause"/> inserts for the source rows <paramref name="rows"/>: the source columns it
+    /// copies, or the values it assigns, computed from the source row. The append fills in the columns it omits.
+    /// </summary>
+    private static RecordBatch MergeInsertBatch(RecordBatch rows, MergeClausePlan clause, Snapshot.Snapshot snapshot)
+    {
+        if (clause.Writes.Values.All(v => v is null))
+            return ProjectColumns(rows, clause.WrittenColumns);
+
+        var pairs = MergeConditionBatch(null, rows);
+        var fields = new List<Field>(clause.Writes.Count);
+        var columns = new List<IArrowArray>(clause.Writes.Count);
+        foreach (string column in clause.WrittenColumns)
+        {
+            var value = clause.Writes[column];
+            var array = value is null
+                ? rows.Column(rows.Schema.GetFieldIndex(column))
+                : AssignedValue(value, column, pairs, snapshot);
+            fields.Add(new Field(column, array.Data.DataType, nullable: true));
+            columns.Add(array);
+        }
+        return new RecordBatch(new Apache.Arrow.Schema(fields, null), columns, rows.Length);
+    }
+
+    /// <summary>
+    /// <paramref name="value"/> evaluated over <paramref name="pairs"/> (a <see cref="MergeConditionBatch"/>) and
+    /// converted to the type of the table column <paramref name="column"/>, as Spark's MERGE assigns it.
+    /// </summary>
+    /// <remarks>
+    /// <para>Measured against Spark 4.0 / Delta 4.0, a MERGE assignment of another type is an ANSI <c>CAST</c> to
+    /// the column's type, not the stricter store-assignment rule: <c>'42'</c> and <c>true</c> go into an
+    /// <c>int</c> column, <c>1</c> and <c>'true'</c> into a <c>boolean</c> one, and a decimal is rounded half up.
+    /// Malformed input is <c>CAST_INVALID_INPUT</c>, as the cast raises it; a value the column cannot hold is
+    /// <c>DELTA_CAST_OVERFLOW_IN_TABLE_WRITE</c>, where a bare cast says <c>CAST_OVERFLOW</c>.</para>
+    /// <para>A type the cast cannot target (<c>timestamp_ntz</c>, a struct, array or map) takes only a value of its
+    /// own Delta type, in any Arrow form of it; anything else is refused as a mistyped column. NULL goes anywhere.</para>
+    /// </remarks>
+    private static IArrowArray AssignedValue(
+        Expressions.Expression value, string column, RecordBatch pairs, Snapshot.Snapshot snapshot)
+    {
+        var target = snapshot.ArrowSchema.GetFieldByName(column)!;
+        var array = RowEvaluator.EvaluateExpression(value, pairs);
+        if (array is NullArray || array.Data.DataType.TypeId == Apache.Arrow.Types.ArrowTypeId.Null)
+            return ArrowCompute.MakeNullArray(target.DataType, array.Length);
+
+        if (!SameDeltaType(array.Data.DataType, target.DataType))
+        {
+            var declared = snapshot.Schema.Fields.First(f => string.Equals(f.Name, column, StringComparison.Ordinal));
+            if (CastTypeName(declared.Type) is not { } castTo)
+            {
+                var supplied = new RecordBatch(
+                    new Apache.Arrow.Schema([new Field(column, array.Data.DataType, true)], null), [array], array.Length);
+                ThrowIfMistypedColumns([supplied], snapshot.Schema, "MERGE");
+                throw new ArgumentException(
+                    $"MERGE: the value assigned to column '{column}' is Arrow {array.Data.DataType.Name}, which "
+                    + $"cannot be converted to the column's type {declared.Type}.");
+            }
+
+            // A value that reads no column is cast as itself, not as the column it evaluated to, so the cast sees a
+            // constant operand as Spark's does: its SpecialDatetimeValues rule reads `'epoch'` assigned to a DATE
+            // column as 1970-01-01, where the same word read from a row is CAST_INVALID_INPUT. Evaluating a
+            // constant again costs nothing; a value that reads a column is not evaluated twice.
+            const string valueName = "__ew_assigned";
+            bool constant = !ReferenceResolutions(value, NoColumns.Schema).Any();
+            var cast = new Expressions.FunctionCall(
+                "cast",
+                [constant ? value : new Expressions.UnboundReference(valueName),
+                 new Expressions.LiteralExpression(Expressions.LiteralValue.Of(castTo))]);
+            var batch = constant
+                ? pairs
+                : new RecordBatch(
+                    new Apache.Arrow.Schema([new Field(valueName, array.Data.DataType, true)], null), [array],
+                    array.Length);
+            try
+            {
+                array = RowEvaluator.EvaluateExpression(cast, batch);
+            }
+            catch (Expressions.Arrow.Spark.SparkEvaluationException e) when (
+                e.ErrorClass is "CAST_OVERFLOW" || e.ErrorClass.StartsWith("NUMERIC_VALUE_OUT_OF_RANGE", StringComparison.Ordinal))
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.CastOverflowInTableWrite,
+                    $"MERGE: failed to write a value of Arrow type {array.Data.DataType.Name} into the "
+                    + $"{declared.Type} column '{column}' due to an overflow. {e.Message}",
+                    e);
+            }
+            catch (NotSupportedException e)
+            {
+                // Refused by the types alone -- an integer to BINARY, say -- so over no rows too, which is how the
+                // check before the scan sees it (RefuseUnanalyzableValue).
+                throw new ArgumentException(
+                    $"MERGE: the value assigned to column '{column}' is Arrow {array.Data.DataType.Name}, "
+                    + $"which cannot be converted to the column's type {declared.Type}: {e.Message}",
+                    e);
+            }
+        }
+
+        // The table's own Arrow form of the type, as a copied row of the same file carries it.
+        var conformed = ConformToTable(
+            new RecordBatch(new Apache.Arrow.Schema([new Field(column, array.Data.DataType, true)], null), [array],
+                array.Length),
+            snapshot.ArrowSchema);
+        return WriteTypeNormalization.Normalize(conformed).Column(0);
+    }
+
+    /// <summary>The <c>CAST</c> target the expression library spells <paramref name="type"/> as, or null for a type
+    /// it cannot cast to.</summary>
+    private static string? CastTypeName(DeltaDataType type) => type switch
+    {
+        PrimitiveType { TypeName: "byte" } => "TINYINT",
+        PrimitiveType { TypeName: "short" } => "SMALLINT",
+        PrimitiveType { TypeName: "integer" } => "INT",
+        PrimitiveType { TypeName: "long" } => "BIGINT",
+        PrimitiveType { TypeName: "float" } => "FLOAT",
+        PrimitiveType { TypeName: "double" } => "DOUBLE",
+        PrimitiveType { TypeName: "boolean" } => "BOOLEAN",
+        PrimitiveType { TypeName: "string" } => "STRING",
+        PrimitiveType { TypeName: "binary" } => "BINARY",
+        PrimitiveType { TypeName: "date" } => "DATE",
+        PrimitiveType { TypeName: "timestamp" } => "TIMESTAMP",
+        PrimitiveType { TypeName: var name } when name.StartsWith("decimal(", StringComparison.Ordinal) =>
+            name.ToUpperInvariant(),
+        _ => null,
+    };
+
+    /// <summary>
+    /// Refuses a clause condition or assigned value Spark's analyzer would refuse (<c>target.d = 5</c>, a column
+    /// neither row has), before the target is scanned.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// A condition is evaluated only over the rows that reach its clause, so with an empty source, no key that
-    /// matches, or every file pruned by the key range it never runs, and the MERGE committed where Spark refuses
-    /// at analysis (#589). Each is asked over an empty batch of the shape it is evaluated over -- the
+    /// A condition or value is evaluated only over the rows that reach its clause, so with an empty source, no key
+    /// that matches, or every file pruned by the key range it never runs, and the MERGE committed where Spark
+    /// refuses at analysis (#589). Each is asked over an empty batch of the shape it is evaluated over -- the
     /// <see cref="MergeConditionBatch"/> of its clause -- which reads no value and so raises only what the
     /// types decide; see <see cref="RefuseUnanalyzable(Expressions.Predicate, Snapshot.Snapshot)"/>.
     /// </para>
     /// <para>
     /// A source with no batches has no schema of its own. Its columns can only be the table's, normalized to
     /// the table's types (<see cref="PrepareMergeSource"/>), so the table's schema stands in for it. Which of
-    /// them it has is not known, though, so the matched condition may name any target column bare: whether the
+    /// them it has is not known, though, so a matched clause may name any target column bare: whether the
     /// source shares it, which would hide the bare name, cannot be told.
     /// </para>
     /// </remarks>
-    private static void RefuseUnanalyzableConditions(MergeOptions options, Snapshot.Snapshot snapshot, RecordBatch? src)
+    private static void RefuseUnanalyzableClauses(MergePlan plan, Snapshot.Snapshot snapshot, RecordBatch? src)
     {
         var targetSchema = snapshot.ArrowSchema;
         var sourceSchema = src?.Schema ?? targetSchema;
 
-        if (options.WhenMatchedCondition is { } matched)
+        var matchedNames = src is not null
+            ? MergeConditionSchema(targetSchema, sourceSchema)
+            : new Apache.Arrow.Schema(
+                [SideField("source", sourceSchema), .. MergeConditionSchema(targetSchema, null).FieldsList], null);
+        Refuse(plan.Matched, matchedNames, () => MergeConditionBatch(EmptyBatch(targetSchema), EmptyBatch(sourceSchema)));
+        Refuse(plan.NotMatched, MergeConditionSchema(null, sourceSchema),
+            () => MergeConditionBatch(null, EmptyBatch(sourceSchema)));
+        Refuse(plan.NotMatchedBySource, MergeConditionSchema(targetSchema, null),
+            () => MergeConditionBatch(EmptyBatch(targetSchema), null));
+
+        void Refuse(IReadOnlyList<MergeClausePlan> clauses, Apache.Arrow.Schema names, Func<RecordBatch> noRows)
         {
-            var names = src is not null
-                ? MergeConditionSchema(targetSchema, sourceSchema)
-                : new Apache.Arrow.Schema(
-                    [SideField("source", sourceSchema), .. MergeConditionSchema(targetSchema, null).FieldsList],
-                    null);
-            RefuseUnanalyzable(
-                matched, names, () => MergeConditionBatch(EmptyBatch(targetSchema), EmptyBatch(sourceSchema)));
+            foreach (var clause in clauses)
+            {
+                if (clause.Condition is { } condition)
+                    RefuseUnanalyzable(condition, names, noRows);
+                foreach (var entry in clause.Writes)
+                {
+                    if (entry.Value is { } value)
+                        RefuseUnanalyzableValue(entry.Key, value, names, noRows, snapshot);
+                }
+            }
         }
-        if (options.WhenNotMatchedCondition is { } notMatched)
+    }
+
+    /// <summary>
+    /// <see cref="RefuseUnanalyzableClauses"/> for one assigned value: a reference neither of its rows has is
+    /// <c>DELTA_MERGE_UNRESOLVED_EXPRESSION</c>, as Spark names it (an insert reading the target row, a
+    /// not-matched-by-source update reading the source row); then its types, with the conversion to the column, are
+    /// asked over no rows.
+    /// </summary>
+    private static void RefuseUnanalyzableValue(
+        string column, Expressions.Expression value, Apache.Arrow.Schema names, Func<RecordBatch> noRows,
+        Snapshot.Snapshot snapshot)
+    {
+        foreach (var (name, resolution) in ReferenceResolutions(value, names))
         {
-            RefuseUnanalyzable(
-                notMatched, MergeConditionSchema(null, sourceSchema),
-                () => MergeConditionBatch(null, EmptyBatch(sourceSchema)));
+            if (resolution == ReferenceResolution.Missing)
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.MergeUnresolvedExpression,
+                    $"MERGE: the value {value} assigned to column '{column}' reads '{name}', which this clause cannot "
+                    + "see. It can read: " + string.Join(", ", names.FieldsList.Select(f => f.Name)) + ".");
+            }
+            if (resolution == ReferenceResolution.Ambiguous)
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.AmbiguousReference,
+                    $"MERGE: the value {value} assigned to column '{column}' reads '{name}', which is ambiguous: "
+                    + "column names are compared ignoring case, and more than one field matches it.");
+            }
         }
-        if (options.WhenNotMatchedBySourceCondition is { } sourceless)
+
+        RefuseUntypableLiterals(value);
+        try
         {
-            RefuseUnanalyzable(
-                sourceless, MergeConditionSchema(targetSchema, null),
-                () => MergeConditionBatch(EmptyBatch(targetSchema), null));
+            AssignedValue(value, column, noRows(), snapshot);
+        }
+        catch (Expressions.Arrow.ExpressionAnalysisException)
+        {
+            throw;
+        }
+        catch (ArgumentException e) when (e.Message.StartsWith("MERGE:", StringComparison.Ordinal))
+        {
+            throw; // a value of a type the column cannot take
+        }
+        catch (Exception)
+        {
+            // Not an analysis refusal; the rows decide.
         }
     }
 
@@ -917,54 +1159,184 @@ public sealed partial class DeltaTable
         + "keys unique. Only a MERGE whose sole matched clause is an unconditional DELETE, or one that only inserts, "
         + "may match a row more than once.");
 
+    /// <summary>One clause of a MERGE, checked against the table.</summary>
+    private sealed class MergeClausePlan
+    {
+        public MergeClausePlan(MergeAction action) => Action = action;
+
+        public MergeAction Action { get; }
+        public MergeActionKind Kind => Action.Kind;
+        public Expressions.Predicate? Condition => Action.Condition;
+
+        /// <summary>The columns an update or insert writes, by the table's names, each with its value: null to copy
+        /// the source column of that name, else the expression assigned. Empty for a delete. Set by
+        /// <see cref="MergePlan.Resolve"/>.</summary>
+        public IReadOnlyDictionary<string, Expressions.Expression?> Writes { get; set; } =
+            new Dictionary<string, Expressions.Expression?>(StringComparer.Ordinal);
+
+        /// <summary>The keys of <see cref="Writes"/>, in the order the action names them.</summary>
+        public IReadOnlyList<string> WrittenColumns { get; set; } = [];
+
+        /// <summary>
+        /// The source columns an update needs gathered for its rows: those it copies, and those whose names its
+        /// assigned values read. Null for all of them. Set by <see cref="MergePlan.Resolve"/>.
+        /// </summary>
+        public IReadOnlyList<string>? SourceColumns { get; set; }
+    }
+
     /// <summary>The MERGE options, checked against the table.</summary>
     private sealed class MergePlan
     {
         private MergePlan(
-            IReadOnlyList<string> keys, MergeAction? whenMatched, MergeAction? whenNotMatched,
-            MergeAction? whenNotMatchedBySource)
+            IReadOnlyList<string> keys, IReadOnlyList<MergeClausePlan> matched,
+            IReadOnlyList<MergeClausePlan> notMatched, IReadOnlyList<MergeClausePlan> notMatchedBySource)
         {
             Keys = keys;
-            WhenMatched = whenMatched;
-            WhenNotMatched = whenNotMatched;
-            WhenNotMatchedBySource = whenNotMatchedBySource;
+            Matched = matched;
+            NotMatched = notMatched;
+            NotMatchedBySource = notMatchedBySource;
         }
 
         public IReadOnlyList<string> Keys { get; }
-        public MergeAction? WhenMatched { get; }
-        public MergeAction? WhenNotMatched { get; }
-        public MergeAction? WhenNotMatchedBySource { get; }
+        public IReadOnlyList<MergeClausePlan> Matched { get; }
+        public IReadOnlyList<MergeClausePlan> NotMatched { get; }
+        public IReadOnlyList<MergeClausePlan> NotMatchedBySource { get; }
 
-        /// <summary>The columns a matched update sets: those it names, or every column of the table.</summary>
-        public IReadOnlyList<string> SetColumns(RecordBatch? source, Schema.StructType schema) =>
-            WhenMatched is { Kind: MergeActionKind.Update } update
-                ? ColumnsOf(update, source, schema, "the update sets", "UPDATE SET *", "MergeAction.UpdateColumns")
-                : [];
+        /// <summary>Every column some update writes. Set by <see cref="Resolve"/>.</summary>
+        public IReadOnlyList<string> UpdatedColumns { get; private set; } = [];
 
-        /// <summary>The columns an insert writes: those it names, or every column of the table.</summary>
-        public IReadOnlyList<string> InsertColumns(RecordBatch? source, Schema.StructType schema) =>
-            WhenNotMatched is { } insert
-                ? ColumnsOf(insert, source, schema, "the insert writes", "INSERT *", "MergeAction.InsertColumns")
-                : [];
+        /// <summary>Every column some insert writes. Set by <see cref="Resolve"/>.</summary>
+        public IReadOnlyList<string> InsertedColumns { get; private set; } = [];
+
+        /// <summary>
+        /// Settles the columns each update and insert writes, now that the source's columns are known (null for a
+        /// source with no batches).
+        /// </summary>
+        public void Resolve(RecordBatch? source, Schema.StructType schema)
+        {
+            foreach (var clause in Matched.Concat(NotMatchedBySource))
+                ResolveClause(clause, source, schema, "the update sets", "UPDATE SET *", "MergeAction.UpdateColumns");
+            foreach (var clause in NotMatched)
+                ResolveClause(clause, source, schema, "the insert writes", "INSERT *", "MergeAction.InsertColumns");
+            UpdatedColumns = Matched.Concat(NotMatchedBySource).SelectMany(c => c.WrittenColumns)
+                .Distinct(StringComparer.Ordinal).ToList();
+            InsertedColumns = NotMatched.SelectMany(c => c.WrittenColumns).Distinct(StringComparer.Ordinal).ToList();
+            if (source is not null)
+            {
+                foreach (var clause in Matched.Where(c => c.Kind == MergeActionKind.Update))
+                    clause.SourceColumns = SourceColumnsRead(clause.Writes, source.Schema, Keys);
+            }
+        }
 
         // A `*` action takes every table column from the source, and Spark refuses one whose source lacks any
         // (DELTA_MERGE_UNRESOLVED_EXPRESSION), generated and identity columns included; a column list names its own.
-        private static IReadOnlyList<string> ColumnsOf(
-            MergeAction action, RecordBatch? source, Schema.StructType schema, string verb, string star, string listed)
+        // An assignment names a table column ignoring case, as Spark resolves it, and is recorded under the
+        // table's name for it.
+        private static void ResolveClause(
+            MergeClausePlan clause, RecordBatch? source, Schema.StructType schema, string verb, string star,
+            string listed)
         {
-            var columns = action.Columns ?? schema.Fields.Select(f => f.Name).ToList();
-            if (source is null)
-                return columns;
-            var missing = columns.Where(c => source.Schema.GetFieldIndex(c) < 0).ToList();
-            if (missing.Count == 0)
-                return columns;
-            throw new ArgumentException(
-                action.Columns is null
-                    ? $"MERGE: {star} takes every column of the table from the source, which has no "
-                      + $"{string.Join(", ", missing.Select(c => "'" + c + "'"))}. Name the columns to take with "
-                      + $"{listed}, or add the missing ones to the source."
-                    : $"MERGE: {verb} '{missing[0]}', which the source does not carry.",
-                "source");
+            if (clause.Kind == MergeActionKind.Delete)
+                return;
+
+            var writes = new Dictionary<string, Expressions.Expression?>(StringComparer.Ordinal);
+            var order = new List<string>();
+            if (clause.Action.Assignments is { } assignments)
+            {
+                foreach (var assignment in assignments)
+                {
+                    string column = TableColumn(assignment.Column, schema, verb);
+                    writes[column] = assignment.Value;
+                    order.Add(column);
+                }
+            }
+            else
+            {
+                var columns = clause.Action.Columns ?? schema.Fields.Select(f => f.Name).ToList();
+                if (source is not null)
+                {
+                    var missing = columns.Where(c => source.Schema.GetFieldIndex(c) < 0).ToList();
+                    if (missing.Count > 0)
+                    {
+                        throw new ArgumentException(
+                            clause.Action.Columns is null
+                                ? $"MERGE: {star} takes every column of the table from the source, which has no "
+                                  + $"{string.Join(", ", missing.Select(c => "'" + c + "'"))}. Name the columns to "
+                                  + $"take with {listed}, or add the missing ones to the source."
+                                : $"MERGE: {verb} '{missing[0]}', which the source does not carry.",
+                            "source");
+                    }
+                }
+                foreach (string column in columns)
+                {
+                    writes[column] = null;
+                    order.Add(column);
+                }
+            }
+            clause.Writes = writes;
+            clause.WrittenColumns = order;
+        }
+
+        // Keeping every source column a value names, at any level of any reference, keeps how each of its
+        // references resolves: a dropped column is one no reference names, so it can neither be read nor be the
+        // reason a bare name is hidden. The keys stay too, so that the source keeps a column (Arrow has no empty
+        // struct) even for values that read none.
+        private static List<string>? SourceColumnsRead(
+            IReadOnlyDictionary<string, Expressions.Expression?> writes, Apache.Arrow.Schema source,
+            IReadOnlyList<string> keys)
+        {
+            var named = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var value in writes.Values)
+            {
+                if (value is not null && !AddNames(value, named))
+                    return null;
+            }
+            return source.FieldsList.Select(f => f.Name)
+                .Where(n => (writes.TryGetValue(n, out var value) && value is null) || named.Contains(n)
+                    || keys.Contains(n, StringComparer.Ordinal))
+                .ToList();
+
+            // False for an expression of a kind it cannot see into.
+            static bool AddNames(Expressions.Expression expression, HashSet<string> names)
+            {
+                switch (expression)
+                {
+                    case Expressions.UnboundReference reference:
+                        names.UnionWith(reference.NameParts);
+                        return true;
+                    case Expressions.BoundReference bound:
+                        names.Add(bound.Name);
+                        return true;
+                    case Expressions.LiteralExpression or Expressions.TruePredicate or Expressions.FalsePredicate:
+                        return true;
+                    case Expressions.FunctionCall or Expressions.AndPredicate or Expressions.OrPredicate
+                        or Expressions.NotPredicate or Expressions.ComparisonPredicate or Expressions.UnaryPredicate
+                        or Expressions.SetPredicate:
+                        return ExpressionChildren(expression).All(child => AddNames(child, names));
+                    default:
+                        return false;
+                }
+            }
+        }
+
+        private static string TableColumn(string name, Schema.StructType schema, string verb)
+        {
+            // No exact-match shortcut: in a table with both `a` and `A` (a schema Spark refuses to write, but one
+            // written elsewhere opens), `a` is ambiguous, as a reference to it in an expression is.
+            var folded = schema.Fields.Where(f => string.Equals(f.Name, name, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            if (folded.Count == 1)
+                return folded[0].Name;
+            if (folded.Count > 1)
+            {
+                throw new DeltaFormatException(
+                    DeltaTableErrorCodes.AmbiguousReference,
+                    $"MERGE: {verb} '{name}', which is ambiguous: column names are compared ignoring case, and more "
+                    + "than one column of the table matches it.");
+            }
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.ColumnNotFound,
+                $"MERGE: {verb} '{name}', which is not a column of the table.");
         }
 
         public static MergePlan Validate(MergeOptions options, Schema.StructType schema)
@@ -987,19 +1359,29 @@ public sealed partial class DeltaTable
                 }
             }
 
-            Check(options.WhenMatched, "WhenMatched", MergeActionKind.Update, MergeActionKind.Delete);
-            Check(options.WhenNotMatched, "WhenNotMatched", MergeActionKind.Insert);
-            Check(options.WhenNotMatchedBySource, "WhenNotMatchedBySource", MergeActionKind.Delete);
-            Unused(options.WhenMatchedCondition, options.WhenMatched, "WhenMatched");
-            Unused(options.WhenNotMatchedCondition, options.WhenNotMatched, "WhenNotMatched");
-            Unused(options.WhenNotMatchedBySourceCondition, options.WhenNotMatchedBySource, "WhenNotMatchedBySource");
-            if (options.WhenMatched is null && options.WhenNotMatched is null && options.WhenNotMatchedBySource is null)
+            var matched = Check(options.WhenMatched, "WhenMatched", MergeActionKind.Update, MergeActionKind.Delete);
+            var notMatched = Check(options.WhenNotMatched, "WhenNotMatched", MergeActionKind.Insert);
+            var sourceless = Check(
+                options.WhenNotMatchedBySource, "WhenNotMatchedBySource", MergeActionKind.Update, MergeActionKind.Delete);
+            if (matched.Count == 0 && notMatched.Count == 0 && sourceless.Count == 0)
                 throw new ArgumentException("MERGE needs at least one clause.", nameof(options));
 
-            foreach (var (action, verb) in new[]
-                { (options.WhenMatched, "the update sets"), (options.WhenNotMatched, "the insert writes") })
+            foreach (var clause in sourceless)
             {
-                foreach (string column in action?.Columns ?? [])
+                // There is no source row to copy from.
+                if (clause.Kind == MergeActionKind.Update && clause.Action.Assignments is null)
+                {
+                    throw new ArgumentException(
+                        $"MERGE: WhenNotMatchedBySource cannot be {clause.Action}: a target row no source row matches "
+                        + "has no source columns to copy. Assign values with MergeAction.UpdateSet.",
+                        nameof(options));
+                }
+            }
+
+            foreach (var (clause, verb) in matched.Select(c => (c, "the update sets"))
+                .Concat(notMatched.Select(c => (c, "the insert writes"))))
+            {
+                foreach (string column in clause.Action.Columns ?? [])
                 {
                     if (!schema.Fields.Any(f => string.Equals(f.Name, column, StringComparison.Ordinal)))
                     {
@@ -1010,26 +1392,36 @@ public sealed partial class DeltaTable
                 }
             }
 
-            return new MergePlan(keys, options.WhenMatched, options.WhenNotMatched, options.WhenNotMatchedBySource);
+            return new MergePlan(keys, matched, notMatched, sourceless);
 
-            static void Check(MergeAction? action, string clause, params MergeActionKind[] allowed)
+            // As in Spark, only the last clause of a kind may be unconditional: one before it would take every row
+            // and leave the clauses after it unreachable.
+            static List<MergeClausePlan> Check(
+                IReadOnlyList<MergeAction>? actions, string clause, params MergeActionKind[] allowed)
             {
-                if (action is not null && !allowed.Contains(action.Kind))
+                if (actions is null)
+                    throw new ArgumentException($"MERGE: {clause} is null; leave it empty for no clauses.", nameof(options));
+                var plans = new List<MergeClausePlan>(actions.Count);
+                for (int i = 0; i < actions.Count; i++)
                 {
-                    throw new ArgumentException(
-                        $"MERGE: {clause} cannot be {action}; it takes {string.Join(" or ", allowed)}.",
-                        nameof(options));
+                    var action = actions[i] ?? throw new ArgumentException(
+                        $"MERGE: {clause}[{i}] is null.", nameof(options));
+                    if (!allowed.Contains(action.Kind))
+                    {
+                        throw new ArgumentException(
+                            $"MERGE: {clause} cannot be {action}; it takes {string.Join(" or ", allowed)}.",
+                            nameof(options));
+                    }
+                    if (action.Condition is null && i < actions.Count - 1)
+                    {
+                        throw new ArgumentException(
+                            $"MERGE: {clause}[{i}] ({action}) has no condition, so the clauses after it could never "
+                            + "apply. Only the last clause of a kind may be unconditional.",
+                            nameof(options));
+                    }
+                    plans.Add(new MergeClausePlan(action));
                 }
-            }
-
-            static void Unused(Expressions.Predicate? condition, MergeAction? action, string clause)
-            {
-                if (condition is not null && action is null)
-                {
-                    throw new ArgumentException(
-                        $"MERGE: {clause}Condition is set but {clause} is not, so it would never be evaluated.",
-                        nameof(options));
-                }
+                return plans;
             }
         }
     }

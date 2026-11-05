@@ -195,11 +195,10 @@ public class OperationMetricsInteropTests : IDisposable
             (_, version) = await table.MergeAsync([Rows((2, "B"), (6, "f"))], new MergeOptions
             {
                 Keys = ["id"],
-                WhenMatched = MergeAction.Update,
-                WhenNotMatched = MergeAction.Insert,
-                WhenNotMatchedBySource = MergeAction.Delete,
-                WhenNotMatchedBySourceCondition = Ex.Equal(
-                    UnboundReference.FromParts(["target", "id"]), Ex.Lit(LiteralValue.Of(5L))),
+                WhenMatched = [MergeAction.Update],
+                WhenNotMatched = [MergeAction.Insert],
+                WhenNotMatchedBySource = [MergeAction.Delete.When(Ex.Equal(
+                    UnboundReference.FromParts(["target", "id"]), Ex.Lit(LiteralValue.Of(5L))))],
             });
         }
 

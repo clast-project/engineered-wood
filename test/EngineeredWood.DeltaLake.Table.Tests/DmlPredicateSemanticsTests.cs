@@ -230,8 +230,7 @@ public class DmlPredicateSemanticsTests : IDisposable
             new MergeOptions
             {
                 Keys = ["id"],
-                WhenMatched = MergeAction.Update,
-                WhenMatchedCondition = X.Equal(Side("target", "d"), X.Lit(LiteralValue.Of(5))),
+                WhenMatched = [MergeAction.Update.When(X.Equal(Side("target", "d"), X.Lit(LiteralValue.Of(5))))],
             }));
 
         Assert.Equal(before, table.CurrentSnapshot.Version);
@@ -249,8 +248,7 @@ public class DmlPredicateSemanticsTests : IDisposable
             new MergeOptions
             {
                 Keys = ["id"],
-                WhenNotMatched = MergeAction.Insert,
-                WhenNotMatchedCondition = X.Equal(Side("source", "d"), X.Lit(LiteralValue.Of(5))),
+                WhenNotMatched = [MergeAction.Insert.When(X.Equal(Side("source", "d"), X.Lit(LiteralValue.Of(5))))],
             }));
 
         Assert.Equal(before, table.CurrentSnapshot.Version);
@@ -270,8 +268,7 @@ public class DmlPredicateSemanticsTests : IDisposable
             new MergeOptions
             {
                 Keys = ["id"],
-                WhenNotMatchedBySource = MergeAction.Delete,
-                WhenNotMatchedBySourceCondition = X.Equal(Side("target", "d"), X.Lit(LiteralValue.Of(5))),
+                WhenNotMatchedBySource = [MergeAction.Delete.When(X.Equal(Side("target", "d"), X.Lit(LiteralValue.Of(5))))],
             }));
     }
 
@@ -286,8 +283,7 @@ public class DmlPredicateSemanticsTests : IDisposable
             new MergeOptions
             {
                 Keys = ["id"],
-                WhenMatched = MergeAction.Delete,
-                WhenMatchedCondition = X.Equal(Side("target", "d"), X.Lit(LiteralValue.Of("2026-10-03"))),
+                WhenMatched = [MergeAction.Delete.When(X.Equal(Side("target", "d"), X.Lit(LiteralValue.Of("2026-10-03"))))],
             });
 
         Assert.Equal(1, metrics.NumTargetRowsDeleted);
@@ -438,8 +434,7 @@ public class DmlPredicateSemanticsTests : IDisposable
             new MergeOptions
             {
                 Keys = ["id"],
-                WhenMatched = MergeAction.Update,
-                WhenMatchedCondition = X.Equal(Side("target", "nope"), X.Lit(LiteralValue.Of(1L))),
+                WhenMatched = [MergeAction.Update.When(X.Equal(Side("target", "nope"), X.Lit(LiteralValue.Of(1L))))],
             }));
 
         Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
@@ -457,8 +452,7 @@ public class DmlPredicateSemanticsTests : IDisposable
             new MergeOptions
             {
                 Keys = ["id"],
-                WhenNotMatched = MergeAction.Insert,
-                WhenNotMatchedCondition = X.Equal(Side("source", "nope"), X.Lit(LiteralValue.Of(1L))),
+                WhenNotMatched = [MergeAction.Insert.When(X.Equal(Side("source", "nope"), X.Lit(LiteralValue.Of(1L))))],
             }));
 
         Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
@@ -480,8 +474,7 @@ public class DmlPredicateSemanticsTests : IDisposable
             new MergeOptions
             {
                 Keys = ["id"],
-                WhenNotMatchedBySource = MergeAction.Delete,
-                WhenNotMatchedBySourceCondition = X.IsNull(Side("source", "d")),
+                WhenNotMatchedBySource = [MergeAction.Delete.When(X.IsNull(Side("source", "d")))],
             }));
 
         Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);
@@ -502,9 +495,8 @@ public class DmlPredicateSemanticsTests : IDisposable
             new MergeOptions
             {
                 Keys = ["id"],
-                WhenMatched = MergeAction.Delete,
-                WhenMatchedCondition = X.IsNull("d"),
-                WhenNotMatchedBySource = MergeAction.Delete,
+                WhenMatched = [MergeAction.Delete.When(X.IsNull("d"))],
+                WhenNotMatchedBySource = [MergeAction.Delete],
             });
 
         Assert.Equal(3, metrics.NumTargetRowsDeleted);
@@ -543,8 +535,7 @@ public class DmlPredicateSemanticsTests : IDisposable
             new MergeOptions
             {
                 Keys = ["id"],
-                WhenNotMatched = MergeAction.Insert,
-                WhenNotMatchedCondition = X.IsNull(Side("source", "nope")),
+                WhenNotMatched = [MergeAction.Insert.When(X.IsNull(Side("source", "nope")))],
             }));
 
         Assert.Equal(DeltaTableErrorCodes.UnresolvedColumn, ex.ErrorCode);

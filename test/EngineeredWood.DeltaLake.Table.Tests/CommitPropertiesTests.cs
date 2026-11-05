@@ -93,7 +93,7 @@ public class CommitPropertiesTests : IDisposable
             Ex.Equal("id", 3L), batch => batch, commitProperties: Tagged("update"));
         await table.MergeAsync(
             [Rows(4, 6)],
-            new MergeOptions { Keys = ["id"], WhenMatched = MergeAction.Update, WhenNotMatched = MergeAction.Insert },
+            new MergeOptions { Keys = ["id"], WhenMatched = [MergeAction.Update], WhenNotMatched = [MergeAction.Insert] },
             commitProperties: Tagged("merge"));
         await table.CompactAsync(commitProperties: Tagged("optimize"));
 

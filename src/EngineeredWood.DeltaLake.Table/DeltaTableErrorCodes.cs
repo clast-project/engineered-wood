@@ -423,6 +423,21 @@ public static class DeltaTableErrorCodes
     /// matched DELETE is exempt: every candidate deletes the same row.</remarks>
     public const string MultipleSourceRowsMatchingTargetRow = "DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE";
 
+    /// <summary>
+    /// A MERGE assignment reads a column its clause cannot see: an insert reading the target row, a
+    /// not-matched-by-source update reading the source row, or a column neither row has.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_MERGE_UNRESOLVED_EXPRESSION</c>, raised at analysis.</remarks>
+    public const string MergeUnresolvedExpression = "DELTA_MERGE_UNRESOLVED_EXPRESSION";
+
+    /// <summary>
+    /// A value written into a column does not fit its type: a MERGE assignment of 3000000000 to an <c>int</c>
+    /// column, or of 123456789012.5 to a <c>decimal(10,2)</c> one. Nothing is committed.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_CAST_OVERFLOW_IN_TABLE_WRITE</c>, where a bare cast says
+    /// <c>CAST_OVERFLOW</c>.</remarks>
+    public const string CastOverflowInTableWrite = "DELTA_CAST_OVERFLOW_IN_TABLE_WRITE";
+
     // ── RESTORE ──
 
     /// <summary>
