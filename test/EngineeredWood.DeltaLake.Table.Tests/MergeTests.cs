@@ -430,6 +430,158 @@ public class MergeTests : IDisposable
         Assert.Equal([(1L, 11L), (2L, 20L), (3L, 30L)], (await ReadAsync(table)).Select(r => (r.Id!.Value, r.Ts!.Value)));
     }
 
+    // #578: key-range pruning beyond integer and string keys. Each source holds a negative and a positive key, so
+    // a range found by comparing the values' bytes without their sign would be empty or inverted.
+    [Fact]
+    public Task AByteKey_PrunesAFileOutsideTheSourceKeyRange() =>
+        AssertKeyRangePrunes(Int8Type.Default, values =>
+        {
+            var b = new Int8Array.Builder();
+            foreach (long v in values) b.Append((sbyte)v);
+            return b.Build();
+        });
+
+    [Fact]
+    public Task AShortKey_PrunesAFileOutsideTheSourceKeyRange() =>
+        AssertKeyRangePrunes(Int16Type.Default, values =>
+        {
+            var b = new Int16Array.Builder();
+            foreach (long v in values) b.Append((short)v);
+            return b.Build();
+        });
+
+    [Fact]
+    public Task ADateKey_PrunesAFileOutsideTheSourceKeyRange() =>
+        AssertKeyRangePrunes(Date32Type.Default, values =>
+        {
+            var data = new ArrowBuffer.Builder<int>();
+            foreach (long v in values) data.Append((int)v);
+            return new Date32Array(data.Build(), ArrowBuffer.Empty, values.Length, 0, 0);
+        });
+
+    [Fact]
+    public Task ATimestampKey_PrunesAFileOutsideTheSourceKeyRange() =>
+        // Whole seconds: the statistics hold milliseconds, and the pruner widens a maximum by one.
+        AssertKeyRangePrunes(Micros, values => Timestamps(Micros, values.Select(v => v * 1_000_000).ToArray()));
+
+    [Fact]
+    public Task ATimestampNtzKey_PrunesAFileOutsideTheSourceKeyRange()
+    {
+        var ntz = new TimestampType(TimeUnit.Microsecond, (string?)null);
+        return AssertKeyRangePrunes(ntz, values => Timestamps(ntz, values.Select(v => v * 1_000_000).ToArray()));
+    }
+
+    [Fact]
+    public Task ADecimalKey_PrunesAFileOutsideTheSourceKeyRange()
+    {
+        var type = new Decimal128Type(10, 2);
+        return AssertKeyRangePrunes(type, values =>
+        {
+            var b = new Decimal128Array.Builder(type);
+            foreach (long v in values) b.Append(v + 0.25m);
+            return b.Build();
+        });
+    }
+
+    [Fact]
+    public Task AWideDecimalKey_PrunesAFileOutsideTheSourceKeyRange()
+    {
+        // Values past 2^64, so the order is decided by the high word, its sign, and then the low word.
+        var type = new Decimal128Type(38, 0);
+        return AssertKeyRangePrunes(type, values =>
+        {
+            var b = new Decimal128Array.Builder(type);
+            foreach (long v in values) b.Append(v * 100_000_000_000_000_000_000m + v);
+            return b.Build();
+        });
+    }
+
+    // A source timestamp whose ticks overflow must leave the key unbounded. Unchecked, the maximum wrapped to
+    // epoch + 4 ticks, the range one second..4 ticks was empty, and the file holding one second was skipped.
+    [Fact]
+    public async Task ATimestampKeyWhoseTicksOverflow_DoesNotSkipTheMatchingFile()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", Micros, true)).Field(new Field("v", StringType.Default, true)).Build();
+        await using var table = await CreateAsync(schema: schema);
+        await table.WriteAsync([TimestampRows(Micros, [1_000_000],
+            new StringArray.Builder().Append("a").Build(), StringType.Default)]);
+
+        var (metrics, _) = await table.MergeAsync(
+            [TimestampRows(Micros, [1_000_000, 1_844_674_407_370_955_162],
+                new StringArray.Builder().Append("A").Append("far").Build(), StringType.Default)],
+            new MergeOptions { Keys = ["k"], WhenMatched = MergeAction.Update });
+
+        Assert.Equal(1, metrics.NumTargetRowsUpdated);
+    }
+
+    // A sliced source key: its extremes must be found within the slice. Unsliced, the leading 500 and 50 make the
+    // range 50..500, which prunes the file holding -2.
+    [Fact]
+    public Task ASlicedLongKey_IsBoundedWithinTheSlice() =>
+        AssertKeyRangePrunes(Int64Type.Default, values =>
+        {
+            var b = new Int64Array.Builder();
+            foreach (long v in values) b.Append(v);
+            return b.Build();
+        }, sliced: true);
+
+    [Fact]
+    public Task ASlicedDecimalKey_IsBoundedWithinTheSlice()
+    {
+        var type = new Decimal128Type(10, 2);
+        return AssertKeyRangePrunes(type, values =>
+        {
+            var b = new Decimal128Array.Builder(type);
+            foreach (long v in values) b.Append(v + 0.25m);
+            return b.Build();
+        }, sliced: true);
+    }
+
+    // A near file (keys -2, 1) and a far one (100, 120); the source (-2, 3) updates -2 and inserts 3. The far file
+    // must be neither read nor rewritten, and is no read dependency of the transaction. A sliced source holds
+    // 500 and 50 ahead of its window.
+    private async Task AssertKeyRangePrunes(IArrowType keyType, Func<long[], IArrowArray> keys, bool sliced = false)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", keyType, true)).Field(new Field("v", StringType.Default, true)).Build();
+        RecordBatch Batch(long[] k, params string[] v)
+        {
+            var values = new StringArray.Builder();
+            foreach (string x in v) values.Append(x);
+            return new RecordBatch(schema, [keys(k), values.Build()], k.Length);
+        }
+
+        await using var table = await CreateAsync(schema: schema);
+        await table.WriteAsync([Batch([-2, 1], "a", "b")]);
+        var near = table.CurrentSnapshot.ActiveFiles.Keys.ToHashSet();
+        await table.WriteAsync([Batch([100, 120], "x", "y")]);
+        string far = table.CurrentSnapshot.ActiveFiles.Keys.Single(p => !near.Contains(p));
+
+        await using var txn = table.StartTransaction();
+        var options = new MergeOptions { Keys = ["k"], WhenMatched = MergeAction.Update, WhenNotMatched = MergeAction.Insert };
+        var source = sliced
+            ? new RecordBatch(schema,
+                Batch([500, 50, -2, 3], "p", "q", "A", "c").Arrays.Select(a => ArrowArrayFactory.Slice(a, 2, 2)), 2)
+            : Batch([-2, 3], "A", "c");
+        var metrics = await txn.MergeAsync([source], options);
+        Assert.Equal(1, metrics.NumTargetRowsUpdated);
+        Assert.Equal(1, metrics.NumTargetRowsInserted);
+        Assert.DoesNotContain(far, txn.DeclaredReadPaths);
+        Assert.DoesNotContain(far, txn.RemovedPaths);
+        Assert.Contains(near.Single(), txn.RemovedPaths);
+        await txn.CommitAsync();
+
+        Assert.Contains(far, table.CurrentSnapshot.ActiveFiles.Keys);
+        var values = new List<string?>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            for (int i = 0; i < batch.Length; i++)
+                values.Add(((StringArray)batch.Column("v")).GetString(i));
+        }
+        Assert.Equal(["A", "b", "c", "x", "y"], values.OrderBy(v => v, StringComparer.Ordinal));
+    }
+
     private static MergeOptions UpsertByValue => new()
     {
         Keys = ["value"],

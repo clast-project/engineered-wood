@@ -932,7 +932,8 @@ keys and for `SET *` / `INSERT *` (pinned by `MergeInteropTests`). It does not t
 an arbitrary ON condition, several clauses of one kind, SET or VALUES expressions
 (only source columns, all of them or a named list), or schema evolution (appends have it since #568; MERGE
 does not use it yet); it always copy-on-writes, never writing deletion vectors;
-it prunes files by the source's key range only for integer and string keys (not date, timestamp or decimal);
+it prunes files by the source's key range only for `byte`, `short`, `integer`, `long`, `date`, `timestamp`,
+`timestamp_ntz`, `decimal` and `string` keys (#578), not `float`, `double`, `boolean` or `binary` ones;
 and, like EW's other DML (only VACUUM writes them), its commit records no
 `operationMetrics`: the counts come back to the caller as `MergeMetrics` instead. `RestoreAsync` (by version or
 timestamp, #567) commits an earlier version's files, metadata and clustering columns as Spark's RESTORE does (pinned
