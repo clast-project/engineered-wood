@@ -8552,7 +8552,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// <see cref="StatsWithLooseBounds(string?)"/> for a file re-added under a deletion vector whose physical row count
     /// the caller knows: the protocol requires such a file to carry a correct <c>numRecords</c>, so statistics that
-    /// lack one, or a file with none at all, are given <paramref name="physicalRows"/>. A count already there is kept.
+    /// lack one, or a file with none at all, are given <paramref name="physicalRows"/>. A count already there is kept,
+    /// unless it is not an integer the log could read.
     /// </summary>
     private static string StatsWithLooseBounds(string? stats, long physicalRows)
     {
@@ -8580,11 +8581,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
             {
                 writer.WriteStartObject();
-                if (doc is null || !doc.RootElement.TryGetProperty("numRecords", out var count)
-                    || count.ValueKind != System.Text.Json.JsonValueKind.Number)
-                {
+                // Kept only when it reads as the count the log reads (ColumnStats.Parse takes an Int64): 2.5 is no
+                // count, and is replaced rather than written back beside the new one.
+                bool keepCount = doc is not null && doc.RootElement.TryGetProperty("numRecords", out var count)
+                    && count.ValueKind == System.Text.Json.JsonValueKind.Number && count.TryGetInt64(out _);
+                if (!keepCount)
                     writer.WriteNumber("numRecords", physicalRows);
-                }
                 writer.WriteBoolean("tightBounds", false);
                 if (doc is not null)
                 {
@@ -8592,7 +8594,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     {
                         if (prop.NameEquals("tightBounds"))
                             continue;
-                        if (prop.NameEquals("numRecords") && prop.Value.ValueKind != System.Text.Json.JsonValueKind.Number)
+                        if (prop.NameEquals("numRecords") && !keepCount)
                             continue; // replaced above
                         prop.WriteTo(writer);
                     }
@@ -9353,8 +9355,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // boundary (RowSelection) defaults to Throw instead.
         var selection = RowSelection.FromOrdinals(
             positionsByOrdinal, snapshot, StaleAddressPolicy.Skip, nameof(positionsByOrdinal));
-        var result = await ComputeDvActionsWithEditsAsync(selection, snapshot, cancellationToken)
-            .ConfigureAwait(false);
+        // The caller owns the vectors only once it has the actions naming them: a failure part-way (a later file's
+        // vector or row count unreadable, or a cancellation) takes back those already written.
+        var result = await CollectOnFailureAsync(
+            written => ComputeDvActionsWithEditsAsync(selection, snapshot, cancellationToken, written),
+            cancellationToken).ConfigureAwait(false);
         return (result.Actions, result.RowsDeleted);
     }
 
@@ -10940,7 +10945,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>baseRowId</c> and leave the high-water mark alone. Metadata/protocol changes between the snapshots
     /// throw. The caller re-runs commitInfo assembly after the rebase.
     /// </summary>
-    public async ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsAsync(
+    public ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsAsync(
         IReadOnlyList<DeltaAction> actions,
         IReadOnlyDictionary<int, IReadOnlyCollection<long>> newPositionsByOrdinal,
         Snapshot.Snapshot from,
@@ -10948,6 +10953,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        // The host owns the vectors only once it has the rebased actions naming them: a rebase that fails part-way
+        // (a conflict, an unreadable file or row count, a cancellation) takes back those it already wrote.
+        return CollectOnFailureAsync(
+            written => RebaseDvDmlActionsCoreAsync(
+                actions, newPositionsByOrdinal, from, to, written, cancellationToken),
+            cancellationToken);
+    }
+
+    private async ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsCoreAsync(
+        IReadOnlyList<DeltaAction> actions,
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> newPositionsByOrdinal,
+        Snapshot.Snapshot from,
+        Snapshot.Snapshot to,
+        WrittenFileLedger written,
+        CancellationToken cancellationToken)
+    {
         if (to.Version == from.Version)
         {
             return actions;
@@ -11060,6 +11081,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // vector behind.
                     string? reAddStats = await VectorStatsAsync(current, cancellationToken).ConfigureAwait(false);
                     var newDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
+                    written.RecordDeletionVector(newDv);
                     rebased.Add(current with
                     {
                         DeletionVector = newDv,
@@ -11109,9 +11131,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var resolvedPaths = new HashSet<string>(StringComparer.Ordinal); // the checker bookkeeping the
             // autocommit caller needs; the buffered caller re-validates via CheckLogicalRebaseAsync instead,
             // where the remap's remove(newPath, current DV) matches the still-active file and passes.
-            // No ledger: this is the buffered/host-driven rebase seam, whose files the HOST owns end to end.
+            // The ledger only takes the vectors back if the rebase fails; the host owns the ones it returns.
             var remapped = await RemapRowLevelDeletesAsync(
-                from, to, remapEdits, resolvedPaths, cancellationToken, written: null)
+                from, to, remapEdits, resolvedPaths, cancellationToken, written)
                 .ConfigureAwait(false);
             if (remapped is null)
             {

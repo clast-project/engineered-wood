@@ -83,6 +83,7 @@ public class DeletionVectorRowCountTests : IDisposable
     {
         Assert.NotNull(file.DeletionVector);
         Assert.Equal(5, file.GetNumRecords());
+        Assert.Single(System.Text.RegularExpressions.Regex.Matches(file.Stats!, "\"numRecords\""));
         Assert.Contains("\"tightBounds\":false", file.Stats);
         if (originalStats is not null)
             Assert.Contains("\"minValues\":{\"id\":1}", file.Stats);
@@ -93,6 +94,8 @@ public class DeletionVectorRowCountTests : IDisposable
         { null, false },
         { "{\"minValues\":{\"id\":1}}", false },
         { null, true },
+        // Not an integer, so no count the log can read: replaced, not written back beside the new one.
+        { "{\"numRecords\":2.5,\"minValues\":{\"id\":1}}", false },
     };
 
     [Theory]
@@ -192,6 +195,47 @@ public class DeletionVectorRowCountTests : IDisposable
         Assert.Empty(Directory.GetFiles(_tempDir, "*.bin", SearchOption.AllDirectories));
     }
 
+    /// <summary>Across files: a later file's count read failing takes back the vector an earlier file already
+    /// wrote, since the caller never receives the actions naming it.</summary>
+    [Fact]
+    public async Task AFailedCountReadOfALaterFile_TakesBackTheEarlierVector()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var reader = new CountingReader(fs);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, TableSchema, new DeltaTableOptions { CheckpointInterval = 0, DataFileReader = reader },
+            enableDeletionVectors: true);
+        table.DeletionVectorInlineThreshold = 0; // vector files of their own
+        await table.WriteAsync([Ids(1, 2, 3, 4, 5)]);
+        await table.WriteAsync([Ids(6, 7, 8, 9, 10)]);
+        var files = table.CurrentSnapshot.ActiveFiles.Values.ToList();
+        await using (var transaction = table.StartTransaction())
+        {
+            foreach (var file in files)
+            {
+                transaction.StageActions(
+                [
+                    new RemoveFile
+                    {
+                        Path = file.Path,
+                        DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                        DataChange = false,
+                    },
+                    file with { Stats = null, TypedStats = null, DataChange = false },
+                ]);
+            }
+            await transaction.CommitAsync();
+        }
+        reader.Reads = 0;
+        reader.FailAfter = 1; // the first file is counted and its vector written; the second fails
+
+        await Assert.ThrowsAsync<IOException>(() => table.ComputeDeletionVectorActionsAsync(
+            new Dictionary<int, IReadOnlyCollection<long>> { [0] = [1L], [1] = [1L] }).AsTask());
+
+        Assert.Equal(2, reader.Reads);
+        Assert.Empty(Directory.GetFiles(_tempDir, "*.bin", SearchOption.AllDirectories));
+    }
+
     /// <summary>A codec-seam reader that counts the files it decodes, delegating to the built-in codec.</summary>
     private sealed class CountingReader(ITableFileSystem fs) : IDataFileReader
     {
@@ -199,12 +243,15 @@ public class DeletionVectorRowCountTests : IDisposable
 
         public bool Fail { get; set; }
 
+        /// <summary>Fails every read after this many.</summary>
+        public int FailAfter { get; set; } = int.MaxValue;
+
         public async IAsyncEnumerable<RecordBatch> ReadAsync(
             string relativePath, IReadOnlyList<string>? physicalColumns,
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             Reads++;
-            if (Fail)
+            if (Fail || Reads > FailAfter)
                 throw new IOException("The codec failed.");
             await using var file = await fs.OpenReadAsync(relativePath, cancellationToken);
             using var reader = new ParquetFileReader(file, ownsFile: false);
