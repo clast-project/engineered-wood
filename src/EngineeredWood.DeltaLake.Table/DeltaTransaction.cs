@@ -372,11 +372,11 @@ public sealed class DeltaTransaction : IAsyncDisposable
     ///
     /// <para><paramref name="mergeSchema"/> evolves the schema to fit the batches, in this transaction's commit,
     /// as <see cref="DeltaTable.WriteAsync(IReadOnlyList{RecordBatch}, DeltaWriteMode, CancellationToken, IReadOnlyList{string}, bool?, CommitProperties, bool)"/>
-    /// does. Several merging writes compose, and every append staged after one sees the merged schema. A merge
-    /// cannot share a transaction with a schema change staged any other way (<see cref="StageSchemaChange"/>, a
-    /// <c>metaData</c> through <see cref="StageActions"/>), in either order: the commit carries one
-    /// <c>metaData</c>, and each was computed without the other. Nor with a later MERGE or replaceWhere that
-    /// advances identity marks, for the same reason.</para>
+    /// does. Several merging writes compose, and every append or MERGE staged after one sees the merged schema. A
+    /// merge that changes the schema cannot share a transaction with a schema change staged any other way
+    /// (<see cref="StageSchemaChange"/>, a <c>metaData</c> through <see cref="StageActions"/>), in either order: the
+    /// commit carries one <c>metaData</c>, and each was computed without the other. One that changes nothing is a
+    /// plain append. Nor with a later replaceWhere that advances identity marks, for the same reason.</para>
     /// </summary>
     public async ValueTask<long> WriteAsync(
         IReadOnlyList<RecordBatch> batches, CancellationToken cancellationToken = default, bool mergeSchema = false)

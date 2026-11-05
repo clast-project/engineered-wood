@@ -270,8 +270,9 @@ public sealed class MergeOptions
     /// and is written as an append writes it by such an insert; a field of a struct column the source lacks is kept
     /// by an update and NULL in an insert. Without evolution such a MERGE is refused.</item>
     /// </list>
-    /// <para>Inside a transaction it composes with merging appends, and is refused alongside a schema change
-    /// staged any other way, as <see cref="DeltaTransaction.WriteAsync"/> with <c>mergeSchema</c> is. A new field
+    /// <para>Inside a transaction it composes with merging appends, and when it changes the schema it is refused
+    /// alongside a schema change staged any other way, as <see cref="DeltaTransaction.WriteAsync"/> with
+    /// <c>mergeSchema</c> is; one that changes nothing runs as a plain MERGE. A new field
     /// inside an array element or a map key or value is refused, as a <c>mergeSchema</c> write refuses it, though
     /// Spark adds one. A source column whose name differs from a table column's only in case is refused rather than
     /// matched or added.</para>
