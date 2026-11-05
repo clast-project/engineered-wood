@@ -3998,6 +3998,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (added.Count != ours.Length)
                 return null;
 
+            // Before the vector is written: a failed or cancelled read of the row count must leave no
+            // vector behind.
+            string? reAddStats = await VectorStatsAsync(latestAdd, cancellationToken).ConfigureAwait(false);
             var unionDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
             written?.RecordDeletionVector(unionDv);
 
@@ -4022,7 +4025,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = unionDv,
                 DataChange = true,
-                Stats = StatsWithLooseBounds(latestAdd.GetStatsJson()),
+                Stats = reAddStats,
             });
         }
 
@@ -4174,6 +4177,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var deleted = cand.DeletionVector is not null
                 ? await _dvReader.ReadAsync(cand.DeletionVector, cancellationToken).ConfigureAwait(false)
                 : DeletionVectorBitmap.Empty;
+            // Before the vector is written: a failed or cancelled read of the row count must leave no
+            // vector behind.
+            string? reAddStats = await VectorStatsAsync(cand, cancellationToken).ConfigureAwait(false);
             var newDv = await dvWriter.CreateAsync(deleted.Union(positions), cancellationToken)
                 .ConfigureAwait(false);
             written?.RecordDeletionVector(newDv);
@@ -4194,7 +4200,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
-                Stats = StatsWithLooseBounds(cand.GetStatsJson()),
+                Stats = reAddStats,
             });
         }
         return result;
@@ -4917,7 +4923,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     {
                         DeletionVector = newDv,
                         DataChange = true,
-                        Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
+                        Stats = StatsWithLooseBounds(addFile.GetStatsJson(), fileRows),
                     });
 
                     // Record the exact rows this delete added (absolute positions), so a concurrent DV-delete
@@ -8548,7 +8554,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// <see cref="StatsWithLooseBounds(string?)"/> for a file re-added under a deletion vector whose physical row count
     /// the caller knows: the protocol requires such a file to carry a correct <c>numRecords</c>, so statistics that
-    /// lack one, or a file with none at all, are given <paramref name="physicalRows"/>. A count already there is kept.
+    /// lack one, or a file with none at all, are given <paramref name="physicalRows"/>. A count already there is kept,
+    /// unless it is not an integer the log could read.
     /// </summary>
     private static string StatsWithLooseBounds(string? stats, long physicalRows)
     {
@@ -8576,11 +8583,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
             {
                 writer.WriteStartObject();
-                if (doc is null || !doc.RootElement.TryGetProperty("numRecords", out var count)
-                    || count.ValueKind != System.Text.Json.JsonValueKind.Number)
-                {
+                // Kept only when it reads as the count the log reads (ColumnStats.Parse takes an Int64): 2.5 is no
+                // count, and is replaced rather than written back beside the new one.
+                bool keepCount = doc is not null && doc.RootElement.TryGetProperty("numRecords", out var count)
+                    && count.ValueKind == System.Text.Json.JsonValueKind.Number && count.TryGetInt64(out _);
+                if (!keepCount)
                     writer.WriteNumber("numRecords", physicalRows);
-                }
                 writer.WriteBoolean("tightBounds", false);
                 if (doc is not null)
                 {
@@ -8588,7 +8596,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     {
                         if (prop.NameEquals("tightBounds"))
                             continue;
-                        if (prop.NameEquals("numRecords") && prop.Value.ValueKind != System.Text.Json.JsonValueKind.Number)
+                        if (prop.NameEquals("numRecords") && !keepCount)
                             continue; // replaced above
                         prop.WriteTo(writer);
                     }
@@ -8597,6 +8605,46 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
             return System.Text.Encoding.UTF8.GetString(stream.ToArray());
         }
+    }
+
+    /// <summary>
+    /// The statistics of <paramref name="file"/>, an existing data file re-added under a new deletion vector: its own,
+    /// marked loose (<see cref="StatsWithLooseBounds(string?)"/>), and given its physical row count when they lack
+    /// one, since the protocol requires a file with a deletion vector to carry a correct <c>numRecords</c> (#705). The
+    /// count comes from the file's footer (or, through the codec seam, which hides it, from reading the file), so a
+    /// file whose statistics have it costs nothing more.
+    /// </summary>
+    internal async ValueTask<string?> VectorStatsAsync(AddFile file, CancellationToken cancellationToken)
+    {
+        string? stats = file.GetStatsJson();
+        // A count either copy of the statistics carries is passed on, so the JSON committed gets it even when only
+        // the checkpoint's typed copy had it (another writer's stats_parsed with a count, its stats string without).
+        long rows = file.GetNumRecords()
+            ?? await PhysicalRowCountAsync(file, cancellationToken).ConfigureAwait(false);
+        return StatsWithLooseBounds(stats, rows);
+    }
+
+    /// <summary>The rows <paramref name="file"/> holds physically, deletion vector or not.</summary>
+    private async ValueTask<long> PhysicalRowCountAsync(AddFile file, CancellationToken cancellationToken)
+    {
+        string path = EngineeredWood.DeltaLake.DeltaPath.Decode(file.Path);
+        long rows = 0;
+        if (_options.DataFileReader is { } seam)
+        {
+            await foreach (var batch in seam.ReadAsync(path, null, cancellationToken).ConfigureAwait(false))
+            {
+                rows += batch.Length;
+                batch.Dispose();
+            }
+            return rows;
+        }
+
+        await using var stream = await _fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        using var reader = new Parquet.ParquetFileReader(stream, ownsFile: false, _dataFileReadOptions);
+        var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var rowGroup in footer.RowGroups)
+            rows += rowGroup.NumRows;
+        return rows;
     }
 
     private static string? StatsWithLooseBounds(string? stats)
@@ -9310,8 +9358,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // boundary (RowSelection) defaults to Throw instead.
         var selection = RowSelection.FromOrdinals(
             positionsByOrdinal, snapshot, StaleAddressPolicy.Skip, nameof(positionsByOrdinal));
-        var result = await ComputeDvActionsWithEditsAsync(selection, snapshot, cancellationToken)
-            .ConfigureAwait(false);
+        // The caller owns the vectors only once it has the actions naming them: a failure part-way (a later file's
+        // vector or row count unreadable, or a cancellation) takes back those already written.
+        var result = await CollectOnFailureAsync(
+            written => ComputeDvActionsWithEditsAsync(selection, snapshot, cancellationToken, written),
+            cancellationToken).ConfigureAwait(false);
         return (result.Actions, result.RowsDeleted);
     }
 
@@ -9365,6 +9416,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             edits.Add(new DeleteDvEdit(addFile.Path, newRows));
             touched.Add(addFile.Path);
 
+            // Before the vector is written: a failed or cancelled read of the row count must leave no
+            // vector behind.
+            string? reAddStats = await VectorStatsAsync(addFile, cancellationToken).ConfigureAwait(false);
             var newDv = await dvWriter.CreateAsync(allDeleted, cancellationToken)
                 .ConfigureAwait(false);
             written?.RecordDeletionVector(newDv);
@@ -9385,7 +9439,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
-                Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
+                Stats = reAddStats,
             });
         }
 
@@ -9510,6 +9564,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 continue;
             totalDeleted += newPositions.Count;
 
+            // Before the vector is written: a failed or cancelled read of the row count must leave no
+            // vector behind.
+            string? reAddStats = await VectorStatsAsync(addFile, cancellationToken).ConfigureAwait(false);
             var newDv = await dvWriter.CreateAsync(allDeleted, cancellationToken)
                 .ConfigureAwait(false);
             // The vector is ours; the file it masks is not — the re-add below names live table data.
@@ -9531,7 +9588,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
-                Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
+                Stats = reAddStats,
             });
             removedPaths.Add(addFile.Path);
             dvEdits.Add(new DeleteDvEdit(addFile.Path, newPositions));
@@ -10907,7 +10964,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>baseRowId</c> and leave the high-water mark alone. Metadata/protocol changes between the snapshots
     /// throw. The caller re-runs commitInfo assembly after the rebase.
     /// </summary>
-    public async ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsAsync(
+    public ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsAsync(
         IReadOnlyList<DeltaAction> actions,
         IReadOnlyDictionary<int, IReadOnlyCollection<long>> newPositionsByOrdinal,
         Snapshot.Snapshot from,
@@ -10915,6 +10972,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        // The host owns the vectors only once it has the rebased actions naming them: a rebase that fails part-way
+        // (a conflict, an unreadable file or row count, a cancellation) takes back those it already wrote.
+        return CollectOnFailureAsync(
+            written => RebaseDvDmlActionsCoreAsync(
+                actions, newPositionsByOrdinal, from, to, written, cancellationToken),
+            cancellationToken);
+    }
+
+    private async ValueTask<IReadOnlyList<DeltaAction>> RebaseDvDmlActionsCoreAsync(
+        IReadOnlyList<DeltaAction> actions,
+        IReadOnlyDictionary<int, IReadOnlyCollection<long>> newPositionsByOrdinal,
+        Snapshot.Snapshot from,
+        Snapshot.Snapshot to,
+        WrittenFileLedger written,
+        CancellationToken cancellationToken)
+    {
         if (to.Version == from.Version)
         {
             return actions;
@@ -11023,12 +11096,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                             $"row-level conflict on file '{add.Path}': {overlap} row(s) this transaction "
                             + "deletes/updates were concurrently deleted or updated — retry the transaction");
                     }
+                    // Before the vector is written: a failed or cancelled read of the row count must leave no
+                    // vector behind.
+                    string? reAddStats = await VectorStatsAsync(current, cancellationToken).ConfigureAwait(false);
                     var newDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
+                    written.RecordDeletionVector(newDv);
                     rebased.Add(current with
                     {
                         DeletionVector = newDv,
                         DataChange = true,
-                        Stats = StatsWithLooseBounds(current.GetStatsJson()),
+                        Stats = reAddStats,
                     });
                     break;
                 }
@@ -11073,9 +11150,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var resolvedPaths = new HashSet<string>(StringComparer.Ordinal); // the checker bookkeeping the
             // autocommit caller needs; the buffered caller re-validates via CheckLogicalRebaseAsync instead,
             // where the remap's remove(newPath, current DV) matches the still-active file and passes.
-            // No ledger: this is the buffered/host-driven rebase seam, whose files the HOST owns end to end.
+            // The ledger only takes the vectors back if the rebase fails; the host owns the ones it returns.
             var remapped = await RemapRowLevelDeletesAsync(
-                from, to, remapEdits, resolvedPaths, cancellationToken, written: null)
+                from, to, remapEdits, resolvedPaths, cancellationToken, written)
                 .ConfigureAwait(false);
             if (remapped is null)
             {
