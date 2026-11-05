@@ -43,7 +43,7 @@ public class MergeSchemaInteropTests : IDisposable
         }
     }
 
-    private static JsonElement Sql(string dir, params string[] statements)
+    internal static JsonElement Sql(string dir, params string[] statements)
     {
         var result = Spark.InvokeRaw("sql", new { path = dir, sql = statements });
         Assert.True(result.GetProperty("ok").GetBoolean(), result.ToString());
@@ -63,7 +63,7 @@ public class MergeSchemaInteropTests : IDisposable
 
     /// <summary>The newest metaData's schema, logically: names, types, nullability and recorded type changes,
     /// without column-mapping ids and physical names.</summary>
-    private static string LogicalSchema(string dir)
+    internal static string LogicalSchema(string dir)
     {
         string? schemaString = null;
         foreach (var file in Directory.GetFiles(Path.Combine(dir, "_delta_log"), "*.json").OrderBy(f => f, StringComparer.Ordinal))
@@ -125,12 +125,12 @@ public class MergeSchemaInteropTests : IDisposable
         }
     }
 
-    private static List<string> SparkRows(string dir) =>
+    internal static List<string> SparkRows(string dir) =>
         [.. Spark.Invoke("read", new { path = dir }).GetProperty("rows").EnumerateArray()
             .Select(r => r.GetRawText())
             .OrderBy(x => x, StringComparer.Ordinal)];
 
-    private static List<string> Features(string dir) =>
+    internal static List<string> Features(string dir) =>
         [.. Spark.Invoke("read", new { path = dir }).GetProperty("detail").GetProperty("table_features")
             .EnumerateArray().Select(f => f.GetString()!).OrderBy(f => f, StringComparer.Ordinal)];
 

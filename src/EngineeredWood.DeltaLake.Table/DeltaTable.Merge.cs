@@ -27,9 +27,10 @@ public sealed partial class DeltaTable
     /// generated columns, identity columns, CHECK constraints and NOT NULL, and a Change Data Feed table records
     /// <c>update_preimage</c>/<c>update_postimage</c>, <c>delete</c> and <c>insert</c> rows.</para>
     /// </summary>
-    /// <param name="source">The source rows. Every column must be a column of the table, by logical name and
-    /// type; columns the table has and the source lacks are left alone by an update and written as an append
-    /// would write them by an insert.</param>
+    /// <param name="source">The source rows. A column of the table must have the table's type, by logical name.
+    /// A column the table lacks is the source's own: conditions and assigned values may read it, and an update or
+    /// insert of every column leaves it out, unless <see cref="MergeOptions.MergeSchema"/> evolves the schema to take
+    /// it.</param>
     /// <param name="options">The keys and clauses.</param>
     /// <param name="cancellationToken">Cancels the MERGE; files it already wrote are deleted again.</param>
     /// <param name="commitProperties">The caller's own metadata for the commit.</param>
@@ -492,14 +493,17 @@ public sealed partial class DeltaTable
             ThrowIfDuplicateColumns(batch.Schema, snapshot.Schema, "MERGE");
             foreach (var field in batch.Schema.FieldsList)
             {
-                // By logical name: a condition names columns the way the table's schema does.
-                if (!snapshot.Schema.Fields.Any(f => string.Equals(f.Name, field.Name, StringComparison.Ordinal)))
+                // A column the table lacks is the source's own: a condition or value may read it, and an update
+                // or insert that copies every column leaves it out, as Spark's does (measured, Spark 4.0 / Delta
+                // 4.0). Unless the schema evolved to take it, MergeOptions.MergeSchema. One that differs from a
+                // table column only in case is refused rather than guessed at: the copy would leave it out.
+                if (FindDeclared(snapshot.Schema.Fields, field.Name) is null
+                    && snapshot.Schema.Fields.FirstOrDefault(f =>
+                        string.Equals(f.Name, field.Name, StringComparison.OrdinalIgnoreCase)) is { } folded)
                 {
                     throw new ArgumentException(
-                        $"MERGE: the source has a column '{field.Name}' that the table does not declare. A MERGE "
-                        + "does not evolve the schema; drop the column from the source, or ALTER the table first. "
-                        + "The table declares: "
-                        + string.Join(", ", snapshot.Schema.Fields.Select(f => "'" + f.Name + "'")) + ".",
+                        $"MERGE: the source's column '{field.Name}' differs only in case from the table's "
+                        + $"'{folded.Name}'. Rename it in the source to '{folded.Name}'.",
                         nameof(source));
                 }
             }
@@ -543,6 +547,70 @@ public sealed partial class DeltaTable
             combined = new RecordBatch(schema, columns, source.Sum(b => b.Length));
         }
         return combined;
+    }
+
+    /// <summary>
+    /// The schema change <see cref="MergeOptions.MergeSchema"/> makes for <paramref name="source"/>, or null when the
+    /// table already takes every source column the MERGE writes: those an update or insert copies whole (its
+    /// <c>*</c>), names in a column list, or assigns under their own name. A column only a condition reads, or one
+    /// no clause writes, changes nothing, as measured against Spark 4.0 / Delta 4.0. The change is the one a
+    /// <c>mergeSchema</c> write makes for those columns (<see cref="ComputeSchemaMerge(Snapshot.Snapshot, IReadOnlyList{RecordBatch})"/>):
+    /// new columns at the end in the source's order, new struct fields, and widening on a table that enables it.
+    /// </summary>
+    internal DeferredSchemaChange? ComputeMergeSchemaEvolution(
+        Snapshot.Snapshot snapshot, IReadOnlyList<RecordBatch> source, MergeOptions options)
+    {
+        if (source is null)
+            throw new ArgumentNullException(nameof(source));
+        if (options is null)
+            throw new ArgumentNullException(nameof(options));
+        var plan = MergePlan.Validate(options, snapshot.Schema, columnsMayBeAdded: true);
+        if (source.Count == 0)
+            return null; // no schema to evolve to: as an empty source, the MERGE writes nothing
+        if (source[0] is not { } first)
+            throw new ArgumentException("A source batch is null.", nameof(source));
+
+        var sourceFields = first.Schema.FieldsList;
+        var written = new HashSet<int>();
+        foreach (var clause in plan.Matched.Concat(plan.NotMatched))
+        {
+            if (clause.Kind == MergeActionKind.Delete)
+                continue;
+            var names = clause.Action.Assignments?.Select(a => a.Column)
+                ?? clause.Action.Columns
+                ?? sourceFields.Select(f => f.Name);
+            foreach (string name in names)
+            {
+                if (SourceColumnIndex(sourceFields, name) is int index)
+                    written.Add(index);
+            }
+        }
+        if (written.Count == 0)
+            return null;
+
+        var fields = written.OrderBy(i => i).Select(i => sourceFields[i]).ToList();
+        return ComputeSchemaMerge(snapshot, [new Apache.Arrow.Schema(fields, null)], "MERGE");
+
+        // By name, then ignoring case when that names one column: an assignment names its column as Spark resolves
+        // it.
+        static int? SourceColumnIndex(IReadOnlyList<Field> fields, string name)
+        {
+            for (int i = 0; i < fields.Count; i++)
+            {
+                if (string.Equals(fields[i].Name, name, StringComparison.Ordinal))
+                    return i;
+            }
+            int? found = null;
+            for (int i = 0; i < fields.Count; i++)
+            {
+                if (!string.Equals(fields[i].Name, name, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (found is not null)
+                    return null;
+                found = i;
+            }
+            return found;
+        }
     }
 
     /// <summary>
@@ -709,11 +777,72 @@ public sealed partial class DeltaTable
                 continue;
             }
             columns[c] = value is null
-                ? sources!.Column(sources.Schema.GetFieldIndex(field.Name))
+                ? CopiedColumn(sources!, field.Name, field.DataType, clause, preimage.Column(c))
                 : AssignedValue(value, field.Name, pairs ??= MergeConditionBatch(preimage, sources), snapshot);
             fields.Add(new Field(field.Name, columns[c].Data.DataType, field.IsNullable, field.Metadata));
         }
         return new RecordBatch(new Apache.Arrow.Schema(fields, preimage.Schema.Metadata), columns, preimage.Length);
+    }
+
+    /// <summary>
+    /// The source column <paramref name="column"/> of <paramref name="sources"/> as <paramref name="clause"/> writes
+    /// it into the table column of Arrow type <paramref name="target"/>: as it is, or with a struct fitted to the
+    /// table's (<see cref="FitStruct"/>), taking a field the source lacks from <paramref name="kept"/> (the target
+    /// row an update changes) or NULL.
+    /// </summary>
+    private static IArrowArray CopiedColumn(
+        RecordBatch sources, string column, Apache.Arrow.Types.IArrowType target, MergeClausePlan clause,
+        IArrowArray? kept)
+    {
+        var supplied = sources.Column(sources.Schema.GetFieldIndex(column));
+        return clause.FitsStructs ? FitStruct(supplied, target, kept) : supplied;
+    }
+
+    /// <summary>
+    /// <paramref name="supplied"/> with each struct in it, at any depth of structs, given the fields of
+    /// <paramref name="target"/> by name and in its order: a field the source lacks comes from
+    /// <paramref name="kept"/>, or is NULL without one. Measured against Spark 4.0 / Delta 4.0, under schema
+    /// evolution an update keeps the target's value of a struct field its source lacks and an insert writes NULL.
+    /// A struct NULL in the source stays NULL. Anything but a struct is returned as it is; the type checks judge it.
+    /// </summary>
+    private static IArrowArray FitStruct(IArrowArray supplied, Apache.Arrow.Types.IArrowType target, IArrowArray? kept)
+    {
+        if (supplied is not StructArray structs || target is not Apache.Arrow.Types.StructType targetType
+            || supplied.Data.DataType.Equals(target))
+        {
+            return supplied;
+        }
+
+        var suppliedType = (Apache.Arrow.Types.StructType)structs.Data.DataType;
+        var keptStructs = kept as StructArray;
+        var keptType = keptStructs?.Data.DataType as Apache.Arrow.Types.StructType;
+        var fields = new List<Field>(targetType.Fields.Count);
+        var children = new List<IArrowArray>(targetType.Fields.Count);
+        foreach (var field in targetType.Fields)
+        {
+            int k = keptType?.GetFieldIndex(field.Name) ?? -1;
+            // StructArray.Fields are the children as sliced to the struct's own window.
+            var keptChild = k >= 0 ? keptStructs!.Fields[k] : null;
+            int s = suppliedType.GetFieldIndex(field.Name);
+            var child = s >= 0
+                ? FitStruct(structs.Fields[s], field.DataType, keptChild)
+                : keptChild ?? ArrowCompute.MakeNullArray(field.DataType, structs.Length);
+            fields.Add(new Field(field.Name, child.Data.DataType, field.IsNullable, field.Metadata));
+            children.Add(child);
+        }
+
+        // The children are already windowed, so the struct is rebuilt at offset 0 with its validity copied out.
+        ArrowBuffer validity = ArrowBuffer.Empty;
+        int nulls = structs.NullCount;
+        if (nulls > 0)
+        {
+            var bits = new ArrowBuffer.BitmapBuilder(structs.Length);
+            for (int i = 0; i < structs.Length; i++)
+                bits.Append(!structs.IsNull(i));
+            validity = bits.Build();
+        }
+        return new StructArray(
+            new Apache.Arrow.Types.StructType(fields), structs.Length, children, validity, nulls, offset: 0);
     }
 
     /// <summary>
@@ -722,18 +851,18 @@ public sealed partial class DeltaTable
     /// </summary>
     private static RecordBatch MergeInsertBatch(RecordBatch rows, MergeClausePlan clause, Snapshot.Snapshot snapshot)
     {
-        if (clause.Writes.Values.All(v => v is null))
+        if (clause.Writes.Values.All(v => v is null) && !clause.FitsStructs)
             return ProjectColumns(rows, clause.WrittenColumns);
 
-        var pairs = MergeConditionBatch(null, rows);
+        RecordBatch? pairs = null;
         var fields = new List<Field>(clause.Writes.Count);
         var columns = new List<IArrowArray>(clause.Writes.Count);
         foreach (string column in clause.WrittenColumns)
         {
             var value = clause.Writes[column];
             var array = value is null
-                ? rows.Column(rows.Schema.GetFieldIndex(column))
-                : AssignedValue(value, column, pairs, snapshot);
+                ? CopiedColumn(rows, column, snapshot.ArrowSchema.GetFieldByName(column)!.DataType, clause, kept: null)
+                : AssignedValue(value, column, pairs ??= MergeConditionBatch(null, rows), snapshot);
             fields.Add(new Field(column, array.Data.DataType, nullable: true));
             columns.Add(array);
         }
@@ -1182,6 +1311,13 @@ public sealed partial class DeltaTable
         /// assigned values read. Null for all of them. Set by <see cref="MergePlan.Resolve"/>.
         /// </summary>
         public IReadOnlyList<string>? SourceColumns { get; set; }
+
+        /// <summary>
+        /// Whether a struct column copied from the source is fitted to the table's struct (<see cref="FitStruct"/>):
+        /// under schema evolution a field the source lacks is kept from the target row, or NULL in an insert. Set by
+        /// <see cref="MergePlan.Resolve"/>.
+        /// </summary>
+        public bool FitsStructs { get; set; }
     }
 
     /// <summary>The MERGE options, checked against the table.</summary>
@@ -1202,6 +1338,10 @@ public sealed partial class DeltaTable
         public IReadOnlyList<MergeClausePlan> NotMatched { get; }
         public IReadOnlyList<MergeClausePlan> NotMatchedBySource { get; }
 
+        /// <summary><see cref="MergeOptions.MergeSchema"/>: the schema was evolved for the source, so a column or
+        /// struct field the source lacks is left to the row instead of refused.</summary>
+        public bool Evolving { get; private init; }
+
         /// <summary>Every column some update writes. Set by <see cref="Resolve"/>.</summary>
         public IReadOnlyList<string> UpdatedColumns { get; private set; } = [];
 
@@ -1215,9 +1355,15 @@ public sealed partial class DeltaTable
         public void Resolve(RecordBatch? source, Schema.StructType schema)
         {
             foreach (var clause in Matched.Concat(NotMatchedBySource))
-                ResolveClause(clause, source, schema, "the update sets", "UPDATE SET *", "MergeAction.UpdateColumns");
+            {
+                ResolveClause(
+                    clause, source, schema, Evolving, "the update sets", "UPDATE SET *", "MergeAction.UpdateColumns");
+            }
             foreach (var clause in NotMatched)
-                ResolveClause(clause, source, schema, "the insert writes", "INSERT *", "MergeAction.InsertColumns");
+            {
+                ResolveClause(
+                    clause, source, schema, Evolving, "the insert writes", "INSERT *", "MergeAction.InsertColumns");
+            }
             UpdatedColumns = Matched.Concat(NotMatchedBySource).SelectMany(c => c.WrittenColumns)
                 .Distinct(StringComparer.Ordinal).ToList();
             InsertedColumns = NotMatched.SelectMany(c => c.WrittenColumns).Distinct(StringComparer.Ordinal).ToList();
@@ -1230,12 +1376,14 @@ public sealed partial class DeltaTable
 
         // A `*` action takes every table column from the source, and Spark refuses one whose source lacks any
         // (DELTA_MERGE_UNRESOLVED_EXPRESSION), generated and identity columns included; a column list names its own.
-        // An assignment names a table column ignoring case, as Spark resolves it, and is recorded under the
-        // table's name for it.
+        // Under schema evolution Spark takes only the columns the source has instead: an update leaves the others
+        // as they are, and an insert writes them as an append would. An assignment names a table column ignoring
+        // case, as Spark resolves it, and is recorded under the table's name for it.
         private static void ResolveClause(
-            MergeClausePlan clause, RecordBatch? source, Schema.StructType schema, string verb, string star,
-            string listed)
+            MergeClausePlan clause, RecordBatch? source, Schema.StructType schema, bool evolving, string verb,
+            string star, string listed)
         {
+            clause.FitsStructs = evolving;
             if (clause.Kind == MergeActionKind.Delete)
                 return;
 
@@ -1253,6 +1401,8 @@ public sealed partial class DeltaTable
             else
             {
                 var columns = clause.Action.Columns ?? schema.Fields.Select(f => f.Name).ToList();
+                if (evolving && clause.Action.Columns is null)
+                    columns = columns.Where(c => source is null || source.Schema.GetFieldIndex(c) >= 0).ToList();
                 if (source is not null)
                 {
                     var missing = columns.Where(c => source.Schema.GetFieldIndex(c) < 0).ToList();
@@ -1339,7 +1489,10 @@ public sealed partial class DeltaTable
                 $"MERGE: {verb} '{name}', which is not a column of the table.");
         }
 
-        public static MergePlan Validate(MergeOptions options, Schema.StructType schema)
+        /// <param name="columnsMayBeAdded">Leaves a column list naming a column the table lacks to the second
+        /// validation, against the evolved schema: <see cref="ComputeMergeSchemaEvolution"/> may add it.</param>
+        public static MergePlan Validate(
+            MergeOptions options, Schema.StructType schema, bool columnsMayBeAdded = false)
         {
             if (options.Keys is not { Count: > 0 } keys)
                 throw new ArgumentException("MERGE needs at least one key column.", nameof(options));
@@ -1381,7 +1534,7 @@ public sealed partial class DeltaTable
             foreach (var (clause, verb) in matched.Select(c => (c, "the update sets"))
                 .Concat(notMatched.Select(c => (c, "the insert writes"))))
             {
-                foreach (string column in clause.Action.Columns ?? [])
+                foreach (string column in columnsMayBeAdded ? [] : clause.Action.Columns ?? [])
                 {
                     if (!schema.Fields.Any(f => string.Equals(f.Name, column, StringComparison.Ordinal)))
                     {
@@ -1392,7 +1545,7 @@ public sealed partial class DeltaTable
                 }
             }
 
-            return new MergePlan(keys, matched, notMatched, sourceless);
+            return new MergePlan(keys, matched, notMatched, sourceless) { Evolving = options.MergeSchema };
 
             // As in Spark, only the last clause of a kind may be unconditional: one before it would take every row
             // and leave the clauses after it unreachable.

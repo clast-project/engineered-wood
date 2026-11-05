@@ -647,20 +647,59 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _baseSnapshot, isAppend: false,
             handling: WriteTimeExpressionHandling.ValidatedHere, appendOnlyCheckedLater: true);
 
+        if (source is null)
+            throw new ArgumentNullException(nameof(source));
+        if (options is null)
+            throw new ArgumentNullException(nameof(options));
+
+        // Schema evolution builds on the schema the staged merging writes left, as a merging append does, and the
+        // MERGE then runs against the evolved one: its `*` takes the new columns, and its rewrites and inserts are
+        // written with them.
+        var mergeSnapshot = options.MergeSchema ? PendingWriteSnapshot() : _baseSnapshot;
+        DeltaTable.DeferredSchemaChange? evolution = null;
+        if (options.MergeSchema)
+        {
+            evolution = _table.ComputeMergeSchemaEvolution(mergeSnapshot, source, options);
+            if (evolution is { } change)
+            {
+                RefuseSchemaMergeAfterOtherMetadata();
+                mergeSnapshot = DeltaTable.WithStagedMetadata(mergeSnapshot, change.Actions);
+            }
+        }
+
         int mark = _written.Paths.Count;
         var plan = await TakingBackOnFailureAsync(mark, () => _table.ComputeMergeActionsAsync(
-            _baseSnapshot, source, options, cancellationToken, rowIdStart: _nextRowId, written: _written,
+            mergeSnapshot, source, options, cancellationToken, rowIdStart: _nextRowId, written: _written,
             identityHighWaterMarks: _identityMarks), cancellationToken).ConfigureAwait(false);
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "MERGE", cancellationToken)
             .ConfigureAwait(false);
 
-        await RefuseBaseSchemaMetadataAfterMergeAsync(plan.InsertActions, mark, "MERGE", cancellationToken)
-            .ConfigureAwait(false);
+        // A MERGE with MergeSchema ran against the merged schema, so a metaData its inserts carry builds on it.
+        if (!options.MergeSchema)
+        {
+            await RefuseBaseSchemaMetadataAfterMergeAsync(plan.InsertActions, mark, "MERGE", cancellationToken)
+                .ConfigureAwait(false);
+        }
         if (plan.NextRowId is long nextRowId)
             _nextRowId = nextRowId;
+        var insertActions = plan.InsertActions;
+        if (evolution is { } evolved)
+        {
+            // Staged even when no row changed, as Spark commits the new schema alone: it is decided before any row
+            // is read.
+            insertActions = DeltaTable.WithSchemaMerge(insertActions, evolved);
+            if (evolved.ProtocolUpgrade is { } protocol)
+            {
+                // Cumulative: computed on top of the previous merge's upgrade, so it replaces it.
+                if (_stagedMergeProtocol is not null)
+                    _dataActions.Remove(_stagedMergeProtocol);
+                _stagedMergeProtocol = protocol;
+            }
+            _schemaMerged = true;
+        }
         StageInternal(plan.RewriteActions);
-        StageInternal(plan.InsertActions);
-        ChainIdentityMarks(plan.InsertActions);
+        StageInternal(insertActions);
+        ChainIdentityMarks(insertActions);
         RecordUncoveredAppends(plan.InsertActions);
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
