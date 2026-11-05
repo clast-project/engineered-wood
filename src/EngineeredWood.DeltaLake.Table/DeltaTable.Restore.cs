@@ -102,7 +102,8 @@ public sealed partial class DeltaTable
         if (earliestReadable is { } earliestCommit && requested >= earliestCommit.Timestamp)
         {
             match = await FindCommitAtTimestampAsync(
-                    commits, CurrentSnapshot.Metadata.Configuration, requested, cancellationToken)
+                    commits, await LatestConfigurationAsync(commits, cancellationToken).ConfigureAwait(false), requested,
+                    cancellationToken)
                 .ConfigureAwait(false);
         }
 
@@ -458,6 +459,21 @@ public sealed partial class DeltaTable
     }
 
     /// <summary>
+    /// The table configuration as of the newest of <paramref name="commits"/> or later: the handle's own when it is
+    /// that current, else that of a snapshot brought up to date for the purpose (the handle does not move).
+    /// </summary>
+    /// <remarks>A later configuration than the listing's is harmless: one that turns in-commit timestamps off makes the
+    /// caller walk, and one that turns them on past the listing leaves it no commit to search.</remarks>
+    private async ValueTask<IReadOnlyDictionary<string, string>?> LatestConfigurationAsync(
+        List<(long Version, long Modified)> commits, CancellationToken cancellationToken)
+    {
+        var snapshot = CurrentSnapshot;
+        if (commits.Count > 0 && commits[commits.Count - 1].Version > snapshot.Version)
+            snapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken).ConfigureAwait(false);
+        return snapshot.Metadata.Configuration;
+    }
+
+    /// <summary>
     /// The latest of <paramref name="commits"/> committed at or before <paramref name="targetMs"/>, with its
     /// timestamp; null when every commit is later.
     /// </summary>
@@ -472,10 +488,13 @@ public sealed partial class DeltaTable
     /// <para><b>Below the range.</b> A target before <see cref="InCommitTimestamp.EnablementTimestampKey"/> walks only
     /// the commits before the enablement version; the configuration says so without a read.</para>
     ///
-    /// <para><b>Any doubt falls back to the walk.</b> A probe without an <c>inCommitTimestamp</c> (from a writer that
-    /// never recorded where they began, or from after they were turned off, when <paramref name="configuration"/> is
-    /// stale) makes the search answer nothing, and the whole log is walked as before. A stale configuration therefore
-    /// costs only speed: the probes, not the configuration, decide whether the search's answer stands.</para>
+    /// <para><b>⚠ <paramref name="configuration"/> must be the latest version's</b> (<see cref="LatestConfigurationAsync"/>),
+    /// not a stale handle's. The range is only increasing from the version that LAST turned them on: a stale one can
+    /// reach back over a later disable and re-enable, and if the re-enabled run was stamped by a clock set back, the
+    /// search can skip the unstamped gap and answer from the earlier run (#690 review).</para>
+    ///
+    /// <para><b>A probe without an <c>inCommitTimestamp</c></b> (from a writer that never recorded where they began)
+    /// makes the search answer nothing, and the whole log is walked as before.</para>
     /// </remarks>
     private async ValueTask<(long Version, long Timestamp)?> FindCommitAtTimestampAsync(
         List<(long Version, long Modified)> commits, IReadOnlyDictionary<string, string>? configuration,

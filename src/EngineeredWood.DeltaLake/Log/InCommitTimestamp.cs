@@ -179,14 +179,16 @@ public static class InCommitTimestamp
     /// commits.
     /// </summary>
     /// <remarks>
-    /// <para>Sound because in-commit timestamps strictly increase with version, the property the feature exists to
-    /// provide. A <see cref="InCommitTimestampSearchOutcome.Found"/> answer at version b has read b and, unless b is
-    /// the last, the version after it, so it is exact whatever the commits the search skipped hold.</para>
+    /// <para>Sound only where in-commit timestamps strictly increase over all of <paramref name="versions"/>, the
+    /// property the feature provides from the version that last turned it on to the latest. ⚠ The caller must take
+    /// that range from the table's CURRENT configuration: one wider than it can span an earlier stamped run, a gap
+    /// where they were off, and a later run stamped by a clock set back, and the search can then skip the gap and
+    /// answer from the wrong run (#690 review).</para>
     ///
     /// <para>A probe that carries no <c>inCommitTimestamp</c> (a commit from before the feature, after it was turned
     /// off, or from a writer that never stamped where it began) ends the search as
     /// <see cref="InCommitTimestampSearchOutcome.Unsearchable"/>, for the caller to fall back to reading every commit,
-    /// rather than guessing.</para>
+    /// rather than guessing. That catches only the gaps it lands on; it does not make a wrong range safe.</para>
     /// </remarks>
     internal static async ValueTask<InCommitTimestampSearch> SearchAsync(
         TransactionLog log, IReadOnlyList<long> versions, long maxTimestampMs, CancellationToken cancellationToken)

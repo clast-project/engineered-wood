@@ -202,6 +202,67 @@ public class TimeTravelByTimestampSearchTests : IDisposable
     }
 
     /// <summary>
+    /// #690 review: a handle opened while in-commit timestamps were on from creation, after which another writer
+    /// turned them off and then on again under a clock set back. The stale range would span both stamped runs, which
+    /// do not increase across the gap, and the search could skip the gap and answer from the earlier run. Resolving
+    /// from the latest configuration searches only the re-enabled run, so the stale handle answers as a fresh one,
+    /// and a restore after the latest commit's time is refused rather than landing on the earlier run.
+    /// </summary>
+    [Fact]
+    public async Task StaleHandle_AcrossADisableAndARolledBackReEnable_AnswersAsAFreshOne()
+    {
+        const int firstRun = 10, reEnabled = 12, count = 20;
+        await WriteTableAsync(firstRun, ictFrom: 0);
+        await using var stale = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+
+        static long RolledBack(int v) => Base + 500 + (10 * (v - reEnabled));
+        var log = new TransactionLog(new LocalTableFileSystem(_tempDir));
+        for (int v = firstRun; v < count; v++)
+        {
+            bool stamped = v >= reEnabled;
+            long timestamp = stamped ? RolledBack(v) : TimestampOf(v);
+            var actions = new List<DeltaAction>
+            {
+                InCommitTimestamp.CreateCommitInfo(timestamp, "WRITE", includeInCommitTimestamp: stamped),
+            };
+            if (v == firstRun)
+                actions.Add(Metadata(new Dictionary<string, string> { [InCommitTimestamp.EnableKey] = "false" }));
+            if (v == reEnabled)
+            {
+                actions.Add(Metadata(new Dictionary<string, string>
+                {
+                    [InCommitTimestamp.EnableKey] = "true",
+                    [InCommitTimestamp.EnablementVersionKey] = reEnabled.ToString(),
+                    [InCommitTimestamp.EnablementTimestampKey] = RolledBack(reEnabled).ToString(),
+                }));
+            }
+            await log.WriteCommitAsync(v, actions);
+        }
+        await using var fresh = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        Assert.Equal(firstRun - 1, stale.CurrentSnapshot.Version);
+
+        // From the re-enablement on, the re-enabled run's own timestamps decide: v5's time is after all of them.
+        var atV5 = DateTimeOffset.FromUnixTimeMilliseconds(TimestampOf(5));
+        Assert.Equal(count - 1, (await stale.GetSnapshotAtTimestampAsync(atV5)).Version);
+
+        foreach (long target in Targets(count).Concat(Enumerable.Range(reEnabled, count - reEnabled)
+                     .SelectMany(v => new[] { RolledBack(v) - 1, RolledBack(v), RolledBack(v) + 1 })))
+        {
+            var at = DateTimeOffset.FromUnixTimeMilliseconds(target);
+            long? expected = null, actual = null;
+            try { expected = (await fresh.GetSnapshotAtTimestampAsync(at)).Version; }
+            catch (DeltaFormatException) { }
+            try { actual = (await stale.GetSnapshotAtTimestampAsync(at)).Version; }
+            catch (DeltaFormatException) { }
+            Assert.True(expected == actual, $"target {target - Base}: fresh v{expected}, stale v{actual}");
+        }
+        Assert.Equal(firstRun - 1, stale.CurrentSnapshot.Version); // time travel does not move the handle
+
+        var greater = await Assert.ThrowsAsync<DeltaFormatException>(async () => await stale.RestoreAsync(atV5));
+        Assert.Equal(DeltaTableErrorCodes.CannotRestoreTimestampGreater, greater.ErrorCode);
+    }
+
+    /// <summary>
     /// The point of #662: on an in-commit-timestamp table, resolving a timestamp reads O(log N) commits beyond what
     /// building the snapshot at the answer reads, where the walk reads every commit up to the answer.
     /// </summary>

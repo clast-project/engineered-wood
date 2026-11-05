@@ -2754,7 +2754,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         var commits = await ListCommitsAsync(cancellationToken).ConfigureAwait(false);
         var found = await FindCommitAtTimestampAsync(
-                commits, CurrentSnapshot.Metadata.Configuration, timestamp.ToUnixTimeMilliseconds(),
+                commits, await LatestConfigurationAsync(commits, cancellationToken).ConfigureAwait(false),
+                timestamp.ToUnixTimeMilliseconds(),
                 cancellationToken)
             .ConfigureAwait(false);
 
