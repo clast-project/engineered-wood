@@ -4022,7 +4022,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = unionDv,
                 DataChange = true,
-                Stats = StatsWithLooseBounds(latestAdd.GetStatsJson()),
+                Stats = await VectorStatsAsync(latestAdd, cancellationToken).ConfigureAwait(false),
             });
         }
 
@@ -4194,7 +4194,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
-                Stats = StatsWithLooseBounds(cand.GetStatsJson()),
+                Stats = await VectorStatsAsync(cand, cancellationToken).ConfigureAwait(false),
             });
         }
         return result;
@@ -4917,7 +4917,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     {
                         DeletionVector = newDv,
                         DataChange = true,
-                        Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
+                        Stats = StatsWithLooseBounds(addFile.GetStatsJson(), fileRows),
                     });
 
                     // Record the exact rows this delete added (absolute positions), so a concurrent DV-delete
@@ -8597,6 +8597,45 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    /// <summary>
+    /// The statistics of <paramref name="file"/>, an existing data file re-added under a new deletion vector: its own,
+    /// marked loose (<see cref="StatsWithLooseBounds(string?)"/>), and given its physical row count when they lack
+    /// one, since the protocol requires a file with a deletion vector to carry a correct <c>numRecords</c> (#705). The
+    /// count comes from the file's footer (or, through the codec seam, which hides it, from reading the file), so a
+    /// file whose statistics have it costs nothing more.
+    /// </summary>
+    private async ValueTask<string?> VectorStatsAsync(AddFile file, CancellationToken cancellationToken)
+    {
+        string? stats = file.GetStatsJson();
+        if (file.GetNumRecords() is not null)
+            return StatsWithLooseBounds(stats);
+        long rows = await PhysicalRowCountAsync(file, cancellationToken).ConfigureAwait(false);
+        return StatsWithLooseBounds(stats, rows);
+    }
+
+    /// <summary>The rows <paramref name="file"/> holds physically, deletion vector or not.</summary>
+    private async ValueTask<long> PhysicalRowCountAsync(AddFile file, CancellationToken cancellationToken)
+    {
+        string path = EngineeredWood.DeltaLake.DeltaPath.Decode(file.Path);
+        long rows = 0;
+        if (_options.DataFileReader is { } seam)
+        {
+            await foreach (var batch in seam.ReadAsync(path, null, cancellationToken).ConfigureAwait(false))
+            {
+                rows += batch.Length;
+                batch.Dispose();
+            }
+            return rows;
+        }
+
+        await using var stream = await _fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        using var reader = new Parquet.ParquetFileReader(stream, ownsFile: false, _dataFileReadOptions);
+        var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var rowGroup in footer.RowGroups)
+            rows += rowGroup.NumRows;
+        return rows;
+    }
+
     private static string? StatsWithLooseBounds(string? stats)
     {
         if (string.IsNullOrEmpty(stats))
@@ -9383,7 +9422,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
-                Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
+                Stats = await VectorStatsAsync(addFile, cancellationToken).ConfigureAwait(false),
             });
         }
 
@@ -9529,7 +9568,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 DeletionVector = newDv,
                 DataChange = true,
-                Stats = StatsWithLooseBounds(addFile.GetStatsJson()),
+                Stats = await VectorStatsAsync(addFile, cancellationToken).ConfigureAwait(false),
             });
             removedPaths.Add(addFile.Path);
             dvEdits.Add(new DeleteDvEdit(addFile.Path, newPositions));
@@ -11010,7 +11049,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     {
                         DeletionVector = newDv,
                         DataChange = true,
-                        Stats = StatsWithLooseBounds(current.GetStatsJson()),
+                        Stats = await VectorStatsAsync(current, cancellationToken).ConfigureAwait(false),
                     });
                     break;
                 }
