@@ -5,6 +5,7 @@ using Apache.Arrow;
 using Apache.Arrow.Operations.Shredding;
 using Apache.Arrow.Operations.VariantJson;
 using Apache.Arrow.Scalars.Variant;
+using Apache.Arrow.Types;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.Metadata;
@@ -316,5 +317,37 @@ public class VariantShreddingWriterTests : IDisposable
             Assert.Equal(Json(FromJson(json[i])), Json(values[i]));
         }
         Assert.True(nulls[json.Length]);
+    }
+
+    /// <summary>
+    /// A shredded column reads back reassembled, as <c>(metadata, value)</c>. The batch's field must describe that
+    /// array: a field still declaring the file's <c>typed_value</c> made a writer handed the batch index a child the
+    /// array does not have, so a shredded file could not be rewritten (a copy-on-write DML, a compaction).
+    /// </summary>
+    [Fact]
+    public async Task ShreddedColumn_ReadsBackWithTheArraysType_AndWritesAgain()
+    {
+        var shred = ParquetWriteOptions.Default with { ShredVariants = ShredOptions.Default };
+        string path = await WriteAsync(shred, Batch(Obj(1, "x"), Obj(2, "y")));
+
+        RecordBatch batch;
+        await using (var file = new LocalRandomAccessFile(path))
+        await using (var reader = new ParquetFileReader(file, ownsFile: false,
+            new ParquetReadOptions { ExtensionRegistry = VariantRegistry() }))
+        {
+            batch = await reader.ReadRowGroupAsync(0);
+        }
+
+        var fieldType = Assert.IsAssignableFrom<ExtensionType>(batch.Schema.FieldsList[0].DataType);
+        Assert.Equal(["metadata", "value"], ((StructType)fieldType.StorageType).Fields.Select(f => f.Name));
+        Assert.Equal(
+            ((StructType)fieldType.StorageType).Fields.Count,
+            ((StructArray)((ExtensionArray)batch.Column(0)).Storage).Fields.Count);
+
+        foreach (var options in new[] { ParquetWriteOptions.Default, shred })
+        {
+            var (_, values, _) = await ReadAsync(await WriteAsync(options, batch));
+            Assert.Equal([Json(Obj(1, "x")), Json(Obj(2, "y"))], values.Select(Json));
+        }
     }
 }

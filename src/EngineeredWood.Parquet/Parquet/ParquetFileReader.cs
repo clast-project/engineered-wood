@@ -1764,6 +1764,24 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         }
 
         var topLevelFields = (Field[])ctx.TopLevelFields!.Clone();
+
+        // A shredded variant was reassembled into the canonical (metadata, value) form, at any depth, so its array
+        // no longer has the file's storage type. The field takes the array's type: a field still declaring the
+        // shredded typed_value would describe a child the array does not have, and a writer handed the batch
+        // indexes it.
+        if (_options.ExtensionRegistry is not null)
+        {
+            for (int i = 0; i < topLevelFields.Length; i++)
+            {
+                var field = topLevelFields[i];
+                if (Data.VariantNestedWrapper.ContainsVariant(field.DataType))
+                {
+                    topLevelFields[i] = new Field(
+                        field.Name, topLevelArrays[i].Data.DataType, field.IsNullable, field.Metadata);
+                }
+            }
+        }
+
         RestoreDeclaredUnits(topLevelFields, topLevelArrays);
         return BuildRecordBatch(topLevelFields, topLevelArrays, ctx.RowCount);
     }

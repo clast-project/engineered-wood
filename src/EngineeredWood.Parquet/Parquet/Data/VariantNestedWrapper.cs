@@ -27,6 +27,16 @@ namespace EngineeredWood.Parquet.Data;
 /// </remarks>
 internal static class VariantNestedWrapper
 {
+    /// <summary>Whether <paramref name="type"/> is a variant or holds one in a struct, list or map.</summary>
+    internal static bool ContainsVariant(IArrowType type) => type switch
+    {
+        VariantType => true,
+        StructType s => s.Fields.Any(f => ContainsVariant(f.DataType)),
+        MapType m => ContainsVariant(m.KeyField.DataType) || ContainsVariant(m.ValueField.DataType),
+        ListType l => ContainsVariant(l.ValueDataType),
+        _ => false,
+    };
+
     /// <summary>Rewrites <paramref name="array"/> so every variant the <paramref name="fieldType"/>
     /// declares — at this level or nested inside a struct/list/map — is a <see cref="VariantArray"/>.
     /// Returns the same instance when nothing needed wrapping.</summary>
