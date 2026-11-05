@@ -61,6 +61,11 @@ internal static class CdfWriter
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         if (mappingMode != ColumnMappingMode.None)
             rows = ColumnMappingRecursive.ToPhysical(rows, snapshot.Schema, mappingMode);
+        // Field labels from the table schema, as for data files: a list element or map key/value the caller named
+        // differently ("item") takes the table's name, so per-column options keyed by the table's path reach it
+        // (#658), and nullability follows the table's.
+        rows = TableNullability.Apply(
+            rows, SchemaConverter.ToArrowSchema(ColumnMapping.ToPhysicalSchema(snapshot.Schema, mappingMode)).FieldsList);
 
         // Row-tracking identity, under the declared physical names — after the rename (the names are already
         // physical) and before _change_type, which is the layout Spark writes.
