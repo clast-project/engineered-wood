@@ -199,6 +199,33 @@ public class IcebergCompatNestedIdsTests : IDisposable
         Assert.Equal(Nested(before), Nested(table.CurrentSnapshot.Schema.Fields[0]));
     }
 
+    /// <summary>
+    /// #658: an element the caller's builder named <c>item</c> is written as the table's <c>element</c>, and keeps
+    /// the nested id the column-mapping rename stamped on it.
+    /// </summary>
+    [Fact]
+    public async Task Write_ACallerNamedItemElement_IsWrittenAsElement_WithItsId()
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(ListOf("arr", Int64Type.Default)).Build();
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await CreateAsync(schema);
+
+        var builder = new ListArray.Builder(Int64Type.Default);
+        builder.Append();
+        ((Int64Array.Builder)builder.ValueBuilder).Append(1).Append(2);
+        var arr = builder.Build();
+        var batchSchema = new Apache.Arrow.Schema.Builder().Field(new Field("arr", arr.Data.DataType, true)).Build();
+        await table.WriteAsync([new RecordBatch(batchSchema, [arr], 1)]);
+
+        var field = table.CurrentSnapshot.Schema.Fields[0];
+        var addFile = table.CurrentSnapshot.ActiveFiles.Values.Single();
+        await using var file = await fs.OpenReadAsync(addFile.Path);
+        using var reader = new EngineeredWood.Parquet.ParquetFileReader(file, ownsFile: false);
+        var element = (await reader.GetSchemaAsync()).Root.Children.Single().Children[0].Children[0];
+        Assert.Equal("element", element.Name);
+        Assert.Equal(Nested(field)[Physical(field) + ".element"], element.Element.FieldId);
+    }
+
     [Theory]
     [InlineData(ColumnMappingMode.Name)]
     [InlineData(ColumnMappingMode.Id)]

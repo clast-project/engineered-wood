@@ -25,6 +25,9 @@ namespace EngineeredWood.DeltaLake.Table;
 /// list's offsets) does not count, as in the writer's own check: counting it would label two sources of the same
 /// data differently, and split them into separate files. A field the table schema does not describe keeps its
 /// flags.</para>
+///
+/// <para>List elements and map keys/values also take the table's names (#658), since the file's column paths follow
+/// them and per-column writer options are keyed by the table's paths.</para>
 /// </summary>
 internal static class TableNullability
 {
@@ -262,13 +265,14 @@ internal static class TableNullability
                     tm.ValueField, ArrowArrayFactory.BuildArray(entries.Children[1]), entrySlots);
                 bool keyNullable = tm.KeyField.IsNullable;
                 if (ReferenceEquals(key, entries.Children[0]) && ReferenceEquals(value, entries.Children[1])
-                    && valueNullable == am.ValueField.IsNullable && keyNullable == am.KeyField.IsNullable)
+                    && valueNullable == am.ValueField.IsNullable && keyNullable == am.KeyField.IsNullable
+                    && am.KeyField.Name == tm.KeyField.Name && am.ValueField.Name == tm.ValueField.Name)
                 {
                     return data;
                 }
                 var mapType = new MapType(
-                    Relabel(am.KeyField, key.DataType, keyNullable),
-                    Relabel(am.ValueField, value.DataType, valueNullable),
+                    Relabel(am.KeyField, tm.KeyField.Name, key.DataType, keyNullable),
+                    Relabel(am.ValueField, tm.ValueField.Name, value.DataType, valueNullable),
                     am.KeySorted);
                 var newEntries = new ArrayData(mapType.KeyValueType, entries.Length, entries.NullCount,
                     entries.Offset, entries.Buffers, [key, value]);
@@ -338,9 +342,9 @@ internal static class TableNullability
     {
         values = Align(child, target.DataType, childSlots);
         bool nullable = Nullable(target, ArrowArrayFactory.BuildArray(child), childSlots);
-        return ReferenceEquals(values, child) && nullable == actual.IsNullable
+        return ReferenceEquals(values, child) && nullable == actual.IsNullable && actual.Name == target.Name
             ? null
-            : Relabel(actual, values.DataType, nullable);
+            : Relabel(actual, target.Name, values.DataType, nullable);
     }
 
     private static Field? Element(IArrowType type) => type switch
@@ -456,5 +460,13 @@ internal static class TableNullability
         };
 
     private static Field Relabel(Field field, IArrowType type, bool nullable) =>
-        new(field.Name, type, nullable, field.Metadata);
+        Relabel(field, field.Name, type, nullable);
+
+    // A list element or map key/value takes the table's name (#658): the writer names the file's columns from the
+    // batch, so an element the caller's builder named "item" would put the column at "tags.list.item", and an option
+    // keyed by the table's path ("tags.list.element") would match nothing. The metadata stays the batch's, which is
+    // where the column-mapping rename stamped the nested field ids. A struct child keeps its name: it was matched by
+    // it.
+    private static Field Relabel(Field field, string name, IArrowType type, bool nullable) =>
+        new(name, type, nullable, field.Metadata);
 }
