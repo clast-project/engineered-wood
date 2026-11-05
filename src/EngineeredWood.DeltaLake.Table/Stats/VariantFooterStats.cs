@@ -119,37 +119,8 @@ internal static class VariantFooterStats
         return true;
     }
 
-    /// <summary>delta-spark's <c>normalizedJsonPath</c>: <c>$['a']['b']</c>, with <c>'</c>, <c>\</c> and control
-    /// characters escaped.</summary>
-    internal static string NormalizedPath(IReadOnlyList<string> fields)
-    {
-        var sb = new StringBuilder("$");
-        foreach (string field in fields)
-        {
-            sb.Append("['");
-            foreach (char ch in field)
-            {
-                switch (ch)
-                {
-                    case '\\': sb.Append("\\\\"); break;
-                    case '\'': sb.Append("\\'"); break;
-                    case '\b': sb.Append("\\b"); break;
-                    case '\f': sb.Append("\\f"); break;
-                    case '\n': sb.Append("\\n"); break;
-                    case '\r': sb.Append("\\r"); break;
-                    case '\t': sb.Append("\\t"); break;
-                    default:
-                        if (ch < ' ')
-                            sb.Append("\\u").Append(((int)ch).ToString("x4", CultureInfo.InvariantCulture));
-                        else
-                            sb.Append(ch);
-                        break;
-                }
-            }
-            sb.Append("']");
-        }
-        return sb.ToString();
-    }
+    /// <summary>delta-spark's <c>normalizedJsonPath</c>; see <see cref="VariantStatsEncoding.NormalizedPath"/>.</summary>
+    internal static string NormalizedPath(IReadOnlyList<string> fields) => VariantStatsEncoding.NormalizedPath(fields);
 
     private static string Encode(Dictionary<string, VariantValue> fields)
     {

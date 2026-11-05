@@ -200,4 +200,18 @@ public static class Expressions
     public static FunctionCall Call(string name, IReadOnlyList<Expression> arguments) =>
         new(name, arguments);
 
+    // ── Variant extraction ──
+
+    /// <summary>
+    /// Spark's <c>variant_get(column, path, type)</c>: the value at <paramref name="path"/> (Spark path text such
+    /// as <c>$.a.b</c>) cast to <paramref name="type"/>; NULL when the path is missing, an error when the value
+    /// does not convert. See <see cref="VariantGetCall"/>.
+    /// </summary>
+    public static FunctionCall VariantGet(string column, string path, string type) =>
+        new("variant_get", new Expression[] { new UnboundReference(column), Lit(path), Lit(type) });
+
+    /// <summary>Spark's <c>try_variant_get(column, path, type)</c>: as <see cref="VariantGet"/>, but NULL where
+    /// the value does not convert.</summary>
+    public static FunctionCall TryVariantGet(string column, string path, string type) =>
+        new("try_variant_get", new Expression[] { new UnboundReference(column), Lit(path), Lit(type) });
 }

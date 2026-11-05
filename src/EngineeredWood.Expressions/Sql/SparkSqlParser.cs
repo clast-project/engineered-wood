@@ -388,11 +388,82 @@ public static class SparkSqlParser
                 {
                     expression = new FunctionCall("cast", new[] { expression, Lit(ParseTypeName()) });
                 }
+                else if (TakeToken(TokenKind.Colon))
+                {
+                    expression = ParseVariantExtraction(expression);
+                }
                 else
                 {
                     return expression;
                 }
             }
+        }
+
+        /// <summary>
+        /// Spark's <c>v:a.b[0]['c d']</c> after the colon: <c>variant_get(v, '$.a.b[0][\'c d\']')</c>, a variant.
+        /// </summary>
+        /// <remarks>
+        /// Measured against Spark 4.1: the first step is a name (back-quoted or not), <c>['key']</c> or
+        /// <c>[n]</c>; later steps are <c>.name</c>, <c>['key']</c> or <c>[n]</c>; keys are case-sensitive. A
+        /// bracketed key takes a single-quoted string only, and not one holding a quote (<c>['q''x']</c> is an
+        /// error there, <c>`q'x`</c> is not). <c>v:a:b</c> extracts again from the variant <c>v:a</c>.
+        /// </remarks>
+        private Expression ParseVariantExtraction(Expression variant)
+        {
+            var segments = new List<VariantPathSegment>();
+            if (Current.Kind is TokenKind.Identifier or TokenKind.QuotedIdentifier)
+                segments.Add(VariantPathSegment.Field(ExpectIdentifier("a variant path")));
+            else if (!TryTakeBracketedPathStep(segments))
+                throw Fail($"expected a variant path after ':', found '{TextOf(Current)}'");
+
+            while (true)
+            {
+                if (Current.Kind == TokenKind.Dot
+                    && Peek(1).Kind is TokenKind.Identifier or TokenKind.QuotedIdentifier)
+                {
+                    Advance();
+                    segments.Add(VariantPathSegment.Field(ExpectIdentifier("a variant path step")));
+                }
+                else if (!TryTakeBracketedPathStep(segments))
+                {
+                    break;
+                }
+            }
+
+            var text = VariantPath.Of(segments).ToPathText()
+                ?? throw Fail("a variant path key holds characters no path text can spell");
+            return new FunctionCall("variant_get", new Expression[] { variant, Lit(text) });
+        }
+
+        private bool TryTakeBracketedPathStep(List<VariantPathSegment> segments)
+        {
+            if (Current.Kind != TokenKind.OpenBracket || Peek(2).Kind != TokenKind.CloseBracket)
+                return false;
+
+            var step = Peek(1);
+            var text = TextOf(step);
+            if (step.Kind == TokenKind.String && text.Length > 0 && text[0] == '\'')
+            {
+                var key = SparkLiteral.Unquote(text);
+                if (key.Length == 0 || key.IndexOf('\'') >= 0)
+                    throw new SparkSqlParseException("unsupported key in a variant path", _sql, step.Start);
+                segments.Add(VariantPathSegment.Field(key));
+            }
+            else if (step.Kind == TokenKind.Number && text.All(c => c is >= '0' and <= '9')
+                && int.TryParse(text, System.Globalization.NumberStyles.None,
+                    System.Globalization.CultureInfo.InvariantCulture, out int index))
+            {
+                segments.Add(VariantPathSegment.Element(index));
+            }
+            else
+            {
+                return false;
+            }
+
+            Advance();
+            Advance();
+            Advance();
+            return true;
         }
 
         // ── Primaries ──────────────────────────────────────────────────────────────────

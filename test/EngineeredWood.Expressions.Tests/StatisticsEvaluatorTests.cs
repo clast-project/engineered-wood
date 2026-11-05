@@ -531,6 +531,27 @@ public class StatisticsEvaluatorTests
         Assert.Equal(FilterResult.AlwaysTrue, Eval(p, stats));
     }
 
+    /// <summary>
+    /// <c>x &lt;=&gt; NULL</c> is <c>x IS NULL</c>, which the bounds cannot answer: read through them, NULL sorted
+    /// below the minimum and a file with NULL rows beside its values was skipped (#680 review).
+    /// </summary>
+    [Theory]
+    [InlineData(3L, FilterResult.Unknown)]
+    [InlineData(null, FilterResult.Unknown)]
+    [InlineData(0L, FilterResult.AlwaysFalse)]
+    public void NullSafeEqual_NullValue_BoundedColumn_FollowsTheNullCount(long? nullCount, FilterResult expected)
+    {
+        var stats = new TestStats().With("x", min: 1, max: 5, nullCount: nullCount, valueCount: 10);
+        var p = new ComparisonPredicate(
+            new UnboundReference("x"), ComparisonOperator.NullSafeEqual,
+            new LiteralExpression(LiteralValue.Null));
+        Assert.Equal(expected, Eval(p, stats));
+        var flipped = new ComparisonPredicate(
+            new LiteralExpression(LiteralValue.Null), ComparisonOperator.NullSafeEqual,
+            new UnboundReference("x"));
+        Assert.Equal(expected, Eval(flipped, stats));
+    }
+
     [Fact]
     public void NullSafeEqual_NonNullValue_AllNullColumn_AlwaysFalse()
     {

@@ -137,7 +137,8 @@ internal static class SparkSqlTokenizer
                     position += 2;
                     return new Token(TokenKind.ColonColon, start, 2);
                 }
-                throw Fail("unexpected ':'", source, start);
+                position++;
+                return new Token(TokenKind.Colon, start, 1);
 
             case '|':
                 if (Peek(source, position + 1) == '|')

@@ -2,6 +2,8 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers.Binary;
+using System.Globalization;
+using System.Text;
 using EngineeredWood.DeltaLake.DeletionVectors;
 
 namespace EngineeredWood.DeltaLake;
@@ -22,6 +24,38 @@ namespace EngineeredWood.DeltaLake;
 /// </remarks>
 internal static class VariantStatsEncoding
 {
+    /// <summary>delta-spark's <c>normalizedJsonPath</c>, the key a path's bound is stored under: <c>$['a']['b']</c>,
+    /// with <c>'</c>, <c>\</c> and control characters escaped; the root is <c>$</c>.</summary>
+    public static string NormalizedPath(IReadOnlyList<string> fields)
+    {
+        var sb = new StringBuilder("$");
+        foreach (string field in fields)
+        {
+            sb.Append("['");
+            foreach (char ch in field)
+            {
+                switch (ch)
+                {
+                    case '\\': sb.Append("\\\\"); break;
+                    case '\'': sb.Append("\\'"); break;
+                    case '\b': sb.Append("\\b"); break;
+                    case '\f': sb.Append("\\f"); break;
+                    case '\n': sb.Append("\\n"); break;
+                    case '\r': sb.Append("\\r"); break;
+                    case '\t': sb.Append("\\t"); break;
+                    default:
+                        if (ch < ' ')
+                            sb.Append("\\u").Append(((int)ch).ToString("x4", CultureInfo.InvariantCulture));
+                        else
+                            sb.Append(ch);
+                        break;
+                }
+            }
+            sb.Append("']");
+        }
+        return sb.ToString();
+    }
+
     /// <summary>The Z85 string for a Variant's metadata and value.</summary>
     public static string Encode(ReadOnlySpan<byte> metadata, ReadOnlySpan<byte> value)
     {
