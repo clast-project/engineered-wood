@@ -427,6 +427,16 @@ internal ref struct RleBitPackedDecoder
         for (int i = 0; i < byteWidth; i++)
             value |= _data[_position++] << (i * 8);
 
+        // The value is stored in whole bytes but must fit the declared width, as a bit-packed value
+        // does by construction. Callers rely on that: a dictionary skips checking indices whose width
+        // cannot reach past its entries, and its arrays are rented, so an index past them would read
+        // what the pool's previous user left there rather than fail (#688).
+        if (_bitWidth < 32 && (uint)value >> _bitWidth != 0)
+        {
+            throw new ParquetFormatException(
+                $"An RLE run repeats the value {value}, which does not fit its bit width of {_bitWidth}.");
+        }
+
         return value;
     }
 

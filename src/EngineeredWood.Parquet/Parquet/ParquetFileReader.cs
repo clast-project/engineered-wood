@@ -994,6 +994,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             foreach (var chunk in held)
                 chunk?.Dispose();
 
+            // The last batch is decoded, or the caller stopped early: no page of this row group is
+            // decoded again, so the dictionaries go back to the pool (#644).
+            ColumnPageMap.ReleaseDictionaries(pageMaps);
+
             // Rows decoded but not returned, when the caller stops early.
             foreach (var cursor in cursors)
                 cursor.Dispose();
@@ -1049,6 +1053,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         {
             for (int i = 0; i < buffers.Count; i++)
                 buffers[i].Dispose();
+
+            // These maps only size the batches; ReadColumn decoded from dictionaries of its own.
+            ColumnPageMap.ReleaseDictionaries(pageMaps);
         }
 
         // Each batch holds its own reference to the decoded buffers; this one is let go at the end, or
@@ -1193,14 +1200,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken)
     {
         var pageMaps = new ColumnPageMap?[ctx.Count];
-        if (useOffsetIndex)
-            await BuildPageMapsFromOffsetIndexesAsync(ctx, pageMaps, offsetIndexes, cancellationToken).ConfigureAwait(false);
-
         var held = new IMemoryOwner<byte>?[ctx.Count];
         long budget = HeaderScanBudgetBytes;
         long heldBytes = 0;
         try
         {
+            if (useOffsetIndex)
+                await BuildPageMapsFromOffsetIndexesAsync(ctx, pageMaps, offsetIndexes, cancellationToken).ConfigureAwait(false);
+
             // The chunks to scan, in file order rather than the projection's, as a coalescing reader
             // merges them: a request then spans only the gaps between its own chunks, which it counts.
             var toScan = new List<int>();
@@ -1278,6 +1285,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         {
             foreach (var buffer in held)
                 buffer?.Dispose();
+            ColumnPageMap.ReleaseDictionaries(pageMaps);
             throw;
         }
 

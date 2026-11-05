@@ -80,49 +80,58 @@ internal static class ColumnChunkReader
         var pages = new PageReader(data, column, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
         long valuesRead = 0;
 
-        while (valuesRead < columnMeta.NumValues && pages.TryRead(out var page))
+        try
         {
-            var pageHeader = page.Header;
-            var pageData = page.Payload;
-
-            if (validateCrc)
-                ValidateCrc(pageHeader.Crc, pageData, column);
-
-            // The level and value buffers are sized from the chunk's metadata, not from the pages.
-            if (page.NumValues > capacity - valuesRead)
-                throw TooManyValues(column, page, capacity - valuesRead);
-
-            try
+            while (valuesRead < columnMeta.NumValues && pages.TryRead(out var page))
             {
-                switch (pageHeader.Type)
+                var pageHeader = page.Header;
+                var pageData = page.Payload;
+
+                if (validateCrc)
+                    ValidateCrc(pageHeader.Crc, pageData, column);
+
+                // The level and value buffers are sized from the chunk's metadata, not from the pages.
+                if (page.NumValues > capacity - valuesRead)
+                    throw TooManyValues(column, page, capacity - valuesRead);
+
+                try
                 {
-                    case PageType.DictionaryPage:
-                        dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
-                        break;
+                    switch (pageHeader.Type)
+                    {
+                        case PageType.DictionaryPage:
+                            dictionary?.Dispose(); // a second dictionary page replaces the first
+                            dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+                            break;
 
-                    case PageType.SymbolTablePage:
-                        symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
-                        break;
+                        case PageType.SymbolTablePage:
+                            symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                            break;
 
-                    case PageType.DataPage:
-                        valuesRead += ReadDataPageV1(
-                            pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
-                        break;
+                        case PageType.DataPage:
+                            valuesRead += ReadDataPageV1(
+                                pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
+                            break;
 
-                    case PageType.DataPageV2:
-                        valuesRead += ReadDataPageV2(
-                            pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
-                        break;
+                        case PageType.DataPageV2:
+                            valuesRead += ReadDataPageV2(
+                                pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state);
+                            break;
 
-                    default:
-                        // Skip index pages and unknown page types
-                        break;
+                        default:
+                            // Skip index pages and unknown page types
+                            break;
+                    }
+                }
+                catch (Exception ex) when (IsDecodeFailure(ex))
+                {
+                    throw UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
                 }
             }
-            catch (Exception ex) when (IsDecodeFailure(ex))
-            {
-                throw UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
-            }
+        }
+        finally
+        {
+            // Every page is decoded into the build state, so nothing reads the dictionary after this.
+            dictionary?.Dispose();
         }
 
         if (valuesRead < columnMeta.NumValues)
@@ -301,68 +310,77 @@ internal static class ColumnChunkReader
         var pages = new PageReader(data, column, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
         long valuesRead = 0;
 
-        while (valuesRead < columnMeta.NumValues)
+        try
         {
-            Page page;
-            try
+            while (valuesRead < columnMeta.NumValues)
             {
-                if (!pages.TryRead(out page))
-                    break;
-            }
-            catch (ParquetFormatException)
-            {
-                return null; // let the general path produce the diagnostic
-            }
-
-            var pageHeader = page.Header;
-            var pageData = page.Payload;
-
-            if (page.NumValues > numValues - valuesRead)
-                return null;
-
-            if (validateCrc && pageHeader.Crc.HasValue)
-            {
-                uint expected = unchecked((uint)pageHeader.Crc.Value);
-                if (ComputeCrc32C(pageData) != expected)
-                    return null;
-            }
-
-            try
-            {
-                switch (pageHeader.Type)
+                Page page;
+                try
                 {
-                    case PageType.DictionaryPage:
-                        dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
-                        break;
-
-                    case PageType.SymbolTablePage:
-                        symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
-                        break;
-
-                    case PageType.DataPage:
-                        if (!TryReadFixedListPageV1(
-                                pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
-                                ref listLength, valuesRead))
-                            return null;
-                        valuesRead += pageHeader.DataPageHeader!.NumValues;
-                        break;
-
-                    case PageType.DataPageV2:
-                        if (!TryReadFixedListPageV2(
-                                pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
-                                ref listLength, valuesRead))
-                            return null;
-                        valuesRead += pageHeader.DataPageHeaderV2!.NumValues;
-                        break;
-
-                    default:
+                    if (!pages.TryRead(out page))
                         break;
                 }
+                catch (ParquetFormatException)
+                {
+                    return null; // let the general path produce the diagnostic
+                }
+
+                var pageHeader = page.Header;
+                var pageData = page.Payload;
+
+                if (page.NumValues > numValues - valuesRead)
+                    return null;
+
+                if (validateCrc && pageHeader.Crc.HasValue)
+                {
+                    uint expected = unchecked((uint)pageHeader.Crc.Value);
+                    if (ComputeCrc32C(pageData) != expected)
+                        return null;
+                }
+
+                try
+                {
+                    switch (pageHeader.Type)
+                    {
+                        case PageType.DictionaryPage:
+                            dictionary?.Dispose(); // a second dictionary page replaces the first
+                            dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+                            break;
+
+                        case PageType.SymbolTablePage:
+                            symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
+                            break;
+
+                        case PageType.DataPage:
+                            if (!TryReadFixedListPageV1(
+                                    pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
+                                    ref listLength, valuesRead))
+                                return null;
+                            valuesRead += pageHeader.DataPageHeader!.NumValues;
+                            break;
+
+                        case PageType.DataPageV2:
+                            if (!TryReadFixedListPageV2(
+                                    pageHeader, pageData, column, columnMeta, dictionary, symbolTable, state,
+                                    ref listLength, valuesRead))
+                                return null;
+                            valuesRead += pageHeader.DataPageHeaderV2!.NumValues;
+                            break;
+
+                        default:
+                            break;
+                    }
+                }
+                catch (Exception ex) when (IsDecodeFailure(ex))
+                {
+                    throw UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
+                }
             }
-            catch (Exception ex) when (IsDecodeFailure(ex))
-            {
-                throw UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
-            }
+        }
+        finally
+        {
+            // Every page is decoded into the build state, so nothing reads the dictionary after this.
+            dictionary?.Dispose();
         }
 
         if (valuesRead != columnMeta.NumValues || listLength <= 0)
@@ -804,7 +822,15 @@ internal static class ColumnChunkReader
         try
         {
             var decoder = new DictionaryDecoder(column.PhysicalType);
-            decoder.Load(plainData, dictHeader.NumValues, column.TypeLength ?? 0);
+            try
+            {
+                decoder.Load(plainData, dictHeader.NumValues, column.TypeLength ?? 0);
+            }
+            catch
+            {
+                decoder.Dispose();
+                throw;
+            }
             return decoder;
         }
         finally
