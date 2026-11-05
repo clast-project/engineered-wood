@@ -3624,8 +3624,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 // is already true; this stops opting out.
                 WriteCheckpointOnInterval = true,
                 // Incremental: this handle's snapshot is usually newer than the transaction's base, so
-                // refreshing from it replays fewer versions for the same result.
-                RefreshFrom = CurrentSnapshot,
+                // refreshing from it replays fewer versions for the same result. But not always: RESTORE commits
+                // on a base it brought up to date itself, from the checkpoint when log cleanup removed commits
+                // after this handle's version, and refreshing from the handle would then replay across that gap
+                // and throw after a durable commit (#698 review). So from whichever is newer.
+                RefreshFrom = CurrentSnapshot.Version >= baseSnapshot.Version ? CurrentSnapshot : baseSnapshot,
             },
             cancellationToken).ConfigureAwait(false);
 

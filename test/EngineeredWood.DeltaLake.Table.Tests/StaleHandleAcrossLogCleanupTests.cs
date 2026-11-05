@@ -270,6 +270,100 @@ public class StaleHandleAcrossLogCleanupTests : IDisposable
         Assert.Equal(CleanedBaseGuard.MaxFreshWindow, TimeSpan.FromMinutes(5));
     }
 
+    /// <summary>
+    /// #698 review: a restore that actually commits, from a handle cleanup overtook. It commits on the base it
+    /// brought up from the checkpoint, and the refresh after the commit used to start from the handle's own stale
+    /// snapshot instead, replay across the gap, and throw after the commit was durable.
+    /// </summary>
+    [Fact]
+    public async Task Restore_ThatCommits_FromAnOvertakenHandle_RefreshesFromItsOwnBase()
+    {
+        await using var stale = await OvertakenHandleAsync();
+        await using (var writer = await DeltaTable.OpenAsync(Fs, Options))
+            Assert.Equal(20, await writer.WriteAsync([Rows(20)]));
+
+        var result = await stale.RestoreAsync(19);
+
+        Assert.Equal(19, result.RestoredVersion);
+        Assert.Equal(21, result.Version);
+        Assert.Equal(21, stale.CurrentSnapshot.Version);
+        Assert.Equal(AllNineteen, await FreshIdsAsync());
+    }
+
+    /// <summary>
+    /// #698 review: cleanup landing mid-refresh. The listing names v10..v19, and the commits before v19 are deleted
+    /// before the replay reads v10, so the read fails with the file system's own not-found error rather than the
+    /// truncated-log one. The refresh re-lists, sees the gap, and builds from the checkpoint.
+    /// </summary>
+    [Fact]
+    public async Task Refresh_WhenCleanupDeletesAListedCommitMidReplay_BuildsFromTheCheckpoint()
+    {
+        await CreateAsync(ShortRetention);
+        var racing = new CleanupMidReplayFileSystem(Fs, firstRead: 10, deleteBelow: 19, LogDir);
+        await using var stale = await DeltaTable.OpenAsync(racing, Options);
+        await using (var writer = await DeltaTable.OpenAsync(Fs, Options))
+        {
+            for (long i = 10; i <= 19; i++)
+                await writer.WriteAsync([Rows(i)]);                                         // v10..v19
+            Assert.Equal(19, await writer.CheckpointAsync());
+        }
+
+        await stale.RefreshAsync();
+
+        Assert.True(racing.Raced);
+        Assert.Equal(19, stale.CurrentSnapshot.Version);
+        Assert.Equal(AllNineteen, await IdsAsync(stale));
+    }
+
+    /// <summary>
+    /// The first time commit <c>firstRead</c> is read, deletes every commit below <c>deleteBelow</c>, as a cleanup
+    /// running between a listing and the read would; the read then fails as the inner file system fails it.
+    /// </summary>
+    private sealed class CleanupMidReplayFileSystem(
+        ITableFileSystem inner, long firstRead, long deleteBelow, string logDir) : ITableFileSystem
+    {
+        private int _raced;
+
+        public bool Raced => Volatile.Read(ref _raced) == 1;
+
+        public PathNameConstraints PathConstraints => inner.PathConstraints;
+
+        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
+        {
+            if (DeltaVersion.TryParseCommitVersion(Path.GetFileName(path), out long v) && v == firstRead
+                && Interlocked.Exchange(ref _raced, 1) == 0)
+            {
+                for (long d = 0; d < deleteBelow; d++)
+                {
+                    File.Delete(Path.Combine(logDir, $"{d:D20}.json"));
+                    File.Delete(Path.Combine(logDir, $"{d:D20}.crc"));
+                }
+            }
+            return inner.ReadAllBytesAsync(path, cancellationToken);
+        }
+
+        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ExistsAsync(path, cancellationToken);
+
+        public ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
+            => inner.OpenReadAsync(path, cancellationToken);
+
+        public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default)
+            => inner.ListAsync(prefix, cancellationToken);
+
+        public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
+            => inner.CreateAsync(path, overwrite, cancellationToken);
+
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
+            => inner.DeleteAsync(path, cancellationToken);
+
+        public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+
+        public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.WriteAllBytesAsync(path, data, cancellationToken);
+    }
+
     /// <summary>Counts existence checks of commit files; everything else passes through.</summary>
     private sealed class CommitExistsCountingFileSystem(ITableFileSystem inner) : ITableFileSystem
     {

@@ -428,6 +428,11 @@ public sealed class SnapshotBuilder
     /// would hide exactly that. A commit path refuses such a base before writing
     /// (<see cref="Log.CleanedBaseGuard"/>), and refreshes after committing with <see cref="UpdateAsync"/>, which
     /// still throws.</para>
+    ///
+    /// <para><b>Cleanup can also land mid-replay</b> (#698 review): the listing names a commit that is deleted before
+    /// it is read. That surfaces as the file system's own not-found error, which differs by backend, so it is not
+    /// recognised by type. Any other failure re-lists the log instead: if commits after <paramref name="current"/>
+    /// are now missing, the snapshot is built from the checkpoint; otherwise the original error is rethrown.</para>
     /// </remarks>
     public static async ValueTask<Snapshot> UpdateOrRebuildAsync(
         Snapshot current,
@@ -441,6 +446,14 @@ public sealed class SnapshotBuilder
         }
         catch (DeltaFormatException ex) when (ex.ErrorCode == DeltaErrorCodes.TruncatedTransactionLog)
         {
+            return await BuildAsync(log, checkpointReader, atVersion: null, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            var listing = await log.ReadListingAsync(cancellationToken).ConfigureAwait(false);
+            long missing = listing.LatestVersion - current.Version;
+            if (missing <= 0 || listing.CommitsInRange(current.Version + 1, listing.LatestVersion).Count() == missing)
+                throw;
             return await BuildAsync(log, checkpointReader, atVersion: null, cancellationToken).ConfigureAwait(false);
         }
     }
