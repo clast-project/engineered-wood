@@ -171,6 +171,34 @@ public class TimeTravelByTimestampSearchTests : IDisposable
     }
 
     /// <summary>
+    /// #690 review: an unrecorded mid-life enablement whose unstamped commit before it carries a LATER informational
+    /// timestamp than the stamped ones after it (a skewed clock). The walk raises the stamped commits past it; a
+    /// search over the stamped suffix alone would not, and need never probe the unstamped prefix to notice (a target
+    /// just after v5 searches v9, v4, v6, v5 and answers v5, where the walk answers v0). Reading the first commit
+    /// first finds the prefix and walks instead.
+    /// </summary>
+    [Fact]
+    public async Task UnrecordedEnablement_WithASkewedUnstampedPrefix_ResolvesAsTheWalkDoes()
+    {
+        const int count = 20, ictFrom = 2, skewed = 1;
+        var written = Written(count);
+        written[skewed] = TimestampOf(10) + 500;
+        var log = new TransactionLog(new LocalTableFileSystem(_tempDir));
+        for (int v = 0; v < count; v++)
+        {
+            var actions = CommitActions(v, ictFrom, recordEnablement: false);
+            if (v == skewed)
+                actions[0] = InCommitTimestamp.CreateCommitInfo(written[v], "WRITE", includeInCommitTimestamp: false);
+            await log.WriteCommitAsync(v, actions);
+        }
+        await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+
+        Assert.Equal(0, (await table.GetSnapshotAtTimestampAsync(
+            DateTimeOffset.FromUnixTimeMilliseconds(TimestampOf(5) + 1))).Version);
+        await AssertResolvesLikeTheWalkAsync(table, written);
+    }
+
+    /// <summary>
     /// A handle opened while in-commit timestamps were on still sees them on after another writer turns them off: its
     /// probes into the unstamped commits make it walk instead, so the stale configuration costs only speed. One of
     /// those commits is dated before its predecessor (a skewed clock), so a search that read the informational

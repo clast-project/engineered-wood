@@ -510,8 +510,9 @@ public sealed partial class DeltaTable
     /// reach back over a later disable and re-enable, and if the re-enabled run was stamped by a clock set back, the
     /// search can skip the unstamped gap and answer from the earlier run (#690 review).</para>
     ///
-    /// <para><b>A probe without an <c>inCommitTimestamp</c></b> (from a writer that never recorded where they began)
-    /// makes the search answer nothing, and the whole log is walked as before.</para>
+    /// <para><b>A writer that never recorded where they began.</b> With no enablement recorded, the first listed commit
+    /// is read first: one without an <c>inCommitTimestamp</c> means the range is not what the configuration claims,
+    /// and the whole log is walked as before. A probe without one does the same.</para>
     /// </remarks>
     private async ValueTask<(long Version, long Timestamp)?> FindCommitAtTimestampAsync(
         List<(long Version, long Modified)> commits, IReadOnlyDictionary<string, string>? configuration,
@@ -532,6 +533,18 @@ public sealed partial class DeltaTable
             if (enablement is { } en && targetMs < en.Timestamp)
             {
                 search = InCommitTimestampSearch.BeforeFirst;
+            }
+            else if (enablement is null && commits.Count > 0
+                     && InCommitTimestamp.GetStrictTimestamp(
+                         await _log.ReadCommitAsync(commits[0].Version, cancellationToken).ConfigureAwait(false))
+                         is null)
+            {
+                // No enablement recorded claims every commit is stamped. A first commit that is not says a writer
+                // turned them on mid-life without recording where, and its unstamped commits form a prefix of the
+                // listing (cleanup removes the oldest first), so this one read finds them. The search could otherwise
+                // probe only the stamped suffix and miss that the walk raises it past a later informational
+                // timestamp before it (#690 review).
+                search = InCommitTimestampSearch.Unsearchable;
             }
             else
             {
