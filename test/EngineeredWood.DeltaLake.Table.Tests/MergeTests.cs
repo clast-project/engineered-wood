@@ -515,9 +515,33 @@ public class MergeTests : IDisposable
         Assert.Equal(1, metrics.NumTargetRowsUpdated);
     }
 
+    // A sliced source key: its extremes must be found within the slice. Unsliced, the leading 500 and 50 make the
+    // range 50..500, which prunes the file holding -2.
+    [Fact]
+    public Task ASlicedLongKey_IsBoundedWithinTheSlice() =>
+        AssertKeyRangePrunes(Int64Type.Default, values =>
+        {
+            var b = new Int64Array.Builder();
+            foreach (long v in values) b.Append(v);
+            return b.Build();
+        }, sliced: true);
+
+    [Fact]
+    public Task ASlicedDecimalKey_IsBoundedWithinTheSlice()
+    {
+        var type = new Decimal128Type(10, 2);
+        return AssertKeyRangePrunes(type, values =>
+        {
+            var b = new Decimal128Array.Builder(type);
+            foreach (long v in values) b.Append(v + 0.25m);
+            return b.Build();
+        }, sliced: true);
+    }
+
     // A near file (keys -2, 1) and a far one (100, 120); the source (-2, 3) updates -2 and inserts 3. The far file
-    // must be neither read nor rewritten, and is no read dependency of the transaction.
-    private async Task AssertKeyRangePrunes(IArrowType keyType, Func<long[], IArrowArray> keys)
+    // must be neither read nor rewritten, and is no read dependency of the transaction. A sliced source holds
+    // 500 and 50 ahead of its window.
+    private async Task AssertKeyRangePrunes(IArrowType keyType, Func<long[], IArrowArray> keys, bool sliced = false)
     {
         var schema = new Apache.Arrow.Schema.Builder()
             .Field(new Field("k", keyType, true)).Field(new Field("v", StringType.Default, true)).Build();
@@ -536,7 +560,11 @@ public class MergeTests : IDisposable
 
         await using var txn = table.StartTransaction();
         var options = new MergeOptions { Keys = ["k"], WhenMatched = MergeAction.Update, WhenNotMatched = MergeAction.Insert };
-        var metrics = await txn.MergeAsync([Batch([-2, 3], "A", "c")], options);
+        var source = sliced
+            ? new RecordBatch(schema,
+                Batch([500, 50, -2, 3], "p", "q", "A", "c").Arrays.Select(a => ArrowArrayFactory.Slice(a, 2, 2)), 2)
+            : Batch([-2, 3], "A", "c");
+        var metrics = await txn.MergeAsync([source], options);
         Assert.Equal(1, metrics.NumTargetRowsUpdated);
         Assert.Equal(1, metrics.NumTargetRowsInserted);
         Assert.DoesNotContain(far, txn.DeclaredReadPaths);
