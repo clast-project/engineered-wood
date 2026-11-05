@@ -28,6 +28,14 @@ namespace EngineeredWood.DeltaLake.Log;
 ///
 /// <para>Refused rather than rebased: a rebase checks the commits after the base for conflicts, and those are
 /// gone. Refreshing the handle and retrying is the remedy, which the message says.</para>
+///
+/// <para><b>Known limits</b> (#698 review). (1) A retention shortened below <see cref="MaxFreshWindow"/> by another
+/// writer after this snapshot was read, followed by a checkpoint and cleanup within that window, is not seen: the
+/// window trusts this snapshot's retention up to the cap. (2) A cleanup that deletes the base between the existence
+/// check and the create is not seen either. Delta has no lock to close that window, and closing it after the fact
+/// would mean deleting a commit already reported durable; delta-spark has the same theoretical gap between a
+/// transaction's snapshot and its commit. Both need cleanup to run against a handle at exactly that moment, where
+/// without this guard every write through an overtaken handle was lost.</para>
 /// </remarks>
 internal static class CleanedBaseGuard
 {
