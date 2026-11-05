@@ -2745,26 +2745,26 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// file's modification time, as Spark falls back to it; and never earlier than the commit before it. A
     /// timestamp after the latest commit gives the latest version.
     /// </summary>
+    /// <remarks>On a table with in-commit timestamps, the commits from where they were turned on are binary-searched,
+    /// reading O(log N) of them; there, as in delta-spark, each commit's in-commit timestamp is taken as it is.</remarks>
     public async ValueTask<Snapshot.Snapshot> GetSnapshotAtTimestampAsync(
         DateTimeOffset timestamp, CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
 
-        long targetMs = timestamp.ToUnixTimeMilliseconds();
-        long? bestVersion = null;
-        await foreach (var (version, commitTs) in ReadCommitTimestampsAsync(cancellationToken).ConfigureAwait(false))
-        {
-            if (commitTs > targetMs)
-                break; // the sequence never goes backwards
-            bestVersion = version;
-        }
+        var commits = await ListCommitsAsync(cancellationToken).ConfigureAwait(false);
+        var found = await FindCommitAtTimestampAsync(
+                commits, await LatestConfigurationAsync(commits, cancellationToken).ConfigureAwait(false),
+                timestamp.ToUnixTimeMilliseconds(),
+                cancellationToken)
+            .ConfigureAwait(false);
 
-        if (bestVersion is null)
+        if (found is not { } commit)
             throw new DeltaFormatException(
                 DeltaTableErrorCodes.NoCommitAtTimestamp,
                 "No commit found at or before the specified timestamp.");
 
-        return await GetSnapshotAtVersionAsync(bestVersion.Value, cancellationToken)
+        return await GetSnapshotAtVersionAsync(commit.Version, cancellationToken)
             .ConfigureAwait(false);
     }
 

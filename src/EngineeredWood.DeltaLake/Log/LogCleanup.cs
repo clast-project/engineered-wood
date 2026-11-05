@@ -319,47 +319,17 @@ internal static class LogCleanup
         if (probes.Count == 0)
             return 0;
 
-        long cutoffMs = cutoff.ToUnixTimeMilliseconds();
-        long? boundary = null;
-        int lo = 0, hi = probes.Count - 1;
-        while (lo <= hi)
-        {
-            int mid = lo + ((hi - lo) / 2);
-            var actions = await log.ReadCommitAsync(probes[mid], cancellationToken).ConfigureAwait(false);
-            if (StrictInCommitTimestamp(actions) is not { } timestamp)
-                return 0;
-            if (timestamp < cutoffMs)
-            {
-                boundary = probes[mid];
-                lo = mid + 1;
-            }
-            else
-            {
-                hi = mid - 1;
-            }
-        }
-        if (boundary is not { } b)
+        // "Before the cutoff" is "at or before one millisecond earlier" in the shared search's terms.
+        var search = await InCommitTimestamp.SearchAsync(
+                log, probes, cutoff.ToUnixTimeMilliseconds() - 1, cancellationToken)
+            .ConfigureAwait(false);
+        if (search.Outcome != InCommitTimestampSearchOutcome.Found)
             return 0;
 
         int cut = 0;
-        while (cut < candidates.Count && candidates[cut].Version <= b)
+        while (cut < candidates.Count && candidates[cut].Version <= search.Version)
             cut++;
         return cut;
-    }
-
-    // The commit's own inCommitTimestamp. Not InCommitTimestamp.GetTimestamp, which falls back to commitInfo's
-    // informational `timestamp`: that one is not promised to increase, and this decides what gets deleted.
-    private static long? StrictInCommitTimestamp(IReadOnlyList<Actions.DeltaAction> actions)
-    {
-        foreach (var action in actions)
-        {
-            if (action is Actions.CommitInfo commitInfo
-                && commitInfo.GetValue("inCommitTimestamp") is { ValueKind: System.Text.Json.JsonValueKind.Number } ts)
-            {
-                return ts.GetInt64();
-            }
-        }
-        return null;
     }
 
     /// <summary>

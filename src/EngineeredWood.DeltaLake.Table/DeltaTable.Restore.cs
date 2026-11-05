@@ -79,36 +79,55 @@ public sealed partial class DeltaTable
     {
         ThrowIfDisposed();
         long requested = timestamp.ToUnixTimeMilliseconds();
-        var commits = new List<(long Version, long Timestamp)>();
-        await foreach (var commit in ReadCommitTimestampsAsync(cancellationToken).ConfigureAwait(false))
-            commits.Add(commit);
+        var commits = await ListCommitsAsync(cancellationToken).ConfigureAwait(false);
         var readable = (await _log.ReadVersionsAsync(cancellationToken).ConfigureAwait(false)).ReadableVersions;
         var readableSet = new HashSet<long>(readable);
-        // The earliest version that can still be reconstructed bounds the request from below, as in Spark.
-        var earliestReadable = commits.FirstOrDefault(c => readableSet.Contains(c.Version));
 
-        if (commits.Count == 0 || !readableSet.Contains(earliestReadable.Version)
-            || requested < earliestReadable.Timestamp)
+        // The earliest version that can still be reconstructed bounds the request from below, as in Spark. Usually
+        // the first commit, so this walk usually reads one.
+        (long Version, long Timestamp)? earliestReadable = null;
+        await foreach (var commit in ReadCommitTimestampsAsync(commits, commits.Count, cancellationToken)
+                           .ConfigureAwait(false))
         {
-            string earliest = commits.Count == 0 || !readableSet.Contains(earliestReadable.Version)
-                ? "none"
-                : FormatTimestamp(earliestReadable.Timestamp);
+            if (readableSet.Contains(commit.Version))
+            {
+                earliestReadable = commit;
+                break;
+            }
+        }
+
+        // Against every commit, not only the readable ones: a timestamp that lands on a version the log can no
+        // longer reconstruct must be refused as that version, not quietly moved to an older one that can be.
+        (long Version, long Timestamp)? match = null;
+        if (earliestReadable is { } earliestCommit && requested >= earliestCommit.Timestamp)
+        {
+            match = await FindCommitAtTimestampAsync(
+                    commits, await LatestConfigurationAsync(commits, cancellationToken).ConfigureAwait(false), requested,
+                    cancellationToken)
+                .ConfigureAwait(false);
+        }
+
+        // Null where the earliest readable commit is after the request, or (a table whose in-commit timestamps
+        // contradict its enablement properties) where the search finds nothing; either way nothing is early enough.
+        if (match is not { } found)
+        {
+            string earliest = earliestReadable is { } e ? FormatTimestamp(e.Timestamp) : "none";
             throw new DeltaFormatException(
                 DeltaTableErrorCodes.CannotRestoreTimestampEarlier,
                 $"Cannot restore table to timestamp ({FormatTimestamp(requested)}) as it is before the earliest version "
                 + $"available. Please use a timestamp after ({earliest}).");
         }
-        if (requested > commits[^1].Timestamp)
+
+        // After the latest commit exactly when the answer is the latest commit and is earlier than the request.
+        if (found.Version == commits[commits.Count - 1].Version && requested > found.Timestamp)
         {
             throw new DeltaFormatException(
                 DeltaTableErrorCodes.CannotRestoreTimestampGreater,
                 $"Cannot restore table to timestamp ({FormatTimestamp(requested)}) as it is after the latest version "
-                + $"available. Please use a timestamp before ({FormatTimestamp(commits[^1].Timestamp)})");
+                + $"available. Please use a timestamp before ({FormatTimestamp(found.Timestamp)})");
         }
 
-        // Against every commit, not only the readable ones: a timestamp that lands on a version the log can no
-        // longer reconstruct must be refused as that version, not quietly moved to an older one that can be.
-        long version = commits.Last(c => c.Timestamp <= requested).Version;
+        long version = found.Version;
         return await RestoreCoreAsync(
             version, timestampText: timestamp.ToString("o", CultureInfo.InvariantCulture),
             options ?? RestoreOptions.Default, commitProperties, cancellationToken).ConfigureAwait(false);
@@ -397,17 +416,8 @@ public sealed partial class DeltaTable
         }
     }
 
-    /// <summary>
-    /// Each commit file's version and timestamp, ascending: the in-commit timestamp where the commit carries one,
-    /// else <c>commitInfo.timestamp</c> (so a timestamp read from history resolves back to its version), else the
-    /// commit file's modification time; raised where needed to one past the previous commit's so the sequence never
-    /// goes backwards, as Spark does. Spark uses the modification time where this library uses
-    /// <c>commitInfo.timestamp</c>; the two differ by the time the commit took to write, unless the log was copied.
-    /// </summary>
-    /// <remarks>Lazy: each commit is read only when it is reached, so a caller looking for an early version stops
-    /// reading there. The listing itself is one call.</remarks>
-    private async IAsyncEnumerable<(long Version, long Timestamp)> ReadCommitTimestampsAsync(
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    /// <summary>The versions of the log's commit files, ascending, with each file's modification time. One listing.</summary>
+    private async ValueTask<List<(long Version, long Modified)>> ListCommitsAsync(CancellationToken cancellationToken)
     {
         var modified = new Dictionary<long, long>();
         await foreach (var file in _fs.ListAsync(DeltaVersion.LogPrefix, cancellationToken).ConfigureAwait(false))
@@ -415,17 +425,151 @@ public sealed partial class DeltaTable
             if (DeltaVersion.TryParseCommitVersion(Path.GetFileName(file.Path), out long v))
                 modified[v] = file.LastModified.ToUnixTimeMilliseconds();
         }
+        var commits = new List<(long Version, long Modified)>(modified.Count);
+        foreach (var pair in modified.OrderBy(p => p.Key))
+            commits.Add((pair.Key, pair.Value));
+        return commits;
+    }
 
+    /// <summary>
+    /// The version and timestamp of each of <paramref name="commits"/> before index <paramref name="end"/>, ascending:
+    /// the in-commit timestamp where the commit carries one, else <c>commitInfo.timestamp</c> (so a timestamp read
+    /// from history resolves back to its version), else the commit file's modification time; raised where needed to
+    /// one past the previous commit's so the sequence never goes backwards, as Spark does. Spark uses the modification
+    /// time where this library uses <c>commitInfo.timestamp</c>; the two differ by the time the commit took to write,
+    /// unless the log was copied.
+    /// </summary>
+    /// <remarks>Lazy: each commit is read only when it is reached, so a caller looking for an early version stops
+    /// reading there. Always from the first commit, since each adjustment depends on every timestamp before it.</remarks>
+    private async IAsyncEnumerable<(long Version, long Timestamp)> ReadCommitTimestampsAsync(
+        List<(long Version, long Modified)> commits, int end,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         long? previous = null;
-        foreach (long v in modified.Keys.OrderBy(v => v))
+        for (int i = 0; i < end; i++)
         {
+            var (v, modified) = commits[i];
             var actions = await _log.ReadCommitAsync(v, cancellationToken).ConfigureAwait(false);
-            long timestamp = InCommitTimestamp.GetTimestampFromActions(actions) ?? modified[v];
+            long timestamp = InCommitTimestamp.GetTimestampFromActions(actions) ?? modified;
             if (previous is { } p && timestamp <= p)
                 timestamp = p + 1;
             previous = timestamp;
             yield return (v, timestamp);
         }
+    }
+
+    /// <summary>
+    /// The table configuration as of the newest of <paramref name="commits"/> or later: the handle's own when it is
+    /// that current, else that of a snapshot brought up to date for the purpose (the handle does not move).
+    /// </summary>
+    /// <remarks>
+    /// <para>A later configuration than the listing's is harmless: one that turns in-commit timestamps off makes the
+    /// caller walk, and one that turns them on past the listing leaves it no commit to search.</para>
+    ///
+    /// <para><b>Incrementally where it can, from a checkpoint where it must</b> (#690 review). The incremental update
+    /// is the cheap path, but it refuses a gap after the handle's version, which is what log cleanup leaves once a
+    /// checkpoint covers the commits it removed. That table is still readable, so time travel on it must not fail
+    /// because this handle predates the cleanup: the latest snapshot is then built from the checkpoint.</para>
+    /// </remarks>
+    private async ValueTask<IReadOnlyDictionary<string, string>?> LatestConfigurationAsync(
+        List<(long Version, long Modified)> commits, CancellationToken cancellationToken)
+    {
+        var snapshot = CurrentSnapshot;
+        if (commits.Count == 0 || commits[commits.Count - 1].Version <= snapshot.Version)
+            return snapshot.Metadata.Configuration;
+
+        try
+        {
+            snapshot = await SnapshotBuilder.UpdateAsync(snapshot, _log, cancellationToken).ConfigureAwait(false);
+        }
+        catch (DeltaFormatException ex) when (ex.ErrorCode == DeltaErrorCodes.TruncatedTransactionLog)
+        {
+            snapshot = await SnapshotBuilder.BuildAsync(_log, _checkpointReader, atVersion: null, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        return snapshot.Metadata.Configuration;
+    }
+
+    /// <summary>
+    /// The latest of <paramref name="commits"/> committed at or before <paramref name="targetMs"/>, with its
+    /// timestamp; null when every commit is later.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Binary-searched over the in-commit-timestamp range</b> (#662) when <paramref name="configuration"/> has
+    /// them on: from <see cref="InCommitTimestamp.EnablementVersionKey"/> (or the first commit, when they were on from
+    /// creation) to the latest. There a commit's time is its own <c>inCommitTimestamp</c>, which increases by
+    /// construction, so the search reads O(log N) commits where the walk reads up to N. This is delta-spark's split
+    /// (<c>DeltaHistoryManager.getActiveCommitAtTimeFromICTRange</c>): inside the range the in-commit timestamps are
+    /// authoritative, and the walk with its adjustment applies only below it.</para>
+    ///
+    /// <para><b>Below the range.</b> A target before <see cref="InCommitTimestamp.EnablementTimestampKey"/> walks only
+    /// the commits before the enablement version; the configuration says so without a read.</para>
+    ///
+    /// <para><b>⚠ <paramref name="configuration"/> must be the latest version's</b> (<see cref="LatestConfigurationAsync"/>),
+    /// not a stale handle's. The range is only increasing from the version that LAST turned them on: a stale one can
+    /// reach back over a later disable and re-enable, and if the re-enabled run was stamped by a clock set back, the
+    /// search can skip the unstamped gap and answer from the earlier run (#690 review).</para>
+    ///
+    /// <para><b>A writer that never recorded where they began.</b> With no enablement recorded, the first listed commit
+    /// is read first: one without an <c>inCommitTimestamp</c> means the range is not what the configuration claims,
+    /// and the whole log is walked as before. A probe without one does the same.</para>
+    /// </remarks>
+    private async ValueTask<(long Version, long Timestamp)?> FindCommitAtTimestampAsync(
+        List<(long Version, long Modified)> commits, IReadOnlyDictionary<string, string>? configuration,
+        long targetMs, CancellationToken cancellationToken)
+    {
+        int end = commits.Count;
+        if (InCommitTimestamp.IsEnabled(configuration))
+        {
+            var enablement = InCommitTimestamp.GetEnablement(configuration);
+            int rangeStart = 0;
+            if (enablement is { } e)
+            {
+                while (rangeStart < commits.Count && commits[rangeStart].Version < e.Version)
+                    rangeStart++;
+            }
+
+            InCommitTimestampSearch search;
+            if (enablement is { } en && targetMs < en.Timestamp)
+            {
+                search = InCommitTimestampSearch.BeforeFirst;
+            }
+            else if (enablement is null && commits.Count > 0
+                     && InCommitTimestamp.GetStrictTimestamp(
+                         await _log.ReadCommitAsync(commits[0].Version, cancellationToken).ConfigureAwait(false))
+                         is null)
+            {
+                // No enablement recorded claims every commit is stamped. A first commit that is not says a writer
+                // turned them on mid-life without recording where, and its unstamped commits form a prefix of the
+                // listing (cleanup removes the oldest first), so this one read finds them. The search could otherwise
+                // probe only the stamped suffix and miss that the walk raises it past a later informational
+                // timestamp before it (#690 review).
+                search = InCommitTimestampSearch.Unsearchable;
+            }
+            else
+            {
+                var versions = new List<long>(commits.Count - rangeStart);
+                for (int i = rangeStart; i < commits.Count; i++)
+                    versions.Add(commits[i].Version);
+                search = await InCommitTimestamp.SearchAsync(_log, versions, targetMs, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            if (search.Outcome == InCommitTimestampSearchOutcome.Found)
+                return (search.Version, search.Timestamp);
+            if (search.Outcome == InCommitTimestampSearchOutcome.BeforeFirst)
+                end = rangeStart; // only a commit before the range can be at or before the target
+            // Unsearchable: walk every commit.
+        }
+
+        (long Version, long Timestamp)? best = null;
+        await foreach (var commit in ReadCommitTimestampsAsync(commits, end, cancellationToken).ConfigureAwait(false))
+        {
+            if (commit.Timestamp > targetMs)
+                break; // the sequence never goes backwards
+            best = commit;
+        }
+        return best;
     }
 
     private static string FormatTimestamp(long unixMilliseconds) =>
