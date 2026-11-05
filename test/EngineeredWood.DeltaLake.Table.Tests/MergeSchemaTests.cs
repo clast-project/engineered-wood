@@ -594,7 +594,7 @@ public class MergeSchemaTests : IDisposable
             .Count(f => !f.Contains("_delta_log"));
 
     [Fact]
-    public async Task Transaction_IdentityMergeAfterASchemaMerge_IsRefused_AndLeavesNoFiles()
+    public async Task Transaction_IdentityMergeAfterASchemaMerge_BuildsOnTheMergedSchema()
     {
         var fs = Fs;
         var idMeta = JsonSerializer.Serialize(IdentityColumn.CreateMetadata(1, 1, false));
@@ -610,19 +610,19 @@ public class MergeSchemaTests : IDisposable
         await using var txn = table.StartTransaction();
         await txn.WriteAsync(
             [new RecordBatch(Schema(Str("value"), Str("extra")), [Strings("a"), Strings("x")], 1)], mergeSchema: true);
-        int files = DataFileCount();
 
-        // The MERGE inserts a row, so it advances the identity mark: a metaData of its own, which the commit
-        // cannot carry beside the merge's. Its insert file is written before that is known, and must go again.
-        var source = new RecordBatch(Schema(Str("value")), [Strings("b")], 1);
-        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-            await txn.MergeAsync([source], new MergeOptions { Keys = ["value"], WhenNotMatched = [MergeAction.InsertColumns("value")] }));
-        Assert.Equal(files, DataFileCount());
+        // The MERGE inserts a row, so it advances the identity mark: its metaData is computed from the merged schema,
+        // as a later write's is, and replaces the merge's in the commit without dropping the merged column.
+        var source = new RecordBatch(Schema(Str("value"), Str("extra")), [Strings("b"), Strings("y")], 1);
+        await txn.MergeAsync([source], new MergeOptions { Keys = ["value"], WhenNotMatched = [MergeAction.InsertColumns("value", "extra")] });
+        long version = await txn.CommitAsync();
 
-        // The earlier work still commits.
-        await txn.CommitAsync();
         Assert.Equal(["id", "value", "extra"], table.CurrentSnapshot.Schema.Fields.Select(f => f.Name));
-        Assert.Equal(files, DataFileCount());
+        Assert.Equal(2, IdentityColumn.GetConfig(table.CurrentSnapshot.Schema.Fields[0])!.HighWaterMark);
+        Assert.Single(ActionKinds(version), k => k == "metaData");
+        var rows = await RowsByIdAsync(table);
+        Assert.Equal(["a", "b"], rows.Values.Select(r => (string?)r["value"]).OrderBy(v => v));
+        Assert.Equal(["x", "y"], rows.Values.Select(r => (string?)r["extra"]).OrderBy(v => v));
     }
 
     // ── Names with dots ──

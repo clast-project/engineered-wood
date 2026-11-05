@@ -933,12 +933,20 @@ column's type by an ANSI cast as Spark's MERGE converts them, and with Spark's r
 keys, for `SET *` / `INSERT *` and for an assigned generated column (pinned by `MergeInteropTests`). It does not
 take an arbitrary ON condition; an assignment names a top-level column (not a nested struct field), and a
 `timestamp_ntz`, struct, array or map column takes only a value already of its type, since the expression
-library cannot cast to those; nor does MERGE evolve the schema (appends have it since #568; MERGE does not use
-it yet); it always copy-on-writes, never writing deletion vectors;
+library cannot cast to those; a column copied from the source (`*`, a column list) must already have the
+table's type, where Spark casts it; it always copy-on-writes, never writing deletion vectors;
 it prunes files by the source's key range only for `byte`, `short`, `integer`, `long`, `date`, `timestamp`,
 `timestamp_ntz`, `decimal` and `string` keys (#578), not `float`, `double`, `boolean` or `binary` ones.
 Its commit records Spark's MERGE `operationMetrics`, and the counts also come back to the caller as
-`MergeMetrics`. `RestoreAsync` (by version or
+`MergeMetrics`. A source column the table lacks may be read by a condition or value, and `*` leaves it out, as
+Spark's MERGE does. `MergeOptions.MergeSchema` (#604) evolves the schema as Spark's MERGE does under
+`spark.databricks.delta.schema.autoMerge.enabled`, measured against Spark 4.0 / Delta 4.0 and pinned by
+`MergeSchemaEvolutionInteropTests` (Spark 4.0's SQL `MERGE WITH SCHEMA EVOLUTION` evolves nothing): only the
+source columns an update or insert writes (by `*`, a column list, or an assignment to their own name) are added
+or widened, with the source column's type, even when no row reaches the clause; a table column or struct field
+the source lacks is kept by the update and NULL in the insert. It shares the `mergeSchema` write's limits below,
+and refuses a source column differing from a table column only in case, which Spark matches to it.
+`RestoreAsync` (by version or
 timestamp, #567) commits an earlier version's files, metadata and clustering columns as Spark's RESTORE does (pinned
 by `RestoreInteropTests`); unlike Spark it also refuses a missing deletion-vector file, and it resolves a
 timestamp by `commitInfo.timestamp` where Spark uses the commit file's modification time (they agree unless the log
@@ -962,8 +970,8 @@ only in case, where Spark's default case-insensitive resolution would write into
 the existing column; it adds no field and widens no value inside an array element
 or a map key or value (`DELTA_UNSUPPORTED_SCHEMA_MERGE`), and widens no partition
 column or column a CHECK constraint or generation expression reads. It never
-casts a narrower batch type up to the table's. MERGE's own schema evolution is
-not built on it yet. Still missing: column reorder and nullability change
+casts a narrower batch type up to the table's. MERGE's schema evolution
+(`MergeOptions.MergeSchema`, #604) is built on it. Still missing: column reorder and nullability change
 (drop/add NOT NULL). Column mapping mode is fixed at `CreateAsync`.
 
 **Vacuum does not collect expired change-data-feed files.** `_change_data/`

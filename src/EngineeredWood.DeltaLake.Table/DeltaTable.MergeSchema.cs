@@ -48,23 +48,32 @@ public sealed partial class DeltaTable
     /// </list>
     /// </remarks>
     internal DeferredSchemaChange? ComputeSchemaMerge(
-        Snapshot.Snapshot snapshot, IReadOnlyList<RecordBatch> batches)
+        Snapshot.Snapshot snapshot, IReadOnlyList<RecordBatch> batches) =>
+        ComputeSchemaMerge(snapshot, batches.Select(b => b.Schema).ToList(), "Write");
+
+    /// <summary><see cref="ComputeSchemaMerge(Snapshot.Snapshot, IReadOnlyList{RecordBatch})"/> for the schemas of
+    /// the columns to fit, without their data: a MERGE evolves the schema for the source columns it writes, not
+    /// for every column its source has.</summary>
+    internal DeferredSchemaChange? ComputeSchemaMerge(
+        Snapshot.Snapshot snapshot, IReadOnlyList<Apache.Arrow.Schema> schemas, string entryPoint)
     {
         // First, as the write itself does: once a duplicate's first copy is added, the second would match it.
-        foreach (var batch in batches)
-            ThrowIfDuplicateColumns(batch.Schema, snapshot.Schema, "Write");
+        foreach (var schema in schemas)
+            ThrowIfDuplicateColumns(schema, snapshot.Schema, entryPoint);
 
         var merge = new SchemaMerge(this, snapshot);
-        foreach (var batch in batches)
+        foreach (var schema in schemas)
         {
-            foreach (var field in batch.Schema.FieldsList)
+            foreach (var field in schema.FieldsList)
                 merge.MergeTopLevel(field);
         }
         return merge.Result();
     }
 
-    /// <summary>The running state of one <see cref="ComputeSchemaMerge"/>: each change composes on the
-    /// previous one's pending metadata and protocol, so the commit carries only the final pair.</summary>
+    /// <summary>The running state of one
+    /// <see cref="ComputeSchemaMerge(Snapshot.Snapshot, IReadOnlyList{Apache.Arrow.Schema}, string)"/>: each change
+    /// composes on the previous one's pending metadata and protocol, so the commit carries only the final pair.
+    /// </summary>
     private sealed class SchemaMerge
     {
         private readonly DeltaTable _table;

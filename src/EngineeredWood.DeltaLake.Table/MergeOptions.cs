@@ -245,6 +245,39 @@ public sealed class MergeOptions
     /// or <see cref="MergeAction.Delete"/>, each with an optional condition over the target row. Any clause here
     /// makes the MERGE read every file of the table, since any row may be unmatched.</summary>
     public IReadOnlyList<MergeAction> WhenNotMatchedBySource { get; init; } = [];
+
+    /// <summary>
+    /// Evolves the table's schema to take the source columns the MERGE writes, in the same commit: Spark's MERGE
+    /// with <c>spark.databricks.delta.schema.autoMerge.enabled</c>, or <c>withSchemaEvolution()</c> on its builder.
+    /// Off by default, as in Spark: a typo in a column name should not silently add a column.
+    /// </summary>
+    /// <remarks>
+    /// <para>As measured against Spark 4.0 / Delta 4.0:</para>
+    /// <list type="bullet">
+    /// <item>A source column is written by an update or insert that copies every column
+    /// (<see cref="MergeAction.Update"/>, <see cref="MergeAction.Insert"/>), names it in a column list, or assigns a
+    /// table column of the same name. Only those evolve the schema; a column only a condition reads, or one no
+    /// clause writes, does not.</item>
+    /// <item>A written source column the table lacks is added at the end, nullable, with the source column's type;
+    /// a value assigned to it is cast to that type. A new field of a struct column is added too. Rows the MERGE does
+    /// not write read NULL for them.</item>
+    /// <item>A written source column wider than the table's (a <c>long</c> into an <c>int</c> column) widens the
+    /// column when the table enables <c>delta.enableTypeWidening</c>, with the changes a <c>mergeSchema</c> write
+    /// makes. The type is the source column's, not the assigned value's.</item>
+    /// <item>The schema evolves even when no row reaches the clause that writes the column: the MERGE then commits
+    /// the new schema alone.</item>
+    /// <item>A column the table has and the source lacks is left as it is by an update that copies every column,
+    /// and is written as an append writes it by such an insert; a field of a struct column the source lacks is kept
+    /// by an update and NULL in an insert. Without evolution such a MERGE is refused.</item>
+    /// </list>
+    /// <para>Inside a transaction it composes with merging appends, and when it changes the schema it is refused
+    /// alongside a schema change staged any other way, as <see cref="DeltaTransaction.WriteAsync"/> with
+    /// <c>mergeSchema</c> is; one that changes nothing runs as a plain MERGE. A new field
+    /// inside an array element or a map key or value is refused, as a <c>mergeSchema</c> write refuses it, though
+    /// Spark adds one. A source column whose name differs from a table column's only in case is refused rather than
+    /// matched or added.</para>
+    /// </remarks>
+    public bool MergeSchema { get; init; }
 }
 
 /// <summary>
