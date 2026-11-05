@@ -652,20 +652,19 @@ public sealed class DeltaTransaction : IAsyncDisposable
         if (options is null)
             throw new ArgumentNullException(nameof(options));
 
-        // Schema evolution builds on the schema the staged merging writes left, as a merging append does, and the
-        // MERGE then runs against the evolved one: its `*` takes the new columns, and its rewrites and inserts are
-        // written with them.
-        var mergeSnapshot = options.MergeSchema ? PendingWriteSnapshot() : _baseSnapshot;
+        // A MERGE after a staged schema merge runs against the merged schema, as a write does: its reads, `*`,
+        // rewrites and inserts agree with the schema the commit carries. Its own evolution builds on that schema too,
+        // and the MERGE then runs against the evolved one, its conditions and values bound to the schema before it.
+        var mergeSnapshot = _schemaMerged || options.MergeSchema ? PendingWriteSnapshot() : _baseSnapshot;
         DeltaTable.DeferredSchemaChange? evolution = null;
-        IReadOnlyCollection<string> added = [];
+        Apache.Arrow.Schema? boundSchema = null;
         if (options.MergeSchema)
         {
             evolution = _table.ComputeMergeSchemaEvolution(mergeSnapshot, source, options);
             if (evolution is { } change)
             {
                 RefuseSchemaMergeAfterOtherMetadata();
-                var before = new HashSet<string>(mergeSnapshot.Schema.Fields.Select(f => f.Name), StringComparer.Ordinal);
-                added = change.NewSchema.Fields.Select(f => f.Name).Where(n => !before.Contains(n)).ToList();
+                boundSchema = mergeSnapshot.ArrowSchema;
                 mergeSnapshot = DeltaTable.WithStagedMetadata(mergeSnapshot, change.Actions);
             }
         }
@@ -673,16 +672,10 @@ public sealed class DeltaTransaction : IAsyncDisposable
         int mark = _written.Paths.Count;
         var plan = await TakingBackOnFailureAsync(mark, () => _table.ComputeMergeActionsAsync(
             mergeSnapshot, source, options, cancellationToken, rowIdStart: _nextRowId, written: _written,
-            identityHighWaterMarks: _identityMarks, addedColumns: added), cancellationToken).ConfigureAwait(false);
+            identityHighWaterMarks: _identityMarks, boundSchema: boundSchema), cancellationToken).ConfigureAwait(false);
         await RefuseRestagedFilesAsync(plan.RemovedPaths, mark, "MERGE", cancellationToken)
             .ConfigureAwait(false);
 
-        // A MERGE with MergeSchema ran against the merged schema, so a metaData its inserts carry builds on it.
-        if (!options.MergeSchema)
-        {
-            await RefuseBaseSchemaMetadataAfterMergeAsync(plan.InsertActions, mark, "MERGE", cancellationToken)
-                .ConfigureAwait(false);
-        }
         if (plan.NextRowId is long nextRowId)
             _nextRowId = nextRowId;
         var insertActions = plan.InsertActions;

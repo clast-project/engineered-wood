@@ -84,9 +84,10 @@ public sealed partial class DeltaTable
     /// <param name="written">Records the rewritten, inserted and change-data files this MERGE writes.</param>
     /// <param name="identityHighWaterMarks">The identity marks a transaction's earlier appends left pending, for
     /// the insert to continue from (see <see cref="ComputeWriteActionsAsync"/>).</param>
-    /// <param name="addedColumns">The columns <see cref="MergeOptions.MergeSchema"/> added to
-    /// <paramref name="snapshot"/>'s schema for this MERGE. Its conditions and values read the target row without
-    /// them, as Spark binds them before evolving: a bare name only the source had stays the source's.</param>
+    /// <param name="boundSchema">The table's schema before <see cref="MergeOptions.MergeSchema"/> evolved it into
+    /// <paramref name="snapshot"/>'s for this MERGE, or null without an evolution. Its conditions and values read the
+    /// target row without the columns and struct fields the evolution added, as Spark binds them before evolving: a
+    /// bare name only the source had stays the source's, and a new field is not the target's.</param>
     internal async ValueTask<MergeActions> ComputeMergeActionsAsync(
         Snapshot.Snapshot snapshot,
         IReadOnlyList<RecordBatch> source,
@@ -95,7 +96,7 @@ public sealed partial class DeltaTable
         long? rowIdStart = null,
         WrittenFileLedger? written = null,
         IReadOnlyDictionary<string, long>? identityHighWaterMarks = null,
-        IReadOnlyCollection<string>? addedColumns = null)
+        Apache.Arrow.Schema? boundSchema = null)
     {
         if (source is null)
             throw new ArgumentNullException(nameof(source));
@@ -103,7 +104,7 @@ public sealed partial class DeltaTable
             throw new ArgumentNullException(nameof(options));
 
         var plan = MergePlan.Validate(options, snapshot.Schema);
-        plan.AddedColumns = addedColumns ?? [];
+        plan.BoundSchema = boundSchema;
         var src = PrepareMergeSource(source, snapshot, plan);
         plan.Resolve(src, snapshot.Schema);
         RefuseUnanalyzableClauses(plan, snapshot, src);
@@ -751,12 +752,68 @@ public sealed partial class DeltaTable
         };
     }
 
-    /// <summary><paramref name="batch"/> without the columns <paramref name="hidden"/> names.</summary>
-    private static RecordBatch WithoutColumns(RecordBatch batch, IReadOnlyCollection<string> hidden) =>
-        hidden.Count == 0
-            ? batch
-            : ProjectColumns(
-                batch, batch.Schema.FieldsList.Select(f => f.Name).Where(n => !hidden.Contains(n)).ToList());
+    /// <summary>
+    /// <paramref name="batch"/> as conditions and values bind to it under schema evolution: without the columns and
+    /// struct fields, at any depth, that <paramref name="bound"/> (the schema before the evolution) lacks. Fields are
+    /// only dropped; a widened column keeps its new type. Null <paramref name="bound"/> leaves it as it is.
+    /// </summary>
+    private static RecordBatch BoundTo(RecordBatch batch, Apache.Arrow.Schema? bound)
+    {
+        if (bound is null)
+            return batch;
+        var fields = new List<Field>(batch.ColumnCount);
+        var columns = new List<IArrowArray>(batch.ColumnCount);
+        for (int c = 0; c < batch.ColumnCount; c++)
+        {
+            var field = batch.Schema.FieldsList[c];
+            var was = BoundField(bound, field.Name);
+            if (was is null)
+                continue;
+            var column = FitStruct(batch.Column(c), was.DataType, kept: null);
+            fields.Add(ReferenceEquals(column, batch.Column(c))
+                ? field
+                : new Field(field.Name, column.Data.DataType, field.IsNullable, field.Metadata));
+            columns.Add(column);
+        }
+        return new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
+    }
+
+    /// <inheritdoc cref="BoundTo(RecordBatch, Apache.Arrow.Schema?)"/>
+    private static Apache.Arrow.Schema BoundTo(Apache.Arrow.Schema schema, Apache.Arrow.Schema? bound)
+    {
+        if (bound is null)
+            return schema;
+        var fields = new List<Field>(schema.FieldsList.Count);
+        foreach (var field in schema.FieldsList)
+        {
+            if (BoundField(bound, field.Name) is { } was)
+                fields.Add(new Field(field.Name, BoundType(field.DataType, was.DataType), field.IsNullable, field.Metadata));
+        }
+        return new Apache.Arrow.Schema(fields, schema.Metadata);
+    }
+
+    private static Field? BoundField(Apache.Arrow.Schema bound, string name) =>
+        bound.FieldsList.FirstOrDefault(f => string.Equals(f.Name, name, StringComparison.Ordinal));
+
+    /// <summary><paramref name="type"/> with only the struct fields <paramref name="bound"/> has, in its order, as
+    /// <see cref="FitStruct"/> leaves an array.</summary>
+    private static Apache.Arrow.Types.IArrowType BoundType(
+        Apache.Arrow.Types.IArrowType type, Apache.Arrow.Types.IArrowType bound)
+    {
+        if (type is not Apache.Arrow.Types.StructType structType || bound is not Apache.Arrow.Types.StructType boundType)
+            return type;
+        var fields = new List<Field>(boundType.Fields.Count);
+        foreach (var was in boundType.Fields)
+        {
+            int k = structType.GetFieldIndex(was.Name);
+            if (k >= 0)
+            {
+                var field = structType.Fields[k];
+                fields.Add(new Field(field.Name, BoundType(field.DataType, was.DataType), was.IsNullable, field.Metadata));
+            }
+        }
+        return new Apache.Arrow.Types.StructType(fields);
+    }
 
     /// <summary>The columns of <paramref name="batch"/> <paramref name="columns"/> names, in the batch's order.</summary>
     private static RecordBatch ProjectColumns(RecordBatch batch, IReadOnlyList<string> columns)
@@ -1395,11 +1452,11 @@ public sealed partial class DeltaTable
         /// </summary>
         public bool FitsStructs { get; set; }
 
-        /// <summary><see cref="MergePlan.AddedColumns"/>.</summary>
-        public IReadOnlyCollection<string> AddedColumns { get; set; } = [];
+        /// <summary><see cref="MergePlan.BoundSchema"/>.</summary>
+        public Apache.Arrow.Schema? BoundSchema { get; set; }
 
         /// <summary>The target row's columns as conditions and values are bound to them.</summary>
-        public RecordBatch AsBound(RecordBatch target) => WithoutColumns(target, AddedColumns);
+        public RecordBatch AsBound(RecordBatch target) => BoundTo(target, BoundSchema);
     }
 
     /// <summary>The MERGE options, checked against the table.</summary>
@@ -1424,18 +1481,16 @@ public sealed partial class DeltaTable
         /// struct field the source lacks is left to the row instead of refused.</summary>
         public bool Evolving { get; private init; }
 
-        /// <summary>The columns the evolution added, which conditions and values do not see on the target row.
-        /// Set before <see cref="Resolve"/>, which hands them to each clause.</summary>
-        public IReadOnlyCollection<string> AddedColumns { get; set; } = [];
+        /// <summary>The table's schema before the evolution, which conditions and values bind to: they do not see
+        /// the columns or struct fields it added on the target row. Null without an evolution. Set before
+        /// <see cref="Resolve"/>, which hands it to each clause.</summary>
+        public Apache.Arrow.Schema? BoundSchema { get; set; }
 
         /// <summary>The target row's columns as conditions and values are bound to them.</summary>
-        public RecordBatch AsBound(RecordBatch target) => WithoutColumns(target, AddedColumns);
+        public RecordBatch AsBound(RecordBatch target) => BoundTo(target, BoundSchema);
 
         /// <inheritdoc cref="AsBound(RecordBatch)"/>
-        public Apache.Arrow.Schema AsBound(Apache.Arrow.Schema target) => AddedColumns.Count == 0
-            ? target
-            : new Apache.Arrow.Schema(
-                target.FieldsList.Where(f => !AddedColumns.Contains(f.Name)).ToList(), target.Metadata);
+        public Apache.Arrow.Schema AsBound(Apache.Arrow.Schema target) => BoundTo(target, BoundSchema);
 
         /// <summary>Every column some update writes. Set by <see cref="Resolve"/>.</summary>
         public IReadOnlyList<string> UpdatedColumns { get; private set; } = [];
@@ -1450,7 +1505,7 @@ public sealed partial class DeltaTable
         public void Resolve(RecordBatch? source, Schema.StructType schema)
         {
             foreach (var clause in Matched.Concat(NotMatchedBySource).Concat(NotMatched))
-                clause.AddedColumns = AddedColumns;
+                clause.BoundSchema = BoundSchema;
             foreach (var clause in Matched.Concat(NotMatchedBySource))
             {
                 ResolveClause(

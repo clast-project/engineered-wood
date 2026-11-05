@@ -563,6 +563,50 @@ public class MergeSchemaEvolutionTests : IDisposable
         Assert.Equal(before, table.CurrentSnapshot.Version);
     }
 
+    /// <summary>
+    /// Measured: a struct field the evolution adds is not the target's either: <c>t.st.b IS NULL</c> in a condition
+    /// and <c>length(t.st.b)</c> in a value are FIELD_NOT_FOUND, though the source supplies <c>st.b</c>.
+    /// </summary>
+    [Theory]
+    [InlineData("target.st.b IS NULL", "source.id")]
+    [InlineData("target.st.a = 1", "length(target.st.b)")]
+    [InlineData("target.st.a = 1", "length(TARGET.ST.B)")]
+    public async Task TheTargetsNewStructField_IsNotReadable(string condition, string value)
+    {
+        await using var table = await CreateNestedAsync();
+        long before = table.CurrentSnapshot.Version;
+
+        await Assert.ThrowsAnyAsync<Exception>(() => table.MergeAsync(
+            [Batch(("id", Ints(1)), ("st", Struct(("a", Ints(10)), ("c", Strings("x")), ("b", Strings("y")))))],
+            new MergeOptions
+            {
+                Keys = ["id"],
+                WhenMatched = [MergeAction.UpdateSet(("st", E("source.st")), ("id", E(value))).When(P(condition))],
+                MergeSchema = true,
+            }).AsTask());
+
+        Assert.Equal(before, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task TheTargetsOldStructFields_StayReadable_UnderEvolution()
+    {
+        // Measured: t.st.a = 1 (and t.st IS NOT NULL) still bind under evolution.
+        await using var table = await CreateNestedAsync();
+
+        await table.MergeAsync(
+            [Batch(("id", Ints(1, 2)), ("st", Struct(("a", Ints(10, 20)), ("c", Strings("x", "z")), ("b", Strings("y", "w")))))],
+            new MergeOptions
+            {
+                Keys = ["id"],
+                WhenMatched = [MergeAction.Update.When(P("target.st.a = 1 AND target.st.c = 'c1'"))],
+                MergeSchema = true,
+            });
+
+        Assert.Equal("id:integer, st:struct<a:integer, c:string, b:string>", Columns(table));
+        Assert.Equal(["id=1, st={a=10, c=x, b=y}", "id=2, st={a=2, c=c2, b=null}"], await RowsAsync(table));
+    }
+
     [Fact]
     public async Task ANewFieldInsideAnArrayElement_IsRefused()
     {
@@ -714,6 +758,30 @@ public class MergeSchemaEvolutionTests : IDisposable
             "id=2, v=b, w=null, extra=null",
             "id=3, v=z, w=null, extra=30",
             "id=5, v=e, w=w5, extra=null",
+        ], await RowsAsync(table));
+        var commit = File.ReadAllLines(Path.Combine(_tempDir, "_delta_log", $"{version:D20}.json"));
+        Assert.Single(commit, l => l.StartsWith("{\"metaData\"", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task InATransaction_AMerge_AfterAMergingWrite_RunsAgainstTheMergedSchema()
+    {
+        // Without MergeSchema of its own the MERGE still sees the column the staged write added: `*` writes it.
+        await using var table = await CreateAsync();
+        await using var txn = table.StartTransaction();
+
+        await txn.WriteAsync([Batch(("id", Ints(5)), ("v", Strings("e")), ("w", Strings("w5")))], mergeSchema: true);
+        await txn.MergeAsync(
+            [Batch(("id", Ints(1, 3)), ("v", Strings("x", "z")), ("w", Strings("w1", "w3")))], Upsert(mergeSchema: false));
+        long version = await txn.CommitAsync();
+
+        Assert.Equal("id:integer, v:string, w:string", Columns(table));
+        Assert.Equal(
+        [
+            "id=1, v=x, w=w1",
+            "id=2, v=b, w=null",
+            "id=3, v=z, w=w3",
+            "id=5, v=e, w=w5",
         ], await RowsAsync(table));
         var commit = File.ReadAllLines(Path.Combine(_tempDir, "_delta_log", $"{version:D20}.json"));
         Assert.Single(commit, l => l.StartsWith("{\"metaData\"", StringComparison.Ordinal));
