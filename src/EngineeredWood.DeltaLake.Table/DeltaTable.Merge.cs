@@ -141,7 +141,7 @@ public sealed partial class DeltaTable
         bool readsWholeTable = plan.WhenNotMatchedBySource is not null;
         bool scan = readsWholeTable || head.Count > 0;
         Expressions.Predicate? keyRange = !readsWholeTable && head.Count > 0
-            ? KeyRangePredicate(plan.Keys, sourceKeys!)
+            ? KeyRangePredicate(plan.Keys, sourceKeys!, snapshot.Schema)
             : null;
 
         if (scan)
@@ -760,21 +760,33 @@ public sealed partial class DeltaTable
 
     /// <summary>
     /// <c>min(k) &lt;= k AND k &lt;= max(k)</c> over the source's non-null values of each key whose type the
-    /// file statistics can bound here (integers and strings): every target row a source row can match satisfies it,
-    /// so a file whose statistics refute it holds no match. Null when no key can be bounded.
+    /// file statistics can bound here: <c>byte</c>, <c>short</c>, <c>integer</c>, <c>long</c>, <c>date</c>,
+    /// <c>timestamp</c>, <c>timestamp_ntz</c>, <c>decimal</c> and <c>string</c>. Every target row a source row can
+    /// match satisfies it, so a file whose statistics refute it holds no match. Null when no key can be bounded.
     /// </summary>
-    private static Expressions.Predicate? KeyRangePredicate(IReadOnlyList<string> keys, IArrowArray[] sourceKeys)
+    /// <remarks>
+    /// The keys arrive in the table's Arrow form (<see cref="PrepareMergeSource"/>). The extremes are found on the
+    /// raw values, which order as the Delta type does, and only those two rows become literals, through the
+    /// decoder a checkpoint's typed <c>stats_parsed</c> goes through: a bound has the literal kind (and a decimal
+    /// the scale) the file statistics decode to, so they compare exactly. A form the decoder does not take
+    /// leaves the key unbounded. A truncated timestamp maximum in the statistics is widened by the pruner.
+    /// </remarks>
+    private static Expressions.Predicate? KeyRangePredicate(
+        IReadOnlyList<string> keys, IArrowArray[] sourceKeys, Schema.StructType schema)
     {
         var bounds = new List<Expressions.Predicate>();
         for (int k = 0; k < keys.Count; k++)
         {
+            string? typeName = schema.Fields
+                .FirstOrDefault(f => string.Equals(f.Name, keys[k], StringComparison.Ordinal))?.Type is PrimitiveType p
+                ? p.TypeName
+                : null;
             (Expressions.LiteralValue Min, Expressions.LiteralValue Max)? range = sourceKeys[k] switch
             {
-                Int32Array a => IntRange(a.Length, a.IsNull, i => a.GetValue(i)!.Value) is { } r
-                    ? (Expressions.LiteralValue.Of((int)r.Min), Expressions.LiteralValue.Of((int)r.Max)) : null,
-                Int64Array a => IntRange(a.Length, a.IsNull, i => a.GetValue(i)!.Value) is { } r
-                    ? (Expressions.LiteralValue.Of(r.Min), Expressions.LiteralValue.Of(r.Max)) : null,
                 StringArray a => StringRange(a),
+                var a when typeName is not null && Extremes(a) is { } at
+                    && DeltaLiteralDecoder.FromArrow(a, at.Min, typeName) is { } min
+                    && DeltaLiteralDecoder.FromArrow(a, at.Max, typeName) is { } max => (min, max),
                 _ => null,
             };
             if (range is not { } bound)
@@ -784,20 +796,77 @@ public sealed partial class DeltaTable
         }
         return bounds.Count == 0 ? null : Expressions.Expressions.And(bounds.ToArray());
 
-        static (long Min, long Max)? IntRange(int length, Func<int, bool> isNull, Func<int, long> value)
+        // The rows holding the least and the greatest non-null value, for a form whose raw values order as its
+        // Delta type does; null for any other form, or when every value is null. A timestamp in another unit
+        // than the table's microseconds would decode wrongly, so it is not bounded.
+        static (int Min, int Max)? Extremes(IArrowArray array) => array switch
         {
-            long min = long.MaxValue, max = long.MinValue;
-            bool any = false;
-            for (int i = 0; i < length; i++)
+            Int8Array a => PrimitiveExtremes(a),
+            Int16Array a => PrimitiveExtremes(a),
+            Int32Array a => PrimitiveExtremes(a),
+            Int64Array a => PrimitiveExtremes(a),
+            Date32Array a => PrimitiveExtremes(a),
+            TimestampArray a when ((Apache.Arrow.Types.TimestampType)a.Data.DataType).Unit
+                == Apache.Arrow.Types.TimeUnit.Microsecond => PrimitiveExtremes(a),
+            Decimal32Array a => DecimalExtremes(a, a.ValueBuffer, 4),
+            Decimal64Array a => DecimalExtremes(a, a.ValueBuffer, 8),
+            Decimal128Array a => DecimalExtremes(a, a.ValueBuffer, 16),
+            Decimal256Array a => DecimalExtremes(a, a.ValueBuffer, 32),
+            _ => null,
+        };
+
+        static (int Min, int Max)? PrimitiveExtremes<T>(PrimitiveArray<T> a)
+            where T : struct, IEquatable<T>, IComparable<T>
+        {
+            var values = a.Values;
+            int min = -1, max = -1;
+            for (int i = 0; i < a.Length; i++)
             {
-                if (isNull(i))
+                if (a.IsNull(i))
                     continue;
-                long v = value(i);
-                any = true;
-                if (v < min) min = v;
-                if (v > max) max = v;
+                if (min < 0 || values[i].CompareTo(values[min]) < 0)
+                    min = i;
+                if (max < 0 || values[i].CompareTo(values[max]) > 0)
+                    max = i;
             }
-            return any ? (min, max) : null;
+            return min < 0 ? null : (min, max);
+        }
+
+        // Unscaled two's-complement little-endian values of one width; all of one scale, the table's.
+        static (int Min, int Max)? DecimalExtremes(IArrowArray a, ArrowBuffer buffer, int width)
+        {
+            var data = buffer.Span.Slice(a.Data.Offset * width, a.Length * width);
+            int min = -1, max = -1;
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (a.IsNull(i))
+                    continue;
+                var value = data.Slice(i * width, width);
+                if (min < 0 || CompareSigned(value, data.Slice(min * width, width)) < 0)
+                    min = i;
+                if (max < 0 || CompareSigned(value, data.Slice(max * width, width)) > 0)
+                    max = i;
+            }
+            return min < 0 ? null : (min, max);
+        }
+
+        // The most significant word decides the sign, so it compares signed and the lower words unsigned.
+        static int CompareSigned(ReadOnlySpan<byte> x, ReadOnlySpan<byte> y)
+        {
+            if (x.Length == 4)
+            {
+                return System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(x)
+                    .CompareTo(System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(y));
+            }
+            int top = x.Length - 8;
+            int c = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(x.Slice(top))
+                .CompareTo(System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(y.Slice(top)));
+            for (int w = top - 8; c == 0 && w >= 0; w -= 8)
+            {
+                c = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(x.Slice(w, 8))
+                    .CompareTo(System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(y.Slice(w, 8)));
+            }
+            return c;
         }
 
         // Ordered as UTF-8 bytes, as the statistics are: for well-formed UTF-8 that is code point order. An
