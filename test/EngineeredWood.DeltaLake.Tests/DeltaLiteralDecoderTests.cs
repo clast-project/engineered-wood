@@ -138,4 +138,17 @@ public class DeltaLiteralDecoderTests
         // and reading it would mean guessing at a producer this decoder has never met.
         Assert.Null(DeltaLiteralDecoder.FromJson(Json(json), "double"));
     }
+
+    [Theory]
+    [InlineData("timestamp")]
+    [InlineData("timestamp_ntz")]
+    public void FromArrow_ATimestampWhoseTicksOverflow_IsNoBound(string typeName)
+    {
+        // 1_844_674_407_370_955_162 * 10 is 2^64 + 4: unchecked, it wrapped to epoch + 4 ticks.
+        var type = new Apache.Arrow.Types.TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, (string?)null);
+        var data = new Apache.Arrow.ArrowBuffer.Builder<long>().Append(1_844_674_407_370_955_162).Build();
+        var array = new Apache.Arrow.TimestampArray(type, data, Apache.Arrow.ArrowBuffer.Empty, 1, 0, 0);
+
+        Assert.Null(DeltaLiteralDecoder.FromArrow(array, 0, typeName));
+    }
 }

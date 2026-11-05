@@ -192,10 +192,12 @@ internal static class DeltaLiteralDecoder
                         : null;
                 case "timestamp":
                 case "timestamp_ntz":
+                    // Checked: an unchecked product wraps to a small valid tick count, a bound far from the
+                    // value, which could prune a file holding it. Overflow is caught below as no bound.
                     return array is Apache.Arrow.TimestampArray ts
                         ? (LiteralValue?)LiteralValue.Of(
                             new DateTimeOffset(
-                                s_epoch.AddTicks(ts.GetValue(row)!.Value * 10), TimeSpan.Zero))
+                                s_epoch.AddTicks(checked(ts.GetValue(row)!.Value * 10)), TimeSpan.Zero))
                         : null;
                 default:
                     return typeName.StartsWith("decimal(", StringComparison.Ordinal)

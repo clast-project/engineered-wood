@@ -496,6 +496,25 @@ public class MergeTests : IDisposable
         });
     }
 
+    // A source timestamp whose ticks overflow must leave the key unbounded. Unchecked, the maximum wrapped to
+    // epoch + 4 ticks, the range one second..4 ticks was empty, and the file holding one second was skipped.
+    [Fact]
+    public async Task ATimestampKeyWhoseTicksOverflow_DoesNotSkipTheMatchingFile()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", Micros, true)).Field(new Field("v", StringType.Default, true)).Build();
+        await using var table = await CreateAsync(schema: schema);
+        await table.WriteAsync([TimestampRows(Micros, [1_000_000],
+            new StringArray.Builder().Append("a").Build(), StringType.Default)]);
+
+        var (metrics, _) = await table.MergeAsync(
+            [TimestampRows(Micros, [1_000_000, 1_844_674_407_370_955_162],
+                new StringArray.Builder().Append("A").Append("far").Build(), StringType.Default)],
+            new MergeOptions { Keys = ["k"], WhenMatched = MergeAction.Update });
+
+        Assert.Equal(1, metrics.NumTargetRowsUpdated);
+    }
+
     // A near file (keys -2, 1) and a far one (100, 120); the source (-2, 3) updates -2 and inserts 3. The far file
     // must be neither read nor rewritten, and is no read dependency of the transaction.
     private async Task AssertKeyRangePrunes(IArrowType keyType, Func<long[], IArrowArray> keys)
