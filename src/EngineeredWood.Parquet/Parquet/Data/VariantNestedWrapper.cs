@@ -27,6 +27,82 @@ namespace EngineeredWood.Parquet.Data;
 /// </remarks>
 internal static class VariantNestedWrapper
 {
+    /// <summary>The type <see cref="VariantShredding.Reassemble"/> gives a shredded variant: the builder's
+    /// canonical <c>(metadata, value)</c> storage. Taken from the builder itself, so the two cannot drift.</summary>
+    private static readonly IArrowType s_reassembledVariant = new VariantArray.Builder().Build(allocator: null).Data.DataType;
+
+    /// <summary>
+    /// The type of the array <see cref="Wrap"/> returns for a field of <paramref name="fieldType"/>: a SHREDDED variant
+    /// (its storage carries <c>typed_value</c>) is reassembled into the canonical <c>(metadata, value)</c> form, at any
+    /// depth, and a container holding one is rebuilt around it the way <see cref="Wrap"/> rebuilds it; everything else,
+    /// an unshredded variant among it, keeps its type (it reads back as the file declares it). The reader gives the
+    /// batch and the schema-only <c>GetArrowSchemaAsync</c> these types, so the two agree by construction (#691).
+    /// </summary>
+    /// <remarks>Must recognise the same container types as <see cref="Wrap"/> and rebuild them identically (name,
+    /// nullability and metadata of every field; a map's <c>KeySorted</c>), or a batch's schema stops describing its
+    /// arrays. <see cref="MapType"/> is not a <see cref="ListType"/> (it derives from <c>NestedType</c>), so the order
+    /// of the two cases does not matter here or in <see cref="Wrap"/>.</remarks>
+    internal static IArrowType AssembledType(IArrowType fieldType)
+    {
+        switch (fieldType)
+        {
+            case VariantType variant:
+                return variant.IsShredded ? s_reassembledVariant : fieldType;
+
+            case StructType structType:
+            {
+                Field[]? fields = null;
+                for (int i = 0; i < structType.Fields.Count; i++)
+                {
+                    var field = structType.Fields[i];
+                    var type = AssembledType(field.DataType);
+                    if (!ReferenceEquals(type, field.DataType))
+                        (fields ??= structType.Fields.ToArray())[i] = new Field(field.Name, type, field.IsNullable, field.Metadata);
+                }
+                return fields is null ? fieldType : new StructType(fields);
+            }
+
+            case ListType listType:
+            {
+                var value = AssembledType(listType.ValueDataType);
+                return ReferenceEquals(value, listType.ValueDataType)
+                    ? fieldType
+                    : new ListType(new Field(listType.ValueField.Name, value, listType.ValueField.IsNullable,
+                                             listType.ValueField.Metadata));
+            }
+
+            case MapType mapType:
+            {
+                var key = AssembledType(mapType.KeyField.DataType);
+                var value = AssembledType(mapType.ValueField.DataType);
+                if (ReferenceEquals(key, mapType.KeyField.DataType) && ReferenceEquals(value, mapType.ValueField.DataType))
+                    return fieldType;
+                return new MapType(
+                    new Field(mapType.KeyField.Name, key, mapType.KeyField.IsNullable, mapType.KeyField.Metadata),
+                    new Field(mapType.ValueField.Name, value, mapType.ValueField.IsNullable, mapType.ValueField.Metadata),
+                    mapType.KeySorted);
+            }
+
+            default:
+                return fieldType;
+        }
+    }
+
+    /// <summary><see cref="AssembledType"/> for each of <paramref name="fields"/>; the same instances where nothing changes.</summary>
+    internal static Field[] AssembledFields(IReadOnlyList<Field> fields)
+    {
+        var result = new Field[fields.Count];
+        for (int i = 0; i < result.Length; i++)
+        {
+            var field = fields[i];
+            var type = AssembledType(field.DataType);
+            result[i] = ReferenceEquals(type, field.DataType)
+                ? field
+                : new Field(field.Name, type, field.IsNullable, field.Metadata);
+        }
+        return result;
+    }
+
     /// <summary>Rewrites <paramref name="array"/> so every variant the <paramref name="fieldType"/>
     /// declares — at this level or nested inside a struct/list/map — is a <see cref="VariantArray"/>.
     /// Returns the same instance when nothing needed wrapping.</summary>

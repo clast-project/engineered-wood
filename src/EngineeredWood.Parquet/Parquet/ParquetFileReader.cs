@@ -143,7 +143,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var declared = DeclaredArrowSchema(metadata);
         var builder = new Apache.Arrow.Schema.Builder();
-        foreach (var field in ArrowSchemaConverter.ToArrowFields(schema.Root, _options))
+        IReadOnlyList<Field> fields = ArrowSchemaConverter.ToArrowFields(schema.Root, _options);
+        // What a batch carries: a shredded variant reads back reassembled (#691).
+        if (_options.ExtensionRegistry is not null)
+            fields = Data.VariantNestedWrapper.AssembledFields(fields);
+        foreach (var field in fields)
             builder.Field(RestoreDeclaredUnits(field, declared));
 
         return builder.Build();
@@ -1717,8 +1721,13 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             topLevelFields = ArrowSchemaConverter.ToArrowFields(effectiveRoot, _options);
         }
 
+        // Wrap (per batch) is handed the file's types, which a shredded variant needs to be reassembled; the batch
+        // carries the types of what that produces, worked out once here.
+        var batchFields = topLevelFields is null || _options.ExtensionRegistry is null
+            ? topLevelFields
+            : Data.VariantNestedWrapper.AssembledFields(topLevelFields);
         return new RowGroupContext(selectedColumns, selectedChunks, ranges,
-            leafArrowFields, rowCount, hasNestedColumns, schemaRoot, topLevelFields);
+            leafArrowFields, rowCount, hasNestedColumns, schemaRoot, topLevelFields, batchFields);
     }
 
     private RecordBatch AssembleRecordBatch(RowGroupContext ctx, ColumnResult[] results)
@@ -1763,7 +1772,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     topLevelArrays[i], ctx.TopLevelFields![i].DataType);
         }
 
-        var topLevelFields = (Field[])ctx.TopLevelFields!.Clone();
+        // The batch's fields, not the file's: a shredded variant was reassembled above (#691).
+        var topLevelFields = (Field[])ctx.BatchFields!.Clone();
+
         RestoreDeclaredUnits(topLevelFields, topLevelArrays);
         return BuildRecordBatch(topLevelFields, topLevelArrays, ctx.RowCount);
     }
@@ -2056,7 +2067,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         int RowCount,
         bool HasNestedColumns = false,
         SchemaNode? SchemaRoot = null,
-        Field[]? TopLevelFields = null)
+        Field[]? TopLevelFields = null,
+        Field[]? BatchFields = null)
     {
         public int Count => Columns.Count;
     }
