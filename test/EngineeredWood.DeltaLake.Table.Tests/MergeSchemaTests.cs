@@ -95,6 +95,10 @@ public class MergeSchemaTests : IDisposable
             Int64Array a => a.GetValue(i),
             Int32Array a => a.GetValue(i),
             StringArray a => a.GetString(i),
+            MapArray a => Enumerable.Range(a.ValueOffsets[i], a.GetValueLength(i)).ToDictionary(
+                e => Value(a.Keys, e)!, e => Value(a.Values, e)),
+            ListArray a => Enumerable.Range(a.ValueOffsets[i], a.GetValueLength(i))
+                .Select(e => Value(a.Values, e)).ToList(),
             StructArray a => Enumerable.Range(0, a.Fields.Count).ToDictionary(
                 f => ((Apache.Arrow.Types.StructType)a.Data.DataType).Fields[f].Name, f => Value(a.Fields[f], i)),
             _ => throw new NotSupportedException(array.GetType().Name),
@@ -256,44 +260,232 @@ public class MergeSchemaTests : IDisposable
         Assert.Equal("bee", s2["b"]);
     }
 
-    [Fact]
-    public async Task NewFieldInsideAnArrayElement_IsRefused()
+    // ── Inside arrays and maps (#603) ──
+
+    /// <summary>A one-row list column holding <paramref name="values"/> as its single row's elements.</summary>
+    private static ListArray OneRowList(ListType type, IArrowArray values)
+    {
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(values.Length).Build();
+        return new ListArray(type, 1, offsets, values, ArrowBuffer.Empty);
+    }
+
+    /// <summary>A one-row map column holding the single entry <paramref name="key"/> → <paramref name="value"/>.</summary>
+    private static MapArray OneEntryMap(Apache.Arrow.Types.MapType type, IArrowArray key, IArrowArray value)
+    {
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(1).Build();
+        var entries = new StructArray(type.KeyValueType, 1, [key, value], ArrowBuffer.Empty);
+        return new MapArray(type, 1, offsets, entries, ArrowBuffer.Empty);
+    }
+
+    private static Field ListOf(string name, Field element) => new(name, new ListType(element), true);
+
+    private static StructField Column(DeltaTable table, string name) =>
+        table.CurrentSnapshot.Schema.Fields.Single(f => f.Name == name);
+
+    [Theory]
+    [InlineData(ColumnMappingMode.None)]
+    [InlineData(ColumnMappingMode.Name)]
+    public async Task NewFieldInsideAnArrayElement_IsAdded(ColumnMappingMode mode)
     {
         var inner = new Apache.Arrow.Types.StructType([Int("a", nullable: true)]);
-        var schema = Schema(Long("id"), new Field("xs", new ListType(new Field("element", inner, true)), true));
+        var schema = Schema(Long("id"), ListOf("xs", new Field("element", inner, true)));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema, columnMappingMode: mode);
+        await table.WriteAsync([new RecordBatch(schema,
+            [Longs(1), OneRowList(new ListType(new Field("element", inner, true)),
+                new StructArray(inner, 1, [Ints(10)], ArrowBuffer.Empty))], 1)]);
+        int maxBefore = mode == ColumnMappingMode.None
+            ? 0
+            : int.Parse(table.CurrentSnapshot.Metadata.Configuration![ColumnMapping.MaxColumnIdKey]);
+
+        var wider = new Apache.Arrow.Types.StructType([Int("a", nullable: true), Str("b", nullable: false)]);
+        var listType = new ListType(new Field("element", wider, true));
+        var list = OneRowList(listType, new StructArray(wider, 1, [Ints(20), Strings("bee")], ArrowBuffer.Empty));
+        long version = await table.WriteAsync(
+            [new RecordBatch(Schema(Long("id"), ListOf("xs", new Field("element", wider, true))), [Longs(2), list], 1)],
+            mergeSchema: true);
+        Assert.Contains("metaData", ActionKinds(version));
+
+        var element = Assert.IsType<DeltaLake.Schema.StructType>(Assert.IsType<DeltaLake.Schema.ArrayType>(Column(table, "xs").Type).ElementType);
+        Assert.Equal(["a", "b"], element.Fields.Select(f => f.Name));
+        var b = element.Fields[1];
+        Assert.True(b.Nullable); // added nullable, whatever the batch declares
+        if (mode == ColumnMappingMode.Name)
+        {
+            Assert.Equal((maxBefore + 1).ToString(), b.Metadata![ColumnMapping.FieldIdKey]);
+            Assert.StartsWith("col-", b.Metadata![ColumnMapping.PhysicalNameKey]);
+            Assert.Equal((maxBefore + 1).ToString(),
+                table.CurrentSnapshot.Metadata.Configuration![ColumnMapping.MaxColumnIdKey]);
+        }
+
+        // The old file's elements read the new field as NULL.
+        var rows = await RowsByIdAsync(table);
+        var old = (Dictionary<string, object?>)Assert.Single((List<object?>)rows[1]["xs"]!)!;
+        Assert.Equal(10, old["a"]);
+        Assert.Null(old["b"]);
+        var added = (Dictionary<string, object?>)Assert.Single((List<object?>)rows[2]["xs"]!)!;
+        Assert.Equal(20, added["a"]);
+        Assert.Equal("bee", added["b"]);
+    }
+
+    [Fact]
+    public async Task NewFieldInsideAMapValue_IsAdded()
+    {
+        var inner = new Apache.Arrow.Types.StructType([Int("a", nullable: true)]);
+        var schema = Schema(Long("id"), new Field("m", new Apache.Arrow.Types.MapType(Str("key", nullable: false), new Field("value", inner, true)), true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema);
+
+        var wider = new Apache.Arrow.Types.StructType([Int("a", nullable: true), Str("b")]);
+        var mapType = new Apache.Arrow.Types.MapType(Str("key", nullable: false), new Field("value", wider, true));
+        var map = OneEntryMap(mapType, Strings("k"), new StructArray(wider, 1, [Ints(1), Strings("x")], ArrowBuffer.Empty));
+        await table.WriteAsync(
+            [new RecordBatch(Schema(Long("id"), new Field("m", mapType, true)), [Longs(1), map], 1)], mergeSchema: true);
+
+        var value = Assert.IsType<DeltaLake.Schema.StructType>(Assert.IsType<DeltaLake.Schema.MapType>(Column(table, "m").Type).ValueType);
+        Assert.Equal(["a", "b"], value.Fields.Select(f => f.Name));
+    }
+
+    [Fact]
+    public async Task WideningInsideAnArrayElement_IsRecordedOnTheColumn_WithAFieldPath()
+    {
+        var schema = Schema(Long("id"), ListOf("xs", Int("element", nullable: true)));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema, configuration: Widening);
+        await table.WriteAsync([new RecordBatch(schema,
+            [Longs(1), OneRowList(new ListType(Int("element", nullable: true)), Ints(7))], 1)]);
+
+        var listType = new ListType(Long("element", nullable: true));
+        await table.WriteAsync(
+            [new RecordBatch(Schema(Long("id"), new Field("xs", listType, true)),
+                [Longs(2), OneRowList(listType, Longs(5_000_000_000L))], 1)],
+            mergeSchema: true);
+
+        var xs = Column(table, "xs");
+        var array = Assert.IsType<DeltaLake.Schema.ArrayType>(xs.Type);
+        Assert.Equal("long", Assert.IsType<PrimitiveType>(array.ElementType).TypeName);
+        Assert.True(array.ContainsNull);
+        var change = Assert.Single(DeltaLake.Schema.TypeWidening.GetTypeChanges(xs));
+        Assert.Equal(("integer", "long", "element"), (change.FromType, change.ToType, change.FieldPath));
+
+        // The old file's elements are read widened.
+        var rows = await RowsByIdAsync(table);
+        Assert.Equal(new object?[] { 7L }, (List<object?>)rows[1]["xs"]!);
+        Assert.Equal(new object?[] { 5_000_000_000L }, (List<object?>)rows[2]["xs"]!);
+    }
+
+    [Fact]
+    public async Task WideningAMapsKeyAndValue_RecordsBothOnTheColumn()
+    {
+        var narrow = new Apache.Arrow.Types.MapType(Int("key"), Int("value", nullable: true));
+        var schema = Schema(Long("id"), new Field("m", narrow, true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema, configuration: Widening);
+        await table.WriteAsync([new RecordBatch(schema, [Longs(1), OneEntryMap(narrow, Ints(1), Ints(2))], 1)]);
+
+        var wide = new Apache.Arrow.Types.MapType(Long("key"), Long("value", nullable: true));
+        await table.WriteAsync(
+            [new RecordBatch(Schema(Long("id"), new Field("m", wide, true)), [Longs(2), OneEntryMap(wide, Longs(3), Longs(4))], 1)],
+            mergeSchema: true);
+
+        var m = Column(table, "m");
+        var map = Assert.IsType<DeltaLake.Schema.MapType>(m.Type);
+        Assert.Equal(("long", "long"),
+            (((PrimitiveType)map.KeyType).TypeName, ((PrimitiveType)map.ValueType).TypeName));
+        Assert.Equal(
+            [("integer", "long", "key"), ("integer", "long", "value")],
+            DeltaLake.Schema.TypeWidening.GetTypeChanges(m).Select(c => (c.FromType, c.ToType, c.FieldPath!)));
+
+        var rows = await RowsByIdAsync(table);
+        Assert.Equal(new Dictionary<object, object?> { [1L] = 2L }, rows[1]["m"]);
+        Assert.Equal(new Dictionary<object, object?> { [3L] = 4L }, rows[2]["m"]);
+    }
+
+    [Fact]
+    public async Task WideningInsideNestedCollections_JoinsTheFieldPath()
+    {
+        var narrow = new ListType(new Field("element", new ListType(Int("element", nullable: true)), true));
+        var schema = Schema(Long("id"), new Field("xss", narrow, true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema, configuration: Widening);
+
+        var wide = new ListType(new Field("element", new ListType(Long("element", nullable: true)), true));
+        var inner = OneRowList((ListType)wide.ValueDataType, Longs(1));
+        await table.WriteAsync(
+            [new RecordBatch(Schema(Long("id"), new Field("xss", wide, true)), [Longs(1), OneRowList(wide, inner)], 1)],
+            mergeSchema: true);
+
+        var change = Assert.Single(DeltaLake.Schema.TypeWidening.GetTypeChanges(Column(table, "xss")));
+        Assert.Equal("element.element", change.FieldPath);
+    }
+
+    [Fact]
+    public async Task WideningInsideAStructInsideAnArray_IsRecordedOnTheNearestStructField()
+    {
+        // xs: array<struct<a: array<int>>> — the change goes on `a`, with fieldPath "element", not on `xs`.
+        var narrowA = ListOf("a", Int("element", nullable: true));
+        var narrowElement = new Apache.Arrow.Types.StructType([narrowA]);
+        var schema = Schema(Long("id"), ListOf("xs", new Field("element", narrowElement, true)));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema, configuration: Widening);
+
+        var wideAType = new ListType(Long("element", nullable: true));
+        var wideElement = new Apache.Arrow.Types.StructType([new Field("a", wideAType, true)]);
+        var xsType = new ListType(new Field("element", wideElement, true));
+        var element = new StructArray(wideElement, 1, [OneRowList(wideAType, Longs(9))], ArrowBuffer.Empty);
+        await table.WriteAsync(
+            [new RecordBatch(Schema(Long("id"), new Field("xs", xsType, true)), [Longs(1), OneRowList(xsType, element)], 1)],
+            mergeSchema: true);
+
+        var xs = Column(table, "xs");
+        Assert.Empty(DeltaLake.Schema.TypeWidening.GetTypeChanges(xs));
+        var a = Assert.IsType<DeltaLake.Schema.StructType>(((DeltaLake.Schema.ArrayType)xs.Type).ElementType).Fields[0];
+        var change = Assert.Single(DeltaLake.Schema.TypeWidening.GetTypeChanges(a));
+        Assert.Equal(("integer", "long", "element"), (change.FromType, change.ToType, change.FieldPath));
+    }
+
+    [Fact]
+    public async Task AStructFieldNamedElement_IsNotTakenForAnArrayElement()
+    {
+        // s: struct<element: int> widened is s.element's own change, with no fieldPath.
+        var schema = Schema(Long("id"), new Field("s", new Apache.Arrow.Types.StructType([Int("element", nullable: true)]), true));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema, configuration: Widening);
+
+        var wide = new Apache.Arrow.Types.StructType([Long("element", nullable: true)]);
+        await table.WriteAsync(
+            [new RecordBatch(Schema(Long("id"), new Field("s", wide, true)),
+                [Longs(1), new StructArray(wide, 1, [Longs(1)], ArrowBuffer.Empty)], 1)],
+            mergeSchema: true);
+
+        var field = Assert.IsType<DeltaLake.Schema.StructType>(Column(table, "s").Type).Fields[0];
+        var change = Assert.Single(DeltaLake.Schema.TypeWidening.GetTypeChanges(field));
+        Assert.Null(change.FieldPath);
+    }
+
+    [Fact]
+    public async Task WideningInsideAnArray_WithoutTypeWidening_IsRefused()
+    {
+        var schema = Schema(Long("id"), ListOf("xs", Int("element", nullable: true)));
         await using var table = await DeltaTable.CreateAsync(Fs, schema);
         long before = table.CurrentSnapshot.Version;
 
-        var wider = new Apache.Arrow.Types.StructType([Int("a", nullable: true), Str("b")]);
-        var listType = new ListType(new Field("element", wider, true));
-        var values = new StructArray(wider, 1, [Ints(1), Strings("x")], ArrowBuffer.Empty);
-        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(1).Build();
-        var list = new ListArray(listType, 1, offsets, values, ArrowBuffer.Empty);
-        var batchSchema = Schema(Long("id"), new Field("xs", listType, true));
-
+        var listType = new ListType(Long("element", nullable: true));
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
-            await table.WriteAsync([new RecordBatch(batchSchema, [Longs(1), list], 1)], mergeSchema: true));
-        Assert.Equal(DeltaTableErrorCodes.UnsupportedSchemaMerge, ex.ErrorCode);
+            await table.WriteAsync(
+                [new RecordBatch(Schema(Long("id"), new Field("xs", listType, true)), [Longs(1), OneRowList(listType, Longs(5))], 1)],
+                mergeSchema: true));
+        Assert.Equal(DeltaTableErrorCodes.MergeIncompatibleDataType, ex.ErrorCode);
+        Assert.Contains("'xs.element'", ex.Message);
         Assert.Equal(before, table.CurrentSnapshot.Version);
     }
 
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task WideningInsideAnArrayElement_IsRefusedAsUnsupported_WhateverTheTableSetting(bool widening)
+    [Fact]
+    public async Task WideningInsideAnArrayACheckConstraintReads_IsRefused()
     {
-        var schema = Schema(Long("id"), new Field("xs", new ListType(Int("element", nullable: true)), true));
-        await using var table = await DeltaTable.CreateAsync(
-            Fs, schema, configuration: widening ? Widening : null);
+        var config = new Dictionary<string, string>(Widening) { ["delta.constraints.first"] = "xs[0] > 0" };
+        var schema = Schema(Long("id"), ListOf("xs", Int("element", nullable: true)));
+        await using var table = await DeltaTable.CreateAsync(Fs, schema, configuration: config);
 
         var listType = new ListType(Long("element", nullable: true));
-        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(1).Build();
-        var list = new ListArray(listType, 1, offsets, Longs(5), ArrowBuffer.Empty);
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
             await table.WriteAsync(
-                [new RecordBatch(Schema(Long("id"), new Field("xs", listType, true)), [Longs(1), list], 1)],
+                [new RecordBatch(Schema(Long("id"), new Field("xs", listType, true)), [Longs(1), OneRowList(listType, Longs(5))], 1)],
                 mergeSchema: true));
-        Assert.Equal(DeltaTableErrorCodes.UnsupportedSchemaMerge, ex.ErrorCode);
+        Assert.Equal(DeltaTableErrorCodes.ConstraintDataTypeMismatch, ex.ErrorCode);
     }
 
     [Fact]
@@ -483,7 +675,7 @@ public class MergeSchemaTests : IDisposable
         var schema = Schema(Long("id"), Str("p"));
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
             await table.WriteAsync([new RecordBatch(schema, [Longs(3), Strings("c")], 1)], mergeSchema: true));
-        Assert.Equal(DeltaTableErrorCodes.ConstraintDependentColumnChange, ex.ErrorCode);
+        Assert.Equal(DeltaTableErrorCodes.ConstraintDataTypeMismatch, ex.ErrorCode);
     }
 
     [Theory]

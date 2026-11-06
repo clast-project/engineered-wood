@@ -252,13 +252,6 @@ public static class DeltaTableErrorCodes
     public const string UpdateSchemaMismatchExpression = "DELTA_UPDATE_SCHEMA_MISMATCH_EXPRESSION";
 
     /// <summary>
-    /// A <c>mergeSchema</c> write would need a change this library's merge does not make: a new field, or a
-    /// widening, inside an array element or a map key or value. Nothing is written.
-    /// </summary>
-    /// <remarks>No delta-spark equivalent: Spark's merge makes these changes.</remarks>
-    public const string UnsupportedSchemaMerge = "DELTA_UNSUPPORTED_SCHEMA_MERGE";
-
-    /// <summary>
     /// A RENAME or DROP would change a column that a CHECK constraint reads, or a schema replacement
     /// would remove one.
     /// </summary>
@@ -269,6 +262,22 @@ public static class DeltaTableErrorCodes
     /// <para>Drop the constraint first, then change the column.</para>
     /// </remarks>
     public const string ConstraintDependentColumnChange = "DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE";
+
+    /// <summary>
+    /// A <c>mergeSchema</c> write or MERGE would widen a column that a CHECK constraint reads. Nothing is written.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_CONSTRAINT_DATA_TYPE_MISMATCH</c>, as Spark's schema evolution refuses it.
+    /// For a value inside an array or map, a constraint reading the collection's column (<c>xs[0] &gt; 0</c>) reads
+    /// it. Drop the constraint first, or cast the batch's column to the table's type.</remarks>
+    public const string ConstraintDataTypeMismatch = "DELTA_CONSTRAINT_DATA_TYPE_MISMATCH";
+
+    /// <summary>
+    /// A <c>mergeSchema</c> write or MERGE would widen a column that a generated column's expression reads.
+    /// Nothing is written.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_GENERATED_COLUMNS_DATA_TYPE_MISMATCH</c>. Same reach as
+    /// <see cref="ConstraintDataTypeMismatch"/>.</remarks>
+    public const string GeneratedColumnsDataTypeMismatch = "DELTA_GENERATED_COLUMNS_DATA_TYPE_MISMATCH";
 
     /// <summary>
     /// A RENAME or DROP would change a column that a generated column's expression reads.

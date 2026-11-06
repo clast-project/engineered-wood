@@ -40,44 +40,28 @@ internal static class SchemaChangeDependents
         new Dictionary<string, string>();
 
     /// <summary>
+    /// Throws if a CHECK constraint or a generation expression reads the column at <paramref name="path"/>
+    /// (LOGICAL names), whose type a merge is about to widen, as Spark refuses it
+    /// (<see cref="DeltaTableErrorCodes.ConstraintDataTypeMismatch"/>,
+    /// <see cref="DeltaTableErrorCodes.GeneratedColumnsDataTypeMismatch"/>). <paramref name="display"/> names the
+    /// value being widened in the message (<c>xs.element</c>), where <paramref name="path"/> may stop at its column.
+    /// </summary>
+    public static void EnsureTypeChangeable(
+        StructType schema, MetadataAction metadata, IReadOnlyList<string> path, string display) =>
+        EnsureNoDependentExpressions(
+            schema, metadata, path, $"change the type of column '{display}'", isTypeChange: true);
+
+    /// <summary>
     /// Throws if anything depends on the field at <paramref name="path"/> (LOGICAL names, as they
-    /// stand in <paramref name="schema"/>), which a RENAME or DROP is about to change. <paramref name="verb"/>
-    /// names some other change for the message (a merge's type widening); it does not change the checks.
+    /// stand in <paramref name="schema"/>), which a RENAME or DROP is about to change.
     /// </summary>
     public static void EnsureChangeable(
         StructType schema, MetadataAction metadata, IReadOnlyDictionary<string, DomainMetadata> domains,
-        IReadOnlyList<string> path, bool isDrop, string? verb = null)
+        IReadOnlyList<string> path, bool isDrop)
     {
-        verb ??= isDrop ? "drop" : "rename";
         string target = string.Join(".", path);
-
-        foreach (var (key, sql) in Constraints(metadata))
-        {
-            if (References($"CHECK constraint '{key}'", sql).Any(r => DependsOn(r, path)))
-            {
-                throw new DeltaFormatException(
-                    DeltaTableErrorCodes.ConstraintDependentColumnChange,
-                    $"Cannot {verb} column '{target}': CHECK constraint '{key}' ({sql}) reads it. "
-                    + "Drop the constraint first.");
-            }
-        }
-
-        foreach (var field in schema.Fields)
-        {
-            if (field.Metadata is null
-                || !field.Metadata.TryGetValue(GenerationExpressionKey, out var sql))
-            {
-                continue;
-            }
-
-            if (References($"generated column '{field.Name}'", sql).Any(r => DependsOn(r, path)))
-            {
-                throw new DeltaFormatException(
-                    DeltaTableErrorCodes.GeneratedColumnsDependentColumnChange,
-                    $"Cannot {verb} column '{target}': generated column '{field.Name}' is computed "
-                    + $"from it ({sql}).");
-            }
-        }
+        EnsureNoDependentExpressions(
+            schema, metadata, path, $"{(isDrop ? "drop" : "rename")} column '{target}'", isTypeChange: false);
 
         // A RENAME keeps the physical name, which is what the clustering spec stores.
         if (isDrop && ClusteringPaths(domains) is { } clustering)
@@ -104,6 +88,42 @@ internal static class SchemaChangeDependents
                         $"Cannot drop column '{target}': the table is clustered by it. Change the "
                         + "clustering columns first.");
                 }
+            }
+        }
+    }
+
+    // The CHECK constraints and generation expressions that read `path`, refused with Spark's codes for the
+    // change: a type change has its own pair, a RENAME or DROP the dependent-column-change pair.
+    private static void EnsureNoDependentExpressions(
+        StructType schema, MetadataAction metadata, IReadOnlyList<string> path, string change, bool isTypeChange)
+    {
+        foreach (var (key, sql) in Constraints(metadata))
+        {
+            if (References($"CHECK constraint '{key}'", sql).Any(r => DependsOn(r, path)))
+            {
+                throw new DeltaFormatException(
+                    isTypeChange
+                        ? DeltaTableErrorCodes.ConstraintDataTypeMismatch
+                        : DeltaTableErrorCodes.ConstraintDependentColumnChange,
+                    $"Cannot {change}: CHECK constraint '{key}' ({sql}) reads it. Drop the constraint first.");
+            }
+        }
+
+        foreach (var field in schema.Fields)
+        {
+            if (field.Metadata is null
+                || !field.Metadata.TryGetValue(GenerationExpressionKey, out var sql))
+            {
+                continue;
+            }
+
+            if (References($"generated column '{field.Name}'", sql).Any(r => DependsOn(r, path)))
+            {
+                throw new DeltaFormatException(
+                    isTypeChange
+                        ? DeltaTableErrorCodes.GeneratedColumnsDataTypeMismatch
+                        : DeltaTableErrorCodes.GeneratedColumnsDependentColumnChange,
+                    $"Cannot {change}: generated column '{field.Name}' is computed from it ({sql}).");
             }
         }
     }
