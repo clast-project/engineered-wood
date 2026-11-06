@@ -31,7 +31,8 @@ Delete a `<name>.ready` marker, or the folder, to rebuild them.
 Every benchmark can run with its tables in an Azure storage account instead of on local disk: EW through
 `EngineeredWood.Azure`'s `AzureTableFileSystem`, delta-dotnet through delta-rs / delta-kernel-rs's object_store
 (`az://container/prefix`, with the account name and key as storage options). Both use the Blob endpoint, so the
-account does not need a hierarchical namespace. The store is chosen by environment variables, because
+account does not need a hierarchical namespace, though it may have one: the full `--verify` passes on a
+hierarchical-namespace account and on Azurite (flat). The banner says which kind it found. The store is chosen by environment variables, because
 BenchmarkDotNet runs each benchmark in a child process that inherits the environment but not the command line:
 
 | Variable | Meaning |
