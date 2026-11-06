@@ -115,6 +115,28 @@ public sealed class SchemaDescriptor
     }
 
     /// <summary>
+    /// The index in <see cref="Columns"/> of the leaf <paramref name="name"/> names, or -1: a top-level leaf of
+    /// that exact name first, then the first nested leaf whose dotted path it is. A name may hold a dot, so a
+    /// top-level column literally named <c>s.a</c> beside a struct <c>s</c> with a field <c>a</c> is that column,
+    /// not the struct's leaf, whose dotted path is the same text. A projected read resolves names by the same
+    /// rule, so a filter prunes by the column the read returns.
+    /// </summary>
+    internal int FindLeaf(string name)
+    {
+        for (int i = 0; i < Columns.Count; i++)
+        {
+            if (Columns[i].Path.Count == 1 && Columns[i].Path[0] == name)
+                return i;
+        }
+        for (int i = 0; i < Columns.Count; i++)
+        {
+            if (Columns[i].Path.Count > 1 && Columns[i].DottedPath == name)
+                return i;
+        }
+        return -1;
+    }
+
+    /// <summary>
     /// Resolves Parquet field_ids to top-level column names.
     /// For leaf columns, returns the dotted path. For group columns
     /// (struct, list, map), returns the top-level group name.

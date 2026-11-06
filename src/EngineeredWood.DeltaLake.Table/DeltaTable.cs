@@ -4516,6 +4516,52 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private enum ReferenceResolution { Found, Missing, Ambiguous }
 
     /// <summary>
+    /// The top-level columns of <paramref name="schema"/> that <paramref name="predicate"/> references, in schema
+    /// order and spelling, resolved by the evaluator's rule (<see cref="ReferenceResolutions"/>: the first part of
+    /// a name, ignoring case; a reference to a struct field needs its whole top-level column). Null, to read every
+    /// column, when the predicate holds a node this does not know, a reference that does not resolve to exactly
+    /// one column, or no reference at all.
+    /// </summary>
+    internal static IReadOnlyList<string>? PredicateColumns(Expressions.Predicate predicate, Apache.Arrow.Schema schema)
+    {
+        var referenced = new HashSet<string>(StringComparer.Ordinal);
+        if (!Visit(predicate) || referenced.Count == 0)
+            return null;
+        return schema.FieldsList.Where(f => referenced.Contains(f.Name)).Select(f => f.Name).ToList();
+
+        bool Visit(Expressions.Expression expression)
+        {
+            switch (expression)
+            {
+                case Expressions.UnboundReference reference:
+                    return Add(reference.NameParts[0]);
+                case Expressions.BoundReference bound:
+                    return Add(bound.Name);
+                case Expressions.LiteralExpression or Expressions.TruePredicate or Expressions.FalsePredicate:
+                    return true;
+                case Expressions.AndPredicate or Expressions.OrPredicate or Expressions.NotPredicate
+                    or Expressions.ComparisonPredicate or Expressions.UnaryPredicate or Expressions.SetPredicate
+                    or Expressions.FunctionCall:
+                    return ExpressionChildren(expression).All(Visit);
+                default:
+                    return false;
+            }
+        }
+
+        bool Add(string name)
+        {
+            var matches = schema.FieldsList
+                .Where(f => string.Equals(f.Name, name, StringComparison.OrdinalIgnoreCase))
+                .Take(2)
+                .ToList();
+            if (matches.Count != 1)
+                return false;
+            referenced.Add(matches[0].Name);
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Each column <paramref name="expression"/> references, in order, with how it resolves against
     /// <paramref name="schema"/> by the evaluator's rule: each part of a name matched ignoring case, a nested part as
     /// a field of the struct before it, and a bound reference by its name, as an unbound one. A part that matches
@@ -4837,6 +4883,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         var partitionKeyMap = ColumnMapping.BuildLogicalToPhysicalMap(
             snapshot.Schema, ColumnMapping.GetMode(snapshot.Metadata.Configuration));
+
+        // The columns the match reads: only those the predicate references, when it is analyzable (the mask is
+        // then MaskFor(prunePredicate), which looks columns up by name) and no change file needs the deleted rows
+        // whole. A file the delete partly matches is read again, whole, by the copy-on-write rewrite; reading
+        // every column here as well downloaded it twice (#713). Null reads every column.
+        var matchColumns = prunePredicate is not null && !cdfEnabled
+            ? PredicateColumns(prunePredicate, snapshot.ArrowSchema)
+            : null;
+
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
             // One stats object serves the skip and the proof, so the JSON statistics are parsed once.
@@ -4920,10 +4975,17 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     prunePredicate, snapshot.Schema, mappingMode, parquetSchema, snapshot.Metadata.PartitionColumns);
             }
 
+            var matchFileColumns = matchColumns is null
+                ? null
+                : await FileColumnsAsync(
+                        reader, snapshot, matchColumns, mappingMode, logicalToPhysical, withRowTracking: false,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+
             // Row groups the existing vector already deletes in full hold no row this delete could remove, so
             // they are skipped unread; positions after them are unchanged.
             await foreach (var (batch, firstRow) in ReadPositionedAsync(
-                reader, filePredicate, columns: null, rawDeletedRows, cancellationToken).ConfigureAwait(false))
+                reader, filePredicate, matchFileColumns, rawDeletedRows, cancellationToken).ConfigureAwait(false))
             {
                 // Resolved exactly as the read path resolves it: the predicate must see what a scan sees.
                 var logicalBatch = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
@@ -4944,8 +5006,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 // The predicate sees each row as a scan returns it: current schema, columns added since this
                 // file was written as NULL, partition columns re-materialized, widened types widened.
                 logicalBatch = ReconcileToTableShape(
-                    logicalBatch, snapshot, addFile.PartitionValues, columns: null, partitionColumns, partitionColumns.Count > 0,
-                    logicalToPhysical, addFile.Path);
+                    logicalBatch, snapshot, addFile.PartitionValues, matchColumns, partitionColumns,
+                    partitionColumns.Count > 0, logicalToPhysical, addFile.Path);
 
                 // The rows this delete removes: those the predicate is TRUE for (a NULL deletes nothing) that the
                 // existing vector does not already hide — the vector and the predicate mask merged word by word.
@@ -12259,6 +12321,126 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// The columns the built-in reader asks <paramref name="reader"/>'s file for, to read the LOGICAL
+    /// <paramref name="columns"/> of <paramref name="snapshot"/> (null: every column; with partitions, every data
+    /// column). Partition columns are left out (the read re-adds them), names are translated by the column mapping
+    /// (by field id in id mode), and columns the file does not have are dropped (the read backfills them as NULL).
+    /// <paramref name="withRowTracking"/> adds the hidden materialized row-tracking columns, for a read that needs
+    /// each row's stable id.
+    /// </summary>
+    private static async ValueTask<IReadOnlyList<string>?> FileColumnsAsync(
+        ParquetFileReader reader,
+        Snapshot.Snapshot snapshot,
+        IReadOnlyList<string>? columns,
+        ColumnMappingMode mappingMode,
+        IReadOnlyDictionary<string, string> logicalToPhysical,
+        bool withRowTracking,
+        CancellationToken cancellationToken)
+    {
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        bool hasPartitions = partitionColumns.Count > 0;
+        Parquet.Schema.SchemaDescriptor? parquetSchema = null;
+
+        // Determine which columns to request from the Parquet file
+        IReadOnlyList<string>? fileColumns = null;
+
+        if (mappingMode == ColumnMappingMode.Id)
+        {
+            // In ID mode: resolve field_ids from the Parquet schema to column names
+            parquetSchema = await reader.GetSchemaAsync(cancellationToken)
+                .ConfigureAwait(false);
+
+            if (columns is not null)
+            {
+                var partSet = hasPartitions
+                    ? new HashSet<string>(partitionColumns, StringComparer.Ordinal)
+                    : new HashSet<string>();
+                var logicalToFieldId = ColumnMapping.BuildLogicalToFieldIdMap(snapshot.Schema);
+
+                // Map logical names → field_ids → Parquet column names
+                var fieldIds = columns
+                    .Where(c => !partSet.Contains(c))
+                    .Where(c => logicalToFieldId.ContainsKey(c))
+                    .Select(c => logicalToFieldId[c])
+                    .ToList();
+                var resolved = parquetSchema.ResolveFieldIds(fieldIds);
+                fileColumns = resolved.Where(n => n is not null).Select(n => n!).ToList();
+            }
+            // else: read all columns, rename by field_id after
+        }
+        else
+        {
+            // Name mode or None mode: translate by physical name
+            fileColumns = columns;
+            if (columns is not null)
+            {
+                var partSet = hasPartitions
+                    ? new HashSet<string>(partitionColumns, StringComparer.Ordinal)
+                    : new HashSet<string>();
+
+                fileColumns = columns
+                    .Where(c => !partSet.Contains(c))
+                    .Select(c => logicalToPhysical.TryGetValue(c, out var p) ? p : c)
+                    .ToList();
+            }
+            else if (hasPartitions)
+            {
+                var partSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
+                fileColumns = snapshot.Schema.Fields
+                    .Where(f => !partSet.Contains(f.Name))
+                    .Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
+                    .ToList();
+            }
+        }
+
+        // Row tracking: the same omission as in OpenDataFileAsync's codec-seam branch — the hidden materialized
+        // columns are not schema fields, so a PROJECTED read (either mapping mode) and an UNPROJECTED read of a
+        // PARTITIONED table both build a file-level column list without them, and every id then falls back to
+        // baseRowId + position. Here the file's own schema IS available, so name them and let the file-present
+        // intersect below drop them again for a file that carries none — which is every fresh append, the common
+        // case.
+        if (fileColumns is not null && withRowTracking)
+        {
+            var trackingColumns = MaterializedRowTrackingColumnNames(snapshot);
+            if (trackingColumns.Count > 0)
+            {
+                var withTracking = new List<string>(fileColumns.Count + trackingColumns.Count);
+                withTracking.AddRange(fileColumns);
+                withTracking.AddRange(trackingColumns);
+                fileColumns = withTracking;
+            }
+        }
+
+        // Schema evolution: ADD COLUMN is a metadata-only commit, so a file written BEFORE it does not
+        // contain the new column — asking the parquet reader for it throws ("Column 'x' was not found in
+        // the schema"). Intersect the projection with the file's ACTUAL top-level columns and let the
+        // BackfillMissingColumns step downstream reconstitute the absent ones as typed NULL, exactly as it
+        // already does for an UNPROJECTED read of the same file. Without this a projected read is strictly
+        // less capable than an unprojected one over identical data, which is the wrong way round.
+        //
+        // An empty result — a projection naming ONLY later-added columns — is deliberately left empty
+        // rather than padded with some column the file does happen to have: the reader takes its row count
+        // from the row group, not from the columns it returns, so the batches still carry the lengths the
+        // backfill needs, and padding would read bytes only to discard them. Pinned by
+        // SchemaEvolutionTests.ProjectedRead_OfAColumnAddedAfterTheFile_BackfillsNull.
+        //
+        // Id mode never threw here (an unresolvable field id already drops out of ResolveFieldIds); it runs
+        // through the same reconciliation so one rule covers every mapping mode.
+        if (fileColumns is not null)
+        {
+            parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+            var filePresent = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var child in parquetSchema.Root.Children)
+                filePresent.Add(child.Name);
+
+            if (fileColumns.Any(c => !filePresent.Contains(c)))
+                fileColumns = fileColumns.Where(filePresent.Contains).ToList();
+        }
+
+        return fileColumns;
+    }
+
+    /// <summary>
     /// Everything about reading <paramref name="addFile"/> that is decided once per file, before any of its rows
     /// are read: see <see cref="DataFileRead"/>. The caller holds the one share it returns.
     /// <paramref name="rowGroupFilter"/>: a LOGICAL-name predicate; row groups whose statistics prove no row
@@ -12279,7 +12461,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         // Column mapping setup
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
-        bool isIdMode = mappingMode == ColumnMappingMode.Id;
 
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
             snapshot.Schema, mappingMode);
@@ -12359,102 +12540,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // one after another, on the one thread that plans.
             await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
 
+            var fileColumns = await FileColumnsAsync(
+                    reader, snapshot, columns, mappingMode, logicalToPhysical, withRowTracking: true, cancellationToken)
+                .ConfigureAwait(false);
             Parquet.Schema.SchemaDescriptor? parquetSchema = null;
-
-            // Determine which columns to request from the Parquet file
-            IReadOnlyList<string>? fileColumns = null;
-
-            if (isIdMode)
-            {
-                // In ID mode: resolve field_ids from the Parquet schema to column names
-                parquetSchema = await reader.GetSchemaAsync(cancellationToken)
-                    .ConfigureAwait(false);
-
-                if (columns is not null)
-                {
-                    var partSet = hasPartitions
-                        ? new HashSet<string>(partitionColumns, StringComparer.Ordinal)
-                        : new HashSet<string>();
-                    var logicalToFieldId = ColumnMapping.BuildLogicalToFieldIdMap(snapshot.Schema);
-
-                    // Map logical names → field_ids → Parquet column names
-                    var fieldIds = columns
-                        .Where(c => !partSet.Contains(c))
-                        .Where(c => logicalToFieldId.ContainsKey(c))
-                        .Select(c => logicalToFieldId[c])
-                        .ToList();
-                    var resolved = parquetSchema.ResolveFieldIds(fieldIds);
-                    fileColumns = resolved.Where(n => n is not null).Select(n => n!).ToList();
-                }
-                // else: read all columns, rename by field_id after
-            }
-            else
-            {
-                // Name mode or None mode: translate by physical name
-                fileColumns = columns;
-                if (columns is not null)
-                {
-                    var partSet = hasPartitions
-                        ? new HashSet<string>(partitionColumns, StringComparer.Ordinal)
-                        : new HashSet<string>();
-
-                    fileColumns = columns
-                        .Where(c => !partSet.Contains(c))
-                        .Select(c => logicalToPhysical.TryGetValue(c, out var p) ? p : c)
-                        .ToList();
-                }
-                else if (hasPartitions)
-                {
-                    var partSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
-                    fileColumns = snapshot.Schema.Fields
-                        .Where(f => !partSet.Contains(f.Name))
-                        .Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
-                        .ToList();
-                }
-            }
-
-            // Row tracking: same omission as the seam branch above — the hidden materialized columns are not schema
-            // fields, so a PROJECTED read (either mapping mode) and an UNPROJECTED read of a PARTITIONED table both
-            // build a file-level column list without them, and every id then falls back to baseRowId + position.
-            // Here the file's own schema IS available, so name them and let the file-present intersect below drop
-            // them again for a file that carries none — which is every fresh append, the common case.
-            if (fileColumns is not null)
-            {
-                var trackingColumns = MaterializedRowTrackingColumnNames(snapshot);
-                if (trackingColumns.Count > 0)
-                {
-                    var withTracking = new List<string>(fileColumns.Count + trackingColumns.Count);
-                    withTracking.AddRange(fileColumns);
-                    withTracking.AddRange(trackingColumns);
-                    fileColumns = withTracking;
-                }
-            }
-
-            // Schema evolution: ADD COLUMN is a metadata-only commit, so a file written BEFORE it does not
-            // contain the new column — asking the parquet reader for it throws ("Column 'x' was not found in
-            // the schema"). Intersect the projection with the file's ACTUAL top-level columns and let the
-            // BackfillMissingColumns step downstream reconstitute the absent ones as typed NULL, exactly as it
-            // already does for an UNPROJECTED read of the same file. Without this a projected read is strictly
-            // less capable than an unprojected one over identical data, which is the wrong way round.
-            //
-            // An empty result — a projection naming ONLY later-added columns — is deliberately left empty
-            // rather than padded with some column the file does happen to have: the reader takes its row count
-            // from the row group, not from the columns it returns, so the batches still carry the lengths the
-            // backfill needs, and padding would read bytes only to discard them. Pinned by
-            // SchemaEvolutionTests.ProjectedRead_OfAColumnAddedAfterTheFile_BackfillsNull.
-            //
-            // Id mode never threw here (an unresolvable field id already drops out of ResolveFieldIds); it runs
-            // through the same reconciliation so one rule covers every mapping mode.
-            if (fileColumns is not null)
-            {
-                parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-                var filePresent = new HashSet<string>(StringComparer.Ordinal);
-                foreach (var child in parquetSchema.Root.Children)
-                    filePresent.Add(child.Name);
-
-                if (fileColumns.Any(c => !filePresent.Contains(c)))
-                    fileColumns = fileColumns.Where(filePresent.Contains).ToList();
-            }
 
             Expressions.Predicate? filePredicate = null;
             if (rowGroupFilter is not null)

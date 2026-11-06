@@ -819,23 +819,12 @@ internal static class MembershipPredicateEvaluator
             FindColumn(Schema, name, out index, out descriptor);
     }
 
-    /// <summary>A leaf by dotted path, or by bare name for a top-level leaf.</summary>
+    /// <summary>The leaf <paramref name="name"/> names, as <see cref="SchemaDescriptor.FindLeaf"/> resolves it.</summary>
     internal static bool FindColumn(
         SchemaDescriptor schema, string name, out int index, out ColumnDescriptor? descriptor)
     {
-        for (int i = 0; i < schema.Columns.Count; i++)
-        {
-            if (schema.Columns[i].DottedPath == name
-                || (schema.Columns[i].Path.Count == 1
-                    && schema.Columns[i].Path[0] == name))
-            {
-                index = i;
-                descriptor = schema.Columns[i];
-                return true;
-            }
-        }
-        index = -1;
-        descriptor = null;
-        return false;
+        index = schema.FindLeaf(name);
+        descriptor = index >= 0 ? schema.Columns[index] : null;
+        return index >= 0;
     }
 }

@@ -91,19 +91,24 @@ public sealed class ParquetStatisticsAccessor
     }
 
     /// <summary>
-    /// Maps a predicate's column names to leaf indexes: every leaf by dotted path, and a top-level leaf
-    /// by bare name too. The page-index pruner resolves names with this, so that both agree.
+    /// Maps a predicate's column names to leaf indexes, as <see cref="SchemaDescriptor.FindLeaf"/> resolves
+    /// them: a top-level leaf by its name, and a nested leaf by its dotted path unless a top-level leaf or an
+    /// earlier nested leaf already holds that text. The page-index pruner resolves names with this, so that
+    /// both agree.
     /// </summary>
     internal static Dictionary<string, int> BuildNameIndex(SchemaDescriptor schema)
     {
         var map = new Dictionary<string, int>(StringComparer.Ordinal);
         for (int i = 0; i < schema.Columns.Count; i++)
         {
+            if (schema.Columns[i].Path.Count == 1)
+                map[schema.Columns[i].Path[0]] = i;
+        }
+        for (int i = 0; i < schema.Columns.Count; i++)
+        {
             var col = schema.Columns[i];
-            map[col.DottedPath] = i;
-            // Also index by leaf-only name when unambiguous, for convenience.
-            if (col.Path.Count == 1 && !map.ContainsKey(col.Path[0]))
-                map[col.Path[0]] = i;
+            if (col.Path.Count > 1 && !map.ContainsKey(col.DottedPath))
+                map[col.DottedPath] = i;
         }
         return map;
     }
