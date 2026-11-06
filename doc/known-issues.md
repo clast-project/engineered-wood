@@ -482,13 +482,15 @@ bounds and over Spark's. What is not done:
 - *Row groups and pages are not pruned on a variant path.* Parquet row groups
   and pages inside a kept file are not pruned by the `typed_value` footer
   statistics (#682).
-- *Row-level `variant_get` (#681) has three refusals.* DML predicates and CHECK
-  constraints on a variant path are evaluated row by row with Spark's variant
-  cast. An object or array cast to `string` (Spark answers its JSON text), a
-  `timestamp_ntz` or nested target, and a TIME or nanosecond-timestamp value
-  are refused rather than approximated. A generated column on a variant path is
-  refused, as Delta refuses it, but as `DELTA_UNEVALUABLE_TABLE_EXPRESSION`
-  rather than Spark's `DELTA_UNSUPPORTED_EXPRESSION_GENERATED_COLUMN`. A
+- *Row-level `variant_get` (#681) has three refusals and two differences.* DML
+  predicates and CHECK constraints on a variant path are evaluated row by row
+  with Spark's variant cast. An object or array cast to `string` (Spark answers
+  its JSON text), a `timestamp_ntz` or nested target, and a TIME or
+  nanosecond-timestamp value are refused rather than approximated. A generated
+  column on a variant path is refused with Delta's codes
+  (`DELTA_UNSUPPORTED_EXPRESSION_GENERATED_COLUMN`, or
+  `DELTA_UNSUPPORTED_DATA_TYPE_IN_GENERATED_COLUMN` for a VARIANT column), but
+  at the first write rather than when the column is declared. A
   `variant_get` that fails its cast while a write is checked against a constraint
   is reported as `DELTA_UNEVALUABLE_TABLE_EXPRESSION` wrapping
   `INVALID_VARIANT_CAST`, where Spark reports `TASK_WRITE_FAILED`.

@@ -62,6 +62,12 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
     /// </summary>
     private readonly IConstantFoldedFunctions? _constantFolded;
 
+    /// <summary>
+    /// The registry's rule for arguments that must be foldable, when it has one. See
+    /// <see cref="IFoldableArgumentRules"/>.
+    /// </summary>
+    private readonly IFoldableArgumentRules? _foldableArguments;
+
     public ArrowRowEvaluator(IFunctionRegistry? functions = null)
     {
         _functions = functions;
@@ -71,6 +77,7 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         _literalPrecision = functions as ILiteralPrecisionRules;
         _analysis = functions as IAnalysisRules;
         _constantFolded = functions as IConstantFoldedFunctions;
+        _foldableArguments = functions as IFoldableArgumentRules;
     }
 
     public BooleanArray EvaluatePredicate(Predicate predicate, RecordBatch batch) =>
@@ -1403,6 +1410,15 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         // else is evaluated first and invoked with the answers.
         if (_shortCircuiting is not null && _shortCircuiting.ShortCircuits(call.Name))
             return _shortCircuiting.Invoke(call.Name, new CallArguments(this, call, batch), batch.Length);
+
+        // Before any argument is read, so the refusal is the expression's and not the batch's.
+        if (_foldableArguments is not null)
+        {
+            var foldable = new bool[call.Arguments.Count];
+            for (int i = 0; i < foldable.Length; i++)
+                foldable[i] = IsConstant(call.Arguments[i]);
+            Refuse(_foldableArguments.CheckFoldableArguments(call.Name, foldable));
+        }
 
         var arguments = new IArrowArray[call.Arguments.Count];
         for (int i = 0; i < call.Arguments.Count; i++)

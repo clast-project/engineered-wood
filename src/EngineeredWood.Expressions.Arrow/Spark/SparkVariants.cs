@@ -49,22 +49,19 @@ internal static class SparkVariants
         if (args.Count is not (2 or 3))
             throw new ArgumentException($"{name} expects 2 or 3 arguments but got {args.Count}");
 
-        string pathText = ConstantText(name, args[1], "path");
-        if (!VariantPath.TryParse(pathText, out var path))
-        {
-            throw new SparkEvaluationException(
-                "INVALID_VARIANT_GET_PATH",
-                $"The path `{pathText}` is not a valid variant extraction path in `{name}`. A valid path should "
-                + "start with `$` and is followed by zero or more segments like `[123]`, `.name`, `['name']`, "
-                + "or `[\"name\"]`.");
-        }
+        // The path may differ by row (measured, Spark 4.1: `variant_get(v, p, 'int')` over a path column reads each
+        // row's path, and a NULL path is NULL). Every element present is parsed, which over no rows is still the
+        // one row a constant path keeps (ArrowRowEvaluator.ConstantArray), so an invalid literal path is refused
+        // when a CHECK constraint is added, as Spark refuses it at analysis.
+        var paths = ParsePaths(name, args[1]);
 
         IArrowType? target = null;
         if (args.Count == 3)
         {
             // Through the canonical spelling where there is one, so an alias such as timestamp_ltz reads as
-            // Spark's DataType.fromDDL reads it.
-            string typeText = ConstantText(name, args[2], "type");
+            // Spark's DataType.fromDDL reads it. The type must be foldable, which the evaluator checks before
+            // the call (CheckFoldableArguments); here it must also be the same non-null string throughout.
+            string typeText = TypeText(args[2]);
             if (!VariantGetCall.TryNormalizeTypeName(typeText, out string canonical))
                 target = SparkArrays.ParseTypeName(typeText);
             else if (canonical != VariantGetCall.VariantTypeName)
@@ -78,7 +75,10 @@ internal static class SparkVariants
         var variants = RequireVariant(name, args[0]);
         var leaves = new VariantValue?[rowCount];
         for (int row = 0; row < rowCount; row++)
-            leaves[row] = TryNavigate(variants, row, path, out var leaf) ? leaf : null;
+        {
+            var path = paths[paths.Length == 1 ? 0 : row];
+            leaves[row] = path is not null && TryNavigate(variants, row, path, out var leaf) ? leaf : null;
+        }
 
         return target is null
             ? BuildVariants(leaves)
@@ -115,21 +115,66 @@ internal static class SparkVariants
     }
 
     /// <summary>
-    /// The path or type argument, which Spark requires be a constant: the same string at every row.
+    /// Each row's path, null where the path is NULL. An invalid one is <c>INVALID_VARIANT_GET_PATH</c> under either
+    /// form (measured). Parsed once per distinct text.
     /// </summary>
-    private static string ConstantText(string name, IArrowArray argument, string what)
+    private static VariantPath?[] ParsePaths(string name, IArrowArray argument)
     {
-        if (argument is not StringArray strings || strings.Length == 0 || strings.IsNull(0))
-            throw new ArgumentException($"{name} expects its {what} as a non-null string literal");
-
-        string text = strings.GetString(0)!;
-        for (int i = 1; i < strings.Length; i++)
+        if (argument is NullArray)
+            return new VariantPath?[Math.Max(argument.Length, 1)];
+        if (argument is not StringArray strings)
         {
-            if (strings.IsNull(i) || !string.Equals(strings.GetString(i), text, StringComparison.Ordinal))
-                throw new ArgumentException($"{name} expects its {what} as a constant, not a per-row value");
+            throw new ExpressionAnalysisException(new AnalysisDiagnostic(
+                "DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE",
+                $"The second parameter of `{name}` requires the \"STRING\" type, however it has the type "
+                + $"\"{SparkArrays.Describe(argument.Data.DataType)}\"."));
         }
-        return text;
+
+        var paths = new VariantPath?[Math.Max(strings.Length, 1)];
+        var parsed = new Dictionary<string, VariantPath>(StringComparer.Ordinal);
+        for (int i = 0; i < strings.Length; i++)
+        {
+            if (strings.IsNull(i))
+                continue;
+            string text = strings.GetString(i)!;
+            if (!parsed.TryGetValue(text, out var path))
+            {
+                if (!VariantPath.TryParse(text, out path))
+                {
+                    throw new SparkEvaluationException(
+                        "INVALID_VARIANT_GET_PATH",
+                        $"The path `{text}` is not a valid variant extraction path in `{name}`. A valid path should "
+                        + "start with `$` and is followed by zero or more segments like `[123]`, `.name`, "
+                        + "`['name']`, or `[\"name\"]`.");
+                }
+                parsed.Add(text, path);
+            }
+            paths[i] = path;
+        }
+        return paths;
     }
+
+    /// <summary>
+    /// The type argument: a non-null string, the same throughout. Spark requires a foldable one, which the evaluator
+    /// has already checked; a NULL is refused as Spark refuses <c>cast(null as string)</c> there.
+    /// </summary>
+    private static string TypeText(IArrowArray argument)
+    {
+        string? text = argument is StringArray strings && strings.Length > 0 && !strings.IsNull(0)
+            ? strings.GetString(0)
+            : null;
+        for (int i = 1; text is not null && i < argument.Length; i++)
+        {
+            if (argument.IsNull(i) || !string.Equals(((StringArray)argument).GetString(i), text, StringComparison.Ordinal))
+                text = null;
+        }
+        return text ?? throw new ExpressionAnalysisException(NonStringLiteralType);
+    }
+
+    /// <summary>Spark's refusal of a type argument that is not a non-null string constant (measured).</summary>
+    internal static AnalysisDiagnostic NonStringLiteralType { get; } = new(
+        "INVALID_SCHEMA.NON_STRING_LITERAL",
+        "The input schema is not a valid schema string. The input expression must be string literal and not null.");
 
     /// <summary>The whole variant at <paramref name="row"/>, which must not be a SQL NULL.</summary>
     private static VariantValue Logical(VariantArray variants, int row) =>

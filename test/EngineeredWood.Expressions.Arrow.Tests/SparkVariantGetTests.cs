@@ -268,6 +268,68 @@ public sealed class SparkVariantGetTests
         Assert.Equal(0, result.Length);
     }
 
+    /// <summary>
+    /// Measured, Spark 4.1 over a path column: each row's path is read, a NULL path is NULL, and an invalid one is
+    /// INVALID_VARIANT_GET_PATH in both forms. The type must be a foldable non-null string (PR #721 review).
+    /// </summary>
+    [Fact]
+    public void APathColumnIsReadPerRow()
+    {
+        var v = Unshredded(
+            Obj2(("a", VariantValue.FromInt8(3)), ("b", VariantValue.FromString("x"))),
+            Obj2(("a", VariantValue.FromInt8(3)), ("b", VariantValue.FromString("7"))),
+            A(VariantValue.FromInt8(3)),
+            A(VariantValue.FromInt8(3)));
+        var batch = WithPaths(v, "$.a", "$.b", null, "$.zz");
+
+        var ints = (Int32Array)Eval("try_variant_get(v, p, 'int')", batch);
+        Assert.Equal(new int?[] { 3, 7, null, null }, Enumerable.Range(0, 4).Select(i => ints.GetValue(i)));
+
+        var strings = (StringArray)Eval("variant_get(v, p, 'string')", batch);
+        Assert.Equal(new[] { "3", "7", null, null }, Enumerable.Range(0, 4).Select(i => strings.GetString(i)));
+
+        var bad = WithPaths(Unshredded(A(VariantValue.FromInt8(3))), "bad");
+        Assert.Equal("INVALID_VARIANT_GET_PATH",
+            Assert.Throws<SparkEvaluationException>(() => Eval("try_variant_get(v, p, 'int')", bad)).ErrorClass);
+    }
+
+    [Fact]
+    public void ATypeThatIsNotAFoldableStringIsRefusedWhateverTheRows()
+    {
+        // Every row of `p` holds 'int', and Spark still refuses it at analysis.
+        var batch = WithPaths(Unshredded(A(VariantValue.FromInt8(3))), "int");
+        Assert.Equal("INVALID_SCHEMA.NON_STRING_LITERAL",
+            Assert.Throws<ExpressionAnalysisException>(() => Eval("variant_get(v, '$.a', p)", batch)).ErrorClass);
+        Assert.Equal("INVALID_SCHEMA.NON_STRING_LITERAL",
+            Assert.Throws<ExpressionAnalysisException>(() => Eval("variant_get(v, '$.a', CAST(NULL AS STRING))", batch)).ErrorClass);
+
+        // A NULL path is not refused: it is NULL.
+        Assert.Null(((Int32Array)Eval("variant_get(v, CAST(NULL AS STRING), 'int')", batch)).GetValue(0));
+    }
+
+    [Fact]
+    public void AnInvalidLiteralPathIsRefusedOverNoRows()
+    {
+        // How a CHECK constraint is analysed: the literal still has its one row.
+        var none = Batch(new VariantArray.Builder().Build());
+        Assert.Throws<SparkEvaluationException>(() => new ArrowRowEvaluator(new SparkFunctionRegistry())
+            .EvaluatePredicate(SparkSqlParser.ParsePredicate("variant_get(v, 'a', 'int') > 0"), none));
+    }
+
+    private static VariantValue Obj2(params (string Key, VariantValue Value)[] fields) =>
+        VariantValue.FromObject(fields.ToDictionary(f => f.Key, f => f.Value));
+
+    private static RecordBatch WithPaths(VariantArray v, params string?[] paths)
+    {
+        var p = new StringArray.Builder();
+        foreach (var path in paths) { if (path is null) p.AppendNull(); else p.Append(path); }
+        var schema = new Schema.Builder()
+            .Field(new Field("v", v.Data.DataType, true))
+            .Field(new Field("p", StringType.Default, true))
+            .Build();
+        return new RecordBatch(schema, new IArrowArray[] { v, p.Build() }, v.Length);
+    }
+
     [Fact]
     public void ATimestampColumnCastsToANumberWithItsFraction()
     {

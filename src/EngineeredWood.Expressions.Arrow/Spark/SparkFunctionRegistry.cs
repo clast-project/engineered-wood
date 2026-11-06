@@ -30,7 +30,7 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </remarks>
 public sealed class SparkFunctionRegistry
     : IFunctionRegistry, IComparisonCoercion, IShortCircuitingFunctions, INullabilityRules,
-      ILiteralPrecisionRules, IAnalysisRules, IConstantFoldedFunctions, IFoldableFunctions
+      ILiteralPrecisionRules, IAnalysisRules, IConstantFoldedFunctions, IFoldableFunctions, IFoldableArgumentRules
 {
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
@@ -72,6 +72,17 @@ public sealed class SparkFunctionRegistry
     /// <c>current_date()</c>, ...) is not registered. A function added that is not must answer false here.
     /// </summary>
     public bool IsFoldable(string name) => IsRegistered(name);
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// Only <c>variant_get</c>'s type: measured against Spark 4.1, a type column is
+    /// <c>INVALID_SCHEMA.NON_STRING_LITERAL</c> whatever its rows hold, while the path may be a column (each row's
+    /// path is read). <c>cast</c>'s type is a string literal by construction (the parser puts it there).
+    /// </remarks>
+    public AnalysisDiagnostic? CheckFoldableArguments(string name, ReadOnlySpan<bool> argumentsFoldable) =>
+        name is "variant_get" or "try_variant_get" && argumentsFoldable.Length == 3 && !argumentsFoldable[2]
+            ? SparkVariants.NonStringLiteralType
+            : null;
 
     public bool IsRegistered(string name) => name switch
     {
