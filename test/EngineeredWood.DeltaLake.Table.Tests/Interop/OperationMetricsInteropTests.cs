@@ -161,7 +161,9 @@ public class OperationMetricsInteropTests : IDisposable
     }
 
     /// <summary>With deletion vectors the file keeps its unchanged rows (#704): the vector masks the updated row 3 and
-    /// its post-image goes to a new file, so no file is removed and no row copied.</summary>
+    /// its post-image goes to a new file, so the file stays in the table and no row is copied. The metrics still
+    /// count it as removed: unlike its DELETE and MERGE, Spark's deletion-vector UPDATE reports the masked file in
+    /// <c>numRemovedFiles</c> and <c>numRemovedBytes</c>, and so does this library.</summary>
     [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
