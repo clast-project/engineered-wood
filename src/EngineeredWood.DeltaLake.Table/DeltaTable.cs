@@ -8544,9 +8544,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             ResolveIsolation(baseSnapshot);
 
         // Every file's stats before any deletion vector is written: a refusal part-way would orphan one.
+        // The variant bounds are added from each footer here, once, rather than in BuildActionsAsync: a rebase
+        // re-derives the actions, and the file it would read again has not changed (#693).
         var statsByIndex = new string[files.Count];
         for (int fi = 0; fi < files.Count; fi++)
-            statsByIndex[fi] = StatsCarryingCount(files[fi]);
+        {
+            statsByIndex[fi] = await StatsWithFooterVariantBoundsAsync(
+                baseSnapshot, files[fi], StatsCarryingCount(files[fi]), cancellationToken).ConfigureAwait(false);
+        }
 
         // deletedPositionsByFileIndex: rows of a not-yet-committed file that a buffered transaction deleted
         // after inserting them (same-transaction DML) — the add is born with a deletion vector, so the rows
@@ -8925,6 +8930,124 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// The stats of a host's file (<see cref="StatsCarryingCount"/>), given the variant <c>minValues</c> /
+    /// <c>maxValues</c> the file's footer supports (#693). The bounds come from
+    /// <see cref="Stats.VariantFooterStats"/>, the same code the append path uses (#675, #692), so a host does not
+    /// have to rebuild delta-spark's rules.
+    /// </summary>
+    /// <remarks>
+    /// <para>The footer is read only when it can add something: the table allows shredding (Delta allows variant
+    /// bounds only then), it has a top-level variant column the table's data-skipping properties take stats for,
+    /// and the host's stats have no bound for that column. A host's own bound is kept as given. A file with
+    /// nothing to add costs no read.</para>
+    /// <para>If the footer cannot be read, the stage or commit fails. As in #692, committing with
+    /// <c>nullCount</c> only would make the file's bounds, and whether a scan prunes it, depend on a transient
+    /// error. Nothing has been written at that point, so the call can be retried.</para>
+    /// <para>The table's schema and properties come from <paramref name="snapshot"/>. A variant column that a
+    /// schema change in the same commit adds gets no bound.</para>
+    /// </remarks>
+    private async ValueTask<string> StatsWithFooterVariantBoundsAsync(
+        Snapshot.Snapshot snapshot, WrittenDataFile file, string stats, CancellationToken cancellationToken)
+    {
+        if (!VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration))
+            return stats;
+
+        var selection = StatsSelection(snapshot.Schema, snapshot.Metadata);
+        var mode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        List<string>? missing = null;
+        using (var doc = System.Text.Json.JsonDocument.Parse(stats))
+        {
+            var root = doc.RootElement;
+            foreach (var field in snapshot.Schema.Fields)
+            {
+                if (field.Type is not Schema.PrimitiveType { TypeName: "variant" })
+                    continue;
+                string physical = ColumnMapping.GetPhysicalName(field, mode);
+                if (!selection.Includes(physical, out _))
+                    continue;
+                // Either side present means the host supplied the column's bounds: they are left alone.
+                if (HasEntry(root, "minValues", physical) || HasEntry(root, "maxValues", physical))
+                    continue;
+                // A min/max map that is not an object cannot take an entry; leave the stats as the host wrote them.
+                if (!ObjectOrAbsent(root, "minValues") || !ObjectOrAbsent(root, "maxValues"))
+                    return stats;
+                (missing ??= []).Add(physical);
+            }
+        }
+        if (missing is null)
+            return stats;
+
+        EngineeredWood.Parquet.Metadata.FileMetaData footer;
+        await using (var stream = await _fs.OpenReadAsync(file.RelativePath, cancellationToken).ConfigureAwait(false))
+        {
+            using var reader = new Parquet.ParquetFileReader(stream, ownsFile: false);
+            footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        }
+        var bounds = Stats.VariantFooterStats.Compute(footer, missing, selection.StringPrefixLength);
+        return bounds.Count == 0 ? stats : StatsWithVariantBounds(stats, bounds);
+
+        static bool HasEntry(System.Text.Json.JsonElement root, string map, string column) =>
+            root.TryGetProperty(map, out var values)
+            && values.ValueKind == System.Text.Json.JsonValueKind.Object
+            && values.TryGetProperty(column, out _);
+
+        static bool ObjectOrAbsent(System.Text.Json.JsonElement root, string map) =>
+            !root.TryGetProperty(map, out var values) || values.ValueKind == System.Text.Json.JsonValueKind.Object;
+    }
+
+    /// <summary><paramref name="stats"/> with <paramref name="bounds"/> added to its <c>minValues</c> /
+    /// <c>maxValues</c> (each created when absent). The caller has checked that neither map names these columns
+    /// already and that each one present is an object. Every other property is copied unchanged.</summary>
+    private static string StatsWithVariantBounds(
+        string stats, IReadOnlyDictionary<string, (string Min, string Max)> bounds)
+    {
+        using var doc = System.Text.Json.JsonDocument.Parse(stats);
+        using var stream = new MemoryStream();
+        using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            bool wroteMin = false, wroteMax = false;
+            foreach (var prop in doc.RootElement.EnumerateObject())
+            {
+                if (prop.NameEquals("minValues"))
+                {
+                    WriteMap(writer, "minValues", prop.Value, min: true);
+                    wroteMin = true;
+                }
+                else if (prop.NameEquals("maxValues"))
+                {
+                    WriteMap(writer, "maxValues", prop.Value, min: false);
+                    wroteMax = true;
+                }
+                else
+                {
+                    prop.WriteTo(writer);
+                }
+            }
+            if (!wroteMin)
+                WriteMap(writer, "minValues", existing: null, min: true);
+            if (!wroteMax)
+                WriteMap(writer, "maxValues", existing: null, min: false);
+            writer.WriteEndObject();
+        }
+        return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+
+        void WriteMap(System.Text.Json.Utf8JsonWriter writer, string name, System.Text.Json.JsonElement? existing, bool min)
+        {
+            writer.WritePropertyName(name);
+            writer.WriteStartObject();
+            if (existing is { } values)
+            {
+                foreach (var entry in values.EnumerateObject())
+                    entry.WriteTo(writer);
+            }
+            foreach (var (column, (lo, hi)) in bounds)
+                writer.WriteString(column, min ? lo : hi);
+            writer.WriteEndObject();
+        }
+    }
+
+    /// <summary>
     /// The row count an add's row-id range is sized by. A file without one is refused rather than given an empty
     /// range: the next file's ids would overlap its rows. delta-spark refuses the same file
     /// (<c>DELTA_ROW_ID_ASSIGNMENT_WITHOUT_STATS</c>).
@@ -9256,12 +9379,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     internal (IReadOnlyList<DeltaAction> Actions, long NextRowId) BuildStagedAppendActions(
         Snapshot.Snapshot snapshot, IReadOnlyList<WrittenDataFile> files, long? rowIdStart)
     {
-        // No born-deleted rows means no deletion vector to write, so this path performs no I/O and the
-        // ValueTask below is already completed — which is what lets the synchronous StageDataFiles keep its
-        // signature while sharing one definition of what a staged add looks like.
+        // No born-deleted rows means no deletion vector to write, and no footer is read for variant bounds, so
+        // this path performs no I/O and the ValueTask below is already completed — which is what lets the
+        // synchronous StageDataFiles keep its signature while sharing one definition of what a staged add looks
+        // like.
         var pending = BuildStagedAppendActionsAsync(
             snapshot, files, bornDeleted: null, identityValuesPreGenerated: false, rowIdStart,
-            CancellationToken.None);
+            CancellationToken.None, footerVariantBounds: false);
         System.Diagnostics.Debug.Assert(pending.IsCompleted, "the no-DV staging path must not perform I/O");
         var (actions, nextRowId, _) = pending.GetAwaiter().GetResult();
         return (actions, nextRowId);
@@ -9280,6 +9404,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <param name="written">Records only the born-deleted vector's <c>.bin</c>, when one is written to a file
     /// at all. The DATA files are the HOST's — it wrote them and it decides their lifetime — so an abort of the
     /// transaction they were staged on must not delete them.</param>
+    /// <param name="footerVariantBounds">Adds the variant bounds each file's footer supports to stats that lack
+    /// them (<see cref="StatsWithFooterVariantBoundsAsync"/>), which can read the footer. False only for the
+    /// synchronous <see cref="DeltaTransaction.StageDataFiles"/>, which must not perform I/O.</param>
     /// <returns>The actions, the next free stable row id, and the rows the commit will make VISIBLE
     /// (every file's <c>numRecords</c> less anything <paramref name="bornDeleted"/> hides).</returns>
     internal async ValueTask<(IReadOnlyList<DeltaAction> Actions, long NextRowId, long LiveRows)>
@@ -9290,7 +9417,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             bool identityValuesPreGenerated,
             long? rowIdStart,
             CancellationToken cancellationToken,
-            WrittenFileLedger? written = null)
+            WrittenFileLedger? written = null,
+            bool footerVariantBounds = true)
     {
         // Mirrors CommitDataFilesAsync' gate exactly: identity columns need write-time per-row processing an
         // outside writer did not do, UNLESS the caller generated the values itself (GenerateIdentityValues) —
@@ -9317,7 +9445,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // Every file's stats before any deletion vector is written: a refusal part-way would orphan one.
         var statsByIndex = new string[files.Count];
         for (int fi = 0; fi < files.Count; fi++)
+        {
             statsByIndex[fi] = StatsCarryingCount(files[fi]);
+            if (footerVariantBounds)
+            {
+                statsByIndex[fi] = await StatsWithFooterVariantBoundsAsync(
+                    snapshot, files[fi], statsByIndex[fi], cancellationToken).ConfigureAwait(false);
+            }
+        }
 
         for (int fi = 0; fi < files.Count; fi++)
         {

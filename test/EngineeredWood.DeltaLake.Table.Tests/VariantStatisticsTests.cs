@@ -660,6 +660,167 @@ public class VariantStatisticsTests : IDisposable
         AssertBounds(await AddedStatsAsync(fs, version!.Value), (-2, "w"), (9, "y"));
     }
 
+    // ── Files a host wrote AND gave stats for, committed through CommitDataFilesAsync or StageDataFilesAsync (#693).
+    // The host's stats say nothing about the shredded paths, so EW reads the bounds from the file's footer. ──
+
+    /// <summary>A host's stats for <see cref="ThreeRows"/>, as DuckDB's RETURN_STATS gives them: no variant bound.</summary>
+    private const string HostStats = """{"numRecords":3,"minValues":{"id":0},"maxValues":{"id":2},"nullCount":{"id":0,"v":0}}""";
+
+    /// <summary>Writes <see cref="ThreeRows"/> as a host would, straight to the table directory, shredded.</summary>
+    private static async Task<WrittenDataFile> HostFileAsync(LocalTableFileSystem fs, string? stats, string name = "host.parquet")
+    {
+        long size;
+        await using (var file = await fs.CreateAsync(name))
+        {
+            await using (var writer = new ParquetFileWriter(file, ownsFile: false, HostShreds))
+            {
+                await writer.WriteRowGroupAsync(Batch(ThreeRows));
+                await writer.CloseAsync();
+            }
+            size = file.Position;
+        }
+        return new WrittenDataFile(name, size, ThreeRows.Length, null, stats);
+    }
+
+    /// <summary>A file the table never reads: committing it shows that no footer was read.</summary>
+    private static WrittenDataFile AbsentFile(string? stats = HostStats) => new("absent.parquet", 100, 3, null, stats);
+
+    [Theory]
+    [InlineData(HostStats)]
+    [InlineData(null)]
+    public async Task CommitDataFiles_AHostFileWithoutVariantBounds_GetsTheFootersBounds(string? stats)
+    {
+        var fs = NewTableDir("t");
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled());
+
+        long version = await table.CommitDataFilesAsync([await HostFileAsync(fs, stats)]);
+
+        var committed = await AddedStatsAsync(fs, version);
+        AssertBounds(committed, (-2, "w"), (9, "y"));
+        Assert.Equal(3, committed.GetProperty("numRecords").GetInt64());
+        if (stats is not null)
+        {
+            // The host's own entries are kept beside the added bounds.
+            Assert.Equal(0, committed.GetProperty("minValues").GetProperty("id").GetInt64());
+            Assert.Equal(2, committed.GetProperty("maxValues").GetProperty("id").GetInt64());
+            Assert.Equal(0, committed.GetProperty("nullCount").GetProperty("v").GetInt64());
+        }
+    }
+
+    [Fact]
+    public async Task CommitDataFiles_GivesTheBoundsEwsOwnWriterGives()
+    {
+        var ewFs = NewTableDir("ew");
+        await using (var table = await DeltaTable.CreateAsync(
+            ewFs, VariantSchema(), configuration: Enabled(), options: Writer(ewFs, host: false)))
+            await table.WriteAsync([Batch(ThreeRows)]);
+        var hostFs = NewTableDir("host");
+        await using var hostTable = await DeltaTable.CreateAsync(hostFs, VariantSchema(), configuration: Enabled());
+        long version = await hostTable.CommitDataFilesAsync([await HostFileAsync(hostFs, HostStats)]);
+
+        var ew = await AddedStatsAsync(ewFs, 1);
+        var host = await AddedStatsAsync(hostFs, version);
+        foreach (string side in new[] { "minValues", "maxValues" })
+            Assert.Equal(ew.GetProperty(side).GetProperty("v").GetString(), host.GetProperty(side).GetProperty("v").GetString());
+    }
+
+    [Fact]
+    public async Task StageDataFilesAsync_AHostFileWithoutVariantBounds_GetsTheFootersBounds()
+    {
+        var fs = NewTableDir("t");
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled());
+
+        var txn = table.StartTransaction();
+        await txn.StageDataFilesAsync([await HostFileAsync(fs, HostStats)]);
+        long version = await txn.CommitAsync();
+
+        AssertBounds(await AddedStatsAsync(fs, version), (-2, "w"), (9, "y"));
+    }
+
+    [Fact]
+    public async Task StageDataFiles_TheSynchronousOverload_ReadsNoFooter()
+    {
+        var fs = NewTableDir("t");
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled());
+
+        var txn = table.StartTransaction();
+        txn.StageDataFiles([await HostFileAsync(fs, HostStats)]);
+        long version = await txn.CommitAsync();
+
+        AssertNoBounds(await AddedStatsAsync(fs, version));
+    }
+
+    [Fact]
+    public async Task CommitDataFiles_AHostsOwnVariantBound_IsKeptAsGiven()
+    {
+        var fs = NewTableDir("t");
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled());
+        const string Given = """{"numRecords":3,"minValues":{"v":"host-min"},"maxValues":{"v":"host-max"},"nullCount":{"v":0}}""";
+
+        // The file is never read: the host's bound stands, whatever the footer would say.
+        long version = await table.CommitDataFilesAsync([AbsentFile(Given)]);
+
+        var committed = await AddedStatsAsync(fs, version);
+        Assert.Equal("host-min", committed.GetProperty("minValues").GetProperty("v").GetString());
+        Assert.Equal("host-max", committed.GetProperty("maxValues").GetProperty("v").GetString());
+    }
+
+    [Fact]
+    public async Task CommitDataFiles_OnATableWithoutShredding_ReadsNoFooter()
+    {
+        var fs = NewTableDir("t");
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema());
+
+        long version = await table.CommitDataFilesAsync([AbsentFile()]);
+
+        Assert.Equal(HostStats, (await new TransactionLog(fs).ReadCommitAsync(version)).OfType<AddFile>().Single().Stats);
+    }
+
+    [Fact]
+    public async Task CommitDataFiles_AVariantColumnOutsideTheStatsColumns_ReadsNoFooter()
+    {
+        var fs = NewTableDir("t");
+        var configuration = Enabled();
+        configuration["delta.dataSkippingStatsColumns"] = "id";
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: configuration);
+
+        long version = await table.CommitDataFilesAsync([AbsentFile()]);
+
+        Assert.Equal(HostStats, (await new TransactionLog(fs).ReadCommitAsync(version)).OfType<AddFile>().Single().Stats);
+    }
+
+    [Fact]
+    public async Task CommitDataFiles_AFooterThatCannotBeRead_FailsTheCommit()
+    {
+        var fs = NewTableDir("t");
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled());
+
+        await Assert.ThrowsAnyAsync<IOException>(async () => await table.CommitDataFilesAsync([AbsentFile()]));
+
+        Assert.Equal(0, table.CurrentSnapshot.Version);
+    }
+
+    [Fact]
+    public async Task CommitDataFiles_AnUnshreddedHostFile_GetsNoBounds()
+    {
+        var fs = NewTableDir("t");
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled());
+        long size;
+        await using (var file = await fs.CreateAsync("plain.parquet"))
+        {
+            await using (var writer = new ParquetFileWriter(file, ownsFile: false, ParquetWriteOptions.Default))
+            {
+                await writer.WriteRowGroupAsync(Batch(ThreeRows));
+                await writer.CloseAsync();
+            }
+            size = file.Position;
+        }
+
+        long version = await table.CommitDataFilesAsync([new WrittenDataFile("plain.parquet", size, 3, null, HostStats)]);
+
+        Assert.Equal(HostStats, (await new TransactionLog(fs).ReadCommitAsync(version)).OfType<AddFile>().Single().Stats);
+    }
+
     // ── A footer EW did not write (#695 review). A host IDataFileWriter's file is bounded from its footer read back,
     // and the footer that matters is DuckDB's: the writer behind fabricator's IDataFileWriter. ──
 
