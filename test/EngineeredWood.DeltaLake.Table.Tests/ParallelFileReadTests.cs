@@ -785,6 +785,173 @@ public class ParallelFileReadTests : IDisposable
         Assert.Equal(0, tracking.Open);
     }
 
+    // ── #713: the files opened ahead are planned ahead ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A filtered scan plans the files it has opened ahead at once, not one after another (#713). Each file's
+    /// row-group pruning here needs a read of its own (the dictionary of a <c>tag</c> column whose statistics
+    /// span the value, which the dictionary then proves absent), and against an object store that read is a
+    /// round trip: planned one file at a time, the scan paid one round trip per file, in series. Every row group
+    /// is pruned, so the only reads besides the footers are the planning's, and several files must have one in
+    /// flight at once. Measured before the fix: 1.
+    /// </summary>
+    [Fact]
+    public async Task AFilteredScan_PlansTheFilesItOpenedAhead_AtOnce()
+    {
+        const int files = 8;
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("tag", StringType.Default, false))
+            .Build();
+        await using (var create = await DeltaTable.CreateAsync(_fs, schema, Options(1)))
+        {
+            for (int f = 0; f < files; f++)
+            {
+                var ids = new Int64Array.Builder();
+                var tags = new StringArray.Builder();
+                for (int r = 0; r < RowsPerFile; r++)
+                {
+                    ids.Append((long)f * RowsPerFile + r);
+                    tags.Append(r % 2 == 0 ? "a" : "c");
+                }
+                await create.WriteAsync([new RecordBatch(schema, [ids.Build(), tags.Build()], RowsPerFile)]);
+            }
+        }
+
+        var fs = new PlanningReadsFileSystem(_fs, delayMs: 50);
+        await using var table = await DeltaTable.OpenAsync(fs, Options(files));
+        long rows = 0;
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Filter = Ex.Equal("tag", LiteralValue.Of("b")) }))
+        {
+            rows += batch.Length;
+            batch.Dispose();
+        }
+
+        // The dictionaries pruned every row group (the statistics cannot: "b" lies between "a" and "c").
+        Assert.Equal(0, rows);
+        Assert.Equal(files, fs.FilesRead);
+        Assert.InRange(fs.MaxFilesPlanning, 2, files);
+    }
+
+    /// <summary>
+    /// Counts, over the data files, the most that had a read in flight at once other than a footer read (one
+    /// ending at the end of the file, or at its last 8 bytes: the length and magic). Every read is delayed.
+    /// </summary>
+    private sealed class PlanningReadsFileSystem(ITableFileSystem inner, int delayMs) : ITableFileSystem
+    {
+        private readonly object _gate = new();
+        private readonly Dictionary<string, int> _inFlight = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _read = new(StringComparer.Ordinal);
+        public int MaxFilesPlanning;
+
+        public int FilesRead
+        {
+            get
+            {
+                lock (_gate)
+                    return _read.Count;
+            }
+        }
+
+        public PathNameConstraints PathConstraints => inner.PathConstraints;
+
+        public async ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
+        {
+            var file = await inner.OpenReadAsync(path, cancellationToken);
+            return path.EndsWith(".parquet", StringComparison.Ordinal) && !path.Contains("_delta_log")
+                ? new File(file, path, this)
+                : file;
+        }
+
+        public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default)
+            => inner.ListAsync(prefix, cancellationToken);
+        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ReadAllBytesAsync(path, cancellationToken);
+        public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
+            => inner.CreateAsync(path, overwrite, cancellationToken);
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
+            => inner.DeleteAsync(path, cancellationToken);
+        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ExistsAsync(path, cancellationToken);
+        public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+        public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.WriteAllBytesAsync(path, data, cancellationToken);
+
+        private void Enter(string path, bool planning)
+        {
+            lock (_gate)
+            {
+                _read.Add(path);
+                if (!planning)
+                    return;
+                _inFlight[path] = _inFlight.TryGetValue(path, out int n) ? n + 1 : 1;
+                MaxFilesPlanning = Math.Max(MaxFilesPlanning, _inFlight.Count);
+            }
+        }
+
+        private void Exit(string path, bool planning)
+        {
+            if (!planning)
+                return;
+            lock (_gate)
+            {
+                if (--_inFlight[path] == 0)
+                    _inFlight.Remove(path);
+            }
+        }
+
+        private sealed class File(IRandomAccessFile file, string path, PlanningReadsFileSystem owner) : IRandomAccessFile
+        {
+            public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
+                => file.GetLengthAsync(cancellationToken);
+
+            public async ValueTask<System.Buffers.IMemoryOwner<byte>> ReadAsync(
+                FileRange range, CancellationToken cancellationToken = default)
+            {
+                bool planning = !await IsFooterAsync([range], cancellationToken);
+                owner.Enter(path, planning);
+                try
+                {
+                    await Task.Delay(owner._delayMs, cancellationToken);
+                    return await file.ReadAsync(range, cancellationToken);
+                }
+                finally
+                {
+                    owner.Exit(path, planning);
+                }
+            }
+
+            public async ValueTask<IReadOnlyList<System.Buffers.IMemoryOwner<byte>>> ReadRangesAsync(
+                IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
+            {
+                bool planning = !await IsFooterAsync(ranges, cancellationToken);
+                owner.Enter(path, planning);
+                try
+                {
+                    await Task.Delay(owner._delayMs, cancellationToken);
+                    return await file.ReadRangesAsync(ranges, cancellationToken);
+                }
+                finally
+                {
+                    owner.Exit(path, planning);
+                }
+            }
+
+            private async ValueTask<bool> IsFooterAsync(IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken)
+            {
+                long length = await file.GetLengthAsync(cancellationToken);
+                return ranges.All(r => r.End == length || r.End == length - 8);
+            }
+
+            public void Dispose() => file.Dispose();
+
+            public ValueTask DisposeAsync() => file.DisposeAsync();
+        }
+
+        private readonly int _delayMs = delayMs;
+    }
+
     // ── #633: ReadRowsAsync by row group ───────────────────────────────────────────────────────────────────
 
     /// <summary>

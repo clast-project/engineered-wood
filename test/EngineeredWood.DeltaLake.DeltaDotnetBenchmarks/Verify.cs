@@ -53,13 +53,24 @@ internal static class Verify
                 foreach (var method in type.GetMethods().Where(m => m.GetCustomAttribute<BenchmarkAttribute>() != null))
                 {
                     string category = method.GetCustomAttribute<BenchmarkCategoryAttribute>()?.Categories[0] ?? "";
+                    if (!TraceMarks.Selected(method.Name))
+                        continue;
                     InvokeIterationSetup(instance, type, method.Name);
                     string result;
+                    await TraceMarks.BeginAsync($"{label}.{method.Name}");
                     var sw = Stopwatch.StartNew();
                     try
                     {
-                        long value = await (Task<long>)method.Invoke(instance, null)!;
-                        sw.Stop();
+                        long value;
+                        try
+                        {
+                            value = await (Task<long>)method.Invoke(instance, null)!;
+                        }
+                        finally
+                        {
+                            sw.Stop();
+                            await TraceMarks.EndAsync();
+                        }
                         if (instance is MutationBenchmark mutation)
                         {
                             var byEw = await Ew.FingerprintAsync(mutation.CurrentPath!);
@@ -107,7 +118,6 @@ internal static class Verify
                     }
                     catch (Exception ex)
                     {
-                        sw.Stop();
                         var inner = ex is TargetInvocationException { InnerException: { } e } ? e : ex;
                         result = $"THREW {inner.GetType().Name}: {inner.Message}";
                     }

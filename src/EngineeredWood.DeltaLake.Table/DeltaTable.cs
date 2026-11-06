@@ -6329,16 +6329,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// The units of a scan of <paramref name="files"/>, file after file and, within a file, row group after row
     /// group: the order a serial read gives. Enumerated once, in order (by the scan's dispatcher when it runs in
-    /// parallel), because a file's row-group pruning is not thread-safe.
+    /// parallel).
     /// <para>Each file is opened once (<see cref="OpenDataFileAsync"/>: its footer, deletion vector, column
     /// resolution), and up to <paramref name="lookahead"/> files are opened ahead of the one being planned, so
-    /// that a footer's round trip overlaps the reads in flight rather than stalling the planning. A file whose
-    /// row groups are all pruned yields no unit and is closed here; otherwise its last unit to end closes it.
-    /// Files opened ahead but never planned, because the scan stopped, are closed when the enumeration ends.</para>
+    /// that a footer's round trip overlaps the reads in flight rather than stalling the planning. A file opened
+    /// ahead is also PLANNED ahead, on its opening task: its row-group pruning (the dictionary probes and page
+    /// index reads, a round trip or two each) runs alongside the other files' rather than one file at a time in
+    /// this enumeration, where against an object store it held the scan to one file's planning per round trip
+    /// (#713). Planning one file is not thread-safe, but each file has a reader of its own, so planning several
+    /// files at once is. The first file is planned here, lazily, so that its first row groups are read while
+    /// its later ones are still being planned.</para>
+    /// <para>A file whose row groups are all pruned yields no unit and is closed here; otherwise its last unit
+    /// to end closes it. Files opened ahead but never planned, because the scan stopped, are closed when the
+    /// enumeration ends.</para>
     /// <para><paramref name="skipRows"/>, when given, names for each file (by its index in
     /// <paramref name="files"/>) further rows the caller needs none of, on top of those its deletion vector
     /// deletes: <see cref="ReadRowsAsync"/> skips every row group, and every long run within one, that holds no
-    /// selected row (#633). It is called in file order, by the planner, once per file.</para>
+    /// selected row (#633). It is called once per file, from whichever task plans that file, so it must be safe
+    /// to call concurrently for different files.</para>
     /// </summary>
     private async IAsyncEnumerable<ScanUnit> PlanScanUnitsAsync(
         Snapshot.Snapshot snapshot,
@@ -6348,11 +6356,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         [EnumeratorCancellation] CancellationToken cancellationToken,
         Func<int, RowSkipPredicate?>? skipRows = null)
     {
-        var opening = new Queue<Task<DataFileRead>>();
+        var opening = new Queue<Task<OpenedFile>>();
         int next = 0;
         // The files opened ahead are the planner's: when it stops (an error, an early exit, the scan's own
-        // cancellation) it cancels them BEFORE waiting for them, so that a stalled footer read on a later file
-        // cannot hold back the error or the exit that stopped it.
+        // cancellation) it cancels them BEFORE waiting for them, so that a stalled footer read or plan on a later
+        // file cannot hold back the error or the exit that stopped it.
         using var openingCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         try
         {
@@ -6360,16 +6368,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 while (next < files.Count && opening.Count < Math.Max(1, lookahead))
                 {
-                    var addFile = files[next++];
                     // The scan forwards its predicate to the row-group level: it promises only a superset of the
                     // matching rows (so does a predicate DELETE, which prunes in ComputeDeleteActionsAsync).
                     // Compaction, CDF and the copy-on-write rewrites must see every row of a file they read, and
                     // never pass one.
-                    opening.Enqueue(OpenDataFileAsync(
-                        addFile, options.Columns, snapshot, options.Filter, openingCts.Token).AsTask());
+                    int file = next++;
+                    opening.Enqueue(OpenScanFileAsync(
+                        snapshot, options, files[file], skipRows, file, planAhead: file > 0, openingCts.Token));
                 }
 
-                var read = await opening.Dequeue().ConfigureAwait(false);
+                var (read, plans) = await opening.Dequeue().ConfigureAwait(false);
                 try
                 {
                     if (read.Reader is null)
@@ -6377,16 +6385,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         read.AddRef();
                         yield return new ScanUnit(f, read, null);
                     }
+                    else if (plans is not null)
+                    {
+                        foreach (var plan in plans)
+                        {
+                            read.AddRef();
+                            yield return new ScanUnit(f, read, plan);
+                        }
+                    }
                     else
                     {
-                        var skip = read.SkipRows;
-                        if (skipRows?.Invoke(f) is { } extra)
-                        {
-                            var deleted = skip;
-                            skip = deleted is null ? extra : (first, count) => extra(first, count) || deleted(first, count);
-                        }
                         await foreach (var plan in read.Reader.PlanRowGroupsAsync(
-                                           read.FilePredicate, read.FileColumns, skip, cancellationToken)
+                                           read.FilePredicate, read.FileColumns, SkipOf(read, skipRows?.Invoke(f)),
+                                           cancellationToken)
                                            .ConfigureAwait(false))
                         {
                             read.AddRef();
@@ -6409,7 +6420,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 try
                 {
-                    (await opening.Dequeue().ConfigureAwait(false)).Release();
+                    (await opening.Dequeue().ConfigureAwait(false)).Read.Release();
                 }
                 catch
                 {
@@ -6418,6 +6429,54 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 }
             }
         }
+    }
+
+    /// <summary>A file a scan has opened, and, when it was planned ahead, the row groups it reads.</summary>
+    private readonly record struct OpenedFile(DataFileRead Read, List<ParquetFileReader.RowGroupPlan>? Plans);
+
+    /// <summary>
+    /// Opens file <paramref name="file"/> of a scan and, with <paramref name="planAhead"/> and the built-in
+    /// reader, plans its row groups too (<see cref="PlanScanUnitsAsync"/>). On failure nothing is left open.
+    /// </summary>
+    private async Task<OpenedFile> OpenScanFileAsync(
+        Snapshot.Snapshot snapshot,
+        DeltaReadOptions options,
+        AddFile addFile,
+        Func<int, RowSkipPredicate?>? skipRows,
+        int file,
+        bool planAhead,
+        CancellationToken cancellationToken)
+    {
+        var read = await OpenDataFileAsync(addFile, options.Columns, snapshot, options.Filter, cancellationToken)
+            .ConfigureAwait(false);
+        if (!planAhead || read.Reader is null)
+            return new OpenedFile(read, null);
+        try
+        {
+            var plans = new List<ParquetFileReader.RowGroupPlan>();
+            await foreach (var plan in read.Reader.PlanRowGroupsAsync(
+                               read.FilePredicate, read.FileColumns, SkipOf(read, skipRows?.Invoke(file)),
+                               cancellationToken)
+                               .ConfigureAwait(false))
+            {
+                plans.Add(plan);
+            }
+            return new OpenedFile(read, plans);
+        }
+        catch
+        {
+            read.Release();
+            throw;
+        }
+    }
+
+    /// <summary>The rows a scan skips in a file: those its deletion vector deletes, and <paramref name="extra"/>.</summary>
+    private static RowSkipPredicate? SkipOf(DataFileRead read, RowSkipPredicate? extra)
+    {
+        var deleted = read.SkipRows;
+        if (extra is null)
+            return deleted;
+        return deleted is null ? extra : (first, count) => extra(first, count) || deleted(first, count);
     }
 
     /// <summary>
