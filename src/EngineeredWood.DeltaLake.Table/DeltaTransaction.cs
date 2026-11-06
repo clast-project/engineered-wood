@@ -300,6 +300,13 @@ public sealed class DeltaTransaction : IAsyncDisposable
     private long _updatedRows;
     private MergeMetrics? _mergeMetrics;
 
+    // What the staged DML was asked to do, for the commit's operationParameters (#591): each DELETE's or UPDATE's
+    // condition (null for a delegate or a row selection, which have no text), each MERGE's options, each
+    // replaceWhere's condition.
+    private readonly List<Expressions.Predicate?> _dmlConditions = [];
+    private readonly List<MergeOptions> _merges = [];
+    private readonly List<Expressions.Predicate> _replaceWheres = [];
+
     // Whether StageActions staged a data-changing add or remove. Its rows are not counted by any staging call,
     // so the commit's metrics would fold them into the DML's (an added file's rows into copied rows).
     private bool _rawDataActionsStaged;
@@ -317,6 +324,43 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// </summary>
     internal IReadOnlyDictionary<string, string>? OperationMetricsFor(IReadOnlyList<DeltaAction> actions)
     {
+        return SoleStagedKind(actions) switch
+        {
+            "DELETE" => DmlOperationMetrics.ForDelete(actions, _deletedRows),
+            "UPDATE" => DmlOperationMetrics.ForUpdate(actions, _updatedRows),
+            "MERGE" when _mergeMetrics is { } merge => DmlOperationMetrics.ForMerge(actions, merge),
+            ReplaceWhereKind => DmlOperationMetrics.ForReplaceWhere(actions, _deletedRows, _replaceWhereRows),
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// The <c>commitInfo.operationParameters</c> the commit records: what a DELETE, UPDATE, MERGE or replaceWhere
+    /// was asked to do (<see cref="DmlOperationParameters"/>). Under the same terms as
+    /// <see cref="OperationMetricsFor"/>: only for a transaction whose staged work is that one kind of operation.
+    /// Several DELETEs or UPDATEs list each condition, as Spark's <c>predicate</c> is a list; several MERGEs or
+    /// replaceWheres record nothing, as their parameters describe one.
+    /// </summary>
+    internal IReadOnlyDictionary<string, string>? OperationParametersFor(IReadOnlyList<DeltaAction> actions)
+    {
+        return SoleStagedKind(actions) switch
+        {
+            "DELETE" or "UPDATE" => DmlOperationParameters.ForConditions(_dmlConditions),
+            "MERGE" when _merges.Count == 1 => DmlOperationParameters.ForMerge(_merges[0]),
+            ReplaceWhereKind when _replaceWheres.Count == 1 => DmlOperationParameters.ForReplaceWhere(_replaceWheres[0]),
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// The one kind of work this transaction staged, when the commit records it as that operation: what its
+    /// <c>operationMetrics</c> and <c>operationParameters</c> can describe. Null for mixed work, for a caller's
+    /// <see cref="Operation"/> naming another, when <see cref="StageActions"/> staged a data-changing add or
+    /// remove that no staging call accounted for, or when a commitInfo staged there names another operation: that
+    /// commitInfo is the one the commit records.
+    /// </summary>
+    private string? SoleStagedKind(IReadOnlyList<DeltaAction> actions)
+    {
         if (_operations.Count != 1 || _rawDataActionsStaged)
             return null;
         string kind = _operations.First();
@@ -332,15 +376,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
                 return null;
             }
         }
-
-        return kind switch
-        {
-            "DELETE" => DmlOperationMetrics.ForDelete(actions, _deletedRows),
-            "UPDATE" => DmlOperationMetrics.ForUpdate(actions, _updatedRows),
-            "MERGE" when _mergeMetrics is { } merge => DmlOperationMetrics.ForMerge(actions, merge),
-            ReplaceWhereKind => DmlOperationMetrics.ForReplaceWhere(actions, _deletedRows, _replaceWhereRows),
-            _ => null,
-        };
+        return kind;
     }
 
     /// <summary>The app-transaction preconditions to re-check on every commit attempt.</summary>
@@ -535,6 +571,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         else
             _opaqueReadPredicate = true;
         _operations.Add("DELETE");
+        _dmlConditions.Add(analyzable);
         _deletedRows += plan.TotalDeleted;
 
         return plan.TotalDeleted;
@@ -584,6 +621,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _removedPaths.Add(path);
         _opaqueReadPredicate = true;
         _operations.Add("UPDATE");
+        _dmlConditions.Add(null);
         _updatedRows += plan.TotalUpdated;
 
         return plan.TotalUpdated;
@@ -624,6 +662,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _removedPaths.Add(path);
         _readPredicates.Add(predicate);
         _operations.Add("UPDATE");
+        _dmlConditions.Add(predicate);
         _updatedRows += plan.TotalUpdated;
 
         return plan.TotalUpdated;
@@ -720,6 +759,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         else if (plan.ScannedTarget)
             _opaqueReadPredicate = true;
         _operations.Add("MERGE");
+        _merges.Add(options);
         _mergeStaged = true;
         _mergeMetrics = _mergeMetrics is { } earlier ? DmlOperationMetrics.Sum(earlier, plan.Metrics) : plan.Metrics;
 
@@ -786,6 +826,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         _dvEdits.AddRange(delete.DvEdits);
         _readPredicates.Add(predicate);
         _operations.Add(ReplaceWhereKind);
+        _replaceWheres.Add(predicate);
         _deletedRows += delete.TotalDeleted;
 
         long rows = 0;
@@ -1000,6 +1041,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         foreach (string path in result.TouchedPaths)
             _removedPaths.Add(path);
         _operations.Add("DELETE");
+        _dmlConditions.Add(null);
         _deletedRows += result.RowsDeleted;
         return result.RowsDeleted;
     }
@@ -1028,6 +1070,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
         _operations.Add("DELETE");
+        _dmlConditions.Add(null);
         _deletedRows += plan.RowsDeleted;
         return plan.RowsDeleted;
     }

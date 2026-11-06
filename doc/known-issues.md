@@ -908,8 +908,18 @@ reads by type. `operationMetrics` is written, under Spark's names and as
 strings, by DELETE, UPDATE and MERGE (#577), and by VACUUM; not by WRITE,
 OPTIMIZE or the metadata commits, and never Spark's timing metrics
 (`executionTimeMs`, `scanTimeMs`, `rewriteTimeMs`). A transaction records them
-only when everything it staged is one kind of DELETE, UPDATE or MERGE. Fields
-still never emitted: `readVersion`, `isolationLevel`, `userId`, `userName`,
+only when everything it staged is one kind of DELETE, UPDATE or MERGE.
+`operationParameters` carries the condition of a DELETE, UPDATE, MERGE or
+replaceWhere (#591), under Spark's keys and in Spark's shapes, and likewise only
+for one kind of staged work. The text is Spark SQL from
+`SparkSqlRenderer` (`(id = 2L)`), which Spark parses and which reads back as the
+same condition. It is not Spark's own text for DML. Spark records its optimized
+Catalyst tree's debug form, `(id#494L = 2)`, with expression ids and unquoted
+strings, which nothing can reproduce or parse. Spark writes its SQL form only for
+`INSERT … REPLACE WHERE`. A delegate condition, a row selection, or a
+tree with no Spark SQL (an unsigned literal, a sub-microsecond timestamp) records
+no parameters, because an empty list would claim the operation had no condition.
+Fields still never emitted: `readVersion`, `isolationLevel`, `userId`, `userName`,
 `txnId`, `clusterId`, `notebook`.
 
 **Post-creation protocol upgrades — partial.** `AddColumnAsync` and
