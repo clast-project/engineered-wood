@@ -14,7 +14,7 @@ param(
     [switch] $Clear
 )
 
-$names = 'EWDD_STORAGE', 'EWDD_AZURE_ACCOUNT', 'EWDD_AZURE_KEY', 'EWDD_AZURE_CONTAINER', 'EWDD_AZURE_PREFIX', 'EWDD_AZURE_EMULATOR'
+$names = 'EWDD_STORAGE', 'EWDD_AZURE_ACCOUNT', 'EWDD_AZURE_KEY', 'EWDD_AZURE_CONTAINER', 'EWDD_AZURE_PREFIX', 'EWDD_AZURE_EMULATOR', 'EWDD_AZURE_CONCURRENCY'
 if ($Clear) {
     foreach ($name in $names) { Remove-Item "Env:$name" -ErrorAction SilentlyContinue }
     Write-Host 'Benchmark storage reset to local disk.'

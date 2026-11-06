@@ -54,8 +54,11 @@ internal abstract class BenchStorage
     /// <summary>delta-rs's <c>storage_options</c> (object_store config keys) for <see cref="DeltaRsUri"/>.</summary>
     public abstract Dictionary<string, string> DeltaRsOptions { get; }
 
-    /// <summary>A small sibling marker (<c>&lt;location&gt;.ready</c>) outside the table, so no vacuum collects it.</summary>
-    public abstract bool MarkerExists(string location);
+    /// <summary>
+    /// The content of a small sibling marker (<c>&lt;location&gt;.ready</c>) outside the table, so no vacuum
+    /// collects it; null when there is none.
+    /// </summary>
+    public abstract string? ReadMarker(string location);
 
     public abstract void WriteMarker(string location, string content);
 
@@ -72,15 +75,19 @@ internal abstract class BenchStorage
     public abstract IEnumerable<string> Children(string location);
 
     /// <summary>
-    /// An exclusive lock on building the template at <paramref name="location"/>, held across the marker
-    /// re-check, the build and the marker. It covers everyone who shares this store: on local disk, the
-    /// processes of this machine; in Azure, every machine using the same container and prefix. Waits until
+    /// An exclusive lock on building the template named by <paramref name="location"/>'s marker, held across
+    /// the marker re-check, the build and the marker. It covers everyone who shares this store: on local disk,
+    /// the processes of this machine; in Azure, every machine using the same container and prefix. Waits until
     /// free. A holder that dies releases it (the OS closes a file; a blob lease expires).
+    ///
+    /// <para>It saves duplicate builds; correctness does not rest on it. Each build writes a location of its
+    /// own, so a holder that lost the lock (a lease that expired while the process stalled) can only finish
+    /// and publish a second complete build, never write into someone else's.</para>
     /// </summary>
-    public abstract BuildLock AcquireBuildLock(string location, string name);
+    public abstract IDisposable AcquireBuildLock(string location, string name);
 
     /// <summary>Retries <paramref name="tryAcquire"/> until it returns a lock, for up to 30 minutes.</summary>
-    protected static BuildLock WaitFor(string name, Func<BuildLock?> tryAcquire)
+    protected static IDisposable WaitFor(string name, Func<IDisposable?> tryAcquire)
     {
         var waited = System.Diagnostics.Stopwatch.StartNew();
         bool announced = false;
@@ -128,7 +135,8 @@ internal sealed class LocalStorage : BenchStorage
 
     public override Dictionary<string, string> DeltaRsOptions { get; } = [];
 
-    public override bool MarkerExists(string location) => File.Exists(location + ".ready");
+    public override string? ReadMarker(string location) =>
+        File.Exists(location + ".ready") ? File.ReadAllText(location + ".ready") : null;
 
     public override void WriteMarker(string location, string content) => File.WriteAllText(location + ".ready", content);
 
@@ -169,7 +177,7 @@ internal sealed class LocalStorage : BenchStorage
         Directory.Exists(location) ? Directory.EnumerateDirectories(location) : [];
 
     /// <summary>A sibling <c>.lock</c> file opened with no sharing.</summary>
-    public override BuildLock AcquireBuildLock(string location, string name)
+    public override IDisposable AcquireBuildLock(string location, string name)
     {
         string lockPath = location + ".lock";
         Directory.CreateDirectory(Path.GetDirectoryName(lockPath)!);
@@ -177,7 +185,7 @@ internal sealed class LocalStorage : BenchStorage
         {
             try
             {
-                return new FileLock(new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
+                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
             }
             catch (IOException)
             {
@@ -185,25 +193,6 @@ internal sealed class LocalStorage : BenchStorage
             }
         });
     }
-
-    private sealed class FileLock(FileStream stream) : BuildLock
-    {
-        public override void Dispose() => stream.Dispose();
-    }
-}
-
-/// <summary>A held template-build lock (see <see cref="BenchStorage.AcquireBuildLock"/>).</summary>
-internal abstract class BuildLock : IDisposable
-{
-    /// <summary>
-    /// Throws if the lock may have passed to someone else (a blob lease that could not be renewed), so the
-    /// holder never marks a template ready that another run may also have been building.
-    /// </summary>
-    public virtual void ThrowIfLost()
-    {
-    }
-
-    public abstract void Dispose();
 }
 
 /// <summary>
@@ -311,7 +300,17 @@ internal sealed class AzureStorage : BenchStorage
 
     public override Dictionary<string, string> DeltaRsOptions { get; }
 
-    public override bool MarkerExists(string location) => _container.GetBlobClient(location + ".ready").Exists().Value;
+    public override string? ReadMarker(string location)
+    {
+        try
+        {
+            return _container.GetBlobClient(location + ".ready").DownloadContent().Value.Content.ToString();
+        }
+        catch (Azure.RequestFailedException e) when (e.Status == 404)
+        {
+            return null;
+        }
+    }
 
     public override void WriteMarker(string location, string content) =>
         _container.GetBlobClient(location + ".ready").Upload(BinaryData.FromString(content), overwrite: true);
@@ -396,7 +395,7 @@ internal sealed class AzureStorage : BenchStorage
     /// <see cref="LeaseDuration"/> and renewed in the background while the build runs; a holder that dies stops
     /// renewing, and the lease expires on its own.
     /// </summary>
-    public override BuildLock AcquireBuildLock(string location, string name)
+    public override IDisposable AcquireBuildLock(string location, string name)
     {
         var blob = _container.GetBlobClient(location + ".lock");
         try
@@ -424,11 +423,10 @@ internal sealed class AzureStorage : BenchStorage
 
     private static readonly TimeSpan LeaseDuration = TimeSpan.FromSeconds(60);
 
-    private sealed class LeaseLock : BuildLock
+    private sealed class LeaseLock : IDisposable
     {
         private readonly BlobLeaseClient _lease;
         private readonly Timer _renewal;
-        private volatile Exception? _lost;
 
         public LeaseLock(BlobLeaseClient lease)
         {
@@ -445,26 +443,11 @@ internal sealed class AzureStorage : BenchStorage
             }
             catch (Exception e) when (e is Azure.RequestFailedException or AggregateException)
             {
-                _lost ??= e; // a transient failure may still leave time on the lease; ThrowIfLost renews again
+                // A lost lease costs at most a duplicate build (see AcquireBuildLock), so carry on.
             }
         }
 
-        public override void ThrowIfLost()
-        {
-            // A synchronous renewal proves the lease is still ours at the moment of marking the template ready.
-            try
-            {
-                _lease.Renew();
-            }
-            catch (Azure.RequestFailedException e)
-            {
-                throw new InvalidOperationException(
-                    "Lost the lease on a fixture's build lock; another run may have built it too. Delete the "
-                    + "template and its .ready blob and rerun.", _lost ?? e);
-            }
-        }
-
-        public override void Dispose()
+        public void Dispose()
         {
             using (var stopped = new ManualResetEvent(false))
             {

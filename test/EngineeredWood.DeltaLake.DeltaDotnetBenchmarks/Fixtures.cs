@@ -220,27 +220,53 @@ internal static class Fixtures
 
     private static string Ensure(string name, Func<string, Task> build)
     {
-        string path = Storage.Combine(Templates, name);
-        if (Storage.MarkerExists(path))
-            return path;
+        // The marker names the template; each build writes a fresh location of its own (templates/<name>.<id>)
+        // and publishes it by writing the marker last. No run ever writes into a location another run may be
+        // building or using, so even a run that lost its lock mid-build (a stalled process whose lease expired)
+        // can only publish a second complete build, never mix its files into someone else's.
+        string marker = Storage.Combine(Templates, name);
+        if (Built(marker) is { } built)
+            return built;
 
-        // Two runs sharing a root (a --verify beside a benchmark run, two filtered runs, or two machines on one
-        // Azure prefix) could otherwise both find no marker, and one would delete or mark the other's half-built
-        // template. The lock covers the re-check, the build and the marker; a run that dies mid-build releases
-        // it, leaves no marker, and the next holder rebuilds from scratch.
-        using (var buildLock = Storage.AcquireBuildLock(path, name))
+        // The lock (a file on local disk, a blob lease in Azure) spares the second run a duplicate build: it
+        // waits, re-checks and finds the first run's template. A run that dies mid-build releases it and leaves
+        // no marker, and the next holder builds a fresh location.
+        using (Storage.AcquireBuildLock(marker, name))
         {
-            if (Storage.MarkerExists(path))
-                return path; // built by whoever held the lock before us
+            if (Built(marker) is { } builtMeanwhile)
+                return builtMeanwhile; // built by whoever held the lock before us
 
-            Delete(path);
-            Storage.CreateEmpty(path);
+            string path = Storage.Combine(Templates, $"{name}.{Guid.NewGuid():N}");
             Console.WriteLine($"// building fixture {name} on {Storage.Description} ...");
-            build(path).GetAwaiter().GetResult();
-            buildLock.ThrowIfLost();
-            Storage.WriteMarker(path, DateTime.UtcNow.ToString("O"));
+            try
+            {
+                Storage.CreateEmpty(path);
+                build(path).GetAwaiter().GetResult();
+            }
+            catch
+            {
+                Delete(path);
+                throw;
+            }
+            Storage.WriteMarker(marker, $"{GenerationPrefix}{Storage.NameOf(path)}\nbuilt {DateTime.UtcNow:O}\n");
+            return path;
         }
-        return path;
+    }
+
+    private const string GenerationPrefix = "template ";
+
+    /// <summary>
+    /// The published template behind a marker, or null if none. A marker from before templates had their own
+    /// locations holds only a timestamp, and its template is the marker's own location.
+    /// </summary>
+    private static string? Built(string marker)
+    {
+        if (Storage.ReadMarker(marker) is not { } content)
+            return null;
+        if (!content.StartsWith(GenerationPrefix, StringComparison.Ordinal))
+            return marker;
+        string generation = content[GenerationPrefix.Length..].Split('\n')[0].Trim();
+        return Storage.Combine(Templates, generation);
     }
 
     /// <summary>Creates the table with the first batch list, then appends each further list as one commit.</summary>

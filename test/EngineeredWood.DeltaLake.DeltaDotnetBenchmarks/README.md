@@ -56,10 +56,11 @@ dotnet run -c Release --project test/EngineeredWood.DeltaLake.DeltaDotnetBenchma
 
 Every run prints a `// storage: …` line first, so a result can never be mistaken for the other store's.
 
-- **Fixtures live in the container** (`<prefix>/templates/<name>`, marked by a `<name>.ready` blob), built once by
-  the first run through both engines' own Azure writers. Delete the `.ready` blob, or the prefix, to rebuild.
-  Machines may share a prefix: a build holds a lease on a `<name>.lock` blob, so a second cold run waits for
-  the first run's template instead of building over it, and a lease whose holder dies expires within a minute.
+- **Fixtures live in the container** (`<prefix>/templates/<name>.<id>`, published by a `<name>.ready` blob that
+  names it), built once by the first run through both engines' own Azure writers. Delete the `.ready` blob, or
+  the prefix, to rebuild. Machines may share a prefix: each build writes a location of its own and publishes it
+  last, so no run ever writes into another's template, and a lease on a `<name>.lock` blob makes a second cold
+  run wait for the first run's build rather than repeat it (a lease whose holder dies expires within a minute).
 - **Each mutation iteration gets a server-side copy** of its template (Copy Blob within the account, so no
   bytes come back through this machine), under `<prefix>/scratch/<machine>/<pid>/`, deleted after the
   iteration. A run sweeps only its own machine's leftovers, since a process id means nothing elsewhere.
