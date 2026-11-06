@@ -59,10 +59,21 @@ Every run prints a `// storage: …` line first, so a result can never be mistak
 - **Fixtures live in the container** (`<prefix>/templates/<name>.<id>`, published by a `<name>.ready` blob that
   names it), built once by the first run through both engines' own Azure writers. Delete the `.ready` blob, or
   the prefix, to rebuild; the rebuild deletes the copy the old marker named once nothing has written to it for
-  10 minutes (so not while another run is still building it). Machines may share a prefix: each build writes a
-  location of its own and publishes it last, create-only, so no run ever writes into another's template, and a
-  lease on a `<name>.lock` blob makes a second cold run wait for the first run's build rather than repeat it (a
-  lease whose holder dies expires within a minute).
+  10 minutes. That spares a build still in progress, but not a run still READING the old copy: reads leave no
+  trace, so see the sharing note below before deleting a marker.
+- **Sharing a prefix.** Several machines may use one prefix at once. Each build writes a location of its own and
+  publishes it last, create-only, so no run ever writes into another's template; a lease on a `<name>.lock` blob
+  makes a second cold run wait for the first run's build rather than repeat it (a lease whose holder dies
+  expires within a minute); and each machine keeps its scratch copies in its own subtree. Two limits:
+  - **Deleting a `.ready` (or the prefix) replaces that template at once, for everyone.** A run elsewhere that is
+    scanning the old copy, or copying it for an iteration, fails; in the worst case an iteration copies a
+    half-deleted template and times an older version of the table without complaint (only `--verify` checks
+    results). Rebuild only when no one else is running against the prefix.
+  - **Concurrent runs share the account's bandwidth and request rate**, and may read the same blobs, so each can
+    skew the other's numbers without anything failing.
+
+  For numbers you mean to compare, give each person (or machine) a prefix of their own, for example
+  `azure-env.ps1 -Prefix bench-<name>`: nothing is shared, at the cost of building the templates once per prefix.
 - **Each mutation iteration gets a server-side copy** of its template (Copy Blob within the account, so no
   bytes come back through this machine), under `<prefix>/scratch/<machine>/<pid>/`, deleted after the
   iteration. A run sweeps only its own machine's leftovers, since a process id means nothing elsewhere.
