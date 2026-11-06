@@ -167,6 +167,7 @@ internal sealed class AzureStorage : BenchStorage
     private readonly string _account;
     private readonly bool _emulator;
     private readonly int _concurrency;
+    private readonly string _namespace;
 
     private AzureStorage(string account, string key, string container, string prefix, bool emulator, int concurrency)
     {
@@ -183,8 +184,21 @@ internal sealed class AzureStorage : BenchStorage
         var options = emulator
             ? new BlobClientOptions(BlobClientOptions.ServiceVersion.V2024_11_04)
             : new BlobClientOptions();
-        _container = new BlobServiceClient(serviceUri, credential, options).GetBlobContainerClient(container);
+        var service = new BlobServiceClient(serviceUri, credential, options);
+        _container = service.GetBlobContainerClient(container);
         _container.CreateIfNotExists();
+
+        // A hierarchical-namespace (ADLS Gen2) account lists its directories as zero-length blobs, which the
+        // housekeeping below must step around; say which kind this is, since it changes what the store does.
+        try
+        {
+            _namespace = service.GetAccountInfo().Value.IsHierarchicalNamespaceEnabled
+                ? "hierarchical namespace" : "flat namespace";
+        }
+        catch (Azure.RequestFailedException)
+        {
+            _namespace = "namespace unknown";
+        }
 
         DeltaRsOptions = new Dictionary<string, string>
         {
@@ -218,7 +232,7 @@ internal sealed class AzureStorage : BenchStorage
     public override string Root { get; }
 
     public override string Description =>
-        $"Azure Blob{(_emulator ? " (Azurite emulator)" : "")}, account {_account}, "
+        $"Azure Blob{(_emulator ? " (Azurite emulator)" : "")}, account {_account} ({_namespace}), "
         + $"container {_container.Name}, prefix {Root}/, EW maxConcurrency {_concurrency}";
 
     public override string Combine(string location, string child) => location + "/" + child;
@@ -237,17 +251,38 @@ internal sealed class AzureStorage : BenchStorage
     public override void WriteMarker(string location, string content) =>
         _container.GetBlobClient(location + ".ready").Upload(BinaryData.FromString(content), overwrite: true);
 
-    private List<string> BlobsUnder(string location) =>
-        _container.GetBlobs(BlobTraits.None, BlobStates.None, location + "/", default).Select(b => b.Name).ToList();
+    /// <summary>
+    /// The files under a location, and separately the directories: on a hierarchical-namespace account a flat
+    /// listing returns each directory as a zero-length blob marked <c>hdi_isfolder</c>, which can be neither
+    /// copied nor deleted while it has children.
+    /// </summary>
+    private (List<string> Files, List<string> Directories) BlobsUnder(string location)
+    {
+        var files = new List<string>();
+        var directories = new List<string>();
+        foreach (var blob in _container.GetBlobs(BlobTraits.Metadata, BlobStates.None, location + "/", default))
+        {
+            bool isDirectory = blob.Metadata is { } metadata
+                && metadata.TryGetValue("hdi_isfolder", out string? flag)
+                && string.Equals(flag, "true", StringComparison.OrdinalIgnoreCase);
+            (isDirectory ? directories : files).Add(blob.Name);
+        }
+        return (files, directories);
+    }
 
     public override void DeleteTree(string location)
     {
         try
         {
-            Parallel.ForEach(BlobsUnder(location), new ParallelOptions { MaxDegreeOfParallelism = 32 },
+            var (files, directories) = BlobsUnder(location);
+            Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = 32 },
                 name => _container.GetBlobClient(name).DeleteIfExists());
+            // Deepest first: a directory can only go once it is empty.
+            foreach (string directory in directories.OrderByDescending(d => d.Length))
+                _container.GetBlobClient(directory).DeleteIfExists();
+            _container.GetBlobClient(location).DeleteIfExists(); // the table's own directory, if it has one
         }
-        catch (AggregateException)
+        catch (Exception e) when (e is AggregateException or Azure.RequestFailedException)
         {
             // Best effort, as on local disk: the scratch sweep retries.
         }
@@ -261,11 +296,21 @@ internal sealed class AzureStorage : BenchStorage
     /// </summary>
     public override void CopyTree(string source, string destination)
     {
-        Parallel.ForEach(BlobsUnder(source), new ParallelOptions { MaxDegreeOfParallelism = 32 }, name =>
+        // Directories are not copied: writing a blob creates its parent directories on a hierarchical account,
+        // and a flat one has none.
+        Parallel.ForEach(BlobsUnder(source).Files, new ParallelOptions { MaxDegreeOfParallelism = 32 }, name =>
         {
             var from = _container.GetBlobClient(name);
             var to = _container.GetBlobClient(destination + name[source.Length..]);
-            to.StartCopyFromUri(from.Uri).WaitForCompletion();
+            try
+            {
+                to.StartCopyFromUri(from.Uri).WaitForCompletion();
+            }
+            catch (Azure.RequestFailedException e)
+            {
+                throw new InvalidOperationException(
+                    $"Copy Blob failed for '{name}' -> '{to.Name}' ({e.Status} {e.ErrorCode}).", e);
+            }
         });
     }
 
