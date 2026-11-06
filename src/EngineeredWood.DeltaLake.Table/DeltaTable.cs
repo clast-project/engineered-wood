@@ -1681,14 +1681,32 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<string> containerPath, StructField newField,
         MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null)
     {
+        if (containerPath.Count == 0)
+            throw new ArgumentException(
+                "containerPath must name the containing struct column.", nameof(containerPath));
+        return ComputeAddFieldAt(
+            containerPath.Select(SchemaPathStep.Field).ToList(), newField, baseMetadata, baseProtocol);
+    }
+
+    /// <summary>
+    /// <see cref="ComputeAddField(IReadOnlyList{string}, StructField, MetadataAction, ProtocolAction)"/> for a
+    /// containing struct that may sit inside an array element or a map key or value: <paramref name="containerPath"/>
+    /// steps through collections as well as struct fields (a <c>mergeSchema</c> write adding
+    /// <c>xs.element.b</c>). It must not be empty.
+    /// </summary>
+    internal DeferredSchemaChange ComputeAddFieldAt(
+        IReadOnlyList<SchemaPathStep> containerPath, StructField newField,
+        MetadataAction? baseMetadata = null, ProtocolAction? baseProtocol = null)
+    {
         ThrowIfDisposed();
         ValidateWriteSupport(CurrentSnapshot);
         if (containerPath.Count == 0)
             throw new ArgumentException(
                 "containerPath must name the containing struct column.", nameof(containerPath));
+        string containerText = PathText(containerPath.Select(step => step.Name).ToList());
         if (!newField.Nullable)
             throw new InvalidOperationException(
-                $"ADD COLUMN '{PathText(containerPath)}.{newField.Name}' must be nullable — existing rows have "
+                $"ADD COLUMN '{containerText}.{newField.Name}' must be nullable — existing rows have "
                 + "no value for a new field.");
 
         var snapshot = CurrentSnapshot;
@@ -1711,15 +1729,17 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         var addedField = newDeltaField;
-        var newSchema = TransformStructAt(baseSchema, containerPath, 0, fields =>
+        var newSchema = (StructType)TransformTypeAt(baseSchema, containerPath, 0, container =>
         {
-            foreach (var f in fields)
+            if (container is not StructType st)
+                throw new InvalidOperationException($"'{containerText}' is not a STRUCT column.");
+            foreach (var f in st.Fields)
             {
                 if (string.Equals(f.Name, addedField.Name, StringComparison.Ordinal))
                     throw new InvalidOperationException(
-                        $"Field '{PathText(containerPath)}.{addedField.Name}' already exists.");
+                        $"Field '{containerText}.{addedField.Name}' already exists.");
             }
-            return new List<StructField>(fields) { addedField };
+            return new StructType { Fields = new List<StructField>(st.Fields) { addedField } };
         });
 
         if (mappingMode != ColumnMappingMode.None)
@@ -2643,6 +2663,74 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             throw new InvalidOperationException(
                 $"Column '{PathText(containerPath.Take(depth + 1).ToList())}' does not exist.");
         return new StructType { Fields = newFields };
+    }
+
+    // Rebuilds `current` with the type at `path` (from `depth` on) replaced by `transform` of it. A field step
+    // needs a struct and descends into the named field's type; an element, key or value step needs an array or
+    // a map and descends into that part. Everything off the path is untouched, and each container keeps its own
+    // nullability, metadata and containsNull flags.
+    private static DeltaDataType TransformTypeAt(
+        DeltaDataType current, IReadOnlyList<SchemaPathStep> path, int depth,
+        Func<DeltaDataType, DeltaDataType> transform)
+    {
+        if (depth == path.Count)
+            return transform(current);
+
+        var step = path[depth];
+        string Prefix() => PathText(path.Take(depth + 1).Select(s => s.Name).ToList());
+        switch (step.Kind, current)
+        {
+            case (SchemaPathStepKind.Field, StructType st):
+            {
+                var newFields = new List<StructField>(st.Fields.Count);
+                bool found = false;
+                foreach (var f in st.Fields)
+                {
+                    if (!found && string.Equals(f.Name, step.Name, StringComparison.Ordinal))
+                    {
+                        found = true;
+                        newFields.Add(new StructField
+                        {
+                            Name = f.Name,
+                            Type = TransformTypeAt(f.Type, path, depth + 1, transform),
+                            Nullable = f.Nullable,
+                            Metadata = f.Metadata,
+                        });
+                    }
+                    else
+                    {
+                        newFields.Add(f);
+                    }
+                }
+                if (!found)
+                    throw new InvalidOperationException($"Column '{Prefix()}' does not exist.");
+                return new StructType { Fields = newFields };
+            }
+            case (SchemaPathStepKind.Element, ArrayType at):
+                return new ArrayType
+                {
+                    ElementType = TransformTypeAt(at.ElementType, path, depth + 1, transform),
+                    ContainsNull = at.ContainsNull,
+                };
+            case (SchemaPathStepKind.Key, MapType mt):
+                return new MapType
+                {
+                    KeyType = TransformTypeAt(mt.KeyType, path, depth + 1, transform),
+                    ValueType = mt.ValueType,
+                    ValueContainsNull = mt.ValueContainsNull,
+                };
+            case (SchemaPathStepKind.Value, MapType mt):
+                return new MapType
+                {
+                    KeyType = mt.KeyType,
+                    ValueType = TransformTypeAt(mt.ValueType, path, depth + 1, transform),
+                    ValueContainsNull = mt.ValueContainsNull,
+                };
+            default:
+                throw new InvalidOperationException(step.Kind == SchemaPathStepKind.Field
+                    ? $"'{PathText(path.Take(depth).Select(s => s.Name).ToList())}' is not a STRUCT column."
+                    : $"'{PathText(path.Take(depth).Select(s => s.Name).ToList())}' has no {step.Name}.");
+        }
     }
 
     private static string PathText(IReadOnlyList<string> path) => string.Join(".", path);
@@ -6731,17 +6819,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </param>
     /// <param name="mergeSchema">
     /// Spark's <c>mergeSchema=true</c>: evolve the table's schema to fit <paramref name="batches"/>, in the SAME
-    /// commit as the data. A column or struct field the table does not have is added, nullable, at the end; a
+    /// commit as the data. A column or struct field the table does not have is added, nullable, at the end, also
+    /// in a struct inside an array element or a map key or value; a
     /// column whose type in the batch is a wider one Spark would widen to during schema evolution is widened, when
     /// the table enables <c>delta.enableTypeWidening</c>; a name that differs from a column's only in case is
     /// refused. Off by default, where a column the table does not declare is refused instead: a typo in a column
     /// name should not silently add a column.
     /// <para>The widenings are the ones Spark applies by itself: a wider integer, float to double, a decimal no
     /// narrower in integer or fractional digits, and date to timestamp_ntz; integer to double or decimal is refused,
-    /// as are a narrower type, a widening of a partition column or of a column a CHECK constraint or generation
-    /// expression reads, and a new field or widening inside an array element or map key or value
-    /// (<see cref="DeltaTableErrorCodes.UnsupportedSchemaMerge"/>). A widened column records
-    /// <c>delta.typeChanges</c> and the protocol gains <c>typeWidening</c>; files written before it read
+    /// as are a narrower type, and a widening of a partition column or of a column a CHECK constraint or generation
+    /// expression reads. A value inside an array element or a map key or value is widened too. A widened column
+    /// records <c>delta.typeChanges</c> (for a value inside a collection, on the nearest enclosing struct field,
+    /// with a <c>fieldPath</c>) and the protocol gains <c>typeWidening</c>; files written before it read
     /// widened.</para>
     /// </param>
     public ValueTask<long> WriteAsync(

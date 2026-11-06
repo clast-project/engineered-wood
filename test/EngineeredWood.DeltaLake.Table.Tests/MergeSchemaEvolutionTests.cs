@@ -107,6 +107,8 @@ public class MergeSchemaEvolutionTests : IDisposable
             Int32Array a => a.GetValue(i)!.Value.ToString(CultureInfo.InvariantCulture),
             Int64Array a => a.GetValue(i)!.Value.ToString(CultureInfo.InvariantCulture),
             StringArray a => a.GetString(i),
+            ListArray l => "[" + string.Join(", ", Enumerable.Range(l.ValueOffsets[i], l.GetValueLength(i))
+                .Select(e => Format(l.Values, e))) + "]",
             StructArray s => "{" + string.Join(", ", ((StructType)s.Data.DataType).Fields.Select(
                 (f, k) => f.Name + "=" + Format(s.Fields[k], i))) + "}",
             _ => throw new NotSupportedException(array.GetType().Name),
@@ -619,31 +621,54 @@ public class MergeSchemaEvolutionTests : IDisposable
         Assert.Equal(["id=1, st={a=10, c=x, b=y}", "id=2, st={a=2, c=c2, b=null}"], await RowsAsync(table));
     }
 
-    [Fact]
-    public async Task ANewFieldInsideAnArrayElement_IsRefused()
+    /// <summary>A list column with one single-element row per value of <paramref name="elements"/>.</summary>
+    private static ListArray OneEach(IArrowArray elements)
     {
-        // Spark adds it; a mergeSchema write here refuses it, and so does the MERGE, before anything is written.
+        var offsets = new ArrowBuffer.Builder<int>();
+        for (int i = 0; i <= elements.Length; i++)
+            offsets.Append(i);
+        return new ListArray(
+            new ListType(new Field("element", elements.Data.DataType, true)), elements.Length, offsets.Build(),
+            elements, ArrowBuffer.Empty);
+    }
+
+    [Fact]
+    public async Task ANewFieldInsideAnArrayElement_IsAdded()
+    {
+        // As Spark adds it (#603): the matched row takes the source's elements, the untouched one reads NULL for it.
         var element = new StructType([new Field("a", Int32Type.Default, true)]);
         var schema = new Apache.Arrow.Schema.Builder()
             .Field(new Field("id", Int32Type.Default, true))
             .Field(new Field("arr", new ListType(new Field("element", element, true)), true))
             .Build();
-        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
-        long before = table.CurrentSnapshot.Version;
-        var wider = new StructType([new Field("a", Int32Type.Default, true), new Field("b", StringType.Default, true)]);
-        var values = new StructArray(wider, 1, [Ints(1), Strings("x")], ArrowBuffer.Empty);
-        var list = new ListArray(
-            new ListType(new Field("element", wider, true)), 1,
-            new ArrowBuffer.Builder<int>().Append(0).Append(1).Build(), values, ArrowBuffer.Empty);
-        var source = new RecordBatch(
-            new Apache.Arrow.Schema([new Field("id", Int32Type.Default, true), new Field("arr", list.Data.DataType, true)], null),
-            [Ints(1), list], 1);
+        await using var table = await CreateAsync(
+            schema, null, Batch(("id", Ints(1, 2)), ("arr", OneEach(Struct(("a", Ints(1, 2)))))));
 
-        var e = await Assert.ThrowsAsync<DeltaFormatException>(() =>
-            table.MergeAsync([source], Upsert(mergeSchema: true)).AsTask());
+        await table.MergeAsync(
+            [Batch(("id", Ints(1, 3)), ("arr", OneEach(Struct(("a", Ints(10, 30)), ("b", Strings("x", "z"))))))],
+            Upsert(mergeSchema: true));
 
-        Assert.Equal(DeltaTableErrorCodes.UnsupportedSchemaMerge, e.ErrorCode);
-        Assert.Equal(before, table.CurrentSnapshot.Version);
+        Assert.Equal("id:integer, arr:array<struct<a:integer, b:string>>", Columns(table));
+        Assert.Equal(
+            ["id=1, arr=[{a=10, b=x}]", "id=2, arr=[{a=2, b=null}]", "id=3, arr=[{a=30, b=z}]"],
+            await RowsAsync(table));
+    }
+
+    [Fact]
+    public async Task AWiderArrayElement_WidensTheColumn_OnATableThatEnablesTypeWidening()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int32Type.Default, true))
+            .Field(new Field("arr", new ListType(new Field("element", Int32Type.Default, true)), true))
+            .Build();
+        await using var table = await CreateAsync(
+            schema, TypeWidening, Batch(("id", Ints(1, 2)), ("arr", OneEach(Ints(1, 2)))));
+
+        await table.MergeAsync(
+            [Batch(("id", Ints(1, 3)), ("arr", OneEach(Longs(5_000_000_000L, 30))))], Upsert(mergeSchema: true));
+
+        Assert.Equal("id:integer, arr:array<long>", Columns(table));
+        Assert.Equal(["id=1, arr=[5000000000]", "id=2, arr=[2]", "id=3, arr=[30]"], await RowsAsync(table));
     }
 
     // ── Types ──

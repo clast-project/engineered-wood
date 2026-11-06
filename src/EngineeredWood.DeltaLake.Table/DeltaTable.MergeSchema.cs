@@ -26,8 +26,10 @@ public sealed partial class DeltaTable
     /// so under column mapping it gets an id and a physical name as <see cref="AddColumnAsync(Field, CancellationToken)"/>
     /// would give it.</item>
     /// <item><b>A new field of a struct column</b>, at any depth of structs, is added through
-    /// <see cref="ComputeAddField(IReadOnlyList{string}, StructField, MetadataAction, ProtocolAction)"/>. Inside an
-    /// array element or a map key or value it is refused: there is no path to it that a nested ADD can name.</item>
+    /// <see cref="ComputeAddField(IReadOnlyList{string}, StructField, MetadataAction, ProtocolAction)"/>, including
+    /// in a struct inside an array element or a map key or value (<c>array&lt;struct&lt;a, b&gt;&gt;</c> into a
+    /// column that is <c>array&lt;struct&lt;a&gt;&gt;</c>), as Spark's schema evolution adds it. Under column
+    /// mapping it gets an id and a physical name there too.</item>
     /// <item><b>Everything is added nullable</b>, nested fields and elements included, whatever the batch declares,
     /// as Spark adds them (<c>asNullable</c>): rows already in the table have no value for the column. A NOT NULL
     /// column cannot be added by a merge.</item>
@@ -37,9 +39,12 @@ public sealed partial class DeltaTable
     /// evolution: a wider integer, float to double, a decimal no narrower in either integer or fractional digits,
     /// and date to timestamp_ntz. Integer to double or decimal is a change Spark makes only on an explicit ALTER,
     /// so it is refused here too. The change is recorded in <c>delta.typeChanges</c>, and files written before it
-    /// read widened. A partition column, a column a CHECK constraint or generation expression reads, and a value
-    /// inside an array or map are not widened. Any other type difference is left to the write's own type check,
-    /// which refuses it.</item>
+    /// read widened. A value inside an array element or a map key or value (<c>array&lt;int&gt;</c> to
+    /// <c>array&lt;long&gt;</c>) is widened too, and recorded as Spark records it: on the nearest enclosing struct
+    /// field, with a <c>fieldPath</c> (<c>element</c>, <c>key</c> or <c>value</c>, dot-joined when collections
+    /// nest). A partition column and a column a CHECK constraint or generation expression reads are not widened;
+    /// inside a collection, an expression reading the collection's column counts as reading the value. Any other
+    /// type difference is left to the write's own type check, which refuses it.</item>
     /// <item><b>A name differing from a column's only in case</b> (<c>ID</c> against <c>id</c>) is refused. Delta
     /// column names are case-insensitive, so it cannot be a new column, and writing it into <c>id</c> would be
     /// guessing.</item>
@@ -77,21 +82,20 @@ public sealed partial class DeltaTable
     private sealed class SchemaMerge
     {
         private readonly DeltaTable _table;
-        private readonly Snapshot.Snapshot _snapshot;
         private MetadataAction _metadata;
         private ProtocolAction _protocol;
         private StructType _schema;
         private bool _changed;
         private bool _protocolChanged;
-        // Paths (logical, one segment per name) this merge added. A later batch that disagrees about one of their
-        // types is not a widening — no file was ever written with the first type — so it is left to the type
-        // check. Kept as segments: a column may itself be named "a.b", so a dot-joined path is ambiguous.
-        private readonly List<string[]> _added = [];
+        // Paths (logical, one step per name or collection step) this merge added. A later batch that disagrees
+        // about one of their types is not a widening — no file was ever written with the first type — so it is
+        // left to the type check. Kept as steps: a column may itself be named "a.b" (a dot-joined path is
+        // ambiguous) or "element" (which is not a list's element).
+        private readonly List<SchemaPathStep[]> _added = [];
 
         public SchemaMerge(DeltaTable table, Snapshot.Snapshot snapshot)
         {
             _table = table;
-            _snapshot = snapshot;
             _metadata = snapshot.Metadata;
             _protocol = snapshot.Protocol;
             _schema = snapshot.Schema;
@@ -108,20 +112,18 @@ public sealed partial class DeltaTable
 
                 var added = AsNullable(ToDeltaField(field));
                 Apply(_table.ComputeAddColumn(added, _metadata, _protocol));
-                _added.Add([added.Name]);
+                _added.Add([SchemaPathStep.Field(added.Name)]);
                 return;
             }
 
             var supplied = ToDeltaField(field);
-            Merge([declared.Name], declared.Type, supplied.Type, field.Name, inCollection: false);
+            Merge([SchemaPathStep.Field(declared.Name)], declared.Type, supplied.Type, field.Name);
         }
 
-        /// <param name="path">The LOGICAL path of the value being merged, as a nested ADD or a type change names
-        /// it.</param>
+        /// <param name="path">The LOGICAL path of the value being merged: the struct fields' names, with an
+        /// <c>element</c>, <c>key</c> or <c>value</c> step where it goes into a collection.</param>
         /// <param name="display">The path as the batch spells it, for messages.</param>
-        /// <param name="inCollection">The value sits inside an array element or a map key or value.</param>
-        private void Merge(
-            List<string> path, DeltaDataType declared, DeltaDataType supplied, string display, bool inCollection)
+        private void Merge(List<SchemaPathStep> path, DeltaDataType declared, DeltaDataType supplied, string display)
         {
             switch (declared, supplied)
             {
@@ -133,35 +135,27 @@ public sealed partial class DeltaTable
                         if (match is null)
                         {
                             ThrowIfCaseOnly(d.Fields, child.Name, childDisplay);
-                            if (inCollection)
-                            {
-                                throw new DeltaFormatException(
-                                    DeltaTableErrorCodes.UnsupportedSchemaMerge,
-                                    $"mergeSchema: the batch has a field '{childDisplay}' the table does not "
-                                    + "declare, inside an array element or a map key or value. A merge adds nested "
-                                    + "fields only inside struct columns; declare it with SetSchemaAsync first.");
-                            }
                             var added = AsNullable(child);
-                            Apply(_table.ComputeAddField(path, added, _metadata, _protocol));
-                            _added.Add([.. path, added.Name]);
+                            Apply(_table.ComputeAddFieldAt(path, added, _metadata, _protocol));
+                            _added.Add([.. path, SchemaPathStep.Field(added.Name)]);
                             continue;
                         }
-                        Merge([.. path, match.Name], match.Type, child.Type, childDisplay, inCollection);
+                        Merge([.. path, SchemaPathStep.Field(match.Name)], match.Type, child.Type, childDisplay);
                     }
                     break;
 
                 case (ArrayType d, ArrayType s):
-                    Merge(path, d.ElementType, s.ElementType, display + ".element", inCollection: true);
+                    Merge([.. path, SchemaPathStep.Element], d.ElementType, s.ElementType, display + ".element");
                     break;
 
                 case (MapType d, MapType s):
-                    Merge(path, d.KeyType, s.KeyType, display + ".key", inCollection: true);
-                    Merge(path, d.ValueType, s.ValueType, display + ".value", inCollection: true);
+                    Merge([.. path, SchemaPathStep.Key], d.KeyType, s.KeyType, display + ".key");
+                    Merge([.. path, SchemaPathStep.Value], d.ValueType, s.ValueType, display + ".value");
                     break;
 
                 case (PrimitiveType d, PrimitiveType s)
                     when !string.Equals(d.TypeName, s.TypeName, StringComparison.Ordinal):
-                    Widen(path, d, s, display, inCollection);
+                    Widen(path, d, s, display);
                     break;
 
                 // The same type, or a shape difference (a struct against a primitive): the write's type check
@@ -169,20 +163,19 @@ public sealed partial class DeltaTable
             }
         }
 
-        private static bool IsPrefix(string[] prefix, List<string> path)
+        private static bool IsPrefix(SchemaPathStep[] prefix, List<SchemaPathStep> path)
         {
             if (prefix.Length > path.Count)
                 return false;
             for (int i = 0; i < prefix.Length; i++)
             {
-                if (!string.Equals(prefix[i], path[i], StringComparison.Ordinal))
+                if (prefix[i] != path[i])
                     return false;
             }
             return true;
         }
 
-        private void Widen(
-            List<string> path, PrimitiveType declared, PrimitiveType supplied, string display, bool inCollection)
+        private void Widen(List<SchemaPathStep> path, PrimitiveType declared, PrimitiveType supplied, string display)
         {
             var config = _metadata.Configuration;
             bool iceberg = IcebergCompat.GetVersion(config) != IcebergCompatVersion.None;
@@ -193,14 +186,6 @@ public sealed partial class DeltaTable
                 return; // added by this merge, so there is nothing to widen; the type check judges the disagreement
 
             string change = $"'{display}' is {declared.TypeName} in the table and {supplied.TypeName} in the batch";
-            // Before the table setting: inside a collection no setting would make it work, so the error says so.
-            if (inCollection)
-            {
-                throw new DeltaFormatException(
-                    DeltaTableErrorCodes.UnsupportedSchemaMerge,
-                    $"mergeSchema: {change}, inside an array element or a map key or value, which a merge does "
-                    + $"not widen. Cast the column to {declared.TypeName}.");
-            }
             if (!Schema.TypeWidening.IsEnabled(config))
             {
                 throw new DeltaFormatException(
@@ -208,23 +193,46 @@ public sealed partial class DeltaTable
                     $"mergeSchema: {change}. Widening the column needs type widening; set "
                     + $"{Schema.TypeWidening.EnableKey}=true on the table, or cast the column to {declared.TypeName}.");
             }
-            if (_metadata.PartitionColumns.Contains(path[0]))
+            string column = path[0].Name;
+            if (_metadata.PartitionColumns.Contains(column))
             {
                 throw new DeltaFormatException(
                     DeltaTableErrorCodes.MergeIncompatibleDataType,
-                    $"mergeSchema: {change}, and '{path[0]}' is a partition column, which a merge does not widen. "
+                    $"mergeSchema: {change}, and '{column}' is a partition column, which a merge does not widen. "
                     + $"Cast the column to {declared.TypeName}.");
             }
-            SchemaChangeDependents.EnsureChangeable(
-                _schema, _metadata, _snapshot.DomainMetadata, path, isDrop: false, verb: "change the type of");
 
-            string name = path[path.Count - 1];
-            var newSchema = TransformStructAt(_schema, path.Take(path.Count - 1).ToList(), 0, fields =>
-                fields.Select(f => string.Equals(f.Name, name, StringComparison.Ordinal)
+            // Constraints and generation expressions name struct fields only: a value inside a collection is read
+            // through the collection (`xs[0]`, `m['k']`), so there the dependents are those of the path down to
+            // the first collection.
+            int firstCollection = path.FindIndex(step => !step.IsField);
+            var dependentPath = path.Take(firstCollection < 0 ? path.Count : firstCollection)
+                .Select(step => step.Name).ToList();
+            SchemaChangeDependents.EnsureTypeChangeable(_schema, _metadata, dependentPath, display);
+
+            // The type change goes on the nearest enclosing struct field. The collection steps below it (none for
+            // a struct field's own type) are its fieldPath, as Spark records it.
+            int last = path.FindLastIndex(step => step.IsField);
+            var containerSteps = path.Take(last).ToList();
+            var collectionSteps = path.Skip(last + 1).ToList();
+            string? fieldPath = collectionSteps.Count == 0
+                ? null
+                : string.Join(".", collectionSteps.Select(step => step.Name));
+            string name = path[last].Name;
+            var newSchema = (StructType)TransformTypeAt(_schema, containerSteps, 0, container => new StructType
+            {
+                Fields = ((StructType)container).Fields.Select(f => string.Equals(f.Name, name, StringComparison.Ordinal)
                     ? Schema.TypeWidening.AddTypeChange(
-                        new StructField { Name = f.Name, Type = supplied, Nullable = f.Nullable, Metadata = f.Metadata },
-                        declared.TypeName, supplied.TypeName)
-                    : f).ToList());
+                        new StructField
+                        {
+                            Name = f.Name,
+                            Type = TransformTypeAt(f.Type, collectionSteps, 0, _ => supplied),
+                            Nullable = f.Nullable,
+                            Metadata = f.Metadata,
+                        },
+                        declared.TypeName, supplied.TypeName, fieldPath)
+                    : f).ToList(),
+            });
             CommitSchemaValidation.EnsureValid(newSchema);
 
             _schema = newSchema;

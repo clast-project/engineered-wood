@@ -278,9 +278,9 @@ public sealed class MergeOptions
     /// </list>
     /// <para>Inside a transaction it composes with merging appends, and when it changes the schema it is refused
     /// alongside a schema change staged any other way, as <see cref="DeltaTransaction.WriteAsync"/> with
-    /// <c>mergeSchema</c> is; one that changes nothing runs as a plain MERGE. A new field
-    /// inside an array element or a map key or value is refused, as a <c>mergeSchema</c> write refuses it, though
-    /// Spark adds one. A source column whose name differs from a table column's only in case is refused rather than
+    /// <c>mergeSchema</c> is; one that changes nothing runs as a plain MERGE. A new field, or a wider value,
+    /// inside an array element or a map key or value evolves the column as a <c>mergeSchema</c> write evolves it,
+    /// and as Spark does. A source column whose name differs from a table column's only in case is refused rather than
     /// matched or added.</para>
     /// </remarks>
     public bool MergeSchema { get; init; }

@@ -986,9 +986,12 @@ fields are added nullable, and a wider type is widened under
 `delta.enableTypeWidening`, limited to the changes Spark applies automatically
 (not integer to double or decimal). It refuses a name that differs from a column's
 only in case, where Spark's default case-insensitive resolution would write into
-the existing column; it adds no field and widens no value inside an array element
-or a map key or value (`DELTA_UNSUPPORTED_SCHEMA_MERGE`), and widens no partition
-column or column a CHECK constraint or generation expression reads. It never
+the existing column. Inside an array element or a map key or value it adds struct
+fields and widens values too, as Spark does (#603): a widening there is recorded
+on the nearest enclosing struct field with a `fieldPath` (`element`, `key`,
+`value`). It widens no partition column or column a CHECK constraint or
+generation expression reads (inside a collection, an expression reading the
+collection's column counts as reading the value). It never
 casts a narrower batch type up to the table's. MERGE's schema evolution
 (`MergeOptions.MergeSchema`, #604) is built on it. Still missing: column reorder and nullability change
 (drop/add NOT NULL). Column mapping mode is fixed at `CreateAsync`.
