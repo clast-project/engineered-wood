@@ -39,7 +39,7 @@ namespace EngineeredWood.Expressions.Sql;
 /// </list>
 /// <para>
 /// Some trees have no Spark SQL: a <see cref="BoundReference"/> (its name alone cannot say which nested field
-/// it is), a literal of a kind Spark has no type for (unsigned integers, <see cref="Half"/>, a time of day, a
+/// it is), a literal of a kind Spark has no type for (unsigned integers, <see cref="LiteralValue.Kind.Half"/>, a time of day, a
 /// GUID), a timestamp finer than Spark's microsecond, and a function name no identifier spells.
 /// <see cref="Render"/> refuses those and <see cref="TryRender"/> answers false, rather than write text that
 /// reads as a different condition.
