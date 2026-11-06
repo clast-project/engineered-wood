@@ -45,11 +45,17 @@ internal static class Fixtures
     private static string ScratchRoot => Storage.Combine(Root, "scratch");
 
     /// <summary>
+    /// This machine's scratch directories. A process id means something only on its own machine, and an Azure
+    /// root may be shared by runs on several, so each machine keeps (and sweeps) only its own subtree.
+    /// </summary>
+    private static string HostScratch => Storage.Combine(ScratchRoot, Environment.MachineName.ToLowerInvariant());
+
+    /// <summary>
     /// This process's own scratch directory. BenchmarkDotNet runs each benchmark in a child process, and a
     /// <c>--verify</c> or a second filtered run may share <see cref="Root"/> with a run in progress, so no
     /// process may sweep another live process's iteration copies.
     /// </summary>
-    private static string Scratch => Storage.Combine(ScratchRoot, Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
+    private static string Scratch => Storage.Combine(HostScratch, Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
 
     /// <summary>One commit of <see cref="Rows"/> rows.</summary>
     public static string SingleCommit(TableWriter writer) =>
@@ -173,14 +179,15 @@ internal static class Fixtures
     }
 
     /// <summary>
-    /// Clears out iteration copies left by interrupted runs: this process's own directory, and those of
-    /// processes that have exited. A directory whose process is still running is left alone. (A reused process
-    /// id can only make a dead run's copies survive one more sweep; it can never delete a live run's.)
+    /// Clears out iteration copies left by interrupted runs on THIS machine: this process's own directory, and
+    /// those of processes that have exited. A directory whose process is still running is left alone, and other
+    /// machines' subtrees are never looked at. (A reused process id can only make a dead run's copies survive
+    /// one more sweep; it can never delete a live run's.)
     /// </summary>
     public static void SweepScratch()
     {
         Delete(Scratch);
-        foreach (string dir in Storage.Children(ScratchRoot))
+        foreach (string dir in Storage.Children(HostScratch))
         {
             if (int.TryParse(Storage.NameOf(dir), NumberStyles.None, CultureInfo.InvariantCulture, out int pid)
                 && !IsRunning(pid))
@@ -217,11 +224,11 @@ internal static class Fixtures
         if (Storage.MarkerExists(path))
             return path;
 
-        // Two processes sharing a root (a --verify beside a benchmark run, or two filtered runs) could otherwise
-        // both find no marker, and one would delete or mark the other's half-built template. The lock covers
-        // the re-check, the build and the marker; a process that dies mid-build releases it (the OS closes the
-        // handle), leaves no marker, and the next holder rebuilds from scratch.
-        using (AcquireBuildLock(Storage.LockPath(path), name))
+        // Two runs sharing a root (a --verify beside a benchmark run, two filtered runs, or two machines on one
+        // Azure prefix) could otherwise both find no marker, and one would delete or mark the other's half-built
+        // template. The lock covers the re-check, the build and the marker; a run that dies mid-build releases
+        // it, leaves no marker, and the next holder rebuilds from scratch.
+        using (var buildLock = Storage.AcquireBuildLock(path, name))
         {
             if (Storage.MarkerExists(path))
                 return path; // built by whoever held the lock before us
@@ -230,33 +237,10 @@ internal static class Fixtures
             Storage.CreateEmpty(path);
             Console.WriteLine($"// building fixture {name} on {Storage.Description} ...");
             build(path).GetAwaiter().GetResult();
+            buildLock.ThrowIfLost();
             Storage.WriteMarker(path, DateTime.UtcNow.ToString("O"));
         }
         return path;
-    }
-
-    /// <summary>An exclusive, inter-process lock: a sibling file opened with no sharing, retried until free.</summary>
-    private static FileStream AcquireBuildLock(string lockPath, string name)
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(lockPath)!);
-        var waited = System.Diagnostics.Stopwatch.StartNew();
-        bool announced = false;
-        while (true)
-        {
-            try
-            {
-                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-            }
-            catch (IOException) when (waited.Elapsed < TimeSpan.FromMinutes(30))
-            {
-                if (!announced)
-                {
-                    Console.WriteLine($"// waiting for another process to finish building fixture {name} ...");
-                    announced = true;
-                }
-                Thread.Sleep(250);
-            }
-        }
     }
 
     /// <summary>Creates the table with the first batch list, then appends each further list as one commit.</summary>

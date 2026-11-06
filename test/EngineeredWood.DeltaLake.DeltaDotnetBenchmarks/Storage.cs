@@ -4,6 +4,7 @@
 using Azure.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
+using Azure.Storage.Blobs.Specialized;
 using EngineeredWood.IO;
 using EngineeredWood.IO.Azure;
 using EngineeredWood.IO.Local;
@@ -71,10 +72,32 @@ internal abstract class BenchStorage
     public abstract IEnumerable<string> Children(string location);
 
     /// <summary>
-    /// A LOCAL file used as an inter-process lock while a template is built, so two processes on this machine
-    /// never build one template at once.
+    /// An exclusive lock on building the template at <paramref name="location"/>, held across the marker
+    /// re-check, the build and the marker. It covers everyone who shares this store: on local disk, the
+    /// processes of this machine; in Azure, every machine using the same container and prefix. Waits until
+    /// free. A holder that dies releases it (the OS closes a file; a blob lease expires).
     /// </summary>
-    public abstract string LockPath(string location);
+    public abstract BuildLock AcquireBuildLock(string location, string name);
+
+    /// <summary>Retries <paramref name="tryAcquire"/> until it returns a lock, for up to 30 minutes.</summary>
+    protected static BuildLock WaitFor(string name, Func<BuildLock?> tryAcquire)
+    {
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        bool announced = false;
+        while (true)
+        {
+            if (tryAcquire() is { } acquired)
+                return acquired;
+            if (waited.Elapsed > TimeSpan.FromMinutes(30))
+                throw new TimeoutException($"Fixture {name} was still being built by another run after 30 minutes.");
+            if (!announced)
+            {
+                Console.WriteLine($"// waiting for another run to finish building fixture {name} ...");
+                announced = true;
+            }
+            Thread.Sleep(250);
+        }
+    }
 
     private static BenchStorage Create()
     {
@@ -145,7 +168,42 @@ internal sealed class LocalStorage : BenchStorage
     public override IEnumerable<string> Children(string location) =>
         Directory.Exists(location) ? Directory.EnumerateDirectories(location) : [];
 
-    public override string LockPath(string location) => location + ".lock";
+    /// <summary>A sibling <c>.lock</c> file opened with no sharing.</summary>
+    public override BuildLock AcquireBuildLock(string location, string name)
+    {
+        string lockPath = location + ".lock";
+        Directory.CreateDirectory(Path.GetDirectoryName(lockPath)!);
+        return WaitFor(name, () =>
+        {
+            try
+            {
+                return new FileLock(new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
+            }
+            catch (IOException)
+            {
+                return null; // held by another process
+            }
+        });
+    }
+
+    private sealed class FileLock(FileStream stream) : BuildLock
+    {
+        public override void Dispose() => stream.Dispose();
+    }
+}
+
+/// <summary>A held template-build lock (see <see cref="BenchStorage.AcquireBuildLock"/>).</summary>
+internal abstract class BuildLock : IDisposable
+{
+    /// <summary>
+    /// Throws if the lock may have passed to someone else (a blob lease that could not be renewed), so the
+    /// holder never marks a template ready that another run may also have been building.
+    /// </summary>
+    public virtual void ThrowIfLost()
+    {
+    }
+
+    public abstract void Dispose();
 }
 
 /// <summary>
@@ -222,6 +280,13 @@ internal sealed class AzureStorage : BenchStorage
         }
         string container = Env("EWDD_AZURE_CONTAINER") ?? "ew-vs-delta-dotnet";
         string prefix = (Env("EWDD_AZURE_PREFIX") ?? "bench").Trim('/');
+        if (prefix.Length == 0)
+        {
+            // Every location is "<prefix>/...", and the housekeeping lists blobs by that literal prefix; an empty
+            // one would make it look under "/templates/..." while the engines write "templates/...".
+            throw new InvalidOperationException(
+                "EWDD_AZURE_PREFIX must name a blob-name prefix (such as 'bench'); the container root is not supported.");
+        }
         int concurrency = int.TryParse(Env("EWDD_AZURE_CONCURRENCY"), out int c) && c > 0 ? c : 16;
         return new AzureStorage(account, key, container, prefix, emulator, concurrency);
     }
@@ -325,8 +390,95 @@ internal sealed class AzureStorage : BenchStorage
             .Select(item => item.Prefix.TrimEnd('/'))
             .ToList();
 
-    public override string LockPath(string location) =>
-        Path.Combine(Path.GetTempPath(), "ew-vs-delta-dotnet-azure-locks",
-            string.Join("_", $"{_account}/{_container.Name}/{location}".Split(Path.GetInvalidFileNameChars().Append('/').ToArray()))
-            + ".lock");
+    /// <summary>
+    /// A lease on a sibling <c>&lt;location&gt;.lock</c> blob, so runs on DIFFERENT machines sharing the container
+    /// and prefix serialize too (a local file would only cover this one). The lease is taken for
+    /// <see cref="LeaseDuration"/> and renewed in the background while the build runs; a holder that dies stops
+    /// renewing, and the lease expires on its own.
+    /// </summary>
+    public override BuildLock AcquireBuildLock(string location, string name)
+    {
+        var blob = _container.GetBlobClient(location + ".lock");
+        try
+        {
+            blob.Upload(BinaryData.FromString(""), overwrite: false);
+        }
+        catch (Azure.RequestFailedException e) when (e.Status is 409 or 412)
+        {
+            // Already there (409), or there and leased by its current holder (412).
+        }
+        var lease = blob.GetBlobLeaseClient();
+        return WaitFor(name, () =>
+        {
+            try
+            {
+                lease.Acquire(LeaseDuration);
+                return new LeaseLock(lease);
+            }
+            catch (Azure.RequestFailedException e) when (e.Status == 409)
+            {
+                return null; // LeaseAlreadyPresent: another run is building it
+            }
+        });
+    }
+
+    private static readonly TimeSpan LeaseDuration = TimeSpan.FromSeconds(60);
+
+    private sealed class LeaseLock : BuildLock
+    {
+        private readonly BlobLeaseClient _lease;
+        private readonly Timer _renewal;
+        private volatile Exception? _lost;
+
+        public LeaseLock(BlobLeaseClient lease)
+        {
+            _lease = lease;
+            var period = LeaseDuration / 3;
+            _renewal = new Timer(_ => Renew(), null, period, period);
+        }
+
+        private void Renew()
+        {
+            try
+            {
+                _lease.Renew();
+            }
+            catch (Exception e) when (e is Azure.RequestFailedException or AggregateException)
+            {
+                _lost ??= e; // a transient failure may still leave time on the lease; ThrowIfLost renews again
+            }
+        }
+
+        public override void ThrowIfLost()
+        {
+            // A synchronous renewal proves the lease is still ours at the moment of marking the template ready.
+            try
+            {
+                _lease.Renew();
+            }
+            catch (Azure.RequestFailedException e)
+            {
+                throw new InvalidOperationException(
+                    "Lost the lease on a fixture's build lock; another run may have built it too. Delete the "
+                    + "template and its .ready blob and rerun.", _lost ?? e);
+            }
+        }
+
+        public override void Dispose()
+        {
+            using (var stopped = new ManualResetEvent(false))
+            {
+                _renewal.Dispose(stopped); // wait out a renewal in flight, so it cannot follow the release
+                stopped.WaitOne();
+            }
+            try
+            {
+                _lease.Release();
+            }
+            catch (Azure.RequestFailedException)
+            {
+                // Expired or taken over already; nothing of ours to release.
+            }
+        }
+    }
 }

@@ -41,7 +41,7 @@ BenchmarkDotNet runs each benchmark in a child process that inherits the environ
 | `EWDD_AZURE_ACCOUNT` | storage account name (required for `azure`) |
 | `EWDD_AZURE_KEY` | an account key (required for `azure`); shared-key auth for both engines |
 | `EWDD_AZURE_CONTAINER` | container, created if absent (default `ew-vs-delta-dotnet`) |
-| `EWDD_AZURE_PREFIX` | blob-name prefix all fixtures and scratch copies go under (default `bench`) |
+| `EWDD_AZURE_PREFIX` | blob-name prefix all fixtures and scratch copies go under (default `bench`; must not be empty) |
 | `EWDD_AZURE_CONCURRENCY` | EW's `AzureTableFileSystem` `maxConcurrency` (default 16, its own default) |
 | `EWDD_AZURE_EMULATOR` | `1`: Azurite's well-known account on `127.0.0.1:10000`, for a smoke test without an account |
 
@@ -58,8 +58,11 @@ Every run prints a `// storage: …` line first, so a result can never be mistak
 
 - **Fixtures live in the container** (`<prefix>/templates/<name>`, marked by a `<name>.ready` blob), built once by
   the first run through both engines' own Azure writers. Delete the `.ready` blob, or the prefix, to rebuild.
+  Machines may share a prefix: a build holds a lease on a `<name>.lock` blob, so a second cold run waits for
+  the first run's template instead of building over it, and a lease whose holder dies expires within a minute.
 - **Each mutation iteration gets a server-side copy** of its template (Copy Blob within the account, so no
-  bytes come back through this machine), under `<prefix>/scratch/<pid>/`, deleted after the iteration.
+  bytes come back through this machine), under `<prefix>/scratch/<machine>/<pid>/`, deleted after the
+  iteration. A run sweeps only its own machine's leftovers, since a process id means nothing elsewhere.
   The copy is not timed. Unlike a local copy, its blobs' last-modified times are new; the only fixture whose
   vacuum keys off file age uses a zero retention, so that changes nothing.
 - **Run from a VM in the account's region** if you want numbers about the engines rather than about your
