@@ -2914,9 +2914,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
-        await foreach (long version in _log.ListVersionsAsync(0, cancellationToken).ConfigureAwait(false))
+        // Each commit is one small read, and against an object store one round trip; reading them one after
+        // another made a 100-commit history cost 100 round trips. The reads now run EffectiveConcurrentRequests
+        // ahead of the consumer, and the entries still come out in version order.
+        await foreach (var (version, actions) in BoundedParallel.SelectInOrderAsync(
+                           _log.ListVersionsAsync(0, cancellationToken),
+                           EffectiveConcurrentRequests,
+                           async (v, ct) => (v, await _log.ReadCommitAsync(v, ct).ConfigureAwait(false)),
+                           cancellationToken).ConfigureAwait(false))
         {
-            var actions = await _log.ReadCommitAsync(version, cancellationToken).ConfigureAwait(false);
             long? ts = null;
             string? op = null;
             string? opParams = null;
@@ -6473,6 +6479,17 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// file system suggests (<see cref="IReadConcurrencyHint"/>: an object store's requests in flight, #632) or
     /// else up to 4, where a local read stops gaining; and 1 through the codec seam, whose contract never
     /// promised that two files may be read at once.</summary>
+    /// <summary>The small, independent file-system requests run at once outside a scan: the commit reads of
+    /// <see cref="GetHistoryAsync"/> and the deletes of <see cref="VacuumAsync"/>.
+    /// <see cref="DeltaTableOptions.MaxConcurrentReads"/> when set (1 keeps them serial); by default what the
+    /// table's file system suggests (<see cref="IReadConcurrencyHint"/>), or else up to 4. Unlike
+    /// <see cref="EffectiveConcurrentReads"/> the codec seam plays no part: these requests go to the file system,
+    /// never through a <see cref="DeltaTableOptions.DataFileReader"/>.</summary>
+    internal int EffectiveConcurrentRequests =>
+        _options.MaxConcurrentReads
+        ?? ((_fs as IReadConcurrencyHint)?.PreferredConcurrentReads is int hint and >= 1 ? hint
+            : Math.Min(4, Environment.ProcessorCount));
+
     internal int EffectiveConcurrentReads =>
         _options.MaxConcurrentReads
         ?? (_options.DataFileReader is not null ? 1
@@ -11736,7 +11753,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 var plan = await Compaction.CompactionExecutor.ExecuteAsync(
                     _fs, snapshot, options,
                     DataFileWriteOptions(snapshot), _dataFileReadOptions,
-                    cancellationToken, _options.DataFileWriter, _options.DataFileReader, written)
+                    cancellationToken, _options.DataFileWriter, _options.DataFileReader, written,
+                    maxConcurrentReads: EffectiveConcurrentReads, maxBufferedReadBytes: _options.MaxBufferedReadBytes)
                     .ConfigureAwait(false);
                 if (plan is not { } compaction)
                     return null;
@@ -11873,7 +11891,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         return await Vacuum.VacuumExecutor.ExecuteAsync(
             _fs, _log, CurrentSnapshot, retention, dryRun,
             _options.HideIcebergMetadataDirectory, cancellationToken,
-            afterCommit: AfterVacuumCommitAsync, commitProperties: commitProperties)
+            afterCommit: AfterVacuumCommitAsync, commitProperties: commitProperties,
+            maxConcurrentDeletes: EffectiveConcurrentRequests)
             .ConfigureAwait(false);
     }
 
@@ -12522,7 +12541,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// Reserves scan memory before pulling each raw batch from <paramref name="source"/>, i.e. before it is
     /// decoded. A read outside a parallel scan passes <see cref="ScanReservation.None"/>, which reserves nothing.
     /// </summary>
-    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> Reserving(
+    internal static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> Reserving(
         IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> source,
         ScanReservation reservation,
         [EnumeratorCancellation] CancellationToken cancellationToken)
@@ -12560,7 +12579,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// measured. Parquet's uncompressed size is close to the Arrow size for plain data and an UNDERestimate
     /// for dictionary-encoded strings; the reservation is trued up to the measured size once decoded.
     /// </summary>
-    private static long LargestRowGroupBytes(
+    internal static long LargestRowGroupBytes(
         Parquet.Metadata.FileMetaData footer, IReadOnlyList<string>? fileColumns, DeletionVectorBitmap? deletedRows)
     {
         HashSet<string>? wanted = fileColumns is null
