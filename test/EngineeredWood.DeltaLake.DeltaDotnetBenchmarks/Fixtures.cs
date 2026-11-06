@@ -8,8 +8,8 @@ using EwDeltaTable = EngineeredWood.DeltaLake.Table.DeltaTable;
 namespace DeltaDotnetComparison;
 
 /// <summary>
-/// Template tables, built once and cached under <see cref="Root"/> (override with <c>EWDD_BENCH_ROOT</c>), and
-/// fresh copies of them for the benchmarks that mutate a table.
+/// Template tables, built once and cached under <see cref="Root"/> (on local disk, or in Azure Blob Storage: see
+/// <see cref="BenchStorage"/>), and fresh copies of them for the benchmarks that mutate a table.
 ///
 /// <para>Each template is built by its <see cref="TableWriter"/> with that engine's DEFAULT writer settings,
 /// so a table's file layout (page version, encodings, row-group size, stats) is that engine's own. Readers
@@ -37,19 +37,25 @@ internal static class Fixtures
     private static readonly Dictionary<string, string> NoAutoCheckpoint =
         new() { ["delta.checkpointInterval"] = "1000000" };
 
-    public static string Root { get; } =
-        Environment.GetEnvironmentVariable("EWDD_BENCH_ROOT")
-        ?? Path.Combine(Path.GetTempPath(), "ew-vs-delta-dotnet");
+    private static BenchStorage Storage => BenchStorage.Current;
 
-    private static string Templates => Path.Combine(Root, "templates");
-    private static string ScratchRoot => Path.Combine(Root, "scratch");
+    public static string Root => Storage.Root;
+
+    private static string Templates => Storage.Combine(Root, "templates");
+    private static string ScratchRoot => Storage.Combine(Root, "scratch");
+
+    /// <summary>
+    /// This machine's scratch directories. A process id means something only on its own machine, and an Azure
+    /// root may be shared by runs on several, so each machine keeps (and sweeps) only its own subtree.
+    /// </summary>
+    private static string HostScratch => Storage.Combine(ScratchRoot, Environment.MachineName.ToLowerInvariant());
 
     /// <summary>
     /// This process's own scratch directory. BenchmarkDotNet runs each benchmark in a child process, and a
     /// <c>--verify</c> or a second filtered run may share <see cref="Root"/> with a run in progress, so no
     /// process may sweep another live process's iteration copies.
     /// </summary>
-    private static string Scratch => Path.Combine(ScratchRoot, Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
+    private static string Scratch => Storage.Combine(HostScratch, Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
 
     /// <summary>One commit of <see cref="Rows"/> rows.</summary>
     public static string SingleCommit(TableWriter writer) =>
@@ -153,49 +159,37 @@ internal static class Fixtures
     /// <summary>A fresh, private copy of a template, for one benchmark iteration to mutate.</summary>
     public static string FreshCopy(string template)
     {
-        string path = Path.Combine(Scratch, Guid.NewGuid().ToString("N"));
-        CopyDirectory(template, path);
+        string path = Storage.Combine(Scratch, Guid.NewGuid().ToString("N"));
+        Storage.CopyTree(template, path);
         return path;
     }
 
     /// <summary>A fresh, empty directory, for one write iteration.</summary>
     public static string FreshEmpty()
     {
-        string path = Path.Combine(Scratch, Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(path);
+        string path = Storage.Combine(Scratch, Guid.NewGuid().ToString("N"));
+        Storage.CreateEmpty(path);
         return path;
     }
 
     public static void Delete(string? path)
     {
-        if (path is null || !Directory.Exists(path))
-            return;
-        try
-        {
-            Directory.Delete(path, recursive: true);
-        }
-        catch (IOException)
-        {
-            // A native handle released a moment late; the scratch root is swept on the next run anyway.
-        }
-        catch (UnauthorizedAccessException)
-        {
-        }
+        if (path is not null)
+            Storage.DeleteTree(path);
     }
 
     /// <summary>
-    /// Clears out iteration copies left by interrupted runs: this process's own directory, and those of
-    /// processes that have exited. A directory whose process is still running is left alone. (A reused process
-    /// id can only make a dead run's copies survive one more sweep; it can never delete a live run's.)
+    /// Clears out iteration copies left by interrupted runs on THIS machine: this process's own directory, and
+    /// those of processes that have exited. A directory whose process is still running is left alone, and other
+    /// machines' subtrees are never looked at. (A reused process id can only make a dead run's copies survive
+    /// one more sweep; it can never delete a live run's.)
     /// </summary>
     public static void SweepScratch()
     {
         Delete(Scratch);
-        if (!Directory.Exists(ScratchRoot))
-            return;
-        foreach (string dir in Directory.EnumerateDirectories(ScratchRoot))
+        foreach (string dir in Storage.Children(HostScratch))
         {
-            if (int.TryParse(Path.GetFileName(dir), NumberStyles.None, CultureInfo.InvariantCulture, out int pid)
+            if (int.TryParse(Storage.NameOf(dir), NumberStyles.None, CultureInfo.InvariantCulture, out int pid)
                 && !IsRunning(pid))
             {
                 Delete(dir);
@@ -226,51 +220,91 @@ internal static class Fixtures
 
     private static string Ensure(string name, Func<string, Task> build)
     {
-        string path = Path.Combine(Templates, name);
-        string marker = path + ".ready";
-        if (File.Exists(marker))
-            return path;
+        // The marker names the template; each build writes a fresh location of its own (templates/<name>.<id>)
+        // and publishes it by writing the marker last. No run ever writes into a location another run may be
+        // building or using, so even a run that lost its lock mid-build (a stalled process whose lease expired)
+        // can only publish a second complete build, never mix its files into someone else's.
+        string marker = Storage.Combine(Templates, name);
+        if (Built(marker) is { } built)
+            return built;
 
-        // Two processes sharing a root (a --verify beside a benchmark run, or two filtered runs) could otherwise
-        // both find no marker, and one would delete or mark the other's half-built template. The lock covers
-        // the re-check, the build and the marker; a process that dies mid-build releases it (the OS closes the
-        // handle), leaves no marker, and the next holder rebuilds from scratch.
-        using (AcquireBuildLock(path + ".lock", name))
+        // The lock (a file on local disk, a blob lease in Azure) spares the second run a duplicate build: it
+        // waits, re-checks and finds the first run's template. A run that dies mid-build releases it and leaves
+        // no marker, and the next holder builds a fresh location.
+        using (Storage.AcquireBuildLock(marker, name))
         {
-            if (File.Exists(marker))
-                return path; // built by whoever held the lock before us
+            if (Built(marker) is { } builtMeanwhile)
+                return builtMeanwhile; // built by whoever held the lock before us
 
-            Delete(path);
-            Directory.CreateDirectory(path);
-            Console.WriteLine($"// building fixture {name} ...");
-            build(path).GetAwaiter().GetResult();
-            File.WriteAllText(marker, DateTime.UtcNow.ToString("O"));
-        }
-        return path;
-    }
+            DeleteAbandonedTemplates(name);
 
-    /// <summary>An exclusive, inter-process lock: a sibling file opened with no sharing, retried until free.</summary>
-    private static FileStream AcquireBuildLock(string lockPath, string name)
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(lockPath)!);
-        var waited = System.Diagnostics.Stopwatch.StartNew();
-        bool announced = false;
-        while (true)
-        {
+            string path = Storage.Combine(Templates, $"{name}.{Guid.NewGuid():N}");
+            Console.WriteLine($"// building fixture {name} on {Storage.Description} ...");
             try
             {
-                return new FileStream(lockPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                Storage.CreateEmpty(path);
+                build(path).GetAwaiter().GetResult();
             }
-            catch (IOException) when (waited.Elapsed < TimeSpan.FromMinutes(30))
+            catch
             {
-                if (!announced)
-                {
-                    Console.WriteLine($"// waiting for another process to finish building fixture {name} ...");
-                    announced = true;
-                }
-                Thread.Sleep(250);
+                Delete(path);
+                throw;
+            }
+
+            // Create-only: a run that stalled past its lock and finds a marker already published drops its own
+            // build and uses the published one, rather than replacing a template other runs may be reading.
+            if (Storage.TryCreateMarker(marker, $"{GenerationPrefix}{Storage.NameOf(path)}\nbuilt {DateTime.UtcNow:O}\n"))
+                return path;
+            Delete(path);
+            return Built(marker)
+                ?? throw new InvalidOperationException($"Fixture {name}'s marker vanished while it was being published.");
+        }
+    }
+
+    private const string GenerationPrefix = "template ";
+
+    /// <summary>
+    /// How long a template location must have gone unwritten before a rebuild deletes it. A build in progress
+    /// writes every few seconds, so this only ever catches an old template or a dead build, never a live one.
+    /// </summary>
+    private static readonly TimeSpan AbandonedAfter = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Deletes this template's unpublished locations, called (under the lock, with no marker) before a rebuild:
+    /// the copy a deleted <c>.ready</c> used to name, the old-style <c>templates/&lt;name&gt;</c>, and any build
+    /// that died. One written to within <see cref="AbandonedAfter"/> is left alone, as it may be a stalled build
+    /// that will resume; if it does, it finds this build's marker and deletes itself.
+    /// </summary>
+    private static void DeleteAbandonedTemplates(string name)
+    {
+        DateTimeOffset cutoff = DateTimeOffset.UtcNow - AbandonedAfter;
+        foreach (string location in Storage.Children(Templates))
+        {
+            string child = Storage.NameOf(location);
+            bool ours = child == name
+                || (child.Length == name.Length + 33
+                    && child.StartsWith(name + ".", StringComparison.Ordinal)
+                    && child[(name.Length + 1)..].All(char.IsAsciiHexDigitLower));
+            if (ours && !(Storage.LastWrite(location) > cutoff))
+            {
+                Console.WriteLine($"// deleting abandoned fixture location {child} ...");
+                Delete(location);
             }
         }
+    }
+
+    /// <summary>
+    /// The published template behind a marker, or null if none. A marker from before templates had their own
+    /// locations holds only a timestamp, and its template is the marker's own location.
+    /// </summary>
+    private static string? Built(string marker)
+    {
+        if (Storage.ReadMarker(marker) is not { } content)
+            return null;
+        if (!content.StartsWith(GenerationPrefix, StringComparison.Ordinal))
+            return marker;
+        string generation = content[GenerationPrefix.Length..].Split('\n')[0].Trim();
+        return Storage.Combine(Templates, generation);
     }
 
     /// <summary>Creates the table with the first batch list, then appends each further list as one commit.</summary>
@@ -290,12 +324,7 @@ internal static class Fixtures
         }
         else
         {
-            var create = new TableCreateOptions(path, Data.Schema)
-            {
-                SaveMode = global::DeltaLake.Table.SaveMode.ErrorIfExists,
-                Configuration = configuration.ToDictionary(p => p.Key, p => p.Value),
-            };
-            using var table = await Dd.Engine.CreateTableAsync(create, CancellationToken.None);
+            using var table = await Dd.Engine.CreateTableAsync(Dd.CreateOptions(path, configuration), CancellationToken.None);
             foreach (var commit in commits)
                 await Dd.InsertAsync(table, commit, Dd.DefaultMaxRowsPerGroup);
         }
@@ -326,20 +355,6 @@ internal static class Fixtures
         {
             using var table = await Dd.OpenAsync(path);
             await table.OptimizeAsync(new OptimizeOptions(), CancellationToken.None);
-        }
-    }
-
-    private static void CopyDirectory(string source, string destination)
-    {
-        Directory.CreateDirectory(destination);
-        foreach (string dir in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories))
-            Directory.CreateDirectory(Path.Combine(destination, Path.GetRelativePath(source, dir)));
-        foreach (string file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
-        {
-            string target = Path.Combine(destination, Path.GetRelativePath(source, file));
-            File.Copy(file, target);
-            // Keep the source's mtime: vacuum retention and file-age logic key off it.
-            File.SetLastWriteTimeUtc(target, File.GetLastWriteTimeUtc(file));
         }
     }
 }

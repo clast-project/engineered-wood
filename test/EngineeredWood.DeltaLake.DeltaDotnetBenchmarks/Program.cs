@@ -4,6 +4,18 @@
 using BenchmarkDotNet.Running;
 using DeltaDotnetComparison;
 
+// Which store the tables live on (EWDD_STORAGE; see BenchStorage). Printed so a result is never mistaken for
+// the other store's, and resolved up front so a missing credential fails here rather than inside a benchmark.
+try
+{
+    Console.WriteLine($"// storage: {BenchStorage.Current.Description}");
+}
+catch (TypeInitializationException e) when (e.InnerException is InvalidOperationException config)
+{
+    Console.Error.WriteLine($"Storage configuration error: {config.Message}");
+    return 2;
+}
+
 if (args.Length > 0 && args[0] == "--verify")
     return await Verify.RunAsync(args.Skip(1).ToArray());
 
