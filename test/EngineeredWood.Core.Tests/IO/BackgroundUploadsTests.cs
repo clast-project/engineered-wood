@@ -173,6 +173,8 @@ public class BackgroundUploadsTests
 
         gated.Release(0).SetException(new IOException("block 0 failed"));
 
+        // Not left waiting for a release that will never come.
+        Assert.Same(inTurn, await Task.WhenAny(inTurn, Task.Delay(TimeSpan.FromSeconds(10))));
         var failure = await Assert.ThrowsAsync<IOException>(() => inTurn);
         Assert.Equal("block 0 failed", failure.Message);
         Assert.Empty(gated.Done);
