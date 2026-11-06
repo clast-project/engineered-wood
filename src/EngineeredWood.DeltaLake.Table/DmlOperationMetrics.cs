@@ -18,7 +18,9 @@ namespace EngineeredWood.DeltaLake.Table;
 ///
 /// <para>An <c>add</c> and a <c>remove</c> of the same path are one file given a new deletion vector, not a file
 /// removed and another added, which is how Spark counts a deletion-vector DELETE or MERGE: no file added or
-/// removed, one vector added (or updated, when the file already had one). Spark's deletion-vector UPDATE counts
+/// removed, and one vector added. When the file already had a vector, Spark counts its replacement as one vector
+/// added, one removed AND one updated, for DELETE, UPDATE and MERGE alike (measured on Spark 4.0.1 / Delta 4.0.0,
+/// #703); a file removed whole with its vector counts that vector as removed. Spark's deletion-vector UPDATE counts
 /// such a file as removed as well, with its bytes (measured on Spark 4.0.1 / Delta 4.0.0), and so does
 /// <see cref="ForUpdate"/>.</para>
 ///
@@ -65,10 +67,13 @@ internal static class DmlOperationMetrics
                         readdedBytes += replaced.Size ?? add.Size;
                     if (add.DeletionVector is not null)
                     {
-                        if (replaced.DeletionVector is null)
-                            dvAdded++;
-                        else
+                        dvAdded++;
+                        if (replaced.DeletionVector is not null)
+                        {
+                            // A replaced vector: Spark counts the old one removed and the pair updated too (#703).
+                            dvRemoved++;
                             dvUpdated++;
+                        }
                     }
                     else if (replaced.DeletionVector is not null)
                     {

@@ -257,7 +257,11 @@ public class UpdateDeletionVectorTests : IDisposable
 
         Assert.Equal([(1, "a"), (2, "B"), (3, "C"), (4, "d")], await ReadAsync(table));
         Assert.Equal(3, FileAt(table, path).DeletionVector!.Cardinality);
-        Assert.Equal("1", (await LastMetricsAsync(table))["numDeletionVectorsUpdated"]);
+        // A replaced vector counts as added, removed and updated, as Spark counts it (#703).
+        var committed = await LastMetricsAsync(table);
+        Assert.Equal("1", committed["numDeletionVectorsAdded"]);
+        Assert.Equal("1", committed["numDeletionVectorsRemoved"]);
+        Assert.Equal("1", committed["numDeletionVectorsUpdated"]);
     }
 
     [Fact]

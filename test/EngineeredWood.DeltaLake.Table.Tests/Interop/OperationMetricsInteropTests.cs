@@ -60,8 +60,10 @@ public class OperationMetricsInteropTests : IDisposable
         return new RecordBatch(TableSchema, [id.Build(), value.Build()], rows.Length);
     }
 
-    /// <summary>Two identical tables of two files each: (1, 2, 3) and (4, 5).</summary>
-    private async Task CreateTwinsAsync(bool deletionVectors, bool changeDataFeed = false)
+    /// <summary>Two identical tables of two files each: (1, 2, 3) and (4, 5). With
+    /// <paramref name="existingVectors"/> rows 1 and 4 are then deleted, so each file already has a deletion vector
+    /// for the operation under test to replace (or to remove with its file) (#703).</summary>
+    private async Task CreateTwinsAsync(bool deletionVectors, bool changeDataFeed = false, bool existingVectors = false)
     {
         var configuration = new Dictionary<string, string>();
         if (changeDataFeed)
@@ -73,6 +75,11 @@ public class OperationMetricsInteropTests : IDisposable
                 configuration: configuration);
             await table.WriteAsync([Rows((1, "a"), (2, "b"), (3, "c"))]);
             await table.WriteAsync([Rows((4, "d"), (5, "e"))]);
+            if (existingVectors)
+            {
+                await table.DeleteAsync(Ex.Equal("id", 1L), RowDeleteMode.DeletionVector);
+                await table.DeleteAsync(Ex.Equal("id", 4L), RowDeleteMode.DeletionVector);
+            }
         }
     }
 
@@ -114,23 +121,19 @@ public class OperationMetricsInteropTests : IDisposable
         params string[] unsetBySpark)
     {
         Assert.NotEmpty(ours);
+        // Every mismatch at once, so one run against Spark shows the whole difference.
+        var mismatches = new List<string>();
         foreach (var (key, value) in ours)
         {
-            Assert.True(theirs.TryGetValue(key, out string? sparks),
-                $"Spark records no '{key}'. Spark's metrics: {string.Join(", ", theirs.Keys)}");
-            if (unsetBySpark.Contains(key))
-            {
-                Assert.Equal("0", sparks);
-            }
-            else if (DependsOnFileLayout(key))
-            {
-                Assert.True(value == "0" == (sparks == "0"), $"{key}: ours {value}, Spark's {sparks}");
-            }
-            else
-            {
-                Assert.True(value == sparks, $"{key}: ours {value}, Spark's {sparks}");
-            }
+            if (!theirs.TryGetValue(key, out string? sparks))
+                mismatches.Add($"Spark records no '{key}'");
+            else if (unsetBySpark.Contains(key) ? sparks != "0"
+                : DependsOnFileLayout(key) ? value == "0" != (sparks == "0")
+                : value != sparks)
+                mismatches.Add($"{key}: ours {value}, Spark's {sparks}");
         }
+        Assert.True(mismatches.Count == 0, string.Join("; ", mismatches)
+            + $". Spark's metrics: {string.Join(", ", theirs.OrderBy(p => p.Key, StringComparer.Ordinal).Select(p => $"{p.Key}={p.Value}"))}");
     }
 
     private static bool DependsOnFileLayout(string key) =>
@@ -139,12 +142,13 @@ public class OperationMetricsInteropTests : IDisposable
         || key is "numAddedFiles" or "numTargetFilesAdded";
 
     [SkippableTheory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task ADelete_RecordsSparksMetrics(bool deletionVectors)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task ADelete_RecordsSparksMetrics(bool deletionVectors, bool existingVectors)
     {
         Spark.Require();
-        await CreateTwinsAsync(deletionVectors, changeDataFeed: !deletionVectors);
+        await CreateTwinsAsync(deletionVectors, changeDataFeed: !deletionVectors, existingVectors);
 
         long version;
         await using (var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_ours)))
@@ -165,12 +169,13 @@ public class OperationMetricsInteropTests : IDisposable
     /// count it as removed: unlike its DELETE and MERGE, Spark's deletion-vector UPDATE reports the masked file in
     /// <c>numRemovedFiles</c> and <c>numRemovedBytes</c>, and so does this library.</summary>
     [SkippableTheory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task AnUpdate_RecordsSparksMetrics(bool deletionVectors)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task AnUpdate_RecordsSparksMetrics(bool deletionVectors, bool existingVectors)
     {
         Spark.Require();
-        await CreateTwinsAsync(deletionVectors, changeDataFeed: true);
+        await CreateTwinsAsync(deletionVectors, changeDataFeed: true, existingVectors);
 
         long version;
         await using (var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_ours)))
@@ -192,12 +197,13 @@ public class OperationMetricsInteropTests : IDisposable
     /// <summary>With deletion vectors both files keep their unchanged rows (#574): the vector masks the updated row 2
     /// in the one and the deleted row 5 in the other, so no file is removed and no row copied.</summary>
     [SkippableTheory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task AMerge_RecordsSparksMetrics(bool deletionVectors)
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public async Task AMerge_RecordsSparksMetrics(bool deletionVectors, bool existingVectors)
     {
         Spark.Require();
-        await CreateTwinsAsync(deletionVectors, changeDataFeed: true);
+        await CreateTwinsAsync(deletionVectors, changeDataFeed: true, existingVectors);
 
         long version;
         await using (var table = await DeltaTable.OpenAsync(new LocalTableFileSystem(_ours)))
