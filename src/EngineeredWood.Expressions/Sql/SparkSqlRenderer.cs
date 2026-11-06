@@ -294,6 +294,10 @@ public static class SparkSqlRenderer
                 return Text(sql, value.AsDecimal.ToString(CultureInfo.InvariantCulture) + "BD");
             case LiteralValue.Kind.HighPrecisionDecimal:
                 var (unscaled, scale) = value.AsHighPrecisionDecimal;
+                // Checked first, so the arithmetic below cannot overflow (-int.MinValue): no scale past 38 either way
+                // fits in 38 digits.
+                if (scale > MaxDecimalPrecision || scale < -MaxDecimalPrecision)
+                    return $"a decimal of scale {scale} is wider than Spark's {MaxDecimalPrecision} digits";
                 // Spark's widest decimal is 38 digits, the scale counted among them (0 <= scale <= precision <= 38),
                 // and a negative scale is written out as trailing zeros. Past that, Spark refuses the literal.
                 int digits = BigInteger.Abs(unscaled).ToString(CultureInfo.InvariantCulture).Length;

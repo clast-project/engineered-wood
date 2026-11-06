@@ -1356,6 +1356,24 @@ def _run(command, args_path):
         # Spark stacks are enormous and the useful part is the innermost Delta/Java message.
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:4000],
                 "traceback": traceback.format_exc()[-4000:]}
+    finally:
+        _release_delta_logs()
+
+
+def _release_delta_logs():
+    """Drop Delta's per-path DeltaLog cache after every command.
+
+    Every test works on fresh temporary paths, so a cached DeltaLog (and the snapshot state it holds) is never
+    reused, and the cache only grows. MEASURED on Spark 4.1 / 1 GB heap: about 3.4 MB retained per table without
+    this, versus a flat ~150-185 MB with it. A full CI run of ~290 tests filled the driver heap and failed with
+    "Not enough memory to build and broadcast the table", landing on whichever test came next.
+    """
+    if _SESSION is None:
+        return
+    try:
+        _SESSION._jvm.org.apache.spark.sql.delta.DeltaLog.clearCache()
+    except Exception:
+        pass
 
 
 def _serve():

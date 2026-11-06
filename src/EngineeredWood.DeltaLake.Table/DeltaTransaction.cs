@@ -300,12 +300,13 @@ public sealed class DeltaTransaction : IAsyncDisposable
     private long _updatedRows;
     private MergeMetrics? _mergeMetrics;
 
-    // What the staged DML was asked to do, for the commit's operationParameters (#591): each DELETE's or UPDATE's
-    // condition (null for a delegate or a row selection, which have no text), each MERGE's options, each
-    // replaceWhere's condition.
-    private readonly List<Expressions.Predicate?> _dmlConditions = [];
-    private readonly List<MergeOptions> _merges = [];
-    private readonly List<Expressions.Predicate> _replaceWheres = [];
+    // What the staged DML was asked to do, for the commit's operationParameters (#591), rendered when it was staged
+    // so a caller changing its MergeOptions lists afterwards cannot change what is recorded: each DELETE's or
+    // UPDATE's condition as SQL (null for a delegate, a row selection, or no Spark SQL), and each MERGE's and
+    // replaceWhere's parameters (null when they have no Spark SQL).
+    private readonly List<string?> _dmlConditions = [];
+    private readonly List<IReadOnlyDictionary<string, string>?> _mergeParameters = [];
+    private readonly List<IReadOnlyDictionary<string, string>?> _replaceWhereParameters = [];
 
     // Whether StageActions staged a data-changing add or remove. Its rows are not counted by any staging call,
     // so the commit's metrics would fold them into the DML's (an added file's rows into copied rows).
@@ -346,8 +347,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
         return SoleStagedKind(actions) switch
         {
             "DELETE" or "UPDATE" => DmlOperationParameters.ForConditions(_dmlConditions),
-            "MERGE" when _merges.Count == 1 => DmlOperationParameters.ForMerge(_merges[0]),
-            ReplaceWhereKind when _replaceWheres.Count == 1 => DmlOperationParameters.ForReplaceWhere(_replaceWheres[0]),
+            "MERGE" when _mergeParameters.Count == 1 => _mergeParameters[0],
+            ReplaceWhereKind when _replaceWhereParameters.Count == 1 => _replaceWhereParameters[0],
             _ => null,
         };
     }
@@ -571,7 +572,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         else
             _opaqueReadPredicate = true;
         _operations.Add("DELETE");
-        _dmlConditions.Add(analyzable);
+        _dmlConditions.Add(DmlOperationParameters.Render(analyzable));
         _deletedRows += plan.TotalDeleted;
 
         return plan.TotalDeleted;
@@ -662,7 +663,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
             _removedPaths.Add(path);
         _readPredicates.Add(predicate);
         _operations.Add("UPDATE");
-        _dmlConditions.Add(predicate);
+        _dmlConditions.Add(DmlOperationParameters.Render(predicate));
         _updatedRows += plan.TotalUpdated;
 
         return plan.TotalUpdated;
@@ -759,7 +760,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         else if (plan.ScannedTarget)
             _opaqueReadPredicate = true;
         _operations.Add("MERGE");
-        _merges.Add(options);
+        _mergeParameters.Add(DmlOperationParameters.ForMerge(options));
         _mergeStaged = true;
         _mergeMetrics = _mergeMetrics is { } earlier ? DmlOperationMetrics.Sum(earlier, plan.Metrics) : plan.Metrics;
 
@@ -826,7 +827,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         _dvEdits.AddRange(delete.DvEdits);
         _readPredicates.Add(predicate);
         _operations.Add(ReplaceWhereKind);
-        _replaceWheres.Add(predicate);
+        _replaceWhereParameters.Add(DmlOperationParameters.ForReplaceWhere(predicate));
         _deletedRows += delete.TotalDeleted;
 
         long rows = 0;

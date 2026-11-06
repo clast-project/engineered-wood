@@ -217,6 +217,9 @@ public sealed class SparkSqlRendererTests
         Assert.False(SparkSqlRenderer.TryRender(Ex.Lit(LiteralValue.HighPrecisionDecimalOf(1, -38)), out _));
         Assert.False(SparkSqlRenderer.TryRender(
             Ex.Lit(LiteralValue.HighPrecisionDecimalOf(BigInteger.Pow(10, 38), 0)), out _));
+        // Refused, not thrown: negating int.MinValue overflows.
+        Assert.False(SparkSqlRenderer.TryRender(Ex.Lit(LiteralValue.HighPrecisionDecimalOf(1, int.MinValue)), out _));
+        Assert.False(SparkSqlRenderer.TryRender(Ex.Lit(LiteralValue.HighPrecisionDecimalOf(1, int.MaxValue)), out _));
     }
 
     // ── What has no Spark SQL ──────────────────────────────────────────────────────────────────

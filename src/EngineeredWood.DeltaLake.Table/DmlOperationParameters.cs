@@ -39,9 +39,16 @@ internal static class DmlOperationParameters
     // (id <= 1).
     private static readonly JsonWriterOptions Relaxed = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 
-    /// <summary>A DELETE's or UPDATE's parameters: each staged condition, in order. Null when any is null (a
-    /// delegate or a row selection) or has no Spark SQL.</summary>
-    internal static IReadOnlyDictionary<string, string>? ForConditions(IReadOnlyList<Predicate?> conditions)
+    /// <summary>A DELETE's or UPDATE's condition as Spark SQL, or null for none (a delegate, a row selection) or one
+    /// with no Spark SQL.</summary>
+    /// <remarks>Called when the operation is staged, not when it commits: what is recorded is then the condition the
+    /// operation ran with, whatever its caller does with the objects afterwards.</remarks>
+    internal static string? Render(Predicate? condition) =>
+        condition is not null && SparkSqlRenderer.TryRender(condition, out string? sql) ? sql : null;
+
+    /// <summary>A DELETE's or UPDATE's parameters: each staged condition (from <see cref="Render"/>), in order. Null
+    /// when any is null.</summary>
+    internal static IReadOnlyDictionary<string, string>? ForConditions(IReadOnlyList<string?> conditions)
     {
         if (conditions.Count == 0)
             return null;
@@ -49,7 +56,7 @@ internal static class DmlOperationParameters
         var rendered = new string[conditions.Count];
         for (int i = 0; i < conditions.Count; i++)
         {
-            if (conditions[i] is not { } condition || !SparkSqlRenderer.TryRender(condition, out string? sql))
+            if (conditions[i] is not { } sql)
                 return null;
             rendered[i] = sql;
         }
@@ -57,7 +64,8 @@ internal static class DmlOperationParameters
         return new Dictionary<string, string>(StringComparer.Ordinal) { ["predicate"] = StringArray(rendered) };
     }
 
-    /// <summary>A MERGE's parameters. Null when a clause condition has no Spark SQL.</summary>
+    /// <summary>A MERGE's parameters. Null when a clause condition has no Spark SQL. Called when the MERGE is staged:
+    /// <see cref="MergeOptions"/> holds lists its caller may change afterwards.</summary>
     internal static IReadOnlyDictionary<string, string>? ForMerge(MergeOptions options)
     {
         var on = new List<Predicate>(options.Keys.Count);

@@ -189,6 +189,29 @@ public class OperationParametersTests : IDisposable
             parameters);
     }
 
+    /// <summary>The parameters are taken when the MERGE is staged. Its options hold lists the caller still owns, and
+    /// changing them before the commit must not change what is recorded for the rows already staged.</summary>
+    [Fact]
+    public async Task AMerge_RecordsTheOptionsItRanWith_NotLaterChangesToThem()
+    {
+        await using var table = await CreateAsync();
+        var keys = new List<string> { "id" };
+        var whenMatched = new List<MergeAction> { MergeAction.Delete };
+
+        long version;
+        await using (var txn = table.StartTransaction())
+        {
+            await txn.MergeAsync([Rows(2)], new MergeOptions { Keys = keys, WhenMatched = whenMatched });
+            keys[0] = "value";
+            whenMatched[0] = MergeAction.Update.When(Ex.Equal("id", 99L));
+            version = await txn.CommitAsync();
+        }
+
+        var parameters = await ParametersAsync(table, version);
+        Assert.Equal("[\"(target.id = source.id)\"]", parameters["predicate"]);
+        Assert.Equal("[{\"actionType\":\"delete\"}]", parameters["matchedPredicates"]);
+    }
+
     /// <summary>A MERGE on several keys equates each, and an empty clause list is recorded empty, as Spark does.</summary>
     [Fact]
     public async Task AMergeOnSeveralKeys_RecordsTheirConjunction()

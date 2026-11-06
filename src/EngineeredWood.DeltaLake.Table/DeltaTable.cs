@@ -5304,7 +5304,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 rebaseSafe: true, cancellationToken, written: written,
                 isBlindAppend: false, commitProperties: commitProperties,
                 operationMetrics: committing => DmlOperationMetrics.ForUpdate(committing, plan.TotalUpdated),
-                operationParameters: DmlOperationParameters.ForConditions([opaquePredicate ? null : prunePredicate]))
+                operationParameters: DmlOperationParameters.ForConditions(
+                    [DmlOperationParameters.Render(opaquePredicate ? null : prunePredicate)]))
                 .ConfigureAwait(false);
 
             return (plan.TotalUpdated, committed);
