@@ -69,10 +69,10 @@ internal static class Verify
                             {
                                 result = byEw.ToString();
                             }
-                            else if (byEw.Equals(byDf) && method.Name == nameof(DeletionVectorDeleteBenchmarks.EW_DeleteDeletionVector))
+                            else if (byEw.Equals(byDf) && instance is DeletionVectorDmlBenchmarks)
                             {
-                                // The ONE known exception, and only on the one benchmark that writes a deletion
-                                // vector: delta-dotnet's ReadParquetAsArrow drops the kernel's selection vector, so
+                                // The ONE known exception, and only on the benchmarks that write deletion vectors:
+                                // delta-dotnet's ReadParquetAsArrow drops the kernel's selection vector, so
                                 // DV-deleted rows come back (delta-incubator/delta-dotnet#234). Two independent
                                 // readers agree here. Any other kernel disagreement is a failure.
                                 result = byEw.ToString();
@@ -88,6 +88,17 @@ internal static class Verify
                             // preserve the rows, so a no-op would pass the fingerprint. Check that each did its job too.
                             if (instance is MaintenanceBenchmarks or ConstraintBenchmarks or RestoreBenchmarks)
                                 result += " " + await MaintenancePostconditionAsync(category, mutation.CurrentPath!, method.Name);
+
+                            // Each deletion-vector category has one method and no delta-dotnet twin, so nothing
+                            // above compares it with anything. Check that it wrote a vector, and that it left the
+                            // rows its copy-on-write counterpart leaves.
+                            // Pruning shows only in what a MERGE read, not in the table it leaves (either way
+                            // just the one matching file is rewritten), so print what each engine reports.
+                            if (instance is MergeKeyRangeBenchmarks)
+                                Console.WriteLine($"   ({method.Name}: {LatestOperationMetrics(mutation.CurrentPath!)})");
+
+                            if (instance is DeletionVectorDmlBenchmarks)
+                                result += " " + await DeletionVectorPostconditionAsync(instance, method, mutation.CurrentPath!, byEw);
                         }
                         else
                         {
@@ -153,6 +164,60 @@ internal static class Verify
         result.StartsWith("THREW", StringComparison.Ordinal)
         || result.Contains("READERS DISAGREE", StringComparison.Ordinal)
         || result.Contains(PostconditionFailed, StringComparison.Ordinal);
+
+    /// <summary>The latest commit's <c>commitInfo.operationMetrics</c> that count files, as each engine names them.</summary>
+    private static string LatestOperationMetrics(string path)
+    {
+        string latest = Directory.EnumerateFiles(Path.Combine(path, "_delta_log"), "*.json")
+            .OrderBy(f => f, StringComparer.Ordinal).Last();
+        foreach (string line in File.ReadLines(latest))
+        {
+            using var json = System.Text.Json.JsonDocument.Parse(line);
+            if (!json.RootElement.TryGetProperty("commitInfo", out var info)
+                || !info.TryGetProperty("operationMetrics", out var metrics))
+            {
+                continue;
+            }
+            return string.Join(", ", metrics.EnumerateObject()
+                .Where(m => m.Name.Contains("File", StringComparison.OrdinalIgnoreCase)
+                    || m.Name.Contains("_files", StringComparison.OrdinalIgnoreCase))
+                .Select(m => $"{m.Name}={m.Value}"));
+        }
+        return "no operationMetrics";
+    }
+
+    /// <summary>
+    /// A deletion-vector DML must have left an active file with a deletion vector, and the same rows as the same
+    /// method run on <see cref="Fixtures.SingleCommit"/> by EW, a table without deletion vectors, where it
+    /// rewrites the file instead.
+    /// </summary>
+    private static async Task<string> DeletionVectorPostconditionAsync(
+        object instance, MethodInfo method, string path, Fingerprint actual)
+    {
+        int withVector;
+        await using (var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(Ew.Fs(path)))
+            withVector = table.CurrentSnapshot.ActiveFiles.Values.Count(f => f.DeletionVector is not null);
+        if (withVector == 0)
+            return $"{PostconditionFailed}: NO deletion vector written (the file was rewritten)";
+
+        var benchmark = (DeletionVectorDmlBenchmarks)instance;
+        string copyOnWrite = Fixtures.FreshCopy(Fixtures.SingleCommit(TableWriter.EngineeredWood));
+        string dvTable = benchmark.CurrentPath!;
+        try
+        {
+            benchmark.CurrentPath = copyOnWrite;
+            await (Task<long>)method.Invoke(benchmark, null)!;
+            var expected = await Ew.FingerprintAsync(copyOnWrite);
+            return expected.Equals(actual)
+                ? $"deletion vectors on {withVector} file(s), rows as copy-on-write"
+                : $"{PostconditionFailed}: rows differ from copy-on-write ({expected})";
+        }
+        finally
+        {
+            benchmark.CurrentPath = dvTable;
+            Fixtures.Delete(copyOnWrite);
+        }
+    }
 
     private static async Task<string> MaintenancePostconditionAsync(string category, string path, string method)
     {

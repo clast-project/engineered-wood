@@ -40,6 +40,28 @@ internal static class Sql
     /// <summary>The CHECK constraint the ADD CONSTRAINT benchmark adds: true of every row, so both engines scan all.</summary>
     public const string ConstraintName = "amount_non_negative";
     public const string ConstraintExpression = "amount >= 0";
+
+    // The clauses of the expression MERGE, with `{t}` for the target's alias: EW names it `target`, delta-dotnet
+    // `deltatable`. A matched row whose source quantity is under 100 (about 1 in 10) is deleted; any other matched
+    // row adds the source's amount to its own and takes the source's quantity; an unmatched one is inserted.
+
+    /// <summary>The condition of the first WHEN MATCHED clause, a DELETE.</summary>
+    public const string MergeDeleteCondition = "source.quantity < 100";
+
+    /// <summary>The second WHEN MATCHED clause's SET <c>amount</c> expression.</summary>
+    public const string MergeAmountExpression = "{t}.amount + source.amount";
+
+    public static string WithTarget(string sql, string alias) => sql.Replace("{t}", alias);
+}
+
+/// <summary>The key the key-range MERGE joins on. Both identify a row: <c>ts</c> is one millisecond per <c>id</c>.</summary>
+public enum MergeKey
+{
+    /// <summary>The <c>long</c> id.</summary>
+    Id,
+
+    /// <summary>The UTC microsecond timestamp, pruned by key range since #578.</summary>
+    Timestamp,
 }
 
 /// <summary>EngineeredWood operations, shaped as the benchmarks call them.</summary>
@@ -202,17 +224,41 @@ internal static class Ew
         return updated;
     }
 
-    /// <summary><c>MERGE … ON id WHEN MATCHED UPDATE SET * WHEN NOT MATCHED INSERT *</c>.</summary>
-    public static async Task<long> MergeAsync(string path, IReadOnlyList<RecordBatch> source)
+    /// <summary><c>MERGE … ON <paramref name="key"/> WHEN MATCHED UPDATE SET * WHEN NOT MATCHED INSERT *</c>. On a
+    /// table that enables deletion vectors, a matched file gets one rather than being rewritten (#574).</summary>
+    public static async Task<long> MergeAsync(string path, IReadOnlyList<RecordBatch> source, string key = "id")
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Fs(path));
+        var (metrics, _) = await table.MergeAsync(source, new MergeOptions
+        {
+            Keys = [key],
+            WhenMatched = [MergeAction.Update],
+            WhenNotMatched = [MergeAction.Insert],
+        });
+        return metrics.NumTargetRowsUpdated + metrics.NumTargetRowsInserted;
+    }
+
+    /// <summary>
+    /// <c>MERGE … ON id WHEN MATCHED AND source.quantity &lt; 100 THEN DELETE WHEN MATCHED THEN UPDATE SET amount =
+    /// target.amount + source.amount, quantity = source.quantity WHEN NOT MATCHED THEN INSERT *</c>: two clauses of a
+    /// kind, evaluated in order (#575), and a SET expression over both sides (#576).
+    /// </summary>
+    public static async Task<long> MergeWithExpressionsAsync(string path, IReadOnlyList<RecordBatch> source)
     {
         await using var table = await EwDeltaTable.OpenAsync(Fs(path));
         var (metrics, _) = await table.MergeAsync(source, new MergeOptions
         {
             Keys = ["id"],
-            WhenMatched = [MergeAction.Update],
+            WhenMatched =
+            [
+                MergeAction.Delete.When(SparkSqlParser.ParsePredicate(Sql.MergeDeleteCondition)),
+                MergeAction.UpdateSet(
+                    ("amount", SparkSqlParser.ParseExpression(Sql.WithTarget(Sql.MergeAmountExpression, "target"))),
+                    ("quantity", SparkSqlParser.ParseExpression("source.quantity"))),
+            ],
             WhenNotMatched = [MergeAction.Insert],
         });
-        return metrics.NumTargetRowsUpdated + metrics.NumTargetRowsInserted;
+        return metrics.NumTargetRowsUpdated + metrics.NumTargetRowsDeleted + metrics.NumTargetRowsInserted;
     }
 
     /// <summary>replaceWhere: delete the rows matching the predicate and append <paramref name="batches"/>, in one commit.</summary>
@@ -347,19 +393,38 @@ internal static class Dd
         return (long)(table.Version() ?? 0);
     }
 
-    public static async Task<long> MergeAsync(string path, IReadOnlyList<RecordBatch> source)
+    public static async Task<long> MergeAsync(string path, IReadOnlyList<RecordBatch> source, string key = "id")
     {
         using var table = await OpenAsync(path);
-        var columns = Data.Schema.FieldsList.Select(f => f.Name).ToList();
-        string set = string.Join(", ", columns.Select(c => $"{c} = source.{c}"));
-        string values = string.Join(", ", columns.Select(c => $"source.{c}"));
+        string set = string.Join(", ", Columns.Select(c => $"{c} = source.{c}"));
         await table.MergeAsync(
-            "MERGE INTO deltatable USING source ON deltatable.id = source.id "
+            $"MERGE INTO deltatable USING source ON deltatable.{key} = source.{key} "
             + $"WHEN MATCHED THEN UPDATE SET {set} "
-            + $"WHEN NOT MATCHED THEN INSERT ({string.Join(", ", columns)}) VALUES ({values})",
+            + InsertAll,
             source.ToArray(), Data.Schema, CancellationToken.None);
         return (long)(table.Version() ?? 0);
     }
+
+    /// <summary>The same clauses as <see cref="Ew.MergeWithExpressionsAsync"/>, in delta-rs's SQL.</summary>
+    public static async Task<long> MergeWithExpressionsAsync(string path, IReadOnlyList<RecordBatch> source)
+    {
+        using var table = await OpenAsync(path);
+        await table.MergeAsync(
+            "MERGE INTO deltatable USING source ON deltatable.id = source.id "
+            + $"WHEN MATCHED AND {Sql.MergeDeleteCondition} THEN DELETE "
+            + $"WHEN MATCHED THEN UPDATE SET amount = {Sql.WithTarget(Sql.MergeAmountExpression, "deltatable")}, "
+            + "quantity = source.quantity "
+            + InsertAll,
+            source.ToArray(), Data.Schema, CancellationToken.None);
+        return (long)(table.Version() ?? 0);
+    }
+
+    private static readonly IReadOnlyList<string> Columns = Data.Schema.FieldsList.Select(f => f.Name).ToList();
+
+    /// <summary><c>WHEN NOT MATCHED THEN INSERT *</c>, spelled out column by column.</summary>
+    private static string InsertAll =>
+        $"WHEN NOT MATCHED THEN INSERT ({string.Join(", ", Columns)}) "
+        + $"VALUES ({string.Join(", ", Columns.Select(c => $"source.{c}"))})";
 
     /// <summary>replaceWhere: an overwrite insert with a predicate, delta-rs's form of it.</summary>
     public static async Task<long> ReplaceWhereAsync(string path, IReadOnlyList<RecordBatch> batches, string predicateSql)
