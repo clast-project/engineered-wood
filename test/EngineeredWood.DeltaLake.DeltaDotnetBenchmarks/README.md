@@ -86,8 +86,8 @@ any proxy works that answers `GET /__mark?label=…` (attribute what follows to 
 | `EWDD_TRACE_URL` | the proxy's base URL (such as `http://127.0.0.1:10000`); unset, no marks are sent |
 | `EWDD_TRACE_LATENCY_MS` | the latency the proxy adds while a method runs; fixture builds and the fingerprint reads run at 0 |
 | `EWDD_VERIFY_METHODS` | comma-separated substrings: `--verify` runs only the methods whose names contain one |
-| `EWDD_EW_MAX_BUFFERED_MB` | EW's `MaxBufferedReadBytes` in the scan benchmarks (default: EW's own) |
-| `EWDD_EW_MAX_CONCURRENT_READS` | EW's `MaxConcurrentReads` in the scan benchmarks (default: EW's own) |
+| `EWDD_EW_MAX_BUFFERED_MB` | EW's `MaxBufferedReadBytes` in the scan and change-feed benchmarks (default: EW's own); the snapshot benchmarks (open, history) always use the defaults |
+| `EWDD_EW_MAX_CONCURRENT_READS` | EW's `MaxConcurrentReads` in the scan and change-feed benchmarks (default: EW's own); the snapshot benchmarks (open, history) always use the defaults |
 
 ## What is measured
 

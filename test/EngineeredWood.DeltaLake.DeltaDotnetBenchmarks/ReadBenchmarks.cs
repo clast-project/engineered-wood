@@ -235,7 +235,7 @@ public class SnapshotBenchmarks
     [BenchmarkCategory("OpenLatest"), Benchmark(Baseline = true, Description = "EW OpenAsync")]
     public async Task<long> EW_OpenLatest()
     {
-        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path));
         return table.CurrentSnapshot.Version;
     }
 
@@ -249,7 +249,7 @@ public class SnapshotBenchmarks
     [BenchmarkCategory("OpenAtVersion"), Benchmark(Baseline = true, Description = "EW OpenAsync + GetSnapshotAtVersionAsync(50)")]
     public async Task<long> EW_OpenAtVersion()
     {
-        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path));
         var snapshot = await table.GetSnapshotAtVersionAsync(50);
         return snapshot.Version;
     }
@@ -264,7 +264,7 @@ public class SnapshotBenchmarks
     [BenchmarkCategory("History"), Benchmark(Baseline = true, Description = "EW GetHistoryAsync")]
     public async Task<long> EW_History()
     {
-        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path));
         long count = 0;
         await foreach (var _ in table.GetHistoryAsync())
             count++;
