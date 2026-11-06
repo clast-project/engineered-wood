@@ -41,6 +41,14 @@ public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint
     private readonly string _rootPrefix;
     private readonly BufferAllocator? _allocator;
     private readonly int _maxConcurrency;
+    private readonly UploadBufferPool? _uploadPool;
+
+    /// <summary>
+    /// The spare parts the writers of a filesystem share by default (<c>uploadBuffers</c>): 4, so a writer can
+    /// have up to 5 parts uploading at once, and all of a filesystem's writers together hold at most 32 MiB of
+    /// 8 MiB parts beyond their own.
+    /// </summary>
+    public const int DefaultUploadBuffers = 4;
 
     /// <summary>
     /// Creates a new filesystem rooted at <paramref name="bucket"/> and, optionally, a key
@@ -59,19 +67,29 @@ public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint
     /// The range requests each file opened via <see cref="OpenReadAsync"/> lets be in flight at once, and
     /// the reads this filesystem suggests a table scan run at once (<see cref="PreferredConcurrentReads"/>).
     /// </param>
+    /// <param name="uploadBuffers">
+    /// The spare parts every file created via <see cref="CreateAsync"/> shares, to upload a full part in the
+    /// background while it fills the next (#713). A writer borrows one only when it is free and otherwise uploads
+    /// its parts in turn, so this bounds the memory all of this filesystem's writers hold beyond their own one part
+    /// each, however many are open. 0 uploads every part in turn. Defaults to <see cref="DefaultUploadBuffers"/>.
+    /// </param>
     public S3TableFileSystem(
         IAmazonS3 client,
         string bucket,
         string? rootPath = null,
         BufferAllocator? allocator = null,
-        int maxConcurrency = 16)
+        int maxConcurrency = 16,
+        int uploadBuffers = DefaultUploadBuffers)
     {
         if (maxConcurrency < 1)
             throw new ArgumentOutOfRangeException(nameof(maxConcurrency), maxConcurrency, "Must be at least 1.");
+        if (uploadBuffers < 0)
+            throw new ArgumentOutOfRangeException(nameof(uploadBuffers), uploadBuffers, "Must not be negative.");
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _bucket = bucket ?? throw new ArgumentNullException(nameof(bucket));
         _allocator = allocator;
         _maxConcurrency = maxConcurrency;
+        _uploadPool = uploadBuffers > 0 ? new UploadBufferPool(uploadBuffers) : null;
 
         string normalized = (rootPath ?? string.Empty).Replace('\\', '/').Trim('/');
         _rootPrefix = normalized.Length == 0 ? string.Empty : normalized + "/";
@@ -159,7 +177,7 @@ public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint
         if (!overwrite && await ObjectExistsAsync(key, cancellationToken).ConfigureAwait(false))
             throw new IOException($"Object already exists: {path}");
 
-        return new S3SequentialFile(_client, _bucket, key, overwrite: overwrite);
+        return new S3SequentialFile(_client, _bucket, key, S3SequentialFile.DefaultPartSize, overwrite, _uploadPool);
     }
 
     /// <inheritdoc/>

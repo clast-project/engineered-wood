@@ -254,4 +254,94 @@ public class S3FileTests : IAsyncLifetime
             Assert.True(expected.SequenceEqual(owner.Memory.Span));
         }
     }
+
+    /// <summary>Bytes no two parts share at the same offset, so a part out of place is caught.</summary>
+    private static byte[] Payload(int length, int seed)
+    {
+        var payload = new byte[length];
+        new Random(seed).NextBytes(payload);
+        return payload;
+    }
+
+    /// <summary>Writes <paramref name="payload"/> in irregular pieces, straddling part boundaries.</summary>
+    private static async Task WriteInPiecesAsync(ISequentialFile file, byte[] payload)
+    {
+        int[] pieces = [1, 4093, 1 << 20, 5 * (1 << 20) + 7, 65536];
+        int offset = 0;
+        for (int i = 0; offset < payload.Length; i++)
+        {
+            int length = Math.Min(pieces[i % pieces.Length], payload.Length - offset);
+            await file.WriteAsync(payload.AsMemory(offset, length));
+            offset += length;
+        }
+    }
+
+    private static void AssertSameBytes(byte[] expected, byte[] actual)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        Assert.True(expected.AsSpan().SequenceEqual(actual), "the bytes read back differ");
+    }
+
+    /// <summary>
+    /// An object of four 8 MiB parts and a partial one comes back byte for byte whether its parts uploaded in turn
+    /// (no spares), mostly in turn (one spare), or several at once (the default): parts may finish in any order,
+    /// and the completion lists them in theirs (#713).
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(S3TableFileSystem.DefaultUploadBuffers)]
+    public async Task FileSystemCreate_ManyParts_RoundTrips_HoweverManyUploadAtOnce(int uploadBuffers)
+    {
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
+        var fs = new S3TableFileSystem(Client, _bucket, "table-root", uploadBuffers: uploadBuffers);
+        var payload = Payload(4 * S3SequentialFile.DefaultPartSize + 12345, seed: uploadBuffers);
+
+        await using (var file = await fs.CreateAsync("data/part-0.parquet"))
+        {
+            await WriteInPiecesAsync(file, payload);
+            Assert.Equal(payload.Length, file.Position);
+            await file.CompleteAsync();
+        }
+
+        AssertSameBytes(payload, await fs.ReadAllBytesAsync("data/part-0.parquet"));
+    }
+
+    /// <summary>Two writers open at once share one spare part, and both objects come back whole.</summary>
+    [SkippableFact]
+    public async Task FileSystemCreate_TwoWritersSharingOneSpare_BothRoundTrip()
+    {
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
+        var fs = new S3TableFileSystem(Client, _bucket, "table-root", uploadBuffers: 1);
+        var first = Payload(2 * S3SequentialFile.DefaultPartSize + 1, seed: 1);
+        var second = Payload(2 * S3SequentialFile.DefaultPartSize + 2, seed: 2);
+
+        await using (var a = await fs.CreateAsync("a.bin"))
+        await using (var b = await fs.CreateAsync("b.bin"))
+        {
+            await Task.WhenAll(WriteInPiecesAsync(a, first), WriteInPiecesAsync(b, second));
+            await Task.WhenAll(a.CompleteAsync().AsTask(), b.CompleteAsync().AsTask());
+        }
+
+        AssertSameBytes(first, await fs.ReadAllBytesAsync("a.bin"));
+        AssertSameBytes(second, await fs.ReadAllBytesAsync("b.bin"));
+    }
+
+    /// <summary>
+    /// A writer disposed with parts uploading in the background publishes nothing and leaves no multipart upload
+    /// behind: the abort waits for the parts in flight before aborting the upload.
+    /// </summary>
+    [SkippableFact]
+    public async Task FileSystemCreate_DisposedWithoutCompleting_LeavesNothing()
+    {
+        CloudEmulator.Require("an S3 emulator on 127.0.0.1:9000", _s3Available, _unavailableReason);
+        var fs = new S3TableFileSystem(Client, _bucket, "table-root");
+
+        await using (var file = await fs.CreateAsync("abandoned.bin"))
+            await WriteInPiecesAsync(file, Payload(3 * S3SequentialFile.DefaultPartSize, seed: 3));
+
+        Assert.False(await fs.ExistsAsync("abandoned.bin"));
+        var uploads = await Client.ListMultipartUploadsAsync(new ListMultipartUploadsRequest { BucketName = _bucket });
+        Assert.Empty(uploads.MultipartUploads ?? []);
+    }
 }

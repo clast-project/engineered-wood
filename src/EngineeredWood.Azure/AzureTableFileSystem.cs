@@ -32,6 +32,14 @@ public sealed class AzureTableFileSystem : ITableFileSystem, IReadConcurrencyHin
     private readonly string _rootPrefix;
     private readonly BufferAllocator? _allocator;
     private readonly int _maxConcurrency;
+    private readonly UploadBufferPool? _uploadPool;
+
+    /// <summary>
+    /// The spare blocks the writers of a filesystem share by default (<c>uploadBuffers</c>): 8, so a writer can
+    /// have up to 9 blocks staging at once, and all of a filesystem's writers together hold at most 32 MiB of
+    /// 4 MiB blocks beyond their own.
+    /// </summary>
+    public const int DefaultUploadBuffers = 8;
 
     /// <summary>
     /// Creates a new filesystem rooted at <paramref name="container"/> and, optionally, a
@@ -49,17 +57,28 @@ public sealed class AzureTableFileSystem : ITableFileSystem, IReadConcurrencyHin
     /// The range requests each file opened via <see cref="OpenReadAsync"/> lets be in flight at once, and
     /// the reads this filesystem suggests a table scan run at once (<see cref="PreferredConcurrentReads"/>).
     /// </param>
+    /// <param name="uploadBuffers">
+    /// The spare blocks every file created via <see cref="CreateAsync"/> shares, to stage a full block in the
+    /// background while it fills the next (#713). A writer borrows one only when it is free and otherwise stages
+    /// its blocks in turn, so this bounds the memory all of this filesystem's writers hold beyond their own one
+    /// block each, however many are open. 0 stages every block in turn. Defaults to
+    /// <see cref="DefaultUploadBuffers"/>.
+    /// </param>
     public AzureTableFileSystem(
         BlobContainerClient container,
         string? rootPath = null,
         BufferAllocator? allocator = null,
-        int maxConcurrency = 16)
+        int maxConcurrency = 16,
+        int uploadBuffers = DefaultUploadBuffers)
     {
         if (maxConcurrency < 1)
             throw new ArgumentOutOfRangeException(nameof(maxConcurrency), maxConcurrency, "Must be at least 1.");
+        if (uploadBuffers < 0)
+            throw new ArgumentOutOfRangeException(nameof(uploadBuffers), uploadBuffers, "Must not be negative.");
         _container = container ?? throw new ArgumentNullException(nameof(container));
         _allocator = allocator;
         _maxConcurrency = maxConcurrency;
+        _uploadPool = uploadBuffers > 0 ? new UploadBufferPool(uploadBuffers) : null;
 
         string normalized = (rootPath ?? string.Empty).Replace('\\', '/').Trim('/');
         _rootPrefix = normalized.Length == 0 ? string.Empty : normalized + "/";
@@ -129,7 +148,8 @@ public sealed class AzureTableFileSystem : ITableFileSystem, IReadConcurrencyHin
                 throw new IOException($"Blob already exists: {path}");
         }
 
-        return new AzureBlobSequentialFile(_container.GetBlockBlobClient(blobName), overwrite: overwrite);
+        return new AzureBlobSequentialFile(
+            _container.GetBlockBlobClient(blobName), AzureBlobSequentialFile.DefaultBlockSize, overwrite, _uploadPool);
     }
 
     /// <inheritdoc/>
