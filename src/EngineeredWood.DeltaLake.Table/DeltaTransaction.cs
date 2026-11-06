@@ -855,6 +855,10 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// set, which is precisely what a rebase cannot re-derive. Throws if the table has identity columns or
     /// IcebergCompat, which need write-time per-row processing an outside writer did not do — check
     /// <see cref="DeltaTable.SupportsExternalDataFileCommit"/> first.</para>
+    ///
+    /// <para>This overload performs no I/O, so it does not add variant bounds that the files' stats lack; use
+    /// <see cref="StageDataFilesAsync"/>, which reads them from each file's footer (see
+    /// <see cref="WrittenDataFile.StatsJson"/>).</para>
     /// </summary>
     /// <param name="constraintsEnforcedByCaller">
     /// Declares that the caller has already enforced the table's CHECK constraints, invariants and
@@ -902,6 +906,10 @@ public sealed class DeltaTransaction : IAsyncDisposable
     ///
     /// <para>Returns the rows the commit will make VISIBLE: every file's row count, less anything
     /// <paramref name="bornDeleted"/> hides.</para>
+    ///
+    /// <para>Unlike <see cref="StageDataFiles"/>, this adds the variant bounds a file's stats lack, from its footer
+    /// (see <see cref="WrittenDataFile.StatsJson"/>). A footer that cannot be read fails the call with nothing
+    /// staged.</para>
     /// </summary>
     /// <param name="bornDeleted">Rows this transaction inserted and then deleted, so they never appear in any
     /// committed version — keyed by <see cref="WrittenDataFile.RelativePath"/>, which is what
