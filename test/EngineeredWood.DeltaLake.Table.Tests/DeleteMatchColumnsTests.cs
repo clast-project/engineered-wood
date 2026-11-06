@@ -239,6 +239,69 @@ public class DeleteMatchColumnsTests : IDisposable
         Assert.Equal(await IdsAsync(oracle), await IdsAsync(narrowed));
     }
 
+    /// <summary>
+    /// A top-level column literally named <c>s.a</c> beside a struct <c>s</c> with a field <c>a</c>, in either
+    /// order, without column mapping (so the file's names are the table's). A projected read of <c>s.a</c>, and a
+    /// DELETE on it, must take the top-level column, not the struct's leaf, whose dotted path is the same text.
+    /// Struct leaf values are 0..599, the top-level column's 1000..1599.
+    /// </summary>
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    public async Task ATopLevelColumnNamedLikeAStructField_IsTheColumnRead(bool structFirst, bool dv)
+    {
+        var structField = new Field("s", new Apache.Arrow.Types.StructType([new Field("a", Int64Type.Default, false)]), false);
+        var dotted = new Field("s.a", Int64Type.Default, false);
+        var id = new Field("id", Int64Type.Default, false);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(id).Field(structFirst ? structField : dotted).Field(structFirst ? dotted : structField).Build();
+
+        async Task<DeltaTable> CreateDottedAsync(string name)
+        {
+            var table = await DeltaTable.CreateAsync(
+                new LocalTableFileSystem(Path.Combine(_tempDir, name)), schema, Options(), enableDeletionVectors: dv);
+            var ids = new Int64Array.Builder();
+            var leaves = new Int64Array.Builder();
+            var literal = new Int64Array.Builder();
+            for (int i = 0; i < Rows; i++)
+            {
+                ids.Append(i);
+                leaves.Append(i);
+                literal.Append(1000 + i);
+            }
+            var s = new StructArray(structField.DataType, Rows, [leaves.Build()], ArrowBuffer.Empty, 0);
+            var dottedArray = literal.Build();
+            await table.WriteAsync([new RecordBatch(schema,
+                [ids.Build(), structFirst ? s : dottedArray, structFirst ? dottedArray : s], Rows)]);
+            return table;
+        }
+
+        await using var narrowed = await CreateDottedAsync("narrowed");
+        await using var oracle = await CreateDottedAsync("oracle");
+
+        // The projected scan returns the top-level column's values.
+        var projected = new List<long>();
+        await foreach (var batch in narrowed.ReadAsync(new DeltaReadOptions { Columns = ["s.a"] }))
+        {
+            var column = (Int64Array)batch.Column("s.a");
+            for (int i = 0; i < batch.Length; i++)
+                projected.Add(column.GetValue(i)!.Value);
+            batch.Dispose();
+        }
+        Assert.Equal(Enumerable.Range(1000, Rows).Select(v => (long)v), projected.OrderBy(v => v));
+
+        // Ex.Equal("s.a", ...) is a one-part reference: the top-level column. Row 5 holds 1005 there.
+        var predicate = Ex.Equal("s.a", 1005L);
+        var (narrowedDeleted, _) = await narrowed.DeleteAsync(predicate);
+        var (oracleDeleted, _) = await oracle.DeleteAsync(DeltaTable.MaskFor(predicate));
+
+        Assert.Equal(1, oracleDeleted);
+        Assert.Equal(oracleDeleted, narrowedDeleted);
+        Assert.Equal(await IdsAsync(oracle), await IdsAsync(narrowed));
+    }
+
     [Fact]
     public void PredicateColumns_AreTheTopLevelColumnsReferenced_InSchemaOrder()
     {

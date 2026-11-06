@@ -2108,7 +2108,30 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         {
             bool found = false;
 
-            // First, try matching a leaf column by dotted path
+            // First, a top-level column of that exact name: a leaf, or a group, which resolves to all its
+            // descendant leaves. Before the dotted paths, because a name may hold a dot: a top-level column
+            // literally named "s.a" beside a struct s with a field a is that column, not the struct's leaf,
+            // whose dotted path is the same text (#718).
+            foreach (var child in schema.Root.Children)
+            {
+                if (child.Name != name)
+                    continue;
+                for (int i = 0; i < schema.Columns.Count; i++)
+                {
+                    var col = schema.Columns[i];
+                    if (col.Path.Count > 0 && col.Path[0] == name)
+                    {
+                        columns.Add(col);
+                        chunks.Add(rowGroup.Columns[i]);
+                    }
+                }
+                found = true;
+                break;
+            }
+
+            if (found) continue;
+
+            // Then a nested leaf by its dotted path.
             for (int i = 0; i < schema.Columns.Count; i++)
             {
                 var col = schema.Columns[i];
@@ -2116,28 +2139,6 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 {
                     columns.Add(col);
                     chunks.Add(rowGroup.Columns[i]);
-                    found = true;
-                    break;
-                }
-            }
-
-            if (found) continue;
-
-            // Second, try matching a top-level group name → resolve to all descendant leaves
-            foreach (var child in schema.Root.Children)
-            {
-                if (child.Name == name && !child.IsLeaf)
-                {
-                    // Add all descendant leaves
-                    for (int i = 0; i < schema.Columns.Count; i++)
-                    {
-                        var col = schema.Columns[i];
-                        if (col.Path.Count > 0 && col.Path[0] == name)
-                        {
-                            columns.Add(col);
-                            chunks.Add(rowGroup.Columns[i]);
-                        }
-                    }
                     found = true;
                     break;
                 }
