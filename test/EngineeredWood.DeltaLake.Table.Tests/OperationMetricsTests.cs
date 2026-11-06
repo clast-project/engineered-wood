@@ -145,9 +145,11 @@ public class OperationMetricsTests : IDisposable
             ("numDeletedRows", 1), ("numCopiedRows", 0), ("numAddedFiles", 0), ("numRemovedFiles", 0),
             ("numDeletionVectorsAdded", 1), ("numDeletionVectorsUpdated", 0), ("numDeletionVectorsRemoved", 0));
 
+        // A replaced vector counts as added, removed and updated, as Spark counts it (#703).
         var (_, second) = await table.DeleteAsync(Ex.Equal("id", 3L));
         AssertCounts(await MetricsAsync(table, second),
-            ("numDeletedRows", 1), ("numDeletionVectorsAdded", 0), ("numDeletionVectorsUpdated", 1));
+            ("numDeletedRows", 1), ("numRemovedFiles", 0), ("numDeletionVectorsAdded", 1),
+            ("numDeletionVectorsRemoved", 1), ("numDeletionVectorsUpdated", 1));
 
         var (_, third) = await table.DeleteAsync(Ex.Equal("id", 1L));
         var metrics = await MetricsAsync(table, third);

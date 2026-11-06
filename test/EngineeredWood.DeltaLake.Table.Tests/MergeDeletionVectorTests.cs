@@ -224,7 +224,11 @@ public class MergeDeletionVectorTests : IDisposable
 
         Assert.Equal([(1, "a"), (2, "B"), (4, "d"), (9, "z")], await ReadAsync(table));
         Assert.Equal(3, FileAt(table, path).DeletionVector!.Cardinality);
-        Assert.Equal("1", (await LastMetricsAsync(table))["numTargetDeletionVectorsUpdated"]);
+        // A replaced vector counts as added, removed and updated, as Spark counts it (#703).
+        var committed = await LastMetricsAsync(table);
+        Assert.Equal("1", committed["numTargetDeletionVectorsAdded"]);
+        Assert.Equal("1", committed["numTargetDeletionVectorsRemoved"]);
+        Assert.Equal("1", committed["numTargetDeletionVectorsUpdated"]);
     }
 
     [Fact]
