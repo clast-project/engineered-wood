@@ -94,8 +94,9 @@ internal sealed class BackgroundUploads
     /// Uploads <paramref name="buffer"/>'s first <paramref name="length"/> bytes with <paramref name="upload"/>
     /// and returns the buffer to fill next: a spare, while <paramref name="buffer"/> uploads in the background
     /// (it goes to the pool when its upload ends); or <paramref name="buffer"/> itself, once its upload is done.
-    /// A background upload runs under its own cancellation (<see cref="Abort"/>), not
-    /// <paramref name="cancellationToken"/>, which covers only an upload made in turn.
+    /// <paramref name="cancellationToken"/> already cancelled refuses the buffer. Once handed over, a background
+    /// upload runs under its own cancellation (<see cref="Abort"/>); an upload made in turn runs under both, so a
+    /// background failure stops it too, and is what it reports.
     /// <para><paramref name="last"/>: nothing is written after this one, so it is made in turn (still alongside
     /// the uploads in flight) rather than taking a spare that would never be filled.</para>
     /// </summary>
@@ -103,6 +104,7 @@ internal sealed class BackgroundUploads
         byte[] buffer, int length, Func<byte[], int, CancellationToken, Task> upload,
         CancellationToken cancellationToken, bool last = false)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         ThrowIfFailed();
         _inFlight.RemoveAll(t => t.IsCompleted);
 
@@ -112,7 +114,20 @@ internal sealed class BackgroundUploads
             return spare!;
         }
 
-        await upload(buffer, length, cancellationToken).ConfigureAwait(false);
+        using (var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _abort.Token))
+        {
+            try
+            {
+                await upload(buffer, length, linked.Token).ConfigureAwait(false);
+            }
+            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                // Cancelled by a background failure, or failing alongside one: the background failure came first.
+                ThrowIfFailed();
+                throw;
+            }
+        }
+        ThrowIfFailed();
         return buffer;
     }
 

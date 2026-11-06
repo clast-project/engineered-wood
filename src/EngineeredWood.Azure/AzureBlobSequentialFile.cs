@@ -208,12 +208,21 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         BitConverter.GetBytes(_stagedBlockIds.Count).CopyTo(rawId, _blockIdPrefix.Length);
         string blockId = Convert.ToBase64String(rawId);
 
-        // The ID takes its place in the list now, so the list keeps the blocks' order whenever they finish.
+        // The ID takes its place in the list now, so the list keeps the blocks' order whenever they finish. An
+        // upload refused or failed in turn takes it back out: the list must name only blocks that were staged.
         _stagedBlockIds.Add(blockId);
-        _buffer = await _uploads.UploadAsync(
-                _buffer, _bufferPosition, (buffer, length, ct) => StageBlockAsync(blockId, buffer, length, ct),
-                cancellationToken, last)
-            .ConfigureAwait(false);
+        try
+        {
+            _buffer = await _uploads.UploadAsync(
+                    _buffer, _bufferPosition, (buffer, length, ct) => StageBlockAsync(blockId, buffer, length, ct),
+                    cancellationToken, last)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            _stagedBlockIds.RemoveAt(_stagedBlockIds.Count - 1);
+            throw;
+        }
         _bufferPosition = 0;
     }
 

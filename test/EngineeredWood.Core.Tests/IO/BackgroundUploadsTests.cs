@@ -156,6 +156,51 @@ public class BackgroundUploadsTests
         Assert.Equal(0, pool.InUse);
     }
 
+    /// <summary>
+    /// An upload made in turn, for want of a spare, is stopped by a background upload failing meanwhile, and
+    /// reports that failure rather than its own cancellation: the write cannot succeed now.
+    /// </summary>
+    [Fact]
+    public async Task AnUploadInTurn_IsStoppedByABackgroundFailure_AndReportsIt()
+    {
+        var pool = new UploadBufferPool(maxBuffers: 1);
+        var uploads = new BackgroundUploads(pool);
+        var gated = new GatedUploads();
+
+        var next = await uploads.UploadAsync(Filled(1), Size, gated.For(0), default);
+        var inTurn = uploads.UploadAsync(next, Size, gated.For(1), default).AsTask();
+        Assert.False(inTurn.IsCompleted);
+
+        gated.Release(0).SetException(new IOException("block 0 failed"));
+
+        var failure = await Assert.ThrowsAsync<IOException>(() => inTurn);
+        Assert.Equal("block 0 failed", failure.Message);
+        Assert.Empty(gated.Done);
+        Assert.Equal(0, pool.InUse);
+    }
+
+    /// <summary>
+    /// A token already cancelled refuses the buffer even with a spare free: it is neither uploaded nor handed
+    /// to the background, and no spare is taken.
+    /// </summary>
+    [Fact]
+    public async Task ACancelledToken_RefusesTheBuffer_EvenWithASpare()
+    {
+        var pool = new UploadBufferPool(maxBuffers: 1);
+        var uploads = new BackgroundUploads(pool);
+        int calls = 0;
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => uploads.UploadAsync(
+            Filled(1), Size, (_, _, _) => { Interlocked.Increment(ref calls); return Task.CompletedTask; }, cts.Token)
+            .AsTask());
+
+        Assert.Equal(0, Volatile.Read(ref calls));
+        Assert.Equal(0, pool.InUse);
+        Assert.Equal(0, uploads.InFlight);
+    }
+
     [Fact]
     public async Task Abort_CancelsTheUploadsInFlight_AndTheirBuffersGoBack()
     {
