@@ -36,6 +36,15 @@ internal static class Verify
             return 2;
         }
 
+        // Likewise a mistyped EWDD_VERIFY_METHODS: checked before any fixture is built.
+        if (!types.Any(t => t.GetMethods().Any(m =>
+                m.GetCustomAttribute<BenchmarkAttribute>() != null && TraceMarks.Selected(m.Name))))
+        {
+            Console.Error.WriteLine(
+                $"VERIFY FAILED: no benchmark method of the classes matching '{filter}' matches EWDD_VERIFY_METHODS.");
+            return 2;
+        }
+
         int failures = 0;
         foreach (var type in types)
         {

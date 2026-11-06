@@ -6333,20 +6333,23 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>Each file is opened once (<see cref="OpenDataFileAsync"/>: its footer, deletion vector, column
     /// resolution), and up to <paramref name="lookahead"/> files are opened ahead of the one being planned, so
     /// that a footer's round trip overlaps the reads in flight rather than stalling the planning. A file opened
-    /// ahead is also PLANNED ahead, on its opening task: its row-group pruning (the dictionary probes and page
-    /// index reads, a round trip or two each) runs alongside the other files' rather than one file at a time in
-    /// this enumeration, where against an object store it held the scan to one file's planning per round trip
-    /// (#713). Planning one file is not thread-safe, but each file has a reader of its own, so planning several
-    /// files at once is. The first file is planned here, lazily, so that its first row groups are read while
-    /// its later ones are still being planned.</para>
-    /// <para>A file whose row groups are all pruned yields no unit and is closed here; otherwise its last unit
-    /// to end closes it. Files opened ahead but never planned, because the scan stopped, are closed when the
-    /// enumeration ends.</para>
+    /// AHEAD of the one being planned also starts its planning on its opening task: its first
+    /// <see cref="PlansAhead"/> row groups, which issue the file's first dictionary and page-index reads (a round
+    /// trip or two each). Planned here instead, one file after another, those reads held a filtered scan against
+    /// an object store to one file's planning per round trip (#713). The rest of the file is planned here,
+    /// lazily, by the same enumeration of its row groups, handed over: planning one file is not thread-safe,
+    /// but the opening task has finished with it by then, and each file has a reader of its own, so planning
+    /// several files at once is safe. A serial scan (<paramref name="lookahead"/> 1) opens nothing ahead, so it
+    /// plans every file lazily, as before.</para>
+    /// <para>A planning error on an opening task is held until the row groups planned before it have been
+    /// handed out, where a serial read would have thrown. A file whose row groups are all pruned yields no unit
+    /// and is closed here; otherwise its last unit to end closes it. Files opened ahead but never planned,
+    /// because the scan stopped, are closed when the enumeration ends.</para>
     /// <para><paramref name="skipRows"/>, when given, names for each file (by its index in
     /// <paramref name="files"/>) further rows the caller needs none of, on top of those its deletion vector
     /// deletes: <see cref="ReadRowsAsync"/> skips every row group, and every long run within one, that holds no
-    /// selected row (#633). It is called once per file, from whichever task plans that file, so it must be safe
-    /// to call concurrently for different files.</para>
+    /// selected row (#633). It is called once per file, from whichever task starts that file's planning, so it
+    /// must be safe to call concurrently for different files.</para>
     /// </summary>
     private async IAsyncEnumerable<ScanUnit> PlanScanUnitsAsync(
         Snapshot.Snapshot snapshot,
@@ -6374,10 +6377,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // never pass one.
                     int file = next++;
                     opening.Enqueue(OpenScanFileAsync(
-                        snapshot, options, files[file], skipRows, file, planAhead: file > 0, openingCts.Token));
+                        snapshot, options, files[file], skipRows, file, planAhead: file > f, openingCts.Token));
                 }
 
-                var (read, plans) = await opening.Dequeue().ConfigureAwait(false);
+                var opened = await opening.Dequeue().ConfigureAwait(false);
+                var read = opened.Read;
+                var rest = opened.Rest;
                 try
                 {
                     if (read.Reader is null)
@@ -6385,28 +6390,33 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         read.AddRef();
                         yield return new ScanUnit(f, read, null);
                     }
-                    else if (plans is not null)
+                    else
                     {
-                        foreach (var plan in plans)
+                        foreach (var plan in opened.Planned)
                         {
                             read.AddRef();
                             yield return new ScanUnit(f, read, plan);
                         }
-                    }
-                    else
-                    {
-                        await foreach (var plan in read.Reader.PlanRowGroupsAsync(
-                                           read.FilePredicate, read.FileColumns, SkipOf(read, skipRows?.Invoke(f)),
-                                           cancellationToken)
-                                           .ConfigureAwait(false))
+                        opened.Error?.Throw();
+
+                        if (!opened.PlannedAhead)
+                        {
+                            rest = read.Reader.PlanRowGroupsAsync(
+                                    read.FilePredicate, read.FileColumns, SkipOf(read, skipRows?.Invoke(f)),
+                                    cancellationToken)
+                                .GetAsyncEnumerator(cancellationToken);
+                        }
+                        while (rest is not null && await rest.MoveNextAsync().ConfigureAwait(false))
                         {
                             read.AddRef();
-                            yield return new ScanUnit(f, read, plan);
+                            yield return new ScanUnit(f, read, rest.Current);
                         }
                     }
                 }
                 finally
                 {
+                    if (rest is not null)
+                        await rest.DisposeAsync().ConfigureAwait(false);
                     read.Release();
                 }
             }
@@ -6420,7 +6430,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 try
                 {
-                    (await opening.Dequeue().ConfigureAwait(false)).Read.Release();
+                    var opened = await opening.Dequeue().ConfigureAwait(false);
+                    try
+                    {
+                        if (opened.Rest is not null)
+                            await opened.Rest.DisposeAsync().ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        opened.Read.Release();
+                    }
                 }
                 catch
                 {
@@ -6431,12 +6450,33 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
-    /// <summary>A file a scan has opened, and, when it was planned ahead, the row groups it reads.</summary>
-    private readonly record struct OpenedFile(DataFileRead Read, List<ParquetFileReader.RowGroupPlan>? Plans);
+    /// <summary>
+    /// The row groups a file opened ahead plans on its opening task (<see cref="PlansAhead"/>): enough to issue
+    /// its first dictionary and page-index reads, and the whole of a small file, while bounding what a file
+    /// waiting its turn holds (each plan may carry its row group's OffsetIndex bytes).
+    /// </summary>
+    private const int PlansAhead = 4;
+
+    /// <summary>
+    /// A file a scan has opened. When it was planned ahead (<see cref="PlannedAhead"/>): the row groups planned so
+    /// far (<see cref="Planned"/>), then either the planning that continues (<see cref="Rest"/>, whose owner
+    /// disposes it), or the error that stopped it (<see cref="Error"/>), or neither, when it planned the whole
+    /// file.
+    /// </summary>
+    private sealed class OpenedFile(DataFileRead read, bool plannedAhead)
+    {
+        public DataFileRead Read { get; } = read;
+        public bool PlannedAhead { get; } = plannedAhead;
+        public List<ParquetFileReader.RowGroupPlan> Planned { get; } = [];
+        public IAsyncEnumerator<ParquetFileReader.RowGroupPlan>? Rest { get; set; }
+        public System.Runtime.ExceptionServices.ExceptionDispatchInfo? Error { get; set; }
+    }
 
     /// <summary>
     /// Opens file <paramref name="file"/> of a scan and, with <paramref name="planAhead"/> and the built-in
-    /// reader, plans its row groups too (<see cref="PlanScanUnitsAsync"/>). On failure nothing is left open.
+    /// reader, plans up to <see cref="PlansAhead"/> of its row groups (<see cref="PlanScanUnitsAsync"/>). A
+    /// failure to open leaves nothing open and throws; a failure to plan is kept in the result, after the plans
+    /// made before it.
     /// </summary>
     private async Task<OpenedFile> OpenScanFileAsync(
         Snapshot.Snapshot snapshot,
@@ -6450,24 +6490,47 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var read = await OpenDataFileAsync(addFile, options.Columns, snapshot, options.Filter, cancellationToken)
             .ConfigureAwait(false);
         if (!planAhead || read.Reader is null)
-            return new OpenedFile(read, null);
+            return new OpenedFile(read, plannedAhead: false);
+
+        var opened = new OpenedFile(read, plannedAhead: true);
+        IAsyncEnumerator<ParquetFileReader.RowGroupPlan>? plans = null;
         try
         {
-            var plans = new List<ParquetFileReader.RowGroupPlan>();
-            await foreach (var plan in read.Reader.PlanRowGroupsAsync(
-                               read.FilePredicate, read.FileColumns, SkipOf(read, skipRows?.Invoke(file)),
-                               cancellationToken)
-                               .ConfigureAwait(false))
+            plans = read.Reader.PlanRowGroupsAsync(
+                    read.FilePredicate, read.FileColumns, SkipOf(read, skipRows?.Invoke(file)), cancellationToken)
+                .GetAsyncEnumerator(cancellationToken);
+            while (true)
             {
-                plans.Add(plan);
+                if (opened.Planned.Count == PlansAhead)
+                {
+                    opened.Rest = plans; // the planner continues it
+                    plans = null;
+                    break;
+                }
+                if (!await plans.MoveNextAsync().ConfigureAwait(false))
+                    break;
+                opened.Planned.Add(plans.Current);
             }
-            return new OpenedFile(read, plans);
         }
-        catch
+        catch (Exception ex)
         {
-            read.Release();
-            throw;
+            opened.Error = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
         }
+        finally
+        {
+            if (plans is not null)
+            {
+                try
+                {
+                    await plans.DisposeAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    opened.Error ??= System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+                }
+            }
+        }
+        return opened;
     }
 
     /// <summary>The rows a scan skips in a file: those its deletion vector deletes, and <paramref name="extra"/>.</summary>

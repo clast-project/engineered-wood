@@ -799,24 +799,7 @@ public class ParallelFileReadTests : IDisposable
     public async Task AFilteredScan_PlansTheFilesItOpenedAhead_AtOnce()
     {
         const int files = 8;
-        var schema = new Apache.Arrow.Schema.Builder()
-            .Field(new Field("id", Int64Type.Default, false))
-            .Field(new Field("tag", StringType.Default, false))
-            .Build();
-        await using (var create = await DeltaTable.CreateAsync(_fs, schema, Options(1)))
-        {
-            for (int f = 0; f < files; f++)
-            {
-                var ids = new Int64Array.Builder();
-                var tags = new StringArray.Builder();
-                for (int r = 0; r < RowsPerFile; r++)
-                {
-                    ids.Append((long)f * RowsPerFile + r);
-                    tags.Append(r % 2 == 0 ? "a" : "c");
-                }
-                await create.WriteAsync([new RecordBatch(schema, [ids.Build(), tags.Build()], RowsPerFile)]);
-            }
-        }
+        await CreateTagTableAsync(files);
 
         var fs = new PlanningReadsFileSystem(_fs, delayMs: 50);
         await using var table = await DeltaTable.OpenAsync(fs, Options(files));
@@ -834,10 +817,69 @@ public class ParallelFileReadTests : IDisposable
     }
 
     /// <summary>
-    /// Counts, over the data files, the most that had a read in flight at once other than a footer read (one
-    /// ending at the end of the file, or at its last 8 bytes: the length and magic). Every read is delayed.
+    /// A file opened ahead whose planning fails reports the failure where a serial read would: after every row
+    /// of the files before it, in order. Its opening task holds the error rather than throwing it ahead of them.
     /// </summary>
-    private sealed class PlanningReadsFileSystem(ITableFileSystem inner, int delayMs) : ITableFileSystem
+    [Fact]
+    public async Task APlanningErrorOnAFileOpenedAhead_ComesAfterTheFilesBeforeIt()
+    {
+        const int files = 8;
+        await CreateTagTableAsync(files);
+        List<string> paths;
+        await using (var probe = await OpenAsync(1))
+            paths = DeltaTable.OrderedActiveFiles(probe.CurrentSnapshot).Select(f => f.Path).ToList();
+
+        // "a" is in every dictionary, so every row group is kept and read; file 5's dictionary probe fails.
+        var fs = new PlanningReadsFileSystem(_fs, delayMs: 10, failPlanning: paths[5]);
+        await using var table = await DeltaTable.OpenAsync(fs, Options(files));
+        var seen = new List<long>();
+        var ex = await Assert.ThrowsAsync<IOException>(async () =>
+        {
+            await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Filter = Ex.Equal("tag", LiteralValue.Of("a")) }))
+            {
+                var ids = (Int64Array)batch.Column(0);
+                for (int i = 0; i < batch.Length; i++)
+                    seen.Add(ids.GetValue(i)!.Value);
+                batch.Dispose();
+            }
+        });
+
+        Assert.Equal($"cannot plan {paths[5]}", ex.Message);
+        Assert.Equal(5 * RowsPerFile, seen.Count);
+        // Files 0-4 in path order, each whole: its ids are one contiguous run of RowsPerFile.
+        var runs = seen.Select((id, i) => (id, i)).GroupBy(x => x.i / RowsPerFile, x => x.id).ToList();
+        Assert.All(runs, run => Assert.Equal(Enumerable.Range((int)run.First(), RowsPerFile).Select(i => (long)i), run));
+    }
+
+    /// <summary><paramref name="files"/> files of <see cref="RowsPerFile"/> rows: an id, and a <c>tag</c> of
+    /// "a" or "c", so the statistics of every row group span "b" and only its dictionary can rule it out.</summary>
+    private async Task CreateTagTableAsync(int files)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("tag", StringType.Default, false))
+            .Build();
+        await using var create = await DeltaTable.CreateAsync(_fs, schema, Options(1));
+        for (int f = 0; f < files; f++)
+        {
+            var ids = new Int64Array.Builder();
+            var tags = new StringArray.Builder();
+            for (int r = 0; r < RowsPerFile; r++)
+            {
+                ids.Append((long)f * RowsPerFile + r);
+                tags.Append(r % 2 == 0 ? "a" : "c");
+            }
+            await create.WriteAsync([new RecordBatch(schema, [ids.Build(), tags.Build()], RowsPerFile)]);
+        }
+    }
+
+    /// <summary>
+    /// Counts, over the data files, the most that had a read in flight at once other than a footer read (one
+    /// ending at the end of the file, or at its last 8 bytes: the length and magic). Every read is delayed. A
+    /// file whose path contains <paramref name="failPlanning"/> fails its first read other than a footer read.
+    /// </summary>
+    private sealed class PlanningReadsFileSystem(ITableFileSystem inner, int delayMs, string? failPlanning = null)
+        : ITableFileSystem
     {
         private readonly object _gate = new();
         private readonly Dictionary<string, int> _inFlight = new(StringComparer.Ordinal);
@@ -880,6 +922,8 @@ public class ParallelFileReadTests : IDisposable
 
         private void Enter(string path, bool planning)
         {
+            if (planning && failPlanning is not null && path.Contains(failPlanning))
+                throw new IOException($"cannot plan {failPlanning}");
             lock (_gate)
             {
                 _read.Add(path);
