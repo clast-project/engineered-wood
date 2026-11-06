@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <PackageReference Include="Apache.Arrow" />
+    <PackageReference Include="Apache.Arrow.Operations" />
     <PackageReference Include="coverlet.collector" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
     <PackageReference Include="xunit" />

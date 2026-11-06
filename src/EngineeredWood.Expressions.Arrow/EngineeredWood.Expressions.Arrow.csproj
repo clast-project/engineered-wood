@@ -10,6 +10,8 @@
 
   <ItemGroup>
     <PackageReference Include="Apache.Arrow" />
+    <!-- variant_get over a shredded VariantArray reads its logical value through GetLogicalVariantValue (#681). -->
+    <PackageReference Include="Apache.Arrow.Operations" />
     <PackageReference Include="Clast.DatabaseDecimal" />
     <ProjectReference Include="..\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
     <!--

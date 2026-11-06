@@ -1136,8 +1136,20 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
             return Constant(unary.Op == UnaryOperator.IsNotNull, batch.Length);
         }
 
-        var operand = EvalExpression(unary.Operand, batch);
         var result = new bool?[batch.Length];
+
+        // A null test reads only validity, so it is answered off the array: an operand whose values have no
+        // LiteralValue -- a variant, as `variant_get(v, '$.a') IS NULL` yields (#681) -- is still testable.
+        if (unary.Op is UnaryOperator.IsNull or UnaryOperator.IsNotNull)
+        {
+            var array = EvalExpressionAsArray(unary.Operand, batch);
+            bool wantNull = unary.Op == UnaryOperator.IsNull;
+            for (int i = 0; i < batch.Length; i++)
+                result[i] = array.IsNull(i) == wantNull;
+            return result;
+        }
+
+        var operand = EvalExpression(unary.Operand, batch);
 
         for (int i = 0; i < batch.Length; i++)
         {

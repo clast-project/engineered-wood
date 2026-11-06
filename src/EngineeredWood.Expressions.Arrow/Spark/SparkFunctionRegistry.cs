@@ -84,6 +84,7 @@ public sealed class SparkFunctionRegistry
         "date_format" => true,
         "coalesce" or "nvl" or "ifnull" or "nullif" or "nvl2" or "if" or "case" => true,
         "round" or "greatest" or "least" => true,
+        "variant_get" or "try_variant_get" => true,
         _ => false,
     };
 
@@ -111,13 +112,24 @@ public sealed class SparkFunctionRegistry
             // null under either dialect. See SparkIntegralCasts.
             case "cast":
                 Expect(name, args, 2);
+                // A variant's cast is VariantGet.cast, which raises INVALID_VARIANT_CAST on a value that
+                // does not convert under either dialect (measured, Spark 4.1 with ANSI off).
+                if (args[0] is VariantArray castVariant)
+                    return SparkVariants.Cast(castVariant, TargetTypeOf(args[1]), rowCount, true, TryCast);
                 return Cast(
                     args[0], TargetTypeOf(args[1]), rowCount,
                     raising: _options.Ansi, legacy: !_options.Ansi);
 
             case "try_cast":
                 Expect(name, args, 2);
+                if (args[0] is VariantArray tryCastVariant)
+                    return SparkVariants.Cast(tryCastVariant, TargetTypeOf(args[1]), rowCount, false, TryCast);
                 return Cast(args[0], TargetTypeOf(args[1]), rowCount, raising: false, legacy: false);
+
+            // The failing form raises INVALID_VARIANT_CAST in either dialect: VariantGet's failOnError is
+            // the function, not spark.sql.ansi.enabled.
+            case "variant_get" or "try_variant_get":
+                return SparkVariants.VariantGet(name, args, rowCount, name == "variant_get", TryCast);
 
             case "length":
                 Expect(name, args, 1);
@@ -1578,6 +1590,10 @@ public sealed class SparkFunctionRegistry
 
         return SparkArrays.ParseTypeName(text!);
     }
+
+    /// <summary><c>try_cast</c>: the cast a variant's value goes through once it is read as a Spark scalar.</summary>
+    private IArrowArray TryCast(IArrowArray source, IArrowType target, int rowCount) =>
+        Cast(source, target, rowCount, raising: false, legacy: false);
 
     /// <summary>
     /// Casts a column, where <paramref name="raising"/> and <paramref name="legacy"/> together say
