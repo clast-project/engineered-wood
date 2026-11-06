@@ -307,6 +307,24 @@ public interface IConstantFoldedFunctions
 }
 
 /// <summary>
+/// A function registry with arguments that must be foldable: constant by the expression's structure, whatever
+/// the data.
+/// </summary>
+/// <remarks>
+/// Spark checks this at analysis -- <c>variant_get(v, '$.a', ty)</c> over a type column is refused even when
+/// every row holds <c>'int'</c> -- so it cannot be read off an argument's values. The evaluator asks before the
+/// call with each argument's foldability, which is <c>ArrowRowEvaluator.IsConstant</c>.
+/// </remarks>
+public interface IFoldableArgumentRules
+{
+    /// <summary>
+    /// Why calling <paramref name="name"/> with arguments whose foldability is
+    /// <paramref name="argumentsFoldable"/> is refused at analysis, or null when it is accepted.
+    /// </summary>
+    AnalysisDiagnostic? CheckFoldableArguments(string name, ReadOnlySpan<bool> argumentsFoldable);
+}
+
+/// <summary>
 /// A function registry that knows which of its functions are foldable: a call to one whose every
 /// argument is constant has the same value in every row.
 /// </summary>

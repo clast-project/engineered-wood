@@ -30,7 +30,7 @@ namespace EngineeredWood.Expressions.Arrow.Spark;
 /// </remarks>
 public sealed class SparkFunctionRegistry
     : IFunctionRegistry, IComparisonCoercion, IShortCircuitingFunctions, INullabilityRules,
-      ILiteralPrecisionRules, IAnalysisRules, IConstantFoldedFunctions, IFoldableFunctions
+      ILiteralPrecisionRules, IAnalysisRules, IConstantFoldedFunctions, IFoldableFunctions, IFoldableArgumentRules
 {
     private static CultureInfo Invariant => CultureInfo.InvariantCulture;
 
@@ -73,6 +73,17 @@ public sealed class SparkFunctionRegistry
     /// </summary>
     public bool IsFoldable(string name) => IsRegistered(name);
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// Only <c>variant_get</c>'s type: measured against Spark 4.1, a type column is
+    /// <c>INVALID_SCHEMA.NON_STRING_LITERAL</c> whatever its rows hold, while the path may be a column (each row's
+    /// path is read). <c>cast</c>'s type is a string literal by construction (the parser puts it there).
+    /// </remarks>
+    public AnalysisDiagnostic? CheckFoldableArguments(string name, ReadOnlySpan<bool> argumentsFoldable) =>
+        name is "variant_get" or "try_variant_get" && argumentsFoldable.Length == 3 && !argumentsFoldable[2]
+            ? SparkVariants.NonStringLiteralType
+            : null;
+
     public bool IsRegistered(string name) => name switch
     {
         "+" or "-" or "*" or "/" or "%" or "negative" or "positive"
@@ -84,6 +95,7 @@ public sealed class SparkFunctionRegistry
         "date_format" => true,
         "coalesce" or "nvl" or "ifnull" or "nullif" or "nvl2" or "if" or "case" => true,
         "round" or "greatest" or "least" => true,
+        "variant_get" or "try_variant_get" => true,
         _ => false,
     };
 
@@ -111,13 +123,24 @@ public sealed class SparkFunctionRegistry
             // null under either dialect. See SparkIntegralCasts.
             case "cast":
                 Expect(name, args, 2);
+                // A variant's cast is VariantGet.cast, which raises INVALID_VARIANT_CAST on a value that
+                // does not convert under either dialect (measured, Spark 4.1 with ANSI off).
+                if (args[0] is VariantArray castVariant)
+                    return SparkVariants.Cast(castVariant, TargetTypeOf(args[1]), rowCount, true, TryCast);
                 return Cast(
                     args[0], TargetTypeOf(args[1]), rowCount,
                     raising: _options.Ansi, legacy: !_options.Ansi);
 
             case "try_cast":
                 Expect(name, args, 2);
+                if (args[0] is VariantArray tryCastVariant)
+                    return SparkVariants.Cast(tryCastVariant, TargetTypeOf(args[1]), rowCount, false, TryCast);
                 return Cast(args[0], TargetTypeOf(args[1]), rowCount, raising: false, legacy: false);
+
+            // The failing form raises INVALID_VARIANT_CAST in either dialect: VariantGet's failOnError is
+            // the function, not spark.sql.ansi.enabled.
+            case "variant_get" or "try_variant_get":
+                return SparkVariants.VariantGet(name, args, rowCount, name == "variant_get", TryCast);
 
             case "length":
                 Expect(name, args, 1);
@@ -1579,6 +1602,10 @@ public sealed class SparkFunctionRegistry
         return SparkArrays.ParseTypeName(text!);
     }
 
+    /// <summary><c>try_cast</c>: the cast a variant's value goes through once it is read as a Spark scalar.</summary>
+    private IArrowArray TryCast(IArrowArray source, IArrowType target, int rowCount) =>
+        Cast(source, target, rowCount, raising: false, legacy: false);
+
     /// <summary>
     /// Casts a column, where <paramref name="raising"/> and <paramref name="legacy"/> together say
     /// what a failure does.
@@ -1864,7 +1891,9 @@ public sealed class SparkFunctionRegistry
                 throw SparkEvaluationException.InvalidCast(value.Value.Text, described);
             }
 
-            var truncated = decimal.Truncate(exact);
+            // A timestamp's seconds floor, as Spark's floorDiv does (1969-12-31 23:59:58.75 is -2); every
+            // other source truncates toward zero.
+            var truncated = family == SparkIntegralCasts.Source.Temporal ? decimal.Floor(exact) : decimal.Truncate(exact);
 
             if (truncated < long.MinValue || truncated > long.MaxValue
                 || !SparkArrays.FitsIn((long)truncated, target))

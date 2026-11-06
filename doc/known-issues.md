@@ -479,10 +479,21 @@ delta-spark 4.3.1 and DuckDB's delta extension do not prune on these bounds
 answer only: every row Spark selects must come from a file EW kept, over EW's
 bounds and over Spark's. What is not done:
 
-- *No row-level `variant_get`.* The row evaluator has no `variant_get`, so a
-  DML predicate (DELETE, UPDATE, MERGE), CHECK constraint or generated column
-  on a variant path is refused, and Parquet row groups and pages inside a kept
-  file are not pruned by the `typed_value` footer statistics.
+- *Row groups and pages are not pruned on a variant path.* Parquet row groups
+  and pages inside a kept file are not pruned by the `typed_value` footer
+  statistics (#682).
+- *Row-level `variant_get` (#681) has three refusals and two differences.* DML
+  predicates and CHECK constraints on a variant path are evaluated row by row
+  with Spark's variant cast. An object or array cast to `string` (Spark answers
+  its JSON text), a `timestamp_ntz` or nested target, and a TIME or
+  nanosecond-timestamp value are refused rather than approximated. A generated
+  column on a variant path is refused with Delta's codes
+  (`DELTA_UNSUPPORTED_EXPRESSION_GENERATED_COLUMN`, or
+  `DELTA_UNSUPPORTED_DATA_TYPE_IN_GENERATED_COLUMN` for a VARIANT column), but
+  at the first write rather than when the column is declared. A
+  `variant_get` that fails its cast while a write is checked against a constraint
+  is reported as `DELTA_UNEVALUABLE_TABLE_EXPRESSION` wrapping
+  `INVALID_VARIANT_CAST`, where Spark reports `TASK_WRITE_FAILED`.
 - *Floats prune one way only.* Delta keeps no NaN count, so a variant float
   bound skips a file for `<` and `=` but not for `>`, as for a float column.
 - *delta-spark writes none by default.* Its bounds need

@@ -279,6 +279,15 @@ public static class DeltaTableErrorCodes
     /// <see cref="ConstraintDataTypeMismatch"/>.</remarks>
     public const string GeneratedColumnsDataTypeMismatch = "DELTA_GENERATED_COLUMNS_DATA_TYPE_MISMATCH";
 
+    /// <summary>A generated column's expression extracts from a variant (<c>variant_get</c>, <c>v:a</c>).</summary>
+    /// <remarks>delta-spark: <c>DELTA_UNSUPPORTED_EXPRESSION_GENERATED_COLUMN</c>, raised when the column is
+    /// declared; here, when a write meets a table that declares one.</remarks>
+    public const string UnsupportedExpressionGeneratedColumn = "DELTA_UNSUPPORTED_EXPRESSION_GENERATED_COLUMN";
+
+    /// <summary>A generated column is of a type Delta does not generate, such as VARIANT.</summary>
+    /// <remarks>delta-spark: <c>DELTA_UNSUPPORTED_DATA_TYPE_IN_GENERATED_COLUMN</c>.</remarks>
+    public const string UnsupportedDataTypeInGeneratedColumn = "DELTA_UNSUPPORTED_DATA_TYPE_IN_GENERATED_COLUMN";
+
     /// <summary>
     /// A RENAME or DROP would change a column that a generated column's expression reads.
     /// </summary>
