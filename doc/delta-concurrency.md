@@ -50,7 +50,7 @@ conflict. `ReadFileAsync` supplies each surviving row's absolute in-file positio
 `strippedAbsPositionsOut` out-param, which is what lets a delete's target positions be correlated
 with the resolved stable ids.
 
-**Row-tracking rebase.** An append or an UPDATE's copy-on-write post-image add re-derives its
+**Row-tracking rebase.** An append or an UPDATE's (or MERGE's) post-image add re-derives its
 `baseRowId` from the latest snapshot's high-water mark and its `defaultRowCommitVersion` from the
 attempt version, then rebuilds the `delta.rowTracking` domain (`RebaseRowTrackingAddIds`). Adds
 excluded from that re-derivation — a DV re-union re-add of an existing file, or a remap re-add on a

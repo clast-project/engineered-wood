@@ -263,7 +263,9 @@ public class RowLevelConcurrencyTests : IDisposable
                 for (int i = 0; i < batch.Length; i++)
                     vals.Append(id.GetValue(i) == 2 ? "updated" : ((StringArray)batch.Column("val")).GetString(i));
                 return new RecordBatch(RtSchema, [batch.Column(0), vals.Build()], batch.Length);
-            });
+            },
+            // The rewrite is what this pins; on a deletion-vector table an UPDATE masks by default (#704).
+            mode: RowDeleteMode.CopyOnWrite);
         Assert.Equal(1, updated);
         Assert.Equal(baseVersion + 1, vA);
 
@@ -273,6 +275,40 @@ public class RowLevelConcurrencyTests : IDisposable
 
         Assert.Equal(
             new (long, string?)[] { (2, "updated"), (3, "v3") },
+            await ReadRowsFresh());
+    }
+
+    /// <summary>
+    /// A deletion-vector UPDATE (#704) keeps the file and adds its post-images as a new file. A stale delete of a
+    /// disjoint row rebases onto the kept file by uniting vectors, but a FUNCTIONAL predicate cannot say whether the
+    /// post-image file holds a row it would match, so that add is a concurrentAppend conflict. (An analyzable
+    /// predicate is tested against the file's statistics and lands: see
+    /// <see cref="UpdateDeletionVectorTests.ALosingDeleteOfAnotherRowOfTheMaskedFile_Lands"/>.)
+    /// </summary>
+    [Fact]
+    public async Task ConcurrentDeletionVectorUpdate_ConflictsWithAFunctionalDelete()
+    {
+        await using (var setup = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), RtSchema,
+            enableDeletionVectors: true, enableRowTracking: true))
+        {
+            await setup.WriteAsync([RtBatch(1, 3)]);
+        }
+
+        await using var tableA = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+        await using var tableB = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir));
+
+        await tableA.UpdateAsync(RtIdEquals(2), batch =>
+        {
+            var vals = new StringArray.Builder();
+            for (int i = 0; i < batch.Length; i++)
+                vals.Append("updated");
+            return new RecordBatch(RtSchema, [batch.Column(0), vals.Build()], batch.Length);
+        });
+
+        await Assert.ThrowsAnyAsync<DeltaConflictException>(() => tableB.DeleteAsync(RtIdEquals(1)).AsTask());
+        Assert.Equal(
+            new (long, string?)[] { (1, "v1"), (2, "updated"), (3, "v3") },
             await ReadRowsFresh());
     }
 

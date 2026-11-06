@@ -5135,14 +5135,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="DeleteAsync(Func{RecordBatch, BooleanArray}, CancellationToken)"/>, a concurrent add of any
     /// file is taken to match the opaque predicate (concurrentAppend, precise to the isolation level).
     /// Returns the number of rows updated and the committed version.
+    /// <para>A file holding an updated row is changed as <paramref name="mode"/> says. Null (the default) lets the
+    /// table decide, as a DELETE does: on a table with <c>delta.enableDeletionVectors</c> the updated rows are masked
+    /// by the file's deletion vector (the file is removed and re-added under the new vector, with loose statistics)
+    /// and their post-images written to a new file, keeping their stable row ids, as Spark's UPDATE writes them; on
+    /// one without, the file is rewritten with the updated rows changed and the rest copied (copy-on-write).
+    /// <see cref="RowDeleteMode.DeletionVector"/> on a table without deletion vectors refuses an UPDATE that would
+    /// mask part of a file. In both modes a file whose every live row is updated is removed whole, and the change
+    /// data feed is the same. An UPDATE that writes deletion vectors still conflicts with a concurrent commit that
+    /// changed a file it changed: an update cannot be rebased row by row.</para>
     /// </summary>
     public ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
         Func<RecordBatch, BooleanArray> predicate,
         Func<RecordBatch, RecordBatch> updater,
         CancellationToken cancellationToken = default,
-        CommitProperties? commitProperties = null)
+        CommitProperties? commitProperties = null,
+        RowDeleteMode? mode = null)
         => UpdateCoreAsync(predicate, updater, prunePredicate: null, readPredicates: [],
-            opaquePredicate: true, cancellationToken, commitProperties);
+            opaquePredicate: true, cancellationToken, commitProperties, mode);
 
     /// <summary>
     /// Updates rows matching an analyzable <see cref="Expressions.Predicate"/>. As with the analyzable
@@ -5150,14 +5160,17 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// row matches are skipped without being read, and the predicate becomes the operation's read-set so a
     /// concurrent commit adding a file that matches it is a conflict (concurrentAppend), precise to the
     /// isolation level. Returns the number of rows updated and the committed version.
+    /// <para>A file holding an updated row is changed as <paramref name="mode"/> says; see
+    /// <see cref="UpdateAsync(Func{RecordBatch, BooleanArray}, Func{RecordBatch, RecordBatch}, CancellationToken, CommitProperties?, RowDeleteMode?)"/>.</para>
     /// </summary>
     public ValueTask<(long RowsUpdated, long Version)> UpdateAsync(
         Expressions.Predicate predicate,
         Func<RecordBatch, RecordBatch> updater,
         CancellationToken cancellationToken = default,
-        CommitProperties? commitProperties = null)
+        CommitProperties? commitProperties = null,
+        RowDeleteMode? mode = null)
         => UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
-            readPredicates: [predicate], opaquePredicate: false, cancellationToken, commitProperties);
+            readPredicates: [predicate], opaquePredicate: false, cancellationToken, commitProperties, mode);
 
     private async ValueTask<(long RowsUpdated, long Version)> UpdateCoreAsync(
         Func<RecordBatch, BooleanArray> predicate,
@@ -5166,7 +5179,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<Expressions.Predicate> readPredicates,
         bool opaquePredicate,
         CancellationToken cancellationToken,
-        CommitProperties? commitProperties)
+        CommitProperties? commitProperties,
+        RowDeleteMode? mode)
     {
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
@@ -5181,7 +5195,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         return await CollectOnFailureAsync(async written =>
         {
             var plan = await ComputeUpdateActionsAsync(
-                snapshot, predicate, updater, cancellationToken, prunePredicate, written: written)
+                snapshot, predicate, updater, cancellationToken, prunePredicate, written: written, mode: mode)
                 .ConfigureAwait(false);
 
             // An UPDATE reads exactly the files it rewrites, so — like DELETE — the removed paths are both its
@@ -5209,7 +5223,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>The remove/add (and CDC) actions an UPDATE produces, the paths it rewrote, and the row
     /// count — everything a commit needs, without committing. Shared by the auto-committing
-    /// <see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken, CommitProperties?)"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
+    /// <see cref="UpdateAsync(Expressions.Predicate, Func{RecordBatch, RecordBatch}, CancellationToken, CommitProperties?, RowDeleteMode?)"/> and the transactional <see cref="DeltaTransaction"/> path.</summary>
     internal sealed record UpdateActions(
         IReadOnlyList<DeltaAction> Actions, ISet<string> RemovedPaths, long TotalUpdated, long NextRowId);
 
@@ -5233,7 +5247,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         Expressions.Predicate? prunePredicate = null,
         long? rowIdStart = null,
-        WrittenFileLedger? written = null)
+        WrittenFileLedger? written = null,
+        RowDeleteMode? mode = null)
     {
         if (prunePredicate is not null)
             RefuseUnanalyzable(prunePredicate, snapshot);
@@ -5241,6 +5256,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
         long totalUpdated = 0;
+
+        // As a DELETE decides it (see DeletesByCopyOnWrite): deletion vectors where the table enables them, unless
+        // the caller says otherwise. With them, a file holding an updated row keeps its other rows where they are:
+        // the updated rows are masked by the file's deletion vector and their post-images written to a new file, as
+        // Spark's UPDATE writes them. A file whose every live row is updated is removed whole either way.
+        bool copyOnWrite = DeletesByCopyOnWrite(snapshot, mode);
+        bool deletionVectorsEnabled = DeletionVectors.DeletionVectorConfig.IsEnabled(
+            snapshot.Metadata.Configuration);
+        var dvWriter = copyOnWrite ? null : NewDeletionVectorWriter();
 
         // Parsed once for the whole rewrite rather than per batch. Create refuses an expression
         // this writer cannot read, which is what keeps the UPDATE fail-closed on a table whose
@@ -5259,9 +5283,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         // Row tracking through the copy-on-write rewrite: an UPDATE moves every row of a modified file to a new
         // file, so a row's id can no longer be derived from position. Materialize each row's ORIGINAL id +
-        // commit version into the declared hidden columns (a matched row's version advances to this commit; an
-        // untouched-but-rewritten row keeps its original). A fresh baseRowId/defaultRowCommitVersion still goes
-        // on the new add (spec: the null-materialized fallback).
+        // commit version into the declared hidden columns (a matched row's version is left NULL, so it takes the
+        // new add's defaultRowCommitVersion: this commit's, re-derived if it rebases; an untouched-but-rewritten
+        // row keeps its original). A fresh baseRowId/defaultRowCommitVersion still goes on the new add (spec: the
+        // null-materialized fallback).
         bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
@@ -5280,8 +5305,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var batches = new List<RecordBatch>();
             var srcIds = materializeIds ? new List<Int64Array?>() : null;
             var srcVers = materializeIds ? new List<Int64Array?>() : null;
+            // A deletion vector addresses rows by their position in the file.
+            var srcPositions = copyOnWrite ? null : new List<Int64Array?>();
             await foreach (var batch in ReadFileAsync(
-                addFile, null, snapshot, cancellationToken, srcIds, srcVers).ConfigureAwait(false))
+                addFile, null, snapshot, cancellationToken, srcIds, srcVers, srcPositions).ConfigureAwait(false))
             {
                 batches.Add(batch);
             }
@@ -5289,13 +5316,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (batches.Count == 0)
                 continue;
 
+            long liveRows = batches.Sum(b => (long)b.Length);
+
             // Evaluate predicate and apply updates
             bool fileModified = false;
+            // With deletion vectors: how many live rows the UPDATE left alone, and the positions of those it changed.
+            long keptHere = 0;
+            var changedPositions = copyOnWrite ? null : new List<long>();
             // The output rows by destination: an updated row whose partition values changed moves to its new
             // partition (#519). Each output batch carries the ORIGINAL id + commit version to materialize (null =
             // no tracking). An UPDATE keeps EVERY row (matched rows updated in place, the rest copied), so each
-            // output row carries its source id; a matched row's version becomes newVersion, an untouched row keeps
-            // its original.
+            // output row carries its source id; a matched row's version is NULL (the new add's default, so this
+            // commit's), an untouched row keeps its original.
             var router = new PartitionRouter(
                 snapshot, mappingMode, batches.FirstOrDefault(b => b.Length > 0), materializeIds);
             var preimages = new List<RecordBatch>();
@@ -5314,9 +5346,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
                 if (matchCount == 0)
                 {
-                    // Untouched but (once the file is modified) rewritten: keep every row's original id + version.
-                    router.Add(batch, batchIds is not null && batchVers is not null
-                        ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null, mayMove: false);
+                    if (copyOnWrite)
+                    {
+                        // Untouched but (once the file is modified) rewritten: keep every row's original id + version.
+                        router.Add(batch, batchIds is not null && batchVers is not null
+                            ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null, mayMove: false);
+                    }
+                    else
+                    {
+                        keptHere += batch.Length; // they stay in the file
+                    }
                     continue;
                 }
 
@@ -5332,6 +5371,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         matchRows.Add(i);
                     else
                         keepRows.Add(i);
+                }
+
+                if (changedPositions is not null)
+                {
+                    var positions = bi < srcPositions!.Count ? srcPositions[bi] : null;
+                    foreach (int i in matchRows)
+                    {
+                        if (positions is null || positions.IsNull(i))
+                        {
+                            throw new InvalidOperationException(
+                                $"UPDATE could not resolve the position of a row it changed in '{addFile.Path}', "
+                                + "which a deletion vector needs. Pass RowDeleteMode.CopyOnWrite as the UPDATE's "
+                                + "mode to rewrite the file instead.");
+                        }
+                        changedPositions.Add(positions.GetValue(i)!.Value);
+                    }
                 }
 
                 if (matchRows.Count > 0)
@@ -5352,14 +5407,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // string went through unrefused).
                     updatedBatch = PreparePostImage(updatedBatch, snapshot, generatedColumns, constraints);
 
-                    // Matched rows keep their id; their commit version advances to this commit (they changed).
+                    // Matched rows keep their id; their commit version advances to this commit (they changed). It is
+                    // materialized as NULL, so a reader takes the new file's defaultRowCommitVersion, as Spark's
+                    // UPDATE leaves it: a commit that rebases past a concurrent one re-derives that default for the
+                    // version it lands at, and a materialized value would keep the version first attempted.
                     router.Add(updatedBatch, batchIds is not null
-                        ? (TakeIds(batchIds, matchRows), ConstInt64(newVersion, matchRows.Count))
+                        ? (TakeIds(batchIds, matchRows), AllNullInt64(matchRows.Count))
                         : ((Int64Array, Int64Array)?)null, mayMove: true);
 
                     // Collect preimage and postimage for CDC, each with the touched rows' identity. Both images
                     // are the SAME rows, so both carry the same ids; only the commit version differs — the
-                    // pre-image belongs to the version that last wrote it, the post-image to this one.
+                    // pre-image belongs to the version that last wrote it, the post-image to this one (NULL, which
+                    // a change file's reader resolves to the commit that wrote it, wherever a rebase lands it).
                     if (cdfEnabled)
                     {
                         preimages.Add(matchBatch);
@@ -5372,12 +5431,17 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                                 ids,
                                 batchVers is not null ? TakeIds(batchVers, matchRows) : AllNullInt64(matchRows.Count),
                                 ids,
-                                ConstInt64(newVersion, matchRows.Count)));
+                                AllNullInt64(matchRows.Count)));
                         }
                     }
                 }
 
-                if (keepRows.Count > 0)
+                if (keepRows.Count > 0 && !copyOnWrite)
+                {
+                    // They stay in the file, whose deletion vector masks only the updated rows.
+                    keptHere += keepRows.Count;
+                }
+                else if (keepRows.Count > 0)
                 {
                     // Untouched rows in a modified file: original id + original commit version.
                     router.Add(TakeRowsFromBatch(batch, keepRows), batchIds is not null && batchVers is not null
@@ -5389,11 +5453,52 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (!fileModified)
                 continue;
 
-            // Each destination as its own file: the stayers under the source's partition directory, each moved group
-            // under its new one. The remove, adds and statistics are built as the row-level rewrites build them.
-            nextRowId = await WriteRewriteGroupsAsync(
-                snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
-                assignRowIds, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
+            if (copyOnWrite || keptHere == 0)
+            {
+                // Each destination as its own file: the stayers under the source's partition directory, each moved
+                // group under its new one. The remove, adds and statistics are built as the row-level rewrites build
+                // them. With deletion vectors and no live row left alone, the file is removed and the post-images
+                // written to a new file, as Spark removes such a file.
+                nextRowId = await WriteRewriteGroupsAsync(
+                    snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
+                    assignRowIds, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                // Before anything of this file is written: a vector a foreign reader would ignore is never written
+                // into a table that does not enable them (#524).
+                if (!deletionVectorsEnabled)
+                {
+                    throw new InvalidOperationException(
+                        "UPDATE was asked to mask rows of a data file with a deletion vector, and this table does not "
+                        + "have deletion vectors enabled. Pass RowDeleteMode.CopyOnWrite (or no mode) as the UPDATE's "
+                        + "mode to rewrite the affected files instead, or create the table with "
+                        + "DeltaTable.CreateAsync(..., enableDeletionVectors: true).");
+                }
+
+                // The post-images alone, each under the partition its row now belongs to: the other rows stay put.
+                nextRowId = await WriteRewriteGroupsAsync(
+                    snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
+                    assignRowIds, nextRowId, newVersion, actions, written, cancellationToken,
+                    removeSource: false).ConfigureAwait(false);
+
+                var existing = addFile.DeletionVector is not null
+                    ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
+                    : DeletionVectors.DeletionVectorBitmap.Empty;
+                var newDv = await dvWriter!.CreateAsync(
+                    existing.Union(DeletionVectors.DeletionVectorBuilder.SortedDistinct(changedPositions!), null),
+                    cancellationToken).ConfigureAwait(false);
+                // The vector is ours; the file it masks is not: the re-add names live table data.
+                written?.RecordDeletionVector(newDv);
+                actions.Add(RemoveOf(addFile));
+                actions.Add(addFile with
+                {
+                    DeletionVector = newDv,
+                    DataChange = true,
+                    // The read skipped only the rows the existing vector hid, so the two give the physical count.
+                    Stats = StatsWithLooseBounds(addFile.GetStatsJson(), liveRows + existing.Count),
+                });
+            }
             removedPaths.Add(addFile.Path);
 
             // Write CDC files for update preimage/postimage
@@ -10241,7 +10346,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>delta.enableChangeDataFeed</c> each touched row's before/after values are written as
     /// <c>update_preimage</c>/<c>update_postimage</c> change files. IcebergCompat is not yet supported on this
     /// path. Returns the committed version (or the current version if nothing matched).
-    /// <para>The selected rows are the post-image, checked as <see cref="UpdateAsync(Func{RecordBatch, BooleanArray}, Func{RecordBatch, RecordBatch}, CancellationToken, CommitProperties)"/>
+    /// <para>The selected rows are the post-image, checked as <see cref="UpdateAsync(Func{RecordBatch, BooleanArray}, Func{RecordBatch, RecordBatch}, CancellationToken, CommitProperties?, RowDeleteMode?)"/>
     /// checks its own: generated columns are recomputed from the new values (whatever <paramref name="rewriteFile"/>
     /// put in them), then CHECK constraints, invariants and NOT NULL are evaluated. The other rows are copied
     /// through unchecked. A selected row may land later in the rewritten file than it was.</para>
