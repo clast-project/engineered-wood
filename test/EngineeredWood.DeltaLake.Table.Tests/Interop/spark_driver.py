@@ -1312,8 +1312,23 @@ COMMANDS = {
 DONE_MARKER = "__EW_DONE__"
 
 
+def _json_safe(value):
+    """Non-finite floats as the strings Spark's JSON and EW's stats spell them ("NaN", "Infinity").
+
+    json.dumps writes them as bare NaN / Infinity tokens, which are not JSON, so any table holding one
+    made every command that returns its rows fail to parse on the .NET side.
+    """
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        return "NaN" if value != value else ("Infinity" if value > 0 else "-Infinity")
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def _emit(out_path, obj):
-    payload = json.dumps(obj, ensure_ascii=False, default=str)
+    payload = json.dumps(_json_safe(obj), ensure_ascii=False, default=str, allow_nan=False)
     if not out_path:
         _real_stdout.write(payload)
         return

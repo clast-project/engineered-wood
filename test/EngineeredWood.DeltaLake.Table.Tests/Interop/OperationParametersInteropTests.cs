@@ -51,12 +51,14 @@ public class OperationParametersInteropTests : IDisposable
         .Field(new Field("ts", new TimestampType(TimeUnit.Microsecond, "UTC"), true))
         .Field(new Field("dbl", DoubleType.Default, true))
         .Field(new Field("bin", BinaryType.Default, true))
+        .Field(new Field("nan", DoubleType.Default, true))
         .Build();
 
     private static readonly DateTimeOffset Epoch = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
     /// <summary>Rows 1 to 5; row <c>i</c> holds day <c>i</c>, <c>i.50</c>, hour <c>i</c>, <c>i * 1.5</c> and the
-    /// byte <c>i</c>. Row 2's value has a quote in it, row 3's a backslash, and row 5's is null.</summary>
+    /// byte <c>i</c>. Row 2's value has a quote in it, row 3's a backslash, and row 5's is null. <c>nan</c> is
+    /// 1.0, NaN, NULL, 2.0 and NaN, so a NaN test is checked against a NULL as well as a number.</summary>
     private static RecordBatch Rows()
     {
         var id = new Int64Array.Builder();
@@ -66,6 +68,7 @@ public class OperationParametersInteropTests : IDisposable
         var ts = new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, "UTC"));
         var dbl = new DoubleArray.Builder();
         var bin = new BinaryArray.Builder();
+        var nan = new DoubleArray.Builder();
         for (int i = 1; i <= 5; i++)
         {
             id.Append(i);
@@ -78,9 +81,13 @@ public class OperationParametersInteropTests : IDisposable
             ts.Append(Epoch.AddHours(i));
             dbl.Append(i * 1.5);
             bin.Append(new byte[] { (byte)i });
+            if (i == 3)
+                nan.AppendNull();
+            else
+                nan.Append(i switch { 1 => 1.0, 4 => 2.0, _ => double.NaN });
         }
         return new RecordBatch(TableSchema,
-            [id.Build(), value.Build(), d.Build(), amt.Build(), ts.Build(), dbl.Build(), bin.Build()], 5);
+            [id.Build(), value.Build(), d.Build(), amt.Build(), ts.Build(), dbl.Build(), bin.Build(), nan.Build()], 5);
     }
 
     private async Task CreateTwinsAsync()
@@ -155,6 +162,12 @@ public class OperationParametersInteropTests : IDisposable
         ["arithmetic"] = Ex.Equal(Ex.Call("-", Ex.Ref("id"), Ex.Lit(1L)), Ex.Lit(2L)),
         ["starts with"] = Ex.StartsWith("value", "v"),
         ["not starts with"] = Ex.NotStartsWith("value", "v"),
+        // A NULL operand: isnan(NULL) is false in Spark, and IS NOT NaN must stay NULL, which only NOT can tell
+        // apart from false.
+        ["is nan"] = Ex.IsNaN(Ex.Ref("nan")),
+        ["is not nan"] = Ex.IsNotNaN(Ex.Ref("nan")),
+        ["not is nan"] = Ex.Not(Ex.IsNaN(Ex.Ref("nan"))),
+        ["not is not nan"] = Ex.Not(Ex.IsNotNaN(Ex.Ref("nan"))),
     };
 
     public static TheoryData<string> Conditions() => new(ConditionsByName.Keys);

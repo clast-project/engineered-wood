@@ -25,7 +25,9 @@ namespace EngineeredWood.Expressions.Sql;
 /// <list type="bullet">
 /// <item><description>A <see cref="ComparisonOperator.StartsWith"/> comparison renders as Spark's
 ///   <c>startswith(a, b)</c>, and <see cref="UnaryOperator.IsNaN"/> as <c>isnan(a)</c>. Spark SQL has no operator
-///   for either, and the parser reads the call back as a call.</description></item>
+///   for either, and the parser reads the call back as a call. <see cref="UnaryOperator.IsNotNaN"/> renders as
+///   <c>CASE WHEN (a IS NULL) THEN NULL ELSE (NOT isnan(a)) END</c>, because Spark's <c>isnan(NULL)</c> is false,
+///   and a plain <c>NOT isnan(a)</c> would turn a NULL into true.</description></item>
 /// <item><description>A <c>DATE</c> value (<see cref="LiteralValue.Kind.DateOnly"/>) renders as
 ///   <c>DATE '2026-01-02'</c>, which the parser lowers to a cast of a timestamp. That cast renders as the same
 ///   <c>DATE</c> literal again, so the text is stable from the second rendering on.</description></item>
@@ -179,9 +181,25 @@ public static class SparkSqlRenderer
         UnaryOperator.IsNull => Wrapped(sql, "(", unary.Operand, " IS NULL)"),
         UnaryOperator.IsNotNull => Wrapped(sql, "(", unary.Operand, " IS NOT NULL)"),
         UnaryOperator.IsNaN => Wrapped(sql, "isnan(", unary.Operand, ")"),
-        UnaryOperator.IsNotNaN => Wrapped(sql, "(NOT isnan(", unary.Operand, "))"),
+        UnaryOperator.IsNotNaN => NotNaN(sql, unary.Operand),
         _ => $"the unary operator {unary.Op} has no SQL spelling",
     };
+
+    /// <summary>
+    /// <c>IS NOT NaN</c>, which is NULL for a NULL operand. Spark's <c>isnan(NULL)</c> is false rather than NULL,
+    /// so a plain <c>NOT isnan(x)</c> would be true there, and <c>NOT (x IS NOT NaN)</c> would select different
+    /// rows. The CASE keeps the NULL.
+    /// </summary>
+    private static string? NotNaN(StringBuilder sql, Expression operand)
+    {
+        sql.Append("CASE WHEN (");
+        if (Append(sql, operand) is { } reason)
+            return reason;
+        sql.Append(" IS NULL) THEN NULL ELSE (NOT isnan(");
+        Append(sql, operand);
+        sql.Append(")) END");
+        return null;
+    }
 
     private static string? Set(StringBuilder sql, SetPredicate set)
     {
@@ -276,6 +294,12 @@ public static class SparkSqlRenderer
                 return Text(sql, value.AsDecimal.ToString(CultureInfo.InvariantCulture) + "BD");
             case LiteralValue.Kind.HighPrecisionDecimal:
                 var (unscaled, scale) = value.AsHighPrecisionDecimal;
+                // Spark's widest decimal is 38 digits, the scale counted among them (0 <= scale <= precision <= 38),
+                // and a negative scale is written out as trailing zeros. Past that, Spark refuses the literal.
+                int digits = BigInteger.Abs(unscaled).ToString(CultureInfo.InvariantCulture).Length;
+                int precision = scale >= 0 ? Math.Max(digits, scale) : (unscaled.IsZero ? 1 : digits - scale);
+                if (precision > MaxDecimalPrecision)
+                    return $"a decimal of {precision} digits is wider than Spark's {MaxDecimalPrecision}";
                 return Text(sql, DecimalText(unscaled, scale) + "BD");
             case LiteralValue.Kind.String:
                 AppendString(sql, value.AsString);
@@ -296,6 +320,8 @@ public static class SparkSqlRenderer
                 return $"Spark has no type for a {value.Type} literal";
         }
     }
+
+    private const int MaxDecimalPrecision = 38;
 
     private static string? FloatingPoint(StringBuilder sql, double value, string suffix, string type)
     {

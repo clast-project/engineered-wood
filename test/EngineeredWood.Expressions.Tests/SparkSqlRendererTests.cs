@@ -193,6 +193,32 @@ public sealed class SparkSqlRendererTests
         Assert.Equal("isnan(dbl)", Render(Ex.IsNaN(Ex.Ref("dbl"))));
     }
 
+    /// <summary>Spark's <c>isnan(NULL)</c> is false, so <c>NOT isnan(x)</c> would be true for a NULL where
+    /// <c>x IS NOT NaN</c> is NULL; the CASE keeps the NULL.</summary>
+    [Fact]
+    public void IsNotNaNKeepsANullOperandNull()
+    {
+        string sql = Render(Ex.IsNotNaN(Ex.Ref("dbl")));
+        Assert.Equal("CASE WHEN (dbl IS NULL) THEN NULL ELSE (NOT isnan(dbl)) END", sql);
+        // The parser reads isnan(dbl) under NOT as isnan(dbl) = TRUE, the same condition, so the text is stable from
+        // the second rendering on.
+        string again = Render(Parse(sql));
+        Assert.Equal(again, Render(Parse(again)));
+    }
+
+    /// <summary>A decimal is at most 38 digits, its scale among them; a negative scale's zeros count too.</summary>
+    [Fact]
+    public void ADecimalWithinSparksPrecisionRenders_AndOneBeyondIsRefused()
+    {
+        Assert.Equal("0." + new string('0', 37) + "1BD", Render(Ex.Lit(LiteralValue.HighPrecisionDecimalOf(1, 38))));
+        Assert.Equal("1" + new string('0', 37) + "BD", Render(Ex.Lit(LiteralValue.HighPrecisionDecimalOf(1, -37))));
+
+        Assert.False(SparkSqlRenderer.TryRender(Ex.Lit(LiteralValue.HighPrecisionDecimalOf(1, 39)), out _));
+        Assert.False(SparkSqlRenderer.TryRender(Ex.Lit(LiteralValue.HighPrecisionDecimalOf(1, -38)), out _));
+        Assert.False(SparkSqlRenderer.TryRender(
+            Ex.Lit(LiteralValue.HighPrecisionDecimalOf(BigInteger.Pow(10, 38), 0)), out _));
+    }
+
     // ── What has no Spark SQL ──────────────────────────────────────────────────────────────────
 
     public static TheoryData<Expression> Unrenderable() => new()
