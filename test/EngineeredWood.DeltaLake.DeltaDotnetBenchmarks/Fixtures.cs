@@ -236,6 +236,8 @@ internal static class Fixtures
             if (Built(marker) is { } builtMeanwhile)
                 return builtMeanwhile; // built by whoever held the lock before us
 
+            DeleteAbandonedTemplates(name);
+
             string path = Storage.Combine(Templates, $"{name}.{Guid.NewGuid():N}");
             Console.WriteLine($"// building fixture {name} on {Storage.Description} ...");
             try
@@ -248,12 +250,48 @@ internal static class Fixtures
                 Delete(path);
                 throw;
             }
-            Storage.WriteMarker(marker, $"{GenerationPrefix}{Storage.NameOf(path)}\nbuilt {DateTime.UtcNow:O}\n");
-            return path;
+
+            // Create-only: a run that stalled past its lock and finds a marker already published drops its own
+            // build and uses the published one, rather than replacing a template other runs may be reading.
+            if (Storage.TryCreateMarker(marker, $"{GenerationPrefix}{Storage.NameOf(path)}\nbuilt {DateTime.UtcNow:O}\n"))
+                return path;
+            Delete(path);
+            return Built(marker)
+                ?? throw new InvalidOperationException($"Fixture {name}'s marker vanished while it was being published.");
         }
     }
 
     private const string GenerationPrefix = "template ";
+
+    /// <summary>
+    /// How long a template location must have gone unwritten before a rebuild deletes it. A build in progress
+    /// writes every few seconds, so this only ever catches an old template or a dead build, never a live one.
+    /// </summary>
+    private static readonly TimeSpan AbandonedAfter = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// Deletes this template's unpublished locations, called (under the lock, with no marker) before a rebuild:
+    /// the copy a deleted <c>.ready</c> used to name, the old-style <c>templates/&lt;name&gt;</c>, and any build
+    /// that died. One written to within <see cref="AbandonedAfter"/> is left alone, as it may be a stalled build
+    /// that will resume; if it does, it finds this build's marker and deletes itself.
+    /// </summary>
+    private static void DeleteAbandonedTemplates(string name)
+    {
+        DateTimeOffset cutoff = DateTimeOffset.UtcNow - AbandonedAfter;
+        foreach (string location in Storage.Children(Templates))
+        {
+            string child = Storage.NameOf(location);
+            bool ours = child == name
+                || (child.Length == name.Length + 33
+                    && child.StartsWith(name + ".", StringComparison.Ordinal)
+                    && child[(name.Length + 1)..].All(char.IsAsciiHexDigitLower));
+            if (ours && !(Storage.LastWrite(location) > cutoff))
+            {
+                Console.WriteLine($"// deleting abandoned fixture location {child} ...");
+                Delete(location);
+            }
+        }
+    }
 
     /// <summary>
     /// The published template behind a marker, or null if none. A marker from before templates had their own

@@ -60,7 +60,14 @@ internal abstract class BenchStorage
     /// </summary>
     public abstract string? ReadMarker(string location);
 
-    public abstract void WriteMarker(string location, string content);
+    /// <summary>
+    /// Writes the marker only if there is none yet; false if another run's marker got there first. Publishing
+    /// is create-only so a run that stalled past its lock can never replace a marker someone else published.
+    /// </summary>
+    public abstract bool TryCreateMarker(string location, string content);
+
+    /// <summary>When any file under the location was last written; null if it holds none.</summary>
+    public abstract DateTimeOffset? LastWrite(string location);
 
     /// <summary>Removes every file of the table. Best effort: a failure is left for the next sweep.</summary>
     public abstract void DeleteTree(string location);
@@ -138,7 +145,34 @@ internal sealed class LocalStorage : BenchStorage
     public override string? ReadMarker(string location) =>
         File.Exists(location + ".ready") ? File.ReadAllText(location + ".ready") : null;
 
-    public override void WriteMarker(string location, string content) => File.WriteAllText(location + ".ready", content);
+    public override bool TryCreateMarker(string location, string content)
+    {
+        try
+        {
+            using var stream = new FileStream(location + ".ready", FileMode.CreateNew, FileAccess.Write);
+            using var writer = new StreamWriter(stream);
+            writer.Write(content);
+            return true;
+        }
+        catch (IOException) when (File.Exists(location + ".ready"))
+        {
+            return false; // someone else published first
+        }
+    }
+
+    public override DateTimeOffset? LastWrite(string location)
+    {
+        if (!Directory.Exists(location))
+            return null;
+        DateTimeOffset? newest = null;
+        foreach (string file in Directory.EnumerateFiles(location, "*", SearchOption.AllDirectories))
+        {
+            DateTimeOffset written = File.GetLastWriteTimeUtc(file);
+            if (newest is null || written > newest)
+                newest = written;
+        }
+        return newest;
+    }
 
     public override void DeleteTree(string location)
     {
@@ -259,8 +293,10 @@ internal sealed class AzureStorage : BenchStorage
     public static AzureStorage FromEnvironment()
     {
         bool emulator = Environment.GetEnvironmentVariable("EWDD_AZURE_EMULATOR") is "1" or "true";
-        string? account = Env("EWDD_AZURE_ACCOUNT") ?? (emulator ? EmulatorAccount : null);
-        string? key = Env("EWDD_AZURE_KEY") ?? (emulator ? EmulatorKey : null);
+        // The emulator always uses Azurite's own account: a shell left with a real account's settings would
+        // otherwise sign Azurite requests for that account, which Azurite rejects.
+        string? account = emulator ? EmulatorAccount : Env("EWDD_AZURE_ACCOUNT");
+        string? key = emulator ? EmulatorKey : Env("EWDD_AZURE_KEY");
         if (account is null || key is null)
         {
             throw new InvalidOperationException(
@@ -312,8 +348,24 @@ internal sealed class AzureStorage : BenchStorage
         }
     }
 
-    public override void WriteMarker(string location, string content) =>
-        _container.GetBlobClient(location + ".ready").Upload(BinaryData.FromString(content), overwrite: true);
+    public override bool TryCreateMarker(string location, string content)
+    {
+        try
+        {
+            _container.GetBlobClient(location + ".ready").Upload(BinaryData.FromString(content),
+                new BlobUploadOptions { Conditions = new BlobRequestConditions { IfNoneMatch = Azure.ETag.All } });
+            return true;
+        }
+        catch (Azure.RequestFailedException e) when (e.Status is 409 or 412)
+        {
+            return false; // BlobAlreadyExists / ConditionNotMet: someone else published first
+        }
+    }
+
+    public override DateTimeOffset? LastWrite(string location) =>
+        _container.GetBlobs(BlobTraits.None, BlobStates.None, location + "/", default)
+            .Select(blob => blob.Properties.LastModified)
+            .Max();
 
     /// <summary>
     /// The files under a location, and separately the directories: on a hierarchical-namespace account a flat
