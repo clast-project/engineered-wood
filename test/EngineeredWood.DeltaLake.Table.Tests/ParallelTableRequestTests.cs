@@ -129,6 +129,37 @@ public class ParallelTableRequestTests : IDisposable
         Assert.InRange(fs.CommitReadsStarted, 3, 3 + Hint);
     }
 
+    /// <summary>
+    /// Cancelling after the first entry ends the enumeration with a cancellation even when every remaining commit was
+    /// already read ahead: the reads that completed never look at the token again (#714 review).
+    /// </summary>
+    [Fact]
+    public async Task History_Cancelled_WithTheRestAlreadyReadAhead_StillThrows()
+    {
+        string dir = await CreateManyCommitsAsync(4); // 5 versions: all inside one read-ahead window
+        var fs = new LatencyFileSystem(new LocalTableFileSystem(dir), Hint, delayMs: 0);
+        await using var table = await OpenAsync(fs, window: null);
+        using var cts = new CancellationTokenSource();
+
+        var seen = new List<long>();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (var e in table.GetHistoryAsync(cts.Token))
+            {
+                seen.Add(e.Version);
+                if (seen.Count == 1)
+                {
+                    while (fs.CommitReadsInFlight > 0 || fs.CommitReadsStarted < 5)
+                        await Task.Delay(5); // every remaining read has completed
+                    cts.Cancel();
+                }
+            }
+        });
+
+        Assert.Equal([0L], seen);
+        Assert.Equal(0, fs.CommitReadsInFlight);
+    }
+
     [Fact]
     public async Task History_AFailingCommitRead_ThrowsAtItsVersion_AfterTheEntriesBeforeIt()
     {
@@ -192,6 +223,11 @@ public class ParallelTableRequestTests : IDisposable
         Assert.Equal(10, await RowCountAsync(table));
     }
 
+    /// <summary>
+    /// The third delete fails while the first two are held open (they wait until cancelled), so the outcome does
+    /// not depend on scheduling: no delete starts after the failure, the two held ones are cancelled, and so
+    /// nothing at all is deleted (#714 review).
+    /// </summary>
     [Fact]
     public async Task Vacuum_AFailingDelete_StopsTheRest_AndWritesNoVacuumEnd()
     {
@@ -200,15 +236,15 @@ public class ParallelTableRequestTests : IDisposable
         var fs = new LatencyFileSystem(new LocalTableFileSystem(dir), Hint, delayMs: 15)
         {
             FailDelete = _ => Interlocked.Increment(ref deletes) == 3,
+            HoldDeletes = true,
         };
         await using var table = await OpenAsync(fs, window: null);
 
         await Assert.ThrowsAsync<IOException>(async () => await table.VacuumAsync(retentionPeriod: TimeSpan.Zero));
 
+        Assert.Equal(3, fs.DeletesStarted);
         Assert.Equal(0, fs.DeletesInFlight);
-        // Only deletes already in flight when the third failed can have been carried out (the failing one was not,
-        // and none started after it); the overwrite's own file is never a candidate.
-        Assert.InRange(DataFiles(dir), 17 - (Hint - 1), 17);
+        Assert.Equal(17, DataFiles(dir));
 
         await using var reopened = await DeltaTable.OpenAsync(new LocalTableFileSystem(dir));
         var history = await HistoryAsync(reopened);
@@ -301,7 +337,10 @@ public class ParallelTableRequestTests : IDisposable
     {
         var (serialDir, parallelDir) = await CreateCompactionTablesAsync();
         var serialFs = new LatencyFileSystem(new LocalTableFileSystem(serialDir), Hint, delayMs: 20);
-        var parallelFs = new LatencyFileSystem(new LocalTableFileSystem(parallelDir), Hint, delayMs: 20);
+        var parallelFs = new LatencyFileSystem(new LocalTableFileSystem(parallelDir), Hint, delayMs: 20)
+        {
+            AwaitSecondOpen = true,
+        };
         await using var serial = await OpenAsync(serialFs, window: 1);
         await using var parallel = await OpenAsync(parallelFs, window: null);
         Assert.Equal(Hint, parallel.EffectiveConcurrentReads);
@@ -309,8 +348,8 @@ public class ParallelTableRequestTests : IDisposable
         Assert.NotNull(await serial.CompactAsync(CompactEverything));
         Assert.NotNull(await parallel.CompactAsync(CompactEverything));
 
-        Assert.Equal(1, serialFs.MaxOpenDataFiles);
-        Assert.InRange(parallelFs.MaxOpenDataFiles, 2, Hint);
+        Assert.Equal(1, serialFs.MaxOpening);
+        Assert.InRange(parallelFs.MaxOpening, 2, Hint);
         Assert.Equal(0, parallelFs.OpenDataFiles);
         Assert.Equal(0, serialFs.OpenDataFiles);
 
@@ -353,19 +392,29 @@ public class ParallelTableRequestTests : IDisposable
 
     /// <summary>
     /// The table file system with a latency on the requests under test, measuring how many overlap: commit reads
-    /// (<c>_delta_log/*.json</c> through <see cref="ReadAllBytesAsync"/>), deletes, and open data files (from
-    /// open to dispose). Suggests <paramref name="hint"/> through <see cref="IReadConcurrencyHint"/>, as the
+    /// (<c>_delta_log/*.json</c> through <see cref="ReadAllBytesAsync"/>), deletes, and data-file opens (across
+    /// their latency; how long a file then stays open says nothing about overlap, since a small one is read and
+    /// closed in well under a millisecond). Open data files are counted too, from open to dispose, to show that
+    /// every one is closed. Suggests <paramref name="hint"/> through <see cref="IReadConcurrencyHint"/>, as the
     /// object-store file systems do.
     /// </summary>
     private sealed class LatencyFileSystem(ITableFileSystem inner, int hint, int delayMs)
         : ITableFileSystem, IReadConcurrencyHint
     {
-        private int _commitReads, _deletes, _openDataFiles;
-        public int MaxCommitReads, MaxDeletes, MaxOpenDataFiles, CommitReadsStarted;
+        private int _commitReads, _deletes, _openDataFiles, _opening;
+        public int MaxCommitReads, MaxDeletes, MaxOpening, CommitReadsStarted, DeletesStarted;
 
         public Func<string, bool>? FailRead { get; init; }
         public Func<string, bool>? FailDelete { get; init; }
         public Func<string, bool>? FailOpen { get; init; }
+
+        /// <summary>Every delete that does not fail waits until it is cancelled, so a failing one lands while the
+        /// earlier ones are still in flight, whatever the scheduling.</summary>
+        public bool HoldDeletes { get; init; }
+
+        /// <summary>The first data-file open waits (up to 10 s) until a second one is in flight: proves overlap
+        /// without depending on how fast the machine dispatches them. Only for a run that is expected to overlap.</summary>
+        public bool AwaitSecondOpen { get; init; }
 
         public int CommitReadsInFlight => Volatile.Read(ref _commitReads);
         public int DeletesInFlight => Volatile.Read(ref _deletes);
@@ -376,7 +425,7 @@ public class ParallelTableRequestTests : IDisposable
 
         public void Reset()
         {
-            MaxCommitReads = MaxDeletes = MaxOpenDataFiles = CommitReadsStarted = 0;
+            MaxCommitReads = MaxDeletes = MaxOpening = CommitReadsStarted = DeletesStarted = 0;
         }
 
         private static void Enter(ref int counter, ref int max)
@@ -415,12 +464,13 @@ public class ParallelTableRequestTests : IDisposable
 
         public async ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
         {
+            Interlocked.Increment(ref DeletesStarted);
             Enter(ref _deletes, ref MaxDeletes);
             try
             {
-                await Task.Delay(delayMs, cancellationToken);
                 if (FailDelete?.Invoke(path) == true)
                     throw new IOException($"cannot delete {path}");
+                await Task.Delay(HoldDeletes ? Timeout.Infinite : delayMs, cancellationToken);
                 await inner.DeleteAsync(path, cancellationToken);
             }
             finally
@@ -433,11 +483,26 @@ public class ParallelTableRequestTests : IDisposable
         {
             if (!IsDataFile(path))
                 return await inner.OpenReadAsync(path, cancellationToken);
-            await Task.Delay(delayMs, cancellationToken);
-            if (FailOpen?.Invoke(path) == true)
-                throw new IOException($"cannot open {path}");
-            var file = await inner.OpenReadAsync(path, cancellationToken);
-            Enter(ref _openDataFiles, ref MaxOpenDataFiles);
+            Enter(ref _opening, ref MaxOpening);
+            IRandomAccessFile file;
+            try
+            {
+                if (AwaitSecondOpen)
+                {
+                    var waited = System.Diagnostics.Stopwatch.StartNew();
+                    while (Volatile.Read(ref MaxOpening) < 2 && waited.Elapsed < TimeSpan.FromSeconds(10))
+                        await Task.Delay(1, cancellationToken);
+                }
+                await Task.Delay(delayMs, cancellationToken);
+                if (FailOpen?.Invoke(path) == true)
+                    throw new IOException($"cannot open {path}");
+                file = await inner.OpenReadAsync(path, cancellationToken);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _opening);
+            }
+            Interlocked.Increment(ref _openDataFiles);
             return new CountedFile(file, this);
         }
 

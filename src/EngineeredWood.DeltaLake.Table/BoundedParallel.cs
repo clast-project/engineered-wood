@@ -102,6 +102,10 @@ internal static class BoundedParallel
             bool more = true;
             while (true)
             {
+                // Checked here, not only by the reads: a read that completed before the token fired never looks at
+                // it again, so a cancelled enumeration whose remaining results were all already read ahead would
+                // otherwise run to the end as if nothing had happened. A serial loop observes the token per item.
+                cancellationToken.ThrowIfCancellationRequested();
                 while (more && pending.Count < lookahead)
                 {
                     more = await e.MoveNextAsync().ConfigureAwait(false);
@@ -110,7 +114,9 @@ internal static class BoundedParallel
                 }
                 if (pending.Count == 0)
                     break;
-                yield return await pending.Dequeue().ConfigureAwait(false);
+                var result = await pending.Dequeue().ConfigureAwait(false);
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return result;
             }
         }
         finally
