@@ -14,7 +14,7 @@ namespace DeltaDotnetComparison;
 /// </summary>
 public abstract class MutationBenchmark
 {
-    public string? CurrentPath { get; protected set; }
+    public string? CurrentPath { get; protected internal set; }
 
     [IterationCleanup]
     public void Cleanup()
@@ -179,6 +179,78 @@ public class MergeBenchmarks : MutationBenchmark
     public Task<long> DD_Merge() => Dd.MergeAsync(CurrentPath!, _source);
 }
 
+/// <summary>
+/// An update-only MERGE of 10K rows into the 20-file prunable table, every source row matching one in the
+/// one file holding ids 500,000–509,999 (their <c>amount</c> doubled). Only that file needs reading and
+/// rewriting, if the engine can tell from the source's key range and the files' statistics: EW by key-range
+/// pruning (#578, which added timestamp keys among others), delta-rs by its early filter. The join is on
+/// <c>id</c> or on <c>ts</c>, one millisecond per id, so the two keys select the same rows.
+/// </summary>
+[Config(typeof(SingleShotConfig))]
+public class MergeKeyRangeBenchmarks : MutationBenchmark
+{
+    [ParamsAllValues]
+    public TableWriter Writer { get; set; }
+
+    [ParamsAllValues]
+    public MergeKey Key { get; set; }
+
+    private string _template = "";
+    private string _key = "";
+    private IReadOnlyList<RecordBatch> _source = [];
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Fixtures.SweepScratch();
+        _template = Fixtures.Prunable(Writer);
+        _key = Key == MergeKey.Id ? "id" : "ts";
+        _source = Data.Generate(500_000, 10_000).Select(Data.DoubleAmount).ToList();
+    }
+
+    [IterationSetup]
+    public void Fresh() => CurrentPath = Fixtures.FreshCopy(_template);
+
+    [BenchmarkCategory("MergeKeyRange"), Benchmark(Baseline = true, Description = "EW MergeAsync (update on key)")]
+    public Task<long> EW_Merge() => Ew.MergeAsync(CurrentPath!, _source, _key);
+
+    [BenchmarkCategory("MergeKeyRange"), Benchmark(Description = "DD MergeAsync (SQL)")]
+    public Task<long> DD_Merge() => Dd.MergeAsync(CurrentPath!, _source, _key);
+}
+
+/// <summary>
+/// <see cref="MergeBenchmarks"/>' source and table with the clauses a change feed is applied with: a matched row
+/// whose source quantity is under 100 is deleted, any other matched row takes <c>amount = target.amount +
+/// source.amount</c> and the source's quantity, and an unmatched row is inserted. Two WHEN MATCHED clauses
+/// evaluated in order (#575) and a SET expression over both sides (#576).
+/// </summary>
+[Config(typeof(SingleShotConfig))]
+public class MergeExpressionBenchmarks : MutationBenchmark
+{
+    [ParamsAllValues]
+    public TableWriter Writer { get; set; }
+
+    private string _template = "";
+    private IReadOnlyList<RecordBatch> _source = [];
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        Fixtures.SweepScratch();
+        _template = Fixtures.SingleCommit(Writer);
+        _source = Data.Generate(Fixtures.Rows - 5_000, 10_000).Select(Data.DoubleAmount).ToList();
+    }
+
+    [IterationSetup]
+    public void Fresh() => CurrentPath = Fixtures.FreshCopy(_template);
+
+    [BenchmarkCategory("MergeExpressions"), Benchmark(Baseline = true, Description = "EW MergeAsync (DELETE when, UPDATE SET expr, INSERT)")]
+    public Task<long> EW_Merge() => Ew.MergeWithExpressionsAsync(CurrentPath!, _source);
+
+    [BenchmarkCategory("MergeExpressions"), Benchmark(Description = "DD MergeAsync (SQL)")]
+    public Task<long> DD_Merge() => Dd.MergeWithExpressionsAsync(CurrentPath!, _source);
+}
+
 /// <summary>The two replaceWhere windows.</summary>
 public enum ReplaceWindow
 {
@@ -296,22 +368,25 @@ public class RestoreBenchmarks : MutationBenchmark
 }
 
 /// <summary>
-/// EW's own predicate DELETE, which writes a deletion vector, on the same 1M rows written by EW with
-/// <c>delta.enableDeletionVectors</c>. A reference for what EW's native path costs next to the copy-on-write
-/// DELETE in <see cref="DmlBenchmarks"/>. It has no delta-dotnet counterpart (delta-rs never writes deletion
-/// vectors) and only one writer (delta-rs cannot create the table), so this class has no <c>Writer</c>
-/// parameter.
+/// EW's own DELETE, UPDATE (#704) and MERGE (#574), each writing a deletion vector instead of rewriting, on the
+/// same 1M rows written by EW with <c>delta.enableDeletionVectors</c>: the DELETE and UPDATE of
+/// <see cref="DmlBenchmarks"/> and the upsert of <see cref="MergeBenchmarks"/>. A reference for what EW's native
+/// path costs next to their copy-on-write rows. They have no delta-dotnet counterpart (delta-rs never writes
+/// deletion vectors) and only one writer (delta-rs cannot create the table), so this class has no
+/// <c>Writer</c> parameter. An UPDATE or MERGE still writes the changed rows to a new file, beside the vector.
 /// </summary>
 [Config(typeof(SingleShotConfig))]
-public class DeletionVectorDeleteBenchmarks : MutationBenchmark
+public class DeletionVectorDmlBenchmarks : MutationBenchmark
 {
     private string _template = "";
+    private IReadOnlyList<RecordBatch> _mergeSource = [];
 
     [GlobalSetup]
     public void Setup()
     {
         Fixtures.SweepScratch();
         _template = Fixtures.SingleCommitWithDeletionVectors();
+        _mergeSource = Data.Generate(Fixtures.Rows - 5_000, 10_000).Select(Data.DoubleAmount).ToList();
     }
 
     [IterationSetup]
@@ -319,6 +394,12 @@ public class DeletionVectorDeleteBenchmarks : MutationBenchmark
 
     [BenchmarkCategory("DeleteDeletionVector"), Benchmark(Baseline = true, Description = "EW DeleteAsync (deletion vector)")]
     public Task<long> EW_DeleteDeletionVector() => Ew.DeleteAsync(CurrentPath!, Sql.OneCategory);
+
+    [BenchmarkCategory("UpdateDeletionVector"), Benchmark(Baseline = true, Description = "EW UpdateAsync (deletion vector)")]
+    public Task<long> EW_UpdateDeletionVector() => Ew.UpdateAsync(CurrentPath!, Sql.OneCategory);
+
+    [BenchmarkCategory("MergeDeletionVector"), Benchmark(Baseline = true, Description = "EW MergeAsync (deletion vector)")]
+    public Task<long> EW_MergeDeletionVector() => Ew.MergeAsync(CurrentPath!, _mergeSource);
 }
 
 /// <summary>

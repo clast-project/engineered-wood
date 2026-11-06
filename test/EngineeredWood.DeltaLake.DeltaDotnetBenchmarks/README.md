@@ -13,7 +13,8 @@ that nothing in the build or test gate needs. Build and run it directly.
 # 1. Check that both engines do the same work (row counts, and the table each mutation leaves behind,
 #    read back by EW, by delta-dotnet's kernel scan and by delta-rs's DataFusion scan; for the operations that
 #    keep the rows, that the checkpoint was published, the file count fell, no unreferenced data file remains,
-#    the constraint is in the metadata, and the restore re-added the 100 small files). Builds the fixtures. Exits non-zero on any mismatch, or when the filter matches no class.
+#    the constraint is in the metadata, and the restore re-added the 100 small files; for EW's deletion-vector
+#    DML, that it wrote a vector and left the rows its copy-on-write run leaves). Builds the fixtures. Exits non-zero on any mismatch, or when the filter matches no class.
 dotnet run -c Release --project test/EngineeredWood.DeltaLake.DeltaDotnetBenchmarks -- --verify [ClassFilter]
 
 # 2. Benchmark (all, or e.g. --filter *FullScan*).
@@ -46,10 +47,12 @@ runs against both.
 | `AppendBenchmarks` | Append10K | open a 100-commit table + append 10K rows |
 | `DmlBenchmarks` | Delete, Update | copy-on-write DELETE / UPDATE of 1 row in 16 on the one-commit 1M-row table |
 | `MergeBenchmarks` | Merge | upsert 10K rows on `id` into the one-commit 1M-row table: 5K matched (their `amount` doubled), 5K inserted |
+| `MergeKeyRangeBenchmarks` | MergeKeyRange | update-only MERGE of 10K rows into the 20-file table, all matching one file, joined on `id` or on the `ts` timestamp (`Key`): what key-range pruning (#578) and delta-rs's early filter save. `--verify` prints each engine's file metrics |
+| `MergeExpressionBenchmarks` | MergeExpressions | `MergeBenchmarks`' source and table, with `WHEN MATCHED AND source.quantity < 100 THEN DELETE`, `WHEN MATCHED THEN UPDATE SET amount = target.amount + source.amount, quantity = source.quantity` and `WHEN NOT MATCHED THEN INSERT *`: several clauses of a kind (#575) and SET expressions (#576) |
 | `ReplaceWhereBenchmarks` | ReplaceWhere | replaceWhere on a non-partition column, the replacements with `amount` doubled: a 10K-row id range on the 20-file table (`Selective`), and one category in 16 on the one-commit 1M-row table (`OneCategory`). delta-dotnet: `InsertAsync` with `SaveMode.Overwrite` and a `Predicate` |
 | `ConstraintBenchmarks` | AddConstraint | `ADD CONSTRAINT … CHECK (amount >= 0)` on the one-commit 1M-row table; every row satisfies it, so both engines read the whole column |
 | `RestoreBenchmarks` | Restore | RESTORE the compacted 100-commit table to the version before its compaction: 100 small files re-added, the compacted ones removed |
-| `DeletionVectorDeleteBenchmarks` | DeleteDeletionVector | EW's own deletion-vector DELETE of the same rows, on an EW-written DV table; no writer parameter and no delta-dotnet counterpart |
+| `DeletionVectorDmlBenchmarks` | DeleteDeletionVector, UpdateDeletionVector, MergeDeletionVector | EW's own deletion-vector DELETE, UPDATE (#704) and MERGE (#574) of the same rows as `DmlBenchmarks` and `MergeBenchmarks`, on an EW-written DV table; no writer parameter and no delta-dotnet counterpart |
 | `MaintenanceBenchmarks` | Checkpoint, Compact, Vacuum | on the 100-small-file table |
 
 ## Read these numbers with care
@@ -67,8 +70,8 @@ runs against both.
 - **EW's predicate DELETE copy-on-writes on a table without deletion vectors** (#562), as delta-rs does; before
   #562 it refused a partial-file delete there. `EW_DeleteHostComposed` keeps the copy-on-write a host had to
   compose until then (a Locator scan, evaluating the predicate, then
-  `DeleteRowsAsync(…, RowDeleteMode.CopyOnWrite)`) as a reference row. EW's own deletion-vector DELETE is
-  measured separately (`DeletionVectorDeleteBenchmarks`), on an EW-written DV table.
+  `DeleteRowsAsync(…, RowDeleteMode.CopyOnWrite)`) as a reference row. EW's own deletion-vector DELETE, UPDATE
+  and MERGE are measured separately (`DeletionVectorDmlBenchmarks`), on an EW-written DV table.
 - **EW has no "open at version".** It opens the latest snapshot and then builds the older one, so its
   OpenAtVersion includes a latest-snapshot load.
 - **delta-dotnet's `InsertOptions.MaxRowsPerGroup` defaults to 100**, which delta-rs uses as its
@@ -106,8 +109,41 @@ and tables much larger than 10M rows.
 `ITable.ReadAsArrowTableAsync` / `ReadAsDataFrameAsync` **ignore deletion vectors**: on a table with a DV they
 return the deleted rows. `ArrowFFIInterOpHandler.ReadParquetAsArrow` receives the kernel's `selectionVector`
 and never applies it. delta-rs's DataFusion path (`QueryAsync`) honours the same DV, as EW does, so the DV
-itself is fine. `--verify` reports this as a `WARN` on `EW_DeleteDeletionVector`. Filed upstream as
+itself is fine. `--verify` reports this as a `WARN` on each `DeletionVectorDmlBenchmarks` method. Filed upstream as
 [delta-dotnet#234](https://github.com/delta-incubator/delta-dotnet/issues/234).
+
+## Results, 2026-11-06: MERGE variants and deletion-vector DML
+
+Same machine, at fa664592 (after #709). A run of the new classes beside the existing `MergeBenchmarks` and
+`DmlBenchmarks`, so the deletion-vector rows have copy-on-write baselines from the same session. The key-range
+class was run twice, because one cell of the first run was about 3× its siblings and the second run moved the
+slow cell elsewhere: its rows give the range over both runs. Means, with the min in brackets where the
+single-shot noise makes the mean misleading.
+
+| Operation | EW | delta-dotnet | DD/EW ratio (EW-written / DD-written) |
+|---|---|---|---|
+| MERGE, upsert 10K rows (5K matched), rerun | 187 / 187 ms | 2,400 / 2,328 ms | 12.8 / 12.5 |
+| **MERGE, expressions + several clauses** (5K matched, ~1 in 10 deleted) | 190 / 189 ms | 2,273 / 2,703 ms (min 2,243) | **11.9 / 14.3** |
+| **MERGE, 10K rows into 1 file of 20, on `id`** | 41–80 / 37–55 ms (min 34–61) | 225–270 / 176–251 ms (min 132–222) | **3.4–5.5 / 4.5–4.8** |
+| **MERGE, 10K rows into 1 file of 20, on `ts`** | 66–108 / 41–68 ms (min 28–84) | 199–262 / 178–206 ms (min 133–195) | **2.4–3.0 / 2.6–5.0** |
+| DELETE 1 row in 16, copy-on-write, rerun | 186 / 177 ms | 304 / 313 ms | 1.64 / 1.76 |
+| DELETE 1 row in 16, EW deletion vector | 23.5 ms | none | — (7.9× faster than EW's copy-on-write) |
+| UPDATE 1 row in 16, copy-on-write, rerun | 175 / 164 ms | 237 / 250 ms | 1.35 / 1.52 |
+| **UPDATE 1 row in 16, EW deletion vector** (#704) | 60.4 ms | none | — (2.9× faster than EW's copy-on-write) |
+| **MERGE, upsert 10K rows, EW deletion vector** (#574) | 83.6 ms | none | — (2.2× faster than EW's copy-on-write) |
+
+- **Several clauses and SET expressions cost EW nothing measurable:** 190 ms against the plain upsert's 187 ms.
+  delta-dotnet's time is about the same as its upsert too, so MERGE stays the widest gap, at 12–14×.
+- **Both engines prune the key-range MERGE**, and the gap narrows to 2.4–5.5× from the one-file upsert's 12×.
+  delta-rs reports `num_target_files_skipped_during_scan=19` of 20 (printed by `--verify`). EW records no
+  skipped-file count in its commit, but its 28–84 ms (min) against about 180 ms for a one-file 1M-row MERGE
+  is the read of one file of 20; a prune-only scan with the same `id` or `ts` range reads 20K rows (one row
+  group) on both writers' tables. The timestamp key prunes as well as the `long` id (#578): the spread between
+  the two keys is no larger than the run-to-run spread of either.
+- **Deletion vectors pay off most for DELETE**, which rewrites nothing (7.9×). UPDATE and MERGE still write the
+  changed rows to a new file beside the vector, so they gain less (2.9× and 2.2×), and allocate 50 and 77 MB of
+  managed memory where copy-on-write allocates 230–280 MB.
+- The rerun rows are within about 6% of 2026-11-04's, so the machine had not drifted.
 
 ## Results, 2026-11-04
 
@@ -195,7 +231,7 @@ Notes that still hold:
 - **Single-shot mutations are noisy for EW.** Each iteration is one invocation, and EW's means carry GC pauses
   (the managed heap) that delta-rs does not have. The min or median is given where it differs much from the mean.
 - **MERGE** is the widest gap. The target is one file, so neither engine prunes anything, and the gap is in the
-  match itself. EW hashes the 10K source keys and probes them as it reads the target. delta-rs plans a DataFusion
+  match itself (see the 2026-11-06 key-range rows for a MERGE both engines prune). EW hashes the 10K source keys and probes them as it reads the target. delta-rs plans a DataFusion
   join, which is suspected, not profiled, as the cost.
 - **Commit metadata (#564/#577) and mergeSchema (#568) have no rows.** They add next to nothing to a commit or an
   append, and appends are already measured.
