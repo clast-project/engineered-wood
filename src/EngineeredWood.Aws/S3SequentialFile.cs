@@ -16,8 +16,14 @@ namespace EngineeredWood.IO.Aws;
 /// <para>
 /// Writes accumulate in a buffer; once the buffer reaches the configured part size it is
 /// uploaded as a multipart part, and the upload is completed by <see cref="CompleteAsync"/>.
-/// Because this driver owns the chunking loop, peak memory is roughly one part (plus the
-/// largest single write) rather than the whole object.
+/// Because this driver owns the chunking loop, peak memory is one part rather than the whole object.
+/// </para>
+/// <para>
+/// A writer created by <see cref="S3TableFileSystem"/> uploads its parts in the background while it fills the
+/// next, up to as many at once as the file system's shared spare buffers allow (#713). Part numbers are fixed
+/// when a part is handed over, so parts may finish in any order; <see cref="CompleteAsync"/> waits for all of
+/// them before completing the upload, and an abort waits for them before aborting it, since S3 may keep a part
+/// that was still uploading when its upload was aborted. One constructed directly uploads each part in turn.
 /// </para>
 /// <para>
 /// Objects smaller than one part skip multipart entirely and are written with a single
@@ -42,8 +48,12 @@ public sealed class S3SequentialFile : ISequentialFile
     private readonly int _partSize;
     private readonly bool _overwrite;
     private readonly List<PartETag> _parts = new();
+    private readonly object _partsGate = new();
+    private readonly BackgroundUploads _uploads;
 
-    private MemoryStream _buffer = new();
+    /// <summary>Grows to <see cref="_partSize"/> as bytes arrive, so a small object never holds a whole part.</summary>
+    private byte[] _buffer = [];
+    private int _bufferPosition;
     private string? _uploadId;
     private int _partNumber = 1;
     private long _position;
@@ -71,7 +81,16 @@ public sealed class S3SequentialFile : ISequentialFile
         string key,
         int partSize = DefaultPartSize,
         bool overwrite = true)
+        : this(client, bucket, key, partSize, overwrite, uploadPool: null)
     {
+    }
+
+    /// <summary>As above, uploading parts in the background with the spare buffers of
+    /// <paramref name="uploadPool"/>, when given.</summary>
+    internal S3SequentialFile(
+        IAmazonS3 client, string bucket, string key, int partSize, bool overwrite, UploadBufferPool? uploadPool)
+    {
+        _uploads = new BackgroundUploads(uploadPool);
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _bucket = bucket ?? throw new ArgumentNullException(nameof(bucket));
         _key = key ?? throw new ArgumentNullException(nameof(key));
@@ -99,21 +118,32 @@ public sealed class S3SequentialFile : ISequentialFile
             throw new InvalidOperationException(
                 "Cannot write to an S3 object that has already been completed or aborted.");
 
-#if NET8_0_OR_GREATER
-        _buffer.Write(data.Span);
-#else
-        if (System.Runtime.InteropServices.MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment))
-            _buffer.Write(segment.Array!, segment.Offset, segment.Count);
-        else
+        int remaining = data.Length;
+        int sourceOffset = 0;
+        while (remaining > 0)
         {
-            byte[] temp = data.ToArray();
-            _buffer.Write(temp, 0, temp.Length);
-        }
-#endif
-        _position += data.Length;
+            int toCopy = Math.Min(remaining, _partSize - _bufferPosition);
+            EnsureCapacity(_bufferPosition + toCopy);
+            data.Span.Slice(sourceOffset, toCopy).CopyTo(_buffer.AsSpan(_bufferPosition));
+            _bufferPosition += toCopy;
+            _position += toCopy;
+            sourceOffset += toCopy;
+            remaining -= toCopy;
 
-        if (_buffer.Length >= _partSize)
-            await FlushBufferAsPartAsync(cancellationToken).ConfigureAwait(false);
+            if (_bufferPosition == _partSize)
+                await FlushBufferAsPartAsync(last: false, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>Grows the buffer, by doubling and up to one part, to hold <paramref name="needed"/> bytes.</summary>
+    private void EnsureCapacity(int needed)
+    {
+        if (needed <= _buffer.Length)
+            return;
+        int size = Math.Max(Math.Max(64 * 1024, needed), Math.Min(_partSize, 2 * _buffer.Length));
+        var grown = new byte[Math.Min(_partSize, size)];
+        _buffer.AsSpan(0, _bufferPosition).CopyTo(grown);
+        _buffer = grown;
     }
 
     /// <summary>
@@ -180,7 +210,6 @@ public sealed class S3SequentialFile : ISequentialFile
         finally
         {
             _disposed = true;
-            _buffer.Dispose();
         }
     }
 
@@ -198,11 +227,10 @@ public sealed class S3SequentialFile : ISequentialFile
         finally
         {
             _disposed = true;
-            _buffer.Dispose();
         }
     }
 
-    private async ValueTask FlushBufferAsPartAsync(CancellationToken cancellationToken)
+    private async ValueTask FlushBufferAsPartAsync(bool last, CancellationToken cancellationToken)
     {
         if (_uploadId is null)
         {
@@ -212,25 +240,34 @@ public sealed class S3SequentialFile : ISequentialFile
             _uploadId = init.UploadId;
         }
 
-        _buffer.Position = 0;
+        // The number is the part's place in the object, whenever its upload finishes.
+        int partNumber = _partNumber++;
+        string uploadId = _uploadId!;
+        _buffer = await _uploads.UploadAsync(
+                _buffer, _bufferPosition, (buffer, length, ct) => UploadPartAsync(uploadId, partNumber, buffer, length, ct),
+                cancellationToken, last)
+            .ConfigureAwait(false);
+        _bufferPosition = 0;
+    }
+
+    private async Task UploadPartAsync(
+        string uploadId, int partNumber, byte[] buffer, int length, CancellationToken cancellationToken)
+    {
+        using var stream = new MemoryStream(buffer, 0, length, writable: false);
         UploadPartResponse part = await _client.UploadPartAsync(
             new UploadPartRequest
             {
                 BucketName = _bucket,
                 Key = _key,
-                UploadId = _uploadId,
-                PartNumber = _partNumber,
-                PartSize = _buffer.Length,
-                InputStream = _buffer,
+                UploadId = uploadId,
+                PartNumber = partNumber,
+                PartSize = length,
+                InputStream = stream,
             },
             cancellationToken).ConfigureAwait(false);
 
-        _parts.Add(new PartETag(_partNumber, part.ETag));
-        _partNumber++;
-
-        // Start a fresh buffer; the uploaded one is no longer needed.
-        _buffer.Dispose();
-        _buffer = new MemoryStream();
+        lock (_partsGate)
+            _parts.Add(new PartETag(partNumber, part.ETag));
     }
 
     private async ValueTask PublishAsync(CancellationToken cancellationToken)
@@ -240,25 +277,32 @@ public sealed class S3SequentialFile : ISequentialFile
         {
             // The whole object fit in under one part: write it with a single PutObject.
             // Also handles the empty-object case (zero writes).
-            await RetryConflictsAsync(() =>
+            // A fresh stream for every attempt: a retry sends the bytes again from the start.
+            await RetryConflictsAsync(async () =>
             {
-                _buffer.Position = 0;
-                return _client.PutObjectAsync(
+                using var stream = new MemoryStream(_buffer, 0, _bufferPosition, writable: false);
+                await _client.PutObjectAsync(
                     new PutObjectRequest
                     {
                         BucketName = _bucket,
                         Key = _key,
-                        InputStream = _buffer,
+                        InputStream = stream,
                         AutoCloseStream = false,
                         IfNoneMatch = ifNoneMatch,
                     },
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
             }, cancellationToken).ConfigureAwait(false);
         }
         else
         {
-            if (_buffer.Length > 0)
-                await FlushBufferAsPartAsync(cancellationToken).ConfigureAwait(false);
+            if (_bufferPosition > 0)
+                await FlushBufferAsPartAsync(last: true, cancellationToken).ConfigureAwait(false);
+            await _uploads.DrainAsync(cancellationToken).ConfigureAwait(false);
+
+            // Parts finish in any order; S3 wants them listed in theirs.
+            List<PartETag> parts;
+            lock (_partsGate)
+                parts = _parts.OrderBy(p => p.PartNumber).ToList();
 
             // The upload stays in progress until it is completed or aborted, so a retry completes the same
             // parts.
@@ -268,7 +312,7 @@ public sealed class S3SequentialFile : ISequentialFile
                     BucketName = _bucket,
                     Key = _key,
                     UploadId = _uploadId,
-                    PartETags = _parts,
+                    PartETags = parts,
                     IfNoneMatch = ifNoneMatch,
                 },
                 cancellationToken), cancellationToken).ConfigureAwait(false);
@@ -304,6 +348,10 @@ public sealed class S3SequentialFile : ISequentialFile
         if (_aborted)
             return;
         _aborted = true;
+
+        // Parts still uploading are cancelled, and waited for: S3 may keep a part that finishes after its upload
+        // was aborted.
+        await _uploads.AbortAndWaitAsync().ConfigureAwait(false);
 
         // Leave no dangling multipart upload (which would otherwise accrue storage cost). A small object
         // has staged nothing: its bytes are only in the buffer.

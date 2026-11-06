@@ -21,6 +21,12 @@ namespace EngineeredWood.IO.Azure;
 /// never overwrite each other's blocks.
 /// </para>
 /// <para>
+/// A writer created by <see cref="AzureTableFileSystem"/> stages its blocks in the background while it fills the
+/// next, up to as many at once as the file system's shared spare buffers allow (#713). Block IDs are fixed by
+/// position when a block is handed over, so blocks may finish in any order; <see cref="CompleteAsync"/> waits for
+/// all of them before committing the list. One constructed directly stages each block in turn.
+/// </para>
+/// <para>
 /// Azure block blobs support up to 50,000 blocks of up to 4 GiB each (service version 2019-12-12+).
 /// The default block size of 4 MiB allows files up to ~195 GiB, which is well beyond
 /// typical Parquet file sizes. For larger files, increase the <c>blockSize</c> constructor argument.
@@ -36,6 +42,7 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
     private readonly bool _overwrite;
     private readonly byte[] _blockIdPrefix = Guid.NewGuid().ToByteArray();
     private readonly List<string> _stagedBlockIds = new();
+    private readonly BackgroundUploads _uploads;
     private byte[] _buffer;
     private int _bufferPosition;
     private long _position;
@@ -57,6 +64,14 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
     /// </param>
     public AzureBlobSequentialFile(
         BlockBlobClient blobClient, int blockSize = DefaultBlockSize, bool overwrite = true)
+        : this(blobClient, blockSize, overwrite, uploadPool: null)
+    {
+    }
+
+    /// <summary>As above, staging blocks in the background with the spare buffers of
+    /// <paramref name="uploadPool"/>, when given.</summary>
+    internal AzureBlobSequentialFile(
+        BlockBlobClient blobClient, int blockSize, bool overwrite, UploadBufferPool? uploadPool)
     {
 #if NET8_0_OR_GREATER
         ArgumentOutOfRangeException.ThrowIfLessThan(blockSize, 1);
@@ -67,6 +82,7 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         _blockSize = blockSize;
         _overwrite = overwrite;
         _buffer = new byte[blockSize];
+        _uploads = new BackgroundUploads(uploadPool);
     }
 
     /// <inheritdoc/>
@@ -132,7 +148,8 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
 
         try
         {
-            await StageCurrentBlockAsync(cancellationToken).ConfigureAwait(false);
+            await StageCurrentBlockAsync(cancellationToken, last: true).ConfigureAwait(false);
+            await _uploads.DrainAsync(cancellationToken).ConfigureAwait(false);
             await _blobClient.CommitBlockListAsync(
                 _stagedBlockIds,
                 new CommitBlockListOptions
@@ -160,6 +177,7 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         catch
         {
             _aborted = true;
+            _uploads.Abort();
             throw;
         }
         _completed = true;
@@ -177,7 +195,7 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         }
     }
 
-    private async ValueTask StageCurrentBlockAsync(CancellationToken cancellationToken)
+    private async ValueTask StageCurrentBlockAsync(CancellationToken cancellationToken, bool last = false)
     {
         if (_bufferPosition == 0)
             return;
@@ -190,17 +208,25 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         BitConverter.GetBytes(_stagedBlockIds.Count).CopyTo(rawId, _blockIdPrefix.Length);
         string blockId = Convert.ToBase64String(rawId);
 
-        using var stream = new MemoryStream(_buffer, 0, _bufferPosition, writable: false);
-        await _blobClient.StageBlockAsync(
-            blockId, stream, cancellationToken: cancellationToken).ConfigureAwait(false);
-
+        // The ID takes its place in the list now, so the list keeps the blocks' order whenever they finish.
         _stagedBlockIds.Add(blockId);
+        _buffer = await _uploads.UploadAsync(
+                _buffer, _bufferPosition, (buffer, length, ct) => StageBlockAsync(blockId, buffer, length, ct),
+                cancellationToken, last)
+            .ConfigureAwait(false);
         _bufferPosition = 0;
     }
 
+    private async Task StageBlockAsync(string blockId, byte[] buffer, int length, CancellationToken cancellationToken)
+    {
+        using var stream = new MemoryStream(buffer, 0, length, writable: false);
+        await _blobClient.StageBlockAsync(
+            blockId, stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>
-    /// Aborts the write unless it was completed. Nothing needs sending: uncommitted blocks are never
-    /// visible, and Azure garbage-collects them.
+    /// Aborts the write unless it was completed, cancelling the blocks still staging. Nothing needs sending:
+    /// uncommitted blocks are never visible, and Azure garbage-collects them.
     /// </summary>
     public ValueTask DisposeAsync()
     {
@@ -214,6 +240,9 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         if (_disposed) return;
         _disposed = true;
         if (!_completed)
+        {
             _aborted = true;
+            _uploads.Abort();
+        }
     }
 }

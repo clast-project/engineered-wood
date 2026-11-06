@@ -30,6 +30,8 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="EngineeredWood.Core.Tests" />
+    <InternalsVisibleTo Include="EngineeredWood.Azure" />
+    <InternalsVisibleTo Include="EngineeredWood.Aws" />
     <InternalsVisibleTo Include="EngineeredWood" />
     <InternalsVisibleTo Include="EngineeredWood.Parquet" />
     <InternalsVisibleTo Include="EngineeredWood.Tests" />
