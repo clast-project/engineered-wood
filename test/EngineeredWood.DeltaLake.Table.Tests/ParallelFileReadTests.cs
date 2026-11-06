@@ -851,9 +851,10 @@ public class ParallelFileReadTests : IDisposable
         Assert.All(runs, run => Assert.Equal(Enumerable.Range((int)run.First(), RowsPerFile).Select(i => (long)i), run));
     }
 
-    /// <summary><paramref name="files"/> files of <see cref="RowsPerFile"/> rows: an id, and a <c>tag</c> of
-    /// "a" or "c", so the statistics of every row group span "b" and only its dictionary can rule it out.</summary>
-    private async Task CreateTagTableAsync(int files)
+    /// <summary><paramref name="files"/> files of <paramref name="rowsPerFile"/> rows (100 to a row group): an
+    /// id, and a <c>tag</c> of "a" or "c", so the statistics of every row group span "b" and only its dictionary
+    /// can rule it out.</summary>
+    private async Task CreateTagTableAsync(int files, int rowsPerFile = RowsPerFile)
     {
         var schema = new Apache.Arrow.Schema.Builder()
             .Field(new Field("id", Int64Type.Default, false))
@@ -864,13 +865,123 @@ public class ParallelFileReadTests : IDisposable
         {
             var ids = new Int64Array.Builder();
             var tags = new StringArray.Builder();
-            for (int r = 0; r < RowsPerFile; r++)
+            for (int r = 0; r < rowsPerFile; r++)
             {
-                ids.Append((long)f * RowsPerFile + r);
+                ids.Append((long)f * rowsPerFile + r);
                 tags.Append(r % 2 == 0 ? "a" : "c");
             }
-            await create.WriteAsync([new RecordBatch(schema, [ids.Build(), tags.Build()], RowsPerFile)]);
+            await create.WriteAsync([new RecordBatch(schema, [ids.Build(), tags.Build()], rowsPerFile)]);
         }
+    }
+
+    /// <summary>
+    /// A file opened ahead plans only its first row groups before its turn, by INDEX, even when the dictionaries
+    /// prune them all: four files of ten row groups, every row group pruned, and file 0's planning held until
+    /// every file after it has planned. Until then none of them has read a byte of its row groups 4-9 (planning
+    /// to a count of KEPT row groups instead read all ten groups' dictionaries in its first window). Once file
+    /// 0 is let go, the scan plans the rest of each file in its turn.
+    /// </summary>
+    [Fact]
+    public async Task AFileOpenedAhead_PlansOnlyItsFirstRowGroups_BeforeItsTurn()
+    {
+        const int files = 4, rowsPerFile = 1000;
+        await CreateTagTableAsync(files, rowsPerFile);
+        List<string> paths;
+        await using (var probe = await OpenAsync(1))
+            paths = DeltaTable.OrderedActiveFiles(probe.CurrentSnapshot).Select(f => f.Path).ToList();
+        var spans = new List<List<(long Start, long End)>>();
+        foreach (var path in paths)
+            spans.Add(await RowGroupSpansAsync(path));
+        Assert.All(spans, s => Assert.Equal(10, s.Count));
+
+        var fs = new PlanningReadsFileSystem(_fs, delayMs: 0, holdPlanning: paths[0]);
+        await using var table = await DeltaTable.OpenAsync(fs, Options(files));
+        var scan = Task.Run(async () =>
+        {
+            long rows = 0;
+            await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Filter = Ex.Equal("tag", LiteralValue.Of("b")) }))
+            {
+                rows += batch.Length;
+                batch.Dispose();
+            }
+            return rows;
+        });
+
+        try
+        {
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (!Enumerable.Range(1, files - 1).All(f => fs.PlanningReadsOf(paths[f]).Count > 0))
+            {
+                Assert.False(scan.IsCompleted, "the scan ended while file 0's planning was held");
+                Assert.True(DateTime.UtcNow < deadline, "the files opened ahead never planned");
+                await Task.Delay(10);
+            }
+            await Task.Delay(200); // anything further an opening task would read
+
+            for (int f = 1; f < files; f++)
+            {
+                var late = fs.PlanningReadsOf(paths[f])
+                    .Where(r => spans[f].Skip(4).Any(g => r.Offset < g.End && g.Start < r.End))
+                    .ToList();
+                Assert.True(late.Count == 0, $"file {f} read row groups 4-9 before its turn: {string.Join(", ", late)}");
+            }
+        }
+        finally
+        {
+            fs.ReleasePlanning();
+        }
+
+        Assert.Equal(0, await scan);
+        for (int f = 0; f < files; f++)
+        {
+            Assert.Contains(fs.PlanningReadsOf(paths[f]),
+                r => spans[f].Skip(4).Any(g => r.Offset < g.End && g.Start < r.End));
+        }
+    }
+
+    /// <summary>
+    /// Files of ten row groups, every one kept, come back whole and in order across the row groups a file opened
+    /// ahead planned (0-3) and those the scan planned in its turn (4-9).
+    /// </summary>
+    [Fact]
+    public async Task AFileOfManyRowGroups_ComesBackWholeAcrossItsPlanningAhead()
+    {
+        const int files = 4, rowsPerFile = 1000;
+        await CreateTagTableAsync(files, rowsPerFile);
+        var fs = new PlanningReadsFileSystem(_fs, delayMs: 5);
+        await using var table = await DeltaTable.OpenAsync(fs, Options(files));
+        var seen = new List<long>();
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Filter = Ex.Equal("tag", LiteralValue.Of("a")) }))
+        {
+            var ids = (Int64Array)batch.Column(0);
+            for (int i = 0; i < batch.Length; i++)
+                seen.Add(ids.GetValue(i)!.Value);
+            batch.Dispose();
+        }
+
+        // Files in path order, each one contiguous run of its ids.
+        Assert.Equal(files * rowsPerFile, seen.Count);
+        var runs = seen.Select((id, i) => (id, i)).GroupBy(x => x.i / rowsPerFile, x => x.id).ToList();
+        Assert.All(runs, run => Assert.Equal(Enumerable.Range((int)run.First(), rowsPerFile).Select(i => (long)i), run));
+        Assert.Equal(Enumerable.Range(0, files).Select(f => (long)f * rowsPerFile), runs.Select(r => r.First()).OrderBy(i => i));
+    }
+
+    /// <summary>Each row group's byte span in a data file, from its dictionary or first data page to the end of
+    /// its last column chunk.</summary>
+    private async Task<List<(long Start, long End)>> RowGroupSpansAsync(string path)
+    {
+        await using var file = await _fs.OpenReadAsync(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var footer = await reader.ReadMetadataAsync();
+        return footer.RowGroups.Select(g =>
+        {
+            var chunks = g.Columns.Select(c => c.MetaData!).Select(m =>
+            {
+                long start = m.DictionaryPageOffset is long d && d > 0 && d < m.DataPageOffset ? d : m.DataPageOffset;
+                return (Start: start, End: start + m.TotalCompressedSize);
+            }).ToList();
+            return (chunks.Min(c => c.Start), chunks.Max(c => c.End));
+        }).ToList();
     }
 
     /// <summary>
@@ -878,10 +989,43 @@ public class ParallelFileReadTests : IDisposable
     /// ending at the end of the file, or at its last 8 bytes: the length and magic). Every read is delayed. A
     /// file whose path contains <paramref name="failPlanning"/> fails its first read other than a footer read.
     /// </summary>
-    private sealed class PlanningReadsFileSystem(ITableFileSystem inner, int delayMs, string? failPlanning = null)
+    private sealed class PlanningReadsFileSystem(
+        ITableFileSystem inner, int delayMs, string? failPlanning = null, string? holdPlanning = null)
         : ITableFileSystem
     {
         private readonly object _gate = new();
+        private readonly List<(string Path, FileRange Range)> _planningReads = [];
+        private readonly TaskCompletionSource<bool> _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>The ranges of <paramref name="path"/>'s planning reads that have completed.</summary>
+        public List<FileRange> PlanningReadsOf(string path)
+        {
+            lock (_gate)
+                return _planningReads.Where(r => r.Path == path).Select(r => r.Range).ToList();
+        }
+
+        /// <summary>Lets the planning reads of <c>holdPlanning</c> proceed.</summary>
+        public void ReleasePlanning() => _release.TrySetResult(true);
+
+        private async Task HoldAsync(string path, bool planning, CancellationToken cancellationToken)
+        {
+            if (planning && holdPlanning is not null && path.Contains(holdPlanning))
+            {
+                await Task.WhenAny(_release.Task, Task.Delay(Timeout.Infinite, cancellationToken));
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+        }
+
+        private void Record(string path, bool planning, IReadOnlyList<FileRange> ranges)
+        {
+            if (!planning)
+                return;
+            lock (_gate)
+            {
+                foreach (var range in ranges)
+                    _planningReads.Add((path, range));
+            }
+        }
         private readonly Dictionary<string, int> _inFlight = new(StringComparer.Ordinal);
         private readonly HashSet<string> _read = new(StringComparer.Ordinal);
         public int MaxFilesPlanning;
@@ -954,11 +1098,14 @@ public class ParallelFileReadTests : IDisposable
                 FileRange range, CancellationToken cancellationToken = default)
             {
                 bool planning = !await IsFooterAsync([range], cancellationToken);
+                await owner.HoldAsync(path, planning, cancellationToken);
                 owner.Enter(path, planning);
                 try
                 {
                     await Task.Delay(owner._delayMs, cancellationToken);
-                    return await file.ReadAsync(range, cancellationToken);
+                    var read = await file.ReadAsync(range, cancellationToken);
+                    owner.Record(path, planning, [range]);
+                    return read;
                 }
                 finally
                 {
@@ -970,11 +1117,14 @@ public class ParallelFileReadTests : IDisposable
                 IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
             {
                 bool planning = !await IsFooterAsync(ranges, cancellationToken);
+                await owner.HoldAsync(path, planning, cancellationToken);
                 owner.Enter(path, planning);
                 try
                 {
                     await Task.Delay(owner._delayMs, cancellationToken);
-                    return await file.ReadRangesAsync(ranges, cancellationToken);
+                    var read = await file.ReadRangesAsync(ranges, cancellationToken);
+                    owner.Record(path, planning, ranges);
+                    return read;
                 }
                 finally
                 {

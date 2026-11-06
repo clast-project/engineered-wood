@@ -36,9 +36,13 @@ internal static class Verify
             return 2;
         }
 
-        // Likewise a mistyped EWDD_VERIFY_METHODS: checked before any fixture is built.
-        if (!types.Any(t => t.GetMethods().Any(m =>
-                m.GetCustomAttribute<BenchmarkAttribute>() != null && TraceMarks.Selected(m.Name))))
+        // Only the classes with a method EWDD_VERIFY_METHODS selects: the others would build and sweep their
+        // fixtures for nothing. None at all is a mistyped filter, refused before any fixture is built.
+        types = types
+            .Where(t => t.GetMethods().Any(m =>
+                m.GetCustomAttribute<BenchmarkAttribute>() != null && TraceMarks.Selected(m.Name)))
+            .ToList();
+        if (types.Count == 0)
         {
             Console.Error.WriteLine(
                 $"VERIFY FAILED: no benchmark method of the classes matching '{filter}' matches EWDD_VERIFY_METHODS.");
