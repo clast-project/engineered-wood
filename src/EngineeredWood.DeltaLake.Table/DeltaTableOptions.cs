@@ -75,8 +75,14 @@ public sealed record DeltaTableOptions
     /// and its row groups share it. Which row groups are read is decided in file order, by the same pruning as
     /// a serial read. Applies to <see cref="DeltaTable.ReadAsync"/> and the methods built on it
     /// (<c>ReadAllAsync</c>, <c>ReadAtVersionAsync</c>, <c>ReadAtTimestampAsync</c>), and to <c>ReadRowsAsync</c>,
-    /// which reads only the row groups holding a selected row (#633). DML, the change feed, compaction and
-    /// copy-on-write rewrites still read their files one at a time.</para>
+    /// which reads only the row groups holding a selected row (#633). <c>CompactAsync</c> reads this many of a
+    /// group's source files at once (a whole file each, within <see cref="MaxBufferedReadBytes"/>), and writes their
+    /// rows in the same order a serial read does. DML, the change feed and copy-on-write rewrites still read their
+    /// files one at a time.</para>
+    /// <para>The same setting, ignoring <see cref="DataFileReader"/> (these requests never go through it), caps
+    /// the small file-system requests run at once outside a scan: the commit reads of
+    /// <c>GetHistoryAsync</c>, which still yields its entries in version order, and the deletes of
+    /// <c>VacuumAsync</c>. 1 keeps them one at a time.</para>
     /// <para>A <see cref="DataFileReader"/> reads serially unless this is set explicitly, because its
     /// contract never promised that two files may be read at once. Setting it above 1 declares that it may:
     /// its <see cref="IDataFileReader.ReadAsync"/> is then called for several files concurrently, each

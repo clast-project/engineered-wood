@@ -30,6 +30,8 @@ internal static class VacuumExecutor
     /// post-commit work — its version checksum, its interval checkpoint — is owed per version, not per
     /// operation. Reporting only the last would leave <c>VACUUM START</c> as the one commit in the library
     /// with no checksum beside it.</param>
+    /// <param name="maxConcurrentDeletes">The physical deletes run at once. Each is one request, and against an
+    /// object store one round trip, so deleting one file at a time cost a round trip per file.</param>
     public static async ValueTask<VacuumResult> ExecuteAsync(
         ITableFileSystem fs,
         TransactionLog log,
@@ -39,7 +41,8 @@ internal static class VacuumExecutor
         bool hideIcebergMetadataDir,
         CancellationToken cancellationToken,
         Func<long, CancellationToken, ValueTask>? afterCommit = null,
-        CommitProperties? commitProperties = null)
+        CommitProperties? commitProperties = null,
+        int maxConcurrentDeletes = 1)
     {
         // ── Mark: the keep-set is the CURRENT version's files, plus their deletion vectors. ──
         //
@@ -124,11 +127,14 @@ internal static class VacuumExecutor
             if (afterCommit is not null)
                 await afterCommit(startVersion, cancellationToken).ConfigureAwait(false);
 
-            foreach (string path in filesToDelete)
+            // The files are unreferenced and independent, so their order does not matter. A failed delete stops
+            // the rest and throws before VACUUM END, as the serial loop did; the files already deleted stay
+            // deleted, and the next VACUUM collects what was left.
+            await BoundedParallel.ForEachAsync(filesToDelete, maxConcurrentDeletes, async (path, ct) =>
             {
-                await fs.DeleteAsync(path, cancellationToken).ConfigureAwait(false);
-                deleted++;
-            }
+                await fs.DeleteAsync(path, ct).ConfigureAwait(false);
+                Interlocked.Increment(ref deleted);
+            }, cancellationToken).ConfigureAwait(false);
 
             // #698 review: the deletes can outlast the log retention, and other writers' commits after START can be
             // checkpointed and cleaned up meanwhile, so END at START + 1 would land below the checkpoint. END carries
