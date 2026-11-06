@@ -26,6 +26,47 @@ Run from the worktree whose code you mean to measure: BenchmarkDotNet locates th
 Fixture tables are cached under `%TEMP%\ew-vs-delta-dotnet\templates` (override with `EWDD_BENCH_ROOT`).
 Delete a `<name>.ready` marker, or the folder, to rebuild them.
 
+### Against Azure Blob Storage
+
+Every benchmark can run with its tables in an Azure storage account instead of on local disk: EW through
+`EngineeredWood.Azure`'s `AzureTableFileSystem`, delta-dotnet through delta-rs / delta-kernel-rs's object_store
+(`az://container/prefix`, with the account name and key as storage options). Both use the Blob endpoint, so the
+account does not need a hierarchical namespace. The store is chosen by environment variables, because
+BenchmarkDotNet runs each benchmark in a child process that inherits the environment but not the command line:
+
+| Variable | Meaning |
+|---|---|
+| `EWDD_STORAGE` | `local` (default) or `azure` |
+| `EWDD_AZURE_ACCOUNT` | storage account name (required for `azure`) |
+| `EWDD_AZURE_KEY` | an account key (required for `azure`); shared-key auth for both engines |
+| `EWDD_AZURE_CONTAINER` | container, created if absent (default `ew-vs-delta-dotnet`) |
+| `EWDD_AZURE_PREFIX` | blob-name prefix all fixtures and scratch copies go under (default `bench`) |
+| `EWDD_AZURE_CONCURRENCY` | EW's `AzureTableFileSystem` `maxConcurrency` (default 16, its own default) |
+| `EWDD_AZURE_EMULATOR` | `1`: Azurite's well-known account on `127.0.0.1:10000`, for a smoke test without an account |
+
+The helper script sets them for the current PowerShell session, prompting for the key without echoing it:
+
+```powershell
+. .\test\EngineeredWood.DeltaLake.DeltaDotnetBenchmarks\azure-env.ps1 -Account mystorageacct
+dotnet run -c Release --project test/EngineeredWood.DeltaLake.DeltaDotnetBenchmarks -- --verify
+dotnet run -c Release --project test/EngineeredWood.DeltaLake.DeltaDotnetBenchmarks -- --filter "*FullScan*"
+. .\test\EngineeredWood.DeltaLake.DeltaDotnetBenchmarks\azure-env.ps1 -Clear   # back to local disk
+```
+
+Every run prints a `// storage: …` line first, so a result can never be mistaken for the other store's.
+
+- **Fixtures live in the container** (`<prefix>/templates/<name>`, marked by a `<name>.ready` blob), built once by
+  the first run through both engines' own Azure writers. Delete the `.ready` blob, or the prefix, to rebuild.
+- **Each mutation iteration gets a server-side copy** of its template (Copy Blob within the account, so no
+  bytes come back through this machine), under `<prefix>/scratch/<pid>/`, deleted after the iteration.
+  The copy is not timed. Unlike a local copy, its blobs' last-modified times are new; the only fixture whose
+  vacuum keys off file age uses a zero retention, so that changes nothing.
+- **Run from a VM in the account's region** if you want numbers about the engines rather than about your
+  link: from a laptop, round trips dominate, and the comparison becomes how many requests each engine makes
+  and how many it keeps in flight.
+- **It costs money**: every mutation iteration copies and deletes a table, and every scan reads one. A full
+  run is tens of thousands of transactions, plus egress when run from outside the region.
+
 ## What is measured
 
 Every category has EW as the baseline, so **Ratio = delta-dotnet time / EW time** (above 1 means EW is faster).

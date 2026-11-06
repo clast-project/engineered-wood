@@ -8,7 +8,7 @@ using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.Expressions.Arrow;
 using EngineeredWood.Expressions.Sql;
-using EngineeredWood.IO.Local;
+using EngineeredWood.IO;
 using DdRestoreOptions = DeltaLake.Table.RestoreOptions;
 using DdSaveMode = DeltaLake.Table.SaveMode;
 using EwDeltaTable = EngineeredWood.DeltaLake.Table.DeltaTable;
@@ -69,7 +69,7 @@ internal static class Ew
 {
     private static readonly ArrowRowEvaluator Evaluator = new(new EngineeredWood.Expressions.Arrow.Spark.SparkFunctionRegistry());
 
-    public static LocalTableFileSystem Fs(string path) => new(path);
+    public static ITableFileSystem Fs(string path) => BenchStorage.Current.FileSystem(path);
 
     public static async Task<long> CreateAndWriteAsync(
         string path, IReadOnlyList<RecordBatch> batches, IReadOnlyDictionary<string, string>? configuration = null)
@@ -328,7 +328,22 @@ internal static class Dd
 
     public static async Task<ITable> OpenAsync(string path, ulong? version = null, DeltaEngine? engine = null) =>
         await (engine ?? Engine).LoadTableAsync(
-            new TableOptions { TableLocation = path, Version = version }, CancellationToken.None);
+            new TableOptions
+            {
+                TableLocation = BenchStorage.Current.DeltaRsUri(path),
+                StorageOptions = BenchStorage.Current.DeltaRsOptions,
+                Version = version,
+            },
+            CancellationToken.None);
+
+    /// <summary>Create options for a new table at <paramref name="path"/>, on whichever store the run uses.</summary>
+    public static TableCreateOptions CreateOptions(string path, IReadOnlyDictionary<string, string>? configuration) =>
+        new(BenchStorage.Current.DeltaRsUri(path), Data.Schema)
+        {
+            SaveMode = DdSaveMode.ErrorIfExists,
+            Configuration = configuration?.ToDictionary(p => p.Key, p => p.Value),
+            StorageOptions = BenchStorage.Current.DeltaRsOptions,
+        };
 
     public static async Task CreateAndInsertAsync(
         string path,
@@ -336,12 +351,7 @@ internal static class Dd
         IReadOnlyDictionary<string, string>? configuration = null,
         ulong maxRowsPerGroup = DefaultMaxRowsPerGroup)
     {
-        var create = new TableCreateOptions(path, Data.Schema)
-        {
-            SaveMode = DdSaveMode.ErrorIfExists,
-            Configuration = configuration?.ToDictionary(p => p.Key, p => p.Value),
-        };
-        using var table = await Engine.CreateTableAsync(create, CancellationToken.None);
+        using var table = await Engine.CreateTableAsync(CreateOptions(path, configuration), CancellationToken.None);
         await InsertAsync(table, batches, maxRowsPerGroup);
     }
 

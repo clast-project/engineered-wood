@@ -8,8 +8,8 @@ using EwDeltaTable = EngineeredWood.DeltaLake.Table.DeltaTable;
 namespace DeltaDotnetComparison;
 
 /// <summary>
-/// Template tables, built once and cached under <see cref="Root"/> (override with <c>EWDD_BENCH_ROOT</c>), and
-/// fresh copies of them for the benchmarks that mutate a table.
+/// Template tables, built once and cached under <see cref="Root"/> (on local disk, or in Azure Blob Storage: see
+/// <see cref="BenchStorage"/>), and fresh copies of them for the benchmarks that mutate a table.
 ///
 /// <para>Each template is built by its <see cref="TableWriter"/> with that engine's DEFAULT writer settings,
 /// so a table's file layout (page version, encodings, row-group size, stats) is that engine's own. Readers
@@ -37,19 +37,19 @@ internal static class Fixtures
     private static readonly Dictionary<string, string> NoAutoCheckpoint =
         new() { ["delta.checkpointInterval"] = "1000000" };
 
-    public static string Root { get; } =
-        Environment.GetEnvironmentVariable("EWDD_BENCH_ROOT")
-        ?? Path.Combine(Path.GetTempPath(), "ew-vs-delta-dotnet");
+    private static BenchStorage Storage => BenchStorage.Current;
 
-    private static string Templates => Path.Combine(Root, "templates");
-    private static string ScratchRoot => Path.Combine(Root, "scratch");
+    public static string Root => Storage.Root;
+
+    private static string Templates => Storage.Combine(Root, "templates");
+    private static string ScratchRoot => Storage.Combine(Root, "scratch");
 
     /// <summary>
     /// This process's own scratch directory. BenchmarkDotNet runs each benchmark in a child process, and a
     /// <c>--verify</c> or a second filtered run may share <see cref="Root"/> with a run in progress, so no
     /// process may sweep another live process's iteration copies.
     /// </summary>
-    private static string Scratch => Path.Combine(ScratchRoot, Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
+    private static string Scratch => Storage.Combine(ScratchRoot, Environment.ProcessId.ToString(CultureInfo.InvariantCulture));
 
     /// <summary>One commit of <see cref="Rows"/> rows.</summary>
     public static string SingleCommit(TableWriter writer) =>
@@ -153,34 +153,23 @@ internal static class Fixtures
     /// <summary>A fresh, private copy of a template, for one benchmark iteration to mutate.</summary>
     public static string FreshCopy(string template)
     {
-        string path = Path.Combine(Scratch, Guid.NewGuid().ToString("N"));
-        CopyDirectory(template, path);
+        string path = Storage.Combine(Scratch, Guid.NewGuid().ToString("N"));
+        Storage.CopyTree(template, path);
         return path;
     }
 
     /// <summary>A fresh, empty directory, for one write iteration.</summary>
     public static string FreshEmpty()
     {
-        string path = Path.Combine(Scratch, Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(path);
+        string path = Storage.Combine(Scratch, Guid.NewGuid().ToString("N"));
+        Storage.CreateEmpty(path);
         return path;
     }
 
     public static void Delete(string? path)
     {
-        if (path is null || !Directory.Exists(path))
-            return;
-        try
-        {
-            Directory.Delete(path, recursive: true);
-        }
-        catch (IOException)
-        {
-            // A native handle released a moment late; the scratch root is swept on the next run anyway.
-        }
-        catch (UnauthorizedAccessException)
-        {
-        }
+        if (path is not null)
+            Storage.DeleteTree(path);
     }
 
     /// <summary>
@@ -191,11 +180,9 @@ internal static class Fixtures
     public static void SweepScratch()
     {
         Delete(Scratch);
-        if (!Directory.Exists(ScratchRoot))
-            return;
-        foreach (string dir in Directory.EnumerateDirectories(ScratchRoot))
+        foreach (string dir in Storage.Children(ScratchRoot))
         {
-            if (int.TryParse(Path.GetFileName(dir), NumberStyles.None, CultureInfo.InvariantCulture, out int pid)
+            if (int.TryParse(Storage.NameOf(dir), NumberStyles.None, CultureInfo.InvariantCulture, out int pid)
                 && !IsRunning(pid))
             {
                 Delete(dir);
@@ -226,25 +213,24 @@ internal static class Fixtures
 
     private static string Ensure(string name, Func<string, Task> build)
     {
-        string path = Path.Combine(Templates, name);
-        string marker = path + ".ready";
-        if (File.Exists(marker))
+        string path = Storage.Combine(Templates, name);
+        if (Storage.MarkerExists(path))
             return path;
 
         // Two processes sharing a root (a --verify beside a benchmark run, or two filtered runs) could otherwise
         // both find no marker, and one would delete or mark the other's half-built template. The lock covers
         // the re-check, the build and the marker; a process that dies mid-build releases it (the OS closes the
         // handle), leaves no marker, and the next holder rebuilds from scratch.
-        using (AcquireBuildLock(path + ".lock", name))
+        using (AcquireBuildLock(Storage.LockPath(path), name))
         {
-            if (File.Exists(marker))
+            if (Storage.MarkerExists(path))
                 return path; // built by whoever held the lock before us
 
             Delete(path);
-            Directory.CreateDirectory(path);
-            Console.WriteLine($"// building fixture {name} ...");
+            Storage.CreateEmpty(path);
+            Console.WriteLine($"// building fixture {name} on {Storage.Description} ...");
             build(path).GetAwaiter().GetResult();
-            File.WriteAllText(marker, DateTime.UtcNow.ToString("O"));
+            Storage.WriteMarker(path, DateTime.UtcNow.ToString("O"));
         }
         return path;
     }
@@ -290,12 +276,7 @@ internal static class Fixtures
         }
         else
         {
-            var create = new TableCreateOptions(path, Data.Schema)
-            {
-                SaveMode = global::DeltaLake.Table.SaveMode.ErrorIfExists,
-                Configuration = configuration.ToDictionary(p => p.Key, p => p.Value),
-            };
-            using var table = await Dd.Engine.CreateTableAsync(create, CancellationToken.None);
+            using var table = await Dd.Engine.CreateTableAsync(Dd.CreateOptions(path, configuration), CancellationToken.None);
             foreach (var commit in commits)
                 await Dd.InsertAsync(table, commit, Dd.DefaultMaxRowsPerGroup);
         }
@@ -326,20 +307,6 @@ internal static class Fixtures
         {
             using var table = await Dd.OpenAsync(path);
             await table.OptimizeAsync(new OptimizeOptions(), CancellationToken.None);
-        }
-    }
-
-    private static void CopyDirectory(string source, string destination)
-    {
-        Directory.CreateDirectory(destination);
-        foreach (string dir in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories))
-            Directory.CreateDirectory(Path.Combine(destination, Path.GetRelativePath(source, dir)));
-        foreach (string file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
-        {
-            string target = Path.Combine(destination, Path.GetRelativePath(source, file));
-            File.Copy(file, target);
-            // Keep the source's mtime: vacuum retention and file-age logic key off it.
-            File.SetLastWriteTimeUtc(target, File.GetLastWriteTimeUtc(file));
         }
     }
 }

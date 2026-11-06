@@ -95,7 +95,7 @@ internal static class Verify
                             // Pruning shows only in what a MERGE read, not in the table it leaves (either way
                             // just the one matching file is rewritten), so print what each engine reports.
                             if (instance is MergeKeyRangeBenchmarks)
-                                Console.WriteLine($"   ({method.Name}: {LatestOperationMetrics(mutation.CurrentPath!)})");
+                                Console.WriteLine($"   ({method.Name}: {await LatestOperationMetricsAsync(mutation.CurrentPath!)})");
 
                             if (instance is DeletionVectorDmlBenchmarks)
                                 result += " " + await DeletionVectorPostconditionAsync(instance, method, mutation.CurrentPath!, byEw);
@@ -166,11 +166,14 @@ internal static class Verify
         || result.Contains(PostconditionFailed, StringComparison.Ordinal);
 
     /// <summary>The latest commit's <c>commitInfo.operationMetrics</c> that count files, as each engine names them.</summary>
-    private static string LatestOperationMetrics(string path)
+    private static async Task<string> LatestOperationMetricsAsync(string path)
     {
-        string latest = Directory.EnumerateFiles(Path.Combine(path, "_delta_log"), "*.json")
+        var fs = Ew.Fs(path);
+        string latest = (await ListAsync(fs, "_delta_log/"))
+            .Where(f => f.EndsWith(".json", StringComparison.Ordinal) && !f["_delta_log/".Length..].Contains('/'))
             .OrderBy(f => f, StringComparer.Ordinal).Last();
-        foreach (string line in File.ReadLines(latest))
+        string text = System.Text.Encoding.UTF8.GetString(await fs.ReadAllBytesAsync(latest));
+        foreach (string line in text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             using var json = System.Text.Json.JsonDocument.Parse(line);
             if (!json.RootElement.TryGetProperty("commitInfo", out var info)
@@ -223,18 +226,19 @@ internal static class Verify
     {
         await using var table = await EngineeredWood.DeltaLake.Table.DeltaTable.OpenAsync(Ew.Fs(path));
         var snapshot = table.CurrentSnapshot;
-        string log = Path.Combine(path, "_delta_log");
+        var fs = Ew.Fs(path);
+        const string log = "_delta_log/";
         switch (category)
         {
             case "Checkpoint":
             {
                 // A checkpoint at the latest version, published through _last_checkpoint.
-                string hint = Path.Combine(log, "_last_checkpoint");
-                if (!File.Exists(hint))
+                string hint = log + "_last_checkpoint";
+                if (!await fs.ExistsAsync(hint))
                     return $"{PostconditionFailed}: NOT checkpointed (no _last_checkpoint)";
-                using var json = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(hint));
+                using var json = System.Text.Json.JsonDocument.Parse(await fs.ReadAllBytesAsync(hint));
                 long version = json.RootElement.GetProperty("version").GetInt64();
-                bool fileExists = Directory.EnumerateFiles(log, $"{version:D20}.checkpoint*").Any();
+                bool fileExists = (await ListAsync(fs, $"{log}{version:D20}.checkpoint")).Count > 0;
                 return version == snapshot.Version && fileExists
                     ? $"checkpoint@v{version}"
                     : $"{PostconditionFailed}: NOT checkpointed at the latest version (hint v{version}, latest v{snapshot.Version}, file {(fileExists ? "present" : "missing")})";
@@ -252,12 +256,14 @@ internal static class Verify
             case "Vacuum":
             {
                 // Every data file on disk is referenced by the snapshot: the removed small files are gone.
+                // Compared as relative, '/'-separated paths, the form ITableFileSystem lists them in on either store.
                 var referenced = new HashSet<string>(
-                    snapshot.ActiveFiles.Keys.Select(p => Path.GetFullPath(Path.Combine(path, Uri.UnescapeDataString(p)))),
+                    snapshot.ActiveFiles.Keys.Select(p => Uri.UnescapeDataString(p).Replace('\\', '/').TrimStart('/')),
                     StringComparer.OrdinalIgnoreCase);
-                int unreferenced = Directory.EnumerateFiles(path, "*.parquet", SearchOption.AllDirectories)
-                    .Where(f => !f.StartsWith(log, StringComparison.OrdinalIgnoreCase))
-                    .Count(f => !referenced.Contains(Path.GetFullPath(f)));
+                int unreferenced = (await ListAsync(fs, ""))
+                    .Where(f => f.EndsWith(".parquet", StringComparison.OrdinalIgnoreCase)
+                        && !f.StartsWith(log, StringComparison.OrdinalIgnoreCase))
+                    .Count(f => !referenced.Contains(f));
                 return unreferenced == 0
                     ? "vacuumed (0 unreferenced data files)"
                     : $"{PostconditionFailed}: NOT vacuumed ({unreferenced} unreferenced data files remain)";
@@ -283,6 +289,15 @@ internal static class Verify
             default:
                 return "";
         }
+    }
+
+    /// <summary>The relative, '/'-separated paths of every file under <paramref name="prefix"/>.</summary>
+    private static async Task<List<string>> ListAsync(EngineeredWood.IO.ITableFileSystem fs, string prefix)
+    {
+        var paths = new List<string>();
+        await foreach (var file in fs.ListAsync(prefix))
+            paths.Add(file.Path.Replace('\\', '/'));
+        return paths;
     }
 
     private static IEnumerable<List<(PropertyInfo Property, object Value)>> Combinations(Type type)

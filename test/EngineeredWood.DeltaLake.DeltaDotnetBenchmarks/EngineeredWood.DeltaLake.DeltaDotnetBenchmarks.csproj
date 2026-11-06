@@ -22,6 +22,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The Azure Blob backend, for runs with EWDD_STORAGE=azure (see README.md). -->
+    <ProjectReference Include="..\..\src\EngineeredWood.Azure\EngineeredWood.Azure.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.DeltaLake\EngineeredWood.DeltaLake.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.DeltaLake.Table\EngineeredWood.DeltaLake.Table.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
