@@ -3294,7 +3294,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             isBlindAppend: transaction.EffectiveIsBlindAppend,
             insertFillIn: insertFillIn,
             commitProperties: transaction.CommitProperties,
-            operationMetrics: transaction.OperationMetricsFor).ConfigureAwait(false);
+            operationMetrics: transaction.OperationMetricsFor,
+            operationParameters: transaction.OperationParametersFor(actions)).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -5302,7 +5303,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 IsolationFor(snapshot, plan.Actions), "UPDATE",
                 rebaseSafe: true, cancellationToken, written: written,
                 isBlindAppend: false, commitProperties: commitProperties,
-                operationMetrics: committing => DmlOperationMetrics.ForUpdate(committing, plan.TotalUpdated))
+                operationMetrics: committing => DmlOperationMetrics.ForUpdate(committing, plan.TotalUpdated),
+                operationParameters: DmlOperationParameters.ForConditions(
+                    [DmlOperationParameters.Render(opaquePredicate ? null : prunePredicate)]))
                 .ConfigureAwait(false);
 
             return (plan.TotalUpdated, committed);

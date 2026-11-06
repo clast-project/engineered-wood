@@ -1312,8 +1312,23 @@ COMMANDS = {
 DONE_MARKER = "__EW_DONE__"
 
 
+def _json_safe(value):
+    """Non-finite floats as the strings Spark's JSON and EW's stats spell them ("NaN", "Infinity").
+
+    json.dumps writes them as bare NaN / Infinity tokens, which are not JSON, so any table holding one
+    made every command that returns its rows fail to parse on the .NET side.
+    """
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        return "NaN" if value != value else ("Infinity" if value > 0 else "-Infinity")
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def _emit(out_path, obj):
-    payload = json.dumps(obj, ensure_ascii=False, default=str)
+    payload = json.dumps(_json_safe(obj), ensure_ascii=False, default=str, allow_nan=False)
     if not out_path:
         _real_stdout.write(payload)
         return
@@ -1341,6 +1356,24 @@ def _run(command, args_path):
         # Spark stacks are enormous and the useful part is the innermost Delta/Java message.
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:4000],
                 "traceback": traceback.format_exc()[-4000:]}
+    finally:
+        _release_delta_logs()
+
+
+def _release_delta_logs():
+    """Drop Delta's per-path DeltaLog cache after every command.
+
+    Every test works on fresh temporary paths, so a cached DeltaLog (and the snapshot state it holds) is never
+    reused, and the cache only grows. MEASURED on Spark 4.1 / 1 GB heap: about 3.4 MB retained per table without
+    this, versus a flat ~150-185 MB with it. A full CI run of ~290 tests filled the driver heap and failed with
+    "Not enough memory to build and broadcast the table", landing on whichever test came next.
+    """
+    if _SESSION is None:
+        return
+    try:
+        _SESSION._jvm.org.apache.spark.sql.delta.DeltaLog.clearCache()
+    except Exception:
+        pass
 
 
 def _serve():
