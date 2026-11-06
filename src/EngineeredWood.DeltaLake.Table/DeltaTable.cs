@@ -12461,7 +12461,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         // Column mapping setup
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
-        bool isIdMode = mappingMode == ColumnMappingMode.Id;
 
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(
             snapshot.Schema, mappingMode);
