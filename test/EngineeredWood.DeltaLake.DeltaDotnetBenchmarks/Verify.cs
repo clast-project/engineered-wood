@@ -36,6 +36,19 @@ internal static class Verify
             return 2;
         }
 
+        // Only the classes with a method EWDD_VERIFY_METHODS selects: the others would build and sweep their
+        // fixtures for nothing. None at all is a mistyped filter, refused before any fixture is built.
+        types = types
+            .Where(t => t.GetMethods().Any(m =>
+                m.GetCustomAttribute<BenchmarkAttribute>() != null && TraceMarks.Selected(m.Name)))
+            .ToList();
+        if (types.Count == 0)
+        {
+            Console.Error.WriteLine(
+                $"VERIFY FAILED: no benchmark method of the classes matching '{filter}' matches EWDD_VERIFY_METHODS.");
+            return 2;
+        }
+
         int failures = 0;
         foreach (var type in types)
         {
@@ -53,13 +66,24 @@ internal static class Verify
                 foreach (var method in type.GetMethods().Where(m => m.GetCustomAttribute<BenchmarkAttribute>() != null))
                 {
                     string category = method.GetCustomAttribute<BenchmarkCategoryAttribute>()?.Categories[0] ?? "";
+                    if (!TraceMarks.Selected(method.Name))
+                        continue;
                     InvokeIterationSetup(instance, type, method.Name);
                     string result;
+                    await TraceMarks.BeginAsync($"{label}.{method.Name}");
                     var sw = Stopwatch.StartNew();
                     try
                     {
-                        long value = await (Task<long>)method.Invoke(instance, null)!;
-                        sw.Stop();
+                        long value;
+                        try
+                        {
+                            value = await (Task<long>)method.Invoke(instance, null)!;
+                        }
+                        finally
+                        {
+                            sw.Stop();
+                            await TraceMarks.EndAsync();
+                        }
                         if (instance is MutationBenchmark mutation)
                         {
                             var byEw = await Ew.FingerprintAsync(mutation.CurrentPath!);
@@ -107,7 +131,6 @@ internal static class Verify
                     }
                     catch (Exception ex)
                     {
-                        sw.Stop();
                         var inner = ex is TargetInvocationException { InnerException: { } e } ? e : ex;
                         result = $"THREW {inner.GetType().Name}: {inner.Message}";
                     }

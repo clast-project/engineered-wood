@@ -329,18 +329,24 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <see cref="ReadPlannedAsync(RowGroupPlan, IReadOnlyList{string}?, ScanReservation, DecodedGrowth, CancellationToken)"/>,
     /// which may run concurrently for different plans; the planning itself is NOT thread-safe and must be
     /// enumerated once, in order.
+    /// <para>Only row groups <paramref name="firstRowGroup"/> (inclusive) to <paramref name="endRowGroup"/>
+    /// (exclusive) are planned, and nothing is read ahead for the others: a caller can plan a file in parts,
+    /// each enumeration holding the dictionary and page-index windows of its own part only.</para>
     /// </summary>
     internal async IAsyncEnumerable<RowGroupPlan> PlanRowGroupsAsync(
         EngineeredWood.Expressions.Predicate? filter,
         IReadOnlyList<string>? columnNames,
         RowSkipPredicate? skipRows,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        int firstRowGroup = 0,
+        int endRowGroup = int.MaxValue)
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         // Built before any plan is handed out, so that concurrent reads of the plans find it cached.
         await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-        await foreach (var plan in PlanRowGroupsAsync(metadata, filter, columnNames, skipRows, cancellationToken)
+        await foreach (var plan in PlanRowGroupsAsync(
+                           metadata, filter, columnNames, skipRows, cancellationToken, firstRowGroup, endRowGroup)
             .ConfigureAwait(false))
         {
             yield return plan;
@@ -372,6 +378,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// statistics, dictionaries, Bloom filters and page indexes, and the runs <paramref name="skipRows"/> cuts
     /// out. NOT thread-safe — the dictionary and Bloom filter windows and the page-index read-ahead are state of
     /// this one enumeration — so it is enumerated once, in order, whether the reads it plans run serially or not.
+    /// Row groups outside <paramref name="firstRowGroup"/> to <paramref name="endRowGroup"/> are treated as
+    /// skipped: never planned, and left out of every window.
     /// </summary>
     internal async IAsyncEnumerable<RowGroupPlan> PlanRowGroupsAsync(
         FileMetaData metadata,
@@ -379,11 +387,13 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? columnNames,
         RowSkipPredicate? skipRows,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        int firstRowGroup = 0,
+        int endRowGroup = int.MaxValue)
     {
         // Decided for every group up front, from the footer alone, so that the read-ahead below can leave the
         // skipped groups out too: it would otherwise fetch their dictionaries or page indexes for nothing.
-        var skipped = SkippedRowGroups(metadata, skipRows);
+        var skipped = SkippedRowGroups(metadata, skipRows, firstRowGroup, endRowGroup);
 
         ParquetStatisticsAccessor? accessor = null;
         SchemaDescriptor? schema = null;
@@ -2746,21 +2756,29 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Which row groups <paramref name="skipRows"/> skips, by index; null when <paramref name="skipRows"/> is null or
-    /// skips none, so the common read pays nothing. Empty groups are never asked about: they hold no rows to skip.
+    /// Which row groups <paramref name="skipRows"/> skips, by index, and every group outside
+    /// <paramref name="first"/> to <paramref name="end"/>; null when that is none, so the common read pays
+    /// nothing. Empty groups are never asked about: they hold no rows to skip.
     /// </summary>
-    private static bool[]? SkippedRowGroups(FileMetaData metadata, RowSkipPredicate? skipRows)
+    private static bool[]? SkippedRowGroups(FileMetaData metadata, RowSkipPredicate? skipRows, int first = 0, int end = int.MaxValue)
     {
-        if (skipRows is null)
-            return null;
-
+        int count = metadata.RowGroups.Count;
         bool[]? skipped = null;
+        if (first > 0 || end < count)
+        {
+            skipped = new bool[count];
+            for (int i = 0; i < count; i++)
+                skipped[i] = i < first || i >= end;
+        }
+        if (skipRows is null)
+            return skipped;
+
         long start = 0;
-        for (int i = 0; i < metadata.RowGroups.Count; i++)
+        for (int i = 0; i < count; i++)
         {
             long rows = metadata.RowGroups[i].NumRows;
-            if (rows > 0 && skipRows(start, rows))
-                (skipped ??= new bool[metadata.RowGroups.Count])[i] = true;
+            if (rows > 0 && !(skipped is not null && skipped[i]) && skipRows(start, rows))
+                (skipped ??= new bool[count])[i] = true;
             start += rows;
         }
         return skipped;

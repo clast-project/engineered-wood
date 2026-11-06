@@ -71,6 +71,23 @@ internal static class Ew
 
     public static ITableFileSystem Fs(string path) => BenchStorage.Current.FileSystem(path);
 
+    /// <summary>
+    /// The options the read benchmarks open EW's table with: the defaults, unless <c>EWDD_EW_MAX_BUFFERED_MB</c>
+    /// (<see cref="EngineeredWood.DeltaLake.Table.DeltaTableOptions.MaxBufferedReadBytes"/>) or
+    /// <c>EWDD_EW_MAX_CONCURRENT_READS</c> override them, for experiments on a scan's window (#713).
+    /// </summary>
+    public static EngineeredWood.DeltaLake.Table.DeltaTableOptions ReadOptions { get; } = CreateReadOptions();
+
+    private static EngineeredWood.DeltaLake.Table.DeltaTableOptions CreateReadOptions()
+    {
+        var options = new EngineeredWood.DeltaLake.Table.DeltaTableOptions();
+        if (int.TryParse(Environment.GetEnvironmentVariable("EWDD_EW_MAX_BUFFERED_MB"), out int mb) && mb > 0)
+            options = options with { MaxBufferedReadBytes = mb * 1024L * 1024L };
+        if (int.TryParse(Environment.GetEnvironmentVariable("EWDD_EW_MAX_CONCURRENT_READS"), out int reads) && reads > 0)
+            options = options with { MaxConcurrentReads = reads };
+        return options;
+    }
+
     public static async Task<long> CreateAndWriteAsync(
         string path, IReadOnlyList<RecordBatch> batches, IReadOnlyDictionary<string, string>? configuration = null)
     {

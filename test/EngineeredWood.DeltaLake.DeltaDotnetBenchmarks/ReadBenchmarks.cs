@@ -30,7 +30,7 @@ public class FullScanBenchmarks
     [BenchmarkCategory("FullScan"), Benchmark(Baseline = true, Description = "EW ReadAllAsync")]
     public async Task<long> EW()
     {
-        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path));
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
         return await Ew.CountAsync(table.ReadAllAsync());
     }
 
@@ -96,14 +96,14 @@ public class FilteredScanBenchmarks
     [BenchmarkCategory("FilteredScan"), Benchmark(Baseline = true, Description = "EW ReadAsync + row filter")]
     public async Task<long> EW_Exact()
     {
-        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path));
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
         return await Ew.FilteredCountAsync(table, _sql, Columns, exact: true);
     }
 
     [BenchmarkCategory("FilteredScan"), Benchmark(Description = "EW ReadAsync, prune only")]
     public async Task<long> EW_PruneOnly()
     {
-        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path));
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
         return await Ew.FilteredCountAsync(table, _sql, Columns, exact: false);
     }
 
@@ -144,7 +144,7 @@ public class LargeScanBenchmarks
     [BenchmarkCategory("LargeFullScan"), Benchmark(Baseline = true, Description = "EW ReadAllAsync, 10M rows")]
     public async Task<long> EW_Full()
     {
-        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path));
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
         return await Ew.CountAsync(table.ReadAllAsync());
     }
 
@@ -157,7 +157,7 @@ public class LargeScanBenchmarks
     [BenchmarkCategory("LargeOneCategory"), Benchmark(Baseline = true, Description = "EW ReadAsync + row filter, 10M rows")]
     public async Task<long> EW_OneCategory()
     {
-        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path));
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
         return await Ew.FilteredCountAsync(table, Sql.OneCategory, Columns, exact: true);
     }
 
@@ -295,7 +295,7 @@ public class ChangeFeedBenchmarks
     [BenchmarkCategory("ChangeFeed"), Benchmark(Baseline = true, Description = "EW ReadChangesAsync")]
     public async Task<long> EW()
     {
-        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path));
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
         return await Ew.CountAsync(table.ReadChangesAsync(new EngineeredWood.DeltaLake.Table.DeltaChangeReadOptions
         {
             StartVersion = 0,
