@@ -73,6 +73,17 @@ public class VariantRowEvaluationTests : IDisposable
     }
 
     [Fact]
+    public async Task AConstraintWithAFoldablePathCanBeAdded()
+    {
+        // The constraint is analysed over no rows, where a computed path used to read as empty (PR #721 review).
+        await using var table = await CreateAsync(shredded: false);
+        await table.AddConstraintAsync("pos", "variant_get(v, concat('$.', 'a'), 'int') > 0");
+
+        await table.WriteAsync([Batch(0, A(VariantValue.FromInt64(1)))]);
+        await AssertViolatedAsync(table, Batch(1, A(VariantValue.FromInt64(-1))));
+    }
+
+    [Fact]
     public async Task AddingAConstraintTheRowsViolateIsRefused()
     {
         await using var table = await CreateAsync(shredded: false);

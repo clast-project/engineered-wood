@@ -80,6 +80,21 @@ public sealed class SparkVariantGetTests
         yield return ("key into an array", VariantValue.FromArray(VariantValue.FromInt8(1), VariantValue.FromInt8(2)), "$.a", "int", null, null);
         yield return ("element of an object", A(VariantValue.FromInt8(1)), "$[0]", "int", null, null);
         yield return ("root", VariantValue.FromInt8(3), "$", "int", 3, 3);
+        // PR #721 review, measured: a timestamp keeps its fraction, an integral cast floors it, TIMESTAMP_NTZ has no
+        // numeric reading, and timestamp_ltz is timestamp.
+        yield return ("timestamp 1.25 s as double", VariantValue.FromTimestamp(1_250_000L), "$", "double", 1.25, 1.25);
+        yield return ("timestamp 1.25 s as float", VariantValue.FromTimestamp(1_250_000L), "$", "float", 1.25f, 1.25f);
+        yield return ("timestamp 1.25 s as decimal(10,2)", VariantValue.FromTimestamp(1_250_000L), "$", "decimal(10,2)", 1.25m, 1.25m);
+        yield return ("timestamp -1.25 s as decimal(10,1)", VariantValue.FromTimestamp(-1_250_000L), "$", "decimal(10,1)", -1.3m, -1.3m);
+        yield return ("timestamp -1.25 s as bigint floors", VariantValue.FromTimestamp(-1_250_000L), "$", "bigint", -2L, -2L);
+        yield return ("timestamp 1.25 s as int", VariantValue.FromTimestamp(1_250_000L), "$", "int", 1, 1);
+        yield return ("timestamp as boolean", VariantValue.FromTimestamp(1_250_000L), "$", "boolean", Error, null);
+        yield return ("timestamp_ntz as double", VariantValue.FromTimestampNtz(1_250_000L), "$", "double", Error, null);
+        yield return ("timestamp_ntz as bigint", VariantValue.FromTimestampNtz(1_250_000L), "$", "bigint", Error, null);
+        yield return ("timestamp_ntz as date", VariantValue.FromTimestampNtz(1_250_000L), "$", "date",
+            DateTimeOffset.FromUnixTimeSeconds(0), DateTimeOffset.FromUnixTimeSeconds(0));
+        yield return ("1 as timestamp_ltz", A(VariantValue.FromInt8(1)), "$.a", "timestamp_ltz",
+            DateTimeOffset.FromUnixTimeSeconds(1), DateTimeOffset.FromUnixTimeSeconds(1));
     }
 
     private static readonly IReadOnlyDictionary<string, VariantValue> ByName =
@@ -237,6 +252,44 @@ public sealed class SparkVariantGetTests
         Assert.False(result.GetValue(1));
         Assert.Null(result.GetValue(2));
         Assert.Null(result.GetValue(3));
+    }
+
+    [Fact]
+    public void AFoldablePathAndTypeAreRead()
+    {
+        // Spark takes any foldable path and type (measured: concat('$.', 'a') and concat('in', 't') both answer 3).
+        var batch = Batch(Unshredded(A(VariantValue.FromInt8(3))));
+        Assert.Equal(3, ((Int32Array)Eval("variant_get(v, concat('$.', 'a'), concat('in', 't'))", batch)).GetValue(0));
+
+        // Over no rows too, which is how a CHECK constraint is analysed (PR #721 review).
+        var none = Batch(new VariantArray.Builder().Build());
+        var result = new ArrowRowEvaluator(new SparkFunctionRegistry()).EvaluatePredicate(
+            SparkSqlParser.ParsePredicate("variant_get(v, concat('$.', 'a'), concat('in', 't')) > 0"), none);
+        Assert.Equal(0, result.Length);
+    }
+
+    [Fact]
+    public void ATimestampColumnCastsToANumberWithItsFraction()
+    {
+        // Measured, Spark 4.1: CAST(TIMESTAMP '1970-01-01 00:00:01.25' AS DOUBLE) is 1.25, and
+        // CAST(TIMESTAMP '1969-12-31 23:59:58.75' AS BIGINT) is -2. The fraction used to be dropped (PR #721 review).
+        var b = new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, "UTC"));
+        b.Append(DateTimeOffset.FromUnixTimeMilliseconds(1250));
+        b.Append(DateTimeOffset.FromUnixTimeMilliseconds(-1250));
+        var ts = b.Build();
+        var batch = new RecordBatch(new Schema.Builder().Field(new Field("ts", ts.Data.DataType, true)).Build(), new[] { ts }, 2);
+
+        var doubles = (DoubleArray)Eval("CAST(ts AS DOUBLE)", batch);
+        Assert.Equal(1.25, doubles.GetValue(0));
+        Assert.Equal(-1.25, doubles.GetValue(1));
+
+        var longs = (Int64Array)Eval("CAST(ts AS BIGINT)", batch);
+        Assert.Equal(1L, longs.GetValue(0));
+        Assert.Equal(-2L, longs.GetValue(1));
+
+        var decimals = (Decimal128Array)Eval("CAST(ts AS DECIMAL(10,1))", batch);
+        Assert.Equal(1.3m, decimals.GetSqlDecimal(0)!.Value.Value);
+        Assert.Equal(-1.3m, decimals.GetSqlDecimal(1)!.Value.Value);
     }
 
     // ── helpers ──

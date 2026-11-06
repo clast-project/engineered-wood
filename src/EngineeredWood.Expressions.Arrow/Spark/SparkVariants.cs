@@ -62,12 +62,13 @@ internal static class SparkVariants
         IArrowType? target = null;
         if (args.Count == 3)
         {
+            // Through the canonical spelling where there is one, so an alias such as timestamp_ltz reads as
+            // Spark's DataType.fromDDL reads it.
             string typeText = ConstantText(name, args[2], "type");
-            if (!VariantGetCall.TryNormalizeTypeName(typeText, out string canonical)
-                || canonical != VariantGetCall.VariantTypeName)
-            {
+            if (!VariantGetCall.TryNormalizeTypeName(typeText, out string canonical))
                 target = SparkArrays.ParseTypeName(typeText);
-            }
+            else if (canonical != VariantGetCall.VariantTypeName)
+                target = SparkArrays.ParseTypeName(canonical);
         }
 
         // A bare NULL is a NULL variant, so the answer is NULL whatever the path.
@@ -305,7 +306,9 @@ internal static class SparkVariants
             BinaryType => target is BinaryType,
             BooleanType => numericTarget,
             Date32Type => target is TimestampType,
-            TimestampType => target is TimestampType or Date32Type || numericTarget,
+            // A number for a zoned timestamp only: Spark refuses one for TIMESTAMP_NTZ.
+            TimestampType ts => target is TimestampType or Date32Type
+                || (numericTarget && SparkArrays.IsZonedTimestamp(ts)),
             _ when SparkNumericTypes.IsNumeric(source) => numericTarget || target is BooleanType or TimestampType,
             _ => false,
         };

@@ -1406,7 +1406,11 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
 
         var arguments = new IArrowArray[call.Arguments.Count];
         for (int i = 0; i < call.Arguments.Count; i++)
-            arguments[i] = EvalExpressionAsArray(call.Arguments[i], batch);
+        {
+            arguments[i] = batch.Length == 0 && call.Arguments[i] is FunctionCall && IsConstant(call.Arguments[i])
+                ? ConstantCallOverNoRows(call.Arguments[i], batch)
+                : EvalExpressionAsArray(call.Arguments[i], batch);
+        }
 
         // A call whose every argument is constant may mean something the same call over a column
         // does not -- see IConstantFoldedFunctions. Asked before PickMinimumPrecision, which has
@@ -1421,6 +1425,29 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         PickMinimumPrecision(call, arguments);
 
         return _functions.Invoke(call.Name, arguments, batch.Length);
+    }
+
+    /// <summary>
+    /// A constant call argument over a batch of no rows, evaluated over one row so that it has a value, as a
+    /// literal does (see <see cref="ConstantArray"/>).
+    /// </summary>
+    /// <remarks>
+    /// A function that reads an argument as a value rather than per row -- <c>variant_get</c>'s path and type,
+    /// <c>variant_get(v, concat('$.', 'a'), 'int')</c> -- otherwise sees an empty array, and a CHECK constraint
+    /// is analysed over no rows. Should the one-row evaluation raise, the argument is evaluated over no rows as
+    /// before, so this only ever adds a value and never an error.
+    /// </remarks>
+    private IArrowArray ConstantCallOverNoRows(Expression argument, RecordBatch batch)
+    {
+        try
+        {
+            var oneRow = new RecordBatch(new Schema.Builder().Build(), System.Array.Empty<IArrowArray>(), 1);
+            return EvalExpressionAsArray(argument, oneRow);
+        }
+        catch (Exception)
+        {
+            return EvalExpressionAsArray(argument, batch);
+        }
     }
 
     private static bool AllConstant(IReadOnlyList<Expression> expressions)
@@ -1707,9 +1734,9 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
     /// <para>
     /// With rows, if it has to be. A few functions read a scalar argument whose value decides the
     /// result type out of row 0 — <c>round</c>'s scale, which may itself be computed. A literal
-    /// survives an empty batch (<see cref="ConstantArray"/> keeps one row for this), but
-    /// <c>round(f, 1 + 1)</c> hands <c>round</c> a zero-length scale and it throws. So when the
-    /// empty evaluation fails, it is retried over the batch.
+    /// survives an empty batch (<see cref="ConstantArray"/> keeps one row for this), and so does a
+    /// constant call such as <c>round(f, 1 + 1)</c>'s scale (<see cref="ConstantCallOverNoRows"/>).
+    /// When the empty evaluation still fails, it is retried over the batch.
     /// </para>
     /// <para>
     /// The empty attempt must stay first: the retry evaluates a branch no row selected, which is
@@ -1717,9 +1744,9 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
     /// answer into an error.
     /// </para>
     /// <para>
-    /// The residual gap is an expression with both a value-dependent result type and a branch that
-    /// raises over real rows, as in <c>round(CAST('x' AS DOUBLE), 1 + 1)</c> inside a branch
-    /// nothing reaches. That needs the type inferred rather than evaluated.
+    /// The residual gap is an expression with both a value-dependent result type that no constant
+    /// supplies and a branch that raises over real rows. That needs the type inferred rather than
+    /// evaluated.
     /// </para>
     /// </remarks>
     private IArrowType TypeOver(Expression expression, RecordBatch batch)

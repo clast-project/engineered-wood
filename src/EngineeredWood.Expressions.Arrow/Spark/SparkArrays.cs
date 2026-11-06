@@ -423,6 +423,9 @@ internal static class SparkArrays
     public static bool IsDateType(IArrowType type) => type is Date32Type or Date64Type;
 
     /// <summary>Reads a value for casting, keeping strings as strings.</summary>
+    /// <summary><c>DateTimeOffset.UnixEpoch.UtcTicks</c>, which netstandard2.0 lacks.</summary>
+    private const long UnixEpochTicks = 621_355_968_000_000_000L;
+
     public static CastInput? ReadForCast(IArrowArray array, int index)
     {
         // First, because a `void` column has no value at any row and every later branch would
@@ -436,9 +439,12 @@ internal static class SparkArrays
             if (instant is null)
                 return null;
 
+            // A timestamp reads as epoch seconds WITH its fraction, as Spark's does: 1.25 s past the epoch casts
+            // to the DOUBLE 1.25 and the DECIMAL(10,1) 1.3. An integral cast floors it (CastToIntegral).
             var isDate = IsDateType(array.Data.DataType);
+            long micros = (instant.Value.UtcTicks - UnixEpochTicks) / 10;
             return new CastInput(
-                instant.Value.ToUnixTimeSeconds(), instant.Value.ToUnixTimeSeconds(),
+                micros / 1_000_000d, micros / 1_000_000m,
                 RenderInstant(instant.Value, isDate))
             {
                 Instant = instant,

@@ -1880,7 +1880,9 @@ public sealed class SparkFunctionRegistry
                 throw SparkEvaluationException.InvalidCast(value.Value.Text, described);
             }
 
-            var truncated = decimal.Truncate(exact);
+            // A timestamp's seconds floor, as Spark's floorDiv does (1969-12-31 23:59:58.75 is -2); every
+            // other source truncates toward zero.
+            var truncated = family == SparkIntegralCasts.Source.Temporal ? decimal.Floor(exact) : decimal.Truncate(exact);
 
             if (truncated < long.MinValue || truncated > long.MaxValue
                 || !SparkArrays.FitsIn((long)truncated, target))
