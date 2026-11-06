@@ -99,6 +99,7 @@ public sealed class AzureBlobSequentialFile : ISequentialFile
         if (_completed || _aborted)
             throw new InvalidOperationException(
                 "Cannot write to an Azure blob that has already been completed or aborted.");
+        _uploads.ThrowIfFailed();
 
         int remaining = data.Length;
         int sourceOffset = 0;

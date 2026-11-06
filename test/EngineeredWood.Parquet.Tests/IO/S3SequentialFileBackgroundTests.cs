@@ -216,6 +216,40 @@ public class S3SequentialFileBackgroundTests
     }
 
     /// <summary>
+    /// A part that fails in the background is reported by the next write, even one too small to fill a part: the
+    /// write cannot succeed, so it accepts no more bytes.
+    /// </summary>
+    [Fact]
+    public async Task AFailedBackgroundPart_IsReportedByTheNextWrite_HoweverSmall()
+    {
+        var (client, fake) = FakeS3.Create();
+        fake.FailPart = 1;
+        fake.PartDelayMs = 0;
+        var fs = new S3TableFileSystem(client, "bucket", uploadBuffers: 4);
+
+        await using var file = await fs.CreateAsync("failed.bin", overwrite: true);
+        await file.WriteAsync(Payload(Part, seed: 10)); // part 1 goes to the background, and fails there
+
+        // One byte at a time never fills the next part, so only the check on each write can report it.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        AmazonS3Exception? failure = null;
+        while (failure is null && DateTime.UtcNow < deadline)
+        {
+            try
+            {
+                await file.WriteAsync(new byte[1]);
+                await Task.Delay(5);
+            }
+            catch (AmazonS3Exception ex)
+            {
+                failure = ex;
+            }
+        }
+        Assert.NotNull(failure);
+        Assert.Equal("part 1 failed", failure!.Message);
+    }
+
+    /// <summary>
     /// A part that fails in the background fails the write: completing reports it, the upload is aborted, and
     /// nothing is published.
     /// </summary>

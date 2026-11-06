@@ -76,8 +76,8 @@ internal sealed class UploadBufferPool
 /// <summary>
 /// One writer's uploads of its full buffers: in the background when <see cref="UploadBufferPool"/> lends a spare,
 /// otherwise in turn. The upload callback names the block or part itself, so uploads may finish in any order.
-/// <para>A background upload that fails is reported by the writer's next <see cref="UploadAsync"/> or by
-/// <see cref="DrainAsync"/>, and cancels the others. <see cref="Abort"/> cancels whatever is in flight.</para>
+/// <para>A background upload that fails is reported by <see cref="ThrowIfFailed"/>, which the writer calls on each
+/// write, by its next <see cref="UploadAsync"/> and by <see cref="DrainAsync"/>, and cancels the others. <see cref="Abort"/> cancels whatever is in flight.</para>
 /// <para>Not thread-safe, like the writer it serves: one caller at a time.</para>
 /// </summary>
 internal sealed class BackgroundUploads
@@ -187,7 +187,11 @@ internal sealed class BackgroundUploads
         }
     }
 
-    private void ThrowIfFailed()
+    /// <summary>
+    /// Rethrows the first background upload that failed, if one has: the write cannot succeed, so the writer
+    /// reports it before accepting more bytes, even ones that would not fill its buffer.
+    /// </summary>
+    public void ThrowIfFailed()
     {
         ExceptionDispatchInfo? failure;
         lock (_gate)

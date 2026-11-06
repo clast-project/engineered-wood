@@ -117,6 +117,7 @@ public sealed class S3SequentialFile : ISequentialFile
         if (_completed || _aborted)
             throw new InvalidOperationException(
                 "Cannot write to an S3 object that has already been completed or aborted.");
+        _uploads.ThrowIfFailed();
 
         int remaining = data.Length;
         int sourceOffset = 0;
