@@ -74,6 +74,21 @@ Every run prints a `// storage: …` line first, so a result can never be mistak
 - **It costs money**: every mutation iteration copies and deletes a table, and every scan reads one. A full
   run is tens of thousands of transactions, plus egress when run from outside the region.
 
+### Counting requests (#713)
+
+`--verify` can label each method it runs on a logging HTTP proxy placed in front of the store (Azurite, typically),
+so that both engines' requests are counted the same way, from the storage side. The proxy is not part of the repo;
+any proxy works that answers `GET /__mark?label=…` (attribute what follows to that label) and
+`GET /__latency?ms=…` (delay each forwarded request that long, to stand in for a remote store's round trip).
+
+| Variable | Meaning |
+|---|---|
+| `EWDD_TRACE_URL` | the proxy's base URL (such as `http://127.0.0.1:10000`); unset, no marks are sent |
+| `EWDD_TRACE_LATENCY_MS` | the latency the proxy adds while a method runs; fixture builds and the fingerprint reads run at 0 |
+| `EWDD_VERIFY_METHODS` | comma-separated substrings: `--verify` runs only the methods whose names contain one |
+| `EWDD_EW_MAX_BUFFERED_MB` | EW's `MaxBufferedReadBytes` in the scan benchmarks (default: EW's own) |
+| `EWDD_EW_MAX_CONCURRENT_READS` | EW's `MaxConcurrentReads` in the scan benchmarks (default: EW's own) |
+
 ## What is measured
 
 Every category has EW as the baseline, so **Ratio = delta-dotnet time / EW time** (above 1 means EW is faster).
