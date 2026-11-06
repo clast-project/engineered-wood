@@ -5,6 +5,7 @@ using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
+using Ex = EngineeredWood.Expressions.Expressions;
 
 namespace EngineeredWood.Tests.Parquet;
 
@@ -64,17 +65,53 @@ public class DottedNameProjectionTests : IDisposable
         return path;
     }
 
-    private static async Task<RecordBatch> ReadAsync(string path, string column)
+    private static async Task<RecordBatch> ReadAsync(string path, string column, ParquetReadOptions? options = null)
+    {
+        var batch = await TryReadAsync(path, column, options);
+        return Assert.IsType<RecordBatch>(batch);
+    }
+
+    /// <summary>The one batch a read of <paramref name="column"/> returns, or null when pruning skipped it.</summary>
+    private static async Task<RecordBatch?> TryReadAsync(string path, string column, ParquetReadOptions? options)
     {
         await using var file = new LocalRandomAccessFile(path);
-        using var reader = new ParquetFileReader(file, ownsFile: false);
+        using var reader = new ParquetFileReader(file, ownsFile: false, options);
         RecordBatch? result = null;
         await foreach (var batch in reader.ReadAllAsync([column]))
         {
             Assert.Null(result);
             result = batch;
         }
-        return Assert.IsType<RecordBatch>(result);
+        return result;
+    }
+
+    /// <summary>
+    /// A filter on <c>s.a</c> prunes by the top-level column too, the column the read returns, in either order:
+    /// the statistics, page-index, dictionary and Bloom filter lookups all take the top-level name first. Only
+    /// the top-level column holds 102; the struct's leaf holds 1..3, so pruning by its statistics or dictionary
+    /// skips the one row group. The statistics lookup let the later of the two win and the dictionary lookup the
+    /// earlier, so each order failed one of them.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AFilterOnATopLevelDottedName_PrunesByTheTopLevelColumn(bool structFirst)
+    {
+        string path = await WriteAsync(structFirst);
+        var options = ParquetReadOptions.Default with { Filter = Ex.Equal("s.a", 102L) };
+
+        var batch = await TryReadAsync(path, "s.a", options);
+
+        Assert.True(batch is not null, "the filter pruned the row group holding s.a = 102");
+        using (batch)
+        {
+            var values = (Int64Array)batch!.Column(0);
+            Assert.Contains(102L, Enumerable.Range(0, values.Length).Select(i => values.GetValue(i)!.Value));
+        }
+
+        // And a value only the struct's leaf holds is pruned: the filter is not ignored.
+        var pruned = await TryReadAsync(path, "s.a", options with { Filter = Ex.Equal("s.a", 2L) });
+        Assert.Null(pruned);
     }
 
     [Theory]

@@ -3141,21 +3141,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </summary>
     private static int ResolveLeafColumnIndex(SchemaDescriptor schema, string column)
     {
-        // Try matching by dotted path first.
-        for (int i = 0; i < schema.Columns.Count; i++)
-        {
-            if (schema.Columns[i].DottedPath == column)
-                return i;
-        }
-
-        // Try matching a top-level leaf by name.
-        for (int i = 0; i < schema.Columns.Count; i++)
-        {
-            if (schema.Columns[i].Path.Count == 1 && schema.Columns[i].Path[0] == column)
-                return i;
-        }
-
-        throw new ArgumentException($"Column '{column}' was not found in the schema.", nameof(column));
+        int index = schema.FindLeaf(column);
+        return index >= 0
+            ? index
+            : throw new ArgumentException($"Column '{column}' was not found in the schema.", nameof(column));
     }
 
     public async ValueTask DisposeAsync()
