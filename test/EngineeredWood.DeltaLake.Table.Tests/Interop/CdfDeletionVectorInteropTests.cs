@@ -253,10 +253,22 @@ public class CdfDeletionVectorInteropTests : IDisposable
 
     private async Task AssertVectorDeleteFeedsAsync(LocalTableFileSystem fs)
     {
-        // The premise: each version carries the vector edit AND a change file.
+        // The premise: each version carries a change file, and v2 and v4 (each part of a file) a vector edit beside
+        // it, a removed file re-added under a vector. A copy-on-write rewrite would give the same feed, so without
+        // this the test could not tell the two apart. v3's shape differs by path (#737) and is checked by the caller
+        // that pins it.
         var log = new TransactionLog(fs);
         for (long v = 2; v <= 4; v++)
-            Assert.Contains(await log.ReadCommitAsync(v), a => a is CdcFile);
+        {
+            var actions = await log.ReadCommitAsync(v);
+            Assert.Contains(actions, a => a is CdcFile);
+            if (v == 3)
+                continue;
+            var removed = actions.OfType<RemoveFile>().Select(r => r.Path).ToHashSet(StringComparer.Ordinal);
+            Assert.True(
+                actions.OfType<AddFile>().Any(a => a.DeletionVector is not null && removed.Contains(a.Path)),
+                $"v{v} re-adds no removed file under a deletion vector");
+        }
 
         var spark = Spark.Invoke("read_changes", new { path = _tempDir, start = 2, end = 4 })
             .GetProperty("rows").EnumerateArray()
