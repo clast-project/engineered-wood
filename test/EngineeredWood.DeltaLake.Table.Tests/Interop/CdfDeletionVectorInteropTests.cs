@@ -188,6 +188,173 @@ public class CdfDeletionVectorInteropTests : IDisposable
         Assert.Equal(spark, ours);
     }
 
+    private static Apache.Arrow.Schema IdPartSchema { get; } = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, false))
+        .Field(new Field("part", StringType.Default, true))
+        .Build();
+
+    /// <summary>
+    /// Unlike Spark, engineered-wood's vector DELETE writes a change file (#731: delta-rs cannot yet infer the
+    /// feed of one). The commit then holds both the vector edits and a change file, and Spark must read it from
+    /// the change file alone: the rows deleted, nothing re-inserted, and not the rows a vector hid before. Three
+    /// deletes on a partitioned table: part of a file, the rest of that file (a remove carrying its vector), and
+    /// part of one file with all of another.
+    /// </summary>
+    [SkippableTheory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task EwPredicateVectorDeletes_SparkFeedIsTheDeletedRows(bool rowTracking)
+    {
+        Spark.Require();
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var table = await DeltaTable.CreateAsync(
+            fs, IdPartSchema, partitionColumns: ["part"], enableDeletionVectors: true,
+            enableRowTracking: rowTracking,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" }))
+        {
+            await table.WriteAsync([IdParts((1, "a"), (2, "a"), (3, "a"), (4, "b"), (5, "b"), (6, "c"))]); // v1
+            await table.DeleteAsync(IdIn(2), RowDeleteMode.DeletionVector);       // v2
+            await table.DeleteAsync(IdIn(1, 3), RowDeleteMode.DeletionVector);    // v3
+            await table.DeleteAsync(IdIn(4, 6), RowDeleteMode.DeletionVector);    // v4
+        }
+
+        // v3 removes a file that already has a vector, the case delta-rs reads wrongly without a change file
+        // (delta-io/delta-rs#4946).
+        var v3 = await new TransactionLog(fs).ReadCommitAsync(3);
+        Assert.Contains(v3, a => a is RemoveFile { DeletionVector: not null });
+        Assert.DoesNotContain(v3, a => a is AddFile);
+
+        await AssertVectorDeleteFeedsAsync(fs);
+    }
+
+    /// <summary>
+    /// <see cref="EwPredicateVectorDeletes_SparkFeedIsTheDeletedRows"/> through the row-level
+    /// <see cref="DeltaTable.DeleteRowsAsync"/>, which writes its change files on a path of its own. Its v3 re-adds
+    /// the file under a vector hiding every row rather than removing it (#737); the feed is the same.
+    /// </summary>
+    [SkippableFact]
+    public async Task EwRowLevelVectorDeletes_SparkFeedIsTheDeletedRows()
+    {
+        Spark.Require();
+
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var table = await DeltaTable.CreateAsync(
+            fs, IdPartSchema, partitionColumns: ["part"], enableDeletionVectors: true,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" }))
+        {
+            await table.WriteAsync([IdParts((1, "a"), (2, "a"), (3, "a"), (4, "b"), (5, "b"), (6, "c"))]); // v1
+            foreach (long[] ids in new[] { new long[] { 2 }, [1, 3], [4, 6] })                         // v2..v4
+                await table.DeleteRowsAsync(await SelectionOfAsync(table, ids));
+        }
+
+        await AssertVectorDeleteFeedsAsync(fs);
+    }
+
+    private async Task AssertVectorDeleteFeedsAsync(LocalTableFileSystem fs)
+    {
+        // The premise: each version carries a change file, and v2 and v4 (each part of a file) a vector edit beside
+        // it, a removed file re-added under a vector. A copy-on-write rewrite would give the same feed, so without
+        // this the test could not tell the two apart. v3's shape differs by path (#737) and is checked by the caller
+        // that pins it.
+        var log = new TransactionLog(fs);
+        for (long v = 2; v <= 4; v++)
+        {
+            var actions = await log.ReadCommitAsync(v);
+            Assert.Contains(actions, a => a is CdcFile);
+            if (v == 3)
+                continue;
+            var removed = actions.OfType<RemoveFile>().Select(r => r.Path).ToHashSet(StringComparer.Ordinal);
+            Assert.True(
+                actions.OfType<AddFile>().Any(a => a.DeletionVector is not null && removed.Contains(a.Path)),
+                $"v{v} re-adds no removed file under a deletion vector");
+        }
+
+        var spark = Spark.Invoke("read_changes", new { path = _tempDir, start = 2, end = 4 })
+            .GetProperty("rows").EnumerateArray()
+            .Select(r => (
+                Version: r.GetProperty("_commit_version").GetInt64(),
+                Type: r.GetProperty("_change_type").GetString()!,
+                Id: r.GetProperty("id").GetInt64(),
+                Part: r.GetProperty("part").GetString()!))
+            .OrderBy(r => r.Version).ThenBy(r => r.Id)
+            .ToList();
+
+        var ours = new List<(long Version, string Type, long Id, string Part)>();
+        await using (var reader = await DeltaTable.OpenAsync(fs))
+        {
+            await foreach (var batch in reader.ReadChangesAsync(
+                new DeltaChangeReadOptions { StartVersion = 2, EndVersion = 4 }))
+            {
+                var ids = (Int64Array)batch.Column("id");
+                var parts = (StringArray)batch.Column("part");
+                var types = (StringArray)batch.Column("_change_type");
+                var versions = (Int64Array)batch.Column("_commit_version");
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    ours.Add((versions.GetValue(i)!.Value, types.GetString(i), ids.GetValue(i)!.Value,
+                        parts.GetString(i)));
+                }
+            }
+        }
+        ours = [.. ours.OrderBy(r => r.Version).ThenBy(r => r.Id)];
+
+        Assert.Equal(
+            new (long, string, long, string)[]
+            {
+                (2, "delete", 2, "a"),
+                (3, "delete", 1, "a"), (3, "delete", 3, "a"),
+                (4, "delete", 4, "b"), (4, "delete", 6, "c"),
+            },
+            spark);
+        Assert.Equal(spark, ours);
+    }
+
+    private static Func<RecordBatch, BooleanArray> IdIn(params long[] ids) => batch =>
+    {
+        var column = (Int64Array)batch.Column("id");
+        var mask = new BooleanArray.Builder();
+        for (int i = 0; i < batch.Length; i++)
+            mask.Append(System.Array.IndexOf(ids, column.GetValue(i)!.Value) >= 0);
+        return mask.Build();
+    };
+
+    /// <summary>The live rows holding <paramref name="ids"/>, by file and absolute position.</summary>
+    private static async Task<RowSelection> SelectionOfAsync(DeltaTable table, long[] ids)
+    {
+        var selected = new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal);
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator }))
+        {
+            var column = (Int64Array)batch.Column("id");
+            var paths = (StringArray)batch.Column(
+                RowSelection.DefaultMetadataPrefix + RowSelection.FilePathColumnSuffix);
+            var positions = (Int64Array)batch.Column(
+                RowSelection.DefaultMetadataPrefix + RowSelection.RowIndexColumnSuffix);
+            for (int i = 0; i < batch.Length; i++)
+            {
+                if (System.Array.IndexOf(ids, column.GetValue(i)!.Value) < 0)
+                    continue;
+                string path = paths.GetString(i);
+                if (!selected.TryGetValue(path, out var set))
+                    selected[path] = set = new HashSet<long>();
+                ((HashSet<long>)set).Add(positions.GetValue(i)!.Value);
+            }
+        }
+        return RowSelection.ByPath(selected);
+    }
+
+    private static RecordBatch IdParts(params (long Id, string Part)[] rows)
+    {
+        var ids = new Int64Array.Builder();
+        var parts = new StringArray.Builder();
+        foreach (var (id, part) in rows)
+        {
+            ids.Append(id);
+            parts.Append(part);
+        }
+        return new RecordBatch(IdPartSchema, [ids.Build(), parts.Build()], rows.Length);
+    }
+
     private static RecordBatch Ids(params long[] ids) =>
         new(IdSchema, [new Int64Array.Builder().AppendRange(ids).Build()], ids.Length);
 
