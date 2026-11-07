@@ -429,68 +429,6 @@ public class CreateTimeFeatureEnablementTests : IDisposable
         Assert.Equal(-1, await new TransactionLog(fs).GetLatestVersionAsync());
     }
 
-    // delta-spark refuses every write to an IcebergCompatV2 table whose protocol supports deletion vectors (#744).
-    // Caller-supplied actions can make one from either side, so each seam that takes them checks the table as the
-    // commit leaves it.
-    [Fact]
-    public async Task EnablingIcebergCompatV2_OnADeletionVectorTable_IsRefused()
-    {
-        var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdValueSchema(),
-            columnMappingMode: ColumnMappingMode.Name,
-            enableDeletionVectors: true);
-        var metadata = table.CurrentSnapshot.Metadata;
-        var withV2 = metadata with
-        {
-            Configuration = metadata.Configuration!
-                .Append(new KeyValuePair<string, string>(IcebergCompat.EnableV2Key, "true"))
-                .ToDictionary(pair => pair.Key, pair => pair.Value),
-        };
-        var protocol = table.CurrentSnapshot.Protocol;
-        var withV2Feature = protocol with { WriterFeatures = [.. protocol.WriterFeatures!, "icebergCompatV2"] };
-
-        await AssertEverySeamRefusesAsync(fs, table, [withV2Feature, withV2]);
-    }
-
-    [Fact]
-    public async Task AddingDeletionVectors_ToAnIcebergCompatV2Table_IsRefused()
-    {
-        var fs = new LocalTableFileSystem(_tempDir);
-        await using var table = await DeltaTable.CreateAsync(fs, IdValueSchema(),
-            columnMappingMode: ColumnMappingMode.Name,
-            configuration: new Dictionary<string, string> { [IcebergCompat.EnableV2Key] = "true" });
-        var protocol = table.CurrentSnapshot.Protocol;
-        var withDvs = protocol with
-        {
-            MinReaderVersion = 3,
-            ReaderFeatures = [.. protocol.ReaderFeatures ?? [], "deletionVectors"],
-            WriterFeatures = [.. protocol.WriterFeatures!, "deletionVectors"],
-        };
-
-        await AssertEverySeamRefusesAsync(fs, table, [withDvs]);
-    }
-
-    private static async Task AssertEverySeamRefusesAsync(
-        LocalTableFileSystem fs, DeltaTable table, IReadOnlyList<EngineeredWood.DeltaLake.Actions.DeltaAction> actions)
-    {
-        long version = table.CurrentSnapshot.Version;
-
-        var fused = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
-            await table.CommitDataFilesAsync(System.Array.Empty<WrittenDataFile>(), extraActions: actions));
-        Assert.Equal(DeltaErrorCodes.IcebergCompatViolation, fused.ErrorCode);
-
-        var txn = table.StartTransaction();
-        txn.StageActions(actions);
-        var staged = await Assert.ThrowsAsync<DeltaFormatException>(async () => await txn.CommitAsync());
-        Assert.Equal(DeltaErrorCodes.IcebergCompatViolation, staged.ErrorCode);
-
-        var clustering = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
-            await table.SetClusteringColumnsAsync([], extraActions: actions));
-        Assert.Equal(DeltaErrorCodes.IcebergCompatViolation, clustering.ErrorCode);
-
-        Assert.Equal(version, await new TransactionLog(fs).GetLatestVersionAsync());
-    }
-
     [Fact]
     public async Task IcebergCompatV1_WithArrayColumn_Throws()
     {

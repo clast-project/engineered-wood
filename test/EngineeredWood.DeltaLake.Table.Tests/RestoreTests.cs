@@ -696,6 +696,8 @@ public class RestoreTests : IDisposable
             };
             if (icebergCompatV2)
                 configuration[IcebergCompat.EnableV2Key] = "true";
+            else
+                configuration[DeletionVectors.DeletionVectorConfig.EnableKey] = "true";
             return RawMetadata(configuration) with { SchemaString = mappedSchema };
         }
 

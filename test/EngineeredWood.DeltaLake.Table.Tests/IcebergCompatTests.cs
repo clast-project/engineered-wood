@@ -195,6 +195,7 @@ public class IcebergCompatTests : IDisposable
             {
                 { ColumnMapping.ModeKey, "name" },
                 { IcebergCompat.EnableV1Key, "true" },
+                { "delta.enableDeletionVectors", "true" },
             },
         };
         var protocol = new ProtocolAction
@@ -323,33 +324,70 @@ public class IcebergCompatTests : IDisposable
         IcebergCompat.Validate(IcebergCompatVersion.V2, metadata, protocol);
     }
 
-    [Fact]
-    public void Validate_V2_WithDeletionVectors_Throws()
+    // delta-spark's CheckDeletionVectorDisabled, shared by V1 and V2 (#744): a protocol that supports deletion
+    // vectors is refused when they are writable (supported AND delta.enableDeletionVectors) before the commit or
+    // after it. The feature alone, with the property off, passes.
+    private static MetadataAction V2Metadata(bool deletionVectorsEnabled) => new()
     {
-        var metadata = new MetadataAction
+        Id = "test",
+        Format = Format.Parquet,
+        SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
+        PartitionColumns = [],
+        Configuration = new Dictionary<string, string>
         {
-            Id = "test",
-            Format = Format.Parquet,
-            SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}}]}""",
-            PartitionColumns = [],
-            Configuration = new Dictionary<string, string>
-            {
-                { ColumnMapping.ModeKey, "name" },
-                { IcebergCompat.EnableV2Key, "true" },
-            },
-        };
-        var protocol = new ProtocolAction
-        {
-            MinReaderVersion = 2,
-            MinWriterVersion = 7,
-            WriterFeatures = ["columnMapping", "icebergCompatV2", "deletionVectors"],
-        };
+            { ColumnMapping.ModeKey, "name" },
+            { IcebergCompat.EnableV2Key, "true" },
+            { "delta.enableDeletionVectors", deletionVectorsEnabled ? "true" : "false" },
+        },
+    };
 
-        // delta-spark's IcebergCompatV2 carries CheckDeletionVectorDisabled, as V1 does (#744).
-        var ex = Assert.Throws<DeltaFormatException>(() =>
-            IcebergCompat.Validate(IcebergCompatVersion.V2, metadata, protocol));
+    private static ProtocolAction V2Protocol(bool deletionVectorsSupported) => new()
+    {
+        MinReaderVersion = deletionVectorsSupported ? 3 : 2,
+        MinWriterVersion = 7,
+        ReaderFeatures = deletionVectorsSupported ? ["columnMapping", "deletionVectors"] : null,
+        WriterFeatures = deletionVectorsSupported
+            ? ["columnMapping", "icebergCompatV2", "deletionVectors"]
+            : ["columnMapping", "icebergCompatV2"],
+    };
+
+    [Fact]
+    public void Validate_V2_WithDeletionVectorsEnabled_Throws()
+    {
+        var ex = Assert.Throws<DeltaFormatException>(() => IcebergCompat.Validate(
+            IcebergCompatVersion.V2, V2Metadata(deletionVectorsEnabled: true), V2Protocol(deletionVectorsSupported: true)));
         Assert.Equal(DeltaErrorCodes.IcebergCompatViolation, ex.ErrorCode);
         Assert.Contains("IcebergCompatV2", ex.Message);
+    }
+
+    [Fact]
+    public void Validate_V2_WithTheDeletionVectorFeatureButThePropertyOff_Passes()
+    {
+        var off = V2Metadata(deletionVectorsEnabled: false);
+        var supported = V2Protocol(deletionVectorsSupported: true);
+        IcebergCompat.Validate(IcebergCompatVersion.V2, off, supported);
+        IcebergCompat.Validate(IcebergCompatVersion.V2, off, supported, off, supported);
+    }
+
+    // Spark judges the snapshot the commit is based on too, so even the commit that turns the property off is
+    // refused while IcebergCompat stays on.
+    [Fact]
+    public void Validate_V2_TurningWritableDeletionVectorsOff_Throws()
+    {
+        var supported = V2Protocol(deletionVectorsSupported: true);
+        var ex = Assert.Throws<DeltaFormatException>(() => IcebergCompat.Validate(
+            IcebergCompatVersion.V2, V2Metadata(deletionVectorsEnabled: false), supported,
+            V2Metadata(deletionVectorsEnabled: true), supported));
+        Assert.Equal(DeltaErrorCodes.IcebergCompatViolation, ex.ErrorCode);
+    }
+
+    // The property counts only where the protocol supports the feature: before it did, the property was inert.
+    [Fact]
+    public void Validate_V2_ThePropertyBeforeTheFeatureWasSupported_DoesNotCount()
+    {
+        IcebergCompat.Validate(
+            IcebergCompatVersion.V2, V2Metadata(deletionVectorsEnabled: false), V2Protocol(deletionVectorsSupported: true),
+            V2Metadata(deletionVectorsEnabled: true), V2Protocol(deletionVectorsSupported: false));
     }
 
     #endregion
