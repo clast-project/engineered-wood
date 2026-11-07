@@ -355,8 +355,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// is the whole cost of the open (#740).
     /// </summary>
     /// <param name="fileSystem">The filesystem rooted at the table directory.</param>
-    /// <param name="startFrom">A snapshot of this table, at any version. It is not modified, and can start any number
-    /// of opens, concurrently: a <see cref="Snapshot.Snapshot"/> is immutable.</param>
+    /// <param name="startFrom">A snapshot of THIS table (the one at <paramref name="fileSystem"/>), at any version. It
+    /// is not modified, and can start any number of opens, concurrently: a <see cref="Snapshot.Snapshot"/> is
+    /// immutable.</param>
     /// <param name="options">Table options.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <remarks>
@@ -365,7 +366,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <paramref name="startFrom"/> would be wrong or cannot be shown right: log cleanup has removed commits after
     /// it, the table was dropped and re-created at this path, or <paramref name="startFrom"/> cannot be matched to
     /// the log (a snapshot built in memory, or a backend that identifies files by neither ETag nor modification
-    /// time). A snapshot of a different table at another path falls back the same way.</para>
+    /// time).</para>
+    ///
+    /// <para><b>⚠ A snapshot of a different table is the caller's error, and is recognised only as a side effect.</b>
+    /// A snapshot does not know which table it came from: its log files are recorded by their paths in the log, and
+    /// those are the same in every table. One taken from another table is rebuilt from when the files at its version
+    /// differ from this table's, which they do whenever each table wrote its own: by ETag on Azure and GCS (whose tags
+    /// name one object each), and by size or modification time elsewhere. They can match only for byte-identical
+    /// commit files, e.g. a log copied with its times preserved, or on S3 (whose ETag is the content's MD5) two
+    /// commits with identical bytes. Then the other table's state is kept. Key a snapshot cache by table location.</para>
     ///
     /// <para><b>Writers can use it too.</b> The handle's snapshot is the latest listed version, as after a fresh open,
     /// so a transaction begun on it has the same (normally empty) range of concurrent commits to check: a metadata

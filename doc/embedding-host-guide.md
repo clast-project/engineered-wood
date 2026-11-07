@@ -39,8 +39,12 @@ cached = table.CurrentSnapshot;
 The handle is at the table's LATEST version, the same as a fresh `OpenAsync(fs)`, and it falls back to that full
 open whenever continuing from `cached` cannot be shown right. That covers log cleanup past it, a table dropped and
 re-created at the same path (recognised by the identity of the log files at `cached`'s version, see
-`TableFileInfo.ETag`), and a snapshot of another table. A writer can use it too: its base is the latest version,
-so a metadata change committed while `cached` was held is in the snapshot, not a conflict.
+`TableFileInfo.ETag`). A writer can use it too: its base is the latest version, so a metadata change committed
+while `cached` was held is in the snapshot, not a conflict.
+
+**Key the cache by table location.** A snapshot does not know which table it came from; one from another table is
+usually rebuilt from, because the log files at its version differ, but not when they are byte-identical (a copied
+log, or on S3, whose ETag is the content's MD5, two identical commits). Then the other table's state is kept.
 
 This is NOT a pin. To commit against the version the work was planned on, use the next section.
 

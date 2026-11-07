@@ -155,8 +155,11 @@ public class OpenFromSnapshotTests : IDisposable
     }
 
     [Fact]
-    public async Task Snapshot_of_another_table_opens_this_one()
+    public async Task Snapshot_of_another_table_that_wrote_its_own_log_opens_this_one()
     {
+        // The usual case: each table wrote its own commit files, so the files at the snapshot's version differ.
+        // Byte-identical ones (a copied log) would match; see the overload's remarks. Passing another table's
+        // snapshot is the caller's error either way.
         string other = Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), $"delta_other_{Guid.NewGuid():N}"))
             .FullName;
         try
