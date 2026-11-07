@@ -376,6 +376,7 @@ internal static class OrderedScan
                 }
             }
             _undrained.Clear();
+            _budget.Close();
             _cts.Dispose();
             _running.Dispose();
         }

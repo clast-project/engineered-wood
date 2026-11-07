@@ -236,6 +236,52 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.Equal(0, parallel.LastScanBudget.Used);
     }
 
+    /// <summary>Two readers given one <see cref="ParquetReadOptions.MemoryBudget"/> (#719): their own budgets
+    /// are far above it, so the shared one holds both reads back, and both still read every row.</summary>
+    [Fact]
+    public async Task TwoReadersSharingABudget_AreHeldToItTogether()
+    {
+        long largest = 0;
+        await using (var file = new LocalRandomAccessFile(_path))
+        using (var reader = new ParquetFileReader(file, ownsFile: false, Options(1)))
+        {
+            await foreach (var batch in reader.ReadAllAsync())
+            {
+                using (batch)
+                    largest = Math.Max(largest, EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(batch));
+            }
+        }
+        var expected = await ReadAsync(Options(1));
+
+        long cap = 2 * largest;
+        var shared = new EngineeredWood.Memory.MemoryBudget(cap);
+        var options = Options(8) with { MemoryBudget = shared };
+
+        async Task<(List<Snapshot> Read, long Peak)> SlowlyAsync()
+        {
+            await using var input = new LocalRandomAccessFile(_path);
+            using var reader = new ParquetFileReader(input, ownsFile: false, options);
+            var result = new List<Snapshot>();
+            await foreach (var positioned in reader.ReadWithPositionsAsync(null, null, null, default))
+            {
+                using var batch = positioned.Batch;
+                result.Add(Take(positioned.FirstRow, batch));
+                await Task.Delay(5);
+            }
+            Assert.Equal(0, reader.LastScanBudget!.Used);
+            return (result, reader.LastScanBudget.Peak);
+        }
+
+        var reads = await Task.WhenAll(SlowlyAsync(), SlowlyAsync());
+
+        AssertSame(expected, reads[0].Read);
+        AssertSame(expected, reads[1].Read);
+        // The shared cap, plus for each reader the batch its caller waits on and one underestimate (as in
+        // TheBudget_BoundsWhatIsHeld).
+        Assert.InRange(shared.PeakBytes, 1, cap + 2 * 2 * largest);
+        Assert.Equal(0, shared.UsedBytes);
+    }
+
     [Theory]
     [InlineData(1)]
     [InlineData(3)]

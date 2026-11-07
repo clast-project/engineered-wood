@@ -306,7 +306,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // concurrently, on this one reader, which is safe for them.
         // The schema is built before the fan-out, so that the decodes find it cached rather than race to.
         await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-        var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes);
+        var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes, _options.MemoryBudget);
         LastScanBudget = budget;
         var growth = new DecodedGrowth();
         await foreach (var batch in OrderedScan.RunAsync(

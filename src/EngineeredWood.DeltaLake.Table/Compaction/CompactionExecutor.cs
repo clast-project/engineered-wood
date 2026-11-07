@@ -74,7 +74,8 @@ internal static class CompactionExecutor
         IDataFileReader? dataFileReader = null,
         WrittenFileLedger? written = null,
         int maxConcurrentReads = 1,
-        long maxBufferedReadBytes = long.MaxValue)
+        long maxBufferedReadBytes = long.MaxValue,
+        EngineeredWood.Memory.MemoryBudget? memoryBudget = null)
     {
         // Select small files as compaction candidates and group them BY PARTITION: a data file belongs to
         // exactly ONE partition (its add.partitionValues), so each group must compact independently. Mixing
@@ -144,7 +145,7 @@ internal static class CompactionExecutor
                 fs, snapshot, options, parquetOptions, parquetReadOptions, group, targetSchema, mappingMode,
                 dvReader, actions, now, assignRowIds, nextRowId, materialize, matRowIdName, matRowVerName,
                 dataFileWriter, dataFileReader, cancellationToken, written, statsSelection,
-                maxConcurrentReads, maxBufferedReadBytes).ConfigureAwait(false);
+                maxConcurrentReads, maxBufferedReadBytes, memoryBudget).ConfigureAwait(false);
             anyAdds |= compacted;
         }
 
@@ -199,7 +200,7 @@ internal static class CompactionExecutor
     /// <summary>
     /// The raw batches of every file of <paramref name="group"/>, in group order then file order. With
     /// <paramref name="maxConcurrentReads"/> above 1 the files are read that many at once through
-    /// <see cref="OrderedScan"/>, holding at most <paramref name="maxBufferedReadBytes"/> of decoded batches the
+    /// <see cref="OrderedScan"/>, holding at most <paramref name="maxBufferedReadBytes"/> (within <paramref name="memoryBudget"/>, when given) of decoded batches the
     /// writer has not taken yet, as a table scan does; with 1, one after another.
     /// </summary>
     private static IAsyncEnumerable<SourceBatch> ReadGroupAsync(
@@ -210,6 +211,7 @@ internal static class CompactionExecutor
         IDataFileReader? dataFileReader,
         int maxConcurrentReads,
         long maxBufferedReadBytes,
+        EngineeredWood.Memory.MemoryBudget? memoryBudget,
         CancellationToken cancellationToken)
     {
         if (maxConcurrentReads <= 1 || group.Count == 1)
@@ -222,7 +224,7 @@ internal static class CompactionExecutor
             static b => RollingDataFileWriter.EstimatedBytes(b.Batch),
             static b => b.Batch.Dispose(),
             maxConcurrentReads,
-            new ScanMemoryBudget(maxBufferedReadBytes),
+            new ScanMemoryBudget(maxBufferedReadBytes, memoryBudget),
             cancellationToken: cancellationToken);
     }
 
@@ -341,7 +343,8 @@ internal static class CompactionExecutor
         WrittenFileLedger? written,
         Stats.StatsColumnSelection statsSelection,
         int maxConcurrentReads,
-        long maxBufferedReadBytes)
+        long maxBufferedReadBytes,
+        EngineeredWood.Memory.MemoryBudget? memoryBudget)
     {
         // The group's Hive directory: one partition = one directory, so the compacted file joins its
         // sources' directory. The add keeps the ENCODED prefix (reused verbatim from a source path, so it
@@ -373,7 +376,7 @@ internal static class CompactionExecutor
             // store), but their batches arrive here in group order, so what is written is what a serial read wrote.
             await foreach (var source in ReadGroupAsync(
                                fs, group, dvReader, parquetReadOptions, dataFileReader,
-                               maxConcurrentReads, maxBufferedReadBytes, cancellationToken).ConfigureAwait(false))
+                               maxConcurrentReads, maxBufferedReadBytes, memoryBudget, cancellationToken).ConfigureAwait(false))
             {
                 var (batch, batchStartRow, deletedRows) = (source.Batch, source.FirstRow, source.DeletedRows);
                 long baseId = source.File.BaseRowId ?? 0;

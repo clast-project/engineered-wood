@@ -135,6 +135,21 @@ public sealed record DeltaTableOptions
     private readonly long _maxBufferedReadBytes = 256L * 1024 * 1024;
 
     /// <summary>
+    /// A budget that every scan of this table running several reads at once (<see cref="MaxConcurrentReads"/>)
+    /// draws from on top of its own <see cref="MaxBufferedReadBytes"/>. Default: null, a budget of each scan's
+    /// own.
+    /// </summary>
+    /// <remarks>
+    /// <para>Each scan charges a child of this budget capped at <see cref="MaxBufferedReadBytes"/>, so
+    /// <see cref="MaxBufferedReadBytes"/> caps one scan and this budget caps all of them together. Give the same
+    /// budget to several tables (or to Parquet readers, through <c>ParquetReadOptions.MemoryBudget</c>) to
+    /// bound their total. A scan waits while either is full, except that the batch its caller is waiting on is
+    /// always admitted, so one scan can never be stalled by the others. See
+    /// <see cref="EngineeredWood.Memory.MemoryBudget"/> for what is counted; a writer's memory is not, yet.</para>
+    /// </remarks>
+    public EngineeredWood.Memory.MemoryBudget? MemoryBudget { get; init; }
+
+    /// <summary>
     /// Number of commits between automatic checkpoints, used when the table declares no interval of its
     /// own. Set to 0 to disable automatic checkpointing. Default: 10.
     /// </summary>

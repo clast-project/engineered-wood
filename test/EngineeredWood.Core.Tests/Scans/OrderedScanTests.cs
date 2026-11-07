@@ -3,6 +3,7 @@
 
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using EngineeredWood.Memory;
 using EngineeredWood.Scans;
 
 namespace EngineeredWood.Core.Tests.Scans;
@@ -323,6 +324,135 @@ public class OrderedScanTests
         // No reservation is smaller than its item, so nothing is charged without waiting: the budget plus the
         // front file's one admitted item at most.
         Assert.InRange(memory.Peak, 1000, budget + 1000);
+    }
+
+    // ---- A budget shared by several scans (#719) ----
+
+    [Fact]
+    public async Task TwoScansSharingAParent_StayWithinItsCap_PlusOneItemEach()
+    {
+        const long size = 100;
+        const long cap = 400; // four items, for both scans together
+        var parent = new MemoryBudget(cap);
+        var a = new ScanMemoryBudget(1 << 20, parent);
+        var b = new ScanMemoryBudget(1 << 20, parent);
+
+        async Task<int> Consume(ScanMemoryBudget memory)
+        {
+            int n = 0;
+            await foreach (var item in Scan(new Files(), fileCount: 6, itemsPerFile: 4, window: 4, budget: 0,
+                               itemSize: size, memory: memory))
+            {
+                item.Delivered = true;
+                n++;
+                await Task.Delay(1); // slow consumers: the reads run ahead until the SHARED cap stops them
+            }
+            return n;
+        }
+
+        var counts = await Task.WhenAll(Consume(a), Consume(b)).WaitAsync(Timeout);
+
+        Assert.Equal([24, 24], counts);
+        // Each scan's own cap is far above the parent's, so the parent is what bound them: its cap, plus the one
+        // item each scan's front file may decode over it.
+        Assert.InRange(parent.PeakBytes, size, cap + 2 * size);
+        Assert.True(a.Peak + b.Peak > parent.PeakBytes - size, "the scans never overlapped");
+        Assert.Equal(0, parent.UsedBytes);
+    }
+
+    [Fact]
+    public async Task OneConsumerOfTwoScans_UnderAParentSmallerThanOneItem_DoesNotDeadlock()
+    {
+        // A MERGE's shape: one consumer that alternates between two scans of the same budget. Every reservation
+        // is over the parent's cap, and whichever scan the consumer is NOT waiting on may have filled it; only
+        // each scan's front-file admission lets the other through.
+        var parent = new MemoryBudget(1);
+        var first = Scan(new Files(), fileCount: 5, itemsPerFile: 3, window: 4, budget: 0, itemSize: 1000,
+            memory: new ScanMemoryBudget(1 << 20, parent));
+        var second = Scan(new Files(), fileCount: 5, itemsPerFile: 3, window: 4, budget: 0, itemSize: 1000,
+            memory: new ScanMemoryBudget(1 << 20, parent));
+
+        async Task<int> Alternate()
+        {
+            int n = 0;
+            await using var x = first.GetAsyncEnumerator();
+            await using var y = second.GetAsyncEnumerator();
+            bool moreX = true, moreY = true;
+            while (moreX || moreY)
+            {
+                if (moreX && (moreX = await x.MoveNextAsync()))
+                    n++;
+                if (moreY && (moreY = await y.MoveNextAsync()))
+                    n++;
+            }
+            return n;
+        }
+
+        Assert.Equal(30, await Alternate().WaitAsync(Timeout));
+        Assert.Equal(0, parent.UsedBytes);
+    }
+
+    [Fact]
+    public async Task AParentFullOfSomethingElse_StillLetsAScanThrough_OneItemAtATime()
+    {
+        const long size = 100;
+        var parent = new MemoryBudget(1000);
+        var hog = parent.CreateChild(long.MaxValue);
+        lock (parent.Gate)
+            hog.AdjustLocked(5000);
+
+        var memory = new ScanMemoryBudget(1 << 20, parent);
+        var got = await CollectAsync(Scan(new Files(), fileCount: 4, itemsPerFile: 3, window: 4, budget: 0,
+            itemSize: size, memory: memory)).WaitAsync(Timeout);
+
+        Assert.Equal(12, got.Count);
+        // Only the front file is admitted, and only while it has nothing queued.
+        Assert.InRange(memory.Peak, size, 2 * size);
+        lock (parent.Gate)
+            hog.AdjustLocked(-5000);
+        Assert.Equal(0, parent.UsedBytes);
+    }
+
+    [Theory]
+    [InlineData("break")]
+    [InlineData("error")]
+    [InlineData("cancel")]
+    public async Task HoweverAScanEnds_ItHandsBackEverythingItChargedToTheParent(string ending)
+    {
+        var parent = new MemoryBudget(1 << 20);
+        var files = new Files();
+        var memory = new ScanMemoryBudget(1 << 20, parent);
+        using var cts = new CancellationTokenSource();
+        var scan = Scan(files, fileCount: 10, itemsPerFile: 5, window: 4, budget: 0, itemSize: 100,
+            delay: (_, _) => TimeSpan.FromMilliseconds(1), memory: memory,
+            failFile: ending == "error" ? 3 : -1, failAt: 2, ct: cts.Token);
+
+        try
+        {
+            int n = 0;
+            await foreach (var item in scan.WithCancellation(default))
+            {
+                item.Delivered = true;
+                if (++n == 7)
+                {
+                    if (ending == "break")
+                        break;
+                    if (ending == "cancel")
+                        cts.Cancel();
+                }
+            }
+            Assert.Equal("break", ending);
+        }
+        catch (InvalidOperationException) when (ending == "error")
+        {
+        }
+        catch (OperationCanceledException) when (ending == "cancel")
+        {
+        }
+
+        Assert.True(parent.PeakBytes > 0);
+        Assert.Equal(0, parent.UsedBytes);
+        files.AssertNothingLeaked();
     }
 
     [Fact]

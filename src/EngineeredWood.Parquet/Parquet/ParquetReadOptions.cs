@@ -482,6 +482,19 @@ public sealed record ParquetReadOptions
     private readonly long _maxBufferedReadBytes = 256L * 1024 * 1024;
 
     /// <summary>
+    /// A budget that a read of several row groups at once (<see cref="MaxConcurrentRowGroups"/>) draws from on
+    /// top of its own <see cref="MaxBufferedReadBytes"/>. Default: null, a budget of the read's own.
+    /// </summary>
+    /// <remarks>
+    /// <para>Each such read charges a child of this budget capped at <see cref="MaxBufferedReadBytes"/>, so
+    /// <see cref="MaxBufferedReadBytes"/> caps one read and this budget caps all of them together: give the same
+    /// budget to several readers (or to a <c>DeltaTableOptions</c>) to bound their total. A read waits while
+    /// either is full, except that the batch the caller is waiting on is always admitted, so one read can never
+    /// be stalled by the others. See <see cref="EngineeredWood.Memory.MemoryBudget"/> for what is counted.</para>
+    /// </remarks>
+    public EngineeredWood.Memory.MemoryBudget? MemoryBudget { get; init; }
+
+    /// <summary>
     /// Shorthand for <c>ByteArrayOutput == ByteArrayOutputKind.ViewType</c>.
     /// When set to <see langword="true"/>, sets <see cref="ByteArrayOutput"/> to
     /// <see cref="ByteArrayOutputKind.ViewType"/>; setting to <see langword="false"/>
