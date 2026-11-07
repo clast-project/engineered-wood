@@ -23,10 +23,16 @@ namespace EngineeredWood.DeltaLake.Table.ChangeDataFeed;
 /// <c>_change_type</c>, and every reader (Spark's <c>table_changes</c>, delta-rs, engineered-wood's own feed) reads
 /// a file of mixed types.</para>
 ///
-/// <para>Rows are held only until a row group fills. Across partitions the held bytes are capped at one row
-/// group's worth (<see cref="ParquetWriteOptions.RowGroupMaxBytes"/>): past it, the partition holding the most is
-/// written out as a row group, so an UPDATE moving rows across many partitions cannot buffer a row group for each.
-/// </para>
+/// <para>Rows are held only until a row group fills. Across partitions the held bytes (counting the whole batch a
+/// held slice keeps alive) are capped at one row group's worth (<see cref="ParquetWriteOptions.RowGroupMaxBytes"/>):
+/// past it, the partition holding the most is written out as a row group, so an UPDATE moving rows across many
+/// partitions cannot buffer a row group for each. One partition alone may hold more, as a lone data writer does: the
+/// batch it keeps alive is one the caller held anyway.</para>
+///
+/// <para>At most <see cref="DefaultMaxOpenFiles"/> files are open at once: each holds a stream, and a cloud stream
+/// holds an upload buffer (4 MiB on Azure). Opening one more closes the least recently used, and that partition's
+/// next rows start a new file, so an operation interleaving rows of many partitions writes more files rather than
+/// holding a stream per partition.</para>
 ///
 /// <para>Disposing without <see cref="CompleteAsync"/> abandons the open files, unpublished. Every file is recorded
 /// in <c>written</c> before its first byte, so a failed operation's cleanup finds it.</para>
@@ -40,11 +46,23 @@ internal sealed class ChangeDataFileSink : IAsyncDisposable
     private readonly WrittenFileLedger? _written;
     private readonly List<Partition> _partitions = new();
     private readonly Dictionary<string, Partition> _byKey = new(StringComparer.Ordinal);
+    private readonly int _maxOpenFiles;
+
+    // Kept up to date after every call into a writer, so no call scans every partition the operation has reached.
+    private readonly HashSet<Partition> _holding = new();
+    private readonly HashSet<Partition> _open = new();
+    private long _held;
+    private long _clock;
+
+    /// <summary>How many change files may be open at once.</summary>
+    internal const int DefaultMaxOpenFiles = 16;
 
     private sealed class Partition(Dictionary<string, string> values, RollingDataFileWriter writer)
     {
         public Dictionary<string, string> Values { get; } = values;
         public RollingDataFileWriter Writer { get; } = writer;
+        public long Retained { get; set; }
+        public long LastUsed { get; set; }
     }
 
     public ChangeDataFileSink(
@@ -52,8 +70,10 @@ internal sealed class ChangeDataFileSink : IAsyncDisposable
         EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot,
         ParquetWriteOptions options,
         long targetFileSize,
-        WrittenFileLedger? written)
+        WrittenFileLedger? written,
+        int maxOpenFiles = DefaultMaxOpenFiles)
     {
+        _maxOpenFiles = Math.Max(1, maxOpenFiles);
         _fs = fs;
         _snapshot = snapshot;
         _options = options;
@@ -78,23 +98,53 @@ internal sealed class ChangeDataFileSink : IAsyncDisposable
 
         var prepared = CdfWriter.PrepareRows(_snapshot, rows, changeType, rowIds, rowCommitVersions);
         var partition = PartitionOf(partitionValues);
+        partition.LastUsed = ++_clock;
         // No stats are collected for a change file, so the stats batch is never read.
         await partition.Writer.AddAsync(prepared, prepared, cancellationToken).ConfigureAwait(false);
+        Track(partition);
 
-        long held = 0;
-        foreach (var p in _partitions)
-            held += p.Writer.PendingBytes;
-        while (held > _options.RowGroupMaxBytes)
+        // A non-positive limit (unvalidated) is taken as one byte. Every pass empties a holding partition, so the
+        // loop ends.
+        long limit = Math.Max(1, _options.RowGroupMaxBytes);
+        while (_held > limit && _holding.Count > 1)
         {
-            var largest = _partitions[0];
-            foreach (var p in _partitions)
+            Partition? largest = null;
+            foreach (var p in _holding)
             {
-                if (p.Writer.PendingBytes > largest.Writer.PendingBytes)
+                if (largest is null || p.Retained > largest.Retained)
                     largest = p;
             }
-            held -= largest.Writer.PendingBytes;
-            await largest.Writer.FlushPendingAsync(cancellationToken).ConfigureAwait(false);
+            await largest!.Writer.FlushPendingAsync(cancellationToken).ConfigureAwait(false);
+            Track(largest);
         }
+
+        while (_open.Count > _maxOpenFiles)
+        {
+            Partition? oldest = null;
+            foreach (var p in _open)
+            {
+                if (oldest is null || p.LastUsed < oldest.LastUsed)
+                    oldest = p;
+            }
+            await oldest!.Writer.CloseFileAsync(cancellationToken).ConfigureAwait(false);
+            Track(oldest);
+        }
+    }
+
+    // Brings the totals up to date with what a call into the partition's writer changed.
+    private void Track(Partition partition)
+    {
+        long retained = partition.Writer.RetainedBytes;
+        _held += retained - partition.Retained;
+        partition.Retained = retained;
+        if (retained > 0)
+            _holding.Add(partition);
+        else
+            _holding.Remove(partition);
+        if (partition.Writer.HasOpenFile)
+            _open.Add(partition);
+        else
+            _open.Remove(partition);
     }
 
     /// <summary>Writes what is held, closes every file, and returns their <c>cdc</c> actions: the partitions in the

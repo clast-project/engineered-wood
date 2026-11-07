@@ -112,6 +112,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     private readonly List<RecordBatch> _pending = new();
     private long _pendingRows;
     private long _pendingBytes;
+    private long _retainedBytes;
 
     /// <param name="partitionDirectory">The file's Hive-style directory relative to the table root, or empty.</param>
     /// <param name="collectStats">Whether to collect per-file stats, over the batches <see cref="AddAsync"/> is
@@ -152,7 +153,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         long batchBytes = EstimatedBytes(writeBatch);
         if (_host is not null)
         {
-            Append(writeBatch, statsBatch, batchBytes);
+            Append(writeBatch, statsBatch, batchBytes, batchBytes);
             if (_pendingBytes >= _targetFileSize)
                 await CloseFileAsync(cancellationToken).ConfigureAwait(false);
             return;
@@ -179,7 +180,8 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             Append(
                 whole ? writeBatch : writeBatch.Slice(offset, rows),
                 whole ? statsBatch : statsBatch.Slice(offset, rows),
-                whole ? batchBytes : batchBytes * rows / writeBatch.Length);
+                whole ? batchBytes : batchBytes * rows / writeBatch.Length,
+                batchBytes);
             offset += rows;
 
             if (_pendingRows >= maxRows || _pendingBytes >= _options.RowGroupMaxBytes)
@@ -192,7 +194,9 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     }
 
     // Adds rows to the file being filled. They are written to it: the file closes only once they are flushed.
-    private void Append(RecordBatch writeBatch, RecordBatch statsBatch, long bytes)
+    // `bytes` is the rows' share of their batch, which sizes the row group; `retained` is what holding them keeps
+    // alive, the whole batch, since a slice shares its batch's buffers.
+    private void Append(RecordBatch writeBatch, RecordBatch statsBatch, long bytes, long retained)
     {
         _fileSchema ??= writeBatch.Schema;
         _fileRows += writeBatch.Length;
@@ -202,11 +206,17 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         _pending.Add(writeBatch);
         _pendingRows += writeBatch.Length;
         _pendingBytes += bytes;
+        _retainedBytes += retained;
     }
 
-    /// <summary>The estimated Arrow bytes held for the row group being built (under a host writer, the whole
-    /// file), which <see cref="FlushPendingAsync"/> writes out.</summary>
-    public long PendingBytes => _pendingBytes;
+    /// <summary>The estimated Arrow bytes the pending rows (the row group being built; under a host writer, the
+    /// whole file) keep alive, which <see cref="FlushPendingAsync"/> releases. A pending slice keeps its whole batch's
+    /// buffers, so this counts the whole batch, and can exceed the row group's size.</summary>
+    public long RetainedBytes => _retainedBytes;
+
+    /// <summary>Whether a file is open: a row group has been written to it and it is not yet closed.</summary>
+    public bool HasOpenFile => _writer is not null;
+
 
     /// <summary>
     /// Writes the pending rows as a row group now, before it is full, and closes the file if that takes it to the
@@ -262,7 +272,9 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         await _writer.WriteRowGroupAsync(rowGroup, cancellationToken).ConfigureAwait(false);
     }
 
-    private async ValueTask CloseFileAsync(CancellationToken cancellationToken)
+    /// <summary>Writes what is pending and closes the file being filled, so the next rows start a new one; also for a
+    /// caller that bounds how many files its writers hold open.</summary>
+    public async ValueTask CloseFileAsync(CancellationToken cancellationToken)
     {
         if (_fileRows == 0)
             return;
@@ -319,6 +331,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         _pending.Clear();
         _pendingRows = 0;
         _pendingBytes = 0;
+        _retainedBytes = 0;
     }
 
     private async ValueTask DisposeOpenFileAsync()

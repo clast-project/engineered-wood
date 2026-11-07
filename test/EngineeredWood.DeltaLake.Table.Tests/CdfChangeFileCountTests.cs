@@ -7,6 +7,7 @@ using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
 using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.RowTracking;
+using EngineeredWood.DeltaLake.Table.ChangeDataFeed;
 using EngineeredWood.Expressions;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
@@ -336,6 +337,80 @@ public class CdfChangeFileCountTests : IDisposable
             Assert.True((await reader.ReadMetadataAsync()).RowGroups.Count > 1);
         }
         Assert.Equal(UpdateFeed(Enumerable.Range(0, Files * RowsPerFile).Select(i => (long)i)), await FeedAsync(table, version));
+    }
+
+    private static Dictionary<string, string> PartitionNamed(string name) => new() { ["p"] = name };
+
+    private async Task<List<long>> RowGroupRowsAsync(CdcFile file)
+    {
+        await using var stream = new LocalRandomAccessFile(Path.Combine(_tempDir, DeltaPath.Decode(file.Path)));
+        using var reader = new ParquetFileReader(stream, ownsFile: false);
+        return (await reader.ReadMetadataAsync()).RowGroups.Select(g => g.NumRows).ToList();
+    }
+
+    // Each open file holds a stream (on Azure, a 4 MiB upload buffer): opening one past the cap closes the least
+    // recently used, whose partition's next rows start a new file.
+    [Fact]
+    public async Task OpenChangeFiles_AreCapped_TheLeastRecentlyUsedClosing()
+    {
+        await using var table = await CreateAsync();
+        var options = ParquetWriteOptions.Default with { RowGroupMaxBytes = 1 };
+        var cdc = new List<CdcFile>();
+        await using (var sink = new ChangeDataFileSink(
+                         Fs, table.CurrentSnapshot, options, targetFileSize: long.MaxValue, written: null, maxOpenFiles: 2))
+        {
+            // Every add is written at once (one-byte row groups), so each opens its partition's file.
+            foreach (string partition in new[] { "a", "b", "c", "a", "b", "c" })
+                await sink.AddAsync(Rows(FlatSchema, [1, 2]), CdfConfig.Delete, PartitionNamed(partition), default);
+            cdc.AddRange(await sink.CompleteAsync(default));
+        }
+
+        // Three partitions under a cap of two: every add found its partition's file closed by the one before.
+        Assert.Equal(6, cdc.Count);
+        // The partitions in the order first reached, each one's files in order.
+        Assert.Equal(["a", "a", "b", "b", "c", "c"], cdc.Select(f => f.PartitionValues["p"]).ToList());
+        foreach (var file in cdc)
+            Assert.Equal([1L, 1L], await RowGroupRowsAsync(file));
+    }
+
+    // RowGroupMaxBytes is not validated; a non-positive one is taken as one byte rather than flushing forever.
+    [Fact]
+    public async Task ANonPositiveRowGroupMaxBytes_WritesEveryRowRatherThanLooping()
+    {
+        await using var table = await CreateAsync();
+        var options = ParquetWriteOptions.Default with { RowGroupMaxBytes = -1 };
+        await using var sink = new ChangeDataFileSink(Fs, table.CurrentSnapshot, options, long.MaxValue, written: null);
+        await sink.AddAsync(Rows(FlatSchema, [1, 2]), CdfConfig.Delete, PartitionNamed("a"), default);
+        await sink.AddAsync(Rows(FlatSchema, [3, 4]), CdfConfig.Delete, PartitionNamed("b"), default);
+        var cdc = await sink.CompleteAsync(default);
+
+        Assert.Equal(2, cdc.Count);
+        foreach (var file in cdc)
+            Assert.Equal([1L, 1L], await RowGroupRowsAsync(file));
+    }
+
+    // A held slice keeps its whole batch alive, so it is charged the whole batch: two partitions each holding the
+    // tail of a batch are over a budget of one and a half batches, and the fuller is written out.
+    [Fact]
+    public async Task AHeldSlice_IsChargedTheBatchItKeepsAlive()
+    {
+        await using var table = await CreateAsync();
+        var batch = Rows(FlatSchema, Enumerable.Range(0, 10).Select(i => (long)i));
+        long batchBytes = RollingDataFileWriter.EstimatedBytes(
+            CdfWriter.PrepareRows(table.CurrentSnapshot, batch, CdfConfig.Delete, null, null));
+        var options = ParquetWriteOptions.Default with { RowGroupMaxRows = 4, RowGroupMaxBytes = batchBytes * 3 / 2 };
+        await using var sink = new ChangeDataFileSink(Fs, table.CurrentSnapshot, options, long.MaxValue, written: null);
+
+        // a: row groups of 4 and 4 written, a tail of 2 held. b: the same, which puts the held total past the budget,
+        // so a's tail is written. a again: its next ten rows start a new row group.
+        await sink.AddAsync(batch, CdfConfig.Delete, PartitionNamed("a"), default);
+        await sink.AddAsync(batch, CdfConfig.Delete, PartitionNamed("b"), default);
+        await sink.AddAsync(batch, CdfConfig.Delete, PartitionNamed("a"), default);
+        var cdc = await sink.CompleteAsync(default);
+
+        var a = cdc.Single(f => f.PartitionValues["p"] == "a");
+        // Charged only its two rows' share, a's tail would have been held and joined by the next batch: 4,4,4,4,4.
+        Assert.Equal([4L, 4L, 2L, 4L, 4L, 2L], await RowGroupRowsAsync(a));
     }
 
     private static BooleanArray AllTrue(int length)
