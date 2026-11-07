@@ -64,6 +64,12 @@ public sealed partial class DeltaTable
     /// <param name="ScannedTarget">Whether it read the target at all. A source with no matchable key needs no
     /// scan, and then the MERGE reads nothing.</param>
     /// <param name="NextRowId">Where the next staged add reserves stable row ids; null without row tracking.</param>
+    /// <param name="InsertsCovered">Whether the inserted rows' change rows are in the MERGE's own change files, so the
+    /// commit's fill-in must not write them again.</param>
+    /// <param name="InsertChangeFiles">The change files that may hold inserted rows: on a row-tracking table, the ones a
+    /// rebase that moves an insert's baseRowId rewrites.</param>
+    /// <param name="InsertRowCounts">Each inserted add's row count, by path, for sizing its row-id range: an add's
+    /// statistics record none when statistics are not collected.</param>
     internal sealed record MergeActions(
         IReadOnlyList<DeltaAction> RewriteActions,
         IReadOnlyList<DeltaAction> InsertActions,
@@ -73,7 +79,10 @@ public sealed partial class DeltaTable
         bool ReadsWholeTable,
         bool ScannedTarget,
         MergeMetrics Metrics,
-        long? NextRowId);
+        long? NextRowId,
+        bool InsertsCovered,
+        IReadOnlyList<CdcFile> InsertChangeFiles,
+        IReadOnlyDictionary<string, long> InsertRowCounts);
 
     // A target row's fate in a MERGE.
     private const byte MergeCopy = 0, MergeUpdate = 1, MergeMatchedDelete = 2, MergeSourcelessDelete = 3,
@@ -160,10 +169,30 @@ public sealed partial class DeltaTable
             ? KeyRangePredicate(plan.Keys, sourceKeys!, snapshot.Schema)
             : null;
 
+        bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
+        // Every change row the MERGE makes, of every type, goes to the same change files, one per partition (#723).
+        await using var changeData = cdfEnabled ? NewChangeDataSink(snapshot, written) : null;
+
         if (scan)
         {
             nextRowId = await ScanMergeTargetAsync().ConfigureAwait(false);
         }
+
+        // The inserted rows join them once the MERGE changed a target row, as Spark's MERGE writes one change file
+        // with every type in it, inserts included (#732). A MERGE that changed none writes no change file, so its
+        // inserts are inferred from its adds, as Spark leaves an insert-only MERGE's (both MEASURED against
+        // pyspark 4.0.4 / delta-spark 4.0.0 and 4.1). On a row-tracking table each row carries the id its add gives
+        // it, which Spark leaves NULL; a rebase that moves the add's baseRowId rewrites the file
+        // (InsertChangeDataFillIn).
+        bool coverInserts = changeData is { HasRows: true };
+        // An INSERT clause naming only some columns, or naming them in another order, writes rows of its own layout; they
+        // take the table's, a column it left out NULL, so they share a file with the update rows read from the table.
+        WrittenRowsObserver? insertChangeRows = coverInserts
+            ? (partitionValues, rows, rowIds, ct) => changeData!.AddAsync(
+                InTableColumnOrder(rows, snapshot), DeltaLake.ChangeDataFeed.CdfConfig.Insert, partitionValues, ct,
+                rowIds)
+            : null;
+        var insertRowCounts = new Dictionary<string, long>(StringComparer.Ordinal);
 
         // The unmatched source rows, each inserted by the first not-matched clause whose condition holds.
         var insertActions = new List<DeltaAction>();
@@ -197,12 +226,20 @@ public sealed partial class DeltaTable
                     snapshot, insertBatches, DeltaWriteMode.Append,
                     overwritePartitions: null, dynamicPartitionOverwrite: false, repartitionTo: null,
                     cancellationToken, rowIdStart: assignRowIds ? nextRowId : null, written: written,
-                    identityHighWaterMarks: identityHighWaterMarks)
+                    identityHighWaterMarks: identityHighWaterMarks, rowsWritten: insertChangeRows,
+                    rowCounts: insertRowCounts)
                     .ConfigureAwait(false);
                 insertActions.AddRange(actions);
                 if (assignRowIds)
                     nextRowId = insertNextRowId;
             }
+        }
+
+        IReadOnlyList<CdcFile> insertChangeFiles = System.Array.Empty<CdcFile>();
+        if (changeData is not null)
+        {
+            rewriteActions.AddRange(await changeData.CompleteAsync(cancellationToken).ConfigureAwait(false));
+            insertChangeFiles = changeData.FilesHoldingInserts;
         }
 
         // A file given a deletion vector is re-added under its own path: neither added nor removed, as Spark counts it.
@@ -213,15 +250,12 @@ public sealed partial class DeltaTable
             filesAdded, removedPaths.Count - maskedPaths.Count);
         return new MergeActions(
             rewriteActions, insertActions, removedPaths, readPaths, keyRange, readsWholeTable, scan, metrics,
-            assignRowIds ? nextRowId : null);
+            assignRowIds ? nextRowId : null, InsertsCovered: coverInserts, insertChangeFiles, insertRowCounts);
 
         async ValueTask<long> ScanMergeTargetAsync()
         {
             var constraints = DeltaConstraintEnforcer.Create(snapshot);
             var generatedColumns = DeltaGeneratedColumns.Create(snapshot);
-            bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
-            // Every changed file's change rows, of every type, go to the same change files, one per partition (#723).
-            await using var changeData = cdfEnabled ? NewChangeDataSink(snapshot, written) : null;
             var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
             var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
                 .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
@@ -578,9 +612,6 @@ public sealed partial class DeltaTable
                     }
                 }
             }
-
-            if (changeData is not null)
-                rewriteActions.AddRange(await changeData.CompleteAsync(cancellationToken).ConfigureAwait(false));
 
             return rowId;
         }
@@ -1207,6 +1238,38 @@ public sealed partial class DeltaTable
         buffers[0] = bits.Build();
         return ArrowArrayFactory.BuildArray(
             new ArrayData(data.DataType, data.Length, nulls, data.Offset, buffers, data.Children, data.Dictionary));
+    }
+
+    /// <summary>
+    /// <paramref name="rows"/> with every top-level column of <paramref name="snapshot"/>'s table, in the table's
+    /// order: a column the rows lack is NULL. Columns only the rows have are dropped (none reach a data file).
+    /// </summary>
+    private static RecordBatch InTableColumnOrder(RecordBatch rows, Snapshot.Snapshot snapshot)
+    {
+        var table = snapshot.ArrowSchema.FieldsList;
+        bool same = rows.ColumnCount == table.Count;
+        for (int i = 0; same && i < table.Count; i++)
+            same = string.Equals(rows.Schema.FieldsList[i].Name, table[i].Name, StringComparison.Ordinal);
+        if (same)
+            return rows;
+
+        var fields = new List<Field>(table.Count);
+        var columns = new List<IArrowArray>(table.Count);
+        foreach (var field in table)
+        {
+            int index = rows.Schema.GetFieldIndex(field.Name);
+            if (index >= 0)
+            {
+                fields.Add(rows.Schema.FieldsList[index]);
+                columns.Add(rows.Column(index));
+            }
+            else
+            {
+                fields.Add(new Field(field.Name, field.DataType, nullable: true, field.Metadata));
+                columns.Add(ArrowCompute.MakeNullArray(field.DataType, rows.Length));
+            }
+        }
+        return new RecordBatch(new Apache.Arrow.Schema(fields, null), columns, rows.Length);
     }
 
     /// <summary>

@@ -94,6 +94,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
     // adds, as staged) and deletion-vector deletes (the rows each newly hid). A commit that carries any cdc
     // action is read from its change files alone, so the commit writes change rows for these then (#530).
     private readonly List<AddFile> _uncoveredAppends = [];
+    private readonly List<CoveredInsertChangeData> _coveredInsertChanges = [];
     private readonly List<DeltaTable.DeleteDvEdit> _uncoveredVectorDeletes = [];
     // Where the NEXT staged add starts reserving stable row ids. Each staging call must continue from here
     // rather than restart at the base snapshot's high-water mark: two appends staged on one transaction
@@ -190,6 +191,20 @@ public sealed class DeltaTransaction : IAsyncDisposable
 
     /// <summary>The staged appends whose rows no change file covers.</summary>
     internal IReadOnlyList<AddFile> UncoveredAppends => _uncoveredAppends;
+
+    /// <summary>
+    /// Appends whose <c>insert</c> rows an operation wrote into change files of its own, with their stable row ids
+    /// (a MERGE's, #732): the files a rebase that moves one of the adds' <c>baseRowId</c> rewrites.
+    /// </summary>
+    /// <param name="Adds">The appends, as staged.</param>
+    /// <param name="RowCounts">Each append's row count, by path, which its statistics may not record.</param>
+    /// <param name="Files">The change files that may hold their rows.</param>
+    internal sealed record CoveredInsertChangeData(
+        IReadOnlyList<AddFile> Adds, IReadOnlyDictionary<string, long> RowCounts, IReadOnlyList<CdcFile> Files);
+
+    /// <summary>The staged appends whose change rows carry ids a rebase may move; see
+    /// <see cref="CoveredInsertChangeData"/>.</summary>
+    internal IReadOnlyList<CoveredInsertChangeData> CoveredInsertChanges => _coveredInsertChanges;
 
     /// <summary>The staged deletion-vector deletes whose rows no change file covers.</summary>
     internal IReadOnlyList<DeltaTable.DeleteDvEdit> UncoveredVectorDeletes => _uncoveredVectorDeletes;
@@ -745,7 +760,16 @@ public sealed class DeltaTransaction : IAsyncDisposable
         StageInternal(plan.RewriteActions);
         StageInternal(insertActions);
         ChainIdentityMarks(insertActions);
-        RecordUncoveredAppends(plan.InsertActions);
+        if (!plan.InsertsCovered)
+        {
+            RecordUncoveredAppends(plan.InsertActions);
+        }
+        else
+        {
+            var adds = plan.InsertActions.OfType<AddFile>().Where(static a => a.BaseRowId is not null).ToList();
+            if (adds.Count > 0 && plan.InsertChangeFiles.Count > 0)
+                _coveredInsertChanges.Add(new CoveredInsertChangeData(adds, plan.InsertRowCounts, plan.InsertChangeFiles));
+        }
         foreach (string path in plan.RemovedPaths)
             _removedPaths.Add(path);
         foreach (string path in plan.ReadPaths)

@@ -1992,6 +1992,66 @@ public class SparkInteropTests : IDisposable
     }
 
     /// <summary>
+    /// Issue #732: a MERGE's inserted rows share its change files with its updates and deletes, one file per
+    /// partition, as Spark's MERGE writes them. Spark reads the feed of such a MERGE on a column-mapped, partitioned,
+    /// row-tracking table, whose change files carry the materialized row-tracking columns: every change type, with the
+    /// right values and partitions, and the inserts exactly once.
+    /// </summary>
+    [SkippableFact]
+    public async Task EwWritten_MergeChangeFeedWithInserts_SparkReadsEveryChangeType()
+    {
+        Spark.Require();
+
+        long mergeVersion;
+        await using (var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(_tempDir), IdValueRegionSchema,
+            partitionColumns: ["region"],
+            columnMappingMode: ColumnMappingMode.Name,
+            enableRowTracking: true,
+            configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" }))
+        {
+            await table.WriteAsync([IdValueRegionBatch([1, 2, 3], ["a", "b", "c"], ["emea", "emea", "apac"])]);
+            (_, mergeVersion) = await table.MergeAsync(
+                [IdValueRegionBatch([1, 3, 4, 5], ["A", "DEL", "d", "e"], ["emea", "apac", "emea", "apac"])],
+                new MergeOptions
+                {
+                    Keys = ["id"],
+                    WhenMatched =
+                    [
+                        MergeAction.Delete.When(EngineeredWood.Expressions.Expressions.Equal(
+                            EngineeredWood.Expressions.UnboundReference.FromParts(["source", "value"]),
+                            EngineeredWood.Expressions.Expressions.Lit("DEL"))),
+                        MergeAction.Update,
+                    ],
+                    WhenNotMatched = [MergeAction.Insert],
+                });
+        }
+
+        var cdc = (await new TransactionLog(new LocalTableFileSystem(_tempDir)).ReadCommitAsync(mergeVersion))
+            .OfType<CdcFile>().ToList();
+        Assert.Equal(2, cdc.Count);
+
+        var result = Spark.Invoke("read_changes", new { path = _tempDir, start = mergeVersion, end = mergeVersion });
+        var rows = result.GetProperty("rows").EnumerateArray()
+            .Select(r => (
+                Ct: r.GetProperty("_change_type").GetString()!,
+                Id: r.GetProperty("id").GetInt64(),
+                Value: r.GetProperty("value").GetString()!,
+                Region: r.GetProperty("region").GetString()!))
+            .OrderBy(t => t.Id).ThenBy(t => t.Ct, StringComparer.Ordinal)
+            .ToList();
+        Assert.Equal(
+            [
+                ("update_postimage", 1L, "A", "emea"),
+                ("update_preimage", 1L, "a", "emea"),
+                ("delete", 3L, "c", "apac"),
+                ("insert", 4L, "d", "emea"),
+                ("insert", 5L, "e", "apac"),
+            ],
+            rows);
+    }
+
+    /// <summary>
     /// Issue #447: a change feed over a range that spans an ADD COLUMN has ONE schema, and which one depends on
     /// column mapping. EW builds the issue's table (v1 inserts id = 1, v2 adds <c>extra</c>, v3 inserts
     /// (2, 20)) and both engines read the same range; the columns and rows must agree. Spark takes the LATEST

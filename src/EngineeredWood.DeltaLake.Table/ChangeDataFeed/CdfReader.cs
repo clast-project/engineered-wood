@@ -485,6 +485,55 @@ internal static class CdfReader
     }
 
     /// <summary>
+    /// Reads back a change file this table's writer wrote under <paramref name="snapshot"/>, for rewriting it: each
+    /// batch's rows in the table's LOGICAL shape (the shape <see cref="CdfWriter.PrepareRows"/> takes), its
+    /// <c>_change_type</c> values, and the materialized row-tracking columns exactly as stored (a NULL commit version
+    /// stays NULL, so it still resolves to whichever version the file is finally committed in).
+    /// </summary>
+    internal static async IAsyncEnumerable<(RecordBatch Rows, StringArray ChangeTypes, Int64Array? RowIds,
+        Int64Array? RowCommitVersions)> ReadWrittenChangeFileAsync(
+        ITableFileSystem fs,
+        Snapshot.Snapshot snapshot,
+        CdcFile file,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
+        var (rowIdName, rowVersionName) = DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
+        var ctx = new CdfSchemaContext(
+            snapshot, mappingMode,
+            mappingMode == ColumnMappingMode.None
+                ? new Dictionary<string, string>()
+                : ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode),
+            rowIdName, rowVersionName, EmitRowTracking: false,
+            DeltaLake.RowTracking.RowTrackingConfig.RowIdColumnName,
+            DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName);
+
+        await using var opened = (await OpenAsync(
+            fs, EngineeredWood.DeltaLake.DeltaPath.Decode(file.Path), file.Size, readOptions: null,
+            missingMeansVacuumed: false, cancellationToken).ConfigureAwait(false))!;
+        await foreach (var batch in opened.Reader.ReadAllAsync(cancellationToken: cancellationToken)
+            .ConfigureAwait(false))
+        {
+            var (physicalData, changeType) = SplitChangeType(batch);
+            if (changeType is not StringArray changeTypes)
+            {
+                throw new InvalidOperationException(
+                    $"The change file '{file.Path}' has no string {CdfConfig.ChangeTypeColumn} column "
+                    + $"(read as {changeType?.Data.DataType.Name ?? "absent"}).");
+            }
+            var cleanPhysical = physicalData;
+            Int64Array? ids = null, versions = null;
+            if (ctx.HasMaterializedColumns)
+            {
+                (cleanPhysical, ids, versions) = RowTracking.RowTrackingWriter.StripMaterializedColumns(
+                    physicalData, ctx.MaterializedRowIdName, ctx.MaterializedRowVersionName);
+            }
+            yield return (ToTableShape(cleanPhysical, file.PartitionValues, ctx), changeTypes, ids, versions);
+        }
+    }
+
+    /// <summary>
     /// A remove/add pair of one file whose vectors differ. The positions that changed are worked out once, on
     /// first use, and shared by the pair's two reads (the delete side and the insert side), which may run at
     /// the same time.
