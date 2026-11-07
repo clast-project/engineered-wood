@@ -24,6 +24,26 @@ var snapshot = txn.Snapshot;   // NOT table.CurrentSnapshot
 `DeltaTable.CurrentSnapshot` advances whenever another writer commits. `DeltaTransaction.Snapshot` does not,
 which is what makes file ordinals (below) mean the same thing at plan time and at commit time.
 
+### Opening a handle per transaction
+
+A `DeltaTable` is one mutable handle: a refresh or a commit on it moves `CurrentSnapshot` for everyone holding
+it. A host that gives each of its transactions its own handle can still avoid replaying the log every time, by
+keeping the last `Snapshot` (it is immutable) and opening from it:
+
+```csharp
+// One listing of _delta_log/, plus the commits since `cached`. Nothing new: the listing is the whole cost.
+await using var table = await DeltaTable.OpenAsync(fs, cached, options);
+cached = table.CurrentSnapshot;
+```
+
+The handle is at the table's LATEST version, the same as a fresh `OpenAsync(fs)`, and it falls back to that full
+open whenever continuing from `cached` cannot be shown right. That covers log cleanup past it, a table dropped and
+re-created at the same path (recognised by the identity of the log files at `cached`'s version, see
+`TableFileInfo.ETag`), and a snapshot of another table. A writer can use it too: its base is the latest version,
+so a metadata change committed while `cached` was held is in the snapshot, not a conflict.
+
+This is NOT a pin. To commit against the version the work was planned on, use the next section.
+
 ### When the transaction starts later than the pin
 
 A host whose transaction spans several of its own statements pins a version at the *first* statement, but may

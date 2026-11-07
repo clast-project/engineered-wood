@@ -349,6 +349,53 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Opens an existing Delta table starting from a snapshot the caller already holds, typically the
+    /// <see cref="CurrentSnapshot"/> of an earlier handle on the same table. The log is listed once, and only the
+    /// commits after <paramref name="startFrom"/> are replayed; when nothing has been committed since, that listing
+    /// is the whole cost of the open (#740).
+    /// </summary>
+    /// <param name="fileSystem">The filesystem rooted at the table directory.</param>
+    /// <param name="startFrom">A snapshot of this table, at any version. It is not modified, and can start any number
+    /// of opens, concurrently: a <see cref="Snapshot.Snapshot"/> is immutable.</param>
+    /// <param name="options">Table options.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <remarks>
+    /// <para>The result is the table at its LATEST version, exactly what <see cref="OpenAsync(ITableFileSystem,
+    /// DeltaTableOptions?, CancellationToken)"/> returns. It falls back to that full open where continuing from
+    /// <paramref name="startFrom"/> would be wrong or cannot be shown right: log cleanup has removed commits after
+    /// it, the table was dropped and re-created at this path, or <paramref name="startFrom"/> cannot be matched to
+    /// the log (a snapshot built in memory, or a backend that identifies files by neither ETag nor modification
+    /// time). A snapshot of a different table at another path falls back the same way.</para>
+    ///
+    /// <para><b>Writers can use it too.</b> The handle's snapshot is the latest listed version, as after a fresh open,
+    /// so a transaction begun on it has the same (normally empty) range of concurrent commits to check: a metadata
+    /// change committed while <paramref name="startFrom"/> was held is already in the snapshot, not a conflict.</para>
+    /// </remarks>
+    /// <exception cref="DeltaTableNotFoundException">No table is at the path any longer.</exception>
+    public static async ValueTask<DeltaTable> OpenAsync(
+        ITableFileSystem fileSystem,
+        Snapshot.Snapshot startFrom,
+        DeltaTableOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (startFrom is null)
+            throw new ArgumentNullException(nameof(startFrom));
+        options ??= DeltaTableOptions.Default;
+
+        // The reader refresh, deliberately: it rebuilds wherever continuing is not provably right, and that is also
+        // what a writer needs. Its base is the latest listed version either way, and a base taken from a replaced
+        // log is never one (#740).
+        var snapshot = await SnapshotBuilder.UpdateOrRebuildAsync(
+            startFrom, new TransactionLog(fileSystem), new CheckpointReader(fileSystem), cancellationToken)
+            .ConfigureAwait(false);
+
+        // Again, not trusted from startFrom: the protocol may have changed since it was taken.
+        ProtocolVersions.ValidateReadSupport(snapshot.Protocol);
+
+        return new DeltaTable(fileSystem, options, snapshot);
+    }
+
+    /// <summary>
     /// Creates a new Delta table with the given Arrow schema.
     /// </summary>
     /// <param name="fileSystem">The filesystem rooted at the table directory.</param>
