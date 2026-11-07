@@ -204,6 +204,29 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         _pendingBytes += bytes;
     }
 
+    /// <summary>The estimated Arrow bytes held for the row group being built (under a host writer, the whole
+    /// file), which <see cref="FlushPendingAsync"/> writes out.</summary>
+    public long PendingBytes => _pendingBytes;
+
+    /// <summary>
+    /// Writes the pending rows as a row group now, before it is full, and closes the file if that takes it to the
+    /// target; for a caller that holds several writers and bounds the memory of all of them. A host writer's
+    /// pending rows are its whole file, so under one this closes the file.
+    /// </summary>
+    public async ValueTask FlushPendingAsync(CancellationToken cancellationToken)
+    {
+        if (_pending.Count == 0)
+            return;
+        if (_host is not null)
+        {
+            await CloseFileAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        await FlushRowGroupAsync(cancellationToken).ConfigureAwait(false);
+        if (_file!.Position >= _targetFileSize)
+            await CloseFileAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>Writes what is pending and closes the last file. Returns every file written, in order.</summary>
     public async ValueTask<IReadOnlyList<RolledDataFile>> CompleteAsync(CancellationToken cancellationToken)
     {

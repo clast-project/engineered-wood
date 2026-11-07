@@ -220,6 +220,8 @@ public sealed partial class DeltaTable
             var constraints = DeltaConstraintEnforcer.Create(snapshot);
             var generatedColumns = DeltaGeneratedColumns.Create(snapshot);
             bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
+            // Every changed file's change rows, of every type, go to the same change files, one per partition (#723).
+            await using var changeData = cdfEnabled ? NewChangeDataSink(snapshot, written) : null;
             var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
             var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
                 .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
@@ -547,39 +549,38 @@ public sealed partial class DeltaTable
                 }
                 removedPaths.Add(addFile.Path);
 
-                if (!cdfEnabled)
+                if (changeData is null)
                     continue;
 
                 // The change rows, each from the one read that also fed the rewrite, so a row's stable id in the
                 // feed is the id the rewrite preserved.
                 for (int b = 0; b < deletes.Count; b++)
                 {
-                    rewriteActions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, deletes[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                        cancellationToken, deleteTracking[b].Ids, deleteTracking[b].Vers, written)
-                        .ConfigureAwait(false));
+                    await changeData.AddAsync(
+                        deletes[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete, addFile.PartitionValues,
+                        cancellationToken, deleteTracking[b].Ids, deleteTracking[b].Vers).ConfigureAwait(false);
                 }
                 for (int b = 0; b < preimages.Count; b++)
                 {
                     var (ids, vers) = updateTracking[b];
-                    rewriteActions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, preimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
-                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                        cancellationToken, ids, vers, written).ConfigureAwait(false));
+                    await changeData.AddAsync(
+                        preimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage, addFile.PartitionValues,
+                        cancellationToken, ids, vers).ConfigureAwait(false);
 
                     // A post-image row belongs to the partition the row now lives in.
                     // NULL: the change file's reader resolves it to the commit that wrote it, wherever a rebase lands it.
                     var postVers = ids is not null ? AllNullInt64(postimages[b].Length) : null;
                     foreach (var (target, _, post, aligned) in router.Split(postimages[b], ids, postVers))
                     {
-                        rewriteActions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
-                            _fs, snapshot, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
-                            target ?? addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                            cancellationToken, aligned[0], aligned[1], written).ConfigureAwait(false));
+                        await changeData.AddAsync(
+                            post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage, target ?? addFile.PartitionValues,
+                            cancellationToken, aligned[0], aligned[1]).ConfigureAwait(false);
                     }
                 }
             }
+
+            if (changeData is not null)
+                rewriteActions.AddRange(await changeData.CompleteAsync(cancellationToken).ConfigureAwait(false));
 
             return rowId;
         }

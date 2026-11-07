@@ -338,6 +338,17 @@ public static partial class ArrowCompute
         var type = inputs[0].Data.DataType;
         if (type is NullType)
             return new NullArray(inputs.Sum(a => a.Length));
+        // Arrow's concatenator has no run-end encoded arm; the runs are joined as runs.
+        if (type is RunEndEncodedType)
+        {
+            var runs = new List<RunEndEncodedArray>(inputs.Count);
+            foreach (var array in inputs)
+            {
+                runs.Add(array as RunEndEncodedArray ?? throw new ArgumentException(
+                    $"Cannot concatenate {array.Data.DataType.Name} onto a run-end encoded array.", nameof(arrays)));
+            }
+            return RunEndEncoding.Concatenate(runs);
+        }
         if (!HasExtensionType(type))
         {
             if (!ConcatenatesItself(type))

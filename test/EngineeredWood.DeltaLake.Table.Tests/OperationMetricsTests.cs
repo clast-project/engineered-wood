@@ -160,8 +160,8 @@ public class OperationMetricsTests : IDisposable
     }
 
     /// <summary>
-    /// An UPDATE's rewritten file holds the row it changed and the two it copied. On a CDF table it writes its
-    /// pre-images and post-images to a change file each.
+    /// An UPDATE's rewritten file holds the row it changed and the two it copied. On a CDF table its pre-images and
+    /// post-images share one change file, as Spark writes them (#723).
     /// </summary>
     [Fact]
     public async Task AnUpdate_CountsUpdatedAndCopiedRows()
@@ -171,7 +171,7 @@ public class OperationMetricsTests : IDisposable
 
         AssertCounts(await MetricsAsync(table, version),
             ("numUpdatedRows", 1), ("numCopiedRows", 2), ("numAddedFiles", 1), ("numRemovedFiles", 1),
-            ("numAddedChangeFiles", 2));
+            ("numAddedChangeFiles", 1));
     }
 
     /// <summary>The host-driven DELETE and UPDATE by row position record the same metrics.</summary>

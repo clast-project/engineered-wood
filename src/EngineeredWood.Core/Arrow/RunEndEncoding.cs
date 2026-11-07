@@ -157,6 +157,44 @@ public static class RunEndEncoding
     }
 
     /// <summary>
+    /// Joins run-end encoded arrays end to end, run-end encoded again: each input's runs (clipped to its window, as
+    /// <see cref="Compact"/> clips them) follow the previous input's, and their values are gathered and joined.
+    /// O(runs). A run that ends one input and the run that starts the next stay two runs, even when their values
+    /// are equal; the layout allows that, and comparing values of any type is not worth it here.
+    /// </summary>
+    public static RunEndEncodedArray Concatenate(IReadOnlyList<RunEndEncodedArray> arrays)
+    {
+        if (arrays is null)
+            throw new ArgumentNullException(nameof(arrays));
+        if (arrays.Count == 0)
+            throw new ArgumentException("There is nothing to concatenate.", nameof(arrays));
+
+        var valueType = ((RunEndEncodedType)arrays[0].Data.DataType).ValuesDataType;
+        var values = new List<IArrowArray>(arrays.Count);
+        var lengths = new List<int>();
+        foreach (var array in arrays)
+        {
+            var arrayValueType = ((RunEndEncodedType)array.Data.DataType).ValuesDataType;
+            if (arrayValueType.TypeId != valueType.TypeId)
+            {
+                throw new ArgumentException(
+                    $"Cannot concatenate run-end encoded {arrayValueType.Name} values onto {valueType.Name} ones.",
+                    nameof(arrays));
+            }
+
+            var physical = new List<int>();
+            foreach (var run in EnumerateRuns(array))
+            {
+                physical.Add(run.PhysicalIndex);
+                lengths.Add(run.Length);
+            }
+            values.Add(ArrowCompute.Take(array.Values, physical));
+        }
+
+        return Build(ArrowCompute.Concatenate(values), lengths);
+    }
+
+    /// <summary>
     /// Reads run end <paramref name="index"/>. The spec allows int16, int32 or int64 run ends; all three
     /// are read here as <see cref="long"/> so callers never have to care which they were handed.
     /// </summary>
