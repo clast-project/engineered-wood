@@ -106,9 +106,9 @@ jobs:
       # pyspark<=4.1.1, so pip refuses 4.1.2 + 4.3.1 with ResolutionImpossible. The
       # pairing works (4.3.1 is the first delta-spark whose jars match Spark 4.1.2;
       # 4.1.0 hits a NoSuchMethodError on checkpointed tables). Its one other
-      # dependency is installed explicitly, within its declared range. Do NOT move to
-      # delta-spark 4.4.x to lose the --no-deps: it fails every ConflictSemantics case
-      # until spark_driver.py learns Delta 4.4's conflict exception class.
+      # dependency is installed explicitly, within its declared range. pyspark 4.2.0 +
+      # delta-spark 4.4.1 needs no --no-deps and passes the full tier locally
+      # (doc/running-tests.md), but moving this matrix to it is a separate decision.
       #
       # pyarrow is listed EXPLICITLY: deltalake 1.6.2 made it an optional extra, so
       # without it every delta-rs read raises "Pyarrow is required" — invisible on a

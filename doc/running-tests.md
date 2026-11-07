@@ -234,13 +234,28 @@ unsupported-but-measured and re-verify on any bump. Only `delta-spark` takes
 dependency, `importlib_metadata`, is installed by hand within its declared
 range (`<=8.7.1`).
 
-**Do not "fix" that by moving to `delta-spark` 4.4.0.** It is the first to
-widen the cap (`pyspark<=4.2.0`) so `pyspark 4.2.0 + delta-spark 4.4.0`
-resolves with no `--no-deps` and clears the `NoSuchMethodError` — but it
-fails 4 of 109: every `ConflictSemanticsInteropTests` case, expecting
-`ConcurrentAppend` and getting `unrecognised`, because Delta 4.4 raises a
-conflict exception class `spark_driver.py` does not classify. That is the
-oracle moving, and the driver has to learn it before the bump can land.
+**`delta-spark` 4.4 + `pyspark` 4.2.0 also works, with no `--no-deps`.**
+4.4.0 is the first `delta-spark` to widen the cap (`pyspark<=4.2.0`), and
+4.4.1 keeps it:
+
+```
+py -3.13 -m venv spark42 && spark42\Scripts\pip install pyspark==4.2.0 delta-spark==4.4.1
+```
+
+Measured at **297 passed / 2 skipped** of 299 (2026-11-07), the same as the
+4.1.2 / 4.3.1 pairing on the same day. Both skips are DuckDB-2.0-only cases,
+skipped because the local DuckDB was 1.5.5. Its bundled Hadoop is 3.5.0, and
+the 3.4.0 `winutils.exe` / `hadoop.dll` work with it. `pyspark` 4.2.1 is
+above the cap, so it would need `--no-deps` again.
+
+Before then, every `ConflictSemanticsInteropTests` case failed on it,
+expecting `ConcurrentAppend` and getting `unrecognised`. Delta's conflict
+rules had not changed: it refuses in exactly the cases 4.3.1 refuses. What
+changed is how the error reaches Python. Under `pyspark` 4.2 a conflict
+arrives as Delta's own Python exception class (`ConcurrentAppendException`,
+`ConcurrentTransactionException`) with no `java_exception`, and its message
+names no class. `spark_driver.py` now matches on the exception's type name
+too (`_exception_text`).
 
 The GA annotated path and the nested-variant cases have been validated against
 both pairings above; the unannotated path against 4.0.1 / 4.0.0. delta-rs

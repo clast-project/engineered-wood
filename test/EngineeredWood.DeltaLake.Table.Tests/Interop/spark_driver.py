@@ -47,6 +47,23 @@ sys.stdout = sys.stderr
 _SESSION = None
 
 
+def _exception_text(e):
+    """Everything that can name a Delta conflict exception, for classifying it by substring.
+
+    Where the name shows up depends on the pyspark/delta-spark pairing. Through pyspark 4.1 the error is a
+    Py4JJavaError, and the Java `toString()` starts with the class name
+    (`io.delta.exceptions.ConcurrentAppendException: ...`). Under pyspark 4.2.0 + delta-spark 4.4.1 (MEASURED)
+    Delta's own Python exception arrives instead. Its CLASS is `ConcurrentAppendException` /
+    `ConcurrentTransactionException`, there is no `java_exception`, and `str(e)` is only the message
+    (`[DELTA_CONCURRENT_APPEND.WITHOUT_HINT] Transaction conflict detected. ...`), which names no class.
+    """
+    text = type(e).__name__ + " " + str(e)
+    java_exc = getattr(e, "java_exception", None)
+    if java_exc is not None:
+        text += " " + java_exc.toString()
+    return text
+
+
 def _spark():
     """The process-wide SparkSession, created on first use.
 
@@ -921,10 +938,7 @@ def cmd_conflict_semantics(args):
             txn.commit(actions, op)
             return dict(scenario, verdict="committed")
         except Exception as e:
-            text = str(e)
-            java_exc = getattr(e, "java_exception", None)
-            if java_exc is not None:
-                text += " " + java_exc.toString()
+            text = _exception_text(e)
             kind = next((m for m in ("ConcurrentDeleteRead", "ConcurrentAppend",
                                      "ConcurrentDeleteDelete", "MetadataChanged", "ProtocolChanged",
                                      "ConcurrentTransaction")
@@ -981,10 +995,7 @@ def cmd_conflict_semantics(args):
             commit(ours, scenario["our_domain"], scenario["our_config"])
             return dict(scenario, verdict="committed")
         except Exception as e:
-            text = str(e)
-            java_exc = getattr(e, "java_exception", None)
-            if java_exc is not None:
-                text += " " + java_exc.toString()
+            text = _exception_text(e)
             kind = next((m for m in ("ConcurrentTransaction", "MetadataChanged", "ProtocolChanged",
                                      "ConcurrentAppend", "ConcurrentDeleteRead",
                                      "ConcurrentDeleteDelete")
