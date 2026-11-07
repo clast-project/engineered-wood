@@ -85,6 +85,13 @@ public sealed class MemoryBudget
     /// <summary><see cref="UsedBytes"/>, for a caller that holds <see cref="Gate"/>.</summary>
     internal long UsedLocked => _used;
 
+    /// <summary>
+    /// The most one reservation may charge: 1 PiB. Real charges come nowhere near it; an estimate does when it
+    /// comes from a corrupt footer. Capping each one keeps the running totals from wrapping: it would take 8,192
+    /// such charges held at once to reach <see cref="long.MaxValue"/>.
+    /// </summary>
+    internal const long MaxCharge = 1L << 50;
+
     /// <summary>The lock every budget in this one's tree shares.</summary>
     internal object Gate => _gate;
 
@@ -100,7 +107,9 @@ public sealed class MemoryBudget
         {
             for (var level = this; level is not null; level = level.Parent)
             {
-                if (level._used != 0 && level._used + bytes > level._max)
+                // Subtracted rather than added: both are non-negative, so this cannot wrap, whereas
+                // _used + bytes can for a cap of long.MaxValue (#727 review).
+                if (level._used != 0 && bytes > level._max - level._used)
                 {
                     blocking = level;
                     return false;

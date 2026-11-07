@@ -46,8 +46,9 @@ internal sealed class ScanReservation
 
     internal void Observe(long bytes)
     {
+        // An estimate past MaxCharge can only come from a corrupt footer; capped, so the totals cannot wrap.
         if (bytes > _estimate)
-            _estimate = bytes;
+            _estimate = Math.Min(bytes, MemoryBudget.MaxCharge);
     }
 
     /// <summary>Waits until the budget can take the next item, then reserves for it. A reservation still
@@ -89,6 +90,7 @@ internal sealed class ScanReservation
     {
         if (_budget is null || bytes <= 0)
             return;
+        bytes = Math.Min(bytes, MemoryBudget.MaxCharge); // as in Observe
         await _budget.ReserveAsync(_unit, bytes, cancellationToken).ConfigureAwait(false);
         _held += bytes;
     }

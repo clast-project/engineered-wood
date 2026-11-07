@@ -100,6 +100,40 @@ public class MemoryBudgetTests
     }
 
     [Fact]
+    public void ABudgetOfLongMaxValue_RefusesWhatDoesNotFit_RatherThanWrapping()
+    {
+        // _used + bytes would wrap negative here, and admit the reservation.
+        var root = new MemoryBudget(long.MaxValue);
+        lock (root.Gate)
+        {
+            Assert.True(root.TryReserveLocked(long.MaxValue - 10, force: false, out _));
+            Assert.False(root.TryReserveLocked(100, force: false, out var blocking));
+            Assert.Same(root, blocking);
+            Assert.True(root.TryReserveLocked(10, force: false, out _));
+        }
+        Assert.Equal(long.MaxValue, root.UsedBytes);
+    }
+
+    [Fact]
+    public async Task AnEstimateFromACorruptFooter_IsCappedAtMaxCharge()
+    {
+        // A footer can claim any size. Capping each charge keeps a shared budget's totals far from wrapping, and
+        // what is released is what was charged.
+        var scan = new EngineeredWood.Scans.ScanMemoryBudget(1 << 20);
+        var reservation = new EngineeredWood.Scans.ScanReservation(scan, 0);
+        reservation.SetInitialEstimate(long.MaxValue);
+        Assert.Equal(MemoryBudget.MaxCharge, reservation.Estimate);
+
+        await reservation.HoldAsync(long.MaxValue, default);
+        await reservation.ReserveNextAsync(default);
+        Assert.Equal(2 * MemoryBudget.MaxCharge, scan.Used);
+
+        reservation.ReleasePending();
+        reservation.ReleaseHeld();
+        Assert.Equal(0, scan.Used);
+    }
+
+    [Fact]
     public async Task AReleaseAnywhereBelow_WakesAWaiterOnTheLevelItFrees()
     {
         var root = new MemoryBudget(100);
