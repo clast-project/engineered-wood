@@ -3284,6 +3284,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var (filled, insertFillIn) = await FillInChangeDataAsync(transaction, actions, cancellationToken)
             .ConfigureAwait(false);
         actions = filled;
+        if (transaction.CoveredInsertChanges.Count > 0)
+        {
+            // An operation's own change files with insert rows in them (a MERGE's, #732) carry the ids the adds give
+            // those rows, so a rebase that moves an add's baseRowId rewrites them, as it rewrites the fill-in's.
+            var committed = WithStagedMetadata(transaction.BaseSnapshot, actions);
+            if (DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(committed.Metadata.Configuration))
+            {
+                insertFillIn ??= new InsertChangeDataFillIn(this, committed, transaction.Written);
+                foreach (var covered in transaction.CoveredInsertChanges)
+                    insertFillIn.RecordCovered(covered.Adds, covered.Files);
+            }
+        }
 
         return await CommitOccAsync(
             baseSnapshot, actions, reads,
@@ -3405,6 +3417,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// (<see cref="RebaseRowTrackingAddIds"/>), so files written for the old one would name ids the commit no
     /// longer assigns. A change file is the only place a change row's identity lives (a <c>cdc</c> action has
     /// no <c>baseRowId</c> to shift), so it is rewritten rather than adjusted.
+    ///
+    /// <para>It also carries the change files a MERGE wrote its inserted rows into beside its other change rows
+    /// (#732, <see cref="RecordCovered"/>). Those are rewritten whole, the insert rows' ids moved from each add's old
+    /// range to its new one (<see cref="RewriteInsertRowIdsAsync"/>).</para>
     /// </summary>
     internal sealed class InsertChangeDataFillIn
     {
@@ -3416,6 +3432,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             new(StringComparer.Ordinal);
         // Every fill-in file the STAGED actions carry. Each rebase starts again from those actions.
         private readonly HashSet<string> _stagedPaths = new(StringComparer.Ordinal);
+        // An operation's own change files holding its appends' insert rows among other change rows (a MERGE's,
+        // #732): by add.path, the baseRowId the files' ids were written for and the add's row count.
+        private readonly List<(Dictionary<string, (long BaseRowId, long Rows)> Adds, List<CdcFile> Files)>
+            _covered = new();
 
         public InsertChangeDataFillIn(DeltaTable table, Snapshot.Snapshot snapshot, WrittenFileLedger written)
         {
@@ -3427,6 +3447,21 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         public void Record(AddFile add, List<CdcFile> files)
         {
             _byAdd[add.Path] = (add.BaseRowId, files);
+            foreach (var f in files)
+                _stagedPaths.Add(f.Path);
+        }
+
+        /// <summary>
+        /// Records change files an operation wrote itself, whose <c>insert</c> rows carry the ids
+        /// <paramref name="adds"/> give them. Other change rows share the files; their ids are materialized and
+        /// do not move.
+        /// </summary>
+        public void RecordCovered(IReadOnlyList<AddFile> adds, IReadOnlyList<CdcFile> files)
+        {
+            var byPath = new Dictionary<string, (long BaseRowId, long Rows)>(StringComparer.Ordinal);
+            foreach (var add in adds)
+                byPath[add.Path] = (add.BaseRowId!.Value, RowCountForRowIds(add));
+            _covered.Add((byPath, files.ToList()));
             foreach (var f in files)
                 _stagedPaths.Add(f.Path);
         }
@@ -3455,6 +3490,36 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     supersededPaths.Add(DeltaPath.Decode(f.Path));
                 _byAdd[add.Path] = (add.BaseRowId, replacement);
             }
+            if (_covered.Count > 0)
+            {
+                var rebasedIds = new Dictionary<string, long>(StringComparer.Ordinal);
+                foreach (var action in actions)
+                {
+                    if (action is AddFile { BaseRowId: { } baseRowId } add)
+                        rebasedIds[add.Path] = baseRowId;
+                }
+                for (int i = 0; i < _covered.Count; i++)
+                {
+                    var (adds, files) = _covered[i];
+                    var moves = new List<(long OldBase, long Rows, long NewBase)>(adds.Count);
+                    var rebasedAdds = new Dictionary<string, (long BaseRowId, long Rows)>(StringComparer.Ordinal);
+                    bool moved = false;
+                    foreach (var entry in adds)
+                    {
+                        long newBase = rebasedIds.TryGetValue(entry.Key, out long id) ? id : entry.Value.BaseRowId;
+                        moves.Add((entry.Value.BaseRowId, entry.Value.Rows, newBase));
+                        rebasedAdds[entry.Key] = (newBase, entry.Value.Rows);
+                        moved |= newBase != entry.Value.BaseRowId;
+                    }
+                    if (!moved)
+                        continue;
+                    var replacement = await _table.RewriteInsertRowIdsAsync(
+                        _snapshot, files, moves, cancellationToken, _written).ConfigureAwait(false);
+                    foreach (var f in files)
+                        supersededPaths.Add(DeltaPath.Decode(f.Path));
+                    _covered[i] = (rebasedAdds, replacement);
+                }
+            }
             if (supersededPaths.Count > 0)
             {
                 var superseded = new WrittenFileLedger();
@@ -3472,6 +3537,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
             foreach (var entry in _byAdd.Values)
                 result.AddRange(entry.Files);
+            foreach (var (_, files) in _covered)
+                result.AddRange(files);
             return result;
         }
     }
@@ -5773,6 +5840,17 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     // A constant Int64 column (the commit version assigned to every matched/updated row). Tiled by Repeat
     // rather than appended per row, which also drops the validity buffer a builder allocates for a column
     // that has no nulls to record.
+    // first, first + 1, ..., first + n - 1: the stable ids of n rows written in order from first.
+    internal static Int64Array SequentialInt64(long first, int n)
+    {
+        var values = new long[n];
+        for (int i = 0; i < n; i++)
+            values[i] = first + i;
+        return new Int64Array(
+            new ArrowBuffer(System.Runtime.InteropServices.MemoryMarshal.AsBytes(values.AsSpan()).ToArray()),
+            ArrowBuffer.Empty, n, nullCount: 0, offset: 0);
+    }
+
     private static Int64Array ConstInt64(long value, int n) =>
         (Int64Array)ArrowCompute.Repeat(
             Apache.Arrow.Types.Int64Type.Default, BitConverter.GetBytes(value), n);
@@ -7124,6 +7202,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Rows <see cref="ComputeWriteActionsAsync"/> wrote to a data file: <paramref name="partitionValues"/> as the
+    /// file's add records them, and <paramref name="rowIds"/> the rows' stable ids on a row-tracking table, else null.
+    /// </summary>
+    internal delegate ValueTask WrittenRowsObserver(
+        IReadOnlyDictionary<string, string> partitionValues,
+        RecordBatch rows,
+        Int64Array? rowIds,
+        CancellationToken cancellationToken);
+
+    /// <summary>
     /// Computes the full action list for a write against <paramref name="snapshot"/> WITHOUT committing:
     /// pre-commit removes (overwrite family), the per-batch adds (identity, row tracking, column mapping,
     /// partition split, stats), dynamic-overwrite removes, and any identity/repartition metaData +
@@ -7140,6 +7228,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <param name="identityHighWaterMarks">The identity high-water marks earlier appends staged against the same
     /// snapshot left pending, for a transaction: generation continues from them, and the metaData action this
     /// write emits carries them, so it supersedes the earlier one. Null starts at the snapshot's marks.</param>
+    /// <param name="rowsWritten">Told of every batch of rows as written: logical, with generated and identity
+    /// columns filled in, under the partition values its add records, and on a row-tracking table with the stable
+    /// id each row's add gives it. A MERGE writes its inserts' change rows from it (#732).</param>
     internal async ValueTask<(IReadOnlyList<DeltaAction> Actions, long NextRowId)> ComputeWriteActionsAsync(
         Snapshot.Snapshot snapshot,
         IReadOnlyList<RecordBatch> batches,
@@ -7151,7 +7242,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         long? rowIdStart = null,
         WrittenFileLedger? written = null,
         IReadOnlyDictionary<string, long>? identityHighWaterMarks = null,
-        Expressions.Predicate? replaceWhere = null)
+        Expressions.Predicate? replaceWhere = null,
+        WrittenRowsObserver? rowsWritten = null)
     {
         // The shared chokepoint for both the auto-committing path and a transaction's append. This path
         // converts no schema, so a column the table does not declare would ride into the data file unnoticed.
@@ -7442,6 +7534,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             touchedPartitions?.Add(CanonicalPartitionKey(
                 trackedPartValues, partitionColumns, logicalToPhysical, snapshot.Schema));
 
+            // A partition's files take consecutive baseRowIds in the order written (below), so a row's stable id is
+            // the partition's first id plus the row's place among the partition's rows, known before any file closes.
+            long groupFirstRowId = nextRowId;
+            long groupRows = 0;
+            bool observedIds = rowsWritten is not null && assignRowIds
+                && DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
+
             IReadOnlyList<RolledDataFile> files;
             await using (var writer = new RollingDataFileWriter(
                 _fs, _options.DataFileWriter, DataFileWriteOptions(snapshot), _options.TargetFileSize,
@@ -7479,9 +7578,25 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         : VariantColumnCoercion.StripAnnotation(fileBatch);
 
                     await writer.AddAsync(writeBatch, physicalBatch, cancellationToken).ConfigureAwait(false);
+
+                    if (rowsWritten is not null)
+                    {
+                        await rowsWritten(
+                            trackedPartValues, dataBatch,
+                            observedIds ? SequentialInt64(groupFirstRowId + groupRows, dataBatch.Length) : null,
+                            cancellationToken).ConfigureAwait(false);
+                    }
+                    groupRows += dataBatch.Length;
                 }
 
                 files = await writer.CompleteAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (rowsWritten is not null && files.Sum(static f => f.Rows) != groupRows)
+            {
+                throw new InvalidOperationException(
+                    $"The files written for a partition hold {files.Sum(static f => f.Rows)} rows where "
+                    + $"{groupRows} were written; the row ids reported for them would be wrong.");
             }
 
             foreach (var file in files)
@@ -10272,6 +10387,83 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 written).ConfigureAwait(false));
         }
         return files;
+    }
+
+    /// <summary>
+    /// Writes <paramref name="files"/> again with each <c>insert</c> row's id moved from the add range it was written
+    /// for to the one the add now has, every other row as it was, and returns the new files. An insert row's id
+    /// falls in exactly one add's old range [OldBase, OldBase + Rows), since the ranges of one commit's adds do not
+    /// overlap; it becomes NewBase plus its offset in that range. The other change rows keep their ids, which a
+    /// rewrite materialized from the rows they describe, and a NULL commit version stays NULL.
+    /// </summary>
+    internal async ValueTask<List<CdcFile>> RewriteInsertRowIdsAsync(
+        Snapshot.Snapshot snapshot,
+        IReadOnlyList<CdcFile> files,
+        IReadOnlyList<(long OldBase, long Rows, long NewBase)> moves,
+        CancellationToken cancellationToken,
+        WrittenFileLedger? written)
+    {
+        var sorted = moves.OrderBy(static m => m.OldBase).ToArray();
+        await using var sink = NewChangeDataSink(snapshot, written);
+        foreach (var file in files)
+        {
+            await foreach (var (rows, changeTypes, ids, versions) in ChangeDataFeed.CdfReader
+                .ReadWrittenChangeFileAsync(_fs, snapshot, file, cancellationToken).ConfigureAwait(false))
+            {
+                var movedIds = ids is null ? null : MoveInsertRowIds(ids, changeTypes, sorted);
+                // One AddAsync per run of a change type, so the rows keep their order.
+                int start = 0;
+                for (int i = 1; i <= rows.Length; i++)
+                {
+                    if (i < rows.Length && changeTypes.GetString(i) == changeTypes.GetString(start))
+                        continue;
+                    int length = i - start;
+                    await sink.AddAsync(
+                        rows.Slice(start, length), changeTypes.GetString(start), file.PartitionValues,
+                        cancellationToken,
+                        (Int64Array?)movedIds?.Slice(start, length),
+                        (Int64Array?)versions?.Slice(start, length)).ConfigureAwait(false);
+                    start = i;
+                }
+            }
+        }
+        return (await sink.CompleteAsync(cancellationToken).ConfigureAwait(false)).ToList();
+    }
+
+    private static Int64Array MoveInsertRowIds(
+        Int64Array ids, StringArray changeTypes, (long OldBase, long Rows, long NewBase)[] sortedMoves)
+    {
+        var builder = new Int64Array.Builder().Reserve(ids.Length);
+        for (int i = 0; i < ids.Length; i++)
+        {
+            if (ids.GetValue(i) is not { } id)
+            {
+                builder.AppendNull();
+                continue;
+            }
+            if (changeTypes.GetString(i) == DeltaLake.ChangeDataFeed.CdfConfig.Insert)
+            {
+                // The last range starting at or before the id.
+                int lo = 0, hi = sortedMoves.Length - 1, found = -1;
+                while (lo <= hi)
+                {
+                    int mid = lo + ((hi - lo) / 2);
+                    if (sortedMoves[mid].OldBase <= id)
+                    {
+                        found = mid;
+                        lo = mid + 1;
+                    }
+                    else
+                    {
+                        hi = mid - 1;
+                    }
+                }
+                if (found >= 0 && id < sortedMoves[found].OldBase + sortedMoves[found].Rows)
+                    id = sortedMoves[found].NewBase + (id - sortedMoves[found].OldBase);
+            }
+            builder.Append(id);
+        }
+        return builder.Build();
     }
 
     /// <summary>

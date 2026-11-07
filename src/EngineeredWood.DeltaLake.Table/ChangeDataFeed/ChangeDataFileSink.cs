@@ -63,7 +63,20 @@ internal sealed class ChangeDataFileSink : IAsyncDisposable
         public RollingDataFileWriter Writer { get; } = writer;
         public long Retained { get; set; }
         public long LastUsed { get; set; }
+        public bool HoldsInserts { get; set; }
     }
+
+    private readonly List<CdcFile> _filesHoldingInserts = new();
+
+    /// <summary>Whether any change rows have been added.</summary>
+    public bool HasRows { get; private set; }
+
+    /// <summary>
+    /// After <see cref="CompleteAsync"/>, the files of every partition that took <c>insert</c> rows: the files whose
+    /// row ids a rebase may have to rewrite (see <c>DeltaTable.InsertChangeDataFillIn</c>). A partition's file closed
+    /// before its first insert is listed too, which costs that rewrite a read and nothing else.
+    /// </summary>
+    public IReadOnlyList<CdcFile> FilesHoldingInserts => _filesHoldingInserts;
 
     public ChangeDataFileSink(
         ITableFileSystem fs,
@@ -99,6 +112,9 @@ internal sealed class ChangeDataFileSink : IAsyncDisposable
         var prepared = CdfWriter.PrepareRows(_snapshot, rows, changeType, rowIds, rowCommitVersions);
         var partition = PartitionOf(partitionValues);
         partition.LastUsed = ++_clock;
+        HasRows = true;
+        if (string.Equals(changeType, CdfConfig.Insert, StringComparison.Ordinal))
+            partition.HoldsInserts = true;
         // No stats are collected for a change file, so the stats batch is never read.
         await partition.Writer.AddAsync(prepared, prepared, cancellationToken).ConfigureAwait(false);
         Track(partition);
@@ -156,13 +172,16 @@ internal sealed class ChangeDataFileSink : IAsyncDisposable
         {
             foreach (var file in await partition.Writer.CompleteAsync(cancellationToken).ConfigureAwait(false))
             {
-                actions.Add(new CdcFile
+                var action = new CdcFile
                 {
                     Path = EngineeredWood.DeltaLake.DeltaPath.Encode(file.FileName),
                     PartitionValues = new Dictionary<string, string>(partition.Values),
                     Size = file.Size,
                     DataChange = false,
-                });
+                };
+                actions.Add(action);
+                if (partition.HoldsInserts)
+                    _filesHoldingInserts.Add(action);
             }
         }
         return actions;
