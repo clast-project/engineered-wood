@@ -10,9 +10,17 @@ namespace EngineeredWood.DeltaLake.Table;
 public sealed record DeltaChangeReadOptions
 {
     /// <summary>First version of the range, inclusive.</summary>
+    /// <remarks>Must not precede the earliest commit file left in the log: a range reaching back past what log
+    /// cleanup removed is refused (<see cref="DeltaErrorCodes.TruncatedTransactionLog"/>), as delta-spark refuses
+    /// it, rather than read as if those versions had no changes. A start past the latest version reads
+    /// nothing.</remarks>
     public long StartVersion { get; init; }
 
     /// <summary>Last version of the range, inclusive.</summary>
+    /// <remarks>An end past the table's latest version is read as the latest. The end must have a commit file,
+    /// or the range is refused (<see cref="DeltaErrorCodes.TruncatedTransactionLog"/>). A version inside the
+    /// range with no commit file is skipped, as delta-spark skips it; a commit that is there but cannot be read
+    /// fails the read.</remarks>
     public long EndVersion { get; init; }
 
     /// <summary>

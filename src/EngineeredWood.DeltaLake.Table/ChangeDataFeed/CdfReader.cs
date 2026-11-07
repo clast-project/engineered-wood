@@ -60,6 +60,12 @@ internal static class CdfReader
     /// <paramref name="maxBufferedReadBytes"/> of decoded batches the caller has not taken, as a scan does
     /// (<see cref="OrderedScan"/>). Batches come in the order a serial read gives: by version, then file. On an
     /// object store each file costs a few round trips, and read one after another they set the feed's time.</para>
+    /// <para>Which commits the range has comes from ONE listing of the log, as delta-spark's does (measured
+    /// against delta-spark 4.0.0): a version with no commit file inside the range is skipped; a range that starts
+    /// before the earliest commit file left (log cleanup removed it), or whose end has no commit file, is refused
+    /// with <see cref="DeltaErrorCodes.TruncatedTransactionLog"/>; and every listed commit must read, so a read
+    /// that fails fails the feed. An end past <paramref name="latestVersion"/> is read as the latest version.
+    /// The listed commits are read up to <paramref name="maxConcurrentReads"/> ahead, in order (#724).</para>
     /// </summary>
     public static async IAsyncEnumerable<RecordBatch> ReadChangesAsync(
         ITableFileSystem fs,
@@ -75,8 +81,12 @@ internal static class CdfReader
         string? emittedRowVersionName = null,
         int maxConcurrentReads = 1,
         long maxBufferedReadBytes = DefaultMaxBufferedReadBytes,
+        long latestVersion = -1,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        var versions = await CommitsInRangeAsync(log, startVersion, endVersion, latestVersion, cancellationToken)
+            .ConfigureAwait(false);
+
         var mappingMode = ColumnMapping.GetMode(schemaSnapshot.Metadata.Configuration);
         var ctx = new CdfSchemaContext(
             schemaSnapshot, mappingMode,
@@ -91,9 +101,10 @@ internal static class CdfReader
         // Stateless over the file system — one instance serves every action in the range.
         var dvReader = new DeletionVectorReader(fs);
 
-        // The units come from ONE enumeration, in order: the commit reads stay serial, and under OrderedScan
-        // they overlap the reads of the files already dispatched. Every other request is made by a file's read.
-        var units = UnitsAsync(log, startVersion, endVersion, dvReader, cancellationToken);
+        // The units come from ONE enumeration, in order. It reads the commits ahead of itself, and under
+        // OrderedScan those reads overlap the files already dispatched. Every other request is made by a file's
+        // read.
+        var units = UnitsAsync(log, versions, Math.Max(1, maxConcurrentReads), dvReader, cancellationToken);
 
         IAsyncEnumerable<RecordBatch> batches = maxConcurrentReads <= 1
             ? SeriallyAsync(fs, units, readOptions, ctx, dvReader, cancellationToken)
@@ -131,109 +142,180 @@ internal static class CdfReader
         long? DefaultRowCommitVersion);
 
     /// <summary>
-    /// The files of every version in the range, in the order the feed reports them: a version's change files
-    /// when it has any; else its removed data files, then its added ones. A commit is read only once the units
-    /// before it have been taken, so this runs no further ahead than the reads do.
+    /// The versions of [<paramref name="startVersion"/>, <paramref name="endVersion"/>] that have a commit file,
+    /// ascending, from one listing of the log. The end is clamped to the table's latest version (the newer of
+    /// <paramref name="latestVersion"/> and the newest commit file); a start past it gives no versions.
+    /// Refused, as delta-spark refuses them: a start before the earliest commit file (the commits it needs were
+    /// removed by log cleanup), and a clamped end with no commit file at or after it. A version missing in
+    /// between is left out, which is delta-spark's behaviour too.
+    /// </summary>
+    private static async ValueTask<List<long>> CommitsInRangeAsync(
+        TransactionLog log, long startVersion, long endVersion, long latestVersion,
+        CancellationToken cancellationToken)
+    {
+        var listed = new List<long>();
+        await foreach (long version in log.ListVersionsAsync(0, cancellationToken).ConfigureAwait(false))
+            listed.Add(version);
+
+        long latest = Math.Max(latestVersion, listed.Count > 0 ? listed[listed.Count - 1] : -1);
+        long end = Math.Min(endVersion, latest);
+        var inRange = new List<long>();
+        if (startVersion > end)
+            return inRange;
+
+        if (listed.Count == 0 || listed[0] > startVersion)
+        {
+            throw new DeltaFormatException(
+                DeltaErrorCodes.TruncatedTransactionLog,
+                listed.Count == 0
+                    ? $"Cannot read changes from version {startVersion}: the log holds no commit files."
+                    : $"Cannot read changes from version {startVersion}: the earliest commit left in the log is "
+                      + $"version {listed[0]}; the ones before it were removed (log cleanup, under "
+                      + "delta.logRetentionDuration).");
+        }
+        if (listed[listed.Count - 1] < end)
+        {
+            throw new DeltaFormatException(
+                DeltaErrorCodes.TruncatedTransactionLog,
+                $"Cannot read changes up to version {end}: the log has no commit file for it.");
+        }
+
+        foreach (long version in listed)
+        {
+            if (version >= startVersion && version <= end)
+                inRange.Add(version);
+        }
+        return inRange;
+    }
+
+    /// <summary>
+    /// The files of every listed version, in the order the feed reports them: a version's change files when it
+    /// has any; else its removed data files, then its added ones. Up to <paramref name="readAhead"/> commits are
+    /// read at once, the next ones started as each is taken, so the reads run only that far ahead of the units.
+    /// A commit that fails to read fails the feed at its position.
     /// </summary>
     private static async IAsyncEnumerable<CdfUnit> UnitsAsync(
         TransactionLog log,
-        long startVersion,
-        long endVersion,
+        IReadOnlyList<long> versions,
+        int readAhead,
         DeletionVectorReader dvReader,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        for (long version = startVersion; version <= endVersion; version++)
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var pending = new Queue<(long Version, Task<IReadOnlyList<DeltaAction>> Read)>();
+        int next = 0;
+        try
         {
-            IReadOnlyList<DeltaAction> actions;
-            try
+            while (true)
             {
-                actions = await log.ReadCommitAsync(version, cancellationToken)
-                    .ConfigureAwait(false);
-            }
-            catch when (!cancellationToken.IsCancellationRequested)
-            {
-                continue; // Skip missing versions
-            }
-
-            // Get commit timestamp
-            long? commitTimestamp = InCommitTimestamp.GetTimestampFromActions(actions);
-
-            // Check if this version has CDC files
-            var cdcFiles = actions.OfType<CdcFile>().ToList();
-
-            if (cdcFiles.Count > 0)
-            {
-                // Read from CDC files — they have _change_type already
-                foreach (var cdcFile in cdcFiles)
+                while (pending.Count < readAhead && next < versions.Count)
                 {
+                    long v = versions[next++];
+                    pending.Enqueue((v, log.ReadCommitAsync(v, stop.Token).AsTask()));
+                }
+                if (pending.Count == 0)
+                    yield break;
+
+                var (version, read) = pending.Dequeue();
+                var actions = await read.ConfigureAwait(false);
+
+                // Get commit timestamp
+                long? commitTimestamp = InCommitTimestamp.GetTimestampFromActions(actions);
+
+                // Check if this version has CDC files
+                var cdcFiles = actions.OfType<CdcFile>().ToList();
+
+                if (cdcFiles.Count > 0)
+                {
+                    // Read from CDC files — they have _change_type already
+                    foreach (var cdcFile in cdcFiles)
+                    {
+                        yield return new CdfUnit(
+                            IsChangeFile: true, cdcFile.Path, cdcFile.Size,
+                            (IReadOnlyDictionary<string, string>?)cdcFile.PartitionValues,
+                            Filter: default, ChangeType: "", version, commitTimestamp,
+                            BaseRowId: null, DefaultRowCommitVersion: null);
+                    }
+                    continue;
+                }
+
+                // Infer changes from add/remove actions
+                var adds = actions.OfType<AddFile>()
+                    .Where(a => a.DataChange).ToList();
+                var removes = actions.OfType<RemoveFile>()
+                    .Where(r => r.DataChange).ToList();
+
+                // A remove and an add of the SAME file in one version, either carrying a deletion vector, is a
+                // vector edit rather than a file replaced: what changed is the difference between the two
+                // vectors, not every row of the file. Read whole, the pair reported every survivor deleted and
+                // re-inserted. Spark's reader pairs them the same way (CDCReader.processDeletionVectorActions).
+                // Pairing needs only the actions. The vectors are read, and the difference taken, by the file's own
+                // read (RowFilter.ResolveEditAsync), so the dispatcher sends no request for them.
+                var vectorEdits = PairVectorEdits(removes, adds, dvReader);
+
+                // Removed files → "delete" rows. The action's DELETION VECTOR is honored: rows it already
+                // marked deleted are not live at this version — they were reported as deletes when the DV
+                // itself committed, so materializing them again double-counts (e.g. an overwrite removing a
+                // file an earlier DV-delete had soft-deleted rows in). Same on the add side: a DV-carrying
+                // add's marked rows are not live inserts.
+                foreach (var remove in removes)
+                {
+                    RowFilter filter;
+                    if (vectorEdits.TryGetValue(remove.Path, out var edit))
+                    {
+                        // The rows the new vector hides that the old one did not.
+                        filter = RowFilter.Edited(edit, reinserted: false);
+                    }
+                    else
+                    {
+                        filter = RowFilter.Exclude(remove.DeletionVector);
+                    }
+
                     yield return new CdfUnit(
-                        IsChangeFile: true, cdcFile.Path, cdcFile.Size,
-                        (IReadOnlyDictionary<string, string>?)cdcFile.PartitionValues,
-                        Filter: default, ChangeType: "", version, commitTimestamp,
-                        BaseRowId: null, DefaultRowCommitVersion: null);
+                        IsChangeFile: false, remove.Path, remove.Size ?? edit?.Add.Size,
+                        remove.PartitionValues ?? edit?.Add.PartitionValues, filter,
+                        CdfConfig.Delete, version, commitTimestamp,
+                        remove.BaseRowId ?? edit?.Add.BaseRowId,
+                        remove.DefaultRowCommitVersion ?? edit?.Add.DefaultRowCommitVersion);
                 }
-                continue;
+
+                // Added files → "insert" rows
+                foreach (var add in adds)
+                {
+                    RowFilter filter;
+                    if (vectorEdits.TryGetValue(add.Path, out var edit))
+                    {
+                        // The rows the old vector hid that the new one no longer does — a RESTORE un-deleting
+                        // them. An ordinary vector DELETE has none.
+                        filter = RowFilter.Edited(edit, reinserted: true);
+                    }
+                    else
+                    {
+                        filter = RowFilter.Exclude(add.DeletionVector);
+                    }
+
+                    yield return new CdfUnit(
+                        IsChangeFile: false, add.Path, add.Size, add.PartitionValues, filter,
+                        CdfConfig.Insert, version, commitTimestamp,
+                        add.BaseRowId, add.DefaultRowCommitVersion);
+                }
             }
-
-            // Infer changes from add/remove actions
-            var adds = actions.OfType<AddFile>()
-                .Where(a => a.DataChange).ToList();
-            var removes = actions.OfType<RemoveFile>()
-                .Where(r => r.DataChange).ToList();
-
-            // A remove and an add of the SAME file in one version, either carrying a deletion vector, is a
-            // vector edit rather than a file replaced: what changed is the difference between the two
-            // vectors, not every row of the file. Read whole, the pair reported every survivor deleted and
-            // re-inserted. Spark's reader pairs them the same way (CDCReader.processDeletionVectorActions).
-            // Pairing needs only the actions. The vectors are read, and the difference taken, by the file's own
-            // read (RowFilter.ResolveEditAsync), so the dispatcher sends no request for them.
-            var vectorEdits = PairVectorEdits(removes, adds, dvReader);
-
-            // Removed files → "delete" rows. The action's DELETION VECTOR is honored: rows it already
-            // marked deleted are not live at this version — they were reported as deletes when the DV
-            // itself committed, so materializing them again double-counts (e.g. an overwrite removing a
-            // file an earlier DV-delete had soft-deleted rows in). Same on the add side: a DV-carrying
-            // add's marked rows are not live inserts.
-            foreach (var remove in removes)
+        }
+        finally
+        {
+            // Stop the reads still running ahead (an early exit, or a failure) and wait for them, so none is left
+            // unobserved or still running once the feed is gone.
+            stop.Cancel();
+            while (pending.Count > 0)
             {
-                RowFilter filter;
-                if (vectorEdits.TryGetValue(remove.Path, out var edit))
+                try
                 {
-                    // The rows the new vector hides that the old one did not.
-                    filter = RowFilter.Edited(edit, reinserted: false);
+                    await pending.Dequeue().Read.ConfigureAwait(false);
                 }
-                else
+                catch
                 {
-                    filter = RowFilter.Exclude(remove.DeletionVector);
+                    // Cancelled, or failed after the feed had stopped needing it.
                 }
-
-                yield return new CdfUnit(
-                    IsChangeFile: false, remove.Path, remove.Size ?? edit?.Add.Size,
-                    remove.PartitionValues ?? edit?.Add.PartitionValues, filter,
-                    CdfConfig.Delete, version, commitTimestamp,
-                    remove.BaseRowId ?? edit?.Add.BaseRowId,
-                    remove.DefaultRowCommitVersion ?? edit?.Add.DefaultRowCommitVersion);
-            }
-
-            // Added files → "insert" rows
-            foreach (var add in adds)
-            {
-                RowFilter filter;
-                if (vectorEdits.TryGetValue(add.Path, out var edit))
-                {
-                    // The rows the old vector hid that the new one no longer does — a RESTORE un-deleting
-                    // them. An ordinary vector DELETE has none.
-                    filter = RowFilter.Edited(edit, reinserted: true);
-                }
-                else
-                {
-                    filter = RowFilter.Exclude(add.DeletionVector);
-                }
-
-                yield return new CdfUnit(
-                    IsChangeFile: false, add.Path, add.Size, add.PartitionValues, filter,
-                    CdfConfig.Insert, version, commitTimestamp,
-                    add.BaseRowId, add.DefaultRowCommitVersion);
             }
         }
     }

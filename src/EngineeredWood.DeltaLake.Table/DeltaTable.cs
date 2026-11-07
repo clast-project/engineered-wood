@@ -5919,7 +5919,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             options.MetadataPrefix + DeltaMetadataColumns.RowIdSuffix,
             options.MetadataPrefix + DeltaMetadataColumns.RowCommitVersionSuffix,
             EffectiveConcurrentRequests, _options.MaxBufferedReadBytes,
-            cancellationToken);
+            latestVersion: snapshot.Version,
+            cancellationToken: cancellationToken);
 
         // Keep set for the projection, if one was asked for. The feed's own three columns are never dropped
         // — they are what makes a change row a change — and neither are the metadata columns just added.
