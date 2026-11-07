@@ -337,6 +337,9 @@ public class OrderedScanTests
         var a = new ScanMemoryBudget(1 << 20, parent);
         var b = new ScanMemoryBudget(1 << 20, parent);
 
+        // Both consumers stop after their first item until released, so both scans are live at once and their
+        // reads run ahead until the SHARED cap stops them. Alone, each would read ahead 4 files x 4 queued items.
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         async Task<int> Consume(ScanMemoryBudget memory)
         {
             int n = 0;
@@ -344,19 +347,37 @@ public class OrderedScanTests
                                itemSize: size, memory: memory))
             {
                 item.Delivered = true;
-                n++;
-                await Task.Delay(1); // slow consumers: the reads run ahead until the SHARED cap stops them
+                if (++n == 1)
+                    await release.Task;
+                else
+                    await Task.Delay(1);
             }
             return n;
         }
 
-        var counts = await Task.WhenAll(Consume(a), Consume(b)).WaitAsync(Timeout);
+        var consumers = Task.WhenAll(Consume(a), Consume(b));
+
+        // Wait until both scans hold something and together they have filled the parent.
+        var deadline = DateTime.UtcNow + Timeout;
+        while (!(a.Used > 0 && b.Used > 0 && parent.UsedBytes >= cap))
+        {
+            Assert.True(DateTime.UtcNow < deadline,
+                $"the scans never filled the shared cap together: a={a.Used}, b={b.Used}, parent={parent.UsedBytes}");
+            await Task.Delay(5);
+        }
+        // Let any read that could still get in do so: nothing more may, beyond the front files' one item each.
+        await Task.Delay(100);
+        long heldA = a.Used, heldB = b.Used, held = parent.UsedBytes;
+        Assert.Equal(heldA + heldB, held);
+        Assert.InRange(held, cap, cap + 2 * size);
+
+        release.SetResult(true);
+        var counts = await consumers.WaitAsync(Timeout);
 
         Assert.Equal([24, 24], counts);
         // Each scan's own cap is far above the parent's, so the parent is what bound them: its cap, plus the one
         // item each scan's front file may decode over it.
         Assert.InRange(parent.PeakBytes, size, cap + 2 * size);
-        Assert.True(a.Peak + b.Peak > parent.PeakBytes - size, "the scans never overlapped");
         Assert.Equal(0, parent.UsedBytes);
     }
 

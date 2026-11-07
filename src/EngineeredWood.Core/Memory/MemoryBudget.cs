@@ -20,10 +20,15 @@ namespace EngineeredWood.Memory;
 /// seen.</para>
 /// <para><b>Overruns.</b> A reservation that does not fit waits until enough is released, with two exceptions
 /// that keep every scan moving, so that contention slows scans down but never deadlocks them. A budget that
-/// holds nothing admits one reservation even if it alone is larger than the budget. And the batch a scan's
+/// holds nothing admits one reservation even if it alone is larger than the budget. And the read a scan's
 /// caller is waiting on is always admitted, however full the budgets are: that scan's consumer can release
-/// nothing until it arrives. So the total can run over by about one batch per scan in progress, plus what a
-/// scan's estimates fall short of its batches (see <c>MaxBufferedReadBytes</c>).</para>
+/// nothing until it arrives.</para>
+/// <para>What that read is admitted for is sized by ROW GROUP, not by batch: before its first batch it
+/// reserves the row group's projected uncompressed size from the footer, and a Parquet read also holds the row
+/// group's projected compressed column chunks for as long as it reads them. A small <c>BatchSize</c> shrinks
+/// neither. So the total can run over by about one row group per scan in progress (its compressed plus its
+/// uncompressed size), plus what a scan's estimates fall short of its batches (see
+/// <c>MaxBufferedReadBytes</c>). Size a shared budget with the files' row-group sizes in mind.</para>
 /// <para>Thread-safe. A budget holds no resources and needs no disposal.</para>
 /// </remarks>
 public sealed class MemoryBudget

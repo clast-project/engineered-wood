@@ -200,9 +200,12 @@ internal sealed class ScanMemoryBudget
                 _queued.Remove(unit);
             else
                 _queued[unit] = left;
-            _memory.AdjustLocked(-charge);
-            // Also when nothing was charged: the unit's queue count changed, which can make it the front unit.
-            _memory.SignalLocked();
+            // A release wakes the waiters itself. With nothing charged they still need waking: the unit's queue
+            // count changed, which can make it the front unit.
+            if (charge != 0)
+                _memory.AdjustLocked(-charge);
+            else
+                _memory.SignalLocked();
         }
     }
 
