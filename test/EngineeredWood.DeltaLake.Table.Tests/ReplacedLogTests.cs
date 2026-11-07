@@ -308,6 +308,18 @@ public class ReplacedLogTests : IDisposable
         var ex = await Assert.ThrowsAsync<DeltaFormatException>(
             async () => await SnapshotBuilder.UpdateAsync(held, new TransactionLog(Local)));
         Assert.Equal(DeltaErrorCodes.TransactionLogReplaced, ex.ErrorCode);
+
+        // A reader rebuilds, and sees exactly what a fresh open of this log sees. The log itself now mixes two tables
+        // (the old checkpoint and the new commits), which every reader of it inherits; the refresh's contract is to
+        // agree with an open, not to second-guess the log's own checkpoints.
+        await table.RefreshAsync();
+        await using var fresh = await DeltaTable.OpenAsync(Local, Options);
+        Assert.Equal(fresh.CurrentSnapshot.Version, table.CurrentSnapshot.Version);
+        Assert.Equal(fresh.CurrentSnapshot.Metadata.Id, table.CurrentSnapshot.Metadata.Id);
+        Assert.Equal(
+            fresh.CurrentSnapshot.ActiveFiles.Keys.OrderBy(k => k, StringComparer.Ordinal),
+            table.CurrentSnapshot.ActiveFiles.Keys.OrderBy(k => k, StringComparer.Ordinal));
+        Assert.NotSame(held.ActiveFiles, table.CurrentSnapshot.ActiveFiles);
     }
 
     [Fact]

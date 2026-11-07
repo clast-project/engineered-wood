@@ -37,6 +37,13 @@ public class LogFileIdentityTests
     }
 
     [Fact]
+    public void An_ETag_on_one_side_only_cannot_be_compared()
+    {
+        Assert.Equal(LogFileMatch.Unknown, Compare(new(Path, 10, T1, "\"a\""), new(Path, 10, T1, null)));
+        Assert.Equal(LogFileMatch.Unknown, Compare(new(Path, 10, T1, null), new(Path, 10, T1, "\"a\"")));
+    }
+
+    [Fact]
     public void Size_still_counts_with_matching_ETags() =>
         Assert.Equal(LogFileMatch.Different, Compare(new(Path, 10, T1, "\"a\""), new(Path, 11, T1, "\"a\"")));
 

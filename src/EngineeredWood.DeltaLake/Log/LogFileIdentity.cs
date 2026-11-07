@@ -48,6 +48,11 @@ internal readonly record struct LogFileIdentity(string Path, long Size, DateTime
         if (ETag is not null && other.ETag is not null)
             return string.Equals(ETag, other.ETag, StringComparison.Ordinal) ? LogFileMatch.Same : LogFileMatch.Different;
 
+        // A tag on one side only means the two listings did not describe the object the same way, so they cannot be
+        // compared. The time is no substitute: a coarse one can match across a same-size replacement (#746 review).
+        if (ETag is not null || other.ETag is not null)
+            return LogFileMatch.Unknown;
+
         return LastModified != default && LastModified == other.LastModified ? LogFileMatch.Same : LogFileMatch.Unknown;
     }
 }
