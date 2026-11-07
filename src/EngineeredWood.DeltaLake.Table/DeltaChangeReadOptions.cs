@@ -19,10 +19,15 @@ public sealed record DeltaChangeReadOptions
     /// <summary>Last version of the range, inclusive.</summary>
     /// <remarks>An end past the table handle's snapshot version is read as that version: like every read on the
     /// handle, the feed does not see commits made after it until <see cref="DeltaTable.RefreshAsync"/>. The end
-    /// must have a commit file,
-    /// or the range is refused (<see cref="DeltaErrorCodes.TruncatedTransactionLog"/>). A version inside the
-    /// range with no commit file is skipped, as delta-spark skips it; a commit that is there but cannot be read
-    /// fails the read.</remarks>
+    /// must have a commit file, or the range is refused (<see cref="DeltaErrorCodes.TruncatedTransactionLog"/>).
+    /// A version inside the range with no commit file is skipped, as delta-spark skips it; a commit that is there
+    /// but cannot be read fails the read.
+    /// <para>One exception, under column mapping: the feed's columns are named by the schema at the END version
+    /// (delta-spark's rule), so an end below the snapshot version needs the table state at that end. A missing
+    /// commit between the checkpoint before the end and the end makes that state impossible to build (the
+    /// missing commit may be the one that renamed a column), and the range is refused
+    /// (<see cref="DeltaErrorCodes.TruncatedTransactionLog"/>) rather than read under a guessed schema.
+    /// delta-spark refuses such a range too.</para></remarks>
     public long EndVersion { get; init; }
 
     /// <summary>

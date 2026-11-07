@@ -61,7 +61,8 @@ internal static class CdfReader
     /// (<see cref="OrderedScan"/>). Batches come in the order a serial read gives: by version, then file. On an
     /// object store each file costs a few round trips, and read one after another they set the feed's time.</para>
     /// <para>Which commits the range has comes from ONE listing of the log, as delta-spark's does (measured
-    /// against delta-spark 4.0.0): a version with no commit file inside the range is skipped; a range that starts
+    /// against delta-spark 4.0.0): a version with no commit file inside the range is skipped (unless the caller
+    /// could not build <paramref name="schemaSnapshot"/> across it, under column mapping); a range that starts
     /// before the earliest commit file left (log cleanup removed it), or whose end has no commit file, is refused
     /// with <see cref="DeltaErrorCodes.TruncatedTransactionLog"/>; and every listed commit must read, so a read
     /// that fails fails the feed. An end past <paramref name="latestVersion"/> is read as that version: commits made

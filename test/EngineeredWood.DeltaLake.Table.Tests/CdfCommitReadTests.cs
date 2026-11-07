@@ -4,6 +4,7 @@
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
+using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 
@@ -208,6 +209,37 @@ public class CdfCommitReadTests : IDisposable
                 after.Add((version.GetValue(i)!.Value, batch.Schema.GetFieldIndex("extra") >= 0));
         }
         Assert.Equal([(1L, true), (2L, true)], after);
+    }
+
+    /// <summary>
+    /// Under column mapping the feed's schema is the END version's (Spark's rule), so an end below the latest
+    /// needs the table state at that end. A hole between the nearest checkpoint and the end means that state,
+    /// and so the schema the end's columns are named by, cannot be built: the missing commit may be the one that
+    /// renamed a column. The range is refused rather than read under a guessed schema; delta-spark refuses it too
+    /// (5..8 with 7 deleted: <c>DELTA_VERSIONS_NOT_CONTIGUOUS</c>). With the end at the latest version the schema
+    /// is the snapshot's, and the hole is skipped as without mapping.
+    /// </summary>
+    [Fact]
+    public async Task UnderColumnMapping_AHoleBeforeAnEndBelowTheLatest_IsRefused()
+    {
+        await using (var table = await DeltaTable.CreateAsync(
+                         new LocalTableFileSystem(_tempDir), Schema, columnMappingMode: ColumnMappingMode.Name,
+                         configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" }))
+        {
+            for (int i = 0; i < Appends; i++)
+            {
+                var id = new Int64Array.Builder().Append(i).Build();
+                await table.WriteAsync([new RecordBatch(table.ArrowSchema, [id], 1)]);
+            }
+            await table.CheckpointAsync();
+        }
+        File.Delete(CommitPath(7));
+        var fs = new LocalTableFileSystem(_tempDir);
+
+        var refused = await Assert.ThrowsAsync<DeltaFormatException>(() => VersionsAsync(fs, 6, 8));
+        Assert.Equal(DeltaErrorCodes.TruncatedTransactionLog, refused.ErrorCode);
+
+        Assert.Equal([6, 8, 9, 10], await VersionsAsync(fs, 6, 10));
     }
 
     [Fact]
