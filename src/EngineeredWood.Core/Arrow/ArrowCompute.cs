@@ -308,6 +308,11 @@ public static partial class ArrowCompute
     /// <para>One gap is not closed here. For a view type the result refers to the inputs' data
     /// buffers without holding them (also #443), so it stays valid only while the inputs do. That is
     /// only a problem for a caller that disposes the inputs before the result.</para>
+    /// <para>The inputs must have the same type throughout: for a nested type, the same children by name, order and
+    /// nullability, at every depth. Arrow's concatenator compares only the kind and the child count, then joins
+    /// children by position under the first input's type, so a struct whose fields come in another order would have
+    /// its values swapped (#733). The one difference allowed is Arrow's own: top-level decimals of one scale but
+    /// different precisions are joined at the larger precision.</para>
     /// <para>As with Arrow's, a single input (after the empty ones are dropped) is returned as it is,
     /// not copied.</para>
     /// <para>String, binary and struct columns (their large forms too, and VARIANT, which is a struct of
@@ -315,7 +320,7 @@ public static partial class ArrowCompute
     /// value buffer of a string column from empty, doubling as it goes, and then copies every buffer it
     /// built once more: a string column cost several times its own size to join (#667).</para>
     /// </remarks>
-    /// <exception cref="ArgumentException"><paramref name="arrays"/> is empty.</exception>
+    /// <exception cref="ArgumentException"><paramref name="arrays"/> is empty, or its arrays' types differ.</exception>
     public static IArrowArray Concatenate(IReadOnlyList<IArrowArray> arrays)
     {
         if (arrays is null)
@@ -336,6 +341,20 @@ public static partial class ArrowCompute
             return inputs[0];
 
         var type = inputs[0].Data.DataType;
+        // The whole type, not only its kind. Arrow's concatenator (and the struct join here) checks the kind and
+        // the child count, then joins children by position under the first input's labels: structs whose fields
+        // differ in name, order or nullability would be joined anyway, values under the wrong field (#733).
+        for (int i = 1; i < inputs.Count; i++)
+        {
+            var other = inputs[i].Data.DataType;
+            if (!ConcatenationCompatible(type, other))
+            {
+                throw new ArgumentException(
+                    $"Cannot concatenate {ArrowTypeEquality.Describe(other)} onto {ArrowTypeEquality.Describe(type)}: "
+                    + "their types differ.",
+                    nameof(arrays));
+            }
+        }
         if (type is NullType)
             return new NullArray(inputs.Sum(a => a.Length));
         // Arrow's concatenator has no run-end encoded arm; the runs are joined as runs.
@@ -359,18 +378,7 @@ public static partial class ArrowCompute
             return ArrowArrayFactory.BuildArray(ConcatenateData(data));
         }
 
-        // Arrow checks that the inputs' storage agrees, which is all it will see. The extension types
-        // are ours to check: relabelling gives every input the first one's.
-        for (int i = 1; i < inputs.Count; i++)
-        {
-            if (!SameExtensionTypes(type, inputs[i].Data.DataType))
-            {
-                throw new ArgumentException(
-                    $"Cannot concatenate {inputs[i].Data.DataType.Name} onto {type.Name}: their extension types differ.",
-                    nameof(arrays));
-            }
-        }
-
+        // The check above compared the extension types too, so relabelling with the first input's is sound.
         var storage = new List<ArrayData>(inputs.Count);
         foreach (var array in inputs)
             storage.Add(AsStorage(array.Data));
@@ -386,31 +394,20 @@ public static partial class ArrowCompute
     };
 
     /// <summary>
-    /// Whether two types carry the same extension types in the same places: same name and metadata,
-    /// over storage that does too. Anything that is not an extension is left to Arrow's own check.
+    /// Whether arrays of type <paramref name="b"/> may be joined onto arrays of type <paramref name="a"/>: the same
+    /// type throughout (<see cref="ArrowTypeEquality.SameType"/>), with one exception kept from Arrow. Top-level
+    /// decimals of one width and scale may differ in precision; Arrow's concatenator widens the result to the
+    /// larger, which loses nothing. Inside a nested type the precision must agree too, since the joined parent
+    /// keeps the first input's type and would mislabel a widened child.
     /// </summary>
-    private static bool SameExtensionTypes(IArrowType a, IArrowType b)
+    private static bool ConcatenationCompatible(IArrowType a, IArrowType b)
     {
-        if (a is ExtensionType || b is ExtensionType)
-        {
-            return a is ExtensionType x && b is ExtensionType y
-                && x.Name == y.Name
-                && x.ExtensionMetadata == y.ExtensionMetadata
-                && SameExtensionTypes(x.StorageType, y.StorageType);
-        }
-
-        if (a is NestedType na && b is NestedType nb)
-        {
-            if (na.Fields.Count != nb.Fields.Count)
-                return false;
-            for (int i = 0; i < na.Fields.Count; i++)
-            {
-                if (!SameExtensionTypes(na.Fields[i].DataType, nb.Fields[i].DataType))
-                    return false;
-            }
-        }
-
-        return true;
+        if (a.TypeId == b.TypeId && ArrowTypeEquality.DecimalScale(a) is int scale)
+            return ArrowTypeEquality.DecimalScale(b) == scale;
+        // Run-end encoded inputs are compared by RunEndEncoding.Concatenate, which names what differs.
+        if (a is RunEndEncodedType && b is RunEndEncodedType)
+            return true;
+        return ArrowTypeEquality.SameType(a, b);
     }
 
     /// <summary>

@@ -191,11 +191,127 @@ public class ConcatenateTests
         Assert.Equal(new[] { "a", null, "c" }, Enumerable.Range(0, 3).Select(i => result.GetString(i)));
     }
 
+    /// <summary>
+    /// Structs are joined child by child, by position, under the first input's type. Inputs whose fields differ in
+    /// name, order or nullability must be refused, or values land under the wrong field (#733).
+    /// </summary>
+    [Theory]
+    [InlineData("a", "b")]          // a different name
+    [InlineData("a!", "a")]         // NOT NULL onto nullable
+    [InlineData("a", "a!")]         // nullable onto NOT NULL
+    [InlineData("a,b", "b,a")]      // the same fields in another order: the values would swap
+    [InlineData("a", "a,b")]        // a different field count
+    [InlineData("a,b", "a")]
+    public void StructsOfDifferentFields_AreRefused(string first, string second)
+    {
+        var ex = Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([Struct(first), Struct(second)]));
+        Assert.Contains("their types differ", ex.Message);
+    }
+
+    [Fact]
+    public void StructsOfDifferentFields_InsideAList_AreRefused()
+    {
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([ListOf(Struct("a,b")), ListOf(Struct("b,a"))]));
+    }
+
+    [Fact]
+    public void StructsOfDifferentFields_InsideAStruct_AreRefused()
+    {
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([Wrap(Struct("a,b")), Wrap(Struct("b,a"))]));
+    }
+
+    [Fact]
+    public void StructsOfTheSameFields_FromSeparateTypeInstances_Concatenate()
+    {
+        var result = Assert.IsType<StructArray>(ArrowCompute.Concatenate([Struct("a!,b"), Struct("a!,b")]));
+        Assert.Equal(new int?[] { 1, 1 }, Enumerable.Range(0, 2).Select(i => ((Int32Array)result.Fields[0]).GetValue(i)));
+        Assert.Equal(new int?[] { 2, 2 }, Enumerable.Range(0, 2).Select(i => ((Int32Array)result.Fields[1]).GetValue(i)));
+    }
+
+    /// <summary>The message spells out the fields, so the difference can be read off it.</summary>
+    [Fact]
+    public void Refusal_NamesTheFields()
+    {
+        var ex = Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([Struct("a!,b"), Struct("b,a")]));
+        Assert.Contains("struct<b: int32, a: int32> onto struct<a: int32 not null, b: int32>", ex.Message);
+    }
+
+    [Fact]
+    public void DifferentLeafTypes_AreRefused()
+    {
+        var ints = new Int32Array.Builder().Append(1).Build();
+        var longs = new Int64Array.Builder().Append(2).Build();
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([ints, longs]));
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([new NullArray(1), ints]));
+    }
+
+    /// <summary>
+    /// Arrow's concatenator widens top-level decimals that differ only in precision, which loses nothing; that is
+    /// kept. A different scale is refused.
+    /// </summary>
+    [Fact]
+    public void TopLevelDecimals_OfDifferentPrecision_Widen()
+    {
+        var result = ArrowCompute.Concatenate([Decimals(10, 2, 1.25m), Decimals(18, 2, 3.5m)]);
+
+        var type = Assert.IsType<Decimal128Type>(result.Data.DataType);
+        Assert.Equal((18, 2), (type.Precision, type.Scale));
+        var values = Assert.IsType<Decimal128Array>(result);
+        Assert.Equal(new decimal?[] { 1.25m, 3.5m }, Enumerable.Range(0, 2).Select(i => values.GetValue(i)));
+    }
+
+    [Fact]
+    public void Decimals_OfDifferentScale_AreRefused()
+    {
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([Decimals(10, 2, 1.25m), Decimals(10, 3, 1.25m)]));
+    }
+
+    /// <summary>
+    /// Inside a struct the joined parent keeps the first input's type, so a widened child would be mislabelled:
+    /// there the precision must agree too.
+    /// </summary>
+    [Fact]
+    public void NestedDecimals_OfDifferentPrecision_AreRefused()
+    {
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate(
+            [Wrap(Decimals(10, 2, 1.25m)), Wrap(Decimals(18, 2, 3.5m))]));
+    }
+
     [Fact]
     public void NoInput_Throws()
     {
         Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([]));
     }
+
+    /// <summary>
+    /// A one-row struct of int32 children, one per comma-separated name (a trailing <c>!</c> makes it NOT NULL),
+    /// each holding its position: 1, 2, and so on.
+    /// </summary>
+    private static StructArray Struct(string spec)
+    {
+        var fields = new List<Field>();
+        var children = new List<IArrowArray>();
+        foreach (var (name, i) in spec.Split(',').Select((n, i) => (n, i)))
+        {
+            fields.Add(new Field(name.TrimEnd('!'), Int32Type.Default, nullable: !name.EndsWith("!", StringComparison.Ordinal)));
+            children.Add(new Int32Array.Builder().Append(i + 1).Build());
+        }
+        return new StructArray(new StructType(fields), 1, children, ArrowBuffer.Empty, nullCount: 0);
+    }
+
+    private static StructArray Wrap(IArrowArray child) => new(
+        new StructType([new Field("inner", child.Data.DataType, nullable: true)]),
+        child.Length, [child], ArrowBuffer.Empty, nullCount: 0);
+
+    private static ListArray ListOf(IArrowArray values)
+    {
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(values.Length).Build();
+        return new ListArray(new ListType(new Field("item", values.Data.DataType, nullable: true)),
+            1, offsets, values, ArrowBuffer.Empty, nullCount: 0);
+    }
+
+    private static Decimal128Array Decimals(int precision, int scale, decimal value) =>
+        new Decimal128Array.Builder(new Decimal128Type(precision, scale)).Append(value).Build();
 
     private static GuidArray Guids(Guid[] values)
     {

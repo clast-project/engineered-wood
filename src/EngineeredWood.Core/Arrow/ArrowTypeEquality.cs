@@ -61,4 +61,42 @@ internal static class ArrowTypeEquality
             _ => true,
         };
     }
+
+    /// <summary>
+    /// The type written out with everything <see cref="SameType"/> compares, for a message that says what differs:
+    /// <c>struct&lt;a: int32 not null, b: timestamp[us, UTC]&gt;</c>. A bare <see cref="IArrowType.Name"/> says only
+    /// <c>struct</c>.
+    /// </summary>
+    public static string Describe(IArrowType type) => type switch
+    {
+        ExtensionType x => $"{x.Name}<{Describe(x.StorageType)}>",
+        DictionaryType x => $"dictionary<{Describe(x.IndexType)}, {Describe(x.ValueType)}{(x.Ordered ? ", ordered" : "")}>",
+        FixedSizeListType x => $"{x.Name}[{x.ListSize}]<{DescribeFields(x.Fields)}>",
+        MapType x => $"{x.Name}{(x.KeySorted ? "[sorted]" : "")}<{DescribeFields(x.Fields)}>",
+        NestedType x => $"{x.Name}<{DescribeFields(x.Fields)}>",
+        Decimal32Type x => $"{x.Name}({x.Precision}, {x.Scale})",
+        Decimal64Type x => $"{x.Name}({x.Precision}, {x.Scale})",
+        Decimal128Type x => $"{x.Name}({x.Precision}, {x.Scale})",
+        Decimal256Type x => $"{x.Name}({x.Precision}, {x.Scale})",
+        TimestampType x => x.Timezone is null ? $"{x.Name}[{x.Unit}]" : $"{x.Name}[{x.Unit}, {x.Timezone}]",
+        Time32Type x => $"{x.Name}[{x.Unit}]",
+        Time64Type x => $"{x.Name}[{x.Unit}]",
+        DurationType x => $"{x.Name}[{x.Unit}]",
+        IntervalType x => $"{x.Name}[{x.Unit}]",
+        FixedSizeBinaryType x => $"{x.Name}[{x.ByteWidth}]",
+        _ => type.Name,
+    };
+
+    /// <summary>A decimal type's scale, of any width; null for any other type.</summary>
+    public static int? DecimalScale(IArrowType type) => type switch
+    {
+        Decimal32Type x => x.Scale,
+        Decimal64Type x => x.Scale,
+        Decimal128Type x => x.Scale,
+        Decimal256Type x => x.Scale,
+        _ => null,
+    };
+
+    private static string DescribeFields(IReadOnlyList<Field> fields) => string.Join(", ",
+        fields.Select(f => $"{f.Name}: {Describe(f.DataType)}{(f.IsNullable ? "" : " not null")}"));
 }
