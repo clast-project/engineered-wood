@@ -17,7 +17,9 @@ public sealed record DeltaChangeReadOptions
     public long StartVersion { get; init; }
 
     /// <summary>Last version of the range, inclusive.</summary>
-    /// <remarks>An end past the table's latest version is read as the latest. The end must have a commit file,
+    /// <remarks>An end past the table handle's snapshot version is read as that version: like every read on the
+    /// handle, the feed does not see commits made after it until <see cref="DeltaTable.RefreshAsync"/>. The end
+    /// must have a commit file,
     /// or the range is refused (<see cref="DeltaErrorCodes.TruncatedTransactionLog"/>). A version inside the
     /// range with no commit file is skipped, as delta-spark skips it; a commit that is there but cannot be read
     /// fails the read.</remarks>

@@ -64,7 +64,8 @@ internal static class CdfReader
     /// against delta-spark 4.0.0): a version with no commit file inside the range is skipped; a range that starts
     /// before the earliest commit file left (log cleanup removed it), or whose end has no commit file, is refused
     /// with <see cref="DeltaErrorCodes.TruncatedTransactionLog"/>; and every listed commit must read, so a read
-    /// that fails fails the feed. An end past <paramref name="latestVersion"/> is read as the latest version.
+    /// that fails fails the feed. An end past <paramref name="latestVersion"/> is read as that version: commits made
+    /// after the handle's snapshot are not read until the handle is refreshed.
     /// The listed commits are read up to <paramref name="maxConcurrentReads"/> ahead, in order (#724).</para>
     /// </summary>
     public static async IAsyncEnumerable<RecordBatch> ReadChangesAsync(
@@ -143,8 +144,8 @@ internal static class CdfReader
 
     /// <summary>
     /// The versions of [<paramref name="startVersion"/>, <paramref name="endVersion"/>] that have a commit file,
-    /// ascending, from one listing of the log. The end is clamped to the table's latest version (the newer of
-    /// <paramref name="latestVersion"/> and the newest commit file); a start past it gives no versions.
+    /// ascending, from one listing of the log. The end is clamped to <paramref name="latestVersion"/> (the
+    /// handle's snapshot; the newest commit file when it is negative); a start past it gives no versions.
     /// Refused, as delta-spark refuses them: a start before the earliest commit file (the commits it needs were
     /// removed by log cleanup), and a clamped end with no commit file of its own. A version missing in
     /// between is left out, which is delta-spark's behaviour too.
@@ -157,7 +158,10 @@ internal static class CdfReader
         await foreach (long version in log.ListVersionsAsync(0, cancellationToken).ConfigureAwait(false))
             listed.Add(version);
 
-        long latest = Math.Max(latestVersion, listed.Count > 0 ? listed[listed.Count - 1] : -1);
+        // The handle's snapshot bounds the feed, as it bounds every read on the handle: a commit made after it may
+        // carry a schema or protocol the feed's schema snapshot does not know. Only with no bound given does the
+        // newest commit file stand in for it.
+        long latest = latestVersion >= 0 ? latestVersion : (listed.Count > 0 ? listed[listed.Count - 1] : -1);
         long end = Math.Min(endVersion, latest);
         var inRange = new List<long>();
         if (startVersion > end)

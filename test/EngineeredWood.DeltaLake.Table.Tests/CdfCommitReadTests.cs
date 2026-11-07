@@ -160,6 +160,56 @@ public class CdfCommitReadTests : IDisposable
         Assert.Equal([6, 8], await VersionsAsync(fs, 6, 8));
     }
 
+    /// <summary>
+    /// The feed reads at most the handle's snapshot version, as every other read on the handle does. A commit
+    /// another writer made after it is not read: its schema (here a column a schema-merging append added) is not
+    /// the one the feed reconciles to, which is the snapshot's. <see cref="DeltaTable.RefreshAsync"/> moves the
+    /// handle, and the feed with it.
+    /// </summary>
+    [Fact]
+    public async Task ACommitAfterTheHandlesSnapshot_IsNotRead_UntilTheHandleRefreshes()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using (var created = await DeltaTable.CreateAsync(
+                         fs, Schema, configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" }))
+        {
+            await created.WriteAsync([new RecordBatch(created.ArrowSchema, [new Int64Array.Builder().Append(1).Build()], 1)]);
+        }
+
+        await using var stale = await DeltaTable.OpenAsync(fs);
+        Assert.Equal(1, stale.CurrentSnapshot.Version);
+
+        await using (var other = await DeltaTable.OpenAsync(new LocalTableFileSystem(_tempDir)))
+        {
+            var wider = new Apache.Arrow.Schema.Builder()
+                .Field(new Field("id", Int64Type.Default, false))
+                .Field(new Field("extra", StringType.Default, true))
+                .Build();
+            await other.WriteAsync(
+                [new RecordBatch(wider, [new Int64Array.Builder().Append(2).Build(), new StringArray.Builder().Append("x").Build()], 1)],
+                mergeSchema: true);
+        }
+
+        var seen = new List<(long Version, bool HasExtra)>();
+        await foreach (var batch in stale.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 0, EndVersion = long.MaxValue }))
+        {
+            var version = (Int64Array)batch.Column(batch.Schema.GetFieldIndex(CdfConfig.CommitVersionColumn));
+            for (int i = 0; i < batch.Length; i++)
+                seen.Add((version.GetValue(i)!.Value, batch.Schema.GetFieldIndex("extra") >= 0));
+        }
+        Assert.Equal([(1L, false)], seen);
+
+        await stale.RefreshAsync();
+        var after = new List<(long Version, bool HasExtra)>();
+        await foreach (var batch in stale.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = 0, EndVersion = long.MaxValue }))
+        {
+            var version = (Int64Array)batch.Column(batch.Schema.GetFieldIndex(CdfConfig.CommitVersionColumn));
+            for (int i = 0; i < batch.Length; i++)
+                after.Add((version.GetValue(i)!.Value, batch.Schema.GetFieldIndex("extra") >= 0));
+        }
+        Assert.Equal([(1L, true), (2L, true)], after);
+    }
+
     [Fact]
     public async Task AnEndPastTheLatestVersion_ReadsToTheLatest()
     {
