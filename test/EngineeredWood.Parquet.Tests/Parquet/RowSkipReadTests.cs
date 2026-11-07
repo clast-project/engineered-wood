@@ -332,7 +332,8 @@ public class RowSkipReadTests : IDisposable
         string path, ParquetReadOptions options, Predicate? filter, int[] skippedGroups)
     {
         var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
-        using var reader = new ParquetFileReader(counting, ownsFile: true, options);
+        // The footer read exactly: a speculative tail would span this small file, and every range with it.
+        using var reader = new ParquetFileReader(counting, ownsFile: true, options with { FooterReadSize = 0 });
         var metadata = await reader.ReadMetadataAsync();
         var positions = new List<long>();
         await foreach (var positioned in reader.ReadWithPositionsAsync(

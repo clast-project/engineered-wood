@@ -789,6 +789,41 @@ public class VariantStatisticsTests : IDisposable
         Assert.Equal(HostStats, (await new TransactionLog(fs).ReadCommitAsync(version)).OfType<AddFile>().Single().Stats);
     }
 
+    /// <summary>The footer is read with the size the host reports, so no length is asked of the store (#722).</summary>
+    [Fact]
+    public async Task CommitDataFiles_ReadsTheFooterWithTheReportedSize()
+    {
+        var local = NewTableDir("t");
+        var fs = new DataFileCountingFileSystem(local);
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled());
+        var host = await HostFileAsync(local, HostStats);
+        fs.Reset();
+
+        long version = await table.CommitDataFilesAsync([host]);
+
+        AssertBounds(await AddedStatsAsync(local, version), (-2, "w"), (9, "y"));
+        Assert.Equal(1, fs.DataFileOpens);
+        Assert.Equal(0, fs.DataLengthRequests);
+    }
+
+    /// <summary>A host that reports the wrong size is refused before the size reaches the log, naming both (#722).</summary>
+    [Theory]
+    [InlineData(5)]
+    [InlineData(-5)]
+    public async Task CommitDataFiles_AWrongReportedSize_FailsTheCommitNamingBothSizes(int change)
+    {
+        var fs = NewTableDir("t");
+        await using var table = await DeltaTable.CreateAsync(fs, VariantSchema(), configuration: Enabled());
+        var host = await HostFileAsync(fs, HostStats);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.CommitDataFilesAsync([host with { SizeBytes = host.SizeBytes + change }]));
+
+        Assert.Equal(DeltaTableErrorCodes.DataFileSizeMismatch, ex.ErrorCode);
+        Assert.Contains($"is {host.SizeBytes} bytes", ex.Message);
+        Assert.Equal(0, table.CurrentSnapshot.Version);
+    }
+
     [Fact]
     public async Task CommitDataFiles_AFooterThatCannotBeRead_FailsTheCommit()
     {

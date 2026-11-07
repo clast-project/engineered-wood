@@ -4949,7 +4949,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // file. A deletion vector moves no row, so a row's identity here is exactly what it already was.
             var deletedRowTracking = new List<(Int64Array Ids, Int64Array Vers)>();
 
-            await using var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+            // The size from the action, so that opening the file asks the store nothing (#722).
+            await using var file = await KnownLengthRandomAccessFile.OpenAsync(
+                    _fs, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), addFile.Size, cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new Parquet.ParquetFileReader(
                 file, ownsFile: false, _dataFileReadOptions);
@@ -4962,7 +4964,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // The file's row count, from the footer: the read below may skip rows, so it cannot be counted
             // from the batches. It decides the whole-file remove, and a short count would turn a partial
             // delete into one.
-            var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+            var footer = await DataFileFooter.ReadAsync(
+                reader, file, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken).ConfigureAwait(false);
             long fileRows = 0;
             foreach (var rowGroup in footer.RowGroups)
                 fileRows += rowGroup.NumRows;
@@ -9024,9 +9027,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             return rows;
         }
 
-        await using var stream = await _fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        // The size from the action: no HEAD before the footer, and a wrong one says so (#722).
+        await using var stream = await KnownLengthRandomAccessFile.OpenAsync(_fs, path, file.Size, cancellationToken)
+            .ConfigureAwait(false);
         using var reader = new Parquet.ParquetFileReader(stream, ownsFile: false, _dataFileReadOptions);
-        var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var footer = await DataFileFooter.ReadAsync(reader, stream, path, cancellationToken).ConfigureAwait(false);
         foreach (var rowGroup in footer.RowGroups)
             rows += rowGroup.NumRows;
         return rows;
@@ -9164,10 +9169,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             return stats;
 
         EngineeredWood.Parquet.Metadata.FileMetaData footer;
-        await using (var stream = await _fs.OpenReadAsync(file.RelativePath, cancellationToken).ConfigureAwait(false))
+        // The size the host reports, which becomes the action's: no HEAD before the footer, and a wrong one is
+        // refused here, before it reaches the log (#722).
+        await using (var stream = await KnownLengthRandomAccessFile.OpenAsync(
+                         _fs, file.RelativePath, file.SizeBytes, cancellationToken).ConfigureAwait(false))
         {
             using var reader = new Parquet.ParquetFileReader(stream, ownsFile: false);
-            footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+            footer = await DataFileFooter.ReadAsync(reader, stream, file.RelativePath, cancellationToken)
+                .ConfigureAwait(false);
         }
         var bounds = Stats.VariantFooterStats.Compute(footer, missing, selection.StringPrefixLength);
         return bounds.Count == 0 ? stats : StatsWithVariantBounds(stats, bounds);
@@ -10576,7 +10585,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             writtenFooter = writer.WrittenMetadata;
         }
         if (await Stats.VariantFooterStats.OfWrittenFileAsync(
-                writtenFooter, _fs, newFileName, fileSchema,
+                writtenFooter, _fs, newFileName, fileSize, fileSchema,
                 VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration),
                 statsSelection.StringPrefixLength, cancellationToken).ConfigureAwait(false) is { } bounds)
         {
@@ -12548,8 +12557,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             };
         }
 
-        // Open the file and read its Parquet schema for field_id resolution
-        var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+        // Open the file and read its Parquet schema for field_id resolution. Its size comes from the action, so
+        // the open asks the store nothing: on an object store that was a HEAD per file before its footer (#722).
+        var file = await KnownLengthRandomAccessFile.OpenAsync(
+                _fs, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), addFile.Size, cancellationToken)
             .ConfigureAwait(false);
         ParquetFileReader? reader = null;
         try
@@ -12560,7 +12571,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // needs it, and a scan opens files AHEAD of the one it is planning, so that the footer's round trips
             // overlap the reads in flight. Left to the planner, an unprojected read would fetch each file's footer
             // one after another, on the one thread that plans.
-            await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+            await DataFileFooter.ReadAsync(
+                reader, file, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken).ConfigureAwait(false);
 
             var fileColumns = await FileColumnsAsync(
                     reader, snapshot, columns, mappingMode, logicalToPhysical, withRowTracking: true, cancellationToken)

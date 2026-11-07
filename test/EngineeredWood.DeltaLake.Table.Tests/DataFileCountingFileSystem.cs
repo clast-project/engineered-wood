@@ -11,12 +11,16 @@ internal sealed class DataFileCountingFileSystem(ITableFileSystem inner) : ITabl
 {
     private long _dataBytesRead;
     private int _dataFileOpens;
+    private int _dataLengthRequests;
     private readonly System.Collections.Concurrent.ConcurrentQueue<string> _opened = new();
     private readonly System.Collections.Concurrent.ConcurrentQueue<(string Path, FileRange Range)> _reads = new();
 
     public long DataBytesRead => Interlocked.Read(ref _dataBytesRead);
 
     public int DataFileOpens => Volatile.Read(ref _dataFileOpens);
+
+    /// <summary>How often a data file's length was asked of the store (on an object store, a HEAD each).</summary>
+    public int DataLengthRequests => Volatile.Read(ref _dataLengthRequests);
 
     /// <summary>The data files opened since the last <see cref="Reset"/>, in order, as the paths passed in.</summary>
     public IReadOnlyList<string> OpenedDataFiles => _opened.ToArray();
@@ -29,6 +33,7 @@ internal sealed class DataFileCountingFileSystem(ITableFileSystem inner) : ITabl
     {
         Interlocked.Exchange(ref _dataBytesRead, 0);
         Interlocked.Exchange(ref _dataFileOpens, 0);
+        Interlocked.Exchange(ref _dataLengthRequests, 0);
         while (_opened.TryDequeue(out _)) { }
         while (_reads.TryDequeue(out _)) { }
     }
@@ -71,7 +76,10 @@ internal sealed class DataFileCountingFileSystem(ITableFileSystem inner) : ITabl
     private sealed class CountingFile(IRandomAccessFile inner, DataFileCountingFileSystem owner, string path) : IRandomAccessFile
     {
         public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
-            => inner.GetLengthAsync(cancellationToken);
+        {
+            Interlocked.Increment(ref owner._dataLengthRequests);
+            return inner.GetLengthAsync(cancellationToken);
+        }
 
         public ValueTask<System.Buffers.IMemoryOwner<byte>> ReadAsync(
             FileRange range, CancellationToken cancellationToken = default)

@@ -1248,7 +1248,9 @@ public class ParallelFileReadTests : IDisposable
             kv => paths[kv.Key], kv => (IReadOnlyCollection<long>)kv.Value));
 
         var fs = new DataFileCountingFileSystem(_fs);
-        await using var table = await DeltaTable.OpenAsync(fs, Options(window));
+        // The footer read exactly: a speculative tail would span the file, and the row groups checked unread.
+        await using var table = await DeltaTable.OpenAsync(
+            fs, Options(window) with { ParquetReadOptions = ParquetReadOptions.Default with { FooterReadSize = 0 } });
         var ids = new List<long>();
         await foreach (var b in table.ReadRowsAsync(selection))
         {
@@ -1315,6 +1317,8 @@ public class ParallelFileReadTests : IDisposable
                 WritePageIndex = true,
             },
             MaxConcurrentReads = window,
+            // The footer read exactly: a speculative tail would span the pages checked unread.
+            ParquetReadOptions = ParquetReadOptions.Default with { FooterReadSize = 0 },
         };
         var root = new LocalTableFileSystem(Path.Combine(_tempDir, "pages"));
         await using (var create = await DeltaTable.CreateAsync(

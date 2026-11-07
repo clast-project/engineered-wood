@@ -45,11 +45,13 @@ public class DeletionVectorRowCountTests : IDisposable
         new(TableSchema, [new Int64Array.Builder().AppendRange(ids).Build()], ids.Length);
 
     /// <summary>A deletion-vector table of one file holding ids 1..5, whose statistics are then
-    /// <paramref name="stats"/>; with <paramref name="existingVector"/>, id 5 is already deleted first.</summary>
+    /// <paramref name="stats"/>; with <paramref name="existingVector"/>, id 5 is already deleted first. With
+    /// <paramref name="sizeChange"/>, the re-added action records the file's size that much off.</summary>
     private async Task<DeltaTable> CreateAsync(
-        string? stats, bool existingVector = false, DeltaTableOptions? options = null)
+        string? stats, bool existingVector = false, DeltaTableOptions? options = null, ITableFileSystem? fs = null,
+        long sizeChange = 0)
     {
-        var fs = new LocalTableFileSystem(_tempDir);
+        fs ??= new LocalTableFileSystem(_tempDir);
         var table = options is null
             ? await DeltaTable.CreateAsync(fs, TableSchema, enableDeletionVectors: true)
             : await DeltaTable.CreateAsync(fs, TableSchema, options, enableDeletionVectors: true);
@@ -67,7 +69,7 @@ public class DeletionVectorRowCountTests : IDisposable
                 DeletionTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 DataChange = false,
             },
-            file with { Stats = stats, TypedStats = null, DataChange = false },
+            file with { Stats = stats, TypedStats = null, DataChange = false, Size = file.Size + sizeChange },
         ]);
         await transaction.CommitAsync();
         Assert.Null(Only(table).GetNumRecords());
@@ -118,6 +120,34 @@ public class DeletionVectorRowCountTests : IDisposable
         await table.DeleteRowsAsync(Rows(table, 1), RowDeleteMode.DeletionVector);
 
         AssertCounted(Only(table), stats);
+    }
+
+    /// <summary>The count is read with the size the action records: no length is asked of the store (#722).</summary>
+    [Fact]
+    public async Task TheCountRead_AsksNoLength()
+    {
+        var fs = new DataFileCountingFileSystem(new LocalTableFileSystem(_tempDir));
+        await using var table = await CreateAsync(stats: null, fs: fs);
+        fs.Reset();
+
+        await table.DeleteRowsAsync(Rows(table, 1), RowDeleteMode.DeletionVector);
+
+        AssertCounted(Only(table), null);
+        Assert.Equal(0, fs.DataLengthRequests);
+    }
+
+    /// <summary>A size the action records wrongly fails the count read naming both sizes (#722).</summary>
+    [Fact]
+    public async Task AWrongRecordedSize_FailsTheCountReadNamingBothSizes()
+    {
+        await using var table = await CreateAsync(stats: null, sizeChange: -5);
+        long version = table.CurrentSnapshot.Version;
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await table.DeleteRowsAsync(Rows(table, 1), RowDeleteMode.DeletionVector));
+
+        Assert.Equal(DeltaTableErrorCodes.DataFileSizeMismatch, ex.ErrorCode);
+        Assert.Equal(version, table.CurrentSnapshot.Version);
     }
 
     [Fact]

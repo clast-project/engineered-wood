@@ -384,6 +384,24 @@ public sealed record ParquetReadOptions
     public int? MaxPageUncompressedSize { get; init; }
 
     /// <summary>
+    /// How many bytes at the end of the file to read in the first request for the footer. Default 64 KiB.
+    /// When the footer and its 8-byte suffix fit in that tail, the footer costs one request; a larger
+    /// footer costs a second, exactly sized one. A value of 8 or less reads exactly what the footer
+    /// needs: the 8-byte suffix, then the footer, always two requests.
+    /// </summary>
+    /// <remarks>
+    /// <para>The footer's length is stored just before the file's trailing <c>PAR1</c>, so a reader that
+    /// reads only what it needs must wait for one request before it can send the next. On an object
+    /// store each is a round trip, so this default trades a few KiB of transfer for one of them, as
+    /// pyarrow's reader (64 KiB) and DataFusion's metadata size hint do. A file shorter than this is read
+    /// whole. On a local file either way is a pair of small reads; set this to 0 to read exactly.</para>
+    /// </remarks>
+    public int FooterReadSize { get; init; } = DefaultFooterReadSize;
+
+    /// <summary>The default <see cref="FooterReadSize"/>: 64 KiB.</summary>
+    public const int DefaultFooterReadSize = 64 * 1024;
+
+    /// <summary>
     /// What to do with a column chunk whose <c>file_path</c> says it is stored in another file.
     /// Defaults to <see cref="ColumnChunkFilePathKind.Refuse"/>.
     /// </summary>

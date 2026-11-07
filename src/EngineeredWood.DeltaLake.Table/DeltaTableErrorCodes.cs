@@ -530,4 +530,17 @@ public static class DeltaTableErrorCodes
     /// </summary>
     /// <remarks>This library's own code: delta-spark has no such option, so no refusal to borrow one from.</remarks>
     public const string ShreddingWithoutVariantAnnotation = "DELTA_SHREDDING_WITHOUT_VARIANT_ANNOTATION";
+
+    // ── Data files ──
+
+    /// <summary>
+    /// A data file could not be read, and its size in the store differs from the <c>size</c> its <c>add</c>
+    /// (or <c>cdc</c>) action records. The message names both sizes.
+    /// </summary>
+    /// <remarks>No delta-spark error class. A data file is opened with the size its action records, so that
+    /// nothing asks the store for it, and a wrong size points the footer read at the wrong bytes. The store is
+    /// asked only after that read fails, and this code replaces the Parquet error only when the sizes differ;
+    /// a file whose size matches keeps its own error. delta-rs also reads with the recorded size; Spark's file
+    /// index takes a file's length from it, though its Parquet footer reader asks the store.</remarks>
+    public const string DataFileSizeMismatch = "DELTA_DATA_FILE_SIZE_MISMATCH";
 }

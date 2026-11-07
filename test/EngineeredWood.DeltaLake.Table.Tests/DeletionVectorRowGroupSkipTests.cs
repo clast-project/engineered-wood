@@ -407,7 +407,8 @@ public class DeletionVectorRowGroupSkipTests : IDisposable
                     RowGroupMaxRows = groupRows,
                     DataPageRowCountLimit = pageRows,
                 },
-                ParquetReadOptions = ParquetReadOptions.Default with { BatchSize = 32 },
+                // The footer read exactly: a speculative tail would span the file, and the groups checked unread.
+                ParquetReadOptions = ParquetReadOptions.Default with { BatchSize = 32, FooterReadSize = 0 },
                 DataFileReader = seam?.Invoke(fs),
             },
             enableDeletionVectors: true, enableRowTracking: true,

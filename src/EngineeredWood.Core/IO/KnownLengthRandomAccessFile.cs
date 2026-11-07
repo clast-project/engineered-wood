@@ -24,6 +24,25 @@ internal sealed class KnownLengthRandomAccessFile : IRandomAccessFile, IReadConc
         _length = length;
     }
 
+    /// <summary>The length this file answers with: the one its caller supplied.</summary>
+    internal long KnownLength => _length;
+
+    /// <summary>
+    /// The wrapped file's own length, asked of the store (on an object store, a HEAD); null when that fails
+    /// (the file may be gone). For explaining a failed read, never on the path of a good one.
+    /// </summary>
+    internal async ValueTask<long?> StoredLengthAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _inner.GetLengthAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null;
+        }
+    }
+
     /// <summary>The wrapped file's hint, if it gives one.</summary>
     public int? PreferredConcurrentReads => (_inner as IReadConcurrencyHint)?.PreferredConcurrentReads;
 
@@ -41,4 +60,15 @@ internal sealed class KnownLengthRandomAccessFile : IRandomAccessFile, IReadConc
     public ValueTask DisposeAsync() => _inner.DisposeAsync();
 
     public void Dispose() => _inner.Dispose();
+
+    /// <summary>
+    /// Opens <paramref name="path"/> for reading, answering its length from <paramref name="length"/> when that
+    /// is known (not null and not negative) instead of asking the store.
+    /// </summary>
+    internal static async ValueTask<IRandomAccessFile> OpenAsync(
+        ITableFileSystem fs, string path, long? length, CancellationToken cancellationToken)
+    {
+        var file = await fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        return length is { } known and >= 0 ? new KnownLengthRandomAccessFile(file, known) : file;
+    }
 }

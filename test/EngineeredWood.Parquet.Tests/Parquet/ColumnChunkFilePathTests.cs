@@ -174,6 +174,8 @@ public class ColumnChunkFilePathTests : IDisposable
         {
             Filter = Ex.Equal("a", LiteralValue.Of(500L)),
             FilterUsePageIndex = true,
+            // The footer read exactly: a speculative tail would span the index this checks is not read.
+            FooterReadSize = 0,
         }))
         {
             await Assert.ThrowsAsync<NotSupportedException>(async () =>
