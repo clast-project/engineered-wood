@@ -383,4 +383,32 @@ public class RunEndEncodingTests
         var big = new RunEndEncodedArray(new Int16Array.Builder().Append(short.MaxValue).Build(), values);
         Assert.Throws<ArgumentException>(() => RunEndEncoding.Concatenate([big, big]));
     }
+
+    // A TypeId leaves a type's parameters open: joining values of two timestamp units or two decimal scales, or
+    // structs whose children are named differently, would label one input's values with the other's type. Arrow's
+    // concatenator catches the units and scales but not the names; the run-end check refuses all three.
+    [Fact]
+    public void Concatenate_RefusesValuesOfTheSameKindButADifferentType()
+    {
+        static RunEndEncodedArray One(IArrowArray value) => new(new Int32Array.Builder().Append(1).Build(), value);
+
+        static RunEndEncodedArray Timestamps(TimeUnit unit) => One(
+            new TimestampArray.Builder(new TimestampType(unit, "UTC"))
+                .Append(new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero)).Build());
+        Assert.Throws<ArgumentException>(() =>
+            RunEndEncoding.Concatenate([Timestamps(TimeUnit.Millisecond), Timestamps(TimeUnit.Microsecond)]));
+
+        static RunEndEncodedArray Decimals(int scale) => One(
+            new Decimal128Array.Builder(new Decimal128Type(10, scale)).Append(1m).Build());
+        Assert.Throws<ArgumentException>(() => RunEndEncoding.Concatenate([Decimals(2), Decimals(3)]));
+
+        static RunEndEncodedArray Structs(string child) => One(new StructArray(
+            new StructType([new Field(child, Int32Type.Default, true)]), 1,
+            [new Int32Array.Builder().Append(1).Build()], ArrowBuffer.Empty, 0));
+        Assert.Throws<ArgumentException>(() => RunEndEncoding.Concatenate([Structs("a"), Structs("b")]));
+
+        // The same full type joins.
+        Assert.Equal(2, RunEndEncoding.Concatenate([Decimals(2), Decimals(2)]).Length);
+        Assert.Equal(2, RunEndEncoding.Concatenate([Structs("a"), Structs("a")]).Length);
+    }
 }

@@ -378,49 +378,6 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     /// the same nullability and types at every depth. Field metadata may differ. Stricter than the Parquet writer's
     /// own check, which is safe: a difference only starts a new file.
     /// </summary>
-    internal static bool SameLayout(IReadOnlyList<Field> a, IReadOnlyList<Field> b)
-    {
-        if (a.Count != b.Count)
-            return false;
-        for (int i = 0; i < a.Count; i++)
-        {
-            if (!string.Equals(a[i].Name, b[i].Name, StringComparison.Ordinal)
-                || a[i].IsNullable != b[i].IsNullable
-                || !SameType(a[i].DataType, b[i].DataType))
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static bool SameType(IArrowType a, IArrowType b)
-    {
-        if (a.TypeId != b.TypeId)
-            return false;
-
-        return (a, b) switch
-        {
-            (ExtensionType x, ExtensionType y) => string.Equals(x.Name, y.Name, StringComparison.Ordinal)
-                && string.Equals(x.ExtensionMetadata, y.ExtensionMetadata, StringComparison.Ordinal)
-                && SameType(x.StorageType, y.StorageType),
-            (DictionaryType x, DictionaryType y) => SameType(x.IndexType, y.IndexType)
-                && SameType(x.ValueType, y.ValueType) && x.Ordered == y.Ordered,
-            (FixedSizeListType x, FixedSizeListType y) => x.ListSize == y.ListSize && SameLayout(x.Fields, y.Fields),
-            (MapType x, MapType y) => x.KeySorted == y.KeySorted && SameLayout(x.Fields, y.Fields),
-            (NestedType x, NestedType y) => SameLayout(x.Fields, y.Fields),
-            (Decimal32Type x, Decimal32Type y) => x.Precision == y.Precision && x.Scale == y.Scale,
-            (Decimal64Type x, Decimal64Type y) => x.Precision == y.Precision && x.Scale == y.Scale,
-            (Decimal128Type x, Decimal128Type y) => x.Precision == y.Precision && x.Scale == y.Scale,
-            (Decimal256Type x, Decimal256Type y) => x.Precision == y.Precision && x.Scale == y.Scale,
-            (TimestampType x, TimestampType y) => x.Unit == y.Unit
-                && string.Equals(x.Timezone, y.Timezone, StringComparison.Ordinal),
-            (Time32Type x, Time32Type y) => x.Unit == y.Unit,
-            (Time64Type x, Time64Type y) => x.Unit == y.Unit,
-            (DurationType x, DurationType y) => x.Unit == y.Unit,
-            (IntervalType x, IntervalType y) => x.Unit == y.Unit,
-            (FixedSizeBinaryType x, FixedSizeBinaryType y) => x.ByteWidth == y.ByteWidth,
-            _ => true,
-        };
-    }
+    internal static bool SameLayout(IReadOnlyList<Field> a, IReadOnlyList<Field> b) =>
+        ArrowTypeEquality.SameLayout(a, b);
 }

@@ -179,10 +179,13 @@ public static class RunEndEncoding
         foreach (var array in arrays)
         {
             var arrayValueType = ((RunEndEncodedType)array.Data.DataType).ValuesDataType;
-            if (arrayValueType.TypeId != valueType.TypeId)
+            // The whole type, not only its kind. Arrow's concatenator refuses different timestamp units or zones and
+            // decimal scales itself, but not structs whose children are named differently: it would label the
+            // joined values with the first input's names.
+            if (!ArrowTypeEquality.SameType(arrayValueType, valueType))
             {
                 throw new ArgumentException(
-                    $"Cannot concatenate run-end encoded {arrayValueType.Name} values onto {valueType.Name} ones.",
+                    $"Cannot concatenate run-end encoded {arrayValueType} values onto {valueType} ones: their types differ.",
                     nameof(arrays));
             }
             if (RunEndsType(array).TypeId != runEndsType.TypeId)
