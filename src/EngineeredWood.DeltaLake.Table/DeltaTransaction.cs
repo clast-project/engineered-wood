@@ -969,7 +969,8 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// validates agree. Returns the rows newly hidden.
     ///
     /// <para>Each touched file's existing vector is unioned with the new positions, so a delete composes with
-    /// the deletes COMMITTED before it, and a position already covered is not counted or replayed. It does not
+    /// the deletes COMMITTED before it, and a position already covered is not counted or replayed. A file left
+    /// with no live row is removed rather than re-added under a vector hiding every row (#737). It does not
     /// compose with work staged earlier on this transaction: a selection naming a file an earlier operation
     /// here already deleted from or rewrote throws <see cref="InvalidOperationException"/> — pass all of a
     /// file's positions in one selection. The per-file edits are recorded, so
