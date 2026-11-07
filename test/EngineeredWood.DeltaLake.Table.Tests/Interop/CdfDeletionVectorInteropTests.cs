@@ -219,19 +219,12 @@ public class CdfDeletionVectorInteropTests : IDisposable
             await table.DeleteAsync(IdIn(4, 6), RowDeleteMode.DeletionVector);    // v4
         }
 
-        // v3 removes a file that already has a vector, the case delta-rs reads wrongly without a change file
-        // (delta-io/delta-rs#4946).
-        var v3 = await new TransactionLog(fs).ReadCommitAsync(3);
-        Assert.Contains(v3, a => a is RemoveFile { DeletionVector: not null });
-        Assert.DoesNotContain(v3, a => a is AddFile);
-
         await AssertVectorDeleteFeedsAsync(fs);
     }
 
     /// <summary>
     /// <see cref="EwPredicateVectorDeletes_SparkFeedIsTheDeletedRows"/> through the row-level
-    /// <see cref="DeltaTable.DeleteRowsAsync"/>, which writes its change files on a path of its own. Its v3 re-adds
-    /// the file under a vector hiding every row rather than removing it (#737); the feed is the same.
+    /// <see cref="DeltaTable.DeleteRowsAsync"/>, which writes its change files on a path of its own.
     /// </summary>
     [SkippableFact]
     public async Task EwRowLevelVectorDeletes_SparkFeedIsTheDeletedRows()
@@ -255,15 +248,19 @@ public class CdfDeletionVectorInteropTests : IDisposable
     {
         // The premise: each version carries a change file, and v2 and v4 (each part of a file) a vector edit beside
         // it, a removed file re-added under a vector. A copy-on-write rewrite would give the same feed, so without
-        // this the test could not tell the two apart. v3's shape differs by path (#737) and is checked by the caller
-        // that pins it.
+        // this the test could not tell the two apart. v3 removes a file that already has a vector, whole and with no
+        // re-add (#737), the case delta-rs reads wrongly without a change file (delta-io/delta-rs#4946).
         var log = new TransactionLog(fs);
         for (long v = 2; v <= 4; v++)
         {
             var actions = await log.ReadCommitAsync(v);
             Assert.Contains(actions, a => a is CdcFile);
             if (v == 3)
+            {
+                Assert.Contains(actions, a => a is RemoveFile { DeletionVector: not null });
+                Assert.DoesNotContain(actions, a => a is AddFile);
                 continue;
+            }
             var removed = actions.OfType<RemoveFile>().Select(r => r.Path).ToHashSet(StringComparer.Ordinal);
             Assert.True(
                 actions.OfType<AddFile>().Any(a => a.DeletionVector is not null && removed.Contains(a.Path)),
