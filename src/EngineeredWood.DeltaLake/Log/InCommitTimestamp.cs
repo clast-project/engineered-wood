@@ -27,6 +27,32 @@ public static class InCommitTimestamp
     public const string EnablementTimestampKey = "delta.inCommitTimestampEnablementTimestamp";
 
     /// <summary>
+    /// The <c>commitInfo</c> key naming the transaction that wrote the commit: a random UUID, one per TRANSACTION
+    /// (the same on every attempt of it), as delta-spark writes it (measured on 4.0.0 and 4.1.0; 4.4.1 assigns it
+    /// once per <c>OptimisticTransactionImpl</c>).
+    /// </summary>
+    /// <remarks>
+    /// <para>It makes every commit's bytes unique, so two commits are never mistaken for one object by a
+    /// content-derived identity: S3's ETag is the MD5 of the content, and recognising a log replaced under a held
+    /// snapshot compares those (#740, #749 review). Being stable across attempts is what would let a committer
+    /// recognise its own commit after a lost reply, which is what delta-spark uses it for.</para>
+    /// </remarks>
+    public const string TxnIdKey = "txnId";
+
+    /// <summary>A fresh transaction id for <see cref="TxnIdKey"/>, in the lower-case hyphenated form Spark writes.</summary>
+    public static string NewTxnId() => Guid.NewGuid().ToString("D");
+
+    // Written through Utf8JsonWriter, as the other helpers here are: no reflection-based serializer, for AOT.
+    private static JsonElement TxnIdJson(string txnId)
+    {
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+            writer.WriteStringValue(txnId);
+        using var document = JsonDocument.Parse(stream.ToArray());
+        return document.RootElement.Clone();
+    }
+
+    /// <summary>
     /// Returns true if in-commit timestamps are enabled for the table.
     /// </summary>
     public static bool IsEnabled(IReadOnlyDictionary<string, string>? configuration)
@@ -58,7 +84,8 @@ public static class InCommitTimestamp
         string operation = "WRITE",
         IDictionary<string, JsonElement>? additionalValues = null,
         bool includeInCommitTimestamp = true,
-        CommitProperties? commitProperties = null)
+        CommitProperties? commitProperties = null,
+        string? txnId = null)
     {
         var values = new Dictionary<string, JsonElement>();
 
@@ -93,6 +120,8 @@ public static class InCommitTimestamp
             values["inCommitTimestamp"] = JsonDocument.Parse(
                 timestampMs.ToString()).RootElement.Clone();
         }
+        if (!values.ContainsKey(TxnIdKey))
+            values[TxnIdKey] = TxnIdJson(txnId ?? NewTxnId());
 
         // Last, so a collision with anything this layer wrote is refused rather than overwritten.
         commitProperties?.ApplyTo(values);
@@ -301,6 +330,8 @@ public static class InCommitTimestamp
     /// <param name="previousCommitTimestamp">The timestamp of the commit at <paramref name="version"/> - 1, when
     /// known: its in-commit timestamp, or its <c>commitInfo.timestamp</c> if it has none. The in-commit timestamp
     /// written here is kept strictly after it.</param>
+    /// <param name="txnId">The transaction's <see cref="TxnIdKey"/>, the same on every attempt of it; null mints one.
+    /// A commitInfo the actions already carry keeps its own if it has one.</param>
     /// <exception cref="ArgumentException"><paramref name="commitProperties"/> names a key the commitInfo
     /// already records.</exception>
     public static IReadOnlyList<DeltaAction> EnsureCommitInfo(
@@ -312,13 +343,14 @@ public static class InCommitTimestamp
         CommitProperties? commitProperties = null,
         IReadOnlyDictionary<string, string>? operationMetrics = null,
         IReadOnlyDictionary<string, string>? operationParameters = null,
-        long? previousCommitTimestamp = null) =>
+        long? previousCommitTimestamp = null,
+        string? txnId = null) =>
         EnsureCommitInfo(
             actions, configuration, version, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), operation,
-            isBlindAppend, commitProperties, operationMetrics, operationParameters, previousCommitTimestamp);
+            isBlindAppend, commitProperties, operationMetrics, operationParameters, previousCommitTimestamp, txnId);
 
     /// <summary>
-    /// <see cref="EnsureCommitInfo(IReadOnlyList{DeltaAction}, IReadOnlyDictionary{string, string}?, long, string, bool?, CommitProperties?, IReadOnlyDictionary{string, string}?, IReadOnlyDictionary{string, string}?, long?)"/>
+    /// <see cref="EnsureCommitInfo(IReadOnlyList{DeltaAction}, IReadOnlyDictionary{string, string}?, long, string, bool?, CommitProperties?, IReadOnlyDictionary{string, string}?, IReadOnlyDictionary{string, string}?, long?, string?)"/>
     /// with the clock injected.
     /// </summary>
     internal static IReadOnlyList<DeltaAction> EnsureCommitInfo(
@@ -331,7 +363,8 @@ public static class InCommitTimestamp
         CommitProperties? commitProperties = null,
         IReadOnlyDictionary<string, string>? operationMetrics = null,
         IReadOnlyDictionary<string, string>? operationParameters = null,
-        long? previousCommitTimestamp = null)
+        long? previousCommitTimestamp = null,
+        string? txnId = null)
     {
         // The metadata this commit installs, if any: it decides whether the commit is timestamped, not the base's.
         int metadataIndex = -1;
@@ -354,14 +387,18 @@ public static class InCommitTimestamp
         {
             if (actions[i] is not CommitInfo existing)
                 continue;
+            // Every commit this library writes names its transaction, a caller's own commitInfo included.
+            bool needsTxnId = !existing.Values.ContainsKey(TxnIdKey);
             bool additions = commitProperties is not null || operationMetrics is not null
-                || operationParameters is not null;
+                || operationParameters is not null || needsTxnId;
             if (!timestamped && !additions)
                 return actions;
 
             var values = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
             foreach (var kvp in existing.Values)
                 values[kvp.Key] = kvp.Value;
+            if (needsTxnId)
+                values[TxnIdKey] = TxnIdJson(txnId ?? NewTxnId());
             if (operationMetrics is not null && !values.ContainsKey("operationMetrics"))
                 values["operationMetrics"] = StringMapJson(operationMetrics);
             if (operationParameters is not null && !values.ContainsKey("operationParameters"))
@@ -430,7 +467,7 @@ public static class InCommitTimestamp
         result.Add(CreateCommitInfo(
             commitTimestamp, operation,
             additionalValues: extra, includeInCommitTimestamp: timestamped,
-            commitProperties: commitProperties));
+            commitProperties: commitProperties, txnId: txnId));
         result.AddRange(stamped);
         return result;
     }
