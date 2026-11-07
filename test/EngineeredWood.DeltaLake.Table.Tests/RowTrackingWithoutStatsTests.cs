@@ -12,8 +12,9 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
 /// With <see cref="DeltaTableOptions.CollectStats"/> off, an add on a row-tracking table still carries its row count
-/// (#742), as <c>{"numRecords":N}</c> and nothing else. A rebase re-sizes each staged add's row-id range from that
-/// count, and threw without it.
+/// (#742). An add that would otherwise have no stats gets <c>{"numRecords":N}</c> alone; one whose writer collects
+/// column stats regardless (an UPDATE/DELETE/MERGE rewrite, IcebergCompat) keeps them. A rebase re-sizes each staged add's
+/// row-id range from that count, and threw without it.
 ///
 /// <para>MEASURED against pyspark 4.0.4 / delta-spark 4.0.0 and 4.1.2 / 4.3.1: with
 /// <c>spark.databricks.delta.stats.collect=false</c> Spark refuses every INSERT and MERGE on a row-tracking table

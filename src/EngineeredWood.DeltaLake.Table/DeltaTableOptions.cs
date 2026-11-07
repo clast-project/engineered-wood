@@ -305,9 +305,11 @@ public sealed record DeltaTableOptions
     public bool AllowWritesWithoutUniversalFormatConversion { get; init; }
 
     /// <summary>Whether to collect per-column statistics on write. Default: true.</summary>
-    /// <remarks>Off, a file on a row-tracking table still records its row count, as <c>{"numRecords":N}</c> and
-    /// nothing else: row ids are sized from it. delta-spark refuses such a write outright
-    /// (<c>DELTA_ROW_ID_ASSIGNMENT_WITHOUT_STATS</c>).</remarks>
+    /// <remarks>Off, every file on a row-tracking table still records at least its row count (<c>numRecords</c>),
+    /// because row ids are sized from it; delta-spark refuses such a write outright
+    /// (<c>DELTA_ROW_ID_ASSIGNMENT_WITHOUT_STATS</c>). An appended file records the count alone,
+    /// <c>{"numRecords":N}</c>. Some writes collect column statistics whatever this says: an IcebergCompat table
+    /// requires them, and an UPDATE, DELETE or MERGE that rewrites a file collects them for the new file.</remarks>
     public bool CollectStats { get; init; } = true;
 
     /// <summary>
