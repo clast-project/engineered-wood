@@ -287,11 +287,63 @@ public class DeletionVectorRowCountTests : IDisposable
         Assert.Equal(5, file.GetNumRecords());
         reader.Reads = 0;
 
-        string? stats = await table.VectorStatsAsync(file, CancellationToken.None);
+        var (hidesEveryRow, stats) = await table.VectorReAddAsync(
+            file, DeletionVectors.DeletionVectorBitmap.FromPositions([1L]), CancellationToken.None);
 
+        Assert.False(hidesEveryRow);
         Assert.Equal(5, (file with { Stats = stats, TypedStats = null }).GetNumRecords());
         Assert.Contains("\"tightBounds\":false", stats);
         Assert.Equal(0, reader.Reads);
+    }
+
+    /// <summary>
+    /// Whether a vector hides every row of a file decides whether the file is removed (#737), so it is never taken
+    /// on the statistics' word. A count they UNDERSTATE (2 for a file of 5) makes a vector over rows 0 and 1 look
+    /// like it covers the file; the footer is read and the file is re-added, its three live rows kept.
+    /// </summary>
+    [Fact]
+    public async Task AnUnderstatedCount_IsCheckedAgainstTheFile_AndTheFileIsKept()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var reader = new CountingReader(fs);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, TableSchema, new DeltaTableOptions { DataFileReader = reader }, enableDeletionVectors: true);
+        await table.WriteAsync([Ids(1, 2, 3, 4, 5)]);
+        var file = Only(table) with { Stats = "{\"numRecords\":2}", TypedStats = null };
+        reader.Reads = 0;
+
+        var (hidesEveryRow, stats) = await table.VectorReAddAsync(
+            file, DeletionVectors.DeletionVectorBitmap.FromPositions([0L, 1L]), CancellationToken.None);
+
+        Assert.False(hidesEveryRow);
+        Assert.NotNull(stats);
+        Assert.Equal(1, reader.Reads);
+    }
+
+    /// <summary>
+    /// The footer is read only for a file the statistics cannot rule out: a vector that leaves a counted row live
+    /// costs nothing, and one that covers the count is confirmed by one read before the file goes.
+    /// </summary>
+    [Theory]
+    [InlineData(new long[] { 0, 1, 2, 3 }, false, 0)]
+    [InlineData(new long[] { 0, 1, 2, 3, 4 }, true, 1)]
+    public async Task TheFooterIsReadOnlyToConfirmAWholeFile(long[] hidden, bool expectWhole, int expectedReads)
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var reader = new CountingReader(fs);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, TableSchema, new DeltaTableOptions { DataFileReader = reader }, enableDeletionVectors: true);
+        await table.WriteAsync([Ids(1, 2, 3, 4, 5)]);
+        var file = Only(table);
+        Assert.Equal(5, file.GetNumRecords());
+        reader.Reads = 0;
+
+        var (hidesEveryRow, stats) = await table.VectorReAddAsync(
+            file, DeletionVectors.DeletionVectorBitmap.FromPositions(hidden), CancellationToken.None);
+
+        Assert.Equal(expectWhole, hidesEveryRow);
+        Assert.Equal(expectWhole, stats is null);
+        Assert.Equal(expectedReads, reader.Reads);
     }
 
     /// <summary>A codec-seam reader that counts the files it decodes, delegating to the built-in codec.</summary>

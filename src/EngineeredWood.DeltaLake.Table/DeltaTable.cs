@@ -4095,9 +4095,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             // Before the vector is written: a failed or cancelled read of the row count must leave no
             // vector behind.
-            string? reAddStats = await VectorStatsAsync(latestAdd, cancellationToken).ConfigureAwait(false);
-            var unionDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
-            written?.RecordDeletionVector(unionDv);
+            // The union can hide every row even when neither delete alone did (each took part of the file), and a
+            // delete that removed the file whole is rebuilt here too; either way the file goes whole (#737).
+            var (hidesEveryRow, reAddStats) = await VectorReAddAsync(latestAdd, union, cancellationToken)
+                .ConfigureAwait(false);
 
             result.Add(new RemoveFile
             {
@@ -4115,7 +4116,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 BaseRowId = latestAdd.BaseRowId,
                 DefaultRowCommitVersion = latestAdd.DefaultRowCommitVersion,
             });
+            if (hidesEveryRow)
+                continue;
 
+            var unionDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
+            written?.RecordDeletionVector(unionDv);
             result.Add(latestAdd with
             {
                 DeletionVector = unionDv,
@@ -4274,10 +4279,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 : DeletionVectorBitmap.Empty;
             // Before the vector is written: a failed or cancelled read of the row count must leave no
             // vector behind.
-            string? reAddStats = await VectorStatsAsync(cand, cancellationToken).ConfigureAwait(false);
-            var newDv = await dvWriter.CreateAsync(deleted.Union(positions), cancellationToken)
+            var union = deleted.Union(positions);
+            var (hidesEveryRow, reAddStats) = await VectorReAddAsync(cand, union, cancellationToken)
                 .ConfigureAwait(false);
-            written?.RecordDeletionVector(newDv);
 
             result.Add(new RemoveFile
             {
@@ -4291,6 +4295,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 BaseRowId = cand.BaseRowId,
                 DefaultRowCommitVersion = cand.DefaultRowCommitVersion,
             });
+            // Every row of the new file was one this delete targets: the remove alone (#737).
+            if (hidesEveryRow)
+                continue;
+
+            var newDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
+            written?.RecordDeletionVector(newDv);
             result.Add(cand with
             {
                 DeletionVector = newDv,
@@ -9002,14 +9012,27 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// count comes from the file's footer (or, through the codec seam, which hides it, from reading the file), so a
     /// file whose statistics have it costs nothing more.
     /// </summary>
-    internal async ValueTask<string?> VectorStatsAsync(AddFile file, CancellationToken cancellationToken)
+    /// <remarks>
+    /// <para>Null when <paramref name="deleted"/>, the vector the file would be re-added under, hides every row of it:
+    /// such a file is removed, not re-added (#737), as Spark removes a file a delete leaves no row of and as this
+    /// library's predicate DELETE, UPDATE and MERGE already did. The caller then writes no vector and commits the
+    /// <c>remove</c> alone.</para>
+    /// <para>Removing a file is the one irreversible answer, so it is never taken on the statistics' word: a count
+    /// they understate would drop live rows. Their count only rules a file OUT (a vector that does not cover it
+    /// cannot cover more), and a file it does not rule out is counted from its footer before it goes.</para>
+    /// </remarks>
+    internal async ValueTask<(bool HidesEveryRow, string? Stats)> VectorReAddAsync(
+        AddFile file, DeletionVectorBitmap deleted, CancellationToken cancellationToken)
     {
-        string? stats = file.GetStatsJson();
         // A count either copy of the statistics carries is passed on, so the JSON committed gets it even when only
         // the checkpoint's typed copy had it (another writer's stats_parsed with a count, its stats string without).
-        long rows = file.GetNumRecords()
-            ?? await PhysicalRowCountAsync(file, cancellationToken).ConfigureAwait(false);
-        return StatsWithLooseBounds(stats, rows);
+        long? counted = file.GetNumRecords();
+        long rows = counted ?? await PhysicalRowCountAsync(file, cancellationToken).ConfigureAwait(false);
+        if (counted is not null && deleted.ContainsRange(0, rows))
+            rows = await PhysicalRowCountAsync(file, cancellationToken).ConfigureAwait(false);
+        return deleted.ContainsRange(0, rows)
+            ? (true, null)
+            : (false, StatsWithLooseBounds(file.GetStatsJson(), rows));
     }
 
     /// <summary>The rows <paramref name="file"/> holds physically, deletion vector or not.</summary>
@@ -9863,7 +9886,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// commit via <see cref="CommitDataFilesAsync"/>' <c>extraActions</c>. Positions are keyed by the
     /// path-sorted file ordinal and are ABSOLUTE in-file row positions; each touched file's existing DV is
     /// unioned with the new positions and the result is a <c>remove</c>(old path+DV) + <c>add</c>(same path, new
-    /// DV) pair. Change Data Feed is NOT captured here (the caller must gate CDF tables to the committing path).
+    /// DV) pair — or the <c>remove</c> alone when the union hides every row of the file, which goes whole as Spark
+    /// removes it (#737). Change Data Feed is NOT captured here (the caller must gate CDF tables to the committing path).
     /// Returns the actions + the count of NEWLY deleted rows.
     /// </summary>
     /// <param name="resolveAgainst">Rebase support: the ordinals + old DVs were captured against the
@@ -9937,15 +9961,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (newlyDeleted == 0)
                 continue;
             totalDeleted += newlyDeleted;
+            // The edit stays even when the file goes whole: a rebase rebuilds this file's actions from it, and
+            // whether the file still goes whole is decided again against the newer snapshot.
             edits.Add(new DeleteDvEdit(addFile.Path, newRows));
             touched.Add(addFile.Path);
 
             // Before the vector is written: a failed or cancelled read of the row count must leave no
             // vector behind.
-            string? reAddStats = await VectorStatsAsync(addFile, cancellationToken).ConfigureAwait(false);
-            var newDv = await dvWriter.CreateAsync(allDeleted, cancellationToken)
+            var (hidesEveryRow, reAddStats) = await VectorReAddAsync(addFile, allDeleted, cancellationToken)
                 .ConfigureAwait(false);
-            written?.RecordDeletionVector(newDv);
 
             actions.Add(new RemoveFile
             {
@@ -9959,6 +9983,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 BaseRowId = addFile.BaseRowId,
                 DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
             });
+            if (hidesEveryRow)
+                continue; // no row left: the remove alone (#737)
+
+            var newDv = await dvWriter.CreateAsync(allDeleted, cancellationToken)
+                .ConfigureAwait(false);
+            written?.RecordDeletionVector(newDv);
             actions.Add(addFile with
             {
                 DeletionVector = newDv,
@@ -10090,11 +10120,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             // Before the vector is written: a failed or cancelled read of the row count must leave no
             // vector behind.
-            string? reAddStats = await VectorStatsAsync(addFile, cancellationToken).ConfigureAwait(false);
-            var newDv = await dvWriter.CreateAsync(allDeleted, cancellationToken)
+            var (hidesEveryRow, reAddStats) = await VectorReAddAsync(addFile, allDeleted, cancellationToken)
                 .ConfigureAwait(false);
-            // The vector is ours; the file it masks is not — the re-add below names live table data.
-            written.RecordDeletionVector(newDv);
 
             actions.Add(new RemoveFile
             {
@@ -10108,13 +10135,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 BaseRowId = addFile.BaseRowId,
                 DefaultRowCommitVersion = addFile.DefaultRowCommitVersion,
             });
-            actions.Add(addFile with
+            // No row left: the remove alone (#737).
+            if (!hidesEveryRow)
             {
-                DeletionVector = newDv,
-                DataChange = true,
-                Stats = reAddStats,
-            });
+                var newDv = await dvWriter.CreateAsync(allDeleted, cancellationToken)
+                    .ConfigureAwait(false);
+                // The vector is ours; the file it masks is not — the re-add below names live table data.
+                written.RecordDeletionVector(newDv);
+                actions.Add(addFile with
+                {
+                    DeletionVector = newDv,
+                    DataChange = true,
+                    Stats = reAddStats,
+                });
+            }
             removedPaths.Add(addFile.Path);
+            // Kept for a whole-file remove too: a rebase rebuilds this file's actions from it.
             dvEdits.Add(new DeleteDvEdit(addFile.Path, newPositions));
 
             // Change Data Feed: a DV delete rewrites no data, so the change file is read back from the file.
@@ -11480,7 +11516,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// newly-deleted positions (<paramref name="newPositionsByOrdinal"/>, keyed by <paramref name="from"/>'s
     /// path-sorted ordinals) must be DISJOINT from the concurrent deletions (an intersection = the same row
     /// deleted/updated by both ⇒ row-level conflict); disjoint ⇒ the pair re-issues against the CURRENT state
-    /// (<c>remove</c>(path, current DV) + <c>add</c>(path, current DV ∪ ours)).</item>
+    /// (<c>remove</c>(path, current DV) + <c>add</c>(path, current DV ∪ ours)). When the union hides every row
+    /// the <c>add</c> is dropped and the file goes whole; a staged <c>remove</c> with no <c>add</c> (a file this
+    /// delete already took whole) gets the same disjointness check, and an <c>add</c> again if a row survives
+    /// (#737).</item>
     /// <item><b>REWRITTEN AWAY</b> by a concurrent compaction / copy-on-write UPDATE — the rows are relocated
     /// by STABLE ROW ID onto the new files instead of aborting, through the same Layer 3 (B) remap the
     /// autocommit path uses (<see cref="RemapRowLevelDeletesAsync"/>, reached from
@@ -11590,11 +11629,56 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
+        // The touched files the staged actions re-add. One they only remove was removed whole: every row of it was
+        // deleted (#737). It still re-unions below, since the rows it removed must not overlap the concurrent
+        // deletions, and against the current vector it may again leave a row live and so need a re-add.
+        var stagedReAdds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var action in actions)
+        {
+            if (action is AddFile add && oursByPath.ContainsKey(add.Path))
+                stagedReAdds.Add(add.Path);
+        }
+
+        // The re-add of a touched file still active in `to`: OUR positions unioned with its CURRENT deletion
+        // vector, after the row-level disjointness check against the concurrent deletions. Null when the union
+        // hides every row, and the remove alone stands.
+        async ValueTask<AddFile?> ReUnionAsync(AddFile current, IReadOnlyCollection<long> ours)
+        {
+            var currentDeleted = current.DeletionVector is not null
+                ? await _dvReader.ReadAsync(current.DeletionVector, cancellationToken).ConfigureAwait(false)
+                : DeletionVectorBitmap.Empty;
+            long[] oursSorted = DeletionVectors.DeletionVectorBuilder.SortedDistinct(ours);
+            var added = new List<long>(oursSorted.Length);
+            var union = currentDeleted.Union(oursSorted, added);
+            int overlap = oursSorted.Length - added.Count;
+            if (overlap > 0)
+            {
+                throw new DeltaConflictException(
+                    DeltaTableErrorCodes.RowLevelConflict,
+                    $"row-level conflict on file '{current.Path}': {overlap} row(s) this transaction "
+                    + "deletes/updates were concurrently deleted or updated — retry the transaction");
+            }
+            // Before the vector is written: a failed or cancelled read of the row count must leave no
+            // vector behind.
+            var (hidesEveryRow, reAddStats) = await VectorReAddAsync(current, union, cancellationToken)
+                .ConfigureAwait(false);
+            if (hidesEveryRow)
+                return null;
+            var newDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
+            written.RecordDeletionVector(newDv);
+            return current with
+            {
+                DeletionVector = newDv,
+                DataChange = true,
+                Stats = reAddStats,
+            };
+        }
+
         foreach (var action in actions)
         {
             switch (action)
             {
-                case RemoveFile remove when oursByPath.ContainsKey(remove.Path):
+                case RemoveFile remove when oursByPath.TryGetValue(remove.Path, out var ours):
                 {
                     if (!toByPath.TryGetValue(remove.Path, out var current))
                     {
@@ -11602,6 +11686,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         break;
                     }
                     rebased.Add(remove with { DeletionVector = current.DeletionVector });
+                    // A whole-file remove has no re-add for the case below to check: check it here.
+                    if (!stagedReAdds.Contains(remove.Path)
+                        && await ReUnionAsync(current, ours).ConfigureAwait(false) is { } reAdd)
+                    {
+                        rebased.Add(reAdd);
+                    }
                     break;
                 }
                 case AddFile add when oursByPath.TryGetValue(add.Path, out var ours):
@@ -11611,33 +11701,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         // Rewritten away — handled by the remap, paired with the skipped remove above.
                         break;
                     }
-                    // The DV-pair re-add: union OUR positions with the CURRENT deletion vector, after the
-                    // row-level disjointness check against the concurrent deletions.
-                    var currentDeleted = current.DeletionVector is not null
-                        ? await _dvReader.ReadAsync(current.DeletionVector, cancellationToken).ConfigureAwait(false)
-                        : DeletionVectorBitmap.Empty;
-                    long[] oursSorted = DeletionVectors.DeletionVectorBuilder.SortedDistinct(ours);
-                    var added = new List<long>(oursSorted.Length);
-                    var union = currentDeleted.Union(oursSorted, added);
-                    int overlap = oursSorted.Length - added.Count;
-                    if (overlap > 0)
-                    {
-                        throw new DeltaConflictException(
-                            DeltaTableErrorCodes.RowLevelConflict,
-                            $"row-level conflict on file '{add.Path}': {overlap} row(s) this transaction "
-                            + "deletes/updates were concurrently deleted or updated — retry the transaction");
-                    }
-                    // Before the vector is written: a failed or cancelled read of the row count must leave no
-                    // vector behind.
-                    string? reAddStats = await VectorStatsAsync(current, cancellationToken).ConfigureAwait(false);
-                    var newDv = await dvWriter.CreateAsync(union, cancellationToken).ConfigureAwait(false);
-                    written.RecordDeletionVector(newDv);
-                    rebased.Add(current with
-                    {
-                        DeletionVector = newDv,
-                        DataChange = true,
-                        Stats = reAddStats,
-                    });
+                    if (await ReUnionAsync(current, ours).ConfigureAwait(false) is { } reAdd)
+                        rebased.Add(reAdd);
                     break;
                 }
                 case AddFile add when !fromByPath.Contains(add.Path) && add.DataChange:
