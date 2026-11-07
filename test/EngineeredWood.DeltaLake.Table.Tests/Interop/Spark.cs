@@ -30,14 +30,17 @@ internal static class Spark
     /// <summary>Versions these assertions were established against — see <see cref="DeltaRs.ValidatedAgainstVersion"/>
     /// for why this is recorded rather than enforced. delta-spark's major version must match
     /// pyspark's: 4.x pairs with Spark 4.0, 3.x with Spark 3.5.
-    /// <para>Two pairings, one per nightly lane (interop-nightly.yml). The primary lane is Spark 4.1, where VARIANT
-    /// is GA and shredding works; it runs every interop case. The 4.0 lane stays because Spark 4.0 writes the
+    /// <para>Three pairings, one per nightly lane (interop-nightly.yml). Spark 4.2 / delta-spark 4.4.1 is the newest
+    /// Delta; under it a conflict reaches Python as Delta's own exception class (see spark_driver.py's
+    /// <c>_exception_text</c>). Spark 4.1 is where VARIANT is GA and shredding works. Both run every interop
+    /// case. The 4.0 lane stays because Spark 4.0 writes the
     /// UNANNOTATED variant layout and only the preview shredding feature, which EW must keep reading and writing;
     /// it skips the cases that need 4.1. delta-spark 4.3.1 caps <c>pyspark&lt;=4.1.1</c> but runs on 4.1.2, so it
     /// is installed with <c>--no-deps</c>; see doc/running-tests.md.</para>
     /// <para>pyspark 4.0.3 / 4.1.2 are the floors on Windows regardless of what this records: earlier builds
     /// crash the Python worker under Python 3.12+ (SPARK-53759, fixed in 4.0.3 / 4.1.2 / 3.5.9).</para></summary>
-    public const string ValidatedAgainstVersion = "pyspark 4.1.2 / delta-spark 4.3.1; pyspark 4.0.4 / delta-spark 4.0.0";
+    public const string ValidatedAgainstVersion =
+        "pyspark 4.2.0 / delta-spark 4.4.1; pyspark 4.1.2 / delta-spark 4.3.1; pyspark 4.0.4 / delta-spark 4.0.0";
 
     private static readonly InteropDriver Driver = new(
         scriptName: "spark_driver.py",

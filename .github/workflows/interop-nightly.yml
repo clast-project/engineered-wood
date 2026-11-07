@@ -36,13 +36,17 @@ jobs:
     # drivers are subprocesses and the assertions are framework-independent — net472
     # coverage of the same tests comes from the per-commit build on Windows.
     #
-    # Two Spark lanes, because the two Spark lines write different VARIANT layouts and EW
-    # must keep both working (see Spark.ValidatedAgainstVersion):
-    #   spark-4.1  primary. VARIANT is GA and shredding works, so every interop case runs;
+    # Three Spark lanes. 4.0 and 4.1 write different VARIANT layouts and EW must keep both
+    # working; 4.2 tracks the newest Delta (see Spark.ValidatedAgainstVersion):
+    #   spark-4.2  pyspark 4.2.0 + delta-spark 4.4.1, the newest pairing. It is the first
+    #              whose declared pyspark range covers its Spark, and the only one with
+    #              Delta 4.4's conflict exceptions (spark_driver.py's _exception_text).
+    #              Every interop case runs; the healthy result is 0 skipped.
+    #   spark-4.1  VARIANT is GA and shredding works, so every interop case runs;
     #              the healthy result is 0 skipped.
     #   spark-4.0  Spark 4.0's UNANNOTATED variant layout and the preview shredding name.
     #              The cases that need 4.1 (or delta-spark 4.3) skip honestly; the healthy result is 10 skipped.
-    # The delta-rs and DuckDB tiers run in both lanes. They are cheap, and keeping the lanes
+    # The delta-rs and DuckDB tiers run in every lane. They are cheap, and keeping the lanes
     # identical except for the two Spark pins means a difference between them is Spark's.
     name: interop (${{ matrix.lane }})
     runs-on: ubuntu-latest
@@ -51,6 +55,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - lane: spark-4.2
+            pyspark: '4.2.0'
+            delta-spark: '4.4.1'
           - lane: spark-4.1
             pyspark: '4.1.2'
             delta-spark: '4.3.1'
@@ -93,7 +100,7 @@ jobs:
       # were established against, so a behaviour change in one of them must arrive as
       # a considered bump here rather than as a nightly that turned red on its own.
       #
-      # delta-spark must be built for the pyspark it runs on. The two pairings are the
+      # delta-spark must be built for the pyspark it runs on. The three pairings are the
       # ones measured against the full tier (doc/running-tests.md).
       #
       # The pyspark versions are the first with the SPARK-53759 fix (see the Setup
@@ -106,9 +113,9 @@ jobs:
       # pyspark<=4.1.1, so pip refuses 4.1.2 + 4.3.1 with ResolutionImpossible. The
       # pairing works (4.3.1 is the first delta-spark whose jars match Spark 4.1.2;
       # 4.1.0 hits a NoSuchMethodError on checkpointed tables). Its one other
-      # dependency is installed explicitly, within its declared range. pyspark 4.2.0 +
-      # delta-spark 4.4.1 needs no --no-deps and passes the full tier locally
-      # (doc/running-tests.md), but moving this matrix to it is a separate decision.
+      # dependency is installed explicitly, within its declared range. The spark-4.2
+      # lane's pairing resolves without --no-deps (delta-spark 4.4 allows pyspark<=4.2.0),
+      # but every lane installs the same way, so a difference between lanes is Spark's.
       #
       # pyarrow is listed EXPLICITLY: deltalake 1.6.2 made it an optional extra, so
       # without it every delta-rs read raises "Pyarrow is required" — invisible on a

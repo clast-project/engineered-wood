@@ -190,8 +190,9 @@ reader throws an NPE on an annotated group (which is why the writer has
 version-aware — it writes whichever layout the running Spark reads — so the
 tier stays green under either. It also covers **nested** variant (a variant
 inside a struct); those cases require GA variant and self-skip on 4.0.x. The
-nightly runs both: its `spark-4.1` lane is the primary one and runs every case,
-and its `spark-4.0` lane keeps the unannotated layout and the
+nightly runs both, plus the newest Delta: its `spark-4.2` lane (pyspark 4.2.0 /
+delta-spark 4.4.1, see below) and `spark-4.1` lane both run every case, and its
+`spark-4.0` lane keeps the unannotated layout and the
 `variantShredding-preview` feature covered. To do the same locally, give each
 Spark its own venv (`pyspark` bundles its JARs, so two versions cannot share
 one environment) and point the tier at the one you want:
