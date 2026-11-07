@@ -7625,7 +7625,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     Size = file.Size,
                     ModificationTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                     DataChange = true,
-                    Stats = file.Stats,
+                    // With statistics off, a row-tracking add still carries its count (#742): a rebase re-sizes
+                    // its row-id range from the committed stats, and delta-spark refuses to write such a table
+                    // without one (DELTA_ROW_ID_ASSIGNMENT_WITHOUT_STATS), so every add in its logs has one.
+                    // The count alone is what Spark writes under delta.dataSkippingNumIndexedCols = 0.
+                    Stats = file.Stats ?? (assignRowIds ? NumRecordsOnlyStats(file.Rows) : null),
                     BaseRowId = assignRowIds ? fileBaseRowId : null,
                     DefaultRowCommitVersion = assignRowIds ? newVersion : null,
                 });
@@ -9219,7 +9223,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     {
         string count = f.NumRecords.ToString(System.Globalization.CultureInfo.InvariantCulture);
         if (f.StatsJson is null)
-            return "{\"numRecords\":" + count + "}";
+            return NumRecordsOnlyStats(f.NumRecords);
 
         System.Text.Json.JsonDocument doc;
         try
@@ -9465,6 +9469,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         result.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
         return result;
     }
+
+    /// <summary>Stats that hold a file's row count and nothing else: <c>{"numRecords":N}</c>.</summary>
+    private static string NumRecordsOnlyStats(long rows) =>
+        "{\"numRecords\":" + rows.ToString(System.Globalization.CultureInfo.InvariantCulture) + "}";
 
     private static long RowCountForRowIds(AddFile add) =>
         add.GetNumRecords() ?? throw new InvalidOperationException(
