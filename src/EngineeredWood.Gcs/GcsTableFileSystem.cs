@@ -107,8 +107,15 @@ public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint
 
             long size = obj.Size is { } s ? checked((long)s) : 0L;
 
-            yield return new TableFileInfo(
-                ToRelative(obj.Name), size, LastModifiedOf(obj), string.IsNullOrEmpty(obj.ETag) ? null : obj.ETag);
+            yield return new TableFileInfo(ToRelative(obj.Name), size, LastModifiedOf(obj))
+            {
+                // The GENERATION, not the ETag: it is GCS's own version of the object's content and changes on
+                // every write. The ETag also moves with metadata changes, and storage-testbench derives it from
+                // the metageneration alone, so an overwrite there keeps it (measured in cloud-io, #746).
+                ETag = obj.Generation is { } generation
+                    ? generation.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    : null,
+            };
         }
     }
 

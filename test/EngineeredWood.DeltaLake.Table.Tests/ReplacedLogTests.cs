@@ -154,6 +154,22 @@ public class ReplacedLogTests : IDisposable
     }
 
     [Fact]
+    public async Task Rebuild_of_a_recreated_table_lists_the_log_once()
+    {
+        var fs = new ListingRewriteFileSystem(Local, f => f);
+        await CreateAsync(fs, 1, 2, 3);
+        await using var table = await DeltaTable.OpenAsync(fs, Options);
+        Drop();
+        await CreateAsync(fs, 100);
+        int listings = fs.Listings;
+
+        await table.RefreshAsync();
+
+        Assert.Equal(listings + 1, fs.Listings);
+        Assert.Equal([100L], await IdsAsync(table));
+    }
+
+    [Fact]
     public async Task Dropped_table_is_not_found_on_refresh()
     {
         await CreateAsync(Local, 1, 2);
@@ -223,10 +239,12 @@ public class ReplacedLogTests : IDisposable
         await using var table = await DeltaTable.OpenAsync(fs, Options);
         var held = table.CurrentSnapshot;
         int reads = fs.ReadsOf(Commit0);
+        int listings = fs.Listings;
 
         await table.RefreshAsync();
 
         Assert.True(fs.ReadsOf(Commit0) > reads, "an unverifiable snapshot is rebuilt, never continued");
+        Assert.Equal(listings + 1, fs.Listings);                             // the rebuild reuses the listing
         Assert.Equal([1L, 2], await IdsAsync(table));
 
         // The strict update has no rebuild to fall back on, and refusing every such snapshot would make the

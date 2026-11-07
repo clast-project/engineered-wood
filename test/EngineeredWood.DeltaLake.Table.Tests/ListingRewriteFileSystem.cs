@@ -21,10 +21,16 @@ internal sealed class ListingRewriteFileSystem(ITableFileSystem inner, Func<Tabl
     /// <summary>How many times <paramref name="path"/> was read whole (commits and JSON checkpoints are).</summary>
     public int ReadsOf(string path) => _reads.TryGetValue(path, out int n) ? n : 0;
 
+    private int _listings;
+
+    /// <summary>How many listings have been started.</summary>
+    public int Listings => Volatile.Read(ref _listings);
+
     public async IAsyncEnumerable<TableFileInfo> ListAsync(
         string prefix,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
+        Interlocked.Increment(ref _listings);
         await foreach (var file in inner.ListAsync(prefix, cancellationToken).ConfigureAwait(false))
             yield return rewrite(file);
     }

@@ -146,8 +146,10 @@ public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint
                     ? new DateTimeOffset(DateTime.SpecifyKind(dt, DateTimeKind.Utc))
                     : default;
 
-                yield return new TableFileInfo(
-                    ToRelative(obj.Key), size, lastModified, string.IsNullOrEmpty(obj.ETag) ? null : obj.ETag);
+                yield return new TableFileInfo(ToRelative(obj.Key), size, lastModified)
+                {
+                    ETag = string.IsNullOrEmpty(obj.ETag) ? null : obj.ETag,
+                };
             }
 
             // Both conditions, not either: a store that reports truncation without handing back a token

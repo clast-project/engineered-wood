@@ -48,6 +48,16 @@ public class LogFileIdentityTests
     }
 
     [Fact]
+    public void TableFileInfo_keeps_its_three_part_shape()
+    {
+        // The ETag is an init property, so the constructor and Deconstruct callers compiled against stay valid.
+        var info = new EngineeredWood.IO.TableFileInfo(Path, 10, T1) { ETag = "\"a\"" };
+        var (path, size, modified) = info;
+        Assert.Equal((Path, 10L, T1), (path, size, modified));
+        Assert.Equal(LogFileMatch.Same, LogFileIdentity.Of(info).Compare(new(Path, 10, T2, "\"a\"")));
+    }
+
+    [Fact]
     public void Different_paths_are_different_files() =>
         Assert.Equal(LogFileMatch.Different,
             Compare(new(Path, 10, T1, "\"a\""), new("_delta_log/00000000000000000004.json", 10, T1, "\"a\"")));

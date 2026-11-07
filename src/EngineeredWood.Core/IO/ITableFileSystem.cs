@@ -113,12 +113,23 @@ public interface ITableFileSystem
 /// <param name="Size">The file's length in bytes.</param>
 /// <param name="LastModified">When the file was last written, or <see langword="default"/> when the backend did
 /// not report it.</param>
-/// <param name="ETag">The backend's version tag for the object, as its listing reported it, or
-/// <see langword="null"/> where the backend has none (a local file system). Compared only for equality: two
-/// listings that report different tags for one path saw two different objects, even when size and time agree.
-/// That is what lets a reader recognise a Delta log replaced under a snapshot it holds (#740).</param>
 public readonly record struct TableFileInfo(
     string Path,
     long Size,
-    DateTimeOffset LastModified,
-    string? ETag = null);
+    DateTimeOffset LastModified)
+{
+    /// <summary>
+    /// The backend's version tag for the object, as its listing reported it, or <see langword="null"/> where the
+    /// backend has none (a local file system). Compared only for equality: two listings that report different tags
+    /// for one path saw two different objects, even when size and time agree. That is what lets a reader recognise
+    /// a Delta log replaced under a snapshot it holds (#740).
+    /// </summary>
+    /// <remarks>
+    /// <para>A tag must change whenever the object's CONTENT is written. Azure and S3 report their ETag; GCS
+    /// reports the object generation, because its ETag also tracks metadata and an emulator's need not change on an
+    /// overwrite at all.</para>
+    /// <para>An init property rather than a fourth positional parameter, so the three-argument constructor and
+    /// <c>Deconstruct</c> stay as they were for code compiled against them.</para>
+    /// </remarks>
+    public string? ETag { get; init; }
+}

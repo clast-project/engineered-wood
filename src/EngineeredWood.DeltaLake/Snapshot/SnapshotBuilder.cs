@@ -33,13 +33,30 @@ public sealed class SnapshotBuilder
         long? atVersion = null,
         CancellationToken cancellationToken = default)
     {
-        var builder = new SnapshotBuilder();
-
         // One classified pass over _delta_log answers everything below: the target version, the newest
         // checkpoint, the compaction files, and the commits to replay. They used to be four separate
         // walks of the same directory, which also let them disagree about a concurrent commit.
         var listedAt = DateTimeOffset.UtcNow; // before the listing, so it errs early (#697)
         var listing = await log.ReadListingAsync(cancellationToken).ConfigureAwait(false);
+
+        return await BuildFromListingAsync(log, checkpointReader, atVersion, listing, listedAt, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// <see cref="BuildAsync"/> from a listing the caller already took, so a refresh that falls back to a rebuild
+    /// does not list the log a second time (#746 review).
+    /// </summary>
+    /// <param name="listedAt">When <paramref name="listing"/> was taken, read just before it.</param>
+    private static async ValueTask<Snapshot> BuildFromListingAsync(
+        TransactionLog log,
+        CheckpointReader? checkpointReader,
+        long? atVersion,
+        LogListing listing,
+        DateTimeOffset listedAt,
+        CancellationToken cancellationToken)
+    {
+        var builder = new SnapshotBuilder();
 
         long targetVersion = atVersion ?? listing.LatestVersion;
 
@@ -390,19 +407,22 @@ public sealed class SnapshotBuilder
         TransactionLog log,
         CancellationToken cancellationToken = default)
     {
-        return await TryUpdateAsync(current, log, rebuildUnverified: false, cancellationToken)
-                .ConfigureAwait(false)
-            ?? throw LogReplaced(current);
+        var (snapshot, _, _) = await TryUpdateAsync(current, log, forReader: false, cancellationToken)
+            .ConfigureAwait(false);
+        return snapshot ?? throw LogReplaced(current);
     }
 
     /// <summary>
-    /// <see cref="UpdateAsync"/>, or null where <paramref name="current"/> cannot be continued: its log was
-    /// replaced, or, with <paramref name="rebuildUnverified"/>, it cannot be shown not to have been.
+    /// <see cref="UpdateAsync"/>, or a null snapshot where <paramref name="current"/> cannot be continued: its log
+    /// was replaced, or, <paramref name="forReader"/>, it cannot be shown not to have been, or log cleanup has removed
+    /// commits after it. The listing comes back either way, for the rebuild.
     /// </summary>
-    private static async ValueTask<Snapshot?> TryUpdateAsync(
+    /// <param name="forReader">The lenient mode <see cref="UpdateOrRebuildAsync"/> uses. Off, a gap after
+    /// <paramref name="current"/> throws, as a committer's refresh must (#697).</param>
+    private static async ValueTask<(Snapshot? Snapshot, LogListing Listing, DateTimeOffset ListedAt)> TryUpdateAsync(
         Snapshot current,
         TransactionLog log,
-        bool rebuildUnverified,
+        bool forReader,
         CancellationToken cancellationToken)
     {
         // One listing here too: the newest version and the commits to reach it came from two separate
@@ -413,29 +433,34 @@ public sealed class SnapshotBuilder
 
         var continuity = ContinuityOf(current, listing);
         if (continuity == LogContinuity.Replaced
-            || (continuity == LogContinuity.Unverified && rebuildUnverified))
+            || (continuity == LogContinuity.Unverified && forReader))
         {
-            return null;
+            return (null, listing, listedAt);
         }
 
         if (latestVersion <= current.Version)
-            return current.WithListedLatestAt(listedAt);
+            return (current.WithListedLatestAt(listedAt), listing, listedAt);
 
         var builder = SnapshotBuilder.FromSnapshot(current);
 
         var versions = listing.CommitsInRange(current.Version + 1, latestVersion).ToList();
 
         // Same rule as BuildAsync: an incremental update that skips a version produces a snapshot that
-        // never existed. There is no checkpoint fallback here — this path only moves forward from one.
+        // never existed. A committer's refresh refuses it; a reader's rebuilds from the checkpoint that log
+        // cleanup left (#697), from this same listing.
         long nextNeeded = current.Version + 1;
         foreach (long v in versions)
         {
             if (v != nextNeeded)
-                throw IncompleteLog(nextNeeded, current.Version + 1, latestVersion);
+                break;
             nextNeeded = v + 1;
         }
         if (nextNeeded <= latestVersion)
-            throw IncompleteLog(nextNeeded, current.Version + 1, latestVersion);
+        {
+            return forReader
+                ? (null, listing, listedAt)
+                : throw IncompleteLog(nextNeeded, current.Version + 1, latestVersion);
+        }
 
         foreach (long v in versions)
         {
@@ -444,7 +469,7 @@ public sealed class SnapshotBuilder
             builder.ApplyCommit(v, actions);
         }
 
-        return builder.Build(listedAt, listing.AnchorAt(latestVersion));
+        return (builder.Build(listedAt, listing.AnchorAt(latestVersion)), listing, listedAt);
     }
 
     /// <summary>Whether a listing still shows the log a snapshot was built from.</summary>
@@ -519,26 +544,30 @@ public sealed class SnapshotBuilder
         CheckpointReader? checkpointReader,
         CancellationToken cancellationToken = default)
     {
+        (Snapshot? Snapshot, LogListing Listing, DateTimeOffset ListedAt) attempt;
         try
         {
-            // An unverified snapshot is rebuilt as well as a replaced one: a rebuild costs what an open costs,
-            // while continuing a log that was replaced mixes two tables (#740).
-            return await TryUpdateAsync(current, log, rebuildUnverified: true, cancellationToken)
-                    .ConfigureAwait(false)
-                ?? await BuildAsync(log, checkpointReader, atVersion: null, cancellationToken).ConfigureAwait(false);
-        }
-        catch (DeltaFormatException ex) when (ex.ErrorCode == DeltaErrorCodes.TruncatedTransactionLog)
-        {
-            return await BuildAsync(log, checkpointReader, atVersion: null, cancellationToken).ConfigureAwait(false);
+            attempt = await TryUpdateAsync(current, log, forReader: true, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception) when (!cancellationToken.IsCancellationRequested)
         {
+            var listedAt = DateTimeOffset.UtcNow;
             var listing = await log.ReadListingAsync(cancellationToken).ConfigureAwait(false);
             long missing = listing.LatestVersion - current.Version;
             if (missing <= 0 || listing.CommitsInRange(current.Version + 1, listing.LatestVersion).Count() == missing)
                 throw;
-            return await BuildAsync(log, checkpointReader, atVersion: null, cancellationToken).ConfigureAwait(false);
+            return await BuildFromListingAsync(log, checkpointReader, atVersion: null, listing, listedAt, cancellationToken)
+                .ConfigureAwait(false);
         }
+
+        // Outside the try, so a rebuild that fails reports its own error rather than being retried by the recovery
+        // above. An unverified snapshot is rebuilt as well as a replaced one: a rebuild costs what an open costs,
+        // while continuing a log that was replaced mixes two tables (#740). Either way, and for a gap log cleanup
+        // left, the rebuild starts from the listing just taken: one listing in all, as an open has (#746 review).
+        return attempt.Snapshot
+            ?? await BuildFromListingAsync(
+                    log, checkpointReader, atVersion: null, attempt.Listing, attempt.ListedAt, cancellationToken)
+                .ConfigureAwait(false);
     }
 
     /// <summary>

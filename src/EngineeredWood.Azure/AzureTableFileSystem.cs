@@ -120,8 +120,10 @@ public sealed class AzureTableFileSystem : ITableFileSystem, IReadConcurrencyHin
             long size = item.Properties.ContentLength ?? 0L;
             DateTimeOffset lastModified = item.Properties.LastModified ?? default;
 
-            yield return new TableFileInfo(
-                ToRelative(item.Name), size, lastModified, item.Properties.ETag?.ToString());
+            yield return new TableFileInfo(ToRelative(item.Name), size, lastModified)
+            {
+                ETag = item.Properties.ETag?.ToString(),
+            };
         }
     }
 
