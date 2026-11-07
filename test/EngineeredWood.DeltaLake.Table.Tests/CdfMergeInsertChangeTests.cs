@@ -229,6 +229,55 @@ public class CdfMergeInsertChangeTests : IDisposable
         Assert.Equal([2L, 22L], feed.Where(r => r.Type == CdfConfig.UpdatePostimage).Select(r => r.Id));
     }
 
+    // An INSERT naming only some columns, or naming them out of order, writes rows of another layout than the update
+    // rows read back from the table. They are brought to the table's layout first, so they still share the file.
+    [Theory]
+    [InlineData("value", "id")]
+    [InlineData("id")]
+    public async Task InsertsOfAPartialOrReorderedColumnList_ShareTheChangeFile(params string[] columns)
+    {
+        await using var table = await CreateAsync();
+        var (_, version) = await table.MergeAsync([Rows(false, "n", 2, 40, 41)], new MergeOptions
+        {
+            Keys = ["id"],
+            WhenMatched = [MergeAction.Update],
+            WhenNotMatched = [MergeAction.InsertColumns(columns)],
+        });
+
+        Assert.Single(await ChangeFilesAsync(version));
+        string? inserted = columns.Contains("value") ? "n" : null;
+        Assert.Equal(
+            [
+                new Change(2, CdfConfig.UpdatePostimage, "n", null, null),
+                new Change(2, CdfConfig.UpdatePreimage, "v2", null, null),
+                new Change(40, CdfConfig.Insert, inserted!, null, null),
+                new Change(41, CdfConfig.Insert, inserted!, null, null),
+            ],
+            await FeedAsync(table, version));
+    }
+
+    // Without per-column statistics an add records no numRecords; the inserted rows' ids still come out right.
+    [Fact]
+    public async Task OnARowTrackingTableWithoutStatistics_InsertedRows_CarryTheirIds()
+    {
+        var table = await DeltaTable.CreateAsync(
+            Fs, FlatSchema, new DeltaTableOptions { CheckpointInterval = 0, CollectStats = false },
+            enableRowTracking: true,
+            configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" });
+        await using (table)
+        {
+            await table.WriteAsync([Rows(false, "v", 1, 2, 3)]);
+            var (_, version) = await table.MergeAsync([Rows(false, "n", 2, 40, 41)], Upsert());
+
+            Assert.Single(await ChangeFilesAsync(version));
+            var committed = await CommittedRowIdsAsync(table);
+            var inserts = (await FeedAsync(table, version, rowTracking: true))
+                .Where(r => r.Type == CdfConfig.Insert).ToList();
+            Assert.Equal([40L, 41L], inserts.Select(r => r.Id));
+            Assert.All(inserts, r => Assert.Equal(committed[r.Id], r.RowId));
+        }
+    }
+
     // The change rows are the rows as stored: an identity column the source leaves out is the value the table generated.
     [Fact]
     public async Task InsertedRows_CarryTheGeneratedIdentityValues()

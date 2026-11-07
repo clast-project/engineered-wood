@@ -3293,7 +3293,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 insertFillIn ??= new InsertChangeDataFillIn(this, committed, transaction.Written);
                 foreach (var covered in transaction.CoveredInsertChanges)
-                    insertFillIn.RecordCovered(covered.Adds, covered.Files);
+                    insertFillIn.RecordCovered(covered.Adds, covered.RowCounts, covered.Files);
             }
         }
 
@@ -3453,14 +3453,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         /// <summary>
         /// Records change files an operation wrote itself, whose <c>insert</c> rows carry the ids
-        /// <paramref name="adds"/> give them. Other change rows share the files; their ids are materialized and
-        /// do not move.
+        /// <paramref name="adds"/> give them, each add holding the number of rows <paramref name="rowCounts"/> gives
+        /// for its path (its statistics may record none). Other change rows share the files; their ids are
+        /// materialized and do not move.
         /// </summary>
-        public void RecordCovered(IReadOnlyList<AddFile> adds, IReadOnlyList<CdcFile> files)
+        public void RecordCovered(
+            IReadOnlyList<AddFile> adds, IReadOnlyDictionary<string, long> rowCounts, IReadOnlyList<CdcFile> files)
         {
             var byPath = new Dictionary<string, (long BaseRowId, long Rows)>(StringComparer.Ordinal);
             foreach (var add in adds)
-                byPath[add.Path] = (add.BaseRowId!.Value, RowCountForRowIds(add));
+                byPath[add.Path] = (add.BaseRowId!.Value, rowCounts[add.Path]);
             _covered.Add((byPath, files.ToList()));
             foreach (var f in files)
                 _stagedPaths.Add(f.Path);
@@ -7231,6 +7233,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <param name="rowsWritten">Told of every batch of rows as written: logical, with generated and identity
     /// columns filled in, under the partition values its add records, and on a row-tracking table with the stable
     /// id each row's add gives it. A MERGE writes its inserts' change rows from it (#732).</param>
+    /// <param name="rowCounts">Given each add's row count, by add path: the count a row-id range is sized by,
+    /// which the add's own statistics leave out when <see cref="DeltaTableOptions.CollectStats"/> is off.</param>
     internal async ValueTask<(IReadOnlyList<DeltaAction> Actions, long NextRowId)> ComputeWriteActionsAsync(
         Snapshot.Snapshot snapshot,
         IReadOnlyList<RecordBatch> batches,
@@ -7243,7 +7247,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         WrittenFileLedger? written = null,
         IReadOnlyDictionary<string, long>? identityHighWaterMarks = null,
         Expressions.Predicate? replaceWhere = null,
-        WrittenRowsObserver? rowsWritten = null)
+        WrittenRowsObserver? rowsWritten = null,
+        IDictionary<string, long>? rowCounts = null)
     {
         // The shared chokepoint for both the auto-committing path and a transaction's append. This path
         // converts no schema, so a column the table does not declare would ride into the data file unnoticed.
@@ -7609,6 +7614,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 long fileBaseRowId = nextRowId;
                 if (assignRowIds)
                     nextRowId += file.Rows;
+                if (rowCounts is not null)
+                    rowCounts[DeltaPath.Encode(file.FileName)] = file.Rows;
 
                 actions.Add(new AddFile
                 {
