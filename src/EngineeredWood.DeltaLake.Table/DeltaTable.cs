@@ -3407,6 +3407,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             Tombstones = snapshot.Tombstones,
             InCommitTimestamp = snapshot.InCommitTimestamp,
             RowIdHighWaterMark = snapshot.RowIdHighWaterMark,
+            // Same version, same log file: a refresh from this snapshot can still check the log it came from.
+            LogAnchor = snapshot.LogAnchor,
         };
     }
 

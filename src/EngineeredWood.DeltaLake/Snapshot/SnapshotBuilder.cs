@@ -252,7 +252,7 @@ public sealed class SnapshotBuilder
             }
         }
 
-        return builder.Build(atVersion is null ? listedAt : null);
+        return builder.Build(atVersion is null ? listedAt : null, listing.AnchorAt(targetVersion));
     }
 
     /// <summary>
@@ -373,16 +373,50 @@ public sealed class SnapshotBuilder
     /// Incrementally updates an existing snapshot by replaying only
     /// the commits newer than the snapshot's version.
     /// </summary>
+    /// <exception cref="DeltaFormatException">
+    /// <see cref="DeltaErrorCodes.TransactionLogReplaced"/> when the log is no longer the one
+    /// <paramref name="current"/> was built from (#740); <see cref="DeltaErrorCodes.TruncatedTransactionLog"/> when
+    /// a commit after it is missing.
+    /// </exception>
+    /// <remarks>
+    /// Only certain evidence refuses: a different size or ETag, or a log that no longer reaches the snapshot's
+    /// version. A snapshot that cannot be checked (one built in memory, a log file cleanup has removed, or a
+    /// backend without ETags whose file shows only a different modification time) is updated as before: a
+    /// committer refreshing after its own durable commit must not fail on a touched file.
+    /// <see cref="UpdateOrRebuildAsync"/> rebuilds such a snapshot instead.
+    /// </remarks>
     public static async ValueTask<Snapshot> UpdateAsync(
         Snapshot current,
         TransactionLog log,
         CancellationToken cancellationToken = default)
+    {
+        return await TryUpdateAsync(current, log, rebuildUnverified: false, cancellationToken)
+                .ConfigureAwait(false)
+            ?? throw LogReplaced(current);
+    }
+
+    /// <summary>
+    /// <see cref="UpdateAsync"/>, or null where <paramref name="current"/> cannot be continued: its log was
+    /// replaced, or, with <paramref name="rebuildUnverified"/>, it cannot be shown not to have been.
+    /// </summary>
+    private static async ValueTask<Snapshot?> TryUpdateAsync(
+        Snapshot current,
+        TransactionLog log,
+        bool rebuildUnverified,
+        CancellationToken cancellationToken)
     {
         // One listing here too: the newest version and the commits to reach it came from two separate
         // walks that a concurrent commit could land between.
         var listedAt = DateTimeOffset.UtcNow; // before the listing, so it errs early (#697)
         var listing = await log.ReadListingAsync(cancellationToken).ConfigureAwait(false);
         long latestVersion = listing.LatestVersion;
+
+        var continuity = ContinuityOf(current, listing);
+        if (continuity == LogContinuity.Replaced
+            || (continuity == LogContinuity.Unverified && rebuildUnverified))
+        {
+            return null;
+        }
 
         if (latestVersion <= current.Version)
             return current.WithListedLatestAt(listedAt);
@@ -410,8 +444,53 @@ public sealed class SnapshotBuilder
             builder.ApplyCommit(v, actions);
         }
 
-        return builder.Build(listedAt);
+        return builder.Build(listedAt, listing.AnchorAt(latestVersion));
     }
+
+    /// <summary>Whether a listing still shows the log a snapshot was built from.</summary>
+    private enum LogContinuity
+    {
+        /// <summary>The file that stood for the snapshot's version is the same object.</summary>
+        Same,
+
+        /// <summary>
+        /// Cannot be shown either way: the snapshot records no log file, log cleanup has since removed it, or
+        /// nothing but a modification time tells the two apart (<see cref="LogFileMatch.Unknown"/>). A reader
+        /// rebuilds; a committer continues.
+        /// </summary>
+        Unverified,
+
+        /// <summary>
+        /// Certainly a different log: another object stands at that path (a different size or ETag), or the log
+        /// no longer reaches the snapshot's version.
+        /// </summary>
+        Replaced,
+    }
+
+    private static LogContinuity ContinuityOf(Snapshot current, LogListing listing)
+    {
+        // A log only grows, and cleanup always keeps the newest version, so one that no longer reaches this
+        // version is not the log the snapshot came from: it was deleted, or re-created shorter.
+        if (listing.LatestVersion < current.Version)
+            return LogContinuity.Replaced;
+
+        if (current.LogAnchor is not { } anchor || listing.IdentityOf(anchor.Path) is not { } listed)
+            return LogContinuity.Unverified;
+
+        return anchor.Compare(listed) switch
+        {
+            LogFileMatch.Same => LogContinuity.Same,
+            LogFileMatch.Different => LogContinuity.Replaced,
+            _ => LogContinuity.Unverified,
+        };
+    }
+
+    private static DeltaFormatException LogReplaced(Snapshot current) =>
+        new(DeltaErrorCodes.TransactionLogReplaced,
+            $"The Delta log is no longer the one the snapshot at version {current.Version} was built from: the " +
+            "file that names that version is a different object now, or the log no longer reaches it. The table " +
+            "was most likely dropped and re-created at the same path, and continuing from the snapshot would mix " +
+            "the two tables. Open the table again.");
 
     /// <summary>
     /// Brings <paramref name="current"/> to the latest version for a READER: incrementally where it can, and from
@@ -442,7 +521,11 @@ public sealed class SnapshotBuilder
     {
         try
         {
-            return await UpdateAsync(current, log, cancellationToken).ConfigureAwait(false);
+            // An unverified snapshot is rebuilt as well as a replaced one: a rebuild costs what an open costs,
+            // while continuing a log that was replaced mixes two tables (#740).
+            return await TryUpdateAsync(current, log, rebuildUnverified: true, cancellationToken)
+                    .ConfigureAwait(false)
+                ?? await BuildAsync(log, checkpointReader, atVersion: null, cancellationToken).ConfigureAwait(false);
         }
         catch (DeltaFormatException ex) when (ex.ErrorCode == DeltaErrorCodes.TruncatedTransactionLog)
         {
@@ -537,13 +620,13 @@ public sealed class SnapshotBuilder
     /// <summary>
     /// Builds the final immutable <see cref="Snapshot"/> from the current state.
     /// </summary>
-    public Snapshot Build() => Build(listedLatestAt: null);
+    public Snapshot Build() => Build(listedLatestAt: null, logAnchor: null);
 
     /// <summary>
     /// As <see cref="Build()"/>, recording when a listing showed this version to be the latest
     /// (<see cref="Snapshot.ListedLatestAt"/>).
     /// </summary>
-    internal Snapshot Build(DateTimeOffset? listedLatestAt)
+    internal Snapshot Build(DateTimeOffset? listedLatestAt, LogFileIdentity? logAnchor)
     {
         if (_metadata is null)
             throw new DeltaFormatException(
@@ -570,6 +653,7 @@ public sealed class SnapshotBuilder
             Tombstones = new Dictionary<string, RemoveFile>(_tombstones),
             InCommitTimestamp = _inCommitTimestamp,
             ListedLatestAt = listedLatestAt,
+            LogAnchor = logAnchor,
             // The delta.rowTracking domainMetadata is the spec source of truth for the high-water mark;
             // the active-file derivation alone under-counts after removes (a later writer could then
             // reassign used row ids). Take the max so either source protects the invariant.

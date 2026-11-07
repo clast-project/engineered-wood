@@ -109,7 +109,16 @@ public interface ITableFileSystem
 /// <summary>
 /// Metadata about a file returned by <see cref="ITableFileSystem.ListAsync"/>.
 /// </summary>
+/// <param name="Path">The file's path, relative to the file system's root.</param>
+/// <param name="Size">The file's length in bytes.</param>
+/// <param name="LastModified">When the file was last written, or <see langword="default"/> when the backend did
+/// not report it.</param>
+/// <param name="ETag">The backend's version tag for the object, as its listing reported it, or
+/// <see langword="null"/> where the backend has none (a local file system). Compared only for equality: two
+/// listings that report different tags for one path saw two different objects, even when size and time agree.
+/// That is what lets a reader recognise a Delta log replaced under a snapshot it holds (#740).</param>
 public readonly record struct TableFileInfo(
     string Path,
     long Size,
-    DateTimeOffset LastModified);
+    DateTimeOffset LastModified,
+    string? ETag = null);

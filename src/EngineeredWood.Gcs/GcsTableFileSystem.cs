@@ -107,7 +107,8 @@ public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint
 
             long size = obj.Size is { } s ? checked((long)s) : 0L;
 
-            yield return new TableFileInfo(ToRelative(obj.Name), size, LastModifiedOf(obj));
+            yield return new TableFileInfo(
+                ToRelative(obj.Name), size, LastModifiedOf(obj), string.IsNullOrEmpty(obj.ETag) ? null : obj.ETag);
         }
     }
 

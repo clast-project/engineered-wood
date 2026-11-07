@@ -65,19 +65,21 @@ internal sealed class LogListing
         await foreach (var file in fileSystem.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
             .ConfigureAwait(false))
         {
-            listing.Add(Path.GetFileName(file.Path), file.Path);
+            listing.Add(Path.GetFileName(file.Path), file);
         }
 
         listing.CommitVersions.Sort();
         return listing;
     }
 
-    private void Add(string fileName, string path)
+    private void Add(string fileName, TableFileInfo file)
     {
+        string path = file.Path;
         if (DeltaVersion.TryParseCommitVersion(fileName, out long commit))
         {
             CommitVersions.Add(commit);
             Observe(commit);
+            Anchor(commit, LogFileIdentity.Of(file), isCommit: true);
             return;
         }
 
@@ -93,6 +95,7 @@ internal sealed class LogListing
             return;
 
         Observe(version);
+        Anchor(version, LogFileIdentity.Of(file), isCommit: false);
 
         string[] suffix = fileName[(fileName.IndexOf(CheckpointMarker, StringComparison.OrdinalIgnoreCase)
             + CheckpointMarker.Length)..].Split('.');
@@ -174,6 +177,42 @@ internal sealed class LogListing
         sorted.Sort(CompareV2Preference);
         return sorted;
     }
+
+    /// <summary>
+    /// Every commit and checkpoint file, by path, as this listing reported it, and per version the one that
+    /// stands for it (<see cref="AnchorAt"/>).
+    /// </summary>
+    private readonly Dictionary<string, LogFileIdentity> _identities = new(StringComparer.Ordinal);
+    private readonly Dictionary<long, (LogFileIdentity Identity, bool IsCommit)> _anchors = [];
+
+    private void Anchor(long version, LogFileIdentity identity, bool isCommit)
+    {
+        _identities[identity.Path] = identity;
+
+        // The commit file where there is one: it is written first and kept longest. Otherwise a checkpoint at
+        // that version (log cleanup can leave one with no commit beside it), the ordinally smallest name, so the
+        // choice does not depend on listing order.
+        if (_anchors.TryGetValue(version, out var existing)
+            && (existing.IsCommit && !isCommit
+                || existing.IsCommit == isCommit
+                   && string.CompareOrdinal(existing.Identity.Path, identity.Path) <= 0))
+        {
+            return;
+        }
+        _anchors[version] = (identity, isCommit);
+    }
+
+    /// <summary>
+    /// The file that stands for <paramref name="version"/> in this listing: its commit, or failing that a
+    /// checkpoint at it. A snapshot records it, so that a later listing can tell whether the log it was built from
+    /// is still the one at this path (#740).
+    /// </summary>
+    public LogFileIdentity? AnchorAt(long version) =>
+        _anchors.TryGetValue(version, out var anchor) ? anchor.Identity : null;
+
+    /// <summary>The commit or checkpoint file at <paramref name="path"/>, as this listing reported it.</summary>
+    public LogFileIdentity? IdentityOf(string path) =>
+        _identities.TryGetValue(path, out var identity) ? identity : null;
 
     private void Observe(long version)
     {

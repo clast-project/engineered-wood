@@ -31,6 +31,9 @@ public sealed class LocalTableFileSystemPathConformanceTests : TableFileSystemPa
     protected override bool Available => true;
 
     /// <inheritdoc/>
+    protected override bool ListsETags => false;
+
+    /// <inheritdoc/>
     protected override string? UnavailableReason => null;
 
     /// <inheritdoc/>
