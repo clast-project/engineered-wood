@@ -140,6 +140,26 @@ public class CdfCommitReadTests : IDisposable
         Assert.Equal(DeltaErrorCodes.TruncatedTransactionLog, refused.ErrorCode);
     }
 
+    /// <summary>The end's own commit, below the latest version (Spark, with 7 deleted and the table at 10: 6..7
+    /// and 7..7 both fail). Checking only that SOME commit at or after the end exists let 6..7 return version 6
+    /// alone.</summary>
+    [Theory]
+    [InlineData(6)]
+    [InlineData(7)]
+    public async Task ARangeWhoseEndHasNoCommit_BelowTheLatest_IsRefused(long start)
+    {
+        await CreateTableAsync();
+        File.Delete(CommitPath(7));
+        var fs = new LocalTableFileSystem(_tempDir);
+
+        var refused = await Assert.ThrowsAsync<DeltaFormatException>(() => VersionsAsync(fs, start, 7));
+        Assert.Equal(DeltaErrorCodes.TruncatedTransactionLog, refused.ErrorCode);
+        Assert.Contains("version 7", refused.Message);
+
+        // An end past the hole still reads, skipping it.
+        Assert.Equal([6, 8], await VersionsAsync(fs, 6, 8));
+    }
+
     [Fact]
     public async Task AnEndPastTheLatestVersion_ReadsToTheLatest()
     {

@@ -146,7 +146,7 @@ internal static class CdfReader
     /// ascending, from one listing of the log. The end is clamped to the table's latest version (the newer of
     /// <paramref name="latestVersion"/> and the newest commit file); a start past it gives no versions.
     /// Refused, as delta-spark refuses them: a start before the earliest commit file (the commits it needs were
-    /// removed by log cleanup), and a clamped end with no commit file at or after it. A version missing in
+    /// removed by log cleanup), and a clamped end with no commit file of its own. A version missing in
     /// between is left out, which is delta-spark's behaviour too.
     /// </summary>
     private static async ValueTask<List<long>> CommitsInRangeAsync(
@@ -173,7 +173,7 @@ internal static class CdfReader
                       + $"version {listed[0]}; the ones before it were removed (log cleanup, under "
                       + "delta.logRetentionDuration).");
         }
-        if (listed[listed.Count - 1] < end)
+        if (listed.BinarySearch(end) < 0)
         {
             throw new DeltaFormatException(
                 DeltaErrorCodes.TruncatedTransactionLog,
