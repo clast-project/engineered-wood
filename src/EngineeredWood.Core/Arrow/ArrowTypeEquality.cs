@@ -72,7 +72,11 @@ internal static class ArrowTypeEquality
     /// </summary>
     public static string Describe(IArrowType type) => type switch
     {
-        ExtensionType x => $"{x.Name}<{Describe(x.StorageType)}>",
+        // The metadata is compared too, so it is shown when there is any: types that differ only there would
+        // otherwise print the same.
+        ExtensionType x => string.IsNullOrEmpty(x.ExtensionMetadata)
+            ? $"{x.Name}<{Describe(x.StorageType)}>"
+            : $"{x.Name}[\"{x.ExtensionMetadata}\"]<{Describe(x.StorageType)}>",
         DictionaryType x => $"dictionary<{Describe(x.IndexType)}, {Describe(x.ValueType)}{(x.Ordered ? ", ordered" : "")}>",
         FixedSizeListType x => $"{x.Name}[{x.ListSize}]<{DescribeFields(x.Fields)}>",
         MapType x => $"{x.Name}{(x.KeySorted ? "[sorted]" : "")}<{DescribeFields(x.Fields)}>",

@@ -268,6 +268,23 @@ public class ConcatenateTests
         Assert.Equal(new byte[] { 3, 5 }, result.TypeIds.ToArray());
     }
 
+    /// <summary>
+    /// Extension types of one name and storage that differ only in their metadata are refused, and the message shows
+    /// the metadata, which is the only place they differ.
+    /// </summary>
+    [Fact]
+    public void ExtensionTypesOfDifferentMetadata_AreRefused_AndTheMessageShowsIt()
+    {
+        var usd = new TaggedType("currency=USD").CreateArray(RawArrays.Fixed(Int64Type.Default, new[] { 1L }));
+        var eur = new TaggedType("currency=EUR").CreateArray(RawArrays.Fixed(Int64Type.Default, new[] { 2L }));
+        var none = new TaggedType("").CreateArray(RawArrays.Fixed(Int64Type.Default, new[] { 3L }));
+
+        var ex = Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([usd, eur]));
+        Assert.Contains("test.tagged[\"currency=EUR\"]<int64> onto test.tagged[\"currency=USD\"]<int64>", ex.Message);
+        ex = Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([usd, none]));
+        Assert.Contains("test.tagged<int64> onto test.tagged[\"currency=USD\"]<int64>", ex.Message);
+    }
+
     [Fact]
     public void DifferentLeafTypes_AreRefused()
     {
@@ -365,6 +382,16 @@ public class ConcatenateTests
         var offsets = new ArrowBuffer.Builder<int>().Append(0).Build();
         return new DenseUnionArray(type, 1, children, ids, offsets, nullCount: 0);
     }
+
+    /// <summary>An extension type over int64 whose metadata is whatever it was built with.</summary>
+    private sealed class TaggedType(string metadata) : ExtensionType(Int64Type.Default)
+    {
+        public override string Name => "test.tagged";
+        public override string ExtensionMetadata => metadata;
+        public override ExtensionArray CreateArray(IArrowArray storage) => new TaggedArray(this, storage);
+    }
+
+    private sealed class TaggedArray(TaggedType type, IArrowArray storage) : ExtensionArray(type, storage);
 
     private static Decimal128Array Decimals(int precision, int scale, decimal value) =>
         new Decimal128Array.Builder(new Decimal128Type(precision, scale)).Append(value).Build();
