@@ -172,10 +172,14 @@ public class CdfParallelReadTests : IDisposable
         Assert.Equal(1, fs.MaxReading);
     }
 
-    [Fact]
-    public async Task NoFile_IsAskedForItsSizeOrWhetherItExists()
+    /// <summary>Without the change feed, the last two versions are vector edits: their vectors are read, and
+    /// a side that changed no rows is skipped, on the file's own read, with no existence check either.</summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task NoFile_IsAskedForItsSizeOrWhetherItExists(bool changeDataFeed)
     {
-        await CreateTableAsync(changeDataFeed: true);
+        await CreateTableAsync(changeDataFeed);
         var fs = new CountingFileSystem(new LocalTableFileSystem(_tempDir));
 
         await using (var table = await DeltaTable.OpenAsync(fs, Options(4)))
@@ -215,6 +219,104 @@ public class CdfParallelReadTests : IDisposable
         Assert.Equal(expected, after);
     }
 
+    /// <summary>
+    /// A vector edit whose vector lives in a file. When VACUUM has removed the data file, and the vector file
+    /// with it, reading the vectors fails; only then is the data file's existence asked, and the edit
+    /// contributes nothing. When the data file is still there, the same failure is an error, not a skip.
+    /// </summary>
+    [Theory]
+    [InlineData(1, true)]
+    [InlineData(4, true)]
+    [InlineData(1, false)]
+    [InlineData(4, false)]
+    public async Task AVectorEdit_WhoseVectorsAreGone_IsSkippedOnlyWhenItsFileIsGone(int window, bool dataFileGone)
+    {
+        await CreateTableAsync(changeDataFeed: false);
+        var fs = new LocalTableFileSystem(_tempDir);
+        long version;
+        AddFile target;
+        await using (var table = await DeltaTable.OpenAsync(fs, Options(1)))
+        {
+            version = table.CurrentSnapshot.Version + 1;
+            target = table.CurrentSnapshot.ActiveFiles.Values.First(f => f.DeletionVector is null);
+        }
+
+        // A file-backed vector (storage type "u") whose .bin file does not exist: Z85 "0" x 20 is the all-zero uuid.
+        var missingVector = new DeletionVector
+        {
+            StorageType = "u", PathOrInlineDv = new string('0', 20), Offset = 1, SizeInBytes = 34, Cardinality = 2,
+        };
+        await new TransactionLog(fs).WriteCommitAsync(version, new List<DeltaAction>
+        {
+            new RemoveFile
+            {
+                Path = target.Path, DataChange = true, DeletionTimestamp = 1, Size = target.Size,
+                PartitionValues = target.PartitionValues,
+            },
+            target with { DeletionVector = missingVector, DataChange = true },
+        });
+        if (dataFileGone)
+            File.Delete(Path.Combine(_tempDir, DeltaPath.Decode(target.Path)));
+
+        await using var reopened = await DeltaTable.OpenAsync(fs, Options(window));
+        var feed = reopened.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = version, EndVersion = version });
+        if (dataFileGone)
+        {
+            await foreach (var batch in feed)
+                Assert.Equal(0, batch.Length);
+        }
+        else
+        {
+            await Assert.ThrowsAnyAsync<Exception>(async () =>
+            {
+                await foreach (var _ in feed)
+                {
+                }
+            });
+        }
+    }
+
+    /// <summary>Leaving the feed early stops it: the commits after the point it reached are not read. A
+    /// cancelled commit read used to be taken for a missing version and skipped, so the dispatcher went on
+    /// through every remaining version before the feed could close.</summary>
+    [Fact]
+    public async Task LeavingEarly_ReadsNoFurtherCommits()
+    {
+        var fs = new CountingFileSystem(new LocalTableFileSystem(_tempDir));
+        const int commits = 40;
+        await using (var table = await DeltaTable.CreateAsync(
+                         fs, Schema(), configuration: new Dictionary<string, string> { [CdfConfig.EnableKey] = "true" }))
+        {
+            for (int c = 0; c < commits; c++)
+            {
+                var ids = new Int64Array.Builder().Append(c).Build();
+                var values = new StringArray.Builder().Append("v").Build();
+                await table.WriteAsync([new RecordBatch(table.ArrowSchema, [ids, values], 1)]);
+            }
+        }
+
+        await using (var table = await DeltaTable.OpenAsync(fs, Options(2)))
+        {
+            fs.Reset();
+            await foreach (var _ in table.ReadChangesAsync(new DeltaChangeReadOptions
+                           {
+                               StartVersion = 0,
+                               EndVersion = table.CurrentSnapshot.Version,
+                           }))
+            {
+                break;
+            }
+        }
+
+        // The window of 2 lets the dispatcher run a few units ahead, never most of the range.
+        Assert.InRange(fs.CommitReads, 1, commits / 2);
+    }
+
+    private static Apache.Arrow.Schema Schema() => new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Apache.Arrow.Types.Int64Type.Default, false))
+        .Field(new Field("value", Apache.Arrow.Types.StringType.Default, true))
+        .Build();
+
     [Theory]
     [InlineData(1)]
     [InlineData(4)]
@@ -250,7 +352,10 @@ public class CdfParallelReadTests : IDisposable
     /// at once, each delayed by <paramref name="delayMs"/> so that overlapping reads are seen to overlap.</summary>
     private sealed class CountingFileSystem(ITableFileSystem inner, int delayMs = 0) : ITableFileSystem
     {
-        private int _opened, _lengthAsks, _existsAsks, _reading, _maxReading;
+        private int _opened, _lengthAsks, _existsAsks, _reading, _maxReading, _commitReads;
+
+        /// <summary>The commit files read (<see cref="ReadAllBytesAsync"/> of a <c>.json</c> in the log).</summary>
+        public int CommitReads => Volatile.Read(ref _commitReads);
 
         public int Opened => Volatile.Read(ref _opened);
         public int LengthAsks => Volatile.Read(ref _lengthAsks);
@@ -263,6 +368,7 @@ public class CdfParallelReadTests : IDisposable
             Interlocked.Exchange(ref _lengthAsks, 0);
             Interlocked.Exchange(ref _existsAsks, 0);
             Interlocked.Exchange(ref _maxReading, 0);
+            Interlocked.Exchange(ref _commitReads, 0);
         }
 
         private static bool IsTracked(string path) =>
@@ -290,7 +396,12 @@ public class CdfParallelReadTests : IDisposable
         public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default)
             => inner.ListAsync(prefix, cancellationToken);
         public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
-            => inner.ReadAllBytesAsync(path, cancellationToken);
+        {
+            if (path.IndexOf("_delta_log", StringComparison.Ordinal) >= 0
+                && path.EndsWith(".json", StringComparison.Ordinal))
+                Interlocked.Increment(ref _commitReads);
+            return inner.ReadAllBytesAsync(path, cancellationToken);
+        }
         public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
             => inner.CreateAsync(path, overwrite, cancellationToken);
         public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)

@@ -93,7 +93,7 @@ internal static class CdfReader
 
         // The units come from ONE enumeration, in order: the commit reads and the vector pairing stay serial,
         // and under OrderedScan they overlap the reads of the files already dispatched.
-        var units = UnitsAsync(fs, log, startVersion, endVersion, dvReader, cancellationToken);
+        var units = UnitsAsync(log, startVersion, endVersion, dvReader, cancellationToken);
 
         IAsyncEnumerable<RecordBatch> batches = maxConcurrentReads <= 1
             ? SeriallyAsync(fs, units, readOptions, ctx, dvReader, cancellationToken)
@@ -136,7 +136,6 @@ internal static class CdfReader
     /// before it have been taken, so this runs no further ahead than the reads do.
     /// </summary>
     private static async IAsyncEnumerable<CdfUnit> UnitsAsync(
-        ITableFileSystem fs,
         TransactionLog log,
         long startVersion,
         long endVersion,
@@ -151,7 +150,7 @@ internal static class CdfReader
                 actions = await log.ReadCommitAsync(version, cancellationToken)
                     .ConfigureAwait(false);
             }
-            catch
+            catch when (!cancellationToken.IsCancellationRequested)
             {
                 continue; // Skip missing versions
             }
@@ -186,8 +185,9 @@ internal static class CdfReader
             // vector edit rather than a file replaced: what changed is the difference between the two
             // vectors, not every row of the file. Read whole, the pair reported every survivor deleted and
             // re-inserted. Spark's reader pairs them the same way (CDCReader.processDeletionVectorActions).
-            var vectorEdits = await PairVectorEditsAsync(fs, removes, adds, dvReader, cancellationToken)
-                .ConfigureAwait(false);
+            // Pairing needs only the actions. The vectors are read, and the difference taken, by the file's own
+            // read (RowFilter.ResolveEditAsync), so the dispatcher sends no request for them.
+            var vectorEdits = PairVectorEdits(removes, adds, dvReader);
 
             // Removed files → "delete" rows. The action's DELETION VECTOR is honored: rows it already
             // marked deleted are not live at this version — they were reported as deletes when the DV
@@ -200,9 +200,7 @@ internal static class CdfReader
                 if (vectorEdits.TryGetValue(remove.Path, out var edit))
                 {
                     // The rows the new vector hides that the old one did not.
-                    if (edit.NewlyDeleted.IsEmpty)
-                        continue;
-                    filter = RowFilter.KeepOnly(edit.NewlyDeleted);
+                    filter = RowFilter.Edited(edit, reinserted: false);
                 }
                 else
                 {
@@ -225,9 +223,7 @@ internal static class CdfReader
                 {
                     // The rows the old vector hid that the new one no longer does — a RESTORE un-deleting
                     // them. An ordinary vector DELETE has none.
-                    if (edit.Reinserted.IsEmpty)
-                        continue;
-                    filter = RowFilter.KeepOnly(edit.Reinserted);
+                    filter = RowFilter.Edited(edit, reinserted: true);
                 }
                 else
                 {
@@ -402,17 +398,47 @@ internal static class CdfReader
         }
     }
 
-    /// <summary>A remove/add pair of one file whose vectors differ, reduced to the positions that changed.</summary>
-    private sealed record VectorEdit(AddFile Add, DeletionVectorBitmap NewlyDeleted, DeletionVectorBitmap Reinserted);
+    /// <summary>
+    /// A remove/add pair of one file whose vectors differ. The positions that changed are worked out once, on
+    /// first use, and shared by the pair's two reads (the delete side and the insert side), which may run at
+    /// the same time.
+    /// </summary>
+    private sealed class VectorEdit(RemoveFile remove, AddFile add, DeletionVectorReader dvReader)
+    {
+        private readonly object _gate = new();
+        private Task<(DeletionVectorBitmap NewlyDeleted, DeletionVectorBitmap Reinserted)>? _diff;
+
+        public AddFile Add => add;
+
+        /// <summary>The rows the new vector hides that the old one did not, and the rows the old one hid that
+        /// the new one no longer does. Reads both vectors, so it fails when VACUUM has removed them.</summary>
+        public Task<(DeletionVectorBitmap NewlyDeleted, DeletionVectorBitmap Reinserted)> DiffAsync(
+            CancellationToken cancellationToken)
+        {
+            lock (_gate)
+                return _diff ??= ComputeAsync(cancellationToken);
+        }
+
+        private async Task<(DeletionVectorBitmap NewlyDeleted, DeletionVectorBitmap Reinserted)> ComputeAsync(
+            CancellationToken cancellationToken)
+        {
+            var oldRows = remove.DeletionVector is null
+                ? DeletionVectorBitmap.Empty
+                : await dvReader.ReadAsync(remove.DeletionVector, cancellationToken).ConfigureAwait(false);
+            var newRows = add.DeletionVector is null
+                ? DeletionVectorBitmap.Empty
+                : await dvReader.ReadAsync(add.DeletionVector, cancellationToken).ConfigureAwait(false);
+            return (newRows.Except(oldRows), oldRows.Except(newRows));
+        }
+    }
 
     /// <summary>
     /// The version's vector edits by path: each file both removed and added in it, with a deletion vector on
     /// at least one side. A pair with neither is a file replaced by itself and is read whole as before; a path
-    /// removed or added twice is left unpaired, since there is no one pair to diff.
+    /// removed or added twice is left unpaired, since there is no one pair to diff. Nothing is read here.
     /// </summary>
-    private static async ValueTask<Dictionary<string, VectorEdit>> PairVectorEditsAsync(
-        ITableFileSystem fs, List<RemoveFile> removes, List<AddFile> adds, DeletionVectorReader dvReader,
-        CancellationToken cancellationToken)
+    private static Dictionary<string, VectorEdit> PairVectorEdits(
+        List<RemoveFile> removes, List<AddFile> adds, DeletionVectorReader dvReader)
     {
         var edits = new Dictionary<string, VectorEdit>(StringComparer.Ordinal);
         if (removes.Count == 0 || adds.Count == 0)
@@ -427,23 +453,7 @@ internal static class CdfReader
             {
                 continue;
             }
-
-            // A file VACUUM has removed takes its vectors with it, and is skipped on both sides as before.
-            if (!await fs.ExistsAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(path), cancellationToken)
-                    .ConfigureAwait(false))
-            {
-                edits[path] = new VectorEdit(add, DeletionVectorBitmap.Empty, DeletionVectorBitmap.Empty);
-                continue;
-            }
-
-            var oldRows = remove.DeletionVector is null
-                ? DeletionVectorBitmap.Empty
-                : await dvReader.ReadAsync(remove.DeletionVector, cancellationToken).ConfigureAwait(false);
-            var newRows = add.DeletionVector is null
-                ? DeletionVectorBitmap.Empty
-                : await dvReader.ReadAsync(add.DeletionVector, cancellationToken).ConfigureAwait(false);
-
-            edits[path] = new VectorEdit(add, newRows.Except(oldRows), oldRows.Except(newRows));
+            edits[path] = new VectorEdit(remove, add, dvReader);
         }
         return edits;
     }
@@ -460,17 +470,34 @@ internal static class CdfReader
     }
 
     /// <summary>Which rows of a data file belong to a change: all but <see cref="Positions"/> (a deletion
-    /// vector's hidden rows), or only <see cref="Positions"/> (the rows a vector edit changed). An excluding
-    /// vector is read only by <see cref="ResolveAsync"/>, once the data file is known to exist — VACUUM removes
-    /// a file's vector along with it.</summary>
+    /// vector's hidden rows), or only <see cref="Positions"/> (the rows a vector edit changed). The vectors are
+    /// read on the file's own read. An excluding one is read by <see cref="ResolveAsync"/>, once the data file is
+    /// known to exist (VACUUM removes a file's vector along with it). A vector edit's two are read by
+    /// <see cref="ResolveEditAsync"/> before the file is opened, so that a side with nothing to report opens
+    /// nothing.</summary>
     private readonly record struct RowFilter(
         DeletionVectorBitmap? Positions, bool KeepOnlyPositions,
-        EngineeredWood.DeltaLake.Actions.DeletionVector? Unread = null)
+        EngineeredWood.DeltaLake.Actions.DeletionVector? Unread = null,
+        VectorEdit? Edit = null, bool ReinsertedSide = false)
     {
         public static RowFilter KeepOnly(DeletionVectorBitmap positions) => new(positions, true);
 
         public static RowFilter Exclude(EngineeredWood.DeltaLake.Actions.DeletionVector? deletionVector) =>
             new(null, false, deletionVector);
+
+        /// <summary>One side of a vector edit: its newly deleted rows, or (<paramref name="reinserted"/>) the rows
+        /// it un-deletes.</summary>
+        public static RowFilter Edited(VectorEdit edit, bool reinserted) =>
+            new(null, true, null, edit, reinserted);
+
+        /// <summary>A vector edit's side as the positions it keeps; any other filter unchanged.</summary>
+        public async ValueTask<RowFilter> ResolveEditAsync(CancellationToken cancellationToken)
+        {
+            if (Edit is null)
+                return this;
+            var (newlyDeleted, reinserted) = await Edit.DiffAsync(cancellationToken).ConfigureAwait(false);
+            return KeepOnly(ReinsertedSide ? reinserted : newlyDeleted);
+        }
 
         public async ValueTask<RowFilter> ResolveAsync(
             DeletionVectorReader dvReader, CancellationToken cancellationToken) =>
@@ -547,15 +574,36 @@ internal static class CdfReader
         // path is an add.path (URL-encoded on-disk relative path) — decode to the on-disk name.
         string diskPath = EngineeredWood.DeltaLake.DeltaPath.Decode(unit.Path);
 
-        // The file may have been deleted already (VACUUM); then it contributes nothing. Its vector is read only
-        // after the file is known to exist, since VACUUM removes a file's vector along with it.
+        // A vector edit's side first: when it changed no rows (an ordinary vector DELETE un-deletes none), the
+        // file is never opened. Its vectors failing to read may mean VACUUM removed them with the file; only
+        // then is the file's existence checked, and a file that is still there makes the failure an error.
+        var filter = unit.Filter;
+        if (filter.Edit is not null)
+        {
+            bool vacuumed = false;
+            try
+            {
+                filter = await filter.ResolveEditAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                if (await fs.ExistsAsync(diskPath, cancellationToken).ConfigureAwait(false))
+                    throw;
+                vacuumed = true;
+            }
+            if (vacuumed || filter.Positions!.IsEmpty)
+                yield break;
+        }
+
+        // The file may have been deleted already (VACUUM); then it contributes nothing. An excluding vector is
+        // read only after the file is known to exist, since VACUUM removes a file's vector along with it.
         await using var opened = await OpenAsync(
             fs, diskPath, unit.Size, readOptions, missingMeansVacuumed: true, cancellationToken).ConfigureAwait(false);
         if (opened is null)
             yield break;
         var reader = opened.Reader;
 
-        var filter = await unit.Filter.ResolveAsync(dvReader, cancellationToken).ConfigureAwait(false);
+        filter = await filter.ResolveAsync(dvReader, cancellationToken).ConfigureAwait(false);
 
         // Every column is read. A row group the vector deletes in full is skipped unread, so it needs no
         // reservation; one a keep-only filter skips is still counted, which can only overestimate.
