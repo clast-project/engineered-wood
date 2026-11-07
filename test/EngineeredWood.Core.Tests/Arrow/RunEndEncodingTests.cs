@@ -315,4 +315,72 @@ public class RunEndEncodingTests
 
         Assert.Equal([(0, 2), (1, 3)], RunsOf(new RunEndEncodedArray(ends, values)));
     }
+
+    // Every operation that rebuilds an array keeps its run-end width: the result goes back under the field the
+    // source came from, and a column whose type disagrees with its field fails later.
+    private static RunEndEncodedArray WithEnds(IArrowType width)
+    {
+        var values = new StringArray.Builder().Append("a").Append("b").Build();
+        IArrowArray ends = width.TypeId switch
+        {
+            ArrowTypeId.Int16 => new Int16Array.Builder().Append((short)2).Append((short)5).Build(),
+            ArrowTypeId.Int64 => new Int64Array.Builder().Append(2L).Append(5L).Build(),
+            _ => new Int32Array.Builder().Append(2).Append(5).Build(),
+        };
+        return new RunEndEncodedArray(ends, values);
+    }
+
+    public static TheoryData<string> Widths => new() { "int16", "int32", "int64" };
+
+    private static IArrowType Width(string name) => name switch
+    {
+        "int16" => Int16Type.Default,
+        "int64" => Int64Type.Default,
+        _ => Int32Type.Default,
+    };
+
+    private static void AssertWidth(IArrowType expected, RunEndEncodedArray array)
+    {
+        Assert.Equal(expected.TypeId, ((RunEndEncodedType)array.Data.DataType).RunEndsDataType.TypeId);
+        Assert.Equal(expected.TypeId, array.RunEnds.Data.DataType.TypeId);
+    }
+
+    [Theory]
+    [MemberData(nameof(Widths))]
+    public void Concatenate_KeepsTheRunEndWidth(string width)
+    {
+        var source = WithEnds(Width(width));
+        var joined = RunEndEncoding.Concatenate([source, source]);
+        AssertWidth(Width(width), joined);
+        AssertRows(["a", "a", "b", "b", "b", "a", "a", "b", "b", "b"], joined);
+    }
+
+    [Theory]
+    [MemberData(nameof(Widths))]
+    public void TakeAndCompact_KeepTheRunEndWidth(string width)
+    {
+        var source = WithEnds(Width(width));
+        var taken = RunEndEncoding.Take(source, [4, 0, 1]);
+        AssertWidth(Width(width), taken);
+        AssertRows(["b", "a", "a"], taken);
+
+        var compacted = RunEndEncoding.Compact((RunEndEncodedArray)source.Slice(1, 3));
+        AssertWidth(Width(width), compacted);
+        AssertRows(["a", "b", "b"], compacted);
+    }
+
+    [Fact]
+    public void Concatenate_RefusesDifferentRunEndWidths()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            RunEndEncoding.Concatenate([WithEnds(Int16Type.Default), WithEnds(Int64Type.Default)]));
+    }
+
+    [Fact]
+    public void Concatenate_RefusesRowsPastTheRunEndWidth()
+    {
+        var values = new StringArray.Builder().Append("a").Build();
+        var big = new RunEndEncodedArray(new Int16Array.Builder().Append(short.MaxValue).Build(), values);
+        Assert.Throws<ArgumentException>(() => RunEndEncoding.Concatenate([big, big]));
+    }
 }
