@@ -293,11 +293,12 @@ internal static class CompactionExecutor
                         fs, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), addFile.Size, cancellationToken)
                     .ConfigureAwait(false);
                 reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
+                // The footer first, so that a size the log records wrongly says so (the reader caches it).
+                var footer = await DataFileFooter.ReadAsync(
+                        reader, file, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+                    .ConfigureAwait(false);
                 if (reservation != ScanReservation.None)
-                {
-                    var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
                     reservation.SetInitialEstimate(DeltaTable.LargestRowGroupBytes(footer, null, deletedRows));
-                }
                 rawBatches = Positioned(reader, deletedRows, cancellationToken);
             }
 

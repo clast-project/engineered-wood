@@ -4964,7 +4964,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // The file's row count, from the footer: the read below may skip rows, so it cannot be counted
             // from the batches. It decides the whole-file remove, and a short count would turn a partial
             // delete into one.
-            var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+            var footer = await DataFileFooter.ReadAsync(
+                reader, file, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken).ConfigureAwait(false);
             long fileRows = 0;
             foreach (var rowGroup in footer.RowGroups)
                 fileRows += rowGroup.NumRows;
@@ -12564,7 +12565,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // needs it, and a scan opens files AHEAD of the one it is planning, so that the footer's round trips
             // overlap the reads in flight. Left to the planner, an unprojected read would fetch each file's footer
             // one after another, on the one thread that plans.
-            await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+            await DataFileFooter.ReadAsync(
+                reader, file, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken).ConfigureAwait(false);
 
             var fileColumns = await FileColumnsAsync(
                     reader, snapshot, columns, mappingMode, logicalToPhysical, withRowTracking: true, cancellationToken)

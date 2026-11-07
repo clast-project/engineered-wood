@@ -80,7 +80,7 @@ internal static class VariantFooterStats
         await using var file = await EngineeredWood.IO.KnownLengthRandomAccessFile.OpenAsync(
             fs, path, fileSize, cancellationToken).ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false);
-        var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var footer = await DataFileFooter.ReadAsync(reader, file, path, cancellationToken).ConfigureAwait(false);
         return Compute(footer, variants, stringPrefixLength);
     }
 

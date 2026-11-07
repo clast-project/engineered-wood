@@ -375,11 +375,10 @@ internal static class CdfReader
         ParquetFileReader? reader = null;
         try
         {
-            file = await fs.OpenReadAsync(diskPath, cancellationToken).ConfigureAwait(false);
-            if (size is { } length and >= 0)
-                file = new KnownLengthRandomAccessFile(file, length);
+            file = await KnownLengthRandomAccessFile.OpenAsync(fs, diskPath, size, cancellationToken)
+                .ConfigureAwait(false);
             reader = new ParquetFileReader(file, ownsFile: false, readOptions);
-            var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+            var footer = await DataFileFooter.ReadAsync(reader, file, diskPath, cancellationToken).ConfigureAwait(false);
             return new OpenedFile(file, reader, footer);
         }
         catch (Exception) when (missingMeansVacuumed && !cancellationToken.IsCancellationRequested)
