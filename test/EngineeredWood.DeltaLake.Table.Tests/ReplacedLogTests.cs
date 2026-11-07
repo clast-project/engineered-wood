@@ -281,6 +281,68 @@ public class ReplacedLogTests : IDisposable
     }
 
     [Fact]
+    public async Task Commit_reappearing_beside_a_surviving_checkpoint_is_a_replacement()
+    {
+        // The held snapshot stands on a checkpoint alone: cleanup removed the commit at its version. A re-created
+        // table then publishes a new commit at that version while the old checkpoint stays. The checkpoint still
+        // matches, but a commit can never legitimately appear at a version that had none (#746 review).
+        await CreateAsync(Local, 1, 2);
+        await using (var writer = await DeltaTable.OpenAsync(Local, Options))
+            await writer.CheckpointAsync();                                  // checkpoint at v2
+        string logDir = Path.Combine(_tempDir, "_delta_log");
+        File.Delete(Path.Combine(logDir, $"{2L:D20}.json"));
+        await using var table = await DeltaTable.OpenAsync(Local, Options);
+        var held = table.CurrentSnapshot;
+
+        // The new table's commits 0..2, written elsewhere and moved in; the old checkpoint is left where it was.
+        string other = Directory.CreateDirectory(Path.Combine(_tempDir, "other")).FullName;
+        await CreateAsync(new LocalTableFileSystem(other), 100, 101);
+        foreach (string file in Directory.GetFiles(Path.Combine(logDir)))
+        {
+            if (!file.EndsWith(".checkpoint.parquet", StringComparison.Ordinal))
+                File.Delete(file);
+        }
+        foreach (string file in Directory.GetFiles(Path.Combine(other, "_delta_log"), "*.json"))
+            File.Move(file, Path.Combine(logDir, Path.GetFileName(file)));
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await SnapshotBuilder.UpdateAsync(held, new TransactionLog(Local)));
+        Assert.Equal(DeltaErrorCodes.TransactionLogReplaced, ex.ErrorCode);
+    }
+
+    [Fact]
+    public async Task Every_file_at_the_version_is_compared_but_only_a_commit_proves_a_replacement()
+    {
+        // Version 2 is named by its commit AND a checkpoint. ETags the test controls stand for the objects.
+        var generation = new Dictionary<string, int>(StringComparer.Ordinal);
+        var fs = new ListingRewriteFileSystem(Local, f => f with
+        {
+            ETag = $"\"{f.Path}#{(generation.TryGetValue(f.Path, out int g) ? g : 0)}\"",
+        });
+        await CreateAsync(fs, 1, 2);
+        await using (var writer = await DeltaTable.OpenAsync(fs, Options))
+            await writer.CheckpointAsync();
+        string commit = $"_delta_log/{2L:D20}.json";
+        string checkpoint = $"_delta_log/{2L:D20}.checkpoint.parquet";
+        await using var table = await DeltaTable.OpenAsync(fs, Options);
+        var held = table.CurrentSnapshot;
+        var log = new TransactionLog(fs);
+
+        // A rewritten checkpoint (another engine may overwrite one) is not proof: the committer continues, and a
+        // reader rebuilds rather than trust it.
+        generation[checkpoint] = 1;
+        Assert.Same(held.ActiveFiles, (await SnapshotBuilder.UpdateAsync(held, log)).ActiveFiles);
+        int reads = fs.ReadsOf(checkpoint);
+        await table.RefreshAsync();
+        Assert.True(fs.ReadsOf(checkpoint) > reads, "a changed checkpoint at the version is rebuilt from");
+
+        // A different commit object at the version is proof.
+        generation[commit] = 1;
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () => await SnapshotBuilder.UpdateAsync(held, log));
+        Assert.Equal(DeltaErrorCodes.TransactionLogReplaced, ex.ErrorCode);
+    }
+
+    [Fact]
     public async Task Snapshot_on_a_checkpoint_whose_commit_was_removed_is_still_recognised()
     {
         // Log cleanup can leave a checkpoint with no commit beside it. The checkpoint then stands for the version.

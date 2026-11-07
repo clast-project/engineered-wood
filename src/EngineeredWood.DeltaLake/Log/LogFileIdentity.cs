@@ -51,3 +51,13 @@ internal readonly record struct LogFileIdentity(string Path, long Size, DateTime
         return LastModified != default && LastModified == other.LastModified ? LogFileMatch.Same : LogFileMatch.Unknown;
     }
 }
+
+/// <summary>
+/// Every log file that named a snapshot's version in the listing it was built from: the commit, and each checkpoint
+/// file at that version (#740, #746 review).
+/// </summary>
+/// <param name="Files">The files, ordered by path.</param>
+/// <param name="HasCommit">Whether the commit file was among them. Log cleanup can leave a checkpoint with no commit
+/// beside it; a commit can never appear at that version afterwards, because a commit is written before any
+/// checkpoint of it and is never written again.</param>
+internal sealed record LogVersionAnchor(IReadOnlyList<LogFileIdentity> Files, bool HasCommit);

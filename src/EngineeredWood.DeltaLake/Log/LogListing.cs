@@ -179,36 +179,42 @@ internal sealed class LogListing
     }
 
     /// <summary>
-    /// Every commit and checkpoint file, by path, as this listing reported it, and per version the one that
-    /// stands for it (<see cref="AnchorAt"/>).
+    /// Every commit and checkpoint file, by path, as this listing reported it, and per version every file that
+    /// names it (<see cref="AnchorAt"/>).
     /// </summary>
     private readonly Dictionary<string, LogFileIdentity> _identities = new(StringComparer.Ordinal);
-    private readonly Dictionary<long, (LogFileIdentity Identity, bool IsCommit)> _anchors = [];
+    private readonly Dictionary<long, List<LogFileIdentity>> _filesAt = [];
+    private readonly HashSet<long> _commitsAt = [];
 
     private void Anchor(long version, LogFileIdentity identity, bool isCommit)
     {
         _identities[identity.Path] = identity;
-
-        // The commit file where there is one: it is written first and kept longest. Otherwise a checkpoint at
-        // that version (log cleanup can leave one with no commit beside it), the ordinally smallest name, so the
-        // choice does not depend on listing order.
-        if (_anchors.TryGetValue(version, out var existing)
-            && (existing.IsCommit && !isCommit
-                || existing.IsCommit == isCommit
-                   && string.CompareOrdinal(existing.Identity.Path, identity.Path) <= 0))
-        {
-            return;
-        }
-        _anchors[version] = (identity, isCommit);
+        if (!_filesAt.TryGetValue(version, out var files))
+            _filesAt[version] = files = [];
+        files.Add(identity);
+        if (isCommit)
+            _commitsAt.Add(version);
     }
 
     /// <summary>
-    /// The file that stands for <paramref name="version"/> in this listing: its commit, or failing that a
-    /// checkpoint at it. A snapshot records it, so that a later listing can tell whether the log it was built from
-    /// is still the one at this path (#740).
+    /// Every log file that names <paramref name="version"/> in this listing: its commit, and each checkpoint file
+    /// at it (every part of a multi-part one, every V2 body). A snapshot records them, so that a later listing can
+    /// tell whether the log it was built from is still the one at this path (#740). Null when none is listed.
     /// </summary>
-    public LogFileIdentity? AnchorAt(long version) =>
-        _anchors.TryGetValue(version, out var anchor) ? anchor.Identity : null;
+    /// <remarks>All of them rather than one chosen file (#746 review): a checkpoint can be several files, and the
+    /// one a snapshot was read from need not be the one a single-file choice would pick.</remarks>
+    public LogVersionAnchor? AnchorAt(long version)
+    {
+        if (!_filesAt.TryGetValue(version, out var files))
+            return null;
+
+        var sorted = new List<LogFileIdentity>(files);
+        sorted.Sort(static (a, b) => string.CompareOrdinal(a.Path, b.Path));
+        return new LogVersionAnchor(sorted, _commitsAt.Contains(version));
+    }
+
+    /// <summary>Whether this listing names a commit file for <paramref name="version"/>.</summary>
+    public bool HasCommitAt(long version) => _commitsAt.Contains(version);
 
     /// <summary>The commit or checkpoint file at <paramref name="path"/>, as this listing reported it.</summary>
     public LogFileIdentity? IdentityOf(string path) =>

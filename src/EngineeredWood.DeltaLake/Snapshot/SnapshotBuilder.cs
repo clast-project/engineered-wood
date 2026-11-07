@@ -396,10 +396,11 @@ public sealed class SnapshotBuilder
     /// a commit after it is missing.
     /// </exception>
     /// <remarks>
-    /// Only certain evidence refuses: a different size or ETag, or a log that no longer reaches the snapshot's
-    /// version. A snapshot that cannot be checked (one built in memory, a log file cleanup has removed, or a
-    /// backend without ETags whose file shows only a different modification time) is updated as before: a
-    /// committer refreshing after its own durable commit must not fail on a touched file.
+    /// Only certain evidence refuses: the commit at the snapshot's version differs in size or ETag, a commit has
+    /// appeared at a version the snapshot saw only a checkpoint for, or the log no longer reaches the snapshot's
+    /// version. A snapshot that cannot be checked (one built in memory, a log file cleanup has removed, a checkpoint
+    /// another engine rewrote, or a backend without ETags whose file shows only a different modification time) is
+    /// updated as before: a committer refreshing after its own durable commit must not fail on a touched file.
     /// <see cref="UpdateOrRebuildAsync"/> rebuilds such a snapshot instead.
     /// </remarks>
     public static async ValueTask<Snapshot> UpdateAsync(
@@ -486,8 +487,8 @@ public sealed class SnapshotBuilder
         Unverified,
 
         /// <summary>
-        /// Certainly a different log: another object stands at that path (a different size or ETag), or the log
-        /// no longer reaches the snapshot's version.
+        /// Certainly a different log: another commit object stands at the snapshot's version (a different size or
+        /// ETag), a commit appeared where there was none, or the log no longer reaches the snapshot's version.
         /// </summary>
         Replaced,
     }
@@ -499,15 +500,46 @@ public sealed class SnapshotBuilder
         if (listing.LatestVersion < current.Version)
             return LogContinuity.Replaced;
 
-        if (current.LogAnchor is not { } anchor || listing.IdentityOf(anchor.Path) is not { } listed)
+        if (current.LogAnchor is not { Files.Count: > 0 } anchor)
             return LogContinuity.Unverified;
 
-        return anchor.Compare(listed) switch
+        // A commit can never appear at a version that had none: it is written before any checkpoint of it and never
+        // written again. So a snapshot built from a checkpoint that now has a commit beside it is looking at a new
+        // log that re-created this version and left the old checkpoint in place (#746 review).
+        if (!anchor.HasCommit && listing.HasCommitAt(current.Version))
+            return LogContinuity.Replaced;
+
+        // Every file is compared, not one chosen file: a checkpoint can be several (multi-part, or two V2 bodies), and
+        // the snapshot may have been read from any of them. A file the snapshot did not see, such as a later
+        // checkpoint at this version, is allowed. A file that is gone (log cleanup) or cannot be told apart leaves
+        // the log unverified.
+        //
+        // Only a COMMIT that differs is proof. A commit is create-if-absent and never rewritten, but a classic
+        // checkpoint has a fixed name, and another engine may publish one with an overwriting put (delta-rs does) when
+        // two writers checkpoint the same version. A changed checkpoint therefore leaves the log unverified: a reader
+        // rebuilds, and a committer does not fail a durable commit over it.
+        bool unverified = false;
+        foreach (var recorded in anchor.Files)
         {
-            LogFileMatch.Same => LogContinuity.Same,
-            LogFileMatch.Different => LogContinuity.Replaced,
-            _ => LogContinuity.Unverified,
-        };
+            if (listing.IdentityOf(recorded.Path) is not { } listed)
+            {
+                unverified = true;
+                continue;
+            }
+            switch (recorded.Compare(listed))
+            {
+                case LogFileMatch.Different when IsCommitFile(recorded.Path):
+                    return LogContinuity.Replaced;
+                case LogFileMatch.Different:
+                case LogFileMatch.Unknown:
+                    unverified = true;
+                    break;
+            }
+        }
+        return unverified ? LogContinuity.Unverified : LogContinuity.Same;
+
+        static bool IsCommitFile(string path) =>
+            DeltaVersion.TryParseCommitVersion(System.IO.Path.GetFileName(path), out _);
     }
 
     private static DeltaFormatException LogReplaced(Snapshot current) =>
@@ -655,7 +687,7 @@ public sealed class SnapshotBuilder
     /// As <see cref="Build()"/>, recording when a listing showed this version to be the latest
     /// (<see cref="Snapshot.ListedLatestAt"/>).
     /// </summary>
-    internal Snapshot Build(DateTimeOffset? listedLatestAt, LogFileIdentity? logAnchor)
+    internal Snapshot Build(DateTimeOffset? listedLatestAt, LogVersionAnchor? logAnchor)
     {
         if (_metadata is null)
             throw new DeltaFormatException(
