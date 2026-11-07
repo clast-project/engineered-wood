@@ -9027,9 +9027,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             return rows;
         }
 
-        await using var stream = await _fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        // The size from the action: no HEAD before the footer, and a wrong one says so (#722).
+        await using var stream = await KnownLengthRandomAccessFile.OpenAsync(_fs, path, file.Size, cancellationToken)
+            .ConfigureAwait(false);
         using var reader = new Parquet.ParquetFileReader(stream, ownsFile: false, _dataFileReadOptions);
-        var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var footer = await DataFileFooter.ReadAsync(reader, stream, path, cancellationToken).ConfigureAwait(false);
         foreach (var rowGroup in footer.RowGroups)
             rows += rowGroup.NumRows;
         return rows;
@@ -9167,10 +9169,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             return stats;
 
         EngineeredWood.Parquet.Metadata.FileMetaData footer;
-        await using (var stream = await _fs.OpenReadAsync(file.RelativePath, cancellationToken).ConfigureAwait(false))
+        // The size the host reports, which becomes the action's: no HEAD before the footer, and a wrong one is
+        // refused here, before it reaches the log (#722).
+        await using (var stream = await KnownLengthRandomAccessFile.OpenAsync(
+                         _fs, file.RelativePath, file.SizeBytes, cancellationToken).ConfigureAwait(false))
         {
             using var reader = new Parquet.ParquetFileReader(stream, ownsFile: false);
-            footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+            footer = await DataFileFooter.ReadAsync(reader, stream, file.RelativePath, cancellationToken)
+                .ConfigureAwait(false);
         }
         var bounds = Stats.VariantFooterStats.Compute(footer, missing, selection.StringPrefixLength);
         return bounds.Count == 0 ? stats : StatsWithVariantBounds(stats, bounds);
