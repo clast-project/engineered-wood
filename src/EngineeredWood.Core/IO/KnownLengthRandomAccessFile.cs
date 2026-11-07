@@ -41,4 +41,15 @@ internal sealed class KnownLengthRandomAccessFile : IRandomAccessFile, IReadConc
     public ValueTask DisposeAsync() => _inner.DisposeAsync();
 
     public void Dispose() => _inner.Dispose();
+
+    /// <summary>
+    /// Opens <paramref name="path"/> for reading, answering its length from <paramref name="length"/> when that
+    /// is known (not null and not negative) instead of asking the store.
+    /// </summary>
+    internal static async ValueTask<IRandomAccessFile> OpenAsync(
+        ITableFileSystem fs, string path, long? length, CancellationToken cancellationToken)
+    {
+        var file = await fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        return length is { } known and >= 0 ? new KnownLengthRandomAccessFile(file, known) : file;
+    }
 }

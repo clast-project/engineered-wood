@@ -4949,7 +4949,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // file. A deletion vector moves no row, so a row's identity here is exactly what it already was.
             var deletedRowTracking = new List<(Int64Array Ids, Int64Array Vers)>();
 
-            await using var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+            // The size from the action, so that opening the file asks the store nothing (#722).
+            await using var file = await KnownLengthRandomAccessFile.OpenAsync(
+                    _fs, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), addFile.Size, cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new Parquet.ParquetFileReader(
                 file, ownsFile: false, _dataFileReadOptions);
@@ -10576,7 +10578,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             writtenFooter = writer.WrittenMetadata;
         }
         if (await Stats.VariantFooterStats.OfWrittenFileAsync(
-                writtenFooter, _fs, newFileName, fileSchema,
+                writtenFooter, _fs, newFileName, fileSize, fileSchema,
                 VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration),
                 statsSelection.StringPrefixLength, cancellationToken).ConfigureAwait(false) is { } bounds)
         {
@@ -12548,8 +12550,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             };
         }
 
-        // Open the file and read its Parquet schema for field_id resolution
-        var file = await _fs.OpenReadAsync(EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+        // Open the file and read its Parquet schema for field_id resolution. Its size comes from the action, so
+        // the open asks the store nothing: on an object store that was a HEAD per file before its footer (#722).
+        var file = await KnownLengthRandomAccessFile.OpenAsync(
+                _fs, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), addFile.Size, cancellationToken)
             .ConfigureAwait(false);
         ParquetFileReader? reader = null;
         try

@@ -330,7 +330,9 @@ public class OffsetIndexPageMapTests : IDisposable
             .ToList();
 
         await using var input = new CountingFile(new LocalRandomAccessFile(path));
-        using var reader = new ParquetFileReader(input, ownsFile: false, new ParquetReadOptions { BatchSize = 1000 });
+        // The footer read exactly: a speculative tail would add its bytes to the ones this counts.
+        using var reader = new ParquetFileReader(
+            input, ownsFile: false, new ParquetReadOptions { BatchSize = 1000, FooterReadSize = 0 });
         // One batch per request: a window holding every batch fetches each chunk's pages whole, which
         // is not the header scan this counts.
         reader.BatchPageWindowBudgetBytes = 1;

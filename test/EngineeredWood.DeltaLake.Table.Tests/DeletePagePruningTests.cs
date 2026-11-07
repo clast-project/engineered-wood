@@ -79,7 +79,8 @@ public class DeletePagePruningTests : IDisposable
             RowGroupMaxRows = RowsPerGroup,
             DataPageRowCountLimit = RowsPerPage,
         },
-        ParquetReadOptions = ParquetReadOptions.Default with { BatchSize = 4 },
+        // The footer read exactly: a speculative tail would span the file, and add its bytes to the ones compared.
+        ParquetReadOptions = ParquetReadOptions.Default with { BatchSize = 4, FooterReadSize = 0 },
     };
 
     private async Task<(DeltaTable Table, DataFileCountingFileSystem Fs)> CreateAsync(string name, Shape shape)

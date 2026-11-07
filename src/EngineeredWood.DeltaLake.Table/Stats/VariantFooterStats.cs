@@ -66,7 +66,8 @@ internal static class VariantFooterStats
     /// a file EW cannot read either.</para>
     /// </remarks>
     public static async ValueTask<Dictionary<string, (string Min, string Max)>?> OfWrittenFileAsync(
-        FileMetaData? writtenFooter, EngineeredWood.IO.ITableFileSystem fs, string path, Apache.Arrow.Schema fileSchema,
+        FileMetaData? writtenFooter, EngineeredWood.IO.ITableFileSystem fs, string path, long? fileSize,
+        Apache.Arrow.Schema fileSchema,
         bool tableAllowsShredding, int stringPrefixLength, CancellationToken cancellationToken)
     {
         if (VariantColumns(fileSchema) is not { } variants)
@@ -75,7 +76,9 @@ internal static class VariantFooterStats
             return Compute(writtenFooter, variants, stringPrefixLength);
         if (!tableAllowsShredding)
             return null;
-        await using var file = await fs.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+        // The size the host writer reported (it becomes the action's size), so the read asks the store nothing more.
+        await using var file = await EngineeredWood.IO.KnownLengthRandomAccessFile.OpenAsync(
+            fs, path, fileSize, cancellationToken).ConfigureAwait(false);
         using var reader = new ParquetFileReader(file, ownsFile: false);
         var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         return Compute(footer, variants, stringPrefixLength);

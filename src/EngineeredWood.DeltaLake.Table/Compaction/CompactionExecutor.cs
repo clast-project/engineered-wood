@@ -288,8 +288,9 @@ internal static class CompactionExecutor
             }
             else
             {
-                file = await fs.OpenReadAsync(
-                    EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
+                // The size from the action: no HEAD before the footer (#722).
+                file = await KnownLengthRandomAccessFile.OpenAsync(
+                        fs, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), addFile.Size, cancellationToken)
                     .ConfigureAwait(false);
                 reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
                 if (reservation != ScanReservation.None)

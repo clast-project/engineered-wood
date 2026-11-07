@@ -79,12 +79,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             throw new ParquetFormatException(
                 $"File is too small to be a valid Parquet file ({fileLength} bytes).");
 
-        // Read the last 8 bytes: 4-byte footer length (LE) + 4-byte PAR1 magic
-        using var suffixBuffer = await _file.ReadAsync(
-            new FileRange(fileLength - FooterSuffixSize, FooterSuffixSize),
+        // One read of the tail: at least the 8-byte suffix (4-byte footer length, LE, + PAR1 magic), and by
+        // default enough to hold a typical footer too, so that it needs no second request (#722).
+        int tailLength = (int)Math.Min(fileLength, Math.Max(_options.FooterReadSize, FooterSuffixSize));
+        using var tailBuffer = await _file.ReadAsync(
+            new FileRange(fileLength - tailLength, tailLength),
             cancellationToken).ConfigureAwait(false);
 
-        var suffix = suffixBuffer.Memory.Span;
+        var tail = tailBuffer.Memory.Span;
+        var suffix = tail.Slice(tailLength - FooterSuffixSize);
 
         // Validate trailing magic
         if (suffix[4] != Par1Magic[0] || suffix[5] != Par1Magic[1] ||
@@ -96,13 +99,22 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             throw new ParquetFormatException(
                 $"Invalid Parquet footer length: {footerLength}.");
 
-        // Read the footer (Thrift-encoded FileMetaData)
-        long footerOffset = fileLength - FooterSuffixSize - footerLength;
-        using var footerBuffer = await _file.ReadAsync(
-            new FileRange(footerOffset, footerLength),
-            cancellationToken).ConfigureAwait(false);
+        // Decode the footer (Thrift-encoded FileMetaData) from the tail when it is all there; else read it.
+        FileMetaData metadata;
+        if (footerLength <= tailLength - FooterSuffixSize)
+        {
+            metadata = MetadataDecoder.DecodeFileMetaData(
+                tail.Slice(tailLength - FooterSuffixSize - footerLength, footerLength));
+        }
+        else
+        {
+            long footerOffset = fileLength - FooterSuffixSize - footerLength;
+            using var footerBuffer = await _file.ReadAsync(
+                new FileRange(footerOffset, footerLength),
+                cancellationToken).ConfigureAwait(false);
+            metadata = MetadataDecoder.DecodeFileMetaData(footerBuffer.Memory.Span);
+        }
 
-        var metadata = MetadataDecoder.DecodeFileMetaData(footerBuffer.Memory.Span);
         _fileLength = fileLength;
         Volatile.Write(ref _metadata, metadata);
         return metadata;

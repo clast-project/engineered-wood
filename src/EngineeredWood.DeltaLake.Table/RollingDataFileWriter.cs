@@ -288,7 +288,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             ClearPending();
             size = await _host.WriteAsync(batches.ToAsyncEnumerable(), fileName, cancellationToken)
                 .ConfigureAwait(false);
-            await AddVariantBoundsAsync(writtenFooter: null, fileName, cancellationToken).ConfigureAwait(false);
+            await AddVariantBoundsAsync(writtenFooter: null, fileName, size, cancellationToken).ConfigureAwait(false);
         }
         else
         {
@@ -297,7 +297,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             // CloseAsync writes the footer and publishes the file before Position is read.
             await _writer!.CloseAsync(cancellationToken).ConfigureAwait(false);
             size = _file!.Position;
-            await AddVariantBoundsAsync(_writer.WrittenMetadata, fileName, cancellationToken).ConfigureAwait(false);
+            await AddVariantBoundsAsync(_writer.WrittenMetadata, fileName, size, cancellationToken).ConfigureAwait(false);
             await DisposeOpenFileAsync().ConfigureAwait(false);
         }
 
@@ -312,12 +312,13 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     /// host writer's read back (see <see cref="Stats.VariantFooterStats.OfWrittenFileAsync"/>).
     /// </summary>
     private async ValueTask AddVariantBoundsAsync(
-        EngineeredWood.Parquet.Metadata.FileMetaData? writtenFooter, string fileName, CancellationToken cancellationToken)
+        EngineeredWood.Parquet.Metadata.FileMetaData? writtenFooter, string fileName, long fileSize,
+        CancellationToken cancellationToken)
     {
         if (_fileStats is null || _fileSchema is null)
             return;
         if (await Stats.VariantFooterStats.OfWrittenFileAsync(
-                writtenFooter, _fs, fileName, _fileSchema, _tableAllowsShredding, StringPrefixLength, cancellationToken)
+                writtenFooter, _fs, fileName, fileSize, _fileSchema, _tableAllowsShredding, StringPrefixLength, cancellationToken)
                 .ConfigureAwait(false) is { } bounds)
         {
             _fileStats.AddVariantBounds(bounds);

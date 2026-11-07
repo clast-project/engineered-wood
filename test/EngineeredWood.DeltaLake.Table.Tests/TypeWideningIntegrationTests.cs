@@ -87,7 +87,7 @@ public class TypeWideningIntegrationTests : IDisposable
             {
                 Path = dataFile,
                 PartitionValues = new Dictionary<string, string>(),
-                Size = 100,
+                Size = new FileInfo(Path.Combine(_tempDir, dataFile)).Length,
                 ModificationTime = 1000,
                 DataChange = true,
             },
@@ -161,7 +161,7 @@ public class TypeWideningIntegrationTests : IDisposable
             {
                 Path = dataFile,
                 PartitionValues = new Dictionary<string, string>(),
-                Size = 100, ModificationTime = 1000, DataChange = true,
+                Size = new FileInfo(Path.Combine(_tempDir, dataFile)).Length, ModificationTime = 1000, DataChange = true,
             },
         });
 
@@ -231,13 +231,13 @@ public class TypeWideningIntegrationTests : IDisposable
             {
                 Path = "data_0.parquet",
                 PartitionValues = new Dictionary<string, string>(),
-                Size = 1, ModificationTime = 1000, DataChange = true,
+                Size = new FileInfo(Path.Combine(_tempDir, "data_0.parquet")).Length, ModificationTime = 1000, DataChange = true,
             },
             new AddFile
             {
                 Path = "data_1.parquet",
                 PartitionValues = new Dictionary<string, string>(),
-                Size = 1, ModificationTime = 1000, DataChange = true,
+                Size = new FileInfo(Path.Combine(_tempDir, "data_1.parquet")).Length, ModificationTime = 1000, DataChange = true,
             },
         });
 
