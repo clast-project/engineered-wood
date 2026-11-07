@@ -5918,6 +5918,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             matRowIdName, matRowVerName, emitRowTracking,
             options.MetadataPrefix + DeltaMetadataColumns.RowIdSuffix,
             options.MetadataPrefix + DeltaMetadataColumns.RowCommitVersionSuffix,
+            EffectiveConcurrentRequests, _options.MaxBufferedReadBytes,
             cancellationToken);
 
         // Keep set for the projection, if one was asked for. The feed's own three columns are never dropped
@@ -6631,8 +6632,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// file system suggests (<see cref="IReadConcurrencyHint"/>: an object store's requests in flight, #632) or
     /// else up to 4, where a local read stops gaining; and 1 through the codec seam, whose contract never
     /// promised that two files may be read at once.</summary>
-    /// <summary>The small, independent file-system requests run at once outside a scan: the commit reads of
-    /// <see cref="GetHistoryAsync"/> and the deletes of <see cref="VacuumAsync"/>.
+    /// <summary>The file-system requests run at once outside a scan: the commit reads of
+    /// <see cref="GetHistoryAsync"/>, the deletes of <see cref="VacuumAsync"/>, and the files
+    /// <see cref="ReadChangesAsync(DeltaChangeReadOptions, CancellationToken)"/> reads, which always go through the
+    /// built-in reader.
     /// <see cref="DeltaTableOptions.MaxConcurrentReads"/> when set (1 keeps them serial); by default what the
     /// table's file system suggests (<see cref="IReadConcurrencyHint"/>), or else up to 4. Unlike
     /// <see cref="EffectiveConcurrentReads"/> the codec seam plays no part: these requests go to the file system,

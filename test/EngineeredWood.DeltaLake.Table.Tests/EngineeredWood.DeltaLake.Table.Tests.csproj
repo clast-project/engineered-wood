@@ -21,6 +21,10 @@
          but the interop tiers decide at RUNTIME (is there a JDK? is deltalake installed?). See
          InteropDriver.Require. -->
     <PackageReference Include="Xunit.SkippableFact" />
+    <!-- The CloudIO tests run the table layer against the emulators the cloud-io CI job starts. -->
+    <PackageReference Include="Azure.Storage.Blobs" />
+    <PackageReference Include="AWSSDK.S3" />
+    <PackageReference Include="Clast.Google.Cloud.Storage.V1" />
   </ItemGroup>
 
   <ItemGroup>
@@ -32,6 +36,14 @@
     <ProjectReference Include="..\..\src\EngineeredWood.DeltaLake.Table\EngineeredWood.DeltaLake.Table.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Core\EngineeredWood.Core.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
+    <ProjectReference Include="..\..\src\EngineeredWood.Azure\EngineeredWood.Azure.csproj" />
+    <ProjectReference Include="..\..\src\EngineeredWood.Aws\EngineeredWood.Aws.csproj" />
+    <ProjectReference Include="..\..\src\EngineeredWood.Gcs\EngineeredWood.Gcs.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The emulator availability gate, shared with the Parquet suite's cloud backend tests. -->
+    <Compile Include="..\EngineeredWood.Parquet.Tests\IO\CloudEmulator.cs" Link="CloudIO\CloudEmulator.cs" />
   </ItemGroup>
 
   <ItemGroup>

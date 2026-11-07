@@ -323,11 +323,12 @@ jobs:
           || echo "scope=full" >> "$GITHUB_OUTPUT"
           echo "::group::cloud-io relevance"
           if grep -qx 'scope=full' "$GITHUB_OUTPUT" \
-             || grep -q '^tests=.*EngineeredWood\.Parquet\.Tests\.csproj' "$GITHUB_OUTPUT"; then
+             || grep -q '^tests=.*EngineeredWood\.Parquet\.Tests\.csproj' "$GITHUB_OUTPUT" \
+             || grep -q '^tests=.*EngineeredWood\.DeltaLake\.Table\.Tests\.csproj' "$GITHUB_OUTPUT"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "EngineeredWood.Parquet.Tests is not affected; skipping the cloud backends."
+            echo "Neither EngineeredWood.Parquet.Tests nor EngineeredWood.DeltaLake.Table.Tests is affected; skipping the cloud backends."
           fi
           echo "::endgroup::"
 
@@ -431,13 +432,17 @@ jobs:
 
       - name: Restore
         if: steps.select.outputs.run == 'true'
-        run: dotnet restore test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj
+        run: |
+          dotnet restore test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj
+          dotnet restore test/EngineeredWood.DeltaLake.Table.Tests/EngineeredWood.DeltaLake.Table.Tests.csproj
 
       - name: Build
         if: steps.select.outputs.run == 'true'
-        run: >
-          dotnet build test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj
-          --no-restore --configuration Release --framework net10.0
+        run: |
+          dotnet build test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj \
+            --no-restore --configuration Release --framework net10.0
+          dotnet build test/EngineeredWood.DeltaLake.Table.Tests/EngineeredWood.DeltaLake.Table.Tests.csproj \
+            --no-restore --configuration Release --framework net10.0
 
       # EW_REQUIRE_CLOUD_EMULATORS=1 is what makes this job mean anything. Without it every one
       # of these tests skips when an emulator is missing and the job still reports success —
@@ -453,12 +458,26 @@ jobs:
           --filter "FullyQualifiedName~EngineeredWood.Tests.IO"
           --logger "trx;LogFileName=cloud-io-results.trx"
 
+      # The table layer over the same emulators: what each backend's errors and existence checks mean
+      # to it (#725: the change feed tells a vacuumed data file from an unreadable one only by them).
+      - name: Test the Delta table layer on cloud backends
+        if: steps.select.outputs.run == 'true'
+        env:
+          EW_REQUIRE_CLOUD_EMULATORS: '1'
+        run: >
+          dotnet test test/EngineeredWood.DeltaLake.Table.Tests/EngineeredWood.DeltaLake.Table.Tests.csproj
+          --no-build --configuration Release --framework net10.0
+          --filter "FullyQualifiedName~EngineeredWood.DeltaLake.Table.Tests.CloudIO"
+          --logger "trx;LogFileName=cloud-io-delta-results.trx"
+
       - name: Upload test results
         if: always() && steps.select.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: cloud-io-test-results
-          path: '**/cloud-io-results.trx'
+          path: |
+            **/cloud-io-results.trx
+            **/cloud-io-delta-results.trx
 
   # EW and upstream vortex agree on the files each other writes, in both directions.
   #

@@ -77,12 +77,14 @@ public sealed record DeltaTableOptions
     /// (<c>ReadAllAsync</c>, <c>ReadAtVersionAsync</c>, <c>ReadAtTimestampAsync</c>), and to <c>ReadRowsAsync</c>,
     /// which reads only the row groups holding a selected row (#633). <c>CompactAsync</c> reads this many of a
     /// group's source files at once (a whole file each, within <see cref="MaxBufferedReadBytes"/>), and writes their
-    /// rows in the same order a serial read does. DML, the change feed and copy-on-write rewrites still read their
-    /// files one at a time.</para>
+    /// rows in the same order a serial read does. DML and copy-on-write rewrites still read their files one at a
+    /// time.</para>
     /// <para>The same setting, ignoring <see cref="DataFileReader"/> (these requests never go through it), caps
-    /// the small file-system requests run at once outside a scan: the commit reads of
-    /// <c>GetHistoryAsync</c>, which still yields its entries in version order, and the deletes of
-    /// <c>VacuumAsync</c>. 1 keeps them one at a time.</para>
+    /// the file-system requests run at once outside a scan: the commit reads of <c>GetHistoryAsync</c>, which
+    /// still yields its entries in version order; the deletes of <c>VacuumAsync</c>; and the files
+    /// <c>ReadChangesAsync</c> reads (change files, and the data files changes are inferred from), which it reads
+    /// this many at once within <see cref="MaxBufferedReadBytes"/> and returns in the order a serial read gives.
+    /// 1 keeps them one at a time.</para>
     /// <para>A <see cref="DataFileReader"/> reads serially unless this is set explicitly, because its
     /// contract never promised that two files may be read at once. Setting it above 1 declares that it may:
     /// its <see cref="IDataFileReader.ReadAsync"/> is then called for several files concurrently, each
@@ -104,6 +106,7 @@ public sealed record DeltaTableOptions
     /// <summary>
     /// The decoded data, in bytes of Arrow buffers, a scan running several reads at once
     /// (<see cref="MaxConcurrentReads"/>) may hold that the caller has not yet received. Default: 256 MiB.
+    /// <c>CompactAsync</c> and <c>ReadChangesAsync</c> hold their concurrent reads to it the same way.
     /// </summary>
     /// <remarks>
     /// <para>A file reserves budget BEFORE it decodes each batch, and the reservation is released when the
