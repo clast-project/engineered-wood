@@ -191,11 +191,210 @@ public class ConcatenateTests
         Assert.Equal(new[] { "a", null, "c" }, Enumerable.Range(0, 3).Select(i => result.GetString(i)));
     }
 
+    /// <summary>
+    /// Structs are joined child by child, by position, under the first input's type. Inputs whose fields differ in
+    /// name, order or nullability must be refused, or values land under the wrong field (#733).
+    /// </summary>
+    [Theory]
+    [InlineData("a", "b")]          // a different name
+    [InlineData("a!", "a")]         // NOT NULL onto nullable
+    [InlineData("a", "a!")]         // nullable onto NOT NULL
+    [InlineData("a,b", "b,a")]      // the same fields in another order: the values would swap
+    [InlineData("a", "a,b")]        // a different field count
+    [InlineData("a,b", "a")]
+    public void StructsOfDifferentFields_AreRefused(string first, string second)
+    {
+        var ex = Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([Struct(first), Struct(second)]));
+        Assert.Contains("their types differ", ex.Message);
+    }
+
+    [Fact]
+    public void StructsOfDifferentFields_InsideAList_AreRefused()
+    {
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([ListOf(Struct("a,b")), ListOf(Struct("b,a"))]));
+    }
+
+    [Fact]
+    public void StructsOfDifferentFields_InsideAStruct_AreRefused()
+    {
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([Wrap(Struct("a,b")), Wrap(Struct("b,a"))]));
+    }
+
+    [Fact]
+    public void StructsOfTheSameFields_FromSeparateTypeInstances_Concatenate()
+    {
+        var result = Assert.IsType<StructArray>(ArrowCompute.Concatenate([Struct("a!,b"), Struct("a!,b")]));
+        Assert.Equal(new int?[] { 1, 1 }, Enumerable.Range(0, 2).Select(i => ((Int32Array)result.Fields[0]).GetValue(i)));
+        Assert.Equal(new int?[] { 2, 2 }, Enumerable.Range(0, 2).Select(i => ((Int32Array)result.Fields[1]).GetValue(i)));
+    }
+
+    /// <summary>The message spells out the fields, so the difference can be read off it.</summary>
+    [Fact]
+    public void Refusal_NamesTheFields()
+    {
+        var ex = Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([Struct("a!,b"), Struct("b,a")]));
+        Assert.Contains("struct<b: int32, a: int32> onto struct<a: int32 not null, b: int32>", ex.Message);
+    }
+
+    /// <summary>
+    /// A union row names its branch by a type id, which the type maps onto a field. Unions with the same fields
+    /// but a different mapping would be joined under the first input's mapping, so a row of the second input
+    /// that picks <c>a</c> would read as <c>b</c>.
+    /// </summary>
+    [Fact]
+    public void UnionsOfDifferentTypeIdMappings_AreRefused()
+    {
+        var first = OneRowUnion(UnionMode.Sparse, typeIds: [0, 1], pick: 0);
+        var second = OneRowUnion(UnionMode.Sparse, typeIds: [1, 0], pick: 1);
+
+        var ex = Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([first, second]));
+        Assert.Contains("ids [1, 0]", ex.Message);
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([Wrap(first), Wrap(second)]));
+    }
+
+    [Fact]
+    public void UnionsOfDifferentModes_AreRefused()
+    {
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate(
+            [OneRowUnion(UnionMode.Sparse, [0, 1], pick: 0), OneRowUnion(UnionMode.Dense, [0, 1], pick: 0)]));
+    }
+
+    [Fact]
+    public void UnionsOfTheSameType_FromSeparateTypeInstances_Concatenate()
+    {
+        var result = Assert.IsType<SparseUnionArray>(ArrowCompute.Concatenate(
+            [OneRowUnion(UnionMode.Sparse, [3, 5], pick: 3), OneRowUnion(UnionMode.Sparse, [3, 5], pick: 5)]));
+
+        Assert.Equal(new byte[] { 3, 5 }, result.TypeIds.ToArray());
+    }
+
+    /// <summary>
+    /// Extension types of one name and storage that differ only in their metadata are refused, and the message shows
+    /// the metadata, which is the only place they differ.
+    /// </summary>
+    [Fact]
+    public void ExtensionTypesOfDifferentMetadata_AreRefused_AndTheMessageShowsIt()
+    {
+        var usd = new TaggedType("currency=USD").CreateArray(RawArrays.Fixed(Int64Type.Default, new[] { 1L }));
+        var eur = new TaggedType("currency=EUR").CreateArray(RawArrays.Fixed(Int64Type.Default, new[] { 2L }));
+        var none = new TaggedType("").CreateArray(RawArrays.Fixed(Int64Type.Default, new[] { 3L }));
+
+        var ex = Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([usd, eur]));
+        Assert.Contains("test.tagged[\"currency=EUR\"]<int64> onto test.tagged[\"currency=USD\"]<int64>", ex.Message);
+        ex = Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([usd, none]));
+        Assert.Contains("test.tagged<int64> onto test.tagged[\"currency=USD\"]<int64>", ex.Message);
+    }
+
+    [Fact]
+    public void DifferentLeafTypes_AreRefused()
+    {
+        var ints = new Int32Array.Builder().Append(1).Build();
+        var longs = new Int64Array.Builder().Append(2).Build();
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([ints, longs]));
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([new NullArray(1), ints]));
+    }
+
+    /// <summary>
+    /// Arrow's concatenator widens top-level decimals that differ only in precision, which loses nothing; that is
+    /// kept. A different scale is refused.
+    /// </summary>
+    [Fact]
+    public void TopLevelDecimals_OfDifferentPrecision_Widen()
+    {
+        var result = ArrowCompute.Concatenate([Decimals(10, 2, 1.25m), Decimals(18, 2, 3.5m)]);
+
+        var type = Assert.IsType<Decimal128Type>(result.Data.DataType);
+        Assert.Equal((18, 2), (type.Precision, type.Scale));
+        var values = Assert.IsType<Decimal128Array>(result);
+        Assert.Equal(new decimal?[] { 1.25m, 3.5m }, Enumerable.Range(0, 2).Select(i => values.GetValue(i)));
+    }
+
+    [Fact]
+    public void Decimals_OfDifferentScale_AreRefused()
+    {
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([Decimals(10, 2, 1.25m), Decimals(10, 3, 1.25m)]));
+    }
+
+    /// <summary>
+    /// Inside a struct the joined parent keeps the first input's type, so a widened child would be mislabelled:
+    /// there the precision must agree too.
+    /// </summary>
+    [Fact]
+    public void NestedDecimals_OfDifferentPrecision_AreRefused()
+    {
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate(
+            [Wrap(Decimals(10, 2, 1.25m)), Wrap(Decimals(18, 2, 3.5m))]));
+    }
+
     [Fact]
     public void NoInput_Throws()
     {
         Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([]));
     }
+
+    /// <summary>
+    /// A one-row struct of int32 children, one per comma-separated name (a trailing <c>!</c> makes it NOT NULL),
+    /// each holding its position: 1, 2, and so on.
+    /// </summary>
+    private static StructArray Struct(string spec)
+    {
+        var fields = new List<Field>();
+        var children = new List<IArrowArray>();
+        foreach (var (name, i) in spec.Split(',').Select((n, i) => (n, i)))
+        {
+            fields.Add(new Field(name.TrimEnd('!'), Int32Type.Default, nullable: !name.EndsWith("!", StringComparison.Ordinal)));
+            children.Add(new Int32Array.Builder().Append(i + 1).Build());
+        }
+        return new StructArray(new StructType(fields), 1, children, ArrowBuffer.Empty, nullCount: 0);
+    }
+
+    private static StructArray Wrap(IArrowArray child) => new(
+        new StructType([new Field("inner", child.Data.DataType, nullable: true)]),
+        child.Length, [child], ArrowBuffer.Empty, nullCount: 0);
+
+    private static ListArray ListOf(IArrowArray values)
+    {
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(values.Length).Build();
+        return new ListArray(new ListType(new Field("item", values.Data.DataType, nullable: true)),
+            1, offsets, values, ArrowBuffer.Empty, nullCount: 0);
+    }
+
+    /// <summary>
+    /// A one-row union of two int32 branches, <c>a</c> (holding 1) and <c>b</c> (holding 2), whose type ids are
+    /// <paramref name="typeIds"/>; the row picks the branch whose id is <paramref name="pick"/>.
+    /// </summary>
+    private static UnionArray OneRowUnion(UnionMode mode, int[] typeIds, byte pick)
+    {
+        var type = new UnionType(
+            [new Field("a", Int32Type.Default, nullable: true), new Field("b", Int32Type.Default, nullable: true)],
+            typeIds, mode);
+        var ids = new ArrowBuffer.Builder<byte>().Append(pick).Build();
+        IArrowArray[] children = [new Int32Array.Builder().Append(1).Build(), new Int32Array.Builder().Append(2).Build()];
+        if (mode == UnionMode.Sparse)
+            return new SparseUnionArray(type, 1, children, ids, nullCount: 0);
+
+        // Dense: only the picked branch holds a row, at offset 0.
+        int picked = System.Array.IndexOf(typeIds, (int)pick);
+        children = [
+            picked == 0 ? children[0] : new Int32Array.Builder().Build(),
+            picked == 1 ? children[1] : new Int32Array.Builder().Build(),
+        ];
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Build();
+        return new DenseUnionArray(type, 1, children, ids, offsets, nullCount: 0);
+    }
+
+    /// <summary>An extension type over int64 whose metadata is whatever it was built with.</summary>
+    private sealed class TaggedType(string metadata) : ExtensionType(Int64Type.Default)
+    {
+        public override string Name => "test.tagged";
+        public override string ExtensionMetadata => metadata;
+        public override ExtensionArray CreateArray(IArrowArray storage) => new TaggedArray(this, storage);
+    }
+
+    private sealed class TaggedArray(TaggedType type, IArrowArray storage) : ExtensionArray(type, storage);
+
+    private static Decimal128Array Decimals(int precision, int scale, decimal value) =>
+        new Decimal128Array.Builder(new Decimal128Type(precision, scale)).Append(value).Build();
 
     private static GuidArray Guids(Guid[] values)
     {
