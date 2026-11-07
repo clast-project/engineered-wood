@@ -91,8 +91,8 @@ internal static class CdfReader
         // Stateless over the file system — one instance serves every action in the range.
         var dvReader = new DeletionVectorReader(fs);
 
-        // The units come from ONE enumeration, in order: the commit reads and the vector pairing stay serial,
-        // and under OrderedScan they overlap the reads of the files already dispatched.
+        // The units come from ONE enumeration, in order: the commit reads stay serial, and under OrderedScan
+        // they overlap the reads of the files already dispatched. Every other request is made by a file's read.
         var units = UnitsAsync(log, startVersion, endVersion, dvReader, cancellationToken);
 
         IAsyncEnumerable<RecordBatch> batches = maxConcurrentReads <= 1
