@@ -223,6 +223,70 @@ public class ParallelFileReadTests : IDisposable
         Assert.Equal(0, table.LastScanBudget.Used);
     }
 
+    /// <summary>Two tables given one <see cref="DeltaTableOptions.MemoryBudget"/> (#719): each scan's own
+    /// <see cref="DeltaTableOptions.MaxBufferedReadBytes"/> is far above it, so it is the shared budget that holds
+    /// the two concurrent scans back, and both still read every row.</summary>
+    [Fact]
+    public async Task TwoTablesSharingABudget_AreHeldToItTogether()
+    {
+        await CreateTableAsync();
+        long largest = await LargestBatchBytesAsync();
+        var expected = await RenderAsync(ReadSeriallyAsync());
+
+        var shared = new EngineeredWood.Memory.MemoryBudget(1);
+        var options = Options(4) with { MemoryBudget = shared };
+        await using var first = await DeltaTable.OpenAsync(_fs, options);
+        await using var second = await DeltaTable.OpenAsync(_fs, options);
+
+        async Task<List<List<string>>> SlowlyAsync(DeltaTable table)
+        {
+            var rendered = await RenderAsync(Slowly(table.ReadAsync()));
+            return rendered;
+        }
+
+        var results = await Task.WhenAll(SlowlyAsync(first), SlowlyAsync(second));
+
+        Assert.Equal(expected, results[0]);
+        Assert.Equal(expected, results[1]);
+        // Each scan alone holds what a budget of 1 lets through (see ASlowConsumer_HoldsTheScanToTheBudget);
+        // without the shared budget each would hold up to 4 files x 4 queued batches.
+        Assert.InRange(shared.PeakBytes, 1, 2 * 3 * largest);
+        Assert.InRange(first.LastScanBudget!.Peak, 1, 3 * largest);
+        Assert.InRange(second.LastScanBudget!.Peak, 1, 3 * largest);
+        Assert.Equal(0, shared.UsedBytes);
+
+        static async IAsyncEnumerable<RecordBatch> Slowly(IAsyncEnumerable<RecordBatch> batches)
+        {
+            await foreach (var b in batches)
+            {
+                yield return b;
+                await Task.Delay(2);
+            }
+        }
+
+        async IAsyncEnumerable<RecordBatch> ReadSeriallyAsync()
+        {
+            await using var serial = await OpenAsync(1);
+            await foreach (var b in serial.ReadAsync())
+                yield return b;
+        }
+    }
+
+    /// <summary>Compaction's reads draw from the table's shared budget too, and hand everything back.</summary>
+    [Fact]
+    public async Task Compaction_DrawsFromTheSharedBudget()
+    {
+        await CreateTableAsync();
+        var shared = new EngineeredWood.Memory.MemoryBudget(long.MaxValue);
+        await using var table = await DeltaTable.OpenAsync(_fs, Options(4) with { MemoryBudget = shared });
+
+        long? version = await table.CompactAsync();
+
+        Assert.NotNull(version);
+        Assert.True(shared.PeakBytes > 0, "compaction's reads were not charged to the shared budget");
+        Assert.Equal(0, shared.UsedBytes);
+    }
+
     /// <summary>The same for ReadRowsAsync, whose per-file read at first did not reserve at all: its producers
     /// filled their channels whatever the budget.</summary>
     [Fact]

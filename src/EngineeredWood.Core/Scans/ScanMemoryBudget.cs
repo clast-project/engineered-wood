@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using EngineeredWood.Memory;
+
 namespace EngineeredWood.Scans;
 
 /// <summary>
@@ -44,8 +46,9 @@ internal sealed class ScanReservation
 
     internal void Observe(long bytes)
     {
+        // An estimate past MaxCharge can only come from a corrupt footer; capped, so the totals cannot wrap.
         if (bytes > _estimate)
-            _estimate = bytes;
+            _estimate = Math.Min(bytes, MemoryBudget.MaxCharge);
     }
 
     /// <summary>Waits until the budget can take the next item, then reserves for it. A reservation still
@@ -87,6 +90,7 @@ internal sealed class ScanReservation
     {
         if (_budget is null || bytes <= 0)
             return;
+        bytes = Math.Min(bytes, MemoryBudget.MaxCharge); // as in Observe
         await _budget.ReserveAsync(_unit, bytes, cancellationToken).ConfigureAwait(false);
         _held += bytes;
     }
@@ -109,15 +113,19 @@ internal sealed class ScanReservation
     }
 }
 
+
 /// <summary>
 /// The bytes an <see cref="OrderedScan"/> may hold: reserved for items being decoded, plus items queued
-/// for the consumer. A reservation is admitted when it fits, and otherwise waits for the consumer to free
-/// some — with two exceptions that keep the scan moving:
+/// for the consumer. They are charged to a <see cref="MemoryBudget"/> of the scan's own, capped at the scan's
+/// limit — a root when the scan is given no budget, otherwise a child of the one it is given, so that the
+/// scan's charges also count against that budget's total (#719). A reservation is admitted when it fits at
+/// every level, and otherwise waits for some to be freed — with two exceptions that keep the scan moving:
 /// <list type="bullet">
-/// <item>The budget is EMPTY: one item is admitted even if it alone is larger than the budget.</item>
+/// <item>A level that is EMPTY admits one item even if it alone is larger than that level's cap.</item>
 /// <item>The unit is the FRONT unit and has nothing queued: the consumer is waiting on exactly this unit, so
 /// making it wait for the units behind it to drain would deadlock (they drain only after it). It may run
-/// over the budget by the one item it is decoding.</item>
+/// over the budget by the one item it is decoding — over EVERY level, since a shared parent may be full of
+/// other scans' items, and another scan's consumer may be waiting on this one.</item>
 /// </list>
 /// <para><b>Underestimates.</b> A reservation is an estimate made before the decode, and an item that comes
 /// out larger is charged in full without waiting (it already exists). Each unit reserves the largest size it
@@ -128,24 +136,26 @@ internal sealed class ScanReservation
 /// </summary>
 internal sealed class ScanMemoryBudget
 {
-    private readonly object _gate = new();
-    private readonly long _max;
+    private readonly MemoryBudget _memory;
+    private readonly object _gate;
     private readonly Dictionary<int, int> _queued = [];
-    private long _used;
     private int _head;
-    private TaskCompletionSource<bool> _changed = NewSignal();
     private bool _cancelled;
+    private bool _closed;
 
-    internal ScanMemoryBudget(long maxBytes) => _max = maxBytes;
-
-    /// <summary>Bytes reserved or queued right now.</summary>
-    internal long Used
+    /// <summary>A scan of its own, capped at <paramref name="maxBytes"/>, and also within
+    /// <paramref name="parent"/> when one is given.</summary>
+    internal ScanMemoryBudget(long maxBytes, MemoryBudget? parent = null)
     {
-        get { lock (_gate) return _used; }
+        _memory = parent?.CreateChild(maxBytes) ?? new MemoryBudget(maxBytes);
+        _gate = _memory.Gate;
     }
 
+    /// <summary>Bytes reserved or queued right now.</summary>
+    internal long Used => _memory.UsedBytes;
+
     /// <summary>The most bytes ever reserved or queued at once.</summary>
-    internal long Peak { get; private set; }
+    internal long Peak => _memory.PeakBytes;
 
     internal async ValueTask ReserveAsync(int unit, long bytes, CancellationToken cancellationToken)
     {
@@ -156,16 +166,14 @@ internal sealed class ScanMemoryBudget
             {
                 if (_cancelled)
                     cancellationToken.ThrowIfCancellationRequested();
-                if (_used == 0
-                    || _used + bytes <= _max
-                    || (unit == _head && QueuedLocked(unit) == 0))
-                {
-                    _used += bytes;
-                    if (_used > Peak)
-                        Peak = _used;
+                bool front = unit == _head && QueuedLocked(unit) == 0;
+                if (_memory.TryReserveLocked(bytes, force: front, out var blocking))
                     return;
-                }
-                changed = _changed.Task;
+                // This scan's own budget signals releases, head changes and cancellation; a full parent
+                // signals only releases, so a wait on one also watches this scan's.
+                changed = ReferenceEquals(blocking, _memory)
+                    ? _memory.ChangedLocked
+                    : Task.WhenAny(blocking!.ChangedLocked, _memory.ChangedLocked);
             }
             await WaitAsync(changed, cancellationToken).ConfigureAwait(false);
         }
@@ -176,13 +184,7 @@ internal sealed class ScanMemoryBudget
         if (delta == 0)
             return;
         lock (_gate)
-        {
-            _used += delta;
-            if (_used > Peak)
-                Peak = _used;
-            if (delta < 0)
-                SignalLocked();
-        }
+            _memory.AdjustLocked(delta);
     }
 
     internal void Enqueue(int unit)
@@ -200,8 +202,12 @@ internal sealed class ScanMemoryBudget
                 _queued.Remove(unit);
             else
                 _queued[unit] = left;
-            _used -= charge;
-            SignalLocked();
+            // A release wakes the waiters itself. With nothing charged they still need waking: the unit's queue
+            // count changed, which can make it the front unit.
+            if (charge != 0)
+                _memory.AdjustLocked(-charge);
+            else
+                _memory.SignalLocked();
         }
     }
 
@@ -210,7 +216,7 @@ internal sealed class ScanMemoryBudget
         lock (_gate)
         {
             _head = unit;
-            SignalLocked();
+            _memory.SignalLocked();
         }
     }
 
@@ -220,21 +226,29 @@ internal sealed class ScanMemoryBudget
         lock (_gate)
         {
             _cancelled = true;
-            SignalLocked();
+            _memory.SignalLocked();
+        }
+    }
+
+    /// <summary>
+    /// The scan is over: hands back whatever is still charged to it. Once every producer has finished and every
+    /// queued item has been dequeued, nothing should be; this guards a shared parent, which outlives the scan,
+    /// against a charge the scan lost track of. Safe to call more than once.
+    /// </summary>
+    internal void Close()
+    {
+        lock (_gate)
+        {
+            if (_closed)
+                return;
+            _closed = true;
+            long left = _memory.UsedLocked;
+            if (left != 0)
+                _memory.AdjustLocked(-left);
         }
     }
 
     private int QueuedLocked(int unit) => _queued.TryGetValue(unit, out int n) ? n : 0;
-
-    private void SignalLocked()
-    {
-        var old = _changed;
-        _changed = NewSignal();
-        old.TrySetResult(true);
-    }
-
-    private static TaskCompletionSource<bool> NewSignal() =>
-        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     private static async Task WaitAsync(Task task, CancellationToken cancellationToken)
     {

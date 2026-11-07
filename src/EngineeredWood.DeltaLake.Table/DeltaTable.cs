@@ -6363,7 +6363,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             yield break;
         }
 
-        var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes);
+        var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes, _options.MemoryBudget);
         LastScanBudget = budget;
         var growth = new ParquetFileReader.DecodedGrowth();
         await foreach (var batch in OrderedScan.RunAsync(
@@ -11272,7 +11272,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             yield break;
         }
 
-        var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes);
+        var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes, _options.MemoryBudget);
         LastScanBudget = budget;
         var growth = new ParquetFileReader.DecodedGrowth();
         await foreach (var batch in OrderedScan.RunAsync(
@@ -12041,7 +12041,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     _fs, snapshot, options,
                     DataFileWriteOptions(snapshot), _dataFileReadOptions,
                     cancellationToken, _options.DataFileWriter, _options.DataFileReader, written,
-                    maxConcurrentReads: EffectiveConcurrentReads, maxBufferedReadBytes: _options.MaxBufferedReadBytes)
+                    maxConcurrentReads: EffectiveConcurrentReads, maxBufferedReadBytes: _options.MaxBufferedReadBytes,
+                    memoryBudget: _options.MemoryBudget)
                     .ConfigureAwait(false);
                 if (plan is not { } compaction)
                     return null;
