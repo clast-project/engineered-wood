@@ -236,6 +236,38 @@ public class ConcatenateTests
         Assert.Contains("struct<b: int32, a: int32> onto struct<a: int32 not null, b: int32>", ex.Message);
     }
 
+    /// <summary>
+    /// A union row names its branch by a type id, which the type maps onto a field. Unions with the same fields
+    /// but a different mapping would be joined under the first input's mapping, so a row of the second input
+    /// that picks <c>a</c> would read as <c>b</c>.
+    /// </summary>
+    [Fact]
+    public void UnionsOfDifferentTypeIdMappings_AreRefused()
+    {
+        var first = OneRowUnion(UnionMode.Sparse, typeIds: [0, 1], pick: 0);
+        var second = OneRowUnion(UnionMode.Sparse, typeIds: [1, 0], pick: 1);
+
+        var ex = Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([first, second]));
+        Assert.Contains("ids [1, 0]", ex.Message);
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([Wrap(first), Wrap(second)]));
+    }
+
+    [Fact]
+    public void UnionsOfDifferentModes_AreRefused()
+    {
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate(
+            [OneRowUnion(UnionMode.Sparse, [0, 1], pick: 0), OneRowUnion(UnionMode.Dense, [0, 1], pick: 0)]));
+    }
+
+    [Fact]
+    public void UnionsOfTheSameType_FromSeparateTypeInstances_Concatenate()
+    {
+        var result = Assert.IsType<SparseUnionArray>(ArrowCompute.Concatenate(
+            [OneRowUnion(UnionMode.Sparse, [3, 5], pick: 3), OneRowUnion(UnionMode.Sparse, [3, 5], pick: 5)]));
+
+        Assert.Equal(new byte[] { 3, 5 }, result.TypeIds.ToArray());
+    }
+
     [Fact]
     public void DifferentLeafTypes_AreRefused()
     {
@@ -308,6 +340,30 @@ public class ConcatenateTests
         var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(values.Length).Build();
         return new ListArray(new ListType(new Field("item", values.Data.DataType, nullable: true)),
             1, offsets, values, ArrowBuffer.Empty, nullCount: 0);
+    }
+
+    /// <summary>
+    /// A one-row union of two int32 branches, <c>a</c> (holding 1) and <c>b</c> (holding 2), whose type ids are
+    /// <paramref name="typeIds"/>; the row picks the branch whose id is <paramref name="pick"/>.
+    /// </summary>
+    private static UnionArray OneRowUnion(UnionMode mode, int[] typeIds, byte pick)
+    {
+        var type = new UnionType(
+            [new Field("a", Int32Type.Default, nullable: true), new Field("b", Int32Type.Default, nullable: true)],
+            typeIds, mode);
+        var ids = new ArrowBuffer.Builder<byte>().Append(pick).Build();
+        IArrowArray[] children = [new Int32Array.Builder().Append(1).Build(), new Int32Array.Builder().Append(2).Build()];
+        if (mode == UnionMode.Sparse)
+            return new SparseUnionArray(type, 1, children, ids, nullCount: 0);
+
+        // Dense: only the picked branch holds a row, at offset 0.
+        int picked = System.Array.IndexOf(typeIds, (int)pick);
+        children = [
+            picked == 0 ? children[0] : new Int32Array.Builder().Build(),
+            picked == 1 ? children[1] : new Int32Array.Builder().Build(),
+        ];
+        var offsets = new ArrowBuffer.Builder<int>().Append(0).Build();
+        return new DenseUnionArray(type, 1, children, ids, offsets, nullCount: 0);
     }
 
     private static Decimal128Array Decimals(int precision, int scale, decimal value) =>

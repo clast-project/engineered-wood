@@ -9,7 +9,7 @@ namespace EngineeredWood.Arrow;
 /// <summary>
 /// Whether two Arrow types describe the same data: the same kind with the same parameters (units, zones,
 /// precision and scale, widths), and for nested types the same children by name, order and nullability, all the way
-/// down. A <see cref="IArrowType.TypeId"/> alone leaves those open: two timestamps of different units share one.
+/// down, and for unions the same mode and type ids. A <see cref="IArrowType.TypeId"/> alone leaves those open: two timestamps of different units share one.
 /// Field metadata is not compared.
 /// </summary>
 internal static class ArrowTypeEquality
@@ -46,6 +46,9 @@ internal static class ArrowTypeEquality
                 && SameType(x.ValueType, y.ValueType) && x.Ordered == y.Ordered,
             (FixedSizeListType x, FixedSizeListType y) => x.ListSize == y.ListSize && SameLayout(x.Fields, y.Fields),
             (MapType x, MapType y) => x.KeySorted == y.KeySorted && SameLayout(x.Fields, y.Fields),
+            // A row names its branch by type id, so the id-to-field mapping is part of the type (#736).
+            (UnionType x, UnionType y) => x.Mode == y.Mode && x.TypeIds.AsSpan().SequenceEqual(y.TypeIds)
+                && SameLayout(x.Fields, y.Fields),
             (NestedType x, NestedType y) => SameLayout(x.Fields, y.Fields),
             (Decimal32Type x, Decimal32Type y) => x.Precision == y.Precision && x.Scale == y.Scale,
             (Decimal64Type x, Decimal64Type y) => x.Precision == y.Precision && x.Scale == y.Scale,
@@ -73,6 +76,7 @@ internal static class ArrowTypeEquality
         DictionaryType x => $"dictionary<{Describe(x.IndexType)}, {Describe(x.ValueType)}{(x.Ordered ? ", ordered" : "")}>",
         FixedSizeListType x => $"{x.Name}[{x.ListSize}]<{DescribeFields(x.Fields)}>",
         MapType x => $"{x.Name}{(x.KeySorted ? "[sorted]" : "")}<{DescribeFields(x.Fields)}>",
+        UnionType x => $"{x.Name}[{x.Mode.ToString().ToLowerInvariant()}, ids [{string.Join(", ", x.TypeIds)}]]<{DescribeFields(x.Fields)}>",
         NestedType x => $"{x.Name}<{DescribeFields(x.Fields)}>",
         Decimal32Type x => $"{x.Name}({x.Precision}, {x.Scale})",
         Decimal64Type x => $"{x.Name}({x.Precision}, {x.Scale})",
