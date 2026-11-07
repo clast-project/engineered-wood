@@ -94,6 +94,12 @@ public abstract partial class TableFileSystemPathConformanceTests : IAsyncLifeti
     /// <summary>The emulator this backend needs, phrased so the skip message is actionable on its own.</summary>
     protected abstract string Emulator { get; }
 
+    /// <summary>
+    /// Whether the backend's listing carries an ETag (<see cref="TableFileInfo.ETag"/>). Every object store does;
+    /// a local file system has none, and falls back to size and modification time.
+    /// </summary>
+    protected virtual bool ListsETags => true;
+
     /// <summary>The probe result. Always <see langword="true"/> for a backend with no emulator.</summary>
     protected abstract bool Available { get; }
 
@@ -252,6 +258,40 @@ public abstract partial class TableFileSystemPathConformanceTests : IAsyncLifeti
         // Ordinal on UTF-16 and byte order on UTF-8 agree for every character used here (all BMP, no
         // surrogates), so the store's own ordering is directly comparable.
         Assert.Equal(expected, actual);
+    }
+
+    /// <summary>
+    /// #740: the listing tells two objects at one path apart, even with the same length. That is how a reader
+    /// recognises a Delta log dropped and re-created under a snapshot it holds.
+    /// </summary>
+    [SkippableFact]
+    public async Task ListedETag_ChangesWhenTheObjectIsReplaced()
+    {
+        Require();
+        var fs = FileSystem;
+        const string path = "identity/_delta_log/00000000000000000000.json";
+
+        byte[] original = PayloadFor(path);
+        await fs.WriteAllBytesAsync(path, original);
+        var first = Assert.Single(await ListAsync(fs, "identity/"));
+
+        byte[] replacement = PayloadFor("replaced:" + path);
+        Assert.Equal(original.Length, replacement.Length);
+        await fs.DeleteAsync(path);
+        await fs.WriteAllBytesAsync(path, replacement);
+        var second = Assert.Single(await ListAsync(fs, "identity/"));
+
+        Assert.Equal(first.Size, second.Size);
+        if (!ListsETags)
+        {
+            Assert.Null(first.ETag);
+            Assert.NotEqual(default, first.LastModified);
+            return;
+        }
+
+        Assert.False(string.IsNullOrEmpty(first.ETag), $"{fs.GetType().Name} listed no ETag");
+        Assert.False(string.IsNullOrEmpty(second.ETag), $"{fs.GetType().Name} listed no ETag");
+        Assert.NotEqual(first.ETag, second.ETag);
     }
 
     [SkippableFact]

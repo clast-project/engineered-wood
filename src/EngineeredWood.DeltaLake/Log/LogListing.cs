@@ -65,19 +65,21 @@ internal sealed class LogListing
         await foreach (var file in fileSystem.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
             .ConfigureAwait(false))
         {
-            listing.Add(Path.GetFileName(file.Path), file.Path);
+            listing.Add(Path.GetFileName(file.Path), file);
         }
 
         listing.CommitVersions.Sort();
         return listing;
     }
 
-    private void Add(string fileName, string path)
+    private void Add(string fileName, TableFileInfo file)
     {
+        string path = file.Path;
         if (DeltaVersion.TryParseCommitVersion(fileName, out long commit))
         {
             CommitVersions.Add(commit);
             Observe(commit);
+            Anchor(commit, LogFileIdentity.Of(file), isCommit: true);
             return;
         }
 
@@ -93,6 +95,7 @@ internal sealed class LogListing
             return;
 
         Observe(version);
+        Anchor(version, LogFileIdentity.Of(file), isCommit: false);
 
         string[] suffix = fileName[(fileName.IndexOf(CheckpointMarker, StringComparison.OrdinalIgnoreCase)
             + CheckpointMarker.Length)..].Split('.');
@@ -174,6 +177,48 @@ internal sealed class LogListing
         sorted.Sort(CompareV2Preference);
         return sorted;
     }
+
+    /// <summary>
+    /// Every commit and checkpoint file, by path, as this listing reported it, and per version every file that
+    /// names it (<see cref="AnchorAt"/>).
+    /// </summary>
+    private readonly Dictionary<string, LogFileIdentity> _identities = new(StringComparer.Ordinal);
+    private readonly Dictionary<long, List<LogFileIdentity>> _filesAt = [];
+    private readonly HashSet<long> _commitsAt = [];
+
+    private void Anchor(long version, LogFileIdentity identity, bool isCommit)
+    {
+        _identities[identity.Path] = identity;
+        if (!_filesAt.TryGetValue(version, out var files))
+            _filesAt[version] = files = [];
+        files.Add(identity);
+        if (isCommit)
+            _commitsAt.Add(version);
+    }
+
+    /// <summary>
+    /// Every log file that names <paramref name="version"/> in this listing: its commit, and each checkpoint file
+    /// at it (every part of a multi-part one, every V2 body). A snapshot records them, so that a later listing can
+    /// tell whether the log it was built from is still the one at this path (#740). Null when none is listed.
+    /// </summary>
+    /// <remarks>All of them rather than one chosen file (#746 review): a checkpoint can be several files, and the
+    /// one a snapshot was read from need not be the one a single-file choice would pick.</remarks>
+    public LogVersionAnchor? AnchorAt(long version)
+    {
+        if (!_filesAt.TryGetValue(version, out var files))
+            return null;
+
+        var sorted = new List<LogFileIdentity>(files);
+        sorted.Sort(static (a, b) => string.CompareOrdinal(a.Path, b.Path));
+        return new LogVersionAnchor(sorted, _commitsAt.Contains(version));
+    }
+
+    /// <summary>Whether this listing names a commit file for <paramref name="version"/>.</summary>
+    public bool HasCommitAt(long version) => _commitsAt.Contains(version);
+
+    /// <summary>The commit or checkpoint file at <paramref name="path"/>, as this listing reported it.</summary>
+    public LogFileIdentity? IdentityOf(string path) =>
+        _identities.TryGetValue(path, out var identity) ? identity : null;
 
     private void Observe(long version)
     {

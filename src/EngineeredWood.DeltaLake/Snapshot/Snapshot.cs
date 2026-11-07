@@ -79,6 +79,14 @@ public sealed class Snapshot
     /// passed.</remarks>
     internal DateTimeOffset? ListedLatestAt { get; init; }
 
+    /// <summary>
+    /// Every log file that named <see cref="Version"/> in the listing this snapshot was built from (its commit, and
+    /// each checkpoint file at that version), or null for a snapshot built in memory with no listing behind it.
+    /// </summary>
+    /// <remarks>How an update recognises a log replaced under this snapshot (#740): a table dropped and re-created
+    /// at the same path can reach this version again, and only different objects at these paths show it.</remarks>
+    internal Log.LogVersionAnchor? LogAnchor { get; init; }
+
     /// <summary>This snapshot, recorded as still the latest at <paramref name="listedAt"/>.</summary>
     internal Snapshot WithListedLatestAt(DateTimeOffset listedAt) => new()
     {
@@ -94,5 +102,6 @@ public sealed class Snapshot
         InCommitTimestamp = InCommitTimestamp,
         RowIdHighWaterMark = RowIdHighWaterMark,
         ListedLatestAt = listedAt,
+        LogAnchor = LogAnchor,
     };
 }

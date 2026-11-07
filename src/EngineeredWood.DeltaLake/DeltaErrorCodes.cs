@@ -50,6 +50,21 @@ public static class DeltaErrorCodes
     public const string TruncatedTransactionLog = "DELTA_TRUNCATED_TRANSACTION_LOG";
 
     /// <summary>
+    /// The log under a snapshot is no longer the one it was built from: the file that names the snapshot's
+    /// version is a different object now, or the log no longer reaches that version. A table dropped and
+    /// re-created at the same path does this, and replaying the new log's commits onto the old snapshot
+    /// would mix the two tables (#740).
+    /// </summary>
+    /// <remarks>
+    /// <para>Raised only by the strict incremental update a committer uses
+    /// (<see cref="Snapshot.SnapshotBuilder.UpdateAsync"/>). A reader's refresh
+    /// (<see cref="Snapshot.SnapshotBuilder.UpdateOrRebuildAsync"/>) rebuilds from the new log instead, which
+    /// is what opening the table afresh would see.</para>
+    /// <para>No delta-spark equivalent: Spark does not check for it.</para>
+    /// </remarks>
+    public const string TransactionLogReplaced = "DELTA_TRANSACTION_LOG_REPLACED";
+
+    /// <summary>
     /// A checkpoint the table depends on is in a form this implementation recognises but cannot
     /// decode, and no other route to the requested version exists.
     /// </summary>
