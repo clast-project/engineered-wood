@@ -46,6 +46,46 @@ internal static class CdfWriter
         Int64Array? rowCommitVersions = null,
         WrittenFileLedger? written = null)
     {
+        var batchWithChangeType = PrepareRows(snapshot, rows, changeType, rowIds, rowCommitVersions);
+
+        string fileName = $"{CdfConfig.ChangeDataDir}/{Guid.NewGuid():N}.parquet";
+        // Recorded before the write, so a write that fails part-way still leaves a deletable path behind.
+        written?.Record(fileName);
+        long fileSize;
+
+        await using (var file = await fs.CreateAsync(
+            fileName, cancellationToken: cancellationToken).ConfigureAwait(false))
+        {
+            await using var writer = new ParquetFileWriter(
+                file, ownsFile: false, parquetOptions);
+            await writer.WriteRowGroupAsync(batchWithChangeType, cancellationToken)
+                .ConfigureAwait(false);
+            await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
+            fileSize = file.Position;
+        }
+
+        return new CdcFile
+        {
+            Path = EngineeredWood.DeltaLake.DeltaPath.Encode(fileName),
+            PartitionValues = CopyDict(partitionValues),
+            Size = fileSize,
+            DataChange = false,
+        };
+    }
+
+    /// <summary>
+    /// Shapes change rows given in the table's LOGICAL shape into the bytes of a change file: partition columns out,
+    /// canonical Arrow forms, physical names and field ids under column mapping, the table's field labels and
+    /// nullability, the row-tracking columns, then <c>_change_type</c> (run-end encoded). Batches prepared for one
+    /// snapshot share a layout whatever their change type, so they can share a file.
+    /// </summary>
+    internal static RecordBatch PrepareRows(
+        EngineeredWood.DeltaLake.Snapshot.Snapshot snapshot,
+        RecordBatch rows,
+        string changeType,
+        Int64Array? rowIds,
+        Int64Array? rowCommitVersions)
+    {
         // Partition columns never live in the file bytes — they ride on the action's partitionValues and the
         // reader re-materializes them POSITIONALLY against the table schema. A caller whose rows came from the
         // read path (which materializes partition columns) would otherwise write them into the file, and the
@@ -72,31 +112,7 @@ internal static class CdfWriter
         rows = AddMaterializedRowTracking(rows, snapshot, rowIds, rowCommitVersions);
 
         // Add _change_type column (unmapped — added after the physical rename)
-        var batchWithChangeType = AddRunEncodedChangeTypeColumn(rows, changeType);
-
-        string fileName = $"{CdfConfig.ChangeDataDir}/{Guid.NewGuid():N}.parquet";
-        // Recorded before the write, so a write that fails part-way still leaves a deletable path behind.
-        written?.Record(fileName);
-        long fileSize;
-
-        await using (var file = await fs.CreateAsync(
-            fileName, cancellationToken: cancellationToken).ConfigureAwait(false))
-        {
-            await using var writer = new ParquetFileWriter(
-                file, ownsFile: false, parquetOptions);
-            await writer.WriteRowGroupAsync(batchWithChangeType, cancellationToken)
-                .ConfigureAwait(false);
-            await writer.CloseAsync(cancellationToken).ConfigureAwait(false);
-            fileSize = file.Position;
-        }
-
-        return new CdcFile
-        {
-            Path = EngineeredWood.DeltaLake.DeltaPath.Encode(fileName),
-            PartitionValues = CopyDict(partitionValues),
-            Size = fileSize,
-            DataChange = false,
-        };
+        return AddRunEncodedChangeTypeColumn(rows, changeType);
     }
 
     /// <summary>

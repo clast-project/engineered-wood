@@ -4854,6 +4854,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         long totalDeleted = 0;
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
             snapshot.Metadata.Configuration);
+        // Every file's deleted rows go to the same change files, one per partition (#723).
+        await using var changeData = cdfEnabled ? NewChangeDataSink(snapshot, written) : null;
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             snapshot.Metadata.Configuration);
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
@@ -5093,19 +5095,20 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             // The change file for the deleted rows, whichever way the file went — removed, masked or rewritten — from
             // the rows the scan captured. They are the rows a scan returns, with their stable identity.
-            if (cdfEnabled)
+            if (changeData is not null)
             {
                 for (int b = 0; b < deletedRowBatches.Count; b++)
                 {
                     var trk = b < deletedRowTracking.Count ? deletedRowTracking[b] : ((Int64Array, Int64Array)?)null;
-                    var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, deletedRowBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                        cancellationToken, trk?.Item1, trk?.Item2, written).ConfigureAwait(false);
-                    actions.Add(cdcAction);
+                    await changeData.AddAsync(
+                        deletedRowBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                        addFile.PartitionValues, cancellationToken, trk?.Item1, trk?.Item2).ConfigureAwait(false);
                 }
             }
         }
+
+        if (changeData is not null)
+            actions.AddRange(await changeData.CompleteAsync(cancellationToken).ConfigureAwait(false));
 
         long? nextRowId = null;
         if (copyOnWriteTargets is not null)
@@ -5433,6 +5436,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(
             snapshot.Metadata.Configuration);
+        // Every rewritten file's pre- and post-images go to the same change files, one per partition (#723).
+        await using var changeData = cdfEnabled ? NewChangeDataSink(snapshot, written) : null;
         var pruner = prunePredicate is null ? null : new DeltaFilePruner(
             snapshot.Schema, snapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
@@ -5660,17 +5665,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
             removedPaths.Add(addFile.Path);
 
-            // Write CDC files for update preimage/postimage
-            if (cdfEnabled)
+            // The update pre- and post-images, into the operation's change files.
+            if (changeData is not null)
             {
                 for (int b = 0; b < preimages.Count; b++)
                 {
                     var trk = b < changeTracking.Count ? changeTracking[b] : default;
-                    var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, preimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
-                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                        cancellationToken, trk.PreIds, trk.PreVers, written).ConfigureAwait(false);
-                    actions.Add(cdcAction);
+                    await changeData.AddAsync(
+                        preimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
+                        addFile.PartitionValues, cancellationToken, trk.PreIds, trk.PreVers).ConfigureAwait(false);
                 }
                 for (int b = 0; b < postimages.Count; b++)
                 {
@@ -5679,15 +5682,17 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // as the data did.
                     foreach (var (target, _, post, aligned) in router.Split(postimages[b], trk.PostIds, trk.PostVers))
                     {
-                        var cdcAction = await ChangeDataFeed.CdfWriter.WriteAsync(
-                            _fs, snapshot, post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
-                            target ?? addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                            cancellationToken, aligned[0], aligned[1], written).ConfigureAwait(false);
-                        actions.Add(cdcAction);
+                        await changeData.AddAsync(
+                            post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
+                            target ?? addFile.PartitionValues, cancellationToken, aligned[0], aligned[1])
+                            .ConfigureAwait(false);
                     }
                 }
             }
         }
+
+        if (changeData is not null)
+            actions.AddRange(await changeData.CompleteAsync(cancellationToken).ConfigureAwait(false));
 
         // Persist the advanced row-id high-water mark (same source of truth the append path maintains).
         if (assignRowIds && nextRowId > snapshot.RowIdHighWaterMark)
@@ -6086,6 +6091,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     private static readonly IReadOnlyDictionary<string, string> EmptyPartitionValues =
         new Dictionary<string, string>();
+
+    /// <summary>The change files of one operation: every change row it adds, of any type, shares files by
+    /// partition, rolled at <see cref="DeltaTableOptions.TargetFileSize"/> (#723).</summary>
+    private ChangeDataFeed.ChangeDataFileSink NewChangeDataSink(Snapshot.Snapshot snapshot, WrittenFileLedger? written) =>
+        new(_fs, snapshot, DataFileWriteOptions(snapshot), _options.TargetFileSize, written);
 
     /// <summary>
     /// Creates a log compaction file for a range of commits.
@@ -10272,8 +10282,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// Computes a copy-on-write DELETE of <paramref name="selection"/> against <paramref name="snapshot"/>
     /// WITHOUT committing: each touched file is rewritten now, without the selected rows, and the result is a
     /// <c>remove</c>(old) + <c>add</c>(rewritten) pair per file — just the <c>remove</c> when every row goes.
-    /// On a Change Data Feed table each rewritten file also gets a <c>delete</c> change file holding the rows
-    /// it lost, since nothing on disk holds them afterwards.
+    /// On a Change Data Feed table the rows the rewritten files lost are written as <c>delete</c> change rows, since
+    /// nothing on disk holds them afterwards: one change file per partition for the whole call (#723).
     /// </summary>
     /// <param name="rowIdStart">Where the rewrites' adds begin reserving stable row ids, as for
     /// <see cref="ComputeUpdateActionsAsync"/>. Null starts at the snapshot's mark.</param>
@@ -10301,6 +10311,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             && DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
         long newVersion = snapshot.Version + 1;
         long nextRowId = assignRowIds ? rowIdStart ?? snapshot.RowIdHighWaterMark : 0;
+        // Every rewritten file's deleted rows go to the same change files, one per partition (#723).
+        await using var changeData = cdfEnabled ? NewChangeDataSink(snapshot, written) : null;
 
         var actions = new List<DeltaAction>();
         var removedPaths = new HashSet<string>(StringComparer.Ordinal);
@@ -10393,7 +10405,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     nextRowId += addedRows;
             }
 
-            // A "delete" change file per rewritten source file. Without it the reader would INFER the feed from
+            // The deleted rows, into the operation's change files. Without them the reader would INFER the feed from
             // remove(old)+add(new) — reporting every surviving row as deleted and re-inserted; a version that
             // carries cdc actions is read cdc-only, so these rows are the whole truth of the change.
             if (deletedBatches is not null)
@@ -10401,13 +10413,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 for (int b = 0; b < deletedBatches.Count; b++)
                 {
                     var trk = deletedTracking![b];
-                    actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, deletedBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                        cancellationToken, trk.Ids, trk.Vers, written).ConfigureAwait(false));
+                    await changeData!.AddAsync(
+                        deletedBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                        addFile.PartitionValues, cancellationToken, trk.Ids, trk.Vers).ConfigureAwait(false);
                 }
             }
         }
+
+        if (changeData is not null)
+            actions.AddRange(await changeData.CompleteAsync(cancellationToken).ConfigureAwait(false));
 
         if (actions.Count > 0 && assignRowIds && nextRowId > snapshot.RowIdHighWaterMark)
             actions.Add(DeltaLake.RowTracking.RowTrackingConfig.BuildHighWaterMarkAction(nextRowId));
@@ -10951,6 +10965,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
         bool materializeIds = rowTrackingEnabled && matRowIdName is not null && matRowVerName is not null;
         bool cdfEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(snapshot.Metadata.Configuration);
+        // Every rewritten file's pre- and post-images go to the same change files, one per partition (#723).
+        await using var changeData = cdfEnabled ? NewChangeDataSink(snapshot, written) : null;
         long newVersion = snapshot.Version + 1;
         long nextRowId = assignRowIds ? snapshot.RowIdHighWaterMark : 0;
         long totalUpdated = 0;
@@ -11123,30 +11139,31 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 assignRowIds, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
             removedPaths.Add(addFile.Path);
 
-            // update_preimage + update_postimage change files for the touched rows. As in the copy-on-write
-            // DELETE, these replace what the reader would otherwise infer from remove(old)+add(new) — which for
-            // a rewrite is every row of the file deleted and re-inserted.
+            // update_preimage + update_postimage rows for the touched rows, into the operation's change files. As
+            // in the copy-on-write DELETE, these replace what the reader would otherwise infer from
+            // remove(old)+add(new) — which for a rewrite is every row of the file deleted and re-inserted.
             if (changePairs is not null)
             {
                 foreach (var (pre, post, ids, preVers) in changePairs)
                 {
-                    actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
-                        _fs, snapshot, pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
-                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                        cancellationToken, ids, preVers, written).ConfigureAwait(false));
+                    await changeData!.AddAsync(
+                        pre, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
+                        addFile.PartitionValues, cancellationToken, ids, preVers).ConfigureAwait(false);
                     // Split as the data was: a post-image row belongs to the partition the row now lives in.
                     foreach (var (target, _, part, aligned) in router.Split(post, ids))
                     {
-                        actions.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
-                            _fs, snapshot, part, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
-                            target ?? addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                            cancellationToken,
-                            aligned[0], aligned[0] is { } partIds ? ConstInt64(newVersion, partIds.Length) : null,
-                            written).ConfigureAwait(false));
+                        await changeData.AddAsync(
+                            part, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
+                            target ?? addFile.PartitionValues, cancellationToken,
+                            aligned[0], aligned[0] is { } partIds ? ConstInt64(newVersion, partIds.Length) : null)
+                            .ConfigureAwait(false);
                     }
                 }
             }
         }
+
+        if (changeData is not null)
+            actions.AddRange(await changeData.CompleteAsync(cancellationToken).ConfigureAwait(false));
 
         if (actions.Count == 0)
             return snapshot.Version;

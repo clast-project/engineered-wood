@@ -112,6 +112,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     private readonly List<RecordBatch> _pending = new();
     private long _pendingRows;
     private long _pendingBytes;
+    private long _retainedBytes;
 
     /// <param name="partitionDirectory">The file's Hive-style directory relative to the table root, or empty.</param>
     /// <param name="collectStats">Whether to collect per-file stats, over the batches <see cref="AddAsync"/> is
@@ -152,7 +153,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         long batchBytes = EstimatedBytes(writeBatch);
         if (_host is not null)
         {
-            Append(writeBatch, statsBatch, batchBytes);
+            Append(writeBatch, statsBatch, batchBytes, batchBytes);
             if (_pendingBytes >= _targetFileSize)
                 await CloseFileAsync(cancellationToken).ConfigureAwait(false);
             return;
@@ -179,7 +180,8 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             Append(
                 whole ? writeBatch : writeBatch.Slice(offset, rows),
                 whole ? statsBatch : statsBatch.Slice(offset, rows),
-                whole ? batchBytes : batchBytes * rows / writeBatch.Length);
+                whole ? batchBytes : batchBytes * rows / writeBatch.Length,
+                batchBytes);
             offset += rows;
 
             if (_pendingRows >= maxRows || _pendingBytes >= _options.RowGroupMaxBytes)
@@ -192,7 +194,9 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     }
 
     // Adds rows to the file being filled. They are written to it: the file closes only once they are flushed.
-    private void Append(RecordBatch writeBatch, RecordBatch statsBatch, long bytes)
+    // `bytes` is the rows' share of their batch, which sizes the row group; `retained` is what holding them keeps
+    // alive, the whole batch, since a slice shares its batch's buffers.
+    private void Append(RecordBatch writeBatch, RecordBatch statsBatch, long bytes, long retained)
     {
         _fileSchema ??= writeBatch.Schema;
         _fileRows += writeBatch.Length;
@@ -202,6 +206,35 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         _pending.Add(writeBatch);
         _pendingRows += writeBatch.Length;
         _pendingBytes += bytes;
+        _retainedBytes += retained;
+    }
+
+    /// <summary>The estimated Arrow bytes the pending rows (the row group being built; under a host writer, the
+    /// whole file) keep alive, which <see cref="FlushPendingAsync"/> releases. A pending slice keeps its whole batch's
+    /// buffers, so this counts the whole batch, and can exceed the row group's size.</summary>
+    public long RetainedBytes => _retainedBytes;
+
+    /// <summary>Whether a file is open: a row group has been written to it and it is not yet closed.</summary>
+    public bool HasOpenFile => _writer is not null;
+
+
+    /// <summary>
+    /// Writes the pending rows as a row group now, before it is full, and closes the file if that takes it to the
+    /// target; for a caller that holds several writers and bounds the memory of all of them. A host writer's
+    /// pending rows are its whole file, so under one this closes the file.
+    /// </summary>
+    public async ValueTask FlushPendingAsync(CancellationToken cancellationToken)
+    {
+        if (_pending.Count == 0)
+            return;
+        if (_host is not null)
+        {
+            await CloseFileAsync(cancellationToken).ConfigureAwait(false);
+            return;
+        }
+        await FlushRowGroupAsync(cancellationToken).ConfigureAwait(false);
+        if (_file!.Position >= _targetFileSize)
+            await CloseFileAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Writes what is pending and closes the last file. Returns every file written, in order.</summary>
@@ -239,7 +272,9 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         await _writer.WriteRowGroupAsync(rowGroup, cancellationToken).ConfigureAwait(false);
     }
 
-    private async ValueTask CloseFileAsync(CancellationToken cancellationToken)
+    /// <summary>Writes what is pending and closes the file being filled, so the next rows start a new one; also for a
+    /// caller that bounds how many files its writers hold open.</summary>
+    public async ValueTask CloseFileAsync(CancellationToken cancellationToken)
     {
         if (_fileRows == 0)
             return;
@@ -296,6 +331,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         _pending.Clear();
         _pendingRows = 0;
         _pendingBytes = 0;
+        _retainedBytes = 0;
     }
 
     private async ValueTask DisposeOpenFileAsync()
@@ -342,49 +378,6 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     /// the same nullability and types at every depth. Field metadata may differ. Stricter than the Parquet writer's
     /// own check, which is safe: a difference only starts a new file.
     /// </summary>
-    internal static bool SameLayout(IReadOnlyList<Field> a, IReadOnlyList<Field> b)
-    {
-        if (a.Count != b.Count)
-            return false;
-        for (int i = 0; i < a.Count; i++)
-        {
-            if (!string.Equals(a[i].Name, b[i].Name, StringComparison.Ordinal)
-                || a[i].IsNullable != b[i].IsNullable
-                || !SameType(a[i].DataType, b[i].DataType))
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static bool SameType(IArrowType a, IArrowType b)
-    {
-        if (a.TypeId != b.TypeId)
-            return false;
-
-        return (a, b) switch
-        {
-            (ExtensionType x, ExtensionType y) => string.Equals(x.Name, y.Name, StringComparison.Ordinal)
-                && string.Equals(x.ExtensionMetadata, y.ExtensionMetadata, StringComparison.Ordinal)
-                && SameType(x.StorageType, y.StorageType),
-            (DictionaryType x, DictionaryType y) => SameType(x.IndexType, y.IndexType)
-                && SameType(x.ValueType, y.ValueType) && x.Ordered == y.Ordered,
-            (FixedSizeListType x, FixedSizeListType y) => x.ListSize == y.ListSize && SameLayout(x.Fields, y.Fields),
-            (MapType x, MapType y) => x.KeySorted == y.KeySorted && SameLayout(x.Fields, y.Fields),
-            (NestedType x, NestedType y) => SameLayout(x.Fields, y.Fields),
-            (Decimal32Type x, Decimal32Type y) => x.Precision == y.Precision && x.Scale == y.Scale,
-            (Decimal64Type x, Decimal64Type y) => x.Precision == y.Precision && x.Scale == y.Scale,
-            (Decimal128Type x, Decimal128Type y) => x.Precision == y.Precision && x.Scale == y.Scale,
-            (Decimal256Type x, Decimal256Type y) => x.Precision == y.Precision && x.Scale == y.Scale,
-            (TimestampType x, TimestampType y) => x.Unit == y.Unit
-                && string.Equals(x.Timezone, y.Timezone, StringComparison.Ordinal),
-            (Time32Type x, Time32Type y) => x.Unit == y.Unit,
-            (Time64Type x, Time64Type y) => x.Unit == y.Unit,
-            (DurationType x, DurationType y) => x.Unit == y.Unit,
-            (IntervalType x, IntervalType y) => x.Unit == y.Unit,
-            (FixedSizeBinaryType x, FixedSizeBinaryType y) => x.ByteWidth == y.ByteWidth,
-            _ => true,
-        };
-    }
+    internal static bool SameLayout(IReadOnlyList<Field> a, IReadOnlyList<Field> b) =>
+        ArrowTypeEquality.SameLayout(a, b);
 }

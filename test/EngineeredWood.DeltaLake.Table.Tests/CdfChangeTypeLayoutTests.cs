@@ -11,8 +11,8 @@ using EngineeredWood.Parquet;
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
-/// The write path builds <c>_change_type</c> run-end encoded — one run rather than one value per row,
-/// since a change batch carries a single change type. That is an in-memory layout and it must not reach
+/// The write path builds <c>_change_type</c> run-end encoded — one run per change batch rather than one value per
+/// row, since a change batch carries a single change type; a change file holding several batches joins their runs. That is an in-memory layout and it must not reach
 /// anything outside the writer: the <c>_change_data</c> file holds the plain required UTF8 column the
 /// Delta spec names, and the read path hands callers a plain string column.
 ///
@@ -130,8 +130,7 @@ public class CdfChangeTypeLayoutTests : IDisposable
     [Fact]
     public async Task AnUpdateFeed_RoundTripsBothChangeTypes()
     {
-        // Two cdc files in one commit, each constant in its own change type — the shape the run form is
-        // built for.
+        // One cdc file holding both change types (#723): two runs, each constant in its own change type.
         await using var table = await CreateCdfTableAsync();
         var schema = table.ArrowSchema;
         await table.WriteAsync([Rows(schema, (1, "before"))]);
@@ -163,5 +162,52 @@ public class CdfChangeTypeLayoutTests : IDisposable
 
         Assert.Contains(seen, s => s.ChangeType == CdfConfig.UpdatePreimage && s.Value == "before");
         Assert.Contains(seen, s => s.ChangeType == CdfConfig.UpdatePostimage && s.Value == "after");
+    }
+
+    [Fact]
+    public async Task AChangeFileOfSeveralChangeTypes_HoldsAPlainRequiredStringColumn_RightInEveryRow()
+    {
+        // The runs of several batches joined into one row group still reach the file as the spec's column, with
+        // each row's own type: Spark and delta-rs read it row by row, without our reader's help.
+        await using var table = await CreateCdfTableAsync();
+        var schema = table.ArrowSchema;
+        await table.WriteAsync([Rows(schema, (1, "a"), (2, "b"))]);
+        await table.WriteAsync([Rows(schema, (3, "c"))]);
+
+        await table.UpdateAsync(
+            batch =>
+            {
+                var all = new BooleanArray.Builder();
+                for (int i = 0; i < batch.Length; i++) all.Append(true);
+                return all.Build();
+            },
+            batch =>
+            {
+                var updated = new StringArray.Builder();
+                for (int i = 0; i < batch.Length; i++) updated.Append("after");
+                return new RecordBatch(batch.Schema, [batch.Column(0), updated.Build()], batch.Length);
+            });
+
+        await using var file = new LocalRandomAccessFile(SingleChangeDataFile());
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        int index = batch.Schema.GetFieldIndex(CdfConfig.ChangeTypeColumn);
+        Assert.IsType<Apache.Arrow.Types.StringType>(batch.Schema.FieldsList[index].DataType);
+        Assert.False(batch.Schema.FieldsList[index].IsNullable);
+
+        var ids = (Int64Array)batch.Column(batch.Schema.GetFieldIndex("id"));
+        var values = (StringArray)batch.Column(batch.Schema.GetFieldIndex("value"));
+        var types = Assert.IsType<StringArray>(batch.Column(index));
+        var rows = Enumerable.Range(0, batch.Length)
+            .Select(i => (ids.GetValue(i)!.Value, types.GetString(i), values.GetString(i)))
+            .OrderBy(r => r.Item1).ThenBy(r => r.Item2, StringComparer.Ordinal).ToList();
+        Assert.Equal(
+            [
+                (1L, CdfConfig.UpdatePostimage, "after"), (1L, CdfConfig.UpdatePreimage, "a"),
+                (2L, CdfConfig.UpdatePostimage, "after"), (2L, CdfConfig.UpdatePreimage, "b"),
+                (3L, CdfConfig.UpdatePostimage, "after"), (3L, CdfConfig.UpdatePreimage, "c"),
+            ],
+            rows);
     }
 }

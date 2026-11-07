@@ -119,7 +119,7 @@ public static class RunEndEncoding
             lengths.Add(run.Length);
         }
 
-        return Build(ArrowCompute.Take(array.Values, physical), lengths);
+        return Build(ArrowCompute.Take(array.Values, physical), lengths, RunEndsType(array));
     }
 
     /// <summary>
@@ -153,7 +153,58 @@ public static class RunEndEncoding
             previous = p;
         }
 
-        return Build(ArrowCompute.Take(source.Values, physical), lengths);
+        return Build(ArrowCompute.Take(source.Values, physical), lengths, RunEndsType(source));
+    }
+
+    /// <summary>
+    /// Joins run-end encoded arrays end to end, run-end encoded again: each input's runs (clipped to its window, as
+    /// <see cref="Compact"/> clips them) follow the previous input's, and their values are gathered and joined.
+    /// O(runs). A run that ends one input and the run that starts the next stay two runs, even when their values
+    /// are equal; the layout allows that, and comparing values of any type is not worth it here.
+    ///
+    /// <para>The result keeps the inputs' run-end width, so it matches the field they came from. Inputs of different
+    /// widths are refused, as inputs of different value types are: no one field describes them all.</para>
+    /// </summary>
+    public static RunEndEncodedArray Concatenate(IReadOnlyList<RunEndEncodedArray> arrays)
+    {
+        if (arrays is null)
+            throw new ArgumentNullException(nameof(arrays));
+        if (arrays.Count == 0)
+            throw new ArgumentException("There is nothing to concatenate.", nameof(arrays));
+
+        var valueType = ((RunEndEncodedType)arrays[0].Data.DataType).ValuesDataType;
+        var runEndsType = RunEndsType(arrays[0]);
+        var values = new List<IArrowArray>(arrays.Count);
+        var lengths = new List<int>();
+        foreach (var array in arrays)
+        {
+            var arrayValueType = ((RunEndEncodedType)array.Data.DataType).ValuesDataType;
+            // The whole type, not only its kind. Arrow's concatenator refuses different timestamp units or zones and
+            // decimal scales itself, but not structs whose children are named differently: it would label the
+            // joined values with the first input's names.
+            if (!ArrowTypeEquality.SameType(arrayValueType, valueType))
+            {
+                throw new ArgumentException(
+                    $"Cannot concatenate run-end encoded {arrayValueType} values onto {valueType} ones: their types differ.",
+                    nameof(arrays));
+            }
+            if (RunEndsType(array).TypeId != runEndsType.TypeId)
+            {
+                throw new ArgumentException(
+                    $"Cannot concatenate {RunEndsType(array).Name} run ends onto {runEndsType.Name} ones.",
+                    nameof(arrays));
+            }
+
+            var physical = new List<int>();
+            foreach (var run in EnumerateRuns(array))
+            {
+                physical.Add(run.PhysicalIndex);
+                lengths.Add(run.Length);
+            }
+            values.Add(ArrowCompute.Take(array.Values, physical));
+        }
+
+        return Build(ArrowCompute.Concatenate(values), lengths, runEndsType);
     }
 
     /// <summary>
@@ -169,40 +220,74 @@ public static class RunEndEncoding
             $"Run ends must be int16, int32 or int64, not {runEnds.Data.DataType.TypeId}."),
     };
 
+    private static IArrowType RunEndsType(RunEndEncodedArray array) =>
+        ((RunEndEncodedType)array.Data.DataType).RunEndsDataType;
+
     /// <summary>
-    /// Assembles an array from values already gathered one-per-run, plus each run's row count. Run ends are
-    /// the running total, which is the only form the layout stores.
+    /// Assembles an array from values already gathered one-per-run, plus each run's row count, with run ends of
+    /// <paramref name="runEndsType"/> (int16, int32 or int64: the source's, so the result matches the field it came
+    /// from). Run ends are the running total, which is the only form the layout stores.
     /// </summary>
-    private static RunEndEncodedArray Build(IArrowArray values, List<int> runLengths)
+    private static RunEndEncodedArray Build(IArrowArray values, List<int> runLengths, IArrowType runEndsType)
     {
-        var ends = new int[runLengths.Count];
+        long max = runEndsType.TypeId switch
+        {
+            ArrowTypeId.Int16 => short.MaxValue,
+            ArrowTypeId.Int32 => int.MaxValue,
+            ArrowTypeId.Int64 => long.MaxValue,
+            _ => throw new NotSupportedException(
+                $"Run ends must be int16, int32 or int64, not {runEndsType.TypeId}."),
+        };
+
+        var ends = new long[runLengths.Count];
         long total = 0;
         for (int i = 0; i < runLengths.Count; i++)
         {
             total += runLengths[i];
-            if (total > int.MaxValue)
+            if (total > max)
             {
                 throw new ArgumentException(
-                    $"Run ends total {total} rows, which overflows the int32 run-end type.",
+                    $"Run ends total {total} rows, which overflows the {runEndsType.Name} run-end type.",
                     nameof(runLengths));
             }
 
-            ends[i] = (int)total;
+            ends[i] = total;
         }
 
-        return new RunEndEncodedArray(Int32Values(ends), values);
+        return new RunEndEncodedArray(RunEnds(runEndsType, ends), values);
     }
+
+    /// <summary>A run-end array of the given width over the given values, built as buffers rather than through a
+    /// builder. Every value fits: <see cref="Build"/> checked.</summary>
+    private static IArrowArray RunEnds(IArrowType type, long[] ends)
+    {
+        switch (type.TypeId)
+        {
+            case ArrowTypeId.Int16:
+            {
+                var narrow = new short[ends.Length];
+                for (int i = 0; i < ends.Length; i++)
+                    narrow[i] = (short)ends[i];
+                return new Int16Array(Buffers(Int16Type.Default, MemoryMarshal.AsBytes(narrow.AsSpan()), ends.Length));
+            }
+            case ArrowTypeId.Int64:
+                return new Int64Array(Buffers(Int64Type.Default, MemoryMarshal.AsBytes(ends.AsSpan()), ends.Length));
+            default:
+            {
+                var narrow = new int[ends.Length];
+                for (int i = 0; i < ends.Length; i++)
+                    narrow[i] = (int)ends[i];
+                return Int32Values(narrow);
+            }
+        }
+    }
+
+    private static ArrayData Buffers(IArrowType type, ReadOnlySpan<byte> bytes, int length) =>
+        new(type, length, nullCount: 0, offset: 0, [ArrowBuffer.Empty, new ArrowBuffer(bytes.ToArray())]);
 
     /// <summary>An int32 array over the given values, built as buffers rather than through a builder.</summary>
-    private static Int32Array Int32Values(ReadOnlySpan<int> values)
-    {
-        var bytes = new byte[values.Length * sizeof(int)];
-        MemoryMarshal.AsBytes(values).CopyTo(bytes);
-
-        return new Int32Array(new ArrayData(
-            Int32Type.Default, values.Length, nullCount: 0, offset: 0,
-            [ArrowBuffer.Empty, new ArrowBuffer(bytes)]));
-    }
+    private static Int32Array Int32Values(ReadOnlySpan<int> values) =>
+        new(Buffers(Int32Type.Default, MemoryMarshal.AsBytes(values), values.Length));
 
     /// <summary>
     /// Walks runs in logical order, clipped to the array's window. A struct enumerator that returns itself

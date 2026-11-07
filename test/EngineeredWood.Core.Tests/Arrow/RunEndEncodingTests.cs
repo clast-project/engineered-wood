@@ -238,6 +238,61 @@ public class RunEndEncodingTests
         AssertRows([null, null, "a"], taken);
     }
 
+    // ── Concatenate ──
+
+    [Fact]
+    public void Concatenate_JoinsTheRunsEndToEnd()
+    {
+        var joined = RunEndEncoding.Concatenate([Ree(("a", 2), ("b", 1)), Ree(("c", 3))]);
+
+        AssertRows(["a", "a", "b", "c", "c", "c"], joined);
+        Assert.Equal([(0, 2), (1, 1), (2, 3)], RunsOf(joined));
+    }
+
+    [Fact]
+    public void Concatenate_OfSlices_TakesOnlyTheRowsTheyExpose()
+    {
+        // A slice's children still hold every run: joining them raw would bring back the rows it hides.
+        var first = (RunEndEncodedArray)Ree(("a", 3), ("b", 3)).Slice(2, 2);
+        var second = (RunEndEncodedArray)Ree(("c", 2), ("d", 2), ("e", 2)).Slice(3, 2);
+
+        var joined = RunEndEncoding.Concatenate([first, second]);
+
+        AssertRows(["a", "b", "d", "e"], joined);
+        Assert.Equal(0, joined.Data.Offset);
+        Assert.Equal(4, joined.Values.Length);
+    }
+
+    [Fact]
+    public void Concatenate_CarriesNullRunsThrough()
+    {
+        AssertRows(["a", null, null, "b"], RunEndEncoding.Concatenate([Ree(("a", 1), (null, 1)), Ree((null, 1), ("b", 1))]));
+    }
+
+    [Fact]
+    public void Concatenate_ThroughArrowCompute_KeepsTheColumnRunEndEncoded()
+    {
+        // The change-data writer joins batches whose _change_type columns are each one run (#723).
+        IArrowArray joined = ArrowCompute.Concatenate([
+            RunEndEncoding.Constant(StringType.Default, "update_preimage"u8, 2),
+            RunEndEncoding.Constant(StringType.Default, "update_postimage"u8, 2),
+            RunEndEncoding.Constant(StringType.Default, "delete"u8, 0),
+            RunEndEncoding.Constant(StringType.Default, "delete"u8, 1),
+        ]);
+
+        var ree = Assert.IsType<RunEndEncodedArray>(joined);
+        AssertRows(["update_preimage", "update_preimage", "update_postimage", "update_postimage", "delete"], ree);
+    }
+
+    [Fact]
+    public void Concatenate_ThroughArrowCompute_RefusesAPlainArrayAfterARunEndEncodedOne()
+    {
+        Assert.Throws<ArgumentException>(() => ArrowCompute.Concatenate([
+            Ree(("a", 1)),
+            new StringArray.Builder().Append("b").Build(),
+        ]));
+    }
+
     // ── Run end widths ──
 
     [Fact]
@@ -259,5 +314,101 @@ public class RunEndEncodingTests
         var ends = new Int64Array.Builder().Append(2L).Append(5L).Build();
 
         Assert.Equal([(0, 2), (1, 3)], RunsOf(new RunEndEncodedArray(ends, values)));
+    }
+
+    // Every operation that rebuilds an array keeps its run-end width: the result goes back under the field the
+    // source came from, and a column whose type disagrees with its field fails later.
+    private static RunEndEncodedArray WithEnds(IArrowType width)
+    {
+        var values = new StringArray.Builder().Append("a").Append("b").Build();
+        IArrowArray ends = width.TypeId switch
+        {
+            ArrowTypeId.Int16 => new Int16Array.Builder().Append((short)2).Append((short)5).Build(),
+            ArrowTypeId.Int64 => new Int64Array.Builder().Append(2L).Append(5L).Build(),
+            _ => new Int32Array.Builder().Append(2).Append(5).Build(),
+        };
+        return new RunEndEncodedArray(ends, values);
+    }
+
+    public static TheoryData<string> Widths => new() { "int16", "int32", "int64" };
+
+    private static IArrowType Width(string name) => name switch
+    {
+        "int16" => Int16Type.Default,
+        "int64" => Int64Type.Default,
+        _ => Int32Type.Default,
+    };
+
+    private static void AssertWidth(IArrowType expected, RunEndEncodedArray array)
+    {
+        Assert.Equal(expected.TypeId, ((RunEndEncodedType)array.Data.DataType).RunEndsDataType.TypeId);
+        Assert.Equal(expected.TypeId, array.RunEnds.Data.DataType.TypeId);
+    }
+
+    [Theory]
+    [MemberData(nameof(Widths))]
+    public void Concatenate_KeepsTheRunEndWidth(string width)
+    {
+        var source = WithEnds(Width(width));
+        var joined = RunEndEncoding.Concatenate([source, source]);
+        AssertWidth(Width(width), joined);
+        AssertRows(["a", "a", "b", "b", "b", "a", "a", "b", "b", "b"], joined);
+    }
+
+    [Theory]
+    [MemberData(nameof(Widths))]
+    public void TakeAndCompact_KeepTheRunEndWidth(string width)
+    {
+        var source = WithEnds(Width(width));
+        var taken = RunEndEncoding.Take(source, [4, 0, 1]);
+        AssertWidth(Width(width), taken);
+        AssertRows(["b", "a", "a"], taken);
+
+        var compacted = RunEndEncoding.Compact((RunEndEncodedArray)source.Slice(1, 3));
+        AssertWidth(Width(width), compacted);
+        AssertRows(["a", "b", "b"], compacted);
+    }
+
+    [Fact]
+    public void Concatenate_RefusesDifferentRunEndWidths()
+    {
+        Assert.Throws<ArgumentException>(() =>
+            RunEndEncoding.Concatenate([WithEnds(Int16Type.Default), WithEnds(Int64Type.Default)]));
+    }
+
+    [Fact]
+    public void Concatenate_RefusesRowsPastTheRunEndWidth()
+    {
+        var values = new StringArray.Builder().Append("a").Build();
+        var big = new RunEndEncodedArray(new Int16Array.Builder().Append(short.MaxValue).Build(), values);
+        Assert.Throws<ArgumentException>(() => RunEndEncoding.Concatenate([big, big]));
+    }
+
+    // A TypeId leaves a type's parameters open: joining values of two timestamp units or two decimal scales, or
+    // structs whose children are named differently, would label one input's values with the other's type. Arrow's
+    // concatenator catches the units and scales but not the names; the run-end check refuses all three.
+    [Fact]
+    public void Concatenate_RefusesValuesOfTheSameKindButADifferentType()
+    {
+        static RunEndEncodedArray One(IArrowArray value) => new(new Int32Array.Builder().Append(1).Build(), value);
+
+        static RunEndEncodedArray Timestamps(TimeUnit unit) => One(
+            new TimestampArray.Builder(new TimestampType(unit, "UTC"))
+                .Append(new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero)).Build());
+        Assert.Throws<ArgumentException>(() =>
+            RunEndEncoding.Concatenate([Timestamps(TimeUnit.Millisecond), Timestamps(TimeUnit.Microsecond)]));
+
+        static RunEndEncodedArray Decimals(int scale) => One(
+            new Decimal128Array.Builder(new Decimal128Type(10, scale)).Append(1m).Build());
+        Assert.Throws<ArgumentException>(() => RunEndEncoding.Concatenate([Decimals(2), Decimals(3)]));
+
+        static RunEndEncodedArray Structs(string child) => One(new StructArray(
+            new StructType([new Field(child, Int32Type.Default, true)]), 1,
+            [new Int32Array.Builder().Append(1).Build()], ArrowBuffer.Empty, 0));
+        Assert.Throws<ArgumentException>(() => RunEndEncoding.Concatenate([Structs("a"), Structs("b")]));
+
+        // The same full type joins.
+        Assert.Equal(2, RunEndEncoding.Concatenate([Decimals(2), Decimals(2)]).Length);
+        Assert.Equal(2, RunEndEncoding.Concatenate([Structs("a"), Structs("a")]).Length);
     }
 }

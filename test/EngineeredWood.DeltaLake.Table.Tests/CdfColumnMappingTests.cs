@@ -101,11 +101,26 @@ public class CdfColumnMappingTests : IDisposable
             Assert.DoesNotContain(Names(b), n => n.StartsWith("col-", StringComparison.Ordinal));
         }
 
-        // The pre-image carries the old value, the post-image the new — both under the logical "value" name.
-        var pre = changes.Where(b => Col(b, CdfConfig.ChangeTypeColumn).GetString(0) == CdfConfig.UpdatePreimage).ToList();
-        var post = changes.Where(b => Col(b, CdfConfig.ChangeTypeColumn).GetString(0) == CdfConfig.UpdatePostimage).ToList();
-        Assert.Contains(pre, b => Col(b, "value").GetString(0) == "a");
-        Assert.Contains(post, b => Col(b, "value").GetString(0) == "updated");
+        // The pre-image carries the old value, the post-image the new — both under the logical "value" name. They
+        // share a change file, so they are told apart row by row.
+        var rows = ChangeRows(changes, "value");
+        Assert.Contains((CdfConfig.UpdatePreimage, "a"), rows);
+        Assert.Contains((CdfConfig.UpdatePostimage, "updated"), rows);
+    }
+
+    /// <summary>Every change row as (<c>_change_type</c>, <paramref name="column"/>), whatever batches it came in:
+    /// one change file holds rows of several change types.</summary>
+    private static List<(string? ChangeType, string? Value)> ChangeRows(IEnumerable<RecordBatch> changes, string column)
+    {
+        var rows = new List<(string?, string?)>();
+        foreach (var b in changes)
+        {
+            var types = Col(b, CdfConfig.ChangeTypeColumn);
+            var values = Col(b, column);
+            for (int i = 0; i < b.Length; i++)
+                rows.Add((types.GetString(i), values.GetString(i)));
+        }
+        return rows;
     }
 
     [Fact]
@@ -182,9 +197,8 @@ public class CdfColumnMappingTests : IDisposable
             for (int i = 0; i < b.Length; i++)
                 Assert.Equal("apac", region.GetString(i)); // partition value re-materialized on the cdc-file path
         }
-        Assert.Contains(changes, b => Col(b, CdfConfig.ChangeTypeColumn).GetString(0) == CdfConfig.UpdatePreimage
-                                      && Col(b, "value").GetString(0) == "a");
-        Assert.Contains(changes, b => Col(b, CdfConfig.ChangeTypeColumn).GetString(0) == CdfConfig.UpdatePostimage
-                                      && Col(b, "value").GetString(0) == "z");
+        var rows = ChangeRows(changes, "value");
+        Assert.Contains((CdfConfig.UpdatePreimage, "a"), rows);
+        Assert.Contains((CdfConfig.UpdatePostimage, "z"), rows);
     }
 }
