@@ -2222,6 +2222,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             EnsureUniversalFormatMaintained(extraActions, _options);
             EnsureNoInvalidIsolationLevelIntroduced(snapshot, extraActions);
             EnsureNoFeaturePropertiesIntroduced(snapshot, extraActions);
+            EnsureIcebergCompatHolds(snapshot, extraActions);
             // One commit carries at most one protocol action. A caller's protocol replaces the table's, so the
             // clustering upgrade is applied to it rather than committed beside it (#598).
             if (extraActions.OfType<ProtocolAction>().LastOrDefault() is { } callerProtocol)
@@ -3101,6 +3102,31 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// carried through unchanged from the base snapshot is left alone, since a table created before #601 / #639 may
     /// already hold one.
     /// </summary>
+    /// <summary>
+    /// Validates IcebergCompat against the table as caller-supplied actions leave it, when they carry a
+    /// <c>metaData</c> or a <c>protocol</c>. Such actions can enable IcebergCompat on a table whose protocol
+    /// supports deletion vectors, or add <c>deletionVectors</c> to an IcebergCompat table's protocol. delta-spark
+    /// refuses every later write to either table (#744).
+    /// </summary>
+    private static void EnsureIcebergCompatHolds(Snapshot.Snapshot baseSnapshot, IEnumerable<DeltaAction> actions)
+    {
+        MetadataAction? metadata = null;
+        ProtocolAction? protocol = null;
+        foreach (var action in actions)
+        {
+            if (action is MetadataAction m)
+                metadata = m;
+            else if (action is ProtocolAction p)
+                protocol = p;
+        }
+        if (metadata is null && protocol is null)
+            return;
+
+        metadata ??= baseSnapshot.Metadata;
+        Schema.IcebergCompat.Validate(
+            Schema.IcebergCompat.GetVersion(metadata.Configuration), metadata, protocol ?? baseSnapshot.Protocol);
+    }
+
     private static void EnsureNoFeaturePropertiesIntroduced(
         Snapshot.Snapshot baseSnapshot, IEnumerable<DeltaAction> actions)
     {
@@ -3207,6 +3233,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         EnsureUniversalFormatMaintained(transaction.DataActions, _options);
         EnsureNoInvalidIsolationLevelIntroduced(baseSnapshot, transaction.DataActions);
         EnsureNoFeaturePropertiesIntroduced(baseSnapshot, transaction.DataActions);
+        EnsureIcebergCompatHolds(baseSnapshot, transaction.DataActions);
 
         // Every transactional operation is now rebase-safe under row tracking: a DELETE only edits deletion
         // vectors on EXISTING files (its re-add keeps that file's own baseRowId), or — when a file was
@@ -8801,6 +8828,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             EnsureUniversalFormatMaintained(extraActions, _options);
             EnsureNoInvalidIsolationLevelIntroduced(CurrentSnapshot, extraActions);
             EnsureNoFeaturePropertiesIntroduced(CurrentSnapshot, extraActions);
+            EnsureIcebergCompatHolds(CurrentSnapshot, extraActions);
         }
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
         // extraActions (a buffered transaction's deletion-vector remove/add pairs) likewise make this a

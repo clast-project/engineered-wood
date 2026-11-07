@@ -194,6 +194,8 @@ public sealed partial class DeltaTable
         // The restored properties are the table's from this commit on, so they are judged as any new metadata is:
         // a restore must not re-enable UniForm, whose metadata this library does not maintain.
         EnsureUniversalFormatMaintained(metadata.Configuration, _options);
+        // A restore can bring back IcebergCompat over a protocol that has since gained deletion vectors (#744).
+        IcebergCompat.Validate(IcebergCompat.GetVersion(metadata.Configuration), metadata, protocol);
 
         // Spark records the one it was given and a null for the other; a null has no place in these string
         // parameters, so the other is left out.

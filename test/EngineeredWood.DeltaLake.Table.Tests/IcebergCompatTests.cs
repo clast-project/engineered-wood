@@ -324,7 +324,7 @@ public class IcebergCompatTests : IDisposable
     }
 
     [Fact]
-    public void Validate_V2_AllowsDeletionVectors()
+    public void Validate_V2_WithDeletionVectors_Throws()
     {
         var metadata = new MetadataAction
         {
@@ -345,8 +345,11 @@ public class IcebergCompatTests : IDisposable
             WriterFeatures = ["columnMapping", "icebergCompatV2", "deletionVectors"],
         };
 
-        // V2 does not prohibit deletion vectors
-        IcebergCompat.Validate(IcebergCompatVersion.V2, metadata, protocol);
+        // delta-spark's IcebergCompatV2 carries CheckDeletionVectorDisabled, as V1 does (#744).
+        var ex = Assert.Throws<DeltaFormatException>(() =>
+            IcebergCompat.Validate(IcebergCompatVersion.V2, metadata, protocol));
+        Assert.Equal(DeltaErrorCodes.IcebergCompatViolation, ex.ErrorCode);
+        Assert.Contains("IcebergCompatV2", ex.Message);
     }
 
     #endregion

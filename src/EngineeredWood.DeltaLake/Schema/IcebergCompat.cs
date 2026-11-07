@@ -20,7 +20,7 @@ public enum IcebergCompatVersion
     V1,
 
     /// <summary>
-    /// V2: column mapping required, Map/Array types allowed with nested field IDs,
+    /// V2: column mapping required, no deletion vectors, Map/Array types allowed with nested field IDs,
     /// partition columns materialized in Parquet files, numRecords required in stats.
     /// </summary>
     V2,
@@ -78,8 +78,10 @@ public static class IcebergCompat
         ValidateColumnMapping(metadata.Configuration);
         ValidateSchema(metadata, version);
 
-        if (version == IcebergCompatVersion.V1)
-            ValidateNoDeletionVectors(protocol);
+        // Both versions refuse a protocol that supports deletion vectors: delta-spark's V1 and V2 each carry
+        // CheckDeletionVectorDisabled, which tests the feature's presence in the protocol and not whether the
+        // table has any DVs (#744). Only V3, which this library does not model, allows them.
+        ValidateNoDeletionVectors(protocol, version);
     }
 
     /// <summary>
@@ -181,7 +183,7 @@ public static class IcebergCompat
         }
     }
 
-    private static void ValidateNoDeletionVectors(Actions.ProtocolAction protocol)
+    private static void ValidateNoDeletionVectors(Actions.ProtocolAction protocol, IcebergCompatVersion version)
     {
         bool hasDeletionVectors =
             (protocol.WriterFeatures is not null &&
@@ -193,7 +195,7 @@ public static class IcebergCompat
         {
             throw new DeltaFormatException(
                 DeltaErrorCodes.IcebergCompatViolation,
-                "IcebergCompatV1 requires that deletion vectors are not enabled. " +
+                $"IcebergCompat{version} requires that deletion vectors are not enabled. " +
                 "The 'deletionVectors' feature must be removed from the protocol.");
         }
     }
