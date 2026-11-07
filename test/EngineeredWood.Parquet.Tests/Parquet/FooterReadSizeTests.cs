@@ -19,8 +19,9 @@ public class FooterReadSizeTests
         int footerReadSize)
     {
         var file = new RequestCountingFile(new LocalRandomAccessFile(Path));
+        // The reader owns the file and closes it; the recorded requests outlive that.
         using var reader = new ParquetFileReader(
-            file, ownsFile: false, ParquetReadOptions.Default with { FooterReadSize = footerReadSize });
+            file, ownsFile: true, ParquetReadOptions.Default with { FooterReadSize = footerReadSize });
         var footer = await reader.ReadMetadataAsync();
         long length = await file.GetLengthAsync();
         return (file, length, footer);
@@ -30,7 +31,7 @@ public class FooterReadSizeTests
     public async Task Default_ReadsASmallFileWholeInOneRequest()
     {
         var file = new RequestCountingFile(new LocalRandomAccessFile(Path));
-        using var reader = new ParquetFileReader(file, ownsFile: false);
+        using var reader = new ParquetFileReader(file, ownsFile: true);
         var footer = await reader.ReadMetadataAsync();
         long length = await file.GetLengthAsync();
 

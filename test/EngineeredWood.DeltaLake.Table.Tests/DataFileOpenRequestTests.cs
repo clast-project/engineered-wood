@@ -70,6 +70,7 @@ public class DataFileOpenRequestTests : IDisposable
     public async Task Scan_AsksNoLengthAndReadsEachFooterInOneRequest()
     {
         var (table, fs) = await CreateAsync("scan", dv: false);
+        await using var disposeTable = table;
         var sizes = table.CurrentSnapshot.ActiveFiles.Values.ToDictionary(a => DeltaPath.Decode(a.Path), a => a.Size);
 
         long rows = 0;
@@ -94,6 +95,7 @@ public class DataFileOpenRequestTests : IDisposable
     public async Task Delete_AsksNoLength(bool dv)
     {
         var (table, fs) = await CreateAsync($"delete_{dv}", dv);
+        await using var disposeTable = table;
         var (deleted, _) = await table.DeleteAsync(Ex.Equal("tag", "a"));
         Assert.Equal(Files * RowsPerFile / 2, deleted);
         Assert.Equal(0, fs.DataLengthRequests);
@@ -103,6 +105,7 @@ public class DataFileOpenRequestTests : IDisposable
     public async Task FunctionalDelete_AsksNoLength()
     {
         var (table, fs) = await CreateAsync("fdelete", dv: true);
+        await using var disposeTable = table;
         var (deleted, _) = await table.DeleteAsync(batch =>
         {
             var ids = (Int64Array)batch.Column("id");
@@ -119,6 +122,7 @@ public class DataFileOpenRequestTests : IDisposable
     public async Task Compact_AsksNoLength()
     {
         var (table, fs) = await CreateAsync("compact", dv: false);
+        await using var disposeTable = table;
         Assert.NotNull(await table.CompactAsync());
         Assert.Single(table.CurrentSnapshot.ActiveFiles);
         Assert.Equal(0, fs.DataLengthRequests);
@@ -175,6 +179,7 @@ public class DataFileOpenRequestTests : IDisposable
     {
         string name = $"size_{operation}_{change}";
         var (table, fs) = await CreateAsync(name, dv: false, cdf: true);
+        await using var disposeTable = table;
         string path = FirstDataFile(table, name);
         long recorded = new FileInfo(path).Length;
         byte[] bytes = File.ReadAllBytes(path);
@@ -200,6 +205,7 @@ public class DataFileOpenRequestTests : IDisposable
     {
         string name = $"corrupt_{operation}";
         var (table, _) = await CreateAsync(name, dv: false, cdf: true);
+        await using var disposeTable = table;
         string path = FirstDataFile(table, name);
         using (var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite))
         {
