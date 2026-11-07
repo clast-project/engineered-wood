@@ -12,6 +12,7 @@ using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet;
+using EngineeredWood.Scans;
 
 namespace EngineeredWood.DeltaLake.Table.ChangeDataFeed;
 
@@ -54,6 +55,11 @@ internal static class CdfReader
     /// GENERATED columns instead, resolved per row; see <see cref="ResolveRowTracking"/>.</para>
     /// <para>Every batch is reconciled to <paramref name="schemaSnapshot"/>'s schema; which snapshot that is
     /// (Spark's rule depends on column mapping) is the caller's decision.</para>
+    /// <para>The files the feed reads (change files, and the data files changes are inferred from) are read
+    /// up to <paramref name="maxConcurrentReads"/> at once, holding at most
+    /// <paramref name="maxBufferedReadBytes"/> of decoded batches the caller has not taken, as a scan does
+    /// (<see cref="OrderedScan"/>). Batches come in the order a serial read gives: by version, then file. On an
+    /// object store each file costs a few round trips, and read one after another they set the feed's time.</para>
     /// </summary>
     public static async IAsyncEnumerable<RecordBatch> ReadChangesAsync(
         ITableFileSystem fs,
@@ -67,6 +73,8 @@ internal static class CdfReader
         bool emitRowTracking = false,
         string? emittedRowIdName = null,
         string? emittedRowVersionName = null,
+        int maxConcurrentReads = 1,
+        long maxBufferedReadBytes = DefaultMaxBufferedReadBytes,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var mappingMode = ColumnMapping.GetMode(schemaSnapshot.Metadata.Configuration);
@@ -83,6 +91,58 @@ internal static class CdfReader
         // Stateless over the file system — one instance serves every action in the range.
         var dvReader = new DeletionVectorReader(fs);
 
+        // The units come from ONE enumeration, in order: the commit reads and the vector pairing stay serial,
+        // and under OrderedScan they overlap the reads of the files already dispatched.
+        var units = UnitsAsync(fs, log, startVersion, endVersion, dvReader, cancellationToken);
+
+        IAsyncEnumerable<RecordBatch> batches = maxConcurrentReads <= 1
+            ? SeriallyAsync(fs, units, readOptions, ctx, dvReader, cancellationToken)
+            : OrderedScan.RunAsync(
+                units,
+                (unit, reservation, ct) => ReadUnitAsync(fs, unit, readOptions, ctx, dvReader, reservation, ct),
+                static b => RollingDataFileWriter.EstimatedBytes(b),
+                static b => b.Dispose(),
+                maxConcurrentReads,
+                new ScanMemoryBudget(maxBufferedReadBytes),
+                cancellationToken: cancellationToken);
+
+        await foreach (var batch in batches.WithCancellation(cancellationToken).ConfigureAwait(false))
+            yield return batch;
+    }
+
+    /// <summary><see cref="DeltaTableOptions.MaxBufferedReadBytes"/>'s default, for a caller that gives none.</summary>
+    internal const long DefaultMaxBufferedReadBytes = 256L * 1024 * 1024;
+
+    /// <summary>
+    /// One file the feed reads, with everything its read needs: a <c>_change_data</c> file
+    /// (<see cref="IsChangeFile"/>), or a data file whose rows, as <see cref="Filter"/> selects them, are reported
+    /// as <see cref="ChangeType"/>. <see cref="Size"/> is the size the action records, null when it records none.
+    /// </summary>
+    private sealed record CdfUnit(
+        bool IsChangeFile,
+        string Path,
+        long? Size,
+        IReadOnlyDictionary<string, string>? PartitionValues,
+        RowFilter Filter,
+        string ChangeType,
+        long Version,
+        long? CommitTimestamp,
+        long? BaseRowId,
+        long? DefaultRowCommitVersion);
+
+    /// <summary>
+    /// The files of every version in the range, in the order the feed reports them: a version's change files
+    /// when it has any; else its removed data files, then its added ones. A commit is read only once the units
+    /// before it have been taken, so this runs no further ahead than the reads do.
+    /// </summary>
+    private static async IAsyncEnumerable<CdfUnit> UnitsAsync(
+        ITableFileSystem fs,
+        TransactionLog log,
+        long startVersion,
+        long endVersion,
+        DeletionVectorReader dvReader,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         for (long version = startVersion; version <= endVersion; version++)
         {
             IReadOnlyList<DeltaAction> actions;
@@ -107,109 +167,203 @@ internal static class CdfReader
                 // Read from CDC files — they have _change_type already
                 foreach (var cdcFile in cdcFiles)
                 {
-                    await foreach (var batch in ReadCdcFileAsync(
-                        fs, cdcFile, version, commitTimestamp, readOptions, ctx,
-                        cancellationToken).ConfigureAwait(false))
-                    {
-                        yield return batch;
-                    }
+                    yield return new CdfUnit(
+                        IsChangeFile: true, cdcFile.Path, cdcFile.Size,
+                        (IReadOnlyDictionary<string, string>?)cdcFile.PartitionValues,
+                        Filter: default, ChangeType: "", version, commitTimestamp,
+                        BaseRowId: null, DefaultRowCommitVersion: null);
                 }
+                continue;
             }
-            else
+
+            // Infer changes from add/remove actions
+            var adds = actions.OfType<AddFile>()
+                .Where(a => a.DataChange).ToList();
+            var removes = actions.OfType<RemoveFile>()
+                .Where(r => r.DataChange).ToList();
+
+            // A remove and an add of the SAME file in one version, either carrying a deletion vector, is a
+            // vector edit rather than a file replaced: what changed is the difference between the two
+            // vectors, not every row of the file. Read whole, the pair reported every survivor deleted and
+            // re-inserted. Spark's reader pairs them the same way (CDCReader.processDeletionVectorActions).
+            var vectorEdits = await PairVectorEditsAsync(fs, removes, adds, dvReader, cancellationToken)
+                .ConfigureAwait(false);
+
+            // Removed files → "delete" rows. The action's DELETION VECTOR is honored: rows it already
+            // marked deleted are not live at this version — they were reported as deletes when the DV
+            // itself committed, so materializing them again double-counts (e.g. an overwrite removing a
+            // file an earlier DV-delete had soft-deleted rows in). Same on the add side: a DV-carrying
+            // add's marked rows are not live inserts.
+            foreach (var remove in removes)
             {
-                // Infer changes from add/remove actions
-                var adds = actions.OfType<AddFile>()
-                    .Where(a => a.DataChange).ToList();
-                var removes = actions.OfType<RemoveFile>()
-                    .Where(r => r.DataChange).ToList();
-
-                // A remove and an add of the SAME file in one version, either carrying a deletion vector, is a
-                // vector edit rather than a file replaced: what changed is the difference between the two
-                // vectors, not every row of the file. Read whole, the pair reported every survivor deleted and
-                // re-inserted. Spark's reader pairs them the same way (CDCReader.processDeletionVectorActions).
-                var vectorEdits = await PairVectorEditsAsync(fs, removes, adds, dvReader, cancellationToken)
-                    .ConfigureAwait(false);
-
-                // Removed files → "delete" rows. The action's DELETION VECTOR is honored: rows it already
-                // marked deleted are not live at this version — they were reported as deletes when the DV
-                // itself committed, so materializing them again double-counts (e.g. an overwrite removing a
-                // file an earlier DV-delete had soft-deleted rows in). Same on the add side: a DV-carrying
-                // add's marked rows are not live inserts.
-                foreach (var remove in removes)
+                RowFilter filter;
+                if (vectorEdits.TryGetValue(remove.Path, out var edit))
                 {
-                    RowFilter filter;
-                    if (vectorEdits.TryGetValue(remove.Path, out var edit))
-                    {
-                        // The rows the new vector hides that the old one did not.
-                        if (edit.NewlyDeleted.IsEmpty)
-                            continue;
-                        filter = RowFilter.KeepOnly(edit.NewlyDeleted);
-                    }
-                    else
-                    {
-                        filter = RowFilter.Exclude(remove.DeletionVector);
-                    }
-
-                    await foreach (var batch in ReadDataFileAsChangesAsync(
-                        fs, remove.Path, remove.PartitionValues ?? edit?.Add.PartitionValues, filter,
-                        CdfConfig.Delete, version,
-                        commitTimestamp, readOptions, ctx, dvReader,
-                        remove.BaseRowId ?? edit?.Add.BaseRowId,
-                        remove.DefaultRowCommitVersion ?? edit?.Add.DefaultRowCommitVersion,
-                        cancellationToken)
-                        .ConfigureAwait(false))
-                    {
-                        yield return batch;
-                    }
+                    // The rows the new vector hides that the old one did not.
+                    if (edit.NewlyDeleted.IsEmpty)
+                        continue;
+                    filter = RowFilter.KeepOnly(edit.NewlyDeleted);
+                }
+                else
+                {
+                    filter = RowFilter.Exclude(remove.DeletionVector);
                 }
 
-                // Added files → "insert" rows
-                foreach (var add in adds)
-                {
-                    RowFilter filter;
-                    if (vectorEdits.TryGetValue(add.Path, out var edit))
-                    {
-                        // The rows the old vector hid that the new one no longer does — a RESTORE un-deleting
-                        // them. An ordinary vector DELETE has none.
-                        if (edit.Reinserted.IsEmpty)
-                            continue;
-                        filter = RowFilter.KeepOnly(edit.Reinserted);
-                    }
-                    else
-                    {
-                        filter = RowFilter.Exclude(add.DeletionVector);
-                    }
+                yield return new CdfUnit(
+                    IsChangeFile: false, remove.Path, remove.Size ?? edit?.Add.Size,
+                    remove.PartitionValues ?? edit?.Add.PartitionValues, filter,
+                    CdfConfig.Delete, version, commitTimestamp,
+                    remove.BaseRowId ?? edit?.Add.BaseRowId,
+                    remove.DefaultRowCommitVersion ?? edit?.Add.DefaultRowCommitVersion);
+            }
 
-                    await foreach (var batch in ReadDataFileAsChangesAsync(
-                        fs, add.Path, add.PartitionValues, filter,
-                        CdfConfig.Insert, version,
-                        commitTimestamp, readOptions, ctx, dvReader,
-                        add.BaseRowId, add.DefaultRowCommitVersion, cancellationToken)
-                        .ConfigureAwait(false))
-                    {
-                        yield return batch;
-                    }
+            // Added files → "insert" rows
+            foreach (var add in adds)
+            {
+                RowFilter filter;
+                if (vectorEdits.TryGetValue(add.Path, out var edit))
+                {
+                    // The rows the old vector hid that the new one no longer does — a RESTORE un-deleting
+                    // them. An ordinary vector DELETE has none.
+                    if (edit.Reinserted.IsEmpty)
+                        continue;
+                    filter = RowFilter.KeepOnly(edit.Reinserted);
                 }
+                else
+                {
+                    filter = RowFilter.Exclude(add.DeletionVector);
+                }
+
+                yield return new CdfUnit(
+                    IsChangeFile: false, add.Path, add.Size, add.PartitionValues, filter,
+                    CdfConfig.Insert, version, commitTimestamp,
+                    add.BaseRowId, add.DefaultRowCommitVersion);
             }
         }
     }
 
-    private static async IAsyncEnumerable<RecordBatch> ReadCdcFileAsync(
+    private static async IAsyncEnumerable<RecordBatch> SeriallyAsync(
         ITableFileSystem fs,
-        CdcFile cdcFile,
-        long commitVersion,
-        long? commitTimestamp,
+        IAsyncEnumerable<CdfUnit> units,
         ParquetReadOptions? readOptions,
         CdfSchemaContext ctx,
+        DeletionVectorReader dvReader,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await using var file = await fs.OpenReadAsync(
-            EngineeredWood.DeltaLake.DeltaPath.Decode(cdcFile.Path), cancellationToken)
-            .ConfigureAwait(false);
-        using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
+        await foreach (var unit in units.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            await foreach (var batch in ReadUnitAsync(
+                fs, unit, readOptions, ctx, dvReader, ScanReservation.None, cancellationToken).ConfigureAwait(false))
+            {
+                yield return batch;
+            }
+        }
+    }
 
-        await foreach (var batch in reader.ReadAllAsync(
-            cancellationToken: cancellationToken).ConfigureAwait(false))
+    private static IAsyncEnumerable<RecordBatch> ReadUnitAsync(
+        ITableFileSystem fs,
+        CdfUnit unit,
+        ParquetReadOptions? readOptions,
+        CdfSchemaContext ctx,
+        DeletionVectorReader dvReader,
+        ScanReservation reservation,
+        CancellationToken cancellationToken) =>
+        unit.IsChangeFile
+            ? ReadCdcFileAsync(fs, unit, readOptions, ctx, reservation, cancellationToken)
+            : ReadDataFileAsChangesAsync(fs, unit, readOptions, ctx, dvReader, reservation, cancellationToken);
+
+    /// <summary>
+    /// Opens <paramref name="diskPath"/> and reads its footer, which is where a missing file shows up. The size
+    /// the action records is passed on (<see cref="KnownLengthRandomAccessFile"/>), so nothing asks the store
+    /// about the file before its first read: on an object store that was a HEAD per file, and a data file paid
+    /// a second one to check that it still existed. With <paramref name="missingMeansVacuumed"/>, a failure on
+    /// a file that turns out not to exist (VACUUM removed it) returns null instead. The existence check runs
+    /// only then, never for a file that opens.
+    /// </summary>
+    private static async ValueTask<OpenedFile?> OpenAsync(
+        ITableFileSystem fs,
+        string diskPath,
+        long? size,
+        ParquetReadOptions? readOptions,
+        bool missingMeansVacuumed,
+        CancellationToken cancellationToken)
+    {
+        IRandomAccessFile? file = null;
+        ParquetFileReader? reader = null;
+        try
+        {
+            file = await fs.OpenReadAsync(diskPath, cancellationToken).ConfigureAwait(false);
+            if (size is { } length and >= 0)
+                file = new KnownLengthRandomAccessFile(file, length);
+            reader = new ParquetFileReader(file, ownsFile: false, readOptions);
+            var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+            return new OpenedFile(file, reader, footer);
+        }
+        catch (Exception) when (missingMeansVacuumed && !cancellationToken.IsCancellationRequested)
+        {
+            reader?.Dispose();
+            if (file is not null)
+                await file.DisposeAsync().ConfigureAwait(false);
+            if (await fs.ExistsAsync(diskPath, cancellationToken).ConfigureAwait(false))
+                throw;
+            return null;
+        }
+        catch
+        {
+            reader?.Dispose();
+            if (file is not null)
+                await file.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <summary>An open file, its reader, and its footer. Disposing it disposes the reader, then the file.</summary>
+    private sealed class OpenedFile(IRandomAccessFile file, ParquetFileReader reader, Parquet.Metadata.FileMetaData footer)
+        : IAsyncDisposable
+    {
+        public ParquetFileReader Reader { get; } = reader;
+        public Parquet.Metadata.FileMetaData Footer { get; } = footer;
+
+        public async ValueTask DisposeAsync()
+        {
+            Reader.Dispose();
+            await file.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>A Parquet read's batches, each with the file position of its first row.</summary>
+    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> PositionedAsync(
+        IAsyncEnumerable<PositionedRecordBatch> source,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (var positioned in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+            yield return (positioned.Batch, positioned.FirstRow);
+    }
+
+    private static async IAsyncEnumerable<RecordBatch> ReadCdcFileAsync(
+        ITableFileSystem fs,
+        CdfUnit unit,
+        ParquetReadOptions? readOptions,
+        CdfSchemaContext ctx,
+        ScanReservation reservation,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        long commitVersion = unit.Version;
+        long? commitTimestamp = unit.CommitTimestamp;
+
+        // A missing change file is an error, as it was before.
+        await using var opened = (await OpenAsync(
+            fs, EngineeredWood.DeltaLake.DeltaPath.Decode(unit.Path), unit.Size, readOptions,
+            missingMeansVacuumed: false, cancellationToken).ConfigureAwait(false))!;
+        var reader = opened.Reader;
+
+        // Every column of every row group is read, so the largest row group bounds the first reservation.
+        if (reservation != ScanReservation.None)
+            reservation.SetInitialEstimate(DeltaTable.LargestRowGroupBytes(opened.Footer, null, null));
+
+        await foreach (var (batch, _) in DeltaTable.Reserving(
+            PositionedAsync(reader.ReadWithPositionsAsync(null, null, cancellationToken), cancellationToken),
+            reservation, cancellationToken).ConfigureAwait(false))
         {
             // The file already carries _change_type (per-row); split it off so the physical data columns can be
             // mapped to logical + interleaved with the re-materialized partition columns, then re-attach it.
@@ -229,7 +383,7 @@ internal static class CdfReader
             }
 
             var logical = ToTableShape(
-                cleanPhysical, (IReadOnlyDictionary<string, string>?)cdcFile.PartitionValues, ctx);
+                cleanPhysical, unit.PartitionValues, ctx);
             var withChangeType = changeType is null
                 ? logical
                 : AppendColumn(logical,
@@ -376,39 +530,47 @@ internal static class CdfReader
 
     private static async IAsyncEnumerable<RecordBatch> ReadDataFileAsChangesAsync(
         ITableFileSystem fs,
-        string path,
-        IReadOnlyDictionary<string, string>? partitionValues,
-        RowFilter filter,
-        string changeType,
-        long commitVersion,
-        long? commitTimestamp,
+        CdfUnit unit,
         ParquetReadOptions? readOptions,
         CdfSchemaContext ctx,
         DeletionVectorReader dvReader,
-        long? baseRowId,
-        long? defaultRowCommitVersion,
+        ScanReservation reservation,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        var partitionValues = unit.PartitionValues;
+        string changeType = unit.ChangeType;
+        long commitVersion = unit.Version;
+        long? commitTimestamp = unit.CommitTimestamp;
+        long? baseRowId = unit.BaseRowId;
+        long? defaultRowCommitVersion = unit.DefaultRowCommitVersion;
+
         // path is an add.path (URL-encoded on-disk relative path) — decode to the on-disk name.
-        string diskPath = EngineeredWood.DeltaLake.DeltaPath.Decode(path);
+        string diskPath = EngineeredWood.DeltaLake.DeltaPath.Decode(unit.Path);
 
-        // Try to read the file — it may have been deleted already
-        if (!await fs.ExistsAsync(diskPath, cancellationToken).ConfigureAwait(false))
+        // The file may have been deleted already (VACUUM); then it contributes nothing. Its vector is read only
+        // after the file is known to exist, since VACUUM removes a file's vector along with it.
+        await using var opened = await OpenAsync(
+            fs, diskPath, unit.Size, readOptions, missingMeansVacuumed: true, cancellationToken).ConfigureAwait(false);
+        if (opened is null)
             yield break;
+        var reader = opened.Reader;
 
-        filter = await filter.ResolveAsync(dvReader, cancellationToken).ConfigureAwait(false);
+        var filter = await unit.Filter.ResolveAsync(dvReader, cancellationToken).ConfigureAwait(false);
 
-        await using var file = await fs.OpenReadAsync(diskPath, cancellationToken)
-            .ConfigureAwait(false);
-        using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
+        // Every column is read. A row group the vector deletes in full is skipped unread, so it needs no
+        // reservation; one a keep-only filter skips is still counted, which can only overestimate.
+        if (reservation != ScanReservation.None)
+        {
+            reservation.SetInitialEstimate(DeltaTable.LargestRowGroupBytes(
+                opened.Footer, null, filter.KeepOnlyPositions ? null : filter.Positions));
+        }
 
         // DV positions are absolute within the file, and so is a row's positional id: each batch's first row comes
         // from the reader, which counts the row groups the filter lets it skip unread (#618).
-        await foreach (var positioned in reader.ReadWithPositionsAsync(
-            null, null, filter.SkipRows, cancellationToken).ConfigureAwait(false))
+        await foreach (var (rawBatch, thisBatchStart) in DeltaTable.Reserving(
+            PositionedAsync(reader.ReadWithPositionsAsync(null, null, filter.SkipRows, cancellationToken), cancellationToken),
+            reservation, cancellationToken).ConfigureAwait(false))
         {
-            var rawBatch = positioned.Batch;
-            long thisBatchStart = positioned.FirstRow;
 
             // Hidden row-tracking columns off first — a data file carries them for every row a rewrite moved,
             // and they are indexed by RAW position, so they must be captured before the DV filter renumbers.
