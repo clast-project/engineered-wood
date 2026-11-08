@@ -388,15 +388,32 @@ internal static class PageIndexPruner
                 return interval.Pages[leaf];
             }
 
+            // The last leaf page decoded, and its converted bounds: a page usually spans several intervals. The
+            // residual is still checked per interval, in Page.
+            private int _decodedPage = -1;
+            private LiteralValue? _min;
+            private LiteralValue? _max;
+
             public LiteralValue? GetMinValue(Interval interval, string column) =>
-                Page(interval) is var page and >= 0 && !Index.NullPages[page]
-                    ? path.LowerBound(Index.MinValues[page], Index.MaxValues[page])
-                    : null;
+                Decode(Page(interval)) ? _min : null;
 
             public LiteralValue? GetMaxValue(Interval interval, string column) =>
-                Page(interval) is var page and >= 0 && !Index.NullPages[page]
-                    ? path.UpperBound(Index.MaxValues[page])
-                    : null;
+                Decode(Page(interval)) ? _max : null;
+
+            private bool Decode(int page)
+            {
+                if (page < 0)
+                    return false;
+                if (_decodedPage != page)
+                {
+                    // A null page's bounds are placeholders; its null count is what prunes it.
+                    bool nullPage = Index.NullPages[page];
+                    _min = nullPage ? null : path.LowerBound(Index.MinValues[page], Index.MaxValues[page]);
+                    _max = nullPage ? null : path.UpperBound(Index.MaxValues[page]);
+                    _decodedPage = page;
+                }
+                return true;
+            }
 
             // As for a row group (ParquetStatisticsAccessor.ForVariantGet), but only a count that holds for any part
             // of the page: all of it null, or none of it.
@@ -418,9 +435,10 @@ internal static class PageIndexPruner
                 int page = Page(interval);
                 if (page < 0)
                     return null;
-                if (Index.NullPages[page])
+                if (Index.NullPages[page] || Index.NullCounts?[page] == owner.PageRows(leaf, page))
                     return 0;
-                return Index.NanCounts is { } counts && counts[page] == 0 ? 0 : null;
+                // As for a row group: the leaf's count holds for the result only under a NaN-preserving conversion.
+                return path.PreservesNaN && Index.NanCounts is { } counts && counts[page] == 0 ? 0 : null;
             }
 
             public long? GetValueCount(Interval interval, string column) => interval.End - interval.Start;

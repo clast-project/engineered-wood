@@ -156,11 +156,14 @@ public class VariantPathPruningTests : IDisposable
         return result;
     }
 
-    private static async Task<bool[]> CandidatesAsync(string path, string sql)
+    private static Task<bool[]> CandidatesAsync(string path, string sql) =>
+        CandidatesAsync(path, SparkSqlParser.ParsePredicate(sql));
+
+    private static async Task<bool[]> CandidatesAsync(string path, Predicate predicate)
     {
+        string sql = predicate.ToString();
         using var reader = Open(path, out var file);
         await using var _ = file;
-        var predicate = SparkSqlParser.ParsePredicate(sql);
         var candidates = await reader.GetCandidateRowGroupsAsync(predicate);
         var meta = await reader.ReadMetadataAsync();
 
@@ -269,6 +272,58 @@ public class VariantPathPruningTests : IDisposable
 
         Assert.Equal(new[] { false, true }, await CandidatesAsync(path, "variant_get(v, '$.d', 'double') > 1.0E2"));
         Assert.Equal(new[] { false, false }, await CandidatesAsync(path, "variant_get(v, '$.d', 'double') < -1.0E0"));
+    }
+
+    /// <summary>
+    /// <c>isnan</c> is answered from the NaN count alone, with no bounds to check the conversion. A double
+    /// path read as <c>int</c> holds 2^40, which raises <c>INVALID_VARIANT_CAST</c>: its zero NaN count must
+    /// not prune the group. Read as <c>double</c>, the count is the result's and prunes it.
+    /// </summary>
+    [Fact]
+    public async Task IsNaN_UsesTheNaNCountOnlyForANaNPreservingConversion()
+    {
+        string path = await WriteAsync(
+            pageRows: null,
+            Batch(Range(0, 9).Append(Row(9, d: Math.Pow(2, 40)))),
+            Batch(Enumerable.Range(0, 10).Select(_ => (VariantValue?)null)));
+
+        static Predicate IsNaN(string type) => new UnaryPredicate(
+            SparkSqlParser.ParseExpression($"variant_get(v, '$.d', '{type}')"), UnaryOperator.IsNaN);
+
+        // The all-NULL group holds no NaN under any conversion.
+        Assert.Equal(new[] { true, false }, await CandidatesAsync(path, IsNaN("int")));
+        Assert.Equal(new[] { true, false }, await CandidatesAsync(path, IsNaN("float")));
+        Assert.Equal(new[] { false, false }, await CandidatesAsync(path, IsNaN("double")));
+    }
+
+    /// <summary>
+    /// A reference resolves by its name parts, not its dotted text: <c>s.v</c> is field <c>v</c> of a struct
+    /// <c>s</c>, which this file does not have, while <c>`s.v`</c> is its top-level column of that name. Both
+    /// spell <c>s.v</c>; reading the first as the second would prune by another column's bounds.
+    /// </summary>
+    [Fact]
+    public async Task Reference_ResolvesByNameParts_NotTheDottedName()
+    {
+        string path = Path.Combine(_tempDir, "dotted.parquet");
+        var options = ParquetWriteOptions.Default with
+        {
+            VariantShredSchemas = new Dictionary<string, ShredSchema> { ["s.v"] = Shape },
+        };
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false, options))
+        {
+            foreach (var batch in new[] { Batch(Range(0, 100)), Batch(Range(100, 200)) })
+            {
+                var renamed = new RecordBatch(
+                    new Apache.Arrow.Schema(new[] { new Field("s.v", batch.Schema.GetFieldByIndex(0).DataType, true) }, null),
+                    new[] { batch.Column(0) }, batch.Length);
+                await writer.WriteRowGroupAsync(renamed);
+            }
+            await writer.CloseAsync();
+        }
+
+        Assert.Equal(new[] { true, false }, await CandidatesAsync(path, "variant_get(`s.v`, '$.a', 'bigint') < 50"));
+        Assert.Equal(new[] { true, true }, await CandidatesAsync(path, "variant_get(s.v, '$.a', 'bigint') < 50"));
     }
 
     [Fact]

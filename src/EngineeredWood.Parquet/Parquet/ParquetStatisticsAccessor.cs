@@ -87,7 +87,8 @@ public sealed class ParquetStatisticsAccessor
     /// The result's null count is the leaf's: a row whose leaf is null has nothing at the path (the residual is
     /// null too), and one whose leaf holds a value has a result, provided both bounds convert, which means every
     /// value between them does. Otherwise only a leaf null in every row says something: the result is NULL there.
-    /// Its NaN count is the leaf's, so a float path prunes both ways when the footer records one.
+    /// Its NaN count is the leaf's when the conversion keeps a NaN a NaN, so a float path prunes both ways when the
+    /// footer records one.
     /// </remarks>
     private sealed class VariantPathAccessor(ShreddedVariantPath path)
         : IStatisticsAccessor<RowGroup>, INanCountAccessor<RowGroup>
@@ -122,7 +123,12 @@ public sealed class ParquetStatisticsAccessor
             return GetMinValue(rg, column) is not null && GetMaxValue(rg, column) is not null ? nulls : null;
         }
 
-        public long? GetNanCount(RowGroup rg, string column) => Stats(rg)?.NanCount;
+        // The leaf's count only for a NaN-preserving conversion (ShreddedVariantPath.PreservesNaN); otherwise only
+        // a result NULL in every row is known to hold no NaN.
+        public long? GetNanCount(RowGroup rg, string column) =>
+            Stats(rg) is not { } stats ? null
+            : path.PreservesNaN ? stats.NanCount
+            : stats.NullCount == rg.NumRows ? 0 : null;
 
         public long? GetValueCount(RowGroup rg, string column) => rg.NumRows;
 

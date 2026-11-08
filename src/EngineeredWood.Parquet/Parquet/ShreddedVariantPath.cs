@@ -51,12 +51,22 @@ internal sealed class ShreddedVariantPath
 
     public string TargetType { get; }
 
+    /// <summary>
+    /// Whether every leaf value converts to the target type, a NaN to a NaN: a FLOAT to <c>float</c> or
+    /// <c>double</c>, a DOUBLE to <c>double</c>. Only then is the leaf's NaN count the result's. Otherwise a unit
+    /// the count rules out could hold a value whose conversion fails, and <c>isnan</c> answers on the count alone,
+    /// without the bounds that would have caught it.
+    /// </summary>
+    public bool PreservesNaN =>
+        (Kind == VariantBoundKind.Float && TargetType is "float" or "double")
+        || (Kind == VariantBoundKind.Double && TargetType == "double");
+
     /// <summary>The shredded path <paramref name="call"/> reads, or null when it reads none this can bound.</summary>
     public static ShreddedVariantPath? Resolve(SchemaDescriptor schema, VariantGetCall call)
     {
         if (!call.Path.IsFieldsOnly || call.TargetType is VariantGetCall.VariantTypeName or "binary")
             return null;
-        if (FindVariantGroup(schema.Root, call.Column.Name) is not { } group)
+        if (FindVariantGroup(schema.Root, call.Column.NameParts) is not { } group)
             return null;
 
         var node = group;
@@ -93,25 +103,23 @@ internal sealed class ShreddedVariantPath
     }
 
     /// <summary>
-    /// The variant group a predicate names: a top-level field by its name, else a nested one by its dotted
-    /// path. A group counts as a variant when it is annotated VARIANT, or has the spec's shape without the
-    /// annotation (a binary <c>metadata</c> leaf beside a binary <c>value</c> leaf), as older Spark writes it.
+    /// The variant group a reference names, by its <see cref="UnboundReference.NameParts"/>: a top-level field,
+    /// then a field of each struct below it. Not by its dotted <see cref="UnboundReference.Name"/>, which cannot
+    /// tell field <c>v</c> of struct <c>s</c> from a top-level column named <c>s.v</c>. A group counts as a variant
+    /// when it is annotated VARIANT, or has the spec's shape without the annotation (a binary <c>metadata</c> leaf
+    /// beside a binary <c>value</c> leaf), as older Spark writes it.
     /// </summary>
-    private static SchemaNode? FindVariantGroup(SchemaNode root, string name)
+    private static SchemaNode? FindVariantGroup(SchemaNode root, IReadOnlyList<string> parts)
     {
-        var node = Child(root, name);
-        if (node is null && name.IndexOf('.') >= 0)
+        SchemaNode? node = root;
+        foreach (string part in parts)
         {
-            node = root;
-            foreach (string part in name.Split('.'))
+            if (node is null || node.IsLeaf || (!ReferenceEquals(node, root)
+                    && node.Element.RepetitionType == FieldRepetitionType.Repeated))
             {
-                if (Child(node, part) is not { IsLeaf: false } next
-                    || next.Element.RepetitionType == FieldRepetitionType.Repeated)
-                {
-                    return null;
-                }
-                node = next;
+                return null;
             }
+            node = Child(node, part);
         }
 
         if (node is null || node.IsLeaf || node.Element.RepetitionType == FieldRepetitionType.Repeated)
