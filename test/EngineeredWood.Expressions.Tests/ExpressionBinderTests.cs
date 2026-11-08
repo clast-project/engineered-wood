@@ -233,6 +233,36 @@ public class ExpressionBinderTests
         Assert.Equal(42, bound.FieldId);
     }
 
+    /// <summary>
+    /// The resolver maps a top-level column's name, so only a one-part reference is offered to it (#771). A
+    /// struct field's path (<c>s.x</c> in SQL) spells the same dotted text as a top-level column named
+    /// <c>s.x</c>, and binding it to that column let Iceberg prune files by the other column's statistics.
+    /// </summary>
+    [Fact]
+    public void Bind_AStructFieldPath_IsNotBoundToATopLevelColumnOfItsDottedName()
+    {
+        var schema = new Dictionary<string, int> { { "s.x", 9 } };
+        var nested = UnboundReference.FromParts(["s", "x"]);
+
+        var bound = Assert.IsType<BoundReference>(new ExpressionBinder(schema).Bind(Expressions.Ref("s.x")));
+        Assert.Equal(9, bound.FieldId);
+
+        Assert.Same(nested, new ExpressionBinder(schema, allowUnresolved: true).Bind(nested));
+        var ex = Assert.Throws<UnboundReferenceException>(() => new ExpressionBinder(schema).Bind(nested));
+        Assert.Equal("s.x", ex.Name);
+    }
+
+    [Fact]
+    public void Bind_AStructFieldPath_IsNeverOfferedToTheResolver()
+    {
+        var asked = new List<string>();
+        var binder = new ExpressionBinder(name => { asked.Add(name); return 1; }, allowUnresolved: true);
+
+        binder.Bind(UnboundReference.FromParts(["s", "x"]));
+
+        Assert.Empty(asked);
+    }
+
     [Fact]
     public void Bind_NullResolver_Throws()
     {

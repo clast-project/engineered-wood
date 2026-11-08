@@ -237,8 +237,8 @@ public sealed class ExtendedTimestampWriteTests : IDisposable
         var metadata = await reader.ReadMetadataAsync();
         var accessor = new ParquetStatisticsAccessor(await reader.GetSchemaAsync());
 
-        var min = accessor.GetMinValue(metadata.RowGroups[0], "t")!.Value.AsDateTimeOffset;
-        var max = accessor.GetMaxValue(metadata.RowGroups[0], "t")!.Value.AsDateTimeOffset;
+        var min = accessor.GetMinValue(metadata.RowGroups[0], ["t"])!.Value.AsDateTimeOffset;
+        var max = accessor.GetMaxValue(metadata.RowGroups[0], ["t"])!.Value.AsDateTimeOffset;
 
         Assert.Equal(DateTimeOffset.FromUnixTimeMilliseconds(-1_000), min);
         Assert.Equal(DateTimeOffset.FromUnixTimeMilliseconds(1_000), max);

@@ -38,9 +38,8 @@ internal static class IndexCatalog
     public static async ValueTask<IReadOnlyList<IndexInfo>> DiscoverAsync(
         ITableFileSystem fs, Proto.Manifest manifest, CancellationToken cancellationToken = default)
     {
-        // Build a field-id → name lookup from the manifest's flat schema.
-        var fieldNames = new Dictionary<int, string>();
-        BuildFieldNameMap(manifest.Fields, fieldNames);
+        // Build a field-id → path lookup from the manifest's flat schema.
+        var fieldPaths = BuildFieldPathMap(manifest.Fields);
 
         // Walk every .txn file in _transactions/ ordered by read_version.
         // Each Lance commit produces a file named "{read_version}-{uuid}.txn".
@@ -87,9 +86,10 @@ internal static class IndexCatalog
         var infos = new List<IndexInfo>(live.Count);
         foreach (var (uuid, (meta, datasetVersion)) in live)
         {
-            var columnNames = new List<string>(meta.Fields.Count);
+            var columnPaths = new List<IReadOnlyList<string>>(meta.Fields.Count);
             foreach (int fieldId in meta.Fields)
-                columnNames.Add(fieldNames.TryGetValue(fieldId, out var name) ? name : $"<field#{fieldId}>");
+                columnPaths.Add(fieldPaths.TryGetValue(fieldId, out var path) ? path : [$"<field#{fieldId}>"]);
+            var columnNames = columnPaths.Select(path => string.Join(".", path)).ToList();
 
             var fragmentIds = DecodeFragmentBitmap(meta.FragmentBitmap);
 
@@ -99,6 +99,7 @@ internal static class IndexCatalog
                 Uuid = uuid,
                 TypeUrl = meta.IndexDetails?.TypeUrl ?? string.Empty,
                 ColumnNames = columnNames,
+                ColumnPaths = columnPaths,
                 FragmentIds = fragmentIds,
                 DirectoryPath = $"_indices/{uuid:D}",
                 BuiltFromVersion = datasetVersion,
@@ -108,15 +109,52 @@ internal static class IndexCatalog
         return infos;
     }
 
-    private static void BuildFieldNameMap(
-        Google.Protobuf.Collections.RepeatedField<Field> fields, Dictionary<int, string> dest)
+    /// <summary>
+    /// Each field's path in the manifest's flat schema: its name, after its parent's path. A field's own name is
+    /// not enough to find it by: an index on field <c>x</c> of struct <c>s</c> answered for a top-level column
+    /// <c>x</c> (#771). A field whose parent chain does not reach the root (a cycle, or a field id two fields
+    /// share) has no path.
+    /// </summary>
+    private static Dictionary<int, IReadOnlyList<string>> BuildFieldPathMap(
+        Google.Protobuf.Collections.RepeatedField<Field> fields)
     {
+        var byId = new Dictionary<int, Field>();
+        var shared = new HashSet<int>();
         foreach (var field in fields)
         {
-            // Field.id may be -1 for proto-default; only index fields with a
-            // real id assignment.
-            dest[field.Id] = field.Name;
+            if (byId.ContainsKey(field.Id))
+                shared.Add(field.Id);
+            else
+                byId[field.Id] = field;
         }
+
+        var paths = new Dictionary<int, IReadOnlyList<string>>();
+        foreach (var field in fields)
+        {
+            if (shared.Contains(field.Id) || paths.ContainsKey(field.Id))
+                continue;
+            var parts = new List<string>();
+            var current = field;
+            bool rooted = false;
+            for (int depth = 0; depth <= fields.Count; depth++)
+            {
+                parts.Add(current.Name);
+                // A parent id outside the schema (-1 by convention) is the root, as LanceSchemaConverter reads it.
+                if (!byId.TryGetValue(current.ParentId, out var parent))
+                {
+                    rooted = true;
+                    break;
+                }
+                if (shared.Contains(parent.Id))
+                    break;
+                current = parent;
+            }
+            if (!rooted)
+                continue;
+            parts.Reverse();
+            paths[field.Id] = parts;
+        }
+        return paths;
     }
 
     private static bool TryGetUuid(IndexMetadata idx, out Guid uuid)

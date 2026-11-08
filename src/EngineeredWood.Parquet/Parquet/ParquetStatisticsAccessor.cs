@@ -32,42 +32,42 @@ public sealed class ParquetStatisticsAccessor
     : IStatisticsAccessor<RowGroup>, INanCountAccessor<RowGroup>, IVariantStatisticsAccessor<RowGroup>
 {
     private readonly SchemaDescriptor _schema;
-    private readonly Dictionary<string, int> _nameToLeafIndex;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<IReadOnlyList<string>, int> _leafIndex =
+        new(ColumnPathComparer.Ordinal);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<VariantGetCall, IStatisticsAccessor<RowGroup>?>
         _variantPaths = new();
 
     public ParquetStatisticsAccessor(SchemaDescriptor schema)
     {
         _schema = schema ?? throw new ArgumentNullException(nameof(schema));
-        _nameToLeafIndex = BuildNameIndex(schema);
     }
 
-    public LiteralValue? GetMinValue(RowGroup rg, string column)
+    public LiteralValue? GetMinValue(RowGroup rg, IReadOnlyList<string> column)
     {
         if (!TryGetColumn(rg, column, out var desc, out var stats))
             return null;
         return DecodeMin(desc!, stats!);
     }
 
-    public LiteralValue? GetMaxValue(RowGroup rg, string column)
+    public LiteralValue? GetMaxValue(RowGroup rg, IReadOnlyList<string> column)
     {
         if (!TryGetColumn(rg, column, out var desc, out var stats))
             return null;
         return DecodeMax(desc!, stats!);
     }
 
-    public long? GetNullCount(RowGroup rg, string column) =>
+    public long? GetNullCount(RowGroup rg, IReadOnlyList<string> column) =>
         TryGetColumn(rg, column, out _, out var stats) ? stats!.NullCount : null;
 
-    public long? GetNanCount(RowGroup rg, string column) =>
+    public long? GetNanCount(RowGroup rg, IReadOnlyList<string> column) =>
         TryGetColumn(rg, column, out _, out var stats) ? stats!.NanCount : null;
 
-    public long? GetValueCount(RowGroup rg, string column) => rg.NumRows;
+    public long? GetValueCount(RowGroup rg, IReadOnlyList<string> column) => rg.NumRows;
 
-    public bool IsMinExact(RowGroup rg, string column) =>
+    public bool IsMinExact(RowGroup rg, IReadOnlyList<string> column) =>
         !TryGetColumn(rg, column, out _, out var stats) || stats!.IsMinValueExact != false;
 
-    public bool IsMaxExact(RowGroup rg, string column) =>
+    public bool IsMaxExact(RowGroup rg, IReadOnlyList<string> column) =>
         !TryGetColumn(rg, column, out _, out var stats) || stats!.IsMaxValueExact != false;
 
     /// <summary>
@@ -75,9 +75,11 @@ public sealed class ParquetStatisticsAccessor
     /// that holds the path (see <see cref="ShreddedVariantPath"/>), or null when the file shreds no such path.
     /// </summary>
     public IStatisticsAccessor<RowGroup>? ForVariantGet(VariantGetCall call) =>
-        _variantPaths.GetOrAdd(call, c => ShreddedVariantPath.Resolve(_schema, c) is { } path
-            ? new VariantPathAccessor(path)
-            : null);
+        _variantPaths.TryGetValue(call, out var cached)
+            ? cached
+            : _variantPaths.GetOrAdd(call, ShreddedVariantPath.Resolve(_schema, call) is { } path
+                ? new VariantPathAccessor(path)
+                : null);
 
     /// <summary>
     /// A variant path's statistics in a row group: the leaf's, in a row group where its residual is null in every
@@ -105,16 +107,16 @@ public sealed class ParquetStatisticsAccessor
             return rg.Columns[path.Leaf].MetaData?.Statistics;
         }
 
-        public LiteralValue? GetMinValue(RowGroup rg, string column) =>
+        public LiteralValue? GetMinValue(RowGroup rg, IReadOnlyList<string> column) =>
             Stats(rg) is { } stats
                 ? path.LowerBound(stats.MinValue ?? FallbackBytes(path.Column, stats.Min),
                     stats.MaxValue ?? FallbackBytes(path.Column, stats.Max))
                 : null;
 
-        public LiteralValue? GetMaxValue(RowGroup rg, string column) =>
+        public LiteralValue? GetMaxValue(RowGroup rg, IReadOnlyList<string> column) =>
             Stats(rg) is { } stats ? path.UpperBound(stats.MaxValue ?? FallbackBytes(path.Column, stats.Max)) : null;
 
-        public long? GetNullCount(RowGroup rg, string column)
+        public long? GetNullCount(RowGroup rg, IReadOnlyList<string> column)
         {
             if (Stats(rg) is not { NullCount: long nulls })
                 return null;
@@ -125,27 +127,30 @@ public sealed class ParquetStatisticsAccessor
 
         // The leaf's count only for a NaN-preserving conversion (ShreddedVariantPath.PreservesNaN); otherwise only
         // a result NULL in every row is known to hold no NaN.
-        public long? GetNanCount(RowGroup rg, string column) =>
+        public long? GetNanCount(RowGroup rg, IReadOnlyList<string> column) =>
             Stats(rg) is not { } stats ? null
             : path.PreservesNaN ? stats.NanCount
             : stats.NullCount == rg.NumRows ? 0 : null;
 
-        public long? GetValueCount(RowGroup rg, string column) => rg.NumRows;
+        public long? GetValueCount(RowGroup rg, IReadOnlyList<string> column) => rg.NumRows;
 
-        public bool IsMinExact(RowGroup rg, string column) => Stats(rg)?.IsMinValueExact != false;
+        public bool IsMinExact(RowGroup rg, IReadOnlyList<string> column) => Stats(rg)?.IsMinValueExact != false;
 
-        public bool IsMaxExact(RowGroup rg, string column) => Stats(rg)?.IsMaxValueExact != false;
+        public bool IsMaxExact(RowGroup rg, IReadOnlyList<string> column) => Stats(rg)?.IsMaxValueExact != false;
     }
 
     // ── Lookup ──
 
     private bool TryGetColumn(
-        RowGroup rg, string column,
+        RowGroup rg, IReadOnlyList<string> column,
         out ColumnDescriptor? descriptor, out Statistics? stats)
     {
         descriptor = null;
         stats = null;
-        if (!_nameToLeafIndex.TryGetValue(column, out int idx))
+        // The lookup is per row group and statistic, so a hit must not build the factory delegate.
+        if (!_leafIndex.TryGetValue(column, out int idx))
+            idx = _leafIndex.GetOrAdd(column, _schema.FindLeaf(column));
+        if (idx < 0)
             return false;
         if (idx >= rg.Columns.Count)
             return false;
@@ -157,29 +162,6 @@ public sealed class ParquetStatisticsAccessor
         descriptor = _schema.Columns[idx];
         stats = meta.Statistics;
         return true;
-    }
-
-    /// <summary>
-    /// Maps a predicate's column names to leaf indexes, as <see cref="SchemaDescriptor.FindLeaf"/> resolves
-    /// them: a top-level leaf by its name, and a nested leaf by its dotted path unless a top-level leaf or an
-    /// earlier nested leaf already holds that text. The page-index pruner resolves names with this, so that
-    /// both agree.
-    /// </summary>
-    internal static Dictionary<string, int> BuildNameIndex(SchemaDescriptor schema)
-    {
-        var map = new Dictionary<string, int>(StringComparer.Ordinal);
-        for (int i = 0; i < schema.Columns.Count; i++)
-        {
-            if (schema.Columns[i].Path.Count == 1)
-                map[schema.Columns[i].Path[0]] = i;
-        }
-        for (int i = 0; i < schema.Columns.Count; i++)
-        {
-            var col = schema.Columns[i];
-            if (col.Path.Count > 1 && !map.ContainsKey(col.DottedPath))
-                map[col.DottedPath] = i;
-        }
-        return map;
     }
 
     // ── Decoding ──

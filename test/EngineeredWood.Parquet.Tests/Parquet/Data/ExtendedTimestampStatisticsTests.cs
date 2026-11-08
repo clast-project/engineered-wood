@@ -138,8 +138,8 @@ public class ExtendedTimestampStatisticsTests
         var metadata = await reader.ReadMetadataAsync();
         var accessor = new ParquetStatisticsAccessor(await reader.GetSchemaAsync());
 
-        var min = accessor.GetMinValue(metadata.RowGroups[0], column);
-        var max = accessor.GetMaxValue(metadata.RowGroups[0], column);
+        var min = accessor.GetMinValue(metadata.RowGroups[0], [column]);
+        var max = accessor.GetMaxValue(metadata.RowGroups[0], [column]);
 
         // The fixture's own documented min and max: year 0001 and year 9999. Both are far outside int64
         // nanoseconds, so a reader that could only narrow to int64 would have no bounds to offer at all.
@@ -163,8 +163,8 @@ public class ExtendedTimestampStatisticsTests
         var metadata = await reader.ReadMetadataAsync();
         var accessor = new ParquetStatisticsAccessor(await reader.GetSchemaAsync());
 
-        var min = accessor.GetMinValue(metadata.RowGroups[0], column)!.Value.AsDateTimeOffset;
-        var max = accessor.GetMaxValue(metadata.RowGroups[0], column)!.Value.AsDateTimeOffset;
+        var min = accessor.GetMinValue(metadata.RowGroups[0], [column])!.Value.AsDateTimeOffset;
+        var max = accessor.GetMaxValue(metadata.RowGroups[0], [column])!.Value.AsDateTimeOffset;
 
         // Read the column itself and check the footer is not lying about it — the property that makes a
         // bound safe to prune on.

@@ -256,7 +256,7 @@ public class RowGroupPushdownTests : IDisposable
     };
 
     [Fact]
-    public async Task NameMap_KeepsOnlyUnambiguousUnchangedStructLeaves()
+    public async Task NameMap_KeepsUnchangedStructLeaves_ByPath()
     {
         var file = await FileSchema(new Apache.Arrow.Schema.Builder()
             .Field(new Field("plain", Int64Type.Default, true))
@@ -296,18 +296,23 @@ public class RowGroupPushdownTests : IDisposable
 
         var map = RowGroupPushdown.LogicalToFileLeaf(table, ColumnMappingMode.None, file);
 
-        // widened: the file's bounds are of the old type. a.b: two table columns claim the path. l: a list
-        // element's bounds do not bound the row. added_later: not in this file.
+        // widened: the file's bounds are of the old type. l: a list element's bounds do not bound the row.
+        // added_later: not in this file. The top-level "a.b" and struct a's leaf b are two paths (#771), shown
+        // here with their parts joined by '/'.
         Assert.Equal(
-            new Dictionary<string, string> { ["plain"] = "plain", ["s.x"] = "s.x" },
-            map);
+            new Dictionary<string, string> { ["plain"] = "plain", ["s/x"] = "s/x", ["a.b"] = "a.b", ["a/b"] = "a/b" },
+            Joined(map));
     }
 
+    private static Dictionary<string, string> Joined(Dictionary<IReadOnlyList<string>, string[]> map) =>
+        map.ToDictionary(e => string.Join("/", e.Key), e => string.Join("/", e.Value));
+
     [Fact]
-    public async Task NameMap_AmbiguousLogicalPath_IsUnresolved_EvenWhenTheFileHoldsOnlyOneOfThem()
+    public async Task NameMap_ADottedNameAndAStructLeaf_AreTwoPaths_EvenWhenTheFileHoldsOnlyOneOfThem()
     {
-        // The file predates the literal "a.b" column, so its leaf path "a.b" is unique; the predicate's
-        // "a.b" still names two table columns, and pruning must not pick one.
+        // The file predates the literal "a.b" column. A reference to struct a's leaf b (parts a, b) still
+        // resolves to the file's leaf, and one to the literal column (one part, "a.b") resolves to nothing: the
+        // dotted text both spell is not what either is matched by (#771).
         var file = await FileSchema(new Apache.Arrow.Schema.Builder()
             .Field(new Field("a", new ArrowStructType([new Field("b", Int64Type.Default, true)]), true))
             .Build());
@@ -323,7 +328,9 @@ public class RowGroupPushdownTests : IDisposable
             ],
         };
 
-        Assert.Empty(RowGroupPushdown.LogicalToFileLeaf(table, ColumnMappingMode.None, file));
+        Assert.Equal(
+            new Dictionary<string, string> { ["a/b"] = "a/b" },
+            Joined(RowGroupPushdown.LogicalToFileLeaf(table, ColumnMappingMode.None, file)));
     }
 
     [Fact]
@@ -336,11 +343,35 @@ public class RowGroupPushdownTests : IDisposable
                 new FunctionCall("lower", [new BoundReference(7, "d")]), ComparisonOperator.Equal,
                 new UnboundReference("e")));
 
-        var rewritten = RowGroupPushdown.Rewrite(predicate, name => "p_" + name);
+        var rewritten = RowGroupPushdown.Rewrite(
+            predicate, path => new UnboundReference("p_" + string.Join(".", path)));
 
         Assert.Equal(
             "(NOT p_a = 1 AND (p_b IS NULL OR p_c IN (1)) AND lower(p_d#7) = p_e)",
             rewritten.ToString());
+    }
+
+    /// <summary>
+    /// A bound reference stays bound only when it maps to one top-level file column. One the file cannot resolve
+    /// becomes the unresolved reference itself, never a bound reference carrying the column's field id under the
+    /// sentinel name; one that maps to a struct field becomes that field's path, which a bound reference cannot
+    /// hold.
+    /// </summary>
+    [Fact]
+    public void Rewrite_ABoundReference_StaysBoundOnlyWhenItMapsToATopLevelColumn()
+    {
+        var bound = new BoundReference(7, "d");
+        Expression RewriteTo(UnboundReference target) =>
+            Assert.IsType<ComparisonPredicate>(
+                RowGroupPushdown.Rewrite(Ex.Equal(bound, new LiteralExpression(LiteralValue.Of(1L))), _ => target)).Left;
+
+        Assert.Equal(new BoundReference(7, "col-d"), RewriteTo(new UnboundReference("col-d")));
+
+        var unresolved = Assert.IsType<UnboundReference>(RewriteTo(new UnboundReference(RowGroupPushdown.Unresolved)));
+        Assert.Equal(RowGroupPushdown.Unresolved, unresolved.Name);
+
+        var nested = Assert.IsType<UnboundReference>(RewriteTo(UnboundReference.FromParts(["s", "d"])));
+        Assert.Equal(["s", "d"], nested.NameParts);
     }
 
     [Fact]

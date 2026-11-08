@@ -137,6 +137,46 @@ public sealed class SchemaDescriptor
     }
 
     /// <summary>
+    /// The index in <see cref="Columns"/> of the leaf a predicate's column path names, or -1, resolved as the row
+    /// evaluator resolves a reference (#771): the top-level field <paramref name="path"/>'s first part names, then a
+    /// field of each struct below it, every part matched exactly. A one-part path is never a nested leaf whose
+    /// dotted path spells the same text, and a longer one never a top-level leaf named with dots. The path must
+    /// end at a leaf and pass only through groups that are not repeated (a list or map's elements are not a
+    /// struct's fields), and a part two siblings share resolves to nothing.
+    /// </summary>
+    internal int FindLeaf(IReadOnlyList<string> path)
+    {
+        if (path.Count == 0)
+            return -1;
+        SchemaNode node = Root;
+        foreach (string part in path)
+        {
+            if (node.IsLeaf)
+                return -1;
+            SchemaNode? match = null;
+            foreach (var child in node.Children)
+            {
+                if (!string.Equals(child.Name, part, StringComparison.Ordinal))
+                    continue;
+                if (match is not null)
+                    return -1;
+                match = child;
+            }
+            if (match is null || match.Element.RepetitionType == FieldRepetitionType.Repeated)
+                return -1;
+            node = match;
+        }
+        if (!node.IsLeaf)
+            return -1;
+        for (int i = 0; i < Columns.Count; i++)
+        {
+            if (ReferenceEquals(Columns[i].SchemaNode, node))
+                return i;
+        }
+        return -1;
+    }
+
+    /// <summary>
     /// Resolves Parquet field_ids to top-level column names.
     /// For leaf columns, returns the dotted path. For group columns
     /// (struct, list, map), returns the top-level group name.

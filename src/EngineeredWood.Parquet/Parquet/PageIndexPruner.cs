@@ -34,15 +34,14 @@ internal static class PageIndexPruner
     internal static List<int> PrunableColumns(
         Predicate filter, RowGroup rowGroup, SchemaDescriptor schema, ColumnChunkFilePathKind filePath)
     {
-        var names = ParquetStatisticsAccessor.BuildNameIndex(schema);
-        var referenced = new HashSet<string>(StringComparer.Ordinal);
+        var referenced = new HashSet<IReadOnlyList<string>>(ColumnPathComparer.Ordinal);
         var variantCalls = new HashSet<VariantGetCall>();
         CollectColumns(filter, referenced, variantCalls);
 
         var leaves = new SortedSet<int>();
-        foreach (string name in referenced)
+        foreach (var name in referenced)
         {
-            if (names.TryGetValue(name, out int leaf) && Indexed(leaf))
+            if (schema.FindLeaf(name) is int leaf and >= 0 && Indexed(leaf))
                 leaves.Add(leaf);
         }
 
@@ -208,7 +207,7 @@ internal static class PageIndexPruner
         return true;
     }
 
-    private static void CollectColumns(Predicate predicate, HashSet<string> sink, HashSet<VariantGetCall> calls)
+    private static void CollectColumns(Predicate predicate, HashSet<IReadOnlyList<string>> sink, HashSet<VariantGetCall> calls)
     {
         switch (predicate)
         {
@@ -235,12 +234,12 @@ internal static class PageIndexPruner
         }
     }
 
-    private static void CollectColumns(Expression expression, HashSet<string> sink, HashSet<VariantGetCall> calls)
+    private static void CollectColumns(Expression expression, HashSet<IReadOnlyList<string>> sink, HashSet<VariantGetCall> calls)
     {
         switch (expression)
         {
-            case UnboundReference reference: sink.Add(reference.Name); break;
-            case BoundReference reference: sink.Add(reference.Name); break;
+            case UnboundReference reference: sink.Add(reference.NameParts); break;
+            case BoundReference reference: sink.Add([reference.Name]); break;
             case FunctionCall call when VariantGetCall.TryMatch(call, out var variantGet):
                 calls.Add(variantGet);
                 break;
@@ -276,7 +275,7 @@ internal static class PageIndexPruner
         private readonly SchemaDescriptor _schema;
         private readonly RowGroup _rowGroup;
         private readonly List<IndexedColumn> _columns;
-        private readonly Dictionary<string, int> _slots = new(StringComparer.Ordinal);
+        private readonly Dictionary<IReadOnlyList<string>, int> _slots = new(ColumnPathComparer.Ordinal);
         private readonly Dictionary<int, int> _slotOfLeaf = new();
         private readonly Dictionary<VariantGetCall, IStatisticsAccessor<Interval>?> _variantPaths = new();
 
@@ -292,11 +291,6 @@ internal static class PageIndexPruner
             _columns = columns;
             for (int slot = 0; slot < columns.Count; slot++)
                 _slotOfLeaf[columns[slot].Leaf] = slot;
-            foreach (var entry in ParquetStatisticsAccessor.BuildNameIndex(schema))
-            {
-                if (_slotOfLeaf.TryGetValue(entry.Value, out int slot))
-                    _slots[entry.Key] = slot;
-            }
 
             _decodedPage = new int[columns.Count];
             _decodedPage.AsSpan().Fill(-1);
@@ -304,15 +298,15 @@ internal static class PageIndexPruner
             _max = new LiteralValue?[columns.Count];
         }
 
-        public LiteralValue? GetMinValue(Interval interval, string column) =>
+        public LiteralValue? GetMinValue(Interval interval, IReadOnlyList<string> column) =>
             Decode(interval, column, out int slot) ? _min[slot] : null;
 
-        public LiteralValue? GetMaxValue(Interval interval, string column) =>
+        public LiteralValue? GetMaxValue(Interval interval, IReadOnlyList<string> column) =>
             Decode(interval, column, out int slot) ? _max[slot] : null;
 
-        public long? GetNullCount(Interval interval, string column)
+        public long? GetNullCount(Interval interval, IReadOnlyList<string> column)
         {
-            if (!_slots.TryGetValue(column, out int slot))
+            if (!TrySlot(column, out int slot))
                 return null;
             int page = interval.Pages[slot];
             var index = _columns[slot].ColumnIndex;
@@ -321,9 +315,9 @@ internal static class PageIndexPruner
             return index.NullCounts is { } counts && counts[page] == 0 ? 0 : null;
         }
 
-        public long? GetNanCount(Interval interval, string column)
+        public long? GetNanCount(Interval interval, IReadOnlyList<string> column)
         {
-            if (!_slots.TryGetValue(column, out int slot))
+            if (!TrySlot(column, out int slot))
                 return null;
             int page = interval.Pages[slot];
             var index = _columns[slot].ColumnIndex;
@@ -332,11 +326,11 @@ internal static class PageIndexPruner
             return index.NanCounts is { } counts && counts[page] == 0 ? 0 : null;
         }
 
-        public long? GetValueCount(Interval interval, string column) => interval.End - interval.Start;
+        public long? GetValueCount(Interval interval, IReadOnlyList<string> column) => interval.End - interval.Start;
 
-        public bool IsMinExact(Interval interval, string column) => false;
+        public bool IsMinExact(Interval interval, IReadOnlyList<string> column) => false;
 
-        public bool IsMaxExact(Interval interval, string column) => false;
+        public bool IsMaxExact(Interval interval, IReadOnlyList<string> column) => false;
 
         /// <summary>
         /// A variant path's statistics in an interval, from its <c>typed_value</c> leaf's covering page, where the
@@ -394,10 +388,10 @@ internal static class PageIndexPruner
             private LiteralValue? _min;
             private LiteralValue? _max;
 
-            public LiteralValue? GetMinValue(Interval interval, string column) =>
+            public LiteralValue? GetMinValue(Interval interval, IReadOnlyList<string> column) =>
                 Decode(Page(interval)) ? _min : null;
 
-            public LiteralValue? GetMaxValue(Interval interval, string column) =>
+            public LiteralValue? GetMaxValue(Interval interval, IReadOnlyList<string> column) =>
                 Decode(Page(interval)) ? _max : null;
 
             private bool Decode(int page)
@@ -417,7 +411,7 @@ internal static class PageIndexPruner
 
             // As for a row group (ParquetStatisticsAccessor.ForVariantGet), but only a count that holds for any part
             // of the page: all of it null, or none of it.
-            public long? GetNullCount(Interval interval, string column)
+            public long? GetNullCount(Interval interval, IReadOnlyList<string> column)
             {
                 int page = Page(interval);
                 if (page < 0)
@@ -430,7 +424,7 @@ internal static class PageIndexPruner
                     : null;
             }
 
-            public long? GetNanCount(Interval interval, string column)
+            public long? GetNanCount(Interval interval, IReadOnlyList<string> column)
             {
                 int page = Page(interval);
                 if (page < 0)
@@ -441,17 +435,29 @@ internal static class PageIndexPruner
                 return path.PreservesNaN && Index.NanCounts is { } counts && counts[page] == 0 ? 0 : null;
             }
 
-            public long? GetValueCount(Interval interval, string column) => interval.End - interval.Start;
+            public long? GetValueCount(Interval interval, IReadOnlyList<string> column) => interval.End - interval.Start;
 
-            public bool IsMinExact(Interval interval, string column) => false;
+            public bool IsMinExact(Interval interval, IReadOnlyList<string> column) => false;
 
-            public bool IsMaxExact(Interval interval, string column) => false;
+            public bool IsMaxExact(Interval interval, IReadOnlyList<string> column) => false;
+        }
+
+        /// <summary>The slot of the indexed leaf a column path names (SchemaDescriptor.FindLeaf), or false.</summary>
+        private bool TrySlot(IReadOnlyList<string> column, out int slot)
+        {
+            if (!_slots.TryGetValue(column, out slot))
+            {
+                int leaf = _schema.FindLeaf(column);
+                slot = leaf >= 0 && _slotOfLeaf.TryGetValue(leaf, out int found) ? found : -1;
+                _slots[column] = slot;
+            }
+            return slot >= 0;
         }
 
         /// <summary>Decodes the covering page's bounds into the slot's cache; false for an unindexed column.</summary>
-        private bool Decode(Interval interval, string column, out int slot)
+        private bool Decode(Interval interval, IReadOnlyList<string> column, out int slot)
         {
-            if (!_slots.TryGetValue(column, out slot))
+            if (!TrySlot(column, out slot))
                 return false;
             int page = interval.Pages[slot];
             if (_decodedPage[slot] != page)

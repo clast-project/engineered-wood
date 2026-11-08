@@ -74,7 +74,7 @@ public sealed class FloatStatsNanPruningTests : IDisposable
         var rowGroup = metadata.RowGroups[0];
 
         return (StatisticsEvaluator.Evaluate(predicate, rowGroup, accessor),
-                accessor.GetNanCount(rowGroup, "g"));
+                accessor.GetNanCount(rowGroup, ["g"]));
     }
 
     /// <summary>

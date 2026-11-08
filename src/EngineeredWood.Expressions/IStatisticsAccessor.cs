@@ -17,23 +17,30 @@ namespace EngineeredWood.Expressions;
 /// available (column missing, statistic absent, or unable to decode). The
 /// evaluator treats <c>null</c> as "unknown" and produces
 /// <see cref="FilterResult.Unknown"/> for the affected predicate.
+/// <para>
+/// A column is named by its path, a reference's <see cref="UnboundReference.NameParts"/>: a top-level column,
+/// then a field of each struct below it. Resolve it exactly, as the row evaluator does. A one-part path is the
+/// top-level column of exactly that name, even when the name holds a dot, and never a nested field whose dotted
+/// path spells the same text; a longer path never resolves to a top-level column. Statistics read from another
+/// column than the one a row is evaluated against skip data that matches (#771).
+/// </para>
 /// </remarks>
 public interface IStatisticsAccessor<TStats>
 {
     /// <summary>Returns the minimum value for a column, or null if unknown.</summary>
-    LiteralValue? GetMinValue(TStats stats, string column);
+    LiteralValue? GetMinValue(TStats stats, IReadOnlyList<string> column);
 
     /// <summary>Returns the maximum value for a column, or null if unknown.</summary>
-    LiteralValue? GetMaxValue(TStats stats, string column);
+    LiteralValue? GetMaxValue(TStats stats, IReadOnlyList<string> column);
 
     /// <summary>Returns the count of null values, or null if unknown.</summary>
-    long? GetNullCount(TStats stats, string column);
+    long? GetNullCount(TStats stats, IReadOnlyList<string> column);
 
     /// <summary>
     /// Returns the total value count (including nulls), or null if unknown.
     /// Used to determine whether all values are null (<c>NullCount == ValueCount</c>).
     /// </summary>
-    long? GetValueCount(TStats stats, string column);
+    long? GetValueCount(TStats stats, IReadOnlyList<string> column);
 
     /// <summary>
     /// Returns true if the minimum value is exact (not truncated). When false,
@@ -41,11 +48,11 @@ public interface IStatisticsAccessor<TStats>
     /// still derive <see cref="FilterResult.AlwaysFalse"/> but is conservative
     /// about <see cref="FilterResult.AlwaysTrue"/> on equality predicates.
     /// </summary>
-    bool IsMinExact(TStats stats, string column);
+    bool IsMinExact(TStats stats, IReadOnlyList<string> column);
 
     /// <summary>
     /// Returns true if the maximum value is exact (not truncated). See
     /// <see cref="IsMinExact"/> for semantics.
     /// </summary>
-    bool IsMaxExact(TStats stats, string column);
+    bool IsMaxExact(TStats stats, IReadOnlyList<string> column);
 }

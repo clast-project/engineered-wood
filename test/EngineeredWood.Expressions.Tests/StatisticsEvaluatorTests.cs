@@ -35,20 +35,23 @@ public class StatisticsEvaluatorTests
     private sealed class TestAccessor
         : IStatisticsAccessor<TestStats>, INanCountAccessor<TestStats>
     {
-        public LiteralValue? GetMinValue(TestStats s, string c) =>
-            s.Columns.TryGetValue(c, out var v) ? v.Min : null;
-        public LiteralValue? GetMaxValue(TestStats s, string c) =>
-            s.Columns.TryGetValue(c, out var v) ? v.Max : null;
-        public long? GetNullCount(TestStats s, string c) =>
-            s.Columns.TryGetValue(c, out var v) ? v.NullCount : null;
-        public long? GetValueCount(TestStats s, string c) =>
-            s.Columns.TryGetValue(c, out var v) ? v.ValueCount : null;
-        public bool IsMinExact(TestStats s, string c) =>
-            !s.Columns.TryGetValue(c, out var v) || v.MinExact;
-        public bool IsMaxExact(TestStats s, string c) =>
-            !s.Columns.TryGetValue(c, out var v) || v.MaxExact;
-        public long? GetNanCount(TestStats s, string c) =>
-            s.Columns.TryGetValue(c, out var v) ? v.NanCount : null;
+        // Statistics are kept for top-level columns, by name: a longer path names none of them.
+        private static string Key(IReadOnlyList<string> c) => c.Count == 1 ? c[0] : "\0path";
+
+        public LiteralValue? GetMinValue(TestStats s, IReadOnlyList<string> c) =>
+            s.Columns.TryGetValue(Key(c), out var v) ? v.Min : null;
+        public LiteralValue? GetMaxValue(TestStats s, IReadOnlyList<string> c) =>
+            s.Columns.TryGetValue(Key(c), out var v) ? v.Max : null;
+        public long? GetNullCount(TestStats s, IReadOnlyList<string> c) =>
+            s.Columns.TryGetValue(Key(c), out var v) ? v.NullCount : null;
+        public long? GetValueCount(TestStats s, IReadOnlyList<string> c) =>
+            s.Columns.TryGetValue(Key(c), out var v) ? v.ValueCount : null;
+        public bool IsMinExact(TestStats s, IReadOnlyList<string> c) =>
+            !s.Columns.TryGetValue(Key(c), out var v) || v.MinExact;
+        public bool IsMaxExact(TestStats s, IReadOnlyList<string> c) =>
+            !s.Columns.TryGetValue(Key(c), out var v) || v.MaxExact;
+        public long? GetNanCount(TestStats s, IReadOnlyList<string> c) =>
+            s.Columns.TryGetValue(Key(c), out var v) ? v.NanCount : null;
     }
 
     private static readonly TestAccessor Accessor = new();

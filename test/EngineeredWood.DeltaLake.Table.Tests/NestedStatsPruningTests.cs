@@ -20,6 +20,9 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// </summary>
 public class NestedStatsPruningTests : IDisposable
 {
+    /// <summary>A reference to a struct field by its path: <c>"s.a"</c> is field <c>a</c> of struct <c>s</c>.</summary>
+    private static UnboundReference Nested(string dotted) => UnboundReference.FromParts(dotted.Split('.'));
+
     private readonly string _tempDir;
 
     public NestedStatsPruningTests()
@@ -179,12 +182,12 @@ public class NestedStatsPruningTests : IDisposable
         var add = MakeAdd(NestedStats);
 
         // s.a is bounded [5, 9] — outside prunes, inside keeps.
-        Assert.False(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(4))));
-        Assert.True(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(7))));
-        Assert.False(pruner.ShouldInclude(add, Ex.GreaterThan("s.a", LiteralValue.Of(9))));
-        Assert.True(pruner.ShouldInclude(add, Ex.LessThan("s.a", LiteralValue.Of(6))));
+        Assert.False(pruner.ShouldInclude(add, Ex.Equal(Nested("s.a"), new LiteralExpression(LiteralValue.Of(4)))));
+        Assert.True(pruner.ShouldInclude(add, Ex.Equal(Nested("s.a"), new LiteralExpression(LiteralValue.Of(7)))));
+        Assert.False(pruner.ShouldInclude(add, Ex.GreaterThan(Nested("s.a"), new LiteralExpression(LiteralValue.Of(9)))));
+        Assert.True(pruner.ShouldInclude(add, Ex.LessThan(Nested("s.a"), new LiteralExpression(LiteralValue.Of(6)))));
         // String leaf, byte-order bounds ["aaa", "zzz"].
-        Assert.False(pruner.ShouldInclude(add, Ex.Equal("s.b", LiteralValue.Of("zzzz"))));
+        Assert.False(pruner.ShouldInclude(add, Ex.Equal(Nested("s.b"), new LiteralExpression(LiteralValue.Of("zzzz")))));
     }
 
     [Fact]
@@ -195,9 +198,9 @@ public class NestedStatsPruningTests : IDisposable
 
         // s.a has no nulls; s.b is all-null (10 of 10). This is the arm that silently did nothing
         // while nested nullCount objects were dropped at parse.
-        Assert.False(pruner.ShouldInclude(add, Ex.IsNull("s.a")));
-        Assert.True(pruner.ShouldInclude(add, Ex.IsNull("s.b")));
-        Assert.False(pruner.ShouldInclude(add, Ex.IsNotNull("s.b")));
+        Assert.False(pruner.ShouldInclude(add, Ex.IsNull(Nested("s.a"))));
+        Assert.True(pruner.ShouldInclude(add, Ex.IsNull(Nested("s.b"))));
+        Assert.False(pruner.ShouldInclude(add, Ex.IsNotNull(Nested("s.b"))));
     }
 
     [Fact]
@@ -212,8 +215,8 @@ public class NestedStatsPruningTests : IDisposable
         var add = MakeAdd(
             """{"numRecords":10,"minValues":{"col-s":{"col-a":5}},"maxValues":{"col-s":{"col-a":9}},"nullCount":{"col-s":{"col-a":0}}}""");
 
-        Assert.False(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(4))));
-        Assert.True(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(7))));
+        Assert.False(pruner.ShouldInclude(add, Ex.Equal(Nested("s.a"), new LiteralExpression(LiteralValue.Of(4)))));
+        Assert.True(pruner.ShouldInclude(add, Ex.Equal(Nested("s.a"), new LiteralExpression(LiteralValue.Of(7)))));
     }
 
     [Fact]
@@ -251,7 +254,38 @@ public class NestedStatsPruningTests : IDisposable
         var add = MakeAdd(
             """{"numRecords":10,"minValues":{"s.a":100,"s":{"a":100}},"maxValues":{"s.a":200,"s":{"a":200}},"nullCount":{"s.a":0,"s":{"a":0}}}""");
 
+        Assert.True(pruner.ShouldInclude(add, Ex.Equal(Nested("s.a"), new LiteralExpression(LiteralValue.Of(4)))));
         Assert.True(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(4))));
+    }
+
+    /// <summary>
+    /// A reference is resolved by its parts, as the row evaluator resolves it (#771): a one-part name is the
+    /// top-level column of exactly that name, never a struct's leaf whose dotted path spells it, and a struct
+    /// field's path is never a top-level column whose name holds the dots. Each of these has statistics that
+    /// would prune, read under the other column.
+    /// </summary>
+    [Fact]
+    public void AReference_IsResolvedByItsParts_NotItsDottedText()
+    {
+        var nestedOnly = new DeltaFilePruner(PrunerSchema(), []);
+        var add = MakeAdd(NestedStats);
+        Assert.True(nestedOnly.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(4))));
+        Assert.True(nestedOnly.ShouldInclude(add, Ex.IsNull("s.a")));
+
+        var topLevelOnly = new DeltaFilePruner(new EngineeredWood.DeltaLake.Schema.StructType
+        {
+            Fields =
+            [
+                new StructField
+                {
+                    Name = "s.a", Type = new PrimitiveType { TypeName = "integer" }, Nullable = true,
+                },
+            ],
+        }, []);
+        var topLevel = MakeAdd("""{"numRecords":10,"minValues":{"s.a":5},"maxValues":{"s.a":9},"nullCount":{"s.a":0}}""");
+        Assert.False(topLevelOnly.ShouldInclude(topLevel, Ex.Equal("s.a", LiteralValue.Of(4))));
+        Assert.True(topLevelOnly.ShouldInclude(topLevel, Ex.Equal(Nested("s.a"), new LiteralExpression(LiteralValue.Of(4)))));
+        Assert.True(topLevelOnly.ShouldInclude(topLevel, Ex.IsNull(Nested("s.a"))));
     }
 
     [Fact]
@@ -262,7 +296,7 @@ public class NestedStatsPruningTests : IDisposable
         var add = MakeAdd(
             """{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":10},"nullCount":{"id":0}}""");
 
-        Assert.True(pruner.ShouldInclude(add, Ex.Equal("s.a", LiteralValue.Of(4))));
+        Assert.True(pruner.ShouldInclude(add, Ex.Equal(Nested("s.a"), new LiteralExpression(LiteralValue.Of(4)))));
     }
 
     // The point of all of it: a predicate on a nested leaf prunes files.
@@ -280,7 +314,7 @@ public class NestedStatsPruningTests : IDisposable
 
         // s.a = 500 lies outside file 1's [10,10] bounds, so that file is pruned on stats alone.
         var rows = new List<long>();
-        await foreach (var b in table.ReadAllAsync(columns: null, Ex.Equal("s.a", 500L)))
+        await foreach (var b in table.ReadAllAsync(columns: null, Ex.Equal(Nested("s.a"), new LiteralExpression(LiteralValue.Of(500L)))))
         {
             var ids = (Int64Array)b.Column(0);
             for (int i = 0; i < b.Length; i++)

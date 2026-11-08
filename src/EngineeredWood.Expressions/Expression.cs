@@ -31,9 +31,21 @@ public sealed record UnboundReference(string Name) : Expression
     private readonly IReadOnlyList<string>? _parts;
     private readonly string? _partsName;
 
+    // A one-part reference's parts, built on first use: pruning reads them once per row group or file. A copy
+    // made by `with` carries the field, so it is used only while it still holds this Name.
+    private IReadOnlyList<string>? _single;
+
     /// <summary>The path this reference names: a top-level column, then a field of each struct below it.</summary>
     public IReadOnlyList<string> NameParts =>
-        _parts is not null && string.Equals(_partsName, Name, StringComparison.Ordinal) ? _parts : [Name];
+        _parts is not null && string.Equals(_partsName, Name, StringComparison.Ordinal) ? _parts : Single();
+
+    private IReadOnlyList<string> Single()
+    {
+        var single = _single;
+        if (single is null || !ReferenceEquals(single[0], Name))
+            _single = single = Array.AsReadOnly(new[] { Name });
+        return single;
+    }
 
     /// <summary>A reference to the field at <paramref name="parts"/>; its <see cref="Name"/> joins them with dots.</summary>
     public static UnboundReference FromParts(IReadOnlyList<string> parts)

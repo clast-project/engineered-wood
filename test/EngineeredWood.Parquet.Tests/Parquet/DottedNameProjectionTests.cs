@@ -86,8 +86,9 @@ public class DottedNameProjectionTests : IDisposable
     }
 
     /// <summary>
-    /// A filter on <c>s.a</c> prunes by the top-level column too, the column the read returns, in either order:
-    /// the statistics, page-index, dictionary and Bloom filter lookups all take the top-level name first. Only
+    /// A filter on <c>s.a</c> (one part, as <c>`s.a`</c> in SQL) prunes by the top-level column too, the column the
+    /// read returns, in either order: the statistics, page-index, dictionary and Bloom filter lookups resolve a
+    /// one-part name to the top-level column only (#771). Only
     /// the top-level column holds 102; the struct's leaf holds 1..3, so pruning by its statistics or dictionary
     /// skips the one row group. The statistics lookup let the later of the two win and the dictionary lookup the
     /// earlier, so each order failed one of them.

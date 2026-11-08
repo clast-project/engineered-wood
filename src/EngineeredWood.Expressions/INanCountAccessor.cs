@@ -32,5 +32,5 @@ public interface INanCountAccessor<TStats>
     /// Answer <see langword="null"/> unless the count is genuinely recorded. Zero is a claim the
     /// evaluator prunes on; do not infer it from bounds that merely look finite.
     /// </remarks>
-    long? GetNanCount(TStats stats, string column);
+    long? GetNanCount(TStats stats, IReadOnlyList<string> column);
 }

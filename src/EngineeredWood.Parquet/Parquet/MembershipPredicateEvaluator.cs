@@ -111,13 +111,13 @@ internal static class MembershipPredicateEvaluator
                     Collect(not.Child);
                     break;
                 case ComparisonPredicate cmp when IsEquality(cmp.Op):
-                    if ((TryGetColumnAndLiteral(cmp.Left, cmp.Right, out string? column, out var value)
+                    if ((TryGetColumnAndLiteral(cmp.Left, cmp.Right, out IReadOnlyList<string>? column, out var value)
                          || TryGetColumnAndLiteral(cmp.Right, cmp.Left, out column, out value))
                         && !value.IsNull)
                         Add(column!, [value]);
                     break;
                 case SetPredicate set when set.Op == SetOperator.In:
-                    if (TryGetColumnName(set.Operand, out string? operand)
+                    if (TryGetColumnName(set.Operand, out IReadOnlyList<string>? operand)
                         && set.Values.Count > 0
                         && set.TryGetLiteralValues(out var values))
                         Add(operand!, values);
@@ -125,7 +125,7 @@ internal static class MembershipPredicateEvaluator
             }
         }
 
-        void Add(string name, IReadOnlyList<LiteralValue> values)
+        void Add(IReadOnlyList<string> name, IReadOnlyList<LiteralValue> values)
         {
             if (!FindColumn(schema, name, out int index, out var descriptor) || seen.Contains(index))
                 return;
@@ -199,7 +199,7 @@ internal static class MembershipPredicateEvaluator
     private static async ValueTask<FilterResult> EvaluateEqualityAsync(
         ComparisonPredicate cmp, Context ctx, CancellationToken ct)
     {
-        if (!TryGetColumnAndLiteral(cmp.Left, cmp.Right, out string? column, out var value)
+        if (!TryGetColumnAndLiteral(cmp.Left, cmp.Right, out IReadOnlyList<string>? column, out var value)
             && !TryGetColumnAndLiteral(cmp.Right, cmp.Left, out column, out value))
             return FilterResult.Unknown;
 
@@ -212,7 +212,7 @@ internal static class MembershipPredicateEvaluator
     private static async ValueTask<FilterResult> EvaluateInAsync(
         SetPredicate set, Context ctx, CancellationToken ct)
     {
-        if (!TryGetColumnName(set.Operand, out string? column))
+        if (!TryGetColumnName(set.Operand, out IReadOnlyList<string>? column))
             return FilterResult.Unknown;
         if (set.Values.Count == 0)
             return FilterResult.AlwaysFalse;
@@ -230,7 +230,7 @@ internal static class MembershipPredicateEvaluator
     /// absent; Unknown if any might be present, or if the source cannot be asked.
     /// </summary>
     private static async ValueTask<FilterResult> ProbeAsync(
-        string column, IReadOnlyList<LiteralValue> values, Context ctx, CancellationToken ct)
+        IReadOnlyList<string> column, IReadOnlyList<LiteralValue> values, Context ctx, CancellationToken ct)
     {
         if (!ctx.TryFindColumn(column, out int columnIndex, out var descriptor))
             return FilterResult.Unknown;
@@ -579,7 +579,7 @@ internal static class MembershipPredicateEvaluator
 
     private static bool TryGetColumnAndLiteral(
         Expression maybeRef, Expression maybeLit,
-        out string? column, out LiteralValue value)
+        out IReadOnlyList<string>? column, out LiteralValue value)
     {
         if (TryGetColumnName(maybeRef, out column) && maybeLit is LiteralExpression lit)
         {
@@ -591,12 +591,12 @@ internal static class MembershipPredicateEvaluator
         return false;
     }
 
-    private static bool TryGetColumnName(Expression expr, out string? name)
+    private static bool TryGetColumnName(Expression expr, out IReadOnlyList<string>? name)
     {
         switch (expr)
         {
-            case UnboundReference u: name = u.Name; return true;
-            case BoundReference b: name = b.Name; return true;
+            case UnboundReference u: name = u.NameParts; return true;
+            case BoundReference b: name = [b.Name]; return true;
             default: name = null; return false;
         }
     }
@@ -815,13 +815,16 @@ internal static class MembershipPredicateEvaluator
         public long FileLength { get; }
         public ColumnChunkFilePathKind FilePath { get; }
 
-        public bool TryFindColumn(string name, out int index, out ColumnDescriptor? descriptor) =>
+        public bool TryFindColumn(IReadOnlyList<string> name, out int index, out ColumnDescriptor? descriptor) =>
             FindColumn(Schema, name, out index, out descriptor);
     }
 
-    /// <summary>The leaf <paramref name="name"/> names, as <see cref="SchemaDescriptor.FindLeaf"/> resolves it.</summary>
+    /// <summary>
+    /// The leaf the column path <paramref name="name"/> names, resolved exactly as the row evaluator resolves a
+    /// reference (<see cref="SchemaDescriptor.FindLeaf(IReadOnlyList{string})"/>, #771).
+    /// </summary>
     internal static bool FindColumn(
-        SchemaDescriptor schema, string name, out int index, out ColumnDescriptor? descriptor)
+        SchemaDescriptor schema, IReadOnlyList<string> name, out int index, out ColumnDescriptor? descriptor)
     {
         index = schema.FindLeaf(name);
         descriptor = index >= 0 ? schema.Columns[index] : null;

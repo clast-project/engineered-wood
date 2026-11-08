@@ -173,8 +173,8 @@ public class PreFixStatisticsTests : IDisposable
         using var reader = new ParquetFileReader(input, ownsFile: false);
         var metadata = await reader.ReadMetadataAsync();
         var accessor = new ParquetStatisticsAccessor(await reader.GetSchemaAsync());
-        var min = accessor.GetMinValue(metadata.RowGroups[0], column)!.Value;
-        var max = accessor.GetMaxValue(metadata.RowGroups[0], column)!.Value;
+        var min = accessor.GetMinValue(metadata.RowGroups[0], [column])!.Value;
+        var max = accessor.GetMaxValue(metadata.RowGroups[0], [column])!.Value;
         Assert.True(min.CompareTo(max) > 0, $"{column}: min {min} is not above max {max}");
     }
 

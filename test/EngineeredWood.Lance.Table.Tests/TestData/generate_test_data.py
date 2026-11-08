@@ -101,6 +101,25 @@ def main() -> None:
         indexed_field="x",
         index_type="BITMAP")
 
+    # A BTREE index on struct field s.x beside an unindexed top-level x
+    # (#771): the index must not answer for x. Two fragments: x 0..99 and
+    # 1000..1099, s.x 100..199 and 1100..1199.
+    _write_with_index("nested_index_v21", mode_seq=_nested_index_tables(),
+        indexed_field="s.x",
+        index_type="BTREE")
+
+
+def _nested_index_tables():
+    tables = []
+    for base, mode in [(0, "create"), (1000, "append")]:
+        s = pa.StructArray.from_arrays(
+            [pa.array(range(base + 100, base + 200), type=pa.int32())], names=["x"])
+        tables.append((pa.table({
+            "x": pa.array(range(base, base + 100), type=pa.int32()),
+            "s": s,
+        }), mode))
+    return tables
+
 
 def _write_with_index(name, mode_seq, indexed_field, index_type, version="2.1"):
     """Create a dataset and add a scalar index to a field."""
