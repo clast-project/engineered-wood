@@ -76,4 +76,25 @@ public class ContainerResolutionTests
         var inner = Assert.IsType<ListArray>(((ListArray)batch.Column(0)).Values);
         Assert.Equal(1.5, Assert.IsType<DoubleArray>(inner.Values).GetValue(0));
     }
+
+    // The compatibility check stopped at the outer array or map, so an incompatible item passed and
+    // the read failed inside Arrow ("Buffer count <2> must be at exactly <3>"). It is now refused up
+    // front, naming the path, as a top-level int under a string already was.
+    [Theory]
+    [InlineData("""{"type": "array", "items": "int"}""", """{"type": "array", "items": "string"}""", "a[]")]
+    [InlineData("""{"type": "map", "values": "int"}""", """{"type": "map", "values": "string"}""", "a{}")]
+    [InlineData("""{"type": "array", "items": ["null", "int"]}""", """{"type": "array", "items": ["null", "string"]}""", "a[]")]
+    [InlineData("""{"type": "array", "items": {"type": "array", "items": "int"}}""",
+                """{"type": "array", "items": {"type": "array", "items": "string"}}""", "a[][]")]
+    [InlineData("""{"type": "map", "values": {"type": "array", "items": "int"}}""",
+                """{"type": "map", "values": {"type": "array", "items": "string"}}""", "a{}[]")]
+    public void AnIncompatibleNestedItem_IsRefused(string writerType, string readerType, string path)
+    {
+        using var ms = RawOcfFile.Create(OneField(writerType).Json, [], lengthPrefixed: false);
+
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => new AvroReaderBuilder().WithReaderSchema(OneField(readerType)).Build(ms).ReadNextBatch());
+        Assert.Contains($"field '{path}'", ex.Message);
+        Assert.Contains("writer is Int, reader is String", ex.Message);
+    }
 }
