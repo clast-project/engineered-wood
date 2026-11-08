@@ -81,6 +81,18 @@ public class ScaledDecimalTests
         Assert.NotEqual(9.999999999999999e29d, ScaledDecimal.ToDouble(unscaled, 0));
     }
 
+    /// <summary>The decimal <c>(double)decimal</c> gets an ulp wrong.</summary>
+    /// <remarks>
+    /// A field, NOT a <c>const</c>. With a <c>const</c>, <c>(double)narrow</c> is a constant
+    /// expression, so the C# compiler converts it at build time using the runtime the compiler
+    /// itself runs on, and writes the resulting double into the compiled code. The 11.0 SDK runs
+    /// on .NET 11, whose cast is correctly rounded, so building with it baked in the right answer
+    /// for every target, net472 included. The test then failed on a box with that SDK and passed
+    /// on CI, which builds with the 10.0 SDK (#634). A field makes the conversion happen when the
+    /// test runs, on the runtime under test.
+    /// </remarks>
+    private static readonly decimal NarrowDecimal = 5814944.01700257601m;
+
     [Fact]
     public void TheRejectedRoutesReallyDoRoundTwice()
     {
@@ -95,7 +107,11 @@ public class ScaledDecimalTests
         // before it: 5814944.017002576 is the correctly rounded double and the cast answers
         // ...577. Measured, the cast is wrong on 17.4% of the decimals that fit exactly, and on
         // integral ones -- scale 0, where nothing has to be divided away -- on 0.2%.
-        const decimal narrow = 5814944.01700257601m;
+        //
+        // The .NET 11 runtime fixed the cast; net8.0, net10.0 and net472 still double-round, and
+        // they are what this assembly ships to. So a net11.0 target will fail this test, and that
+        // is the moment to make it conditional.
+        var narrow = NarrowDecimal;
         var exact = BitConverter.Int64BitsToDouble(0x41562EA8011691F9L);
 
         Assert.False(
