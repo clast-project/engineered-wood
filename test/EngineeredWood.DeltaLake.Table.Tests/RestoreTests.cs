@@ -676,6 +676,56 @@ public class RestoreTests : IDisposable
     }
 
     /// <summary>
+    /// A restore keeps every feature added since the target (the protocol is never downgraded), so restoring an
+    /// IcebergCompatV2 version over a protocol that has since gained deletion vectors would make a V2 table with
+    /// them, one delta-spark refuses to write (#744). The merged protocol is what is judged, not the target's.
+    /// </summary>
+    [Fact]
+    public async Task Restore_ThatReEnablesIcebergCompatV2_OverDeletionVectors_IsRefused()
+    {
+        const string mappedSchema = """
+            {"type":"struct","fields":[{"name":"id","type":"long","nullable":true,
+             "metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-1"}}]}
+            """;
+        MetadataAction Mapped(bool icebergCompatV2)
+        {
+            var configuration = new Dictionary<string, string>
+            {
+                [ColumnMapping.ModeKey] = "name",
+                [ColumnMapping.MaxColumnIdKey] = "1",
+            };
+            if (icebergCompatV2)
+                configuration[IcebergCompat.EnableV2Key] = "true";
+            else
+                configuration[DeletionVectors.DeletionVectorConfig.EnableKey] = "true";
+            return RawMetadata(configuration) with { SchemaString = mappedSchema };
+        }
+
+        await WriteRawAsync(0,
+            new ProtocolAction
+            {
+                MinReaderVersion = 2,
+                MinWriterVersion = 7,
+                WriterFeatures = ["columnMapping", "icebergCompatV2"],
+            },
+            Mapped(icebergCompatV2: true));
+        await WriteRawAsync(1,
+            new ProtocolAction
+            {
+                MinReaderVersion = 3,
+                MinWriterVersion = 7,
+                ReaderFeatures = ["columnMapping", "deletionVectors"],
+                WriterFeatures = ["columnMapping", "icebergCompatV2", "deletionVectors"],
+            },
+            Mapped(icebergCompatV2: false));
+        await using var table = await DeltaTable.OpenAsync(Fs);
+
+        await RefusedAsync(DeltaErrorCodes.IcebergCompatViolation, async () => await table.RestoreAsync(0));
+        Assert.Equal(1, table.CurrentSnapshot.Version);
+        Assert.Equal(1, await new TransactionLog(Fs).GetLatestVersionAsync());
+    }
+
+    /// <summary>
     /// A restore that turns in-commit timestamps back on is where they begin again: its commit carries one, and the
     /// metadata names it as the enablement point, as Spark stamps a mid-life enablement.
     /// </summary>

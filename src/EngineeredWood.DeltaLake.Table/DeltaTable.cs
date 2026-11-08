@@ -1038,7 +1038,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // checked once against the FINISHED commit-0 actions rather than piecemeal. A violating table must
         // not be created at all: the alternative is a table that looks fine until UniForm tries to convert
         // it, long after data has been written into it.
-        Schema.IcebergCompat.Validate(icebergCompatVersion, metadataAction, protocolAction);
+        Schema.IcebergCompat.Validate(
+            icebergCompatVersion, metadataAction, protocolAction,
+            previousSnapshot?.Metadata, previousSnapshot?.Protocol);
 
         var actions = new List<DeltaAction> { protocolAction, metadataAction };
 
@@ -3151,6 +3153,29 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Validates IcebergCompat on the table as <paramref name="actions"/> leave it (their last <c>metaData</c> and
+    /// <c>protocol</c>, else the base's), against <paramref name="baseSnapshot"/> as the state before the commit.
+    /// delta-spark runs these checks on every commit to an IcebergCompat table (#744). That covers a commit that
+    /// changes nothing about the table: a DELETE on a V2 table whose deletion vectors are enabled is refused.
+    /// </summary>
+    private static void EnsureIcebergCompatHolds(Snapshot.Snapshot baseSnapshot, IEnumerable<DeltaAction> actions)
+    {
+        MetadataAction metadata = baseSnapshot.Metadata;
+        ProtocolAction protocol = baseSnapshot.Protocol;
+        foreach (var action in actions)
+        {
+            if (action is MetadataAction m)
+                metadata = m;
+            else if (action is ProtocolAction p)
+                protocol = p;
+        }
+
+        Schema.IcebergCompat.Validate(
+            Schema.IcebergCompat.GetVersion(metadata.Configuration), metadata, protocol,
+            baseSnapshot.Metadata, baseSnapshot.Protocol);
+    }
+
+    /// <summary>
     /// Refuses caller-supplied <c>metaData</c> that introduces a <c>delta.feature.*</c>, <c>delta.minReaderVersion</c>
     /// or <c>delta.minWriterVersion</c> property. Stored there, the property does nothing: <see cref="CreateCoreAsync"/>
     /// consumes one into the protocol and Spark never stores one, so a host means a <c>protocol</c> action. A key
@@ -3793,6 +3818,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyDictionary<string, string>? operationParameters = null)
     {
         ThrowIfDisposed();
+        // Every operation that commits through this loop is checked here, as delta-spark checks every commit:
+        // the transaction, DELETE, UPDATE, MERGE, OPTIMIZE, the metadata-only changes and RESTORE. An auto-committing
+        // operation's files are collected when this throws (CollectOnFailureAsync), and a transaction's on abort.
+        EnsureIcebergCompatHolds(baseSnapshot, dataActions);
 
         bool rowLevel = rowLevelDeletes is { Count: > 0 };
         // Against the protocol this commit PUBLISHES, which a staged upgrade can make differ from the base's.
@@ -8858,6 +8887,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             EnsureNoInvalidIsolationLevelIntroduced(CurrentSnapshot, extraActions);
             EnsureNoFeaturePropertiesIntroduced(CurrentSnapshot, extraActions);
         }
+        // This seam commits through the committer directly, not CommitOccAsync, so it is checked here, before it
+        // writes any deletion vector of its own.
+        EnsureIcebergCompatHolds(CurrentSnapshot, extraActions ?? []);
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
         // extraActions (a buffered transaction's deletion-vector remove/add pairs) likewise make this a
         // non-append. A dataChange=false rewrite (compaction) is append-LEGAL: appendOnly forbids removing

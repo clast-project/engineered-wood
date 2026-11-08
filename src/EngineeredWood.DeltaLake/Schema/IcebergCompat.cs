@@ -20,7 +20,7 @@ public enum IcebergCompatVersion
     V1,
 
     /// <summary>
-    /// V2: column mapping required, Map/Array types allowed with nested field IDs,
+    /// V2: column mapping required, no deletion vectors, Map/Array types allowed with nested field IDs,
     /// partition columns materialized in Parquet files, numRecords required in stats.
     /// </summary>
     V2,
@@ -67,10 +67,17 @@ public static class IcebergCompat
     /// Iceberg compatibility constraints for the active version.
     /// Throws <see cref="DeltaFormatException"/> on violations.
     /// </summary>
+    /// <param name="version">The version <paramref name="metadata"/> enables.</param>
+    /// <param name="metadata">The table's metadata as the commit leaves it.</param>
+    /// <param name="protocol">The table's protocol as the commit leaves it.</param>
+    /// <param name="previousMetadata">The metadata the commit is based on, or null for a new table.</param>
+    /// <param name="previousProtocol">The protocol the commit is based on, or null for a new table.</param>
     public static void Validate(
         IcebergCompatVersion version,
         Actions.MetadataAction metadata,
-        Actions.ProtocolAction protocol)
+        Actions.ProtocolAction protocol,
+        Actions.MetadataAction? previousMetadata = null,
+        Actions.ProtocolAction? previousProtocol = null)
     {
         if (version == IcebergCompatVersion.None)
             return;
@@ -78,8 +85,7 @@ public static class IcebergCompat
         ValidateColumnMapping(metadata.Configuration);
         ValidateSchema(metadata, version);
 
-        if (version == IcebergCompatVersion.V1)
-            ValidateNoDeletionVectors(protocol);
+        ValidateNoDeletionVectors(version, metadata, protocol, previousMetadata, previousProtocol);
     }
 
     /// <summary>
@@ -181,20 +187,40 @@ public static class IcebergCompat
         }
     }
 
-    private static void ValidateNoDeletionVectors(Actions.ProtocolAction protocol)
+    // delta-spark's V1 and V2 both carry CheckDeletionVectorDisabled (read from the 4.0.0, 4.3.1 and 4.4.1 jars;
+    // V3, which this library does not model, has none) (#744). It refuses a commit whose protocol supports
+    // deletion vectors when they are WRITABLE, meaning supported and enabled by delta.enableDeletionVectors, either
+    // in the snapshot the commit is based on or in the table as the commit leaves it. A table that declares the
+    // feature with the property off passes. One whose base has them writable is refused even by the commit that
+    // turns the property off. Spark's REORG ... APPLY (UPGRADE UNIFORM) checks only the new state, but this
+    // library has no such operation.
+    private static void ValidateNoDeletionVectors(
+        IcebergCompatVersion version,
+        Actions.MetadataAction metadata,
+        Actions.ProtocolAction protocol,
+        Actions.MetadataAction? previousMetadata,
+        Actions.ProtocolAction? previousProtocol)
     {
-        bool hasDeletionVectors =
-            (protocol.WriterFeatures is not null &&
-             protocol.WriterFeatures.Contains("deletionVectors")) ||
-            (protocol.ReaderFeatures is not null &&
-             protocol.ReaderFeatures.Contains("deletionVectors"));
+        if (!SupportsDeletionVectors(protocol))
+            return;
 
-        if (hasDeletionVectors)
+        bool writable = DeletionVectors.DeletionVectorConfig.IsEnabled(metadata.Configuration);
+        bool wereWritable = previousMetadata is not null && previousProtocol is not null
+            && SupportsDeletionVectors(previousProtocol)
+            && DeletionVectors.DeletionVectorConfig.IsEnabled(previousMetadata.Configuration);
+        if (writable || wereWritable)
         {
             throw new DeltaFormatException(
                 DeltaErrorCodes.IcebergCompatViolation,
-                "IcebergCompatV1 requires that deletion vectors are not enabled. " +
-                "The 'deletionVectors' feature must be removed from the protocol.");
+                $"IcebergCompat{version} requires that deletion vectors are not enabled: " +
+                $"'{DeletionVectors.DeletionVectorConfig.EnableKey}' must be false, and must have been false " +
+                "before this commit.");
         }
     }
+
+    private static bool SupportsDeletionVectors(Actions.ProtocolAction protocol) =>
+        (protocol.WriterFeatures is not null &&
+         protocol.WriterFeatures.Contains(DeletionVectors.DeletionVectorConfig.FeatureName)) ||
+        (protocol.ReaderFeatures is not null &&
+         protocol.ReaderFeatures.Contains(DeletionVectors.DeletionVectorConfig.FeatureName));
 }

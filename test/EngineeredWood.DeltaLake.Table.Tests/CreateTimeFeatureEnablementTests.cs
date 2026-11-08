@@ -414,6 +414,22 @@ public class CreateTimeFeatureEnablementTests : IDisposable
     }
 
     [Fact]
+    public async Task IcebergCompatV2_WithDeletionVectors_Throws()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(async () =>
+            await DeltaTable.CreateAsync(fs, IdValueSchema(),
+                columnMappingMode: ColumnMappingMode.Name,
+                enableDeletionVectors: true,
+                configuration: new Dictionary<string, string> { [IcebergCompat.EnableV2Key] = "true" }));
+
+        Assert.Equal(DeltaErrorCodes.IcebergCompatViolation, ex.ErrorCode);
+        Assert.Contains("deletion vectors", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(-1, await new TransactionLog(fs).GetLatestVersionAsync());
+    }
+
+    [Fact]
     public async Task IcebergCompatV1_WithArrayColumn_Throws()
     {
         var fs = new LocalTableFileSystem(_tempDir);
