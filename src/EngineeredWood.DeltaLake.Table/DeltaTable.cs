@@ -3876,6 +3876,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// the table can supply: the two rebases that re-derive version-coupled actions
     /// (<see cref="OccRebaseHandler"/>), the app-transaction preconditions, and the ledger of files a losing
     /// attempt leaves behind.</para>
+    ///
+    /// <para><paramref name="restoring"/> is set by <see cref="RestoreAsync(long, RestoreOptions?, CancellationToken, CommitProperties?)"/>
+    /// alone. It is not read off <paramref name="operation"/>, which a transaction's caller chooses.</para>
     /// </summary>
     internal async ValueTask<long> CommitOccAsync(
         Snapshot.Snapshot baseSnapshot,
@@ -3893,14 +3896,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         InsertChangeDataFillIn? insertFillIn = null,
         CommitProperties? commitProperties = null,
         Func<IReadOnlyList<DeltaAction>, IReadOnlyDictionary<string, string>?>? operationMetrics = null,
-        IReadOnlyDictionary<string, string>? operationParameters = null)
+        IReadOnlyDictionary<string, string>? operationParameters = null,
+        bool restoring = false)
     {
         ThrowIfDisposed();
         // Every operation that commits through this loop is checked here, as delta-spark checks every commit:
         // the transaction, DELETE, UPDATE, MERGE, OPTIMIZE, the metadata-only changes and RESTORE. An auto-committing
         // operation's files are collected when this throws (CollectOnFailureAsync), and a transaction's on abort.
         EnsureNoProtocolDowngrade(baseSnapshot, dataActions);
-        EnsureIcebergCompatHolds(baseSnapshot, dataActions, altersTable: operation != "RESTORE");
+        // From RestoreAsync's flag, not the operation name: a transaction's caller can name its commit "RESTORE".
+        EnsureIcebergCompatHolds(baseSnapshot, dataActions, altersTable: !restoring);
 
         bool rowLevel = rowLevelDeletes is { Count: > 0 };
         // Against the protocol this commit PUBLISHES, which a staged upgrade can make differ from the base's.

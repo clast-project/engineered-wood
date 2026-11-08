@@ -72,6 +72,32 @@ public class ColumnDefaultLiteralTests
     [InlineData("'2024-01-02T03:04:05.123456'", "timestamp_ntz", true)]
     [InlineData("'2024-01-02T03:04:05Z'", "timestamp_ntz", false)]
     [InlineData("'2024-01-02 03:04'", "timestamp_ntz", false)]
+    // OffsetDateTime.parse with ISO_DATE_TIME, each case measured with jshell (JDK 17): the offset's form and range,
+    // and the [zone] after it.
+    [InlineData("'2024-01-02T03:04:05z'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05+01:00:30'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05+18:00'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05-18:00'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05+18:01'", "timestamp", false)]
+    [InlineData("'2024-01-02T03:04:05+19:00'", "timestamp", false)]
+    [InlineData("'2024-01-02T03:04:05+99:99'", "timestamp", false)]
+    [InlineData("'2024-01-02T03:04:05+01:60'", "timestamp", false)]
+    [InlineData("'2024-01-02T03:04:05+01'", "timestamp", false)]
+    [InlineData("'2024-01-02T03:04:05+0100'", "timestamp", false)]
+    [InlineData("'2024-01-02T03:04:05+010030'", "timestamp", false)]
+    [InlineData("'2024-01-02T03:04:05+01:00[Europe/Paris]'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05Z[UTC]'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05Z[GMT]'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05Z[Z]'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05+01:00[UT]'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05+01:00[+01:00]'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05+01:00[UTC+01:00]'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05+01:00[GMT+1]'", "timestamp", false)]
+    [InlineData("'2024-01-02T03:04:05+01:00[UTC+19:00]'", "timestamp", false)]
+    [InlineData("'2024-01-02T03:04:05+01:00[America/New_York]'", "timestamp", true)]
+    [InlineData("'2024-01-02T03:04:05Z[z]'", "timestamp", false)]
+    [InlineData("'2024-01-02T03:04:05+01:00[]'", "timestamp", false)]
+    [InlineData("'2024-01-02T03:04:05+01:00[1abc]'", "timestamp", false)]
     // new BigDecimal(text, MathContext(p)).setScale(s): rounds to p digits, then refuses a lossy scale change.
     [InlineData("1.2", "decimal(10,2)", true)]
     [InlineData("1.20", "decimal(10,2)", true)]
@@ -86,11 +112,35 @@ public class ColumnDefaultLiteralTests
     [InlineData("1.", "decimal(10,2)", true)]
     [InlineData(".", "decimal(10,2)", false)]
     [InlineData("1 ", "decimal(10,2)", false)]
+    // Exponents at the int limits, measured with jshell. 1e-1000000000 is refused without building 10^999999998.
+    [InlineData("1e-1000000000", "decimal(10,2)", false)]
+    [InlineData("1e2147483647", "decimal(10,2)", false)]
+    [InlineData("1e2147483648", "decimal(10,2)", false)]
+    [InlineData("1e-2147483648", "decimal(10,2)", false)]
+    [InlineData("1e-2147483649", "decimal(10,2)", false)]
+    [InlineData("1e100000000", "decimal(10,2)", true)]
+    [InlineData("100e-2", "decimal(10,0)", true)]
+    [InlineData("0e-1000000000", "decimal(10,2)", true)]
+    [InlineData("0e2147483647", "decimal(10,2)", true)]
     // Other types never have a literal default.
     [InlineData("'x'", "variant", false)]
     public void IsLiteral_MatchesTheJavaParse(string text, string type, bool expected)
     {
         Assert.Equal(expected, IsLiteral(text, type));
+    }
+
+    /// <summary>
+    /// The one known difference from Java: a region id is checked for its syntax, not looked up in a tz database, so
+    /// a well-formed id that names no zone passes here though <c>OffsetDateTime.parse</c> refuses it (both measured
+    /// with jshell). .NET's zone lookup depends on the platform and on globalization mode.
+    /// </summary>
+    [Theory]
+    [InlineData("'2024-01-02T03:04:05+01:00[Foo/Bar]'")]
+    [InlineData("'2024-01-02T03:04:05+01:00[EST]'")]
+    [InlineData("'2024-01-02T03:04:05+01:00[europe/paris]'")]
+    public void AWellFormedRegionIdNamingNoZone_PassesThoughJavaRefusesIt(string text)
+    {
+        Assert.True(IsLiteral(text, "timestamp"));
     }
 
     [Fact]

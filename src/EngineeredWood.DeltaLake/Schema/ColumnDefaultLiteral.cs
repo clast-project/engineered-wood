@@ -60,10 +60,18 @@ internal static class ColumnDefaultLiteral
     private static readonly Regex SpacedDateTimeText = new(
         @"^([0-9]{4})-([0-9]{2})-([0-9]{2}) ([0-9]{2}):([0-9]{2}):([0-9]{2})$", RegexOptions.CultureInvariant);
 
+    // ZoneOffset as ISO_DATE_TIME parses it ("+HH:MM:ss"): Z (either case), or a sign, hours and minutes, and
+    // optionally seconds, each part two digits after a colon. +01 and +0100 are refused (measured with jshell).
+    private const string IsoOffset = @"([Zz]|[+-][0-9]{2}:[0-9]{2}(?::[0-9]{2})?)";
+
     // DateTimeFormatter.ISO_DATE_TIME with the offset OffsetDateTime.parse needs, and an optional [zone] after it.
     private static readonly Regex OffsetDateTimeText = new(
-        "^" + IsoDate + "T" + IsoTime + @"(Z|[+-][0-9]{2}(?::?[0-9]{2}(?::?[0-9]{2})?)?)(\[[^\]]+\])?$",
-        RegexOptions.CultureInvariant);
+        "^" + IsoDate + "T" + IsoTime + IsoOffset + @"(?:\[([^\]]*)\])?$", RegexOptions.CultureInvariant);
+
+    private static readonly Regex OffsetText = new("^" + IsoOffset + "$", RegexOptions.CultureInvariant);
+
+    // ZoneId.of's region-id syntax: a letter, then letters, digits and ~/._+-.
+    private static readonly Regex RegionIdText = new(@"^[A-Za-z][A-Za-z0-9~/._+-]+$", RegexOptions.CultureInvariant);
 
     /// <summary>True when <paramref name="text"/> is a literal of <paramref name="type"/>.</summary>
     public static bool IsLiteral(string text, DeltaDataType type)
@@ -95,7 +103,7 @@ internal static class ColumnDefaultLiteral
                 return Unquote(text) is { } date && IsDate(DateText.Match(date));
             case "timestamp":
                 return Unquote(text) is { } timestamp
-                    && (IsDateTime(OffsetDateTimeText.Match(timestamp)) || IsLocalTimestamp(timestamp));
+                    && (IsOffsetDateTime(OffsetDateTimeText.Match(timestamp)) || IsLocalTimestamp(timestamp));
             case "timestamp_ntz":
                 return Unquote(text) is { } local && IsLocalTimestamp(local);
         }
@@ -154,6 +162,7 @@ internal static class ColumnDefaultLiteral
         if (integerDigits.Length + fractionDigits.Length == 0)
             return false;
 
+        // BigDecimal refuses an exponent, and a scale, that does not fit an int (NumberFormatException).
         long exponent = 0;
         if (match.Groups[4].Success
             && !long.TryParse(match.Groups[4].Value, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture,
@@ -161,9 +170,13 @@ internal static class ColumnDefaultLiteral
         {
             return false;
         }
+        if (exponent < int.MinValue || exponent > int.MaxValue)
+            return false;
 
         var unscaled = BigInteger.Parse(integerDigits + fractionDigits, CultureInfo.InvariantCulture);
         long valueScale = fractionDigits.Length - exponent;
+        if (valueScale < int.MinValue || valueScale > int.MaxValue)
+            return false;
 
         if (precision > 0)
         {
@@ -180,14 +193,68 @@ internal static class ColumnDefaultLiteral
             }
         }
 
-        if (scale >= valueScale || unscaled.IsZero)
+        // Rounding lowers the scale, and BigDecimal refuses one that leaves the int range (ArithmeticException).
+        if (valueScale < int.MinValue)
+            return false;
+        if (unscaled.IsZero)
             return true;
-        long excess = valueScale - scale;
-        return excess <= int.MaxValue && BigInteger.Remainder(unscaled, BigInteger.Pow(10, (int)excess)).IsZero;
+
+        // setScale raising the scale only appends zeros, but the raise itself must fit an int ("1e2147483647" is
+        // refused, measured).
+        long raise = scale - valueScale;
+        if (raise >= 0)
+            return raise <= int.MaxValue;
+
+        // Lowering it drops the last `excess` digits, which must all be zeros. A non-zero value with no more digits
+        // than that cannot end in that many zeros, so it is refused without building the power of ten: an exponent
+        // such as 1e-1000000000 would otherwise ask for a number of about 400 MB.
+        long excess = -raise;
+        if (excess >= DigitCount(unscaled))
+            return false;
+        return BigInteger.Remainder(unscaled, BigInteger.Pow(10, (int)excess)).IsZero;
     }
 
     private static int DigitCount(BigInteger value) =>
         value.IsZero ? 1 : BigInteger.Abs(value).ToString(CultureInfo.InvariantCulture).Length;
+
+    // OffsetDateTime.parse(text, ISO_DATE_TIME): a valid date-time, an offset within ZoneOffset's range, and, when a
+    // [zone] follows, an id ZoneId's region-id parser takes.
+    private static bool IsOffsetDateTime(Match match) =>
+        IsDateTime(match)
+        && IsValidOffset(match.Groups[7].Value)
+        && (!match.Groups[8].Success || IsZoneId(match.Groups[8].Value));
+
+    // ZoneOffset.ofHoursMinutesSeconds: hours up to 18, minutes and seconds up to 59, and no more than 18:00 in all.
+    private static bool IsValidOffset(string offset)
+    {
+        if (offset is "Z" or "z")
+            return true;
+        int hours = int.Parse(offset.Substring(1, 2), CultureInfo.InvariantCulture);
+        int minutes = int.Parse(offset.Substring(4, 2), CultureInfo.InvariantCulture);
+        int seconds = offset.Length > 6 ? int.Parse(offset.Substring(7, 2), CultureInfo.InvariantCulture) : 0;
+        return hours <= 18 && minutes <= 59 && seconds <= 59 && hours * 3600 + minutes * 60 + seconds <= 18 * 3600;
+    }
+
+    // What ISO_DATE_TIME's appendZoneRegionId takes (measured with jshell on JDK 17): Z, UTC, GMT and UT; an offset;
+    // one of UTC, GMT or UT followed by an offset; or a region id. GMT+1, EST and an empty [] are refused. Java also
+    // requires a region id to name a zone in its tz database (Europe/Paris passes, Foo/Bar and europe/paris do not).
+    // That needs a tz database, and what .NET offers depends on the platform and on globalization mode, so a region
+    // id is checked for its syntax alone. A well-formed id naming no zone passes here and fails in Spark.
+    private static bool IsZoneId(string zone)
+    {
+        if (zone is "Z" or "UTC" or "GMT" or "UT")
+            return true;
+        foreach (string prefix in new[] { "UTC", "GMT", "UT", "" })
+        {
+            if (zone.StartsWith(prefix, StringComparison.Ordinal) && zone.Length > prefix.Length
+                && zone[prefix.Length] is '+' or '-')
+            {
+                string offset = zone.Substring(prefix.Length);
+                return OffsetText.IsMatch(offset) && IsValidOffset(offset);
+            }
+        }
+        return RegionIdText.IsMatch(zone);
+    }
 
     private static bool IsLocalTimestamp(string text) =>
         IsDateTime(SpacedDateTimeText.Match(text)) || IsDateTime(LocalDateTimeText.Match(text));

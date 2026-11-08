@@ -372,12 +372,20 @@ public class IcebergCompatV3Tests : IDisposable
             columnMappingMode: ColumnMappingMode.Name, enableRowTracking: true);
         var protocol = table.CurrentSnapshot.Protocol;
 
+        DeltaAction[] upgrade =
+        [
+            protocol with { WriterFeatures = [.. protocol.WriterFeatures!, "icebergCompatV3"] },
+            WithConfiguration(table.CurrentSnapshot.Metadata, IcebergCompat.EnableV3Key, "true"),
+        ];
         await RefusedAsync(async () => await table.CommitDataFilesAsync(System.Array.Empty<WrittenDataFile>(),
-            extraActions:
-            [
-                protocol with { WriterFeatures = [.. protocol.WriterFeatures!, "icebergCompatV3"] },
-                WithConfiguration(table.CurrentSnapshot.Metadata, IcebergCompat.EnableV3Key, "true"),
-            ]));
+            extraActions: upgrade));
+
+        // A RESTORE is exempt, but a transaction's caller names its own commit: calling it "RESTORE" exempts nothing.
+        var txn = table.StartTransaction();
+        txn.Operation = "RESTORE";
+        txn.StageActions(upgrade);
+        await RefusedAsync(async () => await txn.CommitAsync());
+        await txn.AbortAsync();
     }
 
     // The upgrade Spark makes by itself, turning row tracking on in the same commit, passes the check.
