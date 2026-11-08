@@ -503,14 +503,39 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
         if (ascale == bscale)
             return au.CompareTo(bu);
 
-        int diff = ascale - bscale;
+        // Opposite signs, or a zero on either side, decide it without any scaling.
+        if (au.Sign != bu.Sign)
+            return au.Sign.CompareTo(bu.Sign);
+        if (au.IsZero)
+            return 0;
+
+        // In long: two int scales an int apart overflow the subtraction.
+        long diff = (long)ascale - bscale;
+
+        // A scale is normally 0..38, but HighPrecisionDecimalOf is public and takes any int, and a
+        // scale can come from a file's or a log's metadata. Lining up two scales 50000000 apart
+        // would build a 50-million-digit integer (#760). Past ordinary scales, compare the
+        // positions of the leading digits first; they differ unless the values' own digit counts
+        // differ by just as much, and then the power is no bigger than the values already are.
+        if (Math.Abs(diff) > 2 * 38)
+        {
+            long aLead = DigitCount(au) - (long)ascale;
+            long bLead = DigitCount(bu) - (long)bscale;
+            if (aLead != bLead)
+                return au.Sign * aLead.CompareTo(bLead);
+        }
+
         if (diff > 0)
-            bu *= BigInteger.Pow(10, diff);
+            bu *= BigInteger.Pow(10, (int)diff);
         else
-            au *= BigInteger.Pow(10, -diff);
+            au *= BigInteger.Pow(10, (int)-diff);
 
         return au.CompareTo(bu);
     }
+
+    /// <summary>The number of decimal digits in a non-zero value's magnitude.</summary>
+    private static int DigitCount(BigInteger value) =>
+        BigInteger.Abs(value).ToString(System.Globalization.CultureInfo.InvariantCulture).Length;
 
 #if NET6_0_OR_GREATER
     internal static bool TryAsInstant(LiteralValue v, out DateTimeOffset instant)

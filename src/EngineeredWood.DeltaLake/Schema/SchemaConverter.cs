@@ -78,10 +78,23 @@ public static class SchemaConverter
         var match = s_decimalPattern.Match(typeName);
         if (match.Success)
         {
-            int precision = int.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
-            int scale = int.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture);
+            // TryParse: eleven digits overflow int, and that is a malformed schema, not a crash.
+            if (!int.TryParse(match.Groups[1].Value, NumberStyles.None, CultureInfo.InvariantCulture,
+                    out int precision)
+                || !int.TryParse(match.Groups[2].Value, NumberStyles.None, CultureInfo.InvariantCulture,
+                    out int scale))
+            {
+                throw new DeltaLake.DeltaFormatException(
+                    $"'{typeName}' has a precision or scale too large for any decimal.");
+            }
             if (precision > MaxDecimalPrecision)
                 throw new DeltaLake.DeltaFormatException(DecimalPrecisionMessage(precision, scale));
+            // Spark's DecimalType(p, s) refuses s > p (decimalCannotGreaterThanPrecisionError, read
+            // from spark-sql-api 4.2.0). It also matters here: every later rescale and comparison
+            // sizes a power of ten by the scale, so an unchecked decimal(10,50000000) would stall
+            // whatever touched the column (#760).
+            if (scale > precision)
+                throw new DeltaLake.DeltaFormatException(DecimalScaleMessage(precision, scale));
             return new Decimal128Type(precision, scale);
         }
 
@@ -228,10 +241,16 @@ public static class SchemaConverter
     private static string DecimalPrecisionMessage(int precision, int scale) =>
         $"decimal({precision},{scale}) exceeds Delta's maximum decimal precision of {MaxDecimalPrecision}.";
 
+    private static string DecimalScaleMessage(int precision, int scale) =>
+        $"decimal({precision},{scale}) has a scale outside 0..{precision}; a decimal's scale cannot be "
+        + "negative or exceed its precision.";
+
     private static PrimitiveType Decimal(int precision, int scale) =>
-        precision <= MaxDecimalPrecision
-            ? new PrimitiveType { TypeName = $"decimal({precision},{scale})" }
-            : throw new DeltaLake.DeltaFormatException(DecimalPrecisionMessage(precision, scale));
+        precision > MaxDecimalPrecision
+            ? throw new DeltaLake.DeltaFormatException(DecimalPrecisionMessage(precision, scale))
+            : scale < 0 || scale > precision
+                ? throw new DeltaLake.DeltaFormatException(DecimalScaleMessage(precision, scale))
+                : new PrimitiveType { TypeName = $"decimal({precision},{scale})" };
 
     private static DeltaDataType FromArrowType(IArrowType arrowType) => arrowType switch
     {

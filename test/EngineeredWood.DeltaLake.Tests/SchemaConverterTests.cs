@@ -51,6 +51,52 @@ public class SchemaConverterTests
         Assert.Equal("timestamp_ntz", ((PrimitiveType)deltaSchema.Fields[1].Type).TypeName);
     }
 
+    /// <summary>
+    /// A decimal type name whose scale is above its precision, or whose numbers overflow int, is a
+    /// malformed schema. Spark's DecimalType(p, s) refuses s > p, and an unchecked scale here sizes a
+    /// power of ten in every later rescale and comparison of the column. #760.
+    /// </summary>
+    [Theory]
+    [InlineData("decimal(10,11)")]
+    [InlineData("decimal(10,50000000)")]
+    [InlineData("decimal(10,99999999999)")]
+    [InlineData("decimal(99999999999,2)")]
+    public void ToArrow_RefusesAnInvalidDecimalType(string typeName)
+    {
+        var schema = new Schema.StructType
+        {
+            Fields = [new Schema.StructField { Name = "d", Type = new PrimitiveType { TypeName = typeName }, Nullable = true }],
+        };
+
+        Assert.Throws<DeltaFormatException>(() => SchemaConverter.ToArrowSchema(schema));
+    }
+
+    [Theory]
+    [InlineData(10, 11)]
+    [InlineData(10, -2)]
+    public void FromArrow_RefusesAScaleOutsideZeroToPrecision(int precision, int scale)
+    {
+        var arrowSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("d", new Decimal128Type(precision, scale), true))
+            .Build();
+
+        Assert.Throws<DeltaFormatException>(() => SchemaConverter.FromArrowSchema(arrowSchema));
+    }
+
+    [Theory]
+    [InlineData("decimal(38,38)")]
+    [InlineData("decimal(1,0)")]
+    [InlineData("decimal(5,5)")]
+    public void ToArrow_AcceptsAScaleUpToThePrecision(string typeName)
+    {
+        var schema = new Schema.StructType
+        {
+            Fields = [new Schema.StructField { Name = "d", Type = new PrimitiveType { TypeName = typeName }, Nullable = true }],
+        };
+
+        Assert.IsType<Decimal128Type>(SchemaConverter.ToArrowSchema(schema).FieldsList[0].DataType);
+    }
+
     [Fact]
     public void RoundTrip_DecimalType()
     {
