@@ -97,7 +97,7 @@ public static class StatisticsEvaluator
     {
         // Try to extract (column, op, value). The value may be on either side.
         if (TryExtractColumnAndLiteral(cmp.Left, cmp.Right, cmp.Op, accessor,
-                out string? column, out LiteralValue value, out var op, out var columnAccessor))
+                out IReadOnlyList<string>? column, out LiteralValue value, out var op, out var columnAccessor))
         {
             return EvaluateColumnComparison(column!, op, value, stats, columnAccessor);
         }
@@ -118,7 +118,7 @@ public static class StatisticsEvaluator
     }
 
     private static FilterResult EvaluateColumnComparison<TStats>(
-        string column,
+        IReadOnlyList<string> column,
         ComparisonOperator op,
         LiteralValue value,
         TStats stats,
@@ -205,7 +205,7 @@ public static class StatisticsEvaluator
     /// </remarks>
     private static bool MayContainNaN<TStats>(
         LiteralValue min, LiteralValue max, TStats stats,
-        IStatisticsAccessor<TStats> accessor, string column)
+        IStatisticsAccessor<TStats> accessor, IReadOnlyList<string> column)
     {
         if (!min.IsFloatingPoint && !max.IsFloatingPoint)
             return false;
@@ -433,7 +433,7 @@ public static class StatisticsEvaluator
     private static FilterResult EvaluateUnary<TStats>(
         UnaryPredicate unary, TStats stats, IStatisticsAccessor<TStats> accessor)
     {
-        if (!TryResolveColumn(unary.Operand, accessor, out string? column, out accessor))
+        if (!TryResolveColumn(unary.Operand, accessor, out IReadOnlyList<string>? column, out accessor))
             return FilterResult.Unknown;
 
         switch (unary.Op)
@@ -460,7 +460,7 @@ public static class StatisticsEvaluator
     }
 
     private static FilterResult EvaluateIsNull<TStats>(
-        string column, TStats stats, IStatisticsAccessor<TStats> accessor)
+        IReadOnlyList<string> column, TStats stats, IStatisticsAccessor<TStats> accessor)
     {
         long? nullCount = accessor.GetNullCount(stats, column);
         long? valueCount = accessor.GetValueCount(stats, column);
@@ -478,7 +478,7 @@ public static class StatisticsEvaluator
     /// definitive AlwaysTrue/AlwaysFalse also requires the absence of nulls.
     /// </summary>
     private static FilterResult EvaluateNaN<TStats>(
-        UnaryOperator op, string column, TStats stats, IStatisticsAccessor<TStats> accessor)
+        UnaryOperator op, IReadOnlyList<string> column, TStats stats, IStatisticsAccessor<TStats> accessor)
     {
         if (accessor is not INanCountAccessor<TStats> nanAccessor)
             return FilterResult.Unknown;
@@ -515,7 +515,7 @@ public static class StatisticsEvaluator
     private static FilterResult EvaluateSet<TStats>(
         SetPredicate set, TStats stats, IStatisticsAccessor<TStats> accessor)
     {
-        if (!TryResolveColumn(set.Operand, accessor, out string? column, out accessor))
+        if (!TryResolveColumn(set.Operand, accessor, out IReadOnlyList<string>? column, out accessor))
             return FilterResult.Unknown;
 
         if (set.Values.Count == 0)
@@ -585,7 +585,7 @@ public static class StatisticsEvaluator
     /// </summary>
     private static bool TryExtractColumnAndLiteral<TStats>(
         Expression left, Expression right, ComparisonOperator op, IStatisticsAccessor<TStats> accessor,
-        out string? column, out LiteralValue value, out ComparisonOperator effectiveOp,
+        out IReadOnlyList<string>? column, out LiteralValue value, out ComparisonOperator effectiveOp,
         out IStatisticsAccessor<TStats> columnAccessor)
     {
         if (right is LiteralExpression rl && TryResolveColumn(left, accessor, out column, out columnAccessor))
@@ -620,7 +620,7 @@ public static class StatisticsEvaluator
     /// </summary>
     private static bool TryResolveColumn<TStats>(
         Expression expr, IStatisticsAccessor<TStats> accessor,
-        out string? column, out IStatisticsAccessor<TStats> columnAccessor)
+        out IReadOnlyList<string>? column, out IStatisticsAccessor<TStats> columnAccessor)
     {
         columnAccessor = accessor;
         if (TryGetColumnName(expr, out column))
@@ -630,7 +630,7 @@ public static class StatisticsEvaluator
             && VariantGetCall.TryMatch(expr, out var call)
             && variants.ForVariantGet(call) is { } pathAccessor)
         {
-            column = call.Column.Name;
+            column = call.Column.NameParts;
             columnAccessor = pathAccessor;
             return true;
         }
@@ -639,15 +639,21 @@ public static class StatisticsEvaluator
         return false;
     }
 
-    private static bool TryGetColumnName(Expression expr, out string? name)
+    /// <summary>
+    /// The path a reference names, as the row evaluator resolves it: an unbound reference's
+    /// <see cref="UnboundReference.NameParts"/>, never its dotted <see cref="UnboundReference.Name"/>, which cannot tell
+    /// field <c>x</c> of struct <c>s</c> from a top-level column named <c>s.x</c> (#771). A bound reference names
+    /// one top-level column.
+    /// </summary>
+    private static bool TryGetColumnName(Expression expr, out IReadOnlyList<string>? name)
     {
         switch (expr)
         {
             case UnboundReference u:
-                name = u.Name;
+                name = u.NameParts;
                 return true;
             case BoundReference b:
-                name = b.Name;
+                name = [b.Name];
                 return true;
             default:
                 name = null;

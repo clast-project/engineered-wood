@@ -90,8 +90,8 @@ public sealed class RecentParquetTestingFixturesTests
         // Its min/max were ordered by the annotation, so they are not used (the order is ignored too).
         Assert.NotNull(metadata.RowGroups[0].Columns[0].MetaData!.Statistics?.MinValue);
         var accessor = new ParquetStatisticsAccessor(schema);
-        Assert.Null(accessor.GetMinValue(metadata.RowGroups[0], "int32_uuid"));
-        Assert.Null(accessor.GetMaxValue(metadata.RowGroups[0], "int32_uuid"));
+        Assert.Null(accessor.GetMinValue(metadata.RowGroups[0], ["int32_uuid"]));
+        Assert.Null(accessor.GetMaxValue(metadata.RowGroups[0], ["int32_uuid"]));
     }
 
     /// <summary>
@@ -141,8 +141,8 @@ public sealed class RecentParquetTestingFixturesTests
 
         // The minimum is floored to the microsecond, as the reader floors the value it returns.
         var accessor = new ParquetStatisticsAccessor(await reader.GetSchemaAsync());
-        Assert.Equal(Unix(-50_803_200_000_000L * 10), accessor.GetMinValue(metadata.RowGroups[0], "ts")?.AsDateTimeOffset);
-        Assert.Equal(Unix(86_400_000_000L * 10), accessor.GetMaxValue(metadata.RowGroups[0], "ts")?.AsDateTimeOffset);
+        Assert.Equal(Unix(-50_803_200_000_000L * 10), accessor.GetMinValue(metadata.RowGroups[0], ["ts"])?.AsDateTimeOffset);
+        Assert.Equal(Unix(86_400_000_000L * 10), accessor.GetMaxValue(metadata.RowGroups[0], ["ts"])?.AsDateTimeOffset);
     }
 
     public static TheoryData<string, long, bool> Int96PruningCases() => new()

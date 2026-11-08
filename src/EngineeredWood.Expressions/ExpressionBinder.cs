@@ -26,7 +26,10 @@ public sealed class ExpressionBinder
     /// Creates a binder backed by a resolver function. The resolver returns
     /// null for names not present in the schema.
     /// </summary>
-    /// <param name="resolver">Maps column name to field ID.</param>
+    /// <param name="resolver">
+    /// Maps a top-level column's name to its field ID. Only a one-part reference is offered to it: a reference
+    /// to a struct's field (<see cref="UnboundReference.NameParts"/> longer than one) is left unresolved.
+    /// </param>
     /// <param name="allowUnresolved">
     /// When true, references that the resolver returns null for are left as
     /// <see cref="UnboundReference"/> rather than throwing. Default: false.
@@ -102,7 +105,9 @@ public sealed class ExpressionBinder
         switch (expression)
         {
             case UnboundReference u:
-                int? id = _resolver(u.Name);
+                // The resolver maps a top-level column's name. A struct field's path is not one, though its
+                // dotted Name may spell a top-level column's (#771), so it is never offered.
+                int? id = u.NameParts.Count == 1 ? _resolver(u.Name) : null;
                 if (id.HasValue)
                     return new BoundReference(id.Value, u.Name);
                 if (_allowUnresolved)

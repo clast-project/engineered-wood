@@ -46,18 +46,19 @@ internal static class IndexPruner
         ITableFileSystem fs,
         CancellationToken cancellationToken)
     {
-        // Build column-name → IndexInfo lookup. Only single-column scalar
+        // Build column-path → IndexInfo lookup, by path rather than by name, so an index on a struct's
+        // field never answers for a top-level column of the field's name (#771). Only single-column scalar
         // indices we know how to query (BTREE or BITMAP) get registered;
         // others fall through to "no info" so the caller scans every
         // fragment for that branch.
-        var byColumn = new Dictionary<string, IndexInfo>(StringComparer.Ordinal);
+        var byColumn = new Dictionary<IReadOnlyList<string>, IndexInfo>(ColumnPathComparer.Ordinal);
         foreach (var info in indices)
         {
-            if (info.ColumnNames.Count != 1) continue;
+            if (info.ColumnPaths.Count != 1) continue;
             if (!info.TypeUrl.Contains("BTreeIndexDetails", StringComparison.Ordinal)
                 && !info.TypeUrl.Contains("BitmapIndexDetails", StringComparison.Ordinal))
                 continue;
-            byColumn[info.ColumnNames[0]] = info;
+            byColumn[info.ColumnPaths[0]] = info;
         }
         if (byColumn.Count == 0) return null;
 
@@ -83,7 +84,7 @@ internal static class IndexPruner
 
     private static async ValueTask<HashSet<uint>?> VisitAsync(
         Predicate predicate,
-        IReadOnlyDictionary<string, IndexInfo> byColumn,
+        IReadOnlyDictionary<IReadOnlyList<string>, IndexInfo> byColumn,
         Dictionary<string, BTreeIndex> btreeCache,
         Dictionary<string, BitmapIndex> bitmapCache,
         ITableFileSystem fs,
@@ -139,7 +140,7 @@ internal static class IndexPruner
 
     private static async ValueTask<HashSet<uint>?> VisitComparisonAsync(
         ComparisonPredicate cp,
-        IReadOnlyDictionary<string, IndexInfo> byColumn,
+        IReadOnlyDictionary<IReadOnlyList<string>, IndexInfo> byColumn,
         Dictionary<string, BTreeIndex> btreeCache,
         Dictionary<string, BitmapIndex> bitmapCache,
         ITableFileSystem fs,
@@ -190,13 +191,13 @@ internal static class IndexPruner
 
     private static async ValueTask<HashSet<uint>?> VisitInAsync(
         SetPredicate sp,
-        IReadOnlyDictionary<string, IndexInfo> byColumn,
+        IReadOnlyDictionary<IReadOnlyList<string>, IndexInfo> byColumn,
         Dictionary<string, BTreeIndex> btreeCache,
         Dictionary<string, BitmapIndex> bitmapCache,
         ITableFileSystem fs,
         CancellationToken cancellationToken)
     {
-        if (!TryGetReferenceName(sp.Operand, out string colName)) return null;
+        if (!TryGetReferenceName(sp.Operand, out IReadOnlyList<string> colName)) return null;
         if (!byColumn.TryGetValue(colName, out var info)) return null;
 
         // An index answers "which fragments hold this VALUE", so a list holding anything else --
@@ -252,7 +253,7 @@ internal static class IndexPruner
 
     private static bool TryNormalizeColumnVsLiteral(
         ComparisonPredicate cp,
-        out string columnName,
+        out IReadOnlyList<string> columnName,
         out ComparisonOperator op,
         out LiteralValue value)
     {
@@ -270,19 +271,20 @@ internal static class IndexPruner
             value = litL.Value;
             return true;
         }
-        columnName = string.Empty;
+        columnName = [];
         op = default;
         value = default;
         return false;
     }
 
-    private static bool TryGetReferenceName(Expression e, out string name)
+    // The path a reference names, as the row evaluator resolves it: its parts, not its dotted Name.
+    private static bool TryGetReferenceName(Expression e, out IReadOnlyList<string> name)
     {
         switch (e)
         {
-            case BoundReference b: name = b.Name; return true;
-            case UnboundReference u: name = u.Name; return true;
-            default: name = string.Empty; return false;
+            case BoundReference b: name = [b.Name]; return true;
+            case UnboundReference u: name = u.NameParts; return true;
+            default: name = []; return false;
         }
     }
 

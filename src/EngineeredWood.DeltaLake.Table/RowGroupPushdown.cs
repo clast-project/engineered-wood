@@ -13,7 +13,7 @@ namespace EngineeredWood.DeltaLake.Table;
 /// data file's own leaf columns, for row-group and page pruning by
 /// <see cref="ParquetFileReader.ReadWithPositionsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, CancellationToken)"/>.
 /// <para>
-/// The Parquet statistics accessor resolves a reference by the file's dotted leaf path. Under column mapping
+/// The Parquet statistics accessor resolves a reference by the file's leaf path, part by part. Under column mapping
 /// that is <c>col-&lt;uuid&gt;</c>, not the logical name, so an untranslated predicate would miss every
 /// column and prune nothing at all: safe, but silent. The translation is per FILE rather than per table,
 /// because the file is the authority on what it holds: id mode resolves by field id (as the read path
@@ -25,7 +25,7 @@ namespace EngineeredWood.DeltaLake.Table;
 /// contain, so the accessor answers null and the evaluator Unknown: the row group is KEPT. That covers
 /// partition columns (whose values come from the log, even where IcebergCompat also stores them in the file),
 /// list and map elements, columns absent from an older file,
-/// ambiguous dotted names, and any column whose type has changed (the file's statistics are of the old
+/// and any column whose type has changed (the file's statistics are of the old
 /// type, and a Bloom filter hashes the old physical encoding). Pruning never guesses.
 /// </para>
 /// </summary>
@@ -35,8 +35,11 @@ internal static class RowGroupPushdown
     internal const string Unresolved = "\0unresolved";
 
     /// <summary>
-    /// Rewrites <paramref name="predicate"/>'s references from the table's logical names to
-    /// <paramref name="fileSchema"/>'s dotted leaf paths. A <paramref name="partitionColumns"/> reference never
+    /// Rewrites <paramref name="predicate"/>'s references from the table's logical paths to
+    /// <paramref name="fileSchema"/>'s leaf paths. A reference is matched by its
+    /// <see cref="UnboundReference.NameParts"/>, as the row evaluator resolves it, and never by its dotted text,
+    /// which cannot tell field <c>b</c> of struct <c>a</c> from a top-level column named <c>a.b</c> (#771). A
+    /// <paramref name="partitionColumns"/> reference never
     /// resolves, even to a leaf the file holds: an IcebergCompat file materializes its partition values, but the
     /// log's are the ones a read returns, and the two can disagree (a stored empty string reads as NULL).
     /// </summary>
@@ -46,50 +49,32 @@ internal static class RowGroupPushdown
     {
         var map = LogicalToFileLeaf(tableSchema, mode, fileSchema);
         foreach (var column in partitionColumns)
-            map.Remove(column);
-        return Rewrite(predicate, name => map.TryGetValue(name, out var leaf) ? leaf : Unresolved);
+            map.Remove([column]);
+        return Rewrite(predicate, path => map.TryGetValue(path, out var leaf)
+            ? UnboundReference.FromParts(leaf)
+            : new UnboundReference(Unresolved));
     }
 
     /// <summary>
-    /// Maps each logical dotted leaf path of <paramref name="tableSchema"/> that is a primitive column,
-    /// reached only through structs, and unchanged in type, to the file leaf holding it. A logical path
-    /// that two table columns share (a literal dotted name beside a struct leaf) or a file path that two
-    /// leaves share is left out, which makes it unresolvable.
+    /// Maps each logical leaf path of <paramref name="tableSchema"/> that is a primitive column, reached only
+    /// through structs, and unchanged in type, to the path of the file leaf holding it. Both are paths of parts,
+    /// so a literal dotted name beside a struct leaf of the same spelling is two entries, not a collision.
     /// </summary>
-    internal static Dictionary<string, string> LogicalToFileLeaf(
+    internal static Dictionary<IReadOnlyList<string>, string[]> LogicalToFileLeaf(
         StructType tableSchema, ColumnMappingMode mode, SchemaDescriptor fileSchema)
     {
-        var map = new Dictionary<string, string>(StringComparer.Ordinal);
-        AddFields(tableSchema, fileSchema.Root.Children, "", "", mode, map);
-
-        // Ambiguity is a property of the TABLE, not of this file: a file written before the literal "a.b"
-        // column was added holds only struct a's leaf, yet the predicate's "a.b" still names both.
-        var logicalCount = new Dictionary<string, int>(StringComparer.Ordinal);
-        CountLogicalPaths(tableSchema, "", logicalCount);
-        foreach (var entry in logicalCount.Where(e => e.Value > 1))
-            map.Remove(entry.Key);
-
-        // The accessor indexes leaves by dotted path, last one winning, so a path two file leaves share
-        // (a literal "a.b" leaf beside struct a's leaf b) may be answered with the OTHER column's bounds.
-        var fileLeafCount = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var column in fileSchema.Columns)
-        {
-            fileLeafCount.TryGetValue(column.DottedPath, out int n);
-            fileLeafCount[column.DottedPath] = n + 1;
-        }
-        foreach (var entry in map.Where(e => fileLeafCount.TryGetValue(e.Value, out int n) && n > 1).ToList())
-            map.Remove(entry.Key);
-
+        var map = new Dictionary<IReadOnlyList<string>, string[]>(ColumnPathComparer.Ordinal);
+        AddFields(tableSchema, fileSchema.Root.Children, [], [], mode, map);
         return map;
     }
 
     private static void AddFields(
-        StructType schema, IReadOnlyList<SchemaNode> fileChildren, string logicalPrefix, string filePrefix,
-        ColumnMappingMode mode, Dictionary<string, string> map)
+        StructType schema, IReadOnlyList<SchemaNode> fileChildren, string[] logicalPrefix, string[] filePrefix,
+        ColumnMappingMode mode, Dictionary<IReadOnlyList<string>, string[]> map)
     {
         foreach (var field in schema.Fields)
         {
-            string logical = logicalPrefix.Length == 0 ? field.Name : logicalPrefix + "." + field.Name;
+            string[] logical = [.. logicalPrefix, field.Name];
 
             // A widened column's older files hold the narrower type; leave the whole subtree unresolved.
             if (field.Metadata is not null
@@ -102,7 +87,7 @@ internal static class RowGroupPushdown
             if (node is null || node.Element.RepetitionType == FieldRepetitionType.Repeated)
                 continue;
 
-            string path = filePrefix.Length == 0 ? node.Name : filePrefix + "." + node.Name;
+            string[] path = [.. filePrefix, node.Name];
             if (field.Type is PrimitiveType)
             {
                 if (!node.IsLeaf)
@@ -115,19 +100,6 @@ internal static class RowGroupPushdown
                 AddFields(st, node.Children, logical, path, mode, map);
             }
             // list/map: statistics of a repeated leaf do not bound the row, so nothing to register.
-        }
-    }
-
-    /// <summary>Counts every dotted path the table's columns and struct fields spell, file or no file.</summary>
-    private static void CountLogicalPaths(StructType schema, string prefix, Dictionary<string, int> counts)
-    {
-        foreach (var field in schema.Fields)
-        {
-            string logical = prefix.Length == 0 ? field.Name : prefix + "." + field.Name;
-            counts.TryGetValue(logical, out int n);
-            counts[logical] = n + 1;
-            if (field.Type is StructType st)
-                CountLogicalPaths(st, logical, counts);
         }
     }
 
@@ -166,8 +138,9 @@ internal static class RowGroupPushdown
     }
 
     /// <summary>Rewrites every column reference in <paramref name="predicate"/> through
-    /// <paramref name="rename"/>.</summary>
-    internal static Predicate Rewrite(Predicate predicate, Func<string, string> rename) => predicate switch
+    /// <paramref name="rename"/>, which is given the reference's path.</summary>
+    internal static Predicate Rewrite(Predicate predicate, Func<IReadOnlyList<string>, UnboundReference> rename) =>
+        predicate switch
     {
         TruePredicate or FalsePredicate => predicate,
         AndPredicate and => new AndPredicate(and.Children.Select(c => Rewrite(c, rename)).ToList()),
@@ -185,11 +158,16 @@ internal static class RowGroupPushdown
             new UnboundReference(Unresolved), ComparisonOperator.Equal, new UnboundReference(Unresolved)),
     };
 
-    private static Expression Rewrite(Expression expression, Func<string, string> rename) => expression switch
+    private static Expression Rewrite(Expression expression, Func<IReadOnlyList<string>, UnboundReference> rename) =>
+        expression switch
     {
         Predicate p => Rewrite(p, rename),
-        UnboundReference u => new UnboundReference(rename(u.Name)),
-        BoundReference b => new BoundReference(b.FieldId, rename(b.Name)),
+        UnboundReference u => rename(u.NameParts),
+        // A bound reference names one top-level column. It stays bound when renamed to one, and becomes the
+        // unbound path otherwise: a bound reference has no parts to hold a struct field's path.
+        BoundReference b => rename([b.Name]) is { NameParts.Count: 1 } renamed
+            ? new BoundReference(b.FieldId, renamed.Name)
+            : rename([b.Name]),
         FunctionCall f => new FunctionCall(f.Name, f.Arguments.Select(a => Rewrite(a, rename)).ToList()),
         LiteralExpression => expression,
         _ => new UnboundReference(Unresolved),

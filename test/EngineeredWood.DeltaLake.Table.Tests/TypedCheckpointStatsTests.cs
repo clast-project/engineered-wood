@@ -22,6 +22,9 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 /// </summary>
 public class TypedCheckpointStatsTests : IDisposable
 {
+    /// <summary>A reference to a struct field by its path: <c>"s.a"</c> is field <c>a</c> of struct <c>s</c>.</summary>
+    private static UnboundReference Nested(string dotted) => UnboundReference.FromParts(dotted.Split('.'));
+
     private readonly string _tempDir;
 
     public TypedCheckpointStatsTests()
@@ -132,7 +135,7 @@ public class TypedCheckpointStatsTests : IDisposable
             filters.Add(Ex.GreaterThanOrEqual("id", LiteralValue.Of(v)));
             filters.Add(Ex.LessThan("id", LiteralValue.Of(v)));
             filters.Add(Ex.Equal("id", LiteralValue.Of(v)));
-            filters.Add(Ex.GreaterThan("payload.score", LiteralValue.Of(v)));
+            filters.Add(Ex.GreaterThan(Nested("payload.score"), new LiteralExpression(LiteralValue.Of(v))));
         }
         foreach (string v in new[] { "a", "aa", "mm", "nn", "zz", "zzzz" })
         {
@@ -225,9 +228,9 @@ public class TypedCheckpointStatsTests : IDisposable
 
         var pruner = new DeltaFilePruner(MixedSchema(), []);
         Assert.False(pruner.ShouldInclude(
-            adds[0], Ex.GreaterThan("payload.score", LiteralValue.Of(100L))));
+            adds[0], Ex.GreaterThan(Nested("payload.score"), new LiteralExpression(LiteralValue.Of(100L)))));
         Assert.True(pruner.ShouldInclude(
-            adds[0], Ex.GreaterThan("payload.score", LiteralValue.Of(15L))));
+            adds[0], Ex.GreaterThan(Nested("payload.score"), new LiteralExpression(LiteralValue.Of(15L)))));
     }
 
     /// <summary>

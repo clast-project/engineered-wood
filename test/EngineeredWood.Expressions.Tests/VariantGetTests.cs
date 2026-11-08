@@ -179,12 +179,12 @@ public sealed class VariantGetTests
     {
         public List<VariantGetCall> Asked { get; } = [];
 
-        public LiteralValue? GetMinValue(int stats, string column) => column == "v" ? LiteralValue.Of(0) : (LiteralValue?)null;
-        public LiteralValue? GetMaxValue(int stats, string column) => column == "v" ? LiteralValue.Of(9) : (LiteralValue?)null;
-        public long? GetNullCount(int stats, string column) => null;
-        public long? GetValueCount(int stats, string column) => 100;
-        public bool IsMinExact(int stats, string column) => true;
-        public bool IsMaxExact(int stats, string column) => true;
+        public LiteralValue? GetMinValue(int stats, IReadOnlyList<string> column) => column is ["v"] ? LiteralValue.Of(0) : (LiteralValue?)null;
+        public LiteralValue? GetMaxValue(int stats, IReadOnlyList<string> column) => column is ["v"] ? LiteralValue.Of(9) : (LiteralValue?)null;
+        public long? GetNullCount(int stats, IReadOnlyList<string> column) => null;
+        public long? GetValueCount(int stats, IReadOnlyList<string> column) => 100;
+        public bool IsMinExact(int stats, IReadOnlyList<string> column) => true;
+        public bool IsMaxExact(int stats, IReadOnlyList<string> column) => true;
 
         public IStatisticsAccessor<int>? ForVariantGet(VariantGetCall call)
         {
@@ -194,12 +194,12 @@ public sealed class VariantGetTests
 
         private sealed class Path : IStatisticsAccessor<int>
         {
-            public LiteralValue? GetMinValue(int stats, string column) => LiteralValue.Of(10);
-            public LiteralValue? GetMaxValue(int stats, string column) => LiteralValue.Of(20);
-            public long? GetNullCount(int stats, string column) => null;
-            public long? GetValueCount(int stats, string column) => 100;
-            public bool IsMinExact(int stats, string column) => true;
-            public bool IsMaxExact(int stats, string column) => true;
+            public LiteralValue? GetMinValue(int stats, IReadOnlyList<string> column) => LiteralValue.Of(10);
+            public LiteralValue? GetMaxValue(int stats, IReadOnlyList<string> column) => LiteralValue.Of(20);
+            public long? GetNullCount(int stats, IReadOnlyList<string> column) => null;
+            public long? GetValueCount(int stats, IReadOnlyList<string> column) => 100;
+            public bool IsMinExact(int stats, IReadOnlyList<string> column) => true;
+            public bool IsMaxExact(int stats, IReadOnlyList<string> column) => true;
         }
     }
 
@@ -237,11 +237,11 @@ public sealed class VariantGetTests
 
     private sealed class PlainAccessor : IStatisticsAccessor<int>
     {
-        public LiteralValue? GetMinValue(int stats, string column) => LiteralValue.Of(0);
-        public LiteralValue? GetMaxValue(int stats, string column) => LiteralValue.Of(9);
-        public long? GetNullCount(int stats, string column) => 0;
-        public long? GetValueCount(int stats, string column) => 100;
-        public bool IsMinExact(int stats, string column) => true;
-        public bool IsMaxExact(int stats, string column) => true;
+        public LiteralValue? GetMinValue(int stats, IReadOnlyList<string> column) => LiteralValue.Of(0);
+        public LiteralValue? GetMaxValue(int stats, IReadOnlyList<string> column) => LiteralValue.Of(9);
+        public long? GetNullCount(int stats, IReadOnlyList<string> column) => 0;
+        public long? GetValueCount(int stats, IReadOnlyList<string> column) => 100;
+        public bool IsMinExact(int stats, IReadOnlyList<string> column) => true;
+        public bool IsMaxExact(int stats, IReadOnlyList<string> column) => true;
     }
 }

@@ -74,8 +74,8 @@ public sealed class TimestampBoundPrecisionTests : IDisposable
         var metadata = await reader.ReadMetadataAsync();
         var accessor = new ParquetStatisticsAccessor(await reader.GetSchemaAsync());
 
-        return (accessor.GetMinValue(metadata.RowGroups[0], "t"),
-                accessor.GetMaxValue(metadata.RowGroups[0], "t"));
+        return (accessor.GetMinValue(metadata.RowGroups[0], ["t"]),
+                accessor.GetMaxValue(metadata.RowGroups[0], ["t"]));
     }
 
     private static DateTimeOffset Utc(long ticksSinceEpoch) =>

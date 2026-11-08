@@ -228,8 +228,9 @@ internal sealed class DataFileStats
 /// <summary>
 /// Adapts <see cref="DataFileStats"/> for the shared
 /// <see cref="StatisticsEvaluator"/>. The shared accessor contract is keyed
-/// by column name; Iceberg stores stats by field ID, so this adapter holds
-/// the schema's name→id map for translation.
+/// by column path; Iceberg stores stats by field ID, so this adapter holds
+/// the schema's name→id map for translation. The map holds top-level fields
+/// only, so only a one-part path resolves (#771).
 /// </summary>
 internal sealed class IcebergStatisticsAccessor : IStatisticsAccessor<DataFileStats>
 {
@@ -240,17 +241,17 @@ internal sealed class IcebergStatisticsAccessor : IStatisticsAccessor<DataFileSt
         _nameToId = nameToId;
     }
 
-    public LiteralValue? GetMinValue(DataFileStats stats, string column) =>
-        _nameToId.TryGetValue(column, out int id) ? stats.GetMin(id) : null;
+    public LiteralValue? GetMinValue(DataFileStats stats, IReadOnlyList<string> column) =>
+        column.Count == 1 && _nameToId.TryGetValue(column[0], out int id) ? stats.GetMin(id) : null;
 
-    public LiteralValue? GetMaxValue(DataFileStats stats, string column) =>
-        _nameToId.TryGetValue(column, out int id) ? stats.GetMax(id) : null;
+    public LiteralValue? GetMaxValue(DataFileStats stats, IReadOnlyList<string> column) =>
+        column.Count == 1 && _nameToId.TryGetValue(column[0], out int id) ? stats.GetMax(id) : null;
 
-    public long? GetNullCount(DataFileStats stats, string column) =>
-        _nameToId.TryGetValue(column, out int id) ? stats.GetNullCount(id) : null;
+    public long? GetNullCount(DataFileStats stats, IReadOnlyList<string> column) =>
+        column.Count == 1 && _nameToId.TryGetValue(column[0], out int id) ? stats.GetNullCount(id) : null;
 
-    public long? GetValueCount(DataFileStats stats, string column) => stats.ValueCount;
+    public long? GetValueCount(DataFileStats stats, IReadOnlyList<string> column) => stats.ValueCount;
 
-    public bool IsMinExact(DataFileStats stats, string column) => true;
-    public bool IsMaxExact(DataFileStats stats, string column) => true;
+    public bool IsMinExact(DataFileStats stats, IReadOnlyList<string> column) => true;
+    public bool IsMaxExact(DataFileStats stats, IReadOnlyList<string> column) => true;
 }

@@ -59,25 +59,25 @@ internal sealed class VortexZoneStatsAccessor
         _schema = schema ?? throw new ArgumentNullException(nameof(schema));
     }
 
-    public LiteralValue? GetMinValue(VortexZoneCursor cursor, string column)
+    public LiteralValue? GetMinValue(VortexZoneCursor cursor, IReadOnlyList<string> column)
     {
-        if (!cursor.StatsByColumn.TryGetValue(column, out var stats) || stats?.Min is null)
+        if (!TryGetStats(cursor, column, out var stats) || stats?.Min is null)
             return null;
-        var dtype = TryGetDataType(column);
+        var dtype = TryGetDataType(column[0]);
         return dtype is null ? null : ReadCell(stats.Min, cursor.ZoneIndex, dtype);
     }
 
-    public LiteralValue? GetMaxValue(VortexZoneCursor cursor, string column)
+    public LiteralValue? GetMaxValue(VortexZoneCursor cursor, IReadOnlyList<string> column)
     {
-        if (!cursor.StatsByColumn.TryGetValue(column, out var stats) || stats?.Max is null)
+        if (!TryGetStats(cursor, column, out var stats) || stats?.Max is null)
             return null;
-        var dtype = TryGetDataType(column);
+        var dtype = TryGetDataType(column[0]);
         return dtype is null ? null : ReadCell(stats.Max, cursor.ZoneIndex, dtype);
     }
 
-    public long? GetNullCount(VortexZoneCursor cursor, string column)
+    public long? GetNullCount(VortexZoneCursor cursor, IReadOnlyList<string> column)
     {
-        if (!cursor.StatsByColumn.TryGetValue(column, out var stats) || stats?.NullCount is null)
+        if (!TryGetStats(cursor, column, out var stats) || stats?.NullCount is null)
             return null;
         // NullCount is a non-nullable u64. Cast unchecked — zone sizes vastly
         // smaller than long.MaxValue in any realistic file.
@@ -93,16 +93,16 @@ internal sealed class VortexZoneStatsAccessor
     /// count the evaluator could not tell them apart and would have to refuse to prune either on
     /// <c>&gt;</c> -- so answering it is what keeps ordinary float pruning working here.
     /// </remarks>
-    public long? GetNanCount(VortexZoneCursor cursor, string column)
+    public long? GetNanCount(VortexZoneCursor cursor, IReadOnlyList<string> column)
     {
-        if (!cursor.StatsByColumn.TryGetValue(column, out var stats) || stats?.NaNCount is null)
+        if (!TryGetStats(cursor, column, out var stats) || stats?.NaNCount is null)
             return null;
         return unchecked((long)stats.NaNCount.GetValue(cursor.ZoneIndex)!.Value);
     }
 
-    public long? GetValueCount(VortexZoneCursor cursor, string column)
+    public long? GetValueCount(VortexZoneCursor cursor, IReadOnlyList<string> column)
     {
-        if (!cursor.StatsByColumn.TryGetValue(column, out var stats) || stats is null)
+        if (!TryGetStats(cursor, column, out var stats) || stats is null)
             return null;
         // Vortex zones don't store per-zone row counts in the stats table; the
         // trailing zone may be shorter than ZoneLen. Returning ZoneLen is
@@ -111,17 +111,17 @@ internal sealed class VortexZoneStatsAccessor
         return stats.ZoneLen;
     }
 
-    public bool IsMinExact(VortexZoneCursor cursor, string column)
+    public bool IsMinExact(VortexZoneCursor cursor, IReadOnlyList<string> column)
     {
-        if (!cursor.StatsByColumn.TryGetValue(column, out var stats) || stats?.MinIsTruncated is null)
+        if (!TryGetStats(cursor, column, out var stats) || stats?.MinIsTruncated is null)
             return true; // No truncation flag → assume exact (matches our writer).
         return !stats.MinIsTruncated.IsValid(cursor.ZoneIndex)
             || !stats.MinIsTruncated.GetValue(cursor.ZoneIndex)!.Value;
     }
 
-    public bool IsMaxExact(VortexZoneCursor cursor, string column)
+    public bool IsMaxExact(VortexZoneCursor cursor, IReadOnlyList<string> column)
     {
-        if (!cursor.StatsByColumn.TryGetValue(column, out var stats) || stats?.MaxIsTruncated is null)
+        if (!TryGetStats(cursor, column, out var stats) || stats?.MaxIsTruncated is null)
             return true;
         return !stats.MaxIsTruncated.IsValid(cursor.ZoneIndex)
             || !stats.MaxIsTruncated.GetValue(cursor.ZoneIndex)!.Value;
@@ -173,7 +173,9 @@ internal sealed class VortexZoneStatsAccessor
         switch (e)
         {
             case UnboundReference u:
-                names.Add(u.Name);
+                // A struct's field has no zone stats; its dotted Name may be a top-level column's (#771).
+                if (u.NameParts.Count == 1)
+                    names.Add(u.Name);
                 return;
             case BoundReference b:
                 names.Add(b.Name);
@@ -185,6 +187,17 @@ internal sealed class VortexZoneStatsAccessor
                 WalkPredicate(p, names);
                 return;
         }
+    }
+
+    /// <summary>
+    /// The zone stats of the column a path names. Vortex keeps them for top-level columns only, so only a
+    /// one-part path has any: a longer one names a struct's field, never a top-level column whose name is the
+    /// dotted path (#771).
+    /// </summary>
+    private static bool TryGetStats(VortexZoneCursor cursor, IReadOnlyList<string> column, out ZoneStats? stats)
+    {
+        stats = null;
+        return column.Count == 1 && cursor.StatsByColumn.TryGetValue(column[0], out stats);
     }
 
     private IArrowType? TryGetDataType(string column)

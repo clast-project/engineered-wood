@@ -42,7 +42,9 @@ public sealed class DeltaFilePruner
         // Struct leaves register under their dotted path ("s.a") — matching the flattened stats keys —
         // so a nested reference resolves with the same flat lookup as a top-level column.
         var noBounds = new HashSet<string>(StringComparer.Ordinal);
-        AddFields(schema, logicalPrefix: "", physicalPrefix: "", typeMap, logicalToPhysical, collided, noBounds);
+        var paths = new Dictionary<string, string[]>(StringComparer.Ordinal);
+        AddFields(schema, logicalPrefix: "", physicalPrefix: "", [], typeMap, logicalToPhysical, collided, noBounds,
+            paths);
         // A literal dotted column name colliding with a struct leaf path is ambiguous — drop the key
         // (an unresolvable reference evaluates Unknown => the file is kept; pruning must never guess).
         foreach (var key in collided)
@@ -69,7 +71,7 @@ public sealed class DeltaFilePruner
             StringComparer.Ordinal);
         _accessor = new DeltaFileStatsAccessor(
             typeMap, partitionSet, logicalToPhysical, preferTypedStats, unattributable, noBounds,
-            nonNullablePartitions);
+            nonNullablePartitions, paths, collided);
     }
 
     // A column widened from float (to double) has old files whose bounds are a float's shortest text: "0.1"
@@ -93,13 +95,14 @@ public sealed class DeltaFilePruner
     }
 
     private static void AddFields(
-        StructType schema, string logicalPrefix, string physicalPrefix,
+        StructType schema, string logicalPrefix, string physicalPrefix, string[] partsPrefix,
         Dictionary<string, string> typeMap, Dictionary<string, string> logicalToPhysical,
-        HashSet<string> collided, HashSet<string> noBounds)
+        HashSet<string> collided, HashSet<string> noBounds, Dictionary<string, string[]> paths)
     {
         foreach (var field in schema.Fields)
         {
             string logical = logicalPrefix.Length == 0 ? field.Name : logicalPrefix + "." + field.Name;
+            string[] parts = [.. partsPrefix, field.Name];
             // Column mapping: partitionValues + stats in the log are keyed by the PHYSICAL column name at
             // EVERY level, so track the dotted physical path alongside the logical one. (Older engineered-wood
             // commits used logical keys; the accessor still reads their partition values, not their stats.)
@@ -121,6 +124,7 @@ public sealed class DeltaFilePruner
                 else
                 {
                     typeMap[logical] = pt.TypeName;
+                    paths[logical] = parts;
                     if (physical != logical)
                         logicalToPhysical[logical] = physical;
                     if (WidenedFromFloat(field))
@@ -129,7 +133,7 @@ public sealed class DeltaFilePruner
             }
             else if (field.Type is StructType st)
             {
-                AddFields(st, logical, physical, typeMap, logicalToPhysical, collided, noBounds);
+                AddFields(st, logical, physical, parts, typeMap, logicalToPhysical, collided, noBounds, paths);
             }
             // list/map: stats only cover struct leaves — nothing to register.
         }
@@ -207,7 +211,7 @@ public sealed class DeltaFilePruner
         {
             return false;
         }
-        string column = reference.Name;
+        var column = reference.NameParts;
 
         if (literals.Count > 0)
         {
@@ -277,6 +281,8 @@ internal sealed class DeltaFileStatsAccessor
     private readonly HashSet<string> _unattributable;
     private readonly HashSet<string> _noBounds;
     private readonly HashSet<string> _nonNullablePartitions;
+    private readonly IReadOnlyDictionary<string, string[]> _paths;
+    private readonly HashSet<string> _collided;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<VariantGetCall, VariantPathStatsAccessor?>
         _variantPaths = new();
 
@@ -287,8 +293,12 @@ internal sealed class DeltaFileStatsAccessor
         bool preferTypedStats = true,
         HashSet<string>? unattributableStatsColumns = null,
         HashSet<string>? noBoundsColumns = null,
-        HashSet<string>? nonNullablePartitionColumns = null)
+        HashSet<string>? nonNullablePartitionColumns = null,
+        IReadOnlyDictionary<string, string[]>? paths = null,
+        HashSet<string>? collided = null)
     {
+        _paths = paths ?? new Dictionary<string, string[]>(StringComparer.Ordinal);
+        _collided = collided ?? new HashSet<string>(StringComparer.Ordinal);
         _columnTypes = columnTypes;
         _partitionColumns = partitionColumns;
         _partitionColumnList = new List<string>(partitionColumns);
@@ -358,13 +368,37 @@ internal sealed class DeltaFileStatsAccessor
             _logicalToPhysical.TryGetValue(column, out var physical) ? physical : column, out value!);
     }
 
-    public LiteralValue? GetMinValue(DeltaFileStats stats, string column) =>
-        GetBound(stats, column, isMin: true);
+    /// <summary>
+    /// The key a column path's statistics are kept under, its dotted logical path, or null when the path names
+    /// no column this table registered (#771). The dotted text alone cannot tell field <c>a</c> of struct
+    /// <c>s</c> from a top-level column named <c>s.a</c>, so a key is used only for the path it was registered
+    /// from: a one-part path is the top-level column of that name, never a struct's leaf. Of a text both
+    /// spell, which the pruner dropped, only the top-level reading is kept, for a partition column's value.
+    /// </summary>
+    internal string? Key(IReadOnlyList<string> column)
+    {
+        if (column.Count == 0)
+            return null;
+        string dotted = column.Count == 1 ? column[0] : string.Join(".", column);
+        if (_collided.Contains(dotted))
+            return column.Count == 1 ? dotted : null;
+        if (_paths.TryGetValue(dotted, out var parts))
+            return ColumnPathComparer.Ordinal.Equals(parts, column) ? dotted : null;
+        // Not a registered leaf (a struct, a list, a column the schema lacks): a one-part name finds nothing
+        // under its own text, and a longer path must not be read under a top-level column's.
+        return column.Count == 1 ? dotted : null;
+    }
 
-    public LiteralValue? GetMaxValue(DeltaFileStats stats, string column) =>
-        GetBound(stats, column, isMin: false);
+    public LiteralValue? GetMinValue(DeltaFileStats stats, IReadOnlyList<string> column) =>
+        Key(column) is { } key ? GetBound(stats, key, isMin: true) : null;
 
-    public long? GetNullCount(DeltaFileStats stats, string column)
+    public LiteralValue? GetMaxValue(DeltaFileStats stats, IReadOnlyList<string> column) =>
+        Key(column) is { } key ? GetBound(stats, key, isMin: false) : null;
+
+    public long? GetNullCount(DeltaFileStats stats, IReadOnlyList<string> column) =>
+        Key(column) is { } key ? GetNullCount(stats, key) : null;
+
+    internal long? GetNullCount(DeltaFileStats stats, string column)
     {
         if (_partitionColumns.Contains(column))
         {
@@ -372,7 +406,7 @@ internal sealed class DeltaFileStatsAccessor
             // null (a null string, or a spelling PartitionNulls reads as NULL),
             // every row is null; otherwise no row is null in this column.
             if (TryGetPartitionValue(stats.AddFile, column, out var v))
-                return v is null ? GetValueCount(stats, column) : 0;
+                return v is null ? GetValueCount(stats) : 0;
             return null;
         }
 
@@ -388,7 +422,9 @@ internal sealed class DeltaFileStatsAccessor
         return TryGetStat(stats.ColumnStats?.NullCount, column, out long n) ? (long?)n : null;
     }
 
-    public long? GetValueCount(DeltaFileStats stats, string column)
+    public long? GetValueCount(DeltaFileStats stats, IReadOnlyList<string> column) => GetValueCount(stats);
+
+    internal long? GetValueCount(DeltaFileStats stats)
     {
         if (TypedFor(stats.AddFile) is { } typed)
         {
@@ -400,8 +436,8 @@ internal sealed class DeltaFileStatsAccessor
         return stats.ColumnStats?.NumRecords > 0 ? stats.ColumnStats.NumRecords : null;
     }
 
-    public bool IsMinExact(DeltaFileStats stats, string column) => true;
-    public bool IsMaxExact(DeltaFileStats stats, string column) => true;
+    public bool IsMinExact(DeltaFileStats stats, IReadOnlyList<string> column) => true;
+    public bool IsMaxExact(DeltaFileStats stats, IReadOnlyList<string> column) => true;
 
     /// <summary>
     /// True when the checkpoint's typed statistics cover this column under the name its statistics are keyed
@@ -471,15 +507,15 @@ internal sealed class DeltaFileStatsAccessor
 
     private VariantPathStatsAccessor? CreateVariantPathAccessor(VariantGetCall call)
     {
-        string column = call.Column.Name;
-        if (!_columnTypes.TryGetValue(column, out string? typeName) || typeName != "variant"
+        if (Key(call.Column.NameParts) is not { } column
+            || !_columnTypes.TryGetValue(column, out string? typeName) || typeName != "variant"
             || _partitionColumns.Contains(column) || _noBounds.Contains(column)
             || !call.Path.IsFieldsOnly || call.TargetType is VariantGetCall.VariantTypeName or "binary")
         {
             return null;
         }
         string key = VariantStatsEncoding.NormalizedPath(call.Path.Segments.Select(s => s.Key!).ToList());
-        return new VariantPathStatsAccessor(this, key, call.TargetType);
+        return new VariantPathStatsAccessor(this, column, key, call.TargetType);
     }
 
     internal LiteralValue? GetVariantPathBound(
@@ -530,26 +566,27 @@ internal sealed class DeltaFileStatsAccessor
 /// variant column's per-path bounds (see <see cref="DeltaFileStatsAccessor.ForVariantGet"/>), asked for under the
 /// variant column's name.
 /// </summary>
-internal sealed class VariantPathStatsAccessor(DeltaFileStatsAccessor owner, string key, string typeName)
+internal sealed class VariantPathStatsAccessor(
+    DeltaFileStatsAccessor owner, string variantColumn, string key, string typeName)
     : IStatisticsAccessor<DeltaFileStats>
 {
-    public LiteralValue? GetMinValue(DeltaFileStats stats, string column) =>
-        owner.GetVariantPathBound(stats, column, key, typeName, isMin: true);
+    public LiteralValue? GetMinValue(DeltaFileStats stats, IReadOnlyList<string> column) =>
+        owner.GetVariantPathBound(stats, variantColumn, key, typeName, isMin: true);
 
-    public LiteralValue? GetMaxValue(DeltaFileStats stats, string column) =>
-        owner.GetVariantPathBound(stats, column, key, typeName, isMin: false);
+    public LiteralValue? GetMaxValue(DeltaFileStats stats, IReadOnlyList<string> column) =>
+        owner.GetVariantPathBound(stats, variantColumn, key, typeName, isMin: false);
 
     // The result is NULL in at least the rows where the variant is, and in an unknown number more (a missing
     // path), so the count is known only when the column is NULL throughout.
-    public long? GetNullCount(DeltaFileStats stats, string column) =>
-        owner.GetNullCount(stats, column) is long nulls && owner.GetValueCount(stats, column) is long rows
+    public long? GetNullCount(DeltaFileStats stats, IReadOnlyList<string> column) =>
+        owner.GetNullCount(stats, variantColumn) is long nulls && owner.GetValueCount(stats) is long rows
             && nulls == rows
             ? nulls
             : null;
 
-    public long? GetValueCount(DeltaFileStats stats, string column) => owner.GetValueCount(stats, column);
+    public long? GetValueCount(DeltaFileStats stats, IReadOnlyList<string> column) => owner.GetValueCount(stats);
 
-    public bool IsMinExact(DeltaFileStats stats, string column) => true;
+    public bool IsMinExact(DeltaFileStats stats, IReadOnlyList<string> column) => true;
 
-    public bool IsMaxExact(DeltaFileStats stats, string column) => true;
+    public bool IsMaxExact(DeltaFileStats stats, IReadOnlyList<string> column) => true;
 }

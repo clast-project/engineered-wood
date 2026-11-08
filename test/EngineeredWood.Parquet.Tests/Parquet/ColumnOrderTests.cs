@@ -62,8 +62,8 @@ public sealed class ColumnOrderTests : IDisposable
         var metadata = await reader.ReadMetadataAsync();
         var accessor = new ParquetStatisticsAccessor(await reader.GetSchemaAsync());
         Assert.NotNull(metadata.RowGroups[0].Columns[0].MetaData!.Statistics!.MinValue);
-        Assert.Null(accessor.GetMinValue(metadata.RowGroups[0], "d"));
-        Assert.Null(accessor.GetMaxValue(metadata.RowGroups[0], "d"));
+        Assert.Null(accessor.GetMinValue(metadata.RowGroups[0], ["d"]));
+        Assert.Null(accessor.GetMaxValue(metadata.RowGroups[0], ["d"]));
 
         // The page index is ordered the same way, so it cannot narrow the row group either.
         var ranges = await reader.GetCandidateRowRangesAsync(1, Ex.GreaterThan("d", 190.0));

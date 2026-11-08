@@ -29,11 +29,21 @@ public sealed class IndexInfo
     public required string TypeUrl { get; init; }
 
     /// <summary>
-    /// Names of the columns this index covers, in declaration order.
+    /// Names of the columns this index covers, in declaration order: each
+    /// one's dotted path (<c>s.x</c> for field <c>x</c> of struct <c>s</c>).
     /// Resolved from the <c>field_id</c> list in the IndexMetadata
-    /// against the dataset's current schema.
+    /// against the dataset's current schema. See <see cref="ColumnPaths"/>
+    /// for the same paths as parts.
     /// </summary>
     public required IReadOnlyList<string> ColumnNames { get; init; }
+
+    /// <summary>
+    /// The paths of the columns this index covers, in declaration order: a
+    /// top-level field, then a field of each struct below it. A field whose
+    /// id the schema lacks has a one-part placeholder path,
+    /// <c>&lt;field#id&gt;</c>.
+    /// </summary>
+    public required IReadOnlyList<IReadOnlyList<string>> ColumnPaths { get; init; }
 
     /// <summary>
     /// Fragment ids covered by the index, decoded from the index's
