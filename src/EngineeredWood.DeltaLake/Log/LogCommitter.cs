@@ -90,11 +90,12 @@ public sealed class LogCommitter
         if (stagedActions.Count == 0)
             return new LogCommitResult(baseSnapshot.Version, baseSnapshot, Committed: false);
 
-        // Before anything is written: a base that log cleanup has overtaken would put this commit below the
-        // checkpoint, invisible (#697). Usually free; see the guard. It is also why the refresh after the commit
+        // Before anything is written: a base whose log was replaced (the table dropped and re-created, #750) would
+        // put this commit into another table's log, and one that log cleanup has overtaken would put it below the
+        // checkpoint, invisible (#697). One single-file listing; see the guard. The cleanup half is also why the refresh after the commit
         // below stays the strict SnapshotBuilder.UpdateAsync, never the checkpoint fallback readers use: a gap
         // there means a commit no reader will see, and jumping over it would report that lost write as a success.
-        await CleanedBaseGuard.EnsureBaseNotOvertakenAsync(_log, baseSnapshot, cancellationToken)
+        await CleanedBaseGuard.EnsureCommittableBaseAsync(_log, baseSnapshot, cancellationToken)
             .ConfigureAwait(false);
 
         // The actions actually written this attempt. Starts as the staged actions; a rebase replaces it
@@ -201,6 +202,12 @@ public sealed class LogCommitter
             }
             catch (DeltaConflictException) when (attempt + 1 < request.MaxAttempts)
             {
+                // A collision is also what a table dropped and re-created since the check above produces, when its
+                // new log reaches past the base. Checked again before reading the commits to rebase over, which would
+                // then be the other table's (#755 review).
+                await CleanedBaseGuard.EnsureLogNotReplacedAsync(_log, baseSnapshot, cancellationToken)
+                    .ConfigureAwait(false);
+
                 // A rebase that needs the concurrent files' current state (their deletion vectors, the
                 // advanced row-id high-water mark) has to replay the log into a snapshot; one that only
                 // needs somewhere to land asks for the version, which is a listing rather than a replay.

@@ -131,6 +131,40 @@ public class LogCleanupTests : IDisposable
         Assert.Equal(5, snapshot.Version);
     }
 
+    /// <summary>
+    /// #755 review: a listing of the log is recursive on the local file system (and S3), so a commit-named copy in a
+    /// directory inside the log was classified as a commit by name. Cleanup then deleted it as an expired one, and
+    /// a version listing reported a version the log does not have. Neither touches it now.
+    /// </summary>
+    [Fact]
+    public async Task CommitNamedCopyInADirectoryUnderTheLog_IsNotACommit()
+    {
+        await WriteVersionsAsync(through: 5);
+        var built = await Snapshot.SnapshotBuilder.BuildAsync(
+            _log, new Checkpoint.CheckpointReader(_fs), atVersion: null);
+        await new Checkpoint.CheckpointWriter(_fs).WriteCheckpointAsync(built);
+        string backup = Directory.CreateDirectory(LogFile("backup")).FullName;
+        string copyOf0 = Path.Combine(backup, "00000000000000000000.json");
+        string copyAs9 = Path.Combine(backup, "00000000000000000009.json");
+        File.Copy(LogFile("00000000000000000000.json"), copyOf0);
+        File.Copy(LogFile("00000000000000000000.json"), copyAs9);
+        Backdate(new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+        File.SetLastWriteTimeUtc(copyOf0, new DateTime(2020, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+
+        var versions = new List<long>();
+        await foreach (long v in _log.ListVersionsAsync())
+            versions.Add(v);
+        Assert.Equal([0L, 1, 2, 3, 4, 5], versions);
+
+        int deleted = await LogCleanup.RunAsync(
+            _log, Retention("interval 1 days"), latestCheckpointVersion: 5, Now);
+
+        Assert.Equal(5, deleted);                              // v0..v4 only
+        Assert.False(File.Exists(LogFile("00000000000000000000.json")));
+        Assert.True(File.Exists(copyOf0));
+        Assert.True(File.Exists(copyAs9));
+    }
+
     // ── half one: a checkpoint must cover it ───────────────────────────────────────────────────────────
 
     /// <summary>

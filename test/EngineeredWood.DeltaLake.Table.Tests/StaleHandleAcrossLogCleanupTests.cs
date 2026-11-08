@@ -249,12 +249,12 @@ public class StaleHandleAcrossLogCleanupTests : IDisposable
     }
 
     /// <summary>
-    /// What the guard costs. A snapshot seen as the latest within the window pays nothing, and the handle's own commit
-    /// refreshes it, so a writer that keeps writing never pays. One older than the window pays one existence check of
-    /// its base commit, which is there, and commits.
+    /// What the guard costs since #750: one single-file listing of the base's commit per commit, whether the snapshot
+    /// is fresh or idle, and no existence check. Freshness no longer makes it free, because a drop and re-create can
+    /// happen moments after the base was read; the listing answers both questions (replaced, and overtaken).
     /// </summary>
     [Fact]
-    public async Task Guard_IsFreeForAFreshSnapshot_AndOneExistenceCheckForAnIdleOne()
+    public async Task Guard_CostsOneBaseCheckPerCommit_FreshOrIdle()
     {
         await CreateAsync(ShortRetention);
         var counting = new CommitExistsCountingFileSystem(Fs);
@@ -262,17 +262,18 @@ public class StaleHandleAcrossLogCleanupTests : IDisposable
 
         await table.WriteAsync([Rows(100)]);
         await table.WriteAsync([Rows(101)]);
-        Assert.Equal(0, counting.CommitExistsChecks);
+        Assert.Equal(2, counting.CommitListings);
 
         await Task.Delay(1200);
         await table.WriteAsync([Rows(102)]);
-        Assert.Equal(1, counting.CommitExistsChecks);
+        Assert.Equal(3, counting.CommitListings);
+        Assert.Equal(0, counting.CommitExistsChecks);
         Assert.Equal(12, table.CurrentSnapshot.Version);
     }
 
-    /// <summary>The default retention caps the window at five minutes, so a just-opened handle pays nothing.</summary>
+    /// <summary>Under the default retention too: one check per commit, the window notwithstanding.</summary>
     [Fact]
-    public async Task Guard_IsFreeUnderTheDefaultRetention()
+    public async Task Guard_CostsOneBaseCheckPerCommit_UnderTheDefaultRetention()
     {
         await using (var writer = await DeltaTable.CreateAsync(Fs, TableSchema, Options))
             await writer.WriteAsync([Rows(1)]);
@@ -282,6 +283,7 @@ public class StaleHandleAcrossLogCleanupTests : IDisposable
         await table.WriteAsync([Rows(2)]);
         await table.DeleteAsync(IdIs(1));
 
+        Assert.Equal(2, counting.CommitListings);
         Assert.Equal(0, counting.CommitExistsChecks);
         Assert.Equal(CleanedBaseGuard.MaxFreshWindow, TimeSpan.FromMinutes(5));
     }
@@ -499,6 +501,11 @@ public class StaleHandleAcrossLogCleanupTests : IDisposable
 
         public int CommitExistsChecks => Volatile.Read(ref _commitExistsChecks);
 
+        private int _commitListings;
+
+        /// <summary>Listings whose prefix is one commit file: the guard's check of a base.</summary>
+        public int CommitListings => Volatile.Read(ref _commitListings);
+
         public PathNameConstraints PathConstraints => inner.PathConstraints;
 
         public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
@@ -515,7 +522,11 @@ public class StaleHandleAcrossLogCleanupTests : IDisposable
             => inner.OpenReadAsync(path, cancellationToken);
 
         public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default)
-            => inner.ListAsync(prefix, cancellationToken);
+        {
+            if (DeltaVersion.TryParseCommitVersion(Path.GetFileName(prefix), out _))
+                Interlocked.Increment(ref _commitListings);
+            return inner.ListAsync(prefix, cancellationToken);
+        }
 
         public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
             => inner.CreateAsync(path, overwrite, cancellationToken);

@@ -294,6 +294,28 @@ public abstract partial class TableFileSystemPathConformanceTests : IAsyncLifeti
         Assert.NotEqual(first.ETag, second.ETag);
     }
 
+    /// <summary>
+    /// #750: a listing whose prefix is one file's full path returns that file, described exactly as a listing of
+    /// its directory describes it, and nothing for a path that is not there. A Delta commit checks its base this
+    /// way, against the identity a directory listing recorded, so any difference would refuse good commits.
+    /// </summary>
+    [SkippableFact]
+    public async Task ListingOneFilesPath_ReportsItAsItsDirectoryListingDoes()
+    {
+        Require();
+        var fs = FileSystem;
+        const string path = "single/_delta_log/00000000000000000003.json";
+        await fs.WriteAllBytesAsync(path, PayloadFor(path));
+        await fs.WriteAllBytesAsync("single/_delta_log/00000000000000000004.json", PayloadFor("next"));
+
+        var fromDirectory = (await ListAsync(fs, "single/_delta_log/")).Single(f => f.Path == path);
+        var fromPath = Assert.Single(await ListAsync(fs, path));
+
+        Assert.Equal(fromDirectory, fromPath);
+        Assert.Equal(fromDirectory.ETag, fromPath.ETag);
+        Assert.Empty(await ListAsync(fs, "single/_delta_log/00000000000000000002.json"));
+    }
+
     [SkippableFact]
     public async Task TryWriteAllBytes_UnderAwkwardName_DoesNotOverwrite()
     {

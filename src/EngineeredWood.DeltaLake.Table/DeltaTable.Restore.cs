@@ -425,7 +425,7 @@ public sealed partial class DeltaTable
     private async ValueTask<List<(long Version, long Modified)>> ListCommitsAsync(CancellationToken cancellationToken)
     {
         var modified = new Dictionary<long, long>();
-        await foreach (var file in _fs.ListAsync(DeltaVersion.LogPrefix, cancellationToken).ConfigureAwait(false))
+        await foreach (var file in LogDirectory.ListAsync(_fs, cancellationToken).ConfigureAwait(false))
         {
             if (DeltaVersion.TryParseCommitVersion(Path.GetFileName(file.Path), out long v))
                 modified[v] = file.LastModified.ToUnixTimeMilliseconds();

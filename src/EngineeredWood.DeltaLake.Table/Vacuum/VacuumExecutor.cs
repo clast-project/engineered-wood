@@ -104,9 +104,9 @@ internal static class VacuumExecutor
         long? endVersion = null;
         if (!dryRun)
         {
-            // #697: VACUUM START is committed at the snapshot's version + 1, so it must not land below versions log
-            // cleanup removed. Free for the snapshot DeltaTable.VacuumAsync has just refreshed.
-            await CleanedBaseGuard.EnsureBaseNotOvertakenAsync(log, snapshot, cancellationToken).ConfigureAwait(false);
+            // #697, #750: VACUUM START is committed at the snapshot's version + 1, so it must not land below versions
+            // log cleanup removed, nor in a log that replaced the one the snapshot was read from.
+            await CleanedBaseGuard.EnsureCommittableBaseAsync(log, snapshot, cancellationToken).ConfigureAwait(false);
             // START is the latest version from the moment it is created, which is after this.
             var startLatestAt = DateTimeOffset.UtcNow;
             long startVersion = await WriteCommitInfoAsync(
@@ -119,7 +119,7 @@ internal static class VacuumExecutor
                         $"{{\"numFilesToDelete\":\"{filesToDelete.Count}\",\"sizeOfDataToDelete\":\"{bytesToDelete}\"}}"),
                 },
                 firstCandidateVersion: snapshot.Version + 1,
-                commitProperties, cancellationToken).ConfigureAwait(false);
+                commitProperties, firstAttemptChecked: true, cancellationToken).ConfigureAwait(false);
 
             // Before the deletions, not after them. The commit is durable here, and the work the hook
             // does — summarising a version, possibly checkpointing it — belongs beside the commit rather
@@ -157,7 +157,7 @@ internal static class VacuumExecutor
                         $"{{\"numDeletedFiles\":\"{deleted}\",\"numVacuumedDirectories\":\"0\"}}"),
                 },
                 firstCandidateVersion: firstEndVersion,
-                commitProperties, cancellationToken).ConfigureAwait(false);
+                commitProperties, firstAttemptChecked: false, cancellationToken).ConfigureAwait(false);
 
             if (afterCommit is not null)
                 await afterCommit(endVersion.Value, cancellationToken).ConfigureAwait(false);
@@ -298,7 +298,7 @@ internal static class VacuumExecutor
     private static async ValueTask<long> WriteCommitInfoAsync(
         TransactionLog log, DeltaSnapshot snapshot, string operation,
         IDictionary<string, JsonElement> additionalValues, long firstCandidateVersion,
-        CommitProperties? commitProperties, CancellationToken cancellationToken)
+        CommitProperties? commitProperties, bool firstAttemptChecked, CancellationToken cancellationToken)
     {
         // Both bookend commits carry the caller's properties, as Spark's do: its userMetadata is set per
         // session, and VACUUM START and VACUUM END are two commits of that session.
@@ -310,6 +310,25 @@ internal static class VacuumExecutor
         string txnId = InCommitTimestamp.NewTxnId();
         for (int attempt = 0; ; attempt++, version++)
         {
+            // Never into another table's log (#750): checked before every attempt the caller has not just checked.
+            // A retry follows a collision, which a table dropped and re-created meanwhile produces, and END follows
+            // the deletes, which can take a while (#755 review).
+            if (attempt > 0 || !firstAttemptChecked)
+                await CleanedBaseGuard.EnsureLogNotReplacedAsync(log, snapshot, cancellationToken).ConfigureAwait(false);
+
+            // Nor below a checkpoint (#697): between a collision and this retry, another writer can checkpoint and
+            // log cleanup remove the commit that collided, leaving this version free beneath the checkpoint, where
+            // no reader would see it (#755 review). A commitInfo-only commit needs no base, so it moves past the
+            // latest version rather than failing, as END's first attempt does. One existence check per retry; the
+            // commit that just collided is normally still there.
+            if (attempt > 0
+                && await CleanedBaseGuard.FindOvertakingVersionAsync(
+                        log, version - 1, latestAt: null, snapshot.Metadata.Configuration, cancellationToken)
+                    .ConfigureAwait(false) is { } latestVersion)
+            {
+                version = latestVersion + 1;
+            }
+
             // Prepared per attempt: an in-commit timestamp must come after the commit just below THIS version,
             // whatever the clocks say, and that is START for END, or whatever a concurrent writer just landed.
             long timestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
