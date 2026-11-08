@@ -351,6 +351,29 @@ public class RowGroupPushdownTests : IDisposable
             rewritten.ToString());
     }
 
+    /// <summary>
+    /// A bound reference stays bound only when it maps to one top-level file column. One the file cannot resolve
+    /// becomes the unresolved reference itself, never a bound reference carrying the column's field id under the
+    /// sentinel name; one that maps to a struct field becomes that field's path, which a bound reference cannot
+    /// hold.
+    /// </summary>
+    [Fact]
+    public void Rewrite_ABoundReference_StaysBoundOnlyWhenItMapsToATopLevelColumn()
+    {
+        var bound = new BoundReference(7, "d");
+        Expression RewriteTo(UnboundReference target) =>
+            Assert.IsType<ComparisonPredicate>(
+                RowGroupPushdown.Rewrite(Ex.Equal(bound, new LiteralExpression(LiteralValue.Of(1L))), _ => target)).Left;
+
+        Assert.Equal(new BoundReference(7, "col-d"), RewriteTo(new UnboundReference("col-d")));
+
+        var unresolved = Assert.IsType<UnboundReference>(RewriteTo(new UnboundReference(RowGroupPushdown.Unresolved)));
+        Assert.Equal(RowGroupPushdown.Unresolved, unresolved.Name);
+
+        var nested = Assert.IsType<UnboundReference>(RewriteTo(UnboundReference.FromParts(["s", "d"])));
+        Assert.Equal(["s", "d"], nested.NameParts);
+    }
+
     [Fact]
     public async Task Compaction_ReadsEveryRow_AfterAPrunedScan()
     {

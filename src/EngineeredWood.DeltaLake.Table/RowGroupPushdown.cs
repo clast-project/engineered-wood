@@ -163,13 +163,19 @@ internal static class RowGroupPushdown
     {
         Predicate p => Rewrite(p, rename),
         UnboundReference u => rename(u.NameParts),
-        // A bound reference names one top-level column. It stays bound when renamed to one, and becomes the
-        // unbound path otherwise: a bound reference has no parts to hold a struct field's path.
-        BoundReference b => rename([b.Name]) is { NameParts.Count: 1 } renamed
-            ? new BoundReference(b.FieldId, renamed.Name)
-            : rename([b.Name]),
+        BoundReference b => Rebind(b, rename([b.Name])),
         FunctionCall f => new FunctionCall(f.Name, f.Arguments.Select(a => Rewrite(a, rename)).ToList()),
         LiteralExpression => expression,
         _ => new UnboundReference(Unresolved),
     };
+
+    /// <summary>
+    /// A bound reference after <paramref name="renamed"/>: still bound when it maps to one top-level file column.
+    /// Otherwise it is the renamed reference itself: a struct field's path, which a bound reference has no parts to
+    /// hold, or <see cref="Unresolved"/>, which must not carry the column's field id to a name it does not have.
+    /// </summary>
+    private static Expression Rebind(BoundReference b, UnboundReference renamed) =>
+        renamed.NameParts.Count == 1 && !string.Equals(renamed.Name, Unresolved, StringComparison.Ordinal)
+            ? new BoundReference(b.FieldId, renamed.Name)
+            : renamed;
 }
