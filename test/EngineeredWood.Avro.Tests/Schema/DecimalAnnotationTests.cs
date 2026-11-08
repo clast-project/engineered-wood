@@ -119,9 +119,8 @@ public class DecimalAnnotationTests
         Assert.Throws<NotSupportedException>(() => new AvroReaderBuilder().Build(ms).ReadNextBatch());
     }
 
-    // Schema resolution matches bytes to bytes without comparing the decimal annotations, and the
-    // builders decode with the writer's: the reader's decimal(10,2) must not let decimal(50000000,
-    // 50000000) through.
+    // The writer's annotation is bounded before it is compared with the reader's, so a reader
+    // schema cannot let decimal(50000000, 50000000) through.
     [Fact]
     public void AHugeWriterDecimal_IsRefused_UnderAReaderSchema()
     {
@@ -217,8 +216,116 @@ public class DecimalAnnotationTests
         Assert.Equal([0x30, 0x39], Assert.IsType<BinaryArray>(batch.Column(0)).GetBytes(0).ToArray());
     }
 
-    /// <summary>A null-codec object container file holding one block of single-field <c>bytes</c> records.</summary>
-    private static MemoryStream RawOcf(string schemaJson, byte[][] values)
+    // ── Writer decimal under reader decimal (#767) ──────────────────────────────────────────────────
+    // The spec: two decimals match only if their scales and precisions match. A larger reader
+    // precision at the same scale is let through as well; nothing else is.
+
+    private static string BytesDecimal(int precision, int scale) =>
+        $$"""{"type": "bytes", "logicalType": "decimal", "precision": {{precision}}, "scale": {{scale}}}""";
+
+    // 12345 as a big-endian unscaled value.
+    private static MemoryStream WriterDecimal(int precision, int scale) =>
+        RawOcf(OneField(BytesDecimal(precision, scale)).Json, [[0x30, 0x39]]);
+
+    [Theory]
+    [InlineData(20, 4, 20, 4, "1.2345")]
+    [InlineData(10, 2, 20, 2, "123.45")]
+    [InlineData(5, 0, 38, 0, "12345")]
+    public void AWriterDecimal_ReadsUnderAReaderDecimal_OfTheSameScale_AndAtLeastItsPrecision(
+        int writerPrecision, int writerScale, int readerPrecision, int readerScale, string expected)
+    {
+        using var ms = WriterDecimal(writerPrecision, writerScale);
+
+        var batch = ReadUnder(ms, OneField(BytesDecimal(readerPrecision, readerScale)));
+
+        var column = Assert.IsType<Decimal128Array>(batch.Column(0));
+        var type = (Decimal128Type)column.Data.DataType;
+        Assert.Equal((readerPrecision, readerScale), (type.Precision, type.Scale));
+        Assert.Equal(expected, column.GetSqlDecimal(0)!.Value.ToString());
+    }
+
+    [Theory]
+    [InlineData(20, 4, 20, 2)] // a smaller scale: Avro Java reads 1.2345 as 123.45
+    [InlineData(10, 2, 12, 4)] // a larger scale, even with room for it: 123.45 would read as 1.2345
+    [InlineData(20, 2, 10, 2)] // the same scale with a smaller precision: a value may not fit
+    public void AWriterDecimal_IsRefused_UnderAReaderDecimalItWouldMisread(
+        int writerPrecision, int writerScale, int readerPrecision, int readerScale)
+    {
+        using var ms = WriterDecimal(writerPrecision, writerScale);
+
+        var ex = Assert.Throws<InvalidOperationException>(() => new AvroReaderBuilder()
+            .WithReaderSchema(OneField(BytesDecimal(readerPrecision, readerScale))).Build(ms).ReadNextBatch());
+        Assert.Contains($"decimal({writerPrecision},{writerScale})", ex.Message);
+        Assert.Contains($"decimal({readerPrecision},{readerScale})", ex.Message);
+    }
+
+    // A fixed(8) decimal(9,2) holding 12345, i.e. 123.45.
+    private static MemoryStream WriterFixedDecimal() => RawOcf(
+        OneField("""{"type": "fixed", "name": "F", "size": 8, "logicalType": "decimal", "precision": 9, "scale": 2}""").Json,
+        [[0, 0, 0, 0, 0, 0, 0x30, 0x39]],
+        lengthPrefixed: false);
+
+    [Fact]
+    public void AFixedWriterDecimal_TakesALargerReaderPrecision()
+    {
+        using var ms = WriterFixedDecimal();
+
+        var batch = ReadUnder(ms, OneField("""{"type": "fixed", "name": "F", "size": 8, "logicalType": "decimal", "precision": 18, "scale": 2}"""));
+
+        var type = (Decimal128Type)batch.Column(0).Data.DataType;
+        Assert.Equal((18, 2), (type.Precision, type.Scale));
+        Assert.Equal("123.45", ((Decimal128Array)batch.Column(0)).GetSqlDecimal(0)!.Value.ToString());
+    }
+
+    [Fact]
+    public void AFixedWriterDecimal_IsRefused_UnderAnotherScale()
+    {
+        using var ms = WriterFixedDecimal();
+
+        Assert.Throws<InvalidOperationException>(() => new AvroReaderBuilder()
+            .WithReaderSchema(OneField("""{"type": "fixed", "name": "F", "size": 8, "logicalType": "decimal", "precision": 9, "scale": 3}"""))
+            .Build(ms).ReadNextBatch());
+    }
+
+    // The item builder used to take the writer's type even under a reader schema.
+    [Fact]
+    public void AnArrayOfWriterDecimals_TakesTheReadersItemType()
+    {
+        // One record: an array block of one item (12345, length 2), then the end-of-array 0.
+        using var ms = RawOcf(
+            OneField($$"""{"type": "array", "items": {{BytesDecimal(10, 2)}}}""").Json,
+            [[2, 4, 0x30, 0x39, 0]],
+            lengthPrefixed: false);
+
+        var batch = ReadUnder(ms, OneField($$"""{"type": "array", "items": {{BytesDecimal(20, 2)}}}"""));
+
+        var list = Assert.IsType<ListArray>(batch.Column(0));
+        var items = Assert.IsType<Decimal128Array>(list.Values);
+        Assert.Equal((20, 2), (((Decimal128Type)items.Data.DataType).Precision, ((Decimal128Type)items.Data.DataType).Scale));
+        Assert.Equal("123.45", items.GetSqlDecimal(0)!.Value.ToString());
+    }
+
+    // The top-level compatibility check does not descend into containers; the builder check does.
+    [Theory]
+    [InlineData("""{"type": "array", "items": DEC}""")]
+    [InlineData("""{"type": "map", "values": DEC}""")]
+    [InlineData("""["null", DEC]""")]
+    public void ANestedWriterDecimal_IsRefused_UnderAnotherScale(string shape)
+    {
+        var writerSchema = OneField(shape.Replace("DEC", BytesDecimal(10, 2)));
+        var readerSchema = OneField(shape.Replace("DEC", BytesDecimal(10, 4)));
+        // An empty file is enough: the builders are made from the schemas.
+        using var ms = RawOcf(writerSchema.Json, []);
+
+        Assert.Throws<InvalidOperationException>(
+            () => new AvroReaderBuilder().WithReaderSchema(readerSchema).Build(ms).ReadNextBatch());
+    }
+
+    /// <summary>
+    /// A null-codec object container file holding one block of single-field records: <c>bytes</c>
+    /// values, or with <paramref name="lengthPrefixed"/> false, <c>fixed</c> ones.
+    /// </summary>
+    private static MemoryStream RawOcf(string schemaJson, byte[][] values, bool lengthPrefixed = true)
     {
         var ms = new MemoryStream();
         ms.Write([(byte)'O', (byte)'b', (byte)'j', 1], 0, 4);
@@ -231,7 +338,12 @@ public class DecimalAnnotationTests
 
         using var block = new MemoryStream();
         foreach (var v in values)
-            WriteBytes(block, v);
+        {
+            if (lengthPrefixed)
+                WriteBytes(block, v);
+            else
+                block.Write(v, 0, v.Length);
+        }
         WriteLong(ms, values.Length);
         WriteLong(ms, block.Length);
         block.WriteTo(ms);
