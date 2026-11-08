@@ -541,6 +541,79 @@ public class IcebergCompatV3Tests : IDisposable
         Assert.Equal([0L, 1L, 2L, 3L], await RowIdsAsync(reopened));
     }
 
+    /// <summary>
+    /// IcebergCompat stores the partition values in the data files too, and compaction rewrites them. Its output
+    /// carries the partition column, physical-named, holding the file's partition value (NULL included), as the
+    /// append path writes it. The values stay out of the stats, which describe the data columns.
+    /// </summary>
+    [Theory]
+    [InlineData(IcebergCompat.EnableV2Key)]
+    [InlineData(IcebergCompat.EnableV3Key)]
+    public async Task Compaction_OfAPartitionedIcebergCompatTable_MaterializesThePartitionValues(string enableKey)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("k", Int32Type.Default, true))
+            .Build();
+        RecordBatch Rows(long start, int? k)
+        {
+            var ids = new Int64Array.Builder();
+            var ks = new Int32Array.Builder();
+            for (long i = start; i < start + 2; i++)
+            {
+                ids.Append(i);
+                if (k is int value)
+                    ks.Append(value);
+                else
+                    ks.AppendNull();
+            }
+            return new RecordBatch(schema, [ids.Build(), ks.Build()], 2);
+        }
+
+        await using var table = await DeltaTable.CreateAsync(Fs, schema, partitionColumns: ["k"],
+            columnMappingMode: ColumnMappingMode.Name,
+            configuration: new Dictionary<string, string> { [enableKey] = "true" });
+        foreach (var (start, k) in new (long, int?)[] { (1, 7), (10, 7), (20, null), (30, null) })
+            await table.WriteAsync([Rows(start, k)]);
+
+        Assert.NotNull(await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue }));
+
+        var kField = table.CurrentSnapshot.Schema.Fields.Single(f => f.Name == "k");
+        string physical = ColumnMapping.GetPhysicalName(kField, ColumnMappingMode.Name);
+        var adds = table.CurrentSnapshot.ActiveFiles.Values.ToList();
+        Assert.Equal(2, adds.Count);
+        foreach (var add in adds)
+        {
+            int? expected = add.PartitionValues.TryGetValue(physical, out string? text) && text is not null
+                ? int.Parse(text, System.Globalization.CultureInfo.InvariantCulture)
+                : null;
+            await using var file = await Fs.OpenReadAsync(DeltaPath.Decode(add.Path));
+            using var reader = new Parquet.ParquetFileReader(file, ownsFile: false);
+            int rows = 0;
+            await foreach (var batch in reader.ReadAllAsync())
+            {
+                var column = (Int32Array)batch.Column(batch.Schema.GetFieldIndex(physical));
+                for (int i = 0; i < batch.Length; i++)
+                    Assert.Equal(expected, column.GetValue(i));
+                rows += batch.Length;
+            }
+            Assert.Equal(4, rows);
+            Assert.DoesNotContain(physical, add.Stats!);
+        }
+
+        var read = new List<(long, int?)>();
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            var ids = (Int64Array)batch.Column(batch.Schema.GetFieldIndex("id"));
+            var ks = (Int32Array)batch.Column(batch.Schema.GetFieldIndex("k"));
+            for (int i = 0; i < batch.Length; i++)
+                read.Add((ids.GetValue(i)!.Value, ks.GetValue(i)));
+        }
+        Assert.Equal(
+            [(1L, (int?)7), (2, 7), (10, 7), (11, 7), (20, null), (21, null), (30, null), (31, null)],
+            read.OrderBy(r => r.Item1));
+    }
+
     // Only V3 gives them ids: a row-tracking table without it writes the columns as before.
     [Fact]
     public async Task Compaction_OfARowTrackingTableWithoutV3_StampsNoFieldIds()

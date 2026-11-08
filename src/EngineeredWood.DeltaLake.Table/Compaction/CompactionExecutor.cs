@@ -322,6 +322,36 @@ internal static class CompactionExecutor
     /// the group's Hive directory), and returns whether anything was compacted plus the advanced
     /// row-tracking id cursor.
     /// </summary>
+    // The partition values an IcebergCompat table's data files carry, keyed by logical column name as
+    // PartitionUtils.AppendPartitionColumns takes them; null when the table stores none in its files. A null value is
+    // left out, which AppendPartitionColumns writes as a null column.
+    private static (Dictionary<string, string> Values, IReadOnlyDictionary<string, string> LogicalToPhysical)?
+        MaterializedPartitionValues(DeltaSnapshot snapshot, AddFile source, ColumnMappingMode mappingMode)
+    {
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        if (partitionColumns.Count == 0
+            || !IcebergCompat.RequiresPartitionMaterialization(
+                IcebergCompat.GetVersion(snapshot.Metadata.Configuration)))
+        {
+            return null;
+        }
+
+        // add.partitionValues is keyed by the physical name under column mapping (the spec, and Spark).
+        var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (string column in partitionColumns)
+        {
+            string key = logicalToPhysical.TryGetValue(column, out string? physical) ? physical : column;
+            if ((source.PartitionValues.TryGetValue(key, out string? value)
+                    || source.PartitionValues.TryGetValue(column, out value))
+                && value is not null)
+            {
+                values[column] = value;
+            }
+        }
+        return (values, logicalToPhysical);
+    }
+
     private static async ValueTask<(bool Compacted, long NextRowId)> CompactGroupAsync(
         ITableFileSystem fs,
         DeltaSnapshot snapshot,
@@ -357,6 +387,11 @@ internal static class CompactionExecutor
         if (dirSlash >= 0)
             encodedDir = group[0].Path.Substring(0, dirSlash + 1);
         string physicalDir = EngineeredWood.DeltaLake.DeltaPath.Decode(encodedDir).TrimEnd('/');
+
+        // IcebergCompat stores the partition values in the data file too. The sources' copies are dropped with the
+        // other columns the partition-less target schema lacks, so the group's values (one partition, one set) go
+        // back into each written batch, as the append path writes them, and stay out of the stats batch.
+        var materializedPartition = MaterializedPartitionValues(snapshot, group[0], mappingMode);
 
         // The live rows stream straight into the output (#572). The rolling writer joins consecutive batches into
         // row groups of up to RowGroupMaxRows rows / RowGroupMaxBytes, however the sources were cut, and closes a
@@ -487,6 +522,12 @@ internal static class CompactionExecutor
                     ? RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
                         outBatch, survivorIds!, survivorVers!, matRowIdName!, matRowVerName!)
                     : outBatch;
+                if (materializedPartition is { } partition)
+                {
+                    writeBatch = Partitioning.PartitionUtils.AppendPartitionColumns(
+                        writeBatch, partition.Values, snapshot.Schema, snapshot.Metadata.PartitionColumns,
+                        partition.LogicalToPhysical);
+                }
                 await output.AddAsync(writeBatch, outBatch, cancellationToken).ConfigureAwait(false);
             }
 

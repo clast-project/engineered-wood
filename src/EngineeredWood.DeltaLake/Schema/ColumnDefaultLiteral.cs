@@ -48,7 +48,10 @@ internal static class ColumnDefaultLiteral
         @"^decimal\(\s*([0-9]+)\s*,\s*([0-9]+)\s*\)$", RegexOptions.CultureInvariant);
 
     // DateTimeFormatter.ISO_LOCAL_DATE, ISO_LOCAL_TIME (seconds and fraction optional) and an ISO offset.
-    private const string IsoDate = @"([0-9]{4})-([0-9]{2})-([0-9]{2})";
+    // ISO_LOCAL_DATE's year (SignStyle.EXCEEDS_PAD, 4 to 9 digits): four digits with no sign, 0000 included, or a
+    // sign and more. A plus sign needs more than four digits (+2024 is refused, +10000 accepted); a minus sign takes
+    // four (-0001). Measured with jshell.
+    private const string IsoDate = @"([0-9]{4}|-[0-9]{4,9}|\+[0-9]{5,9})-([0-9]{2})-([0-9]{2})";
     private const string IsoTime = @"([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.[0-9]{1,9})?)?";
 
     private static readonly Regex DateText = new("^" + IsoDate + "$", RegexOptions.CultureInvariant);
@@ -185,6 +188,8 @@ internal static class ColumnDefaultLiteral
             {
                 int drop = digits - precision;
                 var divisor = BigInteger.Pow(10, drop);
+                // HALF_UP rounds a half away from zero. `unscaled` is the magnitude (the sign is matched but not
+                // applied: whether a value is a literal does not depend on it), so rounding up is away from zero.
                 var quotient = BigInteger.DivRem(unscaled, divisor, out var remainder);
                 if (remainder * 2 >= divisor)
                     quotient += 1;
@@ -256,8 +261,11 @@ internal static class ColumnDefaultLiteral
         return RegionIdText.IsMatch(zone);
     }
 
+    // "yyyy-MM-dd HH:mm:ss" reads a year of the era, so it refuses year 0000, which ISO_LOCAL_DATE_TIME accepts
+    // (measured). Its four-digit year carries no sign.
     private static bool IsLocalTimestamp(string text) =>
-        IsDateTime(SpacedDateTimeText.Match(text)) || IsDateTime(LocalDateTimeText.Match(text));
+        (SpacedDateTimeText.Match(text) is var spaced && IsDateTime(spaced) && spaced.Groups[1].Value != "0000")
+        || IsDateTime(LocalDateTimeText.Match(text));
 
     // java.time's STRICT resolution: the day must exist in the month.
     private static bool IsDate(Match match) =>
@@ -273,11 +281,17 @@ internal static class ColumnDefaultLiteral
         return hour < 24 && minute < 60 && second < 60;
     }
 
+    // The proleptic Gregorian calendar java.time uses, for any year it can parse: year 0 and -4 are leap years, 1900
+    // is not.
     private static bool IsValidDate(string year, string month, string day)
     {
-        int y = int.Parse(year, CultureInfo.InvariantCulture);
+        int y = int.Parse(year, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture);
         int m = int.Parse(month, CultureInfo.InvariantCulture);
         int d = int.Parse(day, CultureInfo.InvariantCulture);
-        return y >= 1 && m is >= 1 and <= 12 && d >= 1 && d <= DateTime.DaysInMonth(y, m);
+        if (m is < 1 or > 12 || d < 1)
+            return false;
+        bool leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        int days = m == 2 ? (leap ? 29 : 28) : m is 4 or 6 or 9 or 11 ? 30 : 31;
+        return d <= days;
     }
 }
