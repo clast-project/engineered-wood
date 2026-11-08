@@ -11,14 +11,15 @@ namespace EngineeredWood.Vortex.Tests;
 /// <summary>
 /// Zone pruning resolves a predicate's column by its parts (#771). Vortex keeps zone stats for top-level
 /// columns only, and found them by the reference's dotted text, so struct field <c>s.x</c> was judged by a
-/// top-level column named <c>s.x</c>. Here that column holds 0..99 and the struct's field 100..199.
+/// top-level column named <c>s.x</c>. Here that column holds 0..99 and the struct's field 100..199, in one zone.
+/// The reader prunes whole zones and does not filter rows, so a read returns all 100 rows or none.
 /// </summary>
 public class DottedNamePruningTests
 {
     [Theory]
-    [InlineData("s.x > 150", 100)]   // struct field: every row matches
-    [InlineData("`s.x` > 150", 0)]   // top-level column: none matches (pruning it is fine)
-    public async Task EachSpellingIsJudgedByItsOwnColumn(string sql, int minRows)
+    [InlineData("s.x > 99", 100)]   // struct field: every row matches, so the zone is kept
+    [InlineData("`s.x` > 99", 0)]   // top-level column: no row matches, so the zone is pruned
+    public async Task EachSpellingIsJudgedByItsOwnColumn(string sql, int expected)
     {
         var structType = new StructType([new Field("x", Int32Type.Default, false)]);
         var schema = new Apache.Arrow.Schema(
@@ -40,7 +41,7 @@ public class DottedNamePruningTests
             int rows = 0;
             await foreach (var batch in reader.ReadAllAsync(SparkSqlParser.ParsePredicate(sql)))
                 rows += batch.Length;
-            Assert.True(rows >= minRows, $"`{sql}` read {rows} rows, expected at least {minRows}");
+            Assert.Equal(expected, rows);
         }
         finally
         {
