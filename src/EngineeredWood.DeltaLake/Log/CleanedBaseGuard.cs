@@ -62,8 +62,11 @@ internal static class CleanedBaseGuard
     /// identity came from a listing and is compared against the same report of it. Refused only on proof, as the
     /// refresh is: a different size or ETag, a commit at a version the base saw only a checkpoint for, or a log that
     /// no longer reaches the base. A file that only shows a different modification time is not proof, and is committed
-    /// to: a touched or copied file must not fail a write. On a backend without ETags (a local file system), a
-    /// re-created commit of exactly the old size is therefore not seen.</para>
+    /// to: a touched or copied file must not fail a write. On a backend without ETags (a local file system), that
+    /// leaves a re-created commit of exactly the old size, which a table re-created with the same data produces. There
+    /// the base commit's <c>commitInfo.txnId</c> decides (<see cref="LogVersionAnchor.CommitTxnId"/>): the commit is
+    /// read, and refused when it names another transaction. A base that recorded no id (its commit was written
+    /// without one, or the snapshot ended on a checkpoint) is committed to as before.</para>
     ///
     /// <para><b>Cost.</b> One single-file listing per commit, made in place of the existence check the cleanup guard
     /// made outside its freshness window. Unlike that check it is made every time: a drop and re-create can happen
@@ -133,7 +136,8 @@ internal static class CleanedBaseGuard
 
         if (listed is { } current)
         {
-            EnsureSameCommit(anchor, baseVersion, commitPath, current);
+            await EnsureSameCommitAsync(log, anchor, baseVersion, commitPath, current, cancellationToken)
+                .ConfigureAwait(false);
             return null;
         }
 
@@ -144,7 +148,8 @@ internal static class CleanedBaseGuard
             throw LogReplaced(baseVersion, $"the log now ends at version {listing.LatestVersion}");
         if (listing.IdentityOf(commitPath) is { } relisted)
         {
-            EnsureSameCommit(anchor, baseVersion, commitPath, relisted);
+            await EnsureSameCommitAsync(log, anchor, baseVersion, commitPath, relisted, cancellationToken)
+                .ConfigureAwait(false);
             return null;
         }
         return listing;
@@ -152,8 +157,9 @@ internal static class CleanedBaseGuard
 
     /// <summary>Throws when <paramref name="listed"/>, the base's commit as a listing shows it now, proves the log
     /// is another one.</summary>
-    private static void EnsureSameCommit(
-        LogVersionAnchor anchor, long baseVersion, string commitPath, LogFileIdentity listed)
+    private static async ValueTask EnsureSameCommitAsync(
+        TransactionLog log, LogVersionAnchor anchor, long baseVersion, string commitPath, LogFileIdentity listed,
+        CancellationToken cancellationToken)
     {
         // A commit is never written at a version after its checkpoint, so one beside a checkpoint-only base is
         // another log's.
@@ -162,10 +168,35 @@ internal static class CleanedBaseGuard
 
         foreach (var recorded in anchor.Files)
         {
-            if (string.Equals(recorded.Path, commitPath, StringComparison.Ordinal)
-                && recorded.Compare(listed) == LogFileMatch.Different)
+            if (!string.Equals(recorded.Path, commitPath, StringComparison.Ordinal))
+                continue;
+
+            switch (recorded.Compare(listed))
             {
-                throw LogReplaced(baseVersion, "the commit file for that version is a different object now");
+                case LogFileMatch.Different:
+                    throw LogReplaced(baseVersion, "the commit file for that version is a different object now");
+
+                // The listing cannot tell (no ETags, and only the time differs): the commit's own txnId can, when the
+                // base recorded one. One read of a small file, made only here.
+                case LogFileMatch.Unknown when anchor.CommitTxnId is { } recordedId:
+                    string? currentId;
+                    try
+                    {
+                        currentId = InCommitTimestamp.GetTxnIdFromActions(
+                            await log.ReadCommitAsync(baseVersion, cancellationToken).ConfigureAwait(false));
+                    }
+                    catch (Exception) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        return; // Unreadable now (removed since the listing): no proof either way, as before.
+                    }
+
+                    // The same path never holds two commits, so a different id, or none, is another commit.
+                    if (!string.Equals(currentId, recordedId, StringComparison.Ordinal))
+                    {
+                        throw LogReplaced(
+                            baseVersion, "the commit file for that version names another transaction now");
+                    }
+                    return;
             }
         }
     }

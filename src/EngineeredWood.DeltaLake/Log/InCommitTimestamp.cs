@@ -42,6 +42,21 @@ public static class InCommitTimestamp
     /// <summary>A fresh transaction id for <see cref="TxnIdKey"/>, in the lower-case hyphenated form Spark writes.</summary>
     public static string NewTxnId() => Guid.NewGuid().ToString("D");
 
+    /// <summary>A commitInfo's <see cref="TxnIdKey"/>, when it is a string; otherwise null.</summary>
+    internal static string? GetTxnId(Actions.CommitInfo commitInfo) =>
+        commitInfo.GetValue(TxnIdKey) is { ValueKind: System.Text.Json.JsonValueKind.String } id ? id.GetString() : null;
+
+    /// <summary>The <see cref="TxnIdKey"/> of the commitInfo among <paramref name="actions"/>, or null.</summary>
+    internal static string? GetTxnIdFromActions(IReadOnlyList<Actions.DeltaAction> actions)
+    {
+        foreach (var action in actions)
+        {
+            if (action is Actions.CommitInfo ci)
+                return GetTxnId(ci);
+        }
+        return null;
+    }
+
     // Written through Utf8JsonWriter, as the other helpers here are: no reflection-based serializer, for AOT.
     private static JsonElement TxnIdJson(string txnId)
     {

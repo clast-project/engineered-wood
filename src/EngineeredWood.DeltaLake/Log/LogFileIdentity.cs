@@ -65,4 +65,15 @@ internal readonly record struct LogFileIdentity(string Path, long Size, DateTime
 /// <param name="HasCommit">Whether the commit file was among them. Log cleanup can leave a checkpoint with no commit
 /// beside it; a commit can never appear at that version afterwards, because a commit is written before any
 /// checkpoint of it and is never written again.</param>
-internal sealed record LogVersionAnchor(IReadOnlyList<LogFileIdentity> Files, bool HasCommit);
+internal sealed record LogVersionAnchor(IReadOnlyList<LogFileIdentity> Files, bool HasCommit)
+{
+    /// <summary>
+    /// The <c>commitInfo.txnId</c> of the commit at this version, when the snapshot was built by applying that commit
+    /// and it carries one (this library writes one on every commit, as delta-spark does); otherwise null.
+    /// </summary>
+    /// <remarks>What decides when the listing cannot (#755 follow-up): without ETags, a re-created commit of exactly
+    /// the old size shows only a different modification time, and a table re-created with the same data produces
+    /// exactly that (measured: 478 bytes both times). A commit is never rewritten, so a different id, or none, at the
+    /// same path is a different commit.</remarks>
+    public string? CommitTxnId { get; init; }
+}

@@ -23,6 +23,10 @@ public sealed class SnapshotBuilder
     private long _version = -1;
     private long? _inCommitTimestamp;
 
+    /// <summary>The <c>commitInfo.txnId</c> of the commit applied last, if it carried one
+    /// (<see cref="LogVersionAnchor.CommitTxnId"/>).</summary>
+    private string? _commitTxnId;
+
     /// <summary>
     /// Builds a snapshot by first loading from the latest checkpoint (if available),
     /// then replaying only the commits after the checkpoint version up to the target.
@@ -613,6 +617,7 @@ public sealed class SnapshotBuilder
             _protocol = snapshot.Protocol,
             _version = snapshot.Version,
             _inCommitTimestamp = snapshot.InCommitTimestamp,
+            _commitTxnId = snapshot.LogAnchor?.CommitTxnId,
         };
 
         foreach (var kvp in snapshot.ActiveFiles)
@@ -637,6 +642,7 @@ public sealed class SnapshotBuilder
     {
         _version = version;
         _inCommitTimestamp = null; // Reset for this version
+        _commitTxnId = null;       // Likewise: a checkpoint or compaction carries none
 
         foreach (var action in actions)
         {
@@ -673,6 +679,7 @@ public sealed class SnapshotBuilder
 
                 case CommitInfo ci:
                     _inCommitTimestamp = Log.InCommitTimestamp.GetTimestamp(ci);
+                    _commitTxnId = Log.InCommitTimestamp.GetTxnId(ci);
                     break;
             }
         }
@@ -714,7 +721,11 @@ public sealed class SnapshotBuilder
             Tombstones = new Dictionary<string, RemoveFile>(_tombstones),
             InCommitTimestamp = _inCommitTimestamp,
             ListedLatestAt = listedLatestAt,
-            LogAnchor = logAnchor,
+            // The anchor names this version's files; the commit applied last is this version's whenever the anchor
+            // has a commit and the builder ended on it.
+            LogAnchor = logAnchor is { HasCommit: true } && _commitTxnId is not null
+                ? logAnchor with { CommitTxnId = _commitTxnId }
+                : logAnchor,
             // The delta.rowTracking domainMetadata is the spec source of truth for the high-water mark;
             // the active-file derivation alone under-counts after removes (a later writer could then
             // reassign used row ids). Take the max so either source protects the invariant.
