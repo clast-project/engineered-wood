@@ -465,6 +465,11 @@ public static class IcebergCompat
         {
             foreach (var change in TypeWidening.GetTypeChanges(field))
             {
+                // Spark refuses a change only when Delta supports it and Iceberg does not
+                // (CheckTypeWideningSupported: `isTypeChangeSupported(from, to) && !isTypeChangeSupportedByIceberg(...)`,
+                // javap on 4.4.1). A recorded change Delta does not support, string to integer say, is not this
+                // check's to refuse. TypeWidening's table is delta-spark 4.4.1's isTypeChangeSupported: wider
+                // integers, float to double, date to timestamp_ntz, integer to double, and the decimal widenings.
                 bool deltaSupports = TypeWidening.IsSupported(change.FromType, change.ToType)
                     || TypeWidening.IsDecimalWidening(change.FromType, change.ToType);
                 if (deltaSupports && !IsIcebergTypeChange(change.FromType, change.ToType))

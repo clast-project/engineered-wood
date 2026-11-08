@@ -425,11 +425,15 @@ public class IcebergCompatV3Tests : IDisposable
 
     // CheckTypeWideningSupported: on a table that supports type widening, a recorded type change Iceberg cannot
     // follow is refused (int to double, measured as UNSUPPORTED_TYPE_WIDENING); int to long and byte to short are not.
+    // Spark refuses only a change Delta supports, so a recorded change Delta does not support passes this check.
     [Theory]
     [InlineData("integer", "long", true)]
     [InlineData("byte", "short", true)]
     [InlineData("integer", "double", false)]
     [InlineData("decimal(5,2)", "decimal(7,3)", false)]
+    // Delta supports neither, so Spark's check lets both through (it refuses a Delta-supported change only).
+    [InlineData("string", "integer", true)]
+    [InlineData("long", "integer", true)]
     public async Task ARecordedTypeChange_OnAV3Table_PassesOnlyWhatIcebergFollows(
         string fromType, string toType, bool commits)
     {
