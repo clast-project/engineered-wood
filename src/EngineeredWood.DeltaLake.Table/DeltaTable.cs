@@ -3153,6 +3153,75 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Refuses a <c>protocol</c> in <paramref name="actions"/> that supports fewer features than
+    /// <paramref name="baseSnapshot"/>'s, as delta-spark refuses one that fails <c>Protocol.canTransitionTo</c> (#753).
+    /// Without this, a caller's protocol could drop <c>deletionVectors</c> and resurrect every row the table's DVs
+    /// delete, or drop <c>columnMapping</c>, <c>rowTracking</c> or a constraint feature the table relies on.
+    /// </summary>
+    /// <remarks>
+    /// <para>Like Spark, this compares feature SETS, not version numbers. A lower version that describes the same
+    /// features passes, and so does moving a legacy protocol to the table-features protocol that lists what it
+    /// implied.</para>
+    /// <para>Writer and reader sides are compared separately, so dropping a reader-writer feature from the reader
+    /// list alone is refused too: readers would stop honouring it. A side's set is its explicit list in
+    /// table-features mode (writer 7, reader 3) and what its legacy version implies otherwise, as
+    /// <see cref="TableFeatureProperties.Declare"/> reads a protocol. For a protocol at reader 2 / writer 7 that
+    /// is narrower than Spark, which treats such a protocol as implying every legacy feature. This library never
+    /// reads it that way, and upgrades it without listing them.</para>
+    /// </remarks>
+    private static void EnsureNoProtocolDowngrade(Snapshot.Snapshot baseSnapshot, IEnumerable<DeltaAction> actions)
+    {
+        var current = baseSnapshot.Protocol;
+        HashSet<string>? currentWriter = null;
+        HashSet<string>? currentReader = null;
+        foreach (var action in actions)
+        {
+            if (action is not ProtocolAction proposed)
+                continue;
+            currentWriter ??= SupportedWriterFeatures(current);
+            currentReader ??= SupportedReaderFeatures(current);
+            var writer = SupportedWriterFeatures(proposed);
+            var reader = SupportedReaderFeatures(proposed);
+            var dropped = currentWriter.Where(feature => !writer.Contains(feature))
+                .Concat(currentReader.Where(feature => !reader.Contains(feature)))
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(feature => feature, StringComparer.Ordinal)
+                .ToList();
+            if (dropped.Count == 0)
+                continue;
+            throw new DeltaFormatException(
+                DeltaTableErrorCodes.InvalidProtocolDowngrade,
+                $"Protocol version cannot be downgraded from {Describe(current)} to {Describe(proposed)}: it drops "
+                + $"{string.Join(", ", dropped)}. A table feature cannot be removed by a commit.");
+        }
+
+        static string Describe(ProtocolAction protocol) =>
+            $"({protocol.MinReaderVersion}, {protocol.MinWriterVersion}"
+            + (protocol.ReaderFeatures is { } r ? $", reader [{string.Join(", ", r)}]" : "")
+            + (protocol.WriterFeatures is { } w ? $", writer [{string.Join(", ", w)}]" : "")
+            + ")";
+    }
+
+    private static HashSet<string> SupportedWriterFeatures(ProtocolAction protocol) =>
+        new(protocol.MinWriterVersion >= 7 ? protocol.WriterFeatures ?? [] : LegacyWriterFeatures(protocol),
+            StringComparer.Ordinal);
+
+    // Below reader 3 the reader side is columnMapping's, where the writer side supports it (a legacy (2, 2) does
+    // not: columnMapping needs writer 5).
+    private static HashSet<string> SupportedReaderFeatures(ProtocolAction protocol)
+    {
+        if (protocol.MinReaderVersion >= 3)
+            return new(protocol.ReaderFeatures ?? [], StringComparer.Ordinal);
+        var features = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string feature in LegacyReaderFeatures(protocol.MinReaderVersion))
+        {
+            if (SupportedWriterFeatures(protocol).Contains(feature))
+                features.Add(feature);
+        }
+        return features;
+    }
+
+    /// <summary>
     /// Validates IcebergCompat on the table as <paramref name="actions"/> leave it (their last <c>metaData</c> and
     /// <c>protocol</c>, else the base's), against <paramref name="baseSnapshot"/> as the state before the commit.
     /// delta-spark runs these checks on every commit to an IcebergCompat table (#744). That covers a commit that
@@ -3821,6 +3890,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // Every operation that commits through this loop is checked here, as delta-spark checks every commit:
         // the transaction, DELETE, UPDATE, MERGE, OPTIMIZE, the metadata-only changes and RESTORE. An auto-committing
         // operation's files are collected when this throws (CollectOnFailureAsync), and a transaction's on abort.
+        EnsureNoProtocolDowngrade(baseSnapshot, dataActions);
         EnsureIcebergCompatHolds(baseSnapshot, dataActions);
 
         bool rowLevel = rowLevelDeletes is { Count: > 0 };
@@ -8889,6 +8959,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
         // This seam commits through the committer directly, not CommitOccAsync, so it is checked here, before it
         // writes any deletion vector of its own.
+        EnsureNoProtocolDowngrade(CurrentSnapshot, extraActions ?? []);
         EnsureIcebergCompatHolds(CurrentSnapshot, extraActions ?? []);
         // A dynamic partition overwrite removes files, so it is NOT an append for appendOnly enforcement.
         // extraActions (a buffered transaction's deletion-vector remove/add pairs) likewise make this a
