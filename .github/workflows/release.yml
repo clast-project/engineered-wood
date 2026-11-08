@@ -13,6 +13,7 @@ jobs:
 
     permissions:
       contents: write   # required for creating GitHub Releases
+      id-token: write   # OIDC token for nuget.org trusted publishing
 
     steps:
       - name: Checkout
@@ -53,13 +54,23 @@ jobs:
         # projects opt out of packing via test/Directory.Build.props).
         run: dotnet pack engineered-wood.slnx --no-build --configuration Release -p:Version=${{ steps.version.outputs.version }} --output artifacts
 
+      - name: NuGet login (trusted publishing)
+        # Exchanges the workflow's OIDC token for a short-lived (~1 hour) nuget.org
+        # API key, per the "engineered-wood" trusted publishing policy on nuget.org
+        # (repo clast-project/engineered-wood, workflow release.yml). It runs after
+        # Test so the key cannot expire before the push.
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: curt_hagenlocher
+
       - name: Push to NuGet
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         shell: pwsh
         run: |
           if (-not $env:NUGET_API_KEY) {
-            Write-Error "NUGET_API_KEY secret is not configured."
+            Write-Error "NuGet login produced no API key."
             exit 1
           }
           # `dotnet nuget push` does not reliably expand a wildcard path, so
