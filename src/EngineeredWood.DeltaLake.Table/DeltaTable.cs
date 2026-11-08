@@ -425,7 +425,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// (<c>delta.enableInCommitTimestamps</c>), change data feed (<c>delta.enableChangeDataFeed</c>), variant
     /// shredding (<c>delta.enableVariantShredding</c>, without which a shredded write is refused) and
     /// Iceberg compatibility (<c>delta.enableIcebergCompatV1</c> / <c>…V2</c> / <c>…V3</c>; V3 also turns on row
-    /// tracking unless <c>delta.enableRowTracking</c> is given). Enablement is
+    /// tracking unless <c>delta.enableRowTracking</c> is given, and every version turns on column mapping in
+    /// <c>name</c> mode unless <c>delta.columnMapping.mode</c> is given, as delta-spark does). Enablement is
     /// one-directional — a property can turn a feature on, never off — so an argument and a property that
     /// disagree resolve to the argument. Internally-derived keys (the column-mapping mode and max id)
     /// overwrite caller-supplied ones; caller-supplied row-tracking materialized column names win.</para>
@@ -629,6 +630,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // IcebergCompatV3 requires row tracking, and Spark turns it on when the caller leaves the property out
         // (RequireRowTracking's autoSetValue, measured on delta-spark 4.4.1). A caller's explicit 'false' stays, and
         // IcebergCompat.Validate refuses the table below, as Spark does.
+        // Every IcebergCompat version requires column mapping, and Spark turns on 'name' mode when the caller leaves
+        // delta.columnMapping.mode out (RequireColumnMapping's autoSetValue, measured on 4.0.0 / 4.3.1 / 4.4.1, #757).
+        // Only an ABSENT key: an explicit 'none' stays and IcebergCompat.Validate refuses it below, as Spark does. The
+        // argument's default None cannot say "explicitly off", so only the property can. Create and REPLACE only: on
+        // an existing table Spark refuses instead (autoEnableOnExistingTable = false), and so does EW's ALTER path.
+        bool columnMappingImpliedByIcebergCompat = false;
+        if (mappingMode == ColumnMappingMode.None
+            && icebergCompatVersion != IcebergCompatVersion.None
+            && !(configurationBuilder?.ContainsKey(ColumnMapping.ModeKey) ?? false))
+        {
+            mappingMode = ColumnMappingMode.Name;
+            columnMappingImpliedByIcebergCompat = true;
+        }
         bool rowTrackingEnabled = enableRowTracking
             || DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(configurationBuilder)
             || (icebergCompatVersion == IcebergCompatVersion.V3
@@ -664,8 +678,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     throw new DeltaFormatException(
                         DeltaTableErrorCodes.InvalidPreAssignedSchema,
                         "preAssignedSchema declares no column-mapping field ids, but the table is being "
-                        + $"created with column mapping '{mappingMode}'. Assign ids and physical names before "
-                        + "writing the data files, or create without column mapping.");
+                        + $"created with column mapping '{mappingMode}'"
+                        + (columnMappingImpliedByIcebergCompat
+                            ? ", which Iceberg compatibility implies because it requires column mapping. Assign "
+                              + "ids and physical names before writing the data files."
+                            : ". Assign ids and physical names before writing the data files, or create without "
+                              + "column mapping."));
                 }
                 maxId = ColumnMapping.GetMaxColumnId(deltaSchema);
                 if (previousSnapshot is not null)

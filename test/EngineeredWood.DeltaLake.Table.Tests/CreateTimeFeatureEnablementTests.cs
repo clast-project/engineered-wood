@@ -385,15 +385,20 @@ public class CreateTimeFeatureEnablementTests : IDisposable
         Assert.DoesNotContain("icebergCompatV1", table.CurrentSnapshot.Protocol.WriterFeatures!);
     }
 
-    // The constraints are validated BEFORE commit 0 is written: a violating table must not exist at all.
+    // The constraints are validated BEFORE commit 0 is written: a violating table must not exist at all. Leaving the
+    // mode out turns on name mode (#757, IcebergCompatColumnMappingTests), so an explicit 'none' is the violation.
     [Fact]
-    public async Task IcebergCompat_WithoutColumnMapping_ThrowsAndWritesNoCommit()
+    public async Task IcebergCompat_WithColumnMappingNone_ThrowsAndWritesNoCommit()
     {
         var fs = new LocalTableFileSystem(_tempDir);
 
         await Assert.ThrowsAsync<DeltaFormatException>(async () =>
             await DeltaTable.CreateAsync(fs, IdValueSchema(),
-                configuration: new Dictionary<string, string> { [IcebergCompat.EnableV1Key] = "true" }));
+                configuration: new Dictionary<string, string>
+                {
+                    [IcebergCompat.EnableV1Key] = "true",
+                    [ColumnMapping.ModeKey] = "none",
+                }));
 
         Assert.Equal(-1, await new TransactionLog(fs).GetLatestVersionAsync());
     }
