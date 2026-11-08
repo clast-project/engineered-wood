@@ -6,6 +6,7 @@ using System.Text.Json.Serialization;
 using EngineeredWood.Avro;
 using EngineeredWood.Avro.Container;
 using EngineeredWood.Avro.Encoding;
+using EngineeredWood.Avro.Schema;
 using EngineeredWood.Buffers;
 using EngineeredWood.Iceberg.Serialization;
 using EngineeredWood.IO;
@@ -156,6 +157,7 @@ public static class ManifestIO
         var data = await fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
         using var ms = new MemoryStream(data);
         using var reader = OcfReader.Open(ms);
+        RequireCodecSchema(reader, ManifestEntryCanonicalSchema, "manifest", path);
         var results = new List<ManifestEntry>();
         while (reader.ReadBlock() is { } block)
         {
@@ -191,6 +193,7 @@ public static class ManifestIO
         var data = await fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
         using var ms = new MemoryStream(data);
         using var reader = OcfReader.Open(ms);
+        RequireCodecSchema(reader, ManifestListCanonicalSchema, "manifest list", path);
         var results = new List<ManifestListEntry>();
         while (reader.ReadBlock() is { } block)
         {
@@ -199,6 +202,34 @@ public static class ManifestIO
                 results.Add(DecodeManifestListEntry(ref br));
         }
         return results;
+    }
+
+    // --- Writer-schema guard ---
+
+    private static readonly string ManifestEntryCanonicalSchema =
+        ParsingCanonicalForm.ToCanonicalJson(ManifestAvroSchemas.ManifestEntrySchema);
+
+    private static readonly string ManifestListCanonicalSchema =
+        ParsingCanonicalForm.ToCanonicalJson(ManifestAvroSchemas.ManifestListSchema);
+
+    /// <summary>
+    /// The Avro decoders below read fields by position, in the layout EW itself writes.
+    /// They do not resolve the file's writer schema, so a manifest written by another
+    /// engine (or a V1 manifest) would be misread from its first unfamiliar field on, and
+    /// a commit that rewrites it would write the misread values back. Refuse any file whose
+    /// writer schema is not EW's own, compared in Avro Parsing Canonical Form (which keeps
+    /// what fixes the binary layout and drops attributes such as field-id). See issue #586.
+    /// </summary>
+    private static void RequireCodecSchema(OcfReader reader, string expectedCanonical, string kind, string path)
+    {
+        var actual = ParsingCanonicalForm.ToCanonicalJson(reader.WriterSchema);
+        if (!string.Equals(actual, expectedCanonical, StringComparison.Ordinal))
+            throw new NotSupportedException(
+                $"Cannot read Iceberg {kind} '{path}': its Avro writer schema differs from the one " +
+                "EngineeredWood writes, and the codec cannot yet decode other layouts (for example " +
+                "manifests written by Iceberg Java, Spark or pyiceberg, partitioned manifests, or V1 " +
+                "manifests). Reading or rewriting it could lose or corrupt metadata. See " +
+                "https://github.com/clast-project/engineered-wood/issues/586.");
     }
 
     // --- Avro encoding: Manifest entries ---
