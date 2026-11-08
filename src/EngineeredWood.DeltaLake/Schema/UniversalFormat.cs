@@ -9,7 +9,7 @@ namespace EngineeredWood.DeltaLake.Schema;
 /// each commit (Spark's converter is a post-commit step). This library has no converter.
 /// </summary>
 /// <remarks>
-/// UniForm is no table feature of its own. Iceberg conversion rides on <c>icebergCompatV1</c>/<c>V2</c>, which
+/// UniForm is no table feature of its own. Iceberg conversion rides on <c>icebergCompatV1</c>/<c>V2</c>/<c>V3</c>, which
 /// this library can write, so the protocol alone never stops a write to a UniForm table: the property has to be
 /// read for that.
 /// </remarks>

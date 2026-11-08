@@ -15,7 +15,7 @@ namespace EngineeredWood.DeltaLake.Table;
 /// is not a feature is refused with <c>DELTA_UNSUPPORTED_FEATURES_IN_CONFIG</c>.</item>
 /// <item>The property is consumed, never stored in <c>metaData.configuration</c>.</item>
 /// <item>The feature joins the protocol with the features it requires (<c>rowTracking</c> needs
-/// <c>domainMetadata</c>, <c>icebergCompatV1</c>/<c>V2</c> need <c>columnMapping</c>). A feature set that some
+/// <c>domainMetadata</c>, <c>icebergCompatV1</c>/<c>V2</c> need <c>columnMapping</c>, <c>icebergCompatV3</c> also <c>rowTracking</c>). A feature set that some
 /// legacy version describes exactly keeps the legacy version: <c>checkConstraints</c> alone is writer 3, while
 /// <c>changeDataFeed</c> alone is writer 7, because writer 4 would also imply <c>generatedColumns</c>.</item>
 /// <item><c>clustering</c> is refused: a clustered table is created with clustering columns.</item>
@@ -47,6 +47,8 @@ internal static class TableFeatureProperties
             ["v2Checkpoint"] = (true, []),
             ["icebergCompatV1"] = (false, ["columnMapping"]),
             ["icebergCompatV2"] = (false, ["columnMapping"]),
+            // IcebergCompatV3TableFeature.requiredFeatures (delta-spark 4.3.1/4.4.1); rowTracking brings domainMetadata.
+            ["icebergCompatV3"] = (false, ["columnMapping", "rowTracking"]),
             ["inCommitTimestamp"] = (false, []),
             ["typeWidening"] = (true, []),
             ["vacuumProtocolCheck"] = (true, []),

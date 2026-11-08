@@ -66,6 +66,7 @@ public static class ProtocolVersions
         "domainMetadata",
         "icebergCompatV1",
         "icebergCompatV2",
+        "icebergCompatV3",
         "identityColumns",
         "inCommitTimestamp",
         "rowTracking",

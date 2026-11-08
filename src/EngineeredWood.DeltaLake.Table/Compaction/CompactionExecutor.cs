@@ -369,7 +369,8 @@ internal static class CompactionExecutor
         await using (var output = new RollingDataFileWriter(
             fs, dataFileWriter, parquetOptions, options.TargetFileSize, physicalDir, written,
             collectStats: true, statsSelection,
-                VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration)))
+                VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration),
+                IcebergCompat.RowTrackingFieldIds(snapshot.Metadata.Configuration)))
         {
             // Read all LIVE data from the group's files, widening types if needed. A candidate may carry a
             // deletion vector (DELETE marks rows rather than rewriting), and those rows MUST be excluded —

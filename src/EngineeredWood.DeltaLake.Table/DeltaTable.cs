@@ -424,7 +424,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// (<c>delta.columnMapping.mode</c>), deletion vectors, row tracking, in-commit timestamps
     /// (<c>delta.enableInCommitTimestamps</c>), change data feed (<c>delta.enableChangeDataFeed</c>), variant
     /// shredding (<c>delta.enableVariantShredding</c>, without which a shredded write is refused) and
-    /// Iceberg compatibility (<c>delta.enableIcebergCompatV1</c> / <c>…V2</c>). Enablement is
+    /// Iceberg compatibility (<c>delta.enableIcebergCompatV1</c> / <c>…V2</c> / <c>…V3</c>; V3 also turns on row
+    /// tracking unless <c>delta.enableRowTracking</c> is given). Enablement is
     /// one-directional — a property can turn a feature on, never off — so an argument and a property that
     /// disagree resolve to the argument. Internally-derived keys (the column-mapping mode and max id)
     /// overwrite caller-supplied ones; caller-supplied row-tracking materialized column names win.</para>
@@ -624,14 +625,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             : ColumnMapping.GetMode(configurationBuilder);
         bool dvEnabled = enableDeletionVectors
             || DeletionVectors.DeletionVectorConfig.IsEnabled(configurationBuilder);
+        var icebergCompatVersion = Schema.IcebergCompat.GetVersion(configurationBuilder);
+        // IcebergCompatV3 requires row tracking, and Spark turns it on when the caller leaves the property out
+        // (RequireRowTracking's autoSetValue, measured on delta-spark 4.4.1). A caller's explicit 'false' stays, and
+        // IcebergCompat.Validate refuses the table below, as Spark does.
         bool rowTrackingEnabled = enableRowTracking
-            || DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(configurationBuilder);
+            || DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(configurationBuilder)
+            || (icebergCompatVersion == IcebergCompatVersion.V3
+                && !(configurationBuilder?.ContainsKey(DeltaLake.RowTracking.RowTrackingConfig.EnableKey) ?? false));
         bool inCommitTimestampsEnabled = Log.InCommitTimestamp.IsEnabled(configurationBuilder);
         bool changeDataFeedEnabled = DeltaLake.ChangeDataFeed.CdfConfig.IsEnabled(configurationBuilder);
         bool typeWideningEnabled = Schema.TypeWidening.IsEnabled(configurationBuilder);
         bool v2CheckpointsEnabled = Checkpoint.CheckpointPolicy.WantsV2(configurationBuilder);
         bool variantShreddingEnabled = VariantShreddingConfig.IsEnabled(configurationBuilder);
-        var icebergCompatVersion = Schema.IcebergCompat.GetVersion(configurationBuilder);
 
         if (mappingMode != ColumnMappingMode.None)
         {
@@ -911,19 +917,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             }
         }
 
-        // Iceberg compatibility — WRITER-only features ('icebergCompatV1' / 'icebergCompatV2'); readers see
+        // Iceberg compatibility — WRITER-only features ('icebergCompatV1' / 'V2' / 'V3'); readers see
         // an ordinary Delta table. The constraints bind the WRITER (column mapping required, partition
-        // values materialized into the data files, numRecords in every stats blob; V1 additionally forbids
-        // deletion vectors and array/map columns) so that an external converter — UniForm — can generate
-        // Iceberg metadata over the very same parquet files. Declaring it is what tells a foreign writer it
-        // must honor them too; the full constraint set is validated against the finished commit-0 actions
-        // below. V2 wins if a caller somehow enables both (matching IcebergCompat.GetVersion).
+        // values materialized into the data files, numRecords in every stats blob; V1 and V2 forbid
+        // deletion vectors, V1 also array/map columns; V3 requires row tracking, declared above) so that an
+        // external converter — UniForm — can generate Iceberg metadata over the very same parquet files.
+        // Declaring it is what tells a foreign writer it must honor them too; the full constraint set is
+        // validated against the finished commit-0 actions below. The highest version is declared if a caller
+        // enables several (matching IcebergCompat.GetVersion); Validate refuses that where V3 is one of them.
         if (icebergCompatVersion != IcebergCompatVersion.None)
         {
             minWriterVersion = 7;
-            writerFeatures.Add(icebergCompatVersion == IcebergCompatVersion.V2
-                ? "icebergCompatV2"
-                : "icebergCompatV1");
+            writerFeatures.Add(Schema.IcebergCompat.FeatureName(icebergCompatVersion));
         }
 
         // Identity columns (delta.identity.* field metadata) are a WRITER-only feature ('identityColumns',
@@ -2634,7 +2639,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         return features;
     }
 
-    // IcebergCompatV2 gives array elements and map keys/values column ids too, recorded on the nearest ancestor
+    // IcebergCompatV2 and V3 give array elements and map keys/values column ids too, recorded on the nearest ancestor
     // field (ColumnMapping.AssignNestedIds). Spark and Kernel assign the missing ones on every metadata update of
     // such a table, after the column ids and from the same sequence, so maxId moves past them. EW does so on
     // every schema DDL; the identity high-water-mark updates a write makes are the exception. Any other table
@@ -2642,7 +2647,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private static StructType WithIcebergNestedIds(
         StructType schema, IReadOnlyDictionary<string, string>? config, ref int maxId)
     {
-        if (Schema.IcebergCompat.GetVersion(config) != Schema.IcebergCompatVersion.V2)
+        if (!Schema.IcebergCompat.RequiresNestedIds(Schema.IcebergCompat.GetVersion(config)))
             return schema;
         var (assigned, lastId) = ColumnMapping.AssignNestedIds(schema, maxId);
         maxId = lastId;
@@ -3226,8 +3231,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <c>protocol</c>, else the base's), against <paramref name="baseSnapshot"/> as the state before the commit.
     /// delta-spark runs these checks on every commit to an IcebergCompat table (#744). That covers a commit that
     /// changes nothing about the table: a DELETE on a V2 table whose deletion vectors are enabled is refused.
+    /// <para><paramref name="altersTable"/> is false for a RESTORE: delta-spark's check that V3 is not turned on over
+    /// enabled row tracking applies to ALTER TABLE ... SET TBLPROPERTIES only, whose counterpart here is a commit of
+    /// caller-supplied metadata.</para>
     /// </summary>
-    private static void EnsureIcebergCompatHolds(Snapshot.Snapshot baseSnapshot, IEnumerable<DeltaAction> actions)
+    private static void EnsureIcebergCompatHolds(
+        Snapshot.Snapshot baseSnapshot, IEnumerable<DeltaAction> actions, bool altersTable = true)
     {
         MetadataAction metadata = baseSnapshot.Metadata;
         ProtocolAction protocol = baseSnapshot.Protocol;
@@ -3241,7 +3250,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
         Schema.IcebergCompat.Validate(
             Schema.IcebergCompat.GetVersion(metadata.Configuration), metadata, protocol,
-            baseSnapshot.Metadata, baseSnapshot.Protocol);
+            baseSnapshot.Metadata, baseSnapshot.Protocol, altersTable);
     }
 
     /// <summary>
@@ -3891,7 +3900,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // the transaction, DELETE, UPDATE, MERGE, OPTIMIZE, the metadata-only changes and RESTORE. An auto-committing
         // operation's files are collected when this throws (CollectOnFailureAsync), and a transaction's on abort.
         EnsureNoProtocolDowngrade(baseSnapshot, dataActions);
-        EnsureIcebergCompatHolds(baseSnapshot, dataActions);
+        EnsureIcebergCompatHolds(baseSnapshot, dataActions, altersTable: operation != "RESTORE");
 
         bool rowLevel = rowLevelDeletes is { Count: > 0 };
         // Against the protocol this commit PUBLISHES, which a staged upgrade can make differ from the base's.
@@ -7707,7 +7716,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             await using (var writer = new RollingDataFileWriter(
                 _fs, _options.DataFileWriter, DataFileWriteOptions(snapshot), _options.TargetFileSize,
                 BuildPartitionPath(trackedPartValues), written, collectStats, statsSelection,
-                VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration)))
+                VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration),
+                Schema.IcebergCompat.RowTrackingFieldIds(snapshot.Metadata.Configuration)))
             {
                 foreach (var dataBatch in group.Batches)
                 {
@@ -8774,7 +8784,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             await using (var writer = new RollingDataFileWriter(
                 _fs, _options.DataFileWriter, DataFileWriteOptions(writeSchema, mappingMode, snapshot), _options.TargetFileSize,
                 BuildPartitionPath(trackedPartValues), written: null, _options.CollectStats, statsSelection,
-                VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration)))
+                VariantShreddingConfig.AllowsShreddedWrites(snapshot.Protocol, snapshot.Metadata.Configuration),
+                Schema.IcebergCompat.RowTrackingFieldIds(snapshot.Metadata.Configuration)))
             {
                 foreach (var splitBatch in group.Batches)
                 {
@@ -10854,9 +10865,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             + "a concurrently-rewritten file for you.");
 
     // The corner the copy-on-write rewrite does not yet cover: IcebergCompat needs the committing writer. It is
-    // reached by a row-level delete or update, and by a predicate DELETE that rewrites (an IcebergCompat table
-    // cannot have deletion vectors, so every partial delete there rewrites). (Change Data Feed IS captured — each
-    // rewritten file emits its own change files.)
+    // reached by a row-level delete or update, and by a predicate DELETE that rewrites (a V1 or V2 table cannot have
+    // deletion vectors, so every partial delete there rewrites; a V3 table can, and rewrites only without them).
+    // (Change Data Feed IS captured — each rewritten file emits its own change files.)
     private void RejectCopyOnWriteRowIdUnsupported(string op)
     {
         if (IsIcebergCompat)
