@@ -474,26 +474,13 @@ internal sealed class DeltaFileStatsAccessor
         string column = call.Column.Name;
         if (!_columnTypes.TryGetValue(column, out string? typeName) || typeName != "variant"
             || _partitionColumns.Contains(column) || _noBounds.Contains(column)
-            || !call.Path.IsFieldsOnly || DeltaTypeName(call.TargetType) is not { } target)
+            || !call.Path.IsFieldsOnly || call.TargetType is VariantGetCall.VariantTypeName or "binary")
         {
             return null;
         }
         string key = VariantStatsEncoding.NormalizedPath(call.Path.Segments.Select(s => s.Key!).ToList());
-        return new VariantPathStatsAccessor(this, key, target);
+        return new VariantPathStatsAccessor(this, key, call.TargetType);
     }
-
-    // The Delta type name of a canonical Spark one (VariantGetCall.TryNormalizeTypeName); null for one no variant
-    // bound answers.
-    private static string? DeltaTypeName(string sparkType) => sparkType switch
-    {
-        "tinyint" => "byte",
-        "smallint" => "short",
-        "int" => "integer",
-        "bigint" => "long",
-        "float" or "double" or "string" or "boolean" or "date" or "timestamp" or "timestamp_ntz" => sparkType,
-        _ when sparkType.StartsWith("decimal(", StringComparison.Ordinal) => sparkType,
-        _ => null,
-    };
 
     internal LiteralValue? GetVariantPathBound(
         DeltaFileStats stats, string column, string key, string typeName, bool isMin)

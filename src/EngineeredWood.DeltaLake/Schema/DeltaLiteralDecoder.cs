@@ -214,22 +214,16 @@ internal static class DeltaLiteralDecoder
 
     /// <summary>
     /// One field of a variant column's bound (an object keyed by normalized path, see
-    /// <see cref="VariantStatsEncoding"/>) as the literal a column of <paramref name="typeName"/> would bound
-    /// with, or null when the bound has no such field or its value does not convert EXACTLY.
+    /// <see cref="VariantStatsEncoding"/>) as a bound on <c>variant_get</c>'s result in
+    /// <paramref name="targetType"/>, a canonical Spark type name (<see cref="VariantGetCall.TargetType"/>), or
+    /// null when the bound has no such field or its value does not convert EXACTLY.
     /// </summary>
     /// <remarks>
-    /// <para>The literal's kind and scale are those <see cref="FromJson"/> gives a column of
-    /// <paramref name="typeName"/>, so a variant path compares as such a column does.</para>
-    /// <para>Exactly means that every value between the two bounds converts to the type without rounding,
-    /// overflow or a change of order, so that a file the bounds prune holds no row whose conversion fails:
-    /// skipping it would answer a query Spark answers with an error. An integer bound converts to any
-    /// integer or decimal type it fits; a decimal to a decimal of at least its scale that it fits; a float to
-    /// <c>float</c> or <c>double</c>, a double to <c>double</c>; a string, boolean or date to its own type; a
-    /// timestamp to <c>timestamp</c>, a timestamp without zone to <c>timestamp_ntz</c>. Nothing else, so a
-    /// string bound never answers <c>int</c>, though Spark converts <c>"7"</c> to 7.</para>
+    /// The rules, and the literal kinds, are <see cref="VariantBound.ToLiteral"/>'s, which the Parquet reader's
+    /// pruning on shredded <c>typed_value</c> statistics shares.
     /// </remarks>
     public static LiteralValue? FromVariantField(
-        ReadOnlySpan<byte> metadata, ReadOnlySpan<byte> value, string key, string typeName)
+        ReadOnlySpan<byte> metadata, ReadOnlySpan<byte> value, string key, string targetType)
     {
         try
         {
@@ -237,7 +231,7 @@ internal static class DeltaLiteralDecoder
             if (!bound.IsObject)
                 return null;
             var fields = new Apache.Arrow.Scalars.Variant.VariantObjectReader(metadata, value);
-            return fields.TryGetField(key, out var field) ? FromVariant(field, typeName) : null;
+            return fields.TryGetField(key, out var field) ? FromVariant(field, targetType) : null;
         }
         catch (Exception e) when (e is ArgumentException or InvalidOperationException or IndexOutOfRangeException
             or OverflowException or FormatException)
@@ -246,134 +240,66 @@ internal static class DeltaLiteralDecoder
         }
     }
 
-    private static LiteralValue? FromVariant(Apache.Arrow.Scalars.Variant.VariantReader reader, string typeName)
+    // The bound as the Variant primitive it is, converted under the rules the Parquet reader's variant pruning
+    // shares (VariantBound.ToLiteral).
+    private static LiteralValue? FromVariant(Apache.Arrow.Scalars.Variant.VariantReader reader, string targetType) =>
+        ToVariantBound(reader) is { } bound ? bound.ToLiteral(targetType) : null;
+
+    private static VariantBound? ToVariantBound(Apache.Arrow.Scalars.Variant.VariantReader reader)
     {
         if (reader.IsNull)
             return null;
+        if (reader.IsBoolean)
+            return VariantBound.Boolean(reader.GetBoolean());
+        if (reader.IsString)
+            return VariantBound.String(reader.GetString());
+        if (reader.BasicType != Apache.Arrow.Scalars.Variant.VariantBasicType.Primitive)
+            return null;
 
-        Apache.Arrow.Scalars.Variant.VariantPrimitiveType? primitive =
-            reader.BasicType == Apache.Arrow.Scalars.Variant.VariantBasicType.Primitive ? reader.PrimitiveType : null;
-        switch (typeName)
+        switch (reader.PrimitiveType)
         {
-            case "byte":
-                return TryInteger(reader, primitive, out long b) && b is >= sbyte.MinValue and <= sbyte.MaxValue
-                    ? (LiteralValue?)LiteralValue.Of((int)b) : null;
-            case "short":
-                return TryInteger(reader, primitive, out long s) && s is >= short.MinValue and <= short.MaxValue
-                    ? (LiteralValue?)LiteralValue.Of((int)s) : null;
-            case "integer":
-                return TryInteger(reader, primitive, out long i) && i is >= int.MinValue and <= int.MaxValue
-                    ? (LiteralValue?)LiteralValue.Of((int)i) : null;
-            case "long":
-                return TryInteger(reader, primitive, out long l) ? (LiteralValue?)LiteralValue.Of(l) : null;
-            case "float":
-                return primitive == Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Float
-                    ? (LiteralValue?)LiteralValue.Of(reader.GetFloat()) : null;
-            case "double":
-                return primitive switch
-                {
-                    Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Float => (LiteralValue?)LiteralValue.Of((double)reader.GetFloat()),
-                    Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Double => LiteralValue.Of(reader.GetDouble()),
-                    _ => null,
-                };
-            case "boolean":
-                return reader.IsBoolean ? (LiteralValue?)LiteralValue.Of(reader.GetBoolean()) : null;
-            case "string":
-                return reader.IsString ? (LiteralValue?)LiteralValue.Of(reader.GetString()) : null;
-            case "date":
-                return primitive == Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Date
-                    ? (LiteralValue?)LiteralValue.Of(new DateTimeOffset(s_epoch.AddDays(reader.GetDateDays()), TimeSpan.Zero))
-                    : null;
-            case "timestamp":
-                return primitive == Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Timestamp
-                    ? (LiteralValue?)Micros(reader.GetTimestampMicros()) : null;
-            case "timestamp_ntz":
-                return primitive == Apache.Arrow.Scalars.Variant.VariantPrimitiveType.TimestampNtz
-                    ? (LiteralValue?)Micros(reader.GetTimestampNtzMicros()) : null;
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int8:
+                return VariantBound.Integer(VariantBoundKind.Int8, reader.GetInt8());
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int16:
+                return VariantBound.Integer(VariantBoundKind.Int16, reader.GetInt16());
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int32:
+                return VariantBound.Integer(VariantBoundKind.Int32, reader.GetInt32());
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int64:
+                return VariantBound.Integer(VariantBoundKind.Int64, reader.GetInt64());
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Float:
+                return VariantBound.Float(reader.GetFloat());
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Double:
+                return VariantBound.Double(reader.GetDouble());
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Date:
+                return VariantBound.Date(reader.GetDateDays());
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Timestamp:
+                return VariantBound.Timestamp(reader.GetTimestampMicros());
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.TimestampNtz:
+                return VariantBound.TimestampNtz(reader.GetTimestampNtzMicros());
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Decimal4:
+                return VariantDecimal(reader, 4);
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Decimal8:
+                return VariantDecimal(reader, 8);
+            case Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Decimal16:
+                return VariantDecimal(reader, 16);
             default:
-                return typeName.StartsWith("decimal(", StringComparison.Ordinal)
-                    ? VariantDecimal(reader, primitive, typeName)
-                    : null;
+                return null;
         }
-
-        static LiteralValue Micros(long micros) =>
-            LiteralValue.Of(new DateTimeOffset(s_epoch.AddTicks(checked(micros * 10)), TimeSpan.Zero));
-    }
-
-    private static bool TryInteger(
-        Apache.Arrow.Scalars.Variant.VariantReader reader, Apache.Arrow.Scalars.Variant.VariantPrimitiveType? primitive,
-        out long value)
-    {
-        value = primitive switch
-        {
-            Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int8 => reader.GetInt8(),
-            Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int16 => reader.GetInt16(),
-            Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int32 => reader.GetInt32(),
-            Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int64 => reader.GetInt64(),
-            _ => 0,
-        };
-        return primitive is Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int8
-            or Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int16
-            or Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int32
-            or Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Int64;
     }
 
     // Read from the value bytes rather than through VariantReader's decimal getters: the digits and the scale
     // must both survive exactly, and the scale is a fact about the type here (see ParseDecimalText).
-    private static LiteralValue? VariantDecimal(
-        Apache.Arrow.Scalars.Variant.VariantReader reader, Apache.Arrow.Scalars.Variant.VariantPrimitiveType? primitive,
-        string typeName)
+    private static VariantBound? VariantDecimal(Apache.Arrow.Scalars.Variant.VariantReader reader, int width)
     {
-        BigInteger unscaled;
-        int scale;
-        int width = primitive switch
-        {
-            Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Decimal4 => 4,
-            Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Decimal8 => 8,
-            Apache.Arrow.Scalars.Variant.VariantPrimitiveType.Decimal16 => 16,
-            _ => 0,
-        };
-        if (width > 0)
-        {
-            var bytes = reader.Value;
-            if (bytes.Length < 2 + width)
-                return null;
-            scale = bytes[1];
+        var bytes = reader.Value;
+        if (bytes.Length < 2 + width)
+            return null;
 #if NET6_0_OR_GREATER
-            unscaled = new BigInteger(bytes.Slice(2, width), isUnsigned: false, isBigEndian: false);
+        var unscaled = new BigInteger(bytes.Slice(2, width), isUnsigned: false, isBigEndian: false);
 #else
-            unscaled = new BigInteger(bytes.Slice(2, width).ToArray());
+        var unscaled = new BigInteger(bytes.Slice(2, width).ToArray());
 #endif
-        }
-        else if (TryInteger(reader, primitive, out long integer))
-        {
-            unscaled = integer;
-            scale = 0;
-        }
-        else
-        {
-            return null;
-        }
-
-        if (!TryDeclaredScale(typeName, out int declared) || !TryDeclaredPrecision(typeName, out int precision)
-            || scale > declared || !TryRescale(ref unscaled, scale, declared)
-            || BigInteger.Abs(unscaled) >= BigInteger.Pow(10, precision))
-        {
-            return null;
-        }
-        return MakeDecimalLiteral(unscaled, declared);
-    }
-
-    /// <summary>The precision out of a <c>decimal(p,s)</c> type name.</summary>
-    private static bool TryDeclaredPrecision(string typeName, out int precision)
-    {
-        precision = -1;
-        int open = typeName.IndexOf('(');
-        int comma = typeName.IndexOf(',');
-        return open >= 0 && comma > open
-            && int.TryParse(typeName.Substring(open + 1, comma - open - 1).Trim(), NumberStyles.Integer,
-                CultureInfo.InvariantCulture, out precision)
-            && precision is >= 1 and <= 38;
+        return VariantBound.Decimal(unscaled, bytes[1]);
     }
 
     /// <summary>

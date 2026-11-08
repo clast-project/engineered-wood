@@ -29,10 +29,12 @@ namespace EngineeredWood.Parquet;
 /// fields for backwards compatibility on signed numeric types only.
 /// </remarks>
 public sealed class ParquetStatisticsAccessor
-    : IStatisticsAccessor<RowGroup>, INanCountAccessor<RowGroup>
+    : IStatisticsAccessor<RowGroup>, INanCountAccessor<RowGroup>, IVariantStatisticsAccessor<RowGroup>
 {
     private readonly SchemaDescriptor _schema;
     private readonly Dictionary<string, int> _nameToLeafIndex;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<VariantGetCall, IStatisticsAccessor<RowGroup>?>
+        _variantPaths = new();
 
     public ParquetStatisticsAccessor(SchemaDescriptor schema)
     {
@@ -67,6 +69,67 @@ public sealed class ParquetStatisticsAccessor
 
     public bool IsMaxExact(RowGroup rg, string column) =>
         !TryGetColumn(rg, column, out _, out var stats) || stats!.IsMaxValueExact != false;
+
+    /// <summary>
+    /// Statistics for <c>variant_get(v, path, type)</c> in a row group, from the shredded <c>typed_value</c> column
+    /// that holds the path (see <see cref="ShreddedVariantPath"/>), or null when the file shreds no such path.
+    /// </summary>
+    public IStatisticsAccessor<RowGroup>? ForVariantGet(VariantGetCall call) =>
+        _variantPaths.GetOrAdd(call, c => ShreddedVariantPath.Resolve(_schema, c) is { } path
+            ? new VariantPathAccessor(path)
+            : null);
+
+    /// <summary>
+    /// A variant path's statistics in a row group: the leaf's, in a row group where its residual is null in every
+    /// row, and none in any other.
+    /// </summary>
+    /// <remarks>
+    /// The result's null count is the leaf's: a row whose leaf is null has nothing at the path (the residual is
+    /// null too), and one whose leaf holds a value has a result, provided both bounds convert, which means every
+    /// value between them does. Otherwise only a leaf null in every row says something: the result is NULL there.
+    /// Its NaN count is the leaf's, so a float path prunes both ways when the footer records one.
+    /// </remarks>
+    private sealed class VariantPathAccessor(ShreddedVariantPath path)
+        : IStatisticsAccessor<RowGroup>, INanCountAccessor<RowGroup>
+    {
+        private Statistics? Stats(RowGroup rg)
+        {
+            if (path.Leaf >= rg.Columns.Count)
+                return null;
+            if (path.Residual is int residual
+                && (residual >= rg.Columns.Count || rg.Columns[residual].MetaData?.Statistics?.NullCount != rg.NumRows))
+            {
+                return null;
+            }
+            return rg.Columns[path.Leaf].MetaData?.Statistics;
+        }
+
+        public LiteralValue? GetMinValue(RowGroup rg, string column) =>
+            Stats(rg) is { } stats
+                ? path.LowerBound(stats.MinValue ?? FallbackBytes(path.Column, stats.Min),
+                    stats.MaxValue ?? FallbackBytes(path.Column, stats.Max))
+                : null;
+
+        public LiteralValue? GetMaxValue(RowGroup rg, string column) =>
+            Stats(rg) is { } stats ? path.UpperBound(stats.MaxValue ?? FallbackBytes(path.Column, stats.Max)) : null;
+
+        public long? GetNullCount(RowGroup rg, string column)
+        {
+            if (Stats(rg) is not { NullCount: long nulls })
+                return null;
+            if (nulls == rg.NumRows)
+                return nulls;
+            return GetMinValue(rg, column) is not null && GetMaxValue(rg, column) is not null ? nulls : null;
+        }
+
+        public long? GetNanCount(RowGroup rg, string column) => Stats(rg)?.NanCount;
+
+        public long? GetValueCount(RowGroup rg, string column) => rg.NumRows;
+
+        public bool IsMinExact(RowGroup rg, string column) => Stats(rg)?.IsMinValueExact != false;
+
+        public bool IsMaxExact(RowGroup rg, string column) => Stats(rg)?.IsMaxValueExact != false;
+    }
 
     // ── Lookup ──
 
@@ -227,7 +290,7 @@ public sealed class ParquetStatisticsAccessor
     /// types they are unsafe to use as a fallback when min_value/max_value
     /// are absent.
     /// </summary>
-    private static byte[]? FallbackBytes(ColumnDescriptor desc, byte[]? legacy)
+    internal static byte[]? FallbackBytes(ColumnDescriptor desc, byte[]? legacy)
     {
         if (legacy is null) return null;
         return desc.PhysicalType switch
