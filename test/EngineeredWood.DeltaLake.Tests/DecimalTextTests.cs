@@ -23,6 +23,11 @@ public class DecimalTextTests
     [InlineData("1234567890123456789012345678901234567890")] // 40 integer digits
     [InlineData("1.5e38")] // 39 integer digits
     [InlineData("0.000000000000000000000000000000000000001")] // a non-zero 39th decimal
+    // 38 integer digits plus a fraction: 39 digits of precision, which no decimal(38,s) holds.
+    [InlineData("12345678901234567890123456789012345678.1")]
+    [InlineData("-12345678901234567890123456789012345678.10")]
+    [InlineData("1.23456789012345678901234567890123456789")]
+    [InlineData("1234567890123456789.01234567890123456789e1")]
     public void OutOfRangeValueIsRefusedAtOnce(string text)
     {
         var watch = Stopwatch.StartNew();
@@ -45,6 +50,9 @@ public class DecimalTextTests
     // Trailing zeros past scale 38 are dropped: the value is unchanged.
     [InlineData("1.0000000000000000000000000000000000000000", "100000000000000000000000000000000000000", 38)]
     [InlineData("100e-40", "1", 38)]
+    // Trailing fractional zeros don't count toward precision: a narrower column's rescale drops them.
+    [InlineData("12345678901234567890123456789012345678.000", "12345678901234567890123456789012345678000", 3)]
+    [InlineData("1.234567890123456789012345678901234567", "1234567890123456789012345678901234567", 36)]
     public void InRangeValueParsesExactly(string text, string unscaled, int scale)
     {
         Assert.True(DecimalText.TryParse(text, out var actual, out int actualScale));

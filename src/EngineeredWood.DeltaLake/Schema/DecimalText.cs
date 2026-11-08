@@ -47,8 +47,9 @@ internal static class DecimalText
     /// </remarks>
     /// <returns>
     /// False when the text is absent, malformed, or carries a non-numeric exponent, and when the value it
-    /// describes cannot be any Delta decimal: more than <see cref="MaxPrecision"/> integer digits, or a
-    /// non-zero digit past the <see cref="MaxPrecision"/>th decimal place.
+    /// describes cannot be any Delta decimal: one needing more than <see cref="MaxPrecision"/> digits of
+    /// precision once trailing fractional zeros are discounted, or with a non-zero digit past the
+    /// <see cref="MaxPrecision"/>th decimal place.
     /// </returns>
     public static bool TryParse(string? text, out BigInteger unscaled, out int scale)
     {
@@ -112,10 +113,27 @@ internal static class DecimalText
             valueScale--;
         }
 
-        // Refuse BEFORE building anything (#760). A non-zero digit past the 38th decimal place, or more
-        // than 38 integer digits, is no Delta decimal, and every caller would throw the value away.
+        // Refuse BEFORE building anything (#760). A non-zero digit past the 38th decimal place, or a value
+        // needing more than 38 digits of precision, is no Delta decimal, and every caller would throw the
+        // value away. The precision a value needs is its significant digits, plus the zeros a negative
+        // scale appends, minus the trailing FRACTIONAL zeros a narrower column's rescale may drop:
+        // 12345678901234567890123456789012345678.1 needs 39, but 1.000...0 padded to scale 38 needs 1.
+        if (valueScale > MaxPrecision)
+            return false;
         long significantDigits = last - first;
-        if (valueScale > MaxPrecision || significantDigits - valueScale > MaxPrecision)
+        long precision;
+        if (valueScale < 0)
+        {
+            precision = significantDigits - valueScale;
+        }
+        else
+        {
+            int droppable = 0;
+            while (droppable < valueScale && digits[last - 1 - droppable] == '0')
+                droppable++;
+            precision = significantDigits - droppable;
+        }
+        if (precision > MaxPrecision)
             return false;
 
         unscaled = BigInteger.Parse(digits.Substring(first, last - first), NumberStyles.None,
