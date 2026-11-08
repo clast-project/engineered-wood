@@ -108,6 +108,9 @@ public sealed class LogCommitter
         var pruner = request.Pruner;
 
         long attemptVersion = baseSnapshot.Version + 1;
+        // One per TRANSACTION, not per attempt, as delta-spark's: every attempt is the same transaction, and a stable
+        // id is what lets a committer recognise its own commit after a lost reply.
+        string txnId = InCommitTimestamp.NewTxnId();
         // The timestamp of the commit just below `attemptVersion`, which an in-commit timestamp must come after.
         // Moves with each rebase to the newest concurrent commit, as Spark's resolveTimestampOrderingConflicts does.
         long? previousTimestamp = await InCommitTimestamp.ResolvePreviousTimestampAsync(
@@ -120,7 +123,7 @@ public sealed class LogCommitter
                 currentActions, baseSnapshot.Metadata.Configuration, attemptVersion, request.Operation,
                 request.IsBlindAppend, request.CommitProperties,
                 request.OperationMetrics?.Invoke(currentActions), request.OperationParameters,
-                previousTimestamp);
+                previousTimestamp, txnId);
             try
             {
                 await _log.WriteCommitAsync(attemptVersion, finalActions, cancellationToken)

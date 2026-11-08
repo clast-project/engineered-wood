@@ -148,4 +148,53 @@ public class InCommitTimestampTests
         var result = InCommitTimestamp.EnsureCommitInfo(actions, config, version: 1);
         Assert.Same(actions, result); // No modification needed
     }
+
+    private static CommitInfo CallerCommitInfo(string? txnId)
+    {
+        var values = new Dictionary<string, JsonElement>
+        {
+            ["operation"] = JsonDocument.Parse("\"HOST WRITE\"").RootElement.Clone(),
+        };
+        if (txnId is not null)
+            values[InCommitTimestamp.TxnIdKey] = JsonDocument.Parse($"\"{txnId}\"").RootElement.Clone();
+        return new CommitInfo { Values = values };
+    }
+
+    private static string? TxnIdOf(IReadOnlyList<DeltaAction> actions) =>
+        actions.OfType<CommitInfo>().Single().GetValue(InCommitTimestamp.TxnIdKey)?.GetString();
+
+    [Fact]
+    public void EnsureCommitInfo_NewCommitInfo_CarriesTheGivenTxnId()
+    {
+        var result = InCommitTimestamp.EnsureCommitInfo([], null, version: 1, txnId: "given-id");
+        Assert.Equal("given-id", TxnIdOf(result));
+    }
+
+    [Fact]
+    public void EnsureCommitInfo_NewCommitInfo_MintsAUuidWhenNoneIsGiven()
+    {
+        string? first = TxnIdOf(InCommitTimestamp.EnsureCommitInfo([], null, version: 1));
+        string? second = TxnIdOf(InCommitTimestamp.EnsureCommitInfo([], null, version: 1));
+        Assert.True(Guid.TryParseExact(first, "D", out _));
+        Assert.NotEqual(first, second);
+    }
+
+    [Fact]
+    public void EnsureCommitInfo_CallersCommitInfo_GainsATxnId()
+    {
+        // A host that stages its own commitInfo still writes a commit that names its transaction.
+        IReadOnlyList<DeltaAction> actions = [CallerCommitInfo(txnId: null)];
+        var result = InCommitTimestamp.EnsureCommitInfo(actions, null, version: 1, txnId: "given-id");
+        Assert.Equal("given-id", TxnIdOf(result));
+        Assert.Equal("HOST WRITE", result.OfType<CommitInfo>().Single().GetValue("operation")?.GetString());
+    }
+
+    [Fact]
+    public void EnsureCommitInfo_CallersCommitInfo_KeepsItsOwnTxnId()
+    {
+        IReadOnlyList<DeltaAction> actions = [CallerCommitInfo(txnId: "hosts-own")];
+        var result = InCommitTimestamp.EnsureCommitInfo(actions, null, version: 1, txnId: "given-id");
+        Assert.Same(actions, result);
+        Assert.Equal("hosts-own", TxnIdOf(result));
+    }
 }

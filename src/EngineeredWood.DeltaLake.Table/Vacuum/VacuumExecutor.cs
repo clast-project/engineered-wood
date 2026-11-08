@@ -306,6 +306,8 @@ internal static class VacuumExecutor
 
         const int maxAttempts = 16;
         long version = firstCandidateVersion;
+        // One per commit, kept across its attempts (InCommitTimestamp.TxnIdKey).
+        string txnId = InCommitTimestamp.NewTxnId();
         for (int attempt = 0; ; attempt++, version++)
         {
             // Prepared per attempt: an in-commit timestamp must come after the commit just below THIS version,
@@ -323,7 +325,7 @@ internal static class VacuumExecutor
                 InCommitTimestamp.CreateCommitInfo(
                     timestamp, operation, additionalValues,
                     includeInCommitTimestamp: timestamped,
-                    commitProperties: commitProperties),
+                    commitProperties: commitProperties, txnId: txnId),
             ];
 
             try
