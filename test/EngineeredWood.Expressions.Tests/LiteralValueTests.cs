@@ -485,4 +485,46 @@ public class LiteralValueTests
         Assert.True(nanF.CompareTo(infD) > 0);
         Assert.True(LiteralValue.Of(1.0f).CompareTo(nanD) < 0);
     }
+
+    /// <summary>
+    /// Comparing decimals whose scales are far apart no longer lines them up by multiplying by
+    /// 10^difference: two scales 50000000 apart would build a 50-million-digit integer. #760.
+    /// </summary>
+    [Theory]
+    [InlineData("1", 50000000, "1", 0, -1)] // 10^-50000000 < 1
+    [InlineData("1", 0, "1", 50000000, 1)]
+    [InlineData("-1", 50000000, "-1", 0, 1)] // -10^-50000000 > -1
+    [InlineData("1", int.MaxValue, "1", int.MinValue, -1)]
+    [InlineData("1", int.MinValue, "1", int.MaxValue, 1)]
+    [InlineData("-1", int.MaxValue, "1", int.MinValue, -1)] // signs decide
+    [InlineData("0", int.MaxValue, "0", int.MinValue, 0)]
+    [InlineData("0", 50000000, "1", 0, -1)]
+    public void DecimalsWithFarApartScalesCompareAtOnce(
+        string a, int ascale, string b, int bscale, int expected)
+    {
+        var left = LiteralValue.HighPrecisionDecimalOf(BigInteger.Parse(a), ascale);
+        var right = LiteralValue.HighPrecisionDecimalOf(BigInteger.Parse(b), bscale);
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Assert.Equal(expected, Math.Sign(left.CompareTo(right)));
+        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+    }
+
+    /// <summary>
+    /// Scales far apart whose leading digits still line up: the comparison falls through to the
+    /// exact multiply, which is then no bigger than the values themselves.
+    /// </summary>
+    [Fact]
+    public void DecimalsWithFarApartScalesButEqualMagnitudesCompareExactly()
+    {
+        // 10^100 at scale 100 is 1, as is 1 at scale 0; 10^100 + 1 at scale 100 is just above it.
+        var big = BigInteger.Pow(10, 100);
+        var one = LiteralValue.HighPrecisionDecimalOf(BigInteger.One, 0);
+        var minusOne = LiteralValue.HighPrecisionDecimalOf(BigInteger.MinusOne, 0);
+
+        Assert.Equal(0, LiteralValue.HighPrecisionDecimalOf(big, 100).CompareTo(one));
+        Assert.True(LiteralValue.HighPrecisionDecimalOf(big + 1, 100).CompareTo(one) > 0);
+        Assert.True(LiteralValue.HighPrecisionDecimalOf(big - 1, 100).CompareTo(one) < 0);
+        Assert.True(LiteralValue.HighPrecisionDecimalOf(-(big + 1), 100).CompareTo(minusOne) < 0);
+    }
 }

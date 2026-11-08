@@ -596,6 +596,17 @@ internal static class PartitionUtils
                 + $"{decType.Scale} can hold, so restating it would change the value.");
         }
 
+        // The column's precision, not just its storage: 123456 is no decimal(5,2) value, though it
+        // fits 128 bits easily, and materializing it would hand every row of the partition a value
+        // its own type cannot hold.
+        if (decType.Precision is < 1 or > DeltaLake.Schema.DecimalText.MaxPrecision
+            || System.Numerics.BigInteger.Abs(scaled) >= System.Numerics.BigInteger.Pow(10, decType.Precision))
+        {
+            throw new OverflowException(
+                $"Partition value '{value}' needs more digits than its decimal({decType.Precision},"
+                + $"{decType.Scale}) column's precision of {decType.Precision}.");
+        }
+
         var bytes = new byte[16];
         // Sign-extend first, so a negative value's high bytes are 0xFF rather than 0x00.
         if (scaled.Sign < 0)

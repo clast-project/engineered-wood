@@ -855,6 +855,34 @@ public sealed class SparkSqlParserTests
     }
 
     /// <summary>
+    /// The precision bound is checked before the literal's value is built. A CHECK constraint or
+    /// generated column is SQL text from the table's log, and <c>1e999999999BD</c> used to build a
+    /// billion-digit integer before refusing it; <c>1.5e-2147483648BD</c> wrapped its int exponent
+    /// round to +2147483647 and built that instead. #760.
+    /// </summary>
+    [Theory]
+    [InlineData("1e999999999BD")]
+    [InlineData("1e2147483647BD")]
+    [InlineData("1.5e-2147483648BD")]
+    [InlineData("0e-2147483648BD")]
+    public void AnAbsurdDecimalExponentIsRefusedAtOnce(string sql)
+    {
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Assert.Contains("38", Assert.Throws<SparkSqlParseException>(() => Parse(sql)).Reason,
+            StringComparison.Ordinal);
+        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+    }
+
+    [Theory]
+    [InlineData("0e999999999BD")]
+    [InlineData("0e2147483647BD")]
+    public void AZeroDecimalAtAHugeExponentIsStillZero(string sql)
+    {
+        var value = Assert.IsType<LiteralExpression>(Parse(sql)).Value;
+        Assert.Equal(0, value.CompareTo(LiteralValue.Of(0m)));
+    }
+
+    /// <summary>
     /// A minus before a number is part of the literal, and the SIGNED text is what gets typed.
     /// </summary>
     /// <remarks>

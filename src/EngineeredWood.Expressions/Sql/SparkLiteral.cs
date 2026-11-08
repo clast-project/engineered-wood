@@ -392,18 +392,29 @@ internal static class SparkLiteral
     /// </remarks>
     private static LiteralValue Decimal(string text, string sql, int position)
     {
-        var (unscaled, scale) = SplitDecimal(text, sql, position);
+        var (mantissa, exponent) = SplitDecimal(text, sql, position);
 
         // Precision counts the scale as well as the digits, because a Spark decimal requires
         // 0 <= scale <= precision <= 38: a value with one significant digit is still too wide if
         // its scale is. `1e-38BD` is a decimal(38,38) and `1e-39BD` is refused by Spark's parser,
         // as here. Checking only the digit count would admit `1e-45BD`, which no Spark type holds.
-        var precision = Math.Max(Precision(unscaled), scale);
+        //
+        // Worked out from the mantissa and the exponent, BEFORE the value is built: a positive
+        // exponent appends that many zeros, and `1e999999999BD` would otherwise build a
+        // billion-digit integer only to refuse it. Zero stays one digit at any positive exponent.
+        long precision = exponent >= 0
+            ? (mantissa.IsZero ? 1 : Precision(mantissa) + exponent)
+            : Math.Max(Precision(mantissa), -exponent);
 
         if (precision > MaxPrecision)
             throw new SparkSqlParseException(
                 $"'{text}' needs a precision of {precision}, and no decimal is wider than {MaxPrecision}",
                 sql, position);
+
+        // Bounded by the check: the power is at most 10^37 and the scale at most 38.
+        var (unscaled, scale) = exponent >= 0
+            ? (mantissa.IsZero ? mantissa : mantissa * BigInteger.Pow(Ten, (int)exponent), 0)
+            : (mantissa, (int)-exponent);
 
         // System.Decimal holds a scale up to 28 and an unscaled value inside 96 bits. Inside that
         // it is exact and is the kind the rest of the library expects for an ordinary literal;
@@ -421,28 +432,36 @@ internal static class SparkLiteral
         BigInteger.Parse("79228162514264337593543950335", CultureInfo.InvariantCulture);
 
     /// <summary>
-    /// Splits literal text into the unscaled integer and scale that denote it exactly.
+    /// Splits literal text into the integer digits and base-10 exponent that denote it exactly:
+    /// the value is <c>Mantissa x 10^Exponent</c>.
     /// </summary>
     /// <remarks>
     /// An exponent can reach here: <see cref="Number"/> strips the <c>BD</c> suffix before its
-    /// exponent check, so <c>1e3BD</c> arrives as <c>1e3</c> asking to be a decimal. A negative
-    /// resulting scale is folded into the integer, because a decimal has no negative scale —
-    /// <c>1e3BD</c> is 1000 at scale 0.
+    /// exponent check, so <c>1e3BD</c> arrives as <c>1e3</c> asking to be a decimal. The caller
+    /// folds a positive exponent into the integer, because a decimal has no negative scale —
+    /// <c>1e3BD</c> is 1000 at scale 0 — once it has checked the result fits.
+    /// <para>
+    /// The exponent is a <see cref="long"/>: moving the point left subtracts the fraction's
+    /// length, and <c>1.5e-2147483648BD</c> in an <see cref="int"/> wraps to +2147483647.
+    /// </para>
     /// </remarks>
-    private static (BigInteger Unscaled, int Scale) SplitDecimal(string text, string sql, int position)
+    private static (BigInteger Mantissa, long Exponent) SplitDecimal(string text, string sql, int position)
     {
-        var exponent = 0;
+        long exponent = 0;
         var e = text.IndexOf('E');
         if (e < 0) e = text.IndexOf('e');
 
         if (e >= 0)
         {
+            // The exponent's own spelling is still limited to int, as before.
             if (!int.TryParse(
-                    text.Substring(e + 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out exponent))
+                    text.Substring(e + 1), NumberStyles.Integer, CultureInfo.InvariantCulture,
+                    out var written))
             {
                 throw ExponentOverflow(text, sql, position);
             }
 
+            exponent = written;
             text = text.Substring(0, e);
         }
 
@@ -456,14 +475,11 @@ internal static class SparkLiteral
         // The tokenizer has already established that what is left is digits, possibly none of
         // them — `.5` and `1.` are both literals Spark accepts — behind the sign the parser may
         // have folded in, which the parse reads.
-        var unscaled = text.Length == 0
+        var mantissa = text.Length == 0
             ? BigInteger.Zero
             : BigInteger.Parse(text, NumberStyles.Integer, CultureInfo.InvariantCulture);
 
-        if (exponent >= 0)
-            return (unscaled * BigInteger.Pow(Ten, exponent), 0);
-
-        return (unscaled, -exponent);
+        return (mantissa, exponent);
     }
 
     private static readonly BigInteger Ten = new(10);

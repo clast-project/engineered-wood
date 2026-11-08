@@ -103,6 +103,33 @@ public class PartitionConstantArrayTests
             Assert.Equal(expected, Unscaled(column, i));
     }
 
+    /// <summary>
+    /// A partition value needing more digits than its column's precision is refused, though it fits
+    /// Decimal128's storage: 123456 is no decimal(5,2) value, and materializing it would hand every row
+    /// of the partition a value its own type cannot hold.
+    /// </summary>
+    [Theory]
+    [InlineData(5, 2, "1000")]      // 1000.00 needs 6 digits
+    [InlineData(5, 2, "-1000")]
+    [InlineData(5, 0, "123456")]
+    [InlineData(38, 2, "1e36")]     // 10^36 at scale 2 needs 39 digits
+    public void Decimal_ValueBeyondTheColumnsPrecision_IsRefused(int precision, int scale, string value)
+    {
+        var ex = Assert.Throws<OverflowException>(
+            () => Materialize(new Decimal128Type(precision, scale), value, 1));
+        Assert.Contains($"precision of {precision}", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(5, 2, "999.99")]
+    [InlineData(5, 2, "-999.99")]
+    [InlineData(5, 0, "99999")]
+    public void Decimal_ValueAtTheColumnsPrecision_Reads(int precision, int scale, string value)
+    {
+        var column = Assert.IsType<Decimal128Array>(Materialize(new Decimal128Type(precision, scale), value, 1));
+        Assert.Equal(1, column.Length);
+    }
+
     [Fact]
     public void Decimal_ScalesAValueGivenWithFewerFractionalDigits()
     {
