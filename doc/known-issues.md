@@ -713,8 +713,10 @@ partition column (Spark's allow-list holds `DecimalType`'s companion object, so 
 of a partitioned table's partition columns, by REPLACE either; only type changes Iceberg can follow, on a table that
 supports type widening; a literal top-level column default; V3 cannot be turned off, by a commit, a REPLACE or a
 RESTORE; and it cannot be turned on by a commit over row tracking that was already enabled. Nested ids are assigned
-as under V2, and the materialized row-tracking columns carry Iceberg's reserved row-lineage field ids (2147483540 /
-2147483539), as delta-spark 4.4 writes them. Gaps:
+as under V2, and the materialized row-tracking columns that compaction writes carry Iceberg's reserved row-lineage
+field ids (2147483540 / 2147483539), as delta-spark 4.4 writes them. Gaps:
+- `UpdateAsync` writes its rewritten files without the ids and without the materialized partition columns, on V1/V2
+  as on V3; the other row-rewriting DML paths refuse IcebergCompat tables (#756).
 - A V3 table that delta-spark 4.3.1 created has no `delta.enableRowTracking`, and EW refuses to write it. delta-spark
   4.4 sets the property on its next commit; EW does not change a table's properties on a write.
 - delta-spark 4.4 refuses every write to a V3 table unless the session sets
