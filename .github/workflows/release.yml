@@ -40,8 +40,38 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Releasing version $version"
 
+      - name: Find the previous release
+        id: baseline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          # The newest v* tag reachable from this commit, other than the one being released, that has
+          # a GitHub Release. This workflow creates the Release only after every package has been
+          # pushed, so a tag whose run failed, even partway through the pushes, is skipped. Its
+          # packages are the baseline the Pack step checks API compatibility against.
+          $released = @(gh release list --repo $env:GITHUB_REPOSITORY --limit 1000 --exclude-drafts --json tagName --jq '.[].tagName')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # Collect git's output before filtering: stopping the pipeline early (Select-Object -First)
+          # kills git, whose non-zero exit code would then fail the step.
+          $tags = @(git tag --merged HEAD --list 'v*' --sort=-v:refname)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $prevVersion = $tags |
+            Where-Object { $_ -ne $env:GITHUB_REF_NAME } |
+            Where-Object { $released -contains $_ } |
+            Select-Object -First 1 |
+            ForEach-Object { $_ -replace '^v', '' }
+          if (-not $prevVersion) {
+            Write-Error "No earlier published release found to check API compatibility against."
+            exit 1
+          }
+          "version=$prevVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Checking API compatibility against $prevVersion"
+
       - name: Restore
-        run: dotnet restore engineered-wood.slnx
+        # ApiBaselineVersion here makes restore download the baseline packages that package
+        # validation compares against in the Pack step, which runs with --no-build (so no restore).
+        run: dotnet restore engineered-wood.slnx -p:ApiBaselineVersion=${{ steps.baseline.outputs.version }}
 
       - name: Build
         run: dotnet build engineered-wood.slnx --no-restore --configuration Release -p:Version=${{ steps.version.outputs.version }}
@@ -52,7 +82,10 @@ jobs:
       - name: Pack
         # Produces the 15 src/ libraries at the tag version (test/benchmark
         # projects opt out of packing via test/Directory.Build.props).
-        run: dotnet pack engineered-wood.slnx --no-build --configuration Release -p:Version=${{ steps.version.outputs.version }} --output artifacts
+        # -p:ApiBaselineVersion turns on package validation against the previous release:
+        # a breaking change not listed in a CompatibilitySuppressions.xml fails the release
+        # here, before anything is pushed. See doc/releasing.md.
+        run: dotnet pack engineered-wood.slnx --no-build --configuration Release -p:Version=${{ steps.version.outputs.version }} -p:ApiBaselineVersion=${{ steps.baseline.outputs.version }} --output artifacts
 
       - name: NuGet login (trusted publishing)
         # Exchanges the workflow's OIDC token for a short-lived (~1 hour) nuget.org

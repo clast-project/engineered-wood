@@ -10,6 +10,7 @@ These describe current behaviour.
 | [embedding-host-guide.md](embedding-host-guide.md) | Using the Delta log layer from a host engine that brings its own data plane |
 | [delta-concurrency.md](delta-concurrency.md) | Delta optimistic concurrency: conflicts, retries, rebase |
 | [running-tests.md](running-tests.md) | Running the test suites and the interop tiers (PySpark, delta-rs, DuckDB, cloud emulators) |
+| [releasing.md](releasing.md) | Cutting a release: the API compatibility check, tagging, trusted publishing |
 | [lance.md](lance.md) | Lance format, type and encoding coverage |
 | [lance-future-work.md](lance-future-work.md) | Remaining Lance gaps, by user impact |
 | [vortex.md](vortex.md) | Vortex format, type and encoding coverage |
