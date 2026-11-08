@@ -73,6 +73,15 @@ public static class DeltaTableErrorCodes
     public const string InvalidProtocolVersionProperty = "DELTA_INVALID_PROTOCOL_VERSION_PROPERTY";
 
     /// <summary>
+    /// A commit's <c>protocol</c> action supports fewer features than the table's protocol: it drops a feature
+    /// the table supports, explicitly or as one its legacy version implies.
+    /// </summary>
+    /// <remarks>delta-spark: <c>DELTA_INVALID_PROTOCOL_DOWNGRADE</c> / <c>ProtocolDowngradeException</c> (4.4.1
+    /// bytecode), raised when <c>Protocol.canTransitionTo</c> fails for any protocol in a commit. Spark lets only
+    /// DROP FEATURE remove a feature, and this library has no such operation.</remarks>
+    public const string InvalidProtocolDowngrade = "DELTA_INVALID_PROTOCOL_DOWNGRADE";
+
+    /// <summary>
     /// A caller-supplied <c>preAssignedSchema</c> cannot be used: it carries no column-mapping field
     /// ids for a table being created with column mapping, or it reuses ids the existing table has
     /// already spent.
