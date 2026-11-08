@@ -44,19 +44,30 @@ jobs:
         id: baseline
         shell: pwsh
         run: |
-          # The newest v* tag reachable from this commit, other than the one being released. Its
-          # packages on nuget.org are the baseline the Pack step checks API compatibility against.
-          $prev = git describe --tags --abbrev=0 --match 'v*' --exclude "$env:GITHUB_REF_NAME" HEAD
-          if ($LASTEXITCODE -ne 0 -or -not $prev) {
-            Write-Error "No previous v* tag found to check API compatibility against."
+          # The newest v* tag reachable from this commit, other than the one being released, whose
+          # packages are on nuget.org. A tag whose release failed never published, so it is skipped.
+          # Those packages are the baseline the Pack step checks API compatibility against.
+          $published = (Invoke-RestMethod 'https://api.nuget.org/v3-flatcontainer/engineeredwood.core/index.json').versions
+          # Collect git's output before filtering: stopping the pipeline early (Select-Object -First)
+          # kills git, whose non-zero exit code would then fail the step.
+          $tags = @(git tag --merged HEAD --list 'v*' --sort=-v:refname)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $prevVersion = $tags |
+            Where-Object { $_ -ne $env:GITHUB_REF_NAME } |
+            ForEach-Object { $_ -replace '^v', '' } |
+            Where-Object { $published -contains $_ } |
+            Select-Object -First 1
+          if (-not $prevVersion) {
+            Write-Error "No earlier published release found to check API compatibility against."
             exit 1
           }
-          $prevVersion = $prev -replace '^v', ''
           "version=$prevVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Checking API compatibility against $prevVersion"
 
       - name: Restore
-        run: dotnet restore engineered-wood.slnx
+        # ApiBaselineVersion here makes restore download the baseline packages that package
+        # validation compares against in the Pack step, which runs with --no-build (so no restore).
+        run: dotnet restore engineered-wood.slnx -p:ApiBaselineVersion=${{ steps.baseline.outputs.version }}
 
       - name: Build
         run: dotnet build engineered-wood.slnx --no-restore --configuration Release -p:Version=${{ steps.version.outputs.version }}

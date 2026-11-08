@@ -14,13 +14,15 @@ Release. Nothing is pushed if an earlier step fails.
    dotnet pack engineered-wood.slnx -c Release -o ../ew-apicheck -p:ApiBaselineVersion=0.4.0 -p:ApiCompatGenerateSuppressionFile=true
    ```
 
-   This rewrites `src/*/CompatibilitySuppressions.xml` to list every difference. Review the diff. Each
-   new entry is a breaking change, so describe it in `PackageReleaseNotes`
-   (`src/Directory.Build.props`), then commit the files with the notes.
+   This rewrites `src/*/CompatibilitySuppressions.xml` to list every difference, and drops entries that no
+   longer match anything. Review the diff. A new entry whose `<Left>` names the baseline package is a
+   breaking change, so describe it in `PackageReleaseNotes` (`src/Directory.Build.props`), then commit the
+   files with the notes.
 
-   Some entries are permanent and aren't breaking changes. Within a package, the `netstandard2.0` and
-   `net8.0` builds compile records differently (`CP0005` on `<Clone>$`, for example), and the check
-   reports that as a difference.
+   Entries whose `<Left>` and `<Right>` are two frameworks of the same new package (`lib/netstandard2.0/…`
+   against `lib/net8.0/…`) compare the package with itself, not with the previous release. They don't
+   belong in the release notes. Records produce some permanently: the two frameworks compile a record's
+   `<Clone>$` differently (`CP0005`).
 
    A package that is new since the previous release has no baseline to compare against. Add
    `<PackageValidationBaselineVersion />` to its csproj for that release.
@@ -44,5 +46,5 @@ The `engineered-wood` policy on nuget.org trusts `release.yml` in this repositor
 exchanges the workflow's OIDC token for an API key that lasts about an hour. No API key is stored in the
 repository. New versions take a few minutes to appear on nuget.org after the push.
 
-After a release, the suppression files can be cleared of entries against the old baseline. Entries that no
-longer match anything are ignored, so this is optional.
+Entries left over from the previous baseline stop matching after a release. They are ignored, and the next
+regeneration removes them.
