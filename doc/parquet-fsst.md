@@ -29,14 +29,13 @@ produce files this reader cannot read and vice versa — not because of a bug on
 but because the two encode different formats. Interop testing becomes worthwhile once one
 of the upstream implementations is rewritten against the ratified spec.
 
-## The encoding number is 11 here, not 10
+## The encoding number is 12 here, not 10
 
-The spec assigns `FSST = 10`. So does the ALP proposal, for itself. Both are unratified and
-only one can win. ALP shipped in this library first and keeps 10, so FSST is written as
-**11** — which is also what the arrow-rs author expects ("may become 11 once ALP encoding
-lands"). Reversing this later is a one-line change to `Encoding.Fsst`, but it would
-silently misread already-written files, which is why the choice was made deliberately
-rather than by following the spec text literally.
+The proposal assigns `FSST = 10`, but ALP took 10 and was ratified with it in parquet-format
+2.14.0. FSST was written as 11 until PFOR claimed 11 in a spec PR backed by parquet-java and
+arrow-rs implementations (#238), so FSST is now written as **12** (`Encoding.Fsst`,
+`ParquetEnums.cs`). Changing the number again would make already-written files misread
+silently, which is one reason FSST stays behind `EWPARQUET0003`.
 
 ## What is implemented
 
