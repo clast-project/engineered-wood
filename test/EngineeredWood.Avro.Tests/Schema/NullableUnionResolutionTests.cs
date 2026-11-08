@@ -85,6 +85,34 @@ public class NullableUnionResolutionTests
         Assert.Equal(FiveNullSeven, Values(((ListArray)reader.ReadNextBatch()!.Column(0)).Values));
     }
 
+    // Copilot's two cases on #768: a union item under a plain promoted item, and the reverse.
+    [Fact]
+    public void UnionArrayItems_PromoteUnderPlainReaderItems()
+    {
+        // Three items as ["null","float"]: 5, 6, 7 (branch 1 each), then the end 0.
+        byte[] five = BitConverter.GetBytes(5f), six = BitConverter.GetBytes(6f), seven = BitConverter.GetBytes(7f);
+        using var ms = RawOcfFile.Create(
+            OneField("""{"type": "array", "items": ["null", "float"]}""").Json,
+            [[6, 2, .. five, 2, .. six, 2, .. seven, 0]], lengthPrefixed: false);
+        using var reader = new AvroReaderBuilder()
+            .WithReaderSchema(OneField("""{"type": "array", "items": "double"}""")).Build(ms);
+
+        Assert.Equal(new string?[] { "5", "6", "7" }, Values(((ListArray)reader.ReadNextBatch()!.Column(0)).Values));
+    }
+
+    [Fact]
+    public void PlainArrayItems_PromoteUnderUnionReaderItems()
+    {
+        byte[] five = BitConverter.GetBytes(5f), six = BitConverter.GetBytes(6f), seven = BitConverter.GetBytes(7f);
+        using var ms = RawOcfFile.Create(
+            OneField("""{"type": "array", "items": "float"}""").Json,
+            [[6, .. five, .. six, .. seven, 0]], lengthPrefixed: false);
+        using var reader = new AvroReaderBuilder()
+            .WithReaderSchema(OneField("""{"type": "array", "items": ["null", "double"]}""")).Build(ms);
+
+        Assert.Equal(new string?[] { "5", "6", "7" }, Values(((ListArray)reader.ReadNextBatch()!.Column(0)).Values));
+    }
+
     [Fact]
     public void RecordFields_FollowTheWritersUnion()
     {
