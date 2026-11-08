@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
 using EngineeredWood.Avro.Schema;
 
@@ -132,6 +133,88 @@ public class DecimalAnnotationTests
 
         Assert.Throws<NotSupportedException>(
             () => new AvroReaderBuilder().WithReaderSchema(readerSchema).Build(ms).ReadNextBatch());
+    }
+
+    private static AvroSchema OneField(string type) =>
+        new($$"""{"type": "record", "name": "T", "fields": [{"name": "amount", "type": {{type}}}]}""");
+
+    private static RecordBatch ReadUnder(MemoryStream ms, AvroSchema readerSchema)
+    {
+        using var reader = new AvroReaderBuilder().WithReaderSchema(readerSchema).Build(ms);
+        var batch = reader.ReadNextBatch()!;
+        // Whatever else, the column must be what the batch's schema says it is.
+        Assert.Equal(batch.Schema.FieldsList[0].DataType.TypeId, batch.Column(0).Data.DataType.TypeId);
+        return batch;
+    }
+
+    private static MemoryStream WriteOneColumn(IArrowArray column, string avroType)
+    {
+        var arrowSchema = new Apache.Arrow.Schema.Builder().Field(new Field("amount", column.Data.DataType, false)).Build();
+        var ms = new MemoryStream();
+        using (var writer = new AvroWriterBuilder(arrowSchema).WithAvroSchema(OneField(avroType)).Build(ms))
+        {
+            writer.Write(new RecordBatch(arrowSchema, [column], column.Length));
+            writer.Finish();
+        }
+        ms.Position = 0;
+        return ms;
+    }
+
+    // Resolution pairs bytes with bytes whatever the annotations say; the builder used to follow the
+    // writer's plain bytes and build binary buffers under the reader's Decimal128, which Arrow refused.
+    [Fact]
+    public void PlainWriterBytes_UnderAReaderDecimal_TakeTheReadersDecimal()
+    {
+        using var ms = WriteOneColumn(new BinaryArray.Builder().Append([0x30, 0x39]).Build(), "\"bytes\"");
+
+        var batch = ReadUnder(ms, OneField("""{"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}"""));
+
+        var column = Assert.IsType<Decimal128Array>(batch.Column(0));
+        Assert.Equal((10, 2), (((Decimal128Type)column.Data.DataType).Precision, ((Decimal128Type)column.Data.DataType).Scale));
+        Assert.Equal("123.45", column.GetSqlDecimal(0)!.Value.ToString());
+    }
+
+    [Fact]
+    public void PlainWriterFixed_UnderAReaderDecimal_TakeTheReadersDecimal()
+    {
+        var fixedType = new FixedSizeBinaryType(4);
+        var values = new byte[] { 0x00, 0x00, 0x30, 0x39 };
+        var column = new FixedSizeBinaryArray(new ArrayData(fixedType, 1, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(values)]));
+        using var ms = WriteOneColumn(column, """{"type": "fixed", "name": "F", "size": 4}""");
+
+        var batch = ReadUnder(ms, OneField("""{"type": "fixed", "name": "F", "size": 4, "logicalType": "decimal", "precision": 9, "scale": 2}"""));
+
+        Assert.Equal("123.45", Assert.IsType<Decimal128Array>(batch.Column(0)).GetSqlDecimal(0)!.Value.ToString());
+    }
+
+    // The parser drops the writer's invalid annotation; the reader's valid one then applies.
+    [Fact]
+    public void AnInvalidWriterDecimal_UnderAReaderDecimal_TakesTheReadersDecimal()
+    {
+        const string schemaJson = """
+            {"type": "record", "name": "T", "fields": [
+                {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 50000000}}]}
+            """;
+        using var ms = RawOcf(schemaJson, [[0x30, 0x39]]);
+
+        var batch = ReadUnder(ms, OneField("""{"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}"""));
+
+        Assert.Equal("123.45", Assert.IsType<Decimal128Array>(batch.Column(0)).GetSqlDecimal(0)!.Value.ToString());
+    }
+
+    // The reverse: the reader asks for plain bytes and gets the bytes, not a Decimal128 under a Binary field.
+    [Fact]
+    public void AWriterDecimal_UnderPlainReaderBytes_ReadsTheBytes()
+    {
+        const string schemaJson = """
+            {"type": "record", "name": "T", "fields": [
+                {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 20, "scale": 4}}]}
+            """;
+        using var ms = RawOcf(schemaJson, [[0x30, 0x39]]);
+
+        var batch = ReadUnder(ms, OneField("\"bytes\""));
+
+        Assert.Equal([0x30, 0x39], Assert.IsType<BinaryArray>(batch.Column(0)).GetBytes(0).ToArray());
     }
 
     /// <summary>A null-codec object container file holding one block of single-field <c>bytes</c> records.</summary>
