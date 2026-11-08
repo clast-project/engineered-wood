@@ -94,7 +94,7 @@ public class DecimalAnnotationTests
             {"type": "record", "name": "T", "fields": [
                 {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 50000000}}]}
             """;
-        using var ms = RawOcf(schemaJson, [[0x01, 0x02], [0xFF]]);
+        using var ms = RawOcfFile.Create(schemaJson, [[0x01, 0x02], [0xFF]]);
 
         Assert.Contains("\"scale\": 50000000", System.Text.Encoding.UTF8.GetString(ms.ToArray()));
 
@@ -115,7 +115,7 @@ public class DecimalAnnotationTests
     [Fact]
     public void AnExternallyWrittenHugeDecimal_IsRefused()
     {
-        using var ms = RawOcf(HugeDecimalWriterSchema, [[0x01]]);
+        using var ms = RawOcfFile.Create(HugeDecimalWriterSchema, [[0x01]]);
         Assert.Throws<NotSupportedException>(() => new AvroReaderBuilder().Build(ms).ReadNextBatch());
     }
 
@@ -124,7 +124,7 @@ public class DecimalAnnotationTests
     [Fact]
     public void AHugeWriterDecimal_IsRefused_UnderAReaderSchema()
     {
-        using var ms = RawOcf(HugeDecimalWriterSchema, [[0x01]]);
+        using var ms = RawOcfFile.Create(HugeDecimalWriterSchema, [[0x01]]);
         var readerSchema = new AvroSchema("""
             {"type": "record", "name": "T", "fields": [
                 {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}}]}
@@ -181,7 +181,7 @@ public class DecimalAnnotationTests
     [Fact]
     public void PlainWriterFixed_IsRefused_UnderAReaderDecimal()
     {
-        using var ms = RawOcf(OneField("""{"type": "fixed", "name": "F", "size": 4}""").Json, [[0, 0, 0x30, 0x39]], lengthPrefixed: false);
+        using var ms = RawOcfFile.Create(OneField("""{"type": "fixed", "name": "F", "size": 4}""").Json, [[0, 0, 0x30, 0x39]], lengthPrefixed: false);
         AssertUndeclaredWriterRefused(
             ms, OneField("""{"type": "fixed", "name": "F", "size": 4, "logicalType": "decimal", "precision": 9, "scale": 2}"""));
     }
@@ -190,7 +190,7 @@ public class DecimalAnnotationTests
     [Fact]
     public void AnInvalidWriterDecimal_IsRefused_UnderAReaderDecimal()
     {
-        using var ms = RawOcf(OneField("""{"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 50000000}""").Json, [[0x30, 0x39]]);
+        using var ms = RawOcfFile.Create(OneField("""{"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 50000000}""").Json, [[0x30, 0x39]]);
         AssertUndeclaredWriterRefused(ms, OneField(ReaderBytesDecimal));
     }
 
@@ -205,7 +205,7 @@ public class DecimalAnnotationTests
     [Fact]
     public void PlainWriterBytes_AreRefused_UnderANestedReaderDecimal()
     {
-        using var ms = RawOcf(OneField("""{"type": "array", "items": "bytes"}""").Json, [], lengthPrefixed: false);
+        using var ms = RawOcfFile.Create(OneField("""{"type": "array", "items": "bytes"}""").Json, [], lengthPrefixed: false);
         AssertUndeclaredWriterRefused(ms, OneField($$"""{"type": "array", "items": {{ReaderBytesDecimal}}}"""));
     }
 
@@ -217,7 +217,7 @@ public class DecimalAnnotationTests
             {"type": "record", "name": "T", "fields": [
                 {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 20, "scale": 4}}]}
             """;
-        using var ms = RawOcf(schemaJson, [[0x30, 0x39]]);
+        using var ms = RawOcfFile.Create(schemaJson, [[0x30, 0x39]]);
 
         var batch = ReadUnder(ms, OneField("\"bytes\""));
 
@@ -233,7 +233,7 @@ public class DecimalAnnotationTests
 
     // 12345 as a big-endian unscaled value.
     private static MemoryStream WriterDecimal(int precision, int scale) =>
-        RawOcf(OneField(BytesDecimal(precision, scale)).Json, [[0x30, 0x39]]);
+        RawOcfFile.Create(OneField(BytesDecimal(precision, scale)).Json, [[0x30, 0x39]]);
 
     [Theory]
     [InlineData(20, 4, 20, 4, "1.2345")]
@@ -268,7 +268,7 @@ public class DecimalAnnotationTests
     }
 
     // A fixed(8) decimal(9,2) holding 12345, i.e. 123.45.
-    private static MemoryStream WriterFixedDecimal() => RawOcf(
+    private static MemoryStream WriterFixedDecimal() => RawOcfFile.Create(
         OneField("""{"type": "fixed", "name": "F", "size": 8, "logicalType": "decimal", "precision": 9, "scale": 2}""").Json,
         [[0, 0, 0, 0, 0, 0, 0x30, 0x39]],
         lengthPrefixed: false);
@@ -295,12 +295,51 @@ public class DecimalAnnotationTests
             .Build(ms).ReadNextBatch());
     }
 
+    // Records inside an array or map: the container used to be built from the reader's schema
+    // alone, so the reader's decimal was compared with itself and 1.2345 read as 123.45.
+    private static string RecordOf(string decimalType) =>
+        $$"""{"type": "record", "name": "R", "fields": [{"name": "d", "type": {{decimalType}}}]}""";
+
+    // An array block of one record holding 12345, then the end-of-array 0.
+    private static readonly byte[] ArrayOfOneRecord = [2, 4, 0x30, 0x39, 0];
+
+    // A map block of one entry "k" -> record holding 12345, then the end-of-map 0.
+    private static readonly byte[] MapOfOneRecord = [2, 2, (byte)'k', 4, 0x30, 0x39, 0];
+
+    [Theory]
+    [InlineData("array", "items")]
+    [InlineData("map", "values")]
+    public void ADecimalInARecordInAContainer_IsRefused_UnderAnotherScale(string container, string child)
+    {
+        string Shape(int scale) => $$"""{"type": "{{container}}", "{{child}}": {{RecordOf(BytesDecimal(20, scale))}}}""";
+        using var ms = RawOcfFile.Create(OneField(Shape(4)).Json,
+            [container == "array" ? ArrayOfOneRecord : MapOfOneRecord], lengthPrefixed: false);
+
+        Assert.Throws<InvalidOperationException>(
+            () => new AvroReaderBuilder().WithReaderSchema(OneField(Shape(2))).Build(ms).ReadNextBatch());
+    }
+
+    [Fact]
+    public void ADecimalInARecordInAnArray_TakesALargerReaderPrecision()
+    {
+        using var ms = RawOcfFile.Create(
+            OneField($$"""{"type": "array", "items": {{RecordOf(BytesDecimal(10, 2))}}}""").Json,
+            [ArrayOfOneRecord], lengthPrefixed: false);
+
+        var batch = ReadUnder(ms, OneField($$"""{"type": "array", "items": {{RecordOf(BytesDecimal(20, 2))}}}"""));
+
+        var records = Assert.IsType<StructArray>(((ListArray)batch.Column(0)).Values);
+        var d = Assert.IsType<Decimal128Array>(records.Fields[0]);
+        Assert.Equal(20, ((Decimal128Type)d.Data.DataType).Precision);
+        Assert.Equal("123.45", d.GetSqlDecimal(0)!.Value.ToString());
+    }
+
     // The item builder used to take the writer's type even under a reader schema.
     [Fact]
     public void AnArrayOfWriterDecimals_TakesTheReadersItemType()
     {
         // One record: an array block of one item (12345, length 2), then the end-of-array 0.
-        using var ms = RawOcf(
+        using var ms = RawOcfFile.Create(
             OneField($$"""{"type": "array", "items": {{BytesDecimal(10, 2)}}}""").Json,
             [[2, 4, 0x30, 0x39, 0]],
             lengthPrefixed: false);
@@ -323,59 +362,10 @@ public class DecimalAnnotationTests
         var writerSchema = OneField(shape.Replace("DEC", BytesDecimal(10, 2)));
         var readerSchema = OneField(shape.Replace("DEC", BytesDecimal(10, 4)));
         // An empty file is enough: the builders are made from the schemas.
-        using var ms = RawOcf(writerSchema.Json, []);
+        using var ms = RawOcfFile.Create(writerSchema.Json, []);
 
         Assert.Throws<InvalidOperationException>(
             () => new AvroReaderBuilder().WithReaderSchema(readerSchema).Build(ms).ReadNextBatch());
-    }
-
-    /// <summary>
-    /// A null-codec object container file holding one block of single-field records: <c>bytes</c>
-    /// values, or with <paramref name="lengthPrefixed"/> false, <c>fixed</c> ones.
-    /// </summary>
-    private static MemoryStream RawOcf(string schemaJson, byte[][] values, bool lengthPrefixed = true)
-    {
-        var ms = new MemoryStream();
-        ms.Write([(byte)'O', (byte)'b', (byte)'j', 1], 0, 4);
-        WriteLong(ms, 1);
-        WriteBytes(ms, "avro.schema"u8.ToArray());
-        WriteBytes(ms, System.Text.Encoding.UTF8.GetBytes(schemaJson));
-        WriteLong(ms, 0);
-        byte[] sync = Enumerable.Range(1, 16).Select(i => (byte)i).ToArray();
-        ms.Write(sync, 0, sync.Length);
-
-        using var block = new MemoryStream();
-        foreach (var v in values)
-        {
-            if (lengthPrefixed)
-                WriteBytes(block, v);
-            else
-                block.Write(v, 0, v.Length);
-        }
-        WriteLong(ms, values.Length);
-        WriteLong(ms, block.Length);
-        block.WriteTo(ms);
-        ms.Write(sync, 0, sync.Length);
-
-        ms.Position = 0;
-        return ms;
-
-        static void WriteBytes(Stream s, byte[] b)
-        {
-            WriteLong(s, b.Length);
-            s.Write(b, 0, b.Length);
-        }
-
-        static void WriteLong(Stream s, long v)
-        {
-            ulong z = (ulong)((v << 1) ^ (v >> 63));
-            while (z >= 0x80)
-            {
-                s.WriteByte((byte)(z | 0x80));
-                z >>= 7;
-            }
-            s.WriteByte((byte)z);
-        }
     }
 
     [Fact]

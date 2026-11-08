@@ -96,7 +96,7 @@ internal static class SchemaResolver
     }
 
     /// <summary>Unwrap nullable union to get inner type.</summary>
-    private static AvroSchemaNode UnwrapNullable(AvroSchemaNode schema)
+    internal static AvroSchemaNode UnwrapNullable(AvroSchemaNode schema)
     {
         if (schema is AvroUnionSchema union && union.IsNullable(out var inner, out _))
             return inner;
@@ -159,7 +159,7 @@ internal static class SchemaResolver
     /// Detects the type promotion needed for a matched field pair.
     /// Returns null if no promotion is needed (same types).
     /// </summary>
-    private static TypePromotion? DetectPromotion(AvroSchemaNode writerSchema, AvroSchemaNode readerSchema, int depth)
+    internal static TypePromotion? DetectPromotion(AvroSchemaNode writerSchema, AvroSchemaNode readerSchema, int depth)
     {
         if (depth >= MaxSchemaDepth)
             throw new NotSupportedException(

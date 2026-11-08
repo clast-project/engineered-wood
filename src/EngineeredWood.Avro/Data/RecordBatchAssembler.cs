@@ -216,12 +216,55 @@ internal sealed class RecordBatchAssembler
             PromotionKind.NestedRecord => CreateResolvingStructBuilder(field, promotion, depth + 1),
             PromotionKind.EnumRemap => new RemappingEnumBuilder(
                 (AvroEnumSchema)promotion.WriterSchema!, (AvroEnumSchema)promotion.ReaderSchema!),
-            _ => CreateBuilder(field, readerSchema, depth),
+            PromotionKind.ArrayElement => CreateResolvingArrayBuilder(field, promotion, depth + 1),
+            PromotionKind.MapValue => CreateResolvingMapBuilder(field, promotion, depth + 1),
+            _ => throw new NotSupportedException($"Unhandled Avro type promotion {promotion.Kind}."),
         };
 
         if (isNullable)
             return new NullableBuilder(inner, nullIndex);
         return inner;
+    }
+
+    /// <summary>
+    /// An array whose items need resolving. The items are decoded with the writer's schema and
+    /// resolved against the reader's, as a top-level field is. This used to build the whole array from
+    /// the reader's schema alone, so items were decoded in the reader's encoding: a float read as a
+    /// double, a record missing a dropped field, and a decimal compared with itself (#767).
+    /// </summary>
+    private static IColumnBuilder CreateResolvingArrayBuilder(Field field, TypePromotion promotion, int depth)
+    {
+        var writer = (AvroArraySchema)promotion.WriterSchema!;
+        var reader = (AvroArraySchema)promotion.ReaderSchema!;
+        var itemField = field.DataType is ListType list
+            ? list.ValueField
+            : ToField("item", ArrowSchemaConverter.ToArrowType(reader.Items, depth));
+        return new ArrayBuilder(CreateResolvedBuilder(itemField, writer.Items, reader.Items, depth));
+    }
+
+    /// <summary>A map whose values need resolving; see <see cref="CreateResolvingArrayBuilder"/>.</summary>
+    private static IColumnBuilder CreateResolvingMapBuilder(Field field, TypePromotion promotion, int depth)
+    {
+        var writer = (AvroMapSchema)promotion.WriterSchema!;
+        var reader = (AvroMapSchema)promotion.ReaderSchema!;
+        var valueField = field.DataType is MapType map
+            ? map.ValueField
+            : ToField("value", ArrowSchemaConverter.ToArrowType(reader.Values, depth));
+        return new MapBuilder(CreateResolvedBuilder(valueField, writer.Values, reader.Values, depth));
+    }
+
+    /// <summary>
+    /// The builder for one writer/reader pair: a promoting builder when the pair needs one, otherwise
+    /// the writer's encoding read into the reader's Arrow type.
+    /// </summary>
+    private static IColumnBuilder CreateResolvedBuilder(
+        Field field, AvroSchemaNode writer, AvroSchemaNode reader, int depth)
+    {
+        var promotion = SchemaResolver.DetectPromotion(
+            SchemaResolver.UnwrapNullable(writer), SchemaResolver.UnwrapNullable(reader), depth);
+        return promotion != null
+            ? CreatePromotingBuilder(field, reader, promotion, depth)
+            : CreateBuilder(field, writer, depth);
     }
 
     /// <summary>
