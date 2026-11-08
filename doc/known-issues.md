@@ -1288,12 +1288,18 @@ the Avro codec):
 
 Manifests EngineeredWood writes are not consumable by other Iceberg
 tools (the schema is truncated and does not match the declared V2
-schema), and manifests written by other tools lose bounds and partition
-tuples when decoded here. Because a commit rewrites existing manifests
-through the same codec (`TableOperations`), committing to a table another
-engine wrote also drops its delete files' `equality_ids` and
-`referenced_data_file`, which can change what a later reader treats as
-deleted. [#586](https://github.com/clast-project/engineered-wood/issues/586).
+schema). The decoder reads fields by position in EW's own layout rather
+than resolving the file's writer schema, so it cannot read manifests or
+manifest lists written by other tools (Iceberg Java, Spark, pyiceberg),
+V1 manifests, or manifests with a non-empty partition tuple. Reading any
+Avro manifest or manifest list whose writer schema differs from EW's own
+(compared in Avro Parsing Canonical Form) throws `NotSupportedException`
+instead of misdecoding it. That also stops a commit from rewriting a
+foreign manifest and dropping its delete files' `equality_ids` and
+`referenced_data_file`. The effect is that EW can only operate on tables
+whose metadata it wrote itself, and a partitioned table's manifests are
+still written with an empty partition tuple.
+[#586](https://github.com/clast-project/engineered-wood/issues/586).
 
 **Manifest-list partition summaries written null.** `ManifestIO`
 encodes manifest-list `partitions` as null, so manifest-list-level
