@@ -85,6 +85,18 @@
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
 
+  <!--
+    API compatibility against the previous release. release.yml passes
+    -p:ApiBaselineVersion=<previous tag's version>, and pack then fails on any breaking change
+    that isn't listed in the project's CompatibilitySuppressions.xml. doc/releasing.md says how
+    to regenerate those files before tagging. A package that is new since the baseline has
+    nothing to compare against: set <PackageValidationBaselineVersion /> in its csproj.
+  -->
+  <PropertyGroup Condition="'$(ApiBaselineVersion)' != ''">
+    <EnablePackageValidation>true</EnablePackageValidation>
+    <PackageValidationBaselineVersion>$(ApiBaselineVersion)</PackageValidationBaselineVersion>
+  </PropertyGroup>
+
   <!-- Pack the repository README and the shared clast-project icon into every
        package for the nuget.org / Visual Studio listing. -->
   <ItemGroup Condition="'$(IsPackable)' != 'false'">
