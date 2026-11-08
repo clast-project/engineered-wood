@@ -197,6 +197,24 @@ public sealed class SparkSqlParserTests
         Assert.Equal(["a", "b"], reference.NameParts);
     }
 
+    /// <summary>
+    /// A one-part reference's parts are built once: pruning reads them per row group or file (#771). They cannot
+    /// be changed either, and a <c>with</c> copy that renames the reference reads its new name.
+    /// </summary>
+    [Fact]
+    public void AOnePartReference_BuildsItsPartsOnce()
+    {
+        var reference = new UnboundReference("a.b");
+
+        Assert.Same(reference.NameParts, reference.NameParts);
+        Assert.Equal(["a.b"], reference.NameParts);
+        Assert.Throws<NotSupportedException>(() => ((IList<string>)reference.NameParts)[0] = "x");
+
+        var renamed = reference with { Name = "c" };
+        Assert.Equal(["c"], renamed.NameParts);
+        Assert.Equal(["a.b"], reference.NameParts);
+    }
+
     [Fact]
     public void ANestedPathAndAQuotedDottedNameAreDifferentReferences()
     {

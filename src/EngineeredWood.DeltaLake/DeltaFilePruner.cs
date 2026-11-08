@@ -283,6 +283,8 @@ internal sealed class DeltaFileStatsAccessor
     private readonly HashSet<string> _nonNullablePartitions;
     private readonly IReadOnlyDictionary<string, string[]> _paths;
     private readonly HashSet<string> _collided;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<IReadOnlyList<string>, string?> _keys =
+        new(ColumnPathComparer.Ordinal);
     private readonly System.Collections.Concurrent.ConcurrentDictionary<VariantGetCall, VariantPathStatsAccessor?>
         _variantPaths = new();
 
@@ -376,6 +378,15 @@ internal sealed class DeltaFileStatsAccessor
     /// spell, which the pruner dropped, only the top-level reading is kept, for a partition column's value.
     /// </summary>
     internal string? Key(IReadOnlyList<string> column)
+    {
+        // Asked per file and statistic; the answer depends on the schema alone, so a nested path's dotted
+        // text is joined once.
+        if (!_keys.TryGetValue(column, out string? key))
+            key = _keys.GetOrAdd(column, ResolveKey(column));
+        return key;
+    }
+
+    private string? ResolveKey(IReadOnlyList<string> column)
     {
         if (column.Count == 0)
             return null;
@@ -503,7 +514,9 @@ internal sealed class DeltaFileStatsAccessor
     /// element is never bounded (its rows are elements).</para>
     /// </remarks>
     public IStatisticsAccessor<DeltaFileStats>? ForVariantGet(VariantGetCall call) =>
-        _variantPaths.GetOrAdd(call, c => CreateVariantPathAccessor(c));
+        _variantPaths.TryGetValue(call, out var cached)
+            ? cached
+            : _variantPaths.GetOrAdd(call, CreateVariantPathAccessor(call));
 
     private VariantPathStatsAccessor? CreateVariantPathAccessor(VariantGetCall call)
     {

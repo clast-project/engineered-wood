@@ -75,9 +75,11 @@ public sealed class ParquetStatisticsAccessor
     /// that holds the path (see <see cref="ShreddedVariantPath"/>), or null when the file shreds no such path.
     /// </summary>
     public IStatisticsAccessor<RowGroup>? ForVariantGet(VariantGetCall call) =>
-        _variantPaths.GetOrAdd(call, c => ShreddedVariantPath.Resolve(_schema, c) is { } path
-            ? new VariantPathAccessor(path)
-            : null);
+        _variantPaths.TryGetValue(call, out var cached)
+            ? cached
+            : _variantPaths.GetOrAdd(call, ShreddedVariantPath.Resolve(_schema, call) is { } path
+                ? new VariantPathAccessor(path)
+                : null);
 
     /// <summary>
     /// A variant path's statistics in a row group: the leaf's, in a row group where its residual is null in every
@@ -145,7 +147,9 @@ public sealed class ParquetStatisticsAccessor
     {
         descriptor = null;
         stats = null;
-        int idx = _leafIndex.GetOrAdd(column, _schema.FindLeaf);
+        // The lookup is per row group and statistic, so a hit must not build the factory delegate.
+        if (!_leafIndex.TryGetValue(column, out int idx))
+            idx = _leafIndex.GetOrAdd(column, _schema.FindLeaf(column));
         if (idx < 0)
             return false;
         if (idx >= rg.Columns.Count)
