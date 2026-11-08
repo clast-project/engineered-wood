@@ -466,7 +466,6 @@ public sealed partial class DeltaTable
                     if (!fileModified)
                     {
                         // Before this file writes anything. (The transaction takes back what earlier files wrote.)
-                        RejectCopyOnWriteRowIdUnsupported("MERGE");
                         ThrowIfAppendOnly(snapshot, "MERGE");
                         fileModified = true;
                     }

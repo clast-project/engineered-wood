@@ -170,13 +170,67 @@ public class IcebergCompatV3InteropTests : IDisposable
     }
 
     /// <summary>
+    /// EW rewrites files of a partitioned V3 table without deletion vectors (#756): a copy-on-write DELETE, an UPDATE
+    /// that moves a row to another partition, and a MERGE that updates one row and inserts another. Spark reads the
+    /// same rows with the same row ids and commit versions, then updates through the table, which on 4.4.1 runs every
+    /// V3 check. Spark checks no data file's contents, so the rewritten files' partition columns and row-lineage field
+    /// ids are pinned by <see cref="IcebergCompatRewriteTests"/> instead.
+    /// </summary>
+    [SkippableFact]
+    public async Task EwRewritesOfAV3TableWithoutDeletionVectors_SparkReadsTheSameRowsAndRowIds()
+    {
+        RequireV3();
+        var fs = new LocalTableFileSystem(_tempDir);
+
+        SortedDictionary<long, (string Value, long RowId, long Version)> ewRows;
+        await using (var table = await DeltaTable.CreateAsync(fs, IdKValue, partitionColumns: ["k"],
+            columnMappingMode: ColumnMappingMode.Name,
+            configuration: new Dictionary<string, string> { [IcebergCompat.EnableV3Key] = "true" }))
+        {
+            await table.WriteAsync([Rows((1, 1, "a"), (2, 1, "b"), (3, 1, "c"))]);
+            await table.WriteAsync([Rows((4, 2, "d"), (5, 2, "e"))]);
+            await table.DeleteAsync(Ex.Equal("id", 2L));
+            await table.UpdateAsync(Ex.Equal("id", 3L), batch =>
+            {
+                var ks = new Int32Array.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                    ks.Append(2);
+                var columns = Enumerable.Range(0, batch.ColumnCount).Select(batch.Column).ToArray();
+                columns[batch.Schema.GetFieldIndex("k")] = ks.Build();
+                return new RecordBatch(batch.Schema, columns, batch.Length);
+            });
+            await table.MergeAsync([Rows((4, 2, "D"), (6, 1, "f"))], new MergeOptions
+            {
+                Keys = ["id"],
+                WhenMatched = [MergeAction.Update],
+                WhenNotMatched = [MergeAction.Insert],
+            });
+            Assert.All(table.CurrentSnapshot.ActiveFiles.Values, add => Assert.Null(add.DeletionVector));
+            ewRows = await EwRowsAsync(table);
+        }
+        Assert.Equal([1L, 3L, 4L, 5L, 6L], ewRows.Keys);
+
+        var read = Sql(SelectRowIds, "SELECT id, k FROM delta.`{path}` ORDER BY id");
+        Assert.Equal(ewRows, SparkRows(read.GetProperty("statements")[0]));
+        var partitions = LastStatement(read).GetProperty("rows").EnumerateArray()
+            .Select(row => (row.GetProperty("id").GetInt64(), row.GetProperty("k").GetInt32()));
+        Assert.Equal([(1L, 1), (3, 2), (4, 2), (5, 2), (6, 1)], partitions);
+
+        var after = Sql("UPDATE delta.`{path}` SET value = 'u' WHERE id = 1", SelectRowIds);
+        var sparkAfter = SparkRows(LastStatement(after));
+        Assert.Equal("u", sparkAfter[1].Value);
+        foreach (long id in ewRows.Keys)
+            Assert.Equal(ewRows[id].RowId, sparkAfter[id].RowId);
+    }
+
+    /// <summary>
     /// Spark creates an id-mode V3 table and rewrites rows in it (delta-spark 4.4 materializes their row ids with
     /// Iceberg's row-lineage field ids, which no column of the schema has). EW reads the same row ids, writes through
     /// the table, and Spark reads EW's rows and ids back.
     /// <para>The CREATE names <c>delta.enableRowTracking</c>: delta-spark 4.4 sets it by itself, but 4.3.1 does not
-    /// (measured), and EW refuses to write a V3 table without it, as the V3 rules require. Deletion vectors are on
-    /// because EW's partial DELETE on an IcebergCompat table needs them (its copy-on-write rewrite is refused
-    /// there).</para>
+    /// (measured), and EW refuses to write a V3 table without it, as the V3 rules require. Deletion vectors are on,
+    /// so EW's DELETE writes a vector; its copy-on-write rewrites are covered by
+    /// <see cref="EwRewritesOfAV3TableWithoutDeletionVectors_SparkReadsTheSameRowsAndRowIds"/>.</para>
     /// </summary>
     [SkippableFact]
     public async Task SparkCreatedV3Table_EwWritesThroughIt_AndBothSeeTheSameRowIds()

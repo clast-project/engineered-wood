@@ -252,11 +252,12 @@ public class PredicateCopyOnWriteDeleteTests : IDisposable
     }
 
     /// <summary>
-    /// IcebergCompat tables cannot have deletion vectors, and the rewrite does not yet cover them, so a partial
-    /// delete there is refused as unsupported, and leaves nothing behind. A whole-file delete needs no rewrite.
+    /// IcebergCompat V1 and V2 tables cannot have deletion vectors, so a partial delete there rewrites the file
+    /// (#756; the rewritten file's layout is pinned in IcebergCompatRewriteTests). A whole-file delete needs no
+    /// rewrite.
     /// </summary>
     [Fact]
-    public async Task OnAnIcebergCompatTable_APartialDeleteIsRefused_AWholeFileDeleteIsNot()
+    public async Task OnAnIcebergCompatTable_APartialDeleteRewritesTheFile_AWholeFileDeleteRemovesIt()
     {
         await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(),
             new DeltaTableOptions { AllowWritesWithoutUniversalFormatConversion = true },
@@ -264,27 +265,23 @@ public class PredicateCopyOnWriteDeleteTests : IDisposable
             configuration: new Dictionary<string, string> { [IcebergCompat.EnableV2Key] = "true" });
         await table.WriteAsync([Batch(1, 2)]);
         await table.WriteAsync([Batch(10, 3)]);
-        long version = table.CurrentSnapshot.Version;
-        var before = DataFilesOnDisk();
 
-        var refusal = await Assert.ThrowsAsync<NotSupportedException>(
-            () => table.DeleteAsync(Ex.Equal("id", 11L)).AsTask());
-        Assert.Contains("IcebergCompat", refusal.Message);
-        Assert.Equal(version, table.CurrentSnapshot.Version);
-        Assert.Equal(before, DataFilesOnDisk());
+        var (deleted, _) = await table.DeleteAsync(Ex.Equal("id", 11L));
+        Assert.Equal(1, deleted);
+        Assert.Equal(new long[] { 1, 2, 10, 12 }, await ReadIdsFreshAsync());
+        Assert.All(table.CurrentSnapshot.ActiveFiles.Values, add => Assert.Null(add.DeletionVector));
 
-        var (deleted, _) = await table.DeleteAsync(Ex.LessThanOrEqual("id", 2L));
+        (deleted, _) = await table.DeleteAsync(Ex.LessThanOrEqual("id", 2L));
         Assert.Equal(2, deleted);
-        Assert.Equal(new long[] { 10, 11, 12 }, await ReadIdsFreshAsync());
+        Assert.Equal(new long[] { 10, 12 }, await ReadIdsFreshAsync());
     }
 
     /// <summary>
-    /// On an IcebergCompat change-feed table, a DELETE that removes one file whole and needs to rewrite another
-    /// is refused, but only once the scan reaches the second file. By then it has written the first file's change
-    /// file. In a transaction the refusal takes that file back, so committing the rest leaves nothing orphaned.
+    /// On an IcebergCompat change-feed table, a DELETE in a transaction that removes one file whole and rewrites
+    /// another commits with the transaction's other writes, and each deleted row reaches the feed once.
     /// </summary>
     [Fact]
-    public async Task OnAnIcebergCompatChangeFeedTable_ARefusedDeleteInATransaction_LeavesNoChangeFile()
+    public async Task OnAnIcebergCompatChangeFeedTable_ADeleteInATransaction_RewritesAndFeedsItsRows()
     {
         await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(),
             new DeltaTableOptions { AllowWritesWithoutUniversalFormatConversion = true },
@@ -296,18 +293,15 @@ public class PredicateCopyOnWriteDeleteTests : IDisposable
             });
         await table.WriteAsync([Batch(1, 2)]);
         await table.WriteAsync([Batch(10, 3)]);
-        var before = DataFilesOnDisk();
 
         var txn = table.StartTransaction();
-        await Assert.ThrowsAsync<NotSupportedException>(
-            () => txn.DeleteAsync(Ex.Or(Ex.LessThanOrEqual("id", 2L), Ex.Equal("id", 11L))).AsTask());
-        Assert.Equal(before, DataFilesOnDisk());
-
+        await txn.DeleteAsync(Ex.Or(Ex.LessThanOrEqual("id", 2L), Ex.Equal("id", 11L)));
         await txn.WriteAsync([Batch(100, 1)]);
         await txn.CommitAsync();
 
-        Assert.Equal(before.Length + 1, DataFilesOnDisk().Length);
-        Assert.Equal(new long[] { 1, 2, 10, 11, 12, 100 }, await ReadIdsFreshAsync());
+        Assert.Equal(new long[] { 10, 12, 100 }, await ReadIdsFreshAsync());
+        var feed = await ReadFeedAsync(table.CurrentSnapshot.Version);
+        Assert.Equal([(1L, "delete"), (2L, "delete"), (11L, "delete")], feed.Where(c => c.Type == "delete"));
     }
 
     /// <summary>
