@@ -199,6 +199,10 @@ internal sealed class RecordBatchAssembler
         if (readerSchema is AvroUnionSchema u && u.IsNullable(out _, out int ni))
             nullIndex = ni;
 
+        // A writer string promoted to the reader's bytes has no scale either.
+        if (promotion.Kind == PromotionKind.StringToBytes && field.DataType is Decimal128Type readerDecimal)
+            throw UndeclaredWriterDecimal(promotion.WriterSchema ?? new AvroPrimitiveSchema(AvroType.String), readerDecimal);
+
         IColumnBuilder inner = promotion.Kind switch
         {
             PromotionKind.IntToLong => new PromotingIntToLongBuilder(),
@@ -309,10 +313,9 @@ internal sealed class RecordBatchAssembler
     {
         // `type` is the reader's Arrow type and `avroSchema` the writer's encoding. Reader-schema
         // resolution pairs bytes with bytes and fixed with fixed without comparing decimal
-        // annotations, so the two can disagree. When the writer's bytes carry no decimal annotation
-        // (none was written, or the parser dropped an invalid one) the reader's decimal is applied to
-        // them, as Avro Java applies the reader's logical type. When the reader asks for plain
-        // bytes, a writer's annotation is ignored. Two decimals must agree (CheckDecimalResolution).
+        // annotations, so the two can disagree. When the reader asks for plain bytes, a writer's
+        // annotation is ignored: the bytes are read as written. Otherwise the two decimals must agree
+        // (CheckDecimalResolution).
         if (IsDecimal(avroSchema) && type is not Decimal128Type)
             return CreateBuilderForBaseType(type, avroSchema, depth);
         if (type is Decimal128Type resolvedDecimal && IsDecimal(avroSchema))
@@ -322,13 +325,8 @@ internal sealed class RecordBatchAssembler
                 ? new DecimalFixedBuilder(writerDecimalFixed.Size, resolvedDecimal)
                 : new DecimalBytesBuilder(resolvedDecimal);
         }
-        if (type is Decimal128Type readerDecimal && !IsDecimal(avroSchema))
-        {
-            if (avroSchema is AvroPrimitiveSchema { Type: AvroType.Bytes })
-                return new DecimalBytesBuilder(readerDecimal);
-            if (avroSchema is AvroFixedSchema writerFixed)
-                return new DecimalFixedBuilder(writerFixed.Size, readerDecimal);
-        }
+        if (type is Decimal128Type readerDecimal)
+            throw UndeclaredWriterDecimal(avroSchema, readerDecimal);
 
         // Check for logical types on primitives
         if (avroSchema is AvroPrimitiveSchema { LogicalType: not null } p)
@@ -383,6 +381,15 @@ internal sealed class RecordBatchAssembler
                 $"Writer decimal({written.Precision},{written.Scale}) cannot be read as reader decimal({reader.Precision},{reader.Scale}): "
                 + "the scales must match and the reader's precision must be at least the writer's.");
     }
+
+    /// <summary>
+    /// The writer's bytes, fixed or string declared no decimal, so they say nothing of a scale. Reading
+    /// them with the reader's would be the guess #767 refuses between two decimals; Avro Java makes it
+    /// (AVRO-2078). That includes a writer whose invalid decimal annotation the parser dropped.
+    /// </summary>
+    private static InvalidOperationException UndeclaredWriterDecimal(AvroSchemaNode writer, Decimal128Type reader) =>
+        new($"Writer {writer.Type} with no decimal annotation cannot be read as reader decimal({reader.Precision},{reader.Scale}): "
+            + "the writer declares no scale to match the reader's.");
 
     private static Field ToField(string name, (IArrowType Type, bool Nullable) converted) =>
         new(name, converted.Type, converted.Nullable);

@@ -159,46 +159,54 @@ public class DecimalAnnotationTests
         return ms;
     }
 
-    // Resolution pairs bytes with bytes whatever the annotations say; the builder used to follow the
-    // writer's plain bytes and build binary buffers under the reader's Decimal128, which Arrow refused.
+    // A writer that declares no decimal says nothing of a scale, so the reader's is not applied to its
+    // bytes (Avro Java applies it: AVRO-2078). Before, these built binary buffers under the reader's
+    // Decimal128 and Arrow refused them ("Buffer count <3> must be at exactly <2>").
+    private const string ReaderBytesDecimal = """{"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}""";
+
+    private static void AssertUndeclaredWriterRefused(MemoryStream ms, AvroSchema readerSchema)
+    {
+        var ex = Assert.Throws<InvalidOperationException>(
+            () => new AvroReaderBuilder().WithReaderSchema(readerSchema).Build(ms).ReadNextBatch());
+        Assert.Contains("no decimal annotation", ex.Message);
+    }
+
     [Fact]
-    public void PlainWriterBytes_UnderAReaderDecimal_TakeTheReadersDecimal()
+    public void PlainWriterBytes_AreRefused_UnderAReaderDecimal()
     {
         using var ms = WriteOneColumn(new BinaryArray.Builder().Append([0x30, 0x39]).Build(), "\"bytes\"");
-
-        var batch = ReadUnder(ms, OneField("""{"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}"""));
-
-        var column = Assert.IsType<Decimal128Array>(batch.Column(0));
-        Assert.Equal((10, 2), (((Decimal128Type)column.Data.DataType).Precision, ((Decimal128Type)column.Data.DataType).Scale));
-        Assert.Equal("123.45", column.GetSqlDecimal(0)!.Value.ToString());
+        AssertUndeclaredWriterRefused(ms, OneField(ReaderBytesDecimal));
     }
 
     [Fact]
-    public void PlainWriterFixed_UnderAReaderDecimal_TakeTheReadersDecimal()
+    public void PlainWriterFixed_IsRefused_UnderAReaderDecimal()
     {
-        var fixedType = new FixedSizeBinaryType(4);
-        var values = new byte[] { 0x00, 0x00, 0x30, 0x39 };
-        var column = new FixedSizeBinaryArray(new ArrayData(fixedType, 1, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(values)]));
-        using var ms = WriteOneColumn(column, """{"type": "fixed", "name": "F", "size": 4}""");
-
-        var batch = ReadUnder(ms, OneField("""{"type": "fixed", "name": "F", "size": 4, "logicalType": "decimal", "precision": 9, "scale": 2}"""));
-
-        Assert.Equal("123.45", Assert.IsType<Decimal128Array>(batch.Column(0)).GetSqlDecimal(0)!.Value.ToString());
+        using var ms = RawOcf(OneField("""{"type": "fixed", "name": "F", "size": 4}""").Json, [[0, 0, 0x30, 0x39]], lengthPrefixed: false);
+        AssertUndeclaredWriterRefused(
+            ms, OneField("""{"type": "fixed", "name": "F", "size": 4, "logicalType": "decimal", "precision": 9, "scale": 2}"""));
     }
 
-    // The parser drops the writer's invalid annotation; the reader's valid one then applies.
+    // The parser drops the writer's invalid annotation, which leaves plain bytes.
     [Fact]
-    public void AnInvalidWriterDecimal_UnderAReaderDecimal_TakesTheReadersDecimal()
+    public void AnInvalidWriterDecimal_IsRefused_UnderAReaderDecimal()
     {
-        const string schemaJson = """
-            {"type": "record", "name": "T", "fields": [
-                {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 50000000}}]}
-            """;
-        using var ms = RawOcf(schemaJson, [[0x30, 0x39]]);
+        using var ms = RawOcf(OneField("""{"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 50000000}""").Json, [[0x30, 0x39]]);
+        AssertUndeclaredWriterRefused(ms, OneField(ReaderBytesDecimal));
+    }
 
-        var batch = ReadUnder(ms, OneField("""{"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}"""));
+    // Avro promotes a writer string to the reader's bytes; a decimal on those bytes has no scale to match either.
+    [Fact]
+    public void AWriterString_IsRefused_UnderAReaderBytesDecimal()
+    {
+        using var ms = WriteOneColumn(new StringArray.Builder().Append("09").Build(), "\"string\"");
+        AssertUndeclaredWriterRefused(ms, OneField(ReaderBytesDecimal));
+    }
 
-        Assert.Equal("123.45", Assert.IsType<Decimal128Array>(batch.Column(0)).GetSqlDecimal(0)!.Value.ToString());
+    [Fact]
+    public void PlainWriterBytes_AreRefused_UnderANestedReaderDecimal()
+    {
+        using var ms = RawOcf(OneField("""{"type": "array", "items": "bytes"}""").Json, [], lengthPrefixed: false);
+        AssertUndeclaredWriterRefused(ms, OneField($$"""{"type": "array", "items": {{ReaderBytesDecimal}}}"""));
     }
 
     // The reverse: the reader asks for plain bytes and gets the bytes, not a Decimal128 under a Binary field.
