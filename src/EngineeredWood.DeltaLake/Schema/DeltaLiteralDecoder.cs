@@ -483,14 +483,16 @@ internal static class DeltaLiteralDecoder
         // scale on the value is a fact about the FORMATTING, and StatisticsEvaluator reads it as a
         // fact about the TYPE -- it is what tells the pruner whether Spark would round this
         // comparison. #323.
-        if (TryDeclaredScale(typeName, out var declared) && !TryRescale(ref unscaled, scale, declared))
+        // A type name with no scale part keeps the text's own scale. One that HAS a scale part must
+        // parse to a scale a Delta decimal can have, or the value is unknown: adopting an unchecked
+        // scale such as decimal(38,50000000) would carry it into LiteralValue comparisons, which size a
+        // power of ten by it (#760).
+        if (typeName.IndexOf(',') >= 0)
         {
-            // More decimals than the column declares: the statistic contradicts its own type, and
-            // rescaling would move the bound. Unknown is the only safe answer.
-            return null;
-        }
-        else if (declared >= 0)
-        {
+            // An invalid scale, or more decimals than the column declares: the statistic contradicts
+            // its own type, and rescaling would move the bound. Unknown is the only safe answer.
+            if (!TryDeclaredScale(typeName, out var declared) || !TryRescale(ref unscaled, scale, declared))
+                return null;
             scale = declared;
         }
 
@@ -513,8 +515,15 @@ internal static class DeltaLiteralDecoder
         var digits = typeName.AsSpan(comma + 1, close - comma - 1).Trim();
 #endif
 
-        return int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out scale)
-            && scale >= 0;
+        // Bounded like the precision: the scale sizes a power of ten in TryRescale, and the type name is
+        // text another writer put in the log (#760).
+        // On failure the out value is -1, never the rejected scale, so no caller can adopt it.
+        if (int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out scale)
+            && scale is >= 0 and <= DecimalText.MaxPrecision)
+            return true;
+
+        scale = -1;
+        return false;
     }
 
     /// <summary>
@@ -528,6 +537,10 @@ internal static class DeltaLiteralDecoder
     {
         if (to == from)
             return true;
+
+        // No Delta decimal has a scale outside 0..38, and either one sizes a power of ten (#760).
+        if (from is < 0 or > DecimalText.MaxPrecision || to is < 0 or > DecimalText.MaxPrecision)
+            return false;
 
         if (to > from)
         {
