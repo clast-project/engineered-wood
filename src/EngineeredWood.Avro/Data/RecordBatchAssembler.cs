@@ -156,28 +156,12 @@ internal sealed class RecordBatchAssembler
         for (int ri = 0; ri < readerSchema.Fields.Count; ri++)
         {
             var field = arrowSchema.FieldsList[ri];
-            var readerFieldSchema = readerSchema.Fields[ri].Schema;
             var promotion = resolution.Promotions[ri];
+            var writerFieldSchema = WriterFieldSchema(writerSchema, resolution, ri) ?? readerSchema.Fields[ri].Schema;
 
-            if (promotion != null)
-            {
-                builders[ri] = CreatePromotingBuilder(field, readerFieldSchema, promotion, 0);
-            }
-            else
-            {
-                // Find the writer field that maps to this reader field, if any
-                AvroSchemaNode avroSchemaForBuilder = readerFieldSchema;
-                for (int wi = 0; wi < writerSchema.Fields.Count; wi++)
-                {
-                    if (!resolution.WriterActions[wi].Skip &&
-                        resolution.WriterActions[wi].ReaderFieldIndex == ri)
-                    {
-                        avroSchemaForBuilder = writerSchema.Fields[wi].Schema;
-                        break;
-                    }
-                }
-                builders[ri] = CreateBuilder(field, avroSchemaForBuilder, 0);
-            }
+            builders[ri] = promotion != null
+                ? CreatePromotingBuilder(field, writerFieldSchema, promotion, 0)
+                : CreateBuilder(field, writerFieldSchema, 0);
         }
 
         return builders;
@@ -186,18 +170,29 @@ internal sealed class RecordBatchAssembler
     /// <summary>
     /// Creates a builder that reads using writer encoding but stores in reader type.
     /// </summary>
+    /// <remarks>
+    /// The nullable wrapper follows <paramref name="writerSchema"/>, as <see cref="CreateBuilder"/>
+    /// does: whether a union index is on the wire, and which index means null, are the writer's to say.
+    /// Taking them from the reader's union silently misread every value when the two put null in
+    /// different places (writer <c>["int","null"]</c> under reader <c>["null","long"]</c> read 5, null,
+    /// 7 as null, 1, null), read a union index as the value under a plain reader, and read a plain
+    /// writer's value as a union index.
+    /// </remarks>
     private static IColumnBuilder CreatePromotingBuilder(
-        Field field, AvroSchemaNode readerSchema, TypePromotion promotion, int depth)
+        Field field, AvroSchemaNode writerSchema, TypePromotion promotion, int depth)
     {
         if (depth >= MaxSchemaDepth)
             throw new NotSupportedException(
                 "Avro schema exceeds maximum nesting depth. Recursive schemas cannot be represented in Arrow.");
 
-        // Handle nullable wrapper
-        bool isNullable = readerSchema is AvroUnionSchema union && union.IsNullable(out _, out _);
+        bool isNullable = writerSchema is AvroUnionSchema union && union.IsNullable(out _, out _);
         int nullIndex = 0;
-        if (readerSchema is AvroUnionSchema u && u.IsNullable(out _, out int ni))
+        if (writerSchema is AvroUnionSchema u && u.IsNullable(out _, out int ni))
             nullIndex = ni;
+
+        // A writer string promoted to the reader's bytes has no scale either.
+        if (promotion.Kind == PromotionKind.StringToBytes && field.DataType is Decimal128Type readerDecimal)
+            throw UndeclaredWriterDecimal(promotion.WriterSchema ?? new AvroPrimitiveSchema(AvroType.String), readerDecimal);
 
         IColumnBuilder inner = promotion.Kind switch
         {
@@ -212,12 +207,55 @@ internal sealed class RecordBatchAssembler
             PromotionKind.NestedRecord => CreateResolvingStructBuilder(field, promotion, depth + 1),
             PromotionKind.EnumRemap => new RemappingEnumBuilder(
                 (AvroEnumSchema)promotion.WriterSchema!, (AvroEnumSchema)promotion.ReaderSchema!),
-            _ => CreateBuilder(field, readerSchema, depth),
+            PromotionKind.ArrayElement => CreateResolvingArrayBuilder(field, promotion, depth + 1),
+            PromotionKind.MapValue => CreateResolvingMapBuilder(field, promotion, depth + 1),
+            _ => throw new NotSupportedException($"Unhandled Avro type promotion {promotion.Kind}."),
         };
 
         if (isNullable)
             return new NullableBuilder(inner, nullIndex);
         return inner;
+    }
+
+    /// <summary>
+    /// An array whose items need resolving. The items are decoded with the writer's schema and
+    /// resolved against the reader's, as a top-level field is. This used to build the whole array from
+    /// the reader's schema alone, so items were decoded in the reader's encoding: a float read as a
+    /// double, a record missing a dropped field, and a decimal compared with itself (#767).
+    /// </summary>
+    private static IColumnBuilder CreateResolvingArrayBuilder(Field field, TypePromotion promotion, int depth)
+    {
+        var writer = (AvroArraySchema)promotion.WriterSchema!;
+        var reader = (AvroArraySchema)promotion.ReaderSchema!;
+        var itemField = field.DataType is ListType list
+            ? list.ValueField
+            : ToField("item", ArrowSchemaConverter.ToArrowType(reader.Items, depth));
+        return new ArrayBuilder(CreateResolvedBuilder(itemField, writer.Items, reader.Items, depth));
+    }
+
+    /// <summary>A map whose values need resolving; see <see cref="CreateResolvingArrayBuilder"/>.</summary>
+    private static IColumnBuilder CreateResolvingMapBuilder(Field field, TypePromotion promotion, int depth)
+    {
+        var writer = (AvroMapSchema)promotion.WriterSchema!;
+        var reader = (AvroMapSchema)promotion.ReaderSchema!;
+        var valueField = field.DataType is MapType map
+            ? map.ValueField
+            : ToField("value", ArrowSchemaConverter.ToArrowType(reader.Values, depth));
+        return new MapBuilder(CreateResolvedBuilder(valueField, writer.Values, reader.Values, depth));
+    }
+
+    /// <summary>
+    /// The builder for one writer/reader pair: a promoting builder when the pair needs one, otherwise
+    /// the writer's encoding read into the reader's Arrow type.
+    /// </summary>
+    private static IColumnBuilder CreateResolvedBuilder(
+        Field field, AvroSchemaNode writer, AvroSchemaNode reader, int depth)
+    {
+        var promotion = SchemaResolver.DetectPromotion(
+            SchemaResolver.UnwrapNullable(writer), SchemaResolver.UnwrapNullable(reader), depth);
+        return promotion != null
+            ? CreatePromotingBuilder(field, writer, promotion, depth)
+            : CreateBuilder(field, writer, depth);
     }
 
     /// <summary>
@@ -242,25 +280,10 @@ internal sealed class RecordBatchAssembler
             var childField = new Field(readerRecord.Fields[ri].Name, arrowType, nullable);
             var nestedPromotion = nestedResolution.Promotions[ri];
 
-            if (nestedPromotion != null)
-            {
-                readerBuilders[ri] = CreatePromotingBuilder(childField, readerFieldSchema, nestedPromotion, depth);
-            }
-            else
-            {
-                // Find the writer field that maps to this reader field, if any
-                AvroSchemaNode avroSchemaForBuilder = readerFieldSchema;
-                for (int wi = 0; wi < writerRecord.Fields.Count; wi++)
-                {
-                    if (!nestedResolution.WriterActions[wi].Skip &&
-                        nestedResolution.WriterActions[wi].ReaderFieldIndex == ri)
-                    {
-                        avroSchemaForBuilder = writerRecord.Fields[wi].Schema;
-                        break;
-                    }
-                }
-                readerBuilders[ri] = CreateBuilder(childField, avroSchemaForBuilder, depth);
-            }
+            var writerFieldSchema = WriterFieldSchema(writerRecord, nestedResolution, ri) ?? readerFieldSchema;
+            readerBuilders[ri] = nestedPromotion != null
+                ? CreatePromotingBuilder(childField, writerFieldSchema, nestedPromotion, depth)
+                : CreateBuilder(childField, writerFieldSchema, depth);
         }
 
         return new ResolvingStructBuilder(
@@ -309,20 +332,20 @@ internal sealed class RecordBatchAssembler
     {
         // `type` is the reader's Arrow type and `avroSchema` the writer's encoding. Reader-schema
         // resolution pairs bytes with bytes and fixed with fixed without comparing decimal
-        // annotations, so the two can disagree. When the writer's bytes carry no decimal annotation
-        // (none was written, or the parser dropped an invalid one) the reader's decimal is applied to
-        // them, as Avro Java applies the reader's logical type. When the reader asks for plain
-        // bytes, a writer's annotation is ignored. A writer decimal under a reader decimal of a
-        // different precision or scale is #767.
+        // annotations, so the two can disagree. When the reader asks for plain bytes, a writer's
+        // annotation is ignored: the bytes are read as written. Otherwise the two decimals must agree
+        // (CheckDecimalResolution).
         if (IsDecimal(avroSchema) && type is not Decimal128Type)
             return CreateBuilderForBaseType(type, avroSchema, depth);
-        if (type is Decimal128Type readerDecimal && !IsDecimal(avroSchema))
+        if (type is Decimal128Type resolvedDecimal && IsDecimal(avroSchema))
         {
-            if (avroSchema is AvroPrimitiveSchema { Type: AvroType.Bytes })
-                return new DecimalBytesBuilder(readerDecimal);
-            if (avroSchema is AvroFixedSchema writerFixed)
-                return new DecimalFixedBuilder(writerFixed.Size, readerDecimal);
+            CheckDecimalResolution(avroSchema, resolvedDecimal);
+            return avroSchema is AvroFixedSchema writerDecimalFixed
+                ? new DecimalFixedBuilder(writerDecimalFixed.Size, resolvedDecimal)
+                : new DecimalBytesBuilder(resolvedDecimal);
         }
+        if (type is Decimal128Type readerDecimal)
+            throw UndeclaredWriterDecimal(avroSchema, readerDecimal);
 
         // Check for logical types on primitives
         if (avroSchema is AvroPrimitiveSchema { LogicalType: not null } p)
@@ -336,7 +359,6 @@ internal sealed class RecordBatchAssembler
                 "timestamp-millis" or "local-timestamp-millis" => new TimestampBuilder(),
                 "timestamp-micros" or "local-timestamp-micros" => new TimestampBuilder(),
                 "timestamp-nanos" or "local-timestamp-nanos" => new TimestampBuilder(),
-                "decimal" => new DecimalBytesBuilder(p.Precision, p.Scale),
                 // The schema converter chose GuidType (extension) when the
                 // caller registered arrow.uuid; otherwise StringType. Mirror
                 // that choice here so the wire format stays a 36-char string
@@ -349,6 +371,58 @@ internal sealed class RecordBatchAssembler
 
         return CreateBuilderForBaseType(type, avroSchema, depth);
     }
+
+    /// <summary>
+    /// Refuses a writer decimal that the reader's decimal would misread (#767).
+    /// </summary>
+    /// <remarks>
+    /// The Avro spec: "two schemas that are decimal logical types match if their scales and
+    /// precisions match." The value on the wire is the unscaled integer, so a reader with another
+    /// scale would move the decimal point: a writer's 1.2345 at scale 4 reads as 123.45 at scale 2.
+    /// Avro Java does exactly that (AVRO-2078, open since 2017). A larger reader precision at the
+    /// same scale is let through: the bytes mean the same thing and every value fits, which is the
+    /// one decimal evolution the Avro maintainers agree is sound. The reader's type is then the
+    /// column's, so the column agrees with the batch's schema.
+    /// </remarks>
+    private static void CheckDecimalResolution(AvroSchemaNode writer, Decimal128Type reader)
+    {
+        var (precision, scale) = writer switch
+        {
+            AvroPrimitiveSchema p => (p.Precision, p.Scale),
+            AvroFixedSchema f => (f.Precision, f.Scale),
+            _ => throw new ArgumentException("Not a decimal schema.", nameof(writer)),
+        };
+
+        // Refuses a writer decimal wider than Decimal128 before comparing anything.
+        var written = ArrowSchemaConverter.MakeDecimalType(precision, scale);
+        if (written.Scale != reader.Scale || written.Precision > reader.Precision)
+            throw new InvalidOperationException(
+                $"Writer decimal({written.Precision},{written.Scale}) cannot be read as reader decimal({reader.Precision},{reader.Scale}): "
+                + "the scales must match and the reader's precision must be at least the writer's.");
+    }
+
+    /// <summary>
+    /// The writer's bytes, fixed or string declared no decimal, so they say nothing of a scale. Reading
+    /// them with the reader's would be the guess #767 refuses between two decimals; Avro Java makes it
+    /// (AVRO-2078). That includes a writer whose invalid decimal annotation the parser dropped.
+    /// </summary>
+    private static InvalidOperationException UndeclaredWriterDecimal(AvroSchemaNode writer, Decimal128Type reader) =>
+        new($"Writer {writer.Type} with no decimal annotation cannot be read as reader decimal({reader.Precision},{reader.Scale}): "
+            + "the writer declares no scale to match the reader's.");
+
+    /// <summary>The schema of the writer field read into reader field <paramref name="readerIndex"/>, if any.</summary>
+    private static AvroSchemaNode? WriterFieldSchema(AvroRecordSchema writer, SchemaResolution resolution, int readerIndex)
+    {
+        for (int wi = 0; wi < writer.Fields.Count; wi++)
+        {
+            if (!resolution.WriterActions[wi].Skip && resolution.WriterActions[wi].ReaderFieldIndex == readerIndex)
+                return writer.Fields[wi].Schema;
+        }
+        return null;
+    }
+
+    private static Field ToField(string name, (IArrowType Type, bool Nullable) converted) =>
+        new(name, converted.Type, converted.Nullable);
 
     private static bool IsDecimal(AvroSchemaNode node) =>
         node is AvroPrimitiveSchema { Type: AvroType.Bytes, LogicalType: "decimal" } or AvroFixedSchema { LogicalType: "decimal" };
@@ -377,27 +451,28 @@ internal sealed class RecordBatchAssembler
             case AvroEnumSchema e:
                 return new EnumBuilder(e.Symbols);
 
-            case AvroFixedSchema f when f.LogicalType == "decimal" && type is Decimal128Type:
-                return new DecimalFixedBuilder(f.Size, f.Precision, f.Scale);
             case AvroFixedSchema f when f.LogicalType == "duration" && f.Size == 12:
                 return new DurationBuilder();
             case AvroFixedSchema f:
                 return new FixedBuilder(f.Size);
 
+            // The item and value fields come from `type`, the reader's Arrow type, so that under a
+            // reader schema a nested column is the reader's type as a top-level one is (#767).
+            // Without a reader schema `type` was converted from this same writer schema.
             case AvroArraySchema a:
             {
-                var (itemArrowType, itemNullable) = ArrowSchemaConverter.ToArrowType(a.Items, depth + 1);
-                var itemBuilder = CreateBuilder(
-                    new Field("item", itemArrowType, itemNullable), a.Items, depth + 1);
-                return new ArrayBuilder(itemBuilder);
+                var itemField = type is ListType list
+                    ? list.ValueField
+                    : ToField("item", ArrowSchemaConverter.ToArrowType(a.Items, depth + 1));
+                return new ArrayBuilder(CreateBuilder(itemField, a.Items, depth + 1));
             }
 
             case AvroMapSchema m:
             {
-                var (valArrowType, valNullable) = ArrowSchemaConverter.ToArrowType(m.Values, depth + 1);
-                var valBuilder = CreateBuilder(
-                    new Field("value", valArrowType, valNullable), m.Values, depth + 1);
-                return new MapBuilder(valBuilder);
+                var valueField = type is MapType map
+                    ? map.ValueField
+                    : ToField("value", ArrowSchemaConverter.ToArrowType(m.Values, depth + 1));
+                return new MapBuilder(CreateBuilder(valueField, m.Values, depth + 1));
             }
 
             case AvroRecordSchema r:
@@ -1633,13 +1708,8 @@ internal sealed class DecimalFixedBuilder : ByteBlobBuilder
     private readonly int _size;
     private readonly Decimal128Type _type;
 
-    // The writer's annotation, which reader-schema resolution never compares with the reader's, so it
-    // goes through the converter's bound here rather than reaching Arrow as written (#763).
-    public DecimalFixedBuilder(int size, int? precision, int? scale)
-        : this(size, ArrowSchemaConverter.MakeDecimalType(precision, scale))
-    {
-    }
-
+    // `type` is the column's Arrow type, already bounded and checked against the writer's annotation
+    // by CreateBuilderForType.
     public DecimalFixedBuilder(int size, Decimal128Type type) : base(16)
     {
         _size = size;
@@ -1661,12 +1731,7 @@ internal sealed class DecimalBytesBuilder : ByteBlobBuilder
 {
     private readonly Decimal128Type _type;
 
-    // See DecimalFixedBuilder: the writer's annotation is bounded here too (#763).
-    public DecimalBytesBuilder(int? precision, int? scale)
-        : this(ArrowSchemaConverter.MakeDecimalType(precision, scale))
-    {
-    }
-
+    // `type` as for DecimalFixedBuilder.
     public DecimalBytesBuilder(Decimal128Type type) : base(16)
     {
         _type = type;

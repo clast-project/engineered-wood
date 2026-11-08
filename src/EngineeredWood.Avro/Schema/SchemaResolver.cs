@@ -96,7 +96,7 @@ internal static class SchemaResolver
     }
 
     /// <summary>Unwrap nullable union to get inner type.</summary>
-    private static AvroSchemaNode UnwrapNullable(AvroSchemaNode schema)
+    internal static AvroSchemaNode UnwrapNullable(AvroSchemaNode schema)
     {
         if (schema is AvroUnionSchema union && union.IsNullable(out var inner, out _))
             return inner;
@@ -107,11 +107,33 @@ internal static class SchemaResolver
     /// Validates that the writer schema can be resolved to the reader schema.
     /// Throws if incompatible.
     /// </summary>
+    /// <remarks>
+    /// Descends into array items and map values. It used to check only the outer pair, so an
+    /// <c>array&lt;int&gt;</c> under an <c>array&lt;string&gt;</c> passed, and the read failed later in
+    /// Arrow ("Buffer count &lt;2&gt; must be at exactly &lt;3&gt;"). A nested record is validated when
+    /// its own resolution runs, so it is not descended into here, which also keeps a recursive record
+    /// schema from recursing.
+    /// </remarks>
     private static void ValidateSchemaCompatibility(
-        AvroSchemaNode writerSchema, AvroSchemaNode readerSchema, string fieldName)
+        AvroSchemaNode writerSchema, AvroSchemaNode readerSchema, string fieldName, int depth = 0)
     {
+        if (depth >= MaxSchemaDepth)
+            throw new NotSupportedException(
+                "Avro schema exceeds maximum nesting depth. Recursive schemas cannot be represented in Arrow.");
+
         var w = UnwrapNullable(writerSchema);
         var r = UnwrapNullable(readerSchema);
+
+        if (w is AvroArraySchema wa && r is AvroArraySchema ra)
+        {
+            ValidateSchemaCompatibility(wa.Items, ra.Items, $"{fieldName}[]", depth + 1);
+            return;
+        }
+        if (w is AvroMapSchema wm && r is AvroMapSchema rm)
+        {
+            ValidateSchemaCompatibility(wm.Values, rm.Values, $"{fieldName}{{}}", depth + 1);
+            return;
+        }
 
         // Same type: validate further for enums
         if (w.Type == r.Type)
@@ -159,7 +181,7 @@ internal static class SchemaResolver
     /// Detects the type promotion needed for a matched field pair.
     /// Returns null if no promotion is needed (same types).
     /// </summary>
-    private static TypePromotion? DetectPromotion(AvroSchemaNode writerSchema, AvroSchemaNode readerSchema, int depth)
+    internal static TypePromotion? DetectPromotion(AvroSchemaNode writerSchema, AvroSchemaNode readerSchema, int depth)
     {
         if (depth >= MaxSchemaDepth)
             throw new NotSupportedException(
