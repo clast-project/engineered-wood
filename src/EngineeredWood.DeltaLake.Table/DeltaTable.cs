@@ -7931,7 +7931,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // Declared FALSE: it reads the active-file set to decide what to remove, so it plainly depends
             // on files. Recording that is what lets another engine's checker examine it rather than fall
             // back to a default that happens to agree.
-            await Log.CleanedBaseGuard.EnsureBaseNotOvertakenAsync(_log, snapshot, cancellationToken)
+            await Log.CleanedBaseGuard.EnsureCommittableBaseAsync(_log, snapshot, cancellationToken)
                 .ConfigureAwait(false); // #697: never commit below versions log cleanup removed
             var finalActions = Log.InCommitTimestamp.EnsureCommitInfo(
                 actions, snapshot.Metadata.Configuration, newVersion, "WRITE", isBlindAppend: false,

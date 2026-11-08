@@ -74,7 +74,8 @@ public sealed class Snapshot
     /// BEFORE the listing, so it errs early); null for a snapshot built at an explicit version, or one whose
     /// freshness is unknown.
     /// </summary>
-    /// <remarks>What lets a commit skip <see cref="Log.CleanedBaseGuard"/>'s check (#697): every commit after this
+    /// <remarks>What lets a commit on a snapshot with no <see cref="LogAnchor"/> skip
+    /// <see cref="Log.CleanedBaseGuard"/>'s cleanup check (#697): every commit after this
     /// version was written after this moment, so none can be older than the log retention until that long has
     /// passed.</remarks>
     internal DateTimeOffset? ListedLatestAt { get; init; }

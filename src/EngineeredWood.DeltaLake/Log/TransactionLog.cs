@@ -82,7 +82,7 @@ public sealed class TransactionLog
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var versions = new List<long>();
-        await foreach (var file in _fs.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
+        await foreach (var file in LogDirectory.ListAsync(_fs, cancellationToken)
             .ConfigureAwait(false))
         {
             string fileName = file.Path;

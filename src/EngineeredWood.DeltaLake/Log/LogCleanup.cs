@@ -113,7 +113,9 @@ internal static class LogCleanup
         var checksums = new List<(long Version, string Path, DateTimeOffset Modified)>();
         try
         {
-            await foreach (var file in log.FileSystem.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
+            // The log's own files only: a commit-named copy in a directory inside the log is not an expired commit,
+            // and must not be deleted as one (LogDirectory).
+            await foreach (var file in LogDirectory.ListAsync(log.FileSystem, cancellationToken)
                 .ConfigureAwait(false))
             {
                 string name = FileName(file.Path);

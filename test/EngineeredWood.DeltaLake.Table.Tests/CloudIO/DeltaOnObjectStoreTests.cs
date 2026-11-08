@@ -20,13 +20,22 @@ using Google.Cloud.Storage.V1;
 namespace EngineeredWood.DeltaLake.Table.Tests.CloudIO;
 
 /// <summary>
-/// The change feed on an object store, against the emulators the cloud-io CI job starts (#725). The feed opens
+/// Delta behaviour that depends on each backend's own semantics, against the emulators the cloud-io CI job starts:
+/// its errors and existence checks, and its ETags. Local tests cover the logic.
+/// </summary>
+/// <remarks>
+/// <para><b>Replaced log (#750).</b> A handle held across a drop and re-create is refused by the identity of its base
+/// commit as each backend lists it: Azure's ETag, S3's (the content's MD5 on MinIO), GCS's generation. The local
+/// file system has none of these, so only here is the whole check run against real tags, and an unchanged log shown
+/// to commit with them, which a tag reported differently by two listings would break.</para>
+///
+/// <para><b>The change feed (#725).</b> The feed opens
 /// each file with the size its action records and asks nothing of the store first, so a missing object first
 /// shows up as the footer read failing with the backend's own error (a 404 in Azure's, S3's or GCS's SDK
 /// exception). Only then does the feed check whether the file exists: one VACUUM removed is skipped, one still
-/// there is an error. Local tests cover the logic; these cover each backend's errors and existence checks.
-/// </summary>
-public abstract class ChangeFeedOnObjectStoreTests : IAsyncLifetime
+/// there is an error.</para>
+/// </remarks>
+public abstract class DeltaOnObjectStoreTests : IAsyncLifetime
 {
     private const int Appends = 3;
     private const int RowsPerAppend = 50;
@@ -125,9 +134,90 @@ public abstract class ChangeFeedOnObjectStoreTests : IAsyncLifetime
 
         await Assert.ThrowsAnyAsync<Exception>(() => InsertedIdsAsync(fs, window));
     }
+
+    // ── #750: a handle held across a drop and re-create ────────────────────────────────────────────────
+
+    private static RecordBatch Rows(long start, int count)
+    {
+        var ids = new Int64Array.Builder();
+        var values = new StringArray.Builder();
+        for (long i = start; i < start + count; i++)
+        {
+            ids.Append(i);
+            values.Append($"v{i}");
+        }
+        return new RecordBatch(Schema, [ids.Build(), values.Build()], count);
+    }
+
+    /// <summary>Creates a table and appends <paramref name="appends"/> one-row commits from <paramref name="start"/>.</summary>
+    private static async Task CreateWithAppendsAsync(ITableFileSystem fs, int appends, long start)
+    {
+        await using var table = await DeltaTable.CreateAsync(fs, Schema);
+        for (int a = 0; a < appends; a++)
+            await table.WriteAsync([Rows(start + a, 1)]);
+    }
+
+    /// <summary>Deletes every object under the table's prefix, as a DROP of an external location leaves it.</summary>
+    private static async Task DropAsync(ITableFileSystem fs)
+    {
+        var paths = new List<string>();
+        await foreach (var file in fs.ListAsync(""))
+            paths.Add(file.Path);
+        foreach (string path in paths)
+            await fs.DeleteAsync(path);
+    }
+
+    private static async Task<List<long>> VersionsAsync(ITableFileSystem fs)
+    {
+        var versions = new List<long>();
+        await foreach (long v in new TransactionLog(fs).ListVersionsAsync())
+            versions.Add(v);
+        return versions;
+    }
+
+    /// <summary>The issue's three shapes, against the handle's base at v3: shorter, the same, and longer.</summary>
+    [SkippableTheory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(5)]
+    public async Task AStaleHandle_CannotCommitIntoARecreatedTable(int newAppends)
+    {
+        CloudEmulator.Require(Emulator, Available, UnavailableReason);
+        var fs = NewFileSystem();
+        await CreateWithAppendsAsync(fs, 3, start: 1);                      // v3
+        await using var stale = await DeltaTable.OpenAsync(fs);
+
+        await DropAsync(fs);
+        await CreateWithAppendsAsync(fs, newAppends, start: 100);           // v<newAppends>
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await stale.WriteAsync([Rows(9, 1)]));
+        Assert.Equal(DeltaErrorCodes.TransactionLogReplaced, ex.ErrorCode);
+        Assert.Equal(Enumerable.Range(0, newAppends + 1).Select(v => (long)v), await VersionsAsync(fs));
+    }
+
+    /// <summary>
+    /// The other half: with real tags, a log nobody replaced still commits, from a handle that is current, from
+    /// one another writer has moved past (a rebase), and from one whose base is still the latest.
+    /// </summary>
+    [SkippableFact]
+    public async Task AnUnchangedLog_StillCommits()
+    {
+        CloudEmulator.Require(Emulator, Available, UnavailableReason);
+        var fs = NewFileSystem();
+        await CreateWithAppendsAsync(fs, 1, start: 1);                      // v1
+        await using var a = await DeltaTable.OpenAsync(fs);
+        await using var b = await DeltaTable.OpenAsync(fs);
+
+        Assert.Equal(2, await a.WriteAsync([Rows(2, 1)]));
+        Assert.Equal(3, await b.WriteAsync([Rows(3, 1)]));                  // rebased past a's commit
+        Assert.Equal(4, await a.WriteAsync([Rows(4, 1)]));                  // a's base: its own v2, then refreshed
+        Assert.Equal(5, await b.WriteAsync([Rows(5, 1)]));
+        Assert.Equal([0L, 1, 2, 3, 4, 5], await VersionsAsync(fs));
+    }
 }
 
-public sealed class ChangeFeedOnAzureTests : ChangeFeedOnObjectStoreTests
+public sealed class DeltaOnAzureTests : DeltaOnObjectStoreTests
 {
     private const string ConnectionString =
         "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;";
@@ -165,7 +255,7 @@ public sealed class ChangeFeedOnAzureTests : ChangeFeedOnObjectStoreTests
     }
 }
 
-public sealed class ChangeFeedOnS3Tests : ChangeFeedOnObjectStoreTests
+public sealed class DeltaOnS3Tests : DeltaOnObjectStoreTests
 {
     private AmazonS3Client? _client;
     private string _bucket = "";
@@ -223,7 +313,7 @@ public sealed class ChangeFeedOnS3Tests : ChangeFeedOnObjectStoreTests
     }
 }
 
-public sealed class ChangeFeedOnGcsTests : ChangeFeedOnObjectStoreTests
+public sealed class DeltaOnGcsTests : DeltaOnObjectStoreTests
 {
     private StorageClient? _client;
     private string _bucket = "";

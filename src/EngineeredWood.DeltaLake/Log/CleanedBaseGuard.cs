@@ -19,7 +19,9 @@ namespace EngineeredWood.DeltaLake.Log;
 /// the table has moved past the base and base + 1 is missing. A base whose commit is gone but nothing follows (a
 /// snapshot read from a checkpoint whose commit was cleaned up) commits normally.</para>
 ///
-/// <para><b>Why it is usually free.</b> Every commit after the base was written after the base was last seen as the
+/// <para><b>Why it is usually free</b> where a base carries no log anchor (a snapshot built in memory, or a base
+/// known only by its version). A snapshot read from a listing gets <see cref="EnsureCommittableBaseAsync"/> instead,
+/// which checks its base commit on every commit (#750). Every commit after the base was written after the base was last seen as the
 /// latest version (<see cref="Snapshot.Snapshot.ListedLatestAt"/>), and cleanup deletes only commits older than
 /// <c>delta.logRetentionDuration</c>. So until that long has passed, none can be gone. A handle refreshes after each
 /// of its own commits, so a writer that keeps writing never pays; an idle one pays one existence check. The window is
@@ -43,14 +45,143 @@ internal static class CleanedBaseGuard
     internal static readonly TimeSpan MaxFreshWindow = TimeSpan.FromMinutes(5);
 
     /// <summary>
-    /// Throws <see cref="DeltaFormatException"/> (<see cref="DeltaErrorCodes.TruncatedTransactionLog"/>) when a commit
-    /// of version <paramref name="baseSnapshot"/>.Version + 1 would land below versions log cleanup has removed.
+    /// Before a commit of version <paramref name="baseSnapshot"/>.Version + 1, makes sure the log still holds the
+    /// base: throws <see cref="DeltaFormatException"/> with <see cref="DeltaErrorCodes.TransactionLogReplaced"/> when
+    /// the log is provably not the one the base was read from (#750), and with
+    /// <see cref="DeltaErrorCodes.TruncatedTransactionLog"/> when log cleanup has removed the versions after it (#697).
     /// </summary>
-    internal static ValueTask EnsureBaseNotOvertakenAsync(
+    /// <remarks>
+    /// <para><b>The failure it prevents</b> (#750, measured). A handle held while its table is dropped and re-created
+    /// at the same path commits into the NEW log: the create of base + 1 is free whenever the new log is no longer
+    /// than the base, and a blind append passes the conflict check against the new table's commits when it is
+    /// longer. Against a shorter log that leaves a hole (log 0, 1, 4) that every reader of the new table then fails on,
+    /// and the write was reported as a success.</para>
+    ///
+    /// <para><b>What it checks.</b> The base's commit file, by a listing of that one path, against the identity the
+    /// base recorded (<see cref="Snapshot.Snapshot.LogAnchor"/>). A listing rather than a metadata request, because the
+    /// identity came from a listing and is compared against the same report of it. Refused only on proof, as the
+    /// refresh is: a different size or ETag, a commit at a version the base saw only a checkpoint for, or a log that
+    /// no longer reaches the base. A file that only shows a different modification time is not proof, and is committed
+    /// to: a touched or copied file must not fail a write. On a backend without ETags (a local file system), a
+    /// re-created commit of exactly the old size is therefore not seen.</para>
+    ///
+    /// <para><b>Cost.</b> One single-file listing per commit, made in place of the existence check the cleanup guard
+    /// made outside its freshness window. Unlike that check it is made every time: a drop and re-create can happen
+    /// moments after the base was read. When the base's commit is absent (cleaned up, or never there) the log is
+    /// listed as before.</para>
+    ///
+    /// <para>Refused rather than rebased: the commits after the base belong to another table. Nothing is written.
+    /// A snapshot that records no anchor (one built in memory) gets the cleanup guard alone.</para>
+    ///
+    /// <para><b>Known limit</b>, as for the cleanup guard: a drop and re-create between this check and the create
+    /// is not seen on the first attempt. A create-if-absent cannot be made conditional on another object, and Delta has
+    /// no lock. A committer whose create then collides checks again before it retries
+    /// (<see cref="EnsureLogNotReplacedAsync"/>), so only a new log no longer than the base can take that commit.</para>
+    /// </remarks>
+    internal static async ValueTask EnsureCommittableBaseAsync(
         TransactionLog log, Snapshot.Snapshot baseSnapshot, CancellationToken cancellationToken)
-        => EnsureBaseNotOvertakenAsync(
-            log, baseSnapshot.Version, baseSnapshot.ListedLatestAt, baseSnapshot.Metadata.Configuration,
-            cancellationToken);
+    {
+        long baseVersion = baseSnapshot.Version;
+        if (baseSnapshot.LogAnchor is not { Files.Count: > 0 } anchor)
+        {
+            await EnsureBaseNotOvertakenAsync(
+                log, baseVersion, baseSnapshot.ListedLatestAt, baseSnapshot.Metadata.Configuration,
+                cancellationToken).ConfigureAwait(false);
+            return;
+        }
+
+        // Null when the base's commit was there, which also rules out cleanup having removed anything after it:
+        // cleanup never leaves a hole.
+        if (await CheckSameLogAsync(log, baseVersion, anchor, cancellationToken).ConfigureAwait(false)
+                is { } listing
+            && listing.LatestVersion > baseVersion
+            && !listing.CommitsInRange(baseVersion + 1, baseVersion + 1).Any())
+        {
+            throw Overtaken(baseVersion, listing.LatestVersion);
+        }
+    }
+
+    /// <summary>
+    /// The replaced-log half of <see cref="EnsureCommittableBaseAsync"/> alone: throws
+    /// <see cref="DeltaErrorCodes.TransactionLogReplaced"/> when the log provably is not the one
+    /// <paramref name="baseSnapshot"/> was read from; does nothing for a snapshot with no anchor.
+    /// </summary>
+    /// <remarks>For a commit that has already passed the full check and is about to try again (a retry after a
+    /// collision, which is exactly what a longer re-created log produces; #755 review), and for a commit that needs
+    /// no base but must still not land in another table's log (VACUUM END).</remarks>
+    internal static async ValueTask EnsureLogNotReplacedAsync(
+        TransactionLog log, Snapshot.Snapshot baseSnapshot, CancellationToken cancellationToken)
+    {
+        if (baseSnapshot.LogAnchor is { Files.Count: > 0 } anchor)
+            await CheckSameLogAsync(log, baseSnapshot.Version, anchor, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Throws when the log provably is not the one <paramref name="anchor"/> was recorded from. Returns
+    /// null when the base's commit was found by its own listing, or the full listing it had to read otherwise.</summary>
+    private static async ValueTask<LogListing?> CheckSameLogAsync(
+        TransactionLog log, long baseVersion, LogVersionAnchor anchor, CancellationToken cancellationToken)
+    {
+        string commitPath = DeltaVersion.CommitPath(baseVersion);
+        // Matched by the full path, not the file name: a backend may list a prefix recursively (the local one does),
+        // and a same-named file in a directory under the log is not the commit (#755 review).
+        LogFileIdentity? listed = null;
+        await foreach (var file in log.FileSystem.ListAsync(commitPath, cancellationToken).ConfigureAwait(false))
+        {
+            if (string.Equals(file.Path, commitPath, StringComparison.Ordinal))
+                listed = LogFileIdentity.Of(file);
+        }
+
+        if (listed is { } current)
+        {
+            EnsureSameCommit(anchor, baseVersion, commitPath, current);
+            return null;
+        }
+
+        // The base's commit is gone, or the base never had one: list the log. The table can be re-created between
+        // the two listings, so this one's commit at the base, if any, is checked too (#755 review).
+        var listing = await log.ReadListingAsync(cancellationToken).ConfigureAwait(false);
+        if (listing.LatestVersion < baseVersion)
+            throw LogReplaced(baseVersion, $"the log now ends at version {listing.LatestVersion}");
+        if (listing.IdentityOf(commitPath) is { } relisted)
+        {
+            EnsureSameCommit(anchor, baseVersion, commitPath, relisted);
+            return null;
+        }
+        return listing;
+    }
+
+    /// <summary>Throws when <paramref name="listed"/>, the base's commit as a listing shows it now, proves the log
+    /// is another one.</summary>
+    private static void EnsureSameCommit(
+        LogVersionAnchor anchor, long baseVersion, string commitPath, LogFileIdentity listed)
+    {
+        // A commit is never written at a version after its checkpoint, so one beside a checkpoint-only base is
+        // another log's.
+        if (!anchor.HasCommit)
+            throw LogReplaced(baseVersion, "a commit file now stands at that version, where there was none");
+
+        foreach (var recorded in anchor.Files)
+        {
+            if (string.Equals(recorded.Path, commitPath, StringComparison.Ordinal)
+                && recorded.Compare(listed) == LogFileMatch.Different)
+            {
+                throw LogReplaced(baseVersion, "the commit file for that version is a different object now");
+            }
+        }
+    }
+
+    private static DeltaFormatException LogReplaced(long baseVersion, string evidence) =>
+        new(DeltaErrorCodes.TransactionLogReplaced,
+            $"Cannot commit on version {baseVersion}: the Delta log is no longer the one that version was read from "
+            + $"({evidence}). The table was most likely dropped and re-created at the same path, and this commit "
+            + "would land in the new table's log. Nothing was written. Open the table again and retry.");
+
+    private static DeltaFormatException Overtaken(long baseVersion, long latestVersion) =>
+        new(DeltaErrorCodes.TruncatedTransactionLog,
+            $"Cannot commit on version {baseVersion}: the table is at version {latestVersion}, and log "
+            + $"cleanup has removed the commits after version {baseVersion}, so this commit would land below the "
+            + "latest checkpoint where no reader would see it. Nothing was written. Refresh the table (or reopen it) "
+            + "and retry.");
 
     /// <summary>
     /// As the snapshot overload, for a base known only by its version: <paramref name="latestAt"/> is a moment at
@@ -67,12 +198,7 @@ internal static class CleanedBaseGuard
             return;
         }
 
-        throw new DeltaFormatException(
-            DeltaErrorCodes.TruncatedTransactionLog,
-            $"Cannot commit on version {baseVersion}: the table is at version {latestVersion}, and log "
-            + $"cleanup has removed the commits after version {baseVersion}, so this commit would land below the "
-            + "latest checkpoint where no reader would see it. Nothing was written. Refresh the table (or reopen it) "
-            + "and retry.");
+        throw Overtaken(baseVersion, latestVersion);
     }
 
     /// <summary>

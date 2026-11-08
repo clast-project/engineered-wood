@@ -123,7 +123,7 @@ public sealed class LogCompaction
     {
         var result = new List<(long Start, long End, string Path)>();
 
-        await foreach (var file in _fs.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
+        await foreach (var file in LogDirectory.ListAsync(_fs, cancellationToken)
             .ConfigureAwait(false))
         {
             string fileName = Path.GetFileName(file.Path);

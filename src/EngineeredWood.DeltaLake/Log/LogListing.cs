@@ -62,8 +62,8 @@ internal sealed class LogListing
     {
         var listing = new LogListing();
 
-        await foreach (var file in fileSystem.ListAsync(DeltaVersion.LogPrefix, cancellationToken)
-            .ConfigureAwait(false))
+        // Only the log's own files, never one in a directory inside it (LogDirectory).
+        await foreach (var file in LogDirectory.ListAsync(fileSystem, cancellationToken).ConfigureAwait(false))
         {
             listing.Add(Path.GetFileName(file.Path), file);
         }
