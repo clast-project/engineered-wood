@@ -91,13 +91,12 @@ internal static class AvroSchemaParser
         {
             var logicalType = logicalEl.GetString();
             var baseSchema = ParseTypeName(typeName, namedTypes, enclosingNamespace);
+            var (precision, scale) = ReadDecimal(obj, ref logicalType, baseSchema.Type == AvroType.Bytes, maxPrecision: int.MaxValue);
             return new AvroPrimitiveSchema(baseSchema.Type)
             {
                 LogicalType = logicalType,
-                Precision = logicalType == "decimal" && obj.TryGetProperty("precision", out var precEl)
-                    ? precEl.GetInt32() : null,
-                Scale = logicalType == "decimal" && obj.TryGetProperty("scale", out var scaleEl)
-                    ? scaleEl.GetInt32() : null,
+                Precision = precision,
+                Scale = scale,
             };
         }
 
@@ -208,20 +207,63 @@ internal static class AvroSchemaParser
         var size = obj.GetProperty("size").GetInt32();
 
         var logicalType = obj.TryGetProperty("logicalType", out var ltEl) ? ltEl.GetString() : null;
+        var (precision, scale) = ReadDecimal(obj, ref logicalType, onBytesOrFixed: true, MaxFixedDigits(size));
         var schema = new AvroFixedSchema(name, ns, size)
         {
             Aliases = ParseStringArray(obj, "aliases"),
             LogicalType = logicalType,
-            Precision = logicalType == "decimal" && obj.TryGetProperty("precision", out var precEl)
-                ? precEl.GetInt32() : null,
-            Scale = logicalType == "decimal" && obj.TryGetProperty("scale", out var scaleEl)
-                ? scaleEl.GetInt32() : null,
+            Precision = precision,
+            Scale = scale,
         };
 
         namedTypes[fullName] = schema;
         namedTypes[name] = schema;
         return schema;
     }
+
+    /// <summary>
+    /// Reads a <c>decimal</c> annotation's precision and scale, and clears <paramref name="logicalType"/>
+    /// when the annotation is invalid.
+    /// </summary>
+    /// <remarks>
+    /// The Avro spec: a decimal annotates <c>bytes</c> or <c>fixed</c>, its precision is required and
+    /// positive, <c>0 &lt;= scale &lt;= precision</c>, and a <c>fixed(n)</c> holds at most
+    /// floor(log10(2^(8n-1) - 1)) digits. "If a logical type is invalid, for example a decimal with
+    /// scale greater than its precision, then implementations should ignore the logical type and use
+    /// the underlying Avro type." Clearing it here, once, means the schema converter, the record
+    /// assembler, the encoder and the default-value applicator all read the column as plain
+    /// bytes/fixed alike. Before this, a schema could carry a scale in the millions into the Arrow type,
+    /// and ArrowRowEvaluator.Rescale and the Spark casts size a power of ten by it (#763).
+    /// </remarks>
+    private static (int? Precision, int? Scale) ReadDecimal(
+        JsonElement obj, ref string? logicalType, bool onBytesOrFixed, int maxPrecision)
+    {
+        if (logicalType != "decimal")
+            return (null, null);
+
+        int? precision = obj.TryGetProperty("precision", out var precEl) ? AsInt32(precEl) : null;
+        // The spec gives an absent scale as 0.
+        int? scale = obj.TryGetProperty("scale", out var scaleEl) ? AsInt32(scaleEl) : 0;
+
+        if (!onBytesOrFixed || precision is not { } pr || pr < 1 || pr > maxPrecision
+            || scale is not { } sc || sc < 0 || sc > pr)
+        {
+            logicalType = null;
+            return (null, null);
+        }
+
+        return (pr, sc);
+
+        static int? AsInt32(JsonElement e) =>
+            e.ValueKind == JsonValueKind.Number && e.TryGetInt32(out int v) ? v : null;
+    }
+
+    /// <summary>
+    /// floor(log10(2^(8n-1) - 1)): the decimal digits every value of a signed n-byte integer can hold.
+    /// (8n-1)·log10(2) is irrational, so it is never within rounding error of an integer.
+    /// </summary>
+    private static int MaxFixedDigits(int bytes) =>
+        bytes < 1 ? 0 : (int)Math.Floor((8.0 * bytes - 1) * Math.Log10(2));
 
     private static IReadOnlyList<string> ParseStringArray(JsonElement obj, string property)
     {

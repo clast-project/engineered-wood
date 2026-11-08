@@ -65,7 +65,7 @@ internal static class ArrowSchemaConverter
 
             case AvroFixedSchema f:
                 if (f.LogicalType == "decimal")
-                    return (new Decimal128Type(f.Precision ?? 38, f.Scale ?? 0), false);
+                    return (MakeDecimalType(f.Precision, f.Scale), false);
                 if (f.LogicalType == "duration" && f.Size == 12)
                     return (new IntervalType(IntervalUnit.MonthDayNanosecond), false);
                 return (new FixedSizeBinaryType(f.Size), false);
@@ -92,6 +92,20 @@ internal static class ArrowSchemaConverter
         }
     }
 
+    /// <summary>
+    /// The Arrow type for a decimal annotation. The parser has already dropped an invalid one; a
+    /// precision above 38 is valid Avro, but the reader decodes into Decimal128 and would truncate
+    /// every wider value, so it is refused rather than read wrong.
+    /// </summary>
+    internal static Decimal128Type MakeDecimalType(int? precision, int? scale)
+    {
+        int p = precision ?? 38;
+        if (p > 38)
+            throw new NotSupportedException(
+                $"Avro decimal({p},{scale ?? 0}) is wider than Decimal128, which holds at most 38 digits.");
+        return new Decimal128Type(p, scale ?? 0);
+    }
+
     private static IArrowType ToArrowPrimitive(AvroPrimitiveSchema p, ExtensionTypeRegistry? extensionRegistry = null)
     {
         // Check logical type first
@@ -109,7 +123,7 @@ internal static class ArrowSchemaConverter
                 "local-timestamp-millis" => new TimestampType(TimeUnit.Millisecond, (string?)null),
                 "local-timestamp-micros" => new TimestampType(TimeUnit.Microsecond, (string?)null),
                 "local-timestamp-nanos" => new TimestampType(TimeUnit.Nanosecond, (string?)null),
-                "decimal" => new Decimal128Type(p.Precision ?? 38, p.Scale ?? 0),
+                "decimal" => MakeDecimalType(p.Precision, p.Scale),
                 "uuid" => MakeUuidArrowType(extensionRegistry),
                 _ => ToArrowBasePrimitive(p.Type), // Unknown logical type: fall through to base
             };
