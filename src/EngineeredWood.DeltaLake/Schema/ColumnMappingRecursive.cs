@@ -88,7 +88,10 @@ public static class ColumnMappingRecursive
     /// Removes, at every depth, each field of a data file's batch (as read, physical-named) that belongs to a
     /// column the schema no longer has. Returns the same instance when nothing is removed.
     /// <list type="bullet">
-    /// <item>Id mode: a field carrying a <c>PARQUET:field_id</c> the schema at that level does not have.</item>
+    /// <item>Id mode: a field carrying a <c>PARQUET:field_id</c> the schema at that level does not have, other than
+    /// Iceberg's reserved row-lineage ids (<see cref="IcebergCompat.RowIdFieldId"/>,
+    /// <see cref="IcebergCompat.RowCommitVersionFieldId"/>), which IcebergCompatV3 puts on the materialized
+    /// row-tracking columns.</item>
     /// <item>Name mode: a field whose name is no field's physical name but IS the logical name of a field mapped
     /// to a different physical name. Data files hold physical names only, so that name can only be a dropped
     /// column's physical name: a table upgraded to name mode keeps its original names as physical names, and a
@@ -144,7 +147,10 @@ public static class ColumnMappingRecursive
         if (mode == ColumnMappingMode.Id)
         {
             var byId = FindField(schema, arrow, byId: true, preferPhysical: true);
-            stale = byId is null && ColumnMapping.GetParquetFieldId(arrow) is not null;
+            // An IcebergCompatV3 table's materialized row-tracking columns carry Iceberg's reserved row-lineage
+            // ids, which no table column has: they are hidden columns, not dropped ones.
+            stale = byId is null && ColumnMapping.GetParquetFieldId(arrow) is int id
+                && id != IcebergCompat.RowIdFieldId && id != IcebergCompat.RowCommitVersionFieldId;
             return byId;
         }
 

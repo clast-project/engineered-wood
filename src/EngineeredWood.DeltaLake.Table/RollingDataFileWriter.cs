@@ -98,7 +98,12 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     private readonly Stats.StatsColumnSelection? _statsSelection;
     private readonly bool _collectStats;
     private readonly bool _tableAllowsShredding;
+    private readonly IReadOnlyDictionary<string, int>? _columnFieldIds;
     private readonly List<RolledDataFile> _files = new();
+
+    // The last batch schema given ids by WithColumnFieldIds, and the schema it became: a writer's batches share one.
+    private Apache.Arrow.Schema? _idsFrom;
+    private Apache.Arrow.Schema? _idsTo;
 
     // The file being filled: its layout, rows and stats so far. Its Parquet writer is opened by the first row group.
     private Apache.Arrow.Schema? _fileSchema;
@@ -119,10 +124,14 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     /// given for them, under <paramref name="statsSelection"/>.</param>
     /// <param name="tableAllowsShredding">Whether the table supports variant shredding, which a host's file needs
     /// for variant bounds (EW's own shredded write is refused on a table that does not).</param>
+    /// <param name="columnFieldIds">Parquet field ids for top-level columns the table schema does not hold, by
+    /// physical name: an IcebergCompatV3 table's materialized row-tracking columns
+    /// (<see cref="Schema.IcebergCompat.RowTrackingFieldIds"/>). A column already carrying an id keeps it.</param>
     public RollingDataFileWriter(
         ITableFileSystem fs, IDataFileWriter? host, ParquetWriteOptions options, long targetFileSize,
         string partitionDirectory, WrittenFileLedger? written, bool collectStats,
-        Stats.StatsColumnSelection? statsSelection, bool tableAllowsShredding)
+        Stats.StatsColumnSelection? statsSelection, bool tableAllowsShredding,
+        IReadOnlyDictionary<string, int>? columnFieldIds = null)
     {
         _fs = fs;
         _host = host;
@@ -133,6 +142,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         _collectStats = collectStats;
         _statsSelection = statsSelection;
         _tableAllowsShredding = tableAllowsShredding;
+        _columnFieldIds = columnFieldIds is { Count: > 0 } ? columnFieldIds : null;
     }
 
     /// <summary>
@@ -146,6 +156,9 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     {
         if (writeBatch.Length == 0)
             return;
+
+        if (_columnFieldIds is not null)
+            writeBatch = WithColumnFieldIds(writeBatch);
 
         if (_fileSchema is not null && !SameLayout(_fileSchema.FieldsList, writeBatch.Schema.FieldsList))
             await CloseFileAsync(cancellationToken).ConfigureAwait(false);
@@ -191,6 +204,43 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
                     await CloseFileAsync(cancellationToken).ConfigureAwait(false);
             }
         }
+    }
+
+    private RecordBatch WithColumnFieldIds(RecordBatch batch)
+    {
+        if (!ReferenceEquals(batch.Schema, _idsFrom))
+        {
+            _idsFrom = batch.Schema;
+            _idsTo = batch.Schema.FieldsList.Any(NeedsFieldId) ? WithFieldIds(batch.Schema) : null;
+        }
+        return _idsTo is null
+            ? batch
+            : new RecordBatch(_idsTo, Enumerable.Range(0, batch.ColumnCount).Select(batch.Column), batch.Length);
+    }
+
+    private bool NeedsFieldId(Field field) =>
+        _columnFieldIds!.ContainsKey(field.Name) && Schema.ColumnMapping.GetParquetFieldId(field) is null;
+
+    private Apache.Arrow.Schema WithFieldIds(Apache.Arrow.Schema schema)
+    {
+        var builder = new Apache.Arrow.Schema.Builder();
+        if (schema.Metadata is { } schemaMetadata)
+            builder.Metadata(schemaMetadata);
+        foreach (var field in schema.FieldsList)
+        {
+            if (!NeedsFieldId(field))
+            {
+                builder.Field(field);
+                continue;
+            }
+            var metadata = field.Metadata is null
+                ? new Dictionary<string, string>()
+                : field.Metadata.ToDictionary(pair => pair.Key, pair => pair.Value);
+            metadata[Schema.ColumnMapping.ParquetFieldIdKey] =
+                _columnFieldIds![field.Name].ToString(System.Globalization.CultureInfo.InvariantCulture);
+            builder.Field(new Field(field.Name, field.DataType, field.IsNullable, metadata));
+        }
+        return builder.Build();
     }
 
     // Adds rows to the file being filled. They are written to it: the file closes only once they are flushed.

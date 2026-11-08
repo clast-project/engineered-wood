@@ -268,7 +268,7 @@ public sealed partial class DeltaTable
         long committed = await CommitOccAsync(
             current, actions, new ReadSet { WholeTable = true }, IsolationLevel.Serializable, "RESTORE",
             rebaseSafe: false, cancellationToken, isBlindAppend: false, commitProperties: commitProperties,
-            operationMetrics: _ => metrics, operationParameters: parameters).ConfigureAwait(false);
+            operationMetrics: _ => metrics, operationParameters: parameters, restoring: true).ConfigureAwait(false);
 
         return result with { Version = committed };
     }

@@ -424,18 +424,26 @@ def cmd_sql(args):
 
     The writer-side half of tier 3: Spark MUTATING a table EngineeredWood created is the only
     way to test that EW's output is not merely readable but writable-through.
+
+    `confs` is an optional map of session confs set for the statements and restored after them, e.g.
+    `spark.databricks.delta.uniform.iceberg.v3.enabled`, without which delta-spark 4.4 refuses every write
+    to an IcebergCompatV3 table (CheckAnySQLConf).
     """
     spark = _spark()
     path = _uri(args["path"])
-    results = []
-    for stmt in args["sql"]:
-        rendered = stmt.format(path=path)
-        out = spark.sql(rendered)
-        results.append({"sql": rendered,
-                        "rows": _rows(out) if out.columns else []})
-    df = spark.read.format("delta").load(path)
-    return {"statements": results, "rows": _rows(df), "row_count": df.count(),
-            "detail": _detail(spark, args["path"])}
+
+    def run():
+        results = []
+        for stmt in args["sql"]:
+            rendered = stmt.format(path=path)
+            out = spark.sql(rendered)
+            results.append({"sql": rendered,
+                            "rows": _rows(out) if out.columns else []})
+        df = spark.read.format("delta").load(path)
+        return {"statements": results, "rows": _rows(df), "row_count": df.count(),
+                "detail": _detail(spark, args["path"])}
+
+    return _with_confs(spark, args.get("confs") or {}, run)
 
 
 def cmd_create(args):

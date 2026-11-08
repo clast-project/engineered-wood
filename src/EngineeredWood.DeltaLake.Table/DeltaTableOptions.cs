@@ -280,7 +280,7 @@ public sealed record DeltaTableOptions
     /// it. Nothing in the Delta log references those files, so no keep-set can protect them and a sweep
     /// would collect the lot — which is why Delta hides the directory by NAME rather than by the
     /// underscore convention every other protected directory relies on. This library can enable
-    /// <c>icebergCompatV1</c>/<c>V2</c> itself, so the case is reachable on a table we maintain.</para>
+    /// <c>icebergCompatV1</c>/<c>V2</c>/<c>V3</c> itself, so the case is reachable on a table we maintain.</para>
     ///
     /// <para>Set false to sweep it — appropriate only when nothing is generating Iceberg metadata for
     /// this table and the directory is known to be junk. Delta exposes the same switch

@@ -642,9 +642,12 @@ table requiring one it does not implement is rejected rather than mis-read.
 - Auto-checkpoint (V1 Parquet and V2 JSON+sidecar formats)
 - Compaction and vacuum; log compaction
 - Change data feed (insert / delete / update pre/post-image)
-- Iceberg compatibility (V1 and V2): partition column materialization,
+- Iceberg compatibility (V1, V2 and V3): partition column materialization,
   schema validation, stats enforcement so an external converter can
-  produce valid Iceberg metadata
+  produce valid Iceberg metadata. V3 also requires row tracking (turned on at
+  create when not given) and stamps Iceberg's row-lineage field ids on the
+  materialized row-tracking columns that compaction writes (UPDATE does not
+  yet: #756)
 
 ### Supported reader features
 
@@ -655,9 +658,9 @@ table requiring one it does not implement is rejected rather than mis-read.
 
 `appendOnly`, `changeDataFeed`, `checkConstraints`, `clustering`,
 `columnMapping`, `deletionVectors`, `domainMetadata`, `generatedColumns`,
-`icebergCompatV1`, `icebergCompatV2`, `identityColumns`, `inCommitTimestamp`,
-`invariants`, `rowTracking`, `timestampNtz`, `typeWidening`, `v2Checkpoint`,
-`vacuumProtocolCheck`, `variantType`
+`icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`, `identityColumns`,
+`inCommitTimestamp`, `invariants`, `rowTracking`, `timestampNtz`,
+`typeWidening`, `v2Checkpoint`, `vacuumProtocolCheck`, `variantType`
 
 Two of those need qualifying. The **enforcement** features — `appendOnly`,
 `invariants`, `checkConstraints`, `generatedColumns` — are listed because a

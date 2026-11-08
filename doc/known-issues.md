@@ -675,7 +675,7 @@ delta-spark jar and collect the first argument of each `buildConfig` call.
 VACUUM); `delta.enableChangeDataFeed`; `delta.enableDeletionVectors`; `delta.enableExpiredLogCleanup`
 and `delta.logRetentionDuration` (`LogCleanup`: by the listing's modification times, as delta-spark does, or, where the
 file system cannot date its files, by the commits' in-commit timestamps when the table has them, #115; without either
-it deletes nothing); `delta.enableIcebergCompatV1` / `V2`;
+it deletes nothing); `delta.enableIcebergCompatV1` / `V2` / `V3` (below);
 `delta.enableInCommitTimestamps`, and `delta.inCommitTimestampEnablementVersion` / `…Timestamp`, which any commit that
 turns in-commit timestamps on for an existing table records as Spark does (#598; pinned by
 `InCommitTimestampMidLifeInteropTests`), and which log cleanup reads (below); `delta.enableRowTracking` and its two materialized-column names;
@@ -694,7 +694,7 @@ appends U+007F or U+10FFFF. Both are valid bounds.
 
 *Refused unless the caller opts in:* `delta.universalFormat.enabledFormats` (UniForm). EW generates no Iceberg or
 Hudi metadata, so a commit would leave readers of that format on an older version with nothing to say so. UniForm is
-no writer feature (it rides on `icebergCompatV2`, which EW supports), so the protocol alone never stopped such a write.
+no writer feature (it rides on `icebergCompatV2` or `V3`, which EW supports), so the protocol alone never stopped such a write.
 EW now refuses every commit to a table whose `enabledFormats` is non-empty: data writes, DML, schema changes, OPTIMIZE,
 transactions, and a REPLACE of it even when the replacement drops the property. Creating one is refused as well. The
 error code is `DELTA_UNIVERSAL_FORMAT_NOT_MAINTAINED`. Reads, checkpoints and VACUUM are unaffected. A host that runs
@@ -703,9 +703,33 @@ the conversion itself, or accepts the lag until another engine's next commit, se
 Its companions `delta.universalFormat.iceberg.atomicConversion.supported` and `delta.universalformat.config.*` are not
 read; they matter only to a converter. #473
 
+*`delta.enableIcebergCompatV3`* (#745) follows delta-spark 4.4, the first release that enforces it. 4.3.1 declares the
+feature and its required `columnMapping` + `rowTracking`, but checks nothing (V3 is missing from its
+`IcebergCompat.knownVersions`; measured on Spark 4.1.2). Each rule is delta-spark's check of the same name, read with
+javap and measured on Spark 4.2.0 + delta-spark 4.4.1: column mapping and row tracking required (row tracking is turned
+on at create when the property is left out, as Spark does; an explicit `false` is refused); deletion vectors allowed
+(the V1/V2 rule from #744 does not apply); one IcebergCompat version only; V2's types plus `variant`; no `decimal`
+partition column (Spark's allow-list holds `DecimalType`'s companion object, so it matches no decimal type); no change
+of a partitioned table's partition columns, by REPLACE either; only type changes Iceberg can follow, on a table that
+supports type widening; a literal top-level column default; V3 cannot be turned off, by a commit, a REPLACE or a
+RESTORE; and it cannot be turned on by a commit over row tracking that was already enabled. Nested ids are assigned
+as under V2, and the materialized row-tracking columns that compaction writes carry Iceberg's reserved row-lineage
+field ids (2147483540 / 2147483539), as delta-spark 4.4 writes them. Gaps:
+- `UpdateAsync` writes its rewritten files without the ids and without the materialized partition columns, on V1/V2
+  as on V3; the other row-rewriting DML paths refuse IcebergCompat tables (#756).
+- A V3 table that delta-spark 4.3.1 created has no `delta.enableRowTracking`, and EW refuses to write it. delta-spark
+  4.4 sets the property on its next commit; EW does not change a table's properties on a write.
+- delta-spark 4.4 refuses every write to a V3 table unless the session sets
+  `spark.databricks.delta.uniform.iceberg.v3.enabled` (`CheckAnySQLConf`). EW has no such switch.
+- The geospatial types V3 allows from delta-spark 4.4 are not modelled; EW has no geometry or geography type.
+- The V1/V2 checks EW has always run are still only column mapping, types (`void`, and V1's arrays and maps) and
+  deletion vectors. delta-spark's V2 also refuses `variant`, a decimal partition column, partition evolution, a type
+  change Iceberg cannot follow, and V1 + V2 together.
+
 *`delta.feature.<name>`* declares a table feature as supported at `CreateAsync` / `CreateOrReplaceAsync`, as
 Spark 4.0.0 does (measured, #601). The property is consumed, not stored. The feature is added along with the
-features it requires (`rowTracking` brings `domainMetadata`, `icebergCompatV1`/`V2` bring `columnMapping`). The
+features it requires (`rowTracking` brings `domainMetadata`, `icebergCompatV1`/`V2` bring `columnMapping`,
+`icebergCompatV3` brings `columnMapping` and `rowTracking`). The
 result stays on a legacy protocol version when one describes the feature set exactly, so `checkConstraints` alone
 is writer 3. Key and value are matched without regard to case, and the value may be `supported` or `enabled`.
 Anything else is refused with `DELTA_UNSUPPORTED_FEATURE_STATUS`. A feature this library cannot write is refused
@@ -749,7 +773,7 @@ for `delta.feature.*`. There is no API to set a protocol version mid-life except
 *Moot because EW refuses the table:* each of these belongs to a table feature missing from
 `ProtocolVersions.SupportedWriterFeatures`, so EW will not write the table at all:
 `delta.coordinatedCommits.*-preview`, `delta.redirectReaderWriter-preview`,
-`delta.redirectWriterOnly-preview`, `delta.enableIcebergCompatV3`,
+`delta.redirectWriterOnly-preview`,
 `delta.enableMaterializePartitionColumnsFeature` / `delta.writePartitionColumnsToParquet`, and
 `delta.requireCheckpointProtectionBeforeVersion`.
 
@@ -1060,8 +1084,9 @@ Feed for exactly the deleted rows. `DeleteAsync(predicate, RowDeleteMode)` (and
 the same on `DeltaTransaction`) chooses explicitly: `CopyOnWrite` also works on
 a DV table, dropping the file's existing vector with the rewrite, and
 `DeletionVector` on a table without DVs refuses a partial-file delete with
-`InvalidOperationException` rather than rewrite. IcebergCompat tables, which
-cannot have DVs, refuse the copy-on-write path with `NotSupportedException`.
+`InvalidOperationException` rather than rewrite. IcebergCompat tables refuse
+the copy-on-write path with `NotSupportedException`. V1 and V2 cannot have DVs,
+so a partial DELETE there is refused; a V3 table needs DVs enabled for one.
 There is still **no way to enable DVs on an EXISTING table** (no
 `ALTER TABLE`-style property update / protocol upgrade). The row-level forms
 are `DeleteRowsAsync(selection, RowDeleteMode)` / `UpdateRowsAsync` and
