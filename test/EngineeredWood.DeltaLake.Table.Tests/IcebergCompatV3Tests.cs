@@ -155,10 +155,11 @@ public class IcebergCompatV3Tests : IDisposable
         Assert.False(Directory.Exists(Path.Combine(_tempDir, "_delta_log")));
     }
 
+    // Leaving the mode out turns on name mode (#757), so only an explicit 'none' is refused.
     [Fact]
-    public async Task V3_WithoutColumnMapping_IsRefused()
+    public async Task V3_WithColumnMappingNone_IsRefused()
     {
-        await RefusedAsync(() => CreateV3Async(mode: ColumnMappingMode.None));
+        await RefusedAsync(() => CreateV3Async(mode: ColumnMappingMode.None, more: (ColumnMapping.ModeKey, "none")));
     }
 
     // Spark: VERSION_MUTUAL_EXCLUSIVE.

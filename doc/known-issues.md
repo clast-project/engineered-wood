@@ -703,6 +703,15 @@ the conversion itself, or accepts the lag until another engine's next commit, se
 Its companions `delta.universalFormat.iceberg.atomicConversion.supported` and `delta.universalformat.config.*` are not
 read; they matter only to a converter. #473
 
+*Column mapping under IcebergCompat* (#757): every version requires `name` or `id` mode. `CreateAsync` /
+`CreateOrReplaceAsync` turn on `name` mode when an IcebergCompat property is set and `delta.columnMapping.mode` is
+left out, as delta-spark does (measured on 4.0.0, 4.3.1 and 4.4.1). An explicit `id` is kept and an explicit `none` is
+refused with `DELTA_ICEBERG_COMPAT_VIOLATION`. Only the property can say `none`: the `columnMappingMode` argument's
+default cannot mean "explicitly off". A commit that turns IcebergCompat on for an existing unmapped table is still
+refused, as Spark refuses an ALTER that does not set the mode itself (`autoEnableOnExistingTable` is false for column
+mapping). A `preAssignedSchema` without ids is refused with `InvalidPreAssignedSchema` when IcebergCompat implies the
+mapping.
+
 *`delta.enableIcebergCompatV3`* (#745) follows delta-spark 4.4, the first release that enforces it. 4.3.1 declares the
 feature and its required `columnMapping` + `rowTracking`, but checks nothing (V3 is missing from its
 `IcebergCompat.knownVersions`; measured on Spark 4.1.2). Each rule is delta-spark's check of the same name, read with
