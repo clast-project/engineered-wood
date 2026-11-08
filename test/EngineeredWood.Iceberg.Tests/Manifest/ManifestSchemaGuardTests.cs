@@ -1,9 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using EngineeredWood.Avro;
 using EngineeredWood.Avro.Container;
-using EngineeredWood.Avro.Schema;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Iceberg.Manifest;
 
@@ -80,13 +78,47 @@ public class ManifestSchemaGuardTests : IDisposable
         }
         """;
 
+    /// <summary>
+    /// Writes an OCF header with no blocks, storing <paramref name="schemaJson"/> verbatim.
+    /// <see cref="OcfWriter"/> is not used because it re-serializes the schema, which drops
+    /// attributes such as field-id and doc, and the field-id test depends on them surviving.
+    /// </summary>
     private string WriteEmptyOcf(string name, string schemaJson)
     {
         var path = Path.Combine(_tempDir, name);
         using var fs = File.Create(path);
-        using var writer = new OcfWriter(fs, AvroCodec.Null);
-        writer.WriteHeader((AvroRecordSchema)AvroSchemaParser.Parse(schemaJson));
+        fs.Write([(byte)'O', (byte)'b', (byte)'j', 1], 0, 4);
+        WriteLong(fs, 1); // metadata map: one block of one entry
+        WriteBytes(fs, System.Text.Encoding.UTF8.GetBytes("avro.schema"));
+        WriteBytes(fs, System.Text.Encoding.UTF8.GetBytes(schemaJson));
+        WriteLong(fs, 0); // end of map
+        fs.Write(new byte[16], 0, 16); // sync marker
         return path;
+    }
+
+    private static void WriteLong(Stream s, long value)
+    {
+        var n = (ulong)((value << 1) ^ (value >> 63));
+        while (n >= 0x80)
+        {
+            s.WriteByte((byte)(n | 0x80));
+            n >>= 7;
+        }
+        s.WriteByte((byte)n);
+    }
+
+    private static void WriteBytes(Stream s, byte[] bytes)
+    {
+        WriteLong(s, bytes.Length);
+        s.Write(bytes, 0, bytes.Length);
+    }
+
+    [Fact]
+    public async Task RawHeaderHelper_RoundTripsEwSchema()
+    {
+        // Guards the helper itself: EW's exact schema text must be accepted.
+        var path = WriteEmptyOcf("own-raw.avro", ManifestAvroSchemas.ManifestEntryV2);
+        Assert.Empty(await ManifestIO.ReadManifestAsync(_fs, path));
     }
 
     [Fact]
