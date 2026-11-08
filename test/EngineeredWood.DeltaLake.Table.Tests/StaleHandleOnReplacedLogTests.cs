@@ -116,6 +116,124 @@ public class StaleHandleOnReplacedLogTests : IDisposable
         Assert.Equal(newIds, await IdsAsync(fresh));
     }
 
+    private string CommitFile(long version) => Path.Combine(_tempDir, "_delta_log", $"{version:D20}.json");
+
+    private string TxnIdIn(long version)
+    {
+        foreach (string line in File.ReadAllLines(CommitFile(version)))
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(line);
+            if (doc.RootElement.TryGetProperty("commitInfo", out var ci))
+                return ci.GetProperty(InCommitTimestamp.TxnIdKey).GetString()!;
+        }
+        throw new InvalidOperationException($"no commitInfo in v{version}");
+    }
+
+    /// <summary>
+    /// #755 follow-up, the case measured: a table re-created with the same data writes a commit at the base's version
+    /// of exactly the old size (478 bytes both times), so without ETags only the time differs. The base commit's
+    /// txnId decides: it names another transaction, and the write is refused before anything lands.
+    /// </summary>
+    [Fact]
+    public async Task Table_recreated_with_the_same_data_is_refused_without_ETags()
+    {
+        await CreateAsync(Local, 1, 2, 3);                                   // v3
+        await using var stale = await DeltaTable.OpenAsync(Local, Options);
+        long oldSize = new FileInfo(CommitFile(3)).Length;
+
+        Drop();
+        await CreateAsync(Local, 1, 2, 3);                                   // the same table again
+        Assert.Equal(oldSize, new FileInfo(CommitFile(3)).Length);
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await stale.WriteAsync([Rows(9)]));
+        Assert.Equal(DeltaErrorCodes.TransactionLogReplaced, ex.ErrorCode);
+        Assert.Contains("names another transaction", ex.Message, StringComparison.Ordinal);
+        Assert.Equal([0L, 1, 2, 3], CommitVersions());
+    }
+
+    /// <summary>
+    /// The same, made deterministic: the base commit's bytes with only its txnId changed, or removed and the line padded
+    /// back to its length (another engine's commit, which records none).
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Same_size_commit_naming_another_transaction_is_refused(bool removeId)
+    {
+        await CreateAsync(Local, 1, 2);
+        await using var stale = await DeltaTable.OpenAsync(Local, Options);
+        string original = TxnIdIn(2);
+        string text = File.ReadAllText(CommitFile(2));
+        string field = $",\"{InCommitTimestamp.TxnIdKey}\":\"{original}\"";
+        Assert.Contains(field, text, StringComparison.Ordinal);
+        // Trailing spaces after the commitInfo object are valid JSON, and keep the line, and so the file, its length.
+        string replaced = removeId
+            ? string.Join("\n", text.Split('\n').Select(line => line.Contains(field)
+                ? line.Replace(field, "") + new string(' ', field.Length)
+                : line))
+            : text.Replace(original, Guid.NewGuid().ToString("D"));
+        File.WriteAllText(CommitFile(2), replaced);
+        Assert.Equal(text.Length, File.ReadAllText(CommitFile(2)).Length);
+        Assert.Equal(removeId, !File.ReadAllText(CommitFile(2)).Contains(InCommitTimestamp.TxnIdKey));
+
+        var ex = await Assert.ThrowsAsync<DeltaFormatException>(
+            async () => await stale.WriteAsync([Rows(9)]));
+        Assert.Equal(DeltaErrorCodes.TransactionLogReplaced, ex.ErrorCode);
+        Assert.Equal([0L, 1, 2], CommitVersions());
+    }
+
+    [Fact]
+    public async Task The_anchor_records_the_base_commits_txnId_after_an_open_and_after_a_commit()
+    {
+        await CreateAsync(Local, 1, 2);
+        await using var table = await DeltaTable.OpenAsync(Local, Options);
+        Assert.Equal(TxnIdIn(2), table.CurrentSnapshot.LogAnchor!.CommitTxnId);
+
+        await table.WriteAsync([Rows(3)]);
+        Assert.Equal(3, table.CurrentSnapshot.Version);
+        Assert.Equal(TxnIdIn(3), table.CurrentSnapshot.LogAnchor!.CommitTxnId);
+    }
+
+    /// <summary>
+    /// A refresh continues from the held snapshot, so its builder starts with that snapshot's id. A commit it applies
+    /// with no commitInfo at all (some engines write none) must not inherit it: the guard would then read that commit,
+    /// find no id, and refuse a write to an unchanged table.
+    /// </summary>
+    [Fact]
+    public async Task A_commit_without_a_commitInfo_does_not_inherit_the_previous_id()
+    {
+        await CreateAsync(Local, 1, 2);
+        await using var table = await DeltaTable.OpenAsync(Local, Options);
+        Assert.NotNull(table.CurrentSnapshot.LogAnchor!.CommitTxnId);
+        await using (var other = await DeltaTable.OpenAsync(Local, Options))
+            await other.WriteAsync([Rows(3)]);
+        File.WriteAllLines(
+            CommitFile(3), File.ReadAllLines(CommitFile(3)).Where(l => !l.Contains("\"commitInfo\"")));
+
+        await table.RefreshAsync();
+        Assert.Equal(3, table.CurrentSnapshot.Version);
+        Assert.Null(table.CurrentSnapshot.LogAnchor!.CommitTxnId);
+
+        File.SetLastWriteTimeUtc(CommitFile(3), File.GetLastWriteTimeUtc(CommitFile(3)).AddDays(-1));
+        Assert.Equal(4, await table.WriteAsync([Rows(4)]));
+    }
+
+    [Fact]
+    public async Task A_base_commit_without_a_txnId_commits_as_before()
+    {
+        // Written by an engine that records none: nothing to compare, so a time-only difference is no proof.
+        await CreateAsync(Local, 1, 2);
+        string original = TxnIdIn(2);
+        File.WriteAllText(
+            CommitFile(2), File.ReadAllText(CommitFile(2)).Replace($",\"{InCommitTimestamp.TxnIdKey}\":\"{original}\"", ""));
+        await using var table = await DeltaTable.OpenAsync(Local, Options);
+        Assert.Null(table.CurrentSnapshot.LogAnchor!.CommitTxnId);
+        File.SetLastWriteTimeUtc(CommitFile(2), File.GetLastWriteTimeUtc(CommitFile(2)).AddDays(-1));
+
+        Assert.Equal(3, await table.WriteAsync([Rows(3)]));
+    }
+
     /// <summary>
     /// Without ETags (a local file system) the shorter log is still refused: it no longer reaches the base. A
     /// re-created commit at the base's version of a different size is refused too.
