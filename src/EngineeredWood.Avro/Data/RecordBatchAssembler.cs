@@ -156,28 +156,12 @@ internal sealed class RecordBatchAssembler
         for (int ri = 0; ri < readerSchema.Fields.Count; ri++)
         {
             var field = arrowSchema.FieldsList[ri];
-            var readerFieldSchema = readerSchema.Fields[ri].Schema;
             var promotion = resolution.Promotions[ri];
+            var writerFieldSchema = WriterFieldSchema(writerSchema, resolution, ri) ?? readerSchema.Fields[ri].Schema;
 
-            if (promotion != null)
-            {
-                builders[ri] = CreatePromotingBuilder(field, readerFieldSchema, promotion, 0);
-            }
-            else
-            {
-                // Find the writer field that maps to this reader field, if any
-                AvroSchemaNode avroSchemaForBuilder = readerFieldSchema;
-                for (int wi = 0; wi < writerSchema.Fields.Count; wi++)
-                {
-                    if (!resolution.WriterActions[wi].Skip &&
-                        resolution.WriterActions[wi].ReaderFieldIndex == ri)
-                    {
-                        avroSchemaForBuilder = writerSchema.Fields[wi].Schema;
-                        break;
-                    }
-                }
-                builders[ri] = CreateBuilder(field, avroSchemaForBuilder, 0);
-            }
+            builders[ri] = promotion != null
+                ? CreatePromotingBuilder(field, writerFieldSchema, promotion, 0)
+                : CreateBuilder(field, writerFieldSchema, 0);
         }
 
         return builders;
@@ -186,17 +170,24 @@ internal sealed class RecordBatchAssembler
     /// <summary>
     /// Creates a builder that reads using writer encoding but stores in reader type.
     /// </summary>
+    /// <remarks>
+    /// The nullable wrapper follows <paramref name="writerSchema"/>, as <see cref="CreateBuilder"/>
+    /// does: whether a union index is on the wire, and which index means null, are the writer's to say.
+    /// Taking them from the reader's union silently misread every value when the two put null in
+    /// different places (writer <c>["int","null"]</c> under reader <c>["null","long"]</c> read 5, null,
+    /// 7 as null, 1, null), read a union index as the value under a plain reader, and read a plain
+    /// writer's value as a union index.
+    /// </remarks>
     private static IColumnBuilder CreatePromotingBuilder(
-        Field field, AvroSchemaNode readerSchema, TypePromotion promotion, int depth)
+        Field field, AvroSchemaNode writerSchema, TypePromotion promotion, int depth)
     {
         if (depth >= MaxSchemaDepth)
             throw new NotSupportedException(
                 "Avro schema exceeds maximum nesting depth. Recursive schemas cannot be represented in Arrow.");
 
-        // Handle nullable wrapper
-        bool isNullable = readerSchema is AvroUnionSchema union && union.IsNullable(out _, out _);
+        bool isNullable = writerSchema is AvroUnionSchema union && union.IsNullable(out _, out _);
         int nullIndex = 0;
-        if (readerSchema is AvroUnionSchema u && u.IsNullable(out _, out int ni))
+        if (writerSchema is AvroUnionSchema u && u.IsNullable(out _, out int ni))
             nullIndex = ni;
 
         // A writer string promoted to the reader's bytes has no scale either.
@@ -263,7 +254,7 @@ internal sealed class RecordBatchAssembler
         var promotion = SchemaResolver.DetectPromotion(
             SchemaResolver.UnwrapNullable(writer), SchemaResolver.UnwrapNullable(reader), depth);
         return promotion != null
-            ? CreatePromotingBuilder(field, reader, promotion, depth)
+            ? CreatePromotingBuilder(field, writer, promotion, depth)
             : CreateBuilder(field, writer, depth);
     }
 
@@ -289,25 +280,10 @@ internal sealed class RecordBatchAssembler
             var childField = new Field(readerRecord.Fields[ri].Name, arrowType, nullable);
             var nestedPromotion = nestedResolution.Promotions[ri];
 
-            if (nestedPromotion != null)
-            {
-                readerBuilders[ri] = CreatePromotingBuilder(childField, readerFieldSchema, nestedPromotion, depth);
-            }
-            else
-            {
-                // Find the writer field that maps to this reader field, if any
-                AvroSchemaNode avroSchemaForBuilder = readerFieldSchema;
-                for (int wi = 0; wi < writerRecord.Fields.Count; wi++)
-                {
-                    if (!nestedResolution.WriterActions[wi].Skip &&
-                        nestedResolution.WriterActions[wi].ReaderFieldIndex == ri)
-                    {
-                        avroSchemaForBuilder = writerRecord.Fields[wi].Schema;
-                        break;
-                    }
-                }
-                readerBuilders[ri] = CreateBuilder(childField, avroSchemaForBuilder, depth);
-            }
+            var writerFieldSchema = WriterFieldSchema(writerRecord, nestedResolution, ri) ?? readerFieldSchema;
+            readerBuilders[ri] = nestedPromotion != null
+                ? CreatePromotingBuilder(childField, writerFieldSchema, nestedPromotion, depth)
+                : CreateBuilder(childField, writerFieldSchema, depth);
         }
 
         return new ResolvingStructBuilder(
@@ -433,6 +409,17 @@ internal sealed class RecordBatchAssembler
     private static InvalidOperationException UndeclaredWriterDecimal(AvroSchemaNode writer, Decimal128Type reader) =>
         new($"Writer {writer.Type} with no decimal annotation cannot be read as reader decimal({reader.Precision},{reader.Scale}): "
             + "the writer declares no scale to match the reader's.");
+
+    /// <summary>The schema of the writer field read into reader field <paramref name="readerIndex"/>, if any.</summary>
+    private static AvroSchemaNode? WriterFieldSchema(AvroRecordSchema writer, SchemaResolution resolution, int readerIndex)
+    {
+        for (int wi = 0; wi < writer.Fields.Count; wi++)
+        {
+            if (!resolution.WriterActions[wi].Skip && resolution.WriterActions[wi].ReaderFieldIndex == readerIndex)
+                return writer.Fields[wi].Schema;
+        }
+        return null;
+    }
 
     private static Field ToField(string name, (IArrowType Type, bool Nullable) converted) =>
         new(name, converted.Type, converted.Nullable);
