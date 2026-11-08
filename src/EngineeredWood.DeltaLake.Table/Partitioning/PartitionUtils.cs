@@ -316,6 +316,31 @@ internal static class PartitionUtils
     }
 
     /// <summary>
+    /// The partition values of a file's <c>add.partitionValues</c>, keyed by LOGICAL column name as
+    /// <see cref="AppendPartitionColumns"/> takes them, resolved as the read path resolves them
+    /// (<see cref="AddPartitionColumns"/>). The map's spelling, physical or logical, is decided once from every
+    /// partition column (<see cref="PartitionValueKeys"/>), never key by key: when logical and physical names
+    /// overlap, a per-key fallback reads another column's value. A missing or null value is left out, which
+    /// <see cref="AppendPartitionColumns"/> writes as a null column.
+    /// </summary>
+    internal static Dictionary<string, string> LogicalPartitionValues(
+        IReadOnlyDictionary<string, string> partitionValues,
+        IReadOnlyList<string> partitionColumns,
+        IReadOnlyDictionary<string, string> logicalToPhysical)
+    {
+        var values = new Dictionary<string, string>(partitionColumns.Count, StringComparer.Ordinal);
+        foreach (string column in partitionColumns)
+        {
+            if (PartitionValueKeys.TryGet(partitionValues, column, partitionColumns, logicalToPhysical, out var value)
+                && value is not null)
+            {
+                values[column] = value;
+            }
+        }
+        return values;
+    }
+
+    /// <summary>
     /// Appends partition columns as constant-value arrays to the end of a data batch.
     /// Required by IcebergCompatV1/V2: partition values must be materialized
     /// into the Parquet data files, positioned after the data columns.

@@ -10970,20 +10970,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (partitionColumns.Count > 0 && Schema.IcebergCompat.RequiresPartitionMaterialization(
                 Schema.IcebergCompat.GetVersion(snapshot.Metadata.Configuration)))
         {
-            // add.partitionValues is keyed by the physical name under column mapping, AppendPartitionColumns by the
-            // logical one. A null value is left out, which AppendPartitionColumns writes as a null column.
+            // The values the new add carries, read as a reader reads them: the file then holds the values a read of
+            // the table gives (a source written by an older engineered-wood may be keyed by logical name).
             logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
-            var stored = targetPartition ?? source.PartitionValues;
-            materialized = new Dictionary<string, string>(StringComparer.Ordinal);
-            foreach (string column in partitionColumns)
-            {
-                string key = logicalToPhysical.TryGetValue(column, out string? physical) ? physical : column;
-                if ((stored.TryGetValue(key, out string? value) || stored.TryGetValue(column, out value))
-                    && value is not null)
-                {
-                    materialized[column] = value;
-                }
-            }
+            materialized = Partitioning.PartitionUtils.LogicalPartitionValues(
+                targetPartition ?? source.PartitionValues, partitionColumns, logicalToPhysical);
         }
         var lineageIds = Schema.IcebergCompat.RowTrackingFieldIds(snapshot.Metadata.Configuration);
 

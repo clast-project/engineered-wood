@@ -336,20 +336,10 @@ internal static class CompactionExecutor
             return null;
         }
 
-        // add.partitionValues is keyed by the physical name under column mapping (the spec, and Spark).
+        // Resolved as a reader resolves them (#774): the map's spelling is decided once, not key by key.
         var logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
-        var values = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (string column in partitionColumns)
-        {
-            string key = logicalToPhysical.TryGetValue(column, out string? physical) ? physical : column;
-            if ((source.PartitionValues.TryGetValue(key, out string? value)
-                    || source.PartitionValues.TryGetValue(column, out value))
-                && value is not null)
-            {
-                values[column] = value;
-            }
-        }
-        return (values, logicalToPhysical);
+        return (Partitioning.PartitionUtils.LogicalPartitionValues(
+            source.PartitionValues, partitionColumns, logicalToPhysical), logicalToPhysical);
     }
 
     private static async ValueTask<(bool Compacted, long NextRowId)> CompactGroupAsync(
