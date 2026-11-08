@@ -646,8 +646,8 @@ table requiring one it does not implement is rejected rather than mis-read.
   schema validation, stats enforcement so an external converter can
   produce valid Iceberg metadata. V3 also requires row tracking (turned on at
   create when not given) and stamps Iceberg's row-lineage field ids on the
-  materialized row-tracking columns that compaction writes (UPDATE does not
-  yet: #756)
+  materialized row-tracking columns that compaction and the row-rewriting
+  DML (DELETE, UPDATE, MERGE) write
 
 ### Supported reader features
 

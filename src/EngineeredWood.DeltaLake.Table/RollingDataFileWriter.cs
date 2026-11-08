@@ -211,24 +211,36 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         if (!ReferenceEquals(batch.Schema, _idsFrom))
         {
             _idsFrom = batch.Schema;
-            _idsTo = batch.Schema.FieldsList.Any(NeedsFieldId) ? WithFieldIds(batch.Schema) : null;
+            _idsTo = WithFieldIds(batch.Schema, _columnFieldIds!);
         }
-        return _idsTo is null
-            ? batch
-            : new RecordBatch(_idsTo, Enumerable.Range(0, batch.ColumnCount).Select(batch.Column), batch.Length);
+        return _idsTo is null ? batch : Rebuilt(batch, _idsTo);
     }
 
-    private bool NeedsFieldId(Field field) =>
-        _columnFieldIds!.ContainsKey(field.Name) && Schema.ColumnMapping.GetParquetFieldId(field) is null;
+    /// <summary>
+    /// <paramref name="batch"/> with each top-level column named in <paramref name="columnFieldIds"/> given that
+    /// Parquet field id, unless it already carries one. A batch with no such column comes back as it is.
+    /// </summary>
+    internal static RecordBatch WithColumnFieldIds(RecordBatch batch, IReadOnlyDictionary<string, int> columnFieldIds) =>
+        WithFieldIds(batch.Schema, columnFieldIds) is { } schema ? Rebuilt(batch, schema) : batch;
 
-    private Apache.Arrow.Schema WithFieldIds(Apache.Arrow.Schema schema)
+    private static RecordBatch Rebuilt(RecordBatch batch, Apache.Arrow.Schema schema) =>
+        new(schema, Enumerable.Range(0, batch.ColumnCount).Select(batch.Column), batch.Length);
+
+    private static bool NeedsFieldId(Field field, IReadOnlyDictionary<string, int> columnFieldIds) =>
+        columnFieldIds.ContainsKey(field.Name) && Schema.ColumnMapping.GetParquetFieldId(field) is null;
+
+    // Null when no column needs an id.
+    private static Apache.Arrow.Schema? WithFieldIds(
+        Apache.Arrow.Schema schema, IReadOnlyDictionary<string, int> columnFieldIds)
     {
+        if (!schema.FieldsList.Any(field => NeedsFieldId(field, columnFieldIds)))
+            return null;
         var builder = new Apache.Arrow.Schema.Builder();
         if (schema.Metadata is { } schemaMetadata)
             builder.Metadata(schemaMetadata);
         foreach (var field in schema.FieldsList)
         {
-            if (!NeedsFieldId(field))
+            if (!NeedsFieldId(field, columnFieldIds))
             {
                 builder.Field(field);
                 continue;
@@ -237,7 +249,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
                 ? new Dictionary<string, string>()
                 : field.Metadata.ToDictionary(pair => pair.Key, pair => pair.Value);
             metadata[Schema.ColumnMapping.ParquetFieldIdKey] =
-                _columnFieldIds![field.Name].ToString(System.Globalization.CultureInfo.InvariantCulture);
+                columnFieldIds[field.Name].ToString(System.Globalization.CultureInfo.InvariantCulture);
             builder.Field(new Field(field.Name, field.DataType, field.IsNullable, metadata));
         }
         return builder.Build();

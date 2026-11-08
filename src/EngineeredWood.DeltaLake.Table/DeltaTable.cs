@@ -5317,11 +5317,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             if (!wholeFile && copyOnWrite)
             {
-                // Refused here, at the first file that needs a rewrite the table cannot take, rather than after the
-                // scan has read every file and written their change files. (The transaction takes back whatever
-                // the scan already wrote.)
-                RejectCopyOnWriteRowIdUnsupported("copy-on-write DELETE");
-
                 // Rewritten after the scan, which writes its remove and add. Its change file is written below, from
                 // the deleted rows this scan already captured, so the rewrite is told not to capture them again.
                 (copyOnWriteTargets ??= new Dictionary<string, IReadOnlyCollection<long>>(StringComparer.Ordinal))
@@ -10680,8 +10675,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="RowDeleteMode.CopyOnWrite"/>: each affected file is rewritten without the selected rows and
     /// committed as plain <c>remove</c>/<c>add</c> — NO deletion vectors, NO row-tracking feature needed, so
     /// the result is maximally reader-compatible (Fabric OneLake, Spark, delta-kernel). Row tracking, when
-    /// enabled, is preserved (survivors keep their materialized id + commit version). IcebergCompat is not yet
-    /// supported on this path.
+    /// enabled, is preserved (survivors keep their materialized id + commit version). On an IcebergCompat table the
+    /// rewritten files carry the materialized partition columns (and on V3 the row-lineage field ids), as appends do.
     /// </summary>
     private async ValueTask<(long RowsDeleted, long Version)> DeleteRowsCopyOnWriteAsync(
         RowSelection selection,
@@ -10746,8 +10741,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         WrittenFileLedger? written = null,
         bool writeChangeData = true)
     {
-        RejectCopyOnWriteRowIdUnsupported("copy-on-write DELETE");
-
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         bool assignRowIds = DeltaLake.RowTracking.RowTrackingConfig.IsSupported(snapshot.Protocol);
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(snapshot.Metadata.Configuration);
@@ -10887,16 +10880,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             + "rebuild the selection, or stage the delete on a DeltaTransaction, whose commit loop reconciles "
             + "a concurrently-rewritten file for you.");
 
-    // The corner the copy-on-write rewrite does not yet cover: IcebergCompat needs the committing writer. It is
-    // reached by a row-level delete or update, and by a predicate DELETE that rewrites (a V1 or V2 table cannot have
-    // deletion vectors, so every partial delete there rewrites; a V3 table can, and rewrites only without them).
-    // (Change Data Feed IS captured — each rewritten file emits its own change files.)
-    private void RejectCopyOnWriteRowIdUnsupported(string op)
-    {
-        if (IsIcebergCompat)
-            throw new NotSupportedException($"A {op} is not supported on IcebergCompat tables.");
-    }
-
     // Physical-writes the rewritten output batches for one file and returns the remove(old)+add(new) pair (Add is
     // null when every row was deleted → whole-file remove). Shared by the copy-on-write UPDATE, DeleteRowsAsync and
     // UpdateRowsAsync. With targetPartition (tracked, so physical-keyed under column mapping) the add goes to that
@@ -10977,6 +10960,33 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var relabeled = TableNullability.ApplyToOneFile(
             physicalBatches, PhysicalArrowFields(snapshot.Schema, mappingMode));
 
+        // IcebergCompat stores the partition values in the data file too, as the append path writes them: the values
+        // of the partition the new file joins, which for rows an UPDATE moved is their new one. They go into the
+        // written file alone; the statistics describe the data columns. On V3 the materialized row-tracking columns
+        // carry Iceberg's row-lineage field ids, as the rolling writer stamps them on compaction output (#756).
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        Dictionary<string, string>? materialized = null;
+        IReadOnlyDictionary<string, string>? logicalToPhysical = null;
+        if (partitionColumns.Count > 0 && Schema.IcebergCompat.RequiresPartitionMaterialization(
+                Schema.IcebergCompat.GetVersion(snapshot.Metadata.Configuration)))
+        {
+            // add.partitionValues is keyed by the physical name under column mapping, AppendPartitionColumns by the
+            // logical one. A null value is left out, which AppendPartitionColumns writes as a null column.
+            logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+            var stored = targetPartition ?? source.PartitionValues;
+            materialized = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (string column in partitionColumns)
+            {
+                string key = logicalToPhysical.TryGetValue(column, out string? physical) ? physical : column;
+                if ((stored.TryGetValue(key, out string? value) || stored.TryGetValue(column, out value))
+                    && value is not null)
+                {
+                    materialized[column] = value;
+                }
+            }
+        }
+        var lineageIds = Schema.IcebergCompat.RowTrackingFieldIds(snapshot.Metadata.Configuration);
+
         var writeBatches = new List<RecordBatch>(dataBatches.Count);
         var statsBatches = new List<RecordBatch>(dataBatches.Count);
         for (int k = 0; k < relabeled.Count; k++)
@@ -10985,12 +10995,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             SchemaConverter.ThrowIfUnwritableType(physicalBatch.Schema, convertibleTypesAllowed: HostOwnsBytes);
             // Statistics are keyed by PHYSICAL name, as the append path keys them (see the UPDATE rewrite).
             statsBatches.Add(physicalBatch);
+            if (materialized is not null)
+            {
+                physicalBatch = Partitioning.PartitionUtils.AppendPartitionColumns(
+                    physicalBatch, materialized, snapshot.Schema, partitionColumns, logicalToPhysical!);
+            }
             if (!_options.EmitVariantLogicalType)
                 physicalBatch = VariantColumnCoercion.StripAnnotation(physicalBatch);
             if (materializeIds && outTracking is not null && outTracking[k] is { } trk)
             {
                 physicalBatch = RowTracking.RowTrackingWriter.AddRowIdAndCommitVersionColumns(
                     physicalBatch, trk.Ids, trk.Vers, matRowIdName!, matRowVerName!, nullable: true);
+                if (lineageIds is not null)
+                    physicalBatch = RollingDataFileWriter.WithColumnFieldIds(physicalBatch, lineageIds);
             }
             writeBatches.Add(physicalBatch);
         }
@@ -11205,8 +11222,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// identical row counts) — then re-written as plain <c>remove</c>+<c>add</c>. Row tracking is preserved (an
     /// UPDATED row's commit version advances to this commit; untouched rows keep theirs). With
     /// <c>delta.enableChangeDataFeed</c> each touched row's before/after values are written as
-    /// <c>update_preimage</c>/<c>update_postimage</c> change files. IcebergCompat is not yet supported on this
-    /// path. Returns the committed version (or the current version if nothing matched).
+    /// <c>update_preimage</c>/<c>update_postimage</c> change files. On an IcebergCompat table the rewritten files are written as appends
+    /// are (#756). Returns the committed version (or the current version if nothing matched).
     /// <para>The selected rows are the post-image, checked as <see cref="UpdateAsync(Func{RecordBatch, BooleanArray}, Func{RecordBatch, RecordBatch}, CancellationToken, CommitProperties?, RowDeleteMode?)"/>
     /// checks its own: generated columns are recomputed from the new values (whatever <paramref name="rewriteFile"/>
     /// put in them), then CHECK constraints, invariants and NOT NULL are evaluated. The other rows are copied
@@ -11400,7 +11417,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // A rewrite: without the materialized columns every row of the file would get a fresh stable id. Refused
         // as ValidateWritable refuses it for UpdateAsync.
         RejectRowTrackingWrite(snapshot);
-        RejectCopyOnWriteRowIdUnsupported("copy-on-write UPDATE");
         var constraints = DeltaConstraintEnforcer.Create(snapshot);
         var generatedColumns = DeltaGeneratedColumns.Create(snapshot);
         bool checksPostImage = constraints is not null || generatedColumns is not null;
