@@ -155,7 +155,7 @@ public class ManifestSchemaGuardTests : IDisposable
     }
 
     [Fact]
-    public async Task OwnLayout_DifferingOnlyInFieldIds_IsAccepted()
+    public async Task OwnLayout_DifferingOnlyInFieldIdAndDoc_IsAccepted()
     {
         // Attributes outside the binary layout (field-id, doc) don't matter to the decoder.
         var renumbered = ManifestAvroSchemas.ManifestEntryV2
