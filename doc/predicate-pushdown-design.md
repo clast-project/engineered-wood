@@ -1513,7 +1513,9 @@ filters, as parquet-mr does. Three things the plan above did not know:
   data-page types are treated as one. A page type the reader does not know declines
   the chunk.
 
-## Future: Page-Level Pushdown via Column/Offset Index
+## Page-Level Pushdown via Column/Offset Index
+
+> **Implemented** — see [`parquet-page-index.md`](parquet-page-index.md). This section is the original sketch.
 
 | Index | Content | Enables |
 |---|---|---|

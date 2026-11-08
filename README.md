@@ -1,1057 +1,274 @@
 # EngineeredWood
 
-A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, **Apache Avro**, **Lance**, and **Vortex** — and table formats — **Lance dataset**, **Delta Lake**, and **Apache Iceberg** — as Apache Arrow `RecordBatch` objects.
+A pure-managed .NET library for columnar file formats (**Apache Parquet**, **Apache ORC**, **Apache Avro**, **Lance**, **Vortex**) and table formats (**Delta Lake**, **Apache Iceberg**, **Lance datasets**), all read and written as Apache Arrow `RecordBatch`es.
 
-> **Status — preliminary (0.3.0).** EngineeredWood is pre-1.0 and under active
-> development. The published NuGet packages are versioned `0.3.0`, and
-> **every public API is subject to change — without notice and without a
-> deprecation cycle — until 1.0.0.** If you depend on a package, pin an exact
-> version. Feedback on the API surface is welcome while it's still malleable.
+> **Status: preliminary (0.4.0).** EngineeredWood is pre-1.0. **Every public API may change without notice
+> or a deprecation cycle until 1.0.0**, so pin an exact version. Feedback on the API is welcome.
 >
-> **Breaking in 0.3.0:** `ITableFileSystem.RenameAsync` is gone, replaced by
-> `TryWriteAllBytesAsync` (create-only). A custom `ITableFileSystem` must
-> implement it — see the interface docs for why its atomicity is load-bearing.
->
-> 0.2.0 was the first strongly-named release. The unsigned 0.1.0 packages remain on
-> nuget.org, but assembly identity changed, so upgrading from 0.1.0 requires a
-> rebuild rather than a drop-in binary swap.
+> **The main breaking change in 0.4.0:** format writers publish a file only when it is closed (`CloseAsync` / `FinishAsync`),
+> and a streamed write publishes only on `ISequentialFile.CompleteAsync`. Disposing a writer without closing it
+> abandons the file. A custom `ISequentialFile` must implement `CompleteAsync`, and a custom
+> `ITableFileSystem` must implement `PathConstraints`. The package release notes list the rest.
+
+## Maturity
+
+The packages are not equally mature. Parquet, Delta Lake and the packages they depend on get most of the
+attention and testing. The others work, but are tested less and have known gaps.
+
+| Maturity | Packages | What that means |
+|---|---|---|
+| **Most mature** | `Core`, `Expressions`, `Expressions.Arrow`, `Parquet`, `DeltaLake`, `DeltaLake.Table`, `Azure`, `Gcs`, `Aws` | Tested against other implementations in CI: pyarrow, arrow-rs and DuckDB for Parquet; PySpark and delta-rs for Delta; cloud emulators for the storage backends. Bugs found there get fixed first. |
+| **Functional** | `Orc`, `Avro` | Read and write their formats and are cross-validated against pyarrow (ORC) and fastavro (Avro), with less coverage and some known gaps. |
+| **Experimental** | `Lance`, `Lance.Table`, `Vortex`, `Iceberg` | Useful for reading and experimenting. Expect gaps and format-version churn. **Iceberg is not a conformant writer.** |
+
+All package names begin with `EngineeredWood.`. [doc/known-issues.md](https://github.com/clast-project/engineered-wood/blob/main/doc/known-issues.md) lists known gaps per package.
 
 ## Highlights
 
-- **Five formats, one Arrow surface.** Parquet, ORC, Avro, Lance, and Vortex readers and writers all speak `Apache.Arrow.RecordBatch`; Delta Lake, Lance dataset, and Iceberg sit on top of them.
-- **Predicate pushdown across formats.** A shared expression library (`EngineeredWood.Expressions`) drives row-group pruning in Parquet, file pruning in Delta Lake, scan planning in Iceberg, predicate-based delete/update on Lance datasets, and zone-stats pruning on Vortex — one predicate type works against any of them.
-- **Table-format support.** Delta Lake Reader v3 / Writer v7 with deletion vectors, column mapping, type widening, change data feed, identity columns, row tracking, and V2 checkpoints. Lance datasets with Create / Append / Overwrite / Delete / Update / Compact / Vacuum and version + timestamp time travel. Iceberg v1/v2/v3 table metadata with statistics-based scan planning — experimental, and not yet a conformant Iceberg writer.
-- **Cloud-native I/O.** An offset-based I/O layer (instead of `Stream`) lets readers issue concurrent, coalesced range requests against local files, Azure Blob Storage, Google Cloud Storage, or Amazon S3. Table formats run on the same backends through a shared `ITableFileSystem` abstraction with conflict-free commit support.
-- **Pure-managed compression.** Snappy, Zstd, and LZ4 via managed codecs; no native dependencies.
-- **Multi-targeted.** Libraries build for `netstandard2.0`, `net8.0`, and `net10.0`.
-- **Strongly named.** Every assembly is signed with the shared clast-project key, public key token `0b0eddb1936076d9`, so the libraries can be referenced from strongly-named projects.
+- **One Arrow surface.** Every format reads and writes `Apache.Arrow.RecordBatch`; the table formats sit on top of the file formats.
+- **Delta Lake with DML.** Reader v3 / Writer v7: DELETE, UPDATE, MERGE, RESTORE, replaceWhere, schema evolution, deletion vectors, column mapping, type widening, change data feed, row tracking, CHECK constraints and generated columns, V2 checkpoints, and optimistic concurrency.
+- **Predicate pushdown.** One shared predicate type drives Parquet row-group, page and dictionary pruning, Delta file pruning, Iceberg scan planning, and Vortex zone pruning. A Spark SQL expression parser (`SparkSqlParser`) produces those predicates from text.
+- **Cloud-native I/O.** An offset-based I/O layer (not `Stream`) issues concurrent, coalesced range reads against local files, Azure Blob Storage, Google Cloud Storage and Amazon S3. Commits are a single conditional create on every backend.
+- **No native dependencies.** Snappy, Zstd and LZ4 use pure-managed codecs.
+- **Multi-targeted and strongly named.** `netstandard2.0`, `net8.0` and `net10.0`; signed with the clast-project key (public key token `0b0eddb1936076d9`).
 
 ## Why
 
-There are two motivations for this project, and they're equally important:
+Two goals, equally important:
 
-**1. Better columnar file format libraries for .NET.** Existing .NET Parquet and ORC libraries were not designed around the access patterns that matter for cloud-native analytics — batched range reads, concurrent column chunk fetches, and zero-copy buffer management. EngineeredWood is built from the ground up with these patterns in mind, drawing inspiration from [arrow-rs](https://github.com/apache/arrow-rs).
+1. **Better columnar libraries for .NET**, designed around what cloud analytics needs: batched range reads, concurrent column-chunk fetches, and careful buffer management. The design draws on [arrow-rs](https://github.com/apache/arrow-rs).
+2. **An experiment in agentic coding.** The library is built by a human working with an AI coding agent (Claude Code), to see how far that goes on a nontrivial systems library.
 
-**2. An experiment in agentic coding.** This project is being built collaboratively with an AI coding agent (Claude Code). Every file, test, and design decision has been produced through human-AI pair programming. It's a real-world test of how far agentic coding can go on a nontrivial systems library — not a toy demo, but a genuine attempt to build something useful while exploring a new way of writing software.
+## Packages
 
-## Project structure
+| Package | Contents | Depends on |
+|---|---|---|
+| `EngineeredWood.Core` | Offset-based I/O, local file system, compression, memory budget, Arrow helpers | — |
+| `EngineeredWood.Expressions` | Expression/predicate trees, statistics evaluator, Spark SQL parser | — |
+| `EngineeredWood.Expressions.Arrow` | Row-level evaluation against a `RecordBatch` | Core, Expressions |
+| `EngineeredWood.Parquet` | Parquet reader and writer | Core, Expressions |
+| `EngineeredWood.DeltaLake` | Delta transaction log: actions, snapshots, checkpoints, commits | Core, Parquet, Expressions |
+| `EngineeredWood.DeltaLake.Table` | Delta table API: Arrow read/write, DML, maintenance | DeltaLake, Parquet, Expressions.Arrow |
+| `EngineeredWood.Azure` / `.Gcs` / `.Aws` | Azure Blob, GCS and S3 backends | Core |
+| `EngineeredWood.Orc` | ORC reader and writer | Core |
+| `EngineeredWood.Avro` | Avro OCF and streaming (SOE, Confluent, Apicurio) reader and writer | Core |
+| `EngineeredWood.Lance` | Lance file reader and writer (v2.0–v2.2) | Core |
+| `EngineeredWood.Lance.Table` | Lance datasets: manifests, fragments, time travel, delete/update | Lance, Expressions.Arrow |
+| `EngineeredWood.Vortex` | Vortex reader, writer and zone pruning | Core, Expressions |
+| `EngineeredWood.Iceberg` | Iceberg metadata (v1–v3), manifests, scan planning (metadata only) | Core, Avro, Expressions |
 
-```
-src/
-  EngineeredWood.Core/                   Shared abstractions: I/O, compression, Arrow helpers
-  EngineeredWood.Expressions/            Format-agnostic expression trees + statistics evaluator
-  EngineeredWood.Expressions.Arrow/      Row-level expression evaluation against RecordBatch
-  EngineeredWood.Parquet/                Parquet reader and writer
-  EngineeredWood.Orc/                    ORC reader and writer
-  EngineeredWood.Avro/                   Avro reader and writer
-  EngineeredWood.Lance/                  Lance file reader and writer (v2.0 + v2.1 + v2.2)
-  EngineeredWood.Lance.Table/            Lance dataset / table API (manifests, fragments, time travel)
-  EngineeredWood.Vortex/                 Vortex file reader and writer
-  EngineeredWood.DeltaLake/              Delta Lake transaction log (low-level)
-  EngineeredWood.DeltaLake.Table/        Delta Lake table API (high-level Arrow I/O)
-  EngineeredWood.Iceberg/                Apache Iceberg metadata + scan planning
-  EngineeredWood.Azure/                  Azure Blob Storage I/O backends
-  EngineeredWood.Gcs/                    Google Cloud Storage I/O backends
-  EngineeredWood.Aws/                    Amazon S3 I/O backends
-test/                                    xUnit tests, BenchmarkDotNet suites, and a 92-file
-                                         cross-tool Parquet compatibility harness
-```
+## Parquet
 
-## Features — Parquet
+**Reading:** parallel column I/O; projection by name, including dotted nested paths; streaming via
+`IAsyncEnumerable<RecordBatch>`; all physical types and nested Struct/List/Map at any depth; Decimal32–256;
+INT96 as a timestamp; VARIANT, shredded or not. String columns can come back with 32-bit offsets, as view
+types, or with 64-bit offsets.
 
-### Reading
+**Pruning** (`ParquetReadOptions.Filter`): row groups by statistics; pages by the page index
+(`FilterUsePageIndex`, on by default); row groups by dictionary pages (`FilterUseDictionaries`, on by
+default); Bloom filters for `=` / `IN` (`FilterUseBloomFilters`, off by default because it costs extra I/O).
+Pruning also works on VARIANT paths. The reader does not filter rows: it skips data that cannot match.
 
-- Full footer and metadata parsing (custom Thrift Compact Protocol codec)
-- Parallel column I/O with configurable concurrency strategies
-- Column projection by name (including dotted paths for nested columns)
-- Streaming via `IAsyncEnumerable<RecordBatch>` (`ReadAllAsync`)
-- **Predicate pushdown**: row group pruning via column statistics, with optional Bloom filter probing for equality and `IN` predicates
-- Three BYTE_ARRAY output modes: standard (32-bit offsets), view types (inline short strings), large offsets (64-bit, removes 2 GB limit)
-
-### Writing
-
-- Arrow `RecordBatch` → Parquet with parallel column encoding
-- V2 data pages by default with type-aware encodings
-- Analyze-before-write dictionary encoding (20% cardinality threshold), switchable
-  per column for producers that already know a column's cardinality
-- Run-end encoded input columns, dictionary-encoded from their runs (a constant
-  column costs O(runs), not O(rows), to hold and to write; the file is identical)
-- Auto-splitting of large batches into multiple row groups
-- Per-column compression and encoding overrides
-- Column statistics (min/max/null_count) with binary truncation
-
-### Types
-
-- **Flat columns**: all physical types (Boolean, Int32, Int64, Int96, Float, Double, ByteArray, FixedLenByteArray)
-- **Nested columns**: Struct (optional/required), List (3-level standard, 2-level legacy, bare repeated), Map
-- **Deeply nested**: list-of-list, map-of-map, list-of-map, etc.
-- **Decimal**: INT32→Decimal32, INT64→Decimal64, FLBA→Decimal128/256 with big-endian↔little-endian conversion.
-  On write, a Decimal128/256 column's layout follows its precision, as Spark's does: INT32 up to 9 digits,
-  INT64 up to 18, otherwise the narrowest FLBA that holds the precision
-- **Temporal**: Timestamp (millis/micros/nanos), Date, Time
-- **INT96**: decoded to a naive `timestamp[us]` by default; `ParquetReadOptions.Int96Output`
-  selects `timestamp[ns]` or the raw `fixed_size_binary[12]` instead
-
-### Encodings
+**Writing:** parallel column encoding; V2 data pages; dictionary encoding chosen per column after
+inspecting the data; statistics, page indexes and the Arrow schema written by default; optional Bloom filters
+(`BloomFilterColumns`); per-column compression and encoding overrides. Large batches are split into row
+groups automatically (`RowGroupMaxRows`, default 1,000,000). `BufferedParquetWriter` accepts batches of any
+size.
 
 | Encoding | Read | Write |
 |---|---|---|
-| PLAIN | yes | yes |
-| RLE_DICTIONARY / PLAIN_DICTIONARY | yes | yes |
-| DELTA_BINARY_PACKED | yes | yes |
-| DELTA_LENGTH_BYTE_ARRAY | yes | yes |
-| DELTA_BYTE_ARRAY | yes | yes |
+| PLAIN, RLE_DICTIONARY / PLAIN_DICTIONARY, RLE | yes | yes |
+| DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY | yes | yes |
 | BYTE_STREAM_SPLIT | yes | opt-in |
-| RLE (levels) | yes | yes |
-| BIT_PACKED (deprecated, levels) | yes | — |
-| ALP (preview) | yes | opt-in |
-| PFOR (experimental) | yes | opt-in |
-| FSST (experimental) | yes | opt-in |
+| BIT_PACKED (deprecated) | yes | — |
+| ALP (spec "Preview") | yes | opt-in |
+| PFOR, FSST (unratified proposals) | yes | opt-in, experimental |
 
-BYTE_STREAM_SPLIT is ratified and widely readable, but it is **opt-in on write** because
-Spark's vectorized Parquet reader — on by default — cannot decode it in either data page version
-(SPARK-37975, open). Turn it on per file with
-`ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.ByteStreamSplit` when the
-consumers are known; it compresses smooth float series far better than PLAIN.
+- **BYTE_STREAM_SPLIT** is opt-in because Spark's vectorized reader cannot decode it (SPARK-37975).
+- **ALP** is in parquet-format 2.14.0, but few readers decode it yet (arrow-rs ≥ 60.0.0), and the spec
+  asks writers to make it opt-in.
+- Turn either on with `ParquetWriteOptions.FloatingPointEncoding`.
 
-ALP is in the spec as of parquet-format 2.14.0, as a **Preview** encoding: the wire format is
-final, but few readers decode it yet (arrow-rs from 60.0.0; not yet arrow C++, parquet-java or
-DuckDB), and the spec asks writers to make it opt-in. So it is off by default; turn it on with
-`ParquetWriteOptions.FloatingPointEncoding = FloatingPointEncoding.Alp` when the consumers are
-known to read it.
+### Experimental features
 
-PFOR and FSST are **unratified parquet-format proposals**, gated behind
-`[Experimental]` diagnostics (`EWPARQUET0005` for PFOR, `EWPARQUET0003` for FSST) and off by
-default. Opt in per column or per file with
-`ParquetWriteOptions.IntegerEncoding = IntegerEncoding.Pfor` and
-`ParquetWriteOptions.ByteArrayEncoding = ByteArrayEncoding.Fsst`.
+Features whose wire format may still change are marked `[Experimental]`: using one is a compile error until
+you suppress the diagnostic. Suppress it with a narrow `#pragma warning disable` at the use site.
 
-PFOR (Patched Frame of Reference) subtracts a frame of reference from an integer column and
-bit-packs what is left, storing the values that do not fit the chosen width separately as
-exceptions. That is what lets one outlier stop widening the packing for everyone: a foreign key
-column with a null sentinel, a sequence with gaps, a measure with a few extremes. Each 1024-value
-vector independently chooses whether to pack values or the differences between successive values,
-so a column that is sorted only in stretches gets the delta treatment on those stretches — the
-difference from `DELTA_BINARY_PACKED`, which always differences. The writer measures the result
-and falls back to `PLAIN` for any page PFOR did not shrink, so enabling it cannot make a file
-bigger.
-
-> **A note on the frame.** The proposal says the frame of reference is the column's minimum. That
-> is the wrong answer on exactly the shape PFOR exists for — a low sentinel becomes the frame and
-> the width is set by the gap, not the cluster — and the proposal's own worked example quotes a
-> width only a frame *above* the minimum can produce. This library searches for the frame, which
-> is worth **5.31x against `DELTA_BINARY_PACKED`** on that shape where taking the minimum gives
-> 0.65x. See [doc/parquet-pfor.md](doc/parquet-pfor.md) for the measurements, and for a second
-> place the proposal contradicts itself.
-
-### Experimental diagnostics
-
-Features whose wire format could still change are marked `[Experimental]`, so using one is a
-compile error until the diagnostic is suppressed at the use site. That is deliberate: each of
-these can produce a file that some other implementation reads differently, or not at all.
-
-| ID | Feature | Why it is gated |
+| ID | Feature | Risk |
 |---|---|---|
-| `EWPARQUET0002` | `ParquetWriteOptions.OmitPathInSchema` | **Produces files no other implementation can read.** pyarrow, ParquetSharp and delta-kernel-rs report the file as corrupt rather than as using an unsupported feature. Our own reader tolerates it, so a round trip through this library will not detect the problem |
-| `EWPARQUET0003` | FSST substring compression | Unratified, **and this library writes encoding 12 where the proposal says 10** (see below) |
-| `EWPARQUET0004` | Extended-precision timestamps | Unratified, **and the byte order is still undecided upstream** (see below) |
-| `EWPARQUET0005` | PFOR integer encoding | Unratified proposal; the wire format may change |
-
-Suppress with a narrow `#pragma warning disable` at the use site rather than a project-wide
-`NoWarn`, so the choice stays visible where it is made.
-
-`EWPARQUET0001` used to gate ALP. ALP is now part of the spec, so the diagnostic is retired;
-existing suppressions of it are harmless and can be deleted.
-
-FSST (Fast Static Symbol Table) replaces frequent 1–8 byte substrings with single-byte
-codes drawn from a symbol table trained per column chunk and stored in its own
-`SYMBOL_TABLE_PAGE`, which is what keeps per-value random access. It pays off on
-high-cardinality machine-generated text — URLs, UUIDs, log lines, identifiers — where a
-dictionary cannot help but the values still share substrings. The writer measures the
-result and falls back to `DELTA_LENGTH_BYTE_ARRAY` for any column chunk FSST did not
-actually shrink, so enabling it cannot make a file bigger.
-
-> **Encoding numbers.** FSST's proposal claims encoding 10, and it does not get it. ALP
-> claimed 10 too, shipped here first, and was released with it in parquet-format 2.14.0, so 10
-> is settled. FSST then held 11 here — what the arrow-rs
-> proof-of-concept predicted — until PFOR claimed 11 in a spec PR backed by both a
-> parquet-java and an arrow-rs implementation. So **this library writes FSST as 12**.
-> Files written here are self-consistent, but will not interoperate with an implementation
-> that has settled on a different number until the spec picks one; the number is cheap to
-> move precisely because the encoding is experimental. Both symbol table widths are
-> implemented — `FSST` (8-bit codes) and `FSST_16` (16-bit) — selected by
-> `ByteArrayEncoding.Fsst` and `ByteArrayEncoding.Fsst16`, and told apart on the wire by
-> the symbol table page's type field rather than by the encoding number. See
-> [doc/parquet-fsst.md](doc/parquet-fsst.md), which also records how the arrow-rs and
-> arrow-cpp proofs-of-concept differ from the spec.
-
-### Extended-precision timestamps (experimental)
-
-`TIMESTAMP` annotating `FIXED_LEN_BYTE_ARRAY(12)` — a signed 96-bit little-endian count of the
-column's declared unit since the epoch, covering the whole ANSI SQL `TIMESTAMP(9)` range
-(years 0001–9999) where `INT64` nanoseconds stops at 1677-09-21 and 2262-04-11. Proposed in
-[apache/parquet-format#600](https://github.com/apache/parquet-format/issues/600) and gated behind
-`EWPARQUET0004`.
-
-Reading is controlled by `ParquetReadOptions.ExtendedTimestampOutput`:
-
-| `ExtendedTimestampOutputKind` | Arrow type | Notes |
-|---|---|---|
-| `TimestampMicroseconds` (default) | `timestamp[us]` | Spans ±292,000 years, so a conforming file always reads; a `NANOS` column loses its last three digits |
-| `Timestamp` | `timestamp[declared unit]` | Keeps every digit, and reports a range error rather than wrapping a value int64 cannot hold |
-| `FixedSizeBinary` | `fixed_size_binary[12]` | The raw bytes, uninterpreted |
-
-The default is the mode that always produces an answer, for the same reason `Int96OutputKind`
-defaults to microseconds: reading a valid file should not require knowing in advance that it
-contains one. `Timestamp` is for callers who would rather be told than lose precision silently.
-
-> **The byte order is not settled.** The proposal text, the parquet-java reference implementation
-> and the proposed conformance fixture are all little-endian, but a proposal co-author argued for
-> big-endian on the spec PR and the approving reviewer left the choice explicitly open. Nothing on
-> the wire distinguishes the two, so if it flips, files already written become silently
-> wrong-valued rather than unreadable. That risk is what the experimental gate carries.
->
-Writing is opt-in per column, via `ParquetWriteOptions.ExtendedTimestampColumns` (dotted paths, top-level
-columns only). The promotion is never automatic and never can be: an Arrow timestamp is `int64`, so any
-value Arrow can hold already fits `INT64`. The option exists to produce files in that shape — interop
-fixtures, and readers being tested against the proposal — not to rescue values that would otherwise
-overflow. For the same reason this library cannot write the far-past and far-future *nanosecond* values
-that motivate the carrier: they cannot be expressed in Arrow to begin with.
-
-`converted_type` is deliberately omitted for this carrier. `TIMESTAMP_MILLIS` and `TIMESTAMP_MICROS` are
-defined for `INT64` only, so a reader that understands converted types but not the new logical-type
-carrier would decode twelve bytes as eight.
-
-> Arrow has no type for this and no plan for one — `timestamp128`
-> ([apache/arrow#47848](https://github.com/apache/arrow/issues/47848)) is dormant and there is no
-> canonical extension type — so the mapping above is this library's own choice, not a standard.
-
-See [doc/parquet-extended-precision-timestamps.md](doc/parquet-extended-precision-timestamps.md),
-which records what is ours rather than the spec's, what changes if the byte order flips, and the
-limits of the validation available for it.
-
-## Features — ORC
-
-### Reading
-
-- Full ORC file parsing (postscript, footer, stripe metadata via Protobuf)
-- Selective column I/O with stream coalescing
-- Column projection by name
-- Row indexing support (10K row stride)
-- Streaming via `IAsyncEnumerable<RecordBatch>`
-
-### Writing
-
-- Arrow `RecordBatch` → ORC with auto stripe management (64 MB default)
-- RLE v2 encoding for integers, Dictionary v2 for strings
-- Configurable string dictionary threshold (40K unique values default)
-- Row index generation (10K row stride, configurable)
-- Per-stripe and file-level column statistics
-
-### Types
-
-All 19 ORC types are supported for both reading and writing:
-- **Integer**: Boolean, Byte, Short, Int, Long
-- **Floating point**: Float, Double
-- **String/Binary**: String, Varchar, Char, Binary
-- **Temporal**: Date, Timestamp, TimestampInstant (UTC)
-- **Decimal**: Decimal128 (configurable precision/scale)
-- **Complex**: Struct, List, Map, Union
-
-### Encodings
-
-| Encoding | Read | Write |
-|---|---|---|
-| DIRECT | yes | yes |
-| DIRECT_V2 (RLE v2) | yes | yes |
-| DICTIONARY | yes | — |
-| DICTIONARY_V2 | yes | yes |
-
-## Features — Avro
-
-### Reading
-
-- Object Container File (OCF) reading with sync and async APIs
-- Fluent builder API (`AvroReaderBuilder`)
-- Schema evolution: field matching by name/alias, type promotion, default value insertion
-- Field projection by index or skip-by-name
-- Streaming via `IAsyncEnumerable<RecordBatch>`
-
-### Writing
-
-- Arrow `RecordBatch` → Avro OCF with codec selection
-- Sync and async writers
-- Explicit Avro schema or auto-inferred from Arrow schema
-
-### Streaming (non-OCF)
-
-- Push-based decoder for framed messages (`AvroDecoder`)
-- Row-level encoder with per-message framing (`AvroEncoder`)
-- Wire formats: Single Object Encoding (SOE), Confluent Schema Registry, Apicurio Registry, raw binary
-- Schema fingerprinting: CRC-64-AVRO (Rabin), MD5, SHA-256
-- `SchemaStore` for schema-by-fingerprint lookup
-
-### Types
-
-- **Primitives**: null, boolean, int, long, float, double, bytes, string
-- **Named**: record (→ StructArray), enum (→ DictionaryArray), fixed (→ FixedSizeBinaryArray)
-- **Complex**: array (→ ListArray), map (→ MapArray), union (nullable → nullable field, general → DenseUnionArray)
-- **Logical types**: date, time-millis/micros, timestamp-millis/micros/nanos (UTC and local), decimal (bytes and fixed with precision/scale → Decimal128), uuid
-
-### Compression
-
-| Codec | Read | Write |
-|---|---|---|
-| null (uncompressed) | yes | yes |
-| deflate | yes | yes |
-| snappy (with CRC32C) | yes | yes |
-| zstandard | yes | yes |
-| lz4 | yes | yes |
-
-## Features — Lance
-
-EngineeredWood ships two Lance layers: a file-level reader/writer
-(`EngineeredWood.Lance`) for individual `.lance` files and a dataset
-API (`EngineeredWood.Lance.Table`) for manifests, fragments, and
-transactional operations. Implementation is driven by the protobufs
-and Rust source of [`lance-format/lance`](https://github.com/lance-format/lance)
-plus cross-validation against [pylance](https://pypi.org/project/pylance/)-
-produced files; many of the writer paths are tested via "we write,
-pylance reads" round trips.
-
-### Versions
-
-- **v2.0** (footer bytes `(0, 3)` — pylance's pre-0.38 default — and `(2, 0)`)
-- **v2.1** (footer bytes `(2, 1)` — pylance ≥ 0.38 default for new writes)
-- **v2.2** (footer bytes `(2, 2)` — required for Map type; the file
-  layout is otherwise identical to v2.1)
-
-v0.1 and any future v2.3+ are rejected with explicit errors.
-
-### File-level reading
-
-- Public `LanceFileReader.OpenAsync(path)` parses the footer, GBO/CMO
-  tables, `FileDescriptor`, and per-column metadata.
-- `ReadColumnAsync(int fieldIndex)` returns the N-th top-level Arrow
-  field as an `IArrowArray`. For nested fields it reads every physical
-  column needed and assembles a single nested array.
-- Optimistic 64 KiB tail read brings the footer + metadata + global
-  buffer 0 in one I/O on cloud storage.
-
-### File-level writing
-
-- `LanceFileWriter.CreateAsync(path)` writes a v2.1 file containing one
-  or more columns. Auto-bumps to v2.2 when a column requires it (Map).
-- `WriteColumnAsync(name, IArrowArray)` for single-page columns;
-  `WriteColumnAsync(name, IReadOnlyList<IArrowArray>)` for explicit
-  multi-page leaf columns. Each call appends to the schema in order.
-- Optional ZSTD compression on fixed-width primitive value buffers
-  (`LanceCompressionScheme.Zstd` ctor parameter) wraps Flat in
-  `General(ZSTD, Flat(N))` per chunk.
-- Pylance cross-validation passes for every writer surface — see
-  `LanceFileWriterTests.*_CrossValidatedAgainstPylance`.
-
-### Dataset / table layer
-
-`EngineeredWood.Lance.Table` wraps the file writer in the Lance dataset
-directory layout (`data/`, `_versions/`, `_transactions/`, `_deletions/`)
-and exposes the read side via `LanceTable`.
-
-#### Reading
-
-- `LanceTable.OpenAsync(path)` opens the latest manifest version;
-  overloads accept `version: ulong` or `asOf: DateTimeOffset` for
-  time travel.
-- `IAsyncEnumerable<RecordBatch>` streaming, column projection,
-  deletion-mask filtering applied during read.
-- **Predicate pushdown**: filter passed to `ReadAsync` evaluates against
-  each fragment via `ArrowRowEvaluator`. For indexed columns,
-  fragment-level pruning skips fragments whose B-tree or bitmap
-  index proves they can't match.
-- **Index reads**: B-tree and bitmap secondary index files (read-only —
-  we don't write indices yet).
-
-#### Writing
-
-- `LanceDatasetWriter.CreateAsync(path)` — fresh dataset; refuses to
-  clobber an existing one.
-- `LanceDatasetWriter.AppendAsync(path)` — adds new fragments alongside
-  the existing ones; schema must match.
-- `LanceDatasetWriter.OverwriteAsync(path)` — replaces dataset contents;
-  schema can change.
-- `NewFragmentAsync()` between batches splits a single transaction
-  into multiple fragments.
-- `DeleteRowsAsync(path, perFragmentRowOffsets)` — emits deletion files
-  (Arrow-IPC `{ row_id: uint32 }`) and bumps the manifest.
-- `DeleteAsync(path, predicate)` — predicate-based delete layered on
-  top of `DeleteRowsAsync`.
-- `UpdateAsync(path, predicate, assignments)` — delete-and-rewrite via
-  `ArrowRowEvaluator.EvaluateExpression`; matching rows are tombstoned
-  in their source fragments and reappear in a fresh appended fragment
-  with the assigned columns replaced.
-- `CompactAsync(path)` — repacks fragments carrying deletion files into
-  a single fresh fragment of survivors.
-- `VacuumAsync(path, options)` — removes data, manifest, transaction,
-  and deletion files no longer referenced by any retained version
-  (`RetainVersions`, `DryRun`).
-
-Every commit path stamps `manifest.timestamp` for time travel.
-
-### Type coverage
-
-| Arrow type | Read | Write | Notes |
-|---|---|---|---|
-| Int8/16/32/64, UInt8/16/32/64, Float, Double | yes | yes | |
-| Bool | yes | yes | bit-packed `Flat(1)`, single-chunk only on the writer |
-| String, Binary | yes | yes | |
-| FixedSizeBinary | yes | yes | |
-| Decimal128, Decimal256 | yes | yes | |
-| Date32, Date64, Time32, Time64, Timestamp, Duration | yes | yes | |
-| FixedSizeList | yes | yes | writer: primitive inner only; inner-element nulls (`has_validity=true`) reader-only |
-| List, LargeList | yes | yes | writer: primitive / string / binary inner; inner-element nulls supported |
-| Struct (recursive) | yes | yes | writer: nested struct, FSL, list children all supported |
-| Map (v2.2) | yes | yes | |
-| HalfFloat (Float16), LargeString, LargeBinary, Union | not yet | not yet | |
-
-### v2.0 encoding coverage
-
-| Encoding | Status |
-|---|---|
-| `Flat` | yes |
-| `Nullable` (NoNull / SomeNull / AllNull) | yes |
-| `Binary` (variable strings/binary, with `null_adjustment` nulls) | yes |
-| `Constant` | yes |
-| `FixedSizeBinary` | yes |
-| `Bitpacked` (simple LSB, signed/unsigned) | yes |
-| `Dictionary` (1-based indices with 0 = null) | yes |
-| `BitpackedForNonNeg` (Fastlanes, via `Clast.FastLanes`) | yes |
-| `FixedSizeList` | yes |
-| `SimpleStruct` (multi-column shred) | yes |
-| `List` / `LargeList` (with `null_offset_adjustment`) | yes |
-| `PackedStruct`, `Fsst`, miniblock-only encodings (`Rle`, `InlineBitpacking`, `OutOfLineBitpacking`, `GeneralMiniBlock`, `ByteStreamSplit`, `Block`) | reader: not yet |
-
-### v2.1 / v2.2 encoding coverage
-
-| Layout / Encoding | Read | Write |
-|---|---|---|
-| `MiniBlockLayout` with `Flat` values, primitive leaves, single layer (`ALL_VALID_ITEM` / `NULLABLE_ITEM`) | yes | yes |
-| `MiniBlockLayout` with `Variable` (strings/binary, u32 offsets) | yes | yes |
-| `MiniBlockLayout` with `Fsst` (FSST-compressed strings/binary) | yes | not yet (writer emits `Variable`) |
-| `MiniBlockLayout` with `InlineBitpacking` / `OutOfLineBitpacking` (Fastlanes) | yes | not yet (writer emits `Flat`) |
-| `MiniBlockLayout` with `Dictionary` (layout-level dictionary) | yes | not yet |
-| `MiniBlockLayout` with `General(ZSTD, Flat(N))` (per-chunk ZSTD wrap) | yes | yes (fixed-width primitive scope) |
-| `MiniBlockLayout` with `FixedSizeList` value-compression (FSL row encoding) | yes | yes (primitive inner; inner-null reader-only) |
-| `MiniBlockLayout` with rep/def cascades (every `RepDefLayer` combo, multi-list, struct-of-list) | yes | yes |
-| `MiniBlockLayout` with bool (`bits_per_value=1`) | yes | yes |
-| Multi-chunk pages with repetition index (`repetition_index_depth=1`) | yes | yes (lists) |
-| Multi-page columns | yes | yes (leaf shapes) |
-| `FullZipLayout` fixed-width with `Flat` / `FixedSizeList(Flat)` | yes | not yet |
-| `FullZipLayout` variable-width / nested-leaf cascades | yes | not yet |
-| `ConstantLayout` (all-null pages) | yes | not yet |
-| `BlobLayout` (two-level external blob storage) | not yet | not yet |
-| `Rle`, `ByteStreamSplit`, `PackedStruct` | not yet | not yet |
-
-### Storage abstraction
-
-Reuses the existing offset-based `IRandomAccessFile` — Lance's reader
-needs `size()` + `get_range()` + coalesced `get_ranges()`, all of which
-the Core API already provides. Priority-aware scheduling and HTTP
-multi-range requests are perf optimizations not currently implemented.
-
-### Bit-packing dependency
-
-Lance's v2.0 `BitpackedForNonNeg` and v2.1 `InlineBitpacking` use the
-fastlanes 1024-element packing format. `EngineeredWood.Lance` consumes
-the [`Clast.FastLanes`](https://www.nuget.org/packages/Clast.FastLanes/)
-NuGet package (zero Lance/Arrow dependencies; bit-for-bit compatible
-with the Rust `lance_bitpacking` crate).
-
-### Future work
-
-See [`doc/lance-future-work.md`](doc/lance-future-work.md) for the
-prioritised list of remaining gaps (encoding-level features the writer
-doesn't yet emit, Arrow types not yet covered, dataset-level features
-like fragment-level concurrency control and multi-fragment compaction
-targets).
-
-## Features — Vortex
-
-[Vortex](https://github.com/vortex-data/vortex) is a columnar file format
-with FlatBuffers-based metadata and a rich encoding zoo (ALP, FSST,
-FastLanes bit-packing / FoR / delta / RLE, Pco, sparse, run-end, dict,
-etc.). `EngineeredWood.Vortex` ships a reader, a writer, and a
-predicate-based zone-pruning API — all driven by hand-rolled
-FlatBuffers/protobuf parsing (no `Google.FlatBuffers` or `flatc`
-dependency) and cross-validated against the Rust `vortex-array` 0.86
-implementation in both directions: upstream reads what the writer emits,
-and the reader decodes upstream's published compatibility fixtures — every
-release since 0.64 — to the same values upstream does.
-
-### Reading
-
-- `VortexFileReader.OpenAsync(string)` / `OpenAsync(IRandomAccessFile)`
-  validates the leading + trailing `'VTXF'` magic, parses the
-  postscript / footer / DType / Layout FlatBuffer segments, and exposes
-  `Schema` (`Apache.Arrow.Schema`) and `NumberOfRows`.
-- `ReadAllAsync()` streams the file as `IAsyncEnumerable<RecordBatch>`,
-  one batch per chunk for chunked layouts. Files whose root layout holds
-  whole rows rather than a `vortex.struct` of columns (upstream's flat
-  layout strategy) read the same way.
-- **Column projection**: `ReadAllAsync(IReadOnlyList<int> columnIndices)`
-  decodes only the requested columns. `ReadColumnAsync(int fieldIndex)`
-  returns a single column as one Arrow array (concatenated across chunks).
-- **Row-range slice**: `ReadAllAsync(long rowOffset, long rowCount, ...)`
-  drops chunks fully outside the range with zero I/O; boundary chunks are
-  decoded fully and sliced via `RecordBatch.Slice`.
-- **Predicate-based zone pruning**: `ReadAllAsync(Predicate, ...)` takes
-  a shared `EngineeredWood.Expressions.Predicate` and skips zones whose
-  stored stats prove the predicate can't match. The same predicate types
-  drive Parquet row-group pruning, Delta Lake file pruning, and Iceberg
-  scan planning. Coverage spans numeric (`i8..i64`, `u8..u64`, `f32`,
-  `f64`) + string + binary + bool + temporal (`Date32/64`, `Timestamp`,
-  `Time32/64`) comparisons, `IS NULL` / `IS NOT NULL`, `IN` / `NOT IN`,
-  and `AND` / `OR` / `NOT` composition with three-valued logic.
-- `GetZoneStatsAsync(int fieldIndex)` exposes the per-zone stats table
-  (Min, Max, Sum, NullCount, NaNCount, IsConstant, IsSorted,
-  IsStrictSorted, UncompressedSizeInBytes, MinIsTruncated,
-  MaxIsTruncated) as typed Arrow arrays.
-
-### Writing
-
-- `VortexFileWriter(Stream, Apache.Arrow.Schema, ...)` writes one or
-  more `RecordBatch`es. Single-batch files use a
-  `vortex.struct(vortex.flat × N)` layout; multi-batch files use
-  `vortex.struct(vortex.chunked(vortex.flat × M) × N)`.
-- Opt-in flags: `compress` (turn on the compressing-encoding chain),
-  `preferVarBinView` (use `vortex.varbinview` instead of `vortex.varbin`
-  for strings that fall through compression), `preferPco` (route eligible
-  numeric columns through `vortex.pco`), `preferDateTimeParts` (split
-  `TimestampArray` into days/seconds/subseconds), `preferDictLayout`
-  (share one global string dict across all batches via a
-  `vortex.dict` layout instead of per-batch array-level dicts),
-  `preserveStats` (wrap each column in a `vortex.stats` layout that
-  carries per-zone Min/Max/NullCount/etc., enabling reader-side zone
-  pruning), and `preferDelta` (let the compressing chain use
-  `fastlanes.delta`; see below).
-- Everything the writer emits belongs to a frozen core Vortex edition
-  (`core2025.05.0` through `core2025.10.0`: vortex 0.36 reads the base set,
-  0.40 adds `vortex.pco`, 0.54 adds `fastlanes.rle` and
-  `vortex.fixed_size_list`), except
-  `fastlanes.delta`, which belongs to no edition and so carries no upstream
-  promise that later readers accept it. The writer only uses it under
-  `preferDelta`. A `FixedSizeBinary(16)` column is written as the
-  `vortex.uuid` extension, which vortex has read since before 0.70 but
-  only froze in `core2026.08.3` (0.85). A Map column is written as the Map
-  dtype over `vortex.map`, both from `core2026.08.2`: a file containing
-  one needs vortex 0.85 or later to read it, as it would from vortex's own
-  writer. No earlier encoding can carry the Map dtype, and files without
-  a map are unaffected.
-- `preferDictLayout && preserveStats` emits
-  `vortex.stats(vortex.dict(...), zones-flat)` so predicate pruning
-  works against dict-layout files too.
-
-### Type coverage
-
-| Arrow type | Read | Write |
-|---|---|---|
-| Int8/16/32/64, UInt8/16/32/64, Float, Double | yes | yes |
-| HalfFloat (Float16) | yes (net6+) | yes |
-| Bool | yes | yes |
-| String, Binary | yes | yes |
-| FixedSizeBinary | yes | yes (via `vortex.uuid` for size 16) |
-| Decimal128, Decimal256 | yes | yes |
-| Date32, Date64, Time32, Time64, Timestamp | yes | yes |
-| FixedSizeList | yes | yes |
-| List | yes | yes (i32 offsets; LargeList deferred) |
-| Struct (recursive, including nested struct/list/FSL) | yes | yes |
-| Map (`keys_sorted`, duplicate keys, null maps) | yes | yes (vortex 0.85+ readers) |
-| LargeString, LargeBinary, Union | not yet | not yet |
-
-### Encoding coverage
-
-**Layouts**: `vortex.flat`, `vortex.struct`, `vortex.chunked`,
-`vortex.stats` and `vortex.zoned` (zone maps; the writer emits
-`vortex.stats`), `vortex.dict` (layout-level, shared dict).
-
-**Array encodings — read**: `vortex.primitive` (nullable + non-nullable),
-`vortex.constant`, `vortex.chunked`, `vortex.sequence`, `vortex.bool`, `vortex.bytebool`,
-`vortex.null`, `vortex.varbin`, `vortex.varbinview`, `vortex.fsst`,
-`vortex.onpair`, `vortex.runend`, `vortex.dict`, `vortex.sparse`, `vortex.masked`,
-`vortex.list`, `vortex.listview`, `vortex.map`, `vortex.fixed_size_list`,
-`vortex.struct`, `vortex.decimal`, `vortex.decimal_byte_parts`,
-`vortex.alp`, `vortex.alprd` (f32 + f64), `vortex.datetimeparts`,
-`vortex.ext` (with extension types `vortex.timestamp` / `vortex.date` /
-`vortex.time` / `vortex.uuid`), `fastlanes.bitpacked` (with patches),
-`fastlanes.for`, `fastlanes.rle`, `fastlanes.delta` (signed and unsigned),
-`vortex.zigzag`, `vortex.zstd`, `vortex.pco`.
-
-**Array encodings — write**: `vortex.primitive`, `vortex.bool`,
-`vortex.varbin`, `vortex.varbinview`, `vortex.constant`,
-`vortex.dict` (string), `vortex.fsst` (string + binary, nullable),
-`vortex.runend` (nullable), `vortex.sparse` (nullable),
-`vortex.alp` (f32 + f64), `vortex.alprd` (f32 + f64, nullable),
-`vortex.list`, `vortex.listview` and `vortex.map` (map columns),
-`vortex.fixed_size_list`, `vortex.struct`,
-`vortex.decimal`, `vortex.datetimeparts`, `vortex.ext` (Date / Time /
-Timestamp / UUID), `fastlanes.bitpacked` (with best-bit-width selection
-and patches), `fastlanes.for`, `fastlanes.delta` (under `preferDelta`), `fastlanes.rle`
-(floats, nullable), `vortex.pco`. Compressing encoders honor
-`data.Offset != 0` (sliced inputs).
-
-### Storage and compression
-
-- Uses the existing offset-based `IRandomAccessFile`. Per-segment
-  compression: only `None` is read. The format reserves the
-  `LZ4`/`ZLib`/`ZStd` segment codecs without defining them (no writer sets
-  them, and a segment records no uncompressed length), so a segment that
-  names one is refused. Compression that writers use lives in array
-  encodings such as `vortex.zstd`. Encryption is rejected outright.
-
-### Multi-targeting
-
-- The library compiles clean for `netstandard2.0`, `net8.0`, and
-  `net10.0`. The test suite also runs on `net472`; only the two
-  HalfFloat-focused tests are gated behind `#if NET6_0_OR_GREATER`
-  because `System.Half` / `Apache.Arrow.HalfFloatArray` require .NET 6+.
-
-## Features — Delta Lake
-
-EngineeredWood ships two layers: a low-level transaction log API
-(`EngineeredWood.DeltaLake`) for metadata/stats consumers and a high-level
-table API (`EngineeredWood.DeltaLake.Table`) for Arrow-based read/write.
-Reader v3 / Writer v7; the named features it implements are listed below, and a
-table requiring one it does not implement is rejected rather than mis-read.
-
-### Reading
-
-- Snapshot-based read at current version, a specific version, or a timestamp (time travel)
-- `IAsyncEnumerable<RecordBatch>` streaming, column projection, partition column re-materialization
-- **Predicate pushdown**: file-level pruning via partition values and `AddFile` statistics in a single evaluator pass
-- Deletion vector filtering (RoaringBitmap, inline + file-based)
-- Type widening on read (int/float/date/decimal widenings via `delta.typeChanges` metadata)
-- Column mapping (id and name modes); row tracking; in-commit timestamps
-- VARIANT columns, surfaced as the `arrow.parquet.variant` extension type;
-  shredded layouts (which Spark and DuckDB write by default) are reassembled
-- Stable row ids on read — `_metadata.row_id` / `_metadata.row_commit_version`,
-  on both plain reads and the change data feed, with a configurable prefix
-
-### Writing
-
-- Single-commit `CreateOrReplaceAsync` (protocol + metadata + initial files), append and overwrite;
-  partitioned writes; identity column generation
-- Auto-checkpoint (V1 Parquet and V2 JSON+sidecar formats)
-- Compaction and vacuum; log compaction
-- Change data feed (insert / delete / update pre/post-image)
-- Iceberg compatibility (V1, V2 and V3): partition column materialization,
-  schema validation, stats enforcement so an external converter can
-  produce valid Iceberg metadata. V3 also requires row tracking (turned on at
-  create when not given) and stamps Iceberg's row-lineage field ids on the
-  materialized row-tracking columns that compaction and the row-rewriting
-  DML (DELETE, UPDATE, MERGE) write
-
-### Supported reader features
-
-`columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`,
-`v2Checkpoint`, `vacuumProtocolCheck`, `variantType`
-
-### Supported writer features
-
-`appendOnly`, `changeDataFeed`, `checkConstraints`, `clustering`,
-`columnMapping`, `deletionVectors`, `domainMetadata`, `generatedColumns`,
-`icebergCompatV1`, `icebergCompatV2`, `icebergCompatV3`, `identityColumns`,
-`inCommitTimestamp`, `invariants`, `rowTracking`, `timestampNtz`,
-`typeWidening`, `v2Checkpoint`, `vacuumProtocolCheck`, `variantType`
-
-Two of those need qualifying. The **enforcement** features — `appendOnly`,
-`invariants`, `checkConstraints`, `generatedColumns` — are listed because a
-writer-v7 protocol must enumerate the legacy features explicitly, and merely
-listing them imposes no obligation. When one is genuinely *active*,
-`HonorWriterFeatures` fails closed: `delta.appendOnly=true` blocks non-append
-data changes, and an active constraint or generation expression rejects the
-write rather than committing data it cannot validate (evaluating those needs a
-SQL parser, which is not implemented). **`clustering` is interop only** — the
-`delta.clustering` domain and `add.clusteringProvider` round-trip so a clustered
-table can be appended to and DML'd, but EngineeredWood does not write clustered
-layouts.
-
-## Features — Iceberg
-
-> **Experimental.** The metadata layer is usable for reading Iceberg tables
-> written by other engines. Manifest **writing** is incomplete — the Avro codec
-> omits lower/upper bounds and partition tuples — and partition transforms are
-> declarative only, with no transform able to be applied to a value. So
-> EngineeredWood cannot yet round-trip a table that other Iceberg engines will
-> accept. Do not use it as a writer. See
-> [`doc/known-issues.md`](doc/known-issues.md) for the full list.
-
-`EngineeredWood.Iceberg` provides Apache Iceberg metadata parsing,
-manifest reading/writing, table metadata (v1, v2, v3), partition specs,
-sort orders, snapshots, and scan planning. It is metadata-only — data files
-are read with the Parquet/ORC/Avro readers in this same library.
-
-- Table metadata in JSON (v1, v2, v3 including geometry/geography, variant, default values, row IDs)
-- Manifest file/list read + write (Avro-encoded)
-- Partition transforms (identity, void, bucket, truncate, year, month, day, hour)
-- Catalog interfaces with file-system and in-memory implementations
-- `TableScan` with predicate-based file pruning via the shared
-  `EngineeredWood.Expressions` library
-
-## Features — Expressions
-
-A format-agnostic expression library used by Parquet, Delta Lake, and Iceberg
-for predicate pushdown, and available to consumers for row-level evaluation.
-
-- **`EngineeredWood.Expressions`** (no Arrow dependency):
-  - Expression and predicate trees (`UnboundReference`, `BoundReference`,
-    `LiteralExpression`, `FunctionCall`, comparison/unary/set predicates,
-    boolean combinators)
-  - `LiteralValue` struct with 17 typed kinds, cross-type numeric promotion,
-    and high-precision decimal via `BigInteger`
-  - `ExpressionBinder` for resolving column names to stable IDs against a schema
-  - `StatisticsEvaluator` with three-valued logic (AlwaysTrue / AlwaysFalse / Unknown)
-    over a generic `IStatisticsAccessor<TStats>` adapter
-- **`EngineeredWood.Expressions.Arrow`** (depends on Apache.Arrow):
-  - `ArrowRowEvaluator` walks an expression tree against a `RecordBatch`,
-    producing a `BooleanArray` for predicates with full SQL three-valued
-    null semantics
-  - `IFunctionRegistry` for pluggable function dispatch (date/time, string,
-    cast, etc. — registry implementations live with the parser that produces them)
-
-See [`doc/predicate-pushdown-design.md`](doc/predicate-pushdown-design.md)
-for the architecture and remaining phases.
-
-## Shared infrastructure
-
-### I/O
-
-EngineeredWood uses an offset-based I/O layer instead of `Stream`. A single
-`Stream` position is a poor fit for columnar layouts, where readers fetch many
-disjoint byte ranges — each "seek + read" on cloud storage is a separate
-HTTP request. The offset-based interfaces support concurrent reads with no
-shared cursor, batched range requests, and pooled buffers.
-
-| Backend | Random-access read | Sequential write | Directory / table ops |
-|---|---|---|---|
-| Local files | `LocalRandomAccessFile` | `LocalSequentialFile` | `LocalTableFileSystem` |
-| Azure Blob Storage | `AzureBlobRandomAccessFile` | `AzureBlobSequentialFile` | `AzureTableFileSystem` |
-| Google Cloud Storage | `GcsRandomAccessFile` | `GcsSequentialFile` | `GcsTableFileSystem` |
-| Amazon S3 | `S3RandomAccessFile` | `S3SequentialFile` | `S3TableFileSystem` |
-
-The cloud backends live in separate packages — `EngineeredWood.Azure` (on `Azure.Storage.Blobs`), `EngineeredWood.Gcs` (on `Clast.Google.Cloud.Storage.V1`), and `EngineeredWood.Aws` (on `AWSSDK.S3`) — so consumers pull in only the SDK they use.
-
-Each cloud writer streams with bounded memory using the backend's native chunked-upload mechanism — Azure block blobs, GCS resumable uploads, and S3 multipart uploads — rather than buffering the whole object. `ITableFileSystem` adds the directory-level operations table formats need (list / open / create / delete / exists). Its `TryWriteAllBytesAsync` is the create-only primitive Delta Lake and Iceberg commit protocols rely on: a single conditional request on every cloud backend (`If-None-Match: *` on Azure and S3, `IfGenerationMatch = 0` on GCS), so a whole commit is one round trip.
-
-`CoalescingFileReader` is a decorator that merges nearby byte ranges to reduce I/O round trips — particularly useful on cloud storage.
-
-### Compression
-
-| Codec | Library | Parquet | ORC | Avro |
-|---|---|---|---|---|
-| Snappy | [Snappier](https://github.com/brantburnett/Snappier) — pure managed | yes (default) | yes | yes |
-| Zstd | [ZstdSharp](https://github.com/oleg-st/ZstdSharp) — pure managed | yes | yes (default) | yes |
-| LZ4 / LZ4_RAW | [K4os.Compression.LZ4](https://github.com/MiloszKrajewski/K4os.Compression.LZ4) | yes | yes | yes |
-| Gzip / Zlib | System.IO.Compression | yes | yes | — |
-| Brotli | System.IO.Compression | yes | — | — |
-| Deflate | System.IO.Compression | — | yes | yes |
-| Uncompressed | — | yes | yes | yes |
+| `EWPARQUET0002` | `ParquetWriteOptions.OmitPathInSchema` | **No other implementation can read the file.** pyarrow, ParquetSharp and delta-kernel-rs report it as corrupt |
+| `EWPARQUET0003` | FSST (`ByteArrayEncoding.Fsst` / `Fsst16`) | Unratified, and written as encoding **12** where the proposal says 10 ([doc/parquet-fsst.md](https://github.com/clast-project/engineered-wood/blob/main/doc/parquet-fsst.md)) |
+| `EWPARQUET0004` | Extended-precision timestamps (`FIXED_LEN_BYTE_ARRAY(12)`) | Unratified, and the byte order is still undecided upstream ([doc/parquet-extended-precision-timestamps.md](https://github.com/clast-project/engineered-wood/blob/main/doc/parquet-extended-precision-timestamps.md)) |
+| `EWPARQUET0005` | PFOR (`IntegerEncoding.Pfor`) | Unratified; the wire format may change ([doc/parquet-pfor.md](https://github.com/clast-project/engineered-wood/blob/main/doc/parquet-pfor.md)) |
+
+PFOR and FSST fall back to the default encoding for any page or chunk they don't shrink.
+`EWPARQUET0001` (ALP) is retired, and existing suppressions of it can be deleted.
+
+## Delta Lake
+
+Two layers: `EngineeredWood.DeltaLake` is the transaction log, for hosts that bring their own data plane
+(see [doc/embedding-host-guide.md](https://github.com/clast-project/engineered-wood/blob/main/doc/embedding-host-guide.md)). `EngineeredWood.DeltaLake.Table` is the
+Arrow table API. EngineeredWood implements Reader v3 / Writer v7. It refuses a table that requires a
+feature it doesn't implement, rather than misreading it.
+
+- **Read:** latest version, a given version, or a timestamp; projection; partition pruning and file
+  skipping on statistics, pushed down to Parquet row groups and pages; deletion vectors; column mapping;
+  type widening; VARIANT (shredded or not); row ids (`_metadata.row_id`); change data feed.
+- **Write:** append, overwrite, `OverwritePartitionsAsync`, `DynamicOverwriteAsync`, `OverwriteWhereAsync`
+  (replaceWhere); `CreateOrReplaceAsync` in one commit; partitioned writes; identity columns; generated
+  columns computed; CHECK constraints and NOT NULL enforced; `mergeSchema`, including inside arrays and maps.
+- **DML:** `DeleteAsync`, `UpdateAsync` and `MergeAsync` (several clauses of each kind, SET/VALUES
+  expressions, schema evolution), using deletion vectors when the table enables them and copy-on-write
+  otherwise. Commits record Spark-style `operationParameters` and `operationMetrics`.
+- **Table management:** `RestoreAsync`; `AddConstraintAsync` / `DropConstraintAsync`; add, rename and
+  drop columns and nested fields; compaction; vacuum; checkpoints (V1 and V2) and log compaction; version
+  checksums.
+- **Concurrency:** optimistic concurrency with conflict detection and automatic rebase where it is safe
+  ([doc/delta-concurrency.md](https://github.com/clast-project/engineered-wood/blob/main/doc/delta-concurrency.md)); `DeltaTransaction` stages several operations
+  into one commit.
+- **IcebergCompat V1–V3:** enforces what an external converter needs to produce valid Iceberg metadata.
+  EngineeredWood doesn't write the Iceberg metadata itself.
+
+**Reader features:** `columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`, `v2Checkpoint`,
+`vacuumProtocolCheck`, `variantType`.
+
+**Writer features:** `appendOnly`, `changeDataFeed`, `checkConstraints`, `clustering`, `columnMapping`,
+`deletionVectors`, `domainMetadata`, `generatedColumns`, `icebergCompatV1`–`V3`, `identityColumns`,
+`inCommitTimestamp`, `invariants`, `rowTracking`, `timestampNtz`, `typeWidening`, `v2Checkpoint`,
+`vacuumProtocolCheck`, `variantType`.
+
+`clustering` is supported for interop only: clustered tables can be appended to and modified, but
+EngineeredWood doesn't cluster data. Constraint and generated-column expressions are evaluated with Spark's
+semantics. A write to a table whose expression EngineeredWood cannot parse or evaluate is refused.
+
+## ORC and Avro
+
+**ORC:** all 19 ORC types, read and write; RLE v2 and dictionary v2 encodings; column projection; stripe
+and file statistics; row indexes. Timestamps and decimals follow the spec, and files written by 0.1 are
+still read as written. There is no RLE v1 writer and no public predicate pushdown.
+
+**Avro:** OCF reading and writing (sync and async), with schema evolution by name, alias, type promotion
+and defaults. Streaming encode and decode for Single Object Encoding, Confluent, Apicurio and raw binary,
+with schema fingerprints and a `SchemaStore`. Codecs: null, deflate, snappy, zstandard, lz4.
+
+## Lance, Vortex and Iceberg (experimental)
+
+- **Lance:** reads and writes Lance files v2.0–v2.2. Datasets support create, append, overwrite,
+  predicate delete and update, compact, vacuum, and time travel by version or timestamp. B-tree and
+  bitmap indexes are read (not written) and used to prune fragments. Coverage is in
+  [doc/lance.md](https://github.com/clast-project/engineered-wood/blob/main/doc/lance.md); gaps are in [doc/lance-future-work.md](https://github.com/clast-project/engineered-wood/blob/main/doc/lance-future-work.md).
+- **Vortex:** reads and writes Vortex files, cross-validated against Rust `vortex-array` 0.86 in both
+  directions. Supports projection, row-range slices and zone-stat pruning. Coverage is in
+  [doc/vortex.md](https://github.com/clast-project/engineered-wood/blob/main/doc/vortex.md).
+- **Iceberg:** parses table metadata (v1–v3), reads and writes manifests, and plans scans with predicate
+  pruning. It refuses (`NotSupportedException`) any manifest it didn't write itself rather than misreading
+  it, so for now scans work only on tables EngineeredWood wrote. The manifests it writes lack bounds and
+  partition tuples, and partition transforms can't yet be applied to values. **Do not use it to write
+  tables other engines will read.**
 
 ## Usage
 
-### Parquet — Reading
+### Parquet
 
 ```csharp
-await using var file = new LocalRandomAccessFile("data.parquet");
-await using var reader = new ParquetFileReader(file);
+using EngineeredWood.IO.Local;
+using EngineeredWood.Parquet;
+using Ex = EngineeredWood.Expressions.Expressions;
 
-// Read all row groups
+// Read, skipping row groups and pages that cannot match.
+await using var reader = new ParquetFileReader(
+    new LocalRandomAccessFile("data.parquet"),
+    options: new ParquetReadOptions
+    {
+        Filter = Ex.And(Ex.GreaterThanOrEqual("event_count", 100L), Ex.Equal("region", "us")),
+    });
+
 await foreach (var batch in reader.ReadAllAsync())
 {
     // batch is an Apache.Arrow.RecordBatch
 }
 
-// Or read a specific row group with column projection
-var batch = await reader.ReadRowGroupAsync(0, columnNames: ["id", "name"]);
-```
-
-### Parquet — Writing
-
-```csharp
-await using var file = new LocalSequentialFile("output.parquet");
-await using var writer = new ParquetFileWriter(file, options: new ParquetWriteOptions
-{
-    Compression = CompressionCodec.Zstd,
-    DataPageVersion = DataPageVersion.V2,
-});
-
+// Write. CloseAsync writes the footer and publishes the file.
+await using var writer = new ParquetFileWriter(
+    new LocalSequentialFile("output.parquet"),
+    options: new ParquetWriteOptions { Compression = CompressionCodec.Zstd });
 await writer.WriteRowGroupAsync(recordBatch);
 await writer.CloseAsync();
 ```
 
-`CloseAsync` writes the footer and is what publishes the file. Disposing a writer without closing it
-abandons the file, so a write that fails part-way leaves nothing behind. The ORC and Lance writers work the
-same way with `CloseAsync` and `FinishAsync`.
-
-### Parquet — Predicate pushdown
-
-```csharp
-using Ex = EngineeredWood.Expressions.Expressions;
-
-await using var file = new LocalRandomAccessFile("data.parquet");
-await using var reader = new ParquetFileReader(file, ownsFile: false,
-    new ParquetReadOptions
-    {
-        // Skip row groups whose statistics prove no rows match.
-        Filter = Ex.And(
-            Ex.GreaterThanOrEqual("event_count", 100L),
-            Ex.Equal("region", "us")),
-
-        // Optional: also probe Bloom filters for Equal/IN predicates
-        // (extra I/O per candidate row group).
-        FilterUseBloomFilters = true,
-    });
-
-await foreach (var batch in reader.ReadAllAsync())
-{
-    // Reader does file/row-group level pruning only — no row-level filtering.
-}
-```
-
-### ORC — Reading
-
-```csharp
-await using var reader = await OrcReader.OpenAsync("data.orc");
-
-var rowReader = reader.CreateRowReader();
-await foreach (var batch in rowReader)
-{
-    // batch is an Apache.Arrow.RecordBatch
-}
-```
-
-### ORC — Writing
-
-```csharp
-await using var writer = OrcWriter.Create("output.orc", arrowSchema, new OrcWriterOptions
-{
-    Compression = CompressionKind.Zstd,
-});
-
-await writer.WriteBatchAsync(recordBatch);
-await writer.CloseAsync();
-```
-
-### Avro — Reading
-
-```csharp
-using var stream = File.OpenRead("data.avro");
-using var reader = new AvroReaderBuilder()
-    .WithBatchSize(4096)
-    .Build(stream);
-
-foreach (var batch in reader)
-{
-    // batch is an Apache.Arrow.RecordBatch
-}
-```
-
-### Avro — Writing
-
-```csharp
-using var stream = File.Create("output.avro");
-using var writer = new AvroWriterBuilder(arrowSchema)
-    .WithCompression(AvroCodec.Snappy)
-    .Build(stream);
-
-writer.Write(recordBatch);
-writer.Finish();
-```
-
-### Lance — File-level reading and writing
-
-```csharp
-using EngineeredWood.Lance;
-
-// Write a single Lance file with optional ZSTD on fixed-width columns.
-await using (var writer = await LanceFileWriter.CreateAsync(
-    "data.lance", compression: LanceCompressionScheme.Zstd))
-{
-    await writer.WriteColumnAsync("id", new[] { 1, 2, 3, 4, 5 });
-    await writer.WriteColumnAsync("name", stringArray);
-    await writer.FinishAsync();
-}
-
-// Read it back.
-await using var reader = await LanceFileReader.OpenAsync("data.lance");
-var idArr = (Apache.Arrow.Int32Array)await reader.ReadColumnAsync(0);
-```
-
-### Lance — Dataset / table layer
-
-```csharp
-using EngineeredWood.Lance.Table;
-using Ex = EngineeredWood.Expressions.Expressions;
-
-// Create a fresh dataset with two fragments in one transaction.
-await using (var ds = await LanceDatasetWriter.CreateAsync("/path/to/dataset"))
-{
-    await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
-    await ds.NewFragmentAsync();
-    await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 4, 5, 6 });
-    await ds.FinishAsync();
-}
-
-// Append more data later.
-await using (var ds = await LanceDatasetWriter.AppendAsync("/path/to/dataset"))
-{
-    await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 7, 8 });
-    await ds.FinishAsync();
-}
-
-// Predicate-based delete + update.
-await LanceDatasetWriter.DeleteAsync(
-    "/path/to/dataset", Ex.LessThan("x", LiteralValue.Of(3)));
-
-await LanceDatasetWriter.UpdateAsync(
-    "/path/to/dataset",
-    predicate: Ex.GreaterThanOrEqual("x", LiteralValue.Of(7)),
-    assignments: new Dictionary<string, Expression>
-    {
-        ["x"] = new LiteralExpression(LiteralValue.Of(0)),
-    });
-
-// Maintenance.
-await LanceDatasetWriter.CompactAsync("/path/to/dataset");
-await LanceDatasetWriter.VacuumAsync(
-    "/path/to/dataset", new LanceVacuumOptions { RetainVersions = 1 });
-
-// Read latest, by version, or as-of a timestamp.
-await using var latest = await LanceTable.OpenAsync("/path/to/dataset");
-await using var v3     = await LanceTable.OpenAsync("/path/to/dataset", version: 3);
-await using var asOf   = await LanceTable.OpenAsync(
-    "/path/to/dataset", asOf: DateTimeOffset.UtcNow.AddHours(-1));
-
-await foreach (var batch in latest.ReadAsync(
-    columns: ["x"], filter: Ex.GreaterThan("x", LiteralValue.Of(0))))
-{
-    // ...
-}
-```
-
-### Vortex — Reading and writing
-
-```csharp
-using EngineeredWood.Vortex;
-using EngineeredWood.Vortex.Writer;
-using Ex = EngineeredWood.Expressions.Expressions;
-using EngineeredWood.Expressions;
-
-// Write a Vortex file with the compressing chain enabled and per-zone stats.
-using (var stream = File.Create("data.vortex"))
-using (var writer = new VortexFileWriter(
-    stream, recordBatch.Schema, compress: true, preserveStats: true))
-{
-    writer.WriteBatch(recordBatch);
-    writer.WriteBatch(recordBatch2);
-    writer.Close();
-}
-
-// Read it back, projecting two columns and pruning by predicate.
-await using var reader = await VortexFileReader.OpenAsync("data.vortex");
-
-await foreach (var batch in reader.ReadAllAsync(
-    columnIndices: new[] { 0, 2 },
-    predicate: Ex.And(
-        Ex.GreaterThanOrEqual("event_count", LiteralValue.Of(100L)),
-        Ex.Equal("region", LiteralValue.Of("us")))))
-{
-    // batch is an Apache.Arrow.RecordBatch
-}
-
-// Or read a single column as one Arrow array.
-var idColumn = await reader.ReadColumnAsync(0);
-
-// Or take a row-range slice (zero I/O for chunks fully outside the range).
-await foreach (var batch in reader.ReadAllAsync(rowOffset: 1_000, rowCount: 500))
-{
-    // ...
-}
-```
-
-### Delta Lake — Reading and writing
+### Delta Lake
 
 ```csharp
 using EngineeredWood.DeltaLake.Table;
+using EngineeredWood.Expressions.Sql;
 using EngineeredWood.IO.Local;
-using Ex = EngineeredWood.Expressions.Expressions;
 
-var fs = new LocalTableFileSystem("/path/to/table");
-await using var table = await DeltaTable.OpenAsync(fs);
+await using var table = await DeltaTable.OpenAsync(new LocalTableFileSystem("/path/to/table"));
 
-// Append data
 await table.WriteAsync([recordBatch]);
 
-// Read at the current version with column projection and predicate pushdown
 await foreach (var batch in table.ReadAllAsync(
     columns: ["id", "value"],
-    filter: Ex.And(
-        Ex.Equal("region", "us"),       // partition prune
-        Ex.GreaterThan("id", 1000L))))  // file-level stats prune
+    filter: SparkSqlParser.ParsePredicate("region = 'us' AND id > 1000")))
 {
-    // ...
+    // Files and row groups that cannot match are skipped; rows are not filtered.
 }
 
-// Time travel
-await foreach (var batch in table.ReadAtVersionAsync(version: 5)) { /* ... */ }
-```
+await table.DeleteAsync(SparkSqlParser.ParsePredicate("id < 100"));
 
-### Iceberg — Scan planning
+await table.MergeAsync([sourceBatch], new MergeOptions
+{
+    Keys = ["id"],
+    WhenMatched = [MergeAction.Update],
+    WhenNotMatched = [MergeAction.Insert],
+});
 
-```csharp
-using EngineeredWood.Iceberg.Expressions;
-using Ex = EngineeredWood.Iceberg.Expressions.Expressions;
-
-var scan = new TableScan(metadata, fileSystem)
-    .Filter(Ex.Equal("region", "us"))
-    .Filter(Ex.GreaterThan("event_count", 100L));
-
-var result = await scan.PlanFilesAsync();
-// result.DataFiles contains files that may match — read them with the
-// Parquet/ORC/Avro readers in this same library.
+await foreach (var batch in table.ReadAtVersionAsync(version: 5)) { /* time travel */ }
 ```
 
 ### Cloud storage
 
-Any reader or writer that takes an `IRandomAccessFile` / `ISequentialFile` works
-directly against cloud storage — pass the backend's file handle instead of the
-local one. For Amazon S3 (Azure and GCS are the same shape with their own handles):
+Pass a cloud file handle wherever a local one is accepted, or a cloud `ITableFileSystem` to a table format.
+S3 is shown here; Azure (`AzureBlobRandomAccessFile`, `AzureTableFileSystem`) and GCS
+(`GcsRandomAccessFile`, `GcsTableFileSystem`) work the same way.
 
 ```csharp
 using Amazon.S3;
+using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.IO.Aws;
 using EngineeredWood.Parquet;
 
 var s3 = new AmazonS3Client();
 
-// Read a Parquet object straight from S3 (concurrent, coalesced range GETs).
-await using var file = new S3RandomAccessFile(s3, "my-bucket", "data/events.parquet");
-await using var reader = new ParquetFileReader(file);
-await foreach (var batch in reader.ReadAllAsync()) { /* ... */ }
+await using var reader = new ParquetFileReader(
+    new S3RandomAccessFile(s3, "my-bucket", "data/events.parquet"));
+
+await using var table = await DeltaTable.OpenAsync(
+    new S3TableFileSystem(s3, "my-bucket", rootPath: "tables/events"));
 ```
 
-Table formats run on cloud storage through `ITableFileSystem`. Swap
-`LocalTableFileSystem` for `S3TableFileSystem`, `AzureTableFileSystem`, or
-`GcsTableFileSystem` — everything else is unchanged:
+### Other formats
 
 ```csharp
-using Amazon.S3;
-using EngineeredWood.IO.Aws;
-using EngineeredWood.DeltaLake.Table;
+// ORC
+await using var orc = await OrcReader.OpenAsync("data.orc");
+await foreach (var batch in orc.CreateRowReader()) { }
 
-var s3 = new AmazonS3Client();
-var fs = new S3TableFileSystem(s3, "my-bucket", rootPath: "tables/events");
+await using var orcWriter = OrcWriter.Create("output.orc", schema);
+await orcWriter.WriteBatchAsync(recordBatch);
+await orcWriter.CloseAsync();
 
-await using var table = await DeltaTable.OpenAsync(fs);
-await foreach (var batch in table.ReadAllAsync()) { /* ... */ }
+// Avro
+using var avro = new AvroReaderBuilder().Build(File.OpenRead("data.avro"));
+foreach (var batch in avro) { }
+
+// Lance dataset
+await using var lance = await LanceTable.OpenAsync("/path/to/dataset");
+await foreach (var batch in lance.ReadAsync()) { }
+
+// Vortex
+await using var vortex = await VortexFileReader.OpenAsync("data.vortex");
+await foreach (var batch in vortex.ReadAllAsync()) { }
 ```
 
 ## Building
@@ -1061,31 +278,20 @@ dotnet build
 dotnet test
 ```
 
-Libraries multi-target `netstandard2.0`, `net8.0`, and `net10.0`. Tests and
-benchmarks require .NET 8 or .NET 10 (some also run on `net472`).
-
-## Architecture
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed guide to the source code, implementation choices, and internal structure.
+Tests need .NET 8 or 10, and some also run on `net472`. [doc/running-tests.md](https://github.com/clast-project/engineered-wood/blob/main/doc/running-tests.md) covers
+the interop tiers (PySpark, delta-rs, DuckDB, cloud emulators). [ARCHITECTURE.md](https://github.com/clast-project/engineered-wood/blob/main/ARCHITECTURE.md) is a
+guide to the source. [doc/README.md](https://github.com/clast-project/engineered-wood/blob/main/doc/README.md) indexes the design notes.
 
 ## Acknowledgements
 
-EngineeredWood stands on the shoulders of projects that showed what a
-well-built columnar library looks like:
+- [**arrow-rs**](https://github.com/apache/arrow-rs): the model for the offset-based, range-oriented I/O and
+  columnar buffer management.
+- [**hardwood**](https://github.com/hardwood-hq/hardwood): its "few dependencies, no native code" approach
+  to Parquet inspired EngineeredWood's.
 
-- [**arrow-rs**](https://github.com/apache/arrow-rs) — the reference for the
-  offset-based, range-oriented I/O model and columnar buffer management that
-  shape EngineeredWood's reader design.
-- [**hardwood**](https://github.com/hardwood-hq/hardwood) — a fast,
-  minimal-dependency implementation of Apache Parquet whose "few dependencies,
-  no native code" philosophy directly inspired EngineeredWood's pure-managed,
-  zero-native-dependency approach.
-
-The individual format and table-spec readers/writers are built from the public
-specifications and protobuf/Thrift/FlatBuffers definitions, and cross-validated
-against each ecosystem's reference tools — pyarrow, delta-rs, PySpark, pylance,
-and the Rust `vortex-array` crate among them.
+Each format is built from its public specification and cross-validated against that ecosystem's reference
+tools: pyarrow, arrow-rs, DuckDB, delta-rs, PySpark, fastavro, pylance and `vortex-array`.
 
 ## License
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+[Apache License, Version 2.0](https://github.com/clast-project/engineered-wood/blob/main/LICENSE).

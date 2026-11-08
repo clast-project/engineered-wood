@@ -1,120 +1,110 @@
 # Embedding engineered-wood as a table-format engine
 
-Most callers want the whole library: hand it Arrow batches, get Delta semantics. This document is for the
-other case — a host that already **owns its data plane** (its own parquet codec, its own execution engine)
-and wants engineered-wood only for the *log*: snapshots, protocol conformance, transactions, and conflict
-resolution. DuckDB-style extensions are the motivating case.
-
-The pieces below are designed to compose. Used together they let a host read, write, and mutate a Delta table
-without engineered-wood ever touching the bytes — while still getting spec-conformant commits.
+This guide is for a host that **owns its data plane** (its own Parquet codec, its own execution engine) and
+wants engineered-wood only for the Delta *log*: snapshots, protocol conformance, transactions and conflict
+resolution. DuckDB-style extensions are the motivating case. The pieces below compose, so a host can read,
+write and mutate a Delta table without engineered-wood touching the bytes, and still get spec-conformant
+commits.
 
 ## 1. Pin a snapshot
 
-Everything else keys off one pinned version, and **all four steps below take it explicitly** — plan, read,
-address, commit. Any step left to `CurrentSnapshot` is a step that can silently disagree with the other
-three.
+Plan, read, address and commit against **one** pinned version, and pass it explicitly to every step. A step
+left to `CurrentSnapshot` can silently disagree with the others.
 
 ```csharp
 await using var txn = table.StartTransaction();
 var snapshot = txn.Snapshot;   // NOT table.CurrentSnapshot
 ```
 
-`await using`, because staging **writes files**: see [Abandoning a transaction](#abandoning-a-transaction).
+Use `await using`: staging writes files (see [Abandoning a transaction](#abandoning-a-transaction)).
 
 `DeltaTable.CurrentSnapshot` advances whenever another writer commits. `DeltaTransaction.Snapshot` does not,
-which is what makes file ordinals (below) mean the same thing at plan time and at commit time.
+so file ordinals mean the same thing at plan time and commit time.
 
 ### Opening a handle per transaction
 
-A `DeltaTable` is one mutable handle: a refresh or a commit on it moves `CurrentSnapshot` for everyone holding
-it. A host that gives each of its transactions its own handle can still avoid replaying the log every time, by
-keeping the last `Snapshot` (it is immutable) and opening from it:
+A `DeltaTable` is one mutable handle: a refresh or commit on it moves `CurrentSnapshot` for everyone holding
+it. To give each transaction its own handle without replaying the log each time, keep the last `Snapshot`
+(it is immutable) and open from it:
 
 ```csharp
-// One listing of _delta_log/, plus the commits since `cached`. Nothing new: the listing is the whole cost.
+// One listing of _delta_log/, plus the commits since `cached`.
 await using var table = await DeltaTable.OpenAsync(fs, cached, options);
 cached = table.CurrentSnapshot;
 ```
 
-The handle is at the table's LATEST version, the same as a fresh `OpenAsync(fs)`, and it falls back to that full
-open whenever continuing from `cached` cannot be shown right. That covers log cleanup past it, a table dropped and
-re-created at the same path (recognised by the identity of the log files at `cached`'s version, see
-`TableFileInfo.ETag`). A writer can use it too: its base is the latest version, so a metadata change committed
-while `cached` was held is in the snapshot, not a conflict.
+The handle is at the table's LATEST version, as a fresh `OpenAsync(fs)` would be. It falls back to a full
+open when continuing from `cached` cannot be shown correct: log cleanup removed commits after it, the table
+was dropped and re-created at the path (detected by the log files' ETag, or size/modification time), or
+`cached` cannot be matched to the log. Writers can use it too; a metadata change committed while `cached`
+was held is in the new snapshot, not a conflict.
 
-**Key the cache by table location.** A snapshot does not know which table it came from; one from another table is
-usually rebuilt from, because the log files at its version differ, but not when they are byte-identical (a copied
-log, or on S3, whose ETag is the content's MD5, two identical commits). Then the other table's state is kept.
+**Key the cache by table location.** A snapshot does not know which table it came from. One from another
+table is usually detected and rebuilt, but not when the commit files are byte-identical (a copied log, or two
+identical commits on S3, whose ETag is the content MD5).
 
-This is NOT a pin. To commit against the version the work was planned on, use the next section.
+This is not a pin. To commit against the version the work was planned on, see the next section.
 
 ### When the transaction starts later than the pin
 
-A host whose transaction spans several of its own statements pins a version at the *first* statement, but may
-only open the transaction at the flush. `StartTransaction()` bases on `CurrentSnapshot`, which makes the
-commit loop's validation **vacuous**: it asks what landed since the latest version, and the answer is
-nothing. Base it on the version the work was actually planned against instead:
+A host whose transaction spans several statements pins a version at the first statement but may only open
+the transaction at the flush. `StartTransaction()` bases on `CurrentSnapshot`, so validation would check
+nothing. Base it on the planned version instead:
 
 ```csharp
-// A version number is what a host that cannot keep the table open between statements can carry.
+// A version number, for a host that cannot keep the table open between statements.
 var txn = await table.StartTransactionAsync(pinnedVersion);
 
-// Or, when you still hold the snapshot itself — another transaction's, say. No I/O.
+// Or a snapshot you already hold (another transaction's, say). No I/O.
 var txn = table.StartTransaction(pinnedSnapshot);
 ```
 
-Both refuse a version ahead of the table, and the snapshot form refuses a snapshot belonging to a *different*
-Delta table — its active set is a different one, so every path, ordinal and row-id range derived from it would
-address the wrong file with nothing looking wrong.
+Both take an optional `IsolationLevel` and refuse a version ahead of the table. The snapshot form also
+refuses a snapshot of a different table.
 
-The difference is observable. A transaction pinned to the version its rows were addressed against sees a
-concurrent delete of the same row and raises `DeltaConflictException`; the same work on a current-based
-transaction finds the row already hidden, reports **zero rows deleted**, and commits nothing — the host is
-never told another writer got there first. (Both behaviours are pinned by `PinnedVersionTests`.)
+The difference is observable: a pinned transaction sees a concurrent delete of the same row and throws
+`DeltaConflictException`; the same work on a current-based transaction finds the row already hidden,
+reports zero rows deleted, and commits nothing without telling the host.
 
 ## 2. Plan the scan yourself
 
-`DeltaTable.PlanFiles` gives the same superset-safe prune verdict the built-in read paths use, without
-reading anything:
+`DeltaTable.PlanFiles` returns the same superset-safe prune verdict the built-in reads use, without reading
+data:
 
 ```csharp
 IReadOnlyList<PlannedFile> planned = table.PlanFiles(predicate, snapshot: txn.Snapshot);
 ```
 
 Each `PlannedFile` carries the `AddFile` (path, partition values, stats, deletion vector, row-tracking
-fields) and a `FileOrdinal`. Two properties matter:
+fields) and a `FileOrdinal`:
 
-- **Ordinals are assigned before pruning**, so the sequence is ascending but *gapped*. A pruned file still
-  consumes its position, because the addressing domain is the full active set.
-- **Ordinals are snapshot-scoped.** They are the file's index in the path-sorted active set, so a concurrent
-  append can renumber everything after it. Plan against the transaction's snapshot and they stay valid.
+- **Ordinals are assigned before pruning**, so they ascend with gaps; a pruned file keeps its position.
+- **Ordinals are snapshot-scoped.** They index the path-sorted active set, so a concurrent append can
+  renumber them. Plan against the transaction's snapshot.
 
-Files are returned with their deletion vectors unresolved. Read the deleted positions with the public
-`DeletionVectorReader` and exclude them however your engine prefers — pushing them down as a
-`file_row_number NOT IN (…)` predicate is usually cheaper than filtering rows in C#.
+Deletion vectors are returned unresolved. Read them with the public `DeletionVectorReader` and exclude the
+rows however your engine prefers; a `file_row_number NOT IN (…)` pushdown is usually cheaper than filtering
+in C#.
 
 ## 3. Read, with the metadata you need
 
-`DeltaTable.ReadAsync` is the one read entry point; `DeltaReadOptions` carries everything that varies.
+`DeltaTable.ReadAsync` is the read entry point; `DeltaReadOptions` carries everything that varies.
 
 ```csharp
 await foreach (var batch in table.ReadAsync(new DeltaReadOptions
 {
     Columns  = ["id", "payload"],
-    Filter   = predicate,                       // same superset-safe prune as PlanFiles
-    Snapshot = txn.Snapshot,                    // read the version you pinned (§1)
+    Filter   = predicate,                       // same prune as PlanFiles
+    Snapshot = txn.Snapshot,                    // the version you pinned (§1)
     Metadata = DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking,
 }))
 ```
 
-**Inside a transaction, always set `Snapshot`.** Left unset the read follows `CurrentSnapshot`, so its rows —
-and any address minted from them — can come from a version the transaction is not validating against.
-`AtVersion` is the time-travel form for a caller with no snapshot in hand; setting both throws rather than
-picking one, since two ways to name a version that can disagree is the hazard this removes.
+**Inside a transaction, always set `Snapshot`.** Unset, the read follows `CurrentSnapshot`. `AtVersion` is
+the time-travel form for a caller with no snapshot; setting both throws.
 
-`DeltaRowMetadata` is `[Flags]`, and that is the point: the three kinds resolve from the *same* per-file
-read, so asking for two costs one pass rather than two reads of the table — and the values agree row for
-row, which two reads across a concurrent commit could not promise.
+`DeltaRowMetadata` is `[Flags]`. All kinds resolve from the same per-file read, so combining them costs one
+pass and the values agree row for row.
 
 | Flag | Appends | Use it for |
 |---|---|---|
@@ -122,71 +112,60 @@ row, which two reads across a concurrent commit could not promise.
 | `Locator` | `{prefix}file_path`, `{prefix}row_index` | feeding the DML directly (§4) |
 | `RowTracking` | `{prefix}row_id`, `{prefix}row_commit_version` | durable identity across rewrites |
 
-`MetadataPrefix` (default `_metadata.`, matching Spark's struct) renames the `Locator` and `RowTracking`
-columns. `RowAddress` is not prefixed — it has no Spark counterpart to borrow a name from. A metadata name
-that collides with one of the table's own columns is refused rather than shadowing it, which is what the
-prefix is there to resolve.
+`MetadataPrefix` (default `_metadata.`, matching Spark) renames the `Locator` and `RowTracking` columns;
+`RowAddress` is not prefixed. A metadata name that collides with a table column is refused.
 
-**`GetReadSchema(options)` returns the schema `ReadAsync` will emit, without reading anything** — the same
-projection, the same metadata columns, in the same order. A scan that has to advertise its schema at bind
-time gets it here instead of paying for a metadata open. It honours `Snapshot` (resolving one costs no I/O,
-so you get the pinned version's schema) but not `AtVersion`, which would need a log read.
+`GetReadSchema(options)` returns the schema `ReadAsync` will emit (projection plus metadata columns, in
+order) without reading anything, for a scan that must advertise its schema at bind time. It honours
+`Snapshot` but not `AtVersion`.
 
 ```csharp
 Schema advertised = table.GetReadSchema(options);
 ```
 
-`ReadAllAsync` and `ReadAtVersionAsync` remain as convenience wrappers for the ordinary caller. They expose
-no metadata; that is `ReadAsync`'s job.
+`ReadAllAsync` and `ReadAtVersionAsync` are convenience wrappers and expose no metadata.
 
-The change feed takes the same treatment through `DeltaChangeReadOptions` — `StartVersion` / `EndVersion` /
-`Columns` / `Metadata` / `MetadataPrefix`. Only `RowTracking` is valid there: a `_change_data` file is not in
-the snapshot's active set, so neither address would name a row anything else could resolve.
+The change feed, `ReadChangesAsync(DeltaChangeReadOptions)`, takes `StartVersion` / `EndVersion` / `Columns` /
+`Metadata` / `MetadataPrefix`. Only `RowTracking` is valid there; a `_change_data` file is not in the active
+set, so the other two would address nothing.
 
 ## 4. Address rows
 
-**`RowSelection` is the row-level DML boundary key**, and the only one. It is per data file, keyed by the
-file's `add.path` exactly as the snapshot records it, holding the ABSOLUTE in-file positions selected —
-absolute meaning the parquet row index, counting rows a deletion vector hides. `DeleteRowsAsync`,
-`UpdateRowsAsync`, `ReadRowsAsync` and `DeltaTransaction.StageRowDeletesAsync` all take one.
-
-There are three ways to build it:
+**`RowSelection` is the row-level DML key.** It is per data file, keyed by `add.path` exactly as the
+snapshot records it, holding ABSOLUTE in-file positions (the Parquet row index, counting rows a deletion
+vector hides). `DeleteRowsAsync`, `UpdateRowsAsync`, `ReadRowsAsync` and
+`DeltaTransaction.StageRowDeletesAsync` take one. Three ways to build it:
 
 ```csharp
-// Straight from your own scan output.
+// From your own scan output: path -> positions.
 RowSelection.ByPath(positionsByPath);
 
-// From batches read with DeltaRowMetadata.Locator — the _metadata.file_path / _metadata.row_index pair.
+// From batches read with DeltaRowMetadata.Locator.
 RowSelection.FromLocatorColumns(batches);
 
-// From packed single-BIGINT addresses, resolved against THE SNAPSHOT THEY WERE MINTED AGAINST.
+// From packed BIGINT addresses, resolved against THE SNAPSHOT THEY WERE MINTED AGAINST.
 RowSelection.FromRowAddresses(addresses, txn.Snapshot);
 ```
 
 ### Why the key is a path
 
-A `FileOrdinal` is the file's index in the *path-sorted active set*, so it means something only in the
-snapshot it came from: a concurrent append inserts a path into the sort order and renumbers everything after
-it. An ordinal that has gone stale but is still *in range* silently addresses a **different file**; one that
-falls out of range silently selects **nothing**. Neither is detectable at the point of use.
-
-`FromRowAddresses` resolves the ordinal to a path *at construction*, against a snapshot you pass explicitly.
-That is where a stale address is caught, while you still have the context to explain it:
+A `FileOrdinal` means something only in its own snapshot. A stale ordinal that is still in range silently
+addresses a **different file**; one out of range silently selects nothing. So `FromRowAddresses` resolves
+ordinals to paths at construction, against the snapshot you pass, and by default throws on an ordinal
+outside the active set:
 
 ```csharp
-// Default: throw, naming the ordinal and the size of the active set it fell outside.
-RowSelection.FromRowAddresses(addresses, txn.Snapshot);
-// Opt back into the old silent skip if you genuinely tolerate it.
-RowSelection.FromRowAddresses(addresses, txn.Snapshot, StaleAddressPolicy.Skip);
+RowSelection.FromRowAddresses(addresses, txn.Snapshot);                          // throws on stale
+RowSelection.FromRowAddresses(addresses, txn.Snapshot, StaleAddressPolicy.Skip); // skips instead
 ```
 
-A stale *path* is detectable, so the DML reports it rather than skipping: if a concurrent commit removed or
-rewrote a file the selection names, `DeleteRowsAsync` / `UpdateRowsAsync` / `ReadRowsAsync` throw naming it.
-Stage the delete on a `DeltaTransaction` instead and the commit loop reconciles that case for you (§6).
+A stale *path* is reported too: if a concurrent commit removed or rewrote a file the selection names,
+`DeleteRowsAsync` / `UpdateRowsAsync` / `ReadRowsAsync` throw naming it. Staged on a `DeltaTransaction`
+instead, the commit loop reconciles that case (§6).
 
 ### The packing codec
 
-A host whose own rowid must be one `BIGINT` — DuckDB's, say — packs the pair with `TransientRowAddress`:
+A host whose rowid must be one `BIGINT` packs the pair with `TransientRowAddress`:
 
 ```csharp
 long address = TransientRowAddress.Pack(fileOrdinal, positionInFile);
@@ -194,46 +173,41 @@ int  ordinal  = TransientRowAddress.FileOrdinal(address);
 long position = TransientRowAddress.Position(address);
 ```
 
-Use the helpers rather than open-coding the shift — the split is `TransientRowAddress.PositionBits` and is
-not part of the format. This is a *codec*, not the DML key: unpack it into a `RowSelection` before mutating.
+Use the helpers; the split (`TransientRowAddress.PositionBits`) is not part of any format. Convert to a
+`RowSelection` before mutating.
 
-> **An address, not an identity.** `_ew_row_address` says WHERE a row sits, and only in the snapshot it came
-> from: a concurrent append renumbers ordinals, and any rewrite moves positions. Never persist one, never
-> compare two from different snapshots.
->
-> Delta's own stable id — Spark's `_metadata.row_id`, backed by row tracking's `baseRowId` — is a different
-> number, read as `DeltaRowMetadata.RowTracking` below. The two columns had the same name until recently,
-> which read as a promise of durability the address cannot keep.
+> **An address, not an identity.** `_ew_row_address` says where a row sits in one snapshot. A concurrent
+> append renumbers ordinals and any rewrite moves positions. Never persist one or compare two from different
+> snapshots. Delta's stable id is the `RowTracking` column `_metadata.row_id`, a different number.
 
-`ReadRowsAsync(selection, options:)` reads exactly the selected rows. Its options are `DeltaRowReadOptions` —
-`Metadata` / `MetadataPrefix` / `ResolveAgainst`, the §3 vocabulary applied to this read. Set `ResolveAgainst`
-inside a transaction: without it the read follows `CurrentSnapshot`, where a concurrent rewrite makes the
-selection's paths look stale when they are exactly the ones the transaction is still validating against.
+### Reading selected rows
 
-To pair returned rows with what you asked for, ask for metadata columns — batching and deletion-vector
-filtering both break any positional correspondence, so match on a KEY rather than on order:
+`ReadRowsAsync(selection, options)` reads exactly the selected rows. `DeltaRowReadOptions` has `Metadata`,
+`MetadataPrefix` and `ResolveAgainst`. Set `ResolveAgainst` inside a transaction; without it the read follows
+`CurrentSnapshot`, where a concurrent rewrite makes the selection's paths look stale.
+
+Batching and deletion-vector filtering break positional correspondence, so ask for metadata columns and match
+on a key, not on order:
 
 ```csharp
 await foreach (var batch in table.ReadRowsAsync(
     selection,
     new DeltaRowReadOptions
     {
-        Metadata = DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking,   // combinable, one pass
+        Metadata = DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking,
         ResolveAgainst = txn.Snapshot,
     }))
 ```
 
-`Locator` gives back the same `(add.path, absolute position)` pair the selection is built on; `RowAddress`
-gives it packed, for a host whose own rowid is one `BIGINT`. `RowTracking` gives each row's STABLE id and
-commit version — the materialized value where the file has one, otherwise the spec derivation
-`baseRowId + position` / `defaultRowCommitVersion`. Null only for a file that predates row tracking on the
-table; on a table with no row tracking at all the ASK is refused, naming `Locator` / `RowAddress` instead,
-rather than handing back a column of nulls that cannot be told apart from "not assigned yet".
+`Locator` returns the `(add.path, absolute position)` pair; `RowAddress` returns it packed. `RowTracking`
+returns each row's stable id and commit version: the materialized value where the file has one, otherwise
+`baseRowId + position` / `defaultRowCommitVersion`. It is null only for a file that predates row tracking on
+the table. On a table without row tracking, asking for it throws.
 
 ### Preserving identity across your own rewrite
 
 A host-side UPDATE moves rows to a new file, so their ids can no longer be derived from position. Read the
-stable ids, then hand them back when writing the post-image:
+stable ids and pass them back when writing the post-image:
 
 ```csharp
 var originalIds = new List<long?>();
@@ -253,36 +227,33 @@ await foreach (var batch in table.ReadRowsAsync(
 var files = await table.WriteDataFilesAsync(postImages, materializedRowIds: originalIds);
 ```
 
-The ids are written into the table's declared materialized row-id column, which a spec reader honors over the
-add's `baseRowId`. They ride the partition split with their rows and stay out of the physical rename and the
-statistics. The commit *version* is deliberately not materialized — it should advance to the rewriting
-commit, which the add's `defaultRowCommitVersion` already says. Requires the table to declare
-`delta.rowTracking.materializedRowIdColumnName`.
+The ids go into the table's materialized row-id column (requires
+`delta.rowTracking.materializedRowIdColumnName`), which spec readers honour over `baseRowId`. The commit
+version is not materialized; it advances to the rewriting commit.
 
-**The post-image must not carry the metadata columns.** They are an input to your engine, not part of its
-output — so build the post-image to the table's schema, as your engine would anyway. Forwarding the read's
-batch verbatim is **refused**, naming the column: both write paths reject a batch carrying a column the table
-does not declare, because the parquet file would carry it while every Delta read projected it away, costing
-bytes in every file with nothing reporting it. A batch with *fewer* columns than the table stays legal — an
-absent column reads as null, which is a choice rather than a mistake.
+**Build the post-image to the table's schema.** A batch carrying a column the table does not declare (such
+as a forwarded metadata column) is refused, naming the column. A batch with *fewer* columns is legal; absent
+columns read as null.
 
 ## 5. Swap in your own codec
 
-`IDataFileReader` and `IDataFileWriter` replace the built-in parquet path, wired through `DeltaTableOptions`.
-The library still handles deletion-vector filtering, schema-evolution backfill, partition-column
-materialization, type widening, and row-tracking materialization around your codec — those are log
-semantics, not file-format concerns.
+`IDataFileReader` and `IDataFileWriter` replace the built-in Parquet path, set through
+`DeltaTableOptions.DataFileReader` / `DataFileWriter`. The library still applies deletion vectors,
+schema-evolution backfill, partition-column materialization, type widening and row-tracking materialization
+around your codec.
+
+A `DataFileReader` is called for one file at a time unless you set `DeltaTableOptions.MaxConcurrentReads`
+explicitly; setting it above 1 declares your reader safe to call concurrently. Batches it returns keep
+whatever Arrow types it produces (the built-in reader returns every decimal as `Decimal128`). To bound memory
+across tables and readers, share one `DeltaTableOptions.MemoryBudget`.
 
 ### The write path is value-blind
 
-Between your batch and your `IDataFileWriter`, the library moves and renames columns but never inspects what
-is *in* them. So you may present **your own physical representation** for a column whose Delta type you have
-declared — the partition split, the physical rename, and the statistics collector all pass it through.
-
-This is what lets a host handle a representation the library has no mode for. The motivating case is
-`variant`: if your Arrow boundary cannot carry the canonical struct storage, exchange each value as one
-self-delimiting blob, convert on your own side, and declare the column `variant` via `preAssignedSchema` or
-the Delta-typed `AddColumnAsync`/`ComputeAddColumn` overloads:
+Between your batch and your `IDataFileWriter`, the library moves and renames columns but never inspects
+their values. So you may present **your own physical representation** for a column whose Delta type you
+declared. For example, if your Arrow boundary cannot carry variant's struct storage, exchange each value as
+a blob and declare the column `variant` via `preAssignedSchema` or the Delta-typed overloads (the Arrow ones
+would infer `binary`, permanently):
 
 ```csharp
 await table.AddColumnAsync(new StructField
@@ -291,60 +262,53 @@ await table.AddColumnAsync(new StructField
 });
 ```
 
-Those overloads exist because the Arrow ones infer the Delta type from the Arrow field — a marker-tagged
-binary column would be added as Delta `binary`, permanently, in a metadata commit.
-
-**The read path is deliberately not symmetric.** A variant-declared column must arrive as the physical
-struct-of-binary (or an already-wrapped `VariantArray`); anything else throws rather than emit a column that
-contradicts the declared type. A host reader splits its blob into `(metadata, value)` — in-process work that
-never crosses a foreign ABI — and gets a canonical `VariantArray` back, which it converts on its own side.
-
-Both properties are pinned by `CodecSeamValueBlindnessTests`.
+**The read path is not symmetric.** A variant-declared column must arrive from your reader as the physical
+struct-of-binary (or a `VariantArray`); anything else throws. Split your blob into `(metadata, value)` on
+the way in and you get a canonical `VariantArray` back.
 
 ## 6. Stage work on the transaction
 
-This is the part that most repays reading. A host arrives with work **already done**, so it stages results
-rather than handing over batches and predicates.
+A host arrives with work already done, so it stages results rather than handing over batches and
+predicates. (A `DeltaTransaction` also has computed operations, `WriteAsync`, `DeleteAsync`, `UpdateAsync`,
+`MergeAsync` and `OverwriteWhereAsync`, for work engineered-wood should do itself.)
 
-**Three prefixes, three retry contracts.** The distinction is not cosmetic — it is what the commit loop does
-when each one fails:
+**Three prefixes, three retry contracts:**
 
 | Prefix | Is | On a concurrent commit |
 |---|---|---|
-| `Stage*` | an **effect** — staged output | rebased and retried |
-| `Require*` | a **precondition** — a fact about the base version | re-checked every attempt; violation throws `InvalidOperationException` and is **not** retried |
-| `Declare*` | a **declaration** — what your scan read | widens the read set; what conflicts with it depends on the isolation level |
-
-A precondition cannot become true by retrying, which is why it does not raise `DeltaConflictException`: the
-loop would retry that, and no amount of retrying makes an already-committed batch un-commit. A declaration is
-the opposite — it is subject to *policy*, so the same declaration and the same racer can produce different
-verdicts at different isolation levels.
+| `Stage*` | an **effect** (staged output) | rebased and retried |
+| `Require*` | a **precondition** on the base version | re-checked every attempt; violation throws `InvalidOperationException`, not retried |
+| `Declare*` | a **declaration** of what your scan read | widens the read set; what conflicts depends on the isolation level |
 
 | Method | Stages |
 |---|---|
-| `StageDataFiles(files)` | Data files you already wrote (append-shaped) |
+| `StageDataFiles(files)` | Data files you already wrote (append) |
 | `StageDataFilesAsync(files, bornDeleted:, identityValuesPreGenerated:)` | The same, with full parity to `CommitDataFilesAsync` |
 | `StageRowDeletesAsync(selection)` | A deletion-vector DELETE of rows you identified (§4) |
 | `StageRowDeletesAsync(selection, RowDeleteMode.CopyOnWrite)` | The same DELETE as a file rewrite, for a table without deletion vectors |
 | `StageSchemaChange(change)` | An ALTER computed by `ComputeAddColumn` / `ComputeRenameColumn` / … |
-| `StageChangeDataAsync(rows, changeType)` | Change Data Feed rows for the statement you just ran |
-| `StageActions(actions)` | Anything else — your own domain metadata |
+| `StageChangeDataAsync(rows, changeType)` | Change Data Feed rows for the statement you ran |
+| `StageActions(actions)` | Anything else, e.g. your own domain metadata |
 | `RequireAppTransaction(appId, version, precondition)` | Idempotent-producer compare-and-set |
-| `DeclareRead(predicate)` | What your own scan depended on |
-| `DeclareFilesRead(paths)` | The files it actually read — what `PlanFiles` just handed you |
-| `DeclareWholeTableRead()` | The same, when the scan had no bound at all |
+| `DeclareRead(predicate)` | What your scan's predicate depended on |
+| `DeclareFilesRead(paths)` | The files it read (what `PlanFiles` returned) |
+| `DeclareWholeTableRead()` | The same, when the scan had no bound |
 
-Use the plain `StageDataFiles` unless you need one of the async form's two arguments:
+Use `StageDataFiles` unless you need one of the async form's arguments:
 
-- **`bornDeleted`** — rows this transaction inserted and then deleted, so they never appear in *any*
-  committed version. The add is born with an inline deletion vector (and `tightBounds=false` stats, which
-  the spec requires once a vector hides rows the bounds were computed over) rather than the commit carrying
-  an insert that a later one undoes. Keyed by `WrittenDataFile.RelativePath` — which is what `add.path`
-  becomes — so it is a `RowSelection` like every other DML key. It can only name a file in the same call;
-  these files are in no snapshot yet.
-- **`identityValuesPreGenerated`** — you called `GenerateIdentityValues` yourself, so the per-row write-time
-  work an outside writer skipped has already happened. Without it an identity table's appends **cannot be
-  staged at all**, which meant a host on such a table had no transaction to put anything else into either.
+- **`bornDeleted`**: rows this transaction inserted and then deleted, so they appear in no committed
+  version. The add carries an inline deletion vector and `tightBounds=false` stats. Keyed by
+  `WrittenDataFile.RelativePath` (which becomes `add.path`), and may name only files in the same call.
+  Requires deletion vectors on the table.
+- **`identityValuesPreGenerated`**: you called `GenerateIdentityValues` yourself. Without it an identity
+  table's appends cannot be staged at all.
+
+The async form also adds variant bounds missing from the files' stats, read from each footer.
+
+Both staging calls take **`constraintsEnforcedByCaller`**. A table declaring CHECK constraints, invariants
+or generated columns refuses staged files unless you pass `true`, asserting your engine already enforced
+them. Nothing verifies the assertion. `DeltaTable.SupportsExternalDataFileCommit` reports `false` for such a
+table.
 
 ```csharp
 await using var txn = table.StartTransaction();
@@ -361,137 +325,104 @@ await txn.StageRowDeletesAsync(selection);
 long version = await txn.CommitAsync();   // ONE atomic version
 ```
 
-Build the selection against `txn.Snapshot`, not `table.CurrentSnapshot` — that is what makes the rows the
-delete names agree with what the commit validates.
+Build the selection against `txn.Snapshot`, so the rows the delete names agree with what the commit
+validates. Each file may be deleted from or rewritten by only one staged operation per transaction; a
+second one naming the same file throws, so pass all of a file's positions in one selection.
 
-A staged delete needs deletion vectors by default, and throws on a table without them rather than commit a
-vector its protocol never declared. Pass `RowDeleteMode.CopyOnWrite` to stage it as a rewrite instead. Each
-touched file is rewritten at staging time without the selected rows (an abort deletes the rewrite), and the
-commit carries `remove`(old) + `add`(rewritten). The two modes differ on the Change Data Feed:
+A staged delete defaults to deletion vectors and throws on a table without them. `RowDeleteMode.CopyOnWrite`
+instead rewrites each touched file at staging time (an abort deletes the rewrite) and commits
+`remove`(old) + `add`(rewritten).
 
-- **Deletion vector** writes no change rows at staging, as Spark's vector DML doesn't. The feed infers the
-  deleted rows from the vectors.
-- **Copy-on-write** writes its own `delete` change file, as an immediate copy-on-write delete does.
-
-A commit that carries any change file is read from its change files alone, and one operation per commit
-(as Spark and delta-rs write) never mixes the two kinds. A transaction can. So when the commit carries a
-change file from anything (a copy-on-write delete, a computed `DeleteAsync` or `UpdateAsync`,
-`StageChangeDataAsync`, a raw `cdc` action), it also writes change rows for every staged append (`insert`)
-and deletion-vector delete (`delete`). Nothing you staged drops out of the feed, and you don't need to
-stage those rows yourself (#530).
-
-If you do stage an operation's change rows yourself with `StageChangeDataAsync`, pass
-`changeDataStagedByCaller: true` to the call that staged the operation (`StageDataFiles`,
-`StageDataFilesAsync`, or `StageRowDeletesAsync(selection, mode, ct, changeDataStagedByCaller: true)`).
-Otherwise the rows appear twice. For a copy-on-write delete the flag also stops its own change file from
-being written. Coverage is per operation: the library can't match your rows against what changed. Actions
-you stage raw with `StageActions` are yours to cover.
+**Change Data Feed.** A deletion-vector delete writes no change rows (the feed infers them); a copy-on-write
+delete writes its own `delete` change file. Because a reader takes a commit's change files as its *whole*
+feed when it has any, a commit that carries any change file (a copy-on-write delete, a computed
+`DeleteAsync`/`UpdateAsync`, `StageChangeDataAsync`, a raw `cdc` action) also gets change rows written for
+every staged append (`insert`) and deletion-vector delete (`delete`). If you stage an operation's change
+rows yourself with `StageChangeDataAsync`, pass `changeDataStagedByCaller: true` to the call that staged the
+operation (`StageDataFiles`, `StageDataFilesAsync`, or `StageRowDeletesAsync(selection, mode, ct,
+changeDataStagedByCaller: true)`), or the rows appear twice. Actions staged with `StageActions` are yours to
+cover.
 
 ### Abandoning a transaction
 
-Staging **writes files** — a staged append's parquet, a rewrite's post-image, deletion vectors, change
-files — before `CommitAsync` publishes anything. So a transaction that is refused, conflicts, or is simply
-dropped on an exception path has already put bytes on storage. `DeltaTransaction` is `IAsyncDisposable` for
-that reason:
+Staging writes files (appended Parquet, rewrite post-images, deletion vectors, change files) before
+`CommitAsync` publishes anything. `DeltaTransaction` is `IAsyncDisposable`; disposing an uncommitted
+transaction deletes what it wrote:
 
 ```csharp
-await using var txn = table.StartTransaction();   // deletes what it wrote, if it never commits
+await using var txn = table.StartTransaction();
 ```
 
-`AbortAsync(ct)` is the same cleanup under a name, for a host that decides mid-transaction not to proceed.
-Both are **no-ops after a successful commit** (those files are the table's data now) and both are
-best-effort: a delete that fails is swallowed rather than allowed to mask the error that caused the abort.
+`AbortAsync(ct)` is the same cleanup, called explicitly. Both are no-ops after a successful commit, and both
+are best-effort: a failed delete is swallowed rather than masking the original error.
 
-Two things an abort deliberately does **not** delete, because they are not the transaction's to collect:
+An abort does **not** delete:
 
-- the data file a deletion-vector DELETE re-adds — that parquet is live table data, and only the `.bin`
-  beside it was written here;
-- files you handed to `StageDataFiles` — you wrote them, before the transaction saw them, and you may well
-  mean to stage them onto the next one.
+- the data file a deletion-vector DELETE re-adds (it is live table data; only the `.bin` was written here);
+- files you passed to `StageDataFiles` / `StageDataFilesAsync` (you wrote them, and may stage them again).
 
-Without an abort or a dispose, an abandoned transaction's files sit on storage until VACUUM's retention
-horizon passes — for a crash-looping producer, a whole batch per restart.
+Without an abort or dispose, abandoned files stay until VACUUM's retention horizon passes.
 
 ### Abandoning a buffered write
 
-The buffered seam is the one case the library cannot clean up for you. `WriteDataFilesAsync` hands back a
-plain list and keeps no handle — deliberately, because those files are meant to outlive the call and may be
-committed by a later, unrelated one — so nothing in the library can tell an abandoned write from one whose
-commit has not happened *yet*. Only you know. Say it:
+`WriteDataFilesAsync` returns a plain list and keeps no handle, so the library cannot tell an abandoned write
+from one not yet committed. Discard it yourself:
 
 ```csharp
 var files = await table.WriteDataFilesAsync(batches);
 try
 {
-    // ... more statements, your own validation, the rest of the transaction ...
+    // ... more statements, your own validation ...
     await table.CommitDataFilesAsync(files, extraActions: dml);
 }
 catch
 {
-    await table.DiscardDataFilesAsync(files);   // reclaim the bytes; not committing was already the rollback
+    await table.DiscardDataFilesAsync(files);   // reclaims bytes; not committing is the rollback
     throw;
 }
 ```
 
-Two things to be clear about, because they are easy to conflate:
-
-- **Not committing IS the rollback**, and always was. A file no version references changes nothing a reader
-  can see, so correctness never depended on this call. `DiscardDataFilesAsync` is about reclaiming the
-  *bytes* — which otherwise wait out `delta.deletedFileRetentionDuration` before VACUUM collects them, and
-  on object storage are billed for the whole wait.
-- **It refuses to delete a file the table references.** You supply the list, so unlike every other cleanup
-  path in the library there is no provenance to go on — and a committed file passed by mistake would leave
-  an `add` naming nothing. The check reads the log rather than the handle's cached snapshot, because the
-  commit that made those files live may have come from another handle. Nothing is deleted when it refuses.
-
-Ignoring the method entirely stays valid; VACUUM still collects what it always did.
+- **Not committing is the rollback.** An unreferenced file is invisible to readers. `DiscardDataFilesAsync`
+  only reclaims storage that would otherwise wait out `delta.deletedFileRetentionDuration`.
+- **It refuses to delete a file the table references**, checking the log (not the handle's cached
+  snapshot). Nothing is deleted when it refuses.
 
 ### Exactly-once producers
 
-`RequireAppTransaction` commits the `txn` action recording your progress **atomically with the data it
-describes**, so there is no window in which one exists without the other:
+`RequireAppTransaction` commits the `txn` action recording your progress atomically with the data:
 
 ```csharp
-// Skip a batch the table already holds WITHOUT writing it: WriteAsync writes its parquet immediately, so a
-// batch staged and then refused is parquet written for nothing (the abort deletes it again, but the write
-// still happened).
+// Optional pre-check, to skip writing a batch the table already holds.
 if (txn.IsAppTransactionApplied("my-producer", batchId))
     return;
 
-txn.RequireAppTransaction("my-producer", version: batchId, AppTransactionPrecondition.NotApplied);
+txn.RequireAppTransaction("my-producer", batchId, AppTransactionPrecondition.NotApplied);
 ```
 
-The precondition is re-checked against every concurrent commit before each attempt — the pre-check above is
-an optimisation, not the guard, and cannot close the race against a twin producer. A violation throws
-`AppTransactionPreconditionException` (an `InvalidOperationException`, deliberately **not** a
-`DeltaConflictException`, which the commit loop would retry) carrying `AppId`, `RequiredVersion`,
-`Precondition` and `ActualPrevious`, so a host need not parse the message.
-
-Four preconditions, and which one you want depends on where your version numbers come from:
+The precondition is re-checked against every concurrent commit before each attempt; the pre-check is an
+optimisation, not the guard. A violation throws `AppTransactionPreconditionException` (an
+`InvalidOperationException`, deliberately not a retried `DeltaConflictException`) with `AppId`,
+`RequiredVersion`, `Precondition` and `ActualPrevious`.
 
 | Precondition | The table must record | Use it when |
 |---|---|---|
-| `None` (default) | anything — no check | you implement your own policy and just want the `txn` record |
-| `Absent` | nothing at all | this is the producer's **first** batch |
-| `Exactly(n)` | precisely `n` | your batch boundaries can **move** across a restart — see below |
+| `None` (default) | anything | you implement your own policy |
+| `Absent` | nothing | this is the producer's **first** batch |
+| `Exactly(n)` | precisely `n` | batch boundaries can **move** across a restart |
 | `NotApplied` | nothing, or `< version` | Delta-Spark's rule; batch boundaries are fixed |
 
-`NotApplied` deduplicates a replay of the *same* batch and tolerates gaps, which is what you want when the
-version is a dense counter. It is **blind to a replay whose boundary moved**: with 1000 recorded, a producer
-that restarts from a stale checkpoint at 800 and resubmits 801–1300 passes `NotApplied` and writes rows
-801–1000 a second time. `Exactly(800)` refuses it, because the producer's belief about where it left off is
-precisely what the comparison tests. Delta-Spark can rely on `NotApplied` alone because its version is a
-structured-streaming `batchId` bound by the checkpoint to a fixed offset range; if you pick your own counter
-you have no such guarantee.
+`NotApplied` deduplicates a replay of the same batch but is **blind to a moved boundary**: with 1000
+recorded, a producer restarting from a stale checkpoint at 800 and resubmitting 801–1300 passes it and
+writes 801–1000 twice. `Exactly(800)` refuses that. Delta-Spark can rely on `NotApplied` because a streaming
+`batchId` is bound to a fixed offset range; your own counter may not be.
 
-Requirements for different appIds in one transaction are judged independently and the first failure aborts
-the whole commit — a commit is atomic, so the ones that hold cannot be applied on their own.
+Each appId is checked independently, and the first failure aborts the whole commit. One transaction may
+require at most one version per appId.
 
 ### Declaring what you read
 
-The commit loop can see what you *wrote*, but never what your engine *read* — so a scan's dependencies have
-to be declared. Three shapes, and they are not alternatives to pick one of: they answer different questions,
-and a scan that has answers to two should give both.
+The commit loop sees what you *wrote*, never what your engine *read*, so declare it. The shapes answer
+different questions; declare both when you have both:
 
 | Declaration | Says | Catches a concurrent… |
 |---|---|---|
@@ -505,72 +436,52 @@ txn.DeclareFilesRead(planned.Select(p => p.File.Path).ToList());   // what I rea
 txn.DeclareRead(predicate);                                        // what I would have read
 ```
 
-`DeclareFilesRead` is the middle ground, and the form you already hold — planning handed you exactly this
-list. Keyed by `add.path`, the same key `RowSelection` speaks. Declaring three files of three hundred means a
-concurrent delete in the other 297 does not abort you, which is the entire difference from
-`DeclareWholeTableRead`.
+`DeclareFilesRead` is keyed by `add.path`. Declaring three files of three hundred means a concurrent delete
+in the other 297 does not abort you. It does not protect against concurrent adds (that is the predicate's
+job), and if you really read the racer's files the abort is correct. A path not active at `txn.ReadVersion`
+throws `ArgumentException`, and nothing is declared. Calling `DeclareWholeTableRead` as well simply keeps
+whole-table.
 
-Two things it deliberately does **not** do:
-
-- **No protection against concurrent adds.** A file that did not exist when you scanned was not in your read
-  set, so a file list cannot speak to phantom rows. That is what the predicate is for — hence declaring both
-  above. They compose; they do not compete.
-- **No rescue when you really did read everything.** If the declared set covers the racer's files, the abort
-  is correct, and no declaration shape avoids it. (Spark behaves the same: `filterFiles()` over all files
-  still aborts against a concurrent delete.)
-
-A path that is not active at `txn.ReadVersion` throws `ArgumentException`, and nothing is declared when it
-does. A stale path is *detectable*, unlike a stale ordinal, and one that matches nothing would silently
-protect nothing. `DeclareWholeTableRead` is strictly stronger, so calling it alongside `DeclareFilesRead`
-simply keeps whole-table rather than erroring.
-
-Under `WriteSerializable` — the default — a concurrent *blind append* is exempt from `DeclareRead`; under
-`Serializable` it conflicts. That difference is the levels' whole distinction, and it is why these are
-`Declare*` and not `Require*`. `DeclareFilesRead` reads the same at both levels: a `dataChange=true` remove of
-a file you read invalidates what you decided whichever level you are at.
+Under `WriteSerializable` (the default) a concurrent *blind append* is exempt from `DeclareRead`; under
+`Serializable` it conflicts. `DeclareFilesRead` behaves the same at both levels.
 
 ### What the commit records
 
-`Operation` is a property, not a per-call argument, because Delta's operation field is one string per commit:
-
 ```csharp
-txn.Operation = "MERGE";   // null (the default) keeps the inference
+txn.Operation = "MERGE";          // null (default): the staged kind, or "WRITE" when mixed
+txn.IsBlindAppend = false;        // null (default): recorded only if this transaction saw a read
+txn.CommitProperties = props;     // commitInfo.userMetadata and other keys
 ```
 
-Left null, a transaction that staged one kind of work reports that kind and a mixed one reports `"WRITE"` —
-which is exactly when you want to say something better.
+**Set `IsBlindAppend = false` if your engine read the table** before staging an append. Left null, a staged
+append records no `commitInfo.isBlindAppend`, and engineered-wood's own conflict checker infers an adds-only
+commit as blind, exempting it from later writers' concurrent-append checks. Set `true` only when nothing was
+read.
 
-**Whatever the auto-committing surface can express, the staged surface can express.** That is an invariant,
-not an aspiration: `StagedCommitParityTests` walks `CommitDataFilesAsync`' parameters by reflection and
-requires each to be either mapped to a real member of `DeltaTransaction` or allow-listed with a reason. The
-next capability added without a staged counterpart fails a build rather than waiting for a host to report
-it. The allow-list holds only the overwrite/rewrite family — see **Limits**.
+**The staged surface can express whatever `CommitDataFilesAsync` can**, except the overwrite/rewrite family
+(see [Limits](#limits)). `StagedCommitParityTests` enforces this.
 
-**Do not reimplement the commit loop.** `CommitAsync` runs the same optimistic-concurrency loop the
-built-in operations use: it checks conflicts against every version that landed since the transaction
-started, rebases when nothing it read was invalidated, and retries. A staged delete composes with a
-concurrent delete of *different* rows in the same file, and relocates its rows by stable row id if a
-concurrent compaction rewrote the file away. None of that needs driving from outside.
-
-Row ids stay correct across several staged operations: each reserves a contiguous range continuing from the
-last, and a rebase re-derives the whole range against the advanced high-water mark.
+**Do not reimplement the commit loop.** `CommitAsync` checks conflicts against every version since the
+transaction's base, rebases when nothing it read was invalidated, and retries. A staged delete composes with
+a concurrent delete of *different* rows in the same file, and follows its rows by stable row id through a
+concurrent compaction. Row ids stay correct across several staged operations and across rebases.
 
 ### When to drop to the lower layer
 
-`ComputeDeletionVectorActionsAsync`, `RebaseDvDmlActionsAsync`, `CheckLogicalRebaseAsync`, and
-`CommitDataFilesAsync(expectedVersion:)` are the primitives `DeltaTransaction` is built from. They remain
-public for a host that genuinely needs to own the retry loop — one driving its own distributed commit
-protocol, say. If you are using them to do what the table above describes, use the transaction instead: the
-ordering, the read-set bookkeeping, and the row-id arithmetic are invariants the loop already enforces.
+`ComputeDeletionVectorActionsAsync`, `RebaseDvDmlActionsAsync`, `CheckLogicalRebaseAsync` and
+`CommitDataFilesAsync(expectedVersion:)` are the primitives `DeltaTransaction` is built from. They stay
+public for a host that must own the retry loop (e.g. its own distributed commit protocol). Otherwise use the
+transaction. `CommitDataFilesAsync` with `expectedVersion` makes one attempt and throws
+`DeltaConflictException` with `DELTA_STALE_TRANSACTION_SNAPSHOT` if the table moved.
 
 ## Going lower still: committing without the table layer
 
-Everything above uses `DeltaTable`, which means taking `EngineeredWood.DeltaLake.Table` and the Arrow
-read/write path inside it. A host that reads and writes its own parquet, interprets its own schemas, and
-applies its own statistics pruning does not need any of that — and since the optimistic-concurrency loop
-moved down, it does not have to. `EngineeredWood.DeltaLake` alone can snapshot, commit, and checkpoint:
+A host that reads and writes its own Parquet, interprets its own schemas and prunes on its own does not need
+`EngineeredWood.DeltaLake.Table`. `EngineeredWood.DeltaLake` alone can snapshot, commit and checkpoint:
 
 ```csharp
+using Ex = EngineeredWood.Expressions.Expressions;
+
 var log = new TransactionLog(fs);
 var snapshot = await SnapshotBuilder.BuildAsync(log, new CheckpointReader(fs), atVersion: null);
 
@@ -580,40 +491,39 @@ var result = await committer.CommitAsync(new LogCommitRequest
 {
     BaseSnapshot = snapshot,
     Actions = [new AddFile { Path = "part-0.parquet", /* your writer's numbers */ }],
-    // What you read, so a concurrent commit can be judged against it. Blind is the default: an append
-    // that read nothing conflicts only with a metadata change, a protocol change, or a delete/delete.
+    // What you read. Blind is the default: it conflicts only with a metadata or protocol change,
+    // a delete/delete, or a write to a domainMetadata domain it also writes.
     Reads = new ReadSet { Predicates = [Ex.LessThan("id", LiteralValue.Of(50L))] },
     Operation = "WRITE",
 });
 
-// result.Version is where it LANDED — not necessarily snapshot.Version + 1, since a rebase past a
-// non-conflicting concurrent commit lands later. result.Snapshot is the state there.
+// result.Version is where it LANDED (a rebase can land later than snapshot.Version + 1);
+// result.Snapshot is the state there.
 ```
 
-The committer attempts the commit, and on a collision reads the intervening commits, asks
-`ConflictChecker` whether any of them invalidated what you read or removed, and either aborts (first
-committer wins) or rebases onto the newer version and retries. It also gates on the writer protocol before
-it writes anything — a table declaring writer features this library does not implement is refused, which
-matters more here than through `DeltaTable`, since there is no other layer performing that check for you.
+On a collision the committer reads the intervening commits, asks `ConflictChecker` whether any invalidated
+what you read or removed, and either aborts (first committer wins) or rebases and retries, up to
+`LogCommitRequest.MaxAttempts` (default 100). It also refuses, before writing, a table whose writer features
+this library does not implement (`LogCommitOptions.ValidateWriteProtocol`, default on); at this layer
+nothing else checks that.
 
 Two things to get right:
 
-- **`Reads` is yours to declare.** Nothing at this layer saw your scan, so an empty read-set means "this
-  commit depended on nothing" and will be taken at its word. Predicates buy precision (a concurrent append
-  is pruned against them via `DeltaFilePruner`); `Files` names exactly what you read; `WholeTable` is the
+- **`Reads` is yours to declare.** An empty read set means "depended on nothing" and is taken at its word.
+  `Predicates` are tested against a concurrent add's stats; `Files` names what you read; `WholeTable` is the
   safe blunt answer.
-- **Actions coupled to the version they land at cannot simply be replayed.** If your `add` carries a
-  `baseRowId`, or your deletion vector was computed against a specific file state, a rebase would commit
-  something quietly wrong. Either set `RebaseSafe = false` — a collision then aborts instead — or supply an
-  `ICommitRebaseHandler` that re-derives them. `RecomputeRebaseHandler` covers the common shape: rebuild
-  the whole action list from the newest snapshot, which is also what an overwrite needs.
+- **Actions tied to their landing version cannot be replayed.** If an `add` carries a `baseRowId`, or a
+  deletion vector was computed against a specific file state, set `RebaseSafe = false` (a collision then
+  aborts with `DELTA_REBASE_UNSAFE`) or supply an `ICommitRebaseHandler` to re-derive them.
+  `RecomputeRebaseHandler` rebuilds the whole action list from the newest snapshot, which is also what an
+  overwrite needs.
 
-`DeltaFilePruner` is public at this layer too, so partition + statistics file skipping is available to a
-scan you planned yourself, not only through `PlanFiles`.
+`DeltaFilePruner` is public at this layer, for partition and statistics skipping in a scan you plan
+yourself.
 
 ### Handling a conflict
 
-`DeltaConflictException` is classified, so a retry loop does not have to guess:
+`DeltaConflictException` is classified:
 
 ```csharp
 catch (DeltaConflictException e) when (e.Recovery == ConflictRecovery.Replay)
@@ -622,32 +532,32 @@ catch (DeltaConflictException e) when (e.Recovery == ConflictRecovery.Replay)
 }
 catch (DeltaConflictException e)
 {
-    // Replan: the plan was built against a table state that no longer holds. Re-read, recompute,
-    // commit that. e.ErrorCode says what moved; e.ConflictingVersion says which commit did it.
+    // Replan: re-read, recompute, commit that.
+    // e.ErrorCode says what moved; e.ConflictingVersion says which commit did it.
 }
 ```
 
-`Replay` is deliberately rare — `LogCommitter` already does it internally, so it escapes only when
-`MaxAttempts` runs out or when you drive `TransactionLog.WriteCommitAsync` yourself. Everything else is
-`Replan`, and that is the case worth getting right: replaying work whose premise has gone is the failure
-this classification exists to prevent.
+`Replay` is rare: `LogCommitter` replays internally, so it escapes only when `MaxAttempts` runs out or when
+you call `TransactionLog.WriteCommitAsync` yourself. Everything else is `Replan`; never replay work whose
+premise is gone.
 
-`ErrorCode` is a `DELTA_*` constant from `DeltaErrorCodes` (or `DeltaTableErrorCodes`), in the same flat
-namespace as every other Delta failure — so one `switch` on `ErrorCode` covers conflicts and format
-errors alike. Six of the conflict codes are delta-spark's own names for the same conditions, checked
-against its `error/delta-error-classes.json`, so a host bridging engines can treat them as equivalent.
-Match on the code, never on the message: the prose is free to change.
+`ErrorCode` is a `DELTA_*` constant from `DeltaErrorCodes` or `DeltaTableErrorCodes`, one flat namespace
+shared with format errors, so one `switch` covers both. Codes with a delta-spark counterpart
+(`DELTA_CONCURRENT_WRITE`, `DELTA_METADATA_CHANGED`, `DELTA_PROTOCOL_CHANGED`,
+`DELTA_CONCURRENT_DELETE_READ`, `DELTA_CONCURRENT_DELETE_DELETE`, `DELTA_CONCURRENT_APPEND`) use its name.
+Engineered-wood's own include `DELTA_DOMAIN_METADATA_CONFLICT`, `DELTA_REBASE_UNSAFE`,
+`DELTA_ROW_LEVEL_CONFLICT` (row-level reconciliation failed, e.g. the same row was concurrently changed) and
+`DELTA_STALE_TRANSACTION_SNAPSHOT`. Match on the code, never the message.
 
-What you give up is everything with a data plane in it: the Arrow read/write path, deletion-vector DML,
-compaction, vacuum, CDF writing, identity columns, and the row-level conflict reconciliation that needs to
-read vectors and remap rows. `DeltaTable` remains the recommended surface unless you are specifically
-avoiding that.
+Without the table layer you give up the Arrow read/write path, deletion-vector DML, compaction, vacuum, CDF
+writing, identity columns, and row-level conflict reconciliation. `DeltaTable` remains the recommended
+surface unless you specifically need to avoid it.
 
 ## CTAS: writing files before the table exists
 
-A host streaming a `CREATE TABLE AS SELECT` wants its data files on storage before commit 0 is written. Under
-column mapping that is a trap: physical names are random GUIDs, so if `CreateAsync` assigns them the files
-already written are orphaned. Assign the mapping yourself, write against it, then create with the same schema:
+A host streaming `CREATE TABLE AS SELECT` writes data files before commit 0. Under column mapping, physical
+names are random, so if `CreateAsync` assigns them the files already written are orphaned. Assign the mapping
+yourself, write against it, then create with the same schema:
 
 ```csharp
 var (assigned, _) = ColumnMapping.AssignColumnMapping(SchemaConverter.FromArrowSchema(arrowSchema));
@@ -657,34 +567,30 @@ await using var table = await DeltaTable.CreateAsync(
     fs, arrowSchema, columnMappingMode: ColumnMappingMode.Name, preAssignedSchema: assigned);
 ```
 
-`preAssignedSchema` is used verbatim — the max-column-id in the metadata is derived from it rather than
-reassigned, and a schema with no field ids under a mapping mode is rejected rather than producing an
-unreadable table. `OpenOrCreateAsync` takes it too, so a CTAS retried after a crash reopens what its earlier
-attempt created.
+`preAssignedSchema` is used verbatim; the max column id is derived from it, and a schema with no field ids
+under a mapping mode is rejected. `OpenOrCreateAsync` takes it too, so a CTAS retried after a crash reopens
+what the earlier attempt created.
 
 ## Limits
 
-- **Overwrite modes are not stageable.** They remove the whole active set, which is exactly what a rebase
-  cannot re-derive. Use the auto-committing `WriteAsync(mode: Overwrite)` / `DynamicOverwriteAsync`. A
-  predicate overwrite (Spark's `replaceWhere`) is the exception: it reads only the files its predicate can
-  match, so `DeltaTransaction.OverwriteWhereAsync` stages it like a predicate DELETE plus an append.
-- **The rewrite family is not stageable either** — a `dataChange=false` compaction or a clustering
-  OPTIMIZE removes the files it replaces, and a rewrite's fresh add embeds the attempted version's row-id
-  high-water mark, so it cannot be replayed verbatim onto a newer one. Use `CompactAsync`.
-- **IcebergCompat rejects externally-written files** — it needs write-time per-row processing an outside
-  writer did not do. Check `DeltaTable.SupportsExternalDataFileCommit`. Identity columns are the same, with
-  one escape: generate the values yourself and pass `identityValuesPreGenerated`.
-- **A transaction is single-use and not thread-safe.** Many transactions may race across threads; drive each
-  from one. A commit that throws ends it too — abort or dispose it and start a new one.
-- **A failed commit leaves nothing behind, on any path.** The auto-committing operations — `WriteAsync`,
-  `UpdateAsync`, `DeleteRowsAsync`, `UpdateRowsAsync`, `CompactAsync` — have no transaction to hang cleanup
-  on, so each collects its own output when its commit does not land. Nothing to do for it, and nothing to
-  configure; it applies to the whole operation, so a rewrite that fails part way through its files takes back
-  the ones it had written. What it never collects is the same set a transaction's abort never collects: the
-  file a deletion vector masks, the files a rewrite would have replaced, and anything the host wrote itself.
+- **Full, partition and dynamic overwrites are not stageable.** They remove the whole active set (or
+  partition), which a rebase cannot re-derive. Use `WriteAsync(batches, DeltaWriteMode.Overwrite)` /
+  `DynamicOverwriteAsync`. A predicate overwrite (Spark's `replaceWhere`) is stageable:
+  `DeltaTransaction.OverwriteWhereAsync` stages a predicate delete plus an append.
+- **The rewrite family is not stageable.** A `dataChange=false` compaction or clustering OPTIMIZE embeds the
+  attempted version's row-id high-water mark. Use `CompactAsync`.
+- **Externally written files are refused on some tables.** IcebergCompat always; identity columns unless you
+  pass `identityValuesPreGenerated`; CHECK constraints, invariants and generated columns unless you pass
+  `constraintsEnforcedByCaller`. Check `DeltaTable.SupportsExternalDataFileCommit` before writing files.
+- **A transaction is single-use and not thread-safe.** Many may race across threads; drive each from one. A
+  commit that throws ends it; dispose it and start a new one.
+- **A failed auto-committing operation leaves nothing behind.** `WriteAsync`, `UpdateAsync`,
+  `DeleteRowsAsync`, `UpdateRowsAsync`, `CompactAsync` and the rest delete their own output when their
+  commit does not land. Like an abort, they never delete a file a deletion vector masks, files a rewrite
+  would have replaced, or anything the host wrote.
 
 ## See also
 
-- `doc/delta-concurrency.md` — the concurrency machinery: OCC, row-level DML, the stable-id remap
-- `doc/codec-seam-investigation.md` — why `IDataFile*` exists, and its open contract obligations
-- `doc/known-issues.md` — the gaps a host is most likely to hit
+- `doc/delta-concurrency.md`: OCC, row-level DML, the stable-id remap
+- `doc/codec-seam-investigation.md`: why `IDataFile*` exists, and its open contract obligations
+- `doc/known-issues.md`: gaps a host is most likely to hit

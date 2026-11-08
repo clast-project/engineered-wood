@@ -1,6 +1,8 @@
 # Parquet Page Index (ColumnIndex / OffsetIndex): Implementation Plan
 
-**Status:** Not implemented. Written against `main` @ `201ab13` (2026-09-26). This plan
+**Status:** Implemented. Page indexes are written by default (`ParquetWriteOptions.WritePageIndex`) and used
+for pruning by default (`ParquetReadOptions.FilterUsePageIndex`); the phases below record how it landed.
+This plan was written against `main` @ `201ab13` (2026-09-26). It
 supersedes the "Future: Page-Level Pushdown" section and phases 11–13 of
 [`predicate-pushdown-design.md`](predicate-pushdown-design.md), and corrects one claim made
 there (see [W-2](#w-2-per-page-statistics-are-new-work)).
