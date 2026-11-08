@@ -498,14 +498,16 @@ internal static class StatsParsedBuilder
         {
             if (scale == targetScale)
                 return true;
-            if (scale > targetScale)
+            // Bounded so the power stays below 10^38 whatever the type says (#760).
+            if (scale > targetScale || scale < 0 || targetScale > DecimalText.MaxPrecision)
                 return false;
             unscaled *= BigInteger.Pow(10, targetScale - scale);
             return true;
         }
 
         private static bool FitsPrecision(BigInteger unscaled, int precision) =>
-            BigInteger.Abs(unscaled) < BigInteger.Pow(10, precision);
+            precision is >= 1 and <= DecimalText.MaxPrecision
+            && BigInteger.Abs(unscaled) < BigInteger.Pow(10, precision);
 
         /// <summary>Writes the two's-complement little-endian form Arrow's decimal buffers use.</summary>
         private static void WriteTwosComplement(BigInteger value, Span<byte> destination)

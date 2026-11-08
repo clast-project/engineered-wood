@@ -513,8 +513,10 @@ internal static class DeltaLiteralDecoder
         var digits = typeName.AsSpan(comma + 1, close - comma - 1).Trim();
 #endif
 
+        // Bounded like the precision: the scale sizes a power of ten in TryRescale, and the type name is
+        // text another writer put in the log (#760).
         return int.TryParse(digits, NumberStyles.Integer, CultureInfo.InvariantCulture, out scale)
-            && scale >= 0;
+            && scale is >= 0 and <= DecimalText.MaxPrecision;
     }
 
     /// <summary>
@@ -528,6 +530,10 @@ internal static class DeltaLiteralDecoder
     {
         if (to == from)
             return true;
+
+        // No Delta decimal has a scale outside 0..38, and either one sizes a power of ten (#760).
+        if (from is < 0 or > DecimalText.MaxPrecision || to is < 0 or > DecimalText.MaxPrecision)
+            return false;
 
         if (to > from)
         {
