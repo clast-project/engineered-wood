@@ -319,7 +319,7 @@ internal sealed class RecordBatchAssembler
                 "timestamp-millis" or "local-timestamp-millis" => new TimestampBuilder(),
                 "timestamp-micros" or "local-timestamp-micros" => new TimestampBuilder(),
                 "timestamp-nanos" or "local-timestamp-nanos" => new TimestampBuilder(),
-                "decimal" => new DecimalBytesBuilder(p.Precision ?? 38, p.Scale ?? 0),
+                "decimal" => new DecimalBytesBuilder(p.Precision, p.Scale),
                 // The schema converter chose GuidType (extension) when the
                 // caller registered arrow.uuid; otherwise StringType. Mirror
                 // that choice here so the wire format stays a 36-char string
@@ -358,7 +358,7 @@ internal sealed class RecordBatchAssembler
                 return new EnumBuilder(e.Symbols);
 
             case AvroFixedSchema f when f.LogicalType == "decimal":
-                return new DecimalFixedBuilder(f.Size, f.Precision ?? 38, f.Scale ?? 0);
+                return new DecimalFixedBuilder(f.Size, f.Precision, f.Scale);
             case AvroFixedSchema f when f.LogicalType == "duration" && f.Size == 12:
                 return new DurationBuilder();
             case AvroFixedSchema f:
@@ -1611,20 +1611,20 @@ internal sealed class ResolvingStructBuilder : IColumnBuilder
 internal sealed class DecimalFixedBuilder : ByteBlobBuilder
 {
     private readonly int _size;
-    private readonly int _precision;
-    private readonly int _scale;
+    private readonly Decimal128Type _type;
 
-    public DecimalFixedBuilder(int size, int precision, int scale) : base(16)
+    // The writer's annotation, which reader-schema resolution never compares with the reader's, so it
+    // goes through the converter's bound here rather than reaching Arrow as written (#763).
+    public DecimalFixedBuilder(int size, int? precision, int? scale) : base(16)
     {
         _size = size;
-        _precision = precision;
-        _scale = scale;
+        _type = ArrowSchemaConverter.MakeDecimalType(precision, scale);
     }
 
     protected override void WriteElement(ref AvroBinaryReader reader, Span<byte> dest)
         => DecimalArrayHelper.BigEndianToDecimal128Bytes(reader.ReadFixed(_size), dest);
 
-    protected override IArrowType ValueType(Field field) => new Decimal128Type(_precision, _scale);
+    protected override IArrowType ValueType(Field field) => _type;
 
     /// <summary>Appends a default value from big-endian Avro bytes.</summary>
     public void AppendDefaultFromBigEndian(ReadOnlySpan<byte> bigEndianBytes)
@@ -1634,19 +1634,18 @@ internal sealed class DecimalFixedBuilder : ByteBlobBuilder
 /// <summary>Reads Avro variable-length bytes and converts to Arrow Decimal128 (big-endian → little-endian).</summary>
 internal sealed class DecimalBytesBuilder : ByteBlobBuilder
 {
-    private readonly int _precision;
-    private readonly int _scale;
+    private readonly Decimal128Type _type;
 
-    public DecimalBytesBuilder(int precision, int scale) : base(16)
+    // See DecimalFixedBuilder: the writer's annotation is bounded here too (#763).
+    public DecimalBytesBuilder(int? precision, int? scale) : base(16)
     {
-        _precision = precision;
-        _scale = scale;
+        _type = ArrowSchemaConverter.MakeDecimalType(precision, scale);
     }
 
     protected override void WriteElement(ref AvroBinaryReader reader, Span<byte> dest)
         => DecimalArrayHelper.BigEndianToDecimal128Bytes(reader.ReadBytes(), dest);
 
-    protected override IArrowType ValueType(Field field) => new Decimal128Type(_precision, _scale);
+    protected override IArrowType ValueType(Field field) => _type;
 
     /// <summary>Appends a default value from big-endian Avro bytes.</summary>
     public void AppendDefaultFromBigEndian(ReadOnlySpan<byte> bigEndianBytes)

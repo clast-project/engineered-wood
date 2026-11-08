@@ -97,7 +97,7 @@ internal static class ArrowSchemaConverter
     /// precision above 38 is valid Avro, but the reader decodes into Decimal128 and would truncate
     /// every wider value, so it is refused rather than read wrong.
     /// </summary>
-    private static Decimal128Type MakeDecimalType(int? precision, int? scale)
+    internal static Decimal128Type MakeDecimalType(int? precision, int? scale)
     {
         int p = precision ?? 38;
         if (p > 38)
