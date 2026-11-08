@@ -90,6 +90,36 @@ public class DeltaLiteralDecoderTests
             LiteralValue.HighPrecisionDecimalOf(BigInteger.Pow(10, 30) + 1, 30)));
     }
 
+    // A declared scale no Delta decimal can have makes the value unknown. It must not be adopted as the
+    // literal's scale: LiteralValue comparison sizes a power of ten by the scale difference, so
+    // decimal(38,50000000) would rebuild #760's stall one step later.
+    [Theory]
+    [InlineData("decimal(38,50000000)")]
+    [InlineData("decimal(38,2147483647)")]
+    [InlineData("decimal(38,39)")]
+    [InlineData("decimal(38,-1)")]
+    [InlineData("decimal(38,x)")]
+    public void Decimal_InvalidDeclaredScale_IsUnknown(string typeName)
+    {
+        Assert.Null(DeltaLiteralDecoder.FromJson(Json("1"), typeName));
+        Assert.Null(DeltaLiteralDecoder.FromJson(Json("\"1\""), typeName));
+        Assert.Null(DeltaLiteralDecoder.FromPartitionString("1", typeName));
+    }
+
+    [Fact]
+    public void Decimal_DeclaredScaleOf38_StillDecodes()
+    {
+        var expected = LiteralValue.HighPrecisionDecimalOf(5 * BigInteger.Pow(10, 37), 38);
+
+        var lit = DeltaLiteralDecoder.FromPartitionString("0.5", "decimal(38,38)");
+        Assert.NotNull(lit);
+        Assert.Equal(0, lit!.Value.CompareTo(expected));
+
+        lit = DeltaLiteralDecoder.FromJson(Json("0.5"), "decimal(38,38)");
+        Assert.NotNull(lit);
+        Assert.Equal(0, lit!.Value.CompareTo(expected));
+    }
+
     [Fact]
     public void Date_DecodesIsoString()
     {
