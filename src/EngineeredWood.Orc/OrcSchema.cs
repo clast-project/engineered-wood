@@ -30,7 +30,17 @@ public sealed class OrcSchema
         MaximumLength = type.HasMaximumLength ? type.MaximumLength : 0;
         Precision = type.HasPrecision ? type.Precision : 0;
         Scale = type.HasScale ? type.Scale : 0;
+
+        // ORC's decimal is at most 38 digits with 0 <= scale <= precision, and the reader builds a
+        // Decimal128 for it. Precision 0 is a Hive 0.11 decimal, read with fixed defaults whatever
+        // its scale says. Anything else would hand the footer's scale to Arrow as it is, and the
+        // reader, ArrowRowEvaluator.Rescale and the Spark casts size a power of ten by it (#763).
+        if (kind == Type.Types.Kind.Decimal && Precision > 0 && (Precision > MaxDecimalPrecision || Scale > Precision))
+            throw new InvalidDataException(
+                $"ORC column {columnId} declares decimal({Precision},{Scale}); ORC requires precision <= {MaxDecimalPrecision} and scale <= precision.");
     }
+
+    private const uint MaxDecimalPrecision = 38;
 
     public static OrcSchema FromFooter(Footer footer)
     {

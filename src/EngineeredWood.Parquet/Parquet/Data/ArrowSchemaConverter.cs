@@ -406,6 +406,8 @@ internal static class ArrowSchemaConverter
         };
     }
 
+    private const int MaxDecimal256Precision = 76;
+
     /// <summary>
     /// Decodes a Parquet DECIMAL to an Arrow type. By default the narrowest decimal that fits the physical
     /// width is used; <see cref="DecimalOutputKind.Decimal128"/> widens everything to the classic
@@ -414,6 +416,16 @@ internal static class ArrowSchemaConverter
     private static IArrowType MakeDecimalType(
         int precision, int scale, PhysicalType physicalType, ParquetReadOptions? options)
     {
+        // SchemaAnnotations has already dropped a DECIMAL whose scale is negative or above its
+        // precision, or whose precision the physical width cannot hold. BYTE_ARRAY and a wide
+        // FIXED_LEN_BYTE_ARRAY bound the precision by nothing, though, and Decimal256 is the widest
+        // Arrow decimal: a larger precision would truncate every value, and would let the footer pick
+        // a scale in the millions that ArrowRowEvaluator.Rescale and the Spark casts size a power of
+        // ten by (#763). arrow C++ refuses the same columns.
+        if (precision > MaxDecimal256Precision)
+            throw new NotSupportedException(
+                $"DECIMAL({precision},{scale}) is wider than Decimal256, which holds at most {MaxDecimal256Precision} digits.");
+
         // Widening is lossless — the value decoders sign-extend the unscaled integer to any target width.
         if (options?.DecimalOutput == DecimalOutputKind.Decimal128)
         {

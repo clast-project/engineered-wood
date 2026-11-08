@@ -270,6 +270,15 @@ internal static class LanceSchemaConverter
             throw new LanceFormatException(
                 $"Field '{fieldName}' has non-numeric decimal precision/scale in '{logical}'.");
 
+        // The bounds arrow-rs puts on the Arrow type Lance wrote this from: precision 1..38 or 1..76,
+        // scale at most the precision, and an i8 scale, so negative down to -128. Without them a
+        // scale in the millions reaches ArrowRowEvaluator.Rescale and the Spark casts, which size a
+        // power of ten by it (#763).
+        int maxPrecision = parts[0] switch { "128" => 38, "256" => 76, _ => int.MaxValue };
+        if (precision < 1 || precision > maxPrecision || scale > precision || scale < sbyte.MinValue)
+            throw new LanceFormatException(
+                $"Field '{fieldName}' has out-of-range decimal precision/scale in '{logical}'.");
+
         return parts[0] switch
         {
             "128" => new Decimal128Type(precision, scale),

@@ -191,6 +191,33 @@ public class LanceSchemaConverterTests
             LanceSchemaConverter.ToArrowSchema(schema));
     }
 
+    [Theory]
+    [InlineData("decimal:128:38:38")]
+    [InlineData("decimal:128:10:-2")]
+    [InlineData("decimal:128:38:-128")]
+    [InlineData("decimal:256:76:76")]
+    public void AcceptsTheDecimalRangeArrowAllows(string logical)
+    {
+        var type = LanceSchemaConverter.ToArrowSchema(BuildLeafSchema(logical)).FieldsList[0].DataType;
+        Assert.True(type is Decimal128Type or Decimal256Type);
+    }
+
+    // #763: the precision and scale reached the Arrow type unchecked, so a scale in the millions
+    // reached the code that sizes a power of ten by it.
+    [Theory]
+    [InlineData("decimal:128:10:50000000")]
+    [InlineData("decimal:128:10:11")]
+    [InlineData("decimal:128:39:2")]
+    [InlineData("decimal:256:77:2")]
+    [InlineData("decimal:128:0:0")]
+    [InlineData("decimal:128:-5:-6")]
+    [InlineData("decimal:128:38:-129")]
+    public void RefusesAnOutOfRangeDecimal(string logical)
+    {
+        var ex = Assert.Throws<LanceFormatException>(() => LanceSchemaConverter.ToArrowSchema(BuildLeafSchema(logical)));
+        Assert.Contains("out-of-range", ex.Message);
+    }
+
     private static Proto.Schema BuildLeafSchema(string logicalType)
     {
         var schema = new Proto.Schema();
