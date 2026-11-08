@@ -36,25 +36,49 @@ internal static class PageIndexPruner
     {
         var names = ParquetStatisticsAccessor.BuildNameIndex(schema);
         var referenced = new HashSet<string>(StringComparer.Ordinal);
-        CollectColumns(filter, referenced);
+        var variantCalls = new HashSet<VariantGetCall>();
+        CollectColumns(filter, referenced, variantCalls);
 
         var leaves = new SortedSet<int>();
         foreach (string name in referenced)
         {
-            if (!names.TryGetValue(name, out int leaf) || leaf >= rowGroup.Columns.Count)
-                continue;
-            var chunk = rowGroup.Columns[leaf];
-            if (schema.Columns[leaf].MaxRepetitionLevel == 0
-                && (chunk.FilePath is null || filePath == ColumnChunkFilePathKind.Ignore)
-                && chunk.ColumnIndexOffset is not null && chunk.ColumnIndexLength is not null
-                && chunk.OffsetIndexOffset is not null && chunk.OffsetIndexLength is not null)
-            {
+            if (names.TryGetValue(name, out int leaf) && Indexed(leaf))
                 leaves.Add(leaf);
+        }
+
+        // A variant path prunes pages by its typed_value leaf, where its residual is null throughout the
+        // interval: by the residual's own page index, or for every interval when its chunk is null throughout.
+        foreach (var call in variantCalls)
+        {
+            if (ShreddedVariantPath.Resolve(schema, call) is not { } path || !Indexed(path.Leaf))
+                continue;
+            if (path.Residual is int residual && !ResidualNullThroughout(rowGroup, residual))
+            {
+                if (!Indexed(residual))
+                    continue;
+                leaves.Add(residual);
             }
+            leaves.Add(path.Leaf);
         }
 
         return [.. leaves];
+
+        bool Indexed(int leaf)
+        {
+            if (leaf >= rowGroup.Columns.Count)
+                return false;
+            var chunk = rowGroup.Columns[leaf];
+            return schema.Columns[leaf].MaxRepetitionLevel == 0
+                && (chunk.FilePath is null || filePath == ColumnChunkFilePathKind.Ignore)
+                && chunk.ColumnIndexOffset is not null && chunk.ColumnIndexLength is not null
+                && chunk.OffsetIndexOffset is not null && chunk.OffsetIndexLength is not null;
+        }
     }
+
+    /// <summary>Whether a residual <c>value</c> column's chunk statistics say it is null in every row.</summary>
+    private static bool ResidualNullThroughout(RowGroup rowGroup, int residual) =>
+        residual < rowGroup.Columns.Count
+        && rowGroup.Columns[residual].MetaData?.Statistics?.NullCount == rowGroup.NumRows;
 
     /// <summary>
     /// The ranges of <paramref name="rowGroup"/> that might hold a row matching <paramref name="filter"/>,
@@ -89,7 +113,7 @@ internal static class PageIndexPruner
         cuts.Sort();
         cuts.Add(rows);
 
-        var accessor = new IntervalAccessor(schema, columns);
+        var accessor = new IntervalAccessor(schema, rowGroup, columns);
         var interval = new Interval(columns.Count);
         var result = new List<RowRange>();
         for (int i = 0; i + 1 < cuts.Count; i++)
@@ -184,43 +208,46 @@ internal static class PageIndexPruner
         return true;
     }
 
-    private static void CollectColumns(Predicate predicate, HashSet<string> sink)
+    private static void CollectColumns(Predicate predicate, HashSet<string> sink, HashSet<VariantGetCall> calls)
     {
         switch (predicate)
         {
             case AndPredicate and:
-                foreach (var child in and.Children) CollectColumns(child, sink);
+                foreach (var child in and.Children) CollectColumns(child, sink, calls);
                 break;
             case OrPredicate or:
-                foreach (var child in or.Children) CollectColumns(child, sink);
+                foreach (var child in or.Children) CollectColumns(child, sink, calls);
                 break;
             case NotPredicate not:
-                CollectColumns(not.Child, sink);
+                CollectColumns(not.Child, sink, calls);
                 break;
             case ComparisonPredicate comparison:
-                CollectColumns(comparison.Left, sink);
-                CollectColumns(comparison.Right, sink);
+                CollectColumns(comparison.Left, sink, calls);
+                CollectColumns(comparison.Right, sink, calls);
                 break;
             case UnaryPredicate unary:
-                CollectColumns(unary.Operand, sink);
+                CollectColumns(unary.Operand, sink, calls);
                 break;
             case SetPredicate set:
-                CollectColumns(set.Operand, sink);
-                foreach (var value in set.Values) CollectColumns(value, sink);
+                CollectColumns(set.Operand, sink, calls);
+                foreach (var value in set.Values) CollectColumns(value, sink, calls);
                 break;
         }
     }
 
-    private static void CollectColumns(Expression expression, HashSet<string> sink)
+    private static void CollectColumns(Expression expression, HashSet<string> sink, HashSet<VariantGetCall> calls)
     {
         switch (expression)
         {
             case UnboundReference reference: sink.Add(reference.Name); break;
             case BoundReference reference: sink.Add(reference.Name); break;
-            case FunctionCall call:
-                foreach (var argument in call.Arguments) CollectColumns(argument, sink);
+            case FunctionCall call when VariantGetCall.TryMatch(call, out var variantGet):
+                calls.Add(variantGet);
                 break;
-            case Predicate predicate: CollectColumns(predicate, sink); break;
+            case FunctionCall call:
+                foreach (var argument in call.Arguments) CollectColumns(argument, sink, calls);
+                break;
+            case Predicate predicate: CollectColumns(predicate, sink, calls); break;
         }
     }
 
@@ -243,25 +270,31 @@ internal static class PageIndexPruner
     /// when it holds for any part of the page: all of it for a null page, none when the page has no
     /// nulls. Otherwise it is unknown, since the page's count need not fall in this interval.
     /// </summary>
-    private sealed class IntervalAccessor : IStatisticsAccessor<Interval>, INanCountAccessor<Interval>
+    private sealed class IntervalAccessor
+        : IStatisticsAccessor<Interval>, INanCountAccessor<Interval>, IVariantStatisticsAccessor<Interval>
     {
+        private readonly SchemaDescriptor _schema;
+        private readonly RowGroup _rowGroup;
         private readonly List<IndexedColumn> _columns;
         private readonly Dictionary<string, int> _slots = new(StringComparer.Ordinal);
+        private readonly Dictionary<int, int> _slotOfLeaf = new();
+        private readonly Dictionary<VariantGetCall, IStatisticsAccessor<Interval>?> _variantPaths = new();
 
         // The last page decoded per slot: a page usually spans several intervals.
         private readonly int[] _decodedPage;
         private readonly LiteralValue?[] _min;
         private readonly LiteralValue?[] _max;
 
-        public IntervalAccessor(SchemaDescriptor schema, List<IndexedColumn> columns)
+        public IntervalAccessor(SchemaDescriptor schema, RowGroup rowGroup, List<IndexedColumn> columns)
         {
+            _schema = schema;
+            _rowGroup = rowGroup;
             _columns = columns;
-            var slotOfLeaf = new Dictionary<int, int>();
             for (int slot = 0; slot < columns.Count; slot++)
-                slotOfLeaf[columns[slot].Leaf] = slot;
+                _slotOfLeaf[columns[slot].Leaf] = slot;
             foreach (var entry in ParquetStatisticsAccessor.BuildNameIndex(schema))
             {
-                if (slotOfLeaf.TryGetValue(entry.Value, out int slot))
+                if (_slotOfLeaf.TryGetValue(entry.Value, out int slot))
                     _slots[entry.Key] = slot;
             }
 
@@ -304,6 +337,116 @@ internal static class PageIndexPruner
         public bool IsMinExact(Interval interval, string column) => false;
 
         public bool IsMaxExact(Interval interval, string column) => false;
+
+        /// <summary>
+        /// A variant path's statistics in an interval, from its <c>typed_value</c> leaf's covering page, where the
+        /// residual is null throughout the interval (see <see cref="ShreddedVariantPath"/>). The two columns' pages
+        /// need not line up: an interval lies inside one page of each.
+        /// </summary>
+        public IStatisticsAccessor<Interval>? ForVariantGet(VariantGetCall call)
+        {
+            if (!_variantPaths.TryGetValue(call, out var accessor))
+            {
+                accessor = null;
+                if (ShreddedVariantPath.Resolve(_schema, call) is { } path
+                    && _slotOfLeaf.TryGetValue(path.Leaf, out int leaf))
+                {
+                    // No slot for a residual its chunk shows null throughout; without one for any other, no bounds.
+                    int? residual = null;
+                    if (path.Residual is int r && !ResidualNullThroughout(_rowGroup, r))
+                        residual = _slotOfLeaf.TryGetValue(r, out int slot) ? slot : -1;
+                    if (residual is not -1)
+                        accessor = new VariantPathAccessor(this, path, leaf, residual);
+                }
+                _variantPaths[call] = accessor;
+            }
+            return accessor;
+        }
+
+        private long PageRows(int slot, int page)
+        {
+            var pages = _columns[slot].Pages;
+            return (page + 1 < pages.Count ? pages[page + 1].FirstRowIndex : _rowGroup.NumRows) - pages[page].FirstRowIndex;
+        }
+
+        /// <summary>A variant path's leaf pages, read where the residual's covering page (if any) is all null.</summary>
+        private sealed class VariantPathAccessor(IntervalAccessor owner, ShreddedVariantPath path, int leaf, int? residual)
+            : IStatisticsAccessor<Interval>, INanCountAccessor<Interval>
+        {
+            private ColumnIndex Index => owner._columns[leaf].ColumnIndex;
+
+            // The leaf's covering page, or -1 when the residual's covering page holds a value.
+            private int Page(Interval interval)
+            {
+                if (residual is int slot)
+                {
+                    int page = interval.Pages[slot];
+                    var index = owner._columns[slot].ColumnIndex;
+                    if (!index.NullPages[page] && index.NullCounts?[page] != owner.PageRows(slot, page))
+                        return -1;
+                }
+                return interval.Pages[leaf];
+            }
+
+            // The last leaf page decoded, and its converted bounds: a page usually spans several intervals. The
+            // residual is still checked per interval, in Page.
+            private int _decodedPage = -1;
+            private LiteralValue? _min;
+            private LiteralValue? _max;
+
+            public LiteralValue? GetMinValue(Interval interval, string column) =>
+                Decode(Page(interval)) ? _min : null;
+
+            public LiteralValue? GetMaxValue(Interval interval, string column) =>
+                Decode(Page(interval)) ? _max : null;
+
+            private bool Decode(int page)
+            {
+                if (page < 0)
+                    return false;
+                if (_decodedPage != page)
+                {
+                    // A null page's bounds are placeholders; its null count is what prunes it.
+                    bool nullPage = Index.NullPages[page];
+                    _min = nullPage ? null : path.LowerBound(Index.MinValues[page], Index.MaxValues[page]);
+                    _max = nullPage ? null : path.UpperBound(Index.MaxValues[page]);
+                    _decodedPage = page;
+                }
+                return true;
+            }
+
+            // As for a row group (ParquetStatisticsAccessor.ForVariantGet), but only a count that holds for any part
+            // of the page: all of it null, or none of it.
+            public long? GetNullCount(Interval interval, string column)
+            {
+                int page = Page(interval);
+                if (page < 0)
+                    return null;
+                if (Index.NullPages[page] || Index.NullCounts?[page] == owner.PageRows(leaf, page))
+                    return interval.End - interval.Start;
+                return Index.NullCounts?[page] == 0
+                    && GetMinValue(interval, column) is not null && GetMaxValue(interval, column) is not null
+                    ? 0
+                    : null;
+            }
+
+            public long? GetNanCount(Interval interval, string column)
+            {
+                int page = Page(interval);
+                if (page < 0)
+                    return null;
+                if (Index.NullPages[page] || Index.NullCounts?[page] == owner.PageRows(leaf, page))
+                    return 0;
+                // As for a row group: the leaf's count holds for the result only under a NaN-preserving conversion.
+                return path.PreservesNaN && Index.NanCounts is { } counts && counts[page] == 0 ? 0 : null;
+            }
+
+            public long? GetValueCount(Interval interval, string column) => interval.End - interval.Start;
+
+            public bool IsMinExact(Interval interval, string column) => false;
+
+            public bool IsMaxExact(Interval interval, string column) => false;
+        }
 
         /// <summary>Decodes the covering page's bounds into the slot's cache; false for an unindexed column.</summary>
         private bool Decode(Interval interval, string column, out int slot)

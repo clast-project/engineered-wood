@@ -477,11 +477,19 @@ bound leaves out (path missing, not an object, NULL variant) answers NULL.
 delta-spark 4.3.1 and DuckDB's delta extension do not prune on these bounds
 (measured), so `VariantPruningInteropTests` takes Spark as the oracle for the
 answer only: every row Spark selects must come from a file EW kept, over EW's
-bounds and over Spark's. What is not done:
+bounds and over Spark's.
 
-- *Row groups and pages are not pruned on a variant path.* Parquet row groups
-  and pages inside a kept file are not pruned by the `typed_value` footer
-  statistics (#682).
+Inside a kept file, and for any `ParquetReadOptions.Filter`, the Parquet reader
+prunes row groups and pages on the same predicates (#682), from the statistics
+of the shredded `typed_value` leaf that holds the path. A unit's bounds are used
+only where the path's residual `value` column is null in every row of it, the
+per-unit form of the writer's test above, and they convert under the same
+rules (`VariantBound`, shared with the Delta path). The page index needs no
+alignment between the two columns' pages. A float path prunes both ways when
+the footer records a NaN count, which EW's writer always does. What is not done:
+
+- *Dictionaries and Bloom filters are not consulted on a variant path.* Only
+  statistics and the page index prune it.
 - *Row-level `variant_get` (#681) has three refusals and two differences.* DML
   predicates and CHECK constraints on a variant path are evaluated row by row
   with Spark's variant cast. An object or array cast to `string` (Spark answers
