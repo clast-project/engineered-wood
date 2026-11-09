@@ -411,3 +411,47 @@ With view output, `ColumnBuildState.AddByteArrayValues` counted every DELTA_BYTE
 | clustered 90% narrow (groups kept whole) | +27% | +27% |
 
 So two passes now beat one at high selectivity as well as for point lookups. The remaining local cost is at low selectivity, which 2b's skipping decoders target, and in row groups kept whole, where a group's two passes decode one after the other. Two passes stay the default on object storage only (§13).
+
+## 15. Phase 2b: skipping dropped values in the decoders (2026-11-09)
+
+### What it does
+
+The selection is now applied **page by page** as a column decodes, replacing 2a's whole-chunk compaction (`ColumnBuildState.SetRowSelection`, `BeginPage`, `EndPage`).
+
+After a page's definition levels are read, its deselected rows' levels are dropped and a mask over its values is built. Then, depending on the encoding:
+- **Dictionary pages:** every index is read and checked, as before. The index array is then compacted to the kept rows, and the existing per-type write code runs over only those. Booleans, every fixed width and all three BYTE_ARRAY output kinds come for free, and a dropped value is never looked up.
+- **PLAIN BYTE_ARRAY pages:** every value is measured and checked by `PlainDecoder.MeasureByteArrays`, as before; only kept values are copied.
+- **DELTA_LENGTH_BYTE_ARRAY pages:** every length is decoded, as before; only kept values are copied.
+- **Every other encoding** is decoded whole and its page compacted at once, while still in cache: PLAIN fixed widths, DELTA_BINARY_PACKED, DELTA_BYTE_ARRAY (whose prefix carry needs every value), BYTE_STREAM_SPLIT, ALP, PFOR, FSST and RLE booleans.
+
+The skipping decoders reuse the real decoders' validation instead of duplicating it, so a malformed page fails the same way whether or not its rows are kept.
+
+### The 50% gate is gone
+
+2a compacted in the decoder only when at least half the rows were kept, because a gather of a few rows beat a pass over all of them. With values skipped, compacting in the decoder now beats the gather at every selectivity measured:
+
+| Case | Two-pass vs one-pass, gated (2a's rule) | Ungated (2b) |
+|---|---|---|
+| scattered 0.1% wide | +5% | -18% |
+| scattered 1% wide | +2% | -19% |
+| scattered 10% wide | +6% | -19% |
+| scattered 50% wide | -5% | -19% |
+| scattered 99% wide | -15% | -20% |
+| scattered 10% narrow | +9% | -7% |
+| scattered 50% narrow | +5% | -10% |
+| category = 2% wide | +11% | -8% |
+| category <> 98% wide | -10% | -16% |
+| scattered point wide | -31% | -33% |
+| clustered 90% narrow (groups kept whole) | +22% | +16% |
+
+Locally, two passes now beat one at almost every selectivity. The exceptions:
+- row groups the predicate keeps whole (clustered 90%, +4% to +16%), where a group's two passes decode one after the other;
+- a few narrow cases within a few percent (scattered 0.1% narrow +4%, category = 2% narrow +3%).
+
+### Tests
+
+`KeepRowsTests` (the fixture sweep) now runs through the per-page path. A new many-page test covers DELTA_LENGTH_BYTE_ARRAY, DELTA_BYTE_ARRAY and FSST, nullable, beside a nullable boolean, under each output kind. No fixture has many pages of these, and a mutation of byte-array compaction past the first page survived the fixture sweep until this test existed.
+
+### Open: the default
+
+Two passes are still the default only on object storage (§13), decided before this phase with a note to revisit. Locally they now win nearly everywhere; see the table above.
