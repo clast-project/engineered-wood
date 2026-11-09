@@ -153,13 +153,6 @@ public sealed partial class ParquetFileReader
     internal const double TwoPassMaxCoveredShare = 0.5;
 
     /// <summary>
-    /// The smallest share of a row group's rows a dense second pass must keep to keep them as it decodes
-    /// (<c>ColumnBuildState.KeepRows</c>) rather than gather them after. Compacting walks every row and value; a
-    /// gather walks only the kept ones. Measured crossover: about half.
-    /// </summary>
-    internal const double TwoPassMinKeptShareToCompact = 0.5;
-
-    /// <summary>
     /// Reads one planned row group in two passes. The first decodes the predicates' columns over the whole row
     /// group and works out its selection. The second decodes the other output columns: only over the blocks of
     /// <see cref="TwoPassBlockRows"/> rows holding a selected row when those are few enough
@@ -256,12 +249,11 @@ public sealed partial class ParquetFileReader
             var ranges = SelectedBlocks(selection, groupRows, out long covered);
             IReadOnlyList<RowRange>? passTwoRanges = covered <= groupRows * TwoPassMaxCoveredShare ? ranges : null;
 
-            // A dense second pass read as one batch, keeping at least half its rows, keeps them as it decodes
-            // (phase 2a): the batch comes back holding only those, with nothing to gather. Compacting in place
-            // walks every row, where a gather walks only the kept ones, so below half the gather wins (measured,
-            // doc/row-level-filtering.md §14).
-            byte[]? keepRows = passTwoRanges is null && !SplitsGroup(groupRows)
-                               && kept < groupRows && kept >= groupRows * TwoPassMinKeptShareToCompact
+            // A dense second pass read as one batch keeps the selected rows as it decodes (phase 2): each page drops
+            // its deselected rows, skipping their values where the decoder can, so the batch comes back holding
+            // only the selected rows, with nothing to gather. With decoders that skip, this beats the gather at
+            // every selectivity measured (doc/row-level-filtering.md §15).
+            byte[]? keepRows = passTwoRanges is null && !SplitsGroup(groupRows) && kept < groupRows
                 ? KeepMask(selection, groupRows)
                 : null;
             try

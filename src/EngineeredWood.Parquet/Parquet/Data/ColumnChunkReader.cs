@@ -78,6 +78,8 @@ internal static class ColumnChunkReader
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
             byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
+        if (keepRows is not null)
+            state.SetRowSelection(keepRows);
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
 
@@ -161,10 +163,10 @@ internal static class ColumnChunkReader
 
         EnsureFullRowCoverage(state, column, rowCount);
 
-        // A selected read's second pass: keep only the selected rows, in place, rather than build every row and
-        // gather from the arrays afterwards.
+        // A selected read's second pass: the pages kept only the selected rows (BeginPage), so that is how many the
+        // arrays hold.
         if (keepRows is not null)
-            rowCount = state.KeepRows(keepRows.AsSpan(0, rowCount));
+            rowCount = state.KeptRows;
 
         IArrowArray array;
         if (isRepeated)
@@ -195,7 +197,8 @@ internal static class ColumnChunkReader
         if (column.MaxRepetitionLevel > 0)
             return;
 
-        int decoded = column.MaxDefinitionLevel > 0 ? state.DefLevelSpan.Length : state.ValueCount;
+        int decoded = state.HasRowSelection ? state.SelectionRowsSeen
+            : column.MaxDefinitionLevel > 0 ? state.DefLevelSpan.Length : state.ValueCount;
         if (decoded >= rowCount)
             return;
 
@@ -904,10 +907,12 @@ internal static class ColumnChunkReader
                 nonNullCount = numValues;
             }
 
+            state.BeginPage(numValues, nonNullCount);
+
             // Decode values
             var valueData = pageData.Slice(offset);
             var encoding = dataHeader.Encoding;
-            DecodeValues(valueData, encoding, column, dictionary, symbolTable, nonNullCount, state);
+            DecodePageValues(valueData, encoding, column, dictionary, symbolTable, nonNullCount, state);
 
             return numValues;
         }
@@ -973,6 +978,7 @@ internal static class ColumnChunkReader
                 column.MaxDefinitionLevel, numValues, defDest, out nonNullCount);
         }
         offset += v2Header.DefinitionLevelsByteLength;
+        state.BeginPage(numValues, nonNullCount);
 
         // V2: only values portion is compressed (if is_compressed, default true)
         var valuesCompressed = rawData.Slice(offset);
@@ -980,7 +986,10 @@ internal static class ColumnChunkReader
         // All values may be null — nothing to decompress or decode. An empty section with values
         // left would leave the value buffer unwritten, so it goes on to the decoder, which refuses it.
         if (nonNullCount == 0)
+        {
+            state.EndPage();
             return numValues;
+        }
 
         ReadOnlySpan<byte> valueData;
         byte[]? decompressedBuffer = null;
@@ -1000,7 +1009,7 @@ internal static class ColumnChunkReader
         try
         {
             var encoding = v2Header.Encoding;
-            DecodeValues(valueData, encoding, column, dictionary, symbolTable, nonNullCount, state);
+            DecodePageValues(valueData, encoding, column, dictionary, symbolTable, nonNullCount, state);
 
             return numValues;
         }
@@ -1008,6 +1017,69 @@ internal static class ColumnChunkReader
         {
             if (decompressedBuffer != null)
                 ArrayPool<byte>.Shared.Return(decompressedBuffer);
+        }
+    }
+
+    /// <summary>
+    /// Decodes a page's values under the row selection, if any (#502 phase 2): when the page drops values, the
+    /// decoders that can skip them write only the kept ones (dictionary indices, PLAIN and DELTA_LENGTH_BYTE_ARRAY
+    /// byte arrays); any other page is decoded whole and its values compacted at once, while still in cache.
+    /// </summary>
+    private static void DecodePageValues(
+        ReadOnlySpan<byte> data,
+        Encoding encoding,
+        ColumnDescriptor column,
+        DictionaryDecoder? dictionary,
+        FsstSymbolTable? symbolTable,
+        int nonNullCount,
+        ColumnBuildState state)
+    {
+        try
+        {
+            if (!state.PageHasDrops)
+            {
+                DecodeValues(data, encoding, column, dictionary, symbolTable, nonNullCount, state);
+                return;
+            }
+
+            if (encoding is Encoding.PlainDictionary or Encoding.RleDictionary && dictionary is not null)
+            {
+                DecodeDictValues(data, column, dictionary, nonNullCount, state, state.PageValueMask);
+            }
+            else if (encoding == Encoding.Plain && column.PhysicalType == PhysicalType.ByteArray)
+            {
+                DecodePlainByteArraysSelected(data, column, nonNullCount, state);
+            }
+            else if (encoding == Encoding.DeltaLengthByteArray && column.PhysicalType == PhysicalType.ByteArray)
+            {
+                DeltaLengthByteArrayDecoder.Decode(data, nonNullCount, state, selected: true);
+            }
+            else
+            {
+                DecodeValues(data, encoding, column, dictionary, symbolTable, nonNullCount, state);
+                state.CompactPage();
+            }
+        }
+        finally
+        {
+            state.EndPage();
+        }
+    }
+
+    // A PLAIN BYTE_ARRAY page's kept values: every value measured (and so checked) as the whole-page decode does, only
+    // the kept ones copied.
+    private static void DecodePlainByteArraysSelected(
+        ReadOnlySpan<byte> data, ColumnDescriptor column, int count, ColumnBuildState state)
+    {
+        var offsets = ArrayPool<int>.Shared.Rent(count + 1);
+        try
+        {
+            PlainDecoder.MeasureByteArrays(data, offsets, count, column.DottedPath);
+            state.AddSelectedByteArrayValues(offsets.AsSpan(0, count + 1), data, stride: 4);
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(offsets);
         }
     }
 
@@ -1359,7 +1431,8 @@ internal static class ColumnChunkReader
         ColumnDescriptor column,
         DictionaryDecoder dictionary,
         int count,
-        ColumnBuildState state)
+        ColumnBuildState state,
+        ReadOnlySpan<byte> keep = default)
     {
         if (count == 0)
             return;
@@ -1380,6 +1453,21 @@ internal static class ColumnChunkReader
             decoder.ReadBatch(indicesArray.AsSpan(0, count));
             ReadOnlySpan<int> indices = indicesArray.AsSpan(0, count);
             dictionary.CheckIndices(indices, bitWidth, column);
+
+            // Under a row selection, every index was read and checked above; only the kept ones are looked up and
+            // written, by the same code below, as if the page held just those (#502 phase 2).
+            if (!keep.IsEmpty)
+            {
+                int write = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    indicesArray[write] = indicesArray[i];
+                    write += keep[i];
+                }
+
+                count = write;
+                indices = indicesArray.AsSpan(0, count);
+            }
 
             switch (column.PhysicalType)
             {

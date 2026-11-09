@@ -18,7 +18,9 @@ internal static class DeltaLengthByteArrayDecoder
     /// <summary>
     /// Decodes <paramref name="count"/> byte array values and appends them to <paramref name="state"/>.
     /// </summary>
-    public static void Decode(ReadOnlySpan<byte> data, int count, ColumnBuildState state)
+    /// <param name="selected">Append only the values the page's row selection keeps
+    /// (<see cref="ColumnBuildState.PageValueMask"/>); every length is still decoded and checked.</param>
+    public static void Decode(ReadOnlySpan<byte> data, int count, ColumnBuildState state, bool selected = false)
     {
         // Step 1: Decode lengths using DELTA_BINARY_PACKED
         var lengthDecoder = new DeltaBinaryPackedDecoder(data);
@@ -35,6 +37,9 @@ internal static class DeltaLengthByteArrayDecoder
         int totalDataBytes = offsets[count];
         var byteData = data.Slice(lengthDecoder.BytesConsumed, totalDataBytes);
 
-        state.AddByteArrayValues(offsets, byteData, count);
+        if (selected)
+            state.AddSelectedByteArrayValues(offsets, byteData, stride: 0);
+        else
+            state.AddByteArrayValues(offsets, byteData, count);
     }
 }
