@@ -227,6 +227,67 @@ public class TwoPassReadTests : IDisposable
         Assert.Equal(1, requests);
     }
 
+    /// <summary>
+    /// When the output column's bytes cannot be read, a two-pass read that selects a row raises the failure, and one
+    /// that selects none returns its (empty, and complete) result: no row needed those bytes, as no row needs a
+    /// corrupt page in a block it skips. A one-pass read needs them either way.
+    /// </summary>
+    [Theory]
+    [InlineData(true, true, true)]
+    [InlineData(true, false, false)]
+    [InlineData(false, false, true)]
+    public async Task AnUnreadableOutputColumnFailsOnlyAReadThatNeedsIt(bool twoPass, bool selectsRows, bool fails)
+    {
+        var (path, _) = await WriteCorruptedAsync();
+        FileRange noteChunk;
+        await using (var probe = new LocalRandomAccessFile(path))
+        using (var reader = new ParquetFileReader(probe, ownsFile: false))
+        {
+            var meta = (await reader.ReadMetadataAsync()).RowGroups[0].Columns[1].MetaData!;
+            long start = meta.DictionaryPageOffset is { } d && d > 0 && d < meta.DataPageOffset ? d : meta.DataPageOffset;
+            noteChunk = new FileRange(start, meta.TotalCompressedSize);
+        }
+
+        await using var local = new LocalRandomAccessFile(path);
+        var failing = new FailingWhereItOverlaps(local, noteChunk);
+        // The footer read exactly: its usual 64 KiB tail would reach into the failing chunk in a file this small.
+        using var selected = new ParquetFileReader(failing, ownsFile: false, new ParquetReadOptions { FooterReadSize = 0 })
+        {
+            TwoPassReads = twoPass,
+        };
+        var error = await Record.ExceptionAsync(async () =>
+        {
+            await foreach (var batch in selected.ReadSelectedAsync(Scan(maxId: selectsRows ? 1_000 : -1)))
+                batch.Dispose();
+        });
+
+        if (fails)
+            Assert.IsType<IOException>(error);
+        else
+            Assert.Null(error);
+    }
+
+    /// <summary>A file whose reads touching one range fail, as an object store refusing a request would.</summary>
+    private sealed class FailingWhereItOverlaps(IRandomAccessFile inner, FileRange bad) : IRandomAccessFile
+    {
+        public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default) => inner.GetLengthAsync(cancellationToken);
+
+        public ValueTask<System.Buffers.IMemoryOwner<byte>> ReadAsync(FileRange range, CancellationToken cancellationToken = default) =>
+            Touches(range) ? throw new IOException("refused") : inner.ReadAsync(range, cancellationToken);
+
+        public ValueTask<IReadOnlyList<System.Buffers.IMemoryOwner<byte>>> ReadRangesAsync(
+            IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default) =>
+            ranges.Any(Touches) ? throw new IOException("refused") : inner.ReadRangesAsync(ranges, cancellationToken);
+
+        private bool Touches(FileRange r) => r.Offset < bad.Offset + bad.Length && bad.Offset < r.Offset + r.Length;
+
+        public ValueTask DisposeAsync() => default;
+
+        public void Dispose()
+        {
+        }
+    }
+
     [Fact]
     public async Task AOnePassReadDecodesTheSamePageAndFails()
     {

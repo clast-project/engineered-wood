@@ -13,23 +13,45 @@ namespace EngineeredWood.Parquet;
 /// so deciding which pages to decode costs no extra round trip (doc/row-level-filtering.md, F5).
 /// </summary>
 /// <remarks>
-/// The underlying file is NOT disposed with this one. The fetched bytes are, once nothing more is read: the
-/// arrays decoded from them never point into them, as for any other read buffer.
+/// <para>The underlying file is NOT disposed with this one. The fetched bytes are, once nothing more is read: the
+/// arrays decoded from them never point into them, as for any other read buffer.</para>
+/// <para>A failed fetch is raised by every read through this file, as any read error is. One nobody reads through
+/// (the first pass selected no row, so no output column is decoded) is NOT raised: the read's result needs none
+/// of those bytes and is complete without them, as a two-pass read does not fail on a corrupt page it never
+/// decodes. Disposal also cancels a fetch still running, so a row group that selects nothing does not wait for
+/// bytes it will not use.</para>
 /// </remarks>
 internal sealed class PrefetchedFile : IRandomAccessFile
 {
     private readonly IRandomAccessFile _inner;
     private readonly FileRange[] _ranges;
     private readonly Task<IReadOnlyList<IMemoryOwner<byte>>> _fetch;
+    private readonly CancellationTokenSource _cancel;
 
     /// <summary>Starts reading <paramref name="ranges"/> from <paramref name="inner"/>.</summary>
     public PrefetchedFile(IRandomAccessFile inner, IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken)
     {
         _inner = inner;
         _ranges = ranges.OrderBy(r => r.Offset).ToArray();
+        _cancel = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _fetch = _ranges.Length == 0
             ? Task.FromResult<IReadOnlyList<IMemoryOwner<byte>>>([])
-            : inner.ReadRangesAsync(_ranges, cancellationToken).AsTask();
+            : Start(inner, _ranges, _cancel.Token);
+    }
+
+    // The fetch as a task, a file that throws as it is asked (rather than faulting the task it returns) included:
+    // either way the failure belongs to whoever reads through this file, not to its construction.
+    private static Task<IReadOnlyList<IMemoryOwner<byte>>> Start(
+        IRandomAccessFile inner, FileRange[] ranges, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return inner.ReadRangesAsync(ranges, cancellationToken).AsTask();
+        }
+        catch (Exception e)
+        {
+            return Task.FromException<IReadOnlyList<IMemoryOwner<byte>>>(e);
+        }
     }
 
     public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default) =>
@@ -96,6 +118,10 @@ internal sealed class PrefetchedFile : IRandomAccessFile
 
     public async ValueTask DisposeAsync()
     {
+        // A fetch still running is one nothing will read: stop it rather than wait for bytes nobody uses.
+        if (!_fetch.IsCompleted)
+            _cancel.Cancel();
+
         IReadOnlyList<IMemoryOwner<byte>> buffers;
         try
         {
@@ -103,7 +129,13 @@ internal sealed class PrefetchedFile : IRandomAccessFile
         }
         catch
         {
-            return; // nothing was fetched; the failure reached whoever read through this file, if anyone did
+            // Nothing was fetched. A read through this file has raised the failure already; with no read, no
+            // result depended on the bytes (see the remarks), and a cancellation here is this disposal's own.
+            return;
+        }
+        finally
+        {
+            _cancel.Dispose();
         }
 
         foreach (var buffer in buffers)
