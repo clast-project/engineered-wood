@@ -247,33 +247,246 @@ public class ExactFilterTests : IDisposable
             b.Dispose();
     }
 
+    // ---- Host row masks (3b) ---------------------------------------------------------------------------------------
+
+    private static BooleanArray Answer(int length, Func<int, bool?> row)
+    {
+        var b = new BooleanArray.Builder().Reserve(length);
+        for (int i = 0; i < length; i++)
+        {
+            if (row(i) is { } v)
+                b.Append(v);
+            else
+                b.AppendNull();
+        }
+
+        return b.Build();
+    }
+
+    private static long Id(RecordBatch batch, int row) => ((Int64Array)batch.Column(batch.Schema.GetFieldIndex("id"))).GetValue(row)!.Value;
+
+    private static readonly Dictionary<string, DeltaRowMask[]> Masks = new()
+    {
+        // A key column, as a join filter probes it.
+        ["key"] = [new DeltaRowMask(["v"], b =>
+        {
+            var v = (Int32Array)b.Column(0);
+            return Answer(b.Length, i => v.GetValue(i)!.Value % 3 == 0);
+        })],
+        // Two columns, named out of table order: the batch holds them in the mask's order.
+        ["two columns"] = [new DeltaRowMask(["n", "id"], b =>
+        {
+            Assert.Equal(["n", "id"], b.Schema.FieldsList.Select(f => f.Name));
+            var n = (Int32Array)b.Column(0);
+            var id = (Int64Array)b.Column(1);
+            return Answer(b.Length, i => !n.IsNull(i) && id.GetValue(i)!.Value % 2 == 0);
+        })],
+        // A partition column: the file's value, asked once per file.
+        ["partition"] = [new DeltaRowMask(["region"], b =>
+        {
+            var region = (StringArray)b.Column(0);
+            return Answer(b.Length, i => region.GetString(i) != "b");
+        })],
+        // NULL drops a row, as FALSE does.
+        ["null answers"] = [new DeltaRowMask(["id"], b =>
+        {
+            var id = (Int64Array)b.Column(0);
+            return Answer(b.Length, i => id.GetValue(i)!.Value % 4 == 0 ? null : true);
+        })],
+        // Several masks: every one must keep the row.
+        ["two masks"] =
+        [
+            new DeltaRowMask(["v"], b =>
+            {
+                var v = (Int32Array)b.Column(0);
+                return Answer(b.Length, i => v.GetValue(i)!.Value < 60);
+            }),
+            new DeltaRowMask(["note", "region"], b =>
+            {
+                var note = (StringArray)b.Column(0);
+                var region = (StringArray)b.Column(1);
+                return Answer(b.Length, i => note.GetString(i).EndsWith("1", StringComparison.Ordinal) || region.GetString(i) == "c");
+            }),
+        ],
+    };
+
+    public static IEnumerable<object[]> MaskCases()
+    {
+        foreach (var mask in Masks.Keys)
+        {
+            foreach (var filter in new[] { "", "data", "nullable" })
+            {
+                foreach (var projection in Projections.Keys)
+                {
+                    foreach (var (concurrency, seam) in new[] { (1, false), (4, false), (1, true) })
+                        yield return [mask, filter, projection, concurrency, seam];
+                }
+            }
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(MaskCases))]
+    public async Task HostMasksKeepOnlyTheRowsEveryMaskAnswersTrueFor(
+        string maskName, string filterName, string projectionName, int concurrency, bool seam)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, seam, ColumnMappingMode.None);
+        await AssertExactAsync(
+            table, filterName.Length == 0 ? null : Filters[filterName], Projections[projectionName], Masks[maskName]);
+    }
+
+    [Fact]
+    public async Task WithoutFilterRowsTheFilterStillOnlyPrunesButTheMasksApply()
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, seam: false, ColumnMappingMode.None);
+        var options = new DeltaReadOptions { Filter = Filters["data"], RowMasks = Masks["key"] };
+        var mask = DeltaTable.MaskFor(Filters["data"]);
+        long rows = 0, outsideFilter = 0;
+        await foreach (var b in table.ReadAsync(options))
+        {
+            using (b)
+            {
+                using var inFilter = mask(b);
+                var v = (Int32Array)b.Column(b.Schema.GetFieldIndex("v"));
+                for (int i = 0; i < b.Length; i++)
+                {
+                    Assert.Equal(0, v.GetValue(i)!.Value % 3);
+                    if (inFilter.GetValue(i) != true)
+                        outsideFilter++;
+                }
+
+                rows += b.Length;
+            }
+        }
+
+        Assert.True(rows > 0);
+        Assert.True(outsideFilter > 0, "the filter was applied to rows without FilterRows");
+    }
+
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(4, false)]
+    [InlineData(1, true)]
+    public async Task AMaskIsNeverAskedAboutADeletedRow(int concurrency, bool seam)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, seam, ColumnMappingMode.None);
+        var asked = new System.Collections.Concurrent.ConcurrentBag<long>();
+        var probe = new DeltaRowMask(["id"], b =>
+        {
+            for (int i = 0; i < b.Length; i++)
+                asked.Add(Id(b, i));
+            return Answer(b.Length, _ => true);
+        });
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { Columns = ["note"], RowMasks = [probe] }))
+            b.Dispose();
+
+        Assert.NotEmpty(asked);
+        Assert.DoesNotContain(asked, id => id % 7 == 0);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AMaskOnAColumnAddedLaterSeesNullForTheOlderFiles(bool seam)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 4, seam, ColumnMappingMode.None);
+        await table.AddColumnAsync(new Field("score", DoubleType.Default, true));
+        var withScore = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("region", StringType.Default, false))
+            .Field(new Field("v", Int32Type.Default, false))
+            .Field(new Field("n", Int32Type.Default, true))
+            .Field(new Field("note", StringType.Default, false))
+            .Field(new Field("score", DoubleType.Default, true))
+            .Build();
+        var scores = new DoubleArray.Builder();
+        for (int i = 0; i < 40; i++)
+            scores.Append(i);
+        var batch = Rows(1_000, 40);
+        await table.WriteAsync([new RecordBatch(withScore, [.. Enumerable.Range(0, batch.ColumnCount).Select(batch.Column), scores.Build()], 40)]);
+
+        var nullScore = new DeltaRowMask(["score"], b => Answer(b.Length, i => b.Column(0).IsNull(i)));
+        var bigScore = new DeltaRowMask(["score"], b =>
+        {
+            var score = (DoubleArray)b.Column(0);
+            return Answer(b.Length, i => score.GetValue(i) > 30);
+        });
+        await AssertExactAsync(table, null, ["id"], [nullScore]);
+        await AssertExactAsync(table, null, ["id", "score"], [bigScore]);
+    }
+
+    [Fact]
+    public async Task AMaskNamingAColumnTheTableLacksIsRefusedBeforeAnyFileIsRead()
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, seam: false, ColumnMappingMode.None);
+        bool asked = false;
+        var options = new DeltaReadOptions
+        {
+            RowMasks = [new DeltaRowMask(["id", "missing"], b => { asked = true; return Answer(b.Length, _ => true); })],
+        };
+        await Assert.ThrowsAsync<ArgumentException>(async () =>
+        {
+            await foreach (var b in table.ReadAsync(options))
+                b.Dispose();
+        });
+        Assert.False(asked);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AMaskOfTheWrongLengthIsRefused(bool seam)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, seam, ColumnMappingMode.None);
+        var options = new DeltaReadOptions
+        {
+            RowMasks = [new DeltaRowMask(["id"], b => Answer(b.Length + 1, _ => true))],
+        };
+        await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+        {
+            await foreach (var b in table.ReadAsync(options))
+                b.Dispose();
+        });
+    }
+
+    [Fact]
+    public void AMaskOverNoColumnOrARepeatedOneIsRefused()
+    {
+        Assert.Throws<ArgumentException>(() => new DeltaRowMask([], b => Answer(b.Length, _ => true)));
+        Assert.Throws<ArgumentException>(() => new DeltaRowMask(["id", "id"], b => Answer(b.Length, _ => true)));
+    }
+
     // ---- The oracle ----------------------------------------------------------------------------------------------
 
-    private static async Task AssertExactAsync(DeltaTable table, Predicate filter, string[]? projection)
+    private static async Task AssertExactAsync(
+        DeltaTable table, Predicate? filter, string[]? projection, IReadOnlyList<DeltaRowMask>? masks = null)
     {
-        var expected = await ReadRowsAsync(table, filter, projection, exactly: false);
-        var actual = await ReadRowsAsync(table, filter, projection, exactly: true);
+        var expected = await ReadRowsAsync(table, filter, projection, exactly: false, masks);
+        var actual = await ReadRowsAsync(table, filter, projection, exactly: true, masks);
         Assert.Equal(expected, actual);
     }
 
     /// <summary>
     /// Each row as text: its projected columns, then its locator position and row id. Without <paramref name="exactly"/>,
-    /// a superset scan over the projection plus every column (so the filter can be evaluated), filtered row by row.
+    /// a superset scan over the projection plus every column (so the filter can be evaluated), filtered row by row by
+    /// the filter and then by each of <paramref name="masks"/>, asked over its own columns of the superset batch.
     /// </summary>
-    private static async Task<List<string>> ReadRowsAsync(DeltaTable table, Predicate filter, string[]? projection, bool exactly)
+    private static async Task<List<string>> ReadRowsAsync(
+        DeltaTable table, Predicate? filter, string[]? projection, bool exactly, IReadOnlyList<DeltaRowMask>? masks = null)
     {
         var options = new DeltaReadOptions
         {
             Columns = exactly ? projection : null,
             Filter = filter,
-            FilterRows = exactly,
+            FilterRows = exactly && filter is not null,
+            RowMasks = exactly ? masks : null,
             Metadata = table.CurrentSnapshot.Metadata.Configuration?.TryGetValue("delta.enableRowTracking", out var on) == true
                 && on == "true"
                 ? DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking
                 : DeltaRowMetadata.Locator,
         };
         var rows = new List<string>();
-        var mask = DeltaTable.MaskFor(filter);
+        var mask = filter is null ? null : DeltaTable.MaskFor(filter);
         await foreach (var batch in table.ReadAsync(options))
         {
             using (batch)
@@ -289,10 +502,16 @@ public class ExactFilterTests : IDisposable
                         $"returned {string.Join(",", dataColumns)} for a projection of {string.Join(",", projection)}");
                 }
 
-                BooleanArray? keep = exactly ? null : mask(batch);
+                BooleanArray? keep = exactly || mask is null ? null : mask(batch);
+                var hostAnswers = exactly || masks is null ? [] : masks.Select(m => m.Mask(new RecordBatch(
+                        new Apache.Arrow.Schema(m.Columns.Select(c => batch.Schema.GetFieldByName(c)).ToList(), null),
+                        m.Columns.Select(c => batch.Column(c)).ToList(), batch.Length)))
+                    .ToList();
                 for (int r = 0; r < batch.Length; r++)
                 {
                     if (keep is not null && keep.GetValue(r) != true)
+                        continue;
+                    if (hostAnswers.Any(a => a.GetValue(r) != true))
                         continue;
                     var cells = new List<string>();
                     for (int c = 0; c < batch.ColumnCount; c++)

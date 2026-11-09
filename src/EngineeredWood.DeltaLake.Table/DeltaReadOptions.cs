@@ -51,6 +51,18 @@ public sealed record DeltaReadOptions
     /// </remarks>
     public bool FilterRows { get; init; }
 
+    /// <summary>
+    /// The host's own row conditions (#502): a scan returns only the rows every mask answers TRUE for. Null or empty
+    /// for none. They apply whether or not <see cref="FilterRows"/> is set, after the exact <see cref="Filter"/>
+    /// when it is, in the order given. Each mask's columns are refused before any file is read unless the table has
+    /// them; they are read for the mask and returned only if <see cref="Columns"/> names them.
+    /// </summary>
+    /// <remarks>
+    /// A row a deletion vector deletes is never passed to a mask, and metadata columns follow the rows kept. See
+    /// <see cref="DeltaRowMask"/> for what a mask is given and may assume.
+    /// </remarks>
+    public IReadOnlyList<DeltaRowMask>? RowMasks { get; init; }
+
     /// <summary>Which per-row metadata columns to append. Combinable; defaults to none.</summary>
     public DeltaRowMetadata Metadata { get; init; } = DeltaRowMetadata.None;
 

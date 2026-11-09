@@ -1,0 +1,68 @@
+// Copyright (c) clast-project. All rights reserved.
+// Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+
+using Apache.Arrow;
+
+namespace EngineeredWood.DeltaLake.Table;
+
+/// <summary>
+/// A host's own row condition for a scan (<see cref="DeltaReadOptions.RowMasks"/>): the logical columns it reads,
+/// and a function from them to a mask. A host engine's runtime join filter is the case it is for: a membership test
+/// of a key column against the join's build side, applied while the probe side is read.
+/// </summary>
+/// <remarks>
+/// <para>The scan never looks inside <see cref="Mask"/>, so a mask may over-approximate (a Bloom filter's false
+/// positives): the rows it keeps are returned, and the host rechecks them as its join would anyway.</para>
+/// <para>With the built-in reader the mask runs inside the Parquet read, after <see cref="DeltaReadOptions.Filter"/>
+/// when <see cref="DeltaReadOptions.FilterRows"/> is set, and only over the rows still live, so the other columns of
+/// the rows it rejects can go undecoded. Through a <see cref="DeltaTableOptions.DataFileReader"/> it runs on each
+/// batch the reader returns.</para>
+/// </remarks>
+public sealed class DeltaRowMask
+{
+    /// <summary>Creates a mask over <paramref name="columns"/>.</summary>
+    /// <param name="columns">Top-level logical column names of the table, at least one, without repeats.</param>
+    /// <param name="mask">The mask; see <see cref="Mask"/>.</param>
+    /// <exception cref="ArgumentException"><paramref name="columns"/> is empty or names a column twice.</exception>
+    public DeltaRowMask(IReadOnlyList<string> columns, Func<RecordBatch, BooleanArray> mask)
+    {
+        if (columns is null)
+            throw new ArgumentNullException(nameof(columns));
+        if (columns.Count == 0)
+            throw new ArgumentException("A row mask reads at least one column.", nameof(columns));
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var name in columns)
+        {
+            if (name is null)
+                throw new ArgumentException("A column name is null.", nameof(columns));
+            if (!seen.Add(name))
+                throw new ArgumentException($"Column '{name}' is named twice.", nameof(columns));
+        }
+
+        Columns = columns.ToArray();
+        Mask = mask ?? throw new ArgumentNullException(nameof(mask));
+    }
+
+    /// <summary>
+    /// The top-level logical columns the mask reads. The batch passed to <see cref="Mask"/> holds exactly these, in
+    /// this order and with the table's types, whether or not the scan projects them: a partition column carries the
+    /// file's partition value, and a column added after a file was written is NULL for that file's rows. A name
+    /// the table doesn't have is refused when the scan starts.
+    /// </summary>
+    public IReadOnlyList<string> Columns { get; }
+
+    /// <summary>
+    /// Answers each row of a batch: a mask of the batch's length. TRUE keeps the row; FALSE or NULL drops it.
+    /// </summary>
+    /// <remarks>
+    /// <para>May be called concurrently, since files and row groups are read in parallel. The batch belongs to the
+    /// scan: do not keep it or dispose it. The scan takes ownership of the returned mask, unless it is one of the
+    /// batch's own columns.</para>
+    /// <para>An exception propagates out of the scan.</para>
+    /// <para>How rows are cut into batches is the scan's choice, and differs between reads: a row's answer must
+    /// not depend on which other rows share its batch. A mask that reads no column the file holds (only partition
+    /// columns, or columns added after the file was written) sees the same values on every row of the file, and is
+    /// asked once for the whole file, over a single row.</para>
+    /// </remarks>
+    public Func<RecordBatch, BooleanArray> Mask { get; }
+}
