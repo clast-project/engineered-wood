@@ -57,7 +57,8 @@ public sealed class RowPredicate
     /// Evaluate holds exactly these columns, in this order, whether or not they are projected.
     public IReadOnlyList<string> Columns { get; }
 
-    /// Returns a mask of the batch's length; null and false both drop the row. May be called
+    /// Returns a mask of the batch's length. False drops the row; null keeps it for the predicates
+    /// after this one but out of the result (see RowFilter). May be called
     /// concurrently (row groups are read in parallel). The batch belongs to the reader: don't keep it.
     /// Exceptions propagate out of the read, as from a post-filter.
     public Func<RecordBatch, BooleanArray> Evaluate { get; }
@@ -68,7 +69,11 @@ public sealed class RowPredicate
     public bool ValueWise { get; init; }
 }
 
-/// Predicates ANDed in order. Each one sees only the rows the earlier ones kept.
+/// Predicates ANDed in order, with SQL's three-valued AND short-circuited per row, as
+/// ArrowRowEvaluator's (and Spark's) And is. A row is dropped as soon as one predicate answers
+/// FALSE, and later predicates never see it. A row answered NULL stays live, so later predicates
+/// still evaluate it (and can still raise on it), but it is never returned. A row is returned only
+/// when every predicate answered TRUE. The reader keeps two bitmaps: live, and all-true so far.
 public sealed class RowFilter
 {
     public RowFilter(params RowPredicate[] predicates);
@@ -122,8 +127,8 @@ public IAsyncEnumerable<SelectedRecordBatch> ReadSelectedAsync(ParquetScan scan,
 1. **Seed** a row-group bitmap with the planned `Ranges` (or all rows). Then call `ExcludedRows.ClearExcluded`. At 1M rows this is 128 KB of `SelectionMask`, from `ArrayPool`.
 2. **Pass 1**, for each `RowPredicate` in order:
    - Decode its columns that aren't decoded yet, only for pages holding a selected row (OffsetIndex), selection applied in the decoder (§5).
-   - Evaluate in batches of the selected rows (`BatchSize`, or an internal 64K default), and AND each mask into the bitmap.
-   - If the bitmap is empty, finish the group: no output column is fetched.
+   - Evaluate in batches of the live rows (`BatchSize`, or an internal 64K default). Clear FALSE rows from the live bitmap, and clear FALSE and NULL rows from the all-true bitmap (§3, `RowFilter`).
+   - If the live bitmap is empty, finish the group: no output column is fetched. After the last predicate, the all-true bitmap is the selection.
    - A filter column that is also projected keeps its decoded rows, charged to the scan's `MemoryBudget`. Over budget, they are dropped and re-decoded in pass 2.
 3. **Pass 2:** decode the remaining projected columns under the final bitmap. Pages with no selected row are not fetched or decompressed. Kept filter columns are compacted to the final selection with a bitmap filter, not a `Take`.
 4. **Assemble** output batches of up to `BatchSize` / `MaxBatchByteSize` *output* rows, with positions taken from the bitmap's set bits plus `GroupStart`.
@@ -161,13 +166,18 @@ This is generic over the delegate. So EW's Spark predicates (once marked value-w
 
 It is the 3–5 ms (about 22% of samples) measured on `OneCategory` in #608/#609.
 
-An all-false lookup table proves that no row of the group can pass, provided the null answer is false too or the chunk has no nulls. Treat that as a prune, and skip the group before any data page is read. This is the only way an opaque filter (a host's Bloom probe) can prune a row group. `MembershipPredicateEvaluator` can't, because it needs a `Predicate`.
+An all-false lookup table proves that no row of the group can pass, but only when three things hold:
+- the null answer is false too, or the chunk has no nulls;
+- the chunk is **wholly** dictionary-encoded, as `MembershipPredicateEvaluator.IsWhollyDictionaryEncoded` decides from `encoding_stats`. A chunk that fell back to PLAIN partway through can hold matching values the dictionary doesn't;
+- it is the first predicate, or every predicate before it cannot raise (the rule for reordering in §7). Skipping the group skips evaluating the earlier predicates over its rows, which would suppress an error one of them raises.
+
+Then treat it as a prune, and skip the group before any data page is read. If any of the three fails, keep evaluating: fallback pages are decoded and evaluated row by row. This is the only way an opaque filter (a host's Bloom probe) can prune a row group. `MembershipPredicateEvaluator` can't, because it needs a `Predicate`.
 
 ### Where Bloom filters fit
 
 Two different Bloom filters are involved, at different layers:
 
-- **A host's runtime join filter** (DuckDB's, per cmettler) is a `RowPredicate`, passed through `DeltaReadOptions.RowMasks`. It is evaluated in pass 1 on the key column only and ANDed into the selection; false positives are left for the host's join to recheck. With `ValueWise` set, it is probed once per dictionary entry rather than once per row, and an all-false table prunes the group (above). EW's writer stores integers as DELTA_BINARY_PACKED rather than dictionary-encoding them, so integer keys are still probed per row.
+- **A host's runtime join filter** (DuckDB's, per cmettler) is a `RowPredicate`, passed through `DeltaReadOptions.RowMasks`. It is evaluated in pass 1 on the key column only and ANDed into the selection; false positives are left for the host's join to recheck. With `ValueWise` set, it is probed once per dictionary entry rather than once per row, and an all-false table prunes the group under the conditions above. EW's writer stores integers as DELTA_BINARY_PACKED rather than dictionary-encoding them, so integer keys are still probed per row.
 - **Parquet's own split-block Bloom filters** stay where they are: row-group pruning for `Eq`/`In` in `Prune` (`MightMatchAsync`, opt-in `FilterUseBloomFilters`). They never take part in the row pass. A host with a small build side can also pass `k IN (…)` in `Prune`, and get row-group pruning from the file's dictionaries and Bloom filters before anything is decoded. With a large build side, pass the key range instead.
 
 ## 7. Delta wiring
@@ -177,14 +187,15 @@ Two different Bloom filters are involved, at different layers:
 - `RowMasks` (`IReadOnlyList<DeltaRowMask>`): host delegates over **logical** column names (cmettler's join filters). They may over-approximate and never enter a read set (reads don't declare one anyway). `DeltaRowMask(IReadOnlyList<string> Columns, Func<RecordBatch, BooleanArray> Mask, bool ValueWise = false)`.
 
 Per file, the scan builds the Parquet `RowFilter`:
-- **Split** `Filter` into top-level conjuncts:
-  - A conjunct over partition columns only was already answered by file pruning, so it is dropped.
-  - A partition column inside a mixed conjunct is folded to the file's literal.
-  - A column missing from the file folds to NULL.
+- **Split** `Filter` into top-level conjuncts, **in source order**:
+  - Partition columns are folded to the file's typed partition values, and columns missing from the file to NULL.
+  - A conjunct left with no column reference is evaluated once per file, on a one-row batch. TRUE drops the conjunct; FALSE or NULL skips the file, since no row can pass. File pruning alone can't stand in for this: it keeps a file whenever it can't decide, so `lower(p) = 'us'` survives pruning for a file partitioned on `p = 'ca'`. An error raises, as it would on the file's rows; an empty file raises nothing, since it has no rows.
   - Every other conjunct becomes a `RowPredicate` over physical leaf names.
+  - Because `RowFilter` keeps NULL rows live (§3), splitting `n > 0 AND 1/z > 0` into two predicates still raises on a row with NULL `n` and zero `z`, as `ArrowRowEvaluator`'s `EvalAnd` does (`ShortCircuitEvaluationTests.AndStopsAtFalseAndOrAtTrue`).
 - **Wrap each delegate** to rename physical to logical, and to widen types as `ReconcileToTableShape` would, on the predicate's own small batch. Then call `RowEvaluator.EvaluatePredicate`.
   - `ValueWise` is true when the conjunct has no function calls, or only functions the registry declares deterministic. That needs a new optional registry capability, like `IShortCircuitingFunctions`.
-- **Order:** host masks after the `Filter` conjuncts. Conjuncts that can be evaluated value-wise over dictionaries go first. Selectivity ordering comes later.
+- **Order:** host masks after the `Filter` conjuncts. The conjuncts keep their source order unless reordering can't change which errors are raised. Moving conjunct A ahead of B means B is no longer evaluated on rows where A is FALSE, which suppresses an error B would raise there. So only conjuncts that **cannot raise** may move earlier: comparisons, IN and null tests of a column against a literal, with no cast, arithmetic or function call. Among those, the ones that can be evaluated value-wise over dictionaries go first. Selectivity ordering comes later, under the same rule.
+- **Analysis errors:** `RefuseUnanalyzable` still runs on the whole predicate before the scan. The reader may stop evaluating a row group once no row is live, whereas `EvalAnd` evaluates every operand even over an empty selection, to surface an operand that can't be evaluated at all.
 - **Deletion vector:** `ExcludedRows = DeletedRows`. `ProcessFileBatchesAsync` loses steps 3 and 4 above (its `KeptRows`/`Take`).
 - **Row ids, versions and `_ew_row_address`** are built from `RowPositions`. Materialized row-tracking columns are ordinary projected columns, so they are masked by the same bitmap as everything else. This removes structurally the "masked out of step" hazard that `predicate-pushdown-design.md` warns about.
 - **Filter-only columns** are read and dropped by the reader. `GetReadSchema` doesn't change.
@@ -249,38 +260,40 @@ i9-12900K (24 logical processors), net10.0, median of 7 rounds.
 
 | Case | Kept | none | post | pass1 | late | late vs post | eval | gather |
 |---|---|---|---|---|---|---|---|---|
-| clustered 1% narrow | 1% | 4.8 | 0.7 | 0.4 | 0.8 | +7% | 0.3 | |
-| clustered 90% narrow | 90% | 5.5 | 19.5 | 3.8 | 12.4 | -36% | 2.0 | |
-| clustered 90% wide | 90% | 23.9 | 61.3 | 3.8 | 39.6 | -34% | 2.1 | |
-| scattered point narrow | 0% | 4.9 | 11.1 | 7.0 | 7.3 | -34% | 4.8 | 0.2 |
-| scattered 0.1% narrow | 0.1% | 5.3 | 9.4 | 4.8 | 10.1 | +10% | 2.4 | 0.3 |
-| scattered 1% wide | 1% | 24.2 | 31.8 | 4.9 | 28.4 | -11% | 2.6 | 3.6 |
-| scattered 10% wide | 10% | 23.9 | 44.3 | 5.9 | 32.3 | -25% | 3.6 | 13.6 |
-| scattered 50% narrow | 50% | 5.3 | 26.7 | 10.3 | 17.8 | -33% | 7.9 | 9.5 |
-| scattered 99% narrow | 99% | 5.2 | 30.4 | 4.8 | 14.4 | -51% | 2.4 | 17.5 |
-| scattered 99% wide | 99% | 24.2 | 76.0 | 5.0 | 40.4 | -46% | 2.4 | 49.9 |
-| scattered point wide | 0% | 23.2 | 30.6 | 7.1 | 8.1 | -73% | 4.9 | 0.2 |
-| category = 2% wide | 2% | 25.0 | 32.2 | 7.7 | 33.2 | +2% | 3.7 | |
-| category <> 98% wide | 98% | 26.4 | 70.4 | 7.9 | 47.9 | -34% | 3.8 | |
+| clustered 1% narrow | 1% | 4.9 | 0.7 | 0.4 | 0.7 | +6% | 0.3 | 0.1 |
+| clustered 90% narrow | 90% | 5.3 | 16.6 | 3.8 | 11.6 | -30% | 2.0 | 11.1 |
+| clustered 90% wide | 90% | 24.8 | 64.2 | 3.8 | 37.8 | -41% | 2.0 | 41.4 |
+| scattered point narrow | 0% | 5.3 | 11.3 | 6.8 | 7.1 | -38% | 4.5 | 0.2 |
+| scattered 0.1% narrow | 0.1% | 5.0 | 9.2 | 4.6 | 9.9 | +7% | 2.3 | 0.3 |
+| scattered 1% wide | 1% | 24.7 | 31.1 | 4.9 | 29.7 | -9% | 2.5 | 3.9 |
+| scattered 10% wide | 10% | 23.9 | 40.3 | 5.7 | 32.6 | -18% | 3.6 | 15.1 |
+| scattered 50% narrow | 50% | 5.5 | 23.6 | 10.3 | 17.6 | -26% | 8.1 | 9.3 |
+| scattered 99% narrow | 99% | 5.3 | 26.8 | 4.6 | 13.0 | -50% | 2.4 | 17.4 |
+| scattered 99% wide | 99% | 24.5 | 74.0 | 4.8 | 43.8 | -37% | 2.4 | 44.4 |
+| scattered point wide | 0% | 23.8 | 29.6 | 6.9 | 7.9 | -73% | 4.8 | 0.1 |
+| category = 2% wide | 2% | 25.1 | 31.4 | 7.9 | 32.9 | +5% | 3.8 | 6.0 |
+| category <> 98% wide | 98% | 25.8 | 67.9 | 8.0 | 45.4 | -30% | 3.8 | 42.1 |
 
 **Cloud model** (20 ms per GET through `CoalescingFileReader`, 100 MB/s), milliseconds:
 
 | Case | post | late | late vs post | GETs post / late | MB read post / late |
 |---|---|---|---|---|---|
-| clustered 0.1% narrow | 86 | 160 | +86% | 4 / 6 | 0.2 / 0.2 |
-| clustered 10% wide | 152 | 218 | +44% | 5 / 7 | 8.3 / 8.3 |
-| scattered 1% wide | 308 | 344 | +11% | 6 / 14 | 75.5 / 75.5 |
-| scattered point wide | 323 | 168 | -48% | 6 / 16 | 75.5 / 9.5 |
-| scattered 99% wide | 360 | 365 | +1% | 6 / 14 | 75.5 / 75.5 |
+| clustered 0.1% narrow | 84 | 159 | +87% | 4 / 6 | 0.2 / 0.2 |
+| clustered 10% wide | 151 | 216 | +43% | 5 / 7 | 8.3 / 8.3 |
+| scattered 1% wide | 316 | 347 | +9% | 6 / 14 | 75.5 / 75.5 |
+| scattered point wide | 318 | 169 | -47% | 6 / 16 | 75.5 / 9.5 |
+| scattered 99% wide | 354 | 356 | +3% | 6 / 14 | 75.5 / 75.5 |
+
+Timings exclude the correctness check. Each case's strategies are checked against each other in a separate untimed run (count plus an `id` checksum); an earlier version of the harness ran the checksum inside the timed region, which added 2–6 ms to `post` at high selectivity.
 
 Excluding 1% of rows at random (as a deletion vector would) changed none of these comparisons. The harness clears excluded rows with a naive per-row loop, so it says nothing about the cost of deletion vectors themselves.
 
 ### Findings
 
-- **F1. Today's exact read is bound by the consumer thread, not by decoding.** `post − none` is about `eval + gather`. The gather (index list, `Take`, projection) costs 17.5 ms narrow and 50 ms wide at 99% kept, while the reader decodes four row groups in parallel. `late` gains −34 to −61% at ≥90% kept while decoding the *same* bytes, because its gather runs inside per-row-group tasks. So evaluation and compaction belong inside the row-group unit (`ReadPlannedAsync` under `OrderedScan`). This is phase 1a: the biggest local win, with no I/O change. Separately, `ArrowCompute.Take` allocates its output in managed memory (181 MB managed for the post-filter at 99% wide), which is worth its own look.
-- **F2. Page-level skipping does nothing for scattered selections at ≥0.1%.** With 20,000-row pages, every page holds about 20 or more matches. Only the point lookup skipped pages: 5.8 MB read instead of 21.5, −34% narrow, −73% wide. Phase 1b alone does not serve the host's join filter. Phase 2 (selection inside the decoders) does, and it has to come next.
-- **F3. The evaluator is no longer the bottleneck.** #502 asked for this re-measurement. `r < k` costs 1.2–4 ms per million rows, and `category = '…'` about 2 ms, down from 40 ms per million before #560. The cost peaks at 50% kept (7.9 ms per 2M rows against 2.4 ms at 1% or 99%), which suggests a branchy comparison or `SelectionMask.And` loop. Check it before tuning.
+- **F1. Today's exact read is bound by the consumer thread, not by decoding.** `post − none` is about `eval + gather`. The gather (index list, `Take`, projection) costs 17.4 ms narrow and 44.4 ms wide at 99% kept, while the reader decodes four row groups in parallel. `late` gains 30–51% at ≥90% kept while decoding the *same* bytes, because its gather runs inside per-row-group tasks. So evaluation and compaction belong inside the row-group unit (`ReadPlannedAsync` under `OrderedScan`). This is phase 1a: the biggest local win, with no I/O change. Separately, `ArrowCompute.Take` allocates its output in managed memory (181 MB managed for the post-filter at 99% wide), which is worth its own look.
+- **F2. Page-level skipping does nothing for scattered selections at ≥0.1%.** With 20,000-row pages, every page holds about 20 or more matches. Only the point lookup skipped pages: 5.8 MB read instead of 21.5, −38% narrow, −73% wide. Phase 1b alone does not serve the host's join filter. Phase 2 (selection inside the decoders) does, and it has to come next.
+- **F3. The evaluator is no longer the bottleneck.** #502 asked for this re-measurement. `r < k` costs 1.2–4 ms per million rows, and `category = '…'` about 2 ms, down from 40 ms per million before #560. The cost peaks at 50% kept (8.1 ms per 2M rows against 2.4 ms at 1% or 99%), which suggests a branchy comparison or `SelectionMask.And` loop. Check it before tuning.
 - **F4. Most of an exact read is decoding and gathering what the filter discards.** `pass1` (filter columns plus evaluation) is 4.6–10 ms, against 9–85 ms for `post` on unclustered predicates.
-- **F5. On object storage, a second dependent fetch costs more than lazy decoding saves.** `late` was 44–86% slower on small clustered selections, because pass 2 waits for pass 1, plus the emulation's extra OffsetIndex request. Only the point lookup, which saved 66 MB, won. The design therefore separates I/O from decoding: fetch filter and output pages together by default, and decode output pages lazily. Split the fetch only when pass 1 can be expected to empty enough pages to save more than a round trip. That is roughly `bytes saved / bandwidth > latency`, learned from earlier row groups of the same scan. Clustered predicates are already narrowed by the page index before any fetch.
+- **F5. On object storage, a second dependent fetch costs more than lazy decoding saves.** `late` was 43–87% slower on small clustered selections, because pass 2 waits for pass 1, plus the emulation's extra OffsetIndex request. Only the point lookup, which saved 66 MB, won. The design therefore separates I/O from decoding: fetch filter and output pages together by default, and decode output pages lazily. Split the fetch only when pass 1 can be expected to empty enough pages to save more than a round trip. That is roughly `bytes saved / bandwidth > latency`, learned from earlier row groups of the same scan. Clustered predicates are already narrowed by the page index before any fetch.
 - **F6. Dictionary strings cost about 3 ms more in pass 1.** `pass1` is 7.8 ms for `category` against 4.7 ms for the integer key, consistent with the #608 profile. That is phase 4's target.
 - **F7. A projected filter column decoded twice costs up to 50% more decoding on narrow clustered reads** (24 MB against 16 MB at 50%). Keeping pass-1 arrays (§4 step 2) is worth it.

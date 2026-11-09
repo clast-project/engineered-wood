@@ -22,8 +22,8 @@ namespace EngineeredWood.Benchmarks;
 /// the median of alternating rounds for each strategy below.
 /// </summary>
 /// <remarks>
-/// <para>The strategies all return the same rows (checked every round by count and a checksum of
-/// <c>id</c>), except <c>none</c>:</para>
+/// <para>The strategies all return the same rows (checked by count and a checksum of
+/// <c>id</c>, in an untimed run after each case's timed rounds), except <c>none</c>:</para>
 /// <list type="bullet">
 /// <item><b>none</b>: the projection read with no filter at all. A reference point, not a filtered read.</item>
 /// <item><b>post</b>: today's exact read, as a table layer must do it. Prune with the predicate
@@ -63,6 +63,9 @@ internal static class RowFilterAb
     private static readonly string[] Wide = ["id", "ts", "category", "amount", "qty", "note"];
 
     private static readonly ArrowRowEvaluator Evaluator = new();
+
+    /// <summary>Whether reads checksum their output: only in the untimed validation runs.</summary>
+    private static volatile bool s_validate;
 
     private enum Strategy { None, Post, Pass1, Late }
 
@@ -120,17 +123,27 @@ internal static class RowFilterAb
                         var s = strategies[(round + k) % strategies.Length];
                         samples[s].Add(await RunOnceAsync(s, c, path, layout, excluded, latencyMs, mbps, cloud));
                     }
+                }
 
-                    // The strategies must agree on the rows, or the comparison means nothing.
-                    var post = samples[Strategy.Post][^1];
-                    var pass1 = samples[Strategy.Pass1][^1];
-                    var late = samples[Strategy.Late][^1];
+                // The strategies must agree on the rows, or the comparison means nothing. Checked in a run of
+                // its own, outside every timing: the checksum is a pass over the output, and it would run on
+                // the consumer's thread for post but on the row-group workers for late.
+                s_validate = true;
+                try
+                {
+                    var post = await RunOnceAsync(Strategy.Post, c, path, layout, excluded, 0, 0, cloud);
+                    var pass1 = await RunOnceAsync(Strategy.Pass1, c, path, layout, excluded, 0, 0, cloud);
+                    var late = await RunOnceAsync(Strategy.Late, c, path, layout, excluded, 0, 0, cloud);
                     if (pass1.Rows != post.Rows || late.Rows != post.Rows || late.Checksum != post.Checksum)
                     {
                         throw new InvalidOperationException(
                             $"{c.Label}: post kept {post.Rows} rows (checksum {post.Checksum}), pass1 {pass1.Rows}, " +
                             $"late {late.Rows} (checksum {late.Checksum}).");
                     }
+                }
+                finally
+                {
+                    s_validate = false;
                 }
 
                 var p = samples[Strategy.Post];
@@ -283,7 +296,7 @@ internal static class RowFilterAb
         public void Add(RecordBatch output)
         {
             Rows += output.Length;
-            if (output.Schema.GetFieldIndex("id") is var i and >= 0)
+            if (s_validate && output.Schema.GetFieldIndex("id") is var i and >= 0)
             {
                 var ids = (Int64Array)output.Column(i);
                 for (int r = 0; r < ids.Length; r++)
