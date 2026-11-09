@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a and 1b built (§12, §13). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-2b and 3a built (§12-§16). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -214,7 +214,7 @@ DML:
 | 1a | *(Revised after phase 0, §11.)* `ReadSelectedAsync` + `RowFilter` + `IExcludedRows` + `RowPositions`, with evaluation and compaction moved **inside the row-group unit**. That means they run in parallel across row groups, not on the consumer's thread. Still one decode pass and one fetch, so no I/O risk. A batch whose selection is all set is passed through, not gathered. | Oracle = full read + post-filter, over the test matrix in #502. Mutation: positions off by one; a batch's mask applied to its neighbour |
 | 1b | *(Built as described in §13: decided per row group after a whole-group first pass.)* Lazy decode: within a fetched row group, decode the output columns only for pages holding a selected row, then decode-then-compact. Fetch filter and output pages in **one** request by default. Fetch them in two stages only where pass 1 can be expected to save more bytes than a round trip costs (§11, F5). Nested columns are decoded whole. | Same oracle. Mutation: pass 2 decodes the unmasked selection. `rowfilter-ab` local and cloud |
 | 2 | In-decoder selection (port the prototype to the batched path); run/bitmap switch. | `selection-ab` on the batched path; no regression at 99% kept |
-| 3 | Delta: `FilterRows`, `RowMasks`, deletion vector via `ExcludedRows`, positions-only DELETE. | Delta suites; Spark interop oracle for DELETE counts |
+| 3 | *(Split into 3a exact scans, §16; 3b `RowMasks`; 3c DELETE.)* Delta: `FilterRows`, `RowMasks`, deletion vector via `ExcludedRows`, positions-only DELETE. | Delta suites; Spark interop oracle for DELETE counts |
 | 4 | Dictionary evaluation (§6) + `IDeterministicFunctions`. | `OneCategory` profile; the dictionary-error fallback test |
 | 5 | Fusion of same-column conjuncts, adaptive demotion of a predicate that keeps >~95% (evaluate it after pass 2 instead), limit pushdown, then a decision on whether `FilterRows` should default on. | Measured crossover |
 
@@ -455,3 +455,53 @@ Locally, two passes now beat one at almost every selectivity. The exceptions:
 ### Open: the default
 
 Two passes are still the default only on object storage (§13), decided before this phase with a note to revisit. Locally they now win nearly everywhere; see the table above.
+
+## 16. Phase 3a: exact Delta scans (2026-11-09)
+
+Phase 3 is split in three: **3a**, exact scans (this); **3b**, host row masks (`RowMasks`); **3c**, DELETE through a positions-only selected read.
+
+### What it does
+
+**`DeltaReadOptions.FilterRows`** (default false) makes `Filter` exact: a scan returns only the rows the filter answers TRUE for. Without it, `Filter` still only prunes.
+- The filter is checked up front with the same analysis refusal a DML predicate gets (`RefuseUnanalyzable`). An invalid filter therefore fails before any file is read, whatever the files contain.
+- It is evaluated with the same Spark-configured evaluator as DML.
+
+**Built-in reader, per file** (`OpenDataFileAsync`):
+- The filter's logical columns are mapped to the physical columns present in that file, by name or by field id.
+- The whole filter becomes **one** `RowPredicate`. Its delegate renames the batch to logical names, brings it to the table's shape for exactly the filter's columns (`ReconcileToTableShape`: partition values, schema-evolution NULLs, widened types), and evaluates. Keeping the filter whole keeps the evaluator's AND semantics exactly; splitting into conjuncts only pays once phase 4's dictionary evaluation exists.
+- A filter that reads **no** column of the file (only partition columns, or columns added after the file was written) is asked once per file, over one row of the table's shape. The file is then read unfiltered or skipped whole.
+- The deletion vector is the read's `ExcludedRows`: `DeletionVectorBitmap` now implements `IExcludedRows`.
+- Row groups are planned with the selected read's columns, and each scan unit reads its row group through `ParquetFileReader.PrepareSelectedAsync`'s per-plan reader. This is a Parquet-internal refactor that `ReadSelectedAsync` now shares.
+- `ProcessSelectedFileBatchesAsync` derives each row's position, row id and commit version from `RowPositions`. Materialized row-tracking columns are ordinary read columns, so they are cut by the same selection. Metadata columns cannot fall out of step with their rows.
+
+**Codec seam:** the seam returns every row, so it reads the filter's columns as well. The filter is applied to each batch once it has the table's shape, and the batch is then cut back to the projection.
+
+### Tests
+
+`ExactFilterTests` compares an exact scan against a superset scan of the same table, filtered row by row with `DeltaTable.MaskFor`, comparing rows, values, positions and row ids. The table has three files, partitions, a deletion vector, row tracking and a nullable column. The cases are:
+- 7 filters: data columns only, partition only, mixed OR, nullable, two columns, nothing, everything;
+- × 3 projections, two of which leave the filter's columns out;
+- × serial, parallel and codec seam.
+
+On top of those, there are cases for:
+- name-mode column mapping;
+- a filter on a column added after some files were written;
+- refusal of an unanalyzable filter;
+- `Filter` without `FilterRows` still being a superset.
+
+Mutations each fail tests:
+- row ids from contiguous positions;
+- the once-per-file answer inverted;
+- no deletion vector;
+- the seam's filter skipped;
+- the seam's projection not cut back;
+- positions off by one.
+
+The seam-projection mutation survived until the test also asserted that the returned data columns are exactly the projection.
+
+### Not yet
+
+- **Conjunct splitting, value-wise dictionary evaluation and selectivity ordering:** phase 4 and later.
+- **`RowMasks`:** 3b.
+- **DELETE through the selected read:** 3c.
+- **Performance:** the Delta scan now gets 1a–2b's machinery, but this PR records no Delta-level numbers. `FilteredScanBenchmarks` is the place to measure it.

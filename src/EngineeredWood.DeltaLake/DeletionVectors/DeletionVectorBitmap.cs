@@ -19,7 +19,7 @@ namespace EngineeredWood.DeltaLake.DeletionVectors;
 ///
 /// <para>Instances are immutable and safe to share between threads.</para>
 /// </summary>
-public sealed class DeletionVectorBitmap : IEnumerable<long>
+public sealed class DeletionVectorBitmap : IEnumerable<long>, EngineeredWood.Parquet.IExcludedRows
 {
     private const int ContainerSpan = 1 << 16;
     private const uint MaxHighKey = int.MaxValue - 1;
@@ -375,6 +375,13 @@ public sealed class DeletionVectorBitmap : IEnumerable<long>
     }
 
     /// <summary>The deleted rows in ascending order.</summary>
+    /// <summary>A Parquet read's excluded rows: the rows this deletes (<see cref="ContainsRange"/>).</summary>
+    bool EngineeredWood.Parquet.IExcludedRows.ExcludesAll(long firstRow, long rowCount) => ContainsRange(firstRow, rowCount);
+
+    /// <summary>A Parquet read's excluded rows: clears this vector's deleted rows (<see cref="ClearDeleted"/>).</summary>
+    void EngineeredWood.Parquet.IExcludedRows.ClearExcluded(long firstRow, int rowCount, Span<ulong> selection) =>
+        ClearDeleted(firstRow, rowCount, selection);
+
     public IEnumerator<long> GetEnumerator()
     {
         for (int c = 0; c < _base.Length; c++)

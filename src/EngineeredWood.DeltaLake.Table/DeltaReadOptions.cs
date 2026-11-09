@@ -34,6 +34,23 @@ public sealed record DeltaReadOptions
     /// </summary>
     public Expressions.Predicate? Filter { get; init; }
 
+    /// <summary>
+    /// When true, <see cref="Filter"/> is also applied to rows, exactly: a scan returns only the rows it answers
+    /// TRUE for (a NULL answer drops the row, as a SQL <c>WHERE</c> does). False (the default) keeps the superset
+    /// <see cref="Filter"/> describes.
+    /// </summary>
+    /// <remarks>
+    /// <para>The filter is evaluated with the same Spark-configured rules as a predicate DELETE or UPDATE, against
+    /// each row's logical values (partition values, schema-evolution NULLs and widened types included). It is
+    /// refused before any file is read when Spark's analyzer would refuse it, and a value that fails to evaluate (an
+    /// ANSI cast error, say) raises from the scan. A row a deletion vector deletes is never evaluated.</para>
+    /// <para>With the built-in reader the evaluation runs inside the Parquet read, where it can avoid decoding the
+    /// other columns of rows it rejects (#502); through a <see cref="DeltaTableOptions.DataFileReader"/> it runs on
+    /// each batch the reader returns. Columns the filter reads but <see cref="Columns"/> does not name are read for
+    /// it and not returned. Metadata columns follow the rows: a row keeps its file position and row id.</para>
+    /// </remarks>
+    public bool FilterRows { get; init; }
+
     /// <summary>Which per-row metadata columns to append. Combinable; defaults to none.</summary>
     public DeltaRowMetadata Metadata { get; init; } = DeltaRowMetadata.None;
 
