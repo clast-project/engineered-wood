@@ -171,6 +171,86 @@ public class SelectionMaskTests
         Assert.Throws<ArgumentNullException>(() => SelectionMask.And(words, 10, null!));
     }
 
+    /// <summary>
+    /// <see cref="SelectionMask.AndThreeValued"/> against per-row three-valued AND: FALSE clears a row from both
+    /// selections, NULL only from the all-true one. Over every row (the mask read a word at a time, sliced at
+    /// any offset) and over some (the mask answering the live rows only, in order).
+    /// </summary>
+    [Fact]
+    public void AndThreeValuedMatchesPerRowLogic()
+    {
+        var rng = new Random(502);
+        for (int trial = 0; trial < 2000; trial++)
+        {
+            int rows = rng.Next(1, 300);
+            var live = new ulong[SelectionMask.WordCount(rows)];
+            SelectionMask.SelectAll(live, rows);
+            var expectedLive = Enumerable.Repeat(true, rows).ToArray();
+            if (trial % 2 == 1)
+            {
+                for (int i = 0; i < rows; i++)
+                {
+                    if (rng.Next(3) == 0)
+                    {
+                        live[i >> 6] &= ~(1UL << (i & 63));
+                        expectedLive[i] = false;
+                    }
+                }
+            }
+
+            var allTrue = (ulong[])live.Clone();
+            var expectedTrue = (bool[])expectedLive.Clone();
+            for (int i = 0; i < rows; i++)
+            {
+                if (expectedTrue[i] && rng.Next(4) == 0)
+                {
+                    allTrue[i >> 6] &= ~(1UL << (i & 63)); // an earlier conjunct answered NULL
+                    expectedTrue[i] = false;
+                }
+            }
+
+            int[] liveIndices = Enumerable.Range(0, rows).Where(i => expectedLive[i]).ToArray();
+            if (liveIndices.Length == 0)
+                continue; // never asked: a reader stops once no row is live
+            bool allLive = liveIndices.Length == rows;
+            var answers = Enumerable.Range(0, allLive ? rows : liveIndices.Length)
+                .Select(_ => rng.Next(3) switch { 0 => (bool?)null, 1 => false, _ => true })
+                .ToArray();
+
+            int offset = rng.Next(0, 70);
+            var padded = Enumerable.Repeat((bool?)true, offset).Concat(answers).Concat([(bool?)false]).ToArray();
+            using var full = Build(padded);
+            var mask = (BooleanArray)full.Slice(offset, answers.Length);
+
+            SelectionMask.AndThreeValued(live, allTrue, rows, mask, allLive ? default : liveIndices);
+
+            for (int j = 0; j < answers.Length; j++)
+            {
+                int r = allLive ? j : liveIndices[j];
+                if (answers[j] == false)
+                    expectedLive[r] = false;
+                if (answers[j] != true)
+                    expectedTrue[r] = false;
+            }
+
+            Assert.Equal(expectedLive, ToBools(live, rows));
+            Assert.Equal(expectedTrue, ToBools(allTrue, rows));
+            Assert.Equal(expectedLive.Count(b => b), SelectionMask.Count(live)); // nothing past the last row
+        }
+    }
+
+    [Fact]
+    public void AndThreeValuedRefusesAMaskOfTheWrongLength()
+    {
+        var live = new ulong[1];
+        var allTrue = new ulong[1];
+        SelectionMask.SelectAll(live, 10);
+        SelectionMask.SelectAll(allTrue, 10);
+        using var mask = Build(new bool?[9]);
+        Assert.Throws<ArgumentException>(() => SelectionMask.AndThreeValued(live, allTrue, 10, mask, default));
+        Assert.Throws<ArgumentException>(() => SelectionMask.AndThreeValued(live, allTrue, 10, mask, new[] { 1, 2, 3 }));
+    }
+
     private static BooleanArray Build(bool?[] values)
     {
         var builder = new BooleanArray.Builder();

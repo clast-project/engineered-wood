@@ -39,6 +39,9 @@ namespace EngineeredWood.Benchmarks;
 /// over-states phase 1's cost in two ways: a projected filter column is decoded twice, and each row group's
 /// pass 2 reads its OffsetIndexes again (one more request), where the reader would reuse those planning read.
 /// The page boundaries it plans with are read before timing starts, standing for that planning.</item>
+/// <item><b>selected</b>: phase 1a, <see cref="ParquetFileReader.ReadSelectedAsync"/> with the predicate as a
+/// <see cref="RowPredicate"/> and pruning by it: the same decode as <c>post</c>, with the mask and gather run
+/// inside each row group's read, in parallel.</item>
 /// </list>
 /// <para>The file is 4 row groups of 500,000 rows, written with default options (20,000-row pages, page
 /// indexes). <c>id</c> is sorted, so a range on it is CLUSTERED: the page index narrows it, and its
@@ -67,7 +70,7 @@ internal static class RowFilterAb
     /// <summary>Whether reads checksum their output: only in the untimed validation runs.</summary>
     private static volatile bool s_validate;
 
-    private enum Strategy { None, Post, Pass1, Late }
+    private enum Strategy { None, Post, Pass1, Late, Selected }
 
     private sealed record Case(string Label, Predicate Filter, string[] FilterColumns, string[] Projection);
 
@@ -98,10 +101,10 @@ internal static class RowFilterAb
                 (cloud ? "GET, through CoalescingFileReader" : "request") + (mbps > 0 ? $", then {mbps} MB/s." : ".") +
                 $" {Environment.ProcessorCount} logical processors.");
             Console.WriteLine();
-            Console.WriteLine("| Case | Kept | none ms | post ms | pass1 ms | late ms | late vs post | eval ms | gather ms | post MB decoded | late MB decoded | post MB managed | late MB managed | post MB read | late MB read | post GETs | late GETs |");
-            Console.WriteLine("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+            Console.WriteLine("| Case | Kept | none ms | post ms | pass1 ms | late ms | late vs post | selected ms | selected vs post | eval ms | gather ms | post MB decoded | late MB decoded | post MB managed | late MB managed | post MB read | late MB read | post GETs | late GETs |");
+            Console.WriteLine("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
 
-            var strategies = new[] { Strategy.None, Strategy.Post, Strategy.Pass1, Strategy.Late };
+            var strategies = new[] { Strategy.None, Strategy.Post, Strategy.Pass1, Strategy.Late, Strategy.Selected };
 
             // Unmeasured passes first, so that no case is measured on tier-0 code.
             for (int pass = 0; pass < 3; pass++)
@@ -134,11 +137,13 @@ internal static class RowFilterAb
                     var post = await RunOnceAsync(Strategy.Post, c, path, layout, excluded, 0, 0, cloud);
                     var pass1 = await RunOnceAsync(Strategy.Pass1, c, path, layout, excluded, 0, 0, cloud);
                     var late = await RunOnceAsync(Strategy.Late, c, path, layout, excluded, 0, 0, cloud);
-                    if (pass1.Rows != post.Rows || late.Rows != post.Rows || late.Checksum != post.Checksum)
+                    var selected = await RunOnceAsync(Strategy.Selected, c, path, layout, excluded, 0, 0, cloud);
+                    if (pass1.Rows != post.Rows || late.Rows != post.Rows || late.Checksum != post.Checksum
+                        || selected.Rows != post.Rows || selected.Checksum != post.Checksum)
                     {
                         throw new InvalidOperationException(
                             $"{c.Label}: post kept {post.Rows} rows (checksum {post.Checksum}), pass1 {pass1.Rows}, " +
-                            $"late {late.Rows} (checksum {late.Checksum}).");
+                            $"late {late.Rows} (checksum {late.Checksum}), selected {selected.Rows} (checksum {selected.Checksum}).");
                     }
                 }
                 finally
@@ -149,12 +154,14 @@ internal static class RowFilterAb
                 var p = samples[Strategy.Post];
                 var l = samples[Strategy.Late];
                 var ratios = p.Zip(l, (a, b) => b.Ms / a.Ms).ToList();
+                var sel = samples[Strategy.Selected];
+                var selRatios = p.Zip(sel, (a, b) => b.Ms / a.Ms).ToList();
                 double kept = 100.0 * p[0].Rows / TotalRows;
                 Console.WriteLine(
                     $"| {c.Label} | {kept.ToString(kept < 1 ? "0.###" : "0.#", CultureInfo.InvariantCulture)}% " +
                     $"| {Median(samples[Strategy.None], r => r.Ms):F1} | {Median(p, r => r.Ms):F1} " +
                     $"| {Median(samples[Strategy.Pass1], r => r.Ms):F1} | {Median(l, r => r.Ms):F1} " +
-                    $"| {(Median(ratios) - 1) * 100:+0;-0;0}% | {Median(p, r => r.EvalMs):F1} | {Median(p, r => r.GatherMs):F1} " +
+                    $"| {(Median(ratios) - 1) * 100:+0;-0;0}% | {Median(sel, r => r.Ms):F1} | {(Median(selRatios) - 1) * 100:+0;-0;0}% | {Median(p, r => r.EvalMs):F1} | {Median(p, r => r.GatherMs):F1} " +
                     $"| {p[0].DecodedBytes / 1e6:F1} | {l[0].DecodedBytes / 1e6:F1} " +
                     $"| {Median(p, r => r.AllocBytes) / 1e6:F1} | {Median(l, r => r.AllocBytes) / 1e6:F1} " +
                     $"| {p[0].Bytes / 1e6:F1} | {l[0].Bytes / 1e6:F1} | {p[0].Gets} | {l[0].Gets} |");
@@ -271,7 +278,8 @@ internal static class RowFilterAb
             Strategy.None => await ReadNoneAsync(reader, c),
             Strategy.Post => await ReadPostAsync(reader, c, excluded, includeOutput: true),
             Strategy.Pass1 => await ReadPostAsync(reader, c, excluded, includeOutput: false),
-            _ => await ReadLateAsync(reader, c, layout, excluded),
+            Strategy.Late => await ReadLateAsync(reader, c, layout, excluded),
+            _ => await ReadSelectedAsync(reader, c, excluded),
         };
         double ms = clock.Elapsed.TotalMilliseconds;
         long alloc = GC.GetTotalAllocatedBytes(precise: true) - allocBefore;
@@ -368,6 +376,26 @@ internal static class RowFilterAb
 
         tally.EvalMs = evalClock.Elapsed.TotalMilliseconds;
         tally.GatherMs = gatherClock.Elapsed.TotalMilliseconds;
+        return tally;
+    }
+
+    /// <summary>Phase 1a: the reader's own exact read, filtering inside each row group's read.</summary>
+    private static async Task<Tally> ReadSelectedAsync(ParquetFileReader reader, Case c, Exclusions? excluded)
+    {
+        var tally = new Tally();
+        var scan = new ParquetScan
+        {
+            Columns = c.Projection,
+            Prune = c.Filter,
+            RowFilter = new RowFilter(new RowPredicate(c.FilterColumns, b => Evaluator.EvaluatePredicate(c.Filter, b))),
+            ExcludedRows = excluded,
+        };
+        await foreach (var selected in reader.ReadSelectedAsync(scan))
+        {
+            using (selected)
+                tally.Add(selected.Batch);
+        }
+
         return tally;
     }
 
@@ -582,7 +610,7 @@ internal static class RowFilterAb
     }
 
     /// <summary>Rows excluded by file position, as a deletion vector excludes them.</summary>
-    private sealed class Exclusions(ulong[] words, long count)
+    private sealed class Exclusions(ulong[] words, long count) : IExcludedRows
     {
         public long Count => count;
 
@@ -613,6 +641,10 @@ internal static class RowFilterAb
 
             return true;
         };
+
+        public bool ExcludesAll(long firstRow, long rowCount) => SkipRows(firstRow, rowCount);
+
+        public void ClearExcluded(long firstRow, int rowCount, Span<ulong> selection) => Clear(firstRow, rowCount, selection);
 
         public void Clear(long firstRow, int rows, Span<ulong> selection)
         {
