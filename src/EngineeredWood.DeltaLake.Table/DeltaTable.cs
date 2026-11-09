@@ -13428,6 +13428,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 positions = positions is null ? null : (Int64Array)ArrowCompute.Take(positions, kept);
                 rowIds = rowIds is null ? null : (Int64Array)ArrowCompute.Take(rowIds, kept);
                 versions = versions is null ? null : (Int64Array)ArrowCompute.Take(versions, kept);
+
+                // The superseded arrays: a fixed-width gather copies, so the metadata goes outright; the batch
+                // keeps any column the gather shares a buffer with (a view's data, a dictionary).
+                BatchSelector.ReleaseAfterGather(fb.Batch, batch);
+                fb.Positions?.Dispose();
+                fb.RowIds?.Dispose();
+                fb.Versions?.Dispose();
             }
 
             if (!wantPositions)
