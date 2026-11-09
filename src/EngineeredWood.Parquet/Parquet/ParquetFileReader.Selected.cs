@@ -44,6 +44,7 @@ public sealed partial class ParquetFileReader
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
         var (readColumns, dropped) = ColumnsForSelection(schema, scan.Columns, scan.RowFilter);
         var selector = new BatchSelector(scan.RowFilter, scan.ExcludedRows, dropped);
+        var twoPass = TwoPassColumnsFor(schema, readColumns, dropped, scan.RowFilter, _options);
 
         RowSkipPredicate? skipRows = scan.ExcludedRows is { } excluded ? excluded.ExcludesAll : null;
         var plans = PlanRowGroupsAsync(
@@ -54,11 +55,11 @@ public sealed partial class ParquetFileReader
         {
             await foreach (var plan in plans.ConfigureAwait(false))
             {
-                await foreach (var batch in selector.SelectAsync(
-                                   ReadPlannedAsync(plan, readColumns, cancellationToken)).ConfigureAwait(false))
-                {
+                var batches = ReadsInTwoPasses(plan, twoPass, metadata.RowGroups[plan.Index])
+                    ? ReadTwoPassAsync(plan, twoPass!, selector, cancellationToken)
+                    : selector.SelectAsync(ReadPlannedAsync(plan, readColumns, cancellationToken));
+                await foreach (var batch in batches.ConfigureAwait(false))
                     yield return batch;
-                }
             }
 
             yield break;
@@ -71,11 +72,11 @@ public sealed partial class ParquetFileReader
         var growth = new DecodedGrowth();
         await foreach (var batch in OrderedScan.RunAsync(
                            plans,
-                           (plan, reservation, token) =>
-                               selector.SelectAsync(ReadPlannedAsync(plan, readColumns, reservation, growth, token)),
+                           (plan, reservation, token) => ReadsInTwoPasses(plan, twoPass, metadata.RowGroups[plan.Index])
+                               ? ReadTwoPassAsync(plan, readColumns, twoPass!, selector, reservation, growth, token)
+                               : selector.SelectAsync(ReadPlannedAsync(plan, readColumns, reservation, growth, token)),
                            // The positions count too: a positions-only read (no columns) holds nothing else.
-                           static b => ArrowSizes.EstimatedBytes(b.Batch)
-                                       + (b.Positions.Explicit is { } p ? p.Length * (long)sizeof(long) : 0),
+                           SelectedBytes,
                            static b => b.Dispose(),
                            concurrency,
                            budget,

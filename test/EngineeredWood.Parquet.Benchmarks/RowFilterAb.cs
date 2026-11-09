@@ -42,6 +42,9 @@ namespace EngineeredWood.Benchmarks;
 /// <item><b>selected</b>: phase 1a, <see cref="ParquetFileReader.ReadSelectedAsync"/> with the predicate as a
 /// <see cref="RowPredicate"/> and pruning by it: the same decode as <c>post</c>, with the mask and gather run
 /// inside each row group's read, in parallel.</item>
+/// <item><b>twopass</b>: phase 1b, the same read with two passes allowed: where a row group is read whole (no
+/// pruning narrowed it), the predicate's column first, then the other output columns only over the 8,192-row
+/// batches where a row was selected, their bytes fetched alongside the first pass's.</item>
 /// </list>
 /// <para>The file is 4 row groups of 500,000 rows, written with default options (20,000-row pages, page
 /// indexes). <c>id</c> is sorted, so a range on it is CLUSTERED: the page index narrows it, and its
@@ -70,7 +73,7 @@ internal static class RowFilterAb
     /// <summary>Whether reads checksum their output: only in the untimed validation runs.</summary>
     private static volatile bool s_validate;
 
-    private enum Strategy { None, Post, Pass1, Late, Selected }
+    private enum Strategy { None, Post, Pass1, Late, Selected, TwoPass }
 
     private sealed record Case(string Label, Predicate Filter, string[] FilterColumns, string[] Projection);
 
@@ -101,10 +104,10 @@ internal static class RowFilterAb
                 (cloud ? "GET, through CoalescingFileReader" : "request") + (mbps > 0 ? $", then {mbps} MB/s." : ".") +
                 $" {Environment.ProcessorCount} logical processors.");
             Console.WriteLine();
-            Console.WriteLine("| Case | Kept | none ms | post ms | pass1 ms | late ms | late vs post | selected ms | selected vs post | eval ms | gather ms | post MB decoded | late MB decoded | post MB managed | late MB managed | post MB read | late MB read | post GETs | late GETs |");
-            Console.WriteLine("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
+            Console.WriteLine("| Case | Kept | none ms | post ms | pass1 ms | late ms | late vs post | selected ms | selected vs post | twopass ms | twopass vs selected | twopass MB read | eval ms | gather ms | post MB decoded | late MB decoded | post MB managed | late MB managed | post MB read | late MB read | post GETs | late GETs |");
+            Console.WriteLine("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|");
 
-            var strategies = new[] { Strategy.None, Strategy.Post, Strategy.Pass1, Strategy.Late, Strategy.Selected };
+            var strategies = new[] { Strategy.None, Strategy.Post, Strategy.Pass1, Strategy.Late, Strategy.Selected, Strategy.TwoPass };
 
             // Unmeasured passes first, so that no case is measured on tier-0 code.
             for (int pass = 0; pass < 3; pass++)
@@ -138,12 +141,14 @@ internal static class RowFilterAb
                     var pass1 = await RunOnceAsync(Strategy.Pass1, c, path, layout, excluded, 0, 0, cloud);
                     var late = await RunOnceAsync(Strategy.Late, c, path, layout, excluded, 0, 0, cloud);
                     var selected = await RunOnceAsync(Strategy.Selected, c, path, layout, excluded, 0, 0, cloud);
+                    var twoPass = await RunOnceAsync(Strategy.TwoPass, c, path, layout, excluded, 0, 0, cloud);
                     if (pass1.Rows != post.Rows || late.Rows != post.Rows || late.Checksum != post.Checksum
-                        || selected.Rows != post.Rows || selected.Checksum != post.Checksum)
+                        || selected.Rows != post.Rows || selected.Checksum != post.Checksum
+                        || twoPass.Rows != post.Rows || twoPass.Checksum != post.Checksum)
                     {
                         throw new InvalidOperationException(
                             $"{c.Label}: post kept {post.Rows} rows (checksum {post.Checksum}), pass1 {pass1.Rows}, " +
-                            $"late {late.Rows} (checksum {late.Checksum}), selected {selected.Rows} (checksum {selected.Checksum}).");
+                            $"late {late.Rows} (checksum {late.Checksum}), selected {selected.Rows} (checksum {selected.Checksum}), twopass {twoPass.Rows} (checksum {twoPass.Checksum}).");
                     }
                 }
                 finally
@@ -156,12 +161,14 @@ internal static class RowFilterAb
                 var ratios = p.Zip(l, (a, b) => b.Ms / a.Ms).ToList();
                 var sel = samples[Strategy.Selected];
                 var selRatios = p.Zip(sel, (a, b) => b.Ms / a.Ms).ToList();
+                var two = samples[Strategy.TwoPass];
+                var twoRatios = sel.Zip(two, (a, b) => b.Ms / a.Ms).ToList();
                 double kept = 100.0 * p[0].Rows / TotalRows;
                 Console.WriteLine(
                     $"| {c.Label} | {kept.ToString(kept < 1 ? "0.###" : "0.#", CultureInfo.InvariantCulture)}% " +
                     $"| {Median(samples[Strategy.None], r => r.Ms):F1} | {Median(p, r => r.Ms):F1} " +
                     $"| {Median(samples[Strategy.Pass1], r => r.Ms):F1} | {Median(l, r => r.Ms):F1} " +
-                    $"| {(Median(ratios) - 1) * 100:+0;-0;0}% | {Median(sel, r => r.Ms):F1} | {(Median(selRatios) - 1) * 100:+0;-0;0}% | {Median(p, r => r.EvalMs):F1} | {Median(p, r => r.GatherMs):F1} " +
+                    $"| {(Median(ratios) - 1) * 100:+0;-0;0}% | {Median(sel, r => r.Ms):F1} | {(Median(selRatios) - 1) * 100:+0;-0;0}% | {Median(two, r => r.Ms):F1} | {(Median(twoRatios) - 1) * 100:+0;-0;0}% | {two[0].Bytes / 1e6:F1} | {Median(p, r => r.EvalMs):F1} | {Median(p, r => r.GatherMs):F1} " +
                     $"| {p[0].DecodedBytes / 1e6:F1} | {l[0].DecodedBytes / 1e6:F1} " +
                     $"| {Median(p, r => r.AllocBytes) / 1e6:F1} | {Median(l, r => r.AllocBytes) / 1e6:F1} " +
                     $"| {p[0].Bytes / 1e6:F1} | {l[0].Bytes / 1e6:F1} | {p[0].Gets} | {l[0].Gets} |");
@@ -270,7 +277,11 @@ internal static class RowFilterAb
         IRandomAccessFile file = (IRandomAccessFile?)coalescer ?? transport;
 
         // Every option at its default: Filter stays unset, each read passes its predicate itself.
-        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions());
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions())
+        {
+            // `selected` is phase 1a, one pass; `twopass` lets the reader decode in two where it can (phase 1b).
+            TwoPassReads = strategy == Strategy.TwoPass,
+        };
         long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
         var clock = Stopwatch.StartNew();
         var tally = strategy switch
@@ -279,7 +290,7 @@ internal static class RowFilterAb
             Strategy.Post => await ReadPostAsync(reader, c, excluded, includeOutput: true),
             Strategy.Pass1 => await ReadPostAsync(reader, c, excluded, includeOutput: false),
             Strategy.Late => await ReadLateAsync(reader, c, layout, excluded),
-            _ => await ReadSelectedAsync(reader, c, excluded),
+            _ => await ReadSelectedAsync(reader, c, excluded), // Selected and TwoPass
         };
         double ms = clock.Elapsed.TotalMilliseconds;
         long alloc = GC.GetTotalAllocatedBytes(precise: true) - allocBefore;

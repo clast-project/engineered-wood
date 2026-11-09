@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised the same day after phase 0 (§11). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a and 1b built (§12, §13). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -212,7 +212,7 @@ DML:
 |---|---|---|
 | 0 | `rowfilter-ab` harness next to `pageindex-read-ab`. Vary selectivity (point, 10%, 50%, 90%, 99%), clustered vs scattered, projection width, deletion vector on/off, local vs latency/transfer model. Measure the current post-filter baseline. | Numbers in the PR |
 | 1a | *(Revised after phase 0, §11.)* `ReadSelectedAsync` + `RowFilter` + `IExcludedRows` + `RowPositions`, with evaluation and compaction moved **inside the row-group unit**. That means they run in parallel across row groups, not on the consumer's thread. Still one decode pass and one fetch, so no I/O risk. A batch whose selection is all set is passed through, not gathered. | Oracle = full read + post-filter, over the test matrix in #502. Mutation: positions off by one; a batch's mask applied to its neighbour |
-| 1b | Lazy decode: within a fetched row group, decode the output columns only for pages holding a selected row, then decode-then-compact. Fetch filter and output pages in **one** request by default. Fetch them in two stages only where pass 1 can be expected to save more bytes than a round trip costs (§11, F5). Nested columns are decoded whole. | Same oracle. Mutation: pass 2 decodes the unmasked selection. `rowfilter-ab` local and cloud |
+| 1b | *(Built as described in §13: decided per row group after a whole-group first pass.)* Lazy decode: within a fetched row group, decode the output columns only for pages holding a selected row, then decode-then-compact. Fetch filter and output pages in **one** request by default. Fetch them in two stages only where pass 1 can be expected to save more bytes than a round trip costs (§11, F5). Nested columns are decoded whole. | Same oracle. Mutation: pass 2 decodes the unmasked selection. `rowfilter-ab` local and cloud |
 | 2 | In-decoder selection (port the prototype to the batched path); run/bitmap switch. | `selection-ab` on the batched path; no regression at 99% kept |
 | 3 | Delta: `FilterRows`, `RowMasks`, deletion vector via `ExcludedRows`, positions-only DELETE. | Delta suites; Spark interop oracle for DELETE counts |
 | 4 | Dictionary evaluation (§6) + `IDeterministicFunctions`. | `OneCategory` profile; the dictionary-error fallback test |
@@ -321,3 +321,55 @@ Excluding 1% of rows at random (as a deletion vector would) changed none of thes
 Phase 1a is faster than `post` in every one of the 30 cases: by 1–65%, and by 31–65% at ≥90% kept. Against the two-pass emulation (`late`): it is ahead at low and middle selectivity, where `late` pays for its second pass. At ≥90% kept the two are within a few points of each other, either way, since both gain from parallel gathering. It falls clearly behind only on the scattered point lookup, where page skipping is what helps (−73% for `late`, against −14%). That is phase 1b's case.
 
 **Cloud model** (20 ms per GET, 100 MB/s): between −14% and +10% against `post`, as expected for a read bound by request latency. The small clustered reads came out 1–10% slower, about 7 ms. `pass1`, which reads only the filter column, shows the same gap, so it is not the filtering. It is unexplained, and should be looked at before the default is flipped.
+
+## 13. Phase 1b: what was built, and measurements (2026-11-09)
+
+### What it does
+
+A selected read goes in two passes for a row group when four conditions hold:
+- the group is read whole (pruning narrowed nothing);
+- every column read is a flat top-level column;
+- some output column is not read by any predicate;
+- no returned predicate column comes back as a view or dictionary type.
+
+The two passes (`ParquetFileReader.TwoPass.cs`):
+
+1. **Pass 1** decodes the predicates' columns for the whole group as one batch, as phase 1a does, and evaluates the filter once for the group.
+2. **The pass-2 decision.** The group is cut into blocks of 8,192 rows (`TwoPassBlockRows`). When the blocks holding a selected row span at most half of the group (`TwoPassMaxCoveredShare`), the other output columns are decoded only over those blocks, through the existing range read. Otherwise they are decoded whole, as one pass would.
+3. **One fetch.** Pass 2's bytes, the output columns' whole chunks, are requested when pass 1 starts, through `PrefetchedFile`. Pass 2 then reads from memory, and deciding what to skip costs no round trip.
+
+Other rows are gathered as in phase 1a. A group whose rows are all kept passes the predicate columns through rather than gathering them.
+
+### First attempt, discarded
+
+Both passes cut into 8,192-row batches, with every batch's output decode skipped or done separately. Locally that was **40–170% slower** than one pass on everything but point lookups. The batched read over a dense selection gives up the whole-group decode, and it decodes 20,000-row pages more than once across batch boundaries. Deciding after a whole-group first pass removed most of that cost.
+
+### Measured
+
+Same harness and machine as §11 and §12: `twopass` against `selected` (1a), median of 7 rounds locally and 5 under the cloud model.
+
+| Case | Local, 1a ms | Local, 1b ms | vs 1a | Cloud vs 1a |
+|---|---|---|---|---|
+| scattered point narrow | 8.2 | 6.9 | -19% | -21% |
+| scattered point wide | 26.7 | 16.8 | -35% | -19% |
+| scattered 1% narrow | 7.4 | 8.4 | +11% | -22% |
+| scattered 1% wide | 26.2 | 28.3 | +9% | -9% |
+| scattered 99% wide | 40.4 | 42.1 | +7% | -3% |
+| category = 2% wide | 26.2 | 30.5 | +16% | -3% |
+| clustered 90% narrow | 5.2 | 6.6 | +27% | -6% |
+| clustered 90% wide | 22.2 | 25.3 | +12% | -1% |
+| clustered 1% (page-index narrowed, one pass) | | | ±2% | ±1% |
+
+- **Point and near-point lookups** are the case 1b is for. They gain 19–35% locally and 19–21% in the cloud model, where pass 2 decodes two blocks instead of 500,000 rows.
+- **Dense selections** cost between −1% and +16% locally, and up to 27% for row groups the predicate keeps whole. Within a row group, pass 1's columns now decode before pass 2's instead of alongside them, so a group loses some of its column parallelism. The per-column gather and the join add the rest.
+- **The cloud model** is 0–28% faster in every case but one (clustered 10% wide, +5%). Part of that is the harness: `LatencyCountingFile` charges each GET its own transfer time, so pass 2's prefetch, a second request in flight beside pass 1's, effectively doubles bandwidth. Real object stores do serve concurrent GETs in parallel, but treat the size of this gain as an upper bound.
+- **Unchanged:** page-index-narrowed groups (clustered ≤10%) take the one-pass path.
+
+### Open decision
+
+1b is on by default in this PR, behind `ParquetFileReader.TwoPassReads` (internal). The trade-off is a small local cost on dense reads for a large gain on point lookups, and a gain almost everywhere on object storage. Options:
+- **keep it on;**
+- **on for files that report object-store concurrency** (`IReadConcurrencyHint`) and off for local files;
+- **narrow it** to row groups whose statistics suggest few matches. This is not attempted here: no statistic predicts it reliably for an opaque predicate.
+
+Phase 2, selection inside the decoders, removes most of pass 2's cost on dense selections too, which may settle this.

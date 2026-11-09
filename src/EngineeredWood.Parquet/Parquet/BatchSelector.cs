@@ -37,49 +37,13 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
             return rows == 0 ? Discard(batch) : Whole(batch, positioned.FirstRow);
 
         int wordCount = SelectionMask.WordCount(rows);
-        ulong[] liveBuffer = ArrayPool<ulong>.Shared.Rent(wordCount);
-        ulong[]? trueBuffer = filter is null ? null : ArrayPool<ulong>.Shared.Rent(wordCount);
+        ulong[] selectionBuffer = ArrayPool<ulong>.Shared.Rent(wordCount);
         int[]? indexBuffer = null;
         bool owned = true;
         try
         {
-            var live = liveBuffer.AsSpan(0, wordCount);
-            SelectionMask.SelectAll(live, rows);
-            excluded?.ClearExcluded(positioned.FirstRow, rows, live);
-
-            Span<ulong> selection = live;
-            if (filter is not null)
-            {
-                var allTrue = trueBuffer!.AsSpan(0, wordCount);
-                live.CopyTo(allTrue);
-                foreach (var predicate in filter.Predicates)
-                {
-                    int liveCount = SelectionMask.Count(live);
-                    if (liveCount == 0)
-                    {
-                        // No row left to answer, but every predicate is still asked, over no rows, as EvalAnd
-                        // asks every operand over an empty selection: one that cannot be evaluated at all (an
-                        // unresolvable column, a comparison with no common type) still raises, rather than
-                        // passing whenever an earlier predicate happened to reject every row of the batch.
-                        EvaluateOverNoRows(predicate, batch);
-                        continue;
-                    }
-
-                    ReadOnlySpan<int> liveIndices = default;
-                    if (liveCount < rows)
-                    {
-                        indexBuffer ??= ArrayPool<int>.Shared.Rent(rows);
-                        SelectionMask.ToIndices(live, indexBuffer);
-                        liveIndices = indexBuffer.AsSpan(0, liveCount);
-                    }
-
-                    Evaluate(predicate, batch, liveIndices, live, allTrue, rows);
-                }
-
-                selection = allTrue;
-            }
-
-            int kept = SelectionMask.Count(selection);
+            var selection = selectionBuffer.AsSpan(0, wordCount);
+            int kept = ComputeSelection(batch, positioned.FirstRow, selection);
             if (kept == 0)
                 return Discard(batch);
             if (kept == rows)
@@ -88,35 +52,93 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
                 return Whole(batch, positioned.FirstRow);
             }
 
-            indexBuffer ??= ArrayPool<int>.Shared.Rent(rows);
+            indexBuffer = ArrayPool<int>.Shared.Rent(rows);
             SelectionMask.ToIndices(selection, indexBuffer);
             var keptIndices = indexBuffer.AsSpan(0, kept);
-            var output = Gather(batch, keptIndices);
+            var output = Gather(batch, keptIndices, name => !dropped.Contains(name));
             owned = false;
             ReleaseAfterGather(batch, output);
-
-            // Contiguous survivors (a run) need no explicit positions.
-            Int64Array? positions = null;
-            if (keptIndices[kept - 1] - keptIndices[0] + 1 != kept)
-            {
-                var builder = new Int64Array.Builder().Reserve(kept);
-                foreach (int i in keptIndices)
-                    builder.Append(positioned.FirstRow + i);
-                positions = builder.Build();
-            }
-
-            return new SelectedRecordBatch(output, new RowPositions(positioned.FirstRow + keptIndices[0], positions));
+            return new SelectedRecordBatch(output, PositionsOf(positioned.FirstRow, keptIndices));
         }
         finally
         {
             if (owned)
                 batch.Dispose();
-            ArrayPool<ulong>.Shared.Return(liveBuffer);
-            if (trueBuffer is not null)
-                ArrayPool<ulong>.Shared.Return(trueBuffer);
+            ArrayPool<ulong>.Shared.Return(selectionBuffer);
             if (indexBuffer is not null)
                 ArrayPool<int>.Shared.Return(indexBuffer);
         }
+    }
+
+    /// <summary>
+    /// Writes the rows of <paramref name="batch"/> (whose first row is at file position
+    /// <paramref name="firstRow"/>) that the scan selects into <paramref name="selection"/>, one bit per row, and
+    /// returns how many there are: excluded rows removed, then the predicates applied in order. The batch must
+    /// hold every predicate's columns; it is only read.
+    /// </summary>
+    public int ComputeSelection(RecordBatch batch, long firstRow, Span<ulong> selection)
+    {
+        int rows = batch.Length;
+        int wordCount = SelectionMask.WordCount(rows);
+        var live = selection.Slice(0, wordCount);
+        SelectionMask.SelectAll(live, rows);
+        excluded?.ClearExcluded(firstRow, rows, live);
+        if (filter is null)
+            return SelectionMask.Count(live);
+
+        ulong[] trueBuffer = ArrayPool<ulong>.Shared.Rent(wordCount);
+        int[]? indexBuffer = null;
+        try
+        {
+            var allTrue = trueBuffer.AsSpan(0, wordCount);
+            live.CopyTo(allTrue);
+            foreach (var predicate in filter.Predicates)
+            {
+                int liveCount = SelectionMask.Count(live);
+                if (liveCount == 0)
+                {
+                    // No row left to answer, but every predicate is still asked, over no rows, as EvalAnd
+                    // asks every operand over an empty selection: one that cannot be evaluated at all (an
+                    // unresolvable column, a comparison with no common type) still raises, rather than
+                    // passing whenever an earlier predicate happened to reject every row of the batch.
+                    EvaluateOverNoRows(predicate, batch);
+                    continue;
+                }
+
+                ReadOnlySpan<int> liveIndices = default;
+                if (liveCount < rows)
+                {
+                    indexBuffer ??= ArrayPool<int>.Shared.Rent(rows);
+                    SelectionMask.ToIndices(live, indexBuffer);
+                    liveIndices = indexBuffer.AsSpan(0, liveCount);
+                }
+
+                Evaluate(predicate, batch, liveIndices, live, allTrue, rows);
+            }
+
+            allTrue.CopyTo(live);
+            return SelectionMask.Count(live);
+        }
+        finally
+        {
+            ArrayPool<ulong>.Shared.Return(trueBuffer);
+            if (indexBuffer is not null)
+                ArrayPool<int>.Shared.Return(indexBuffer);
+        }
+    }
+
+    /// <summary>The positions of the rows at <paramref name="keptIndices"/> (ascending) of a batch whose first row
+    /// is at <paramref name="firstRow"/>: no explicit list when they are contiguous.</summary>
+    internal static RowPositions PositionsOf(long firstRow, ReadOnlySpan<int> keptIndices)
+    {
+        int kept = keptIndices.Length;
+        if (keptIndices[kept - 1] - keptIndices[0] + 1 == kept)
+            return new RowPositions(firstRow + keptIndices[0], null);
+
+        var builder = new Int64Array.Builder().Reserve(kept);
+        foreach (int i in keptIndices)
+            builder.Append(firstRow + i);
+        return new RowPositions(firstRow + keptIndices[0], builder.Build());
     }
 
     // Evaluates one predicate over the live rows and folds its answers into the two selections.
@@ -203,7 +225,7 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
     /// those in native memory, so disposing such a column would free bytes the output reads. A column left
     /// undisposed is released by its buffers' finalizers once nothing references them.
     /// </summary>
-    private static void ReleaseAfterGather(RecordBatch batch, RecordBatch output)
+    internal static void ReleaseAfterGather(RecordBatch batch, RecordBatch output)
     {
         var shared = new HashSet<ReadOnlyMemory<byte>>();
         for (int i = 0; i < output.ColumnCount; i++)
@@ -217,7 +239,7 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
         }
     }
 
-    private static void CollectBuffers(ArrayData data, HashSet<ReadOnlyMemory<byte>> into)
+    internal static void CollectBuffers(ArrayData data, HashSet<ReadOnlyMemory<byte>> into)
     {
         foreach (var buffer in data.Buffers ?? [])
         {
@@ -234,7 +256,7 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
             CollectBuffers(dictionary, into);
     }
 
-    private static bool SharesAny(ArrayData data, HashSet<ReadOnlyMemory<byte>> shared)
+    internal static bool SharesAny(ArrayData data, HashSet<ReadOnlyMemory<byte>> shared)
     {
         foreach (var buffer in data.Buffers ?? [])
         {
@@ -264,8 +286,11 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
         return null;
     }
 
-    // The rows at `indices` of the output columns, as a new batch; the input batch is left for the caller.
-    private RecordBatch Gather(RecordBatch batch, ReadOnlySpan<int> indices)
+    /// <summary>
+    /// The rows at <paramref name="indices"/> of the columns <paramref name="keep"/> accepts (by field name), as a
+    /// new batch. The input batch is left for the caller, who releases it with <see cref="ReleaseAfterGather"/>.
+    /// </summary>
+    internal static RecordBatch Gather(RecordBatch batch, ReadOnlySpan<int> indices, Func<string, bool> keep)
     {
         var fields = new List<Field>(batch.ColumnCount);
         var arrays = new List<IArrowArray>(batch.ColumnCount);
@@ -274,7 +299,7 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
             for (int i = 0; i < batch.ColumnCount; i++)
             {
                 var field = batch.Schema.GetFieldByIndex(i);
-                if (dropped.Contains(field.Name))
+                if (!keep(field.Name))
                     continue;
                 fields.Add(field);
                 arrays.Add(ArrowCompute.Take(batch.Column(i), indices));

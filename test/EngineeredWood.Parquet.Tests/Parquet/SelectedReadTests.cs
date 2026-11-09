@@ -67,6 +67,10 @@ public class SelectedReadTests : IDisposable
         ["pt, id, s"] = ["pt", "id", "s"],
         ["s, k"] = ["s", "k"],
 
+        // Flat columns only, with output columns no filter reads: the reads that can go in two passes.
+        ["id, note"] = ["id", "note"],
+        ["note, k, flag, id"] = ["note", "k", "flag", "id"],
+
         // Not swept: a dotted path into a struct ("pt.x"). Reading one leaf of a two-leaf struct throws
         // IndexOutOfRangeException in NestedAssembler on main, with or without a filter (#783). Add it back
         // once that is fixed.
@@ -82,8 +86,9 @@ public class SelectedReadTests : IDisposable
                 {
                     // Pruning and exclusions vary together with the concurrency, to keep the sweep small:
                     // serial reads prune by nothing and exclude nothing; parallel ones prune by the filter
-                    // and exclude 5% of rows.
-                    yield return [filter, projection, concurrency];
+                    // and exclude 5% of rows. Each is read in one pass and, where it can be, in two.
+                    yield return [filter, projection, concurrency, false];
+                    yield return [filter, projection, concurrency, true];
                 }
             }
         }
@@ -91,7 +96,7 @@ public class SelectedReadTests : IDisposable
 
     [Theory]
     [MemberData(nameof(Cases))]
-    public async Task ReturnsExactlyTheSelectedRowsAtTheirPositions(string filterName, string projectionName, int concurrency)
+    public async Task ReturnsExactlyTheSelectedRowsAtTheirPositions(string filterName, string projectionName, int concurrency, bool twoPass)
     {
         var filter = Filters[filterName];
         var projection = Projections[projectionName];
@@ -110,7 +115,7 @@ public class SelectedReadTests : IDisposable
             ExcludedRows = excluded,
         };
 
-        var actual = await ReadAsync(path, options, scan);
+        var actual = await ReadAsync(path, options, scan, twoPass);
 
         Assert.Equal(expected.Count, actual.Count);
         for (int i = 0; i < expected.Count; i++)
@@ -364,6 +369,42 @@ public class SelectedReadTests : IDisposable
         Assert.Equal(expected, actual);
     }
 
+    /// <summary>
+    /// The same in a two-pass read, where the view column is an output the predicates do not read, so the second
+    /// pass decodes and gathers it: sparsely (a few blocks) and densely (the whole row group).
+    /// </summary>
+    [Theory]
+    [InlineData(true, 1)]
+    [InlineData(true, 4)]
+    [InlineData(false, 1)]
+    [InlineData(false, 4)]
+    public async Task OutOfLineViewValuesSurviveTwoPasses(bool sparse, int concurrency)
+    {
+        string path = await WriteFileAsync();
+        // Sparse: a run of ids in one block of each row group. Dense: k < 10, about 1% of rows, in every block.
+        var filter = sparse
+            ? new RowPredicate(["id"], batch =>
+            {
+                var ids = (Int64Array)batch.Column(0);
+                var builder = new BooleanArray.Builder().Reserve(ids.Length);
+                for (int i = 0; i < ids.Length; i++)
+                    builder.Append(ids.GetValue(i) % RowsPerGroup < 500);
+                return builder.Build();
+            })
+            : ToRowPredicate(Ex.LessThan("k", LiteralValue.Of(10)));
+
+        var options = new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.ViewType, MaxConcurrentRowGroups = concurrency };
+        var actual = await ReadAsync(path, options, new ParquetScan { Columns = ["id", "note"], RowFilter = new RowFilter(filter) });
+
+        var (k, _) = await ColumnAsync<Int32Array>(path, "k");
+        var notesByRow = await NotesAsync(path);
+        var expected = Enumerable.Range(0, Rows)
+            .Where(r => sparse ? r % RowsPerGroup < 500 : k[r] < 10)
+            .Select(r => $"{r}:{notesByRow[r]}")
+            .ToList();
+        Assert.Equal(expected, actual.Select(a => $"{PositionOf(a)}:{NoteOf(a)}").ToList());
+    }
+
     private static string NoteOf(string positionAndRow) =>
         System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(positionAndRow[(positionAndRow.LastIndexOf('|') + 1)..]));
 
@@ -561,10 +602,10 @@ public class SelectedReadTests : IDisposable
         long.Parse(positionAndRow[..positionAndRow.IndexOf(':')], System.Globalization.CultureInfo.InvariantCulture);
 
     /// <summary>"position:rendered projected row" for every selected row, in order.</summary>
-    private static async Task<List<string>> ReadAsync(string path, ParquetReadOptions options, ParquetScan scan)
+    private static async Task<List<string>> ReadAsync(string path, ParquetReadOptions options, ParquetScan scan, bool twoPass = true)
     {
         await using var file = new LocalRandomAccessFile(path);
-        using var reader = new ParquetFileReader(file, ownsFile: false, options);
+        using var reader = new ParquetFileReader(file, ownsFile: false, options) { TwoPassReads = twoPass };
         var rows = new List<string>();
         await foreach (var selected in reader.ReadSelectedAsync(scan))
         {
