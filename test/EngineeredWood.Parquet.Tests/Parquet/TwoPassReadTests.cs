@@ -183,6 +183,50 @@ public class TwoPassReadTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A first pass cut into batches builds page maps, from the OffsetIndexes that planning already read with the
+    /// page index: it does not request them again. The footer is read exactly, so that its read holds no index,
+    /// and the prune is one only the page index can judge, so that planning reads the indexes at all.
+    /// </summary>
+    [Fact]
+    public async Task ABatchedFirstPassReusesThePlannedOffsetIndexes()
+    {
+        var (path, _) = await WriteCorruptedAsync();
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        EngineeredWood.Parquet.Metadata.FileMetaData metadata;
+        await using (counting)
+        using (var reader = new ParquetFileReader(counting, ownsFile: false,
+                   new ParquetReadOptions { BatchSize = 3_000, FooterReadSize = 0 }) { TwoPassReads = true })
+        {
+            metadata = await reader.ReadMetadataAsync();
+            var scan = Scan(maxId: 1_000) with
+            {
+                Columns = ["note"], // the predicate column is not returned, so the first pass follows BatchSize
+                // Undecided by the row group's statistics (its minimum is 0), so the page index is read; every page
+                // holds an id of 1 or more, so it keeps them all and hands back the whole group as one range.
+                Prune = EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", EngineeredWood.Expressions.LiteralValue.Of(1L)),
+            };
+            long rows = 0;
+            await foreach (var selected in reader.ReadSelectedAsync(scan))
+            {
+                using (selected)
+                    rows += selected.Batch.Length;
+            }
+
+            Assert.Equal(1_000, rows);
+        }
+
+        // The page index's one read-ahead request holds every index; nothing asks for one again.
+        var indexes = metadata.RowGroups[0].Columns
+            .SelectMany(c => new[] { (c.ColumnIndexOffset, c.ColumnIndexLength), (c.OffsetIndexOffset, c.OffsetIndexLength) })
+            .Where(r => r.Item1 is not null)
+            .Select(r => (Offset: r.Item1!.Value, Length: (long)r.Item2!.Value))
+            .ToList();
+        int requests = counting.RequestRanges.Count(request => request.Any(
+            r => indexes.Any(ix => r.Offset < ix.Offset + ix.Length && ix.Offset < r.Offset + r.Length)));
+        Assert.Equal(1, requests);
+    }
+
     [Fact]
     public async Task AOnePassReadDecodesTheSamePageAndFails()
     {

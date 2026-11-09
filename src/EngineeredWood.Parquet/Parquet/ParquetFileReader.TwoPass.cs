@@ -192,7 +192,10 @@ public sealed partial class ParquetFileReader
             long kept = 0;
             int row = 0;
             await foreach (var batch in ReadBatchesAsync(
-                               plan.Index, columns.Filter, ranges: null, offsetIndexes: null, cancellationToken,
+                               // The OffsetIndexes planning read with the page index, reused as ReadPlannedAsync
+                               // does: a first pass cut into batches builds page maps from them, and would otherwise
+                               // fetch them again.
+                               plan.Index, columns.Filter, ranges: null, plan.OffsetIndexes, cancellationToken,
                                batchRows: keep || !SplitsGroup(groupRows) ? groupRows : null).ConfigureAwait(false))
             {
                 int start = row;
