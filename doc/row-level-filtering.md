@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09 (a design note: check the code before relying on it). Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised the same day after phase 0 (§11). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -200,13 +200,14 @@ DML:
 | Phase | Content | Gate |
 |---|---|---|
 | 0 | `rowfilter-ab` harness next to `pageindex-read-ab`. Vary selectivity (point, 10%, 50%, 90%, 99%), clustered vs scattered, projection width, deletion vector on/off, local vs latency/transfer model. Measure the current post-filter baseline. | Numbers in the PR |
-| 1 | `ReadSelectedAsync` + `RowFilter` + `IExcludedRows` + `RowPositions`. Two passes, page-level I/O skipping, **decode-then-compact** (no decoder changes yet), nested columns whole. | Oracle = full read + post-filter, over the test matrix in #502. Mutation: pass 2 decodes the unmasked selection, and positions are off by one |
+| 1a | *(Revised after phase 0, §11.)* `ReadSelectedAsync` + `RowFilter` + `IExcludedRows` + `RowPositions`, with evaluation and compaction moved **inside the row-group unit**. That means they run in parallel across row groups, not on the consumer's thread. Still one decode pass and one fetch, so no I/O risk. A batch whose selection is all set is passed through, not gathered. | Oracle = full read + post-filter, over the test matrix in #502. Mutation: positions off by one; a batch's mask applied to its neighbour |
+| 1b | Lazy decode: within a fetched row group, decode the output columns only for pages holding a selected row, then decode-then-compact. Fetch filter and output pages in **one** request by default. Fetch them in two stages only where pass 1 can be expected to save more bytes than a round trip costs (§11, F5). Nested columns are decoded whole. | Same oracle. Mutation: pass 2 decodes the unmasked selection. `rowfilter-ab` local and cloud |
 | 2 | In-decoder selection (port the prototype to the batched path); run/bitmap switch. | `selection-ab` on the batched path; no regression at 99% kept |
 | 3 | Delta: `FilterRows`, `RowMasks`, deletion vector via `ExcludedRows`, positions-only DELETE. | Delta suites; Spark interop oracle for DELETE counts |
 | 4 | Dictionary evaluation (§6) + `IDeterministicFunctions`. | `OneCategory` profile; the dictionary-error fallback test |
 | 5 | Fusion of same-column conjuncts, adaptive demotion of a predicate that keeps >~95% (evaluate it after pass 2 instead), limit pushdown, then a decision on whether `FilterRows` should default on. | Measured crossover |
 
-Phase 1 alone delivers cmettler's main request: other columns are not decoded for pages with no surviving row. Phase 2 is what makes scattered selections (8 hits per page) pay. Ask cmettler to test after each of phases 2 and 3.
+Phase 1b delivers cmettler's main request: other columns are not decoded for pages with no surviving row. Phase 0 showed this skips almost nothing for scattered selections (§11, F2). Phase 2 is what makes them pay. Ask cmettler to test after each of phases 2 and 3.
 
 ## 9. Non-goals and open questions
 
@@ -224,3 +225,62 @@ These are not settled by the design above. Settle them in the phase 0/1 PRs.
 - **Memory accounting.** `PlannedBytes` scales the reservation by the share of rows the ranges keep. For pass 2, the selected-row share is known only after pass 1. Pass-1 arrays held for projected filter columns have to be reserved too.
 - **Verify the DELETE behaviour in §7** with a test on main before relying on it as a motivation.
 - **The oracle already exists.** The Parquet test project references `Expressions.Arrow` (since #430), so "full read + `ArrowRowEvaluator` post-filter" can be the phase 1 oracle as it stands.
+
+## 11. Phase 0 measurements (2026-11-09)
+
+Harness: `dotnet run -c Release -f net10.0 -- rowfilter-ab [rounds] [latencyMs] [direct|cloud] [MB/s] [excluded fraction] [case]` (`test/EngineeredWood.Parquet.Benchmarks/RowFilterAb.cs`).
+
+**Data:** 4 row groups of 500,000 rows, default write options (20,000-row pages, page indexes).
+- `id` is sorted, so a range on it is **clustered**.
+- `r` is uniform over [0, 1M), so a range on it is **scattered**.
+- `category` has 50 values and is dictionary-encoded.
+
+**Projections:** narrow is `id, amount`; wide is `id, ts, category, amount, qty, note`.
+
+**Strategies**, all checked every round to return the same rows (count and a checksum of `id`):
+- **none:** the projection with no filter. A reference, not an exact read.
+- **post:** today's exact read. `ReadWithPositionsAsync` with pruning, then per batch: `SelectionMask`, `ArrowRowEvaluator`, `ArrowCompute.Take`, and dropping the filter-only columns.
+- **pass1:** the filter columns only, then evaluate. The floor for any two-pass read.
+- **late:** phase 1 emulated with public APIs. Pass 1 builds each row group's selection. Pass 2 calls `ReadRowRangesAsync` over the pages holding a selected row, four row groups at a time, then gathers. It over-states phase 1's cost: a projected filter column is decoded twice, and pass 2 re-reads the OffsetIndexes.
+
+i9-12900K (24 logical processors), net10.0, median of 7 rounds.
+
+**Local, milliseconds**
+
+| Case | Kept | none | post | pass1 | late | late vs post | eval | gather |
+|---|---|---|---|---|---|---|---|---|
+| clustered 1% narrow | 1% | 4.8 | 0.7 | 0.4 | 0.8 | +7% | 0.3 | |
+| clustered 90% narrow | 90% | 5.5 | 19.5 | 3.8 | 12.4 | -36% | 2.0 | |
+| clustered 90% wide | 90% | 23.9 | 61.3 | 3.8 | 39.6 | -34% | 2.1 | |
+| scattered point narrow | 0% | 4.9 | 11.1 | 7.0 | 7.3 | -34% | 4.8 | 0.2 |
+| scattered 0.1% narrow | 0.1% | 5.3 | 9.4 | 4.8 | 10.1 | +10% | 2.4 | 0.3 |
+| scattered 1% wide | 1% | 24.2 | 31.8 | 4.9 | 28.4 | -11% | 2.6 | 3.6 |
+| scattered 10% wide | 10% | 23.9 | 44.3 | 5.9 | 32.3 | -25% | 3.6 | 13.6 |
+| scattered 50% narrow | 50% | 5.3 | 26.7 | 10.3 | 17.8 | -33% | 7.9 | 9.5 |
+| scattered 99% narrow | 99% | 5.2 | 30.4 | 4.8 | 14.4 | -51% | 2.4 | 17.5 |
+| scattered 99% wide | 99% | 24.2 | 76.0 | 5.0 | 40.4 | -46% | 2.4 | 49.9 |
+| scattered point wide | 0% | 23.2 | 30.6 | 7.1 | 8.1 | -73% | 4.9 | 0.2 |
+| category = 2% wide | 2% | 25.0 | 32.2 | 7.7 | 33.2 | +2% | 3.7 | |
+| category <> 98% wide | 98% | 26.4 | 70.4 | 7.9 | 47.9 | -34% | 3.8 | |
+
+**Cloud model** (20 ms per GET through `CoalescingFileReader`, 100 MB/s), milliseconds:
+
+| Case | post | late | late vs post | GETs post / late | MB read post / late |
+|---|---|---|---|---|---|
+| clustered 0.1% narrow | 86 | 160 | +86% | 4 / 6 | 0.2 / 0.2 |
+| clustered 10% wide | 152 | 218 | +44% | 5 / 7 | 8.3 / 8.3 |
+| scattered 1% wide | 308 | 344 | +11% | 6 / 14 | 75.5 / 75.5 |
+| scattered point wide | 323 | 168 | -48% | 6 / 16 | 75.5 / 9.5 |
+| scattered 99% wide | 360 | 365 | +1% | 6 / 14 | 75.5 / 75.5 |
+
+Excluding 1% of rows at random (as a deletion vector would) changed none of these comparisons. The harness clears excluded rows with a naive per-row loop, so it says nothing about the cost of deletion vectors themselves.
+
+### Findings
+
+- **F1. Today's exact read is bound by the consumer thread, not by decoding.** `post − none` is about `eval + gather`. The gather (index list, `Take`, projection) costs 17.5 ms narrow and 50 ms wide at 99% kept, while the reader decodes four row groups in parallel. `late` gains −34 to −61% at ≥90% kept while decoding the *same* bytes, because its gather runs inside per-row-group tasks. So evaluation and compaction belong inside the row-group unit (`ReadPlannedAsync` under `OrderedScan`). This is phase 1a: the biggest local win, with no I/O change. Separately, `ArrowCompute.Take` allocates its output in managed memory (181 MB managed for the post-filter at 99% wide), which is worth its own look.
+- **F2. Page-level skipping does nothing for scattered selections at ≥0.1%.** With 20,000-row pages, every page holds about 20 or more matches. Only the point lookup skipped pages: 5.8 MB read instead of 21.5, −34% narrow, −73% wide. Phase 1b alone does not serve the host's join filter. Phase 2 (selection inside the decoders) does, and it has to come next.
+- **F3. The evaluator is no longer the bottleneck.** #502 asked for this re-measurement. `r < k` costs 1.2–4 ms per million rows, and `category = '…'` about 2 ms, down from 40 ms per million before #560. The cost peaks at 50% kept (7.9 ms per 2M rows against 2.4 ms at 1% or 99%), which suggests a branchy comparison or `SelectionMask.And` loop. Check it before tuning.
+- **F4. Most of an exact read is decoding and gathering what the filter discards.** `pass1` (filter columns plus evaluation) is 4.6–10 ms, against 9–85 ms for `post` on unclustered predicates.
+- **F5. On object storage, a second dependent fetch costs more than lazy decoding saves.** `late` was 44–86% slower on small clustered selections, because pass 2 waits for pass 1, plus the emulation's extra OffsetIndex request. Only the point lookup, which saved 66 MB, won. The design therefore separates I/O from decoding: fetch filter and output pages together by default, and decode output pages lazily. Split the fetch only when pass 1 can be expected to empty enough pages to save more than a round trip. That is roughly `bytes saved / bandwidth > latency`, learned from earlier row groups of the same scan. Clustered predicates are already narrowed by the page index before any fetch.
+- **F6. Dictionary strings cost about 3 ms more in pass 1.** `pass1` is 7.8 ms for `category` against 4.7 ms for the integer key, consistent with the #608 profile. That is phase 4's target.
+- **F7. A projected filter column decoded twice costs up to 50% more decoding on narrow clustered reads** (24 MB against 16 MB at 50%). Keeping pass-1 arrays (§4 step 2) is worth it.
