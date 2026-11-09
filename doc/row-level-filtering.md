@@ -365,11 +365,10 @@ Same harness and machine as §11 and §12: `twopass` against `selected` (1a), me
 - **The cloud model** is 0–28% faster in every case but one (clustered 10% wide, +5%). Part of that is the harness: `LatencyCountingFile` charges each GET its own transfer time, so pass 2's prefetch, a second request in flight beside pass 1's, effectively doubles bandwidth. Real object stores do serve concurrent GETs in parallel, but treat the size of this gain as an upper bound.
 - **Unchanged:** page-index-narrowed groups (clustered ≤10%) take the one-pass path.
 
-### Open decision
+### Decided: on for object storage only
 
-1b is on by default in this PR, behind `ParquetFileReader.TwoPassReads` (internal). The trade-off is a small local cost on dense reads for a large gain on point lookups, and a gain almost everywhere on object storage. Options:
-- **keep it on;**
-- **on for files that report object-store concurrency** (`IReadConcurrencyHint`) and off for local files;
-- **narrow it** to row groups whose statistics suggest few matches. This is not attempted here: no statistic predicts it reliably for an opaque predicate.
+By default, a selected read uses two passes only for a file that reports object-store concurrency: `IReadConcurrencyHint.PreferredConcurrentReads`, which the S3, Azure and GCS readers report directly and the coalescing and known-length wrappers pass on. Local files read in one pass, as in phase 1a. The internal `ParquetFileReader.TwoPassReads` (a `bool?`) forces two passes either way, for tests and the harness.
 
-Phase 2, selection inside the decoders, removes most of pass 2's cost on dense selections too, which may settle this.
+The trade-off decided it. Locally, two passes cost a dense selection up to 16%, while on object storage they were faster in all but one case, and point lookups gained in both.
+
+Revisit once phase 2 lands: selection inside the decoders should remove most of pass 2's cost on dense selections too, which may settle this.

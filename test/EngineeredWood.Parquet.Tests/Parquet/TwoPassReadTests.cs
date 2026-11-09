@@ -3,6 +3,7 @@
 
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 
@@ -65,6 +66,44 @@ public class TwoPassReadTests : IDisposable
         Assert.Equal(Enumerable.Range(0, 1_000).Select(i => (long)i), rows);
     }
 
+    /// <summary>
+    /// By default, two passes only for a file on an object store: a local file reads in one pass (and so decodes
+    /// the corrupted page), one reporting a concurrency hint reads in two (and never does).
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ByDefaultOnlyAnObjectStoreFileReadsInTwoPasses(bool objectStore)
+    {
+        var (path, _) = await WriteCorruptedAsync();
+        var error = await Record.ExceptionAsync(() => ReadIdsAsync(path, Scan(maxId: 1_000), twoPass: null, objectStore));
+        if (objectStore)
+            Assert.Null(error);
+        else
+            Assert.NotNull(error);
+    }
+
+    /// <summary>A local file that says what an object-store reader says: how many reads it serves at once.</summary>
+    private sealed class ObjectStoreLike(IRandomAccessFile inner) : IRandomAccessFile, IReadConcurrencyHint
+    {
+        public int? PreferredConcurrentReads => 8;
+
+        public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default) => inner.GetLengthAsync(cancellationToken);
+
+        public ValueTask<System.Buffers.IMemoryOwner<byte>> ReadAsync(FileRange range, CancellationToken cancellationToken = default) =>
+            inner.ReadAsync(range, cancellationToken);
+
+        public ValueTask<IReadOnlyList<System.Buffers.IMemoryOwner<byte>>> ReadRangesAsync(
+            IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default) =>
+            inner.ReadRangesAsync(ranges, cancellationToken);
+
+        public ValueTask DisposeAsync() => default; // the local file is disposed by its owner
+
+        public void Dispose()
+        {
+        }
+    }
+
     [Fact]
     public async Task AOnePassReadDecodesTheSamePageAndFails()
     {
@@ -96,9 +135,10 @@ public class TwoPassReadTests : IDisposable
         })),
     };
 
-    private static async Task<List<long>> ReadIdsAsync(string path, ParquetScan scan, bool twoPass)
+    private static async Task<List<long>> ReadIdsAsync(string path, ParquetScan scan, bool? twoPass, bool objectStore = false)
     {
-        await using var file = new LocalRandomAccessFile(path);
+        await using var local = new LocalRandomAccessFile(path);
+        IRandomAccessFile file = objectStore ? new ObjectStoreLike(local) : local;
         using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { PageChecksumValidation = true })
         {
             TwoPassReads = twoPass,

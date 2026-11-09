@@ -4,6 +4,7 @@
 using System.Buffers;
 using Apache.Arrow;
 using EngineeredWood.Arrow;
+using EngineeredWood.IO;
 using EngineeredWood.Parquet.Schema;
 using EngineeredWood.Scans;
 
@@ -102,7 +103,7 @@ public sealed partial class ParquetFileReader
     /// <remarks>Nor a row group with a chunk larger than one Arrow array can hold: the first pass decodes its
     /// predicate columns whole, where a one-pass read splits such a chunk into batches.</remarks>
     private bool ReadsInTwoPasses(RowGroupPlan plan, TwoPassColumns? columns, Metadata.RowGroup rowGroup) =>
-        TwoPassReads && columns is not null && _options.MaxBatchByteSize is not > 0
+        UsesTwoPasses && columns is not null && _options.MaxBatchByteSize is not > 0
         && (plan.Ranges is null
             || (plan.Ranges.Count == 1 && plan.Ranges[0].Start == 0 && plan.Ranges[0].End == rowGroup.NumRows))
         && rowGroup.Columns.All(c => c.MetaData is not { } m || m.TotalUncompressedSize < TwoPassMaxChunkBytes);
@@ -111,9 +112,23 @@ public sealed partial class ParquetFileReader
     /// array can address, as the batched read's own implicit cap is.</summary>
     internal const long TwoPassMaxChunkBytes = 1L << 30;
 
-    /// <summary>Whether a selected read may decode in two passes; false reads every row group in one, as
-    /// phase 1a did. For tests and A/B measurement.</summary>
-    internal bool TwoPassReads { get; set; } = true;
+    /// <summary>
+    /// Whether a selected read may decode in two passes: true or false forces it, for tests and A/B measurement;
+    /// null (the default) decides by the file, see <see cref="UsesTwoPasses"/>.
+    /// </summary>
+    internal bool? TwoPassReads { get; set; }
+
+    /// <summary>
+    /// Whether selected reads of this file may go in two passes. By default only for a file on an object store
+    /// (one that reports <see cref="IReadConcurrencyHint.PreferredConcurrentReads"/>, as the S3, Azure and GCS
+    /// readers do, through the coalescing and known-length wrappers too). Measured (doc/row-level-filtering.md
+    /// §13), two passes cost a local read of a dense selection up to 16% (27% for row groups kept whole), since
+    /// a row group's predicate columns then decode before its other columns rather than alongside them, while on
+    /// object storage they were 0-28% faster in all but one case. Point lookups gain in both. Revisit once
+    /// phase 2 (selection inside the decoders) changes the second pass's cost.
+    /// </summary>
+    private bool UsesTwoPasses =>
+        TwoPassReads ?? (_file as IReadConcurrencyHint)?.PreferredConcurrentReads is not null;
 
     /// <summary>
     /// The block of rows a two-pass read decides to decode or not as one: a block with no selected row has its
