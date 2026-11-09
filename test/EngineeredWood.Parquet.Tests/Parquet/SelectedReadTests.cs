@@ -67,7 +67,8 @@ public class SelectedReadTests : IDisposable
         ["s, k"] = ["s", "k"],
 
         // Not swept: a dotted path into a struct ("pt.x"). Reading one leaf of a two-leaf struct throws
-        // IndexOutOfRangeException in NestedAssembler on main, with or without a filter.
+        // IndexOutOfRangeException in NestedAssembler on main, with or without a filter (#783). Add it back
+        // once that is fixed.
     };
 
     public static IEnumerable<object[]> Cases()
