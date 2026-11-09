@@ -98,6 +98,68 @@ internal static class SelectionMask
         GC.KeepAlive(mask); // spans over its buffers are read above
     }
 
+    /// <summary>
+    /// One step of SQL's three-valued AND, short-circuited per row: applies <paramref name="mask"/>, the answers
+    /// of one conjunct, to the rows still <paramref name="live"/> (no conjunct has answered FALSE) and to those
+    /// <paramref name="allTrue"/> so far. FALSE clears both bits of its row; NULL clears only the
+    /// <paramref name="allTrue"/> bit, so the row stays live for the conjuncts after this one.
+    /// </summary>
+    /// <param name="live">The live rows; the mask answers these.</param>
+    /// <param name="allTrue">The rows every conjunct so far answered TRUE for: a subset of
+    /// <paramref name="live"/>.</param>
+    /// <param name="rows">The batch's row count.</param>
+    /// <param name="mask">One answer per row when every row is live (<paramref name="liveIndices"/> empty);
+    /// otherwise one per live row, in row order.</param>
+    /// <param name="liveIndices">The live rows' indices, ascending, when some rows are not live; empty when
+    /// all are. Not called with no live row at all, which the empty span cannot express.</param>
+    /// <exception cref="ArgumentException">The mask's length does not match.</exception>
+    public static void AndThreeValued(
+        Span<ulong> live, Span<ulong> allTrue, int rows, BooleanArray mask, ReadOnlySpan<int> liveIndices)
+    {
+        if (mask is null)
+            throw new ArgumentNullException(nameof(mask));
+        int expected = liveIndices.IsEmpty ? rows : liveIndices.Length;
+        if (mask.Length != expected)
+            throw new ArgumentException($"The mask has {mask.Length} rows; {expected} were evaluated.", nameof(mask));
+
+        var values = mask.ValueBuffer.Span;
+        var validity = mask.NullCount != 0 ? mask.NullBitmapBuffer.Span : default;
+        if (liveIndices.IsEmpty)
+        {
+            int n = WordCount(rows);
+            for (int w = 0; w < n; w++)
+            {
+                int bit = mask.Offset + (w << 6);
+                ulong value = ReadWord(values, bit);
+                ulong valid = validity.IsEmpty ? ulong.MaxValue : ReadWord(validity, bit);
+                live[w] &= ~(valid & ~value);   // drop FALSE
+                allTrue[w] &= valid & value;    // keep TRUE only
+            }
+        }
+        else
+        {
+            for (int j = 0; j < liveIndices.Length; j++)
+            {
+                int at = mask.Offset + j;
+                bool isValid = validity.IsEmpty || (validity[at >> 3] & (1 << (at & 7))) != 0;
+                bool isTrue = (values[at >> 3] & (1 << (at & 7))) != 0;
+                int r = liveIndices[j];
+                ulong bit = 1UL << (r & 63);
+                if (!isValid)
+                {
+                    allTrue[r >> 6] &= ~bit;
+                }
+                else if (!isTrue)
+                {
+                    live[r >> 6] &= ~bit;
+                    allTrue[r >> 6] &= ~bit;
+                }
+            }
+        }
+
+        GC.KeepAlive(mask); // spans over its buffers are read above
+    }
+
     // ANDs bits [bitOffset, bitOffset + rows) of an Arrow bitmap into words[0..WordCount(rows)).
     private static void AndBits(Span<ulong> words, int rows, ReadOnlySpan<byte> bitmap, int bitOffset)
     {

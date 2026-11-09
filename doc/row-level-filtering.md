@@ -53,7 +53,7 @@ public sealed class RowPredicate
 {
     public RowPredicate(IReadOnlyList<string> columns, Func<RecordBatch, BooleanArray> evaluate);
 
-    /// Resolved as `columnNames` are (top-level names or dotted leaf paths). The batch passed to
+    /// Top-level column names (phase 1a; dotted leaf paths are refused for now). The batch passed to
     /// Evaluate holds exactly these columns, in this order, whether or not they are projected.
     public IReadOnlyList<string> Columns { get; }
 
@@ -95,7 +95,6 @@ public sealed record ParquetScan
     public Predicate? Prune { get; init; }                  // superset pruning, exactly as today
     public RowFilter? RowFilter { get; init; }              // exact (for the rows returned)
     public IExcludedRows? ExcludedRows { get; init; }
-    public bool WithPositions { get; init; }
 }
 
 /// Batches may span rows that were filtered out, so their rows need not be contiguous.
@@ -114,6 +113,7 @@ public IAsyncEnumerable<SelectedRecordBatch> ReadSelectedAsync(ParquetScan scan,
 
 ### Decisions behind the shape
 
+- **Positions always come back.** Phase 1a dropped the proposed `WithPositions` switch: positions cost nothing for a batch whose rows are contiguous, and one `Int64Array` of the surviving rows otherwise, which is small next to the gather that produced them.
 - **A new method, not a changed `Filter`.** `ParquetReadOptions.Filter` and `ReadWithPositionsAsync` keep returning a superset. The doc at `ParquetReadOptions.cs:276` stays true for every caller who doesn't opt in. Over time, `ReadWithPositionsAsync(filter, cols, skipRows)` can become a thin wrapper over `ReadSelectedAsync`.
 - **`Prune` and `RowFilter` stay separate.** The caller already translates a `Predicate` to file leaf paths for pruning (`RowGroupPushdown.ToFileColumns`). A row predicate can be something no `Predicate` expresses (DuckDB's Bloom/hash join filter), and a `Predicate` can prune without being exact. A host passes `k BETWEEN lo AND hi` as `Prune` and the join probe as a `RowPredicate`.
 - **The reader doesn't need to see the `Predicate` for part 3.** This reverses the 11-01 design note on #502. A value-wise delegate evaluated over the dictionary's values (§6) covers equality and IN. It also covers ranges, `LIKE`, `lower(x) = …` and DuckDB's Bloom probe. `MembershipPredicateEvaluator` handles only `Eq`/`In`.
@@ -202,7 +202,7 @@ Per file, the scan builds the Parquet `RowFilter`:
 - **Codec seam:** an `IDataFileReader` gets no predicate. Post-filter with the same `RowPredicate` list there. That post-filter is also the test oracle.
 
 DML:
-- **DELETE** becomes `ReadSelectedAsync` with `Columns = []`, `RowFilter` set to the predicate, `ExcludedRows` set to the deletion vector, and `WithPositions`. It gets positions only, with no output decode, and possibly no predicate-column materialization (dictionary). Footer row counts are unchanged (#439).
+- **DELETE** becomes `ReadSelectedAsync` with `Columns = []`, `RowFilter` set to the predicate, `ExcludedRows` set to the deletion vector, and gets positions only, with no output decode, and possibly no predicate-column materialization (dictionary). Footer row counts are unchanged (#439).
 - **UPDATE and MERGE** still need whole files, but can pass `ExcludedRows` instead of `Take`-filtering.
 - **Worth verifying first:** DELETE today evaluates the predicate on deleted rows and masks them out afterwards. A value error on a deleted row (an ANSI cast) would then fail a DELETE that Spark, which filters deletion-vector rows first, lets through. The new path fixes that, but check it on main with a test.
 
@@ -297,3 +297,27 @@ Excluding 1% of rows at random (as a deletion vector would) changed none of thes
 - **F5. On object storage, a second dependent fetch costs more than lazy decoding saves.** `late` was 43–87% slower on small clustered selections, because pass 2 waits for pass 1, plus the emulation's extra OffsetIndex request. Only the point lookup, which saved 66 MB, won. The design therefore separates I/O from decoding: fetch filter and output pages together by default, and decode output pages lazily. Split the fetch only when pass 1 can be expected to empty enough pages to save more than a round trip. That is roughly `bytes saved / bandwidth > latency`, learned from earlier row groups of the same scan. Clustered predicates are already narrowed by the page index before any fetch.
 - **F6. Dictionary strings cost about 3 ms more in pass 1.** `pass1` is 7.8 ms for `category` against 4.7 ms for the integer key, consistent with the #608 profile. That is phase 4's target.
 - **F7. A projected filter column decoded twice costs up to 50% more decoding on narrow clustered reads** (24 MB against 16 MB at 50%). Keeping pass-1 arrays (§4 step 2) is worth it.
+
+## 12. Phase 1a measurements (2026-11-09)
+
+`selected` in `rowfilter-ab` is phase 1a: `ReadSelectedAsync`, with the predicate as one `RowPredicate` and as `Prune`. It does the same decode as `post`, but the mask and the gather run inside each row group's read, in parallel. Same machine and data as §11, median of 7 rounds.
+
+**Local**, milliseconds:
+
+| Case | post | selected | vs post |
+|---|---|---|---|
+| clustered 1% narrow | 0.7 | 0.6 | -9% |
+| clustered 90% narrow | 16.4 | 5.7 | -65% |
+| clustered 90% wide | 59.0 | 22.4 | -61% |
+| scattered point wide | 30.6 | 27.1 | -14% |
+| scattered 1% narrow | 10.2 | 7.4 | -26% |
+| scattered 1% wide | 28.9 | 26.4 | -11% |
+| scattered 50% narrow | 24.9 | 12.8 | -52% |
+| scattered 99% narrow | 26.2 | 14.5 | -45% |
+| scattered 99% wide | 71.4 | 41.2 | -42% |
+| category = 2% narrow | 14.0 | 9.4 | -33% |
+| category <> 98% wide | 62.0 | 39.9 | -31% |
+
+Phase 1a is faster than `post` in every one of the 30 cases: by 1–65%, and by 31–65% at ≥90% kept. Against the two-pass emulation (`late`): it is ahead at low and middle selectivity, where `late` pays for its second pass. At ≥90% kept the two are within a few points of each other, either way, since both gain from parallel gathering. It falls clearly behind only on the scattered point lookup, where page skipping is what helps (−73% for `late`, against −14%). That is phase 1b's case.
+
+**Cloud model** (20 ms per GET, 100 MB/s): between −14% and +10% against `post`, as expected for a read bound by request latency. The small clustered reads came out 1–10% slower, about 7 ms. `pass1`, which reads only the filter column, shows the same gap, so it is not the filtering. It is unexplained, and should be looked at before the default is flipped.
