@@ -372,3 +372,42 @@ By default, a selected read uses two passes only for a file that reports object-
 The trade-off decided it. Locally, two passes cost a dense selection up to 16%, while on object storage they were faster in all but one case, and point lookups gained in both.
 
 Revisit once phase 2 lands: selection inside the decoders should remove most of pass 2's cost on dense selections too, which may settle this.
+
+## 14. Phase 2a: keeping rows as they are decoded (2026-11-09)
+
+Phase 2 is split in two. **2a** (this) cuts the selection into a column as it is built. **2b** (next) skips dropped values inside the decoders that can skip, so they are never decoded at all.
+
+### What it does
+
+`ColumnBuildState.KeepRows` compacts a flat column's decoded rows in place before the Arrow array is built. It compacts the definition levels and the values together, in every value layout:
+- bit-packed booleans;
+- fixed widths: 4 and 8 bytes, INT96's 12, and any FIXED_LEN_BYTE_ARRAY length;
+- byte arrays with 32-bit or 64-bit offsets;
+- 16-byte views.
+
+It runs before the build-time INT96 and extended-timestamp conversions, so they see only the kept values. `ReadColumn` takes a per-row keep mask, and `ReadBatchesAsync` passes it on its whole-group single-pass path.
+
+The two-pass read's dense second pass uses it when the second pass is one batch and keeps **at least half** the group's rows (`TwoPassMinKeptShareToCompact`). The batch then comes back holding only the selected rows, with nothing to gather.
+
+Below half kept, the gather stays. Compacting walks every row and value; a gather walks only the kept ones. The first version compacted at every selectivity and was 5–19% *slower* than the gather on 0.1–10% selections.
+
+### Found on the way: a bug on `main`
+
+With view output, `ColumnBuildState.AddByteArrayValues` counted every DELTA_BYTE_ARRAY, DELTA_LENGTH_BYTE_ARRAY and FSST value twice: `WriteOneStringView` counts each value, and the branch then added the count again. The view build derives the null count from that count, so for example `delta_byte_array.parquet` reads back with `NullCount` −1000 on a column with no nulls. Fixed here, and pinned by `KeepRowsTests.AViewColumnsNullCountMatchesItsRows`.
+
+### Measured
+
+`rowfilter-ab`, local, median of 7 rounds. Two-pass against 1a's one-pass read:
+
+| Case | 1b vs 1a | 2a vs 1a |
+|---|---|---|
+| scattered 90% narrow | +1% | -3% |
+| scattered 99% wide | +4% | -13% |
+| scattered 90% wide | +4% | -13% |
+| clustered 50% wide | +12% | -11% |
+| category <> 98% wide | +11% | -1% |
+| scattered point wide | -37% | -37% |
+| scattered 1% narrow | +14% | +10% (gather path, unchanged) |
+| clustered 90% narrow (groups kept whole) | +27% | +27% |
+
+So two passes now beat one at high selectivity as well as for point lookups. The remaining local cost is at low selectivity, which 2b's skipping decoders target, and in row groups kept whole, where a group's two passes decode one after the other. Two passes stay the default on object storage only (§13).

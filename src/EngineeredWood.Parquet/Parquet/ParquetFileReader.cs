@@ -725,6 +725,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// reads of different columns cut the same rows into the same batches.</param>
     /// <param name="useOffsetIndex">False builds every page map by scanning page headers, never reading an
     /// OffsetIndex: for a read whose chunks are fetched whole anyway.</param>
+    /// <param name="keepRows">One byte per row of the group, 1 to keep it: the only rows the batch holds. Only for a
+    /// read of a whole flat group that comes back as one batch; the caller makes sure it does.</param>
     private async IAsyncEnumerable<RecordBatch> ReadBatchesAsync(
         int rowGroupIndex,
         IReadOnlyList<string>? columnNames,
@@ -734,7 +736,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         IRandomAccessFile? io = null,
         int? batchRows = null,
-        bool useOffsetIndex = true)
+        bool useOffsetIndex = true,
+        byte[]? keepRows = null)
     {
         var file = io ?? _file;
         int? batchSize = batchRows ?? _options.BatchSize;
@@ -790,6 +793,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 fitsInOneBatch = false;
         }
 
+        if (keepRows is not null && (!fitsInOneBatch || ctx.HasNestedColumns))
+            throw new InvalidOperationException("Rows can be kept only in a flat row group read as one batch.");
+
         if (fitsInOneBatch)
         {
             // Row group fits in a single batch — use the optimised single-pass path.
@@ -806,9 +812,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                         ctx.HasNestedColumns,
                         _options.PageChecksumValidation,
                         _options.FixedListFastPath,
-                        _options.MaxPageUncompressedSize);
+                        _options.MaxPageUncompressedSize,
+                        keepRows);
                 });
-                yield return AssembleRecordBatch(ctx, results);
+                yield return AssembleRecordBatch(
+                    keepRows is null ? ctx : ctx with { RowCount = results.Length > 0 ? results[0].Array.Length : 0 },
+                    results);
             }
             finally
             {

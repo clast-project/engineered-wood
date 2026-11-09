@@ -52,8 +52,12 @@ internal static class ColumnChunkReader
         bool preserveDefLevels = false,
         bool validateCrc = false,
         bool fixedListFastPath = false,
-        int? maxPageUncompressedSize = null)
+        int? maxPageUncompressedSize = null,
+        byte[]? keepRows = null)
     {
+        if (keepRows is not null && (column.MaxRepetitionLevel > 0 || preserveDefLevels || keepRows.Length < rowCount))
+            throw new ArgumentException("Rows can be kept only in a flat column, one byte per row.", nameof(keepRows));
+
         if (fixedListFastPath && IsFixedListCandidate(column))
         {
             var fast = TryReadFixedListColumn(
@@ -156,6 +160,11 @@ internal static class ColumnChunkReader
         }
 
         EnsureFullRowCoverage(state, column, rowCount);
+
+        // A selected read's second pass: keep only the selected rows, in place, rather than build every row and
+        // gather from the arrays afterwards.
+        if (keepRows is not null)
+            rowCount = state.KeepRows(keepRows.AsSpan(0, rowCount));
 
         IArrowArray array;
         if (isRepeated)

@@ -153,6 +153,13 @@ public sealed partial class ParquetFileReader
     internal const double TwoPassMaxCoveredShare = 0.5;
 
     /// <summary>
+    /// The smallest share of a row group's rows a dense second pass must keep to keep them as it decodes
+    /// (<c>ColumnBuildState.KeepRows</c>) rather than gather them after. Compacting walks every row and value; a
+    /// gather walks only the kept ones. Measured crossover: about half.
+    /// </summary>
+    internal const double TwoPassMinKeptShareToCompact = 0.5;
+
+    /// <summary>
     /// Reads one planned row group in two passes. The first decodes the predicates' columns over the whole row
     /// group and works out its selection. The second decodes the other output columns: only over the blocks of
     /// <see cref="TwoPassBlockRows"/> rows holding a selected row when those are few enough
@@ -249,27 +256,47 @@ public sealed partial class ParquetFileReader
             var ranges = SelectedBlocks(selection, groupRows, out long covered);
             IReadOnlyList<RowRange>? passTwoRanges = covered <= groupRows * TwoPassMaxCoveredShare ? ranges : null;
 
-            int range = 0;
-            long cursor = passTwoRanges?[0].Start ?? 0;
-            await foreach (var batch in ReadBatchesAsync(
-                               plan.Index, columns.OutputOnly, passTwoRanges, offsetIndexes: null, cancellationToken,
-                               io: prefetched, useOffsetIndex: false).ConfigureAwait(false))
+            // A dense second pass read as one batch, keeping at least half its rows, keeps them as it decodes
+            // (phase 2a): the batch comes back holding only those, with nothing to gather. Compacting in place
+            // walks every row, where a gather walks only the kept ones, so below half the gather wins (measured,
+            // doc/row-level-filtering.md §14).
+            byte[]? keepRows = passTwoRanges is null && !SplitsGroup(groupRows)
+                               && kept < groupRows && kept >= groupRows * TwoPassMinKeptShareToCompact
+                ? KeepMask(selection, groupRows)
+                : null;
+            try
             {
-                int start = checked((int)cursor);
-                cursor += batch.Length;
-                if (passTwoRanges is not null && cursor == passTwoRanges[range].End && range + 1 < passTwoRanges.Count)
-                    cursor = passTwoRanges[++range].Start;
+                int range = 0;
+                long cursor = passTwoRanges?[0].Start ?? 0;
+                await foreach (var batch in ReadBatchesAsync(
+                                   plan.Index, columns.OutputOnly, passTwoRanges, offsetIndexes: null, cancellationToken,
+                                   io: prefetched, useOffsetIndex: false, keepRows: keepRows).ConfigureAwait(false))
+                {
+                    int start = checked((int)cursor);
+                    cursor += batch.Length;
+                    if (passTwoRanges is not null && cursor == passTwoRanges[range].End && range + 1 < passTwoRanges.Count)
+                        cursor = passTwoRanges[++range].Start;
 
-                secondPassBatches++;
-                long size = ArrowSizes.EstimatedBytes(batch);
-                decoded += size;
-                reservation?.Observe(size);
-                if (SecondPass(batch, start, selection, first, plan.GroupStart, columns, moved) is { } selected)
-                    yield return selected;
+                    secondPassBatches++;
+                    long size = ArrowSizes.EstimatedBytes(batch);
+                    decoded += size;
+                    reservation?.Observe(size);
+                    var selected = keepRows is null
+                        ? SecondPass(batch, start, selection, first, plan.GroupStart, columns, moved)
+                        : SecondPass(batch, start: 0, selection, first, plan.GroupStart, columns, moved, groupRows);
+                    if (selected is { } result)
+                        yield return result;
+                }
+            }
+            finally
+            {
+                if (keepRows is not null)
+                    ArrayPool<byte>.Shared.Return(keepRows);
             }
 
-            // Learnt only from a group each pass decoded whole in one batch: then `decoded` is the group's.
-            if (growth is not null && passTwoRanges is null && firstPassBatches == 1 && secondPassBatches == 1)
+            // Learnt only from a group each pass decoded whole in one batch, every row built: then `decoded` is the
+            // group's. A second pass that kept rows as it decoded measured less than it decoded.
+            if (growth is not null && passTwoRanges is null && keepRows is null && firstPassBatches == 1 && secondPassBatches == 1)
                 growth.Observe(plannedUncompressed, decoded);
         }
         finally
@@ -286,6 +313,37 @@ public sealed partial class ParquetFileReader
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Row group <paramref name="rowGroupIndex"/>'s rows that <paramref name="keepRows"/> keeps (one byte per row, 1
+    /// to keep), of flat columns, cut as they are decoded: the second pass's path, for tests to compare against a
+    /// whole read gathered afterwards.
+    /// </summary>
+    internal async ValueTask<RecordBatch> ReadRowGroupKeepingAsync(
+        int rowGroupIndex, IReadOnlyList<string> columnNames, byte[] keepRows, CancellationToken cancellationToken = default)
+    {
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        int rows = checked((int)metadata.RowGroups[rowGroupIndex].NumRows);
+        RecordBatch? result = null;
+        await foreach (var batch in ReadBatchesAsync(
+                           rowGroupIndex, columnNames, ranges: null, offsetIndexes: null, cancellationToken,
+                           batchRows: Math.Max(1, rows), keepRows: keepRows).ConfigureAwait(false))
+        {
+            result?.Dispose();
+            result = batch;
+        }
+
+        return result ?? throw new InvalidOperationException($"Row group {rowGroupIndex} returned no batch.");
+    }
+
+    /// <summary>The selection as one byte per row (1 keep, 0 drop), from the pool: the decoders' form of it.</summary>
+    private static byte[] KeepMask(ulong[] selection, int rows)
+    {
+        var keep = ArrayPool<byte>.Shared.Rent(rows);
+        for (int r = 0; r < rows; r++)
+            keep[r] = (byte)((selection[r >> 6] >> (r & 63)) & 1);
+        return keep;
     }
 
     /// <summary>ORs the first <paramref name="rows"/> bits of <paramref name="source"/> into
@@ -343,11 +401,14 @@ public sealed partial class ParquetFileReader
     /// batch holds no selected row. Takes ownership of <paramref name="batch"/>. <paramref name="first"/> is null
     /// when the read returns none of the predicate columns.
     /// </summary>
+    /// <param name="compactedFrom">When the batch's rows were already cut to the selection as they were decoded
+    /// (it holds only the selected rows of a whole group of this many rows), that group's size; otherwise null,
+    /// and the batch holds every row of its range.</param>
     private static SelectedRecordBatch? SecondPass(
         RecordBatch batch, int start, ulong[] selection, RecordBatch? first, long groupStart,
-        TwoPassColumns columns, bool[] moved)
+        TwoPassColumns columns, bool[] moved, int? compactedFrom = null)
     {
-        int rows = batch.Length;
+        int rows = compactedFrom ?? batch.Length;
         int[] indices = ArrayPool<int>.Shared.Rent(Math.Max(1, rows));
         RecordBatch owned = batch; // released on failure: the batch, or once gathered, its copy
         RecordBatch? predicateColumns = null;
@@ -360,7 +421,15 @@ public sealed partial class ParquetFileReader
 
             var local = indices.AsSpan(0, kept);
             RecordBatch output = batch;
-            if (kept < rows)
+            if (compactedFrom is not null)
+            {
+                if (batch.Length != kept)
+                {
+                    throw new InvalidOperationException(
+                        $"The second pass kept {batch.Length} rows of a selection of {kept}.");
+                }
+            }
+            else if (kept < rows)
             {
                 output = BatchSelector.Gather(batch, local, static _ => true);
                 BatchSelector.ReleaseAfterGather(batch, output);

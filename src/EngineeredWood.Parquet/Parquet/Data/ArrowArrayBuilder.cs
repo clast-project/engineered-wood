@@ -1234,6 +1234,218 @@ internal sealed class ColumnBuildState : IDisposable
         }
     }
 
+    /// <summary>
+    /// Keeps only the rows whose <paramref name="keep"/> byte is 1 (0 drops it) of a flat column's decoded rows,
+    /// in place, before the build: definition levels and values both, in every value layout (bit-packed booleans,
+    /// fixed widths, byte arrays with 32- or 64-bit offsets, views). Returns how many rows are left. The selected
+    /// read's alternative to gathering the rows from the built arrays (#502 phase 2a): no second allocation and no
+    /// second pass over the built arrays.
+    /// </summary>
+    /// <remarks>
+    /// Runs before any build-time conversion (INT96, extended-precision timestamps), which then sees only the kept
+    /// values. A byte array's or a view's data bytes for a dropped value are left where they are: unreferenced,
+    /// which Arrow permits.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">The column is repeated, or <paramref name="keep"/> does not
+    /// cover its rows.</exception>
+    internal int KeepRows(ReadOnlySpan<byte> keep)
+    {
+        if (MaxRepLevel > 0)
+            throw new InvalidOperationException("Rows can be kept in place only in a flat column.");
+        int rows = keep.Length;
+        if (MaxDefLevel > 0 ? _defLevelCount != rows : _valueCount != rows)
+            throw new InvalidOperationException($"The selection covers {rows} rows; the column decoded others.");
+
+        int count = _valueCount;
+        byte[] maskArray = ArrayPool<byte>.Shared.Rent(count + 1);
+        try
+        {
+            var valueMask = maskArray.AsSpan(0, count + 1);
+            int keptRows, keptValues;
+            if (MaxDefLevel == 0)
+            {
+                keep.CopyTo(valueMask);
+                keptRows = 0;
+                for (int r = 0; r < rows; r++)
+                    keptRows += keep[r];
+                keptValues = keptRows;
+            }
+            else
+            {
+                // Branch-free: nulls and dropped rows are interleaved at random (the 10-22 prototype measured a
+                // branchy loop 30-70% slower at 50% kept). The mask is written at every row and advanced past
+                // values only, so a null's write is overwritten by the next value's; hence the extra slot.
+                var defs = _defLevels.AsSpan(0, _defLevelCount);
+                byte max = (byte)MaxDefLevel;
+                int write = 0, value = 0;
+                keptValues = 0;
+                for (int r = 0; r < rows; r++)
+                {
+                    byte d = defs[r];
+                    int k = keep[r];
+                    int isValue = d == max ? 1 : 0;
+                    valueMask[value] = (byte)k;
+                    value += isValue;
+                    keptValues += k & isValue;
+                    defs[write] = d;
+                    write += k;
+                }
+
+                _defLevelCount = write;
+                keptRows = write;
+            }
+
+            CompactValues(valueMask.Slice(0, count), keptValues);
+            return keptRows;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(maskArray);
+        }
+    }
+
+    // Compacts the decoded values to those `mask` keeps (1 keep, 0 drop), in place, in their layout.
+    private void CompactValues(ReadOnlySpan<byte> mask, int kept)
+    {
+        int count = mask.Length;
+        if (count == 0 || kept == count)
+            return;
+
+        if (_physicalType == PhysicalType.Boolean)
+        {
+            // In place: bit `write` is never past bit `i`, and bit i is read before bit `write` is written.
+            var bits = _valueBuffer!.ByteSpan;
+            int write = 0;
+            for (int i = 0; i < count; i++)
+            {
+                if (mask[i] == 0)
+                    continue;
+                bool set = (bits[i >> 3] & (1 << (i & 7))) != 0;
+                if (set)
+                    bits[write >> 3] |= (byte)(1 << (write & 7));
+                else
+                    bits[write >> 3] &= (byte)~(1 << (write & 7));
+                write++;
+            }
+
+            _boolBitOffset = write;
+        }
+        else if (_physicalType == PhysicalType.ByteArray && _byteArrayOutput == ByteArrayOutputKind.ViewType)
+        {
+            // A view is self-describing (length, then inline bytes or a prefix and an offset into the data
+            // buffer), so a view moves as 16 bytes and its data stays put.
+            var views = _viewsBuffer!.ByteSpan;
+            int write = 0;
+            for (int i = 0; i < count; i++)
+            {
+                if (mask[i] == 0)
+                    continue;
+                if (write != i)
+                    views.Slice(i * ViewEntrySize, ViewEntrySize).CopyTo(views.Slice(write * ViewEntrySize));
+                write++;
+            }
+
+            _viewsCount = write;
+        }
+        else if (_physicalType == PhysicalType.ByteArray)
+        {
+            // Offsets [0, count] (a flat chunk's values are all of them), each value's bytes moved down to follow
+            // the last kept value's.
+            var data = _dataBuffer!.ByteSpan;
+            if (_byteArrayOutput == ByteArrayOutputKind.LargeOffsets)
+            {
+                var offsets = _largeOffsetsBuffer!.Span;
+                long writeData = offsets[0], previous = offsets[0];
+                int writeOffset = 1;
+                for (int i = 0; i < count; i++)
+                {
+                    long start = previous, end = offsets[i + 1];
+                    previous = end;
+                    if (mask[i] == 0)
+                        continue;
+                    int length = checked((int)(end - start));
+                    if (writeData != start)
+                        data.Slice(checked((int)start), length).CopyTo(data.Slice(checked((int)writeData)));
+                    writeData += length;
+                    offsets[writeOffset++] = writeData;
+                }
+
+                _offsetsCount = writeOffset;
+                _dataByteOffset = checked((int)writeData);
+            }
+            else
+            {
+                var offsets = _offsetsBuffer!.Span;
+                int writeData = offsets[0], previous = offsets[0];
+                int writeOffset = 1;
+                for (int i = 0; i < count; i++)
+                {
+                    int start = previous, end = offsets[i + 1];
+                    previous = end;
+                    if (mask[i] == 0)
+                        continue;
+                    int length = end - start;
+                    if (writeData != start)
+                        data.Slice(start, length).CopyTo(data.Slice(writeData));
+                    writeData += length;
+                    offsets[writeOffset++] = writeData;
+                }
+
+                _offsetsCount = writeOffset;
+                _dataByteOffset = writeData;
+            }
+        }
+        else
+        {
+            // Fixed width: INT32/INT64/FLOAT/DOUBLE, INT96 (12), FIXED_LEN_BYTE_ARRAY (its length).
+            int width = _valueByteOffset / count;
+            var bytes = _valueBuffer!.ByteSpan;
+            int write = 0;
+            switch (width)
+            {
+                case 4:
+                {
+                    var values = MemoryMarshal.Cast<byte, int>(bytes.Slice(0, count * 4));
+                    for (int i = 0; i < count; i++)
+                    {
+                        values[write] = values[i];
+                        write += mask[i];
+                    }
+
+                    break;
+                }
+
+                case 8:
+                {
+                    var values = MemoryMarshal.Cast<byte, long>(bytes.Slice(0, count * 8));
+                    for (int i = 0; i < count; i++)
+                    {
+                        values[write] = values[i];
+                        write += mask[i];
+                    }
+
+                    break;
+                }
+
+                default:
+                    for (int i = 0; i < count; i++)
+                    {
+                        if (mask[i] == 0)
+                            continue;
+                        if (write != i)
+                            bytes.Slice(i * width, width).CopyTo(bytes.Slice(write * width));
+                        write++;
+                    }
+
+                    break;
+            }
+
+            _valueByteOffset = write * width;
+        }
+
+        _valueCount = kept;
+    }
+
     /// <summary>Returns true if the value at position <paramref name="rowIndex"/> is null.</summary>
     public bool IsNull(int rowIndex) =>
         MaxDefLevel > 0 && _defLevels![rowIndex] < (byte)MaxDefLevel;
@@ -1326,7 +1538,8 @@ internal sealed class ColumnBuildState : IDisposable
                 int end = sourceOffsets[i + 1];
                 WriteOneStringView(sourceData.Slice(start, end - start));
             }
-            _valueCount += count;
+
+            // WriteOneStringView counts each value itself; adding `count` here as well counted every value twice.
             return;
         }
 
