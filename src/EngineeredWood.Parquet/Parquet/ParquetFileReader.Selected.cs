@@ -41,24 +41,16 @@ public sealed partial class ParquetFileReader
         CancellationToken cancellationToken)
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
-        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-        var (readColumns, dropped) = ColumnsForSelection(schema, scan.Columns, scan.RowFilter);
-        var selector = new BatchSelector(scan.RowFilter, scan.ExcludedRows, dropped);
-        var twoPass = TwoPassColumnsFor(schema, readColumns, dropped, scan.RowFilter, _options);
-
-        RowSkipPredicate? skipRows = scan.ExcludedRows is { } excluded ? excluded.ExcludesAll : null;
+        var selected = await PrepareSelectedAsync(scan, cancellationToken).ConfigureAwait(false);
         var plans = PlanRowGroupsAsync(
-            metadata, scan.Prune ?? _options.Filter, readColumns, skipRows, cancellationToken);
+            metadata, scan.Prune ?? _options.Filter, selected.ReadColumns, selected.SkipRows, cancellationToken);
 
         int concurrency = Math.Min(EffectiveConcurrentRowGroups, metadata.RowGroups.Count);
         if (concurrency <= 1 || metadata.RowGroups.Count <= 1)
         {
             await foreach (var plan in plans.ConfigureAwait(false))
             {
-                var batches = ReadsInTwoPasses(plan, twoPass, metadata.RowGroups[plan.Index])
-                    ? ReadTwoPassAsync(plan, twoPass!, selector, reservation: null, growth: null, 0, cancellationToken)
-                    : selector.SelectAsync(ReadPlannedAsync(plan, readColumns, cancellationToken));
-                await foreach (var batch in batches.ConfigureAwait(false))
+                await foreach (var batch in selected.ReadAsync(plan, cancellationToken).ConfigureAwait(false))
                     yield return batch;
             }
 
@@ -72,9 +64,7 @@ public sealed partial class ParquetFileReader
         var growth = new DecodedGrowth();
         await foreach (var batch in OrderedScan.RunAsync(
                            plans,
-                           (plan, reservation, token) => ReadsInTwoPasses(plan, twoPass, metadata.RowGroups[plan.Index])
-                               ? ReadTwoPassAsync(plan, readColumns, twoPass!, selector, reservation, growth, token)
-                               : selector.SelectAsync(ReadPlannedAsync(plan, readColumns, reservation, growth, token)),
+                           (plan, reservation, token) => selected.ReadAsync(plan, reservation, growth, token),
                            // The positions count too: a positions-only read (no columns) holds nothing else.
                            SelectedBytes,
                            static b => b.Dispose(),
@@ -84,6 +74,67 @@ public sealed partial class ParquetFileReader
         {
             yield return batch;
         }
+    }
+
+    /// <summary>
+    /// Everything a selected read of <paramref name="scan"/> decides once, before any row group: the columns it
+    /// decodes, how it selects rows, whether it may go in two passes. A caller that schedules row groups itself (a
+    /// Delta scan, which plans them with <see cref="PlanRowGroupsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken, int, int)"/>)
+    /// plans with <see cref="SelectedPlanReader.ReadColumns"/> and <see cref="SelectedPlanReader.SkipRows"/> and reads
+    /// each plan with <see cref="SelectedPlanReader.ReadAsync(RowGroupPlan, CancellationToken)"/>, which may run
+    /// concurrently for different plans.
+    /// </summary>
+    internal async ValueTask<SelectedPlanReader> PrepareSelectedAsync(ParquetScan scan, CancellationToken cancellationToken)
+    {
+        if (scan is null)
+            throw new ArgumentNullException(nameof(scan));
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        var (readColumns, dropped) = ColumnsForSelection(schema, scan.Columns, scan.RowFilter);
+        var selector = new BatchSelector(scan.RowFilter, scan.ExcludedRows, dropped);
+        var twoPass = TwoPassColumnsFor(schema, readColumns, dropped, scan.RowFilter, _options);
+        RowSkipPredicate? skipRows = scan.ExcludedRows is { } excluded ? excluded.ExcludesAll : null;
+        return new SelectedPlanReader(this, metadata, readColumns, selector, twoPass, skipRows);
+    }
+
+    /// <summary>A selected read prepared by <see cref="PrepareSelectedAsync"/>: reads its planned row groups.</summary>
+    internal sealed class SelectedPlanReader
+    {
+        private readonly ParquetFileReader _reader;
+        private readonly Metadata.FileMetaData _metadata;
+        private readonly BatchSelector _selector;
+        private readonly TwoPassColumns? _twoPass;
+
+        internal SelectedPlanReader(
+            ParquetFileReader reader, Metadata.FileMetaData metadata, IReadOnlyList<string>? readColumns,
+            BatchSelector selector, TwoPassColumns? twoPass, RowSkipPredicate? skipRows)
+        {
+            _reader = reader;
+            _metadata = metadata;
+            ReadColumns = readColumns;
+            _selector = selector;
+            _twoPass = twoPass;
+            SkipRows = skipRows;
+        }
+
+        /// <summary>The columns the read decodes, predicate columns included: what to plan row groups with.</summary>
+        public IReadOnlyList<string>? ReadColumns { get; }
+
+        /// <summary>The rows the excluded rows rule out whole, for planning to skip unread; null for none.</summary>
+        public RowSkipPredicate? SkipRows { get; }
+
+        /// <summary>The selected rows of one planned row group, read without reserving scan memory.</summary>
+        public IAsyncEnumerable<SelectedRecordBatch> ReadAsync(RowGroupPlan plan, CancellationToken cancellationToken) =>
+            _reader.ReadsInTwoPasses(plan, _twoPass, _metadata.RowGroups[plan.Index])
+                ? _reader.ReadTwoPassAsync(plan, _twoPass!, _selector, reservation: null, growth: null, 0, cancellationToken)
+                : _selector.SelectAsync(_reader.ReadPlannedAsync(plan, ReadColumns, cancellationToken));
+
+        /// <summary>The selected rows of one planned row group, as one unit of a parallel read.</summary>
+        public IAsyncEnumerable<SelectedRecordBatch> ReadAsync(
+            RowGroupPlan plan, ScanReservation reservation, DecodedGrowth growth, CancellationToken cancellationToken) =>
+            _reader.ReadsInTwoPasses(plan, _twoPass, _metadata.RowGroups[plan.Index])
+                ? _reader.ReadTwoPassAsync(plan, ReadColumns, _twoPass!, _selector, reservation, growth, cancellationToken)
+                : _selector.SelectAsync(_reader.ReadPlannedAsync(plan, ReadColumns, reservation, growth, cancellationToken));
     }
 
     /// <summary>

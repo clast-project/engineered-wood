@@ -6609,6 +6609,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool wantTracking = (metadata & DeltaRowMetadata.RowTracking) != 0;
 
         var metadataFields = MetadataFields(metadata, options.MetadataPrefix);
+
+        // An exact filter is refused before any file is read when Spark's analyzer would refuse it, as a DML
+        // predicate is: otherwise whether the scan raised would depend on which files happened to be read.
+        if (options.FilterRows && options.Filter is not null)
+            RefuseUnanalyzable(options.Filter, snapshot);
+
         var pruner = options.Filter is null ? null : new DeltaFilePruner(
             snapshot.Schema, snapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
@@ -6737,7 +6743,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 IAsyncEnumerator<ParquetFileReader.RowGroupPlan>? rest = null;
                 try
                 {
-                    if (read.Reader is null)
+                    if (read.NoRowsMatch)
+                    {
+                        // The exact filter, which reads no column of the file, answered for the whole file: nothing.
+                    }
+                    else if (read.Reader is null)
                     {
                         read.AddRef();
                         yield return new ScanUnit(f, read, null);
@@ -6752,7 +6762,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         opened.Error?.Throw();
 
                         rest = read.Reader.PlanRowGroupsAsync(
-                                read.FilePredicate, read.FileColumns,
+                                read.FilePredicate, read.PlanColumns,
                                 opened.PlannedAhead ? opened.Skip : SkipOf(read, skipRows?.Invoke(f)),
                                 cancellationToken,
                                 firstRowGroup: opened.PlannedAhead ? PlansAhead : 0)
@@ -6829,16 +6839,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool planAhead,
         CancellationToken cancellationToken)
     {
-        var read = await OpenDataFileAsync(addFile, options.Columns, snapshot, options.Filter, cancellationToken)
+        var read = await OpenDataFileAsync(
+                addFile, options.Columns, snapshot, options.Filter, cancellationToken,
+                exactFilter: options.FilterRows ? options.Filter : null)
             .ConfigureAwait(false);
-        if (!planAhead || read.Reader is null)
+        if (!planAhead || read.Reader is null || read.NoRowsMatch)
             return new OpenedFile(read, plannedAhead: false);
 
         var opened = new OpenedFile(read, plannedAhead: true) { Skip = SkipOf(read, skipRows?.Invoke(file)) };
         try
         {
             await foreach (var plan in read.Reader.PlanRowGroupsAsync(
-                                   read.FilePredicate, read.FileColumns, opened.Skip, cancellationToken,
+                                   read.FilePredicate, read.PlanColumns, opened.Skip, cancellationToken,
                                    endRowGroup: PlansAhead)
                                .ConfigureAwait(false))
             {
@@ -6876,10 +6888,26 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var read = unit.Read;
-        var source = UnitSource(unit, reservation, growth, cancellationToken);
-
         bool wantPositions = scan.WantAddress || scan.WantLocator;
         byte[]? pathBytes = scan.WantLocator ? System.Text.Encoding.UTF8.GetBytes(read.AddFile.Path) : null;
+
+        // An exact filter through the built-in reader: the Parquet read selects the rows (deletion vector and filter
+        // both) and says where each one is (#502).
+        if (read.Selected is { } selected && unit.Plan is { } plan)
+        {
+            var rows = growth is null
+                ? selected.ReadAsync(plan, cancellationToken)
+                : selected.ReadAsync(plan, reservation, growth, cancellationToken);
+            await foreach (var fb in ProcessSelectedFileBatchesAsync(rows, read, wantPositions, scan.WantTracking, cancellationToken)
+                               .ConfigureAwait(false))
+            {
+                yield return WithMetadataColumns(fb, scan, ordinal, pathBytes);
+            }
+
+            yield break;
+        }
+
+        var source = UnitSource(unit, reservation, growth, cancellationToken);
         await foreach (var fb in ProcessDataFileBatchesAsync(source, read, wantPositions, scan.WantTracking, cancellationToken)
                            .ConfigureAwait(false))
         {
@@ -12807,6 +12835,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         internal IDataFileReader? Seam { get; init; }
         internal IReadOnlyList<string>? SeamColumns { get; init; }
 
+        /// <summary>
+        /// An exact filter's selected read of this file through the built-in reader (#502): the rows it returns are
+        /// exactly those the filter answers TRUE for and the deletion vector keeps. Null without an exact filter.
+        /// </summary>
+        internal ParquetFileReader.SelectedPlanReader? Selected { get; init; }
+
+        /// <summary>An exact filter through the codec seam: applied to each batch after it is reconciled to the
+        /// table's shape (<see cref="Columns"/> then holds the projection plus the filter's columns), and the batch then
+        /// cut back to <see cref="FilterColumns"/>, the caller's projection (null: every column).</summary>
+        internal Expressions.Predicate? SeamFilter { get; init; }
+        internal IReadOnlyList<string>? FilterColumns { get; init; }
+
+        /// <summary>The exact filter reads no column of this file, and answered for all its rows: none match.</summary>
+        internal bool NoRowsMatch { get; init; }
+
+        /// <summary>The columns row groups are planned with: the selected read's, filter columns included.</summary>
+        internal IReadOnlyList<string>? PlanColumns => Selected is { } selected ? selected.ReadColumns : FileColumns;
+
         /// <summary>The rows the deletion vector deletes in full, for the reader to skip unread.</summary>
         internal RowSkipPredicate? SkipRows => DeletedRows is { IsEmpty: false } d ? d.ContainsRange : null;
 
@@ -12952,12 +12998,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// matches are skipped. Only a read that promises a superset of the matching rows may pass one. The codec
     /// seam ignores it (the seam hides the footer).
     /// </summary>
+    /// <param name="exactFilter">A LOGICAL-name predicate the read applies to rows exactly (#502,
+    /// <see cref="DeltaReadOptions.FilterRows"/>), already refused if unanalyzable; null for none.</param>
     private async ValueTask<DataFileRead> OpenDataFileAsync(
         AddFile addFile,
         IReadOnlyList<string>? columns,
         Snapshot.Snapshot snapshot,
         Expressions.Predicate? rowGroupFilter,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Expressions.Predicate? exactFilter = null)
     {
         // An empty map still goes through the partition step: a missing key is a NULL value, and in a
         // non-nullable column one the read refuses. This engine's own NULL partition is such a map.
@@ -12985,8 +13034,28 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 addFile.DeletionVector, cancellationToken).ConfigureAwait(false);
         }
 
+        // An exact filter's logical columns, in table order (null: it reads none, or none it can name, so every
+        // column is read for it), and the columns the read needs: the projection plus those.
+        IReadOnlyList<string>? filterLogical = null;
+        IReadOnlyList<string>? filterReadColumns = columns;
+        if (exactFilter is not null)
+        {
+            filterLogical = PredicateColumns(exactFilter, snapshot.ArrowSchema);
+            filterReadColumns = columns is null ? null
+                : filterLogical is null ? null
+                : snapshot.ArrowSchema.FieldsList
+                    .Where(f => columns.Contains(f.Name) || filterLogical.Contains(f.Name))
+                    .Select(f => f.Name)
+                    .ToList();
+        }
+
         if (_options.DataFileReader is { } dataFileReader)
         {
+            // The seam reads the filter's columns too; FilterSeamBatchesAsync drops them again.
+            var returned = columns;
+            if (exactFilter is not null)
+                columns = filterReadColumns;
+
             // Pluggable codec read: raw physical batches in file order (DV rows included). Projection resolves
             // by PHYSICAL NAME in every mode — id-mode field-id resolution needs the parquet footer, which the
             // seam deliberately hides; Delta-spec files carry physicalName in BOTH modes, so name resolution is
@@ -13022,12 +13091,20 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (seamColumns is not null && MaterializedRowTrackingColumnNames(snapshot).Count > 0)
                 seamColumns = null;
 
+            // The same holds for the filter's columns when the caller didn't project them: one added after this
+            // file was written is absent from it, and naming it would fail the read before the backfill could
+            // supply its NULLs — a failure the caller's own projection never asked for. Read every column.
+            if (seamColumns is not null && exactFilter is not null && returned is not null
+                && columns is not null && columns.Any(c => !returned.Contains(c)))
+                seamColumns = null;
+
             return new DataFileRead
             {
                 AddFile = addFile, Snapshot = snapshot, Columns = columns, MappingMode = mappingMode,
                 PhysicalToLogical = physicalToLogical, LogicalToPhysical = logicalToPhysical,
                 DeletedRows = deletedRows, PartitionColumns = partitionColumns, HasPartitions = hasPartitions,
                 Seam = dataFileReader, SeamColumns = seamColumns,
+                SeamFilter = exactFilter, FilterColumns = returned,
             };
         }
 
@@ -13061,12 +13138,66 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     rowGroupFilter, snapshot.Schema, mappingMode, parquetSchema, snapshot.Metadata.PartitionColumns);
             }
 
+            ParquetFileReader.SelectedPlanReader? selected = null;
+            bool noRowsMatch = false;
+            if (exactFilter is not null)
+            {
+                // The filter's own columns, physical and present in this file. A filter over none of them (only
+                // partition columns, or columns added after the file) answers the same for every row of the file,
+                // so it is asked once, here, over one row of the table's shape.
+                var filterFileColumns = filterLogical is null ? null : await FileColumnsAsync(
+                        reader, snapshot, filterLogical, mappingMode, logicalToPhysical, withRowTracking: false,
+                        cancellationToken)
+                    .ConfigureAwait(false);
+                if (filterFileColumns is { Count: 0 })
+                {
+                    // Only when some row is live: a scan of an empty file, or of one its deletion vector empties,
+                    // never asks the filter anything, so it must not fail on a value-dependent error here.
+                    var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+                    noRowsMatch = footer.NumRows == 0
+                        || deletedRows is { IsEmpty: false } && deletedRows.ContainsRange(0, footer.NumRows)
+                        || !OneRowAnswersTrue();
+
+                    bool OneRowAnswersTrue()
+                    {
+                        var one = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], 1);
+                        var shaped = ReconcileToTableShape(
+                            one, snapshot, addFile.PartitionValues, filterLogical, partitionColumns, hasPartitions,
+                            logicalToPhysical, addFile.Path);
+                        using var answer = RowEvaluator.EvaluatePredicate(exactFilter, shaped);
+                        return answer.GetValue(0) == true;
+                    }
+                }
+                else
+                {
+                    filterFileColumns ??= await FileColumnsAsync(
+                            reader, snapshot, null, mappingMode, logicalToPhysical, withRowTracking: false, cancellationToken)
+                        .ConfigureAwait(false);
+                    var physicalForFilter = filterFileColumns
+                        ?? (await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false))
+                            .Root.Children.Select(c => c.Name).ToList();
+                    var predicate = new RowPredicate(physicalForFilter, ExactFilterMask(
+                        exactFilter, snapshot, addFile, mappingMode, physicalToLogical, logicalToPhysical,
+                        partitionColumns, hasPartitions, filterLogical));
+                    selected = await reader.PrepareSelectedAsync(
+                            new ParquetScan
+                            {
+                                Columns = fileColumns,
+                                RowFilter = new RowFilter(predicate),
+                                ExcludedRows = deletedRows is { IsEmpty: false } ? deletedRows : null,
+                            },
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+            }
+
             return new DataFileRead
             {
                 AddFile = addFile, Snapshot = snapshot, Columns = columns, MappingMode = mappingMode,
                 PhysicalToLogical = physicalToLogical, LogicalToPhysical = logicalToPhysical,
                 DeletedRows = deletedRows, PartitionColumns = partitionColumns, HasPartitions = hasPartitions,
                 File = file, Reader = reader, FileColumns = fileColumns, FilePredicate = filePredicate,
+                Selected = selected, NoRowsMatch = noRowsMatch,
             };
         }
         catch
@@ -13145,6 +13276,103 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             cancellationToken), reservation, cancellationToken);
 
     /// <summary>
+    /// An exact filter as the Parquet read's row predicate (#502): over the filter's physical columns as the file
+    /// holds them, it answers the LOGICAL predicate, so the batch is first brought to the table's shape as a scan's
+    /// batches are (logical names, widened types, partition values, schema-evolution NULLs) for exactly the
+    /// filter's columns (<paramref name="filterLogical"/>; null for every column).
+    /// </summary>
+    private static Func<RecordBatch, BooleanArray> ExactFilterMask(
+        Expressions.Predicate filter, Snapshot.Snapshot snapshot, AddFile addFile, ColumnMappingMode mappingMode,
+        Dictionary<string, string> physicalToLogical, Dictionary<string, string> logicalToPhysical,
+        IReadOnlyList<string> partitionColumns, bool hasPartitions, IReadOnlyList<string>? filterLogical) =>
+        batch =>
+        {
+            var logical = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
+            logical = ColumnMappingRecursive.StripParquetFieldIds(logical);
+            logical = ReconcileToTableShape(
+                logical, snapshot, addFile.PartitionValues, filterLogical, partitionColumns, hasPartitions,
+                logicalToPhysical, addFile.Path);
+            return RowEvaluator.EvaluatePredicate(filter, logical);
+        };
+
+    /// <summary>
+    /// <see cref="ProcessFileBatchesAsync"/> for an exact filter's selected read (#502): the reader has already
+    /// removed the deletion vector's rows and the filter's, and says where each kept row is, so this only brings the
+    /// batch to the table's shape and derives each row's position, id and commit version from its position.
+    /// </summary>
+    private static async IAsyncEnumerable<FileBatch> ProcessSelectedFileBatchesAsync(
+        IAsyncEnumerable<SelectedRecordBatch> source,
+        DataFileRead read,
+        bool wantPositions,
+        bool wantTracking,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var snapshot = read.Snapshot;
+        var addFile = read.AddFile;
+        var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
+        bool hasMaterialized = matRowIdName is not null || matRowVerName is not null;
+
+        await foreach (var selected in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            var where = selected.Positions;
+            var result = ToLogicalBatch(selected.Batch, snapshot.Schema, read.MappingMode, read.PhysicalToLogical);
+            result = ColumnMappingRecursive.StripParquetFieldIds(result);
+            Int64Array? rawMatIds = null, rawMatVers = null;
+            if (hasMaterialized)
+            {
+                (result, rawMatIds, rawMatVers) = RowTracking.RowTrackingWriter
+                    .StripMaterializedColumns(result, matRowIdName, matRowVerName);
+            }
+
+            int rows = result.Length;
+            Int64Array? positions = null, rowIds = null, versions = null;
+            if (wantTracking)
+            {
+                var idb = new Int64Array.Builder().Reserve(rows);
+                var vrb = new Int64Array.Builder().Reserve(rows);
+                for (int i = 0; i < rows; i++)
+                {
+                    long? mid = rawMatIds is not null && !rawMatIds.IsNull(i) ? rawMatIds.GetValue(i) : null;
+                    long? id = mid ?? (addFile.BaseRowId is { } ab ? ab + where[i] : (long?)null);
+                    if (id is { } iv) idb.Append(iv); else idb.AppendNull();
+
+                    long? mv = rawMatVers is not null && !rawMatVers.IsNull(i) ? rawMatVers.GetValue(i) : null;
+                    long? ver = mv ?? addFile.DefaultRowCommitVersion;
+                    if (ver is { } vv) vrb.Append(vv); else vrb.AppendNull();
+                }
+
+                rowIds = idb.Build();
+                versions = vrb.Build();
+            }
+
+            if (wantPositions)
+            {
+                if (where.Explicit is { } explicitPositions)
+                {
+                    positions = explicitPositions;
+                }
+                else
+                {
+                    var pb = new Int64Array.Builder().Reserve(rows);
+                    for (int i = 0; i < rows; i++)
+                        pb.Append(where.FirstRow + i);
+                    positions = pb.Build();
+                }
+            }
+            else
+            {
+                where.Explicit?.Dispose();
+            }
+
+            var shaped = ReconcileToTableShape(
+                result, snapshot, addFile.PartitionValues, read.Columns, read.PartitionColumns, read.HasPartitions,
+                read.LogicalToPhysical, addFile.Path);
+            yield return new FileBatch(shaped, positions, rowIds, versions);
+        }
+    }
+
+    /// <summary>
     /// The per-batch pipeline below, for the raw batches of <paramref name="read"/>'s file: any run of them, in file order, each with its file
     /// position. The pipeline keeps no state from one batch to the next, so a scan split by row group runs it
     /// once per row group.
@@ -13154,11 +13382,91 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         DataFileRead read,
         bool wantPositions,
         bool wantTracking,
-        CancellationToken cancellationToken) =>
-        ProcessFileBatchesAsync(
+        CancellationToken cancellationToken)
+    {
+        var batches = ProcessFileBatchesAsync(
             source, read.AddFile, read.Snapshot, read.Columns, read.MappingMode, read.PhysicalToLogical,
             read.LogicalToPhysical, read.DeletedRows, read.PartitionColumns, read.HasPartitions,
-            wantPositions, wantTracking, cancellationToken);
+            wantPositions: wantPositions || read.SeamFilter is not null, wantTracking, cancellationToken);
+        return read.SeamFilter is { } filter
+            ? FilterSeamBatchesAsync(batches, filter, read.FilterColumns, wantPositions, cancellationToken)
+            : batches;
+    }
+
+    /// <summary>
+    /// An exact filter through the codec seam (#502): the seam returns every row, so the filter is applied to each
+    /// batch once it has the table's shape, and the batch is then cut back to <paramref name="returned"/>, the
+    /// caller's projection (null: every column), dropping the columns read only for the filter. The positions, ids
+    /// and versions follow the rows kept.
+    /// </summary>
+    private static async IAsyncEnumerable<FileBatch> FilterSeamBatchesAsync(
+        IAsyncEnumerable<FileBatch> batches,
+        Expressions.Predicate filter,
+        IReadOnlyList<string>? returned,
+        bool wantPositions,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (var fb in batches.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            int[] kept;
+            using (var mask = RowEvaluator.EvaluatePredicate(filter, fb.Batch))
+                kept = ArrowCompute.SelectedIndices(mask);
+            if (kept.Length == 0)
+            {
+                fb.Batch.Dispose();
+                fb.Positions?.Dispose();
+                fb.RowIds?.Dispose();
+                fb.Versions?.Dispose();
+                continue;
+            }
+
+            var batch = fb.Batch;
+            Int64Array? positions = fb.Positions, rowIds = fb.RowIds, versions = fb.Versions;
+            if (kept.Length < batch.Length)
+            {
+                batch = ArrowCompute.Take(fb.Batch, fb.Batch.Schema, kept);
+                positions = positions is null ? null : (Int64Array)ArrowCompute.Take(positions, kept);
+                rowIds = rowIds is null ? null : (Int64Array)ArrowCompute.Take(rowIds, kept);
+                versions = versions is null ? null : (Int64Array)ArrowCompute.Take(versions, kept);
+
+                // The superseded arrays: a fixed-width gather copies, so the metadata goes outright; the batch
+                // keeps any column the gather shares a buffer with (a view's data, a dictionary).
+                BatchSelector.ReleaseAfterGather(fb.Batch, batch);
+                fb.Positions?.Dispose();
+                fb.RowIds?.Dispose();
+                fb.Versions?.Dispose();
+            }
+
+            if (!wantPositions)
+            {
+                positions?.Dispose();
+                positions = null;
+            }
+
+            // By name, not by count: a projection naming a column the table lacks returns fewer columns than it
+            // names, so a filter column could make up the difference and survive a count comparison.
+            if (returned is not null && batch.Schema.FieldsList.Any(f => !returned.Contains(f.Name)))
+            {
+                var fields = new List<Field>(returned.Count);
+                var arrays = new List<IArrowArray>(returned.Count);
+                for (int i = 0; i < batch.ColumnCount; i++)
+                {
+                    var field = batch.Schema.GetFieldByIndex(i);
+                    if (returned.Contains(field.Name))
+                    {
+                        fields.Add(field);
+                        arrays.Add(batch.Column(i));
+                    }
+                }
+
+                // Not disposed: the dropped columns may share buffers with the kept ones (a gather of a view or a
+                // dictionary column does), so they are left to the GC with the batch that held them.
+                batch = new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), arrays, batch.Length);
+            }
+
+            yield return new FileBatch(batch, positions, rowIds, versions);
+        }
+    }
 
     /// <summary>
     /// The per-batch read pipeline shared by the built-in <c>ParquetFileReader</c> and a pluggable

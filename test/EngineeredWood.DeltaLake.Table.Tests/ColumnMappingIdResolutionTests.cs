@@ -95,6 +95,48 @@ public class ColumnMappingIdResolutionTests : IDisposable
         Assert.Equal(["p=2 q=20"], await ReadAsync(table));
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task ExactScan_FileWithSwappedNames_FiltersAndProjectsByFieldId(int concurrency)
+    {
+        // An exact scan resolves the filter's columns in each file on its own, apart from the projection; binding
+        // either by name would evaluate "p = 1" against q's values, or return q's values as p's.
+        var fs = new LocalTableFileSystem(_tempDir);
+        await using var table = await DeltaTable.CreateAsync(
+            fs, PqSchema, new DeltaTableOptions { MaxConcurrentReads = concurrency },
+            columnMappingMode: ColumnMappingMode.Id, enableDeletionVectors: true);
+        await table.WriteAsync([Pq((1, 10), (2, 20), (3, 1), (4, 1))]);
+        await SwapFirstTwoColumnNamesAsync(table.CurrentSnapshot.ActiveFiles.Values.Single().Path);
+        await table.WriteAsync([Pq((1, 40), (5, 10))]);
+        var (deleted, _) = await table.DeleteAsync(batch =>
+        {
+            var p = (Int64Array)batch.Column(batch.Schema.GetFieldIndex("p"));
+            var mask = new BooleanArray.Builder();
+            for (int i = 0; i < p.Length; i++)
+                mask.Append(p.GetValue(i) == 4);
+            return mask.Build();
+        });
+        Assert.Equal(1, deleted);
+
+        async Task<List<string>> Exact(Expressions.Predicate filter, string[]? columns)
+        {
+            var batches = new List<RecordBatch>();
+            await foreach (var b in table.ReadAsync(new DeltaReadOptions { Filter = filter, FilterRows = true, Columns = columns }))
+                batches.Add(b);
+            return ColumnMappingNameReuseTests.Render(batches);
+        }
+
+        var pIsOne = Expressions.Expressions.Equal("p", Expressions.LiteralValue.Of(1L));
+        var qIsTen = Expressions.Expressions.Equal("q", Expressions.LiteralValue.Of(10L));
+        Assert.Equal(["p=1 q=10", "p=1 q=40"], await Exact(pIsOne, null));
+        Assert.Equal(["q=10", "q=40"], await Exact(pIsOne, ["q"]));      // the filter's column left out
+        Assert.Equal(["p=1", "p=5"], await Exact(qIsTen, ["p"]));
+        Assert.Equal(["p=3 q=1"], await Exact(
+            Expressions.Expressions.And(Expressions.Expressions.LessThan("q", Expressions.LiteralValue.Of(5L)),
+                Expressions.Expressions.GreaterThan("p", Expressions.LiteralValue.Of(2L))), null));
+    }
+
     [Fact]
     public async Task Compaction_FileWithSwappedNames_KeepsEachColumnsValues()
     {
