@@ -49,7 +49,7 @@ namespace EngineeredWood.Benchmarks;
 /// <c>rowfilter-ab [rounds] [latencyMs] [direct|cloud] [MB/s] [excluded fraction] [case substring]</c>.
 /// <c>latencyMs</c>, <c>cloud</c> and <c>MB/s</c> are as in <c>pageindex-read-ab</c>. The excluded fraction
 /// (e.g. 0.01) excludes that share of rows at random positions, as a deletion vector would, applied by every
-/// strategy. The case substring runs only the cases whose label contains it.</para>
+/// filtered strategy (not by <c>none</c>, the unfiltered reference). The case substring runs only the cases whose label contains it.</para>
 /// Run with: dotnet run -c Release -f net10.0 -- rowfilter-ab 7
 /// </remarks>
 internal static class RowFilterAb
@@ -358,6 +358,9 @@ internal static class RowFilterAb
             if (indices.Length < rows)
                 indices = new int[rows];
             int kept = SelectionMask.ToIndices(selection, indices);
+            // Take builds new arrays and never shares the batch's, so its result has one owner: Project, which
+            // disposes the columns it drops and hands the rest to `output`. `batch` keeps sole ownership of its
+            // own arrays and is disposed by its `using`.
             using var output = Project(ArrowCompute.Take(batch, batch.Schema, indices.AsSpan(0, kept)), c.Projection);
             gatherClock.Stop();
             tally.Add(output);
@@ -484,6 +487,11 @@ internal static class RowFilterAb
         }
     }
 
+    /// <summary>
+    /// The projected columns of <paramref name="batch"/>, TAKING OWNERSHIP of it: the dropped columns are disposed
+    /// here and the kept ones move to the result, so the caller disposes only the result, never
+    /// <paramref name="batch"/>. Only ever given a batch nothing else owns (a fresh <see cref="ArrowCompute.Take(RecordBatch, Schema, ReadOnlySpan{int})"/> result).
+    /// </summary>
     private static RecordBatch Project(RecordBatch batch, string[] projection)
     {
         if (batch.ColumnCount == projection.Length)
