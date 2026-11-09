@@ -105,12 +105,14 @@ public class ExactFilterTests : IDisposable
     /// all their rows and the filter, which reads no column of theirs, is answered once per file.
     /// </summary>
     [Theory]
-    [InlineData(1, false)]
-    [InlineData(4, false)]
-    [InlineData(1, true)]
-    public async Task AFilterOnAColumnAddedLaterMatchesNoRowOfTheOlderFiles(int concurrency, bool seam)
+    [InlineData(1, false, true)]
+    [InlineData(4, false, true)]
+    [InlineData(1, true, true)]
+    [InlineData(1, true, false)] // without row tracking, the seam is asked for a projection, not every column
+    public async Task AFilterOnAColumnAddedLaterMatchesNoRowOfTheOlderFiles(int concurrency, bool seam, bool rowTracking)
     {
-        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, seam, ColumnMappingMode.None);
+        string name = $"t_{Guid.NewGuid():N}";
+        await using var table = await CreateAsync(name, concurrency, seam, ColumnMappingMode.None, rowTracking);
         await table.AddColumnAsync(new Field("score", DoubleType.Default, true));
         var withScore = new Apache.Arrow.Schema.Builder()
             .Field(new Field("id", Int64Type.Default, false))
@@ -125,6 +127,25 @@ public class ExactFilterTests : IDisposable
             scores.Append(i % 2 == 0 ? i : -i);
         var batch = Rows(1_000, 40);
         await table.WriteAsync([new RecordBatch(withScore, [.. Enumerable.Range(0, batch.ColumnCount).Select(batch.Column), scores.Build()], 40)]);
+
+        if (seam && !rowTracking)
+        {
+            // The superset oracle can't read this table through the seam: it names every column, and the older files
+            // lack score (#790). The built-in reader's exact scan, checked against that oracle above, stands in for it.
+            await using var builtIn = await DeltaTable.OpenAsync(new LocalTableFileSystem(Path.Combine(_tempDir, name)));
+            foreach (var (filter, projection) in new (Predicate, string[])[]
+            {
+                (Ex.GreaterThan("score", LiteralValue.Of(10.0)), ["id", "region"]),
+                (Ex.IsNull("score"), ["id"]),
+            })
+            {
+                Assert.Equal(
+                    await ReadRowsAsync(builtIn, filter, projection, exactly: true),
+                    await ReadRowsAsync(table, filter, projection, exactly: true));
+            }
+
+            return;
+        }
 
         await AssertExactAsync(table, Ex.GreaterThan("score", LiteralValue.Of(10.0)), ["id", "region"]);
         await AssertExactAsync(table, Ex.IsNull("score"), ["id"]);
@@ -163,6 +184,69 @@ public class ExactFilterTests : IDisposable
         Assert.True(superset > exact.Count, $"{superset} rows read without FilterRows, {exact.Count} with it");
     }
 
+    /// <summary>
+    /// A projection naming a column the table lacks returns the columns it can, and none of the filter's: the count
+    /// of returned columns can't tell a filter column from the missing one.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AProjectionNamingAMissingColumnStillDropsTheFilterColumns(bool seam)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, seam, ColumnMappingMode.None, rowTracking: false);
+        var options = new DeltaReadOptions { Columns = ["id", "missing"], Filter = Filters["data"], FilterRows = true };
+        long rows = 0;
+        await foreach (var batch in table.ReadAsync(options))
+        {
+            using (batch)
+            {
+                Assert.Equal(["id"], batch.Schema.FieldsList.Select(f => f.Name));
+                rows += batch.Length;
+            }
+        }
+
+        Assert.Equal((await ReadRowsAsync(table, Filters["data"], ["id"], exactly: false)).Count, rows);
+    }
+
+    /// <summary>
+    /// A filter that reads no column of a file is answered once for the file, but not for a file with no live row: a
+    /// scan of that file asks the filter nothing, so a value the filter raises on mustn't fail it.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AFileWithNoLiveRowIsNotAskedTheFilter(bool exactly)
+    {
+        string root = Path.Combine(_tempDir, $"t_{Guid.NewGuid():N}");
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(root), TableSchema, new DeltaTableOptions(), partitionColumns: ["region"]);
+        await table.WriteAsync([Rows(1, 1)]); // region b, so that the schema of an empty file has a model
+
+        // An empty file in partition a (a DELETE removes a file it empties, so a live table has none of its own).
+        string path = Path.Combine(root, "region=a", "empty.parquet");
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var empty = Rows(0, 0);
+        var dataOnly = new RecordBatch(
+            new Apache.Arrow.Schema(empty.Schema.FieldsList.Where(f => f.Name != "region").ToList(), null),
+            [.. Enumerable.Range(0, empty.ColumnCount).Where(i => i != 1).Select(empty.Column)], 0);
+        await using (var file = new LocalSequentialFile(path))
+        {
+            await using var writer = new ParquetFileWriter(file, ownsFile: false);
+            await writer.WriteRowGroupAsync(dataOnly);
+            await writer.CloseAsync();
+        }
+
+        await table.CommitDataFilesAsync([new WrittenDataFile(
+            "region=a/empty.parquet", new FileInfo(path).Length, 0,
+            new Dictionary<string, string> { ["region"] = "a" }, null)]);
+
+        // Under ANSI, 'a' = 5 raises CAST_INVALID_INPUT; 'b' = 5 would too, so only region a may be asked.
+        var raising = Ex.And(Ex.Equal("region", LiteralValue.Of("a")), Ex.Equal("region", LiteralValue.Of(5)));
+        var options = new DeltaReadOptions { Filter = raising, FilterRows = exactly };
+        await foreach (var b in table.ReadAsync(options))
+            b.Dispose();
+    }
+
     // ---- The oracle ----------------------------------------------------------------------------------------------
 
     private static async Task AssertExactAsync(DeltaTable table, Predicate filter, string[]? projection)
@@ -183,7 +267,10 @@ public class ExactFilterTests : IDisposable
             Columns = exactly ? projection : null,
             Filter = filter,
             FilterRows = exactly,
-            Metadata = DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking,
+            Metadata = table.CurrentSnapshot.Metadata.Configuration?.TryGetValue("delta.enableRowTracking", out var on) == true
+                && on == "true"
+                ? DeltaRowMetadata.Locator | DeltaRowMetadata.RowTracking
+                : DeltaRowMetadata.Locator,
         };
         var rows = new List<string>();
         var mask = DeltaTable.MaskFor(filter);
@@ -242,7 +329,8 @@ public class ExactFilterTests : IDisposable
     /// deleting every seventh row, row tracking on: <c>id</c> unique, <c>v</c> = id mod 100, <c>n</c> NULL every
     /// fifth row.
     /// </summary>
-    private async Task<DeltaTable> CreateAsync(string name, int concurrency, bool seam, ColumnMappingMode mapping)
+    private async Task<DeltaTable> CreateAsync(
+        string name, int concurrency, bool seam, ColumnMappingMode mapping, bool rowTracking = true)
     {
         var fs = new LocalTableFileSystem(Path.Combine(_tempDir, name));
         var table = await DeltaTable.CreateAsync(
@@ -255,7 +343,7 @@ public class ExactFilterTests : IDisposable
             },
             partitionColumns: ["region"],
             enableDeletionVectors: true,
-            enableRowTracking: true,
+            enableRowTracking: rowTracking,
             columnMappingMode: mapping);
         for (int f = 0; f < 3; f++)
             await table.WriteAsync([Rows(f * 400, 400)]);

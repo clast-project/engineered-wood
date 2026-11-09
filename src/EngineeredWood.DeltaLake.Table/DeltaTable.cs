@@ -13091,6 +13091,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (seamColumns is not null && MaterializedRowTrackingColumnNames(snapshot).Count > 0)
                 seamColumns = null;
 
+            // The same holds for the filter's columns when the caller didn't project them: one added after this
+            // file was written is absent from it, and naming it would fail the read before the backfill could
+            // supply its NULLs — a failure the caller's own projection never asked for. Read every column.
+            if (seamColumns is not null && exactFilter is not null && returned is not null
+                && columns is not null && columns.Any(c => !returned.Contains(c)))
+                seamColumns = null;
+
             return new DataFileRead
             {
                 AddFile = addFile, Snapshot = snapshot, Columns = columns, MappingMode = mappingMode,
@@ -13144,12 +13151,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     .ConfigureAwait(false);
                 if (filterFileColumns is { Count: 0 })
                 {
-                    var one = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], 1);
-                    var shaped = ReconcileToTableShape(
-                        one, snapshot, addFile.PartitionValues, filterLogical, partitionColumns, hasPartitions,
-                        logicalToPhysical, addFile.Path);
-                    using var answer = RowEvaluator.EvaluatePredicate(exactFilter, shaped);
-                    noRowsMatch = answer.GetValue(0) != true;
+                    // Only when some row is live: a scan of an empty file, or of one its deletion vector empties,
+                    // never asks the filter anything, so it must not fail on a value-dependent error here.
+                    var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+                    noRowsMatch = footer.NumRows == 0
+                        || deletedRows is { IsEmpty: false } && deletedRows.ContainsRange(0, footer.NumRows)
+                        || !OneRowAnswersTrue();
+
+                    bool OneRowAnswersTrue()
+                    {
+                        var one = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], 1);
+                        var shaped = ReconcileToTableShape(
+                            one, snapshot, addFile.PartitionValues, filterLogical, partitionColumns, hasPartitions,
+                            logicalToPhysical, addFile.Path);
+                        using var answer = RowEvaluator.EvaluatePredicate(exactFilter, shaped);
+                        return answer.GetValue(0) == true;
+                    }
                 }
                 else
                 {
@@ -13419,7 +13436,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 positions = null;
             }
 
-            if (returned is not null && batch.ColumnCount != returned.Count)
+            // By name, not by count: a projection naming a column the table lacks returns fewer columns than it
+            // names, so a filter column could make up the difference and survive a count comparison.
+            if (returned is not null && batch.Schema.FieldsList.Any(f => !returned.Contains(f.Name)))
             {
                 var fields = new List<Field>(returned.Count);
                 var arrays = new List<IArrowArray>(returned.Count);
