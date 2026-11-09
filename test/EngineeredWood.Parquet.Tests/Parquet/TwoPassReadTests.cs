@@ -104,6 +104,85 @@ public class TwoPassReadTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The first pass never hands a predicate more rows at once than <see cref="ParquetReadOptions.BatchSize"/>:
+    /// it follows the batch size when the predicate's column is not returned, and when it is (and so would be kept
+    /// whole for the group) the group is read in one pass, which follows it too. The rows are right either way.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task APredicateNeverSeesMoreRowsThanTheBatchSize(bool returnPredicateColumn)
+    {
+        var (path, corruptFrom) = await WriteCorruptedAsync();
+        var sizes = new System.Collections.Concurrent.ConcurrentBag<int>();
+        var scan = new ParquetScan
+        {
+            Columns = returnPredicateColumn ? ["id", "note"] : ["note"],
+            RowFilter = new RowFilter(new RowPredicate(["id"], batch =>
+            {
+                sizes.Add(batch.Length);
+                var ids = (Int64Array)batch.Column(0);
+                var builder = new BooleanArray.Builder().Reserve(ids.Length);
+                for (int i = 0; i < ids.Length; i++)
+                    builder.Append(ids.GetValue(i) < 1_000);
+                return builder.Build();
+            })),
+        };
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 3_000 })
+        {
+            TwoPassReads = true,
+        };
+        long rows = 0;
+        await foreach (var selected in reader.ReadSelectedAsync(scan))
+        {
+            using (selected)
+                rows += selected.Batch.Length;
+        }
+
+        Assert.Equal(1_000, rows);
+        Assert.NotEmpty(sizes);
+        Assert.All(sizes, size => Assert.InRange(size, 0, 3_000));
+        Assert.True(corruptFrom > 0); // the corrupted page is past the selection; validation is off here anyway
+    }
+
+    /// <summary>
+    /// A two-pass read builds its second pass's page maps from the prefetched chunks' headers: it never requests an
+    /// OffsetIndex, which would be a request made after the first pass, the round trip the prefetch avoids.
+    /// </summary>
+    [Fact]
+    public async Task ATwoPassReadNeverRequestsAnOffsetIndex()
+    {
+        var (path, _) = await WriteCorruptedAsync();
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        EngineeredWood.Parquet.Metadata.FileMetaData metadata;
+        await using (counting)
+        using (var reader = new ParquetFileReader(counting, ownsFile: false) { TwoPassReads = true })
+        {
+            metadata = await reader.ReadMetadataAsync();
+            var ids = new List<long>();
+            await foreach (var selected in reader.ReadSelectedAsync(Scan(maxId: 1_000)))
+            {
+                using (selected)
+                    ids.Add(selected.Batch.Length);
+            }
+
+            Assert.Equal(1_000, ids.Sum());
+        }
+
+        // The footer read takes the file's last bytes, which in a file this small hold the page indexes too; it is
+        // not a request for them, so it is left out.
+        long fileLength = new FileInfo(path).Length;
+        var requested = counting.RequestRanges.SelectMany(r => r).Where(r => r.Offset + r.Length != fileLength).ToList();
+        foreach (var chunk in metadata.RowGroups[0].Columns)
+        {
+            long offset = chunk.OffsetIndexOffset!.Value, length = chunk.OffsetIndexLength!.Value;
+            Assert.DoesNotContain(requested, r => r.Offset < offset + length && offset < r.Offset + r.Length);
+        }
+    }
+
     [Fact]
     public async Task AOnePassReadDecodesTheSamePageAndFails()
     {

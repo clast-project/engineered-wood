@@ -56,7 +56,7 @@ public sealed partial class ParquetFileReader
             await foreach (var plan in plans.ConfigureAwait(false))
             {
                 var batches = ReadsInTwoPasses(plan, twoPass, metadata.RowGroups[plan.Index])
-                    ? ReadTwoPassAsync(plan, twoPass!, selector, cancellationToken)
+                    ? ReadTwoPassAsync(plan, twoPass!, selector, reservation: null, growth: null, 0, cancellationToken)
                     : selector.SelectAsync(ReadPlannedAsync(plan, readColumns, cancellationToken));
                 await foreach (var batch in batches.ConfigureAwait(false))
                     yield return batch;

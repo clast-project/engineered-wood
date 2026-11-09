@@ -53,6 +53,8 @@ public sealed class RowPredicate
     /// column answering for itself); otherwise the reader takes ownership of it and disposes it.</para>
     /// <para>An exception propagates out of the read, at the position of the batch that raised it, as it
     /// would from a filter applied to the batches afterwards.</para>
+    /// <para>How rows are cut into batches is the reader's choice, and differs between reads (a batch size, a
+    /// parallel read, two passes): a row's answer must not depend on which other rows share its batch.</para>
     /// </remarks>
     public Func<RecordBatch, BooleanArray> Evaluate { get; }
 
