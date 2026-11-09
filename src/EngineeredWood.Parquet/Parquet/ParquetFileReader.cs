@@ -718,16 +718,27 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// the rows in <paramref name="ranges"/>, or the whole row group when that is null.
     /// <paramref name="offsetIndexes"/> holds OffsetIndex bytes already read, by file offset.
     /// </summary>
+    /// <param name="io">Where the column chunks are read from; the reader's file when null. A selected read's
+    /// second pass reads through a file holding bytes it fetched ahead.</param>
+    /// <param name="batchRows">When set, batches of exactly this many rows (fewer at a range's end) in place of
+    /// <see cref="ParquetReadOptions.BatchSize"/> and <see cref="ParquetReadOptions.MaxBatchByteSize"/>, so that two
+    /// reads of different columns cut the same rows into the same batches.</param>
+    /// <param name="useOffsetIndex">False builds every page map by scanning page headers, never reading an
+    /// OffsetIndex: for a read whose chunks are fetched whole anyway.</param>
     private async IAsyncEnumerable<RecordBatch> ReadBatchesAsync(
         int rowGroupIndex,
         IReadOnlyList<string>? columnNames,
         IReadOnlyList<RowRange>? ranges,
         IReadOnlyDictionary<long, byte[]>? offsetIndexes,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IRandomAccessFile? io = null,
+        int? batchRows = null,
+        bool useOffsetIndex = true)
     {
-        int? batchSize = _options.BatchSize;
-        long? maxBytes = _options.MaxBatchByteSize;
+        var file = io ?? _file;
+        int? batchSize = batchRows ?? _options.BatchSize;
+        long? maxBytes = batchRows is null ? _options.MaxBatchByteSize : null;
 
         var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
             .ConfigureAwait(false);
@@ -782,7 +793,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         if (fitsInOneBatch)
         {
             // Row group fits in a single batch — use the optimised single-pass path.
-            var buffers = await _file.ReadRangesAsync(ctx.Ranges, cancellationToken)
+            var buffers = await file.ReadRangesAsync(ctx.Ranges, cancellationToken)
                 .ConfigureAwait(false);
             try
             {
@@ -835,7 +846,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         //
         // An OffsetIndex map estimates each page's uncompressed size, which the implicit budget
         // cannot use: it exists to keep a batch under the Arrow limit, so it reads the headers.
-        var (pageMaps, held) = await BuildPageMapsAsync(ctx, useOffsetIndex: !implicitBudget, offsetIndexes, cancellationToken)
+        var (pageMaps, held) = await BuildPageMapsAsync(
+                ctx, useOffsetIndex: useOffsetIndex && !implicitBudget, offsetIndexes, cancellationToken, file)
             .ConfigureAwait(false);
         var heldColumns = new bool[ctx.Count];
         for (int i = 0; i < ctx.Count; i++)
@@ -858,7 +870,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             chunkOffsets[i] = ctx.Ranges[i].Offset;
         var endRows = new int[ctx.Count];
         var nextPages = new int[ctx.Count];
-        Func<int, int, int> batchRows = (start, spanEnd) =>
+        Func<int, int, int> batchRowCount = (start, spanEnd) =>
             ComputeBatchRowCount(pageMaps, start, spanEnd, batchSize, maxBytes);
 
         int nextSpan = 0;
@@ -879,7 +891,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 window?.Dispose();
                 window = null;
                 window = await BatchPageWindow.ReadAsync(
-                        _file, pageMaps, chunkOffsets, spans, nextSpan, nextRow, endRows, nextPages, batchRows,
+                        file, pageMaps, chunkOffsets, spans, nextSpan, nextRow, endRows, nextPages, batchRowCount,
                         BatchPageWindowBudgetBytes, heldColumns, cancellationToken)
                     .ConfigureAwait(false);
                 if (window.Batches.Count == 0)
@@ -956,7 +968,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     IReadOnlyList<IMemoryOwner<byte>> pageBuffers = [];
                     if (missing is not null)
                     {
-                        pageBuffers = await _file.ReadRangesAsync(
+                        pageBuffers = await file.ReadRangesAsync(
                                 missing.Select(r => pageRanges[r]).ToArray(), cancellationToken)
                             .ConfigureAwait(false);
                         for (int m = 0; m < missing.Count; m++)
@@ -1223,8 +1235,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </param>
     private async ValueTask<(ColumnPageMap[] Maps, IMemoryOwner<byte>?[] Held)> BuildPageMapsAsync(
         RowGroupContext ctx, bool useOffsetIndex, IReadOnlyDictionary<long, byte[]>? offsetIndexes,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, IRandomAccessFile? io = null)
     {
+        var file = io ?? _file;
         var pageMaps = new ColumnPageMap?[ctx.Count];
         var held = new IMemoryOwner<byte>?[ctx.Count];
         long budget = HeaderScanBudgetBytes;
@@ -1232,7 +1245,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         try
         {
             if (useOffsetIndex)
-                await BuildPageMapsFromOffsetIndexesAsync(ctx, pageMaps, offsetIndexes, cancellationToken).ConfigureAwait(false);
+                await BuildPageMapsFromOffsetIndexesAsync(ctx, pageMaps, offsetIndexes, cancellationToken, file).ConfigureAwait(false);
 
             // The chunks to scan, in file order rather than the projection's, as a coalescing reader
             // merges them: a request then spans only the gaps between its own chunks, which it counts.
@@ -1273,7 +1286,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 if (columns.Count == 0)
                     break;
 
-                var buffers = await _file.ReadRangesAsync(columns.ConvertAll(i => ctx.Ranges[i]), cancellationToken)
+                var buffers = await file.ReadRangesAsync(columns.ConvertAll(i => ctx.Ranges[i]), cancellationToken)
                     .ConfigureAwait(false);
                 for (int k = 0; k < columns.Count; k++)
                 {
@@ -1335,8 +1348,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </remarks>
     private async ValueTask BuildPageMapsFromOffsetIndexesAsync(
         RowGroupContext ctx, ColumnPageMap?[] pageMaps, IReadOnlyDictionary<long, byte[]>? prefetched,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, IRandomAccessFile? io = null)
     {
+        var file = io ?? _file;
         var columns = new List<int>(ctx.Count);
         var indexRanges = new List<FileRange>(ctx.Count);
         for (int i = 0; i < ctx.Count; i++)
@@ -1418,7 +1432,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         }
 
         var prefixes = prefixRanges.Count > 0
-            ? await _file.ReadRangesAsync(prefixRanges, cancellationToken).ConfigureAwait(false)
+            ? await file.ReadRangesAsync(prefixRanges, cancellationToken).ConfigureAwait(false)
             : [];
         try
         {
