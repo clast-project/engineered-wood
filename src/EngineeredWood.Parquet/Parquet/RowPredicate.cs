@@ -49,7 +49,8 @@ public sealed class RowPredicate
     /// </summary>
     /// <remarks>
     /// <para>May be called concurrently, since row groups are read in parallel. The batch belongs to the
-    /// reader: do not keep it or dispose it. The reader disposes the mask.</para>
+    /// reader: do not keep it or dispose it. The mask may be one of the batch's own columns (a boolean
+    /// column answering for itself); otherwise the reader takes ownership of it and disposes it.</para>
     /// <para>An exception propagates out of the read, at the position of the batch that raised it, as it
     /// would from a filter applied to the batches afterwards.</para>
     /// </remarks>

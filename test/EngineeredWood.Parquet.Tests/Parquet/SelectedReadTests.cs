@@ -288,6 +288,35 @@ public class SelectedReadTests : IDisposable
         Assert.Equal(expected, actual.Select(a => $"{PositionOf(a)}:{NoteOf(a)}").ToList());
     }
 
+    /// <summary>
+    /// A predicate may answer with one of its own input columns: <c>WHERE flag</c> over a boolean column. The
+    /// mask is then the reader's column (every row live) or the gathered copy's (some rows live), and disposing
+    /// it as a mask must not free a column the read still returns.
+    /// </summary>
+    [Theory]
+    [InlineData(false, 1)]
+    [InlineData(false, 4)]
+    [InlineData(true, 1)]
+    [InlineData(true, 4)]
+    public async Task APredicateMayAnswerWithItsOwnInputColumn(bool afterAnotherPredicate, int concurrency)
+    {
+        string path = await WriteFileAsync();
+        var itself = new RowPredicate(["flag"], batch => (BooleanArray)batch.Column(0));
+        var filter = afterAnotherPredicate
+            ? new RowFilter(ToRowPredicate(Ex.LessThan("k", LiteralValue.Of(500))), itself)
+            : new RowFilter(itself);
+        var conjuncts = afterAnotherPredicate
+            ? new Predicate[] { Ex.LessThan("k", LiteralValue.Of(500)), Ex.Equal("flag", LiteralValue.Of(true)) }
+            : new Predicate[] { Ex.Equal("flag", LiteralValue.Of(true)) };
+
+        var expected = await OracleAsync(path, conjuncts, ["id", "flag"], excluded: null);
+        var actual = await ReadAsync(path, new ParquetReadOptions { MaxConcurrentRowGroups = concurrency, BatchSize = 4_000 },
+            new ParquetScan { Columns = ["id", "flag"], RowFilter = filter });
+
+        Assert.NotEmpty(expected);
+        Assert.Equal(expected, actual);
+    }
+
     private static string NoteOf(string positionAndRow) =>
         System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(positionAndRow[(positionAndRow.LastIndexOf('|') + 1)..]));
 
@@ -510,7 +539,7 @@ public class SelectedReadTests : IDisposable
         using var reader = new ParquetFileReader(file, ownsFile: false);
         var predicate = Ex.And(conjuncts);
         var rows = new List<string>();
-        await foreach (var positioned in reader.ReadWithPositionsAsync(null, projection is null ? null : projection.Union(["id", "k", "n", "s"]).ToArray()))
+        await foreach (var positioned in reader.ReadWithPositionsAsync(null, projection is null ? null : projection.Union(["id", "k", "n", "s", "flag"]).ToArray()))
         {
             using var batch = positioned.Batch;
             using var mask = Evaluator.EvaluatePredicate(predicate, batch);
@@ -565,8 +594,8 @@ public class SelectedReadTests : IDisposable
     /// <summary>
     /// 30,000 rows in three row groups, 1,000-row pages: <c>id</c> (sorted, equal to the row's position),
     /// <c>k</c> (uniform 0..999), <c>n</c> (nullable, 10% null), <c>s</c> (50 strings, dictionary-encoded),
-    /// <c>tags</c> (a nullable list), <c>pt</c> (a struct) and <c>note</c> (24-character strings: longer than a
-    /// view entry holds inline).
+    /// <c>tags</c> (a nullable list), <c>pt</c> (a struct), <c>note</c> (24-character strings: longer than a
+    /// view entry holds inline) and <c>flag</c> (a nullable boolean).
     /// </summary>
     private async Task<string> WriteFileAsync()
     {
@@ -582,6 +611,7 @@ public class SelectedReadTests : IDisposable
         var tags = new ListArray.Builder(Int32Type.Default);
         var tagValues = (Int32Array.Builder)tags.ValueBuilder;
         var note = new StringArray.Builder();
+        var flag = new BooleanArray.Builder();
         var noteBytes = new byte[12];
         var x = new Int32Array.Builder();
         var y = new StringArray.Builder();
@@ -607,6 +637,10 @@ public class SelectedReadTests : IDisposable
 
             random.NextBytes(noteBytes);
             note.Append(BitConverter.ToString(noteBytes).Replace("-", "")); // 24 characters: out of line in a view array
+            if (random.Next(10) == 0)
+                flag.AppendNull();
+            else
+                flag.Append(random.Next(3) == 0);
             x.Append(r % 97);
             y.Append("y" + (r % 13).ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
@@ -621,8 +655,9 @@ public class SelectedReadTests : IDisposable
             .Field(new Field("tags", new ListType(Int32Type.Default), true))
             .Field(new Field("pt", pointType, false))
             .Field(new Field("note", StringType.Default, false))
+            .Field(new Field("flag", BooleanType.Default, true))
             .Build();
-        using var batch = new RecordBatch(schema, [id.Build(), k.Build(), n.Build(), s.Build(), tags.Build(), point, note.Build()], Rows);
+        using var batch = new RecordBatch(schema, [id.Build(), k.Build(), n.Build(), s.Build(), tags.Build(), point, note.Build(), flag.Build()], Rows);
 
         await using var output = new LocalSequentialFile(path);
         await using var writer = new ParquetFileWriter(output, ownsFile: false,

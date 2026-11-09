@@ -130,14 +130,22 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
         // the batch (a view column's data buffers, a dictionary), and disposing the copy would free them under
         // the predicates after this one and the output gather. Its own buffers are managed, so the GC has them.
         var input = liveIndices.IsEmpty ? view : ArrowCompute.Take(view, view.Schema, liveIndices);
-        using var mask = Ask(predicate, input);
-        SelectionMask.AndThreeValued(live, allTrue, rows, mask, liveIndices);
+        var mask = Ask(predicate, input);
+        try
+        {
+            SelectionMask.AndThreeValued(live, allTrue, rows, mask, liveIndices);
+        }
+        finally
+        {
+            Release(mask, input);
+        }
     }
 
     private static void EvaluateOverNoRows(RowPredicate predicate, RecordBatch batch)
     {
         var view = PredicateView(predicate, batch);
-        using var mask = Ask(predicate, ArrowCompute.Take(view, view.Schema, ReadOnlySpan<int>.Empty));
+        var input = ArrowCompute.Take(view, view.Schema, ReadOnlySpan<int>.Empty);
+        Release(Ask(predicate, input), input);
     }
 
     // The predicate's columns of the batch, in its order, sharing the batch's arrays: never disposed.
@@ -162,12 +170,30 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
         if (mask.Length != input.Length)
         {
             int length = mask.Length;
-            mask.Dispose();
+            Release(mask, input);
             throw new InvalidOperationException(
                 $"A row predicate returned a mask of {length} rows for a batch of {input.Length}.");
         }
 
         return mask;
+    }
+
+    /// <summary>
+    /// Disposes a predicate's mask, unless it shares a buffer with the batch the predicate was given: a predicate
+    /// may answer with one of its own input columns (<c>WHERE flag</c>), and over every live row that column IS
+    /// the decoded batch's, which the read still gathers from or returns.
+    /// </summary>
+    private static void Release(BooleanArray mask, RecordBatch input)
+    {
+        var buffers = new HashSet<ReadOnlyMemory<byte>>();
+        CollectBuffers(mask.Data, buffers);
+        for (int i = 0; i < input.ColumnCount; i++)
+        {
+            if (SharesAny(input.Column(i).Data, buffers))
+                return;
+        }
+
+        mask.Dispose();
     }
 
     /// <summary>
