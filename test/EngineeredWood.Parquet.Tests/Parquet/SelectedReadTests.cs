@@ -8,6 +8,7 @@ using EngineeredWood.Expressions;
 using EngineeredWood.Expressions.Arrow;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
+using EngineeredWood.Parquet.Metadata;
 using Ex = EngineeredWood.Expressions.Expressions;
 
 namespace EngineeredWood.Tests.Parquet;
@@ -172,8 +173,15 @@ public class SelectedReadTests : IDisposable
         Assert.Equal(Rows - excluded.Count, actual.Count);
     }
 
-    [Fact]
-    public async Task AWhollyExcludedRowGroupIsNotRead()
+    /// <summary>
+    /// A row group whose every row is excluded is skipped unread: none of its column chunks is requested (by
+    /// recorded byte range, as <c>RowSkipReadTests</c> checks), and none of its rows reaches a predicate. The
+    /// groups around it are read, so the check is not vacuous.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task AWhollyExcludedRowGroupIsNotRead(int concurrency)
     {
         string path = await WriteFileAsync();
         var excluded = new TestExclusions(Enumerable.Range(RowsPerGroup, RowsPerGroup).Select(i => (long)i));
@@ -186,11 +194,50 @@ public class SelectedReadTests : IDisposable
             return AllTrue(batch.Length);
         });
 
-        var actual = await ReadAsync(path, new ParquetReadOptions(),
-            new ParquetScan { Columns = ["id"], RowFilter = new RowFilter(spy), ExcludedRows = excluded });
+        var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        int rows = 0;
+        FileMetaData metadata;
+        await using (counting)
+        using (var reader = new ParquetFileReader(counting, ownsFile: false, new ParquetReadOptions { MaxConcurrentRowGroups = concurrency }))
+        {
+            metadata = await reader.ReadMetadataAsync();
+            var scan = new ParquetScan { Columns = ["id", "s"], RowFilter = new RowFilter(spy), ExcludedRows = excluded };
+            await foreach (var selected in reader.ReadSelectedAsync(scan))
+            {
+                using (selected)
+                    rows += selected.Batch.Length;
+            }
+        }
 
-        Assert.Equal(Rows - RowsPerGroup, actual.Count);
+        Assert.Equal(Rows - RowsPerGroup, rows);
         Assert.DoesNotContain(seen, id => id >= RowsPerGroup && id < 2 * RowsPerGroup);
+
+        var requested = counting.RequestRanges.SelectMany(r => r).ToList();
+        foreach (var (offset, length) in ChunkRanges(metadata.RowGroups[1]))
+        {
+            // The one overlap allowed, as in RowSkipReadTests: the reader pads a dictionary chunk's read by up to
+            // 100 bytes past its end (the PARQUET-816 workaround), which can run into the next group's first chunk.
+            Assert.DoesNotContain(requested, r =>
+                r.Offset < offset + length && offset < r.Offset + r.Length
+                && !(r.Offset < offset && r.Offset + r.Length <= offset + 100));
+        }
+
+        foreach (int kept in new[] { 0, 2 })
+        {
+            var (offset, _) = ChunkRanges(metadata.RowGroups[kept]).First();
+            Assert.Contains(requested, r => r.Offset <= offset && offset < r.Offset + r.Length);
+        }
+    }
+
+    /// <summary>A row group's column chunks, from the first page (a dictionary page when there is one).</summary>
+    private static IEnumerable<(long Offset, long Length)> ChunkRanges(EngineeredWood.Parquet.Metadata.RowGroup rowGroup)
+    {
+        foreach (var chunk in rowGroup.Columns)
+        {
+            var meta = chunk.MetaData!;
+            long start = meta.DictionaryPageOffset is { } d && d > 0 && d < meta.DataPageOffset ? d : meta.DataPageOffset;
+            yield return (start, meta.TotalCompressedSize);
+        }
     }
 
     /// <summary>
