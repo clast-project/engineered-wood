@@ -13314,14 +13314,32 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             logical = ReconcileToTableShape(
                 logical, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
                 logicalToPhysical, addFile.Path);
-            return condition.Evaluate(logical);
+            return NullAsFalse(condition.Evaluate(logical), logical);
         };
+
+    /// <summary>
+    /// A finished condition's answer, with NULL as FALSE. The Parquet <see cref="RowFilter"/> keeps a row its
+    /// predicate answers NULL for live for the predicates after it, which is right for conjuncts split out of one
+    /// expression (their AND is three-valued), but each row condition is a whole one: its NULL already drops the
+    /// row, and the conditions after it — a host mask that reads a nullable column, say — must not be asked about it.
+    /// </summary>
+    private static BooleanArray NullAsFalse(BooleanArray answer, RecordBatch input)
+    {
+        if (answer.NullCount == 0)
+            return answer;
+        var keep = new BooleanArray.Builder().Reserve(answer.Length);
+        for (int i = 0; i < answer.Length; i++)
+            keep.Append(answer.GetValue(i) == true);
+        var result = keep.Build();
+        BatchSelector.Release(answer, input);
+        return result;
+    }
 
     /// <summary>
     /// One row condition of a scan (#502): the exact <see cref="DeltaReadOptions.Filter"/>, or a host's
     /// <see cref="DeltaRowMask"/>. <see cref="Evaluate"/> answers a LOGICAL batch of the table's shape that holds at
     /// least <see cref="Columns"/> (null: the condition may read any column, so the batch holds every one); TRUE keeps
-    /// a row, FALSE drops it, NULL keeps it out of the result.
+    /// a row, FALSE or NULL drops it (see <see cref="NullAsFalse"/>).
     /// </summary>
     internal sealed record RowCondition(IReadOnlyList<string>? Columns, Func<RecordBatch, BooleanArray> Evaluate);
 
@@ -13360,10 +13378,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             arrays.Add(batch.Column(index));
         }
 
-        var answer = mask.Mask(new RecordBatch(new Apache.Arrow.Schema(fields, null), arrays, batch.Length))
-            ?? throw new InvalidOperationException("A row mask returned null.");
+        var asked = new RecordBatch(new Apache.Arrow.Schema(fields, null), arrays, batch.Length);
+        var answer = mask.Mask(asked) ?? throw new InvalidOperationException("A row mask returned null.");
         if (answer.Length != batch.Length)
         {
+            // The scan owns the answer even when it refuses it.
+            BatchSelector.Release(answer, asked);
             throw new InvalidOperationException(
                 $"A row mask answered {answer.Length} rows for a batch of {batch.Length}.");
         }

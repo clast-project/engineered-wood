@@ -363,6 +363,50 @@ public class ExactFilterTests : IDisposable
         Assert.True(outsideFilter > 0, "the filter was applied to rows without FilterRows");
     }
 
+    /// <summary>
+    /// The filter and each mask are whole conditions: a NULL answer drops the row, so the masks after it are never
+    /// asked about it (a mask dereferencing a nullable column the filter already tested would otherwise see NULLs).
+    /// </summary>
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(4, false)]
+    [InlineData(1, true)]
+    public async Task AMaskIsNeverAskedAboutARowAnEarlierConditionAnsweredNullFor(int concurrency, bool seam)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, seam, ColumnMappingMode.None);
+        var sawN = new System.Collections.Concurrent.ConcurrentBag<int?>();
+        var sawId = new System.Collections.Concurrent.ConcurrentBag<long>();
+        var afterFilter = new DeltaRowMask(["n"], b =>
+        {
+            var n = (Int32Array)b.Column(0);
+            for (int i = 0; i < b.Length; i++)
+                sawN.Add(n.GetValue(i));
+            return Answer(b.Length, _ => true);
+        });
+        var nullForEveryFourth = new DeltaRowMask(["id"], b => Answer(b.Length, i => Id(b, i) % 4 == 0 ? null : true));
+        var afterMask = new DeltaRowMask(["id"], b =>
+        {
+            for (int i = 0; i < b.Length; i++)
+                sawId.Add(Id(b, i));
+            return Answer(b.Length, _ => true);
+        });
+
+        var options = new DeltaReadOptions
+        {
+            Columns = ["id"],
+            Filter = Filters["nullable"], // n > 50: NULL for every fifth row
+            FilterRows = true,
+            RowMasks = [afterFilter, nullForEveryFourth, afterMask],
+        };
+        await foreach (var b in table.ReadAsync(options))
+            b.Dispose();
+
+        Assert.NotEmpty(sawN);
+        Assert.All(sawN, n => Assert.True(n > 50, $"a mask after `n > 50` was asked about n = {n?.ToString() ?? "NULL"}"));
+        Assert.NotEmpty(sawId);
+        Assert.DoesNotContain(sawId, id => id % 4 == 0);
+    }
+
     [Theory]
     [InlineData(1, false)]
     [InlineData(4, false)]

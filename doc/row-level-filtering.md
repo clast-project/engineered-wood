@@ -523,6 +523,7 @@ The seam-projection mutation survived until the test also asserted that the retu
 **Inside:**
 - The `FilterRows` filter and each mask become one internal `RowCondition`: the logical columns it reads, and a function over a table-shaped logical batch. 3a's per-file logic now runs over that list.
 - **Each condition reads at least one of the file's columns:** it becomes one `RowPredicate` of the file's `RowFilter`, in order. The reader therefore asks a mask only about rows the filter and the masks before it left live, and the other columns of rows it rejects can go undecoded.
+- **NULL answers:** each condition is a whole one, so its NULL answer is turned into FALSE before the next condition runs. The Parquet `RowFilter` keeps a NULL row live for the predicates after it, and that is still right for conjuncts split out of one expression (phase 4); without the conversion, a mask after `n > 50` would be asked about rows where `n` is NULL.
 - **A condition reads none of the file's columns** (only partition columns, or columns added after the file was written): it is asked once per file, over one row, and only if the file has a live row. FALSE or NULL skips the file. In that case, a filter error on the file's rows that the filter would otherwise raise is not raised: the file is never read.
 - **Codec seam:** the conditions are applied in turn to each batch once it has the table's shape, each over the rows the ones before it kept.
 
@@ -539,6 +540,7 @@ The seam-projection mutation survived until the test also asserted that the retu
 Also tested:
 - without `FilterRows`, the filter still only prunes while the masks apply;
 - a mask is never asked about a deleted row (serial, parallel, seam);
+- a mask is never asked about a row an earlier condition answered NULL for (serial, parallel, seam);
 - a mask on a column added later sees NULL for the older files;
 - an unknown column is refused before any mask is asked;
 - a mask of the wrong length is refused;
@@ -552,6 +554,7 @@ Each of these mutations fails tests:
 - only the seam's first condition applied;
 - the length check removed;
 - the unknown-column refusal removed.
+- NULL answers left live for the conditions after them (review round 1).
 
 ### Not yet
 
