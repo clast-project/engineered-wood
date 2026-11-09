@@ -193,6 +193,122 @@ public class SelectedReadTests : IDisposable
         Assert.DoesNotContain(seen, id => id >= RowsPerGroup && id < 2 * RowsPerGroup);
     }
 
+    /// <summary>
+    /// When an earlier predicate rejects every row of a batch, a later one is still asked, over no rows, as
+    /// <c>EvalAnd</c> asks every operand over an empty selection. One that cannot be evaluated at all still
+    /// raises then, as the whole conjunction does in a post-filter.
+    /// </summary>
+    [Fact]
+    public async Task APredicateAfterOneThatRejectsEverythingIsStillAskedOverNoRows()
+    {
+        string path = await WriteFileAsync();
+        var rejectAll = Ex.LessThan("k", LiteralValue.Of(0));
+        var calls = new ConcurrentBag<int>();
+        var spy = new RowPredicate(["id"], batch =>
+        {
+            calls.Add(batch.Length);
+            return AllTrue(batch.Length);
+        });
+
+        var actual = await ReadAsync(path, new ParquetReadOptions { BatchSize = 5_000 },
+            new ParquetScan { Columns = ["id"], RowFilter = new RowFilter(ToRowPredicate(rejectAll), spy) });
+
+        Assert.Empty(actual);
+        Assert.Equal(Rows / 5_000, calls.Count); // once per batch
+        Assert.All(calls, length => Assert.Equal(0, length));
+    }
+
+    /// <summary>The differential form: a comparison with no common type (a struct against an integer) raises
+    /// over an empty batch, so the conjunction raises in a post-filter, and the split read raises the same way.</summary>
+    [Fact]
+    public async Task AnUnevaluablePredicateRaisesEvenWhenNoRowReachesIt()
+    {
+        string path = await WriteFileAsync();
+        var rejectAll = Ex.LessThan("k", LiteralValue.Of(0));
+        var unevaluable = Ex.Equal("pt", LiteralValue.Of(1));
+
+        // The oracle: the whole conjunction over a batch.
+        await using (var file = new LocalRandomAccessFile(path))
+        using (var reader = new ParquetFileReader(file, ownsFile: false))
+        using (var batch = await reader.ReadRowGroupAsync(0, ["k", "pt"]))
+        {
+            var expected = Record.Exception(() => Evaluator.EvaluatePredicate(Ex.And(rejectAll, unevaluable), batch));
+            Assert.NotNull(expected);
+
+            var split = new RowFilter(ToRowPredicate(rejectAll), new RowPredicate(["pt"], b => Evaluator.EvaluatePredicate(unevaluable, b)));
+            var actual = await Record.ExceptionAsync(() => ReadAsync(path, new ParquetReadOptions(),
+                new ParquetScan { Columns = ["id"], RowFilter = split }));
+            Assert.NotNull(actual);
+            Assert.Equal(expected!.GetType(), actual!.GetType());
+        }
+    }
+
+    // ---- Buffer ownership ----------------------------------------------------------------------------------
+
+    /// <summary>
+    /// With view output, a gather shares the source's data buffers (<c>ArrowCompute.TakeVarBinaryView</c>), and
+    /// the reader builds those buffers in native memory. Values longer than a view holds inline live there, so
+    /// they read back right only if neither the predicate's gathered input nor the decoded batch frees buffers
+    /// the output still points into. The first predicate drops about half the rows, so the second is handed a
+    /// gathered batch.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task OutOfLineViewValuesSurviveTheGathers(int concurrency)
+    {
+        string path = await WriteFileAsync();
+        var first = Ex.LessThan("k", LiteralValue.Of(500));
+        var second = new RowPredicate(["note", "k"], batch =>
+        {
+            // Reads every value it is handed, out-of-line bytes included, and keeps rows by their first character.
+            var notes = (StringViewArray)batch.Column(0);
+            var builder = new BooleanArray.Builder().Reserve(notes.Length);
+            for (int i = 0; i < notes.Length; i++)
+                builder.Append(notes.GetString(i)[0] <= '7');
+            return builder.Build();
+        });
+
+        var options = new ParquetReadOptions
+        {
+            ByteArrayOutput = ByteArrayOutputKind.ViewType,
+            MaxConcurrentRowGroups = concurrency,
+            BatchSize = 2_000,
+        };
+        var actual = await ReadAsync(path, options,
+            new ParquetScan { Columns = ["id", "note"], RowFilter = new RowFilter(ToRowPredicate(first), second) });
+
+        // The same rows from a default (StringArray) read, rendered the same way (bytes).
+        var (k, _) = await ColumnAsync<Int32Array>(path, "k");
+        var notesByRow = await NotesAsync(path);
+        var expected = Enumerable.Range(0, Rows)
+            .Where(r => k[r] < 500 && notesByRow[r][0] <= '7')
+            .Select(r => $"{r}:{notesByRow[r]}")
+            .ToList();
+        Assert.Equal(expected, actual.Select(a => $"{PositionOf(a)}:{NoteOf(a)}").ToList());
+    }
+
+    private static string NoteOf(string positionAndRow) =>
+        System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(positionAndRow[(positionAndRow.LastIndexOf('|') + 1)..]));
+
+    private static async Task<string[]> NotesAsync(string path)
+    {
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var notes = new List<string>();
+        await foreach (var batch in reader.ReadAllAsync(["note"]))
+        {
+            using (batch)
+            {
+                var array = (StringArray)batch.Column(0);
+                for (int i = 0; i < array.Length; i++)
+                    notes.Add(array.GetString(i));
+            }
+        }
+
+        return notes.ToArray();
+    }
+
     // ---- Positions -----------------------------------------------------------------------------------------
 
     [Fact]
@@ -246,6 +362,38 @@ public class SelectedReadTests : IDisposable
         }
 
         Assert.InRange(rows, 1, Rows / 2);
+    }
+
+    /// <summary>
+    /// A positions-only read (no columns), as a DELETE needs: the batches have no columns, but their lengths and
+    /// positions are exactly the selected rows.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task APositionsOnlyReadReturnsTheSelectedPositions(int concurrency)
+    {
+        string path = await WriteFileAsync();
+        var excluded = TestExclusions.Random(Rows, 0.1, seed: 3);
+        var filter = Ex.LessThan("k", LiteralValue.Of(100));
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { MaxConcurrentRowGroups = concurrency });
+        var positions = new List<long>();
+        await foreach (var selected in reader.ReadSelectedAsync(
+                           new ParquetScan { Columns = [], RowFilter = ToRowFilter([filter]), ExcludedRows = excluded }))
+        {
+            using (selected)
+            {
+                Assert.Equal(0, selected.Batch.ColumnCount);
+                for (int i = 0; i < selected.Batch.Length; i++)
+                    positions.Add(selected.Positions[i]);
+            }
+        }
+
+        var (k, _) = await ColumnAsync<Int32Array>(path, "k");
+        var expected = Enumerable.Range(0, Rows).Where(r => k[r] < 100 && !excluded.Contains(r)).Select(r => (long)r);
+        Assert.Equal(expected, positions);
     }
 
     // ---- Errors --------------------------------------------------------------------------------------------
@@ -417,7 +565,8 @@ public class SelectedReadTests : IDisposable
     /// <summary>
     /// 30,000 rows in three row groups, 1,000-row pages: <c>id</c> (sorted, equal to the row's position),
     /// <c>k</c> (uniform 0..999), <c>n</c> (nullable, 10% null), <c>s</c> (50 strings, dictionary-encoded),
-    /// <c>tags</c> (a nullable list) and <c>pt</c> (a struct).
+    /// <c>tags</c> (a nullable list), <c>pt</c> (a struct) and <c>note</c> (24-character strings: longer than a
+    /// view entry holds inline).
     /// </summary>
     private async Task<string> WriteFileAsync()
     {
@@ -432,6 +581,8 @@ public class SelectedReadTests : IDisposable
         var s = new StringArray.Builder();
         var tags = new ListArray.Builder(Int32Type.Default);
         var tagValues = (Int32Array.Builder)tags.ValueBuilder;
+        var note = new StringArray.Builder();
+        var noteBytes = new byte[12];
         var x = new Int32Array.Builder();
         var y = new StringArray.Builder();
         for (int r = 0; r < Rows; r++)
@@ -454,6 +605,8 @@ public class SelectedReadTests : IDisposable
                     tagValues.Append(random.Next(100));
             }
 
+            random.NextBytes(noteBytes);
+            note.Append(BitConverter.ToString(noteBytes).Replace("-", "")); // 24 characters: out of line in a view array
             x.Append(r % 97);
             y.Append("y" + (r % 13).ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
@@ -467,8 +620,9 @@ public class SelectedReadTests : IDisposable
             .Field(new Field("s", StringType.Default, false))
             .Field(new Field("tags", new ListType(Int32Type.Default), true))
             .Field(new Field("pt", pointType, false))
+            .Field(new Field("note", StringType.Default, false))
             .Build();
-        using var batch = new RecordBatch(schema, [id.Build(), k.Build(), n.Build(), s.Build(), tags.Build(), point], Rows);
+        using var batch = new RecordBatch(schema, [id.Build(), k.Build(), n.Build(), s.Build(), tags.Build(), point, note.Build()], Rows);
 
         await using var output = new LocalSequentialFile(path);
         await using var writer = new ParquetFileWriter(output, ownsFile: false,

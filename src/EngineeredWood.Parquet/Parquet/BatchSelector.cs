@@ -56,7 +56,14 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
                 {
                     int liveCount = SelectionMask.Count(live);
                     if (liveCount == 0)
-                        break;
+                    {
+                        // No row left to answer, but every predicate is still asked, over no rows, as EvalAnd
+                        // asks every operand over an empty selection: one that cannot be evaluated at all (an
+                        // unresolvable column, a comparison with no common type) still raises, rather than
+                        // passing whenever an earlier predicate happened to reject every row of the batch.
+                        EvaluateOverNoRows(predicate, batch);
+                        continue;
+                    }
 
                     ReadOnlySpan<int> liveIndices = default;
                     if (liveCount < rows)
@@ -85,6 +92,8 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
             SelectionMask.ToIndices(selection, indexBuffer);
             var keptIndices = indexBuffer.AsSpan(0, kept);
             var output = Gather(batch, keptIndices);
+            owned = false;
+            ReleaseAfterGather(batch, output);
 
             // Contiguous survivors (a run) need no explicit positions.
             Int64Array? positions = null;
@@ -115,6 +124,25 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
         RowPredicate predicate, RecordBatch batch, ReadOnlySpan<int> liveIndices,
         Span<ulong> live, Span<ulong> allTrue, int rows)
     {
+        var view = PredicateView(predicate, batch);
+
+        // Over some rows the predicate gets a gathered copy. It is NOT disposed: a gather may share buffers with
+        // the batch (a view column's data buffers, a dictionary), and disposing the copy would free them under
+        // the predicates after this one and the output gather. Its own buffers are managed, so the GC has them.
+        var input = liveIndices.IsEmpty ? view : ArrowCompute.Take(view, view.Schema, liveIndices);
+        using var mask = Ask(predicate, input);
+        SelectionMask.AndThreeValued(live, allTrue, rows, mask, liveIndices);
+    }
+
+    private static void EvaluateOverNoRows(RowPredicate predicate, RecordBatch batch)
+    {
+        var view = PredicateView(predicate, batch);
+        using var mask = Ask(predicate, ArrowCompute.Take(view, view.Schema, ReadOnlySpan<int>.Empty));
+    }
+
+    // The predicate's columns of the batch, in its order, sharing the batch's arrays: never disposed.
+    private static RecordBatch PredicateView(RowPredicate predicate, RecordBatch batch)
+    {
         var fields = new List<Field>(predicate.Columns.Count);
         var arrays = new List<IArrowArray>(predicate.Columns.Count);
         foreach (var name in predicate.Columns)
@@ -124,28 +152,80 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
             arrays.Add(batch.Column(index));
         }
 
-        // The predicate's own view of the batch. Over every row it shares the batch's arrays and is not disposed;
-        // over some rows it is a gathered copy, disposed after.
-        var schema = new Apache.Arrow.Schema(fields, null);
-        var view = new RecordBatch(schema, arrays, rows);
-        RecordBatch? gathered = liveIndices.IsEmpty ? null : ArrowCompute.Take(view, schema, liveIndices);
-        try
-        {
-            var input = gathered ?? view;
-            using var mask = predicate.Evaluate(input)
-                ?? throw new InvalidOperationException("A row predicate returned no mask.");
-            if (mask.Length != input.Length)
-            {
-                throw new InvalidOperationException(
-                    $"A row predicate returned a mask of {mask.Length} rows for a batch of {input.Length}.");
-            }
+        return new RecordBatch(new Apache.Arrow.Schema(fields, null), arrays, batch.Length);
+    }
 
-            SelectionMask.AndThreeValued(live, allTrue, rows, mask, liveIndices);
-        }
-        finally
+    private static BooleanArray Ask(RowPredicate predicate, RecordBatch input)
+    {
+        var mask = predicate.Evaluate(input)
+            ?? throw new InvalidOperationException("A row predicate returned no mask.");
+        if (mask.Length != input.Length)
         {
-            gathered?.Dispose();
+            int length = mask.Length;
+            mask.Dispose();
+            throw new InvalidOperationException(
+                $"A row predicate returned a mask of {length} rows for a batch of {input.Length}.");
         }
+
+        return mask;
+    }
+
+    /// <summary>
+    /// Releases the decoded batch once <paramref name="output"/> is gathered from it: every column except those
+    /// the output still shares a buffer with. <see cref="ArrowCompute.Take(IArrowArray, ReadOnlySpan{int})"/>
+    /// copies most types but shares a view column's data buffers (and a dictionary), and the reader builds
+    /// those in native memory, so disposing such a column would free bytes the output reads. A column left
+    /// undisposed is released by its buffers' finalizers once nothing references them.
+    /// </summary>
+    private static void ReleaseAfterGather(RecordBatch batch, RecordBatch output)
+    {
+        var shared = new HashSet<ReadOnlyMemory<byte>>();
+        for (int i = 0; i < output.ColumnCount; i++)
+            CollectBuffers(output.Column(i).Data, shared);
+
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var column = batch.Column(i);
+            if (!SharesAny(column.Data, shared))
+                column.Dispose();
+        }
+    }
+
+    private static void CollectBuffers(ArrayData data, HashSet<ReadOnlyMemory<byte>> into)
+    {
+        foreach (var buffer in data.Buffers ?? [])
+        {
+            if (!buffer.IsEmpty)
+                into.Add(buffer.Memory);
+        }
+
+        if (data.Children is { } children)
+        {
+            foreach (var child in children)
+                CollectBuffers(child, into);
+        }
+        if (data.Dictionary is { } dictionary)
+            CollectBuffers(dictionary, into);
+    }
+
+    private static bool SharesAny(ArrayData data, HashSet<ReadOnlyMemory<byte>> shared)
+    {
+        foreach (var buffer in data.Buffers ?? [])
+        {
+            if (!buffer.IsEmpty && shared.Contains(buffer.Memory))
+                return true;
+        }
+
+        if (data.Children is { } children)
+        {
+            foreach (var child in children)
+            {
+                if (SharesAny(child, shared))
+                    return true;
+            }
+        }
+
+        return data.Dictionary is { } dictionary && SharesAny(dictionary, shared);
     }
 
     // The whole batch, less the dropped columns.

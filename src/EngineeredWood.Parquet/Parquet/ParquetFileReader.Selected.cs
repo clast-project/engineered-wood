@@ -73,7 +73,9 @@ public sealed partial class ParquetFileReader
                            plans,
                            (plan, reservation, token) =>
                                selector.SelectAsync(ReadPlannedAsync(plan, readColumns, reservation, growth, token)),
-                           static b => ArrowSizes.EstimatedBytes(b.Batch),
+                           // The positions count too: a positions-only read (no columns) holds nothing else.
+                           static b => ArrowSizes.EstimatedBytes(b.Batch)
+                                       + (b.Positions.Explicit is { } p ? p.Length * (long)sizeof(long) : 0),
                            static b => b.Dispose(),
                            concurrency,
                            budget,
