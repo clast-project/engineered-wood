@@ -13,16 +13,41 @@ namespace EngineeredWood.Parquet;
 /// and drops the columns read only for the filter. Stateless across batches, so one instance serves the
 /// row groups of a scan concurrently.
 /// </summary>
-internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, IReadOnlyCollection<string> dropped)
+/// <param name="fileColumns">The file's top-level column names, when known: a returned column is not answered from
+/// its dictionary if its answer column's name is one of them (review round 1).</param>
+internal sealed class BatchSelector(
+    RowFilter? filter, IExcludedRows? excluded, IReadOnlyCollection<string> dropped,
+    IReadOnlyCollection<string>? fileColumns = null)
 {
     /// <summary>
-    /// The predicates the reader may answer from a column chunk's dictionary (#502 phase 4b), by the column each
-    /// reads: value-wise, over that one column, which no other predicate reads and the read drops. The reader
-    /// decides per chunk whether it does (Data.DictionaryAnswer); a batch column of answers says it did.
+    /// The predicates the reader may answer from a column chunk's dictionary (#502 phases 4b and 4d), by the column
+    /// each reads: value-wise, over that one column, which no other predicate reads. The reader decides per chunk
+    /// whether it does (Data.DictionaryAnswer); a batch column of answers says it did. For a column the read drops,
+    /// the answers stand in its place; for one it returns, they come as an extra column
+    /// (<see cref="Data.DictionaryAnswer.AnswerColumnName"/>), which the read drops.
     /// </summary>
-    public IReadOnlyDictionary<string, RowPredicate>? Answerable { get; } = AnswerableOf(filter, dropped);
+    public IReadOnlyDictionary<string, AnswerPlan>? Answerable { get; } = AnswerableOf(filter, dropped, fileColumns);
 
-    private static Dictionary<string, RowPredicate>? AnswerableOf(RowFilter? filter, IReadOnlyCollection<string> dropped)
+    // The columns the read drops: the predicates' own, and the answer columns of returned ones.
+    private readonly IReadOnlyCollection<string> _dropped = DroppedWithAnswers(dropped, filter, fileColumns);
+
+    private static IReadOnlyCollection<string> DroppedWithAnswers(
+        IReadOnlyCollection<string> dropped, RowFilter? filter, IReadOnlyCollection<string>? fileColumns)
+    {
+        if (AnswerableOf(filter, dropped, fileColumns) is not { } answerable || answerable.Values.All(p => !p.KeepValues))
+            return dropped;
+        var all = new HashSet<string>(dropped, StringComparer.Ordinal);
+        foreach (var (name, plan) in answerable)
+        {
+            if (plan.KeepValues)
+                all.Add(Data.DictionaryAnswer.AnswerColumnName(name));
+        }
+
+        return all;
+    }
+
+    private static Dictionary<string, AnswerPlan>? AnswerableOf(
+        RowFilter? filter, IReadOnlyCollection<string> dropped, IReadOnlyCollection<string>? fileColumns)
     {
         if (filter is null)
             return null;
@@ -34,13 +59,17 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
                 readers[name] = readers.TryGetValue(name, out int n) ? n + 1 : 1;
         }
 
-        Dictionary<string, RowPredicate>? result = null;
+        Dictionary<string, AnswerPlan>? result = null;
         foreach (var predicate in filter.Predicates)
         {
             if (predicate.ValueWise && predicate.Columns.Count == 1 && predicate.Columns[0] is var name
-                && readers[name] == 1 && dropped.Contains(name))
+                && readers[name] == 1
+                // A returned column's answers need a column name of their own; one the file already has is not.
+                && (dropped.Contains(name) || fileColumns is null
+                    || !fileColumns.Contains(Data.DictionaryAnswer.AnswerColumnName(name))))
             {
-                (result ??= new Dictionary<string, RowPredicate>(StringComparer.Ordinal))[name] = predicate;
+                (result ??= new Dictionary<string, AnswerPlan>(StringComparer.Ordinal))[name] =
+                    new AnswerPlan(predicate, KeepValues: !dropped.Contains(name));
             }
         }
 
@@ -87,7 +116,7 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
             indexBuffer = ArrayPool<int>.Shared.Rent(rows);
             SelectionMask.ToIndices(selection, indexBuffer);
             var keptIndices = indexBuffer.AsSpan(0, kept);
-            var output = Gather(batch, keptIndices, name => !dropped.Contains(name));
+            var output = Gather(batch, keptIndices, name => !_dropped.Contains(name));
             owned = false;
             ReleaseAfterGather(batch, output);
             return new SelectedRecordBatch(output, PositionsOf(positioned.FirstRow, keptIndices));
@@ -220,15 +249,21 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
     private BooleanArray? AnswerColumn(RowPredicate predicate, RecordBatch batch)
     {
         if (Answerable is null || predicate.Columns.Count != 1
-            || !Answerable.TryGetValue(predicate.Columns[0], out var answerable) || !ReferenceEquals(answerable, predicate))
+            || !Answerable.TryGetValue(predicate.Columns[0], out var plan) || !ReferenceEquals(plan.Predicate, predicate))
         {
             return null;
         }
 
-        int index = FieldIndex(batch.Schema, predicate.Columns[0]);
-        return Data.DictionaryAnswer.IsAnswerField(batch.Schema.GetFieldByIndex(index))
-            ? (BooleanArray)batch.Column(index)
-            : null;
+        // A returned column's answers come as a column of their own, absent when the chunk was read as values.
+        string name = plan.KeepValues ? Data.DictionaryAnswer.AnswerColumnName(predicate.Columns[0]) : predicate.Columns[0];
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var field = batch.Schema.GetFieldByIndex(i);
+            if (string.Equals(field.Name, name, StringComparison.Ordinal))
+                return Data.DictionaryAnswer.IsAnswerField(field) ? (BooleanArray)batch.Column(i) : null;
+        }
+
+        return null;
     }
 
     // The predicate's columns of the batch, in its order, sharing the batch's arrays: never disposed.
@@ -379,7 +414,7 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
     // The batch without the dropped columns: the kept arrays move to the result, the dropped ones are disposed.
     private RecordBatch Project(RecordBatch batch)
     {
-        if (dropped.Count == 0)
+        if (_dropped.Count == 0)
             return batch;
 
         var fields = new List<Field>(batch.ColumnCount);
@@ -387,7 +422,7 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
         for (int i = 0; i < batch.ColumnCount; i++)
         {
             var field = batch.Schema.GetFieldByIndex(i);
-            if (dropped.Contains(field.Name))
+            if (_dropped.Contains(field.Name))
             {
                 batch.Column(i).Dispose();
                 continue;
@@ -411,3 +446,9 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
         throw new InvalidOperationException($"The decoded batch has no column '{name}'.");
     }
 }
+
+/// <summary>
+/// A predicate the reader may answer from a dictionary, and whether the read also returns its column, so the column's
+/// values must be built as well as the answers.
+/// </summary>
+internal sealed record AnswerPlan(RowPredicate Predicate, bool KeepValues);

@@ -514,7 +514,7 @@ public sealed partial class ParquetFileReader
 
     /// <summary>
     /// A two-pass read as one unit of a parallel read: reserves scan memory as
-    /// <see cref="ReadPlannedAsync(RowGroupPlan, IReadOnlyList{string}?, ScanReservation, DecodedGrowth, CancellationToken, IReadOnlyDictionary{string, RowPredicate}?)"/>
+    /// <see cref="ReadPlannedAsync(RowGroupPlan, IReadOnlyList{string}?, ScanReservation, DecodedGrowth, CancellationToken, IReadOnlyDictionary{string, AnswerPlan}?)"/>
     /// does, holding the row group's compressed bytes for the whole read; the read itself holds what its first
     /// pass keeps and reports raw decoded sizes.
     /// </summary>

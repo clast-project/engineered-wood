@@ -54,9 +54,11 @@ public class DictionaryAnswerTests : IDisposable
             {
                 foreach (bool twoPass in new[] { false, true })
                 {
-                    // Exclusions and a second predicate after the answered one vary with the concurrency.
+                    // Exclusions and a second predicate after the answered one vary with the concurrency, and
+                    // whether the read returns the answered column with the batching.
                     yield return [answer, batched, twoPass, 1];
                     yield return [answer, batched, twoPass, 4];
+                    yield return [answer, !batched, twoPass, batched ? 4 : 1, "returned"];
                 }
             }
         }
@@ -64,13 +66,16 @@ public class DictionaryAnswerTests : IDisposable
 
     [Theory]
     [MemberData(nameof(Cases))]
-    public async Task ReturnsTheRowsThePredicateSelectsRowByRow(string answerName, bool batched, bool twoPass, int concurrency)
+    public async Task ReturnsTheRowsThePredicateSelectsRowByRow(
+        string answerName, bool batched, bool twoPass, int concurrency, string column = "dropped")
     {
+        // A returned column is built from the dictionary as well as answered from it (#502 phase 4d).
+        string[] projection = column == "returned" ? ["id", "s"] : ["id"];
         string path = await WriteFileAsync();
         var answer = Answers[answerName];
         bool parallel = concurrency > 1;
         var excluded = parallel ? new Exclusions(Enumerable.Range(0, Rows).Where(r => r % 19 == 0).Select(r => (long)r)) : null;
-        var options = new ParquetReadOptions { MaxConcurrentRowGroups = concurrency, BatchSize = batched ? 3_000 : null };
+        var options = new ParquetReadOptions { MaxConcurrentRowGroups = concurrency, BatchSize = batched ? 2_500 : null };
 
         RowFilter Filter(bool valueWise, ConcurrentBag<int> lengths, ConcurrentBag<long> later)
         {
@@ -95,14 +100,14 @@ public class DictionaryAnswerTests : IDisposable
         var rowLater = new ConcurrentBag<long>();
         var expected = await ReadAsync(path, options, new ParquetScan
         {
-            Columns = ["id"], RowFilter = Filter(valueWise: false, rowLengths, rowLater), ExcludedRows = excluded,
+            Columns = projection, RowFilter = Filter(valueWise: false, rowLengths, rowLater), ExcludedRows = excluded,
         }, twoPass);
 
         var dictionaryLengths = new ConcurrentBag<int>();
         var dictionaryLater = new ConcurrentBag<long>();
         var actual = await ReadAsync(path, options, new ParquetScan
         {
-            Columns = ["id"], RowFilter = Filter(valueWise: true, dictionaryLengths, dictionaryLater), ExcludedRows = excluded,
+            Columns = projection, RowFilter = Filter(valueWise: true, dictionaryLengths, dictionaryLater), ExcludedRows = excluded,
         }, twoPass);
 
         Assert.Equal(expected, actual);
@@ -120,7 +125,7 @@ public class DictionaryAnswerTests : IDisposable
 
     public static IEnumerable<object[]> Unanswered() =>
     [
-        ["not value-wise"], ["projected"], ["read by two predicates"], ["two columns"], ["too many distinct values"],
+        ["not value-wise"], ["read by two predicates"], ["two columns"], ["too many distinct values"],
         ["PLAIN-encoded"],
     ];
 
@@ -139,7 +144,7 @@ public class DictionaryAnswerTests : IDisposable
         };
 
         var predicates = new List<RowPredicate>();
-        string[] projection = why == "projected" ? ["id", "s"] : ["id"];
+        string[] projection = ["id"];
         if (why == "two columns")
         {
             predicates.Add(new RowPredicate(["s", "id"], batch =>
@@ -162,6 +167,119 @@ public class DictionaryAnswerTests : IDisposable
 
         Assert.NotEmpty(rows);
         Assert.Equal(Rows, lengths.Sum());
+    }
+
+    /// <summary>
+    /// A returned column read as a view type is answered from its dictionary too: its values are decoded as ever,
+    /// with the indices beside them (#502 phase 4d).
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AReturnedViewTypeColumnIsAnsweredFromItsDictionary(bool batched)
+    {
+        string path = await WriteFileAsync();
+        var options = new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.ViewType, BatchSize = batched ? 2_500 : null };
+        Func<string?, bool?> answer = v => v is null ? null : v.EndsWith("3", StringComparison.Ordinal);
+        var rowLengths = new ConcurrentBag<int>();
+        var expected = await ReadAsync(path, options, new ParquetScan
+        {
+            Columns = ["id", "s"], RowFilter = new RowFilter([Over("s", answer, valueWise: false, rowLengths)]),
+        }, twoPass: false);
+        var dictionaryLengths = new ConcurrentBag<int>();
+        var actual = await ReadAsync(path, options, new ParquetScan
+        {
+            Columns = ["id", "s"], RowFilter = new RowFilter([Over("s", answer, valueWise: true, dictionaryLengths)]),
+        }, twoPass: false);
+
+        Assert.NotEmpty(expected);
+        Assert.Equal(expected, actual);
+        Assert.Equal(Rows, rowLengths.Sum());
+        Assert.All(dictionaryLengths, n => Assert.Equal(Categories + 1, n));
+        Assert.Equal(Rows / RowsPerGroup, dictionaryLengths.Count);
+    }
+
+    /// <summary>
+    /// A returned column answered over a read the page index narrows to two ranges of a row group, with batches
+    /// that do not fall on page boundaries: the answers are held, skipped and cut as the values are.
+    /// </summary>
+    [Theory]
+    [InlineData(0L, 700)]
+    [InlineData(2_000L, 300)] // the first range starts past the group's first row (review round 1)
+    public async Task AReturnedColumnIsAnsweredOverANarrowedRead(long from, int batchSize)
+    {
+        string path = await WriteFileAsync();
+        var options = new ParquetReadOptions { BatchSize = batchSize };
+        var prune = EngineeredWood.Expressions.Expressions.Or(
+            EngineeredWood.Expressions.Expressions.And(
+                EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", EngineeredWood.Expressions.LiteralValue.Of(from)),
+                EngineeredWood.Expressions.Expressions.LessThan("id", EngineeredWood.Expressions.LiteralValue.Of(from + 1_500L))),
+            EngineeredWood.Expressions.Expressions.And(
+                EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", EngineeredWood.Expressions.LiteralValue.Of(6_200L)),
+                EngineeredWood.Expressions.Expressions.LessThan("id", EngineeredWood.Expressions.LiteralValue.Of(7_900L))));
+        Func<string?, bool?> answer = v => v is null ? null : string.CompareOrdinal(v, "cat-20") < 0;
+        var rowLengths = new ConcurrentBag<int>();
+        var expected = await ReadAsync(path, options, new ParquetScan
+        {
+            Columns = ["id", "s"], Prune = prune,
+            RowFilter = new RowFilter([Over("s", answer, valueWise: false, rowLengths)]),
+        }, twoPass: false);
+        var dictionaryLengths = new ConcurrentBag<int>();
+        var actual = await ReadAsync(path, options, new ParquetScan
+        {
+            Columns = ["id", "s"], Prune = prune,
+            RowFilter = new RowFilter([Over("s", answer, valueWise: true, dictionaryLengths)]),
+        }, twoPass: false);
+
+        Assert.NotEmpty(expected);
+        Assert.Equal(expected, actual);
+        Assert.Contains(expected, r => r.StartsWith("7", StringComparison.Ordinal)); // the second range
+        Assert.All(dictionaryLengths, n => Assert.Equal(Categories + 1, n));
+        Assert.NotEmpty(dictionaryLengths);
+    }
+
+    /// <summary>
+    /// A file whose own column has the name a returned column's answers would take: that column is returned, and the
+    /// predicate is asked row by row (review round 1).
+    /// </summary>
+    [Fact]
+    public async Task AColumnNamedAsAnAnswerColumnIsReturnedAndTheDictionaryIsNotUsed()
+    {
+        string answerName = EngineeredWood.Parquet.Data.DictionaryAnswer.AnswerColumnName("s");
+        string path = Path.Combine(_tempDir, "collision.parquet");
+        var id = new Int64Array.Builder();
+        var s = new StringArray.Builder();
+        var other = new StringArray.Builder();
+        for (int r = 0; r < 2_000; r++)
+        {
+            id.Append(r);
+            s.Append("cat-" + (r % 5).ToString(System.Globalization.CultureInfo.InvariantCulture));
+            other.Append("other-" + r.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("s", StringType.Default, false))
+            .Field(new Field(answerName, StringType.Default, false))
+            .Build();
+        using (var batch = new RecordBatch(schema, [id.Build(), s.Build(), other.Build()], 2_000))
+        {
+            await using var output = new LocalSequentialFile(path);
+            await using var writer = new ParquetFileWriter(output, ownsFile: false, ParquetWriteOptions.Default);
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        var lengths = new ConcurrentBag<int>();
+        var rows = await ReadAsync(path, new ParquetReadOptions(), new ParquetScan
+        {
+            Columns = ["id", "s", answerName],
+            RowFilter = new RowFilter([Over("s", v => v == "cat-3", valueWise: true, lengths)]),
+        }, twoPass: false);
+
+        Assert.Equal(400, rows.Count);
+        Assert.All(rows, r => Assert.Equal(3, r.Split('|').Length)); // id, s and the file's own column
+        Assert.Equal(2_000, lengths.Sum());
     }
 
     /// <summary>
@@ -200,7 +318,7 @@ public class DictionaryAnswerTests : IDisposable
         string path = await WriteFileAsync();
         var lengths = new ConcurrentBag<int>();
         var excluded = new Exclusions(Enumerable.Range(0, Rows).Where(IsBad).Select(r => (long)r));
-        var rows = await ReadAsync(path, new ParquetReadOptions { BatchSize = batched ? 3_000 : null }, new ParquetScan
+        var rows = await ReadAsync(path, new ParquetReadOptions { BatchSize = batched ? 2_500 : null }, new ParquetScan
         {
             Columns = ["id"],
             RowFilter = new RowFilter([Over("e", RaisingOnBad, valueWise: true, lengths)]),
@@ -282,8 +400,24 @@ public class DictionaryAnswerTests : IDisposable
         new([column], batch =>
         {
             lengths.Add(batch.Length);
-            return Map((StringArray)batch.Column(0), answer);
+            return batch.Column(0) is StringViewArray views
+                ? Map(Enumerable.Range(0, views.Length).Select(i => views.GetString(i)).ToArray(), answer)
+                : Map((StringArray)batch.Column(0), answer);
         }) { ValueWise = valueWise };
+
+    private static BooleanArray Map(string?[] values, Func<string?, bool?> answer)
+    {
+        var builder = new BooleanArray.Builder().Reserve(values.Length);
+        foreach (var value in values)
+        {
+            if (answer(value) is { } b)
+                builder.Append(b);
+            else
+                builder.AppendNull();
+        }
+
+        return builder.Build();
+    }
 
     private static BooleanArray Map(StringArray values, Func<string?, bool?> answer)
     {

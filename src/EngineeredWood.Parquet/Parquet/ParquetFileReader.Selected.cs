@@ -91,7 +91,9 @@ public sealed partial class ParquetFileReader
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
         var (readColumns, dropped) = ColumnsForSelection(schema, scan.Columns, scan.RowFilter);
-        var selector = new BatchSelector(scan.RowFilter, scan.ExcludedRows, dropped);
+        var selector = new BatchSelector(
+            scan.RowFilter, scan.ExcludedRows, dropped,
+            new HashSet<string>(schema.Root.Children.Select(c => c.Name), StringComparer.Ordinal));
         var twoPass = TwoPassColumnsFor(schema, readColumns, dropped, scan.RowFilter, _options);
         RowSkipPredicate? skipRows = scan.ExcludedRows is { } excluded ? excluded.ExcludesAll : null;
         return new SelectedPlanReader(this, metadata, readColumns, selector, twoPass, skipRows);

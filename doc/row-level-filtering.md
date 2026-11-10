@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 under way (§19-§21). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 under way (§19-§22). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -745,3 +745,63 @@ Each of these mutations fails tests:
 - a mask's flag ignored (2), or not passed through `RowConditions` (2);
 - the switch ignored for masks (1);
 - an unregistered function taken as value-wise (1).
+
+## 22. Phase 4d: answering a column the read returns (2026-11-10)
+
+4d was proposed as three pieces: chunks that mix dictionary and PLAIN pages, a predicate column the read also returns, and an all-false table as a prune. This PR is the second, the one with a common case behind it (`SELECT category, ... WHERE category IN (...)`). The other two are left. EW's own writer never mixes encodings within a chunk: it dictionary-encodes a chunk whole or not at all. And for a filter, dictionary pruning (#57) already skips most of the row groups an all-false table would.
+
+### How
+
+A predicate over a column the read returns is now answerable too (`AnswerPlan.KeepValues`). Its chunk is decoded as ever, to its values, through a `ColumnBuildState` whose `IndexSink` collects each value's dictionary index as the value is written. That is one RLE decode for both. The indices take the values' definition levels, and are mapped to answers as in 4b. The answers come as one more batch column, `AnswerColumnName(column)` (a name starting with NUL; unlikely, but not reserved, so a returned column whose answer name the file already has is not answered, see review round 1). `BatchSelector` applies that column as the predicate's mask and drops it from the output.
+- **Batched read:** a second cursor holds the answers beside each answered column's values, appended, restarted, skipped and cut in step with them.
+- **View types:** the values are built by the column's own decoder, so view types need no special case.
+- **First attempt:** this PR first built the values from the dictionary instead, with `ArrowCompute.Take` over the evaluated dictionary array. That cost more than the decode it replaced, with 38 MB of managed allocation where the decoder's native buffers held 1.7: `= 2%` measured +14% against asking the rows.
+
+### Measured
+
+`dictanswer-ab` (Parquet benchmarks), `category` returned, net10.0, median of 9 runs:
+
+| Case | Kept | rows ms | dict ms | dict vs rows | 2-pass rows ms | 2-pass dict ms | dict vs rows |
+|---|---|---|---|---|---|---|---|
+| `= 'cat-07'`, returns `id, category` | 2% | 6.3 | 6.4 | +2% | 7.1 | 7.1 | 0% |
+| `IN` 5 categories, returns `id, category` | 10% | 154.0 | 8.4 | -95% | 185.5 | 8.7 | -95% |
+| `<> 'cat-07'`, returns `id, category` | 98% | 23.8 | 24.7 | +4% | 24.1 | 24.8 | +3% |
+
+`ValueWiseBenchmarks` (Delta benchmarks), `Returned` true, with the table and settings of §21:
+
+| Read | Kept | Rows | Dictionary | Change |
+|---|---|---|---|---|
+| `category = 'cat_03'` | 6% | 8.2 ms | 8.2 ms | 0% |
+| `category IN ('cat_01', 'cat_05', 'cat_09')` | 19% | 151.1 ms | 9.1 ms | -94% |
+| `category <> 'cat_03'` | 94% | 15.5 ms | 17.3 ms | +12% |
+| `lower(category) = 'cat_03'` | 6% | 195.6 ms | 8.0 ms | -96% |
+| `category = 'cat_03' AND amount < 500` | 3% | 10.7 ms | 10.4 ms | -3% |
+| value-wise host mask (3 keys) | 19% | 26.4 ms | 8.9 ms | -66% |
+
+Where the row path is a direct kernel (`=`, `<>`), the column is decoded either way, and answering from the dictionary saves only the kernel's compare. Mapping the indices and carrying the answers cost about as much, and at 94% kept a little more. Where the row path is slow (`IN`, a function call, a host delegate), the dictionary wins as it does for a dropped column.
+
+**Left for later:**
+- **Choosing between the two paths:** picking the row path when its predicate is a direct kernel needs a cost the reader does not have. That is phase 5's.
+- **Materializing only the selected rows:** building a returned column's values for the selected rows alone (§6, step 3) would also help `=`. It needs the indices carried to the gather, and a second pass that can hand on a column it does not gather.
+
+### Tests
+
+`DictionaryAnswerTests`:
+- the oracle sweep gains 20 cases returning the answered column, with batches of 2,500 rows that do not fall on the 1,000-row page boundaries;
+- a returned view-type column is answered (one batch and batched);
+- a returned column is answered over a read the page index narrows to two ranges, batched by 700.
+
+Each of these mutations fails tests:
+- the sink's NULL rows taken as values (18);
+- answers looked up under the column's own name (22);
+- the answer column returned (18);
+- a returned column never answered (22);
+- the batched answers restarted rather than appended (1).
+
+One mutation passes: not skipping the answer cursor at all. Ranges from the page index are whole pages, so a cursor never has to skip into rows it holds; it only moves its start. That start mattered once (review round 1): the answer cursor was first made lazily, at the column's first decode, after that batch's skip had moved the values cursor to a range starting past row 0. Its start was then behind, and a later skip dropped answers still needed (`held.Take` threw). Both cursors are now made before the first batch. The regression, a narrowed read whose first range starts at row 2,000 with 300-row batches, failed before the fix.
+
+### Review round 1
+
+- **A file column with an answer column's name:** NUL is legal in a Parquet field name, so a file could hold a column called `AnswerColumnName("s")`. Projecting it beside an answered `s` dropped it. `BatchSelector` now takes the file's top-level names and does not answer a returned column whose answer name is among them; that predicate is asked row by row. Tested with such a file (it failed before the fix).
+- **The lazily made answer cursor:** above.
+- **CI build failure:** `CS1705` in `EngineeredWood.DeltaLake` (netstandard2.0). `System.Text.Json` and `Microsoft.Bcl.AsyncInterfaces` both float on `9.*`. nuget.org has STJ 9.0.23, which references AsyncInterfaces 9.0.0.23, but AsyncInterfaces stops at 9.0.22. This is unrelated to the PR and breaks every branch until the matching package is published, or until the two are pinned together.
