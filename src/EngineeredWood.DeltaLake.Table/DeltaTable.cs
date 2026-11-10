@@ -13156,6 +13156,20 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                             reader, snapshot, condition.Columns, mappingMode, logicalToPhysical, withRowTracking: false,
                             cancellationToken)
                         .ConfigureAwait(false);
+                    if (conditionFileColumns is { Count: 0 } && predicates.Count > 0)
+                    {
+                        // After a condition the reader answers row by row, this one may be asked only once a row
+                        // survives that: an earlier mask rejecting every row must keep it from being asked at all.
+                        // So the reader asks it, over the columns it already read for the condition before, and
+                        // the one answer for the file is computed the first time a batch has a row, then repeated
+                        // for every row. (The reader also asks a predicate over no rows once none is live.)
+                        var once = new Lazy<bool>(() => OneRowAnswersTrue(condition));
+                        predicates.Add(new RowPredicate(
+                            predicates[^1].Columns,
+                            batch => Repeat(batch.Length > 0 && once.Value, batch.Length)));
+                        continue;
+                    }
+
                     if (conditionFileColumns is { Count: 0 })
                     {
                         if (live is null)
@@ -13316,6 +13330,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 logicalToPhysical, addFile.Path);
             return NullAsFalse(condition.Evaluate(logical), logical);
         };
+
+    /// <summary>One answer for every row of a batch.</summary>
+    private static BooleanArray Repeat(bool answer, int length)
+    {
+        var mask = new BooleanArray.Builder().Reserve(length);
+        for (int i = 0; i < length; i++)
+            mask.Append(answer);
+        return mask.Build();
+    }
 
     /// <summary>
     /// A finished condition's answer, with NULL as FALSE. The Parquet <see cref="RowFilter"/> keeps a row its
@@ -13525,7 +13548,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     {
         await foreach (var fb in batches.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
-            var batch = fb.Batch;
+            RecordBatch? batch = fb.Batch;
             Int64Array? positions = fb.Positions, rowIds = fb.RowIds, versions = fb.Versions;
             foreach (var condition in conditions)
             {
@@ -13535,6 +13558,17 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 BatchSelector.Release(mask, batch);
                 if (kept.Length == batch.Length)
                     continue;
+                if (kept.Length == 0)
+                {
+                    // Nothing to emit, so nothing to gather: a gather of every column would be wasted work, and
+                    // fails outright on a column type ArrowCompute.Take doesn't gather.
+                    batch.Dispose();
+                    positions?.Dispose();
+                    rowIds?.Dispose();
+                    versions?.Dispose();
+                    batch = null;
+                    break;
+                }
 
                 var gathered = ArrowCompute.Take(batch, batch.Schema, kept);
                 var (p, r, v) = (positions, rowIds, versions);
@@ -13549,10 +13583,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 r?.Dispose();
                 v?.Dispose();
                 batch = gathered;
-                if (kept.Length == 0)
-                    break;
             }
 
+            if (batch is null)
+                continue;
             if (batch.Length == 0)
             {
                 batch.Dispose();

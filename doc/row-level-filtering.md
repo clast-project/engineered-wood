@@ -512,10 +512,11 @@ The seam-projection mutation survived until the test also asserted that the retu
 
 **`DeltaReadOptions.RowMasks`** (`IReadOnlyList<DeltaRowMask>`) applies the host's own row conditions, cmettler's join filters among them. A scan returns only the rows every mask answers TRUE for; FALSE or NULL drops a row.
 - **When:** masks apply whether or not `FilterRows` is set. With it set they come after the filter, in the order given.
-- **What a mask sees:** `DeltaRowMask(Columns, Mask)` names top-level **logical** columns, and the batch holds exactly those, in that order, with the table's types:
+- **What a mask sees:** `DeltaRowMask(Columns, Mask)` names top-level **logical** columns, and the batch holds exactly those, in that order, each as the scan returns it:
   - partition columns carry the file's value;
   - columns added after a file was written are NULL;
-  - deleted rows are never passed.
+  - deleted rows are never passed;
+  - a string or binary column read from the file follows `ParquetReadOptions.ByteArrayOutput` (a view or large-offset array), while partition values and backfilled NULLs are plain arrays. The scan's own batches have the same mix, although `GetReadSchema` reports the plain type for every one of them (#793).
 - **Refusals:** a column the table doesn't have is refused before any file is read. A mask that answers a different number of rows than its batch raises.
 - **Ownership:** the scan owns the returned mask, unless it is one of the batch's own columns.
 - **Over-approximation:** a mask may keep rows that don't match (a Bloom filter's false positives). The host's join rechecks them anyway.
@@ -524,8 +525,10 @@ The seam-projection mutation survived until the test also asserted that the retu
 - The `FilterRows` filter and each mask become one internal `RowCondition`: the logical columns it reads, and a function over a table-shaped logical batch. 3a's per-file logic now runs over that list.
 - **Each condition reads at least one of the file's columns:** it becomes one `RowPredicate` of the file's `RowFilter`, in order. The reader therefore asks a mask only about rows the filter and the masks before it left live, and the other columns of rows it rejects can go undecoded.
 - **NULL answers:** each condition is a whole one, so its NULL answer is turned into FALSE before the next condition runs. The Parquet `RowFilter` keeps a NULL row live for the predicates after it, and that is still right for conjuncts split out of one expression (phase 4); without the conversion, a mask after `n > 50` would be asked about rows where `n` is NULL.
-- **A condition reads none of the file's columns** (only partition columns, or columns added after the file was written): it is asked once per file, over one row, and only if the file has a live row. FALSE or NULL skips the file. In that case, a filter error on the file's rows that the filter would otherwise raise is not raised: the file is never read.
-- **Codec seam:** the conditions are applied in turn to each batch once it has the table's shape, each over the rows the ones before it kept.
+- **A condition reads none of the file's columns** (only partition columns, or columns added after the file was written): its answer is the same for every row of the file, so it is computed once per file, over one row.
+  - **Before any row-level condition:** it is asked while the file is opened, and only if the file has a live row. FALSE or NULL skips the file. In that case, a filter error on the file's rows that the filter would otherwise raise is not raised: the file is never read.
+  - **After a row-level condition:** it waits until a row survives that condition. It becomes a predicate over the columns the earlier condition already reads, computed the first time it is handed a row and repeated after that. An earlier mask that rejects every row of a file therefore keeps it from being asked about that file at all. The reader also calls a predicate over zero rows once none is live; that call doesn't count.
+- **Codec seam:** the conditions are applied in turn to each batch once it has the table's shape, each over the rows the ones before it kept. A batch a condition rejects whole is dropped without being gathered, so a column `ArrowCompute.Take` can't gather (a dictionary the host returned) doesn't fail a scan that returns none of its rows.
 
 `DeltaRowMask` has no `ValueWise` flag yet: it would mean nothing until phase 4 evaluates dictionaries, and adding it then is not a breaking change.
 
@@ -541,6 +544,9 @@ Also tested:
 - without `FilterRows`, the filter still only prunes while the masks apply;
 - a mask is never asked about a deleted row (serial, parallel, seam);
 - a mask is never asked about a row an earlier condition answered NULL for (serial, parallel, seam);
+- a mask over only a partition column is not asked about a file whose rows an earlier mask all rejected (serial, parallel, seam);
+- with view output, a mask's columns have the same Arrow types as the scan's (built-in, seam);
+- through the seam, a batch a mask rejects whole, holding a dictionary column, is dropped without being gathered;
 - a mask on a column added later sees NULL for the older files;
 - an unknown column is refused before any mask is asked;
 - a mask of the wrong length is refused;
@@ -554,7 +560,12 @@ Each of these mutations fails tests:
 - only the seam's first condition applied;
 - the length check removed;
 - the unknown-column refusal removed.
-- NULL answers left live for the conditions after them (review round 1).
+- NULL answers left live for the conditions after them (review round 1);
+- review round 2:
+  - a later partition-only condition asked up front instead of after the earlier conditions;
+  - that condition computed for a zero-row call;
+  - its answer inverted;
+  - a rejected seam batch gathered.
 
 ### Not yet
 

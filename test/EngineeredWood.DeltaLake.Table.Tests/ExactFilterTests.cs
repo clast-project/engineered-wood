@@ -407,6 +407,102 @@ public class ExactFilterTests : IDisposable
         Assert.DoesNotContain(sawId, id => id % 4 == 0);
     }
 
+    /// <summary>
+    /// A mask over only a partition column, after a mask the reader answers row by row: it is asked about a file only
+    /// once a row of it survives the earlier mask. Here it raises for region c, whose rows the earlier mask rejects.
+    /// </summary>
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(4, false)]
+    [InlineData(1, true)]
+    public async Task AFileConstantMaskIsNotAskedAboutAFileAnEarlierMaskEmptied(int concurrency, bool seam)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, seam, ColumnMappingMode.None);
+        var notC = new DeltaRowMask(["id"], b => Answer(b.Length, i => Id(b, i) % 3 != 2)); // region c is id % 3 == 2
+        var onlyA = new DeltaRowMask(["region"], b =>
+        {
+            var region = (StringArray)b.Column(0);
+            return Answer(b.Length, i => region.GetString(i) switch
+            {
+                "c" => throw new InvalidOperationException("asked about region c"),
+                var r => r == "a",
+            });
+        });
+
+        var ids = new List<long>();
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { Columns = ["id"], RowMasks = [notC, onlyA] }))
+        {
+            using (b)
+            {
+                for (int i = 0; i < b.Length; i++)
+                    ids.Add(Id(b, i));
+            }
+        }
+
+        ids.Sort();
+        Assert.Equal(Enumerable.Range(0, 1200).Select(i => (long)i).Where(i => i % 3 == 0 && i % 7 != 0), ids);
+    }
+
+    /// <summary>
+    /// A mask sees each column as the scan returns it: with view output, a string column read from the file is a view
+    /// array, while a partition value is a plain one, in the mask's batch as in the scan's.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AMaskSeesEachColumnAsTheScanReturnsIt(bool seam)
+    {
+        string name = $"t_{Guid.NewGuid():N}";
+        await (await CreateAsync(name, 1, seam, ColumnMappingMode.None)).DisposeAsync();
+        var fs = new LocalTableFileSystem(Path.Combine(_tempDir, name));
+        await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions
+        {
+            ParquetReadOptions = ParquetReadOptions.Default with { ByteArrayOutput = ByteArrayOutputKind.ViewType },
+            DataFileReader = seam ? new PassThroughReader(fs) : null,
+        });
+
+        var maskTypes = new System.Collections.Concurrent.ConcurrentBag<string>();
+        var probe = new DeltaRowMask(["note", "region"], b =>
+        {
+            maskTypes.Add(string.Join(",", b.Schema.FieldsList.Select(f => f.Name + ":" + b.Column(f.Name).GetType().Name)));
+            return Answer(b.Length, _ => true);
+        });
+        var scanTypes = new HashSet<string>();
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { RowMasks = [probe] }))
+        {
+            using (b)
+                scanTypes.Add(string.Join(",", new[] { "note", "region" }.Select(n => n + ":" + b.Column(n).GetType().Name)));
+        }
+
+        Assert.NotEmpty(maskTypes);
+        Assert.Equal(scanTypes, maskTypes.ToHashSet());
+    }
+
+    /// <summary>
+    /// Through the seam, a batch a mask rejects whole is dropped without gathering it: there is nothing to emit, and a
+    /// column the gather can't take (a dictionary the host returned) must not fail a scan that returns none of its rows.
+    /// </summary>
+    [Fact]
+    public async Task ASeamBatchAMaskRejectsWholeIsNotGathered()
+    {
+        // No deletion vector: the pipeline's own deletion-vector gather can't take a dictionary either.
+        var fs = new LocalTableFileSystem(Path.Combine(_tempDir, $"t_{Guid.NewGuid():N}"));
+        await using var table = await DeltaTable.CreateAsync(
+            fs, TableSchema, new DeltaTableOptions { DataFileReader = new DictionaryNoteReader(fs) },
+            partitionColumns: ["region"]);
+        await table.WriteAsync([Rows(0, 300)]);
+
+        var nothing = new DeltaRowMask(["id"], b => Answer(b.Length, _ => false));
+        long rows = 0;
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { Columns = ["id", "note"], RowMasks = [nothing] }))
+        {
+            using (b)
+                rows += b.Length;
+        }
+
+        Assert.Equal(0, rows);
+    }
+
     [Theory]
     [InlineData(1, false)]
     [InlineData(4, false)]
@@ -644,6 +740,35 @@ public class ExactFilterTests : IDisposable
         }
 
         return new RecordBatch(TableSchema, [id.Build(), region.Build(), v.Build(), n.Build(), note.Build()], count);
+    }
+
+    /// <summary>A codec seam that returns <c>note</c> dictionary-encoded, a type <c>ArrowCompute.Take</c> doesn't gather.</summary>
+    private sealed class DictionaryNoteReader(ITableFileSystem fs) : IDataFileReader
+    {
+        public async IAsyncEnumerable<RecordBatch> ReadAsync(
+            string relativePath, IReadOnlyList<string>? physicalColumns,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await foreach (var b in new PassThroughReader(fs).ReadAsync(relativePath, physicalColumns, cancellationToken))
+            {
+                int note = b.Schema.GetFieldIndex("note");
+                if (note < 0)
+                {
+                    yield return b;
+                    continue;
+                }
+
+                var indices = new Int32Array.Builder();
+                for (int i = 0; i < b.Length; i++)
+                    indices.Append(i);
+                var type = new DictionaryType(Int32Type.Default, StringType.Default, false);
+                var fields = b.Schema.FieldsList.ToList();
+                var arrays = Enumerable.Range(0, b.ColumnCount).Select(b.Column).ToList();
+                fields[note] = new Field("note", type, fields[note].IsNullable, fields[note].Metadata);
+                arrays[note] = new DictionaryArray(type, indices.Build(), b.Column(note));
+                yield return new RecordBatch(new Apache.Arrow.Schema(fields, b.Schema.Metadata), arrays, b.Length);
+            }
+        }
     }
 
     /// <summary>A codec seam that decodes with the built-in reader, every row, in file order.</summary>

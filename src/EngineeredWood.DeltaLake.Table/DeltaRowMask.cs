@@ -45,9 +45,13 @@ public sealed class DeltaRowMask
 
     /// <summary>
     /// The top-level logical columns the mask reads. The batch passed to <see cref="Mask"/> holds exactly these, in
-    /// this order and with the table's types, whether or not the scan projects them: a partition column carries the
-    /// file's partition value, and a column added after a file was written is NULL for that file's rows. A name
+    /// this order, whether or not the scan projects them, and each as the scan returns it: a partition column carries
+    /// the file's partition value, and a column added after a file was written is NULL for that file's rows. A name
     /// the table doesn't have is refused when the scan starts.
+    /// <para>Each column has the table's logical type, but not always one Arrow representation of it: a string or
+    /// binary column read from the file follows <see cref="EngineeredWood.Parquet.ParquetReadOptions.ByteArrayOutput"/> (<see cref="DeltaTableOptions.ParquetReadOptions"/>) (a view or
+    /// large-offset array), while a partition value or a backfilled NULL is a plain array, as in the scan's own
+    /// batches. A mask over such a column should accept any of them.</para>
     /// </summary>
     public IReadOnlyList<string> Columns { get; }
 
