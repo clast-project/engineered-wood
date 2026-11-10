@@ -173,7 +173,11 @@ public class StaleHandleOnReplacedLogTests : IDisposable
                 ? line.Replace(field, "") + new string(' ', field.Length)
                 : line))
             : text.Replace(original, Guid.NewGuid().ToString("D"));
+        // Without ETags, an equal size and an equal time prove the same object, and the txnId is never read: a
+        // rewrite within the clock's tick would pass for the original. A re-created log's commit is written later.
+        var written = File.GetLastWriteTimeUtc(CommitFile(2));
         File.WriteAllText(CommitFile(2), replaced);
+        File.SetLastWriteTimeUtc(CommitFile(2), written.AddSeconds(2));
         Assert.Equal(text.Length, File.ReadAllText(CommitFile(2)).Length);
         Assert.Equal(removeId, !File.ReadAllText(CommitFile(2)).Contains(InCommitTimestamp.TxnIdKey));
 
