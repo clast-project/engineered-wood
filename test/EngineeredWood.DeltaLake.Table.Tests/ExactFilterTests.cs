@@ -320,13 +320,21 @@ public class ExactFilterTests : IDisposable
 
     /// <summary>
     /// A host mask after a filter of several conjuncts is asked only about the rows the whole filter answered TRUE
-    /// for: not about one a conjunct answered NULL for and a later one TRUE.
+    /// for: not about one a conjunct answered NULL for and a later one TRUE. The filters after the first end in a
+    /// file-constant conjunct, which is answered TRUE (dropped) for the files it doesn't skip, so no predicate of
+    /// its own stands between the row-level conjunct and the mask (review round 2).
     /// </summary>
     [Theory]
-    [InlineData(1, false)]
-    [InlineData(4, false)]
-    [InlineData(1, true)]
-    public async Task AMaskAfterSplitConjunctsSeesOnlyRowsTheWholeFilterAccepted(int concurrency, bool seam)
+    [InlineData("n > 50 AND v >= 0", 1, false)]
+    [InlineData("n > 50 AND v >= 0", 4, false)]
+    [InlineData("n > 50 AND v >= 0", 1, true)]
+    [InlineData("n > 50 AND region = 'a'", 1, false)]
+    [InlineData("n > 50 AND region = 'a'", 4, false)]
+    [InlineData("n > 50 AND lower(region) <> 'zz'", 1, false)]
+    [InlineData("n > 50 AND lower(region) <> 'zz'", 4, false)]
+    [InlineData("n > 50 AND lower(region) <> 'zz'", 1, true)]
+    public async Task AMaskAfterSplitConjunctsSeesOnlyRowsTheWholeFilterAccepted(
+        string filter, int concurrency, bool seam)
     {
         await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, seam, ColumnMappingMode.None);
         table.EvaluatesConjunctsTogether = false;
@@ -340,7 +348,7 @@ public class ExactFilterTests : IDisposable
         });
         var options = new DeltaReadOptions
         {
-            Columns = ["id"], Filter = P("n > 50 AND v >= 0"), FilterRows = true, RowMasks = [mask],
+            Columns = ["id"], Filter = P(filter), FilterRows = true, RowMasks = [mask],
         };
         await foreach (var b in table.ReadAsync(options))
             b.Dispose();
