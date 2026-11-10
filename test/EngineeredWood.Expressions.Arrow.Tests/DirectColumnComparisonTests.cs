@@ -18,14 +18,14 @@ namespace EngineeredWood.Expressions.Arrow.Tests;
 /// </summary>
 public class DirectColumnComparisonTests
 {
-    private static readonly Func<ArrowRowEvaluator>[] Evaluators =
+    internal static readonly Func<ArrowRowEvaluator>[] Evaluators =
     [
         () => new ArrowRowEvaluator(),
         () => new ArrowRowEvaluator(new SparkFunctionRegistry(new SparkDialectOptions { Ansi = true })),
         () => new ArrowRowEvaluator(new SparkFunctionRegistry(new SparkDialectOptions { Ansi = false })),
     ];
 
-    private static readonly string[] EvaluatorNames = ["plain", "ansi", "legacy"];
+    internal static readonly string[] EvaluatorNames = ["plain", "ansi", "legacy"];
 
     private static readonly DateTimeOffset Epoch = new(1970, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
@@ -38,7 +38,7 @@ public class DirectColumnComparisonTests
         ComparisonOperator.StartsWith, ComparisonOperator.NotStartsWith,
     ];
 
-    private static RecordBatch Batch()
+    internal static RecordBatch Batch()
     {
         var fields = new List<Field>();
         var columns = new List<IArrowArray>();
@@ -212,7 +212,7 @@ public class DirectColumnComparisonTests
         }
     }
 
-    private static IEnumerable<(string Name, Predicate Predicate)> Cases(RecordBatch batch)
+    internal static IEnumerable<(string Name, Predicate Predicate)> Cases(RecordBatch batch)
     {
         foreach (var field in batch.Schema.FieldsList)
         {

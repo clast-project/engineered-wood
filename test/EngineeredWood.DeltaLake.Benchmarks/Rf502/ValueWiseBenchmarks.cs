@@ -50,7 +50,7 @@ public class ValueWiseBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        var conjuncts = new ConjunctSplitBenchmarks { Filter = "amount < 990", Split = true };
+        var conjuncts = new ConjunctSplitBenchmarks { Filter = "amount < 990", Mode = ConjunctSplitBenchmarks.EvaluationMode.Split };
         conjuncts.Setup(); // builds the table when it isn't there yet
         conjuncts.Cleanup();
 

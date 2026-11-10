@@ -210,6 +210,116 @@ public class ValueWiseTests : IDisposable
         ],
     };
 
+    // ---- Whole-batch answers (#502 phase 5a) ------------------------------------------------------------------------
+
+    public static IEnumerable<object[]> WholeBatchFilters() =>
+    [
+        ["id > 100 AND cat = 'c3'"],
+        ["cat <> 'c2' AND id < 5000 AND cat IS NOT NULL"],
+        ["id > 2500 OR cat IS NULL"],
+        ["NOT (id < 300) AND cat <> 'c1'"],
+        // An arithmetic conjunct declines and is asked about the live rows.
+        ["p = 'q1' AND id % 2 = 0 AND cat = 'c4'"],
+    ];
+
+    /// <summary>
+    /// With conjuncts that cannot raise asked about whole batches (the reader taking every one), a scan returns the
+    /// same rows as with none offered; and they are offered. Dictionary answers are off, so every conjunct is asked
+    /// about rows.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(WholeBatchFilters))]
+    public async Task AScanReturnsTheSameRowsWithWholeBatchAnswers(string sql)
+    {
+        foreach (int concurrency in new[] { 1, 4 })
+        {
+            await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency);
+            table.AnswersFromDictionaries = false;
+            table.WholeBatchLiveShare = 0;
+            foreach (var projection in new[] { new[] { "id" }, new[] { "id", "cat", "code" } })
+            {
+                var options = new DeltaReadOptions { Columns = projection, Filter = P(sql), FilterRows = true };
+                var offered = new ConcurrentBag<bool>();
+                table.RowFilterObserver = filter =>
+                {
+                    foreach (var predicate in filter.Predicates)
+                        offered.Add(DeltaTable.OffersWholeBatch(predicate));
+                };
+
+                table.EvaluatesWholeBatches = false;
+                var expected = await ReadAsync(table, options);
+                Assert.DoesNotContain(true, offered);
+
+                offered = new ConcurrentBag<bool>();
+                table.EvaluatesWholeBatches = true;
+                var actual = await ReadAsync(table, options);
+                Assert.Equal(expected, actual);
+                Assert.NotEmpty(actual);
+                Assert.Contains(true, offered);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A conjunct that can raise is never asked about a row an earlier conjunct rejected, even with whole batches
+    /// taken whenever a row is live: <c>CAST(code AS INT)</c> raises on 'x', which <c>code &lt;&gt; 'x'</c> rejects
+    /// first. The rows holding 'x' are live here (no deletion vector).
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task AConjunctThatCanRaiseIsNotAskedAboutRowsAnEarlierOneRejected(int concurrency)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, deleteBadCodes: false);
+        table.AnswersFromDictionaries = false;
+        table.WholeBatchLiveShare = 0;
+        var options = new DeltaReadOptions
+        {
+            Columns = ["id", "code"], Filter = P("code <> 'x' AND CAST(code AS INT) > 3"), FilterRows = true,
+        };
+
+        table.EvaluatesWholeBatches = false;
+        var expected = await ReadAsync(table, options);
+        table.EvaluatesWholeBatches = true;
+        var actual = await ReadAsync(table, options);
+        Assert.Equal(expected, actual);
+        Assert.NotEmpty(actual);
+    }
+
+    /// <summary>
+    /// An expression DELETE offers whole-batch answers when its form cannot raise (its deletion vector leaves most rows
+    /// live, so the reader takes them), and matches the same rows either way.
+    /// </summary>
+    [Theory]
+    [InlineData("cat = 'c3'", true)]
+    [InlineData("id > 1000 AND cat IS NOT NULL", true)]
+    [InlineData("CAST(code AS INT) > 3", false)] // a form that could raise is not offered
+    public async Task ADeleteMatchesTheSameRowsWithWholeBatchAnswers(string sql, bool offers)
+    {
+        var results = new List<(long Deleted, List<string> Left)>();
+        foreach (bool whole in new[] { false, true })
+        {
+            await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 4);
+            table.AnswersFromDictionaries = false;
+            table.WholeBatchLiveShare = 0;
+            table.EvaluatesWholeBatches = whole;
+            var offered = new ConcurrentBag<bool>();
+            table.RowFilterObserver = filter =>
+            {
+                foreach (var predicate in filter.Predicates)
+                    offered.Add(DeltaTable.OffersWholeBatch(predicate));
+            };
+            var (deleted, _) = await table.DeleteAsync(P(sql));
+            Assert.NotEmpty(offered);
+            Assert.All(offered, o => Assert.Equal(whole && offers, o));
+            results.Add((deleted, await ReadAsync(table, new DeltaReadOptions { Columns = ["id", "cat"] })));
+        }
+
+        Assert.True(results[0].Deleted > 0);
+        Assert.Equal(results[0].Deleted, results[1].Deleted);
+        Assert.Equal(results[0].Left, results[1].Left);
+    }
+
     // ---- The table --------------------------------------------------------------------------------------------------
 
     private static bool IsDeleted(int id) => id % 97 == 5;

@@ -15,9 +15,10 @@ namespace EngineeredWood.Parquet;
 /// </summary>
 /// <param name="fileColumns">The file's top-level column names, when known: a returned column is not answered from
 /// its dictionary if its answer column's name is one of them (review round 1).</param>
+/// <param name="wholeBatchLiveShare">See <see cref="DefaultWholeBatchLiveShare"/>.</param>
 internal sealed class BatchSelector(
     RowFilter? filter, IExcludedRows? excluded, IReadOnlyCollection<string> dropped,
-    IReadOnlyCollection<string>? fileColumns = null)
+    IReadOnlyCollection<string>? fileColumns = null, double wholeBatchLiveShare = BatchSelector.DefaultWholeBatchLiveShare)
 {
     /// <summary>
     /// The predicates the reader may answer from a column chunk's dictionary (#502 phases 4b and 4d), by the column
@@ -180,6 +181,15 @@ internal sealed class BatchSelector(
                     continue;
                 }
 
+                // Most rows still live, and a predicate that can answer every row without raising: asked about the
+                // whole batch, with no gather. Rows no longer live are unchanged by its answers, as above.
+                if (liveCount < rows && predicate.EvaluateWholeBatch is { } whole
+                    && liveCount >= rows * wholeBatchLiveShare
+                    && TryEvaluateWholeBatch(predicate, whole, batch, live, allTrue, rows))
+                {
+                    continue;
+                }
+
                 ReadOnlySpan<int> liveIndices = default;
                 if (liveCount < rows)
                 {
@@ -235,6 +245,40 @@ internal sealed class BatchSelector(
         finally
         {
             Release(mask, input);
+        }
+    }
+
+    /// <summary>
+    /// The smallest share of a batch's rows that must still be live for a predicate with
+    /// <see cref="RowPredicate.EvaluateWholeBatch"/> to be asked about the whole batch rather than a gather of the
+    /// live rows (#502 phase 5a). Above 1, never. A reader may set its own (<see cref="ParquetFileReader.WholeBatchLiveShare"/>).
+    /// Measured (doc/row-level-filtering.md §24): the whole batch costs 0-9% more at 25% live or fewer, and saves
+    /// 10-23% from 40% live up.
+    /// </summary>
+    internal const double DefaultWholeBatchLiveShare = 0.4;
+
+    // Asks the predicate about every row of the batch; false when it declined, having changed nothing.
+    private static bool TryEvaluateWholeBatch(
+        RowPredicate predicate, Func<RecordBatch, BooleanArray?> whole, RecordBatch batch,
+        Span<ulong> live, Span<ulong> allTrue, int rows)
+    {
+        var view = PredicateView(predicate, batch);
+        if (whole(view) is not { } mask)
+            return false;
+        try
+        {
+            if (mask.Length != rows)
+            {
+                throw new InvalidOperationException(
+                    $"A row predicate returned a mask of {mask.Length} rows for a batch of {rows}.");
+            }
+
+            SelectionMask.AndThreeValued(live, allTrue, rows, mask, default);
+            return true;
+        }
+        finally
+        {
+            Release(mask, view);
         }
     }
 

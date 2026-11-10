@@ -24,6 +24,8 @@ namespace EngineeredWood.DeltaLake.Benchmarks.Rf502;
 [SimpleJob(warmupCount: 3, iterationCount: 12)]
 public class ConjunctSplitBenchmarks
 {
+    internal static readonly string TableRoot = Path.Combine(Path.GetTempPath(), "ew-rf502-conjuncts");
+
     private const int RowsPerGroup = 131_072;
     private const int Files = 4;
     private const int GroupsPerFile = 4;
@@ -37,11 +39,29 @@ public class ConjunctSplitBenchmarks
         "amount < 990",                                         // one conjunct: the split changes nothing
     ];
 
+    /// <summary>How the filter's conjuncts are evaluated.</summary>
+    public enum EvaluationMode
+    {
+        /// <summary>As one AND (3a's behaviour).</summary>
+        Together,
+
+        /// <summary>One predicate per conjunct, each over a gather of the rows still live (phase 4a).</summary>
+        Split,
+
+        /// <summary>Split, and a conjunct that cannot raise is asked about the whole batch whenever any row is live
+        /// (phase 5a with its live-share threshold at 0).</summary>
+        SplitWhole,
+
+        /// <summary>Split, with phase 5a's default threshold.</summary>
+        SplitDefault,
+    }
+
     [ParamsSource(nameof(Filters))]
     public string Filter { get; set; } = "";
 
-    [Params(false, true)]
-    public bool Split { get; set; }
+    [Params(EvaluationMode.Together, EvaluationMode.Split, EvaluationMode.SplitWhole, EvaluationMode.SplitDefault)]
+    public EvaluationMode Mode { get; set; }
+
 
     private DeltaTable _table = null!;
     private Expressions.Predicate _predicate = null!;
@@ -56,13 +76,16 @@ public class ConjunctSplitBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        string root = Path.Combine(Path.GetTempPath(), "ew-rf502-conjuncts");
+        string root = TableRoot;
         if (!Directory.Exists(Path.Combine(root, "_delta_log")))
             Build(root).GetAwaiter().GetResult();
 
         _table = DeltaTable.OpenAsync(new LocalTableFileSystem(root), new DeltaTableOptions { MaxConcurrentReads = 4 })
             .AsTask().GetAwaiter().GetResult();
-        _table.EvaluatesConjunctsTogether = !Split;
+        _table.EvaluatesConjunctsTogether = Mode == EvaluationMode.Together;
+        _table.EvaluatesWholeBatches = Mode is EvaluationMode.SplitWhole or EvaluationMode.SplitDefault;
+        if (Mode == EvaluationMode.SplitWhole)
+            _table.WholeBatchLiveShare = 0;
         _predicate = SparkSqlParser.ParsePredicate(Filter);
         if (Scan().GetAwaiter().GetResult() == 0)
             throw new InvalidOperationException($"{Filter}: no row matched");
@@ -84,7 +107,7 @@ public class ConjunctSplitBenchmarks
         return rows;
     }
 
-    private static async Task Build(string root)
+    internal static async Task Build(string root)
     {
         Directory.CreateDirectory(root);
         var options = new DeltaTableOptions

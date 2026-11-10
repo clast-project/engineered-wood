@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -177,7 +177,7 @@ Then treat it as a prune, and skip the group before any data page is read. If an
 
 Two different Bloom filters are involved, at different layers:
 
-- **A host's runtime join filter** (DuckDB's, per cmettler) is a `RowPredicate`, passed through `DeltaReadOptions.RowMasks`. It is evaluated in pass 1 on the key column only and ANDed into the selection; false positives are left for the host's join to recheck. With `ValueWise` set, it is probed once per dictionary entry rather than once per row, and an all-false table prunes the group under the conditions above. EW's writer stores integers as DELTA_BINARY_PACKED rather than dictionary-encoding them, so integer keys are still probed per row.
+- **A host's runtime join filter** (DuckDB's, per cmettler) is a `RowPredicate`, passed through `DeltaReadOptions.RowMasks`. It is evaluated in pass 1 on the key column only and ANDed into the selection; false positives are left for the host's join to recheck. With `ValueWise` set, it is probed once per dictionary entry rather than once per row, and an all-false table prunes the group under the conditions above. EW's writer dictionary-encodes a chunk of any type, integers included, while it holds under a fifth of its rows in distinct values, and falls back to DELTA_BINARY_PACKED for integers beyond that (corrected in §24; this said integers were never dictionary-encoded). So a key column of many distinct values is still probed per row.
 - **Parquet's own split-block Bloom filters** stay where they are: row-group pruning for `Eq`/`In` in `Prune` (`MightMatchAsync`, opt-in `FilterUseBloomFilters`). They never take part in the row pass. A host with a small build side can also pass `k IN (…)` in `Prune`, and get row-group pruning from the file's dictionaries and Bloom filters before anything is decoded. With a large build side, pass the key range instead.
 
 ## 7. Delta wiring
@@ -216,7 +216,7 @@ DML:
 | 2 | In-decoder selection (port the prototype to the batched path); run/bitmap switch. | `selection-ab` on the batched path; no regression at 99% kept |
 | 3 | *(Split into 3a exact scans, §16; 3b `RowMasks`; 3c DELETE.)* Delta: `FilterRows`, `RowMasks`, deletion vector via `ExcludedRows`, positions-only DELETE. | Delta suites; Spark interop oracle for DELETE counts |
 | 4 | Dictionary evaluation (§6) + `IDeterministicFunctions`. | `OneCategory` profile; the dictionary-error fallback test |
-| 5 | Fusion of same-column conjuncts, adaptive demotion of a predicate that keeps >~95% (evaluate it after pass 2 instead), limit pushdown, then a decision on whether `FilterRows` should default on. | Measured crossover |
+| 5 | Fusion of same-column conjuncts, adaptive demotion of a predicate that keeps >~95% (evaluate it after pass 2 instead), limit pushdown, then a decision on whether `FilterRows` should default on. *(Re-planned in §24 as 5a-5g.)* | Measured crossover |
 
 Phase 1b delivers cmettler's main request: other columns are not decoded for pages with no surviving row. Phase 0 showed this skips almost nothing for scattered selections (§11, F2). Phase 2 is what makes them pay. Ask cmettler to test after each of phases 2 and 3.
 
@@ -844,3 +844,95 @@ Two passes are still gated to object storage (§13; decided 11-09, to be revisit
 As §15 found, two passes win nearly everywhere locally. The exception is a selection that keeps row groups whole or nearly whole (clustered 90%: +24% narrow, +10% wide), where the second pass reads everything the first did not.
 
 **Decided (2026-11-10):** the default stays as it is (two passes for object storage only) until phase 5. Demoting a predicate that keeps nearly every row should remove the clustered-90% regression, and the local default is revisited then. The feature branch does not wait on it.
+
+## 24. Phase 5: the plan, and 5a (2026-11-10)
+
+### The plan
+
+§8 defined phase 5 as fusion of same-column conjuncts, demotion of a predicate that keeps more than about 95% (evaluated after pass 2), limit pushdown, and a decision on `FilterRows`'s default. Reading the code against §19, §22 and §23 found that a predicate keeping nearly every row costs three different things, and that each has a direct fix needing no learned selectivity:
+- **A gather per later predicate (§19).** `BatchSelector` hands each predicate after the first a gather of the rows still live, because a predicate asked about a row an earlier one rejected could raise there. 5a, below.
+- **Carrying dictionary answers for a returned column (§22).** Where the row path is a direct kernel, the dictionary only adds work. 5d.
+- **Two passes run one after the other over row groups kept whole (§23).** On sorted data, row-group statistics prove those groups all-true. 5c drops a predicate for a group whose statistics prove it, as DataFusion does (`RowFilterSkippedFullyMatched`).
+
+**Upstream (2026-11-10).**
+- arrow-rs never reorders or demotes a predicate by observed selectivity. A cost-aware fallback (arrow-rs#9956) was closed unmerged, and the selectivity metrics issue (#8723) is open.
+- arrow-rs fuses consecutive predicates over one flat leaf (#10859).
+- arrow-rs pushes a limit into the last predicate and stops handing out row groups once it is met (#9766).
+- DataFusion orders conjuncts by the compressed size of their columns. Its only adaptivity is statistics-based: a group proven fully matched gets an empty `RowFilter`. Its selectivity-tracking prototypes (#19639, #21752) were closed: one query 17x faster, others 1.26-1.41x slower, total time flat. The epic for it (#22883) is open.
+- Neither project chooses between evaluating over a dictionary and over decoded values.
+
+**The PRs:**
+
+| PR | Content | Measured by |
+|---|---|---|
+| 5a | Whole-batch answers for conjuncts that cannot raise (below) | `ConjunctSplitBenchmarks`, `WholeBatchShareBenchmarks` |
+| 5b | Fusion of same-column conjuncts. It also lets a dictionary answer them: today `category <> 'a' AND category <> 'b'` is asked row by row, since `BatchSelector.Answerable` requires a column read by one predicate | `ValueWiseBenchmarks` plus same-column cases |
+| 5c | A predicate proven `AlwaysTrue` by a row group's statistics is dropped for that group; then the local two-pass default is revisited (§23) | `rowfilter-ab` local and cloud model, `FilteredScanBenchmarks` |
+| 5d | Dictionary or row path for a returned column: profile the +12% first, else row path for a direct kernel | `ValueWiseBenchmarks` with `Returned`, `dictanswer-ab` |
+| 5e | Reordering by observed selectivity, only if a measured gap (a 99% conjunct ahead of a 2% one) exceeds about 10% after 5a | the gap first |
+| 5f | Limit pushdown, only if the read-ahead a consumer's early stop wastes is material | `LIMIT 10` over `LargeScan`, local and cloud model |
+| 5g | The `FilterRows` default. It is also a behaviour change: a filter that today only prunes would be evaluated with ANSI rules, and could raise | the above, against the post-filter |
+
+"Demote, and evaluate after pass 2" (§8) is replaced by 5a and 5c. Chunks that mix dictionary and PLAIN pages, or lack `encoding_stats`, are #804.
+
+### 5a: what it does
+
+- **`ArrowRowEvaluator.TryEvaluateWithoutRaising`** (public) answers a predicate for every row of a batch, or declines without reading a value. It answers only by a path on which no value can raise:
+  - a comparison of a column with a constant that the direct kernels answer (#560). They read the column's buffers and never convert a row's value, and a coercion that would cast the column declines;
+  - `IS [NOT] NULL` of a column;
+  - AND, OR and NOT of these. Every operand is evaluated over every row, so AND and OR are Kleene's, which is what the short-circuiting evaluation answers too.
+
+  Analysis errors still raise, as they would over any rows. `MayEvaluateWithoutRaising` says from the form alone whether it can ever answer. The method is public rather than internal because an `Expressions.Arrow` IVT to `DeltaLake.Table` leaks PolySharp's polyfills.
+- **`RowPredicate.EvaluateWholeBatch`** (internal) carries it to the reader. When at least `WholeBatchLiveShare` of a batch's rows are still live (default 0.4), `BatchSelector` asks the predicate about the whole batch rather than a gather of the live rows. Its answers for rows no longer live change nothing, exactly as with dictionary answers (§20). A decline falls back to the gather.
+- **Delta** offers it for each run of filter conjuncts, and for an expression DELETE, whose deletion vector leaves most rows live, when the form can answer. The batch is first brought to the table's shape, as `ConditionMask` does. That renames columns, widens types losslessly, and adds partition values and NULLs, none of which raises on a value.
+- **Knobs (internal):** `DeltaTable.EvaluatesWholeBatches`, `DeltaTable.WholeBatchLiveShare` and `ParquetFileReader.WholeBatchLiveShare`, all per instance.
+
+### Measured
+
+`WholeBatchShareBenchmarks` (Delta benchmarks): `ConjunctSplitBenchmarks`'s table, `amount < X AND <second>`, scan returns `id`, `MaxConcurrentReads` 4, dictionary answers off. i9-12900K, net10.0, BenchmarkDotNet, 2 launches x 25 iterations. "Live" is the share `amount < X` leaves for the second conjunct.
+
+| Live | `qty < 99` (nullable INT32): gather / whole | Change | `id >= 0` (INT64): gather / whole | Change |
+|---|---|---|---|---|
+| 5% | 7.6 / 7.8 ms | +3% | 6.2 / 6.7 ms | +7% |
+| 10% | 8.4 / 8.3 ms | -1% | 7.0 / 7.1 ms | +2% |
+| 25% | 10.0 / 10.9 ms | +9% | 8.5 / 8.5 ms | 0% |
+| 40% | 12.6 / 11.2 ms | -11% | 11.2 / 9.7 ms | -13% |
+| 50% | 14.0 / 11.2 ms | -20% | 12.3 / 10.3 ms | -16% |
+| 60% | 14.5 / 11.5 ms | -21% | 11.7 / 10.5 ms | -10% |
+| 75% | 15.3 / 12.1 ms | -21% | 12.6 / 11.3 ms | -10% |
+| 90% | 17.0 / 13.1 ms | -23% | 14.4 / 11.5 ms | -20% |
+
+Hence the default of 0.4. The whole batch also allocates 18-32% less managed memory from 40% live up.
+
+`ConjunctSplitBenchmarks`, §19's regression (12 iterations; "whole" asks for the whole batch at any live share):
+
+| Filter | Kept | Together | Split | Split, whole |
+|---|---|---|---|---|
+| `amount < 990 AND qty < 99 AND id >= 0` | 94% | 20.6 ms | 18.2 ms | 15.3 ms |
+
+Splitting now costs less than evaluating together at 94% kept: -26%, where §19 measured +12%. Since 4b, the benchmark's other filters reach no gather that 5a removes: `qty` (100 values) and `category` are dictionary-encoded and answered from their dictionaries. Its 2-conjunct rows therefore moved only within noise (±2 ms at 12 iterations), and the sweep above turns dictionary answers off for that reason.
+
+### Tests
+
+- `WholeBatchEvaluationTests` (Expressions.Arrow):
+  - Every case of `DirectColumnComparisonTests`' sweep under three evaluators (plain, ANSI, legacy) is answered as the general path answers, or declined, never raised except for an analysis error.
+  - 14 compound forms answer or decline as expected.
+  - A string column against a number under ANSI declines without raising.
+- `SelectedReadTests` (Parquet):
+  - The oracle sweep with whole-batch answers at any live share (8 filters x serial and parallel x one and two passes, 5% excluded).
+  - The threshold decides which path a predicate is asked by (whole: every row, gathered never; below: live rows only).
+  - A decline falls back to the live rows.
+  - A whole mask of the wrong length is refused.
+- `ValueWiseTests` (Delta):
+  - 5 filters x 2 concurrencies x 2 projections return the same rows with whole-batch answers on and off, and are offered them.
+  - `code <> 'x' AND CAST(code AS INT) > 3` over live 'x' rows never raises.
+  - 3 DELETEs match the same rows either way, offered exactly when the form can answer.
+
+Each of these mutations fails tests:
+- Delta offering every conjunct whole, through the evaluator that raises (5);
+- Delta never offering (7);
+- the reader ignoring its threshold (2);
+- the reader's live and all-true bitmaps swapped for whole answers (8);
+- Kleene NULL dropped (4);
+- a declined comparison answered by the general path (3);
+- `IS NULL` of any operand taken (1).
