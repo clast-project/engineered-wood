@@ -44,6 +44,12 @@ internal sealed class DictionaryAnswer
     private byte[]? _table;
     private byte _nullAnswer;
 
+    // The table as two bits per entry, for Map's inner loop: TRUE, and known (not NULL). And whether any entry, or the
+    // NULL row, answers NULL, which is what decides whether the answers need a validity bitmap at all.
+    private byte[] _trueBits = [];
+    private byte[] _knownBits = [];
+    private bool _anyNull;
+
     /// <param name="predicates">The predicates, value-wise, over this one column: a run whose answers are their Kleene AND
     /// (see <see cref="AnswerPlan"/>).</param>
     /// <param name="column">The column: a flat leaf.</param>
@@ -171,6 +177,16 @@ internal sealed class DictionaryAnswer
 
             _table = answers.AsSpan(0, entries).ToArray();
             _nullAnswer = nullable ? answers[entries] : Null;
+            _trueBits = new byte[entries];
+            _knownBits = new byte[entries];
+            _anyNull = false;
+            for (int i = 0; i < entries; i++)
+            {
+                _trueBits[i] = _table[i] == True ? (byte)1 : (byte)0;
+                _knownBits[i] = _table[i] == Null ? (byte)0 : (byte)1;
+                _anyNull |= _table[i] == Null;
+            }
+
             return true;
         }
         finally
@@ -179,33 +195,100 @@ internal sealed class DictionaryAnswer
         }
     }
 
-    /// <summary>The answer for each row of <paramref name="indices"/> (NULL for a NULL row): a column of answers.</summary>
-    internal BooleanArray Map(Int32Array indices)
+    /// <summary>
+    /// The answer for each of <paramref name="rows"/> rows, from the dictionary indices of its non-NULL values
+    /// (<paramref name="denseIndices"/>, in row order) and, for a nullable column, every row's definition level: a row
+    /// below <paramref name="maxDefinitionLevel"/> is NULL and gets the NULL row's answer. One pass, eight rows to a
+    /// byte, without spreading the indices into an array of their own first (#502 phase 5d).
+    /// </summary>
+    internal BooleanArray Map(
+        ReadOnlySpan<int> denseIndices, ReadOnlySpan<byte> definitionLevels, int maxDefinitionLevel, int rows)
     {
-        var table = _table ?? throw new InvalidOperationException("The dictionary has not been evaluated.");
-        int length = indices.Length;
-        int bytes = (length + 7) / 8;
-        var values = new byte[bytes];
-        var validity = new byte[bytes];
-        int nulls = 0;
-        var keys = indices.Values;
-        bool anyNullRow = indices.NullCount != 0;
-        for (int i = 0; i < length; i++)
-        {
-            byte answer = anyNullRow && indices.IsNull(i) ? _nullAnswer : table[keys[i]];
-            if (answer == Null)
-            {
-                nulls++;
-                continue;
-            }
+        if (_table is null)
+            throw new InvalidOperationException("The dictionary has not been evaluated.");
 
-            validity[i >> 3] |= (byte)(1 << (i & 7));
-            if (answer == True)
-                values[i >> 3] |= (byte)(1 << (i & 7));
+        bool nullRows = denseIndices.Length != rows;
+        if (nullRows && definitionLevels.Length < rows)
+            throw new InvalidOperationException($"{denseIndices.Length} values for {rows} rows, with no definition levels.");
+
+        int bytes = (rows + 7) / 8;
+        var values = new byte[bytes];
+        byte nullTrue = _nullAnswer == True ? (byte)1 : (byte)0;
+        byte nullKnown = _nullAnswer == Null ? (byte)0 : (byte)1;
+        bool needValidity = _anyNull || (nullRows && nullKnown == 0);
+        var validity = needValidity ? new byte[bytes] : null;
+        var trueBits = _trueBits;
+        var knownBits = _knownBits;
+        int known = 0;
+
+        if (!nullRows)
+        {
+            // Every row has a value: its answer is its entry's.
+            for (int b = 0, row = 0; b < bytes; b++)
+            {
+                int end = Math.Min(8, rows - row);
+                int v = 0, k = 0;
+                for (int bit = 0; bit < end; bit++, row++)
+                {
+                    int index = denseIndices[row];
+                    v |= trueBits[index] << bit;
+                    k |= knownBits[index] << bit;
+                }
+
+                values[b] = (byte)v;
+                if (validity is not null)
+                {
+                    validity[b] = (byte)k;
+                    known += BitsSet(k);
+                }
+            }
+        }
+        else
+        {
+            for (int b = 0, row = 0, next = 0; b < bytes; b++)
+            {
+                int end = Math.Min(8, rows - row);
+                int v = 0, k = 0;
+                for (int bit = 0; bit < end; bit++, row++)
+                {
+                    if (definitionLevels[row] == maxDefinitionLevel)
+                    {
+                        int index = denseIndices[next++];
+                        v |= trueBits[index] << bit;
+                        k |= knownBits[index] << bit;
+                    }
+                    else
+                    {
+                        v |= nullTrue << bit;
+                        k |= nullKnown << bit;
+                    }
+                }
+
+                values[b] = (byte)v;
+                if (validity is not null)
+                {
+                    validity[b] = (byte)k;
+                    known += BitsSet(k);
+                }
+            }
         }
 
+        int nulls = validity is null ? 0 : rows - known;
         return new BooleanArray(
-            new ArrowBuffer(values), nulls == 0 ? ArrowBuffer.Empty : new ArrowBuffer(validity), length, nulls, 0);
+            new ArrowBuffer(values), nulls == 0 ? ArrowBuffer.Empty : new ArrowBuffer(validity!), rows, nulls, 0);
+    }
+
+    // The set bits of one byte's worth of answers.
+    private static int BitsSet(int b)
+    {
+#if NET
+        return System.Numerics.BitOperations.PopCount((uint)b);
+#else
+        // netstandard2.0's BitOperations (from a polyfill package) has no PopCount: the SWAR count.
+        b -= (b >> 1) & 0x55;
+        b = (b & 0x33) + ((b >> 2) & 0x33);
+        return (b + (b >> 4)) & 0x0F;
+#endif
     }
 
     // Kleene AND of two answers.

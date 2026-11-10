@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24, 5b in §25, 5c in §26. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24, 5b in §25, 5c in §26, 5d in §27. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -781,7 +781,7 @@ A predicate over a column the read returns is now answerable too (`AnswerPlan.Ke
 Where the row path is a direct kernel (`=`, `<>`), the column is decoded either way, and answering from the dictionary saves only the kernel's compare. Mapping the indices and carrying the answers cost about as much, and at 94% kept a little more. Where the row path is slow (`IN`, a function call, a host delegate), the dictionary wins as it does for a dropped column.
 
 **Left for later:**
-- **Choosing between the two paths:** picking the row path when its predicate is a direct kernel needs a cost the reader does not have. That is phase 5's.
+- **Choosing between the two paths:** picking the row path when its predicate is a direct kernel needs a cost the reader does not have. That is phase 5's. *(Resolved in §27 without a choice: once the answers are mapped in one pass, the dictionary path is never slower than the row path beyond noise.)*
 - **Materializing only the selected rows:** building a returned column's values for the selected rows alone (§6, step 3) would also help `=`. It needs the indices carried to the gather, and a second pass that can hand on a column it does not gather.
 
 ### Tests
@@ -1103,3 +1103,60 @@ Each of these mutations fails tests:
 Two traps found while writing it:
 - **The DATE literal.** Copilot's example, `part = DATE'2020-01-01' OR ...`, is never offered a proof whatever the fix: a DATE literal parses as a cast, which `EvaluatesEverywhere` refuses. The test uses `IS NULL`, which also decodes the value.
 - **INT literals.** The test needed a BIGINT literal (`0L`) for its other branch to be proven at all. Every earlier Delta-level proof test had the same flaw, now corrected (see Tests).
+
+## 27. Phase 5d: mapping dictionary answers in one pass (2026-11-10)
+
+### What was wrong
+
+§22 left a choice for phase 5: answer a returned column from its dictionary, or ask its rows, since a returned `<>` was 12% slower answered. 5b found a returned integer run 12-13% slower too. A new benchmark showed the problem was wider than returned columns. Over an integer column, a dictionary answer was slower even for a column the read drops:
+
+`ReturnedAnswerBenchmarks` (new, Delta benchmarks): `ConjunctSplitBenchmarks`'s table, one conjunct, `MaxConcurrentReads` 4, 2 launches x 20 iterations, i9-12900K, net10.0. `qty` is INT32 with 100 values (5% NULL); `category` is a string with 16 values.
+
+| Filter | Column | Rows | Dictionary, before | Dictionary, after | After vs rows |
+|---|---|---|---|---|---|
+| `qty < 20` (19%) | dropped | 7.0 ms | 8.9 ms (+27%) | 5.7 ms | -18% |
+| `qty < 20` | returned | 7.3 ms | 10.9 ms (+48%) | 7.6 ms | 0% |
+| `qty <> 7` (94%) | dropped | 10.3 ms | 12.8 ms (+24%) | 9.9 ms | -5% |
+| `qty <> 7` | returned | 13.0 ms | 16.0 ms (+23%) | 13.2 ms | +1% |
+| `category = 'cat_03'` (6%) | dropped | 7.1 ms | 4.5 ms (-36%) | 3.9 ms | -44% |
+| `category = 'cat_03'` | returned | 7.2 ms | 7.8 ms (+9%) | 7.3 ms | 0% |
+| `category <> 'cat_03'` (94%) | dropped | 12.5 ms | 9.4 ms (-24%) | 9.2 ms | -26% |
+| `category <> 'cat_03'` | returned | 14.0 ms | 15.2 ms (+9%) | 13.8 ms | -4% |
+
+4b-4d measured only `category`, where the string comparison the dictionary saves is expensive enough to hide the cost. Every value-wise filter over a low-cardinality integer column had been 23-48% slower than asking its rows.
+
+### The cause, and the fix
+
+An answered chunk paid two passes over its rows that the row path does not:
+1. `ArrowArrayBuilder.Build` spread the indices of its non-NULL values over the rows, by definition level, into an `Int32Array` with a validity bitmap.
+2. `Map` walked that array with a three-way branch per row.
+
+For an integer column, the comparison the dictionary saves is one cheap pass, so two passes lost.
+
+`DictionaryAnswer.Map` now builds the answers straight from the dense indices and the definition levels, in one pass, eight rows to a byte:
+- `Prepare` turns the lookup table into a TRUE bit and a known (not NULL) bit per entry.
+- A column with no NULL row takes a loop with no definition levels at all.
+- A validity bitmap is built only when some entry, or the NULL row, answers NULL.
+
+The returned-column path (4d) maps from its index sink the same way, and no longer copies the definition levels into it. Nothing chooses between the paths: the dictionary is never slower than the rows beyond noise, and it keeps its large wins for `IN`, functions and host delegates.
+
+5b's returned integer run, `FusionBenchmarks` (2 launches x 20 iterations), fused against separate:
+
+| Filter | Column | Before 5d | After 5d |
+|---|---|---|---|
+| `qty >= 10 AND qty < 20` (10%) | dropped | -2% | -29% (5.4 vs 7.7 ms) |
+| same | returned | +13% | **-20%** (6.5 vs 8.1 ms) |
+| `qty >= 10 AND qty < 90` (80%) | dropped | | -23% (8.8 vs 11.4 ms) |
+| same | returned | +12% | **-8%** (12.5 vs 13.6 ms) |
+
+### Tests
+
+- `DictionaryAnswerTests`: a column with no NULL row (`k`, INT32 with 1,000 values; `w`, 1,500 strings), dropped and returned, batched and not, returns the rows its predicate asked row by row selects, answered once per row group.
+- The existing sweeps (nullable `s`, NULL answers, runs, view types, narrowed reads) cover the path with definition levels. The netstandard2.0 build counts bits without `BitOperations.PopCount`; its fallback is checked against every byte, and the suite runs on net472.
+
+Each of these mutations fails tests:
+- a NULL row answered FALSE whatever the NULL row's answer (48);
+- definition levels ignored (112);
+- no validity bitmap (42);
+- a null count of 0 with a bitmap (42);
+- the TRUE bit read from the known table (6, once the no-NULL test existed; every earlier column held NULLs, so the no-NULL loop was never run).

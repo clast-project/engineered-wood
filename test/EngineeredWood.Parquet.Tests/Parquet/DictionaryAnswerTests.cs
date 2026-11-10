@@ -519,6 +519,45 @@ public class DictionaryAnswerTests : IDisposable
         Assert.Equal(Rows - excluded!.Count, firstLengths.Where(n => n > 8).Sum());
     }
 
+    // ---- Columns without NULLs (#502 phase 5d) ----------------------------------------------------------------
+
+    /// <summary>
+    /// A column with no NULL row is mapped by Map's dense path: every row's answer is its entry's. An integer column
+    /// (<c>k</c>, 1,000 values) and a string one (<c>w</c>, 1,500), dropped or returned, batched or not, answer the rows
+    /// the predicate asked row by row selects.
+    /// </summary>
+    [Theory]
+    [InlineData("k", false, false)]
+    [InlineData("k", true, false)]
+    [InlineData("k", false, true)]
+    [InlineData("k", true, true)]
+    [InlineData("w", false, false)]
+    [InlineData("w", true, true)]
+    public async Task AColumnWithoutNullsIsAnsweredAsItsRowsAre(string column, bool batched, bool returned)
+    {
+        string path = await WriteFileAsync();
+        var options = new ParquetReadOptions { BatchSize = batched ? 2_500 : null };
+        string[] projection = returned ? ["id", column] : ["id"];
+        RowPredicate Predicate(bool valueWise, ConcurrentBag<int> lengths) => column == "k"
+            ? new RowPredicate(["k"], batch =>
+            {
+                lengths.Add(batch.Length);
+                return Map((Int32Array)batch.Column(0), v => v < 300 || v % 7 == 0);
+            }) { ValueWise = valueWise }
+            : Over("w", v => v is not null && (v.EndsWith("7", StringComparison.Ordinal) || v.Length < 4), valueWise, lengths);
+
+        var expected = await ReadAsync(path, options,
+            new ParquetScan { Columns = projection, RowFilter = new RowFilter(Predicate(valueWise: false, new())) }, twoPass: false);
+        var lengths = new ConcurrentBag<int>();
+        var actual = await ReadAsync(path, options,
+            new ParquetScan { Columns = projection, RowFilter = new RowFilter(Predicate(valueWise: true, lengths)) }, twoPass: false);
+
+        Assert.Equal(expected, actual);
+        Assert.NotEmpty(expected);
+        Assert.True(expected.Count < Rows);
+        Assert.Equal(Rows / RowsPerGroup, lengths.Count); // answered from each row group's dictionary
+    }
+
     // ---- Helpers --------------------------------------------------------------------------------------------
 
     private static bool IsBad(int row) => row % 1_000 == 3;
