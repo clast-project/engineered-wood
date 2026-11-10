@@ -84,6 +84,12 @@ public sealed partial class ParquetFileReader
     internal double WholeBatchLiveShare { get; set; } = BatchSelector.DefaultWholeBatchLiveShare;
 
     /// <summary>
+    /// Whether adjacent value-wise predicates over one column are answered from its dictionary together (#502 phase 5b);
+    /// off, a column two predicates read is asked row by row, as before. For tests and the A/B.
+    /// </summary>
+    internal bool FusesAnswers { get; set; } = true;
+
+    /// <summary>
     /// Everything a selected read of <paramref name="scan"/> decides once, before any row group: the columns it
     /// decodes, how it selects rows, whether it may go in two passes. A caller that schedules row groups itself (a
     /// Delta scan, which plans them with <see cref="PlanRowGroupsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken, int, int)"/>)
@@ -101,7 +107,8 @@ public sealed partial class ParquetFileReader
         var selector = new BatchSelector(
             scan.RowFilter, scan.ExcludedRows, dropped,
             new HashSet<string>(schema.Root.Children.Select(c => c.Name), StringComparer.Ordinal),
-            WholeBatchLiveShare);
+            WholeBatchLiveShare,
+            FusesAnswers);
         var twoPass = TwoPassColumnsFor(schema, readColumns, dropped, scan.RowFilter, _options);
         RowSkipPredicate? skipRows = scan.ExcludedRows is { } excluded ? excluded.ExcludesAll : null;
         return new SelectedPlanReader(this, metadata, readColumns, selector, twoPass, skipRows);

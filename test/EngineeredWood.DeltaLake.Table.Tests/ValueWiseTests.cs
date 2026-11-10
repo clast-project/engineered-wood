@@ -72,6 +72,10 @@ public class ValueWiseTests : IDisposable
         ["p = 'q1' AND cat = 'c4'"],
         // 'x' is only on deleted rows: asking the dictionary raises, and the rows are asked instead.
         ["CAST(code AS INT) > 3"],
+        // Adjacent conjuncts over one column, answered together (#502 phase 5b).
+        ["cat <> 'c2' AND cat <> 'c5'"],
+        ["cat >= 'c2' AND cat < 'c6' AND id > 100"],
+        ["cat IS NOT NULL AND lower(cat) <> 'c3'"],
     ];
 
     [Theory]

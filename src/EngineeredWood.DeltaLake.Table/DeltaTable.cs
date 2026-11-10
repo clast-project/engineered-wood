@@ -5229,6 +5229,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 file, ownsFile: false, _dataFileReadOptions)
             {
                 WholeBatchLiveShare = WholeBatchLiveShare,
+                FusesAnswers = FusesAnswers,
             };
 
             var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
@@ -13267,6 +13268,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             reader = new ParquetFileReader(file, ownsFile: false, _dataFileReadOptions)
             {
                 WholeBatchLiveShare = WholeBatchLiveShare,
+                FusesAnswers = FusesAnswers,
             };
 
             // The footer, read here whether or not the columns need resolving against it: every read of the file
@@ -13731,6 +13733,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// of a batch's rows that must still be live for a predicate to be asked about the whole batch.
     /// </summary>
     internal double WholeBatchLiveShare { get; set; } = BatchSelector.DefaultWholeBatchLiveShare;
+
+    /// <summary>
+    /// <see cref="ParquetFileReader.FusesAnswers"/> for this table's data-file reads: whether adjacent value-wise conjuncts
+    /// over one column are answered from its dictionary together (#502 phase 5b). On by default; off for the A/B and as
+    /// the tests' oracle.
+    /// </summary>
+    internal bool FusesAnswers { get; set; } = true;
 
     /// <summary>One answer for every row of a batch.</summary>
     private static BooleanArray Repeat(bool answer, int length)

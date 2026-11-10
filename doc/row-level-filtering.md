@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24, 5b in §25. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -962,3 +962,56 @@ Round 2 was the same pattern on empty batches. The cause was the contract, not t
 - a decline is not a verdict.
 
 A separate analysis pass before each decline was rejected: it would cost the fast path on every batch, and change nothing a reader returns. Round 2's code stays: answering an empty batch through `EvaluatePredicate` is correct, just no longer needed by the contract.
+
+## 25. Phase 5b: a run of conjuncts over one column, answered from its dictionary (2026-11-10)
+
+### What it does
+
+Before 5b, a column read by two predicates was never answered from its dictionary (`BatchSelector.Answerable` required a single reader). `category <> 'a' AND category <> 'b'` was therefore asked row by row: two string comparisons per row, and a gather for the second.
+
+Now the reader groups a **run** of adjacent value-wise predicates over the same single column, none of which drops earlier NULLs, into one `AnswerPlan`. The column is answerable when its run is every predicate that reads it.
+- **Evaluating the run.** `DictionaryAnswer` evaluates each predicate of the run over the dictionary and keeps their Kleene AND per entry: FALSE if any answers FALSE, else NULL if any answers NULL, else TRUE.
+- **Applying it.** `BatchSelector` applies the answers at the run's first predicate through `AndThreeValued`, as for one predicate, and skips the rest. That is what asking them in turn decides: a row any of them answers FALSE is dropped, and a row answered NULL stays live for the predicates after the run but is never returned.
+- **Errors.** Any predicate that raises over the dictionary makes the whole run decline, and the rows are asked as before.
+
+**The fusion is in the reader, not in Delta.** One AND predicate built in Delta would go through the evaluator's general `EvalAnd`, which §19 measured slower than split conjuncts, and would bypass 5a's whole-batch path on chunks that are not dictionary-encoded. In the reader, a run's predicates stay separate wherever no dictionary answers them. This is arrow-rs#10859's fusion (consecutive predicates over one leaf), applied to dictionary answers.
+
+**Only adjacent predicates.** Answering a later predicate where the first of the run stands would hide rows from the predicates between them, and with those rows the errors they would raise. A run is also cut at a predicate that drops earlier NULLs: a host mask is its own condition.
+
+**Knobs (internal):** `ParquetFileReader.FusesAnswers` and `DeltaTable.FusesAnswers`, on by default.
+
+### Measured
+
+`FusionBenchmarks` (new, Delta benchmarks): `ConjunctSplitBenchmarks`'s table, scan returns `id` (the filtered column dropped) or `id` and the filtered column (returned), `MaxConcurrentReads` 4. i9-12900K, net10.0, BenchmarkDotNet, 15 iterations.
+- `Rows`: dictionary answers off.
+- `Separate`: answers on, fusion off. This is how the code behaved before 5b: the run is asked row by row.
+- `Fused`: 5b.
+
+| Filter | Kept | Column | Rows | Separate | Fused | Fused vs separate |
+|---|---|---|---|---|---|---|
+| `category <> 'cat_03' AND category <> 'cat_07'` | 88% | dropped | 13.0 ms | 14.0 ms | 9.3 ms | -34% |
+| same, and `<> 'cat_11'` | 81% | dropped | 13.4 ms | 13.4 ms | 9.1 ms | -32% |
+| `category >= 'cat_04' AND category < 'cat_08'` | 25% | dropped | 15.8 ms | 15.6 ms | 6.7 ms | -57% |
+| `category <> 'cat_03' AND category <> 'cat_07'` | 88% | returned | 15.4 ms | 14.9 ms | 14.7 ms | -1% |
+| same, and `<> 'cat_11'` | 81% | returned | 16.0 ms | 15.9 ms | 15.7 ms | -1% |
+| `category >= 'cat_04' AND category < 'cat_08'` | 25% | returned | 16.6 ms | 16.7 ms | 9.9 ms | -40% |
+| `qty >= 10 AND qty < 20` | 10% | dropped | 7.9 ms | 7.7 ms | 7.5 ms | -2% |
+| `qty >= 10 AND qty < 20` | 10% | returned | 7.9 ms | 7.8 ms | 9.9 ms | +27% (rerun: +13%) |
+| `amount > 100 AND amount < 900` (control: not dictionary-encoded) | 80% | either | | | | within noise |
+
+**A returned integer column costs about 12% more answered from its dictionary.** A focused rerun (2 launches x 30 iterations, `qty` returned) measured 8.2 against 9.2 ms at 10% kept (+13%) and 13.4 against 15.0 ms at 80% (+12%). That is §22's cost: building a returned column's values beside its answers costs more than a direct integer kernel saves. Fusion adds no new kind of cost. A lone `qty < 20` over a returned `qty` has paid it since 4d; runs now pay it too. Choosing between the paths for a returned column is 5d's, and these numbers shape it: returned integers lose about 12%, returned strings break even on `<>` and win 40% on a range.
+
+### Tests
+
+- `DictionaryAnswerTests` (Parquet):
+  - A run oracle sweep: 4 runs of 2-3 predicates (`<>`/`<>`, a range, NULL answers that a later member turns FALSE, `IS NULL` then nothing) x {one batch, batched} x {one pass, two} x {serial, parallel with 5% excluded}, dropped and returned. Each returns the same rows as the predicates asked row by row; each member is asked once per row group over the 50 entries and the NULL; and a predicate after the run sees the same rows.
+  - A run whose second predicate raises over an entry only an excluded row holds declines, and is asked row by row; with that row live, it raises.
+  - Asked row by row when two predicates over the column are not adjacent, when a predicate that drops earlier NULLs is between them, and when fusion is off.
+- `ValueWiseTests` (Delta): 3 same-column filters (`<>`/`<>`, a range then another column, `IS NOT NULL` then `lower`) return the same rows with dictionary answers on and off.
+
+Each of these mutations fails tests:
+- only the run's first predicate evaluated (50);
+- NULL combined as TRUE (64);
+- a predicate dropping earlier NULLs joining the run (1);
+- the run's later predicates asked as well (48);
+- the switch ignored (1).

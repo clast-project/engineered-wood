@@ -35,7 +35,7 @@ internal sealed class DictionaryAnswer
     /// <summary>The field the indices are built as.</summary>
     internal static readonly Field IndexField = new("indices", Int32Type.Default, nullable: true);
 
-    private readonly RowPredicate _predicate;
+    private readonly IReadOnlyList<RowPredicate> _predicates;
     private readonly ColumnDescriptor _column;
     private readonly Field _field;
     private readonly Func<Field, IArrowArray, (Field Field, IArrowArray Array)> _restore;
@@ -44,7 +44,8 @@ internal sealed class DictionaryAnswer
     private byte[]? _table;
     private byte _nullAnswer;
 
-    /// <param name="predicate">The predicate: value-wise, over this one column.</param>
+    /// <param name="predicates">The predicates, value-wise, over this one column: a run whose answers are their Kleene AND
+    /// (see <see cref="AnswerPlan"/>).</param>
     /// <param name="column">The column: a flat leaf.</param>
     /// <param name="field">The column's Arrow field as the read builds it.</param>
     /// <param name="restore">What the read does to a built column before it is returned (the declared time
@@ -52,10 +53,10 @@ internal sealed class DictionaryAnswer
     /// <param name="rows">The rows the answers are for: a dictionary at least this large is not evaluated.</param>
     /// <param name="keepValues">The read returns the column: its values are decoded too (#502 phase 4d).</param>
     internal DictionaryAnswer(
-        RowPredicate predicate, ColumnDescriptor column, Field field,
+        IReadOnlyList<RowPredicate> predicates, ColumnDescriptor column, Field field,
         Func<Field, IArrowArray, (Field Field, IArrowArray Array)> restore, int rows, bool keepValues = false)
     {
-        _predicate = predicate;
+        _predicates = predicates;
         _column = column;
         _field = field;
         _restore = restore;
@@ -94,10 +95,10 @@ internal sealed class DictionaryAnswer
         };
 
     /// <summary>
-    /// Evaluates the predicate over <paramref name="dictionary"/>'s values, and over one NULL when the column is
-    /// nullable. False, leaving the chunk to be read as values, when there is no dictionary, when it holds at
-    /// least as many entries as the rows to answer, or when the predicate raises or returns a mask of the wrong
-    /// length.
+    /// Evaluates every predicate over <paramref name="dictionary"/>'s values, and over one NULL when the column is
+    /// nullable, and keeps their Kleene AND per entry. False, leaving the chunk to be read as values, when there is no
+    /// dictionary, when it holds at least as many entries as the rows to answer, or when a predicate raises or returns
+    /// a mask of the wrong length.
     /// </summary>
     internal bool Prepare(DictionaryDecoder? dictionary)
     {
@@ -137,35 +138,40 @@ internal sealed class DictionaryAnswer
 
         try
         {
-            BooleanArray mask;
-            try
+            // Every entry starts TRUE; each predicate's answer is ANDed in (Kleene: FALSE wins, then NULL).
+            var answers = new byte[rows];
+            answers.AsSpan().Fill(True);
+            foreach (var predicate in _predicates)
             {
-                mask = _predicate.Evaluate(batch);
-            }
-            catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
-            {
-                // An entry no row may use can raise (a cast of a value since deleted): the rows decide.
-                return false;
-            }
-
-            if (mask is null)
-                return false;
-            try
-            {
-                if (mask.Length != rows)
+                BooleanArray mask;
+                try
+                {
+                    mask = predicate.Evaluate(batch);
+                }
+                catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
+                {
+                    // An entry no row may use can raise (a cast of a value since deleted): the rows decide.
                     return false;
+                }
 
-                var table = new byte[entries];
-                for (int i = 0; i < entries; i++)
-                    table[i] = AnswerOf(mask, i);
-                _nullAnswer = nullable ? AnswerOf(mask, entries) : Null;
-                _table = table;
-                return true;
+                if (mask is null)
+                    return false;
+                try
+                {
+                    if (mask.Length != rows)
+                        return false;
+                    for (int i = 0; i < rows; i++)
+                        answers[i] = And(answers[i], AnswerOf(mask, i));
+                }
+                finally
+                {
+                    BatchSelector.Release(mask, batch);
+                }
             }
-            finally
-            {
-                BatchSelector.Release(mask, batch);
-            }
+
+            _table = answers.AsSpan(0, entries).ToArray();
+            _nullAnswer = nullable ? answers[entries] : Null;
+            return true;
         }
         finally
         {
@@ -201,6 +207,9 @@ internal sealed class DictionaryAnswer
         return new BooleanArray(
             new ArrowBuffer(values), nulls == 0 ? ArrowBuffer.Empty : new ArrowBuffer(validity), length, nulls, 0);
     }
+
+    // Kleene AND of two answers.
+    private static byte And(byte a, byte b) => a == False || b == False ? False : a == Null || b == Null ? Null : True;
 
     private static byte AnswerOf(BooleanArray mask, int i) => mask.GetValue(i) switch
     {

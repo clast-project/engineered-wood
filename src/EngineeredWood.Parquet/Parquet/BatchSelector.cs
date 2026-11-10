@@ -16,27 +16,35 @@ namespace EngineeredWood.Parquet;
 /// <param name="fileColumns">The file's top-level column names, when known: a returned column is not answered from
 /// its dictionary if its answer column's name is one of them (review round 1).</param>
 /// <param name="wholeBatchLiveShare">See <see cref="DefaultWholeBatchLiveShare"/>.</param>
+/// <param name="fusesAnswers">Whether adjacent value-wise predicates over one column are answered from its dictionary
+/// together (#502 phase 5b); see <see cref="AnswerPlan"/>.</param>
 internal sealed class BatchSelector(
     RowFilter? filter, IExcludedRows? excluded, IReadOnlyCollection<string> dropped,
-    IReadOnlyCollection<string>? fileColumns = null, double wholeBatchLiveShare = BatchSelector.DefaultWholeBatchLiveShare)
+    IReadOnlyCollection<string>? fileColumns = null, double wholeBatchLiveShare = BatchSelector.DefaultWholeBatchLiveShare,
+    bool fusesAnswers = true)
 {
     /// <summary>
-    /// The predicates the reader may answer from a column chunk's dictionary (#502 phases 4b and 4d), by the column
-    /// each reads: value-wise, over that one column, which no other predicate reads. The reader decides per chunk
-    /// whether it does (Data.DictionaryAnswer); a batch column of answers says it did. For a column the read drops,
-    /// the answers stand in its place; for one it returns, they come as an extra column
+    /// The predicates the reader may answer from a column chunk's dictionary (#502 phases 4b, 4d and 5b), by the column
+    /// they read: a run of adjacent value-wise predicates over that one column, which no other predicate reads. The
+    /// reader decides per chunk whether it does (Data.DictionaryAnswer); a batch column of answers says it did. For a
+    /// column the read drops, the answers stand in its place; for one it returns, they come as an extra column
     /// (<see cref="Data.DictionaryAnswer.AnswerColumnName"/>), which the read drops.
     /// </summary>
-    public IReadOnlyDictionary<string, AnswerPlan>? Answerable { get; } = AnswerableOf(filter, dropped, fileColumns);
+    public IReadOnlyDictionary<string, AnswerPlan>? Answerable { get; } =
+        AnswerableOf(filter, dropped, fileColumns, fusesAnswers);
 
     // The columns the read drops: the predicates' own, and the answer columns of returned ones.
-    private readonly IReadOnlyCollection<string> _dropped = DroppedWithAnswers(dropped, filter, fileColumns);
+    private readonly IReadOnlyCollection<string> _dropped = DroppedWithAnswers(dropped, filter, fileColumns, fusesAnswers);
 
     private static IReadOnlyCollection<string> DroppedWithAnswers(
-        IReadOnlyCollection<string> dropped, RowFilter? filter, IReadOnlyCollection<string>? fileColumns)
+        IReadOnlyCollection<string> dropped, RowFilter? filter, IReadOnlyCollection<string>? fileColumns, bool fuse)
     {
-        if (AnswerableOf(filter, dropped, fileColumns) is not { } answerable || answerable.Values.All(p => !p.KeepValues))
+        if (AnswerableOf(filter, dropped, fileColumns, fuse) is not { } answerable
+            || answerable.Values.All(p => !p.KeepValues))
+        {
             return dropped;
+        }
+
         var all = new HashSet<string>(dropped, StringComparer.Ordinal);
         foreach (var (name, plan) in answerable)
         {
@@ -47,8 +55,15 @@ internal sealed class BatchSelector(
         return all;
     }
 
+    /// <summary>
+    /// The answerable runs. A run is a value-wise predicate over one column, and (when <paramref name="fuse"/>) the
+    /// value-wise predicates over that same column that directly follow it, none dropping earlier NULLs (a host mask
+    /// after the filter is its own condition). Only adjacent ones: answering a later predicate where the first stands
+    /// would hide rows from the predicates between them, and with those rows the errors they would raise. A column is
+    /// answerable when its run is every predicate that reads it.
+    /// </summary>
     private static Dictionary<string, AnswerPlan>? AnswerableOf(
-        RowFilter? filter, IReadOnlyCollection<string> dropped, IReadOnlyCollection<string>? fileColumns)
+        RowFilter? filter, IReadOnlyCollection<string> dropped, IReadOnlyCollection<string>? fileColumns, bool fuse)
     {
         if (filter is null)
             return null;
@@ -61,20 +76,39 @@ internal sealed class BatchSelector(
         }
 
         Dictionary<string, AnswerPlan>? result = null;
-        foreach (var predicate in filter.Predicates)
+        var predicates = filter.Predicates;
+        for (int i = 0; i < predicates.Count; i++)
         {
-            if (predicate.ValueWise && predicate.Columns.Count == 1 && predicate.Columns[0] is var name
-                && readers[name] == 1
+            if (!IsAnswerable(predicates[i]))
+                continue;
+
+            string name = predicates[i].Columns[0];
+            int end = i + 1;
+            while (fuse && end < predicates.Count && IsAnswerable(predicates[end]) && !predicates[end].DropsEarlierNulls
+                   && string.Equals(predicates[end].Columns[0], name, StringComparison.Ordinal))
+            {
+                end++;
+            }
+
+            int length = end - i;
+            if (readers[name] == length
                 // A returned column's answers need a column name of their own; one the file already has is not.
                 && (dropped.Contains(name) || fileColumns is null
                     || !fileColumns.Contains(Data.DictionaryAnswer.AnswerColumnName(name))))
             {
+                var run = new RowPredicate[length];
+                for (int j = 0; j < length; j++)
+                    run[j] = predicates[i + j];
                 (result ??= new Dictionary<string, AnswerPlan>(StringComparer.Ordinal))[name] =
-                    new AnswerPlan(predicate, KeepValues: !dropped.Contains(name));
+                    new AnswerPlan(run, KeepValues: !dropped.Contains(name));
             }
+
+            i = end - 1;
         }
 
         return result;
+
+        static bool IsAnswerable(RowPredicate predicate) => predicate.ValueWise && predicate.Columns.Count == 1;
     }
 
     /// <summary>Selects the rows of each batch of one row group's read, skipping batches left empty.</summary>
@@ -160,13 +194,16 @@ internal sealed class BatchSelector(
                 if (predicate.DropsEarlierNulls)
                     allTrue.CopyTo(live);
 
-                // Answered from the column's dictionary: the batch holds the predicate's answers for every row. Applied
-                // to all of them, a row no longer live is unchanged (its live and all-true bits are already clear), so
-                // this is the step for the live rows alone. The dictionary was evaluated whole, so a predicate that
+                // Answered from the column's dictionary: the batch holds its run's answers for every row (the Kleene
+                // AND of the run's predicates, which is what asking them in turn decides, see AnswerPlan). Applied at
+                // the run's first predicate to all of them, a row no longer live is unchanged (its live and all-true
+                // bits are already clear), so this is the step for the live rows alone; the run's other predicates are
+                // answered with it. The dictionary was evaluated whole, by every predicate of the run, so one that
                 // cannot be evaluated at all has raised already, or the column was read as values.
-                if (AnswerColumn(predicate, batch) is { } answers)
+                if (AnswerColumn(predicate, batch, out bool first) is { } answers)
                 {
-                    SelectionMask.AndThreeValued(live, allTrue, rows, answers, default);
+                    if (first)
+                        SelectionMask.AndThreeValued(live, allTrue, rows, answers, default);
                     continue;
                 }
 
@@ -289,14 +326,30 @@ internal sealed class BatchSelector(
         Release(Ask(predicate, input), input);
     }
 
-    // The answers the reader put in place of the predicate's one column, when it answered it from its dictionary.
-    private BooleanArray? AnswerColumn(RowPredicate predicate, RecordBatch batch)
+    // The answers the reader put in place of the predicate's one column, when it answered its run from the column's
+    // dictionary; `first` says whether the predicate begins that run.
+    private BooleanArray? AnswerColumn(RowPredicate predicate, RecordBatch batch, out bool first)
     {
+        first = false;
         if (Answerable is null || predicate.Columns.Count != 1
-            || !Answerable.TryGetValue(predicate.Columns[0], out var plan) || !ReferenceEquals(plan.Predicate, predicate))
+            || !Answerable.TryGetValue(predicate.Columns[0], out var plan))
         {
             return null;
         }
+
+        int position = -1;
+        for (int i = 0; i < plan.Predicates.Count; i++)
+        {
+            if (ReferenceEquals(plan.Predicates[i], predicate))
+            {
+                position = i;
+                break;
+            }
+        }
+
+        if (position < 0)
+            return null;
+        first = position == 0;
 
         // A returned column's answers come as a column of their own, absent when the chunk was read as values.
         string name = plan.KeepValues ? Data.DictionaryAnswer.AnswerColumnName(predicate.Columns[0]) : predicate.Columns[0];
@@ -492,7 +545,14 @@ internal sealed class BatchSelector(
 }
 
 /// <summary>
-/// A predicate the reader may answer from a dictionary, and whether the read also returns its column, so the column's
-/// values must be built as well as the answers.
+/// The predicates the reader may answer from a column's dictionary, and whether the read also returns the column, so
+/// its values must be built as well as the answers.
 /// </summary>
-internal sealed record AnswerPlan(RowPredicate Predicate, bool KeepValues);
+/// <remarks>
+/// <para><see cref="Predicates"/> is a run of adjacent predicates over the one column, in filter order (#502 phase 5b).
+/// Each is evaluated over the dictionary, and an entry's answer is their Kleene AND: FALSE if any answers FALSE, else
+/// NULL if any answers NULL, else TRUE. Asking them in turn decides the same: a row one answers FALSE for is dropped
+/// whatever the others say, and a row answered NULL stays live but is never returned. Every predicate of the run is
+/// evaluated over every entry, which the dictionary allows: an entry error falls back to asking the rows.</para>
+/// </remarks>
+internal sealed record AnswerPlan(IReadOnlyList<RowPredicate> Predicates, bool KeepValues);
