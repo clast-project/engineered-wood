@@ -706,24 +706,17 @@ internal static class ColumnChunkReader
     private static ColumnResult Answered(
         ColumnBuildState state, ColumnDescriptor column, DictionaryAnswer answer, Field arrowField, int rows)
     {
+        // The answers straight from the indices of the non-NULL values and the rows' definition levels, in one pass,
+        // without first building the indices as an array (#502 phase 5d). The states own their buffers until the
+        // caller disposes them.
         if (!answer.KeepsValues)
         {
-            using var indexOnly = (Int32Array)ArrowArrayBuilder.Build(state, DictionaryAnswer.IndexField, rows);
-            var mapped = answer.Map(indexOnly);
+            var mapped = answer.Map(state.GetValueSpan<int>(), state.DefLevelSpan, state.MaxDefLevel, rows);
             return new ColumnResult(mapped, null, null, Answers: mapped);
         }
 
         // The sink has the indices of the values written; the NULL rows are the values' own.
-        var sink = state.IndexSink!;
-        if (column.MaxDefinitionLevel > 0)
-        {
-            var levels = state.DefLevelSpan;
-            levels.CopyTo(sink.ReserveDefLevels(levels.Length));
-        }
-
-        BooleanArray answers;
-        using (var indices = (Int32Array)ArrowArrayBuilder.Build(sink, DictionaryAnswer.IndexField, rows))
-            answers = answer.Map(indices);
+        var answers = answer.Map(state.IndexSink!.GetValueSpan<int>(), state.DefLevelSpan, state.MaxDefLevel, rows);
         return new ColumnResult(ArrowArrayBuilder.Build(state, arrowField, rows), null, null, Answers: answers);
     }
 
