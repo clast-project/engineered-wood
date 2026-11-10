@@ -247,6 +247,314 @@ public class ExactFilterTests : IDisposable
             b.Dispose();
     }
 
+    // ---- Conjuncts (4a) --------------------------------------------------------------------------------------------
+
+    private static Predicate P(string sql) => EngineeredWood.Expressions.Sql.SparkSqlParser.ParsePredicate(sql);
+
+    private static readonly Dictionary<string, string> ConjunctFilters = new()
+    {
+        ["two data"] = "v < 70 AND n > 20",
+        ["three, one partition"] = "v < 70 AND n > 20 AND region <> 'c'",
+        ["partition false in some files"] = "v < 70 AND region = 'b'",
+        ["partition first"] = "region IN ('a', 'c') AND n > 30",
+        ["unprunable partition"] = "lower(region) = 'a' AND v < 50",
+        ["nested"] = "v < 70 AND (n > 20 AND (id > 100 AND region <> 'a'))",
+        ["no reference"] = "v < 30 AND 1 = 1",
+        ["or inside"] = "(region = 'a' OR v > 90) AND n > 10",
+        ["nullable twice"] = "n > 20 AND n < 80",
+    };
+
+    public static IEnumerable<object[]> ConjunctCases()
+    {
+        foreach (var filter in ConjunctFilters.Keys)
+        {
+            foreach (var projection in Projections.Keys)
+            {
+                foreach (var (concurrency, seam, split) in new[]
+                    { (1, false, false), (1, false, true), (4, false, true), (1, true, false) })
+                    yield return [filter, projection, concurrency, seam, split];
+            }
+        }
+    }
+
+    /// <summary>
+    /// A filter of several conjuncts returns the rows the whole expression answers TRUE for, whether the reader
+    /// evaluates its conjuncts together or each on its own, with the file-constant ones answered once per file.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ConjunctCases))]
+    public async Task AFilterOfConjunctsReturnsExactlyTheRowsTheWholeFilterMatches(
+        string filterName, string projectionName, int concurrency, bool seam, bool split)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, seam, ColumnMappingMode.None);
+        table.EvaluatesConjunctsTogether = !split;
+        await AssertExactAsync(table, P(ConjunctFilters[filterName]), Projections[projectionName]);
+    }
+
+    /// <summary>
+    /// A row the first conjunct answers NULL for is still evaluated by the second, as in the expression's AND: here
+    /// <c>n + 1 &gt; 1000</c> (which pruning does not decide) is FALSE or NULL on every row, and the cast raises (ANSI)
+    /// on the rows where it is NULL.
+    /// </summary>
+    [Theory]
+    [InlineData(1, false, false)]
+    [InlineData(1, false, true)]
+    [InlineData(4, false, true)]
+    [InlineData(1, true, false)]
+    public async Task ALaterConjunctStillEvaluatesTheRowsAnEarlierOneAnsweredNullFor(
+        int concurrency, bool seam, bool split)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, seam, ColumnMappingMode.None);
+        table.EvaluatesConjunctsTogether = !split;
+        var options = new DeltaReadOptions
+        {
+            Columns = ["id"], Filter = P("n + 1 > 1000 AND CAST(note AS INT) > 0"), FilterRows = true,
+        };
+        var error = await Assert.ThrowsAnyAsync<Exception>(async () =>
+        {
+            await foreach (var b in table.ReadAsync(options))
+                b.Dispose();
+        });
+        Assert.Contains("CAST_INVALID_INPUT", error.ToString());
+    }
+
+    /// <summary>
+    /// A host mask after a filter of several conjuncts is asked only about the rows the whole filter answered TRUE
+    /// for: not about one a conjunct answered NULL for and a later one TRUE. The filters after the first end in a
+    /// file-constant conjunct, which is answered TRUE (dropped) for the files it doesn't skip, so no predicate of
+    /// its own stands between the row-level conjunct and the mask (review round 2).
+    /// </summary>
+    [Theory]
+    [InlineData("n > 50 AND v >= 0", 1, false)]
+    [InlineData("n > 50 AND v >= 0", 4, false)]
+    [InlineData("n > 50 AND v >= 0", 1, true)]
+    [InlineData("n > 50 AND region = 'a'", 1, false)]
+    [InlineData("n > 50 AND region = 'a'", 4, false)]
+    [InlineData("n > 50 AND lower(region) <> 'zz'", 1, false)]
+    [InlineData("n > 50 AND lower(region) <> 'zz'", 4, false)]
+    [InlineData("n > 50 AND lower(region) <> 'zz'", 1, true)]
+    public async Task AMaskAfterSplitConjunctsSeesOnlyRowsTheWholeFilterAccepted(
+        string filter, int concurrency, bool seam)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, seam, ColumnMappingMode.None);
+        table.EvaluatesConjunctsTogether = false;
+        var sawN = new System.Collections.Concurrent.ConcurrentBag<int?>();
+        var mask = new DeltaRowMask(["n", "v"], b =>
+        {
+            var n = (Int32Array)b.Column(0);
+            for (int i = 0; i < b.Length; i++)
+                sawN.Add(n.GetValue(i));
+            return Answer(b.Length, _ => true);
+        });
+        var options = new DeltaReadOptions
+        {
+            Columns = ["id"], Filter = P(filter), FilterRows = true, RowMasks = [mask],
+        };
+        await foreach (var b in table.ReadAsync(options))
+            b.Dispose();
+
+        Assert.NotEmpty(sawN);
+        Assert.All(sawN, n => Assert.True(n > 50, $"the mask was asked about n = {n?.ToString() ?? "NULL"}"));
+    }
+
+    /// <summary>
+    /// A conjunct over only a partition column is answered before any row of the file is read, wherever it stands,
+    /// as Spark applies a partition filter: a file it rejects is skipped, so a conjunct before it that raises on that
+    /// file's rows is never asked. <c>lower(region)</c> is not one file pruning decides.
+    /// </summary>
+    [Theory]
+    [InlineData(1, false)]
+    [InlineData(1, true)]
+    [InlineData(4, true)]
+    public async Task AFileAPartitionConjunctRejectsIsSkippedBeforeAnEarlierConjunctRaises(int concurrency, bool split)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, seam: false, ColumnMappingMode.None);
+        table.EvaluatesConjunctsTogether = !split;
+        var options = new DeltaReadOptions
+        {
+            Columns = ["id"], Filter = P("CAST(note AS INT) > 0 AND lower(region) = 'zz'"), FilterRows = true,
+        };
+        int rows = 0;
+        await foreach (var b in table.ReadAsync(options))
+        {
+            rows += b.Length;
+            b.Dispose();
+        }
+
+        Assert.Equal(0, rows);
+    }
+
+    /// <summary>
+    /// A file-constant conjunct that raises over the file's values, after a conjunct answered row by row, raises only
+    /// if a row survives that conjunct, as the expression's AND would: <c>CAST(region AS INT)</c> raises (ANSI) for
+    /// every region, and <c>lower(note)</c> is not one pruning decides.
+    /// </summary>
+    [Theory]
+    [InlineData("lower(note) = 'zz'", false)]
+    [InlineData("lower(note) = 'note-5'", true)]
+    [InlineData("n + 1 > 1000", true)] // NULL rows stay live, so the conjunct is asked about them
+    public async Task AFileConstantConjunctThatRaisesRaisesOnlyOverARowThatReachesIt(string first, bool raises)
+    {
+        foreach (bool split in new[] { false, true })
+        {
+            await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, seam: false, ColumnMappingMode.None);
+            table.EvaluatesConjunctsTogether = !split;
+            var options = new DeltaReadOptions
+            {
+                Columns = ["id"], Filter = P($"{first} AND CAST(region AS INT) > 0"), FilterRows = true,
+            };
+            async Task ReadAsync()
+            {
+                await foreach (var b in table.ReadAsync(options))
+                    b.Dispose();
+            }
+
+            if (raises)
+                Assert.Contains("CAST_INVALID_INPUT", (await Assert.ThrowsAnyAsync<Exception>(ReadAsync)).ToString());
+            else
+                await ReadAsync();
+        }
+    }
+
+    /// <summary>
+    /// A file-constant conjunct that cannot be evaluated at all, whatever the values, raises even when the conjunct
+    /// before it rejects every row: the reader asks every predicate over no rows for that (EvalAnd's rule), and a
+    /// deferred conjunct is only deferred for an error its one row's values cause.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AFileConstantConjunctThatCannotBeEvaluatedRaisesWhenNoRowReachesIt(bool split)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, seam: false, ColumnMappingMode.None);
+        table.EvaluatesConjunctsTogether = !split;
+        var options = new DeltaReadOptions
+        {
+            Columns = ["id"], Filter = P("lower(note) = 'zz' AND length(region, region) > 0"), FilterRows = true,
+        };
+        await Assert.ThrowsAnyAsync<Exception>(async () =>
+        {
+            await foreach (var b in table.ReadAsync(options))
+                b.Dispose();
+        });
+    }
+
+    /// <summary>
+    /// A conjunct that cannot be evaluated at all still raises when a file-constant conjunct skips every file it
+    /// would have been asked about: the skip saves the rows, not the analysis.
+    /// </summary>
+    [Theory]
+    [InlineData("length(note, note) > 0 AND lower(region) = 'zz'")]
+    [InlineData("lower(region) = 'zz' AND length(note, note) > 0")]
+    [InlineData("lower(region) = 'zz' AND length(region, region) > 0")]
+    public async Task AConjunctThatCannotBeEvaluatedRaisesWhenAFileConstantConjunctSkipsTheFile(string filter)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, seam: false, ColumnMappingMode.None);
+        var options = new DeltaReadOptions { Columns = ["id"], Filter = P(filter), FilterRows = true };
+        await Assert.ThrowsAnyAsync<Exception>(async () =>
+        {
+            await foreach (var b in table.ReadAsync(options))
+                b.Dispose();
+        });
+    }
+
+    /// <summary>
+    /// A file-constant conjunct over a boolean partition column, bare, whose answer may be the shaped batch's own
+    /// column: the file is kept or skipped by it, and the answer and batch are released after it is read (review
+    /// round 3). The partition arrays are managed, so this checks the answers, not a double free.
+    /// </summary>
+    [Theory]
+    [InlineData("flag AND v < 30")]
+    [InlineData("v < 30 AND flag")]
+    [InlineData("v < 30 AND NOT flag")]
+    public async Task ABarePartitionBooleanConjunctAnswersOncePerFile(string filter)
+    {
+        await using var table = await CreateFlagPartitionedAsync();
+        bool wantFlag = !filter.Contains("NOT", StringComparison.Ordinal);
+        var expected = Enumerable.Range(0, 400).Where(i => (i / 100 % 2 == 0) == wantFlag && i % 100 < 30)
+            .Select(i => (long)i).ToList();
+        Assert.Equal(expected, await ReadIdsAsync(table, filter));
+    }
+
+    /// <summary>
+    /// A partition-only DELETE whose mask is a bare boolean partition column: the file it matches is removed
+    /// whole from its one-row answer, which is released and disposed after it is read, and the others are read.
+    /// </summary>
+    [Theory]
+    [InlineData("flag", true)]
+    [InlineData("NOT flag", false)]
+    public async Task APartitionOnlyDeleteOnABareBooleanPartitionRemovesItsFiles(string filter, bool deletedFlag)
+    {
+        await using var table = await CreateFlagPartitionedAsync();
+        var (deleted, _) = await table.DeleteAsync(P(filter));
+        Assert.Equal(200, deleted);
+        var expected = Enumerable.Range(0, 400).Where(i => (i / 100 % 2 == 0) != deletedFlag)
+            .Select(i => (long)i).ToList();
+        Assert.Equal(expected, await ReadIdsAsync(table, "v >= 0"));
+    }
+
+    private async Task<DeltaTable> CreateFlagPartitionedAsync()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("flag", BooleanType.Default, false))
+            .Field(new Field("v", Int32Type.Default, false))
+            .Build();
+        var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(Path.Combine(_tempDir, $"t_{Guid.NewGuid():N}")), schema,
+            new DeltaTableOptions { MaxConcurrentReads = 4 }, partitionColumns: ["flag"]);
+        for (int f = 0; f < 4; f++)
+        {
+            var id = new Int64Array.Builder();
+            var flag = new BooleanArray.Builder();
+            var v = new Int32Array.Builder();
+            for (int i = 0; i < 100; i++)
+            {
+                id.Append(f * 100 + i);
+                flag.Append(f % 2 == 0);
+                v.Append(i);
+            }
+
+            await table.WriteAsync([new RecordBatch(schema, [id.Build(), flag.Build(), v.Build()], 100)]);
+        }
+
+        return table;
+    }
+
+    private static async Task<List<long>> ReadIdsAsync(DeltaTable table, string filter)
+    {
+        var actual = new List<long>();
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { Columns = ["id"], Filter = P(filter), FilterRows = true }))
+        {
+            using (b)
+            {
+                var ids = (Int64Array)b.Column(0);
+                for (int i = 0; i < b.Length; i++)
+                    actual.Add(ids.GetValue(i)!.Value);
+            }
+        }
+
+        actual.Sort();
+        return actual;
+    }
+
+    /// <summary>A file-constant conjunct that raises, with no row-level conjunct before it, raises up front.</summary>
+    [Fact]
+    public async Task AFileConstantConjunctThatRaisesFirstRaises()
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, seam: false, ColumnMappingMode.None);
+        var options = new DeltaReadOptions
+        {
+            Columns = ["id"], Filter = P("CAST(region AS INT) > 0 AND v < 70"), FilterRows = true,
+        };
+        var error = await Assert.ThrowsAnyAsync<Exception>(async () =>
+        {
+            await foreach (var b in table.ReadAsync(options))
+                b.Dispose();
+        });
+        Assert.Contains("CAST_INVALID_INPUT", error.ToString());
+    }
+
     // ---- Host row masks (3b) ---------------------------------------------------------------------------------------
 
     private static BooleanArray Answer(int length, Func<int, bool?> row)
