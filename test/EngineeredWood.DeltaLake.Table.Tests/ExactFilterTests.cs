@@ -469,12 +469,38 @@ public class ExactFilterTests : IDisposable
     [InlineData("v < 30 AND NOT flag")]
     public async Task ABarePartitionBooleanConjunctAnswersOncePerFile(string filter)
     {
+        await using var table = await CreateFlagPartitionedAsync();
+        bool wantFlag = !filter.Contains("NOT", StringComparison.Ordinal);
+        var expected = Enumerable.Range(0, 400).Where(i => (i / 100 % 2 == 0) == wantFlag && i % 100 < 30)
+            .Select(i => (long)i).ToList();
+        Assert.Equal(expected, await ReadIdsAsync(table, filter));
+    }
+
+    /// <summary>
+    /// A partition-only DELETE whose mask is a bare boolean partition column: the file it matches is removed
+    /// whole from its one-row answer, which is released and disposed after it is read, and the others are read.
+    /// </summary>
+    [Theory]
+    [InlineData("flag", true)]
+    [InlineData("NOT flag", false)]
+    public async Task APartitionOnlyDeleteOnABareBooleanPartitionRemovesItsFiles(string filter, bool deletedFlag)
+    {
+        await using var table = await CreateFlagPartitionedAsync();
+        var (deleted, _) = await table.DeleteAsync(P(filter));
+        Assert.Equal(200, deleted);
+        var expected = Enumerable.Range(0, 400).Where(i => (i / 100 % 2 == 0) != deletedFlag)
+            .Select(i => (long)i).ToList();
+        Assert.Equal(expected, await ReadIdsAsync(table, "v >= 0"));
+    }
+
+    private async Task<DeltaTable> CreateFlagPartitionedAsync()
+    {
         var schema = new Apache.Arrow.Schema.Builder()
             .Field(new Field("id", Int64Type.Default, false))
             .Field(new Field("flag", BooleanType.Default, false))
             .Field(new Field("v", Int32Type.Default, false))
             .Build();
-        await using var table = await DeltaTable.CreateAsync(
+        var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(Path.Combine(_tempDir, $"t_{Guid.NewGuid():N}")), schema,
             new DeltaTableOptions { MaxConcurrentReads = 4 }, partitionColumns: ["flag"]);
         for (int f = 0; f < 4; f++)
@@ -492,9 +518,11 @@ public class ExactFilterTests : IDisposable
             await table.WriteAsync([new RecordBatch(schema, [id.Build(), flag.Build(), v.Build()], 100)]);
         }
 
-        bool wantFlag = !filter.Contains("NOT", StringComparison.Ordinal);
-        var expected = Enumerable.Range(0, 400).Where(i => (i / 100 % 2 == 0) == wantFlag && i % 100 < 30)
-            .Select(i => (long)i).ToList();
+        return table;
+    }
+
+    private static async Task<List<long>> ReadIdsAsync(DeltaTable table, string filter)
+    {
         var actual = new List<long>();
         await foreach (var b in table.ReadAsync(new DeltaReadOptions { Columns = ["id"], Filter = P(filter), FilterRows = true }))
         {
@@ -507,7 +535,7 @@ public class ExactFilterTests : IDisposable
         }
 
         actual.Sort();
-        Assert.Equal(expected, actual);
+        return actual;
     }
 
     /// <summary>A file-constant conjunct that raises, with no row-level conjunct before it, raises up front.</summary>

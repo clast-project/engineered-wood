@@ -5669,8 +5669,23 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var row = Partitioning.PartitionUtils.AddPartitionColumns(
             noColumns, partitionSchema, addFile.PartitionValues, snapshot.Metadata.PartitionColumns,
             ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode), addFile.Path);
-        var mask = predicate(row);
-        return !mask.IsNull(0) && mask.GetValue(0) == true;
+        try
+        {
+            var mask = predicate(row);
+            try
+            {
+                return !mask.IsNull(0) && mask.GetValue(0) == true;
+            }
+            finally
+            {
+                // A bare boolean partition column answers with the row's own column: release, don't dispose.
+                Parquet.BatchSelector.Release(mask, row);
+            }
+        }
+        finally
+        {
+            row.Dispose();
+        }
     }
 
     /// <summary>
