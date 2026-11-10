@@ -4654,8 +4654,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     // evaluator answered NULL instead -- `dt = '2026-10-03'` deleted nothing, silently -- and disagreed with the
     // enforcer on the same text, which replaceWhere (#566) would have evaluated through both. Neither the
     // evaluator nor the registry holds state, so one shared instance is safe.
-    private static readonly Expressions.Arrow.ArrowRowEvaluator RowEvaluator =
-        new(new Expressions.Arrow.Spark.SparkFunctionRegistry());
+    private static readonly Expressions.Arrow.Spark.SparkFunctionRegistry Functions = new();
+
+    private static readonly Expressions.Arrow.ArrowRowEvaluator RowEvaluator = new(Functions);
 
     /// <summary>Adapts an analyzable predicate to the per-row mask delegate: a row is selected when the
     /// predicate evaluates to TRUE (SQL three-valued logic — NULL/unknown is not selected).</summary>
@@ -5387,9 +5388,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                             .ConfigureAwait(false)
                         : [],
                     Prune = filePredicate,
-                    RowFilter = new Parquet.RowFilter(new Parquet.RowPredicate(matchFileColumns, ConditionMask(
+                    RowFilter = Observed(new Parquet.RowFilter(new Parquet.RowPredicate(matchFileColumns, ConditionMask(
                         condition, snapshot, addFile, mappingMode, physicalToLogical, logicalToPhysical,
-                        partitionColumns, partitionColumns.Count > 0))),
+                        partitionColumns, partitionColumns.Count > 0))
+                    {
+                        ValueWise = AnswersFromDictionaries && prunePredicate is not null && IsValueWise(prunePredicate),
+                    })),
                     ExcludedRows = excluded,
                 };
 
@@ -13396,6 +13400,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         partitionColumns, hasPartitions))
                     {
                         DropsEarlierNulls = dropsEarlierNulls,
+                        ValueWise = AnswersFromDictionaries && condition.ValueWise,
                     });
                 }
 
@@ -13408,7 +13413,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                             new ParquetScan
                             {
                                 Columns = fileColumns,
-                                RowFilter = new RowFilter(predicates),
+                                RowFilter = Observed(new RowFilter(predicates)),
                                 ExcludedRows = deletedRows is { IsEmpty: false } ? deletedRows : null,
                             },
                             cancellationToken)
@@ -13539,7 +13544,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
                     predicates.Add(new RowPredicate(runFileColumns ?? everyColumn!, ConditionMask(
                         condition, snapshot, addFile, mappingMode, physicalToLogical, logicalToPhysical,
-                        partitionColumns, hasPartitions, keepNulls: true)));
+                        partitionColumns, hasPartitions, keepNulls: true))
+                    {
+                        // Each conjunct's answer for a row depends on that row's values alone (#502 phase 4c), so the
+                        // reader may answer it from a dictionary.
+                        ValueWise = AnswersFromDictionaries && run.All(s => IsValueWise(s.Conjunct!)),
+                    });
                     run.Clear();
                     afterFilter = true;
                 }
@@ -13691,7 +13701,34 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         /// built-in reader splits it into its top-level conjuncts (#502 phase 4a). Null for a host mask.
         /// </summary>
         public Expressions.Predicate? Filter { get; init; }
+
+        /// <summary>A host mask's <see cref="DeltaRowMask.ValueWise"/>; false for the filter, whose conjuncts are
+        /// judged one by one (<see cref="IsValueWise"/>).</summary>
+        public bool ValueWise { get; init; }
     }
+
+    /// <summary>
+    /// Whether <paramref name="expression"/>'s answer for a row depends only on that row's values, so the Parquet
+    /// reader may evaluate it once over a column chunk's dictionary (#502 phase 4c,
+    /// <see cref="RowPredicate.ValueWise"/>): column references, literals, the predicate forms, and calls to
+    /// functions the registry declares foldable (<see cref="Expressions.Arrow.IFoldableFunctions"/>: deterministic, and
+    /// reading nothing but their arguments). Anything else, a variant path included, answers false, which costs
+    /// only the speed-up.
+    /// </summary>
+    internal static bool IsValueWise(Expressions.Expression expression) => expression switch
+    {
+        Expressions.UnboundReference or Expressions.BoundReference or Expressions.LiteralExpression
+            or Expressions.TruePredicate or Expressions.FalsePredicate => true,
+        Expressions.AndPredicate and => and.Children.All(IsValueWise),
+        Expressions.OrPredicate or => or.Children.All(IsValueWise),
+        Expressions.NotPredicate not => IsValueWise(not.Child),
+        Expressions.ComparisonPredicate cmp => IsValueWise(cmp.Left) && IsValueWise(cmp.Right),
+        Expressions.UnaryPredicate unary => IsValueWise(unary.Operand),
+        Expressions.SetPredicate set => IsValueWise(set.Operand) && set.Values.All(IsValueWise),
+        Expressions.FunctionCall call => Functions.IsRegistered(call.Name) && Functions.IsFoldable(call.Name)
+            && call.Arguments.All(IsValueWise),
+        _ => false,
+    };
 
     /// <summary>
     /// One step of a file's row conditions, as the built-in reader applies them: a conjunct of the filter
@@ -13727,6 +13764,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     internal bool EvaluatesConjunctsTogether { get; set; }
 
+    /// <summary>
+    /// Whether the scan and DELETE mark a value-wise conjunct, predicate or host mask as such, letting the Parquet
+    /// reader answer it from a column chunk's dictionary (#502 phase 4c). True by default; false for the
+    /// ValueWiseBenchmarks A/B and as the tests' oracle.
+    /// </summary>
+    internal bool AnswersFromDictionaries { get; set; } = true;
+
+    /// <summary>Shown each <see cref="RowFilter"/> a scan or DELETE hands the Parquet reader, for tests.</summary>
+    internal Action<RowFilter>? RowFilterObserver { get; set; }
+
+    private RowFilter Observed(RowFilter filter)
+    {
+        RowFilterObserver?.Invoke(filter);
+        return filter;
+    }
+
     /// <summary>The scan's row conditions, in the order they apply: the exact filter, then the host's masks.</summary>
     private static IReadOnlyList<RowCondition>? RowConditions(DeltaReadOptions options, Snapshot.Snapshot snapshot)
     {
@@ -13741,7 +13794,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         foreach (var mask in options.RowMasks ?? [])
-            conditions.Add(new RowCondition(mask.Columns, batch => AskHostMask(mask, batch)));
+        {
+            conditions.Add(new RowCondition(mask.Columns, batch => AskHostMask(mask, batch))
+            {
+                ValueWise = mask.ValueWise,
+            });
+        }
         return conditions.Count == 0 ? null : conditions;
     }
 
