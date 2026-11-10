@@ -17,8 +17,8 @@ namespace EngineeredWood.Benchmarks;
 /// #502 phase 4b A/B: a selected read whose predicate is over the dictionary-encoded <c>category</c>, asked row by
 /// row (<c>rows</c>) against the same predicate marked <see cref="RowPredicate.ValueWise"/>, so the reader answers
 /// each chunk from its dictionary (<c>dict</c>). Over <see cref="RowFilterAb"/>'s file (4 x 500,000 rows, 50
-/// categories), with <c>category</c> filter-only: projected <c>id, amount</c>, or nothing (positions only, as a
-/// DELETE reads). Each in one pass and in two.
+/// categories): <c>category</c> filter-only, projecting <c>id, amount</c> or nothing (positions only, as a DELETE
+/// reads), or returned too (<c>id, category</c>, phase 4d). Each in one pass and in two.
 /// </summary>
 /// <remarks>Run with: dotnet run -c Release -f net10.0 -- dictanswer-ab [rounds]</remarks>
 internal static class DictionaryAnswerAb
@@ -38,7 +38,7 @@ internal static class DictionaryAnswerAb
             await RowFilterAb.WriteAsync(RowFilterAb.Build(), path);
 
             var cases = new List<Case>();
-            foreach (var (projName, projection) in new[] { ("id, amount", new[] { "id", "amount" }), ("positions", System.Array.Empty<string>()) })
+            foreach (var (projName, projection) in new[] { ("id, amount", new[] { "id", "amount" }), ("positions", System.Array.Empty<string>()), ("id, category", new[] { "id", "category" }) })
             {
                 cases.Add(new Case($"= 2% {projName}", Ex.Equal("category", LiteralValue.Of("cat-07")), projection));
                 cases.Add(new Case($"IN 5 (10%) {projName}", Ex.In("category",

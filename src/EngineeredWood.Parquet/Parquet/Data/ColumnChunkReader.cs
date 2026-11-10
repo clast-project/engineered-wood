@@ -25,7 +25,8 @@ internal readonly record struct ColumnResult(
     IArrowArray Array,
     int[]? DefinitionLevels,
     int[]? RepetitionLevels,
-    int FixedListLength = 0);
+    int FixedListLength = 0,
+    BooleanArray? Answers = null);
 
 /// <summary>
 /// Reads a single column chunk's pages and produces an Arrow array.
@@ -78,11 +79,7 @@ internal static class ColumnChunkReader
             _ => ByteArrayOutputKind.Default,
         };
 
-        using var state = answer is not null
-            ? DictionaryAnswer.IndexState(column, capacity)
-            : new ColumnBuildState(
-                column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-                byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
+        using var state = NewState(column, capacity, byteArrayOutput, answer);
         if (keepRows is not null)
             state.SetRowSelection(keepRows);
         DictionaryDecoder? dictionary = null;
@@ -183,8 +180,7 @@ internal static class ColumnChunkReader
         {
             if (!answer.IsPrepared)
                 throw new ParquetFormatException($"Column '{column.DottedPath}' has no dictionary page.");
-            using var indices = (Int32Array)ArrowArrayBuilder.Build(state, DictionaryAnswer.IndexField, rowCount);
-            array = answer.Map(indices);
+            return Answered(state, column, answer, arrowField, rowCount);
         }
         else if (isRepeated)
         {
@@ -591,11 +587,11 @@ internal static class ColumnChunkReader
         bool preserveDefLevels = false,
         bool validateCrc = false,
         int? maxPageUncompressedSize = null,
-        bool dictionaryIndices = false)
+        DictionaryAnswer? answer = null)
     {
         bool isRepeated = column.MaxRepetitionLevel > 0;
-        if (dictionaryIndices && (isRepeated || preserveDefLevels))
-            throw new ArgumentException("Only a flat column is read as its dictionary indices.", nameof(dictionaryIndices));
+        if (answer is not null && (isRepeated || preserveDefLevels || !answer.IsPrepared))
+            throw new ArgumentException("Only a flat column is answered from its prepared dictionary.", nameof(answer));
 
         int pageNumValues = pageMap.CumulativeValues[endPage + 1] - pageMap.CumulativeValues[startPage];
         int pageRowCount = pageMap.CumulativeRows[endPage + 1] - pageMap.CumulativeRows[startPage];
@@ -608,11 +604,7 @@ internal static class ColumnChunkReader
             _ => ByteArrayOutputKind.Default,
         };
 
-        using var state = dictionaryIndices
-            ? DictionaryAnswer.IndexState(column, capacity)
-            : new ColumnBuildState(
-                column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-                byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
+        using var state = NewState(column, capacity, byteArrayOutput, answer);
 
         int valuesLeft = capacity;
         for (int p = startPage; p <= endPage; p++)
@@ -671,6 +663,9 @@ internal static class ColumnChunkReader
 
         EnsureFullRowCoverage(state, column, pageRowCount);
 
+        if (answer is not null)
+            return Answered(state, column, answer, arrowField, pageRowCount);
+
         IArrowArray array;
         if (isRepeated)
         {
@@ -678,11 +673,58 @@ internal static class ColumnChunkReader
         }
         else
         {
-            array = ArrowArrayBuilder.Build(
-                state, dictionaryIndices ? DictionaryAnswer.IndexField : arrowField, pageRowCount);
+            array = ArrowArrayBuilder.Build(state, arrowField, pageRowCount);
         }
 
         return new ColumnResult(array, defLevels, repLevels);
+    }
+
+    /// <summary>
+    /// The build state for a column chunk: its values', or, answered from its dictionary (#502 phase 4b), its
+    /// indices', or, answered and returned too (phase 4d), its values' with an <see cref="ColumnBuildState.IndexSink"/>.
+    /// </summary>
+    private static ColumnBuildState NewState(
+        ColumnDescriptor column, int capacity, ByteArrayOutputKind byteArrayOutput, DictionaryAnswer? answer)
+    {
+        if (answer is { KeepsValues: false })
+            return DictionaryAnswer.IndexState(column, capacity);
+
+        return new ColumnBuildState(
+            column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
+            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column))
+        {
+            IndexSink = answer is null
+                ? null
+                : new ColumnBuildState(PhysicalType.Int32, column.MaxDefinitionLevel, maxRepLevel: 0, capacity),
+        };
+    }
+
+    /// <summary>
+    /// An answered chunk's result: the answers, in place of its values or (<see cref="DictionaryAnswer.KeepsValues"/>)
+    /// beside them.
+    /// </summary>
+    private static ColumnResult Answered(
+        ColumnBuildState state, ColumnDescriptor column, DictionaryAnswer answer, Field arrowField, int rows)
+    {
+        if (!answer.KeepsValues)
+        {
+            using var indexOnly = (Int32Array)ArrowArrayBuilder.Build(state, DictionaryAnswer.IndexField, rows);
+            var mapped = answer.Map(indexOnly);
+            return new ColumnResult(mapped, null, null, Answers: mapped);
+        }
+
+        // The sink has the indices of the values written; the NULL rows are the values' own.
+        var sink = state.IndexSink!;
+        if (column.MaxDefinitionLevel > 0)
+        {
+            var levels = state.DefLevelSpan;
+            levels.CopyTo(sink.ReserveDefLevels(levels.Length));
+        }
+
+        BooleanArray answers;
+        using (var indices = (Int32Array)ArrowArrayBuilder.Build(sink, DictionaryAnswer.IndexField, rows))
+            answers = answer.Map(indices);
+        return new ColumnResult(ArrowArrayBuilder.Build(state, arrowField, rows), null, null, Answers: answers);
     }
 
     /// <summary>
@@ -1117,6 +1159,15 @@ internal static class ColumnChunkReader
     {
         bool isDictEncoded = encoding == Encoding.PlainDictionary || encoding == Encoding.RleDictionary;
 
+        // A returned column answered from its dictionary collects every value's index too (phase 4d), so every
+        // data page must be dictionary-encoded, as the chunk's encoding_stats said when it was chosen.
+        if (state.IndexSink is not null && !isDictEncoded)
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}': a data page is {encoding}-encoded, but the chunk's encoding_stats " +
+                "say every data page is dictionary-encoded.");
+        }
+
         if (state.DictionaryIndices)
         {
             // A chunk read for its dictionary indices (a dictionary answer, #502 phase 4b) was chosen because its
@@ -1495,6 +1546,8 @@ internal static class ColumnChunkReader
             decoder.ReadBatch(indicesArray.AsSpan(0, count));
             ReadOnlySpan<int> indices = indicesArray.AsSpan(0, count);
             dictionary.CheckIndices(indices, bitWidth, column);
+            if (state.IndexSink is { } sink)
+                indices.CopyTo(sink.ReserveValues<int>(count));
 
             // Under a row selection, every index was read and checked above; only the kept ones are looked up and
             // written, by the same code below, as if the page held just those (#502 phase 2).

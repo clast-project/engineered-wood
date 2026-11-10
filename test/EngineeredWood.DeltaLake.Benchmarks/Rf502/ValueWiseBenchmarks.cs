@@ -12,8 +12,8 @@ namespace EngineeredWood.DeltaLake.Benchmarks.Rf502;
 /// <summary>
 /// #502 phase 4c: a <see cref="DeltaReadOptions.FilterRows"/> scan whose conjuncts over the dictionary-encoded
 /// <c>category</c> (16 values) are answered from each chunk's dictionary (<c>Dictionary</c> true), against the same
-/// scan asking every row (<see cref="DeltaTable.AnswersFromDictionaries"/> off). The scan returns <c>id</c> only, so
-/// <c>category</c> is read for the filter and dropped. A value-wise host mask (a hash-set probe, as a join filter is)
+/// scan asking every row (<see cref="DeltaTable.AnswersFromDictionaries"/> off). The scan returns <c>id</c>, with
+/// <c>category</c> read for the filter and dropped, or <c>id, category</c> (<c>Returned</c>, phase 4d). A value-wise host mask (a hash-set probe, as a join filter is)
 /// is measured the same way.
 /// <para>The table is <see cref="ConjunctSplitBenchmarks"/>'s, under <c>%TEMP%\ew-rf502-conjuncts</c>.
 /// Run with <c>--filter *ValueWiseBenchmarks*</c>.</para>
@@ -36,6 +36,12 @@ public class ValueWiseBenchmarks
 
     [Params(false, true)]
     public bool Dictionary { get; set; }
+
+    /// <summary>Whether the scan returns <c>category</c> too (#502 phase 4d), rather than reading it only for the filter.</summary>
+    [Params(false, true)]
+    public bool Returned { get; set; }
+
+    private string[] Columns => Returned ? ["id", "category"] : ["id"];
 
     private DeltaTable _table = null!;
     private Expressions.Predicate _predicate = null!;
@@ -72,11 +78,11 @@ public class ValueWiseBenchmarks
     public void Cleanup() => _table.DisposeAsync().AsTask().GetAwaiter().GetResult();
 
     [Benchmark(Description = "ReadAsync id, FilterRows")]
-    public Task<long> Scan() => CountAsync(new DeltaReadOptions { Columns = ["id"], Filter = _predicate, FilterRows = true });
+    public Task<long> Scan() => CountAsync(new DeltaReadOptions { Columns = Columns, Filter = _predicate, FilterRows = true });
 
     /// <summary>The host mask alone (the filter is the param's only to vary the runs; it is not applied).</summary>
     [Benchmark(Description = "ReadAsync id, value-wise mask (19%)")]
-    public Task<long> Mask() => CountAsync(new DeltaReadOptions { Columns = ["id"], RowMasks = [_mask] });
+    public Task<long> Mask() => CountAsync(new DeltaReadOptions { Columns = Columns, RowMasks = [_mask] });
 
     private async Task<long> CountAsync(DeltaReadOptions options)
     {

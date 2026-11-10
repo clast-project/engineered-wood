@@ -1153,6 +1153,13 @@ internal sealed class ColumnBuildState : IDisposable
     public bool DictionaryIndices { get; init; }
 
     /// <summary>
+    /// A second, INT32 state that collects each dictionary-encoded value's index as the value itself is written
+    /// (#502 phase 4d): a returned column answered from its dictionary is decoded once, to its values and to the
+    /// indices its answers are mapped from. Disposed with this state.
+    /// </summary>
+    public ColumnBuildState? IndexSink { get; init; }
+
+    /// <summary>
     /// Creates a new column build state.
     /// </summary>
     /// <param name="physicalType">Parquet physical type.</param>
@@ -2166,6 +2173,7 @@ internal sealed class ColumnBuildState : IDisposable
 
     public void Dispose()
     {
+        IndexSink?.Dispose();
         if (_pageMask != null)
         {
             ArrayPool<byte>.Shared.Return(_pageMask);

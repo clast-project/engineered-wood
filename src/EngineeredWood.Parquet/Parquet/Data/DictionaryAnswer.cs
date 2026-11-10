@@ -40,6 +40,7 @@ internal sealed class DictionaryAnswer
     private readonly Field _field;
     private readonly Func<Field, IArrowArray, (Field Field, IArrowArray Array)> _restore;
     private readonly int _rows;
+    private readonly bool _keepValues;
     private byte[]? _table;
     private byte _nullAnswer;
 
@@ -49,16 +50,30 @@ internal sealed class DictionaryAnswer
     /// <param name="restore">What the read does to a built column before it is returned (the declared time
     /// units), so the predicate sees the dictionary as it would see the rows.</param>
     /// <param name="rows">The rows the answers are for: a dictionary at least this large is not evaluated.</param>
+    /// <param name="keepValues">The read returns the column: its values are decoded too (#502 phase 4d).</param>
     internal DictionaryAnswer(
         RowPredicate predicate, ColumnDescriptor column, Field field,
-        Func<Field, IArrowArray, (Field Field, IArrowArray Array)> restore, int rows)
+        Func<Field, IArrowArray, (Field Field, IArrowArray Array)> restore, int rows, bool keepValues = false)
     {
         _predicate = predicate;
         _column = column;
         _field = field;
         _restore = restore;
         _rows = rows;
+        _keepValues = keepValues;
     }
+
+    /// <summary>
+    /// Whether the read returns the column, so its values are decoded as well as its indices, and the answers come
+    /// beside them, as the column <see cref="AnswerColumnName"/> names, rather than in their place.
+    /// </summary>
+    internal bool KeepsValues => _keepValues;
+
+    /// <summary>
+    /// The name of the column holding a returned column's answers: one no Parquet column has (it starts with a NUL),
+    /// which the read drops.
+    /// </summary>
+    internal static string AnswerColumnName(string column) => "\0answer:" + column;
 
     /// <summary>Whether <see cref="Prepare"/> has built the lookup table.</summary>
     internal bool IsPrepared => _table is not null;
