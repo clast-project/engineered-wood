@@ -86,11 +86,15 @@ public class DeleteCountInteropTests : IDisposable
         Spark.Require();
         string path = Path.Combine(_tempDir, "live");
         await CreateAsync(path, deleteUnreadable: false);
-        Assert.ThrowsAny<Exception>(() => Spark.Invoke("sql", new
+        // Refused by Spark for the cast, not for anything else (review round 1): a driver timeout or a crashed JVM
+        // fails the test rather than passing it.
+        var result = Spark.InvokeRaw("sql", new
         {
             path,
             sql = new[] { "DELETE FROM delta.`{path}` WHERE CAST(s AS INT) > 4" },
-        }));
+        });
+        Assert.False(result.GetProperty("ok").GetBoolean(), "Spark deleted with a live row it cannot cast.");
+        Assert.Contains("CAST_INVALID_INPUT", result.GetProperty("error").GetString());
     }
 
     private static async Task CreateAsync(string path, bool deleteUnreadable = true)
