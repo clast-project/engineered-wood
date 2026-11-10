@@ -69,4 +69,17 @@ public sealed class DeltaRowMask
     /// asked once for the whole file, over a single row.</para>
     /// </remarks>
     public Func<RecordBatch, BooleanArray> Mask { get; }
+
+    /// <summary>
+    /// True when a row's answer depends only on that row's values of <see cref="Columns"/>, and on nothing else (not
+    /// its position, not the other rows of the batch), and is deterministic: a membership test of a key against a
+    /// join's build side is. False by default.
+    /// </summary>
+    /// <remarks>
+    /// With the built-in reader, a value-wise mask over one column the scan does not return may then be asked once
+    /// per dictionary-encoded column chunk, over the chunk's dictionary (and one NULL when the column is nullable),
+    /// instead of over its rows; each row takes its value's answer. So the mask may see values no live row holds
+    /// (a deleted row's), and an exception it raises over the dictionary makes the scan ask the rows instead.
+    /// </remarks>
+    public bool ValueWise { get; init; }
 }

@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 started (§19, §20). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 under way (§19-§21). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -184,7 +184,7 @@ Two different Bloom filters are involved, at different layers:
 
 `DeltaReadOptions` (public):
 - `FilterRows` (bool, default false): applies `Filter` exactly. The current superset contract stays the default, since tests and the host guide rely on it.
-- `RowMasks` (`IReadOnlyList<DeltaRowMask>`): host delegates over **logical** column names (cmettler's join filters). They may over-approximate and never enter a read set (reads don't declare one anyway). `DeltaRowMask(IReadOnlyList<string> Columns, Func<RecordBatch, BooleanArray> Mask)`; `ValueWise` comes with phase 4 (§17).
+- `RowMasks` (`IReadOnlyList<DeltaRowMask>`): host delegates over **logical** column names (cmettler's join filters). They may over-approximate and never enter a read set (reads don't declare one anyway). `DeltaRowMask(IReadOnlyList<string> Columns, Func<RecordBatch, BooleanArray> Mask)`; `ValueWise` (init) came with phase 4c (§21).
 
 Per file, the scan builds the Parquet `RowFilter`:
 - **Split** `Filter` into top-level conjuncts, **in source order**:
@@ -706,3 +706,42 @@ Positions only is a DELETE's read (3c). The `IN` rows are slow for a reason outs
 - An INT96 dictionary with an entry out of `timestamp[ns]`'s range declines without asking the predicate (review round 1; raised before the fix).
 
 Each of these mutations fails tests: never answered (40); NULL rows answered NULL (8); no size guard (1); an error over the dictionary propagated (2); a returned column answered (1); a column two predicates read answered (1); a chunk not wholly dictionary-encoded answered (2); the NULL row's NULL answer turned into FALSE (8); a predicate that isn't `ValueWise` answered (41).
+
+## 21. Phase 4c: value-wise conjuncts, DELETE and host masks (2026-11-10)
+
+4c marks predicates `ValueWise`, so that 4b's reader can answer them from dictionaries:
+- **Filter conjuncts:** a row-level conjunct of a `FilterRows` filter is value-wise when `DeltaTable.IsValueWise` holds for it. That means it is built only from column references, literals, the predicate forms (AND, OR, NOT, comparisons, IS [NOT] NULL/NaN, IN), and calls to functions the registry declares foldable. As decided before 4a, that reuses `IFoldableFunctions.IsFoldable`, which the Spark registry answers as `IsRegistered`: every function it registers is deterministic and reads only its arguments. Anything else, a variant path included, is not value-wise, which costs only the speed-up. A run evaluated together (`EvaluatesConjunctsTogether`) is value-wise when every conjunct in it is.
+- **DELETE:** the predicate of an expression DELETE is marked the same way. A delegate DELETE is opaque, so it is not.
+- **Host masks:** `DeltaRowMask.ValueWise` (public, init, default false) carries the host's promise through. Its remarks say what the mask may then see: values no live row holds, a deleted row's included. They also say that a mask raising over the dictionary is asked over the rows instead.
+
+The partition and type-widening wrapper around each predicate (`ConditionMask`) works row by row, so it keeps a predicate value-wise. A deferred file-constant error and a once-per-file answer repeated over rows are not marked. `DeltaTable.AnswersFromDictionaries` (internal, default true) turns all of this off, for the A/B and as the tests' oracle. `DeltaTable.RowFilterObserver` (internal) shows tests each `RowFilter` a scan or DELETE builds.
+
+### Measured
+
+`ValueWiseBenchmarks` (Delta benchmarks), on `ConjunctSplitBenchmarks`'s table: 4 files of 4 row groups x 131,072 rows, with `category` holding 16 values, dictionary-encoded. The scan returns `id` only, with `MaxConcurrentReads` 4. i9-12900K, net10.0, BenchmarkDotNet, 12 iterations.
+
+| Read | Kept | Rows | Dictionary | Change | Allocated, rows / dictionary |
+|---|---|---|---|---|---|
+| `category = 'cat_03'` | 6% | 7.5 ms | 4.4 ms | -42% | 3.0 / 3.2 MB |
+| `category IN ('cat_01', 'cat_05', 'cat_09')` | 19% | 146.8 ms | 6.8 ms | -95% | 171 / 7.3 MB |
+| `category <> 'cat_03'` | 94% | 12.9 ms | 9.1 ms | -29% | 31.1 / 31.4 MB |
+| `lower(category) = 'cat_03'` | 6% | 188.4 ms | 4.3 ms | -98% | 392 / 3.2 MB |
+| `category = 'cat_03' AND amount < 500` | 3% | 9.5 ms | 7.7 ms | -18% | 3.2 / 3.5 MB |
+| value-wise host mask (a hash-set probe of 3 keys) | 19% | 24.2 ms | 5.4 ms | -78% | 87 / 7.0 MB |
+
+The largest gains are where the row path is slowest: `IN` (#799) and a function call, which the evaluator takes row by row through boxed values. Over the dictionary, these cost the same as an equality.
+
+### Tests
+
+`ValueWiseTests` (Delta), on a table of 3 files x 2,000 rows (row groups of 1,000) with a dictionary-encoded `cat` holding 8 values and NULL, a `code` column whose 'x' only deletion-vector-deleted rows hold, and a partition:
+- `IsValueWise` is true for comparisons, IN, IS NULL, NOT, `lower`, `CAST` and `length` arithmetic, and false for an unregistered function.
+- 7 filters x 2 concurrencies x 2 projections return the same rows with and without `AnswersFromDictionaries`. Every predicate the scan builds is marked with it on, and none with it off. One filter is `CAST(code AS INT) > 3`, which raises over the dictionary (because of 'x') and falls back to the rows. A separate test shows it raises when a row holding 'x' is live.
+- 3 DELETEs match the same rows either way, and their predicate is marked exactly when the switch is on.
+- A value-wise host mask is asked once per row group over the 8 entries and the NULL, keeps the same rows, and is not answered from the dictionary with the switch off. One that raises on 'x' is asked over the rows instead.
+
+Each of these mutations fails tests:
+- conjuncts never marked (7);
+- DELETE never marked (3);
+- a mask's flag ignored (2), or not passed through `RowConditions` (2);
+- the switch ignored for masks (1);
+- an unregistered function taken as value-wise (1).
