@@ -205,7 +205,7 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
     /// may answer with one of its own input columns (<c>WHERE flag</c>), and over every live row that column IS
     /// the decoded batch's, which the read still gathers from or returns.
     /// </summary>
-    private static void Release(BooleanArray mask, RecordBatch input)
+    internal static void Release(BooleanArray mask, RecordBatch input)
     {
         var buffers = new HashSet<ReadOnlyMemory<byte>>();
         CollectBuffers(mask.Data, buffers);
