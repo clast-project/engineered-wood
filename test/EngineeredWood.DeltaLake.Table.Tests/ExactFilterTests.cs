@@ -458,6 +458,58 @@ public class ExactFilterTests : IDisposable
         });
     }
 
+    /// <summary>
+    /// A file-constant conjunct over a boolean partition column, bare, whose answer may be the shaped batch's own
+    /// column: the file is kept or skipped by it, and the answer and batch are released after it is read (review
+    /// round 3). The partition arrays are managed, so this checks the answers, not a double free.
+    /// </summary>
+    [Theory]
+    [InlineData("flag AND v < 30")]
+    [InlineData("v < 30 AND flag")]
+    [InlineData("v < 30 AND NOT flag")]
+    public async Task ABarePartitionBooleanConjunctAnswersOncePerFile(string filter)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("flag", BooleanType.Default, false))
+            .Field(new Field("v", Int32Type.Default, false))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(Path.Combine(_tempDir, $"t_{Guid.NewGuid():N}")), schema,
+            new DeltaTableOptions { MaxConcurrentReads = 4 }, partitionColumns: ["flag"]);
+        for (int f = 0; f < 4; f++)
+        {
+            var id = new Int64Array.Builder();
+            var flag = new BooleanArray.Builder();
+            var v = new Int32Array.Builder();
+            for (int i = 0; i < 100; i++)
+            {
+                id.Append(f * 100 + i);
+                flag.Append(f % 2 == 0);
+                v.Append(i);
+            }
+
+            await table.WriteAsync([new RecordBatch(schema, [id.Build(), flag.Build(), v.Build()], 100)]);
+        }
+
+        bool wantFlag = !filter.Contains("NOT", StringComparison.Ordinal);
+        var expected = Enumerable.Range(0, 400).Where(i => (i / 100 % 2 == 0) == wantFlag && i % 100 < 30)
+            .Select(i => (long)i).ToList();
+        var actual = new List<long>();
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { Columns = ["id"], Filter = P(filter), FilterRows = true }))
+        {
+            using (b)
+            {
+                var ids = (Int64Array)b.Column(0);
+                for (int i = 0; i < b.Length; i++)
+                    actual.Add(ids.GetValue(i)!.Value);
+            }
+        }
+
+        actual.Sort();
+        Assert.Equal(expected, actual);
+    }
+
     /// <summary>A file-constant conjunct that raises, with no row-level conjunct before it, raises up front.</summary>
     [Fact]
     public async Task AFileConstantConjunctThatRaisesFirstRaises()

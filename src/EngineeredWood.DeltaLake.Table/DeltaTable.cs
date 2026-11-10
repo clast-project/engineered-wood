@@ -13400,21 +13400,27 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         .ConfigureAwait(false);
                 }
 
-                bool? OneRowAnswer(RowCondition condition)
-                {
-                    using var answer = FileConstantAnswer(condition, 1);
-                    return answer.GetValue(0);
-                }
+                bool? OneRowAnswer(RowCondition condition) => FileConstantAnswer(condition, 1);
 
-                // A file-constant condition over `rows` rows of the table's shape (the file's partition values,
-                // NULL for the columns it lacks).
-                BooleanArray FileConstantAnswer(RowCondition condition, int rows)
+                // A file-constant condition over `rows` (1, or 0 to check only that it can be evaluated) rows of the
+                // table's shape: the file's partition values, NULL for the columns it lacks. Returns the first row's
+                // answer (null for none). The shaped batch's arrays are built here, so it is disposed here, after the
+                // answer, which may be one of its own columns (a boolean partition column answering for itself).
+                bool? FileConstantAnswer(RowCondition condition, int rows)
                 {
                     var empty = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], rows);
-                    var shaped = ReconcileToTableShape(
+                    using var shaped = ReconcileToTableShape(
                         empty, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
                         logicalToPhysical, addFile.Path);
-                    return condition.Evaluate(shaped);
+                    var answer = condition.Evaluate(shaped);
+                    try
+                    {
+                        return rows == 0 ? null : answer.GetValue(0);
+                    }
+                    finally
+                    {
+                        Parquet.BatchSelector.Release(answer, shaped);
+                    }
                 }
 
                 async ValueTask<IReadOnlyList<string>?> ConditionFileColumnsAsync(IReadOnlyList<string>? logical) =>
@@ -13472,7 +13478,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         catch (Exception e) when (rowLevelBefore)
                         {
                             // Deferred only for an error the row's values cause (see above).
-                            FileConstantAnswer(step.Condition, 0).Dispose();
+                            FileConstantAnswer(step.Condition, 0);
                             step.Deferred = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(e);
                             continue;
                         }
@@ -13482,7 +13488,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                             foreach (var other in steps)
                             {
                                 if (other.Conjunct is not null && other != step && !other.Dropped)
-                                    FileConstantAnswer(other.Condition, 0).Dispose();
+                                    FileConstantAnswer(other.Condition, 0);
                             }
 
                             return false;
