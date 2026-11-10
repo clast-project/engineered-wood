@@ -94,6 +94,10 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
             live.CopyTo(allTrue);
             foreach (var predicate in filter.Predicates)
             {
+                // A new condition: the rows answered NULL so far are out (all-true is always a subset of live).
+                if (predicate.DropsEarlierNulls)
+                    allTrue.CopyTo(live);
+
                 int liveCount = SelectionMask.Count(live);
                 if (liveCount == 0)
                 {

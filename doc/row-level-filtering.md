@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-2b and 3a built (§12-§16). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 started (§19). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -615,3 +615,51 @@ Stripping the materialized columns before the predicate turned out to be redunda
 ### Not measured
 
 The delete no longer decodes the columns its predicate doesn't read, but this phase has no timings. The gate in §8 also names a Spark interop oracle for DELETE counts; the interop tiers run in CI.
+
+## 19. Phase 4a: the filter as its conjuncts (2026-11-09)
+
+Phase 4 is split in four: **4a**, the `FilterRows` filter split into its conjuncts (this); **4b**, the reader answering a value-wise predicate from the dictionary (§6); **4c**, `ValueWise` set on Delta conjuncts and `DeltaRowMask`; **4d**, chunks that mix dictionary and PLAIN pages, a projected predicate column, and an all-false lookup table as a prune.
+
+Decided before 4a: a conjunct is value-wise when every function it calls `IsFoldable` (`IFoldableFunctions`: deterministic, and reads nothing but its arguments). No new `IDeterministicFunctions`.
+
+arrow-rs (3db18f75b) has no counterpart in its reader: `ReadPlanBuilder::with_predicate` always decodes and calls `evaluate`. Its comparison and `like` kernels on a `DictionaryArray` evaluate every entry of `values()` once and gather through the keys, unused entries included, and nothing handles an error on an unused entry.
+
+### What it does
+
+With the built-in reader, the filter's top-level conjuncts (nested ANDs flattened) go into the Parquet `RowFilter` one each, in source order:
+- **A conjunct over none of the file's columns** (only partition columns, or columns added after the file was written) is answered once, when the file is opened and only if it has a live row, wherever it stands in the filter. This is how Spark applies a partition filter, before it reads the file. TRUE drops it. FALSE or NULL skips the file, so a conjunct before it that would raise on the file's rows is never asked. If it raises, it raises right away when no row-level conjunct comes before it, as it would on the file's first row. Otherwise it is deferred to its place, and raises once a row survives the conjuncts before it. A conjunct with no column reference at all (`1 = 1`) is one of these.
+- **Every other conjunct** is one row predicate. Its NULL answers stay live for the conjuncts after it (`RowFilter`'s three-valued AND), so `n + 1 > 1000 AND CAST(note AS INT) > 0` still raises on a row where `n` is NULL, as the whole expression does.
+- **A host mask after the filter** must not see a row the filter answered NULL for. A new internal `RowPredicate.DropsEarlierNulls` makes the reader drop the rows answered NULL so far (live = all-true) before asking it. 3b turned each condition's NULLs into FALSE, which no longer works once a condition is several predicates: a row that is NULL on the first conjunct and TRUE on the second would reach the mask.
+
+The codec seam still applies the filter whole: it has no dictionary to gain from.
+
+### Measured: splitting wins except at very high selectivity
+
+`ConjunctSplitBenchmarks` (Delta benchmarks): 4 files of 4 row groups x 131,072 rows, scattered uniform columns, the scan returns `id` only, `MaxConcurrentReads` 4. i9-12900K, net10.0, BenchmarkDotNet, 12 iterations. "Together" is the filter's row-level conjuncts as one AND, as 3a did.
+
+| Filter | Kept | Together | Split | Split vs together |
+|---|---|---|---|---|
+| `amount < 100 AND qty < 90` | 9% | 16.3 ms | 9.3 ms | -43% |
+| `amount < 500 AND qty < 50` | 25% | 24.6 ms | 15.2 ms | -38% |
+| `amount < 900 AND qty < 90 AND category <> 'cat_03'` | 76% | 29.0 ms | 23.7 ms | -18% |
+| `amount < 990 AND qty < 99 AND id >= 0` | 94% | 20.2 ms | 22.5 ms | +12% |
+| `amount < 990` (one conjunct, control) | 99% | 11.5 ms | 11.4 ms | 0% |
+
+The proposal for 4a had been to evaluate adjacent conjuncts together whenever neither gained from standing alone, to save the gather of live rows the reader hands each predicate after the first. The numbers reverse that: one AND in the evaluator costs more than the gathers do (it also allocates 2-4 times as much managed memory), except when nearly every row stays live. Every conjunct is therefore split. The 94% case is phase 5's: demote, or stop gathering for, a predicate that keeps almost everything. `DeltaTable.EvaluatesConjunctsTogether` (internal) keeps the old behaviour for this A/B and for tests.
+
+### Tests
+
+`ExactFilterTests`:
+- 9 filters of several conjuncts (two data columns, a partition column first or last, `lower(region)` that file pruning can't decide, nested ANDs, `1 = 1`, an OR inside a conjunct, one column twice) x 3 projections x {serial and together, serial split, parallel split, seam}, against 3a's oracle;
+- a later conjunct still raises on a row an earlier one answered NULL for (split, together, seam);
+- a host mask after split conjuncts sees only rows the whole filter accepted;
+- a partition conjunct that rejects a file skips it before an earlier conjunct raises on its rows;
+- a file-constant conjunct that raises: up front when first; after a row-level conjunct, only if a row survives it (including a row that conjunct answered NULL for).
+
+Each of these mutations fails tests:
+- conjuncts' NULLs turned into FALSE (3 tests);
+- the reader's NULL barrier ignored (4);
+- a deferred raise raised up front (1);
+- a hoisted FALSE treated as TRUE (12);
+- a deferred raise never thrown (2);
+- a merged conjunct (`EvaluatesConjunctsTogether`) reading only the first conjunct's columns (13).

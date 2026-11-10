@@ -4788,13 +4788,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// order and spelling, resolved by the evaluator's rule (<see cref="ReferenceResolutions"/>: the first part of
     /// a name, ignoring case; a reference to a struct field needs its whole top-level column). Null, to read every
     /// column, when the predicate holds a node this does not know, a reference that does not resolve to exactly
-    /// one column, or no reference at all.
+    /// one column, or (unless <paramref name="emptyWhenUnreferenced"/>, which then answers an empty list) no reference at all.
     /// </summary>
-    internal static IReadOnlyList<string>? PredicateColumns(Expressions.Predicate predicate, Apache.Arrow.Schema schema)
+    internal static IReadOnlyList<string>? PredicateColumns(
+        Expressions.Predicate predicate, Apache.Arrow.Schema schema, bool emptyWhenUnreferenced = false)
     {
         var referenced = new HashSet<string>(StringComparer.Ordinal);
-        if (!Visit(predicate) || referenced.Count == 0)
+        if (!Visit(predicate))
             return null;
+        if (referenced.Count == 0)
+            return emptyWhenUnreferenced ? [] : null;
         return schema.FieldsList.Where(f => referenced.Contains(f.Name)).Select(f => f.Name).ToList();
 
         bool Visit(Expressions.Expression expression)
@@ -13266,15 +13269,82 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 // file, so it is asked once, here, over one row of the table's shape — and only when some row is
                 // live: a scan of an empty file, or of one its deletion vector empties, asks no condition anything,
                 // so it must not fail on a value-dependent error here.
-                var predicates = new List<RowPredicate>(conditions.Count);
-                IReadOnlyList<string>? everyColumn = null;
-                bool? live = null;
+                //
+                // The FilterRows filter goes in as its top-level conjuncts, in source order (#502 phase 4a). A
+                // conjunct over none of the file's columns is answered up front, see FileConstantConjunctsAsync.
+                // The others become one row predicate each, whose NULL answers stay live for the conjuncts after
+                // them, so the split keeps the expression's three-valued AND. The reader hands each conjunct only
+                // the rows still live, which measured 18-43% faster than one AND over 2-3 scattered conjuncts
+                // keeping 9-76% (ConjunctSplitBenchmarks), and 12% slower when they keep 94%. The first host mask
+                // after them drops the rows the filter answered NULL for.
+                var steps = new List<ConditionStep>(conditions.Count);
                 foreach (var condition in conditions)
                 {
-                    var conditionFileColumns = condition.Columns is null ? null : await FileColumnsAsync(
-                            reader, snapshot, condition.Columns, mappingMode, logicalToPhysical, withRowTracking: false,
+                    if (condition.Filter is { } filter)
+                    {
+                        foreach (var conjunct in Conjuncts(filter))
+                        {
+                            var conjunctColumns = PredicateColumns(conjunct, snapshot.ArrowSchema, emptyWhenUnreferenced: true);
+                            steps.Add(new ConditionStep(
+                                new RowCondition(conjunctColumns, batch => RowEvaluator.EvaluatePredicate(conjunct, batch)),
+                                conjunct,
+                                await ConditionFileColumnsAsync(conjunctColumns).ConfigureAwait(false)));
+                        }
+                    }
+                    else
+                    {
+                        steps.Add(new ConditionStep(
+                            condition, null, await ConditionFileColumnsAsync(condition.Columns).ConfigureAwait(false)));
+                    }
+                }
+
+                var predicates = new List<RowPredicate>(steps.Count);
+                IReadOnlyList<string>? everyColumn = null;
+                if (steps.Any(s => s.FileColumns is null))
+                {
+                    everyColumn = await FileColumnsAsync(
+                            reader, snapshot, null, mappingMode, logicalToPhysical, withRowTracking: false,
                             cancellationToken)
-                        .ConfigureAwait(false);
+                        .ConfigureAwait(false)
+                        ?? (await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false))
+                            .Root.Children.Select(c => c.Name).ToList();
+                }
+
+                bool? live = null;
+                noRowsMatch = !await FileConstantConjunctsAsync().ConfigureAwait(false);
+                var run = new List<ConditionStep>();
+                bool afterFilter = false;
+                foreach (var step in noRowsMatch ? [] : (IEnumerable<ConditionStep>)steps)
+                {
+                    if (step.Conjunct is not null)
+                    {
+                        if (step.Dropped)
+                            continue;
+                        if (step.Deferred is { } error)
+                        {
+                            // It raised over the file's one row, after a conjunct the reader answers row by row: it
+                            // raises once a row survives the conjuncts before it, as it would in the expression.
+                            FlushRun();
+                            predicates.Add(new RowPredicate(predicates[^1].Columns, batch =>
+                            {
+                                if (batch.Length > 0)
+                                    error.Throw();
+                                return Repeat(true, 0);
+                            }));
+                            continue;
+                        }
+
+                        if (run.Count > 0 && !EvaluatesConjunctsTogether)
+                            FlushRun();
+                        run.Add(step);
+                        continue;
+                    }
+
+                    FlushRun();
+                    var condition = step.Condition;
+                    var conditionFileColumns = step.FileColumns;
+                    bool dropsEarlierNulls = afterFilter;
+                    afterFilter = false;
                     if (conditionFileColumns is { Count: 0 } && predicates.Count > 0)
                     {
                         // After a condition the reader answers row by row, this one may be asked only once a row
@@ -13282,23 +13352,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         // So the reader asks it, over the columns it already read for the condition before, and
                         // the one answer for the file is computed the first time a batch has a row, then repeated
                         // for every row. (The reader also asks a predicate over no rows once none is live.)
-                        var once = new Lazy<bool>(() => OneRowAnswersTrue(condition));
+                        var once = new Lazy<bool>(() => OneRowAnswer(condition) == true);
                         predicates.Add(new RowPredicate(
                             predicates[^1].Columns,
-                            batch => Repeat(batch.Length > 0 && once.Value, batch.Length)));
+                            batch => Repeat(batch.Length > 0 && once.Value, batch.Length))
+                        {
+                            DropsEarlierNulls = dropsEarlierNulls,
+                        });
                         continue;
                     }
 
                     if (conditionFileColumns is { Count: 0 })
                     {
-                        if (live is null)
-                        {
-                            var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
-                            live = footer.NumRows > 0
-                                && !(deletedRows is { IsEmpty: false } && deletedRows.ContainsRange(0, footer.NumRows));
-                        }
-
-                        if (live == false || !OneRowAnswersTrue(condition))
+                        if (!await LiveAsync().ConfigureAwait(false) || OneRowAnswer(condition) != true)
                         {
                             noRowsMatch = true;
                             break;
@@ -13307,20 +13373,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         continue;
                     }
 
-                    if (conditionFileColumns is null && everyColumn is null)
-                    {
-                        everyColumn = await FileColumnsAsync(
-                                reader, snapshot, null, mappingMode, logicalToPhysical, withRowTracking: false,
-                                cancellationToken)
-                            .ConfigureAwait(false)
-                            ?? (await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false))
-                                .Root.Children.Select(c => c.Name).ToList();
-                    }
-
                     predicates.Add(new RowPredicate(conditionFileColumns ?? everyColumn!, ConditionMask(
                         condition, snapshot, addFile, mappingMode, physicalToLogical, logicalToPhysical,
-                        partitionColumns, hasPartitions)));
+                        partitionColumns, hasPartitions))
+                    {
+                        DropsEarlierNulls = dropsEarlierNulls,
+                    });
                 }
+
+                if (!noRowsMatch)
+                    FlushRun();
 
                 if (!noRowsMatch && predicates.Count > 0)
                 {
@@ -13335,14 +13397,106 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         .ConfigureAwait(false);
                 }
 
-                bool OneRowAnswersTrue(RowCondition condition)
+                bool? OneRowAnswer(RowCondition condition)
                 {
                     var one = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], 1);
                     var shaped = ReconcileToTableShape(
                         one, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
                         logicalToPhysical, addFile.Path);
                     using var answer = condition.Evaluate(shaped);
-                    return answer.GetValue(0) == true;
+                    return answer.GetValue(0);
+                }
+
+                async ValueTask<IReadOnlyList<string>?> ConditionFileColumnsAsync(IReadOnlyList<string>? logical) =>
+                    logical is null ? null : await FileColumnsAsync(
+                            reader, snapshot, logical, mappingMode, logicalToPhysical, withRowTracking: false,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+
+                // Whether the file has a row the deletion vector leaves: a scan of an empty file, or of one its
+                // deletion vector empties, asks no condition anything, so it must not fail on a value-dependent
+                // error over the one row a file-constant condition is asked about.
+                async ValueTask<bool> LiveAsync()
+                {
+                    if (live is null)
+                    {
+                        var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+                        live = footer.NumRows > 0
+                            && !(deletedRows is { IsEmpty: false } && deletedRows.ContainsRange(0, footer.NumRows));
+                    }
+
+                    return live.Value;
+                }
+
+                // The filter's conjuncts over none of the file's columns (only partition columns, or columns added
+                // after the file was written) have one answer for the whole file, and are answered here, once, before
+                // any row is read, wherever they stand in the filter, as Spark applies a partition filter before it
+                // reads a file: TRUE drops the conjunct, FALSE or NULL skips the file (false is returned), since no
+                // row can then pass. One that raises before any conjunct the reader answers row by row raises here,
+                // as it would on the file's first row; after one, it is deferred to its place (see Deferred). A file
+                // with no live row is skipped without asking any of them.
+                async ValueTask<bool> FileConstantConjunctsAsync()
+                {
+                    bool rowLevelBefore = false;
+                    foreach (var step in steps)
+                    {
+                        if (step.Conjunct is null)
+                            continue;
+                        if (step.FileColumns is not { Count: 0 })
+                        {
+                            rowLevelBefore = true;
+                            continue;
+                        }
+
+                        if (!await LiveAsync().ConfigureAwait(false))
+                            return false;
+
+                        bool? answer;
+                        try
+                        {
+                            answer = OneRowAnswer(step.Condition);
+                        }
+                        catch (Exception e) when (rowLevelBefore)
+                        {
+                            step.Deferred = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(e);
+                            continue;
+                        }
+
+                        if (answer != true)
+                            return false;
+                        step.Dropped = true;
+                    }
+
+                    return true;
+                }
+
+                // The pending run of adjacent row-level conjuncts, as one row predicate: their AND, whose NULL
+                // answers stay live for the predicates after it.
+                void FlushRun()
+                {
+                    if (run.Count == 0)
+                        return;
+                    var condition = run[0].Condition;
+                    IReadOnlyList<string>? runFileColumns = run[0].FileColumns;
+                    if (run.Count > 1)
+                    {
+                        var conjuncts = run.Select(s => s.Conjunct!).ToList();
+                        var and = new Expressions.AndPredicate(conjuncts);
+                        var logical = run.Any(s => s.Condition.Columns is null) ? null
+                            : snapshot.ArrowSchema.FieldsList
+                                .Where(f => run.Any(s => s.Condition.Columns!.Contains(f.Name)))
+                                .Select(f => f.Name)
+                                .ToList();
+                        condition = new RowCondition(logical, batch => RowEvaluator.EvaluatePredicate(and, batch));
+                        runFileColumns = run.Any(s => s.FileColumns is null) ? null
+                            : run.SelectMany(s => s.FileColumns!).Distinct(StringComparer.Ordinal).ToList();
+                    }
+
+                    predicates.Add(new RowPredicate(runFileColumns ?? everyColumn!, ConditionMask(
+                        condition, snapshot, addFile, mappingMode, physicalToLogical, logicalToPhysical,
+                        partitionColumns, hasPartitions, keepNulls: true)));
+                    run.Clear();
+                    afterFilter = true;
                 }
             }
 
@@ -13439,7 +13593,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private static Func<RecordBatch, BooleanArray> ConditionMask(
         RowCondition condition, Snapshot.Snapshot snapshot, AddFile addFile, ColumnMappingMode mappingMode,
         Dictionary<string, string> physicalToLogical, Dictionary<string, string> logicalToPhysical,
-        IReadOnlyList<string> partitionColumns, bool hasPartitions) =>
+        IReadOnlyList<string> partitionColumns, bool hasPartitions, bool keepNulls = false) =>
         batch =>
         {
             var logical = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
@@ -13448,7 +13602,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             logical = ReconcileToTableShape(
                 logical, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
                 logicalToPhysical, addFile.Path);
-            return NullAsFalse(condition.Evaluate(logical), logical);
+            var answer = condition.Evaluate(logical);
+            return keepNulls ? answer : NullAsFalse(answer, logical);
         };
 
     /// <summary>One answer for every row of a batch.</summary>
@@ -13484,7 +13639,48 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// least <see cref="Columns"/> (null: the condition may read any column, so the batch holds every one); TRUE keeps
     /// a row, FALSE or NULL drops it (see <see cref="NullAsFalse"/>).
     /// </summary>
-    internal sealed record RowCondition(IReadOnlyList<string>? Columns, Func<RecordBatch, BooleanArray> Evaluate);
+    internal sealed record RowCondition(IReadOnlyList<string>? Columns, Func<RecordBatch, BooleanArray> Evaluate)
+    {
+        /// <summary>
+        /// The <see cref="DeltaReadOptions.FilterRows"/> filter this condition evaluates, if it is that one: the
+        /// built-in reader splits it into its top-level conjuncts (#502 phase 4a). Null for a host mask.
+        /// </summary>
+        public Expressions.Predicate? Filter { get; init; }
+    }
+
+    /// <summary>
+    /// One step of a file's row conditions, as the built-in reader applies them: a conjunct of the filter
+    /// (<see cref="Conjunct"/> set), or a whole host mask.
+    /// </summary>
+    private sealed class ConditionStep(
+        RowCondition condition, Expressions.Predicate? conjunct, IReadOnlyList<string>? fileColumns)
+    {
+        public RowCondition Condition { get; } = condition;
+        public Expressions.Predicate? Conjunct { get; } = conjunct;
+
+        /// <summary>The file's physical columns the step reads; empty for none, null for every column.</summary>
+        public IReadOnlyList<string>? FileColumns { get; } = fileColumns;
+
+        /// <summary>A file-constant conjunct answered TRUE for the file: nothing left to ask.</summary>
+        public bool Dropped { get; set; }
+
+        /// <summary>
+        /// A file-constant conjunct that raised over the file's one row, after a conjunct answered row by row: it is
+        /// raised only once a row survives the conjuncts before it.
+        /// </summary>
+        public System.Runtime.ExceptionServices.ExceptionDispatchInfo? Deferred { get; set; }
+    }
+
+    /// <summary>A filter's top-level conjuncts, in source order, nested ANDs flattened.</summary>
+    private static IEnumerable<Expressions.Predicate> Conjuncts(Expressions.Predicate predicate) =>
+        predicate is Expressions.AndPredicate and ? and.Children.SelectMany(Conjuncts) : [predicate];
+
+    /// <summary>
+    /// Evaluates adjacent row-level conjuncts of a <see cref="DeltaReadOptions.FilterRows"/> filter together, as one
+    /// AND, rather than each as its own row predicate. For tests and the ConjunctSplitBenchmarks A/B; the
+    /// file-constant conjuncts are answered up front either way.
+    /// </summary>
+    internal bool EvaluatesConjunctsTogether { get; set; }
 
     /// <summary>The scan's row conditions, in the order they apply: the exact filter, then the host's masks.</summary>
     private static IReadOnlyList<RowCondition>? RowConditions(DeltaReadOptions options, Snapshot.Snapshot snapshot)
@@ -13493,7 +13689,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         if (options.FilterRows && options.Filter is { } filter)
         {
             conditions.Add(new RowCondition(
-                PredicateColumns(filter, snapshot.ArrowSchema), batch => RowEvaluator.EvaluatePredicate(filter, batch)));
+                PredicateColumns(filter, snapshot.ArrowSchema), batch => RowEvaluator.EvaluatePredicate(filter, batch))
+            {
+                Filter = filter,
+            });
         }
 
         foreach (var mask in options.RowMasks ?? [])

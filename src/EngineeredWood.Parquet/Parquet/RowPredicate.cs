@@ -64,4 +64,16 @@ public sealed class RowPredicate
     /// answer a dictionary-encoded column chunk by evaluating the dictionary once. False by default.
     /// </summary>
     public bool ValueWise { get; init; }
+
+    /// <summary>
+    /// True when this predicate begins a new condition rather than continuing the one before it: the rows an
+    /// earlier predicate answered NULL for are dropped before this one is asked, instead of staying live for it.
+    /// </summary>
+    /// <remarks>
+    /// A <see cref="RowFilter"/> keeps a NULL row live so that the conjuncts split out of one expression keep its
+    /// three-valued AND (a later conjunct still evaluates, and can still raise on, a row an earlier one answered
+    /// NULL for). A separate condition after them, a Delta host mask, must never see such a row: for the
+    /// expression, NULL already decided it.
+    /// </remarks>
+    internal bool DropsEarlierNulls { get; init; }
 }
