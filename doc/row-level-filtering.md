@@ -503,7 +503,7 @@ The seam-projection mutation survived until the test also asserted that the retu
 
 - **Conjunct splitting, value-wise dictionary evaluation and selectivity ordering:** phase 4 and later.
 - **`RowMasks`:** 3b, §17.
-- **DELETE through the selected read:** 3c.
+- **DELETE through the selected read:** 3c, §18.
 - **Performance:** the Delta scan now gets 1a–2b's machinery, but this PR records no Delta-level numbers. `FilteredScanBenchmarks` is the place to measure it.
 
 ## 17. Phase 3b: host row masks (2026-11-09)
@@ -570,4 +570,45 @@ Each of these mutations fails tests:
 ### Not yet
 
 - **`ValueWise` and dictionary probing for masks:** phase 4.
-- **DELETE through the selected read:** 3c.
+- **DELETE through the selected read:** 3c, §18.
+
+## 18. Phase 3c: DELETE through the selected read (2026-11-10)
+
+### Checked first: a bug on `main`
+
+§7 suspected that DELETE evaluates its predicate on rows the file's deletion vector already deletes, and masks them out only afterwards. It does.
+- **Repro:** a file with `s` = '5', 'abc', '7' and the 'abc' row deleted by a deletion vector. `DELETE WHERE s = 5` raised `CAST_INVALID_INPUT` on 'abc' (Spark's ANSI rules, which DML follows), though no live row raises. Spark filters deletion-vector rows before evaluating, so it deletes the one '5' row.
+- **Scope:** UPDATE was checked the same way and is not affected; it already leaves deleted rows out before evaluating.
+
+### What it does
+
+`ComputeDeleteActionsAsync` matches each file's rows with `ReadSelectedAsync` instead of reading every row and masking afterwards:
+- The predicate, an expression's mask or a caller's delegate, is the read's one `RowPredicate`. It reads only the columns the predicate references (every column for a delegate, or with a change feed). It goes through 3a's `ConditionMask`, so it sees each row as a scan returns it.
+- The file's existing deletion vector is the read's `ExcludedRows`. A deleted row is never handed to the predicate, which fixes the bug above, and a row group the vector deletes whole is skipped unread, as before.
+- **Without a change feed**, the read asks for no columns (`Columns = []`): it returns positions only, and nothing beyond the predicate's columns is decoded. The positions are the rows to delete, already excluding those the vector had.
+- **With a change feed**, the read returns the matched rows whole, with the materialized row-tracking columns. They go to the change file as before, each row's id resolved from its materialized value or `baseRowId` plus its position.
+- **A predicate that reads no column of the file** (only partition columns, or columns added after the file was written) is answered once per file, over one row of the table's shape, and only if the file has a live row. TRUE deletes every live row. This case never has a change feed, because with one the delete reads every column.
+- Row-group and page pruning by the predicate (`Prune`), the whole-file remove, copy-on-write rewrites and the vector itself are unchanged.
+
+`ResolveRowTrackingAt` is gone. `MatchingLiveRows` is now used only by its own tests and the #610 deletion-vector benchmark.
+
+### Tests
+
+`DeleteSelectedReadTests`:
+- an expression DELETE never evaluates a row the vector deleted, with the default mode, deletion vector and copy-on-write;
+- a delegate DELETE is never handed one;
+- with a change feed, the change file holds exactly the deleted rows, with their row ids when row tracking is on;
+- a predicate over a column added after the file was written deletes the file's live rows, and only those;
+- a delegate DELETE over a file that a copy-on-write rewrite gave materialized row-tracking columns is handed only the table's columns.
+
+Each of these mutations fails tests across the DeltaLake.Table suite:
+- the vector not passed as `ExcludedRows` (11 tests);
+- positions off by one (167);
+- change-file row ids from the batch index instead of the position (2);
+- the once-per-file answer inverted (6).
+
+Stripping the materialized columns before the predicate turned out to be redundant: `ReconcileToTableShape` already drops them. The test that guards it stays.
+
+### Not measured
+
+The delete no longer decodes the columns its predicate doesn't read, but this phase has no timings. The gate in §8 also names a Spark interop oracle for DELETE counts; the interop tiers run in CI.

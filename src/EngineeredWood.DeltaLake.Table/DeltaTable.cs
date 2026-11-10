@@ -5248,27 +5248,108 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     prunePredicate, snapshot.Schema, mappingMode, parquetSchema, snapshot.Metadata.PartitionColumns);
             }
 
-            var matchFileColumns = matchColumns is null
-                ? null
-                : await FileColumnsAsync(
-                        reader, snapshot, matchColumns, mappingMode, logicalToPhysical, withRowTracking: false,
-                        cancellationToken)
-                    .ConfigureAwait(false);
+            var matchFileColumns = await FileColumnsAsync(
+                    reader, snapshot, matchColumns, mappingMode, logicalToPhysical, withRowTracking: false,
+                    cancellationToken)
+                .ConfigureAwait(false)
+                ?? (await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false))
+                    .Root.Children.Select(c => c.Name).ToList();
+            var excluded = rawDeletedRows.IsEmpty ? null : rawDeletedRows;
 
-            // Row groups the existing vector already deletes in full hold no row this delete could remove, so
-            // they are skipped unread; positions after them are unchanged.
-            await foreach (var (batch, firstRow) in ReadPositionedAsync(
-                reader, filePredicate, matchFileColumns, rawDeletedRows, cancellationToken).ConfigureAwait(false))
+            if (matchFileColumns.Count == 0)
             {
-                // Resolved exactly as the read path resolves it: the predicate must see what a scan sees.
-                var logicalBatch = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
-                // The deleted rows go on to the change file; the source file's ids must not go with them.
-                logicalBatch = ColumnMappingRecursive.StripParquetFieldIds(logicalBatch);
+                // The predicate reads no column of this file (only partition columns, or columns added after it):
+                // it answers the same for every row, so it is asked once, over one row of the table's shape — and
+                // only when a row is live, so that a value-dependent error can't fail a delete of nothing.
+                if (fileRows > rawDeletedRows.Count && OneRowMatches())
+                {
+                    for (long row = 0; row < fileRows; row++)
+                    {
+                        if (!rawDeletedRows.Contains(row))
+                            newDeletedIndices.Add(row);
+                    }
+                }
 
-                // This path reads the file's raw columns rather than going through ReadFileAsync, so the hidden
-                // materialized row-tracking columns (present on any file a rewrite produced) are still attached.
-                // Take them off before the predicate runs — a user predicate should never be handed a column
-                // that is not in the table's schema — and keep their values to identify the deleted rows.
+                bool OneRowMatches()
+                {
+                    var one = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], 1);
+                    var shaped = ReconcileToTableShape(
+                        one, snapshot, addFile.PartitionValues, matchColumns, partitionColumns,
+                        partitionColumns.Count > 0, logicalToPhysical, addFile.Path);
+                    using var answer = predicate(shaped);
+                    return answer.GetValue(0) == true;
+                }
+
+                // A change feed reads every column (matchColumns is null), so this file has some.
+                System.Diagnostics.Debug.Assert(!cdfEnabled, "A change feed's DELETE reads every column.");
+            }
+            else
+            {
+                // The delete is a selected read (#502): the predicate is its row filter, over only the columns it
+                // reads, and the existing vector is its excluded rows, so a row the vector already deleted is never
+                // handed to the predicate (Spark filters those rows first, too). Without a change feed nothing else
+                // is decoded: the read returns positions only. With one, the matched rows come back whole.
+                var condition = new RowCondition(matchColumns, predicate);
+                var scan = new Parquet.ParquetScan
+                {
+                    Columns = cdfEnabled
+                        ? await FileColumnsAsync(
+                                reader, snapshot, null, mappingMode, logicalToPhysical, withRowTracking: true,
+                                cancellationToken)
+                            .ConfigureAwait(false)
+                        : [],
+                    Prune = filePredicate,
+                    RowFilter = new Parquet.RowFilter(new Parquet.RowPredicate(matchFileColumns, ConditionMask(
+                        condition, snapshot, addFile, mappingMode, physicalToLogical, logicalToPhysical,
+                        partitionColumns, partitionColumns.Count > 0))),
+                    ExcludedRows = excluded,
+                };
+
+                await foreach (var selected in reader.ReadSelectedAsync(scan, cancellationToken).ConfigureAwait(false))
+                {
+                    var where = selected.Positions;
+                    for (int i = 0; i < selected.Batch.Length; i++)
+                        newDeletedIndices.Add(where[i]);
+
+                    if (cdfEnabled && selected.Batch.Length > 0)
+                    {
+                        CaptureSelected(selected.Batch, where);
+                        where.Explicit?.Dispose();
+                    }
+                    else
+                    {
+                        selected.Dispose();
+                    }
+                }
+            }
+
+            // A selected batch holds only the deleted rows, each at the file position `where` gives.
+            void CaptureSelected(RecordBatch batch, RowPositions where)
+            {
+                var (logicalBatch, rawMatIds, rawMatVers) = ToDeletedRowsShape(batch);
+                deletedRowBatches.Add(logicalBatch);
+                if (!rowTrackingEnabled)
+                    return;
+                var ids = new Int64Array.Builder().Reserve(batch.Length);
+                var versions = new Int64Array.Builder().Reserve(batch.Length);
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    long? mid = rawMatIds is not null && !rawMatIds.IsNull(i) ? rawMatIds.GetValue(i) : null;
+                    long? id = mid ?? (addFile.BaseRowId is { } ab ? ab + where[i] : (long?)null);
+                    if (id is { } iv) ids.Append(iv); else ids.AppendNull();
+                    long? mv = rawMatVers is not null && !rawMatVers.IsNull(i) ? rawMatVers.GetValue(i) : null;
+                    if ((mv ?? addFile.DefaultRowCommitVersion) is { } vv) versions.Append(vv); else versions.AppendNull();
+                }
+
+                deletedRowTracking.Add((ids.Build(), versions.Build()));
+            }
+
+            // A raw batch as a scan returns it: logical names, no field ids, current schema, the hidden
+            // materialized row-tracking columns taken off (their values kept to identify the deleted rows).
+            (RecordBatch Batch, Int64Array? Ids, Int64Array? Versions) ToDeletedRowsShape(RecordBatch batch)
+            {
+                var logicalBatch = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
+                logicalBatch = ColumnMappingRecursive.StripParquetFieldIds(logicalBatch);
                 Int64Array? rawMatIds = null, rawMatVers = null;
                 if (matRowIdName is not null || matRowVerName is not null)
                 {
@@ -5276,30 +5357,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         .StripMaterializedColumns(logicalBatch, matRowIdName, matRowVerName);
                 }
 
-                // The predicate sees each row as a scan returns it: current schema, columns added since this
-                // file was written as NULL, partition columns re-materialized, widened types widened.
                 logicalBatch = ReconcileToTableShape(
-                    logicalBatch, snapshot, addFile.PartitionValues, matchColumns, partitionColumns,
+                    logicalBatch, snapshot, addFile.PartitionValues, null, partitionColumns,
                     partitionColumns.Count > 0, logicalToPhysical, addFile.Path);
-
-                // The rows this delete removes: those the predicate is TRUE for (a NULL deletes nothing) that the
-                // existing vector does not already hide — the vector and the predicate mask merged word by word.
-                var mask = predicate(logicalBatch);
-                var matchRows = MatchingLiveRows(rawDeletedRows, firstRow, batch.Length, mask);
-                foreach (int i in matchRows)
-                    newDeletedIndices.Add(firstRow + i);
-
-                // Collect deleted row data for CDC
-                if (cdfEnabled && matchRows.Count > 0)
-                {
-                    deletedRowBatches.Add(TakeRowsFromBatch(logicalBatch, matchRows));
-                    if (rowTrackingEnabled)
-                    {
-                        deletedRowTracking.Add(ResolveRowTrackingAt(
-                            matchRows, rawMatIds, rawMatVers, addFile.BaseRowId,
-                            addFile.DefaultRowCommitVersion, firstRow));
-                    }
-                }
+                return (logicalBatch, rawMatIds, rawMatVers);
             }
 
             if (newDeletedIndices.Count == 0)
@@ -5995,33 +6056,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     // row through Int64Array.Builder.
     private static Int64Array TakeIds(Int64Array src, List<int> idx) =>
         (Int64Array)ArrowCompute.Take(src, idx);
-
-    // The row-tracking identity of the rows at `rows` (indices into a raw, unfiltered batch whose first row
-    // sits at absolute file position `batchStartRow`), resolved the way a conformant reader does: the
-    // MATERIALIZED value where the file carries one, else add.baseRowId + absolute position and the file's
-    // defaultRowCommitVersion. Used by the paths that read a file's raw columns themselves rather than going
-    // through ReadFileAsync, which surfaces the same resolution via its out-params.
-    private static (Int64Array Ids, Int64Array Vers) ResolveRowTrackingAt(
-        List<int> rows, Int64Array? materializedIds, Int64Array? materializedVersions,
-        long? baseRowId, long? defaultRowCommitVersion, long batchStartRow)
-    {
-        var idb = new Int64Array.Builder().Reserve(rows.Count);
-        var vrb = new Int64Array.Builder().Reserve(rows.Count);
-        foreach (int i in rows)
-        {
-            long? mid = materializedIds is not null && i < materializedIds.Length && !materializedIds.IsNull(i)
-                ? materializedIds.GetValue(i) : null;
-            long? id = mid ?? (baseRowId is { } br ? br + batchStartRow + i : (long?)null);
-            if (id is { } iv) idb.Append(iv); else idb.AppendNull();
-
-            long? mv = materializedVersions is not null && i < materializedVersions.Length
-                       && !materializedVersions.IsNull(i)
-                ? materializedVersions.GetValue(i) : null;
-            long? ver = mv ?? defaultRowCommitVersion;
-            if (ver is { } vv) vrb.Append(vv); else vrb.AppendNull();
-        }
-        return (idb.Build(), vrb.Build());
-    }
 
     // A constant Int64 column (the commit version assigned to every matched/updated row). Tiled by Repeat
     // rather than appended per row, which also drops the validity buffer a builder allocates for a column
@@ -13325,6 +13359,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             var logical = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
             logical = ColumnMappingRecursive.StripParquetFieldIds(logical);
+
             logical = ReconcileToTableShape(
                 logical, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
                 logicalToPhysical, addFile.Path);
