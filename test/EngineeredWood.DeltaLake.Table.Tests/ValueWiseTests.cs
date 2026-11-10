@@ -335,8 +335,125 @@ public class ValueWiseTests : IDisposable
     [InlineData(true)]
     public async Task AWholeBatchWhoseWideningOverflowsFallsBackToTheLiveRows(bool whole)
     {
-        const int rows = 20;
-        const int bad = 7;
+        const int rows = WidenedRows;
+        const int bad = WidenedBad;
+        await using var table = await CreateWidenedAsync(trustStatisticsProofs: false);
+        table.EvaluatesWholeBatches = whole;
+        table.WholeBatchLiveShare = 0;
+
+        // An earlier conjunct rejects the bad row: it is never widened.
+        var scanned = await ReadAsync(table, new DeltaReadOptions
+        {
+            Columns = ["id"],
+            Filter = P($"id <> {bad} AND d > DATE'2000-02-20'"),
+            FilterRows = true,
+        });
+        Assert.Equal(Enumerable.Range(0, rows).Where(i => i != bad && 11_000 + i > 11_007).Select(i => i.ToString(CultureInfo.InvariantCulture)).OrderBy(x => x, StringComparer.Ordinal), scanned);
+
+        // The deletion vector deletes it: an expression DELETE over d never widens it.
+        var (removed, _) = await table.DeleteAsync(P($"id = {bad}"));
+        Assert.Equal(1, removed);
+        var (deleted, _) = await table.DeleteAsync(P("d > DATE'2000-02-20'"));
+        Assert.Equal(12, deleted); // rows 8-19 (2000-02-21 on)
+    }
+
+    // ---- Statistics proofs (#502 phase 5c) ---------------------------------------------------------------------------
+
+    // id is BIGINT: a proof holds only for a literal of the column's own type, so these are BIGINT literals (2500L).
+    // `id >= 2500` (an INT literal) is offered a proof that never holds.
+    public static IEnumerable<object[]> ProofFilters() =>
+    [
+        ["id >= 2500L"],                         // groups 3-5 proven, group 2 partly
+        ["id >= 2500L AND cat = 'c3'"],          // split: the id conjunct is proven for groups 3-5, cat never
+        ["id >= 100L AND id < 5900L"],
+        ["cat <> 'c1' AND id > 1000L"],          // the id conjunct alone is proven for groups 2-5
+        ["id < 5000L OR cat IS NULL"],           // OR: proven by its first branch for groups 0-4
+    ];
+
+    /// <summary>
+    /// With <see cref="DeltaTableOptions.TrustStatisticsProofs"/>, a conjunct a row group's statistics prove TRUE for
+    /// every row is dropped there; the scan returns the same rows as without the option, which offers no proof.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ProofFilters))]
+    public async Task AScanReturnsTheSameRowsWithStatisticsProofs(string sql)
+    {
+        foreach (int concurrency in new[] { 1, 4 })
+        {
+            List<string>? expected = null;
+            foreach (bool trust in new[] { false, true })
+            {
+                await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, trustStatisticsProofs: trust);
+                var offered = new ConcurrentBag<bool>();
+                table.RowFilterObserver = filter =>
+                {
+                    foreach (var predicate in filter.Predicates)
+                        offered.Add(DeltaTable.OffersProof(predicate));
+                };
+                var rows = await ReadAsync(table, new DeltaReadOptions
+                {
+                    Columns = ["id", "cat"], Filter = P(sql), FilterRows = true,
+                });
+                Assert.Equal(trust, offered.Contains(true));
+
+                // Held, not only offered: some row group was read with a predicate dropped.
+                Assert.Equal(trust, table.ProvenRowGroups > 0);
+                if (expected is null)
+                    expected = rows;
+                else
+                    Assert.Equal(expected, rows);
+                Assert.NotEmpty(rows);
+            }
+        }
+    }
+
+    /// <summary>A conjunct a proof cannot stand in for (one that casts a string, which can raise) is never offered.</summary>
+    [Theory]
+    [InlineData("CAST(code AS INT) > 3")]
+    [InlineData("code = 5")]
+    public async Task AConjunctThatCanRaiseIsNotOfferedAProof(string sql)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, trustStatisticsProofs: true);
+        var offered = new ConcurrentBag<bool>();
+        table.RowFilterObserver = filter =>
+        {
+            foreach (var predicate in filter.Predicates)
+                offered.Add(DeltaTable.OffersProof(predicate));
+        };
+        await ReadAsync(table, new DeltaReadOptions { Columns = ["id"], Filter = P(sql), FilterRows = true });
+        Assert.NotEmpty(offered);
+        Assert.DoesNotContain(true, offered);
+    }
+
+    /// <summary>An expression DELETE whose row groups a proof covers deletes the same rows as without the option.</summary>
+    [Theory]
+    [InlineData("id >= 2500L")]               // file 2 removed on its file proof, row group 3 on its row-group proof
+    [InlineData("id >= 2500L AND id < 4500L")] // row group 3
+    public async Task ADeleteMatchesTheSameRowsWithStatisticsProofs(string sql)
+    {
+        var results = new List<(long Deleted, List<string> Left)>();
+        foreach (bool trust in new[] { false, true })
+        {
+            await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 4, trustStatisticsProofs: trust);
+            var (deleted, _) = await table.DeleteAsync(P(sql));
+            Assert.Equal(trust, table.ProvenRowGroups > 0);
+            results.Add((deleted, await ReadAsync(table, new DeltaReadOptions { Columns = ["id", "cat"] })));
+        }
+
+        Assert.True(results[0].Deleted > 0);
+        Assert.Equal(results[0].Deleted, results[1].Deleted);
+        Assert.Equal(results[0].Left, results[1].Left);
+    }
+
+    private const int WidenedRows = 20;
+    private const int WidenedBad = 7;
+
+    /// <summary>
+    /// One file of 20 rows, <c>id</c> 0-19 and a DATE <c>d</c> the table has widened to TIMESTAMP_NTZ; row 7's day count is
+    /// <c>int.MaxValue</c>, which overflows when widened (checked, in microseconds).
+    /// </summary>
+    private async Task<DeltaTable> CreateWidenedAsync(bool trustStatisticsProofs)
+    {
         string root = Path.Combine(_tempDir, $"widened_{Guid.NewGuid():N}");
         Directory.CreateDirectory(root);
         var fs = new LocalTableFileSystem(root);
@@ -345,16 +462,16 @@ public class ValueWiseTests : IDisposable
             .Field(new Field("d", Date32Type.Default, true))
             .Build();
         var days = new ArrowBuffer.Builder<int>();
-        for (int i = 0; i < rows; i++)
-            days.Append(i == bad ? int.MaxValue : 11_000 + i); // 2000-02-13 onwards; the bad row overflows
+        for (int i = 0; i < WidenedRows; i++)
+            days.Append(i == WidenedBad ? int.MaxValue : 11_000 + i); // 2000-02-13 onwards; the bad row overflows
         var ids = new Int64Array.Builder();
-        for (int i = 0; i < rows; i++)
+        for (int i = 0; i < WidenedRows; i++)
             ids.Append(i);
         await using (var file = await fs.CreateAsync("data.parquet"))
         await using (var writer = new ParquetFileWriter(file, ownsFile: false))
         {
             await writer.WriteRowGroupAsync(new RecordBatch(fileSchema,
-                [ids.Build(), new Date32Array(days.Build(), ArrowBuffer.Empty, rows, 0, 0)], rows));
+                [ids.Build(), new Date32Array(days.Build(), ArrowBuffer.Empty, WidenedRows, 0, 0)], WidenedRows));
             await writer.CloseAsync();
         }
 
@@ -389,24 +506,112 @@ public class ValueWiseTests : IDisposable
             },
         });
 
-        await using var table = await DeltaTable.OpenAsync(fs);
-        table.EvaluatesWholeBatches = whole;
-        table.WholeBatchLiveShare = 0;
+        return await DeltaTable.OpenAsync(fs, new DeltaTableOptions { TrustStatisticsProofs = trustStatisticsProofs });
+    }
 
-        // An earlier conjunct rejects the bad row: it is never widened.
-        var scanned = await ReadAsync(table, new DeltaReadOptions
+    /// <summary>
+    /// #807 review round 1: a proof must not hide an error the rows would raise. <c>id &gt;= 0L</c> proves
+    /// <c>d IS NULL OR id &gt;= 0L</c> for the row group, but asked row by row the OR widens row 7's <c>d</c>, which
+    /// overflows. A column whose type has changed is never one a proof may stand in for, so the scan and the DELETE
+    /// raise with <see cref="DeltaTableOptions.TrustStatisticsProofs"/> on as they do with it off.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AProofDoesNotHideAWideningThatOverflows(bool trust)
+    {
+        await using var table = await CreateWidenedAsync(trust);
+        var offered = new ConcurrentBag<bool>();
+        table.RowFilterObserver = filter =>
         {
-            Columns = ["id"],
-            Filter = P($"id <> {bad} AND d > DATE'2000-02-20'"),
-            FilterRows = true,
-        });
-        Assert.Equal(Enumerable.Range(0, rows).Where(i => i != bad && 11_000 + i > 11_007).Select(i => i.ToString(CultureInfo.InvariantCulture)).OrderBy(x => x, StringComparer.Ordinal), scanned);
+            foreach (var predicate in filter.Predicates)
+                offered.Add(DeltaTable.OffersProof(predicate));
+        };
 
-        // The deletion vector deletes it: an expression DELETE over d never widens it.
-        var (removed, _) = await table.DeleteAsync(P($"id = {bad}"));
-        Assert.Equal(1, removed);
-        var (deleted, _) = await table.DeleteAsync(P("d > DATE'2000-02-20'"));
-        Assert.Equal(12, deleted); // rows 8-19 (2000-02-21 on)
+        await Assert.ThrowsAsync<OverflowException>(() => ReadAsync(table, new DeltaReadOptions
+        {
+            Columns = ["id"], Filter = P("d IS NULL OR id >= 0L"), FilterRows = true,
+        }));
+        await Assert.ThrowsAsync<OverflowException>(() => table.DeleteAsync(P("d IS NULL OR id >= 0L")).AsTask());
+        Assert.NotEmpty(offered);
+        Assert.DoesNotContain(true, offered);
+    }
+
+    /// <summary>
+    /// #807 review round 2: a proof must not skip a partition value the predicate would decode. The file's DATE partition
+    /// value is "abc"; asked row by row, <c>part IS NULL OR id &gt;= 0L</c> decodes it and raises. Proven by its
+    /// <c>id</c> branch, it would not. A predicate referencing a partition column is never offered a proof, so the scan
+    /// and the DELETE raise with <see cref="DeltaTableOptions.TrustStatisticsProofs"/> on as they do with it off.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AProofDoesNotSkipAMalformedPartitionValue(bool trust)
+    {
+        const int rows = 20;
+        string root = Path.Combine(_tempDir, $"badpart_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var fs = new LocalTableFileSystem(root);
+        var fileSchema = new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, false)).Build();
+        var ids = new Int64Array.Builder();
+        for (int i = 0; i < rows; i++)
+            ids.Append(i);
+        await using (var file = await fs.CreateAsync("part=abc/data.parquet"))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(new RecordBatch(fileSchema, [ids.Build()], rows));
+            await writer.CloseAsync();
+        }
+
+        await new EngineeredWood.DeltaLake.Log.TransactionLog(fs).WriteCommitAsync(0, new List<EngineeredWood.DeltaLake.Actions.DeltaAction>
+        {
+            new EngineeredWood.DeltaLake.Actions.ProtocolAction
+            {
+                MinReaderVersion = 3,
+                MinWriterVersion = 7,
+                ReaderFeatures = ["deletionVectors"],
+                WriterFeatures = ["deletionVectors"],
+            },
+            new EngineeredWood.DeltaLake.Actions.MetadataAction
+            {
+                Id = "badpart",
+                Format = EngineeredWood.DeltaLake.Actions.Format.Parquet,
+                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}},{"name":"part","type":"date","nullable":true,"metadata":{}}]}""",
+                PartitionColumns = ["part"],
+                Configuration = new Dictionary<string, string>
+                {
+                    { EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorConfig.EnableKey, "true" },
+                },
+            },
+            new EngineeredWood.DeltaLake.Actions.AddFile
+            {
+                Path = "part=abc/data.parquet",
+                PartitionValues = new Dictionary<string, string> { ["part"] = "abc" },
+                Size = new FileInfo(Path.Combine(root, "part=abc", "data.parquet")).Length,
+                ModificationTime = 1000,
+                DataChange = true,
+            },
+        });
+
+        await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions { TrustStatisticsProofs = trust });
+        var offered = new ConcurrentBag<bool>();
+        table.RowFilterObserver = filter =>
+        {
+            foreach (var predicate in filter.Predicates)
+                offered.Add(DeltaTable.OffersProof(predicate));
+        };
+
+        // Not `part = DATE'...'`: a DATE literal is a cast, which no proof stands in for anyway. IS NULL decodes the
+        // value too ("abc" is no spelling of NULL), and is a form a proof would otherwise cover.
+        const string sql = "part IS NULL OR id >= 0L";
+        var scanError = await Record.ExceptionAsync(() => ReadAsync(table, new DeltaReadOptions
+        {
+            Columns = ["id"], Filter = P(sql), FilterRows = true,
+        }));
+        var deleteError = await Record.ExceptionAsync(() => table.DeleteAsync(P(sql)).AsTask());
+        Assert.NotNull(scanError);
+        Assert.NotNull(deleteError);
+        Assert.DoesNotContain(true, offered);
     }
 
     // ---- The table --------------------------------------------------------------------------------------------------
@@ -420,7 +625,8 @@ public class ValueWiseTests : IDisposable
     /// <c>code</c> '0'..'6', and 'x' on the rows a deletion vector deletes (unless <paramref name="deleteBadCodes"/> is
     /// false); <c>p</c> a partition, q0 or q1.
     /// </summary>
-    private async Task<DeltaTable> CreateAsync(string name, int concurrency, bool deleteBadCodes = true)
+    private async Task<DeltaTable> CreateAsync(
+        string name, int concurrency, bool deleteBadCodes = true, bool trustStatisticsProofs = false)
     {
         var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(Path.Combine(_tempDir, name)), TableSchema,
@@ -428,6 +634,7 @@ public class ValueWiseTests : IDisposable
             {
                 ParquetWriteOptions = ParquetWriteOptions.Default with { RowGroupMaxRows = 1_000, DataPageRowCountLimit = 100 },
                 MaxConcurrentReads = concurrency,
+                TrustStatisticsProofs = trustStatisticsProofs,
             },
             partitionColumns: ["p"],
             enableDeletionVectors: true);

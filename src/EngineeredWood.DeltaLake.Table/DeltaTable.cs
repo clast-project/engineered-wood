@@ -5230,6 +5230,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 WholeBatchLiveShare = WholeBatchLiveShare,
                 FusesAnswers = FusesAnswers,
+                OnProvenRowGroup = CountProvenRowGroup,
             };
 
             var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
@@ -5401,6 +5402,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         EvaluateWholeBatch = prunePredicate is null ? null : WholeBatchMask(
                             prunePredicate, matchColumns, snapshot, addFile, mappingMode, physicalToLogical,
                             logicalToPhysical, partitionColumns, partitionColumns.Count > 0),
+                        // A row group whose statistics prove the predicate deletes every live row unread (#502 5c).
+                        Proof = prunePredicate is null ? null : ProofFor(
+                            prunePredicate, snapshot, mappingMode,
+                            _options.TrustStatisticsProofs ? await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false) : null),
                     })),
                     ExcludedRows = excluded,
                 };
@@ -5583,13 +5588,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// resolves a name ignoring case and throws on an ambiguous one, and it cannot read a struct, array, map or
     /// variant, so a reference must match exactly one primitive column that way. A mixed-type comparison answers
     /// NULL rather than throwing, so it needs no exclusion.
+    /// <para>Nor a column whose type has changed (#502 phase 5c review round 1): an older file's values are widened as
+    /// they are read, and widening can raise on a value (a DATE widened to TIMESTAMP_NTZ overflows, checked, on a
+    /// far-future day count). A proof that never reads the column would hide that error, as `d IS NULL OR id &gt;= 0`
+    /// proven by its second branch would. Such a column proves nothing anyway: the file's statistics are of its old
+    /// type, so <see cref="RowGroupPushdown.ToFileColumns"/> leaves it Unknown.</para>
     /// </summary>
     internal static bool EvaluatesEverywhere(Expressions.Predicate predicate, Schema.StructType schema)
     {
         var columns = new HashSet<string>(
             schema.Fields
                 .GroupBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
-                .Where(g => g.Count() == 1 && g.Single().Type is Schema.PrimitiveType { TypeName: not "variant" })
+                .Where(g => g.Count() == 1 && g.Single().Type is Schema.PrimitiveType { TypeName: not "variant" }
+                    && Schema.TypeWidening.GetTypeChanges(g.Single()).Count == 0)
                 .Select(g => g.Key),
             StringComparer.OrdinalIgnoreCase);
         var types = schema.Fields
@@ -13269,6 +13280,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 WholeBatchLiveShare = WholeBatchLiveShare,
                 FusesAnswers = FusesAnswers,
+                OnProvenRowGroup = CountProvenRowGroup,
             };
 
             // The footer, read here whether or not the columns need resolving against it: every read of the file
@@ -13331,6 +13343,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
                 var predicates = new List<RowPredicate>(steps.Count);
                 IReadOnlyList<string>? everyColumn = null;
+
+                // Row-group statistics may prove a run of conjuncts TRUE for every row, dropping it for that group (#502
+                // phase 5c), only where the table trusts statistics proofs at all.
+                var proofSchema = _options.TrustStatisticsProofs
+                    ? parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false)
+                    : null;
                 if (steps.Any(s => s.FileColumns is null))
                 {
                     everyColumn = await FileColumnsAsync(
@@ -13567,6 +13585,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         EvaluateWholeBatch = WholeBatchMask(
                             runPredicate, condition.Columns, snapshot, addFile, mappingMode, physicalToLogical,
                             logicalToPhysical, partitionColumns, hasPartitions),
+                        Proof = ProofFor(runPredicate, snapshot, mappingMode, proofSchema),
                     });
                     run.Clear();
                     afterFilter = true;
@@ -13717,6 +13736,67 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             return RowEvaluator.TryEvaluateWithoutRaising(predicate, logical);
         };
     }
+
+    /// <summary>
+    /// <see cref="RowPredicate.Proof"/> for <paramref name="predicate"/> (#502 phase 5c): the predicate over the file's
+    /// columns, for the reader to prove TRUE for every row of a row group from its statistics and drop there. Only when
+    /// the table trusts statistics proofs (<paramref name="fileSchema"/> is null otherwise) and the predicate is one a
+    /// proof may stand in for (<see cref="EvaluatesEverywhere"/>: plain comparisons and null tests of the table's own
+    /// columns, none casting a string, so skipping it raises nothing it would have raised). The translation never
+    /// strengthens a proof: a reference the file cannot answer (a column the file lacks or holds in an older type)
+    /// evaluates Unknown, which proves nothing.
+    /// <para>Nor for a predicate that references a partition column (review round 2). Its value comes from the log as
+    /// a string and is decoded only when the predicate is asked, which raises on a malformed one (`abc` for a DATE
+    /// partition); an OR proven by its other branch would skip that. DELETE's file proof refuses partition columns in
+    /// its leaves too, and evaluates a partition-only part for real (#511).</para>
+    /// </summary>
+    private static Expressions.Predicate? ProofFor(
+        Expressions.Predicate predicate, Snapshot.Snapshot snapshot, ColumnMappingMode mappingMode,
+        Parquet.Schema.SchemaDescriptor? fileSchema) =>
+        fileSchema is null || !EvaluatesEverywhere(predicate, snapshot.Schema)
+        || ReferencesAnyPartitionColumn(predicate, snapshot.Metadata.PartitionColumns)
+            ? null
+            : RowGroupPushdown.ToFileColumns(
+                predicate, snapshot.Schema, mappingMode, fileSchema, snapshot.Metadata.PartitionColumns);
+
+    /// <summary>
+    /// Whether <paramref name="predicate"/> refers to any of <paramref name="partitionColumns"/>, by name ignoring case
+    /// as <see cref="EvaluatesEverywhere"/> resolves one.
+    /// </summary>
+    private static bool ReferencesAnyPartitionColumn(
+        Expressions.Predicate predicate, IReadOnlyList<string> partitionColumns)
+    {
+        if (partitionColumns.Count == 0)
+            return false;
+        var partitions = new HashSet<string>(partitionColumns, StringComparer.OrdinalIgnoreCase);
+        return Visit(predicate);
+
+        bool Visit(Expressions.Expression expression) => expression switch
+        {
+            Expressions.AndPredicate and => and.Children.Any(Visit),
+            Expressions.OrPredicate or => or.Children.Any(Visit),
+            Expressions.NotPredicate not => Visit(not.Child),
+            Expressions.ComparisonPredicate cmp => Visit(cmp.Left) || Visit(cmp.Right),
+            Expressions.UnaryPredicate unary => Visit(unary.Operand),
+            Expressions.SetPredicate set => Visit(set.Operand) || set.Values.Any(Visit),
+            Expressions.FunctionCall call => call.Arguments.Any(Visit),
+            Expressions.UnboundReference reference => partitions.Contains(reference.NameParts[0]),
+            _ => false,
+        };
+    }
+
+    /// <summary>Whether a predicate the scan built carries a statistics proof, for tests.</summary>
+    internal static bool OffersProof(RowPredicate predicate) => predicate.Proof is not null;
+
+    /// <summary>
+    /// How many row groups this table's scans and DELETEs have read with a predicate dropped on its statistics proof
+    /// (#502 phase 5c): for tests, so that a proof is shown to hold, not only to be offered.
+    /// </summary>
+    internal int ProvenRowGroups => Volatile.Read(ref _provenRowGroups);
+
+    private int _provenRowGroups;
+
+    private void CountProvenRowGroup() => Interlocked.Increment(ref _provenRowGroups);
 
     /// <summary>
     /// Whether filter conjuncts and DELETE predicates that cannot raise are offered to the reader for whole batches

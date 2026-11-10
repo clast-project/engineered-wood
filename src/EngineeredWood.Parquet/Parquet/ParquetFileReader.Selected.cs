@@ -90,6 +90,12 @@ public sealed partial class ParquetFileReader
     internal bool FusesAnswers { get; set; } = true;
 
     /// <summary>
+    /// Called for each row group a selected read reads with a predicate dropped on its statistics proof (#502 phase 5c):
+    /// for tests, which otherwise could not tell a proof that holds from one that never does.
+    /// </summary>
+    internal Action? OnProvenRowGroup { get; set; }
+
+    /// <summary>
     /// Everything a selected read of <paramref name="scan"/> decides once, before any row group: the columns it
     /// decodes, how it selects rows, whether it may go in two passes. A caller that schedules row groups itself (a
     /// Delta scan, which plans them with <see cref="PlanRowGroupsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken, int, int)"/>)
@@ -111,7 +117,37 @@ public sealed partial class ParquetFileReader
             FusesAnswers);
         var twoPass = TwoPassColumnsFor(schema, readColumns, dropped, scan.RowFilter, _options);
         RowSkipPredicate? skipRows = scan.ExcludedRows is { } excluded ? excluded.ExcludesAll : null;
-        return new SelectedPlanReader(this, metadata, readColumns, selector, twoPass, skipRows);
+        return new SelectedPlanReader(this, metadata, schema, scan, readColumns, selector, twoPass, skipRows);
+    }
+
+    /// <summary>
+    /// How one row group is read: the columns, the selector and the two-pass split. A scan's own, or one for the
+    /// predicates its statistics leave to ask (#502 phase 5c).
+    /// </summary>
+    private sealed record GroupRead(IReadOnlyList<string>? ReadColumns, BatchSelector Selector, TwoPassColumns? TwoPass);
+
+    /// <summary>
+    /// The read of a row group whose statistics prove the predicates <paramref name="proven"/> (a bit per predicate, by
+    /// position) TRUE for every row: those predicates are dropped, and so are the columns only they read.
+    /// </summary>
+    private GroupRead ReadWithout(SchemaDescriptor schema, ParquetScan scan, ulong proven)
+    {
+        var remaining = new List<RowPredicate>();
+        var predicates = scan.RowFilter!.Predicates;
+        for (int i = 0; i < predicates.Count; i++)
+        {
+            if ((proven & (1UL << i)) == 0)
+                remaining.Add(predicates[i]);
+        }
+
+        var filter = remaining.Count == 0 ? null : new RowFilter(remaining);
+        var (readColumns, dropped) = ColumnsForSelection(schema, scan.Columns, filter);
+        var selector = new BatchSelector(
+            filter, scan.ExcludedRows, dropped,
+            new HashSet<string>(schema.Root.Children.Select(c => c.Name), StringComparer.Ordinal),
+            WholeBatchLiveShare,
+            FusesAnswers);
+        return new GroupRead(readColumns, selector, TwoPassColumnsFor(schema, readColumns, dropped, filter, _options));
     }
 
     /// <summary>A selected read prepared by <see cref="PrepareSelectedAsync"/>: reads its planned row groups.</summary>
@@ -119,19 +155,54 @@ public sealed partial class ParquetFileReader
     {
         private readonly ParquetFileReader _reader;
         private readonly Metadata.FileMetaData _metadata;
-        private readonly BatchSelector _selector;
-        private readonly TwoPassColumns? _twoPass;
+        private readonly SchemaDescriptor _schema;
+        private readonly ParquetScan _scan;
+        private readonly GroupRead _whole;
+
+        // The predicates with a proof, by position (at most 64, so a set of them is one word), and the reads already
+        // built for each set a row group proved.
+        private readonly (int Index, EngineeredWood.Expressions.Predicate Proof)[] _proofs;
+        private readonly ParquetStatisticsAccessor? _accessor;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<ulong, GroupRead> _without = new();
 
         internal SelectedPlanReader(
-            ParquetFileReader reader, Metadata.FileMetaData metadata, IReadOnlyList<string>? readColumns,
-            BatchSelector selector, TwoPassColumns? twoPass, RowSkipPredicate? skipRows)
+            ParquetFileReader reader, Metadata.FileMetaData metadata, SchemaDescriptor schema, ParquetScan scan,
+            IReadOnlyList<string>? readColumns, BatchSelector selector, TwoPassColumns? twoPass, RowSkipPredicate? skipRows)
         {
             _reader = reader;
             _metadata = metadata;
+            _schema = schema;
+            _scan = scan;
+            _whole = new GroupRead(readColumns, selector, twoPass);
             ReadColumns = readColumns;
-            _selector = selector;
-            _twoPass = twoPass;
             SkipRows = skipRows;
+
+            var predicates = scan.RowFilter?.Predicates ?? [];
+            _proofs = predicates.Count > 64
+                ? []
+                : predicates.Select((p, i) => (i, p.Proof)).Where(t => t.Proof is not null)
+                    .Select(t => (t.i, t.Proof!)).ToArray();
+            _accessor = _proofs.Length > 0 ? new ParquetStatisticsAccessor(schema) : null;
+        }
+
+        // How to read the planned row group: without the predicates its statistics prove TRUE for every row.
+        private GroupRead ReadFor(RowGroupPlan plan)
+        {
+            if (_proofs.Length == 0)
+                return _whole;
+
+            var rowGroup = _metadata.RowGroups[plan.Index];
+            ulong proven = 0;
+            foreach (var (index, proof) in _proofs)
+            {
+                if (EngineeredWood.Expressions.StatisticsEvaluator.ProvesEveryRowTrue(proof, rowGroup, _accessor!))
+                    proven |= 1UL << index;
+            }
+
+            if (proven == 0)
+                return _whole;
+            _reader.OnProvenRowGroup?.Invoke();
+            return _without.GetOrAdd(proven, set => _reader.ReadWithout(_schema, _scan, set));
         }
 
         /// <summary>The columns the read decodes, predicate columns included: what to plan row groups with.</summary>
@@ -141,18 +212,25 @@ public sealed partial class ParquetFileReader
         public RowSkipPredicate? SkipRows { get; }
 
         /// <summary>The selected rows of one planned row group, read without reserving scan memory.</summary>
-        public IAsyncEnumerable<SelectedRecordBatch> ReadAsync(RowGroupPlan plan, CancellationToken cancellationToken) =>
-            _reader.ReadsInTwoPasses(plan, _twoPass, _metadata.RowGroups[plan.Index])
-                ? _reader.ReadTwoPassAsync(plan, _twoPass!, _selector, reservation: null, growth: null, 0, cancellationToken)
-                : _selector.SelectAsync(_reader.ReadPlannedAsync(plan, ReadColumns, cancellationToken, _selector.Answerable));
+        public IAsyncEnumerable<SelectedRecordBatch> ReadAsync(RowGroupPlan plan, CancellationToken cancellationToken)
+        {
+            var read = ReadFor(plan);
+            return _reader.ReadsInTwoPasses(plan, read.TwoPass, _metadata.RowGroups[plan.Index], _proofs.Length > 0)
+                ? _reader.ReadTwoPassAsync(plan, read.TwoPass!, read.Selector, reservation: null, growth: null, 0, cancellationToken)
+                : read.Selector.SelectAsync(
+                    _reader.ReadPlannedAsync(plan, read.ReadColumns, cancellationToken, read.Selector.Answerable));
+        }
 
         /// <summary>The selected rows of one planned row group, as one unit of a parallel read.</summary>
         public IAsyncEnumerable<SelectedRecordBatch> ReadAsync(
-            RowGroupPlan plan, ScanReservation reservation, DecodedGrowth growth, CancellationToken cancellationToken) =>
-            _reader.ReadsInTwoPasses(plan, _twoPass, _metadata.RowGroups[plan.Index])
-                ? _reader.ReadTwoPassAsync(plan, ReadColumns, _twoPass!, _selector, reservation, growth, cancellationToken)
-                : _selector.SelectAsync(
-                    _reader.ReadPlannedAsync(plan, ReadColumns, reservation, growth, cancellationToken, _selector.Answerable));
+            RowGroupPlan plan, ScanReservation reservation, DecodedGrowth growth, CancellationToken cancellationToken)
+        {
+            var read = ReadFor(plan);
+            return _reader.ReadsInTwoPasses(plan, read.TwoPass, _metadata.RowGroups[plan.Index], _proofs.Length > 0)
+                ? _reader.ReadTwoPassAsync(plan, read.ReadColumns, read.TwoPass!, read.Selector, reservation, growth, cancellationToken)
+                : read.Selector.SelectAsync(
+                    _reader.ReadPlannedAsync(plan, read.ReadColumns, reservation, growth, cancellationToken, read.Selector.Answerable));
+        }
     }
 
     /// <summary>
