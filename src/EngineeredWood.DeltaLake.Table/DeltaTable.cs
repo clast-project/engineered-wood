@@ -13340,6 +13340,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         continue;
                     }
 
+                    // A host mask. FlushRun emits the filter's pending row-level conjuncts and sets afterFilter, so
+                    // the first mask after them drops the rows they answered NULL for. A dropped (TRUE) file-constant
+                    // conjunct in between emits nothing and leaves both alone.
                     FlushRun();
                     var condition = step.Condition;
                     var conditionFileColumns = step.FileColumns;
