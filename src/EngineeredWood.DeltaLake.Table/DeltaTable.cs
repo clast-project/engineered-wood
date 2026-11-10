@@ -13399,12 +13399,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
                 bool? OneRowAnswer(RowCondition condition)
                 {
-                    var one = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], 1);
-                    var shaped = ReconcileToTableShape(
-                        one, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
-                        logicalToPhysical, addFile.Path);
-                    using var answer = condition.Evaluate(shaped);
+                    using var answer = FileConstantAnswer(condition, 1);
                     return answer.GetValue(0);
+                }
+
+                // A file-constant condition over `rows` rows of the table's shape (the file's partition values,
+                // NULL for the columns it lacks).
+                BooleanArray FileConstantAnswer(RowCondition condition, int rows)
+                {
+                    var empty = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], rows);
+                    var shaped = ReconcileToTableShape(
+                        empty, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
+                        logicalToPhysical, addFile.Path);
+                    return condition.Evaluate(shaped);
                 }
 
                 async ValueTask<IReadOnlyList<string>?> ConditionFileColumnsAsync(IReadOnlyList<string>? logical) =>
@@ -13432,9 +13439,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 // after the file was written) have one answer for the whole file, and are answered here, once, before
                 // any row is read, wherever they stand in the filter, as Spark applies a partition filter before it
                 // reads a file: TRUE drops the conjunct, FALSE or NULL skips the file (false is returned), since no
-                // row can then pass. One that raises before any conjunct the reader answers row by row raises here,
-                // as it would on the file's first row; after one, it is deferred to its place (see Deferred). A file
-                // with no live row is skipped without asking any of them.
+                // row can then pass. Skipping the file saves its rows, not the analysis: the filter's other conjuncts
+                // are first asked over no rows, as EvalAnd asks every operand over an empty selection, so one that
+                // cannot be evaluated at all (a wrong argument count, no common type) still raises. One that raises
+                // before any conjunct the reader answers row by row raises here, as it would on the file's first row;
+                // after one, it is deferred to its place (see Deferred), unless it raises over no rows too, which no
+                // value caused. A file with no live row is skipped without asking any of them.
                 async ValueTask<bool> FileConstantConjunctsAsync()
                 {
                     bool rowLevelBefore = false;
@@ -13458,12 +13468,23 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         }
                         catch (Exception e) when (rowLevelBefore)
                         {
+                            // Deferred only for an error the row's values cause (see above).
+                            FileConstantAnswer(step.Condition, 0).Dispose();
                             step.Deferred = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(e);
                             continue;
                         }
 
                         if (answer != true)
+                        {
+                            foreach (var other in steps)
+                            {
+                                if (other.Conjunct is not null && other != step && !other.Dropped)
+                                    FileConstantAnswer(other.Condition, 0).Dispose();
+                            }
+
                             return false;
+                        }
+
                         step.Dropped = true;
                     }
 

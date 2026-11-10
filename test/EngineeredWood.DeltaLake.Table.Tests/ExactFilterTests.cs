@@ -408,6 +408,48 @@ public class ExactFilterTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A file-constant conjunct that cannot be evaluated at all, whatever the values, raises even when the conjunct
+    /// before it rejects every row: the reader asks every predicate over no rows for that (EvalAnd's rule), and a
+    /// deferred conjunct is only deferred for an error its one row's values cause.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AFileConstantConjunctThatCannotBeEvaluatedRaisesWhenNoRowReachesIt(bool split)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, seam: false, ColumnMappingMode.None);
+        table.EvaluatesConjunctsTogether = !split;
+        var options = new DeltaReadOptions
+        {
+            Columns = ["id"], Filter = P("lower(note) = 'zz' AND length(region, region) > 0"), FilterRows = true,
+        };
+        await Assert.ThrowsAnyAsync<Exception>(async () =>
+        {
+            await foreach (var b in table.ReadAsync(options))
+                b.Dispose();
+        });
+    }
+
+    /// <summary>
+    /// A conjunct that cannot be evaluated at all still raises when a file-constant conjunct skips every file it
+    /// would have been asked about: the skip saves the rows, not the analysis.
+    /// </summary>
+    [Theory]
+    [InlineData("length(note, note) > 0 AND lower(region) = 'zz'")]
+    [InlineData("lower(region) = 'zz' AND length(note, note) > 0")]
+    [InlineData("lower(region) = 'zz' AND length(region, region) > 0")]
+    public async Task AConjunctThatCannotBeEvaluatedRaisesWhenAFileConstantConjunctSkipsTheFile(string filter)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, seam: false, ColumnMappingMode.None);
+        var options = new DeltaReadOptions { Columns = ["id"], Filter = P(filter), FilterRows = true };
+        await Assert.ThrowsAnyAsync<Exception>(async () =>
+        {
+            await foreach (var b in table.ReadAsync(options))
+                b.Dispose();
+        });
+    }
+
     /// <summary>A file-constant conjunct that raises, with no row-level conjunct before it, raises up front.</summary>
     [Fact]
     public async Task AFileConstantConjunctThatRaisesFirstRaises()
