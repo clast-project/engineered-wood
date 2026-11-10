@@ -290,6 +290,47 @@ public class DeleteSelectedReadTests : IDisposable
     }
 
     /// <summary>
+    /// A function predicate is opaque: on a file with no column, every row looks the same to it, but its answer may
+    /// still differ by row, so it is asked about every live row rather than once for the file.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AFunctionDeleteOfAFileWithNoColumnIsAskedAboutEveryRow(bool changeDataFeed)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("region", StringType.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(Path.Combine(_tempDir, $"opaque-{changeDataFeed}")), schema,
+            partitionColumns: ["region"],
+            configuration: changeDataFeed ? new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" } : null);
+        await table.WriteAsync([new RecordBatch(schema,
+            [new StringArray.Builder().Append("a").Append("a").Append("a").Append("a").Build()], 4)]);
+
+        int asked = 0;
+        var (deleted, _) = await table.DeleteAsync(batch =>
+        {
+            asked += batch.Length;
+            var mask = new BooleanArray.Builder();
+            for (int i = 0; i < batch.Length; i++)
+                mask.Append(i % 2 == 0);
+            return mask.Build();
+        });
+
+        Assert.Equal(4, asked);
+        Assert.Equal(2, deleted);
+        long left = 0;
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions()))
+        {
+            using (b)
+                left += b.Length;
+        }
+
+        Assert.Equal(2, left);
+    }
+
+    /// <summary>
     /// A function predicate reads every column of the file, and a file a copy-on-write rewrite produced also holds the
     /// hidden materialized row-tracking columns: the predicate is never handed them, only the table's own.
     /// </summary>

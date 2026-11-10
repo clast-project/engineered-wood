@@ -5269,16 +5269,57 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 // The predicate reads no column of this file (only partition columns, or columns added after it), and
                 // the file has none for it to read through (with a change feed, see above, that takes a file with no
-                // column at all: a table whose every column is a partition column writes such files). It answers the
-                // same for every row, so it is asked once, over one row of the table's shape — and only when a row is
-                // live, so that a value-dependent error can't fail a delete of nothing.
+                // column at all: a table whose every column is a partition column writes such files). Every row then
+                // has the same values, of the table's shape. An expression answers the same for all of them, so it is
+                // asked once, over one row — and only when a row is live, so that a value-dependent error can't fail
+                // a delete of nothing. A function predicate is opaque: its answer may still differ by row, so it is
+                // asked about every live row, as a read of the file would have it.
                 int firstNew = newDeletedIndices.Count;
-                if (fileRows > rawDeletedRows.Count && OneRowMatches())
+                if (fileRows > rawDeletedRows.Count)
                 {
+                    if (prunePredicate is null)
+                    {
+                        AskAboutEveryLiveRow();
+                    }
+                    else if (OneRowMatches())
+                    {
+                        for (long row = 0; row < fileRows; row++)
+                        {
+                            if (!rawDeletedRows.Contains(row))
+                                newDeletedIndices.Add(row);
+                        }
+                    }
+                }
+
+                void AskAboutEveryLiveRow()
+                {
+                    const int chunk = 64 * 1024;
+                    var live = new List<long>(chunk);
                     for (long row = 0; row < fileRows; row++)
                     {
                         if (!rawDeletedRows.Contains(row))
-                            newDeletedIndices.Add(row);
+                            live.Add(row);
+                        if (live.Count == chunk || (row == fileRows - 1 && live.Count > 0))
+                        {
+                            var shaped = ReconcileToTableShape(
+                                new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], live.Count), snapshot,
+                                addFile.PartitionValues, matchColumns, partitionColumns, partitionColumns.Count > 0,
+                                logicalToPhysical, addFile.Path);
+                            using var mask = predicate(shaped);
+                            if (mask.Length != live.Count)
+                            {
+                                throw new ArgumentException(
+                                    $"The mask has {mask.Length} rows and the selection {live.Count}.", nameof(predicate));
+                            }
+
+                            for (int i = 0; i < live.Count; i++)
+                            {
+                                if (mask.GetValue(i) == true)
+                                    newDeletedIndices.Add(live[i]);
+                            }
+
+                            live.Clear();
+                        }
                     }
                 }
 
