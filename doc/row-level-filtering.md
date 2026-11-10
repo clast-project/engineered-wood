@@ -1049,10 +1049,12 @@ The regression §23 left for phase 5 is gone where proofs are trusted. Row group
 
 ### The local two-pass default (§23's open decision)
 
-By default no proof is offered, so a default table still reads clustered 90% locally at +31% narrow and +12% wide with two passes. §23 decided to revisit the local default once phase 5 could remove that regression. Phase 5 removes it only for tables with `TrustStatisticsProofs`. **The decision is still open:**
-- keep two passes for object storage only (today);
+By default no proof is offered, so a default table would still read clustered 90% locally at +31% narrow and +12% wide with two passes. §23 decided to revisit the local default once phase 5 could remove that regression, and phase 5 removes it only for tables with `TrustStatisticsProofs`. The options were:
+- keep two passes for object storage only;
 - turn them on locally regardless, accepting +12-31% on row groups kept whole;
-- turn them on locally only where proofs are trusted, which would need the reader to know whether its predicates carry proofs.
+- turn them on locally only where proofs are offered.
+
+**Decided (2026-11-10): the third.** A selected read of a local file goes in two passes when its predicates carry proofs (`UsesTwoPasses(proofs)`; `SelectedPlanReader` passes whether any does). Object storage is unchanged, and a local scan without proofs still reads in one pass. With proofs, the local two-pass numbers are the `With proofs` column above for clustered selections, and §23's for scattered ones, which no proof covers: -4% to -33%, except scattered 0.1% narrow, +7%.
 
 ### Tests
 
@@ -1071,6 +1073,7 @@ By default no proof is offered, so a default table still reads clustered 90% loc
   - a conjunct casting a string (`CAST(code AS INT) > 3`, `code = 5`) is never offered one;
   - 2 DELETEs match the same rows either way.
 - `DeltaFilePruner`'s DELETE and ADD CONSTRAINT proof tests pass unchanged through the shared rules.
+- `TwoPassReadTests`: by default, a local file reads in two passes when its predicate carries a proof (the corrupted page past the selected rows is never decoded), and in one pass when it does not.
 
 Each of these mutations fails tests:
 - a predicate dropped whether proven or not (8);
@@ -1078,4 +1081,13 @@ Each of these mutations fails tests:
 - a leaf's null count ignored (1, the prefix test; for comparisons the evaluator already requires it);
 - the first predicate dropped instead of the proven one (2, once a test put the proven predicate second);
 - Delta offering proofs without the option (5);
-- Delta offering one for a conjunct that can raise (2).
+- Delta offering one for a conjunct that can raise (2);
+- the local two-pass default ignoring proofs (1).
+
+### Review round 1
+
+**A proof could hide a widening error.** `EvaluatesEverywhere` checked the logical predicate, but bringing an older file's column to the table's type can raise on a value: `WidenDate32ToTimestamp` multiplies checked, so a far-future DATE widened to TIMESTAMP_NTZ overflows.
+- **The case:** with `d` widened that way and holding such a value, `d IS NULL OR id >= 0` raised when asked row by row. With proofs, `id >= 0` proved the OR for the row group, `d` was never read, and the error disappeared.
+- **The fix:** `EvaluatesEverywhere` now refuses a column whose type has changed (`delta.typeChanges`). It costs nothing a proof could use: `ToFileColumns` already left such a column Unknown, since the file's statistics are of its old type. Only the unproven branch of an OR referred to it.
+- **Scope:** the same rule gates DELETE's and ADD CONSTRAINT's file-level proofs, so it closes the same hole there under `TrustStatisticsProofs`.
+- **Regression:** `AProofDoesNotHideAWideningThatOverflows` (`ValueWiseTests`, on and off). Its scan and its DELETE each raised nothing with proofs on before the fix, and each was checked on its own.

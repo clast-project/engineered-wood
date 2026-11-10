@@ -108,8 +108,9 @@ public sealed partial class ParquetFileReader
     /// BYTE_ARRAY chunk past what one Arrow array can hold, which the one-pass read splits under its implicit
     /// budget (<see cref="HasChunkOverArrowLimit"/>), is read in one pass too.
     /// </remarks>
-    private bool ReadsInTwoPasses(RowGroupPlan plan, TwoPassColumns? columns, Metadata.RowGroup rowGroup) =>
-        UsesTwoPasses && columns is not null && _options.MaxBatchByteSize is not > 0
+    /// <param name="proofs">Whether the scan's predicates carry statistics proofs (see <see cref="UsesTwoPasses"/>).</param>
+    private bool ReadsInTwoPasses(RowGroupPlan plan, TwoPassColumns? columns, Metadata.RowGroup rowGroup, bool proofs) =>
+        UsesTwoPasses(proofs) && columns is not null && _options.MaxBatchByteSize is not > 0
         && (plan.Ranges is null
             || (plan.Ranges.Count == 1 && plan.Ranges[0].Start == 0 && plan.Ranges[0].End == rowGroup.NumRows))
         && !rowGroup.Columns.Any(c => c.MetaData is { Type: PhysicalType.ByteArray } m
@@ -121,21 +122,24 @@ public sealed partial class ParquetFileReader
 
     /// <summary>
     /// Whether a selected read may decode in two passes: true or false forces it, for tests and A/B measurement;
-    /// null (the default) decides by the file, see <see cref="UsesTwoPasses"/>.
+    /// null (the default) decides by the file and the scan, see <see cref="UsesTwoPasses"/>.
     /// </summary>
     internal bool? TwoPassReads { get; set; }
 
     /// <summary>
-    /// Whether selected reads of this file may go in two passes. By default only for a file on an object store
-    /// (one that reports <see cref="IReadConcurrencyHint.PreferredConcurrentReads"/>, as the S3, Azure and GCS
-    /// readers do, through the coalescing and known-length wrappers too). Measured (doc/row-level-filtering.md
-    /// §13), two passes cost a local read of a dense selection up to 16% (27% for row groups kept whole), since
-    /// a row group's predicate columns then decode before its other columns rather than alongside them, while on
-    /// object storage they were 0-28% faster in all but one case. Point lookups gain in both. Revisit once
-    /// phase 2 (selection inside the decoders) changes the second pass's cost.
+    /// Whether a selected read of this file may go in two passes. By default, for a file on an object store (one that
+    /// reports <see cref="IReadConcurrencyHint.PreferredConcurrentReads"/>, as the S3, Azure and GCS readers do,
+    /// through the coalescing and known-length wrappers too), and for a local file when the scan's predicates carry
+    /// statistics proofs (<paramref name="proofs"/>, <see cref="RowPredicate.Proof"/>).
     /// </summary>
-    private bool UsesTwoPasses =>
-        TwoPassReads ?? (_file as IReadConcurrencyHint)?.PreferredConcurrentReads is not null;
+    /// <remarks>
+    /// Locally, two passes win 4-33% wherever a row group is not kept whole, and lose 12-31% on one kept whole, where
+    /// the second pass reads everything the first did not and the two decode one after the other
+    /// (doc/row-level-filtering.md §23). A proven row group is read in one pass without its predicate (§26), so that
+    /// loss is gone where proofs are offered, and only there (decided 2026-11-10).
+    /// </remarks>
+    private bool UsesTwoPasses(bool proofs) =>
+        TwoPassReads ?? ((_file as IReadConcurrencyHint)?.PreferredConcurrentReads is not null || proofs);
 
     /// <summary>
     /// The block of rows a two-pass read decides to decode or not as one: a block with no selected row has its

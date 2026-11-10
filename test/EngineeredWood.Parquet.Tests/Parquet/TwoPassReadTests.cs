@@ -83,6 +83,28 @@ public class TwoPassReadTests : IDisposable
             Assert.NotNull(error);
     }
 
+    /// <summary>
+    /// By default a local file reads in two passes too when the scan's predicate carries a statistics proof (#502 phase
+    /// 5c, option 3): the corrupted page is then never decoded, whether or not the proof holds for the row group.
+    /// </summary>
+    [Fact]
+    public async Task ByDefaultALocalFileReadsInTwoPassesWhenThePredicateCarriesAProof()
+    {
+        var (path, _) = await WriteCorruptedAsync();
+        var plain = Scan(maxId: 1_000);
+        var predicate = plain.RowFilter!.Predicates[0];
+        var proven = plain with
+        {
+            RowFilter = new RowFilter(new RowPredicate(predicate.Columns, predicate.Evaluate)
+            {
+                Proof = EngineeredWood.Expressions.Expressions.LessThan("id", EngineeredWood.Expressions.LiteralValue.Of(1_000L)),
+            }),
+        };
+
+        var rows = await ReadIdsAsync(path, proven, twoPass: null);
+        Assert.Equal(Enumerable.Range(0, 1_000).Select(i => (long)i), rows);
+    }
+
     /// <summary>A local file that says what an object-store reader says: how many reads it serves at once.</summary>
     private sealed class ObjectStoreLike(IRandomAccessFile inner) : IRandomAccessFile, IReadConcurrencyHint
     {
