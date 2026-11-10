@@ -5226,7 +5226,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     _fs, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), addFile.Size, cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new Parquet.ParquetFileReader(
-                file, ownsFile: false, _dataFileReadOptions);
+                file, ownsFile: false, _dataFileReadOptions)
+            {
+                WholeBatchLiveShare = WholeBatchLiveShare,
+            };
 
             var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
             var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
@@ -5393,6 +5396,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         partitionColumns, partitionColumns.Count > 0))
                     {
                         ValueWise = AnswersFromDictionaries && prunePredicate is not null && IsValueWise(prunePredicate),
+                        // Rows the deletion vector excludes need no gather either (#502 phase 5a).
+                        EvaluateWholeBatch = prunePredicate is null ? null : WholeBatchMask(
+                            prunePredicate, matchColumns, snapshot, addFile, mappingMode, physicalToLogical,
+                            logicalToPhysical, partitionColumns, partitionColumns.Count > 0),
                     })),
                     ExcludedRows = excluded,
                 };
@@ -13257,7 +13264,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         ParquetFileReader? reader = null;
         try
         {
-            reader = new ParquetFileReader(file, ownsFile: false, _dataFileReadOptions);
+            reader = new ParquetFileReader(file, ownsFile: false, _dataFileReadOptions)
+            {
+                WholeBatchLiveShare = WholeBatchLiveShare,
+            };
 
             // The footer, read here whether or not the columns need resolving against it: every read of the file
             // needs it, and a scan opens files AHEAD of the one it is planning, so that the footer's round trips
@@ -13527,11 +13537,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     if (run.Count == 0)
                         return;
                     var condition = run[0].Condition;
+                    var runPredicate = run[0].Conjunct!;
                     IReadOnlyList<string>? runFileColumns = run[0].FileColumns;
                     if (run.Count > 1)
                     {
                         var conjuncts = run.Select(s => s.Conjunct!).ToList();
                         var and = new Expressions.AndPredicate(conjuncts);
+                        runPredicate = and;
                         var logical = run.Any(s => s.Condition.Columns is null) ? null
                             : snapshot.ArrowSchema.FieldsList
                                 .Where(f => run.Any(s => s.Condition.Columns!.Contains(f.Name)))
@@ -13549,6 +13561,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         // Each conjunct's answer for a row depends on that row's values alone (#502 phase 4c), so the
                         // reader may answer it from a dictionary.
                         ValueWise = AnswersFromDictionaries && run.All(s => IsValueWise(s.Conjunct!)),
+                        // A run that cannot raise may be asked about rows earlier predicates dropped (#502 phase 5a).
+                        EvaluateWholeBatch = WholeBatchMask(
+                            runPredicate, condition.Columns, snapshot, addFile, mappingMode, physicalToLogical,
+                            logicalToPhysical, partitionColumns, hasPartitions),
                     });
                     run.Clear();
                     afterFilter = true;
@@ -13660,6 +13676,61 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var answer = condition.Evaluate(logical);
             return keepNulls ? answer : NullAsFalse(answer, logical);
         };
+
+    /// <summary>
+    /// <see cref="ConditionMask"/> for <see cref="RowPredicate.EvaluateWholeBatch"/> (#502 phase 5a): the same batch,
+    /// brought to the table's shape the same way, answered by <paramref name="predicate"/> only where the evaluator can
+    /// do so with no row's value able to raise (<see cref="Expressions.Arrow.ArrowRowEvaluator.TryEvaluateWithoutRaising"/>);
+    /// null otherwise. Not offered at all for a form that always declines. NULL answers are kept; a whole condition's
+    /// NULL drops its row as FALSE does, and no predicate follows one that this is set for but the conjuncts of the same
+    /// expression. Null when <see cref="EvaluatesWholeBatches"/> is off.
+    /// <para>Bringing the whole batch to the table's shape can itself raise on a value that a gather of the live rows
+    /// never reaches: a DATE widened to TIMESTAMP_NTZ overflows, checked, on a far-future day count. So any error while
+    /// shaping declines, and the reader asks the live rows instead, where a live row's value raises as before (review
+    /// round 1).</para>
+    /// </summary>
+    private Func<RecordBatch, BooleanArray?>? WholeBatchMask(
+        Expressions.Predicate predicate, IReadOnlyList<string>? columns, Snapshot.Snapshot snapshot, AddFile addFile,
+        ColumnMappingMode mappingMode, Dictionary<string, string> physicalToLogical,
+        Dictionary<string, string> logicalToPhysical, IReadOnlyList<string> partitionColumns, bool hasPartitions)
+    {
+        if (!EvaluatesWholeBatches || !Expressions.Arrow.ArrowRowEvaluator.MayEvaluateWithoutRaising(predicate))
+            return null;
+        return batch =>
+        {
+            RecordBatch logical;
+            try
+            {
+                logical = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
+                logical = ColumnMappingRecursive.StripParquetFieldIds(logical);
+                logical = ReconcileToTableShape(
+                    logical, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions,
+                    logicalToPhysical, addFile.Path);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                return null;
+            }
+
+            return RowEvaluator.TryEvaluateWithoutRaising(predicate, logical);
+        };
+    }
+
+    /// <summary>
+    /// Whether filter conjuncts and DELETE predicates that cannot raise are offered to the reader for whole batches
+    /// (<see cref="WholeBatchMask"/>). On by default; off for the A/B (#502 phase 5a) and as the tests' oracle.
+    /// </summary>
+    internal bool EvaluatesWholeBatches { get; set; } = true;
+
+    /// <summary>Whether a predicate the scan built offers whole-batch answers, for tests (which cannot see Parquet's
+    /// internals).</summary>
+    internal static bool OffersWholeBatch(RowPredicate predicate) => predicate.EvaluateWholeBatch is not null;
+
+    /// <summary>
+    /// <see cref="ParquetFileReader.WholeBatchLiveShare"/> for this table's data-file reads, for the A/B sweep: the share
+    /// of a batch's rows that must still be live for a predicate to be asked about the whole batch.
+    /// </summary>
+    internal double WholeBatchLiveShare { get; set; } = BatchSelector.DefaultWholeBatchLiveShare;
 
     /// <summary>One answer for every row of a batch.</summary>
     private static BooleanArray Repeat(bool answer, int length)

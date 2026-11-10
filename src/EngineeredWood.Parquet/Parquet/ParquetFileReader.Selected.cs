@@ -77,6 +77,13 @@ public sealed partial class ParquetFileReader
     }
 
     /// <summary>
+    /// The smallest share of a batch's rows still live at which a predicate that can answer every row without raising is
+    /// asked about the whole batch rather than a gather of the live rows (#502 phase 5a); above 1, never. For tests and
+    /// the A/B sweep.
+    /// </summary>
+    internal double WholeBatchLiveShare { get; set; } = BatchSelector.DefaultWholeBatchLiveShare;
+
+    /// <summary>
     /// Everything a selected read of <paramref name="scan"/> decides once, before any row group: the columns it
     /// decodes, how it selects rows, whether it may go in two passes. A caller that schedules row groups itself (a
     /// Delta scan, which plans them with <see cref="PlanRowGroupsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken, int, int)"/>)
@@ -93,7 +100,8 @@ public sealed partial class ParquetFileReader
         var (readColumns, dropped) = ColumnsForSelection(schema, scan.Columns, scan.RowFilter);
         var selector = new BatchSelector(
             scan.RowFilter, scan.ExcludedRows, dropped,
-            new HashSet<string>(schema.Root.Children.Select(c => c.Name), StringComparer.Ordinal));
+            new HashSet<string>(schema.Root.Children.Select(c => c.Name), StringComparer.Ordinal),
+            WholeBatchLiveShare);
         var twoPass = TwoPassColumnsFor(schema, readColumns, dropped, scan.RowFilter, _options);
         RowSkipPredicate? skipRows = scan.ExcludedRows is { } excluded ? excluded.ExcludesAll : null;
         return new SelectedPlanReader(this, metadata, readColumns, selector, twoPass, skipRows);

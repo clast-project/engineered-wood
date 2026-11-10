@@ -76,4 +76,15 @@ public sealed class RowPredicate
     /// expression, NULL already decided it.
     /// </remarks>
     internal bool DropsEarlierNulls { get; init; }
+
+    /// <summary>
+    /// The predicate's answer for EVERY row of a batch, rows no longer live included, when it can be computed with no
+    /// row's value able to raise; null to decline, having raised nothing a value causes (#502 phase 5a). Set, it lets
+    /// the reader ask the predicate about a batch whose rows are mostly still live without first gathering those rows
+    /// (<see cref="BatchSelector.DefaultWholeBatchLiveShare"/>): the answers for rows an earlier predicate already dropped are
+    /// ignored. A decline falls back to <see cref="Evaluate"/> over the live rows, and is not a verdict on the predicate:
+    /// whatever is wrong with it (an unresolvable column, say) is for <see cref="Evaluate"/> to raise. Same batch contract
+    /// as <see cref="Evaluate"/>.
+    /// </summary>
+    internal Func<RecordBatch, BooleanArray?>? EvaluateWholeBatch { get; init; }
 }

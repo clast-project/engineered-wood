@@ -576,13 +576,164 @@ public class SelectedReadTests : IDisposable
         Assert.Throws<ArgumentException>(() => new RowFilter());
     }
 
+    // ---- Whole-batch answers (#502 phase 5a) ----------------------------------------------------------------
+
+    public static IEnumerable<object[]> WholeBatchCases()
+    {
+        foreach (var filter in Filters.Keys)
+        {
+            foreach (int concurrency in new[] { 1, 4 })
+            {
+                foreach (bool twoPass in new[] { false, true })
+                    yield return [filter, concurrency, twoPass];
+            }
+        }
+    }
+
+    /// <summary>
+    /// The oracle sweep with every predicate offering whole-batch answers and the reader taking them whenever a row is
+    /// live: the same rows at the same positions.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(WholeBatchCases))]
+    public async Task WholeBatchAnswersReturnTheSelectedRows(string filterName, int concurrency, bool twoPass)
+    {
+        var filter = Filters[filterName];
+        string[] projection = ["note", "k", "flag", "id"];
+        bool parallel = concurrency > 1;
+        var excluded = TestExclusions.Random(Rows, 0.05, seed: 7);
+
+        string path = await WriteFileAsync();
+        var expected = await OracleAsync(path, filter, projection, excluded);
+
+        var options = new ParquetReadOptions { MaxConcurrentRowGroups = concurrency, BatchSize = parallel ? 3_000 : null };
+        var scan = new ParquetScan
+        {
+            Columns = projection,
+            RowFilter = ToRowFilter(filter, wholeBatch: true),
+            ExcludedRows = excluded,
+        };
+
+        var actual = await ReadAsync(path, options, scan, twoPass, wholeBatchLiveShare: 0);
+        Assert.Equal(expected, actual);
+    }
+
+    /// <summary>
+    /// A predicate offering whole-batch answers is asked about the whole batch, rows an earlier predicate or the
+    /// exclusions dropped included, once the live share reaches the reader's threshold; below it, it is asked about a
+    /// gather of the live rows only. Either way the result is the same.
+    /// </summary>
+    [Theory]
+    [InlineData(0.0, true)]     // always whole
+    [InlineData(0.5, true)]     // the first predicate keeps 90%, less 5% excluded
+    [InlineData(0.95, false)]   // ... which is below 95%
+    [InlineData(1.01, false)]   // never
+    public async Task AWholeBatchIsAskedForOnlyAtTheThreshold(double share, bool whole)
+    {
+        string path = await WriteFileAsync();
+        var excluded = TestExclusions.Random(Rows, 0.05, seed: 3);
+        var first = ToRowPredicate(Ex.LessThan("k", LiteralValue.Of(900)));
+        var asked = new ConcurrentBag<long>();
+        var answeredWhole = new ConcurrentBag<long>();
+        var second = new RowPredicate(["id"], batch =>
+        {
+            RecordIds(batch, asked);
+            return AllTrue(batch.Length);
+        })
+        {
+            EvaluateWholeBatch = batch =>
+            {
+                RecordIds(batch, answeredWhole);
+                return AllTrue(batch.Length);
+            },
+        };
+
+        var actual = await ReadAsync(path, new ParquetReadOptions { BatchSize = 2_500 },
+            new ParquetScan { Columns = ["id"], RowFilter = new RowFilter(first, second), ExcludedRows = excluded },
+            twoPass: false, wholeBatchLiveShare: share);
+
+        var (k, _) = await ColumnAsync<Int32Array>(path, "k");
+        var expected = Enumerable.Range(0, Rows).Where(r => k[r] < 900 && !excluded.Contains(r)).Select(r => (long)r).ToList();
+        Assert.Equal(expected, actual.Select(PositionOf).ToList());
+        if (whole)
+        {
+            // Every row of every batch, live or not, and the gathered path never.
+            Assert.Empty(asked);
+            Assert.Equal(Rows, answeredWhole.Count);
+        }
+        else
+        {
+            Assert.Empty(answeredWhole);
+            Assert.Equal(expected.ToHashSet(), asked.ToHashSet());
+            Assert.Equal(expected.Count, asked.Count);
+        }
+    }
+
+    /// <summary>A predicate that declines a whole batch is asked about the live rows instead, as if it offered none.</summary>
+    [Fact]
+    public async Task ADeclinedWholeBatchFallsBackToTheLiveRows()
+    {
+        string path = await WriteFileAsync();
+        var excluded = TestExclusions.Random(Rows, 0.05, seed: 5);
+        var asked = new ConcurrentBag<long>();
+        int declined = 0;
+        var spy = new RowPredicate(["id"], batch =>
+        {
+            RecordIds(batch, asked);
+            return AllTrue(batch.Length);
+        })
+        {
+            EvaluateWholeBatch = _ =>
+            {
+                Interlocked.Increment(ref declined);
+                return null;
+            },
+        };
+
+        var actual = await ReadAsync(path, new ParquetReadOptions { MaxConcurrentRowGroups = 4 },
+            new ParquetScan { Columns = ["id"], RowFilter = new RowFilter(spy), ExcludedRows = excluded },
+            wholeBatchLiveShare: 0);
+
+        Assert.True(declined > 0);
+        Assert.DoesNotContain(asked, excluded.Contains);
+        Assert.Equal(Rows - excluded.Count, asked.Count);
+        Assert.Equal(Rows - excluded.Count, actual.Count);
+    }
+
+    [Fact]
+    public async Task AWholeBatchMaskOfTheWrongLengthIsRefused()
+    {
+        string path = await WriteFileAsync();
+        var excluded = TestExclusions.Random(Rows, 0.05, seed: 5);
+        var wrong = new RowPredicate(["id"], batch => AllTrue(batch.Length))
+        {
+            EvaluateWholeBatch = batch => AllTrue(batch.Length - 1),
+        };
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => ReadAsync(path, new ParquetReadOptions(),
+            new ParquetScan { Columns = ["id"], RowFilter = new RowFilter(wrong), ExcludedRows = excluded },
+            wholeBatchLiveShare: 0));
+        Assert.Contains("mask", error.Message);
+    }
+
+    private static void RecordIds(RecordBatch batch, ConcurrentBag<long> into)
+    {
+        var ids = (Int64Array)batch.Column(0);
+        for (int i = 0; i < ids.Length; i++)
+            into.Add(ids.GetValue(i)!.Value);
+    }
+
     // ---- Helpers -------------------------------------------------------------------------------------------
 
-    private static RowPredicate ToRowPredicate(Predicate predicate) =>
-        new(ColumnsOf(predicate), batch => Evaluator.EvaluatePredicate(predicate, batch));
+    private static RowPredicate ToRowPredicate(Predicate predicate) => ToRowPredicate(predicate, wholeBatch: false);
 
-    private static RowFilter ToRowFilter(Predicate[] conjuncts) =>
-        new(conjuncts.Select(ToRowPredicate).ToArray());
+    private static RowPredicate ToRowPredicate(Predicate predicate, bool wholeBatch) =>
+        new(ColumnsOf(predicate), batch => Evaluator.EvaluatePredicate(predicate, batch))
+        {
+            EvaluateWholeBatch = wholeBatch ? batch => Evaluator.TryEvaluateWithoutRaising(predicate, batch) : null,
+        };
+
+    private static RowFilter ToRowFilter(Predicate[] conjuncts, bool wholeBatch = false) =>
+        new(conjuncts.Select(c => ToRowPredicate(c, wholeBatch)).ToArray());
 
     private static string[] ColumnsOf(Predicate predicate) => predicate switch
     {
@@ -602,10 +753,13 @@ public class SelectedReadTests : IDisposable
         long.Parse(positionAndRow[..positionAndRow.IndexOf(':')], System.Globalization.CultureInfo.InvariantCulture);
 
     /// <summary>"position:rendered projected row" for every selected row, in order.</summary>
-    private static async Task<List<string>> ReadAsync(string path, ParquetReadOptions options, ParquetScan scan, bool twoPass = true)
+    private static async Task<List<string>> ReadAsync(
+        string path, ParquetReadOptions options, ParquetScan scan, bool twoPass = true, double? wholeBatchLiveShare = null)
     {
         await using var file = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(file, ownsFile: false, options) { TwoPassReads = twoPass };
+        if (wholeBatchLiveShare is { } share)
+            reader.WholeBatchLiveShare = share;
         var rows = new List<string>();
         await foreach (var selected in reader.ReadSelectedAsync(scan))
         {
