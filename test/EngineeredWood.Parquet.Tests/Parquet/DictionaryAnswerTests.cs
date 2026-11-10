@@ -226,6 +226,51 @@ public class DictionaryAnswerTests : IDisposable
         Assert.Contains("bad value", ex.ToString());
     }
 
+    /// <summary>
+    /// An entry the column's Arrow type cannot hold (an INT96 past 2262 read as timestamp[ns]) makes building the
+    /// dictionary fail, where building only the rows a read decodes may not: the dictionary then declines, and the
+    /// rows decide (review round 1).
+    /// </summary>
+    [Fact]
+    public void ADictionaryEntryTheArrowTypeCannotHoldDeclinesRatherThanRaises()
+    {
+        const int julianDayOfUnixEpoch = 2_440_588;
+        var element = new EngineeredWood.Parquet.Metadata.SchemaElement
+        {
+            Name = "ts",
+            Type = PhysicalType.Int96,
+            RepetitionType = FieldRepetitionType.Required,
+        };
+        var column = new EngineeredWood.Parquet.Schema.ColumnDescriptor
+        {
+            Path = ["ts"],
+            PhysicalType = PhysicalType.Int96,
+            MaxDefinitionLevel = 0,
+            MaxRepetitionLevel = 0,
+            SchemaElement = element,
+            SchemaNode = new EngineeredWood.Parquet.Schema.SchemaNode { Element = element, Children = [] },
+        };
+
+        // 1970-01-01, and 9999-12-31: out of timestamp[ns]'s range.
+        var plain = new byte[24];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(plain.AsSpan(8), julianDayOfUnixEpoch);
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(plain.AsSpan(20), julianDayOfUnixEpoch + 2_932_896);
+        using var dictionary = new EngineeredWood.Parquet.Data.DictionaryDecoder(PhysicalType.Int96);
+        dictionary.Load(plain, numValues: 2, typeLength: 12);
+
+        int calls = 0;
+        var predicate = new RowPredicate(["ts"], batch =>
+        {
+            calls++;
+            return Map(new Int32Array.Builder().AppendRange(new int[batch.Length]).Build(), _ => true);
+        }) { ValueWise = true };
+        var field = new Field("ts", new TimestampType(TimeUnit.Nanosecond, (string?)null), nullable: false);
+        var answer = new EngineeredWood.Parquet.Data.DictionaryAnswer(predicate, column, field, (f, a) => (f, a), rows: 100);
+
+        Assert.False(answer.Prepare(dictionary));
+        Assert.Equal(0, calls);
+    }
+
     // ---- Helpers --------------------------------------------------------------------------------------------
 
     private static bool IsBad(int row) => row % 1_000 == 3;

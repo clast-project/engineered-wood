@@ -93,10 +93,11 @@ internal sealed class DictionaryAnswer
         bool nullable = _column.MaxDefinitionLevel > 0;
         int rows = entries + (nullable ? 1 : 0);
         RecordBatch batch;
-        using (var state = new ColumnBuildState(
-                   _column.PhysicalType, _column.MaxDefinitionLevel, maxRepLevel: 0, Math.Max(1, rows),
-                   ByteArrayOutputOf(_field.DataType), _column.DottedPath, ExtendedTimestamp.DeclaredUnit(_column)))
+        try
         {
+            using var state = new ColumnBuildState(
+                _column.PhysicalType, _column.MaxDefinitionLevel, maxRepLevel: 0, Math.Max(1, rows),
+                ByteArrayOutputOf(_field.DataType), _column.DottedPath, ExtendedTimestamp.DeclaredUnit(_column));
             if (nullable)
             {
                 var levels = state.ReserveDefLevels(rows);
@@ -110,6 +111,12 @@ internal sealed class DictionaryAnswer
             ColumnChunkReader.WriteDictionaryValues(_column, dictionary, indices, state);
             var (field, array) = _restore(_field, ArrowArrayBuilder.Build(state, _field, rows));
             batch = new RecordBatch(new Apache.Arrow.Schema([field], null), [array], rows);
+        }
+        catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
+        {
+            // Building every entry can fail where building only the rows' would not (review round 1): an INT96
+            // entry out of nanosecond range that no decoded row uses. The rows decide, as for a predicate's error.
+            return false;
         }
 
         try
