@@ -220,7 +220,7 @@ internal static class RowFilterAb
         }
     }
 
-    private static RecordBatch Build()
+    internal static RecordBatch Build()
     {
         const int rows = (int)TotalRows;
         var random = new Random(502);
@@ -257,7 +257,7 @@ internal static class RowFilterAb
             [ids.Build(), ts.Build(), keys.Build(), categories.Build(), amounts.Build(), qtys.Build(), notes.Build()], rows);
     }
 
-    private static async Task WriteAsync(RecordBatch batch, string path)
+    internal static async Task WriteAsync(RecordBatch batch, string path)
     {
         await using var file = new LocalSequentialFile(path);
         await using var writer = new ParquetFileWriter(file, ownsFile: false,

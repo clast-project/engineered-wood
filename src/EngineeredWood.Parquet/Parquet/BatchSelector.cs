@@ -15,6 +15,38 @@ namespace EngineeredWood.Parquet;
 /// </summary>
 internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, IReadOnlyCollection<string> dropped)
 {
+    /// <summary>
+    /// The predicates the reader may answer from a column chunk's dictionary (#502 phase 4b), by the column each
+    /// reads: value-wise, over that one column, which no other predicate reads and the read drops. The reader
+    /// decides per chunk whether it does (Data.DictionaryAnswer); a batch column of answers says it did.
+    /// </summary>
+    public IReadOnlyDictionary<string, RowPredicate>? Answerable { get; } = AnswerableOf(filter, dropped);
+
+    private static Dictionary<string, RowPredicate>? AnswerableOf(RowFilter? filter, IReadOnlyCollection<string> dropped)
+    {
+        if (filter is null)
+            return null;
+
+        var readers = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var predicate in filter.Predicates)
+        {
+            foreach (var name in predicate.Columns)
+                readers[name] = readers.TryGetValue(name, out int n) ? n + 1 : 1;
+        }
+
+        Dictionary<string, RowPredicate>? result = null;
+        foreach (var predicate in filter.Predicates)
+        {
+            if (predicate.ValueWise && predicate.Columns.Count == 1 && predicate.Columns[0] is var name
+                && readers[name] == 1 && dropped.Contains(name))
+            {
+                (result ??= new Dictionary<string, RowPredicate>(StringComparer.Ordinal))[name] = predicate;
+            }
+        }
+
+        return result;
+    }
+
     /// <summary>Selects the rows of each batch of one row group's read, skipping batches left empty.</summary>
     public async IAsyncEnumerable<SelectedRecordBatch> SelectAsync(IAsyncEnumerable<PositionedRecordBatch> batches)
     {
@@ -98,6 +130,16 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
                 if (predicate.DropsEarlierNulls)
                     allTrue.CopyTo(live);
 
+                // Answered from the column's dictionary: the batch holds the predicate's answers for every row. Applied
+                // to all of them, a row no longer live is unchanged (its live and all-true bits are already clear), so
+                // this is the step for the live rows alone. The dictionary was evaluated whole, so a predicate that
+                // cannot be evaluated at all has raised already, or the column was read as values.
+                if (AnswerColumn(predicate, batch) is { } answers)
+                {
+                    SelectionMask.AndThreeValued(live, allTrue, rows, answers, default);
+                    continue;
+                }
+
                 int liveCount = SelectionMask.Count(live);
                 if (liveCount == 0)
                 {
@@ -172,6 +214,21 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
         var view = PredicateView(predicate, batch);
         var input = ArrowCompute.Take(view, view.Schema, ReadOnlySpan<int>.Empty);
         Release(Ask(predicate, input), input);
+    }
+
+    // The answers the reader put in place of the predicate's one column, when it answered it from its dictionary.
+    private BooleanArray? AnswerColumn(RowPredicate predicate, RecordBatch batch)
+    {
+        if (Answerable is null || predicate.Columns.Count != 1
+            || !Answerable.TryGetValue(predicate.Columns[0], out var answerable) || !ReferenceEquals(answerable, predicate))
+        {
+            return null;
+        }
+
+        int index = FieldIndex(batch.Schema, predicate.Columns[0]);
+        return Data.DictionaryAnswer.IsAnswerField(batch.Schema.GetFieldByIndex(index))
+            ? (BooleanArray)batch.Column(index)
+            : null;
     }
 
     // The predicate's columns of the batch, in its order, sharing the batch's arrays: never disposed.

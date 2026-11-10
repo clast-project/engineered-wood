@@ -338,7 +338,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// The row groups a positioned read of <paramref name="columnNames"/> under <paramref name="filter"/> and
     /// <paramref name="skipRows"/> reads, in file order: the plan <see cref="ReadWithPositionsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken)"/>
     /// follows, for a caller that schedules the row groups itself (a Delta scan, #612). Each plan is read with
-    /// <see cref="ReadPlannedAsync(RowGroupPlan, IReadOnlyList{string}?, ScanReservation, DecodedGrowth, CancellationToken)"/>,
+    /// <see cref="ReadPlannedAsync(RowGroupPlan, IReadOnlyList{string}?, ScanReservation, DecodedGrowth, CancellationToken, IReadOnlyDictionary{string, RowPredicate}?)"/>,
     /// which may run concurrently for different plans; the planning itself is NOT thread-safe and must be
     /// enumerated once, in order.
     /// <para>Only row groups <paramref name="firstRowGroup"/> (inclusive) to <paramref name="endRowGroup"/>
@@ -487,7 +487,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         RowGroupPlan plan,
         IReadOnlyList<string>? columnNames,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, RowPredicate>? answers = null)
     {
         var ranges = plan.Ranges;
 
@@ -501,7 +502,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // the single-batch read itself when there is nothing to split, and it is where the implicit
         // cap for an over-sized chunk is decided. Routing around it here would put that decision in
         // two places and leave ReadAllAsync unable to read a file ReadRowGroupBatchesAsync can.
-        await foreach (var batch in ReadBatchesAsync(plan.Index, columnNames, ranges, plan.OffsetIndexes, cancellationToken)
+        await foreach (var batch in ReadBatchesAsync(
+                               plan.Index, columnNames, ranges, plan.OffsetIndexes, cancellationToken, answers: answers)
             .ConfigureAwait(false))
         {
             yield return new PositionedRecordBatch(batch, plan.GroupStart + cursor);
@@ -527,7 +529,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         ScanReservation reservation,
         DecodedGrowth growth,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, RowPredicate>? answers = null)
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
@@ -536,7 +539,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         long decoded = 0;
         int batches = 0;
-        var e = ReadPlannedAsync(plan, columnNames, cancellationToken).GetAsyncEnumerator(cancellationToken);
+        var e = ReadPlannedAsync(plan, columnNames, cancellationToken, answers).GetAsyncEnumerator(cancellationToken);
         try
         {
             await reservation.HoldAsync(compressed, cancellationToken).ConfigureAwait(false);
@@ -737,7 +740,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         IRandomAccessFile? io = null,
         int? batchRows = null,
         bool useOffsetIndex = true,
-        byte[]? keepRows = null)
+        byte[]? keepRows = null,
+        IReadOnlyDictionary<string, RowPredicate>? answers = null)
     {
         var file = io ?? _file;
         int? batchSize = batchRows ?? _options.BatchSize;
@@ -804,8 +808,26 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             try
             {
                 var results = new ColumnResult[ctx.Count];
+                var wholeAnswers = keepRows is null ? DictionaryAnswersFor(ctx, answers, ctx.RowCount) : null;
+                var wholeAnswered = new bool[ctx.Count];
                 ForEachColumn(ctx.Count, i =>
                 {
+                    if (wholeAnswers?[i] is { } answer)
+                    {
+                        var result = ColumnChunkReader.ReadColumn(
+                            buffers[i].Memory.Span, ctx.Columns[i],
+                            ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
+                            validateCrc: _options.PageChecksumValidation,
+                            maxPageUncompressedSize: _options.MaxPageUncompressedSize,
+                            answer: answer);
+                        if (result.Array is not null)
+                        {
+                            results[i] = result;
+                            wholeAnswered[i] = true;
+                            return;
+                        }
+                    }
+
                     results[i] = ColumnChunkReader.ReadColumn(
                         buffers[i].Memory.Span, ctx.Columns[i],
                         ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
@@ -817,7 +839,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 });
                 yield return AssembleRecordBatch(
                     keepRows is null ? ctx : ctx with { RowCount = results.Length > 0 ? results[0].Array.Length : 0 },
-                    results);
+                    results, wholeAnswered);
             }
             finally
             {
@@ -870,6 +892,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var cursors = new DecodedRows[ctx.Count];
         for (int i = 0; i < ctx.Count; i++)
             cursors[i] = new DecodedRows();
+
+        // A column answered from its dictionary (#502 phase 4b) is decoded as its indices, decided by its first
+        // decode, when its dictionary is in hand: 0 undecided, 1 answered, 2 read as values.
+        int spanRows = 0;
+        foreach (var (start, end) in spans)
+            spanRows += end - start;
+        var dictionaryAnswers = keepRows is null ? DictionaryAnswersFor(ctx, answers, spanRows) : null;
+        var answerModes = new byte[ctx.Count];
+        var answered = new bool[ctx.Count];
 
         // Where every batch falls, and which pages each decodes, is known from the page maps and the
         // decoded rows alone, so the pages of many batches are fetched in one request, a window (#622):
@@ -1000,6 +1031,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                                         _options.MaxPageUncompressedSize);
                                 }
 
+                                if (answerModes[i] == 0)
+                                {
+                                    answerModes[i] = dictionaryAnswers?[i] is { } answer
+                                                     && answer.Prepare(pageMaps[i].Dictionary)
+                                        ? (byte)1
+                                        : (byte)2;
+                                }
+
                                 var buffer = pageBytes[dataSlots[i]];
                                 int startPage = startPages[i];
                                 var decoded = ColumnChunkReader.ReadColumnBatchFromSlice(
@@ -1012,7 +1051,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                                     ctx.LeafArrowFields[i],
                                     ctx.HasNestedColumns,
                                     _options.PageChecksumValidation,
-                                    _options.MaxPageUncompressedSize);
+                                    _options.MaxPageUncompressedSize,
+                                    dictionaryIndices: answerModes[i] == 1);
                                 // Decoded rows that continue the held ones are appended; otherwise the
                                 // pages start at or before the next row to return, and replace them.
                                 if (pageMaps[i].CumulativeRows[startPage] == cursor.EndRow)
@@ -1021,11 +1061,20 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                                     cursor.Restart(decoded.Array, pageMaps[i].CumulativeRows[startPage], endPages[i] + 1);
                             }
 
-                            results[i] = new ColumnResult(cursor.Take(actualBatchRows), null, null);
+                            if (answerModes[i] == 1)
+                            {
+                                using var indices = (Int32Array)cursor.Take(actualBatchRows);
+                                results[i] = new ColumnResult(dictionaryAnswers![i]!.Map(indices), null, null);
+                                answered[i] = true;
+                            }
+                            else
+                            {
+                                results[i] = new ColumnResult(cursor.Take(actualBatchRows), null, null);
+                            }
                         });
 
                         yield return AssembleRecordBatch(
-                            ctx with { RowCount = actualBatchRows }, results);
+                            ctx with { RowCount = actualBatchRows }, results, answered);
                     }
                     finally
                     {
@@ -1775,7 +1824,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             leafArrowFields, rowCount, hasNestedColumns, schemaRoot, topLevelFields, batchFields);
     }
 
-    private RecordBatch AssembleRecordBatch(RowGroupContext ctx, ColumnResult[] results)
+    private RecordBatch AssembleRecordBatch(RowGroupContext ctx, ColumnResult[] results, bool[]? answered = null)
     {
         if (!ctx.HasNestedColumns)
         {
@@ -1785,7 +1834,18 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 arrowArrays[i] = results[i].Array;
 
             var leafFields = (Field[])ctx.LeafArrowFields.Clone();
-            RestoreDeclaredUnits(leafFields, arrowArrays);
+            RestoreDeclaredUnits(leafFields, arrowArrays, answered);
+
+            // A column answered from its dictionary holds the predicate's answers, not its values.
+            if (answered is not null)
+            {
+                for (int i = 0; i < leafFields.Length; i++)
+                {
+                    if (answered[i])
+                        leafFields[i] = DictionaryAnswer.AnswerField(leafFields[i].Name);
+                }
+            }
+
             return BuildRecordBatch(leafFields, arrowArrays, ctx.RowCount);
         }
 
@@ -1880,7 +1940,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// only MILLIS, MICROS or NANOS and no zone name, so without this a <c>timestamp[s]</c> reads
     /// back as milliseconds and every zone reads back as UTC.
     /// </summary>
-    private void RestoreDeclaredUnits(Field[] fields, IArrowArray[] arrays)
+    private void RestoreDeclaredUnits(Field[] fields, IArrowArray[] arrays, bool[]? skip = null)
     {
         // Assembly always follows a metadata read, so the footer is cached by now.
         var declared = Volatile.Read(ref _metadata) is { } metadata ? DeclaredArrowSchema(metadata) : null;
@@ -1889,6 +1949,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         for (int i = 0; i < fields.Length; i++)
         {
+            if (skip is not null && skip[i])
+                continue;
             var target = DeclaredField(fields[i].Name, declared);
             if (target is null)
                 continue;
@@ -1901,6 +1963,42 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             fields[i] = new Field(
                 fields[i].Name, restored.Data.DataType, fields[i].IsNullable, fields[i].Metadata);
         }
+    }
+
+    /// <summary>
+    /// The columns of <paramref name="ctx"/> a selected read answers from their dictionaries (#502 phase 4b), by
+    /// position: those <paramref name="answers"/> names, flat, whose chunk's encoding_stats prove every data page
+    /// dictionary-encoded. Null when there are none. <paramref name="rows"/> is how many rows the read decodes.
+    /// </summary>
+    private DictionaryAnswer?[]? DictionaryAnswersFor(
+        RowGroupContext ctx, IReadOnlyDictionary<string, RowPredicate>? answers, int rows)
+    {
+        if (answers is not { Count: > 0 } || ctx.HasNestedColumns)
+            return null;
+
+        DictionaryAnswer?[]? result = null;
+        for (int i = 0; i < ctx.Count; i++)
+        {
+            var column = ctx.Columns[i];
+            if (column.Path.Count == 1 && column.MaxRepetitionLevel == 0
+                && answers.TryGetValue(column.Path[0], out var predicate)
+                && ctx.Chunks[i].MetaData is { } meta && MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta))
+            {
+                (result ??= new DictionaryAnswer?[ctx.Count])[i] = new DictionaryAnswer(
+                    predicate, column, ctx.LeafArrowFields[i], RestoreDeclaredUnit, rows);
+            }
+        }
+
+        return result;
+    }
+
+    // One column as RestoreDeclaredUnits leaves it.
+    private (Field Field, IArrowArray Array) RestoreDeclaredUnit(Field field, IArrowArray array)
+    {
+        var fields = new[] { field };
+        var arrays = new[] { array };
+        RestoreDeclaredUnits(fields, arrays);
+        return (fields[0], arrays[0]);
     }
 
     private static RecordBatch BuildRecordBatch(
