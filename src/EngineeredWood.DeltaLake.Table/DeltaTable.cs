@@ -5305,17 +5305,27 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                                 new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], live.Count), snapshot,
                                 addFile.PartitionValues, matchColumns, partitionColumns, partitionColumns.Count > 0,
                                 logicalToPhysical, addFile.Path);
-                            using var mask = predicate(shaped);
-                            if (mask.Length != live.Count)
+                            // Nothing else owns the batch built for the predicate, nor its answer: both are released
+                            // here, the answer only when it isn't one of the batch's own columns.
+                            var mask = predicate(shaped);
+                            try
                             {
-                                throw new ArgumentException(
-                                    $"The mask has {mask.Length} rows and the selection {live.Count}.", nameof(predicate));
-                            }
+                                if (mask.Length != live.Count)
+                                {
+                                    throw new ArgumentException(
+                                        $"The mask has {mask.Length} rows and the selection {live.Count}.", nameof(predicate));
+                                }
 
-                            for (int i = 0; i < live.Count; i++)
+                                for (int i = 0; i < live.Count; i++)
+                                {
+                                    if (mask.GetValue(i) == true)
+                                        newDeletedIndices.Add(live[i]);
+                                }
+                            }
+                            finally
                             {
-                                if (mask.GetValue(i) == true)
-                                    newDeletedIndices.Add(live[i]);
+                                Parquet.BatchSelector.Release(mask, shaped);
+                                shaped.Dispose();
                             }
 
                             live.Clear();
@@ -5346,8 +5356,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     var shaped = ReconcileToTableShape(
                         one, snapshot, addFile.PartitionValues, matchColumns, partitionColumns,
                         partitionColumns.Count > 0, logicalToPhysical, addFile.Path);
-                    using var answer = predicate(shaped);
-                    return answer.GetValue(0) == true;
+                    var answer = predicate(shaped);
+                    try
+                    {
+                        return answer.GetValue(0) == true;
+                    }
+                    finally
+                    {
+                        Parquet.BatchSelector.Release(answer, shaped);
+                        shaped.Dispose();
+                    }
                 }
             }
             else
