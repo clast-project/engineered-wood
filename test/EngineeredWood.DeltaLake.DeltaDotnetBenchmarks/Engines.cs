@@ -113,11 +113,6 @@ internal static class Ew
     }
 
     /// <summary>
-    /// <see cref="DeltaReadOptions.Filter"/> only PRUNES (files, row groups, pages); surviving batches still
-    /// hold non-matching rows. A query engine returns exactly the matching rows, so for a like-for-like
-    /// comparison this applies the predicate per row afterwards, as a caller of EW would have to.
-    /// </summary>
-    /// <summary>
     /// The rows <paramref name="predicateSql"/> selects, filtered by the scan itself (<c>FilterRows</c>, #502): the
     /// Parquet reader evaluates the predicate on its own column first, from the dictionary where it can, and decodes
     /// <paramref name="columns"/> only for the rows it keeps.
@@ -138,6 +133,14 @@ internal static class Ew
         return rows;
     }
 
+    /// <summary>
+    /// <see cref="DeltaReadOptions.Filter"/> alone, without <see cref="DeltaReadOptions.FilterRows"/>, only PRUNES
+    /// (files, row groups, pages); surviving batches still hold non-matching rows. A query engine returns exactly
+    /// the matching rows, so for a like-for-like comparison this applies the predicate per row afterwards, as a
+    /// caller of EW had to before
+    /// <see cref="FilterRowsCountAsync"/>'s <c>FilterRows</c>. With <paramref name="exact"/> false it returns the
+    /// pruned superset.
+    /// </summary>
     public static async Task<long> FilteredCountAsync(
         EwDeltaTable table, string predicateSql, IReadOnlyList<string> columns, bool exact)
     {
