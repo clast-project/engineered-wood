@@ -798,4 +798,10 @@ Each of these mutations fails tests:
 - a returned column never answered (22);
 - the batched answers restarted rather than appended (1).
 
-One mutation passes: not skipping the answer cursor over a gap between ranges. Ranges come from the page index, and both cursors restart at a range's first page rather than skip into it, so with ranges from the page index the skip is never needed (nor is the value cursor's).
+One mutation passes: not skipping the answer cursor at all. Ranges from the page index are whole pages, so a cursor never has to skip into rows it holds; it only moves its start. That start mattered once (review round 1): the answer cursor was first made lazily, at the column's first decode, after that batch's skip had moved the values cursor to a range starting past row 0. Its start was then behind, and a later skip dropped answers still needed (`held.Take` threw). Both cursors are now made before the first batch. The regression, a narrowed read whose first range starts at row 2,000 with 300-row batches, failed before the fix.
+
+### Review round 1
+
+- **A file column with an answer column's name:** NUL is legal in a Parquet field name, so a file could hold a column called `AnswerColumnName("s")`. Projecting it beside an answered `s` dropped it. `BatchSelector` now takes the file's top-level names and does not answer a returned column whose answer name is among them; that predicate is asked row by row. Tested with such a file (it failed before the fix).
+- **The lazily made answer cursor:** above.
+- **CI build failure:** `CS1705` in `EngineeredWood.DeltaLake` (netstandard2.0). `System.Text.Json` and `Microsoft.Bcl.AsyncInterfaces` both float on `9.*`. nuget.org has STJ 9.0.23, which references AsyncInterfaces 9.0.0.23, but AsyncInterfaces stops at 9.0.22. This is unrelated to the PR and breaks every branch until the matching package is published, or until the two are pinned together.

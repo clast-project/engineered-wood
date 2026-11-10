@@ -203,13 +203,17 @@ public class DictionaryAnswerTests : IDisposable
     /// A returned column answered over a read the page index narrows to two ranges of a row group, with batches
     /// that do not fall on page boundaries: the answers are held, skipped and cut as the values are.
     /// </summary>
-    [Fact]
-    public async Task AReturnedColumnIsAnsweredOverANarrowedRead()
+    [Theory]
+    [InlineData(0L, 700)]
+    [InlineData(2_000L, 300)] // the first range starts past the group's first row (review round 1)
+    public async Task AReturnedColumnIsAnsweredOverANarrowedRead(long from, int batchSize)
     {
         string path = await WriteFileAsync();
-        var options = new ParquetReadOptions { BatchSize = 700 };
+        var options = new ParquetReadOptions { BatchSize = batchSize };
         var prune = EngineeredWood.Expressions.Expressions.Or(
-            EngineeredWood.Expressions.Expressions.LessThan("id", EngineeredWood.Expressions.LiteralValue.Of(1_500L)),
+            EngineeredWood.Expressions.Expressions.And(
+                EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", EngineeredWood.Expressions.LiteralValue.Of(from)),
+                EngineeredWood.Expressions.Expressions.LessThan("id", EngineeredWood.Expressions.LiteralValue.Of(from + 1_500L))),
             EngineeredWood.Expressions.Expressions.And(
                 EngineeredWood.Expressions.Expressions.GreaterThanOrEqual("id", EngineeredWood.Expressions.LiteralValue.Of(6_200L)),
                 EngineeredWood.Expressions.Expressions.LessThan("id", EngineeredWood.Expressions.LiteralValue.Of(7_900L))));
@@ -232,6 +236,50 @@ public class DictionaryAnswerTests : IDisposable
         Assert.Contains(expected, r => r.StartsWith("7", StringComparison.Ordinal)); // the second range
         Assert.All(dictionaryLengths, n => Assert.Equal(Categories + 1, n));
         Assert.NotEmpty(dictionaryLengths);
+    }
+
+    /// <summary>
+    /// A file whose own column has the name a returned column's answers would take: that column is returned, and the
+    /// predicate is asked row by row (review round 1).
+    /// </summary>
+    [Fact]
+    public async Task AColumnNamedAsAnAnswerColumnIsReturnedAndTheDictionaryIsNotUsed()
+    {
+        string answerName = EngineeredWood.Parquet.Data.DictionaryAnswer.AnswerColumnName("s");
+        string path = Path.Combine(_tempDir, "collision.parquet");
+        var id = new Int64Array.Builder();
+        var s = new StringArray.Builder();
+        var other = new StringArray.Builder();
+        for (int r = 0; r < 2_000; r++)
+        {
+            id.Append(r);
+            s.Append("cat-" + (r % 5).ToString(System.Globalization.CultureInfo.InvariantCulture));
+            other.Append("other-" + r.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("s", StringType.Default, false))
+            .Field(new Field(answerName, StringType.Default, false))
+            .Build();
+        using (var batch = new RecordBatch(schema, [id.Build(), s.Build(), other.Build()], 2_000))
+        {
+            await using var output = new LocalSequentialFile(path);
+            await using var writer = new ParquetFileWriter(output, ownsFile: false, ParquetWriteOptions.Default);
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        var lengths = new ConcurrentBag<int>();
+        var rows = await ReadAsync(path, new ParquetReadOptions(), new ParquetScan
+        {
+            Columns = ["id", "s", answerName],
+            RowFilter = new RowFilter([Over("s", v => v == "cat-3", valueWise: true, lengths)]),
+        }, twoPass: false);
+
+        Assert.Equal(400, rows.Count);
+        Assert.All(rows, r => Assert.Equal(3, r.Split('|').Length)); // id, s and the file's own column
+        Assert.Equal(2_000, lengths.Sum());
     }
 
     /// <summary>

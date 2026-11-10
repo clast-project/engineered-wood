@@ -13,7 +13,11 @@ namespace EngineeredWood.Parquet;
 /// and drops the columns read only for the filter. Stateless across batches, so one instance serves the
 /// row groups of a scan concurrently.
 /// </summary>
-internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, IReadOnlyCollection<string> dropped)
+/// <param name="fileColumns">The file's top-level column names, when known: a returned column is not answered from
+/// its dictionary if its answer column's name is one of them (review round 1).</param>
+internal sealed class BatchSelector(
+    RowFilter? filter, IExcludedRows? excluded, IReadOnlyCollection<string> dropped,
+    IReadOnlyCollection<string>? fileColumns = null)
 {
     /// <summary>
     /// The predicates the reader may answer from a column chunk's dictionary (#502 phases 4b and 4d), by the column
@@ -22,14 +26,15 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
     /// the answers stand in its place; for one it returns, they come as an extra column
     /// (<see cref="Data.DictionaryAnswer.AnswerColumnName"/>), which the read drops.
     /// </summary>
-    public IReadOnlyDictionary<string, AnswerPlan>? Answerable { get; } = AnswerableOf(filter, dropped);
+    public IReadOnlyDictionary<string, AnswerPlan>? Answerable { get; } = AnswerableOf(filter, dropped, fileColumns);
 
     // The columns the read drops: the predicates' own, and the answer columns of returned ones.
-    private readonly IReadOnlyCollection<string> _dropped = DroppedWithAnswers(dropped, filter);
+    private readonly IReadOnlyCollection<string> _dropped = DroppedWithAnswers(dropped, filter, fileColumns);
 
-    private static IReadOnlyCollection<string> DroppedWithAnswers(IReadOnlyCollection<string> dropped, RowFilter? filter)
+    private static IReadOnlyCollection<string> DroppedWithAnswers(
+        IReadOnlyCollection<string> dropped, RowFilter? filter, IReadOnlyCollection<string>? fileColumns)
     {
-        if (AnswerableOf(filter, dropped) is not { } answerable || answerable.Values.All(p => !p.KeepValues))
+        if (AnswerableOf(filter, dropped, fileColumns) is not { } answerable || answerable.Values.All(p => !p.KeepValues))
             return dropped;
         var all = new HashSet<string>(dropped, StringComparer.Ordinal);
         foreach (var (name, plan) in answerable)
@@ -41,7 +46,8 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
         return all;
     }
 
-    private static Dictionary<string, AnswerPlan>? AnswerableOf(RowFilter? filter, IReadOnlyCollection<string> dropped)
+    private static Dictionary<string, AnswerPlan>? AnswerableOf(
+        RowFilter? filter, IReadOnlyCollection<string> dropped, IReadOnlyCollection<string>? fileColumns)
     {
         if (filter is null)
             return null;
@@ -57,7 +63,10 @@ internal sealed class BatchSelector(RowFilter? filter, IExcludedRows? excluded, 
         foreach (var predicate in filter.Predicates)
         {
             if (predicate.ValueWise && predicate.Columns.Count == 1 && predicate.Columns[0] is var name
-                && readers[name] == 1)
+                && readers[name] == 1
+                // A returned column's answers need a column name of their own; one the file already has is not.
+                && (dropped.Contains(name) || fileColumns is null
+                    || !fileColumns.Contains(Data.DictionaryAnswer.AnswerColumnName(name))))
             {
                 (result ??= new Dictionary<string, AnswerPlan>(StringComparer.Ordinal))[name] =
                     new AnswerPlan(predicate, KeepValues: !dropped.Contains(name));

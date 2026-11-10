@@ -899,8 +899,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var dictionaryAnswers = keepRows is null ? DictionaryAnswersFor(ctx, answers, spanRows) : null;
         var answerModes = new byte[ctx.Count];
 
-        // A returned column's answers, decoded beside its values, are held and returned as its values are.
+        // A returned column's answers, decoded beside its values, are held and returned as its values are. Made
+        // before the first batch, so every skip to a range's first row moves them with the values (review round 1).
         var answerCursors = new DecodedRows?[ctx.Count];
+        for (int i = 0; i < ctx.Count; i++)
+        {
+            if (dictionaryAnswers?[i] is { KeepsValues: true })
+                answerCursors[i] = new DecodedRows();
+        }
 
         // Where every batch falls, and which pages each decodes, is known from the page maps and the
         // decoded rows alone, so the pages of many batches are fetched in one request, a window (#622):
@@ -1057,9 +1063,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                                     answer: answerModes[i] == 1 ? dictionaryAnswers![i] : null);
 
                                 // A returned answered column holds its answers as it holds its values.
-                                var answerCursor = answerModes[i] == 1 && dictionaryAnswers![i]!.KeepsValues
-                                    ? answerCursors[i] ??= new DecodedRows()
-                                    : null;
+                                var answerCursor = answerModes[i] == 1 ? answerCursors[i] : null;
 
                                 // Decoded rows that continue the held ones are appended; otherwise the
                                 // pages start at or before the next row to return, and replace them.
@@ -1079,7 +1083,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                             {
                                 // The answers in place of the values, or beside them.
                                 var taken = cursor.Take(actualBatchRows);
-                                results[i] = answerCursors[i] is { } held
+                                results[i] = answerCursors[i] is { } held && dictionaryAnswers![i]!.KeepsValues
                                     ? new ColumnResult(taken, null, null, Answers: (BooleanArray)held.Take(actualBatchRows))
                                     : new ColumnResult(taken, null, null, Answers: (BooleanArray)taken);
                             }
