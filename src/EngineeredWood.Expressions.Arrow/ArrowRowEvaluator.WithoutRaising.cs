@@ -29,14 +29,21 @@ public sealed partial class ArrowRowEvaluator
     /// </para>
     /// <para>
     /// Every operand is evaluated over every row, so AND and OR are Kleene's, as the short-circuiting evaluation
-    /// answers too. An error no value causes (no common type, an unresolvable column) still raises as it would over
-    /// any rows.
+    /// answers too. An empty batch is answered by <see cref="EvaluatePredicate"/> itself, which over no rows reads no
+    /// row's value.
     /// </para>
-    /// <para>
-    /// An empty batch is answered by <see cref="EvaluatePredicate"/> itself: over no rows it reads no row's value, and
-    /// it raises exactly what it raises over any batch, where the direct path would decline before resolving a column
-    /// (review round 2).
-    /// </para>
+    /// <para>What it promises:</para>
+    /// <list type="bullet">
+    /// <item><description>It never raises an error a row's value causes.</description></item>
+    /// <item><description>An answer is exactly <see cref="EvaluatePredicate"/>'s answer for the same batch.</description></item>
+    /// <item><description>An error it does raise is one <see cref="EvaluatePredicate"/> raises for the same batch (an
+    /// analysis error met on the way).</description></item>
+    /// <item><description>A decline is not a verdict on the predicate. It may decline one that
+    /// <see cref="EvaluatePredicate"/> would refuse (an unresolvable column, a pair of types with no comparison, a form it
+    /// does not cover) without checking it. A caller that is declined must ask <see cref="EvaluatePredicate"/> instead,
+    /// over the rows it needs answered (over no rows if none), and that call raises any such error (review rounds 2 and
+    /// 3).</description></item>
+    /// </list>
     /// </remarks>
     public BooleanArray? TryEvaluateWithoutRaising(Predicate predicate, RecordBatch batch)
     {

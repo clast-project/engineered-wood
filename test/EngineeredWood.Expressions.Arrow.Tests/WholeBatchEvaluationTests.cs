@@ -195,6 +195,50 @@ public class WholeBatchEvaluationTests
         }
     }
 
+    /// <summary>
+    /// Review round 3: a decline is not a verdict, so an invalid predicate may be declined without being checked. What
+    /// the contract does promise is that a caller doing what the reader does (asking <see cref="ArrowRowEvaluator.EvaluatePredicate"/>
+    /// on a decline) raises exactly what <see cref="ArrowRowEvaluator.EvaluatePredicate"/> alone raises. Copilot's two
+    /// examples are here: an IN with no common type (a form this does not cover) and a missing column in a covered
+    /// comparison, which the direct kernel declines.
+    /// </summary>
+    [Theory]
+    [InlineData("missing > 0")]
+    [InlineData("i32 > 0 AND missing IS NULL")]
+    [InlineData("i32 IN (X'61')")]
+    [InlineData("1 IN (TRUE)")]
+    [InlineData("i32 > X'61'")]
+    [InlineData("b = 'abc'")]
+    public void ADeclineThenEvaluatePredicateRaisesWhatEvaluatePredicateRaises(string sql)
+    {
+        var batch = DirectColumnComparisonTests.Batch();
+        var predicate = SparkSqlParser.ParsePredicate(sql);
+        int raised = 0;
+        for (int e = 0; e < DirectColumnComparisonTests.Evaluators.Length; e++)
+        {
+            var make = DirectColumnComparisonTests.Evaluators[e];
+            string name = $"[{DirectColumnComparisonTests.EvaluatorNames[e]}] {sql}";
+            var (expected, error) = General(make(), predicate, batch);
+            string actual;
+            try
+            {
+                var evaluator = make();
+                actual = Show(evaluator.TryEvaluateWithoutRaising(predicate, batch) ?? evaluator.EvaluatePredicate(predicate, batch));
+            }
+            catch (Exception ex)
+            {
+                actual = $"{ex.GetType().Name}: {ex.Message}";
+            }
+
+            Assert.True(expected == actual, $"{name}\n  alone:    {expected}\n  declined: {actual}");
+            if (error is not null)
+                raised++;
+        }
+
+        // Not vacuous: the general path refuses each of these under at least one evaluator.
+        Assert.True(raised > 0, $"{sql}: no evaluator refused it");
+    }
+
     [Fact]
     public void AnEmptyBatchIsAnsweredEmpty()
     {

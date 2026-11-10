@@ -882,7 +882,7 @@ As §15 found, two passes win nearly everywhere locally. The exception is a sele
   - `IS [NOT] NULL` of a column;
   - AND, OR and NOT of these. Every operand is evaluated over every row, so AND and OR are Kleene's, which is what the short-circuiting evaluation answers too.
 
-  Analysis errors still raise, as they would over any rows. `MayEvaluateWithoutRaising` says from the form alone whether it can ever answer: a comparison qualifies only with a column on one side and a constant on the other, so `qty > id` is never shaped only to be declined (review round 1). The method is public rather than internal because an `Expressions.Arrow` IVT to `DeltaLake.Table` leaks PolySharp's polyfills.
+  It never raises an error a row's value causes, and an answer is exactly `EvaluatePredicate`'s. A decline is not a verdict: it may decline a predicate `EvaluatePredicate` would refuse, unchecked, and the caller then asks `EvaluatePredicate`, which raises it (review round 3). `MayEvaluateWithoutRaising` says from the form alone whether it can ever answer: a comparison qualifies only with a column on one side and a constant on the other, so `qty > id` is never shaped only to be declined (review round 1). The method is public rather than internal because an `Expressions.Arrow` IVT to `DeltaLake.Table` leaks PolySharp's polyfills.
 - **`RowPredicate.EvaluateWholeBatch`** (internal) carries it to the reader. When at least `WholeBatchLiveShare` of a batch's rows are still live (default 0.4), `BatchSelector` asks the predicate about the whole batch rather than a gather of the live rows. Its answers for rows no longer live change nothing, exactly as with dictionary answers (§20). A decline falls back to the gather.
 - **Delta** offers it for each run of filter conjuncts, and for an expression DELETE, whose deletion vector leaves most rows live, when the form can answer. The batch is first brought to the table's shape, as `ConditionMask` does. That shaping can itself raise on a value no live row holds: a DATE widened to TIMESTAMP_NTZ overflows, checked, on a far-future day count. So any error while shaping declines, and the live rows are asked instead (review round 1).
 - **Knobs (internal):** `DeltaTable.EvaluatesWholeBatches`, `DeltaTable.WholeBatchLiveShare` and `ParquetFileReader.WholeBatchLiveShare`, all per instance.
@@ -916,6 +916,7 @@ Splitting now costs less than evaluating together at 94% kept: -26%, where §19 
 
 - `WholeBatchEvaluationTests` (Expressions.Arrow):
   - Every case of `DirectColumnComparisonTests`' sweep under three evaluators (plain, ANSI, legacy) is answered as the general path answers, or declined, never raised except for an analysis error.
+  - For 6 invalid predicates, a decline followed by `EvaluatePredicate`, as the reader does, raises exactly what `EvaluatePredicate` alone raises. Two are Copilot's examples: an IN with no common type, and a missing column in a covered comparison.
   - 14 compound forms answer or decline as expected.
   - A string column against a number under ANSI declines without raising.
   - The form check admits a column against a constant only (11 forms, and a column as the prefix of `STARTSWITH`).
@@ -947,3 +948,17 @@ Each of these mutations fails tests:
 ### Review round 2
 
 - **An empty batch hid errors no value causes.** `TryEvaluateWithoutRaising` declined any empty batch up front. So over a batch without `i32`, `i32 > 0` came back declined instead of raising as `EvaluatePredicate` does. The direct path also declines an empty batch before resolving its column, under an evaluator with no analysis rules. An empty batch is now answered by `EvaluatePredicate` itself, which reads no row's value and raises what it raises over any batch. The reader never asked about an empty batch: the whole path needs a live row, and a batch with none goes to `EvaluateOverNoRows`. So reads were unaffected; the public method's contract was not. `AnEmptyBatchRaisesWhatTheGeneralPathRaises` (5 forms x 3 evaluators) failed 4 cases before the fix.
+
+### Review round 3
+
+Two more paths where a decline hid an error no value causes:
+- forms the method does not cover (`a IN (bl)` declined before any analysis);
+- a covered comparison over a missing column (the direct kernel catches the lookup's `ArgumentException` and declines).
+
+Round 2 was the same pattern on empty batches. The cause was the contract, not the code. The method promised that such errors "still raise", a promise no caller needs, because every caller treats a decline as "ask `EvaluatePredicate` instead", and that call raises them. The contract now says so:
+- never an error a value causes;
+- an answer equal to `EvaluatePredicate`'s;
+- any error it does raise is one `EvaluatePredicate` raises too;
+- a decline is not a verdict.
+
+A separate analysis pass before each decline was rejected: it would cost the fast path on every batch, and change nothing a reader returns. Round 2's code stays: answering an empty batch through `EvaluatePredicate` is correct, just no longer needed by the contract.
