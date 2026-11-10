@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 under way (§19-§22). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -805,3 +805,42 @@ One mutation passes: not skipping the answer cursor at all. Ranges from the page
 - **A file column with an answer column's name:** NUL is legal in a Parquet field name, so a file could hold a column called `AnswerColumnName("s")`. Projecting it beside an answered `s` dropped it. `BatchSelector` now takes the file's top-level names and does not answer a returned column whose answer name is among them; that predicate is asked row by row. Tested with such a file (it failed before the fix).
 - **The lazily made answer cursor:** above.
 - **CI build failure:** `CS1705` in `EngineeredWood.DeltaLake` (netstandard2.0). `System.Text.Json` and `Microsoft.Bcl.AsyncInterfaces` both float on `9.*`. nuget.org has STJ 9.0.23, which references AsyncInterfaces 9.0.0.23, but AsyncInterfaces stops at 9.0.22. This is unrelated to the PR and breaks every branch until the matching package is published, or until the two are pinned together.
+
+## 23. End of the arc: oracle, Delta timings, the two-pass default (2026-11-10)
+
+Three items were left for before `feature/row-level-filtering` merges to main.
+
+### Spark DELETE counts (3c's gate)
+
+`DeleteCountInteropTests` (tier 3) builds two identical tables. Each has a value in `s` that no integer cast reads ('abc', 'x9'), held only by rows a deletion vector already deleted. Spark runs a DELETE on one table and EW runs the same DELETE on the other. The four conditions are `s = 5`, `CAST(s AS INT) > 4`, `s = 5 OR p = 'b'` (a partition) and `s IS NULL OR CAST(s AS INT) < 3`. For each, EW deletes as many rows as Spark's `num_affected_rows`, and Spark reads the same ids from both tables afterwards. A premise test shows Spark's DELETE raising once such a row is live. All 5 ran and passed locally with `EW_REQUIRE_SPARK_INTEROP=1` (pyspark 4.0.4, delta-spark 4.0.0; 10m45s). Before 3c, EW raised `CAST_INVALID_INPUT` on these tables.
+
+### Delta timings with `FilterRows`
+
+`FilteredScanBenchmarks` and `LargeScanBenchmarks` (DeltaDotnetBenchmarks) gain `EW_FilterRows`. It runs the same query with `FilterRows` set, returning `id, amount`, beside the existing EW read that post-filters, prune-only, and delta-dotnet. `--verify` agrees on every row count. BenchmarkDotNet, net10.0, local disk:
+
+| Case | Fixture written by | Post-filter | `FilterRows` | Change | delta-dotnet (64K batches) |
+|---|---|---|---|---|---|
+| Selective (1 file, 10,000 rows) | EW | 1.65 ms | 1.49 ms | -10% | 7.55 ms |
+| Selective | delta-dotnet | 1.81 ms | 1.71 ms | -6% | 9.59 ms |
+| OneCategory (1M rows, 6%) | EW | 7.07 ms | 4.53 ms | -36% | 15.77 ms |
+| OneCategory | delta-dotnet | 7.32 ms | 6.22 ms | -15% | 19.33 ms |
+| LargeOneCategory (10M rows) | EW | 56.5 ms | 37.2 ms | -34% | 81.8 ms |
+| LargeOneCategory | delta-dotnet | 62.4 ms | 45.9 ms | -26% | 92.9 ms |
+
+`OneCategory` was #608/#609's case. Its predicate is now answered from each chunk's dictionary (4b/4c), and `id, amount` are decoded only for the rows kept.
+
+### The two-pass default for local files
+
+Two passes are still gated to object storage (§13; decided 11-09, to be revisited at the end of the arc). `rowfilter-ab` (local, 7 rounds, i9-12900K, net10.0), `twopass` against `selected` (one pass), on this branch:
+
+| Case | narrow | wide |
+|---|---|---|
+| clustered point / 0.1% / 1% | -12% / -6% / -5% | -6% / -4% / -2% |
+| clustered 10% / 50% / 90% | 0% / +3% / **+24%** | +4% / -26% / **+10%** |
+| scattered point / 0.1% / 1% | -12% / +7% / 0% | -33% / -17% / -15% |
+| scattered 10% / 50% / 90% / 99% | -5% / -7% / -10% / -11% | -23% / -13% / -20% / -20% |
+| category = 2% / <> 98% | -1% / -14% | -4% / -5% |
+
+As §15 found, two passes win nearly everywhere locally. The exception is a selection that keeps row groups whole or nearly whole (clustered 90%: +24% narrow, +10% wide), where the second pass reads everything the first did not.
+
+**Decided (2026-11-10):** the default stays as it is (two passes for object storage only) until phase 5. Demoting a predicate that keeps nearly every row should remove the clustered-90% regression, and the local default is revisited then. The feature branch does not wait on it.
