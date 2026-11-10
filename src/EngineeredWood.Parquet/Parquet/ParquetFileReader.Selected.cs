@@ -127,14 +127,15 @@ public sealed partial class ParquetFileReader
         public IAsyncEnumerable<SelectedRecordBatch> ReadAsync(RowGroupPlan plan, CancellationToken cancellationToken) =>
             _reader.ReadsInTwoPasses(plan, _twoPass, _metadata.RowGroups[plan.Index])
                 ? _reader.ReadTwoPassAsync(plan, _twoPass!, _selector, reservation: null, growth: null, 0, cancellationToken)
-                : _selector.SelectAsync(_reader.ReadPlannedAsync(plan, ReadColumns, cancellationToken));
+                : _selector.SelectAsync(_reader.ReadPlannedAsync(plan, ReadColumns, cancellationToken, _selector.Answerable));
 
         /// <summary>The selected rows of one planned row group, as one unit of a parallel read.</summary>
         public IAsyncEnumerable<SelectedRecordBatch> ReadAsync(
             RowGroupPlan plan, ScanReservation reservation, DecodedGrowth growth, CancellationToken cancellationToken) =>
             _reader.ReadsInTwoPasses(plan, _twoPass, _metadata.RowGroups[plan.Index])
                 ? _reader.ReadTwoPassAsync(plan, ReadColumns, _twoPass!, _selector, reservation, growth, cancellationToken)
-                : _selector.SelectAsync(_reader.ReadPlannedAsync(plan, ReadColumns, reservation, growth, cancellationToken));
+                : _selector.SelectAsync(
+                    _reader.ReadPlannedAsync(plan, ReadColumns, reservation, growth, cancellationToken, _selector.Answerable));
     }
 
     /// <summary>

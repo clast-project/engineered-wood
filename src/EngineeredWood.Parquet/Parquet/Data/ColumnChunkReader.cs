@@ -53,12 +53,15 @@ internal static class ColumnChunkReader
         bool validateCrc = false,
         bool fixedListFastPath = false,
         int? maxPageUncompressedSize = null,
-        byte[]? keepRows = null)
+        byte[]? keepRows = null,
+        DictionaryAnswer? answer = null)
     {
         if (keepRows is not null && (column.MaxRepetitionLevel > 0 || preserveDefLevels || keepRows.Length < rowCount))
             throw new ArgumentException("Rows can be kept only in a flat column, one byte per row.", nameof(keepRows));
+        if (answer is not null && (column.MaxRepetitionLevel > 0 || preserveDefLevels || keepRows is not null))
+            throw new ArgumentException("Only a flat column read whole is answered from its dictionary.", nameof(answer));
 
-        if (fixedListFastPath && IsFixedListCandidate(column))
+        if (answer is null && fixedListFastPath && IsFixedListCandidate(column))
         {
             var fast = TryReadFixedListColumn(
                 data, column, columnMeta, rowCount, arrowField, validateCrc, maxPageUncompressedSize);
@@ -75,9 +78,11 @@ internal static class ColumnChunkReader
             _ => ByteArrayOutputKind.Default,
         };
 
-        using var state = new ColumnBuildState(
-            column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
+        using var state = answer is not null
+            ? DictionaryAnswer.IndexState(column, capacity)
+            : new ColumnBuildState(
+                column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
+                byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
         if (keepRows is not null)
             state.SetRowSelection(keepRows);
         DictionaryDecoder? dictionary = null;
@@ -107,6 +112,11 @@ internal static class ColumnChunkReader
                         case PageType.DictionaryPage:
                             dictionary?.Dispose(); // a second dictionary page replaces the first
                             dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+
+                            // No answer from this dictionary (too large, or the predicate raised over it): the
+                            // caller reads the chunk's values instead.
+                            if (answer is not null && !answer.Prepare(dictionary))
+                                return default;
                             break;
 
                         case PageType.SymbolTablePage:
@@ -169,7 +179,14 @@ internal static class ColumnChunkReader
             rowCount = state.KeptRows;
 
         IArrowArray array;
-        if (isRepeated)
+        if (answer is not null)
+        {
+            if (!answer.IsPrepared)
+                throw new ParquetFormatException($"Column '{column.DottedPath}' has no dictionary page.");
+            using var indices = (Int32Array)ArrowArrayBuilder.Build(state, DictionaryAnswer.IndexField, rowCount);
+            array = answer.Map(indices);
+        }
+        else if (isRepeated)
         {
             int numValues = checked((int)columnMeta.NumValues);
             array = ArrowArrayBuilder.BuildDense(state, arrowField, numValues);
@@ -573,9 +590,12 @@ internal static class ColumnChunkReader
         Field arrowField,
         bool preserveDefLevels = false,
         bool validateCrc = false,
-        int? maxPageUncompressedSize = null)
+        int? maxPageUncompressedSize = null,
+        bool dictionaryIndices = false)
     {
         bool isRepeated = column.MaxRepetitionLevel > 0;
+        if (dictionaryIndices && (isRepeated || preserveDefLevels))
+            throw new ArgumentException("Only a flat column is read as its dictionary indices.", nameof(dictionaryIndices));
 
         int pageNumValues = pageMap.CumulativeValues[endPage + 1] - pageMap.CumulativeValues[startPage];
         int pageRowCount = pageMap.CumulativeRows[endPage + 1] - pageMap.CumulativeRows[startPage];
@@ -588,9 +608,11 @@ internal static class ColumnChunkReader
             _ => ByteArrayOutputKind.Default,
         };
 
-        using var state = new ColumnBuildState(
-            column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
+        using var state = dictionaryIndices
+            ? DictionaryAnswer.IndexState(column, capacity)
+            : new ColumnBuildState(
+                column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
+                byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
 
         int valuesLeft = capacity;
         for (int p = startPage; p <= endPage; p++)
@@ -656,7 +678,8 @@ internal static class ColumnChunkReader
         }
         else
         {
-            array = ArrowArrayBuilder.Build(state, arrowField, pageRowCount);
+            array = ArrowArrayBuilder.Build(
+                state, dictionaryIndices ? DictionaryAnswer.IndexField : arrowField, pageRowCount);
         }
 
         return new ColumnResult(array, defLevels, repLevels);
@@ -1094,6 +1117,25 @@ internal static class ColumnChunkReader
     {
         bool isDictEncoded = encoding == Encoding.PlainDictionary || encoding == Encoding.RleDictionary;
 
+        if (state.DictionaryIndices)
+        {
+            // A chunk read for its dictionary indices (a dictionary answer, #502 phase 4b) was chosen because its
+            // encoding_stats say every data page is dictionary-encoded. A page that is not contradicts them.
+            if (!isDictEncoded)
+            {
+                throw new ParquetFormatException(
+                    $"Column '{column.DottedPath}': a data page is {encoding}-encoded, but the chunk's encoding_stats " +
+                    "say every data page is dictionary-encoded.");
+            }
+
+            if (dictionary == null)
+                throw new ParquetFormatException(
+                    $"Dictionary-encoded data page but no dictionary page found for column '{column.DottedPath}'.");
+
+            DecodeDictIndices(data, column, dictionary, nonNullCount, state);
+            return;
+        }
+
         if (isDictEncoded)
         {
             if (dictionary == null)
@@ -1469,6 +1511,43 @@ internal static class ColumnChunkReader
                 indices = indicesArray.AsSpan(0, count);
             }
 
+            WriteDictionaryValues(column, dictionary, indices, state);
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(indicesArray);
+        }
+    }
+
+    /// <summary>
+    /// The indices of a dictionary-encoded page's values, checked against the dictionary, written to
+    /// <paramref name="state"/> as INT32 values: the form a dictionary answer maps through its lookup table.
+    /// </summary>
+    private static void DecodeDictIndices(
+        ReadOnlySpan<byte> data, ColumnDescriptor column, DictionaryDecoder dictionary, int count, ColumnBuildState state)
+    {
+        if (count == 0)
+            return;
+
+        int bitWidth = data[0];
+        if (bitWidth > 32)
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}': a dictionary-encoded page's indices are {bitWidth} bits wide.");
+        }
+
+        var indices = state.ReserveValues<int>(count);
+        var decoder = new RleBitPackedDecoder(data.Slice(1), bitWidth);
+        decoder.ReadBatch(indices);
+        dictionary.CheckIndices(indices, bitWidth, column);
+    }
+
+    /// <summary>The dictionary's values at <paramref name="indices"/>, appended to <paramref name="state"/>.</summary>
+    internal static void WriteDictionaryValues(
+        ColumnDescriptor column, DictionaryDecoder dictionary, ReadOnlySpan<int> indices, ColumnBuildState state)
+    {
+        int count = indices.Length;
+        {
             switch (column.PhysicalType)
             {
                 case PhysicalType.Boolean:
@@ -1562,10 +1641,6 @@ internal static class ColumnChunkReader
                     throw new NotSupportedException(
                         $"Physical type '{column.PhysicalType}' is not supported for dictionary decoding.");
             }
-        }
-        finally
-        {
-            ArrayPool<int>.Shared.Return(indicesArray);
         }
     }
 

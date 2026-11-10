@@ -196,7 +196,8 @@ public sealed partial class ParquetFileReader
                                // does: a first pass cut into batches builds page maps from them, and would otherwise
                                // fetch them again.
                                plan.Index, columns.Filter, ranges: null, plan.OffsetIndexes, cancellationToken,
-                               batchRows: keep || !SplitsGroup(groupRows) ? groupRows : null).ConfigureAwait(false))
+                               batchRows: keep || !SplitsGroup(groupRows) ? groupRows : null,
+                               answers: selector.Answerable).ConfigureAwait(false))
             {
                 int start = row;
                 row += batch.Length;
@@ -513,7 +514,7 @@ public sealed partial class ParquetFileReader
 
     /// <summary>
     /// A two-pass read as one unit of a parallel read: reserves scan memory as
-    /// <see cref="ReadPlannedAsync(RowGroupPlan, IReadOnlyList{string}?, ScanReservation, DecodedGrowth, CancellationToken)"/>
+    /// <see cref="ReadPlannedAsync(RowGroupPlan, IReadOnlyList{string}?, ScanReservation, DecodedGrowth, CancellationToken, IReadOnlyDictionary{string, RowPredicate}?)"/>
     /// does, holding the row group's compressed bytes for the whole read; the read itself holds what its first
     /// pass keeps and reports raw decoded sizes.
     /// </summary>

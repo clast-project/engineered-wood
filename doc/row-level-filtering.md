@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 started (§19). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 started (§19, §20). A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -664,3 +664,44 @@ Each of these mutations fails tests:
 - a hoisted FALSE treated as TRUE (12);
 - a deferred raise never thrown (2);
 - a merged conjunct (`EvaluatesConjunctsTogether`) reading only the first conjunct's columns (13).
+
+## 20. Phase 4b: answers from the dictionary (2026-11-10)
+
+The reader answers a `ValueWise` predicate from a chunk's dictionary, as §6 proposed, within these limits (4d lifts some):
+- **Which predicates:** one column, `ValueWise`, over a column no other predicate reads and the read does not return. `BatchSelector.Answerable` lists them once per scan.
+- **Which chunks:** a flat top-level column whose `encoding_stats` prove every data page dictionary-encoded (`MembershipPredicateEvaluator.IsWhollyDictionaryEncoded`, as dictionary pruning decides it), not a second pass that keeps rows as it decodes.
+- **Guard:** the dictionary holds fewer entries than the rows the read decodes from the chunk: the row group, or what the page index narrowed it to. That is §6's "selected rows" read as decoded rows, since the excluded rows and earlier predicates are not known when the chunk is decoded. EW's own writer falls back to PLAIN past 20% distinct, so the guard binds only on a narrowed read or another writer's file.
+
+### How
+
+- `Data.DictionaryAnswer.Prepare` builds the dictionary's values as the column's Arrow array, plus one NULL when the column is nullable, with the declared time units restored as the read restores them. It calls `Evaluate` once and keeps a lookup table of answers (TRUE, FALSE or NULL per entry, and the NULL row's). If it raises, or returns a mask of the wrong length, the chunk is read as values and the predicate is asked row by row, as before. So an error on an entry no live row uses (a value only an excluded row holds) never fails the read, and an error a live row's value raises still raises there.
+- The chunk is then decoded to its **indices only**: a `ColumnBuildState` in a new `DictionaryIndices` mode collects them as INT32, through the existing page walk (V1/V2, compression, CRC, definition levels). No value is looked up. A data page that is not dictionary-encoded contradicts the `encoding_stats` and raises `ParquetFormatException`.
+- `Map` turns the indices into a `BooleanArray` of answers, which stands in the batch where the column's values would have been, under a field marked as answers. `BatchSelector` applies that column as the predicate's mask over every row: a row no longer live is unchanged by it, since its live and all-true bits are already clear. Both reads take this path: the one-batch read decides when it meets the dictionary page, and the batched read when it first decodes the column.
+- **Asking every predicate, even over no rows** (§7, "Analysis errors"): the predicate was asked over the dictionary, so one that cannot be evaluated at all has already raised, or made the chunk fall back to row evaluation.
+
+Nothing in Delta sets `ValueWise` yet. That is 4c, reusing `IFoldableFunctions.IsFoldable`.
+
+### Measured
+
+`dictanswer-ab` (Parquet benchmarks): `rowfilter-ab`'s file (4 row groups x 500,000 rows, 50 categories, default options), `category` filter-only, `ArrowRowEvaluator` as the predicate, `rows` = asked per row, `dict` = `ValueWise`. i9-12900K (24 logical), net10.0, local file, median of 9.
+
+| Case | Kept | rows ms | dict ms | dict vs rows | 2-pass rows ms | 2-pass dict ms | dict vs rows |
+|---|---|---|---|---|---|---|---|
+| `= 'cat-07'`, returns `id, amount` | 2% | 10.9 | 7.7 | -29% | 10.3 | 7.4 | -28% |
+| `IN` 5 categories, returns `id, amount` | 10% | 173.5 | 9.3 | -95% | 204.3 | 8.4 | -96% |
+| `<> 'cat-07'`, returns `id, amount` | 98% | 21.6 | 20.4 | -6% | 21.6 | 19.4 | -10% |
+| `= 'cat-07'`, positions only | 2% | 4.9 | 2.6 | -47% | 4.9 | 2.6 | -47% |
+| `IN` 5 categories, positions only | 10% | 175.8 | 3.8 | -98% | 161.1 | 3.7 | -98% |
+| `<> 'cat-07'`, positions only | 98% | 14.3 | 12.1 | -15% | 14.5 | 12.3 | -15% |
+
+Positions only is a DELETE's read (3c). The `IN` rows are slow for a reason outside the reader: `ArrowRowEvaluator.EvalSet` still compares boxed `LiteralValue`s per row (166 MB allocated for 2M rows), where #560 gave comparisons their own kernels. The dictionary hides that, but row evaluation of `IN` should get a kernel of its own.
+
+### Tests
+
+`DictionaryAnswerTests` (Parquet):
+- 5 answers (`=`, `<`, `IS NULL`, NULL for some values, nothing) x {one batch, batched} x {one pass, two} x {serial, parallel with 5% excluded and a second predicate after it}: the same rows as the predicate asked row by row, the predicate asked exactly once per row group over the 50 entries and the NULL, and the second predicate seeing the same rows (so a NULL answer stays live for it).
+- Asked row by row when: not `ValueWise`; the column is returned; two predicates read it; the predicate reads two columns; the column is PLAIN-encoded, by choice or past 20% distinct.
+- A dictionary of 1,500 entries is not evaluated for a read the page index narrows to one 1,000-row page.
+- An entry only an excluded row holds raises over the dictionary and does not fail the read (one batch and batched); one a live row holds raises.
+
+Each of these mutations fails tests: never answered (40); NULL rows answered NULL (8); no size guard (1); an error over the dictionary propagated (2); a returned column answered (1); a column two predicates read answered (1); a chunk not wholly dictionary-encoded answered (2); the NULL row's NULL answer turned into FALSE (8); a predicate that isn't `ValueWise` answered (41).

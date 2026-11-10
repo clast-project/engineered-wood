@@ -1147,6 +1147,12 @@ internal sealed class ColumnBuildState : IDisposable
     public bool IsViewMode => _byteArrayOutput == ByteArrayOutputKind.ViewType;
 
     /// <summary>
+    /// True when the state collects a dictionary-encoded chunk's indices, as INT32 values, rather than its values
+    /// (a dictionary answer, #502 phase 4b). The state is then an INT32 one.
+    /// </summary>
+    public bool DictionaryIndices { get; init; }
+
+    /// <summary>
     /// Creates a new column build state.
     /// </summary>
     /// <param name="physicalType">Parquet physical type.</param>
