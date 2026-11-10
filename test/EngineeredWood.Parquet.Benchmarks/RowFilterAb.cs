@@ -55,11 +55,18 @@ namespace EngineeredWood.Benchmarks;
 /// <c>rowfilter-ab [rounds] [latencyMs] [direct|cloud] [MB/s] [excluded fraction] [case substring]</c>.
 /// <c>latencyMs</c>, <c>cloud</c> and <c>MB/s</c> are as in <c>pageindex-read-ab</c>. The excluded fraction
 /// (e.g. 0.01) excludes that share of rows at random positions, as a deletion vector would, applied by every
-/// filtered strategy (not by <c>none</c>, the unfiltered reference). The case substring runs only the cases whose label contains it.</para>
+/// filtered strategy (not by <c>none</c>, the unfiltered reference). The case substring runs only the cases whose label contains it.
+/// <c>EW_ROWFILTER_PROOFS=1</c> gives the selected reads' predicate its filter as a statistics proof (#502 phase 5c).</para>
 /// Run with: dotnet run -c Release -f net10.0 -- rowfilter-ab 7
 /// </remarks>
 internal static class RowFilterAb
 {
+    /// <summary>
+    /// With <c>EW_ROWFILTER_PROOFS=1</c>, the selected reads' predicate carries its filter as a statistics proof, so a
+    /// row group whose statistics prove it is read without it (#502 phase 5c).
+    /// </summary>
+    private static readonly bool Proofs = Environment.GetEnvironmentVariable("EW_ROWFILTER_PROOFS") == "1";
+
     private const int RowGroups = 4;
     private const int RowsPerGroup = 500_000;
     private const long TotalRows = (long)RowGroups * RowsPerGroup;
@@ -398,7 +405,10 @@ internal static class RowFilterAb
         {
             Columns = c.Projection,
             Prune = c.Filter,
-            RowFilter = new RowFilter(new RowPredicate(c.FilterColumns, b => Evaluator.EvaluatePredicate(c.Filter, b))),
+            RowFilter = new RowFilter(new RowPredicate(c.FilterColumns, b => Evaluator.EvaluatePredicate(c.Filter, b))
+            {
+                Proof = Proofs ? c.Filter : null,
+            }),
             ExcludedRows = excluded,
         };
         await foreach (var selected in reader.ReadSelectedAsync(scan))

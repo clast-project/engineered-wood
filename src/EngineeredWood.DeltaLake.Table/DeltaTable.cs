@@ -5401,6 +5401,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         EvaluateWholeBatch = prunePredicate is null ? null : WholeBatchMask(
                             prunePredicate, matchColumns, snapshot, addFile, mappingMode, physicalToLogical,
                             logicalToPhysical, partitionColumns, partitionColumns.Count > 0),
+                        // A row group whose statistics prove the predicate deletes every live row unread (#502 5c).
+                        Proof = prunePredicate is null ? null : ProofFor(
+                            prunePredicate, snapshot, mappingMode,
+                            _options.TrustStatisticsProofs ? await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false) : null),
                     })),
                     ExcludedRows = excluded,
                 };
@@ -13331,6 +13335,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
                 var predicates = new List<RowPredicate>(steps.Count);
                 IReadOnlyList<string>? everyColumn = null;
+
+                // Row-group statistics may prove a run of conjuncts TRUE for every row, dropping it for that group (#502
+                // phase 5c), only where the table trusts statistics proofs at all.
+                var proofSchema = _options.TrustStatisticsProofs
+                    ? parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false)
+                    : null;
                 if (steps.Any(s => s.FileColumns is null))
                 {
                     everyColumn = await FileColumnsAsync(
@@ -13567,6 +13577,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         EvaluateWholeBatch = WholeBatchMask(
                             runPredicate, condition.Columns, snapshot, addFile, mappingMode, physicalToLogical,
                             logicalToPhysical, partitionColumns, hasPartitions),
+                        Proof = ProofFor(runPredicate, snapshot, mappingMode, proofSchema),
                     });
                     run.Clear();
                     afterFilter = true;
@@ -13717,6 +13728,26 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             return RowEvaluator.TryEvaluateWithoutRaising(predicate, logical);
         };
     }
+
+    /// <summary>
+    /// <see cref="RowPredicate.Proof"/> for <paramref name="predicate"/> (#502 phase 5c): the predicate over the file's
+    /// columns, for the reader to prove TRUE for every row of a row group from its statistics and drop there. Only when
+    /// the table trusts statistics proofs (<paramref name="fileSchema"/> is null otherwise) and the predicate is one a
+    /// proof may stand in for (<see cref="EvaluatesEverywhere"/>: plain comparisons and null tests of the table's own
+    /// columns, none casting a string, so skipping it raises nothing it would have raised). The translation never
+    /// strengthens a proof: a reference the file cannot answer (a partition column, a column the file lacks or holds
+    /// in an older type) evaluates Unknown, which proves nothing.
+    /// </summary>
+    private static Expressions.Predicate? ProofFor(
+        Expressions.Predicate predicate, Snapshot.Snapshot snapshot, ColumnMappingMode mappingMode,
+        Parquet.Schema.SchemaDescriptor? fileSchema) =>
+        fileSchema is null || !EvaluatesEverywhere(predicate, snapshot.Schema)
+            ? null
+            : RowGroupPushdown.ToFileColumns(
+                predicate, snapshot.Schema, mappingMode, fileSchema, snapshot.Metadata.PartitionColumns);
+
+    /// <summary>Whether a predicate the scan built carries a statistics proof, for tests.</summary>
+    internal static bool OffersProof(RowPredicate predicate) => predicate.Proof is not null;
 
     /// <summary>
     /// Whether filter conjuncts and DELETE predicates that cannot raise are offered to the reader for whole batches

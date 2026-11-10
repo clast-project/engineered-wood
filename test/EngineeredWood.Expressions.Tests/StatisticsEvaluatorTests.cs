@@ -1024,4 +1024,76 @@ public class StatisticsEvaluatorTests
         var stats = new TestStats().With("x", min: "b", max: 1, nullCount: 0);
         Assert.Equal(FilterResult.Unknown, Eval(Expressions.Equal("x", 5), stats));
     }
+
+    // ── Proofs that every row is TRUE (#502 phase 5c) ──
+
+    private static bool Proves(Predicate p, TestStats s) => StatisticsEvaluator.ProvesEveryRowTrue(p, s, Accessor);
+
+    [Fact]
+    public void Proof_ALeafWithNoNullsIsProven()
+    {
+        var stats = new TestStats().With("x", min: 10, max: 20, nullCount: 0, valueCount: 100);
+        Assert.True(Proves(Expressions.GreaterThanOrEqual("x", 10), stats));
+        Assert.True(Proves(Expressions.LessThan("x", 21), stats));
+        Assert.True(Proves(Expressions.IsNotNull("x"), stats));
+    }
+
+    [Fact]
+    public void Proof_NullsBlockEveryLeafButIsNull()
+    {
+        var stats = new TestStats().With("x", min: 10, max: 20, nullCount: 3, valueCount: 100);
+        Assert.False(Proves(Expressions.GreaterThanOrEqual("x", 10), stats));
+        var allNull = new TestStats().With("x", nullCount: 100, valueCount: 100);
+        Assert.True(Proves(Expressions.IsNull("x"), allNull));
+    }
+
+    /// <summary>
+    /// A prefix test is the leaf the evaluator answers AlwaysTrue without the null count: the proof adds it.
+    /// </summary>
+    [Fact]
+    public void Proof_APrefixTestNeedsNoNulls()
+    {
+        var withNulls = new TestStats().With("s", min: "abc", max: "abd", nullCount: 3, valueCount: 100);
+        var startsWith = Expressions.StartsWith("s", "ab");
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(startsWith, withNulls)); // the pruning answer this must not follow
+        Assert.False(Proves(startsWith, withNulls));
+        Assert.True(Proves(startsWith, new TestStats().With("s", min: "abc", max: "abd", nullCount: 0, valueCount: 100)));
+    }
+
+    /// <summary>
+    /// The evaluator's AlwaysFalse ignores NULL rows (they are not TRUE either), so NOT of it would claim every row
+    /// TRUE: <c>NOT (x &lt; 5)</c> over [10, 20] with NULLs. A proof never goes through NOT.
+    /// </summary>
+    [Fact]
+    public void Proof_NotIsNeverProven()
+    {
+        var stats = new TestStats().With("x", min: 10, max: 20, nullCount: 3, valueCount: 100);
+        var not = new NotPredicate(Expressions.LessThan("x", 5));
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(not, stats)); // the pruning answer this must not follow
+        Assert.False(Proves(not, stats));
+    }
+
+    [Fact]
+    public void Proof_AndNeedsEveryChildAndOrAny()
+    {
+        var stats = new TestStats()
+            .With("x", min: 10, max: 20, nullCount: 0, valueCount: 100)
+            .With("y", min: 0, max: 50, nullCount: 0, valueCount: 100);
+        var provenX = Expressions.GreaterThanOrEqual("x", 10);
+        var unknownY = Expressions.LessThan("y", 25);
+        Assert.False(Proves(Expressions.And(provenX, unknownY), stats));
+        Assert.True(Proves(Expressions.Or(unknownY, provenX), stats));
+        Assert.True(Proves(Expressions.And(provenX, Expressions.LessThan("y", 51)), stats));
+    }
+
+    [Fact]
+    public void Proof_OtherLeavesAreNotProven()
+    {
+        var stats = new TestStats().With("x", min: 10, max: 10, nullCount: 0, valueCount: 100)
+            .With("s", min: "ab", max: "ab", nullCount: 0, valueCount: 100);
+        Assert.False(Proves(Expressions.In("x", 10), stats));                  // IN: write =
+        Assert.False(Proves(Expressions.GreaterThanOrEqual("x", 10L), stats));  // a literal of another type
+        Assert.False(Proves(new ComparisonPredicate(Expressions.Lit("a"), ComparisonOperator.StartsWith, Expressions.Ref("s")), stats));
+        Assert.True(Proves(Expressions.Equal("x", 10), stats));
+    }
 }

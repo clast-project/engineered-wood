@@ -171,62 +171,23 @@ public sealed class DeltaFilePruner
     /// <c>=</c>.
     /// </summary>
     /// <remarks>
-    /// <para>The evaluator is built for pruning, where AlwaysFalse means "no row is TRUE", NULL rows included.
-    /// That makes its AlwaysTrue unsound in two places this must not follow: under NOT, which turns such an
-    /// AlwaysFalse into AlwaysTrue, and for a prefix test, which it answers without the null count. So the
-    /// caller combines leaves itself (AND and OR only), and here every leaf but <c>IS NULL</c> also needs a null
-    /// count of 0: a NULL row answers NULL, which deletes nothing.</para>
-    /// <para>A literal of another type would hand the decision to cross-type comparison rules the row
-    /// evaluator need not share, and a partition column's NULL is read differently here than by a scan (see
-    /// #511), so neither is answered.</para>
+    /// The rules are <see cref="StatisticsEvaluator.ProvesLeafEveryRowTrue"/>'s, shared with the Parquet reader's
+    /// row-group proofs (#502 phase 5c). Here a partition column is never answered: its NULL is read differently than
+    /// by a scan (see #511).
     /// </remarks>
     internal bool ProvesEveryRowTrue(DeltaFileStats stats, Predicate leaf)
     {
-        Expression operand;
-        IReadOnlyList<Expression> literals;
-        bool isNull = false;
-        switch (leaf)
+        // A partition column's NULL is read differently here than by a scan (#511): never answered from statistics.
+        var operand = leaf switch
         {
-            case ComparisonPredicate cmp when cmp.Right is LiteralExpression:
-                operand = cmp.Left;
-                literals = [cmp.Right];
-                break;
-            // A prefix test does not turn round (see StatisticsEvaluator.TryExtractColumnAndLiteral).
-            case ComparisonPredicate cmp when cmp.Left is LiteralExpression
-                && cmp.Op is not (ComparisonOperator.StartsWith or ComparisonOperator.NotStartsWith):
-                operand = cmp.Right;
-                literals = [cmp.Left];
-                break;
-            case UnaryPredicate { Op: UnaryOperator.IsNull or UnaryOperator.IsNotNull } unary:
-                operand = unary.Operand;
-                literals = [];
-                isNull = unary.Op == UnaryOperator.IsNull;
-                break;
-            default:
-                return false;
-        }
-
-        if (operand is not UnboundReference { NameParts.Count: 1 } reference
-            || _partitionColumns.Contains(reference.Name))
-        {
+            ComparisonPredicate cmp => cmp.Left is LiteralExpression ? cmp.Right : cmp.Left,
+            UnaryPredicate unary => unary.Operand,
+            _ => null,
+        };
+        if (operand is UnboundReference reference && _partitionColumns.Contains(reference.Name))
             return false;
-        }
-        var column = reference.NameParts;
 
-        if (literals.Count > 0)
-        {
-            if (_accessor.GetMinValue(stats, column) is not { } min)
-                return false;
-            foreach (var literal in literals)
-            {
-                if (literal is not LiteralExpression { Value: var value } || value.Type != min.Type)
-                    return false;
-            }
-        }
-
-        if (StatisticsEvaluator.Evaluate(leaf, stats, _accessor) != FilterResult.AlwaysTrue)
-            return false;
-        return isNull || _accessor.GetNullCount(stats, column) == 0;
+        return StatisticsEvaluator.ProvesLeafEveryRowTrue(leaf, stats, _accessor);
     }
 }
 

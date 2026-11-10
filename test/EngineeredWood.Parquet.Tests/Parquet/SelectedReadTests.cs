@@ -722,6 +722,123 @@ public class SelectedReadTests : IDisposable
             into.Add(ids.GetValue(i)!.Value);
     }
 
+    // ---- Statistics proofs (#502 phase 5c) ----------------------------------------------------------------
+
+    /// <summary>
+    /// A predicate whose proof a row group's statistics establish is not asked about that group: <c>id</c> is sorted, so
+    /// <c>id &gt;= 5000</c> holds for every row of groups 1 and 2 and only group 0 is asked. The rows are the oracle's,
+    /// with or without a second predicate after it, in one pass or two, serial or parallel, with exclusions.
+    /// </summary>
+    [Theory]
+    [InlineData(1, false, false, false)]
+    [InlineData(1, true, false, false)]
+    [InlineData(4, false, true, false)]
+    [InlineData(4, true, true, false)]
+    [InlineData(1, false, true, true)]   // the proven predicate second: the right one is dropped
+    [InlineData(4, true, true, true)]
+    public async Task APredicateItsRowGroupsStatisticsProveIsNotAskedThere(
+        int concurrency, bool twoPass, bool second, bool provenSecond)
+    {
+        string path = await WriteFileAsync();
+        var excluded = TestExclusions.Random(Rows, 0.05, seed: 13);
+        var proven = Ex.GreaterThanOrEqual("id", LiteralValue.Of(5_000L));
+        var asked = new ConcurrentBag<long>();
+        var spy = new RowPredicate(["id"], batch =>
+        {
+            RecordIds(batch, asked);
+            return Evaluator.EvaluatePredicate(proven, batch);
+        }) { Proof = proven };
+        var predicates = new List<RowPredicate> { spy };
+        Predicate[] oracle = [proven];
+        if (second)
+        {
+            var k = Ex.LessThan("k", LiteralValue.Of(500));
+            if (provenSecond)
+            {
+                predicates.Insert(0, ToRowPredicate(k));
+                oracle = [k, proven];
+            }
+            else
+            {
+                predicates.Add(ToRowPredicate(k));
+                oracle = [proven, k];
+            }
+        }
+
+        string[] projection = ["id", "note"];
+        var expected = await OracleAsync(path, oracle, projection, excluded);
+        var actual = await ReadAsync(path,
+            new ParquetReadOptions { MaxConcurrentRowGroups = concurrency, BatchSize = concurrency > 1 ? 3_000 : null },
+            new ParquetScan { Columns = projection, RowFilter = new RowFilter(predicates), ExcludedRows = excluded },
+            twoPass);
+
+        Assert.Equal(expected, actual);
+        Assert.NotEmpty(asked);
+        Assert.All(asked, id => Assert.True(id < RowsPerGroup, $"row {id} of a proven row group was asked"));
+    }
+
+    /// <summary>
+    /// A proof that does not hold for a row group leaves its predicate asked there: a column with NULLs (a NULL row is
+    /// not TRUE), and a range the statistics cannot settle.
+    /// </summary>
+    [Theory]
+    [InlineData("n > -1")]      // n has NULLs
+    [InlineData("k < 999")]     // k's maximum is 999 in every group
+    public async Task AProofTheStatisticsDoNotEstablishLeavesThePredicateAsked(string which)
+    {
+        string path = await WriteFileAsync();
+        var predicate = which == "n > -1"
+            ? Ex.GreaterThan("n", LiteralValue.Of(-1))
+            : Ex.LessThan("k", LiteralValue.Of(999));
+        int asked = 0;
+        var spy = new RowPredicate(ColumnsOf(predicate), batch =>
+        {
+            Interlocked.Add(ref asked, batch.Length);
+            return Evaluator.EvaluatePredicate(predicate, batch);
+        }) { Proof = predicate };
+
+        var expected = await OracleAsync(path, [predicate], ["id"], null);
+        var actual = await ReadAsync(path, new ParquetReadOptions(),
+            new ParquetScan { Columns = ["id"], RowFilter = new RowFilter(spy) });
+
+        Assert.Equal(expected, actual);
+        Assert.Equal(Rows, asked);
+    }
+
+    /// <summary>
+    /// A positions-only read (a DELETE's) whose every predicate is proven for a row group returns that group's live
+    /// positions without reading a column.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task APositionsOnlyReadOfAProvenRowGroupReturnsItsLivePositions(int concurrency)
+    {
+        string path = await WriteFileAsync();
+        var excluded = TestExclusions.Random(Rows, 0.05, seed: 17);
+        var proven = Ex.GreaterThanOrEqual("id", LiteralValue.Of(5_000L));
+        var positions = new List<long>();
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { MaxConcurrentRowGroups = concurrency });
+        await foreach (var selected in reader.ReadSelectedAsync(new ParquetScan
+        {
+            Columns = [],
+            RowFilter = new RowFilter(new RowPredicate(["id"], batch => Evaluator.EvaluatePredicate(proven, batch)) { Proof = proven }),
+            ExcludedRows = excluded,
+        }))
+        {
+            using (selected)
+            {
+                Assert.Equal(0, selected.Batch.ColumnCount);
+                for (int i = 0; i < selected.Batch.Length; i++)
+                    positions.Add(selected.Positions[i]);
+            }
+        }
+
+        var expected = Enumerable.Range(5_000, Rows - 5_000).Select(r => (long)r).Where(r => !excluded.Contains(r)).ToList();
+        Assert.Equal(expected, positions);
+    }
+
     // ---- Helpers -------------------------------------------------------------------------------------------
 
     private static RowPredicate ToRowPredicate(Predicate predicate) => ToRowPredicate(predicate, wholeBatch: false);

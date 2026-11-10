@@ -409,6 +409,88 @@ public class ValueWiseTests : IDisposable
         Assert.Equal(12, deleted); // rows 8-19 (2000-02-21 on)
     }
 
+    // ---- Statistics proofs (#502 phase 5c) ---------------------------------------------------------------------------
+
+    public static IEnumerable<object[]> ProofFilters() =>
+    [
+        ["id >= 2500"],                          // groups 3-5 proven, group 2 partly
+        ["id >= 2500 AND cat = 'c3'"],           // the run is one predicate: proven only where both are, so never
+        ["id >= 100 AND id < 5900"],
+        ["cat <> 'c1' AND id > 1000"],           // the id conjunct alone is proven for groups 1-5
+        ["id < 5000 OR cat IS NULL"],            // OR: proven by its first branch for groups 0-4
+    ];
+
+    /// <summary>
+    /// With <see cref="DeltaTableOptions.TrustStatisticsProofs"/>, a conjunct a row group's statistics prove TRUE for
+    /// every row is dropped there; the scan returns the same rows as without the option, which offers no proof.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ProofFilters))]
+    public async Task AScanReturnsTheSameRowsWithStatisticsProofs(string sql)
+    {
+        foreach (int concurrency in new[] { 1, 4 })
+        {
+            List<string>? expected = null;
+            foreach (bool trust in new[] { false, true })
+            {
+                await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", concurrency, trustStatisticsProofs: trust);
+                var offered = new ConcurrentBag<bool>();
+                table.RowFilterObserver = filter =>
+                {
+                    foreach (var predicate in filter.Predicates)
+                        offered.Add(DeltaTable.OffersProof(predicate));
+                };
+                var rows = await ReadAsync(table, new DeltaReadOptions
+                {
+                    Columns = ["id", "cat"], Filter = P(sql), FilterRows = true,
+                });
+                Assert.Equal(trust, offered.Contains(true));
+                if (expected is null)
+                    expected = rows;
+                else
+                    Assert.Equal(expected, rows);
+                Assert.NotEmpty(rows);
+            }
+        }
+    }
+
+    /// <summary>A conjunct a proof cannot stand in for (one that casts a string, which can raise) is never offered.</summary>
+    [Theory]
+    [InlineData("CAST(code AS INT) > 3")]
+    [InlineData("code = 5")]
+    public async Task AConjunctThatCanRaiseIsNotOfferedAProof(string sql)
+    {
+        await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 1, trustStatisticsProofs: true);
+        var offered = new ConcurrentBag<bool>();
+        table.RowFilterObserver = filter =>
+        {
+            foreach (var predicate in filter.Predicates)
+                offered.Add(DeltaTable.OffersProof(predicate));
+        };
+        await ReadAsync(table, new DeltaReadOptions { Columns = ["id"], Filter = P(sql), FilterRows = true });
+        Assert.NotEmpty(offered);
+        Assert.DoesNotContain(true, offered);
+    }
+
+    /// <summary>An expression DELETE whose row groups a proof covers deletes the same rows as without the option.</summary>
+    [Theory]
+    [InlineData("id >= 2500")]
+    [InlineData("id >= 2500 AND id < 4500")]
+    public async Task ADeleteMatchesTheSameRowsWithStatisticsProofs(string sql)
+    {
+        var results = new List<(long Deleted, List<string> Left)>();
+        foreach (bool trust in new[] { false, true })
+        {
+            await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 4, trustStatisticsProofs: trust);
+            var (deleted, _) = await table.DeleteAsync(P(sql));
+            results.Add((deleted, await ReadAsync(table, new DeltaReadOptions { Columns = ["id", "cat"] })));
+        }
+
+        Assert.True(results[0].Deleted > 0);
+        Assert.Equal(results[0].Deleted, results[1].Deleted);
+        Assert.Equal(results[0].Left, results[1].Left);
+    }
+
     // ---- The table --------------------------------------------------------------------------------------------------
 
     private static bool IsDeleted(int id) => id % 97 == 5;
@@ -420,7 +502,8 @@ public class ValueWiseTests : IDisposable
     /// <c>code</c> '0'..'6', and 'x' on the rows a deletion vector deletes (unless <paramref name="deleteBadCodes"/> is
     /// false); <c>p</c> a partition, q0 or q1.
     /// </summary>
-    private async Task<DeltaTable> CreateAsync(string name, int concurrency, bool deleteBadCodes = true)
+    private async Task<DeltaTable> CreateAsync(
+        string name, int concurrency, bool deleteBadCodes = true, bool trustStatisticsProofs = false)
     {
         var table = await DeltaTable.CreateAsync(
             new LocalTableFileSystem(Path.Combine(_tempDir, name)), TableSchema,
@@ -428,6 +511,7 @@ public class ValueWiseTests : IDisposable
             {
                 ParquetWriteOptions = ParquetWriteOptions.Default with { RowGroupMaxRows = 1_000, DataPageRowCountLimit = 100 },
                 MaxConcurrentReads = concurrency,
+                TrustStatisticsProofs = trustStatisticsProofs,
             },
             partitionColumns: ["p"],
             enableDeletionVectors: true);

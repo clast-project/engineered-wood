@@ -87,4 +87,13 @@ public sealed class RowPredicate
     /// as <see cref="Evaluate"/>.
     /// </summary>
     internal Func<RecordBatch, BooleanArray?>? EvaluateWholeBatch { get; init; }
+
+    /// <summary>
+    /// A predicate over the file's column paths that row-group statistics may prove TRUE for every row
+    /// (<see cref="EngineeredWood.Expressions.StatisticsEvaluator.ProvesEveryRowTrue"/>), and that this predicate then
+    /// answers TRUE for every row too: the reader drops it for such a row group, reading neither it nor the columns
+    /// only it needs (#502 phase 5c). Null for none. The caller vouches that trusting the statistics this way is
+    /// wanted, and that skipping the predicate cannot suppress an error it would raise.
+    /// </summary>
+    internal EngineeredWood.Expressions.Predicate? Proof { get; init; }
 }

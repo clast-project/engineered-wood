@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24, 5b in §25. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24, 5b in §25, 5c in §26. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -1015,3 +1015,67 @@ Each of these mutations fails tests:
 - a predicate dropping earlier NULLs joining the run (1);
 - the run's later predicates asked as well (48);
 - the switch ignored (1).
+
+## 26. Phase 5c: dropping a predicate its row group's statistics prove (2026-11-10)
+
+### Decided first: proofs follow `TrustStatisticsProofs`
+
+Dropping a predicate where statistics prove it TRUE for every row trusts the statistics in a direction file skipping never needs. A wrong bound would make an exact scan return a row that does not match. `DeltaTableOptions.TrustStatisticsProofs` already gates that trust for DELETE and ADD CONSTRAINT, and defaults to off, following Spark, which trusts statistics only for skipping. **Decided (2026-11-10):** 5c follows the same option. DataFusion trusts such proofs in its pushdown scans; Spark rechecks every row. So by default nothing changes, and §23's regression remains for a table without the option.
+
+### What it does
+
+- **One set of rules for every proof** (`StatisticsEvaluator.ProvesEveryRowTrue` / `ProvesLeafEveryRowTrue`, public, `EngineeredWood.Expressions`). They are DELETE's rules, moved out of `DeltaFilePruner`:
+  - AND needs every child proven, and OR one;
+  - a leaf is a comparison of a top-level column with a literal of the column's own type, or `IS [NOT] NULL`;
+  - every leaf but `IS NULL` also needs a null count of 0;
+  - NOT and `IN` are never proven.
+
+  The pruning evaluator's AlwaysTrue is unsound for this in two places, which the rules avoid. Under NOT, its AlwaysFalse ignores NULL rows: `NOT (x < 5)` over [10, 20] with NULLs answers AlwaysTrue, and a test pins that. A prefix test is answered without the null count. A NaN outside the bounds is the evaluator's to settle, and it already answers Unknown when one may hide there. `DeltaFilePruner.ProvesEveryRowTrue` keeps only its partition-column refusal (#511) and calls the shared leaf.
+- **Parquet:** `RowPredicate.Proof` (internal) is a predicate over the file's column paths. For each planned row group, `SelectedPlanReader` drops the predicates its statistics prove (`ParquetStatisticsAccessor`, with pruning's trust rules: no bounds under an undefined column order, legacy min/max only for signed numerics). The group is then read with the remaining filter and only the columns it still needs (`ReadWithout`, cached per set of proven predicates). A group with none left is a plain read: one pass, no evaluation. A positions-only read (a DELETE's) of such a group reads no column at all.
+- **Delta:** a run of filter conjuncts, and an expression DELETE's predicate, carry a proof only when the table trusts statistics proofs and `EvaluatesEverywhere` holds (plain comparisons and null tests of the table's own columns, none casting a string, so dropping it raises nothing it would have raised). The proof is translated by `RowGroupPushdown.ToFileColumns`, which never strengthens it: a reference the file cannot answer (a partition column, a missing column, a changed type) evaluates Unknown and proves nothing.
+
+### Measured
+
+`rowfilter-ab` (local, 9 rounds, i9-12900K, net10.0), the clustered cases, `twopass` against `selected` (one pass), with and without `EW_ROWFILTER_PROOFS=1` (the predicate carries its filter as a proof):
+
+| Case | Without proofs | With proofs |
+|---|---|---|
+| clustered 90% narrow | +31% (6.5 vs 5.2 ms) | **-5%** (4.7 vs 4.9 ms) |
+| clustered 90% wide | +12% (24.0 vs 21.6 ms) | **0%** (20.8 vs 21.2 ms) |
+| clustered 50% narrow / wide | +4% / -19% | +10% / -25% |
+| clustered point / 0.1% / 1% / 10% | -11% to 0% | -8% to +1% |
+
+The regression §23 left for phase 5 is gone where proofs are trusted. Row groups kept whole are proven, and are read in one pass with no evaluation. The one-pass read itself gains little (5.2 to 4.9 ms narrow): the predicate's evaluation is all it skips there. The 50% rows hold one partial row group each and moved within the noise of a single row group.
+
+### The local two-pass default (§23's open decision)
+
+By default no proof is offered, so a default table still reads clustered 90% locally at +31% narrow and +12% wide with two passes. §23 decided to revisit the local default once phase 5 could remove that regression. Phase 5 removes it only for tables with `TrustStatisticsProofs`. **The decision is still open:**
+- keep two passes for object storage only (today);
+- turn them on locally regardless, accepting +12-31% on row groups kept whole;
+- turn them on locally only where proofs are trusted, which would need the reader to know whether its predicates carry proofs.
+
+### Tests
+
+- `StatisticsEvaluatorTests` (Expressions):
+  - a leaf with no NULLs is proven, and NULLs block every leaf but `IS NULL`;
+  - NOT is never proven (the pruning evaluator's AlwaysTrue under NOT is pinned beside it);
+  - AND needs every child, OR one;
+  - `IN`, a literal of another type, and a column as a prefix are not proven;
+  - a prefix test needs no NULLs.
+- `SelectedReadTests` (Parquet):
+  - a predicate proven for row groups 1-2 (sorted `id`) is asked only about group 0, with the oracle's rows: alone and with a second predicate before or after it, one pass and two, serial and parallel, 5% excluded;
+  - a proof the statistics do not establish (a column with NULLs, an unsettled range) leaves every row asked;
+  - a positions-only read of proven groups returns their live positions with no column read.
+- `ValueWiseTests` (Delta):
+  - 5 filters (a range, a run, an OR, a conjunct proven beside one that is not) x 2 concurrencies return the same rows with `TrustStatisticsProofs` on and off, offering proofs exactly when on;
+  - a conjunct casting a string (`CAST(code AS INT) > 3`, `code = 5`) is never offered one;
+  - 2 DELETEs match the same rows either way.
+- `DeltaFilePruner`'s DELETE and ADD CONSTRAINT proof tests pass unchanged through the shared rules.
+
+Each of these mutations fails tests:
+- a predicate dropped whether proven or not (8);
+- the proof following the pruning evaluator, NOT included (2 + 2);
+- a leaf's null count ignored (1, the prefix test; for comparisons the evaluator already requires it);
+- the first predicate dropped instead of the proven one (2, once a test put the proven predicate second);
+- Delta offering proofs without the option (5);
+- Delta offering one for a conjunct that can raise (2).
