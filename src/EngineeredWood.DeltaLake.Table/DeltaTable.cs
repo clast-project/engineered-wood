@@ -5256,9 +5256,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     .Root.Children.Select(c => c.Name).ToList();
             var excluded = rawDeletedRows.IsEmpty ? null : rawDeletedRows;
 
+            // A change feed needs each deleted row itself, so the rows must be read even when the predicate reads
+            // no column of the file: one that holds none of the table's current columns (all it was written with
+            // since dropped, under column mapping) reads them through its own, which the predicate never sees.
+            if (matchFileColumns.Count == 0 && cdfEnabled)
+            {
+                matchFileColumns = (await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false))
+                    .Root.Children.Select(c => c.Name).ToList();
+            }
+
             if (matchFileColumns.Count == 0)
             {
-                // The predicate reads no column of this file (only partition columns, or columns added after it):
+                // The predicate reads no column of this file (only partition columns, or columns added after it),
+                // and no change feed needs the rows themselves:
                 // it answers the same for every row, so it is asked once, over one row of the table's shape — and
                 // only when a row is live, so that a value-dependent error can't fail a delete of nothing.
                 if (fileRows > rawDeletedRows.Count && OneRowMatches())
@@ -5279,9 +5289,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     using var answer = predicate(shaped);
                     return answer.GetValue(0) == true;
                 }
-
-                // A change feed reads every column (matchColumns is null), so this file has some.
-                System.Diagnostics.Debug.Assert(!cdfEnabled, "A change feed's DELETE reads every column.");
             }
             else
             {

@@ -587,7 +587,7 @@ Each of these mutations fails tests:
 - The file's existing deletion vector is the read's `ExcludedRows`. A deleted row is never handed to the predicate, which fixes the bug above, and a row group the vector deletes whole is skipped unread, as before.
 - **Without a change feed**, the read asks for no columns (`Columns = []`): it returns positions only, and nothing beyond the predicate's columns is decoded. The positions are the rows to delete, already excluding those the vector had.
 - **With a change feed**, the read returns the matched rows whole, with the materialized row-tracking columns. They go to the change file as before, each row's id resolved from its materialized value or `baseRowId` plus its position.
-- **A predicate that reads no column of the file** (only partition columns, or columns added after the file was written) is answered once per file, over one row of the table's shape, and only if the file has a live row. TRUE deletes every live row. This case never has a change feed, because with one the delete reads every column.
+- **A predicate that reads no column of the file** (only partition columns, or columns added after the file was written) is answered once per file, over one row of the table's shape, and only if the file has a live row. TRUE deletes every live row. With a change feed the rows themselves are needed, so the file is read through its own columns instead, which the predicate never sees: under column mapping, a file can hold none of the table's current columns once every column it was written with has been dropped (review round 1).
 - Row-group and page pruning by the predicate (`Prune`), the whole-file remove, copy-on-write rewrites and the vector itself are unchanged.
 
 `ResolveRowTrackingAt` is gone. `MatchingLiveRows` is now used only by its own tests and the #610 deletion-vector benchmark.
@@ -599,6 +599,7 @@ Each of these mutations fails tests:
 - a delegate DELETE is never handed one;
 - with a change feed, the change file holds exactly the deleted rows, with their row ids when row tracking is on;
 - a predicate over a column added after the file was written deletes the file's live rows, and only those;
+- with a change feed, a file holding none of the table's current columns still records its deleted rows, next to a newer file's;
 - a delegate DELETE over a file that a copy-on-write rewrite gave materialized row-tracking columns is handed only the table's columns.
 
 Each of these mutations fails tests across the DeltaLake.Table suite:

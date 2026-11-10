@@ -4,6 +4,7 @@
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.RowTracking;
+using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.Expressions;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
@@ -179,6 +180,52 @@ public class DeleteSelectedReadTests : IDisposable
 
         Assert.Equal(3, deleted);
         Assert.Equal([9L], await IdsAsync(table));
+    }
+
+    /// <summary>
+    /// A file that holds no column the table still has (every data column it was written with since dropped, the one
+    /// it has now added later) gives a change-feed DELETE nothing to read for the predicate. Its deleted rows must
+    /// still reach the change file, next to those of a newer file the same DELETE matches.
+    /// </summary>
+    [Fact]
+    public async Task WithAChangeFeedAFileHoldingNoCurrentColumnStillRecordsItsDeletedRows()
+    {
+        var original = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("region", StringType.Default, true))
+            .Field(new Field("old", Int64Type.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(Path.Combine(_tempDir, "evolved")), original,
+            partitionColumns: ["region"], columnMappingMode: ColumnMappingMode.Name,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" });
+        await table.WriteAsync([new RecordBatch(original,
+            [new StringArray.Builder().Append("a").Append("a").Build(), new Int64Array.Builder().Append(1).Append(2).Build()], 2)]);
+        await table.AddColumnAsync(new Field("score", DoubleType.Default, true));
+        await table.DropColumnAsync("old");
+        var current = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("region", StringType.Default, true))
+            .Field(new Field("score", DoubleType.Default, true))
+            .Build();
+        await table.WriteAsync([new RecordBatch(current,
+            [new StringArray.Builder().Append("a").Append("a").Build(),
+             new DoubleArray.Builder().AppendNull().Append(2.5).Build()], 2)]);
+
+        var (deleted, version) = await table.DeleteAsync(X.IsNull("score"));
+
+        Assert.Equal(3, deleted);
+        var changes = new List<string>();
+        await foreach (var b in table.ReadChangesAsync(new DeltaChangeReadOptions { StartVersion = version, EndVersion = version }))
+        {
+            using (b)
+            {
+                var region = (StringArray)b.Column(b.Schema.GetFieldIndex("region"));
+                var score = (DoubleArray)b.Column(b.Schema.GetFieldIndex("score"));
+                for (int i = 0; i < b.Length; i++)
+                    changes.Add($"{region.GetString(i)}/{(score.IsNull(i) ? "null" : score.GetValue(i)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture))}");
+            }
+        }
+
+        Assert.Equal(["a/null", "a/null", "a/null"], changes);
     }
 
     /// <summary>
