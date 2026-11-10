@@ -335,61 +335,9 @@ public class ValueWiseTests : IDisposable
     [InlineData(true)]
     public async Task AWholeBatchWhoseWideningOverflowsFallsBackToTheLiveRows(bool whole)
     {
-        const int rows = 20;
-        const int bad = 7;
-        string root = Path.Combine(_tempDir, $"widened_{Guid.NewGuid():N}");
-        Directory.CreateDirectory(root);
-        var fs = new LocalTableFileSystem(root);
-        var fileSchema = new Apache.Arrow.Schema.Builder()
-            .Field(new Field("id", Int64Type.Default, false))
-            .Field(new Field("d", Date32Type.Default, true))
-            .Build();
-        var days = new ArrowBuffer.Builder<int>();
-        for (int i = 0; i < rows; i++)
-            days.Append(i == bad ? int.MaxValue : 11_000 + i); // 2000-02-13 onwards; the bad row overflows
-        var ids = new Int64Array.Builder();
-        for (int i = 0; i < rows; i++)
-            ids.Append(i);
-        await using (var file = await fs.CreateAsync("data.parquet"))
-        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
-        {
-            await writer.WriteRowGroupAsync(new RecordBatch(fileSchema,
-                [ids.Build(), new Date32Array(days.Build(), ArrowBuffer.Empty, rows, 0, 0)], rows));
-            await writer.CloseAsync();
-        }
-
-        await new EngineeredWood.DeltaLake.Log.TransactionLog(fs).WriteCommitAsync(0, new List<EngineeredWood.DeltaLake.Actions.DeltaAction>
-        {
-            new EngineeredWood.DeltaLake.Actions.ProtocolAction
-            {
-                MinReaderVersion = 3,
-                MinWriterVersion = 7,
-                ReaderFeatures = ["typeWidening", "deletionVectors", "timestampNtz"],
-                WriterFeatures = ["typeWidening", "deletionVectors", "timestampNtz"],
-            },
-            new EngineeredWood.DeltaLake.Actions.MetadataAction
-            {
-                Id = "widened",
-                Format = EngineeredWood.DeltaLake.Actions.Format.Parquet,
-                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}},{"name":"d","type":"timestamp_ntz","nullable":true,"metadata":{"delta.typeChanges":"[{\"fromType\":\"date\",\"toType\":\"timestamp_ntz\"}]"}}]}""",
-                PartitionColumns = [],
-                Configuration = new Dictionary<string, string>
-                {
-                    { EngineeredWood.DeltaLake.Schema.TypeWidening.EnableKey, "true" },
-                    { EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorConfig.EnableKey, "true" },
-                },
-            },
-            new EngineeredWood.DeltaLake.Actions.AddFile
-            {
-                Path = "data.parquet",
-                PartitionValues = new Dictionary<string, string>(),
-                Size = new FileInfo(Path.Combine(root, "data.parquet")).Length,
-                ModificationTime = 1000,
-                DataChange = true,
-            },
-        });
-
-        await using var table = await DeltaTable.OpenAsync(fs);
+        const int rows = WidenedRows;
+        const int bad = WidenedBad;
+        await using var table = await CreateWidenedAsync(trustStatisticsProofs: false);
         table.EvaluatesWholeBatches = whole;
         table.WholeBatchLiveShare = 0;
 
@@ -489,6 +437,98 @@ public class ValueWiseTests : IDisposable
         Assert.True(results[0].Deleted > 0);
         Assert.Equal(results[0].Deleted, results[1].Deleted);
         Assert.Equal(results[0].Left, results[1].Left);
+    }
+
+    private const int WidenedRows = 20;
+    private const int WidenedBad = 7;
+
+    /// <summary>
+    /// One file of 20 rows, <c>id</c> 0-19 and a DATE <c>d</c> the table has widened to TIMESTAMP_NTZ; row 7's day count is
+    /// <c>int.MaxValue</c>, which overflows when widened (checked, in microseconds).
+    /// </summary>
+    private async Task<DeltaTable> CreateWidenedAsync(bool trustStatisticsProofs)
+    {
+        string root = Path.Combine(_tempDir, $"widened_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var fs = new LocalTableFileSystem(root);
+        var fileSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("d", Date32Type.Default, true))
+            .Build();
+        var days = new ArrowBuffer.Builder<int>();
+        for (int i = 0; i < WidenedRows; i++)
+            days.Append(i == WidenedBad ? int.MaxValue : 11_000 + i); // 2000-02-13 onwards; the bad row overflows
+        var ids = new Int64Array.Builder();
+        for (int i = 0; i < WidenedRows; i++)
+            ids.Append(i);
+        await using (var file = await fs.CreateAsync("data.parquet"))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(new RecordBatch(fileSchema,
+                [ids.Build(), new Date32Array(days.Build(), ArrowBuffer.Empty, WidenedRows, 0, 0)], WidenedRows));
+            await writer.CloseAsync();
+        }
+
+        await new EngineeredWood.DeltaLake.Log.TransactionLog(fs).WriteCommitAsync(0, new List<EngineeredWood.DeltaLake.Actions.DeltaAction>
+        {
+            new EngineeredWood.DeltaLake.Actions.ProtocolAction
+            {
+                MinReaderVersion = 3,
+                MinWriterVersion = 7,
+                ReaderFeatures = ["typeWidening", "deletionVectors", "timestampNtz"],
+                WriterFeatures = ["typeWidening", "deletionVectors", "timestampNtz"],
+            },
+            new EngineeredWood.DeltaLake.Actions.MetadataAction
+            {
+                Id = "widened",
+                Format = EngineeredWood.DeltaLake.Actions.Format.Parquet,
+                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}},{"name":"d","type":"timestamp_ntz","nullable":true,"metadata":{"delta.typeChanges":"[{\"fromType\":\"date\",\"toType\":\"timestamp_ntz\"}]"}}]}""",
+                PartitionColumns = [],
+                Configuration = new Dictionary<string, string>
+                {
+                    { EngineeredWood.DeltaLake.Schema.TypeWidening.EnableKey, "true" },
+                    { EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorConfig.EnableKey, "true" },
+                },
+            },
+            new EngineeredWood.DeltaLake.Actions.AddFile
+            {
+                Path = "data.parquet",
+                PartitionValues = new Dictionary<string, string>(),
+                Size = new FileInfo(Path.Combine(root, "data.parquet")).Length,
+                ModificationTime = 1000,
+                DataChange = true,
+            },
+        });
+
+        return await DeltaTable.OpenAsync(fs, new DeltaTableOptions { TrustStatisticsProofs = trustStatisticsProofs });
+    }
+
+    /// <summary>
+    /// #807 review round 1: a proof must not hide an error the rows would raise. <c>id &gt;= 0</c> proves
+    /// <c>d IS NULL OR id &gt;= 0</c> for the row group, but asked row by row the OR widens row 7's <c>d</c>, which
+    /// overflows. A column whose type has changed is never one a proof may stand in for, so the scan and the DELETE
+    /// raise with <see cref="DeltaTableOptions.TrustStatisticsProofs"/> on as they do with it off.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AProofDoesNotHideAWideningThatOverflows(bool trust)
+    {
+        await using var table = await CreateWidenedAsync(trust);
+        var offered = new ConcurrentBag<bool>();
+        table.RowFilterObserver = filter =>
+        {
+            foreach (var predicate in filter.Predicates)
+                offered.Add(DeltaTable.OffersProof(predicate));
+        };
+
+        await Assert.ThrowsAsync<OverflowException>(() => ReadAsync(table, new DeltaReadOptions
+        {
+            Columns = ["id"], Filter = P("d IS NULL OR id >= 0"), FilterRows = true,
+        }));
+        await Assert.ThrowsAsync<OverflowException>(() => table.DeleteAsync(P("d IS NULL OR id >= 0")).AsTask());
+        Assert.NotEmpty(offered);
+        Assert.DoesNotContain(true, offered);
     }
 
     // ---- The table --------------------------------------------------------------------------------------------------

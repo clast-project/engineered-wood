@@ -5587,13 +5587,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// resolves a name ignoring case and throws on an ambiguous one, and it cannot read a struct, array, map or
     /// variant, so a reference must match exactly one primitive column that way. A mixed-type comparison answers
     /// NULL rather than throwing, so it needs no exclusion.
+    /// <para>Nor a column whose type has changed (#502 phase 5c review round 1): an older file's values are widened as
+    /// they are read, and widening can raise on a value (a DATE widened to TIMESTAMP_NTZ overflows, checked, on a
+    /// far-future day count). A proof that never reads the column would hide that error, as `d IS NULL OR id &gt;= 0`
+    /// proven by its second branch would. Such a column proves nothing anyway: the file's statistics are of its old
+    /// type, so <see cref="RowGroupPushdown.ToFileColumns"/> leaves it Unknown.</para>
     /// </summary>
     internal static bool EvaluatesEverywhere(Expressions.Predicate predicate, Schema.StructType schema)
     {
         var columns = new HashSet<string>(
             schema.Fields
                 .GroupBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
-                .Where(g => g.Count() == 1 && g.Single().Type is Schema.PrimitiveType { TypeName: not "variant" })
+                .Where(g => g.Count() == 1 && g.Single().Type is Schema.PrimitiveType { TypeName: not "variant" }
+                    && Schema.TypeWidening.GetTypeChanges(g.Single()).Count == 0)
                 .Select(g => g.Key),
             StringComparer.OrdinalIgnoreCase);
         var types = schema.Fields
