@@ -5267,16 +5267,35 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             if (matchFileColumns.Count == 0)
             {
-                // The predicate reads no column of this file (only partition columns, or columns added after it),
-                // and no change feed needs the rows themselves:
-                // it answers the same for every row, so it is asked once, over one row of the table's shape — and
-                // only when a row is live, so that a value-dependent error can't fail a delete of nothing.
+                // The predicate reads no column of this file (only partition columns, or columns added after it), and
+                // the file has none for it to read through (with a change feed, see above, that takes a file with no
+                // column at all: a table whose every column is a partition column writes such files). It answers the
+                // same for every row, so it is asked once, over one row of the table's shape — and only when a row is
+                // live, so that a value-dependent error can't fail a delete of nothing.
+                int firstNew = newDeletedIndices.Count;
                 if (fileRows > rawDeletedRows.Count && OneRowMatches())
                 {
                     for (long row = 0; row < fileRows; row++)
                     {
                         if (!rawDeletedRows.Contains(row))
                             newDeletedIndices.Add(row);
+                    }
+                }
+
+                // A change feed still needs each deleted row: with no column in the file, a row is only its
+                // partition values and NULLs, which the table's shape supplies for a batch of no columns.
+                if (cdfEnabled)
+                {
+                    const int chunk = 64 * 1024;
+                    for (int start = firstNew; start < newDeletedIndices.Count; start += chunk)
+                    {
+                        int rows = Math.Min(chunk, newDeletedIndices.Count - start);
+                        var positions = new Int64Array.Builder().Reserve(rows);
+                        for (int i = 0; i < rows; i++)
+                            positions.Append(newDeletedIndices[start + i]);
+                        var where = new RowPositions(newDeletedIndices[start], positions.Build());
+                        CaptureSelected(new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], rows), where);
+                        where.Explicit?.Dispose();
                     }
                 }
 

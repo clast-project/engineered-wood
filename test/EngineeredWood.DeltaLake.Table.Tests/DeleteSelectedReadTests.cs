@@ -229,6 +229,67 @@ public class DeleteSelectedReadTests : IDisposable
     }
 
     /// <summary>
+    /// A table whose every column is a partition column writes data files with no column at all. A change-feed DELETE
+    /// of such a file still records each deleted row (its partition value, and its row id under row tracking).
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task WithAChangeFeedAFileWithNoColumnAtAllStillRecordsItsDeletedRows(bool rowTracking)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("region", StringType.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(
+            new LocalTableFileSystem(Path.Combine(_tempDir, "partitions-only")), schema,
+            partitionColumns: ["region"], enableRowTracking: rowTracking,
+            configuration: new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" });
+        await table.WriteAsync([new RecordBatch(schema,
+            [new StringArray.Builder().Append("a").Append("a").Append("b").Build()], 3)]);
+
+        // A newer file the DELETE matches only in part, so the commit carries a change file: a change reader then
+        // reads change files alone, and the column-less file's deleted rows must be in one.
+        await table.AddColumnAsync(new Field("score", DoubleType.Default, true));
+        var withScore = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("region", StringType.Default, true))
+            .Field(new Field("score", DoubleType.Default, true))
+            .Build();
+        await table.WriteAsync([new RecordBatch(withScore,
+            [new StringArray.Builder().Append("a").Append("a").Build(),
+             new DoubleArray.Builder().AppendNull().Append(5.0).Build()], 2)]);
+
+        var (deleted, version) = await table.DeleteAsync(
+            X.And(X.Equal("region", LiteralValue.Of("a")), X.IsNull("score")));
+
+        Assert.Equal(3, deleted);
+        var options = new DeltaChangeReadOptions
+        {
+            StartVersion = version,
+            EndVersion = version,
+            Metadata = rowTracking ? DeltaRowMetadata.RowTracking : DeltaRowMetadata.None,
+        };
+        var changes = new List<string>();
+        await foreach (var b in table.ReadChangesAsync(options))
+        {
+            using (b)
+            {
+                var region = (StringArray)b.Column(b.Schema.GetFieldIndex("region"));
+                for (int i = 0; i < b.Length; i++)
+                {
+                    string row = region.GetString(i);
+                    if (rowTracking)
+                        row += "/rowid=" + ((Int64Array)b.Column(b.Schema.GetFieldIndex(RowTrackingConfig.RowIdColumnName))).GetValue(i);
+                    changes.Add(row);
+                }
+            }
+        }
+
+        changes.Sort(StringComparer.Ordinal);
+        // Row ids: the first file's rows are 0-2 (region a holds 0 and 1); the second file's begin at 3.
+        Assert.Equal(rowTracking ? ["a/rowid=0", "a/rowid=1", "a/rowid=3"] : ["a", "a", "a"], changes);
+    }
+
+    /// <summary>
     /// A function predicate reads every column of the file, and a file a copy-on-write rewrite produced also holds the
     /// hidden materialized row-tracking columns: the predicate is never handed them, only the table's own.
     /// </summary>
