@@ -2034,7 +2034,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 && ctx.Chunks[i].MetaData is { } meta && MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta))
             {
                 (result ??= new DictionaryAnswer?[ctx.Count])[i] = new DictionaryAnswer(
-                    plan.Predicate, column, ctx.LeafArrowFields[i], RestoreDeclaredUnit, rows, plan.KeepValues);
+                    plan.Predicates, column, ctx.LeafArrowFields[i], RestoreDeclaredUnit, rows, plan.KeepValues);
             }
         }
 

@@ -125,8 +125,8 @@ public class DictionaryAnswerTests : IDisposable
 
     public static IEnumerable<object[]> Unanswered() =>
     [
-        ["not value-wise"], ["read by two predicates"], ["two columns"], ["too many distinct values"],
-        ["PLAIN-encoded"],
+        ["not value-wise"], ["read by two predicates, not adjacent"], ["read by two predicates, a barrier between"],
+        ["read by two predicates, fusion off"], ["two columns"], ["too many distinct values"], ["PLAIN-encoded"],
     ];
 
     [Theory]
@@ -156,14 +156,22 @@ public class DictionaryAnswerTests : IDisposable
         else
         {
             predicates.Add(Over(column, answer, valueWise: why != "not value-wise", lengths));
-            if (why == "read by two predicates")
-                predicates.Add(Over("s", v => v is null || v != "cat-00", valueWise: true, new ConcurrentBag<int>()));
+            if (why.StartsWith("read by two predicates", StringComparison.Ordinal))
+            {
+                // Answering the second where the first stands would hide rows from the one between them (#502 5b).
+                if (why.EndsWith("not adjacent", StringComparison.Ordinal))
+                    predicates.Add(new RowPredicate(["k"], batch => Map((Int32Array)batch.Column(0), v => v != 7)));
+                var second = Over("s", v => v is null || v != "cat-00", valueWise: true, new ConcurrentBag<int>());
+                predicates.Add(why.EndsWith("a barrier between", StringComparison.Ordinal)
+                    ? new RowPredicate(second.Columns, second.Evaluate) { ValueWise = true, DropsEarlierNulls = true }
+                    : second);
+            }
         }
 
         var rows = await ReadAsync(path, new ParquetReadOptions(), new ParquetScan
         {
             Columns = projection, RowFilter = new RowFilter(predicates),
-        }, twoPass: false);
+        }, twoPass: false, fusesAnswers: why != "read by two predicates, fusion off");
 
         Assert.NotEmpty(rows);
         Assert.Equal(Rows, lengths.Sum());
@@ -383,10 +391,132 @@ public class DictionaryAnswerTests : IDisposable
             return Map(new Int32Array.Builder().AppendRange(new int[batch.Length]).Build(), _ => true);
         }) { ValueWise = true };
         var field = new Field("ts", new TimestampType(TimeUnit.Nanosecond, (string?)null), nullable: false);
-        var answer = new EngineeredWood.Parquet.Data.DictionaryAnswer(predicate, column, field, (f, a) => (f, a), rows: 100);
+        var answer = new EngineeredWood.Parquet.Data.DictionaryAnswer([predicate], column, field, (f, a) => (f, a), rows: 100);
 
         Assert.False(answer.Prepare(dictionary));
         Assert.Equal(0, calls);
+    }
+
+    // ---- Runs over one column (#502 phase 5b) ----------------------------------------------------------------
+
+    private static readonly Dictionary<string, Func<string?, bool?>[]> Runs = new()
+    {
+        ["<> cat-03, <> cat-07"] = [v => v is null ? null : v != "cat-03", v => v is null ? null : v != "cat-07"],
+        ["s >= cat-10, s < cat-20"] = [
+            v => v is null ? null : string.CompareOrdinal(v, "cat-10") >= 0,
+            v => v is null ? null : string.CompareOrdinal(v, "cat-20") < 0],
+        // NULL from the first stays live for the second, which can still answer FALSE.
+        ["NULL for odd, s < cat-30, IS NULL or = cat-04"] = [
+            v => v is null ? false : (v[^1] - '0') % 2 == 0 ? true : null,
+            v => v is null ? null : string.CompareOrdinal(v, "cat-30") < 0,
+            v => v is null || v == "cat-04"],
+        ["IS NULL, nothing"] = [v => v is null, _ => false],
+    };
+
+    public static IEnumerable<object[]> RunCases()
+    {
+        foreach (var run in Runs.Keys)
+        {
+            foreach (bool batched in new[] { false, true })
+            {
+                foreach (bool twoPass in new[] { false, true })
+                {
+                    yield return [run, batched, twoPass, 1];
+                    yield return [run, batched, twoPass, 4];
+                    yield return [run, !batched, twoPass, batched ? 4 : 1, "returned"];
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// A run of adjacent value-wise predicates over one column is answered from the dictionary together: the same rows
+    /// as the predicates asked row by row, each asked once per row group over the dictionary, and a predicate after the
+    /// run seeing the same rows (the run's NULL rows included).
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(RunCases))]
+    public async Task ARunOverOneColumnReturnsTheRowsItsPredicatesSelectRowByRow(
+        string runName, bool batched, bool twoPass, int concurrency, string column = "dropped")
+    {
+        string[] projection = column == "returned" ? ["id", "s"] : ["id"];
+        string path = await WriteFileAsync();
+        var run = Runs[runName];
+        bool parallel = concurrency > 1;
+        var excluded = parallel ? new Exclusions(Enumerable.Range(0, Rows).Where(r => r % 19 == 0).Select(r => (long)r)) : null;
+        var options = new ParquetReadOptions { MaxConcurrentRowGroups = concurrency, BatchSize = batched ? 2_500 : null };
+
+        RowFilter Filter(bool valueWise, ConcurrentBag<int>[] lengths, ConcurrentBag<long> later)
+        {
+            var predicates = run.Select((answer, i) => Over("s", answer, valueWise, lengths[i])).ToList();
+            predicates.Add(new RowPredicate(["k", "id"], batch =>
+            {
+                var ids = (Int64Array)batch.Column(1);
+                for (int i = 0; i < ids.Length; i++)
+                    later.Add(ids.GetValue(i)!.Value);
+                return Map((Int32Array)batch.Column(0), v => v % 3 != 0);
+            }));
+            return new RowFilter(predicates);
+        }
+
+        var rowLengths = run.Select(_ => new ConcurrentBag<int>()).ToArray();
+        var rowLater = new ConcurrentBag<long>();
+        var expected = await ReadAsync(path, options, new ParquetScan
+        {
+            Columns = projection, RowFilter = Filter(valueWise: false, rowLengths, rowLater), ExcludedRows = excluded,
+        }, twoPass);
+
+        var dictionaryLengths = run.Select(_ => new ConcurrentBag<int>()).ToArray();
+        var dictionaryLater = new ConcurrentBag<long>();
+        var actual = await ReadAsync(path, options, new ParquetScan
+        {
+            Columns = projection, RowFilter = Filter(valueWise: true, dictionaryLengths, dictionaryLater), ExcludedRows = excluded,
+        }, twoPass);
+
+        Assert.Equal(expected, actual);
+        Assert.Equal(rowLater.OrderBy(r => r), dictionaryLater.OrderBy(r => r));
+        if (runName != "IS NULL, nothing")
+            Assert.NotEmpty(expected);
+
+        // Every predicate of the run: asked once per row group, over the dictionary and one NULL.
+        foreach (var lengths in dictionaryLengths)
+        {
+            Assert.Equal(Rows / RowsPerGroup, lengths.Count);
+            Assert.All(lengths, n => Assert.Equal(Categories + 1, n));
+        }
+    }
+
+    /// <summary>
+    /// A predicate of the run that raises over an entry only an excluded row holds makes the run decline, and the rows
+    /// are asked instead, every predicate of the run included; one a live row holds raises (#502 phase 5b).
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ARunWhosePredicateRaisesOverTheDictionaryIsAskedRowByRow(bool badRowsExcluded)
+    {
+        string path = await WriteFileAsync();
+        var excluded = badRowsExcluded
+            ? new Exclusions(Enumerable.Range(0, Rows).Where(IsBad).Select(r => (long)r))
+            : null;
+        var firstLengths = new ConcurrentBag<int>();
+        var filter = new RowFilter(
+            Over("e", v => v != "ok-2", valueWise: true, firstLengths),
+            Over("e", RaisingOnBad, valueWise: true, new ConcurrentBag<int>()));
+        var scan = new ParquetScan { Columns = ["id"], RowFilter = filter, ExcludedRows = excluded };
+
+        if (!badRowsExcluded)
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => ReadAsync(path, new ParquetReadOptions(), scan, twoPass: false));
+            return;
+        }
+
+        var rows = await ReadAsync(path, new ParquetReadOptions(), scan, twoPass: false);
+        var expected = Enumerable.Range(0, Rows).Where(r => !IsBad(r) && r % 7 == 1).Select(r => (long)r).ToList();
+        Assert.Equal(expected, rows.Select(r => long.Parse(r[..r.IndexOf(':')], System.Globalization.CultureInfo.InvariantCulture)).ToList());
+
+        // The first predicate was asked over the dictionary and then over the rows (the run declined).
+        Assert.Equal(Rows - excluded!.Count, firstLengths.Where(n => n > 8).Sum());
     }
 
     // ---- Helpers --------------------------------------------------------------------------------------------
@@ -468,10 +598,14 @@ public class DictionaryAnswerTests : IDisposable
         }
     }
 
-    private static async Task<List<string>> ReadAsync(string path, ParquetReadOptions options, ParquetScan scan, bool twoPass)
+    private static async Task<List<string>> ReadAsync(
+        string path, ParquetReadOptions options, ParquetScan scan, bool twoPass, bool fusesAnswers = true)
     {
         await using var file = new LocalRandomAccessFile(path);
-        using var reader = new ParquetFileReader(file, ownsFile: false, options) { TwoPassReads = twoPass };
+        using var reader = new ParquetFileReader(file, ownsFile: false, options)
+        {
+            TwoPassReads = twoPass, FusesAnswers = fusesAnswers,
+        };
         var rows = new List<string>();
         await foreach (var selected in reader.ReadSelectedAsync(scan))
         {
