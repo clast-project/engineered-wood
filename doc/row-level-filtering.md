@@ -842,3 +842,5 @@ Two passes are still gated to object storage (§13; decided 11-09, to be revisit
 | category = 2% / <> 98% | -1% / -14% | -4% / -5% |
 
 As §15 found, two passes win nearly everywhere locally. The exception is a selection that keeps row groups whole or nearly whole (clustered 90%: +24% narrow, +10% wide), where the second pass reads everything the first did not.
+
+**Decided (2026-11-10):** the default stays as it is (two passes for object storage only) until phase 5. Demoting a predicate that keeps nearly every row should remove the clustered-90% regression, and the local default is revisited then. The feature branch does not wait on it.
