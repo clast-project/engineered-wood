@@ -320,6 +320,91 @@ public class ValueWiseTests : IDisposable
         Assert.Equal(results[0].Left, results[1].Left);
     }
 
+    /// <summary>
+    /// Review round 1: bringing a whole batch to the table's shape can raise on a value where a gather of the live rows
+    /// does not. A DATE column widened to TIMESTAMP_NTZ overflows on a far-future day count (checked, in microseconds),
+    /// so a row holding one, rejected by an earlier conjunct or deleted by the deletion vector, must not fail the read
+    /// or the DELETE: the whole batch is declined and the live rows are asked instead.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AWholeBatchWhoseWideningOverflowsFallsBackToTheLiveRows(bool whole)
+    {
+        const int rows = 20;
+        const int bad = 7;
+        string root = Path.Combine(_tempDir, $"widened_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var fs = new LocalTableFileSystem(root);
+        var fileSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("d", Date32Type.Default, true))
+            .Build();
+        var days = new ArrowBuffer.Builder<int>();
+        for (int i = 0; i < rows; i++)
+            days.Append(i == bad ? int.MaxValue : 11_000 + i); // 2000-02-13 onwards; the bad row overflows
+        var ids = new Int64Array.Builder();
+        for (int i = 0; i < rows; i++)
+            ids.Append(i);
+        await using (var file = await fs.CreateAsync("data.parquet"))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(new RecordBatch(fileSchema,
+                [ids.Build(), new Date32Array(days.Build(), ArrowBuffer.Empty, rows, 0, 0)], rows));
+            await writer.CloseAsync();
+        }
+
+        await new EngineeredWood.DeltaLake.Log.TransactionLog(fs).WriteCommitAsync(0, new List<EngineeredWood.DeltaLake.Actions.DeltaAction>
+        {
+            new EngineeredWood.DeltaLake.Actions.ProtocolAction
+            {
+                MinReaderVersion = 3,
+                MinWriterVersion = 7,
+                ReaderFeatures = ["typeWidening", "deletionVectors", "timestampNtz"],
+                WriterFeatures = ["typeWidening", "deletionVectors", "timestampNtz"],
+            },
+            new EngineeredWood.DeltaLake.Actions.MetadataAction
+            {
+                Id = "widened",
+                Format = EngineeredWood.DeltaLake.Actions.Format.Parquet,
+                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}},{"name":"d","type":"timestamp_ntz","nullable":true,"metadata":{"delta.typeChanges":"[{\"fromType\":\"date\",\"toType\":\"timestamp_ntz\"}]"}}]}""",
+                PartitionColumns = [],
+                Configuration = new Dictionary<string, string>
+                {
+                    { EngineeredWood.DeltaLake.Schema.TypeWidening.EnableKey, "true" },
+                    { EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorConfig.EnableKey, "true" },
+                },
+            },
+            new EngineeredWood.DeltaLake.Actions.AddFile
+            {
+                Path = "data.parquet",
+                PartitionValues = new Dictionary<string, string>(),
+                Size = new FileInfo(Path.Combine(root, "data.parquet")).Length,
+                ModificationTime = 1000,
+                DataChange = true,
+            },
+        });
+
+        await using var table = await DeltaTable.OpenAsync(fs);
+        table.EvaluatesWholeBatches = whole;
+        table.WholeBatchLiveShare = 0;
+
+        // An earlier conjunct rejects the bad row: it is never widened.
+        var scanned = await ReadAsync(table, new DeltaReadOptions
+        {
+            Columns = ["id"],
+            Filter = P($"id <> {bad} AND d > DATE'2000-02-20'"),
+            FilterRows = true,
+        });
+        Assert.Equal(Enumerable.Range(0, rows).Where(i => i != bad && 11_000 + i > 11_007).Select(i => i.ToString(CultureInfo.InvariantCulture)).OrderBy(x => x, StringComparer.Ordinal), scanned);
+
+        // The deletion vector deletes it: an expression DELETE over d never widens it.
+        var (removed, _) = await table.DeleteAsync(P($"id = {bad}"));
+        Assert.Equal(1, removed);
+        var (deleted, _) = await table.DeleteAsync(P("d > DATE'2000-02-20'"));
+        Assert.Equal(12, deleted); // rows 8-19 (2000-02-21 on)
+    }
+
     // ---- The table --------------------------------------------------------------------------------------------------
 
     private static bool IsDeleted(int id) => id % 97 == 5;

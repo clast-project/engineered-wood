@@ -134,6 +134,34 @@ public class WholeBatchEvaluationTests
         Assert.Null(evaluator.TryEvaluateWithoutRaising(predicate, batch));
     }
 
+    /// <summary>
+    /// Review round 1: a form the direct path always declines is not one <see cref="ArrowRowEvaluator.MayEvaluateWithoutRaising"/>
+    /// admits, so a caller never prepares a batch only to be declined.
+    /// </summary>
+    [Theory]
+    [InlineData("i32 > 0", true)]
+    [InlineData("0 < i32", true)]
+    [InlineData("d32 >= DATE'2026-10-01'", true)]
+    [InlineData("s = CAST('5' AS STRING)", true)]
+    [InlineData("i32 > i64", false)]
+    [InlineData("i32 > CAST(s AS INT)", false)]
+    [InlineData("i32 + 1 > 0", false)]
+    [InlineData("1 > 0", false)]
+    [InlineData("i32 > 0 AND i32 > i64", false)]
+    [InlineData("s IS NULL OR i32 = 1", true)]
+    public void OnlyFormsTheDirectPathCanAnswerAreAdmitted(string sql, bool admitted) =>
+        Assert.Equal(admitted, ArrowRowEvaluator.MayEvaluateWithoutRaising(SparkSqlParser.ParsePredicate(sql)));
+
+    /// <summary>The direct path reads the column as the value, never the prefix: <c>'ab' STARTSWITH s</c> declines.</summary>
+    [Fact]
+    public void AColumnAsThePrefixIsNotAdmitted()
+    {
+        Assert.False(ArrowRowEvaluator.MayEvaluateWithoutRaising(new ComparisonPredicate(
+            Expressions.Lit(LiteralValue.Of("ab")), ComparisonOperator.StartsWith, Expressions.Ref("s"))));
+        Assert.True(ArrowRowEvaluator.MayEvaluateWithoutRaising(new ComparisonPredicate(
+            Expressions.Ref("s"), ComparisonOperator.StartsWith, Expressions.Lit(LiteralValue.Of("ab")))));
+    }
+
     [Fact]
     public void AnEmptyBatchDeclines()
     {

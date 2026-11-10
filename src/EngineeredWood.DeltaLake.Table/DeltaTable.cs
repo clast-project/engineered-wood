@@ -13681,10 +13681,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="ConditionMask"/> for <see cref="RowPredicate.EvaluateWholeBatch"/> (#502 phase 5a): the same batch,
     /// brought to the table's shape the same way, answered by <paramref name="predicate"/> only where the evaluator can
     /// do so with no row's value able to raise (<see cref="Expressions.Arrow.ArrowRowEvaluator.TryEvaluateWithoutRaising"/>);
-    /// null otherwise. Not offered at all for a form that always declines. Bringing a batch to the table's shape raises nothing a value causes: it renames, widens types
-    /// losslessly, and adds partition values and NULLs. NULL answers are kept; a whole condition's NULL drops its row
-    /// as FALSE does, and no predicate follows one that this is set for but the conjuncts of the same expression.
-    /// Null when <see cref="EvaluatesWholeBatches"/> is off.
+    /// null otherwise. Not offered at all for a form that always declines. NULL answers are kept; a whole condition's
+    /// NULL drops its row as FALSE does, and no predicate follows one that this is set for but the conjuncts of the same
+    /// expression. Null when <see cref="EvaluatesWholeBatches"/> is off.
+    /// <para>Bringing the whole batch to the table's shape can itself raise on a value that a gather of the live rows
+    /// never reaches: a DATE widened to TIMESTAMP_NTZ overflows, checked, on a far-future day count. So any error while
+    /// shaping declines, and the reader asks the live rows instead, where a live row's value raises as before (review
+    /// round 1).</para>
     /// </summary>
     private Func<RecordBatch, BooleanArray?>? WholeBatchMask(
         Expressions.Predicate predicate, IReadOnlyList<string>? columns, Snapshot.Snapshot snapshot, AddFile addFile,
@@ -13695,11 +13698,20 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             return null;
         return batch =>
         {
-            var logical = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
-            logical = ColumnMappingRecursive.StripParquetFieldIds(logical);
-            logical = ReconcileToTableShape(
-                logical, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions,
-                logicalToPhysical, addFile.Path);
+            RecordBatch logical;
+            try
+            {
+                logical = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
+                logical = ColumnMappingRecursive.StripParquetFieldIds(logical);
+                logical = ReconcileToTableShape(
+                    logical, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions,
+                    logicalToPhysical, addFile.Path);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                return null;
+            }
+
             return RowEvaluator.TryEvaluateWithoutRaising(predicate, logical);
         };
     }

@@ -51,11 +51,25 @@ public sealed partial class ArrowRowEvaluator
     /// </summary>
     public static bool MayEvaluateWithoutRaising(Predicate predicate) => predicate switch
     {
-        ComparisonPredicate cmp => IsReference(cmp.Left) || IsReference(cmp.Right),
+        // A column against a constant, as the direct path takes it; anything else would be shaped only to decline
+        // (review round 1). Whether a constant call's functions are foldable depends on the registry, and is left to
+        // the direct path.
+        ComparisonPredicate cmp =>
+            (IsReference(cmp.Left) && IsStructuralConstant(cmp.Right))
+            || (IsStructuralConstant(cmp.Left) && IsReference(cmp.Right)
+                && cmp.Op is not (ComparisonOperator.StartsWith or ComparisonOperator.NotStartsWith)),
         UnaryPredicate { Op: UnaryOperator.IsNull or UnaryOperator.IsNotNull } unary => IsReference(unary.Operand),
         NotPredicate not => MayEvaluateWithoutRaising(not.Child),
         AndPredicate and => and.Children.Count > 0 && and.Children.All(MayEvaluateWithoutRaising),
         OrPredicate or => or.Children.Count > 0 && or.Children.All(MayEvaluateWithoutRaising),
+        _ => false,
+    };
+
+    // A constant operand by its structure: a non-null literal, or a call reading no column.
+    private static bool IsStructuralConstant(Expression expression) => expression switch
+    {
+        LiteralExpression literal => !literal.Value.IsNull,
+        FunctionCall call => IsConstant(call),
         _ => false,
     };
 

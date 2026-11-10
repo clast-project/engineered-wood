@@ -882,9 +882,9 @@ As §15 found, two passes win nearly everywhere locally. The exception is a sele
   - `IS [NOT] NULL` of a column;
   - AND, OR and NOT of these. Every operand is evaluated over every row, so AND and OR are Kleene's, which is what the short-circuiting evaluation answers too.
 
-  Analysis errors still raise, as they would over any rows. `MayEvaluateWithoutRaising` says from the form alone whether it can ever answer. The method is public rather than internal because an `Expressions.Arrow` IVT to `DeltaLake.Table` leaks PolySharp's polyfills.
+  Analysis errors still raise, as they would over any rows. `MayEvaluateWithoutRaising` says from the form alone whether it can ever answer: a comparison qualifies only with a column on one side and a constant on the other, so `qty > id` is never shaped only to be declined (review round 1). The method is public rather than internal because an `Expressions.Arrow` IVT to `DeltaLake.Table` leaks PolySharp's polyfills.
 - **`RowPredicate.EvaluateWholeBatch`** (internal) carries it to the reader. When at least `WholeBatchLiveShare` of a batch's rows are still live (default 0.4), `BatchSelector` asks the predicate about the whole batch rather than a gather of the live rows. Its answers for rows no longer live change nothing, exactly as with dictionary answers (§20). A decline falls back to the gather.
-- **Delta** offers it for each run of filter conjuncts, and for an expression DELETE, whose deletion vector leaves most rows live, when the form can answer. The batch is first brought to the table's shape, as `ConditionMask` does. That renames columns, widens types losslessly, and adds partition values and NULLs, none of which raises on a value.
+- **Delta** offers it for each run of filter conjuncts, and for an expression DELETE, whose deletion vector leaves most rows live, when the form can answer. The batch is first brought to the table's shape, as `ConditionMask` does. That shaping can itself raise on a value no live row holds: a DATE widened to TIMESTAMP_NTZ overflows, checked, on a far-future day count. So any error while shaping declines, and the live rows are asked instead (review round 1).
 - **Knobs (internal):** `DeltaTable.EvaluatesWholeBatches`, `DeltaTable.WholeBatchLiveShare` and `ParquetFileReader.WholeBatchLiveShare`, all per instance.
 
 ### Measured
@@ -918,6 +918,7 @@ Splitting now costs less than evaluating together at 94% kept: -26%, where §19 
   - Every case of `DirectColumnComparisonTests`' sweep under three evaluators (plain, ANSI, legacy) is answered as the general path answers, or declined, never raised except for an analysis error.
   - 14 compound forms answer or decline as expected.
   - A string column against a number under ANSI declines without raising.
+  - The form check admits a column against a constant only (11 forms, and a column as the prefix of `STARTSWITH`).
 - `SelectedReadTests` (Parquet):
   - The oracle sweep with whole-batch answers at any live share (8 filters x serial and parallel x one and two passes, 5% excluded).
   - The threshold decides which path a predicate is asked by (whole: every row, gathered never; below: live rows only).
@@ -927,6 +928,7 @@ Splitting now costs less than evaluating together at 94% kept: -26%, where §19 
   - 5 filters x 2 concurrencies x 2 projections return the same rows with whole-batch answers on and off, and are offered them.
   - `code <> 'x' AND CAST(code AS INT) > 3` over live 'x' rows never raises.
   - 3 DELETEs match the same rows either way, offered exactly when the form can answer.
+  - A DATE widened to TIMESTAMP_NTZ, with a far-future day on a row an earlier conjunct rejects, and then on a row the deletion vector deletes: the scan and the DELETE succeed with whole batches on, as with them off. Each half raised `OverflowException` before the fix.
 
 Each of these mutations fails tests:
 - Delta offering every conjunct whole, through the evaluator that raises (5);
@@ -936,3 +938,8 @@ Each of these mutations fails tests:
 - Kleene NULL dropped (4);
 - a declined comparison answered by the general path (3);
 - `IS NULL` of any operand taken (1).
+
+### Review round 1
+
+- **Shaping a whole batch can raise.** `WidenDate32ToTimestamp` multiplies checked, so a DATE widened to TIMESTAMP_NTZ overflows on a day count past about year 294,000. On the whole-batch path that happened for rows the gather never reaches (rejected by an earlier conjunct, deleted by the vector). Shaping errors now decline. Regression above.
+- **Comparisons that always decline were offered.** `qty > id` and `qty > CAST(code AS INT)` passed the form check, then were shaped and declined on every batch. The form check now requires a column against a structural constant.
