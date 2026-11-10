@@ -943,3 +943,7 @@ Each of these mutations fails tests:
 
 - **Shaping a whole batch can raise.** `WidenDate32ToTimestamp` multiplies checked, so a DATE widened to TIMESTAMP_NTZ overflows on a day count past about year 294,000. On the whole-batch path that happened for rows the gather never reaches (rejected by an earlier conjunct, deleted by the vector). Shaping errors now decline. Regression above.
 - **Comparisons that always decline were offered.** `qty > id` and `qty > CAST(code AS INT)` passed the form check, then were shaped and declined on every batch. The form check now requires a column against a structural constant.
+
+### Review round 2
+
+- **An empty batch hid errors no value causes.** `TryEvaluateWithoutRaising` declined any empty batch up front. So over a batch without `i32`, `i32 > 0` came back declined instead of raising as `EvaluatePredicate` does. The direct path also declines an empty batch before resolving its column, under an evaluator with no analysis rules. An empty batch is now answered by `EvaluatePredicate` itself, which reads no row's value and raises what it raises over any batch. The reader never asked about an empty batch: the whole path needs a live row, and a batch with none goes to `EvaluateOverNoRows`. So reads were unaffected; the public method's contract was not. `AnEmptyBatchRaisesWhatTheGeneralPathRaises` (5 forms x 3 evaluators) failed 4 cases before the fix.

@@ -29,13 +29,21 @@ public sealed partial class ArrowRowEvaluator
     /// </para>
     /// <para>
     /// Every operand is evaluated over every row, so AND and OR are Kleene's, as the short-circuiting evaluation
-    /// answers too. An analysis error (no common type, an unresolvable column) still raises, as it would over any rows.
+    /// answers too. An error no value causes (no common type, an unresolvable column) still raises as it would over
+    /// any rows.
+    /// </para>
+    /// <para>
+    /// An empty batch is answered by <see cref="EvaluatePredicate"/> itself: over no rows it reads no row's value, and
+    /// it raises exactly what it raises over any batch, where the direct path would decline before resolving a column
+    /// (review round 2).
     /// </para>
     /// </remarks>
     public BooleanArray? TryEvaluateWithoutRaising(Predicate predicate, RecordBatch batch)
     {
-        if (batch.Length == 0 || !MayEvaluateWithoutRaising(predicate))
+        if (!MayEvaluateWithoutRaising(predicate))
             return null;
+        if (batch.Length == 0)
+            return EvaluatePredicate(predicate, batch);
 
         // The commonest conjunct: the kernel writes the answer's bitmaps itself.
         if (predicate is ComparisonPredicate cmp)

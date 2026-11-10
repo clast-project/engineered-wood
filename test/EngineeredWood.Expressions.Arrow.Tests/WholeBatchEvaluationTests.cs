@@ -162,11 +162,46 @@ public class WholeBatchEvaluationTests
             Expressions.Ref("s"), ComparisonOperator.StartsWith, Expressions.Lit(LiteralValue.Of("ab")))));
     }
 
+    /// <summary>
+    /// Review round 2: over an empty batch, an error no value causes (an unresolvable column, a pair of types with no
+    /// comparison) still raises exactly as the general path raises it; it is not hidden behind a decline.
+    /// </summary>
+    [Theory]
+    [InlineData("i32 > 0")]                 // no such column
+    [InlineData("i32 IS NULL")]             // no such column
+    [InlineData("j > 1 AND i32 > 0")]       // no such column, in a later operand
+    [InlineData("j > X'61'")]               // no comparison between INT and BINARY
+    [InlineData("j > 'abc'")]               // valid: answered, with no rows
+    public void AnEmptyBatchRaisesWhatTheGeneralPathRaises(string sql)
+    {
+        var batch = new RecordBatch(
+            new Apache.Arrow.Schema([new Field("j", Apache.Arrow.Types.Int32Type.Default, true)], null),
+            [new Int32Array.Builder().Build()], 0);
+        var predicate = SparkSqlParser.ParsePredicate(sql);
+        foreach (var make in DirectColumnComparisonTests.Evaluators)
+        {
+            var (expected, error) = General(make(), predicate, batch);
+            if (error is not null)
+            {
+                var raised = Assert.ThrowsAny<Exception>(() => make().TryEvaluateWithoutRaising(predicate, batch));
+                Assert.Equal(expected, $"{raised.GetType().Name}: {raised.Message}");
+            }
+            else
+            {
+                var whole = make().TryEvaluateWithoutRaising(predicate, batch);
+                Assert.NotNull(whole);
+                Assert.Equal(expected, Show(whole!));
+            }
+        }
+    }
+
     [Fact]
-    public void AnEmptyBatchDeclines()
+    public void AnEmptyBatchIsAnsweredEmpty()
     {
         var batch = DirectColumnComparisonTests.Batch();
         var empty = new RecordBatch(batch.Schema, batch.Arrays.Select(a => ArrowArrayFactory.Slice(a, 0, 0)), 0);
-        Assert.Null(new ArrowRowEvaluator().TryEvaluateWithoutRaising(SparkSqlParser.ParsePredicate("i32 > 0"), empty));
+        var answer = new ArrowRowEvaluator().TryEvaluateWithoutRaising(SparkSqlParser.ParsePredicate("i32 > 0"), empty);
+        Assert.NotNull(answer);
+        Assert.Equal(0, answer!.Length);
     }
 }
