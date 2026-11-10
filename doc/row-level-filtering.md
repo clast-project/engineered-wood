@@ -1032,6 +1032,7 @@ Dropping a predicate where statistics prove it TRUE for every row trusts the sta
 
   The pruning evaluator's AlwaysTrue is unsound for this in two places, which the rules avoid. Under NOT, its AlwaysFalse ignores NULL rows: `NOT (x < 5)` over [10, 20] with NULLs answers AlwaysTrue, and a test pins that. A prefix test is answered without the null count. A NaN outside the bounds is the evaluator's to settle, and it already answers Unknown when one may hide there. `DeltaFilePruner.ProvesEveryRowTrue` keeps only its partition-column refusal (#511) and calls the shared leaf.
 - **Parquet:** `RowPredicate.Proof` (internal) is a predicate over the file's column paths. For each planned row group, `SelectedPlanReader` drops the predicates its statistics prove (`ParquetStatisticsAccessor`, with pruning's trust rules: no bounds under an undefined column order, legacy min/max only for signed numerics). The group is then read with the remaining filter and only the columns it still needs (`ReadWithout`, cached per set of proven predicates). A group with none left is a plain read: one pass, no evaluation. A positions-only read (a DELETE's) of such a group reads no column at all.
+- **A proof holds only for a literal of the column's own type** (DELETE's rule): `id >= 2500` over a BIGINT `id` compares with an INT literal and is never proven; `id >= 2500L` is. Spark SQL types an unsuffixed integer literal as INT, so this is the common case for BIGINT columns. Widening such a literal losslessly before proving is possible, and is left for later: it would change DELETE's file proofs too.
 - **Delta:** a run of filter conjuncts, and an expression DELETE's predicate, carry a proof only when the table trusts statistics proofs and `EvaluatesEverywhere` holds (plain comparisons and null tests of the table's own columns, none casting a string, so dropping it raises nothing it would have raised). The proof is translated by `RowGroupPushdown.ToFileColumns`, which never strengthens it: a reference the file cannot answer (a partition column, a missing column, a changed type) evaluates Unknown and proves nothing.
 
 ### Measured
@@ -1069,9 +1070,9 @@ By default no proof is offered, so a default table would still read clustered 90
   - a proof the statistics do not establish (a column with NULLs, an unsettled range) leaves every row asked;
   - a positions-only read of proven groups returns their live positions with no column read.
 - `ValueWiseTests` (Delta):
-  - 5 filters (a range, a run, an OR, a conjunct proven beside one that is not) x 2 concurrencies return the same rows with `TrustStatisticsProofs` on and off, offering proofs exactly when on;
+  - 5 filters (a range, a run, an OR, a conjunct proven beside one that is not) x 2 concurrencies return the same rows with `TrustStatisticsProofs` on and off, offering proofs exactly when on, and with some row group really proven exactly when on (`DeltaTable.ProvenRowGroups`, internal, fed by `ParquetFileReader.OnProvenRowGroup`). Review round 2 added that check: the filters had INT literals over a BIGINT column, so the proofs were offered but never held, and the on/off comparison compared two identical reads;
   - a conjunct casting a string (`CAST(code AS INT) > 3`, `code = 5`) is never offered one;
-  - 2 DELETEs match the same rows either way.
+  - 2 DELETEs match the same rows either way, with a row group proven when on.
 - `DeltaFilePruner`'s DELETE and ADD CONSTRAINT proof tests pass unchanged through the shared rules.
 - `TwoPassReadTests`: by default, a local file reads in two passes when its predicate carries a proof (the corrupted page past the selected rows is never decoded), and in one pass when it does not.
 
@@ -1090,4 +1091,15 @@ Each of these mutations fails tests:
 - **The case:** with `d` widened that way and holding such a value, `d IS NULL OR id >= 0` raised when asked row by row. With proofs, `id >= 0` proved the OR for the row group, `d` was never read, and the error disappeared.
 - **The fix:** `EvaluatesEverywhere` now refuses a column whose type has changed (`delta.typeChanges`). It costs nothing a proof could use: `ToFileColumns` already left such a column Unknown, since the file's statistics are of its old type. Only the unproven branch of an OR referred to it.
 - **Scope:** the same rule gates DELETE's and ADD CONSTRAINT's file-level proofs, so it closes the same hole there under `TrustStatisticsProofs`.
-- **Regression:** `AProofDoesNotHideAWideningThatOverflows` (`ValueWiseTests`, on and off). Its scan and its DELETE each raised nothing with proofs on before the fix, and each was checked on its own.
+- **Regression:** `AProofDoesNotHideAWideningThatOverflows` (`ValueWiseTests`, on and off). As first written (`id >= 0`, an INT literal), no proof held, so it failed without the fix only on its "no proof offered" assertion. Review round 2 made it `id >= 0L`. Its scan and its DELETE now each raise nothing with proofs on without the fix, and each was checked on its own.
+
+### Review round 2
+
+**A proof could skip a malformed partition value.** `ToFileColumns` turns a partition reference into one the file cannot answer, so an OR could still be proven by its other branch. Asking the predicate decodes the partition value from the log; a proof skips that.
+- **The case:** with the file's DATE partition value `abc`, `part IS NULL OR id >= 0L` raised row by row but, proven, did not, for a scan and for a positions-only DELETE.
+- **The fix:** `ProofFor` refuses a predicate that references a partition column (`ReferencesAnyPartitionColumn`, names compared ignoring case as `EvaluatesEverywhere` compares them). DELETE's file proof already refuses partition columns in its leaves, and evaluates a partition-only part for real.
+- **Regression:** `AProofDoesNotSkipAMalformedPartitionValue`, on and off. Its scan and its DELETE each fail without the fix, each checked on its own.
+
+Two traps found while writing it:
+- **The DATE literal.** Copilot's example, `part = DATE'2020-01-01' OR ...`, is never offered a proof whatever the fix: a DATE literal parses as a cast, which `EvaluatesEverywhere` refuses. The test uses `IS NULL`, which also decodes the value.
+- **INT literals.** The test needed a BIGINT literal (`0L`) for its other branch to be proven at all. Every earlier Delta-level proof test had the same flaw, now corrected (see Tests).

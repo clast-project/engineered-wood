@@ -90,6 +90,12 @@ public sealed partial class ParquetFileReader
     internal bool FusesAnswers { get; set; } = true;
 
     /// <summary>
+    /// Called for each row group a selected read reads with a predicate dropped on its statistics proof (#502 phase 5c):
+    /// for tests, which otherwise could not tell a proof that holds from one that never does.
+    /// </summary>
+    internal Action? OnProvenRowGroup { get; set; }
+
+    /// <summary>
     /// Everything a selected read of <paramref name="scan"/> decides once, before any row group: the columns it
     /// decodes, how it selects rows, whether it may go in two passes. A caller that schedules row groups itself (a
     /// Delta scan, which plans them with <see cref="PlanRowGroupsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken, int, int)"/>)
@@ -179,11 +185,6 @@ public sealed partial class ParquetFileReader
             _accessor = _proofs.Length > 0 ? new ParquetStatisticsAccessor(schema) : null;
         }
 
-        /// <summary>The number of row groups read with a predicate dropped on a proof, for tests.</summary>
-        internal int ProvenGroups => _provenGroups;
-
-        private int _provenGroups;
-
         // How to read the planned row group: without the predicates its statistics prove TRUE for every row.
         private GroupRead ReadFor(RowGroupPlan plan)
         {
@@ -200,7 +201,7 @@ public sealed partial class ParquetFileReader
 
             if (proven == 0)
                 return _whole;
-            Interlocked.Increment(ref _provenGroups);
+            _reader.OnProvenRowGroup?.Invoke();
             return _without.GetOrAdd(proven, set => _reader.ReadWithout(_schema, _scan, set));
         }
 

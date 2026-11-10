@@ -359,13 +359,15 @@ public class ValueWiseTests : IDisposable
 
     // ---- Statistics proofs (#502 phase 5c) ---------------------------------------------------------------------------
 
+    // id is BIGINT: a proof holds only for a literal of the column's own type, so these are BIGINT literals (2500L).
+    // `id >= 2500` (an INT literal) is offered a proof that never holds.
     public static IEnumerable<object[]> ProofFilters() =>
     [
-        ["id >= 2500"],                          // groups 3-5 proven, group 2 partly
-        ["id >= 2500 AND cat = 'c3'"],           // the run is one predicate: proven only where both are, so never
-        ["id >= 100 AND id < 5900"],
-        ["cat <> 'c1' AND id > 1000"],           // the id conjunct alone is proven for groups 1-5
-        ["id < 5000 OR cat IS NULL"],            // OR: proven by its first branch for groups 0-4
+        ["id >= 2500L"],                         // groups 3-5 proven, group 2 partly
+        ["id >= 2500L AND cat = 'c3'"],          // split: the id conjunct is proven for groups 3-5, cat never
+        ["id >= 100L AND id < 5900L"],
+        ["cat <> 'c1' AND id > 1000L"],          // the id conjunct alone is proven for groups 2-5
+        ["id < 5000L OR cat IS NULL"],           // OR: proven by its first branch for groups 0-4
     ];
 
     /// <summary>
@@ -393,6 +395,9 @@ public class ValueWiseTests : IDisposable
                     Columns = ["id", "cat"], Filter = P(sql), FilterRows = true,
                 });
                 Assert.Equal(trust, offered.Contains(true));
+
+                // Held, not only offered: some row group was read with a predicate dropped.
+                Assert.Equal(trust, table.ProvenRowGroups > 0);
                 if (expected is null)
                     expected = rows;
                 else
@@ -422,8 +427,8 @@ public class ValueWiseTests : IDisposable
 
     /// <summary>An expression DELETE whose row groups a proof covers deletes the same rows as without the option.</summary>
     [Theory]
-    [InlineData("id >= 2500")]
-    [InlineData("id >= 2500 AND id < 4500")]
+    [InlineData("id >= 2500L")]               // file 2 removed on its file proof, row group 3 on its row-group proof
+    [InlineData("id >= 2500L AND id < 4500L")] // row group 3
     public async Task ADeleteMatchesTheSameRowsWithStatisticsProofs(string sql)
     {
         var results = new List<(long Deleted, List<string> Left)>();
@@ -431,6 +436,7 @@ public class ValueWiseTests : IDisposable
         {
             await using var table = await CreateAsync($"t_{Guid.NewGuid():N}", 4, trustStatisticsProofs: trust);
             var (deleted, _) = await table.DeleteAsync(P(sql));
+            Assert.Equal(trust, table.ProvenRowGroups > 0);
             results.Add((deleted, await ReadAsync(table, new DeltaReadOptions { Columns = ["id", "cat"] })));
         }
 
@@ -504,8 +510,8 @@ public class ValueWiseTests : IDisposable
     }
 
     /// <summary>
-    /// #807 review round 1: a proof must not hide an error the rows would raise. <c>id &gt;= 0</c> proves
-    /// <c>d IS NULL OR id &gt;= 0</c> for the row group, but asked row by row the OR widens row 7's <c>d</c>, which
+    /// #807 review round 1: a proof must not hide an error the rows would raise. <c>id &gt;= 0L</c> proves
+    /// <c>d IS NULL OR id &gt;= 0L</c> for the row group, but asked row by row the OR widens row 7's <c>d</c>, which
     /// overflows. A column whose type has changed is never one a proof may stand in for, so the scan and the DELETE
     /// raise with <see cref="DeltaTableOptions.TrustStatisticsProofs"/> on as they do with it off.
     /// </summary>
@@ -524,10 +530,87 @@ public class ValueWiseTests : IDisposable
 
         await Assert.ThrowsAsync<OverflowException>(() => ReadAsync(table, new DeltaReadOptions
         {
-            Columns = ["id"], Filter = P("d IS NULL OR id >= 0"), FilterRows = true,
+            Columns = ["id"], Filter = P("d IS NULL OR id >= 0L"), FilterRows = true,
         }));
-        await Assert.ThrowsAsync<OverflowException>(() => table.DeleteAsync(P("d IS NULL OR id >= 0")).AsTask());
+        await Assert.ThrowsAsync<OverflowException>(() => table.DeleteAsync(P("d IS NULL OR id >= 0L")).AsTask());
         Assert.NotEmpty(offered);
+        Assert.DoesNotContain(true, offered);
+    }
+
+    /// <summary>
+    /// #807 review round 2: a proof must not skip a partition value the predicate would decode. The file's DATE partition
+    /// value is "abc"; asked row by row, <c>part IS NULL OR id &gt;= 0L</c> decodes it and raises. Proven by its
+    /// <c>id</c> branch, it would not. A predicate referencing a partition column is never offered a proof, so the scan
+    /// and the DELETE raise with <see cref="DeltaTableOptions.TrustStatisticsProofs"/> on as they do with it off.
+    /// </summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AProofDoesNotSkipAMalformedPartitionValue(bool trust)
+    {
+        const int rows = 20;
+        string root = Path.Combine(_tempDir, $"badpart_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(root);
+        var fs = new LocalTableFileSystem(root);
+        var fileSchema = new Apache.Arrow.Schema.Builder().Field(new Field("id", Int64Type.Default, false)).Build();
+        var ids = new Int64Array.Builder();
+        for (int i = 0; i < rows; i++)
+            ids.Append(i);
+        await using (var file = await fs.CreateAsync("part=abc/data.parquet"))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(new RecordBatch(fileSchema, [ids.Build()], rows));
+            await writer.CloseAsync();
+        }
+
+        await new EngineeredWood.DeltaLake.Log.TransactionLog(fs).WriteCommitAsync(0, new List<EngineeredWood.DeltaLake.Actions.DeltaAction>
+        {
+            new EngineeredWood.DeltaLake.Actions.ProtocolAction
+            {
+                MinReaderVersion = 3,
+                MinWriterVersion = 7,
+                ReaderFeatures = ["deletionVectors"],
+                WriterFeatures = ["deletionVectors"],
+            },
+            new EngineeredWood.DeltaLake.Actions.MetadataAction
+            {
+                Id = "badpart",
+                Format = EngineeredWood.DeltaLake.Actions.Format.Parquet,
+                SchemaString = """{"type":"struct","fields":[{"name":"id","type":"long","nullable":false,"metadata":{}},{"name":"part","type":"date","nullable":true,"metadata":{}}]}""",
+                PartitionColumns = ["part"],
+                Configuration = new Dictionary<string, string>
+                {
+                    { EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorConfig.EnableKey, "true" },
+                },
+            },
+            new EngineeredWood.DeltaLake.Actions.AddFile
+            {
+                Path = "part=abc/data.parquet",
+                PartitionValues = new Dictionary<string, string> { ["part"] = "abc" },
+                Size = new FileInfo(Path.Combine(root, "part=abc", "data.parquet")).Length,
+                ModificationTime = 1000,
+                DataChange = true,
+            },
+        });
+
+        await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions { TrustStatisticsProofs = trust });
+        var offered = new ConcurrentBag<bool>();
+        table.RowFilterObserver = filter =>
+        {
+            foreach (var predicate in filter.Predicates)
+                offered.Add(DeltaTable.OffersProof(predicate));
+        };
+
+        // Not `part = DATE'...'`: a DATE literal is a cast, which no proof stands in for anyway. IS NULL decodes the
+        // value too ("abc" is no spelling of NULL), and is a form a proof would otherwise cover.
+        const string sql = "part IS NULL OR id >= 0L";
+        var scanError = await Record.ExceptionAsync(() => ReadAsync(table, new DeltaReadOptions
+        {
+            Columns = ["id"], Filter = P(sql), FilterRows = true,
+        }));
+        var deleteError = await Record.ExceptionAsync(() => table.DeleteAsync(P(sql)).AsTask());
+        Assert.NotNull(scanError);
+        Assert.NotNull(deleteError);
         Assert.DoesNotContain(true, offered);
     }
 
