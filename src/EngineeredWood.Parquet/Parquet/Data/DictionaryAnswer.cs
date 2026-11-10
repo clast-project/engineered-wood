@@ -70,8 +70,9 @@ internal sealed class DictionaryAnswer
     internal bool KeepsValues => _keepValues;
 
     /// <summary>
-    /// The name of the column holding a returned column's answers: one no Parquet column has (it starts with a NUL),
-    /// which the read drops.
+    /// The name of the column holding a returned column's answers, which the read drops. It starts with a NUL, so it
+    /// is unlikely to be a real column's, but it is not reserved: NUL is legal in a Parquet field name. A caller must
+    /// check it against the file's columns, as <see cref="BatchSelector"/> does, and not answer on a collision.
     /// </summary>
     internal static string AnswerColumnName(string column) => "\0answer:" + column;
 
