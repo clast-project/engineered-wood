@@ -96,19 +96,26 @@ internal static class ByteArrayRepresentation
 
     /// <summary>
     /// <paramref name="batch"/> with every column in <paramref name="kind"/>'s representation: the same batch when
-    /// all already are. A string or binary column that is converted whole is copied; a nested column is rebuilt around
-    /// its converted children, sharing the rest of its buffers.
+    /// all already are. A string or binary array is copied; a nested column is rebuilt around its converted children,
+    /// sharing the rest of its buffers.
     /// </summary>
+    /// <param name="batch">The batch.</param>
+    /// <param name="kind">The representation.</param>
+    /// <param name="releaseReplaced">Whether the caller owns <paramref name="batch"/>, so that the arrays the conversion
+    /// replaces are released. False where the batch is only a view of one someone else still reads, as a row mask's
+    /// is: the reader gathers its rows from the same arrays afterwards (review round 3).</param>
     /// <remarks>
-    /// The originals of the columns converted whole are released once every column is converted, each array once, and
-    /// only those that share no buffer with the result (review round 1): a codec-seam host may hand one array, or arrays
-    /// over the same buffers, for several columns, so releasing one as soon as it was converted freed bytes a later
-    /// conversion, or an unchanged column, still read.
+    /// The replaced arrays, at any depth (a nested column's string child as much as a string column: review round 3),
+    /// are released once every column is converted, each array once, and only those that share no buffer with the
+    /// result (review round 1): a codec-seam host may hand one array, or arrays over the same buffers, for several
+    /// columns, so releasing one as soon as it was converted freed bytes a later conversion, or an unchanged column,
+    /// still read.
     /// </remarks>
-    public static RecordBatch Apply(RecordBatch batch, ByteArrayOutputKind kind)
+    public static RecordBatch Apply(RecordBatch batch, ByteArrayOutputKind kind, bool releaseReplaced = true)
     {
         IArrowArray[]? columns = null;
         Field[]? fields = null;
+        var replaced = releaseReplaced ? new List<ArrayData>() : null;
         for (int i = 0; i < batch.ColumnCount; i++)
         {
             var column = batch.Column(i);
@@ -118,7 +125,7 @@ internal static class ByteArrayRepresentation
 
             columns ??= [.. Enumerable.Range(0, batch.ColumnCount).Select(batch.Column)];
             fields ??= [.. batch.Schema.FieldsList];
-            columns[i] = ArrowArrayFactory.BuildArray(Convert(column.Data, kind));
+            columns[i] = ArrowArrayFactory.BuildArray(Convert(column.Data, kind, replaced));
             var field = batch.Schema.FieldsList[i];
             fields[i] = new Field(field.Name, columns[i].Data.DataType, field.IsNullable, field.Metadata);
         }
@@ -127,27 +134,25 @@ internal static class ByteArrayRepresentation
             return batch;
 
         var result = new RecordBatch(new Apache.Arrow.Schema(fields!, batch.Schema.Metadata), columns, batch.Length);
-        Release(batch, result);
+        if (replaced is not null)
+            Release(replaced, result);
         return result;
     }
 
-    // Disposes the original of each leaf column Apply copied, once per array, unless the result still holds one of
-    // its buffers. Every decision is made before anything is disposed: a disposed array's buffers can't be inspected.
-    // Distinct arrays over the same buffers (slices) are each disposed: Arrow counts their references to the buffers,
-    // which are freed with the last.
-    private static void Release(RecordBatch batch, RecordBatch result)
+    // Disposes each replaced array once, unless the result still holds one of its buffers. Every decision is made
+    // before anything is disposed: a disposed array's buffers can't be inspected. Distinct arrays over the same
+    // buffers (slices) are each disposed: Arrow counts their references to the buffers, which are freed with the last.
+    // A nested column's original is left to the collector: its own buffers and unconverted children are the result's.
+    private static void Release(List<ArrayData> replaced, RecordBatch result)
     {
         var kept = new HashSet<ReadOnlyMemory<byte>>();
         for (int i = 0; i < result.ColumnCount; i++)
             Parquet.BatchSelector.CollectBuffers(result.Column(i).Data, kept);
 
-        var doomed = new List<IArrowArray>();
-        for (int i = 0; i < batch.ColumnCount; i++)
+        var doomed = new List<ArrayData>();
+        foreach (var original in replaced)
         {
-            var original = batch.Column(i);
-            if (ReferenceEquals(original, result.Column(i)) || !IsLeaf(original.Data.DataType))
-                continue;
-            if (doomed.Exists(d => ReferenceEquals(d, original)) || Parquet.BatchSelector.SharesAny(original.Data, kept))
+            if (doomed.Exists(d => ReferenceEquals(d, original)) || Parquet.BatchSelector.SharesAny(original, kept))
                 continue;
             doomed.Add(original);
         }
@@ -159,21 +164,25 @@ internal static class ByteArrayRepresentation
     private static bool IsLeaf(IArrowType type) =>
         type is StringType or StringViewType or LargeStringType or BinaryType or BinaryViewType or LargeBinaryType;
 
-    // `data` in `kind`'s representation: the same instance when nothing in it changes.
-    private static ArrayData Convert(ArrayData data, ByteArrayOutputKind kind)
+    // `data` in `kind`'s representation: the same instance when nothing in it changes. Each string or binary array it
+    // copies is added to `replaced`, when that is given.
+    private static ArrayData Convert(ArrayData data, ByteArrayOutputKind kind, List<ArrayData>? replaced)
     {
         var target = Of(data.DataType, kind);
         if (ReferenceEquals(target, data.DataType))
             return data;
         if (IsLeaf(data.DataType))
+        {
+            replaced?.Add(data);
             return ConvertLeaf(ArrowArrayFactory.BuildArray(data), target).Data;
+        }
 
         // A container keeps its own buffers and offset; only its children change, and Of built the target from the
         // same per-child decisions. ArrayData.Children are unsliced (the parent's offset applies to the parent), so
         // each is converted whole, at its own length.
         var children = new ArrayData[data.Children.Length];
         for (int i = 0; i < children.Length; i++)
-            children[i] = Convert(data.Children[i], kind);
+            children[i] = Convert(data.Children[i], kind, replaced);
 
         return new ArrayData(target, data.Length, data.NullCount, data.Offset, data.Buffers, children, data.Dictionary);
     }

@@ -13844,7 +13844,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             logical = ReconcileToTableShape(
                 logical, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
-                logicalToPhysical, addFile.Path, byteArrays);
+                logicalToPhysical, addFile.Path, byteArrays, ownsBatch: false);
             var answer = condition.Evaluate(logical);
             return keepNulls ? answer : NullAsFalse(answer, logical);
         };
@@ -13877,7 +13877,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 logical = ColumnMappingRecursive.StripParquetFieldIds(logical);
                 logical = ReconcileToTableShape(
                     logical, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions,
-                    logicalToPhysical, addFile.Path, _options.ParquetReadOptions.ByteArrayOutput);
+                    logicalToPhysical, addFile.Path, _options.ParquetReadOptions.ByteArrayOutput, ownsBatch: false);
             }
             catch (Exception e) when (e is not OperationCanceledException)
             {
@@ -14510,7 +14510,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         RecordBatch result, Snapshot.Snapshot snapshot, IReadOnlyDictionary<string, string>? partitionValues,
         IReadOnlyList<string>? columns, IReadOnlyList<string> partitionColumns, bool hasPartitions,
         IReadOnlyDictionary<string, string> logicalToPhysical, string? filePath = null,
-        ByteArrayOutputKind? byteArrays = null)
+        ByteArrayOutputKind? byteArrays = null, bool ownsBatch = true)
     {
         // Apply type widening — convert narrow types from old files to current schema types
         if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
@@ -14563,8 +14563,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // A read's string and binary columns all in the representation ByteArrayOutput asks for (#793): the Parquet
         // reader decodes a data column in it, but a partition column, a backfilled one and a codec-seam host's are
         // built elsewhere. After the variant coercion, whose storage this leaves alone (an extension type). The
-        // metadata columns a scan appends later keep their documented types.
-        return byteArrays is { } kind ? ByteArrayRepresentation.Apply(result, kind) : result;
+        // metadata columns a scan appends later keep their documented types. A row mask's batch is a view of arrays the
+        // reader still reads (`ownsBatch` false), so what the conversion replaces there is not released.
+        return byteArrays is { } kind ? ByteArrayRepresentation.Apply(result, kind, releaseReplaced: ownsBatch) : result;
     }
 
     /// <summary>

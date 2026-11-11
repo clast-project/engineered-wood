@@ -96,6 +96,55 @@ public class ByteArrayRepresentationTests
         Assert.Equal(0, allocator.DoubleReleases); // ...once
     }
 
+    /// <summary>
+    /// A nested column's converted child is released too, not only a top-level string column (review round 3): the
+    /// struct is rebuilt around the copy and its unconverted child, and every buffer the original held is released once
+    /// the result is.
+    /// </summary>
+    [Fact]
+    public void ANestedColumnsReplacedChildIsReleased()
+    {
+        var allocator = new PoisoningAllocator();
+        var strings = Strings(allocator);
+        var ints = new Int32Array.Builder().Append(1).Append(2).Append(3).Append(4).Build(allocator);
+        var type = new StructType([new Field("s", StringType.Default, true), new Field("n", Int32Type.Default, false)]);
+        var column = new StructArray(type, strings.Length, [strings, ints], ArrowBuffer.Empty, 0);
+        var batch = new RecordBatch(new Apache.Arrow.Schema([new Field("st", type, true)], null), [column], column.Length);
+        int before = allocator.Live;
+
+        using (var result = ByteArrayRepresentation.Apply(batch, ByteArrayOutputKind.ViewType))
+        {
+            var converted = (StructArray)result.Column(0);
+            Assert.Equal(Values, Read(converted.Fields[0]));
+            Assert.Equal([1, 2, 3, 4], ((Int32Array)converted.Fields[1]).Values.ToArray());
+            Assert.True(allocator.Live < before, "the replaced string child was not released");
+        }
+
+        Assert.Equal(0, allocator.Live);
+        Assert.Equal(0, allocator.DoubleReleases);
+    }
+
+    /// <summary>
+    /// A conversion that does not own its batch, as a row mask's (review round 3), releases nothing: the reader gathers
+    /// its rows from the same arrays afterwards.
+    /// </summary>
+    [Fact]
+    public void ANonOwningConversionLeavesTheSourceIntact()
+    {
+        var allocator = new PoisoningAllocator();
+        var source = Strings(allocator);
+        var batch = new RecordBatch(new Apache.Arrow.Schema([new Field("s", StringType.Default, true)], null), [source], source.Length);
+        int before = allocator.Live;
+
+        using (var result = ByteArrayRepresentation.Apply(batch, ByteArrayOutputKind.ViewType, releaseReplaced: false))
+            Assert.Equal(Values, Read(result.Column(0)));
+
+        Assert.Equal(before, allocator.Live);
+        Assert.Equal(Values, Read(source)); // still readable: not poisoned
+        source.Dispose();
+        Assert.Equal(0, allocator.Live);
+    }
+
     [Fact]
     public void LargeStringsKeepTheirBytes()
     {
