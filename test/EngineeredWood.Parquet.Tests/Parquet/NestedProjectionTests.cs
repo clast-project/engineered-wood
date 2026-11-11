@@ -4,6 +4,9 @@
 using System.Globalization;
 using System.Text;
 using Apache.Arrow;
+using Apache.Arrow.Operations.Shredding;
+using Apache.Arrow.Operations.VariantJson;
+using Apache.Arrow.Scalars.Variant;
 using Apache.Arrow.Types;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
@@ -213,6 +216,65 @@ public class NestedProjectionTests : IDisposable
         Assert.Equal(RenderSchema(whole.Schema, null), RenderSchema(projected.Schema, null));
         for (int r = 0; r < 3; r++)
             Assert.Equal(RenderRow(whole, r, null), RenderRow(projected, r, null));
+    }
+
+    /// <summary>
+    /// An annotated, shredded variant inside a struct, read with the extension registry so the variant is wrapped and
+    /// reassembled (<c>VariantNestedWrapper</c>): any leaf under it selects the whole variant, which reads back as it
+    /// does in a whole read; the struct's other field is pruned; and a projection of that other field leaves the
+    /// variant out (review round 3).
+    /// </summary>
+    [Fact]
+    public async Task AVariantInsideAStructIsKeptWholeAndStillWrapped()
+    {
+        VariantValue Obj(int a, string b) => VariantValue.FromObject(
+            new Dictionary<string, VariantValue> { ["a"] = VariantValue.FromInt32(a), ["b"] = VariantValue.FromString(b) });
+        var values = new[] { Obj(1, "x"), VariantValue.Null, Obj(3, "z") };
+        Assert.True(VariantShredding.TryShred(values, [false, true, false], out var shredded));
+        Assert.True(shredded.IsShredded);
+
+        var sType = new StructType([new Field("id", Int32Type.Default, false), new Field("v", shredded.Data.DataType, true)]);
+        var ids = new Int32Array.Builder().Append(10).Append(11).Append(12).Build();
+        var schema = new Apache.Arrow.Schema([new Field("s", sType, true)], null);
+        string path = Path.Combine(_tempDir, "nested_variant.parquet");
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            using var batch = new RecordBatch(schema, [new StructArray(sType, 3, [ids, shredded], ArrowBuffer.Empty, 0)], 3);
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        var registry = new ExtensionTypeRegistry();
+        registry.Register(VariantExtensionDefinition.Instance);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { ExtensionRegistry = registry });
+
+        static string Json(VariantArray array, int row) =>
+            array.IsNull(row) ? "null" : VariantJsonWriter.ToJson(array.GetLogicalVariantValue(row), indented: false);
+
+        using var whole = await reader.ReadRowGroupAsync(0, ["s"]);
+        var wholeVariant = Assert.IsType<VariantArray>(((StructArray)whole.Column(0)).Fields[1]);
+        var expected = Enumerable.Range(0, 3).Select(r => Json(wholeVariant, r)).ToList();
+        Assert.Equal(VariantJsonWriter.ToJson(values[0], indented: false), expected[0]); // premise: the whole read is right
+
+        var leaves = (await reader.GetSchemaAsync()).Columns
+            .Select(c => c.DottedPath).Where(p => p.StartsWith("s.v.", StringComparison.Ordinal)).ToList();
+        Assert.True(leaves.Count >= 4, string.Join(", ", leaves)); // metadata, value, and the shredded a and b
+        foreach (string leaf in leaves)
+        {
+            using var projected = await reader.ReadRowGroupAsync(0, [leaf]);
+            var sField = (StructType)projected.Schema.FieldsList[0].DataType;
+            var vField = Assert.Single(sField.Fields);
+            Assert.Equal("v", vField.Name);
+            Assert.IsType<VariantType>(vField.DataType);
+            var variant = Assert.IsType<VariantArray>(Assert.Single(((StructArray)projected.Column(0)).Fields));
+            Assert.Equal(expected, Enumerable.Range(0, 3).Select(r => Json(variant, r)).ToList());
+        }
+
+        using var idOnly = await reader.ReadRowGroupAsync(0, ["s.id"]);
+        Assert.Equal("id", Assert.Single(((StructType)idOnly.Schema.FieldsList[0].DataType).Fields).Name);
+        Assert.Equal([10, 11, 12], ((Int32Array)((StructArray)idOnly.Column(0)).Fields[0]).Values.ToArray());
     }
 
     // ---- The oracle and the reads ------------------------------------------------------------------------------
