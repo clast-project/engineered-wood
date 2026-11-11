@@ -1190,7 +1190,7 @@ So the most reordering can save is about one cheap kernel over the batch per mis
 
 ### Decided (2026-11-10): not built
 
-- **Below the bar.** The gain reaches the ~10% bar only for scans that return almost nothing, and is under a millisecond per 2M rows even there.
+- **The gate is crossed, narrowly.** For scans returning `id` alone, the measurement exceeds the ~10% gate §24 set: +10-11% for one misplaced conjunct, and +16% (+1.1 ms per 2M rows) for two. Returning every column, it stays under it (0-8%). So reordering is not ruled out by the gate; it is declined on benefit against risk. The benefit is confined to scans that return almost nothing, and is about a millisecond per 2M rows there (review round 1 corrected this bullet, which said the measurement stayed below the gate).
 - **Risk.** Reordering needs a static guarantee that a conjunct cannot raise. 5a's is per call (it may decline), so the guarantee would be 5c's proof gate, whose edges took two review rounds (widened types, partition values). Reordering would add a second feature on that surface, plus per-scan selectivity learning and barriers at host masks and dictionary runs.
 - **Upstream.** Neither upstream project reorders adaptively. arrow-rs keeps the caller's order. DataFusion's selectivity-tracking prototypes (#19639, #21752) were closed with mixed results.
 
