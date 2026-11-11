@@ -277,6 +277,24 @@ public class NestedProjectionTests : IDisposable
         Assert.Equal([10, 11, 12], ((Int32Array)((StructArray)idOnly.Column(0)).Fields[0]).Values.ToArray());
     }
 
+    /// <summary>
+    /// <see cref="ParquetFileReader.ReadPageIndexAsync"/> keeps a selection as named, one entry per leaf in the order
+    /// named: a read's assembly order (schema order, a list or map whole) is for reads only (#816 review).
+    /// </summary>
+    [Theory]
+    [InlineData(new[] { "pt.y", "pt.x" }, new[] { "pt.y", "pt.x" })]
+    [InlineData(new[] { "l.list.element.b" }, new[] { "l.list.element.b" })]
+    [InlineData(new[] { "m.key_value.value", "id" }, new[] { "m.key_value.value", "id" })]
+    [InlineData(new[] { "id", "pt.x", "id" }, new[] { "id", "pt.x", "id" })]
+    public async Task APageIndexSelectionKeepsTheLeavesAsNamed(string[] selection, string[] expected)
+    {
+        string path = await WriteFileAsync();
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var indexes = await reader.ReadPageIndexAsync(0, selection);
+        Assert.Equal(expected, indexes.Select(i => string.Join(".", i.Path)));
+    }
+
     // ---- The oracle and the reads ------------------------------------------------------------------------------
 
     private sealed record Rendered(string Schema, List<string> Rows);
