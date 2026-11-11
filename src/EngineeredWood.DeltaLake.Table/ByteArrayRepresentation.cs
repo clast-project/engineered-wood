@@ -169,6 +169,10 @@ internal static class ByteArrayRepresentation
     /// afterwards) or with <paramref name="answer"/> (a predicate may answer with one of its own input columns). These
     /// are the partition values, backfilled NULLs, widened columns and conversions the reshaping created, which nothing
     /// else holds once the mask has answered. Each array once; every decision before anything is disposed.
+    /// <para>Decided node by node, not per column (review round 5): a nested column the reshaping rebuilt (a struct with
+    /// a widened or converted child) still holds the reader's validity, so the column as a whole shares a buffer, but
+    /// the child it built does not. A node that shares nothing is released whole; one that shares something keeps its
+    /// own buffers, and each of its children (and its dictionary) is decided the same way.</para>
     /// </summary>
     public static void ReleaseReshaped(RecordBatch reshaped, RecordBatch borrowed, IArrowArray? answer)
     {
@@ -181,17 +185,33 @@ internal static class ByteArrayRepresentation
         if (answer is not null)
             Parquet.BatchSelector.CollectBuffers(answer.Data, kept);
 
-        var doomed = new List<IArrowArray>();
+        var doomed = new List<ArrayData>();
+        var visited = new List<ArrayData>();
         for (int i = 0; i < reshaped.ColumnCount; i++)
+            Decide(reshaped.Column(i).Data, kept, visited, doomed);
+
+        foreach (var data in doomed)
+            data.Dispose();
+    }
+
+    // Adds to `doomed` the nodes of the tree under `data` that share no buffer with `kept`, outermost first: a node
+    // that shares nothing goes whole (its descendants with it); one that shares something keeps its own buffers.
+    private static void Decide(ArrayData data, HashSet<ReadOnlyMemory<byte>> kept, List<ArrayData> visited, List<ArrayData> doomed)
+    {
+        if (visited.Exists(v => ReferenceEquals(v, data)))
+            return;
+        visited.Add(data);
+
+        if (!Parquet.BatchSelector.SharesAny(data, kept))
         {
-            var column = reshaped.Column(i);
-            if (doomed.Exists(d => ReferenceEquals(d, column)) || Parquet.BatchSelector.SharesAny(column.Data, kept))
-                continue;
-            doomed.Add(column);
+            doomed.Add(data);
+            return;
         }
 
-        foreach (var column in doomed)
-            column.Dispose();
+        foreach (var child in data.Children ?? [])
+            Decide(child, kept, visited, doomed);
+        if (data.Dictionary is { } dictionary)
+            Decide(dictionary, kept, visited, doomed);
     }
 
     private static bool IsLeaf(IArrowType type) =>

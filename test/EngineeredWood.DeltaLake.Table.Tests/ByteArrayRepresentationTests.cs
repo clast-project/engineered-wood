@@ -238,6 +238,43 @@ public class ByteArrayRepresentationTests
         Assert.Equal([true, false], Enumerable.Range(0, 2).Select(i => partitionFlag.GetValue(i)!.Value));
     }
 
+    /// <summary>
+    /// A nested column the reshaping rebuilt still holds the reader's validity, but the child it built is released
+    /// (review round 5): the decision is made node by node, not per column. The reader's validity and its unchanged
+    /// child are kept.
+    /// </summary>
+    [Fact]
+    public void AChildTheReshapingBuiltIsReleasedInsideASharedStruct()
+    {
+        var readerAllocator = new PoisoningAllocator();
+        var builtAllocator = new PoisoningAllocator();
+
+        // The reader's struct {n: int32, s: utf8}, with a validity bitmap of its own.
+        var n = new Int32Array.Builder().Append(1).Append(2).Append(3).Append(4).Build(readerAllocator);
+        var s = Strings(readerAllocator);
+        var validity = new ArrowBuffer.BitmapBuilder().Append(true).Append(true).Append(false).Append(true).Build(readerAllocator);
+        var readerType = new StructType([new Field("n", Int32Type.Default, false), new Field("s", StringType.Default, true)]);
+        var readerStruct = new StructArray(readerType, 4, [n, s], validity, nullCount: 1);
+        var borrowed = new RecordBatch(new Apache.Arrow.Schema([new Field("st", readerType, true)], null), [readerStruct], 4);
+
+        // The reshaping's struct: the reader's validity and `n`, around a string child it built (a conversion, or a
+        // widening, would do the same).
+        var built = Views(builtAllocator);
+        var shapedType = new StructType([new Field("n", Int32Type.Default, false), new Field("s", StringViewType.Default, true)]);
+        var shapedStruct = new StructArray(new ArrayData(
+            shapedType, 4, 1, 0, readerStruct.Data.Buffers, [n.Data, built.Data]));
+        var shaped = new RecordBatch(new Apache.Arrow.Schema([new Field("st", shapedType, true)], null), [shapedStruct], 4);
+        int readerBefore = readerAllocator.Live;
+
+        ByteArrayRepresentation.ReleaseReshaped(shaped, borrowed, answer: null);
+
+        Assert.Equal(0, builtAllocator.Live);
+        Assert.Equal(readerBefore, readerAllocator.Live);
+        Assert.Equal([1, 2, 3, 4], n.Values.ToArray());
+        Assert.Equal(Values, Read(s));
+        Assert.Equal(0, readerAllocator.DoubleReleases + builtAllocator.DoubleReleases);
+    }
+
     [Fact]
     public void LargeStringsKeepTheirBytes()
     {
