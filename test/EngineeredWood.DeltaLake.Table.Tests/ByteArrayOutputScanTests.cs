@@ -32,15 +32,17 @@ public class ByteArrayOutputScanTests : IDisposable
             Directory.Delete(_tempDir, recursive: true);
     }
 
-    /// <summary>A host that always returns plain utf8 and binary, whatever the table's options ask for.</summary>
-    private sealed class PlainReader(ITableFileSystem fs) : IDataFileReader
+    /// <summary>A host that returns its strings and binaries in one fixed representation, whatever the table's
+    /// options ask for.</summary>
+    private sealed class FixedReader(ITableFileSystem fs, ByteArrayOutputKind hostKind) : IDataFileReader
     {
         public async IAsyncEnumerable<RecordBatch> ReadAsync(
             string relativePath, IReadOnlyList<string>? physicalColumns,
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
             await using var file = await fs.OpenReadAsync(relativePath, cancellationToken);
-            using var reader = new ParquetFileReader(file, ownsFile: false);
+            using var reader = new ParquetFileReader(file, ownsFile: false,
+                new ParquetReadOptions { ByteArrayOutput = hostKind });
             await foreach (var b in reader.ReadAllAsync(columnNames: physicalColumns, cancellationToken: cancellationToken))
                 yield return b;
         }
@@ -90,21 +92,27 @@ public class ByteArrayOutputScanTests : IDisposable
     {
         foreach (var kind in new[] { ByteArrayOutputKind.Default, ByteArrayOutputKind.ViewType, ByteArrayOutputKind.LargeOffsets })
         {
-            foreach (bool seam in new[] { false, true })
-                yield return [kind, seam];
+            yield return [kind, "none"];
+            yield return [kind, "utf8 host"];
+            yield return [kind, "view host"];
         }
     }
 
     [Theory]
     [MemberData(nameof(Cases))]
-    public async Task EveryBatchMatchesGetReadSchema(ByteArrayOutputKind kind, bool seam)
+    public async Task EveryBatchMatchesGetReadSchema(ByteArrayOutputKind kind, string seam)
     {
         string path = await WriteTableAsync();
         var fs = new LocalTableFileSystem(path);
         var options = new DeltaTableOptions
         {
             ParquetReadOptions = new ParquetReadOptions { ByteArrayOutput = kind },
-            DataFileReader = seam ? new PlainReader(fs) : null,
+            DataFileReader = seam switch
+            {
+                "utf8 host" => new FixedReader(fs, ByteArrayOutputKind.Default),
+                "view host" => new FixedReader(fs, ByteArrayOutputKind.ViewType),
+                _ => null,
+            },
         };
         await using var table = await DeltaTable.OpenAsync(fs, options);
         var read = new DeltaReadOptions { Metadata = DeltaRowMetadata.Locator };
