@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24, 5b in §25, 5c in §26, 5d in §27. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24, 5b in §25, 5c in §26, 5d in §27; 5e measured and closed in §28. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -1160,3 +1160,38 @@ Each of these mutations fails tests:
 - no validity bitmap (42);
 - a null count of 0 with a bitmap (42);
 - the TRUE bit read from the known table (6, once the no-NULL test existed; every earlier column held NULLs, so the no-NULL loop was never run).
+
+## 28. Phase 5e: reordering conjuncts by selectivity, measured and not built (2026-11-10)
+
+§24 planned reordering a filter's conjuncts by observed selectivity only if a measured gap, an unselective conjunct ahead of a selective one against the reverse, exceeded about 10% after 5a.
+
+### Why the gap is bounded
+
+Two things bound what reordering can win:
+- **Only conjuncts that cannot raise may move** (§7). Moving one that can would hide errors. Those are exactly the cheap ones: direct-kernel comparisons, null tests and dictionary answers. An expensive conjunct (a function call, `IN` without a kernel, a cast) cannot be reordered at all.
+- **The order changes no decoding.** Pass 1 decodes every predicate column of a row group before any predicate is asked, so a selective conjunct placed first saves only the evaluation of the conjuncts after it. With 5a, an unselective first conjunct leaves most rows live, so the selective one is asked about the whole batch; the reverse order asks the unselective one about a gather of 2% of the rows.
+
+So the most reordering can save is about one cheap kernel over the batch per misplaced conjunct.
+
+### Measured
+
+`ConjunctOrderBenchmarks` (new, Delta benchmarks): `ConjunctSplitBenchmarks`'s table (2M rows), returning `id` alone or every column, `MaxConcurrentReads` 4, 2 launches x 20 iterations, i9-12900K, net10.0. The first figure is with the unselective conjunct first, against the selective one first (2% kept). The run was repeated, and rows varied by up to 6 points between runs.
+
+| Conjuncts (unselective \| selective) | `id` only | Every column |
+|---|---|---|
+| `id >= 0 AND amount < 990` \| `amount < 20` | +16% (+1.1 ms) | +5% (+0.55 ms) |
+| `amount < 990` \| `amount > 980` | +11% (+0.7 ms) | +7% (+0.8 ms) |
+| `amount < 990` \| `qty = 7` (dictionary) | +10% (+0.7 ms) | +8% (+0.9 ms) |
+| `id >= 0` \| `amount < 20` | +6% (+0.4 ms) | +2% (+0.2 ms) |
+| `category <> 'cat_03'` (dictionary) \| `amount < 20` | -3% | 0% |
+
+- A misplaced direct-kernel conjunct costs 0.4-1.1 ms per 2M rows, as predicted. That is 6-16% of a scan returning `id` alone, and 0-8% of one returning all four of this table's columns; a wider table's share is smaller still.
+- A conjunct answered from its dictionary costs nothing in either place.
+
+### Decided (2026-11-10): not built
+
+- **Below the bar.** The gain reaches the ~10% bar only for scans that return almost nothing, and is under a millisecond per 2M rows even there.
+- **Risk.** Reordering needs a static guarantee that a conjunct cannot raise. 5a's is per call (it may decline), so the guarantee would be 5c's proof gate, whose edges took two review rounds (widened types, partition values). Reordering would add a second feature on that surface, plus per-scan selectivity learning and barriers at host masks and dictionary runs.
+- **Upstream.** Neither upstream project reorders adaptively. arrow-rs keeps the caller's order. DataFusion's selectivity-tracking prototypes (#19639, #21752) were closed with mixed results.
+
+The conjuncts keep their source order (§7). A host that knows its selectivities can order its filter itself. `ConjunctOrderBenchmarks` stays, to repeat the measurement if evaluation gets more expensive relative to decoding.
