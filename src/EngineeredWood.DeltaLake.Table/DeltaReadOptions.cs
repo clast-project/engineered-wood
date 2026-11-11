@@ -29,10 +29,84 @@ public sealed record DeltaReadOptions
     /// <see cref="DeltaTableOptions.ParquetReadOptions"/>. Row groups and pages are pruned only by the built-in
     /// reader: a <see cref="DeltaTableOptions.DataFileReader"/> gets file pruning alone, because the codec seam
     /// hides the footer. The reader does NOT re-apply this per row, so
-    /// surviving batches still contain non-matching rows — filter them yourself. Metadata columns are
-    /// unaffected: a row keeps its file position and row id however many rows before it were skipped.
+    /// surviving batches still contain non-matching rows — filter them yourself, or set <see cref="FilterRows"/>.
+    /// Metadata columns are unaffected: a row keeps its file position and row id however many rows before it were
+    /// skipped.
     /// </summary>
+    /// <remarks>
+    /// Set <see cref="FilterRows"/> whenever you would otherwise filter the returned rows by this predicate yourself:
+    /// it is exact, and cheaper than filtering afterwards, since it can skip decoding the other columns of rows it
+    /// rejects and can answer a predicate from a column's dictionary. Leave it off when something above the scan
+    /// applies its own filter anyway (a query engine re-checking pushed filters): then the superset is all the scan
+    /// needs to return, and an exact filter would evaluate the rows twice. It is off by default because it changes
+    /// what a scan returns and what it can raise. The filter is then evaluated with Spark's ANSI rules on every row,
+    /// so a value that fails to evaluate raises, and a filter Spark's analyzer refuses is refused before any file is
+    /// read (doc/row-level-filtering.md §30).
+    /// </remarks>
     public Expressions.Predicate? Filter { get; init; }
+
+    /// <summary>
+    /// When true, <see cref="Filter"/> is also applied to rows, exactly: a scan returns only the rows it answers
+    /// TRUE for (a NULL answer drops the row, as a SQL <c>WHERE</c> does). False (the default) keeps the superset
+    /// <see cref="Filter"/> describes.
+    /// </summary>
+    /// <remarks>
+    /// <para>The filter is evaluated with the same Spark-configured rules as a predicate DELETE or UPDATE, against
+    /// each row's logical values (partition values, schema-evolution NULLs and widened types included). It is
+    /// refused before any file is read when Spark's analyzer would refuse it, and a value that fails to evaluate (an
+    /// ANSI cast error, say) raises from the scan. A row a deletion vector deletes is never evaluated.</para>
+    /// <para>With the built-in reader the evaluation runs inside the Parquet read, where it can avoid decoding the
+    /// other columns of rows it rejects (#502); through a <see cref="DeltaTableOptions.DataFileReader"/> it runs on
+    /// each batch the reader returns. Columns the filter reads but <see cref="Columns"/> does not name are read for
+    /// it and not returned. Metadata columns follow the rows: a row keeps its file position and row id.</para>
+    /// </remarks>
+    public bool FilterRows { get; init; }
+
+    /// <summary>
+    /// Rows of the scan's result to skip before the first one returned. 0 (the default) skips none.
+    /// </summary>
+    /// <remarks>
+    /// <para>The result's order is the scan's: files in path order, row groups and rows in file order, whatever
+    /// <see cref="DeltaTableOptions.MaxConcurrentReads"/> is. An offset past the last row returns nothing.</para>
+    /// <para>Applied to the rows the scan returns, so with a <see cref="Filter"/> only when it is exact
+    /// (<see cref="FilterRows"/>); with a superset filter the rows skipped would depend on which ones pruning happened
+    /// to keep, and setting an offset or a limit then throws. <see cref="RowMasks"/> apply first.</para>
+    /// <para>With no row condition (no exact filter, no mask) and the built-in reader, each row group's live rows
+    /// are known from the file's footer and deletion vector, so the row groups the offset covers are not read at
+    /// all. Otherwise skipped rows are read and evaluated to know which they are. Metadata columns are those of the
+    /// rows returned.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">Negative.</exception>
+    public long Offset { get; init; }
+
+    /// <summary>
+    /// The most rows the scan returns, after <see cref="Offset"/>. Null (the default) returns every row; 0 returns
+    /// none and reads nothing.
+    /// </summary>
+    /// <remarks>
+    /// <para>The scan stops reading once the rows are returned. A consumer that stops enumerating early gets that
+    /// too, but only after the scan has read ahead (<see cref="DeltaTableOptions.MaxConcurrentReads"/> row groups);
+    /// with a limit it reads ahead only what it needs. With no row condition and the built-in reader, the row groups
+    /// that hold the rows are known from their footers and deletion vectors, and only those are read, in parallel.
+    /// With an exact filter, masks or a <see cref="DeltaTableOptions.DataFileReader"/>, how many rows match is not
+    /// known ahead: the scan reads one row group first (a whole window when there is an offset, which has to be read
+    /// through anyway), then as many more as the rows still needed suggest, up to its window.</para>
+    /// <para>Same conditions as <see cref="Offset"/>.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">Negative.</exception>
+    public long? Limit { get; init; }
+
+    /// <summary>
+    /// The host's own row conditions (#502): a scan returns only the rows every mask answers TRUE for. Null or empty
+    /// for none. They apply whether or not <see cref="FilterRows"/> is set, after the exact <see cref="Filter"/>
+    /// when it is, in the order given. Each mask's columns are refused before any file is read unless the table has
+    /// them; they are read for the mask and returned only if <see cref="Columns"/> names them.
+    /// </summary>
+    /// <remarks>
+    /// A row a deletion vector deletes is never passed to a mask, and metadata columns follow the rows kept. See
+    /// <see cref="DeltaRowMask"/> for what a mask is given and may assume.
+    /// </remarks>
+    public IReadOnlyList<DeltaRowMask>? RowMasks { get; init; }
 
     /// <summary>Which per-row metadata columns to append. Combinable; defaults to none.</summary>
     public DeltaRowMetadata Metadata { get; init; } = DeltaRowMetadata.None;

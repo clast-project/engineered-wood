@@ -100,6 +100,13 @@ public class FilteredScanBenchmarks
         return await Ew.FilteredCountAsync(table, _sql, Columns, exact: true);
     }
 
+    [BenchmarkCategory("FilteredScan"), Benchmark(Description = "EW ReadAsync, FilterRows")]
+    public async Task<long> EW_FilterRows()
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
+        return await Ew.FilterRowsCountAsync(table, _sql, Columns);
+    }
+
     [BenchmarkCategory("FilteredScan"), Benchmark(Description = "EW ReadAsync, prune only")]
     public async Task<long> EW_PruneOnly()
     {
@@ -159,6 +166,13 @@ public class LargeScanBenchmarks
     {
         await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
         return await Ew.FilteredCountAsync(table, Sql.OneCategory, Columns, exact: true);
+    }
+
+    [BenchmarkCategory("LargeOneCategory"), Benchmark(Description = "EW ReadAsync, FilterRows, 10M rows")]
+    public async Task<long> EW_OneCategoryFilterRows()
+    {
+        await using var table = await EwDeltaTable.OpenAsync(Ew.Fs(_path), Ew.ReadOptions);
+        return await Ew.FilterRowsCountAsync(table, Sql.OneCategory, Columns);
     }
 
     [BenchmarkCategory("LargeOneCategory"), Benchmark(Description = "DD QueryAsync SELECT … WHERE, 10M rows")]

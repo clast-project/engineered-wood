@@ -53,6 +53,18 @@ if (args.Length > 0 && args[0] == "rowgroup-parallel-ab")
     return;
 }
 
+if (args.Length > 0 && args[0] == "dictanswer-ab")
+{
+    Environment.ExitCode = await DictionaryAnswerAb.RunAsync(args);
+    return;
+}
+
+if (args.Length > 0 && args[0] == "rowfilter-ab")
+{
+    Environment.ExitCode = await RowFilterAb.RunAsync(args);
+    return;
+}
+
 if (args.Length > 0 && args[0] == "dictpruning-ab")
 {
     Environment.ExitCode = await DictionaryPruningAb.RunAsync(args);

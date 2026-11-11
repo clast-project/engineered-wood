@@ -1024,4 +1024,154 @@ public class StatisticsEvaluatorTests
         var stats = new TestStats().With("x", min: "b", max: 1, nullCount: 0);
         Assert.Equal(FilterResult.Unknown, Eval(Expressions.Equal("x", 5), stats));
     }
+
+    // ── Proofs that every row is TRUE (#502 phase 5c) ──
+
+    private static bool Proves(Predicate p, TestStats s) => StatisticsEvaluator.ProvesEveryRowTrue(p, s, Accessor);
+
+    [Fact]
+    public void Proof_ALeafWithNoNullsIsProven()
+    {
+        var stats = new TestStats().With("x", min: 10, max: 20, nullCount: 0, valueCount: 100);
+        Assert.True(Proves(Expressions.GreaterThanOrEqual("x", 10), stats));
+        Assert.True(Proves(Expressions.LessThan("x", 21), stats));
+        Assert.True(Proves(Expressions.IsNotNull("x"), stats));
+    }
+
+    [Fact]
+    public void Proof_NullsBlockEveryLeafButIsNull()
+    {
+        var stats = new TestStats().With("x", min: 10, max: 20, nullCount: 3, valueCount: 100);
+        Assert.False(Proves(Expressions.GreaterThanOrEqual("x", 10), stats));
+        var allNull = new TestStats().With("x", nullCount: 100, valueCount: 100);
+        Assert.True(Proves(Expressions.IsNull("x"), allNull));
+    }
+
+    /// <summary>
+    /// A prefix test is the leaf the evaluator answers AlwaysTrue without the null count: the proof adds it.
+    /// </summary>
+    [Fact]
+    public void Proof_APrefixTestNeedsNoNulls()
+    {
+        var withNulls = new TestStats().With("s", min: "abc", max: "abd", nullCount: 3, valueCount: 100);
+        var startsWith = Expressions.StartsWith("s", "ab");
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(startsWith, withNulls)); // the pruning answer this must not follow
+        Assert.False(Proves(startsWith, withNulls));
+        Assert.True(Proves(startsWith, new TestStats().With("s", min: "abc", max: "abd", nullCount: 0, valueCount: 100)));
+    }
+
+    /// <summary>
+    /// The evaluator's AlwaysFalse ignores NULL rows (they are not TRUE either), so NOT of it would claim every row
+    /// TRUE: <c>NOT (x &lt; 5)</c> over [10, 20] with NULLs. A proof never goes through NOT.
+    /// </summary>
+    [Fact]
+    public void Proof_NotIsNeverProven()
+    {
+        var stats = new TestStats().With("x", min: 10, max: 20, nullCount: 3, valueCount: 100);
+        var not = new NotPredicate(Expressions.LessThan("x", 5));
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(not, stats)); // the pruning answer this must not follow
+        Assert.False(Proves(not, stats));
+    }
+
+    [Fact]
+    public void Proof_AndNeedsEveryChildAndOrAny()
+    {
+        var stats = new TestStats()
+            .With("x", min: 10, max: 20, nullCount: 0, valueCount: 100)
+            .With("y", min: 0, max: 50, nullCount: 0, valueCount: 100);
+        var provenX = Expressions.GreaterThanOrEqual("x", 10);
+        var unknownY = Expressions.LessThan("y", 25);
+        Assert.False(Proves(Expressions.And(provenX, unknownY), stats));
+        Assert.True(Proves(Expressions.Or(unknownY, provenX), stats));
+        Assert.True(Proves(Expressions.And(provenX, Expressions.LessThan("y", 51)), stats));
+    }
+
+    [Fact]
+    public void Proof_OtherLeavesAreNotProven()
+    {
+        var stats = new TestStats().With("x", min: 10, max: 10, nullCount: 0, valueCount: 100)
+            .With("s", min: "ab", max: "ab", nullCount: 0, valueCount: 100);
+        Assert.False(Proves(Expressions.In("x", 10), stats));                  // IN: write =
+        Assert.False(Proves(Expressions.GreaterThanOrEqual("x", 10L), stats));  // a literal of another type
+        Assert.False(Proves(new ComparisonPredicate(Expressions.Lit("a"), ComparisonOperator.StartsWith, Expressions.Ref("s")), stats));
+        Assert.True(Proves(Expressions.Equal("x", 10), stats));
+    }
+
+    /// <summary>
+    /// #808: an INT literal over a BIGINT column is proven, as SQL types <c>id &gt;= 2500</c>: the literal widens to
+    /// the column's type exactly, and Spark compares there too. Bounds still decide.
+    /// </summary>
+    [Fact]
+    public void Proof_AnIntLiteralOverABigintColumn()
+    {
+        var stats = new TestStats().With("id", min: 2500L, max: 4999L, nullCount: 0, valueCount: 100);
+        Assert.True(Proves(Expressions.GreaterThanOrEqual("id", 2500), stats));
+        Assert.True(Proves(Expressions.LessThan("id", 5000), stats));
+        Assert.True(Proves(Expressions.NotEqual("id", 100), stats));
+        Assert.False(Proves(Expressions.GreaterThanOrEqual("id", 2501), stats)); // outside the bounds
+        Assert.False(Proves(Expressions.LessThan("id", 4999), stats));
+        Assert.True(Proves(Expressions.Equal("id", 7), new TestStats().With("id", min: 7L, max: 7L, nullCount: 0, valueCount: 3)));
+
+        // Bounds past the INT range: the comparison is exact all the same.
+        var wide = new TestStats().With("id", min: 3_000_000_000L, max: 4_000_000_000L, nullCount: 0, valueCount: 100);
+        Assert.True(Proves(Expressions.GreaterThan("id", int.MaxValue), wide));
+        Assert.False(Proves(Expressions.LessThan("id", int.MaxValue), wide));
+    }
+
+    /// <summary>
+    /// #808: a FLOAT literal over a DOUBLE column proves exactly what the DOUBLE literal of the same value does, NaN,
+    /// -0.0 and the infinities included: the widening keeps every float's value.
+    /// </summary>
+    [Theory]
+    [InlineData(1.5f)]
+    [InlineData(0.1f)]
+    [InlineData(-0.0f)]
+    [InlineData(0.0f)]
+    [InlineData(float.NaN)]
+    [InlineData(float.PositiveInfinity)]
+    [InlineData(float.NegativeInfinity)]
+    public void Proof_AFloatLiteralOverADoubleColumnProvesAsItsDouble(float value)
+    {
+        double widened = value;
+        foreach (var stats in new[]
+        {
+            new TestStats().With("d", min: 0.0, max: 2.5, nullCount: 0, valueCount: 10),
+            new TestStats().With("d", min: -0.0, max: 0.0, nullCount: 0, valueCount: 10),
+            new TestStats().With("d", min: (double)0.1f, max: (double)0.1f, nullCount: 0, valueCount: 10),
+            new TestStats().With("d", min: -1.0, max: double.PositiveInfinity, nullCount: 0, valueCount: 10),
+        })
+        {
+            foreach (var op in new[]
+            {
+                ComparisonOperator.Equal, ComparisonOperator.NotEqual, ComparisonOperator.LessThan,
+                ComparisonOperator.LessThanOrEqual, ComparisonOperator.GreaterThan, ComparisonOperator.GreaterThanOrEqual,
+            })
+            {
+                var asFloat = new ComparisonPredicate(Expressions.Ref("d"), op, Expressions.Lit(LiteralValue.Of(value)));
+                var asDouble = new ComparisonPredicate(Expressions.Ref("d"), op, Expressions.Lit(LiteralValue.Of(widened)));
+                Assert.Equal(Proves(asDouble, stats), Proves(asFloat, stats));
+            }
+        }
+
+        // Not vacuous: a float literal is proven somewhere.
+        var bounded = new TestStats().With("d", min: 1.5, max: 2.5, nullCount: 0, valueCount: 10);
+        Assert.True(Proves(Expressions.GreaterThanOrEqual("d", 1.5f), bounded));
+    }
+
+    /// <summary>#808: only those two widenings. A literal wider than the column, an unsigned one, a double over a float
+    /// column or an integer over a floating one stays unproven.</summary>
+    [Fact]
+    public void Proof_OtherConversionsStayUnproven()
+    {
+        var ints = new TestStats().With("x", min: 10, max: 20, nullCount: 0, valueCount: 100);
+        Assert.False(Proves(Expressions.GreaterThanOrEqual("x", 10L), ints));                     // BIGINT over INT
+        var unsigned = new TestStats().With("u", min: 10UL, max: 20UL, nullCount: 0, valueCount: 100);
+        Assert.False(Proves(Expressions.GreaterThanOrEqual("u", 10U), unsigned));                 // UINT over UBIGINT
+        var floats = new TestStats().With("f", min: 1.5f, max: 2.5f, nullCount: 0, valueCount: 100);
+        Assert.False(Proves(Expressions.GreaterThanOrEqual("f", 1.5), floats));                   // DOUBLE over FLOAT
+        var doubles = new TestStats().With("d", min: 1.0, max: 2.0, nullCount: 0, valueCount: 100);
+        Assert.False(Proves(Expressions.GreaterThanOrEqual("d", 1), doubles));                    // INT over DOUBLE
+        var decimals = new TestStats().With("m", min: 1.50m, max: 2.50m, nullCount: 0, valueCount: 100);
+        Assert.False(Proves(Expressions.GreaterThanOrEqual("m", 1), decimals));                   // INT over DECIMAL
+    }
 }

@@ -19,7 +19,7 @@ namespace EngineeredWood.Expressions;
 /// comparisons), the result is <see cref="FilterResult.Unknown"/>. Callers
 /// should not skip data on Unknown.
 /// </remarks>
-public static class StatisticsEvaluator
+public static partial class StatisticsEvaluator
 {
     /// <summary>
     /// Evaluates a predicate against statistics for a unit of data.

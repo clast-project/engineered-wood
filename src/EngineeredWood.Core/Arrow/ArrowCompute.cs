@@ -57,6 +57,14 @@ public static partial class ArrowCompute
             case NullArray:
                 return new NullArray(indices.Length);
 
+            // A dictionary column gathers its indices and keeps its dictionary (#794), as Arrow's own `take` does:
+            // the indices are fixed-width integers, gathered by value slot with their nulls, and every gathered
+            // index still points into the same dictionary. The result SHARES the source's dictionary, so a caller
+            // that releases the source after gathering must keep it (BatchSelector.ReleaseAfterGather does: it
+            // collects a column's dictionary buffers with the rest).
+            case DictionaryArray a:
+                return new DictionaryArray((DictionaryType)a.Data.DataType, Take(a.Indices, indices), a.Dictionary);
+
             // Boolean values are bit-packed, so they cannot be copied by value slot.
             case BooleanArray a:
                 return TakeBoolean(a, indices);

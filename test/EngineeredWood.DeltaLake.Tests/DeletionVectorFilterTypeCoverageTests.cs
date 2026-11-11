@@ -2,6 +2,8 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
+using Apache.Arrow.Scalars;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.DeletionVectors;
 
@@ -173,10 +175,13 @@ public class DeletionVectorFilterTypeCoverageTests
     [Fact]
     public void Filter_UnsupportedType_Throws()
     {
-        var type = new DictionaryType(Int32Type.Default, StringType.Default, ordered: false);
-        var indices = new Int32Array.Builder().Append(0).Append(1).Append(0).Build();
-        var dictionary = new StringArray.Builder().Append("alpha").Append("bravo").Build();
-        var col = new DictionaryArray(type, indices, dictionary);
+        // An interval column: a dictionary, the example here before, now gathers (#794).
+        var builder = new MonthDayNanosecondIntervalArray.Builder();
+        builder.Append(new MonthDayNanosecondInterval(1, 2, 3));
+        builder.Append(new MonthDayNanosecondInterval(4, 5, 6));
+        builder.Append(new MonthDayNanosecondInterval(7, 8, 9));
+        var col = builder.Build();
+        var type = col.Data.DataType;
 
         var schema = new Apache.Arrow.Schema.Builder().Field(new Field("d", type, true)).Build();
         var batch = new RecordBatch(schema, [col], 3);

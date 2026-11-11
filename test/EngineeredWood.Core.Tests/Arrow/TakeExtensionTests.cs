@@ -2,6 +2,8 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
+using Apache.Arrow.Scalars;
 using Apache.Arrow.Types;
 using EngineeredWood.Arrow;
 
@@ -258,13 +260,14 @@ public class TakeExtensionTests
     public void ExtensionOverUnsupportedStorage_Throws()
     {
         // An extension does not make an ungatherable storage type gatherable; it must still refuse rather
-        // than hand back a wrong-length column.
-        var indices = new Int32Array.Builder().Append(0).Append(1).Build();
-        var dictionary = new StringArray.Builder().Append("alpha").Append("bravo").Build();
-        var dictType = new DictionaryType(Int32Type.Default, StringType.Default, ordered: false);
-        var dict = new DictionaryArray(dictType, indices, dictionary);
+        // than hand back a wrong-length column. An interval: a dictionary, the storage here before, now
+        // gathers (#794).
+        var builder = new MonthDayNanosecondIntervalArray.Builder();
+        builder.Append(new MonthDayNanosecondInterval(1, 2, 3));
+        builder.Append(new MonthDayNanosecondInterval(4, 5, 6));
+        var interval = builder.Build();
 
-        var array = new WrapperType(dictType).CreateArray(dict);
+        var array = new WrapperType(interval.Data.DataType).CreateArray(interval);
 
         Assert.Throws<NotSupportedException>(() => ArrowCompute.Take(array, (int[])[1, 0]));
     }

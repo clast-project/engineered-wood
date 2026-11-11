@@ -4654,8 +4654,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     // evaluator answered NULL instead -- `dt = '2026-10-03'` deleted nothing, silently -- and disagreed with the
     // enforcer on the same text, which replaceWhere (#566) would have evaluated through both. Neither the
     // evaluator nor the registry holds state, so one shared instance is safe.
-    private static readonly Expressions.Arrow.ArrowRowEvaluator RowEvaluator =
-        new(new Expressions.Arrow.Spark.SparkFunctionRegistry());
+    private static readonly Expressions.Arrow.Spark.SparkFunctionRegistry Functions = new();
+
+    private static readonly Expressions.Arrow.ArrowRowEvaluator RowEvaluator = new(Functions);
 
     /// <summary>Adapts an analyzable predicate to the per-row mask delegate: a row is selected when the
     /// predicate evaluates to TRUE (SQL three-valued logic — NULL/unknown is not selected).</summary>
@@ -4797,13 +4798,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// order and spelling, resolved by the evaluator's rule (<see cref="ReferenceResolutions"/>: the first part of
     /// a name, ignoring case; a reference to a struct field needs its whole top-level column). Null, to read every
     /// column, when the predicate holds a node this does not know, a reference that does not resolve to exactly
-    /// one column, or no reference at all.
+    /// one column, or (unless <paramref name="emptyWhenUnreferenced"/>, which then answers an empty list) no reference at all.
     /// </summary>
-    internal static IReadOnlyList<string>? PredicateColumns(Expressions.Predicate predicate, Apache.Arrow.Schema schema)
+    internal static IReadOnlyList<string>? PredicateColumns(
+        Expressions.Predicate predicate, Apache.Arrow.Schema schema, bool emptyWhenUnreferenced = false)
     {
         var referenced = new HashSet<string>(StringComparer.Ordinal);
-        if (!Visit(predicate) || referenced.Count == 0)
+        if (!Visit(predicate))
             return null;
+        if (referenced.Count == 0)
+            return emptyWhenUnreferenced ? [] : null;
         return schema.FieldsList.Where(f => referenced.Contains(f.Name)).Select(f => f.Name).ToList();
 
         bool Visit(Expressions.Expression expression)
@@ -5231,7 +5235,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     _fs, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), addFile.Size, cancellationToken)
                 .ConfigureAwait(false);
             using var reader = new Parquet.ParquetFileReader(
-                file, ownsFile: false, _dataFileReadOptions);
+                file, ownsFile: false, _dataFileReadOptions)
+            {
+                WholeBatchLiveShare = WholeBatchLiveShare,
+                FusesAnswers = FusesAnswers,
+                OnProvenRowGroup = CountProvenRowGroup,
+            };
 
             var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
             var physicalToLogical = ColumnMapping.BuildPhysicalToLogicalMap(
@@ -5257,27 +5266,204 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     prunePredicate, snapshot.Schema, mappingMode, parquetSchema, snapshot.Metadata.PartitionColumns);
             }
 
-            var matchFileColumns = matchColumns is null
-                ? null
-                : await FileColumnsAsync(
-                        reader, snapshot, matchColumns, mappingMode, logicalToPhysical, withRowTracking: false,
-                        cancellationToken)
-                    .ConfigureAwait(false);
+            var matchFileColumns = await FileColumnsAsync(
+                    reader, snapshot, matchColumns, mappingMode, logicalToPhysical, withRowTracking: false,
+                    cancellationToken)
+                .ConfigureAwait(false)
+                ?? (await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false))
+                    .Root.Children.Select(c => c.Name).ToList();
+            var excluded = rawDeletedRows.IsEmpty ? null : rawDeletedRows;
 
-            // Row groups the existing vector already deletes in full hold no row this delete could remove, so
-            // they are skipped unread; positions after them are unchanged.
-            await foreach (var (batch, firstRow) in ReadPositionedAsync(
-                reader, filePredicate, matchFileColumns, rawDeletedRows, cancellationToken).ConfigureAwait(false))
+            // A change feed needs each deleted row itself, so the rows must be read even when the predicate reads
+            // no column of the file: one that holds none of the table's current columns (all it was written with
+            // since dropped, under column mapping) reads them through its own, which the predicate never sees.
+            if (matchFileColumns.Count == 0 && cdfEnabled)
             {
-                // Resolved exactly as the read path resolves it: the predicate must see what a scan sees.
-                var logicalBatch = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
-                // The deleted rows go on to the change file; the source file's ids must not go with them.
-                logicalBatch = ColumnMappingRecursive.StripParquetFieldIds(logicalBatch);
+                matchFileColumns = (await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false))
+                    .Root.Children.Select(c => c.Name).ToList();
+            }
 
-                // This path reads the file's raw columns rather than going through ReadFileAsync, so the hidden
-                // materialized row-tracking columns (present on any file a rewrite produced) are still attached.
-                // Take them off before the predicate runs — a user predicate should never be handed a column
-                // that is not in the table's schema — and keep their values to identify the deleted rows.
+            if (matchFileColumns.Count == 0)
+            {
+                // The predicate reads no column of this file (only partition columns, or columns added after it), and
+                // the file has none for it to read through (with a change feed, see above, that takes a file with no
+                // column at all: a table whose every column is a partition column writes such files). Every row then
+                // has the same values, of the table's shape. An expression answers the same for all of them, so it is
+                // asked once, over one row — and only when a row is live, so that a value-dependent error can't fail
+                // a delete of nothing. A function predicate is opaque: its answer may still differ by row, so it is
+                // asked about every live row, as a read of the file would have it.
+                int firstNew = newDeletedIndices.Count;
+                if (fileRows > rawDeletedRows.Count)
+                {
+                    if (prunePredicate is null)
+                    {
+                        AskAboutEveryLiveRow();
+                    }
+                    else if (OneRowMatches())
+                    {
+                        for (long row = 0; row < fileRows; row++)
+                        {
+                            if (!rawDeletedRows.Contains(row))
+                                newDeletedIndices.Add(row);
+                        }
+                    }
+                }
+
+                void AskAboutEveryLiveRow()
+                {
+                    const int chunk = 64 * 1024;
+                    var live = new List<long>(chunk);
+                    for (long row = 0; row < fileRows; row++)
+                    {
+                        if (!rawDeletedRows.Contains(row))
+                            live.Add(row);
+                        if (live.Count == chunk || (row == fileRows - 1 && live.Count > 0))
+                        {
+                            var shaped = ReconcileToTableShape(
+                                new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], live.Count), snapshot,
+                                addFile.PartitionValues, matchColumns, partitionColumns, partitionColumns.Count > 0,
+                                logicalToPhysical, addFile.Path);
+                            // Nothing else owns the batch built for the predicate, nor its answer: both are released
+                            // here, the answer only when it isn't one of the batch's own columns.
+                            var mask = predicate(shaped);
+                            try
+                            {
+                                if (mask.Length != live.Count)
+                                {
+                                    throw new ArgumentException(
+                                        $"The mask has {mask.Length} rows and the selection {live.Count}.", nameof(predicate));
+                                }
+
+                                for (int i = 0; i < live.Count; i++)
+                                {
+                                    if (mask.GetValue(i) == true)
+                                        newDeletedIndices.Add(live[i]);
+                                }
+                            }
+                            finally
+                            {
+                                Parquet.BatchSelector.Release(mask, shaped);
+                                shaped.Dispose();
+                            }
+
+                            live.Clear();
+                        }
+                    }
+                }
+
+                // A change feed still needs each deleted row: with no column in the file, a row is only its
+                // partition values and NULLs, which the table's shape supplies for a batch of no columns.
+                if (cdfEnabled)
+                {
+                    const int chunk = 64 * 1024;
+                    for (int start = firstNew; start < newDeletedIndices.Count; start += chunk)
+                    {
+                        int rows = Math.Min(chunk, newDeletedIndices.Count - start);
+                        var positions = new Int64Array.Builder().Reserve(rows);
+                        for (int i = 0; i < rows; i++)
+                            positions.Append(newDeletedIndices[start + i]);
+                        var where = new RowPositions(newDeletedIndices[start], positions.Build());
+                        CaptureSelected(new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], rows), where);
+                        where.Explicit?.Dispose();
+                    }
+                }
+
+                bool OneRowMatches()
+                {
+                    var one = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], 1);
+                    var shaped = ReconcileToTableShape(
+                        one, snapshot, addFile.PartitionValues, matchColumns, partitionColumns,
+                        partitionColumns.Count > 0, logicalToPhysical, addFile.Path);
+                    var answer = predicate(shaped);
+                    try
+                    {
+                        return answer.GetValue(0) == true;
+                    }
+                    finally
+                    {
+                        Parquet.BatchSelector.Release(answer, shaped);
+                        shaped.Dispose();
+                    }
+                }
+            }
+            else
+            {
+                // The delete is a selected read (#502): the predicate is its row filter, over only the columns it
+                // reads, and the existing vector is its excluded rows, so a row the vector already deleted is never
+                // handed to the predicate (Spark filters those rows first, too). Without a change feed nothing else
+                // is decoded: the read returns positions only. With one, the matched rows come back whole.
+                var condition = new RowCondition(matchColumns, predicate);
+                var scan = new Parquet.ParquetScan
+                {
+                    Columns = cdfEnabled
+                        ? await FileColumnsAsync(
+                                reader, snapshot, null, mappingMode, logicalToPhysical, withRowTracking: true,
+                                cancellationToken)
+                            .ConfigureAwait(false)
+                        : [],
+                    Prune = filePredicate,
+                    RowFilter = Observed(new Parquet.RowFilter(new Parquet.RowPredicate(matchFileColumns, ConditionMask(
+                        condition, snapshot, addFile, mappingMode, physicalToLogical, logicalToPhysical,
+                        partitionColumns, partitionColumns.Count > 0))
+                    {
+                        ValueWise = AnswersFromDictionaries && prunePredicate is not null && IsValueWise(prunePredicate),
+                        // Rows the deletion vector excludes need no gather either (#502 phase 5a).
+                        EvaluateWholeBatch = prunePredicate is null ? null : WholeBatchMask(
+                            prunePredicate, matchColumns, snapshot, addFile, mappingMode, physicalToLogical,
+                            logicalToPhysical, partitionColumns, partitionColumns.Count > 0),
+                        // A row group whose statistics prove the predicate deletes every live row unread (#502 5c).
+                        Proof = prunePredicate is null ? null : ProofFor(
+                            prunePredicate, snapshot, mappingMode,
+                            _options.TrustStatisticsProofs ? await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false) : null),
+                    })),
+                    ExcludedRows = excluded,
+                };
+
+                await foreach (var selected in reader.ReadSelectedAsync(scan, cancellationToken).ConfigureAwait(false))
+                {
+                    var where = selected.Positions;
+                    for (int i = 0; i < selected.Batch.Length; i++)
+                        newDeletedIndices.Add(where[i]);
+
+                    if (cdfEnabled && selected.Batch.Length > 0)
+                    {
+                        CaptureSelected(selected.Batch, where);
+                        where.Explicit?.Dispose();
+                    }
+                    else
+                    {
+                        selected.Dispose();
+                    }
+                }
+            }
+
+            // A selected batch holds only the deleted rows, each at the file position `where` gives.
+            void CaptureSelected(RecordBatch batch, RowPositions where)
+            {
+                var (logicalBatch, rawMatIds, rawMatVers) = ToDeletedRowsShape(batch);
+                deletedRowBatches.Add(logicalBatch);
+                if (!rowTrackingEnabled)
+                    return;
+                var ids = new Int64Array.Builder().Reserve(batch.Length);
+                var versions = new Int64Array.Builder().Reserve(batch.Length);
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    long? mid = rawMatIds is not null && !rawMatIds.IsNull(i) ? rawMatIds.GetValue(i) : null;
+                    long? id = mid ?? (addFile.BaseRowId is { } ab ? ab + where[i] : (long?)null);
+                    if (id is { } iv) ids.Append(iv); else ids.AppendNull();
+                    long? mv = rawMatVers is not null && !rawMatVers.IsNull(i) ? rawMatVers.GetValue(i) : null;
+                    if ((mv ?? addFile.DefaultRowCommitVersion) is { } vv) versions.Append(vv); else versions.AppendNull();
+                }
+
+                deletedRowTracking.Add((ids.Build(), versions.Build()));
+            }
+
+            // A raw batch as a scan returns it: logical names, no field ids, current schema, the hidden
+            // materialized row-tracking columns taken off (their values kept to identify the deleted rows).
+            (RecordBatch Batch, Int64Array? Ids, Int64Array? Versions) ToDeletedRowsShape(RecordBatch batch)
+            {
+                var logicalBatch = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
+                logicalBatch = ColumnMappingRecursive.StripParquetFieldIds(logicalBatch);
                 Int64Array? rawMatIds = null, rawMatVers = null;
                 if (matRowIdName is not null || matRowVerName is not null)
                 {
@@ -5285,30 +5471,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         .StripMaterializedColumns(logicalBatch, matRowIdName, matRowVerName);
                 }
 
-                // The predicate sees each row as a scan returns it: current schema, columns added since this
-                // file was written as NULL, partition columns re-materialized, widened types widened.
                 logicalBatch = ReconcileToTableShape(
-                    logicalBatch, snapshot, addFile.PartitionValues, matchColumns, partitionColumns,
+                    logicalBatch, snapshot, addFile.PartitionValues, null, partitionColumns,
                     partitionColumns.Count > 0, logicalToPhysical, addFile.Path);
-
-                // The rows this delete removes: those the predicate is TRUE for (a NULL deletes nothing) that the
-                // existing vector does not already hide — the vector and the predicate mask merged word by word.
-                var mask = predicate(logicalBatch);
-                var matchRows = MatchingLiveRows(rawDeletedRows, firstRow, batch.Length, mask);
-                foreach (int i in matchRows)
-                    newDeletedIndices.Add(firstRow + i);
-
-                // Collect deleted row data for CDC
-                if (cdfEnabled && matchRows.Count > 0)
-                {
-                    deletedRowBatches.Add(TakeRowsFromBatch(logicalBatch, matchRows));
-                    if (rowTrackingEnabled)
-                    {
-                        deletedRowTracking.Add(ResolveRowTrackingAt(
-                            matchRows, rawMatIds, rawMatVers, addFile.BaseRowId,
-                            addFile.DefaultRowCommitVersion, firstRow));
-                    }
-                }
+                return (logicalBatch, rawMatIds, rawMatVers);
             }
 
             if (newDeletedIndices.Count == 0)
@@ -5431,13 +5597,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// resolves a name ignoring case and throws on an ambiguous one, and it cannot read a struct, array, map or
     /// variant, so a reference must match exactly one primitive column that way. A mixed-type comparison answers
     /// NULL rather than throwing, so it needs no exclusion.
+    /// <para>Nor a column whose type has changed (#502 phase 5c review round 1): an older file's values are widened as
+    /// they are read, and widening can raise on a value (a DATE widened to TIMESTAMP_NTZ overflows, checked, on a
+    /// far-future day count). A proof that never reads the column would hide that error, as `d IS NULL OR id &gt;= 0`
+    /// proven by its second branch would. Such a column proves nothing anyway: the file's statistics are of its old
+    /// type, so <see cref="RowGroupPushdown.ToFileColumns"/> leaves it Unknown.</para>
     /// </summary>
     internal static bool EvaluatesEverywhere(Expressions.Predicate predicate, Schema.StructType schema)
     {
         var columns = new HashSet<string>(
             schema.Fields
                 .GroupBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
-                .Where(g => g.Count() == 1 && g.Single().Type is Schema.PrimitiveType { TypeName: not "variant" })
+                .Where(g => g.Count() == 1 && g.Single().Type is Schema.PrimitiveType { TypeName: not "variant" }
+                    && Schema.TypeWidening.GetTypeChanges(g.Single()).Count == 0)
                 .Select(g => g.Key),
             StringComparer.OrdinalIgnoreCase);
         var types = schema.Fields
@@ -5529,8 +5701,23 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         var row = Partitioning.PartitionUtils.AddPartitionColumns(
             noColumns, partitionSchema, addFile.PartitionValues, snapshot.Metadata.PartitionColumns,
             ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode), addFile.Path);
-        var mask = predicate(row);
-        return !mask.IsNull(0) && mask.GetValue(0) == true;
+        try
+        {
+            var mask = predicate(row);
+            try
+            {
+                return !mask.IsNull(0) && mask.GetValue(0) == true;
+            }
+            finally
+            {
+                // A bare boolean partition column answers with the row's own column: release, don't dispose.
+                Parquet.BatchSelector.Release(mask, row);
+            }
+        }
+        finally
+        {
+            row.Dispose();
+        }
     }
 
     /// <summary>
@@ -6019,33 +6206,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private static Int64Array TakeIds(Int64Array src, List<int> idx) =>
         (Int64Array)ArrowCompute.Take(src, idx);
 
-    // The row-tracking identity of the rows at `rows` (indices into a raw, unfiltered batch whose first row
-    // sits at absolute file position `batchStartRow`), resolved the way a conformant reader does: the
-    // MATERIALIZED value where the file carries one, else add.baseRowId + absolute position and the file's
-    // defaultRowCommitVersion. Used by the paths that read a file's raw columns themselves rather than going
-    // through ReadFileAsync, which surfaces the same resolution via its out-params.
-    private static (Int64Array Ids, Int64Array Vers) ResolveRowTrackingAt(
-        List<int> rows, Int64Array? materializedIds, Int64Array? materializedVersions,
-        long? baseRowId, long? defaultRowCommitVersion, long batchStartRow)
-    {
-        var idb = new Int64Array.Builder().Reserve(rows.Count);
-        var vrb = new Int64Array.Builder().Reserve(rows.Count);
-        foreach (int i in rows)
-        {
-            long? mid = materializedIds is not null && i < materializedIds.Length && !materializedIds.IsNull(i)
-                ? materializedIds.GetValue(i) : null;
-            long? id = mid ?? (baseRowId is { } br ? br + batchStartRow + i : (long?)null);
-            if (id is { } iv) idb.Append(iv); else idb.AppendNull();
-
-            long? mv = materializedVersions is not null && i < materializedVersions.Length
-                       && !materializedVersions.IsNull(i)
-                ? materializedVersions.GetValue(i) : null;
-            long? ver = mv ?? defaultRowCommitVersion;
-            if (ver is { } vv) vrb.Append(vv); else vrb.AppendNull();
-        }
-        return (idb.Build(), vrb.Build());
-    }
-
     // A constant Int64 column (the commit version assigned to every matched/updated row). Tiled by Repeat
     // rather than appended per row, which also drops the validity buffer a builder allocates for a column
     // that has no nulls to record.
@@ -6508,7 +6668,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             throw new ArgumentNullException(nameof(options));
         var snapshot = ResolveReadSnapshot(options) ?? CurrentSnapshot;
         ValidateReadMetadata(snapshot, options.Metadata, options.MetadataPrefix);
-        return BuildReadSchema(snapshot, options);
+        return BuildReadSchema(snapshot, options, _options.ParquetReadOptions.ByteArrayOutput);
     }
 
     /// <summary>
@@ -6641,6 +6801,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool wantTracking = (metadata & DeltaRowMetadata.RowTracking) != 0;
 
         var metadataFields = MetadataFields(metadata, options.MetadataPrefix);
+
+        // An exact filter is refused before any file is read when Spark's analyzer would refuse it, as a DML
+        // predicate is: otherwise whether the scan raised would depend on which files happened to be read.
+        if (options.FilterRows && options.Filter is not null)
+            RefuseUnanalyzable(options.Filter, snapshot);
+        RefuseUnknownMaskColumns(options.RowMasks, snapshot);
+
         var pruner = options.Filter is null ? null : new DeltaFilePruner(
             snapshot.Schema, snapshot.Metadata.PartitionColumns,
             _options.PreferTypedCheckpointStats);
@@ -6662,35 +6829,61 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // file among small ones, still keep every reader busy. A file read through the codec seam is one unit:
         // the seam hides its row groups.
         int window = EffectiveConcurrentReads;
-        if (window <= 1)
+
+        // An offset and a limit (#502 phase 5f): applied to the rows returned, which makes them exact; the planner
+        // only saves reading. A limit of 0 reads nothing.
+        var limit = ScanLimitFor(options, includedFiles, window);
+        if (limit?.Limit == 0)
+            yield break;
+
+        var rows = window <= 1
+            ? SerialScanAsync(snapshot, options, scan, included, includedFiles, limit, cancellationToken)
+            : ParallelScanAsync(snapshot, options, scan, included, includedFiles, window, limit, cancellationToken);
+        if (limit is not null)
+            rows = LimitRowsAsync(rows, limit, cancellationToken);
+        await foreach (var batch in rows.ConfigureAwait(false))
+            yield return batch;
+    }
+
+    private async IAsyncEnumerable<RecordBatch> SerialScanAsync(
+        Snapshot.Snapshot snapshot, DeltaReadOptions options, ScanFileShape scan,
+        List<(int Ordinal, AddFile File)> included, List<AddFile> includedFiles, ScanLimit? limit,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (var unit in PlanScanUnitsAsync(
+                           snapshot, options, includedFiles, lookahead: 1, cancellationToken, limit: limit)
+                           .ConfigureAwait(false))
         {
-            await foreach (var unit in PlanScanUnitsAsync(snapshot, options, includedFiles, lookahead: 1, cancellationToken)
-                               .ConfigureAwait(false))
+            try
             {
-                try
+                await foreach (var batch in ReadScanUnitAsync(
+                                   unit, scan, included[unit.File].Ordinal, ScanReservation.None, growth: null,
+                                   cancellationToken).ConfigureAwait(false))
                 {
-                    await foreach (var batch in ReadScanUnitAsync(
-                                       unit, scan, included[unit.File].Ordinal, ScanReservation.None, growth: null,
-                                       cancellationToken).ConfigureAwait(false))
-                    {
-                        yield return batch;
-                    }
-                }
-                finally
-                {
-                    unit.Read.Release();
+                    yield return batch;
                 }
             }
-            yield break;
+            finally
+            {
+                unit.Read.Release();
+            }
         }
+    }
 
+    private async IAsyncEnumerable<RecordBatch> ParallelScanAsync(
+        Snapshot.Snapshot snapshot, DeltaReadOptions options, ScanFileShape scan,
+        List<(int Ordinal, AddFile File)> included, List<AddFile> includedFiles, int window, ScanLimit? limit,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes, _options.MemoryBudget);
         LastScanBudget = budget;
         var growth = new ParquetFileReader.DecodedGrowth();
         await foreach (var batch in OrderedScan.RunAsync(
-                           PlanScanUnitsAsync(snapshot, options, includedFiles, lookahead: window, cancellationToken),
-                           (unit, reservation, ct) => ReadScanUnitAsync(
-                               unit, scan, included[unit.File].Ordinal, reservation, growth, ct),
+                           PlanScanUnitsAsync(snapshot, options, includedFiles, lookahead: window, cancellationToken, limit: limit),
+                           (unit, reservation, ct) => limit is null
+                               ? ReadScanUnitAsync(unit, scan, included[unit.File].Ordinal, reservation, growth, ct)
+                               : LimitedUnit(
+                                   ReadScanUnitAsync(unit, scan, included[unit.File].Ordinal, reservation, growth, ct), limit),
                            RollingDataFileWriter.EstimatedBytes,
                            static b => b.Dispose(),
                            window,
@@ -6699,6 +6892,27 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                            cancellationToken: cancellationToken).ConfigureAwait(false))
         {
             yield return batch;
+        }
+    }
+
+    /// <summary>
+    /// A unit's batches, telling <paramref name="limit"/> how many rows it yielded when its read has ended (a bounded
+    /// scan's ramp).
+    /// </summary>
+    private static async IAsyncEnumerable<RecordBatch> LimitedUnit(IAsyncEnumerable<RecordBatch> batches, ScanLimit limit)
+    {
+        long rows = 0;
+        try
+        {
+            await foreach (var batch in batches.ConfigureAwait(false))
+            {
+                rows += batch.Length;
+                yield return batch;
+            }
+        }
+        finally
+        {
+            limit.UnitDone(rows);
         }
     }
 
@@ -6741,7 +6955,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<AddFile> files,
         int lookahead,
         [EnumeratorCancellation] CancellationToken cancellationToken,
-        Func<int, RowSkipPredicate?>? skipRows = null)
+        Func<int, RowSkipPredicate?>? skipRows = null,
+        ScanLimit? limit = null)
     {
         var opening = new Queue<Task<OpenedFile>>();
         int next = 0;
@@ -6753,7 +6968,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             for (int f = 0; f < files.Count; f++)
             {
-                while (next < files.Count && opening.Count < Math.Max(1, lookahead))
+                // A counted limit the units handed out already cover opens no further file (#502 phase 5f).
+                if (limit is { Covered: true })
+                    yield break;
+
+                // With a limit, a file is opened ahead only while it may be needed (#502 phase 5f); the one being
+                // planned always is.
+                while (next < files.Count && opening.Count < Math.Max(1, lookahead)
+                       && (next == f || limit is null || limit.MayOpenAhead(next, f)))
                 {
                     // The scan forwards its predicate to the row-group level: it promises only a superset of the
                     // matching rows (so does a predicate DELETE, which prunes in ComputeDeleteActionsAsync).
@@ -6767,32 +6989,55 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 var opened = await opening.Dequeue().ConfigureAwait(false);
                 var read = opened.Read;
                 IAsyncEnumerator<ParquetFileReader.RowGroupPlan>? rest = null;
+                bool yieldedUnit = false;
                 try
                 {
-                    if (read.Reader is null)
+                    if (read.NoRowsMatch)
                     {
+                        // The exact filter, which reads no column of the file, answered for the whole file: nothing.
+                    }
+                    else if (read.Reader is null)
+                    {
+                        if (limit is not null && await limit.AdmitAsync(null, cancellationToken).ConfigureAwait(false) == UnitAdmission.Stop)
+                            yield break;
                         read.AddRef();
+                        yieldedUnit = true;
                         yield return new ScanUnit(f, read, null);
                     }
                     else
                     {
                         foreach (var plan in opened.Planned)
                         {
+                            var admission = limit is null ? UnitAdmission.Yield : await limit.AdmitAsync(
+                                () => LiveRowsAsync(read, plan, cancellationToken), cancellationToken).ConfigureAwait(false);
+                            if (admission == UnitAdmission.Stop)
+                                yield break;
+                            if (admission == UnitAdmission.Skip)
+                                continue;
                             read.AddRef();
+                            yieldedUnit = true;
                             yield return new ScanUnit(f, read, plan);
                         }
                         opened.Error?.Throw();
 
                         rest = read.Reader.PlanRowGroupsAsync(
-                                read.FilePredicate, read.FileColumns,
+                                read.FilePredicate, read.PlanColumns,
                                 opened.PlannedAhead ? opened.Skip : SkipOf(read, skipRows?.Invoke(f)),
                                 cancellationToken,
                                 firstRowGroup: opened.PlannedAhead ? PlansAhead : 0)
                             .GetAsyncEnumerator(cancellationToken);
                         while (await rest.MoveNextAsync().ConfigureAwait(false))
                         {
+                            var plan = rest.Current;
+                            var admission = limit is null ? UnitAdmission.Yield : await limit.AdmitAsync(
+                                () => LiveRowsAsync(read, plan, cancellationToken), cancellationToken).ConfigureAwait(false);
+                            if (admission == UnitAdmission.Stop)
+                                yield break;
+                            if (admission == UnitAdmission.Skip)
+                                continue;
                             read.AddRef();
-                            yield return new ScanUnit(f, read, rest.Current);
+                            yieldedUnit = true;
+                            yield return new ScanUnit(f, read, plan);
                         }
                     }
                 }
@@ -6802,6 +7047,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         await rest.DisposeAsync().ConfigureAwait(false);
                     read.Release();
                 }
+
+                // A file that yielded no unit lets a bounded limit open further ahead (#502 phase 5f review round 1).
+                if (!yieldedUnit)
+                    limit?.FileWithoutUnits();
             }
         }
         finally
@@ -6861,16 +7110,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool planAhead,
         CancellationToken cancellationToken)
     {
-        var read = await OpenDataFileAsync(addFile, options.Columns, snapshot, options.Filter, cancellationToken)
+        var read = await OpenDataFileAsync(
+                addFile, options.Columns, snapshot, options.Filter, cancellationToken,
+                conditions: RowConditions(options, snapshot))
             .ConfigureAwait(false);
-        if (!planAhead || read.Reader is null)
+        if (!planAhead || read.Reader is null || read.NoRowsMatch)
             return new OpenedFile(read, plannedAhead: false);
 
         var opened = new OpenedFile(read, plannedAhead: true) { Skip = SkipOf(read, skipRows?.Invoke(file)) };
         try
         {
             await foreach (var plan in read.Reader.PlanRowGroupsAsync(
-                                   read.FilePredicate, read.FileColumns, opened.Skip, cancellationToken,
+                                   read.FilePredicate, read.PlanColumns, opened.Skip, cancellationToken,
                                    endRowGroup: PlansAhead)
                                .ConfigureAwait(false))
             {
@@ -6907,12 +7158,33 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         ParquetFileReader.DecodedGrowth? growth,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _scanUnitsRead);
         var read = unit.Read;
-        var source = UnitSource(unit, reservation, growth, cancellationToken);
-
         bool wantPositions = scan.WantAddress || scan.WantLocator;
         byte[]? pathBytes = scan.WantLocator ? System.Text.Encoding.UTF8.GetBytes(read.AddFile.Path) : null;
-        await foreach (var fb in ProcessDataFileBatchesAsync(source, read, wantPositions, scan.WantTracking, cancellationToken)
+
+        // An exact filter through the built-in reader: the Parquet read selects the rows (deletion vector and filter
+        // both) and says where each one is (#502).
+        if (read.Selected is { } selected && unit.Plan is { } plan)
+        {
+            var rows = growth is null
+                ? selected.ReadAsync(plan, cancellationToken)
+                : selected.ReadAsync(plan, reservation, growth, cancellationToken);
+            await foreach (var fb in ProcessSelectedFileBatchesAsync(
+                               rows, read, wantPositions, scan.WantTracking, _options.ParquetReadOptions.ByteArrayOutput,
+                               cancellationToken)
+                               .ConfigureAwait(false))
+            {
+                yield return WithMetadataColumns(fb, scan, ordinal, pathBytes);
+            }
+
+            yield break;
+        }
+
+        var source = UnitSource(unit, reservation, growth, cancellationToken);
+        await foreach (var fb in ProcessDataFileBatchesAsync(
+                               source, read, wantPositions, scan.WantTracking, _options.ParquetReadOptions.ByteArrayOutput,
+                               cancellationToken)
                            .ConfigureAwait(false))
         {
             yield return WithMetadataColumns(fb, scan, ordinal, pathBytes);
@@ -7086,11 +7358,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     private static Apache.Arrow.Schema BuildReadSchema(
-        Snapshot.Snapshot snapshot, DeltaReadOptions options)
+        Snapshot.Snapshot snapshot, DeltaReadOptions options, ByteArrayOutputKind byteArrays)
     {
         var baseSchema = options.Columns is not null
             ? BuildProjectedSchema(snapshot.ArrowSchema, options.Columns)
             : snapshot.ArrowSchema;
+
+        // The table's string and binary columns in the representation the scan emits them in (#793).
+        if (ByteArrayRepresentation.Fields(baseSchema.FieldsList, byteArrays) is { } represented)
+            baseSchema = new Apache.Arrow.Schema(represented, baseSchema.Metadata);
 
         var metadataFields = MetadataFields(options.Metadata, options.MetadataPrefix);
         if (metadataFields.Count == 0)
@@ -11848,7 +12124,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // a scan does. Only the rows the planner kept are decoded, but a kept run still holds unselected ones.
         var source = UnitSource(unit, reservation, growth, cancellationToken);
         await foreach (var fb in ProcessDataFileBatchesAsync(
-                           source, read, wantPositions: true, wantTracking, cancellationToken).ConfigureAwait(false))
+                           source, read, wantPositions: true, wantTracking, _options.ParquetReadOptions.ByteArrayOutput,
+                           cancellationToken).ConfigureAwait(false))
         {
             // Most batches of a file hold no selected row. Every one is released here rather than left to the
             // finalizer: its native buffers would otherwise outlive the budget reservation that covered them.
@@ -11932,7 +12209,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>Whether <see cref="ArrowCompute.Take(RecordBatch, Apache.Arrow.Schema, List{int})"/> over a
     /// batch of this schema can return arrays that share the source's buffers: a binary or string VIEW column
-    /// (at any depth) keeps the source's variadic data buffers, so the source must not be disposed under it.</summary>
+    /// (at any depth) keeps the source's variadic data buffers, and a DICTIONARY column its dictionary (#794, #823
+    /// review), so the source must not be disposed under it.</summary>
     private static bool TakeSharesBuffers(Apache.Arrow.Schema schema)
     {
         foreach (var field in schema.FieldsList)
@@ -11946,6 +12224,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private static bool TakeSharesBuffers(Apache.Arrow.Types.IArrowType type) => type switch
     {
         Apache.Arrow.Types.StringViewType or Apache.Arrow.Types.BinaryViewType => true,
+        Apache.Arrow.Types.DictionaryType => true,
         Apache.Arrow.ExtensionType ext => TakeSharesBuffers(ext.StorageType),
         Apache.Arrow.Types.NestedType nested => nested.Fields.Any(f => TakeSharesBuffers(f.DataType)),
         _ => false,
@@ -12756,6 +13035,71 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Whether <paramref name="addFile"/>'s statistics name every one of <paramref name="physicalColumns"/>, so that
+    /// the file holds them: a writer records a null count for each column it wrote, keyed by physical name at the top
+    /// level of <c>nullCount</c>, a struct's as an object of its fields' counts. A column added after the file was
+    /// written has none (#790). False whenever the statistics cannot show it: none at all, a column left out (one past
+    /// <c>delta.dataSkippingNumIndexedCols</c>, say), or statistics that are not what the protocol describes. The
+    /// caller then reads every column, which is always safe.
+    /// </summary>
+    /// <remarks>
+    /// Reads the JSON itself rather than through <see cref="ColumnStats.Parse"/> (review round 1): that flattens a
+    /// struct's counts into dotted keys, which cannot tell a struct <c>s</c>'s field <c>a</c> from a top-level column
+    /// literally named <c>s.a</c>, and it throws on a root that is not an object or a count that is not an integer,
+    /// where this must decline.
+    /// </remarks>
+    internal static bool StatisticsNameEveryColumn(AddFile addFile, IReadOnlyList<string> physicalColumns)
+    {
+        if (physicalColumns.Count == 0)
+            return true;
+        if (addFile.GetStatsJson() is not { Length: > 0 } json)
+            return false;
+
+        try
+        {
+            using var document = System.Text.Json.JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object
+                || !document.RootElement.TryGetProperty("nullCount", out var nullCounts)
+                || nullCounts.ValueKind != System.Text.Json.JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            foreach (string column in physicalColumns)
+            {
+                if (!nullCounts.TryGetProperty(column, out var count) || !HoldsACount(count))
+                    return false;
+            }
+
+            return true;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return false;
+        }
+
+        // A column's entry: a non-negative integer count, or a struct's object holding at least one.
+        static bool HoldsACount(System.Text.Json.JsonElement entry)
+        {
+            switch (entry.ValueKind)
+            {
+                case System.Text.Json.JsonValueKind.Number:
+                    return entry.TryGetInt64(out long value) && value >= 0;
+                case System.Text.Json.JsonValueKind.Object:
+                    foreach (var field in entry.EnumerateObject())
+                    {
+                        if (HoldsACount(field.Value))
+                            return true;
+                    }
+
+                    return false;
+                default:
+                    return false;
+            }
+        }
+    }
+
+    /// <summary>
     /// Every physical column name a data file may carry the row-tracking materialization under: the two the
     /// table DECLARES (<c>delta.rowTracking.materializedRowIdColumnName</c> /
     /// <c>…materializedRowCommitVersionColumnName</c>) plus the legacy internal names a pre-1.0 EngineeredWood
@@ -12841,6 +13185,25 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         /// <summary>The codec seam's reader and the physical columns to ask it for; null for the built-in one.</summary>
         internal IDataFileReader? Seam { get; init; }
         internal IReadOnlyList<string>? SeamColumns { get; init; }
+
+        /// <summary>
+        /// An exact filter's selected read of this file through the built-in reader (#502): the rows it returns are
+        /// exactly those the filter answers TRUE for and the deletion vector keeps. Null without an exact filter.
+        /// </summary>
+        internal ParquetFileReader.SelectedPlanReader? Selected { get; init; }
+
+        /// <summary>The scan's row conditions through the codec seam: applied in order to each batch after it is
+        /// reconciled to the table's shape (<see cref="Columns"/> then holds the projection plus the conditions'
+        /// columns), and the batch then cut back to <see cref="FilterColumns"/>, the caller's projection (null: every
+        /// column).</summary>
+        internal IReadOnlyList<RowCondition>? SeamConditions { get; init; }
+        internal IReadOnlyList<string>? FilterColumns { get; init; }
+
+        /// <summary>A row condition reads no column of this file, and answered for all its rows: none match.</summary>
+        internal bool NoRowsMatch { get; init; }
+
+        /// <summary>The columns row groups are planned with: the selected read's, filter columns included.</summary>
+        internal IReadOnlyList<string>? PlanColumns => Selected is { } selected ? selected.ReadColumns : FileColumns;
 
         /// <summary>The rows the deletion vector deletes in full, for the reader to skip unread.</summary>
         internal RowSkipPredicate? SkipRows => DeletedRows is { IsEmpty: false } d ? d.ContainsRange : null;
@@ -12987,12 +13350,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// matches are skipped. Only a read that promises a superset of the matching rows may pass one. The codec
     /// seam ignores it (the seam hides the footer).
     /// </summary>
+    /// <param name="conditions">The row conditions the read applies to rows exactly, in order (#502: the
+    /// <see cref="DeltaReadOptions.FilterRows"/> filter, then <see cref="DeltaReadOptions.RowMasks"/>); null for
+    /// none.</param>
     private async ValueTask<DataFileRead> OpenDataFileAsync(
         AddFile addFile,
         IReadOnlyList<string>? columns,
         Snapshot.Snapshot snapshot,
         Expressions.Predicate? rowGroupFilter,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        IReadOnlyList<RowCondition>? conditions = null)
     {
         // An empty map still goes through the partition step: a missing key is a NULL value, and in a
         // non-nullable column one the read refuses. This engine's own NULL partition is such a map.
@@ -13020,8 +13387,25 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 addFile.DeletionVector, cancellationToken).ConfigureAwait(false);
         }
 
+        // The columns the read needs: the projection plus the row conditions' (null: every column, when there is
+        // no projection or a condition may read any column).
+        IReadOnlyList<string>? filterReadColumns = columns;
+        if (conditions is not null)
+        {
+            filterReadColumns = columns is null || conditions.Any(c => c.Columns is null) ? null
+                : snapshot.ArrowSchema.FieldsList
+                    .Where(f => columns.Contains(f.Name) || conditions.Any(c => c.Columns!.Contains(f.Name)))
+                    .Select(f => f.Name)
+                    .ToList();
+        }
+
         if (_options.DataFileReader is { } dataFileReader)
         {
+            // The seam reads the conditions' columns too; FilterSeamBatchesAsync drops them again.
+            var returned = columns;
+            if (conditions is not null)
+                columns = filterReadColumns;
+
             // Pluggable codec read: raw physical batches in file order (DV rows included). Projection resolves
             // by PHYSICAL NAME in every mode — id-mode field-id resolution needs the parquet footer, which the
             // seam deliberately hides; Delta-spec files carry physicalName in BOTH modes, so name resolution is
@@ -13038,14 +13422,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     .Select(c => logicalToPhysical.TryGetValue(c, out var p) ? p : c)
                     .ToList();
             }
-            else if (hasPartitions)
-            {
-                var partSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
-                seamColumns = snapshot.Schema.Fields
-                    .Where(f => !partSet.Contains(f.Name))
-                    .Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
-                    .ToList();
-            }
+
+            // Without a projection the seam is asked for every column (null), partitioned or not: naming the
+            // schema's non-partition fields instead named a column added after this file was written, which the
+            // file lacks (#790).
 
             // Row tracking: the hidden materialized columns are NOT schema fields, so neither projection above
             // ever names them — and reading a rewrite output without them silently re-derives every row's id
@@ -13057,12 +13437,20 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (seamColumns is not null && MaterializedRowTrackingColumnNames(snapshot).Count > 0)
                 seamColumns = null;
 
+            // A column added after this file was written is absent from it, and naming it fails the read in a host
+            // that binds columns by name, before the backfill can supply its NULLs (#790). The seam hides the file's
+            // schema, but the file's statistics name the columns it was written with: keep the projection only when
+            // they name every column asked for, and otherwise read every column.
+            if (seamColumns is not null && !StatisticsNameEveryColumn(addFile, seamColumns))
+                seamColumns = null;
+
             return new DataFileRead
             {
                 AddFile = addFile, Snapshot = snapshot, Columns = columns, MappingMode = mappingMode,
                 PhysicalToLogical = physicalToLogical, LogicalToPhysical = logicalToPhysical,
                 DeletedRows = deletedRows, PartitionColumns = partitionColumns, HasPartitions = hasPartitions,
                 Seam = dataFileReader, SeamColumns = seamColumns,
+                SeamConditions = conditions, FilterColumns = returned,
             };
         }
 
@@ -13074,7 +13462,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         ParquetFileReader? reader = null;
         try
         {
-            reader = new ParquetFileReader(file, ownsFile: false, _dataFileReadOptions);
+            reader = new ParquetFileReader(file, ownsFile: false, _dataFileReadOptions)
+            {
+                WholeBatchLiveShare = WholeBatchLiveShare,
+                FusesAnswers = FusesAnswers,
+                OnProvenRowGroup = CountProvenRowGroup,
+            };
 
             // The footer, read here whether or not the columns need resolving against it: every read of the file
             // needs it, and a scan opens files AHEAD of the one it is planning, so that the footer's round trips
@@ -13096,12 +13489,303 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     rowGroupFilter, snapshot.Schema, mappingMode, parquetSchema, snapshot.Metadata.PartitionColumns);
             }
 
+            ParquetFileReader.SelectedPlanReader? selected = null;
+            bool noRowsMatch = false;
+            if (conditions is not null)
+            {
+                // Each condition's own columns, physical and present in this file. A condition over none of them
+                // (only partition columns, or columns added after the file) answers the same for every row of the
+                // file, so it is asked once, here, over one row of the table's shape — and only when some row is
+                // live: a scan of an empty file, or of one its deletion vector empties, asks no condition anything,
+                // so it must not fail on a value-dependent error here.
+                //
+                // The FilterRows filter goes in as its top-level conjuncts, in source order (#502 phase 4a). A
+                // conjunct over none of the file's columns is answered up front, see FileConstantConjunctsAsync.
+                // The others become one row predicate each, whose NULL answers stay live for the conjuncts after
+                // them, so the split keeps the expression's three-valued AND. The reader hands each conjunct only
+                // the rows still live, which measured 18-43% faster than one AND over 2-3 scattered conjuncts
+                // keeping 9-76% (ConjunctSplitBenchmarks), and 12% slower when they keep 94%. The first host mask
+                // after them drops the rows the filter answered NULL for.
+                var steps = new List<ConditionStep>(conditions.Count);
+                foreach (var condition in conditions)
+                {
+                    if (condition.Filter is { } filter)
+                    {
+                        foreach (var conjunct in Conjuncts(filter))
+                        {
+                            var conjunctColumns = PredicateColumns(conjunct, snapshot.ArrowSchema, emptyWhenUnreferenced: true);
+                            steps.Add(new ConditionStep(
+                                new RowCondition(conjunctColumns, batch => RowEvaluator.EvaluatePredicate(conjunct, batch)),
+                                conjunct,
+                                await ConditionFileColumnsAsync(conjunctColumns).ConfigureAwait(false)));
+                        }
+                    }
+                    else
+                    {
+                        steps.Add(new ConditionStep(
+                            condition, null, await ConditionFileColumnsAsync(condition.Columns).ConfigureAwait(false)));
+                    }
+                }
+
+                var predicates = new List<RowPredicate>(steps.Count);
+                IReadOnlyList<string>? everyColumn = null;
+
+                // Row-group statistics may prove a run of conjuncts TRUE for every row, dropping it for that group (#502
+                // phase 5c), only where the table trusts statistics proofs at all.
+                var proofSchema = _options.TrustStatisticsProofs
+                    ? parquetSchema ??= await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false)
+                    : null;
+                if (steps.Any(s => s.FileColumns is null))
+                {
+                    everyColumn = await FileColumnsAsync(
+                            reader, snapshot, null, mappingMode, logicalToPhysical, withRowTracking: false,
+                            cancellationToken)
+                        .ConfigureAwait(false)
+                        ?? (await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false))
+                            .Root.Children.Select(c => c.Name).ToList();
+                }
+
+                bool? live = null;
+                noRowsMatch = !await FileConstantConjunctsAsync().ConfigureAwait(false);
+                var run = new List<ConditionStep>();
+                bool afterFilter = false;
+                foreach (var step in noRowsMatch ? [] : (IEnumerable<ConditionStep>)steps)
+                {
+                    if (step.Conjunct is not null)
+                    {
+                        if (step.Dropped)
+                            continue;
+                        if (step.Deferred is { } error)
+                        {
+                            // It raised over the file's one row, after a conjunct the reader answers row by row: it
+                            // raises once a row survives the conjuncts before it, as it would in the expression.
+                            FlushRun();
+                            predicates.Add(new RowPredicate(predicates[^1].Columns, batch =>
+                            {
+                                if (batch.Length > 0)
+                                    error.Throw();
+                                return Repeat(true, 0);
+                            }));
+                            continue;
+                        }
+
+                        if (run.Count > 0 && !EvaluatesConjunctsTogether)
+                            FlushRun();
+                        run.Add(step);
+                        continue;
+                    }
+
+                    // A host mask. FlushRun emits the filter's pending row-level conjuncts and sets afterFilter, so
+                    // the first mask after them drops the rows they answered NULL for. A dropped (TRUE) file-constant
+                    // conjunct in between emits nothing and leaves both alone.
+                    FlushRun();
+                    var condition = step.Condition;
+                    var conditionFileColumns = step.FileColumns;
+                    bool dropsEarlierNulls = afterFilter;
+                    afterFilter = false;
+                    if (conditionFileColumns is { Count: 0 } && predicates.Count > 0)
+                    {
+                        // After a condition the reader answers row by row, this one may be asked only once a row
+                        // survives that: an earlier mask rejecting every row must keep it from being asked at all.
+                        // So the reader asks it, over the columns it already read for the condition before, and
+                        // the one answer for the file is computed the first time a batch has a row, then repeated
+                        // for every row. (The reader also asks a predicate over no rows once none is live.)
+                        var once = new Lazy<bool>(() => OneRowAnswer(condition) == true);
+                        predicates.Add(new RowPredicate(
+                            predicates[^1].Columns,
+                            batch => Repeat(batch.Length > 0 && once.Value, batch.Length))
+                        {
+                            DropsEarlierNulls = dropsEarlierNulls,
+                        });
+                        continue;
+                    }
+
+                    if (conditionFileColumns is { Count: 0 })
+                    {
+                        if (!await LiveAsync().ConfigureAwait(false) || OneRowAnswer(condition) != true)
+                        {
+                            noRowsMatch = true;
+                            break;
+                        }
+
+                        continue;
+                    }
+
+                    predicates.Add(new RowPredicate(conditionFileColumns ?? everyColumn!, ConditionMask(
+                        condition, snapshot, addFile, mappingMode, physicalToLogical, logicalToPhysical,
+                        partitionColumns, hasPartitions, byteArrays: _options.ParquetReadOptions.ByteArrayOutput))
+                    {
+                        DropsEarlierNulls = dropsEarlierNulls,
+                        ValueWise = AnswersFromDictionaries && condition.ValueWise,
+                    });
+                }
+
+                if (!noRowsMatch)
+                    FlushRun();
+
+                if (!noRowsMatch && predicates.Count > 0)
+                {
+                    selected = await reader.PrepareSelectedAsync(
+                            new ParquetScan
+                            {
+                                Columns = fileColumns,
+                                RowFilter = Observed(new RowFilter(predicates)),
+                                ExcludedRows = deletedRows is { IsEmpty: false } ? deletedRows : null,
+                            },
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
+                bool? OneRowAnswer(RowCondition condition) => FileConstantAnswer(condition, 1);
+
+                // A file-constant condition over `rows` (1, or 0 to check only that it can be evaluated) rows of the
+                // table's shape: the file's partition values, NULL for the columns it lacks. Returns the first row's
+                // answer (null for none). The shaped batch's arrays are built here, so it is disposed here, after the
+                // answer, which may be one of its own columns (a boolean partition column answering for itself).
+                bool? FileConstantAnswer(RowCondition condition, int rows)
+                {
+                    var empty = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], rows);
+                    using var shaped = ReconcileToTableShape(
+                        empty, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
+                        logicalToPhysical, addFile.Path, _options.ParquetReadOptions.ByteArrayOutput);
+                    var answer = condition.Evaluate(shaped);
+                    try
+                    {
+                        return rows == 0 ? null : answer.GetValue(0);
+                    }
+                    finally
+                    {
+                        Parquet.BatchSelector.Release(answer, shaped);
+                    }
+                }
+
+                async ValueTask<IReadOnlyList<string>?> ConditionFileColumnsAsync(IReadOnlyList<string>? logical) =>
+                    logical is null ? null : await FileColumnsAsync(
+                            reader, snapshot, logical, mappingMode, logicalToPhysical, withRowTracking: false,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+
+                // Whether the file has a row the deletion vector leaves: a scan of an empty file, or of one its
+                // deletion vector empties, asks no condition anything, so it must not fail on a value-dependent
+                // error over the one row a file-constant condition is asked about.
+                async ValueTask<bool> LiveAsync()
+                {
+                    if (live is null)
+                    {
+                        var footer = await reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+                        live = footer.NumRows > 0
+                            && !(deletedRows is { IsEmpty: false } && deletedRows.ContainsRange(0, footer.NumRows));
+                    }
+
+                    return live.Value;
+                }
+
+                // The filter's conjuncts over none of the file's columns (only partition columns, or columns added
+                // after the file was written) have one answer for the whole file, and are answered here, once, before
+                // any row is read, wherever they stand in the filter, as Spark applies a partition filter before it
+                // reads a file: TRUE drops the conjunct, FALSE or NULL skips the file (false is returned), since no
+                // row can then pass. Skipping the file saves its rows, not the analysis: the filter's other conjuncts
+                // are first asked over no rows, as EvalAnd asks every operand over an empty selection, so one that
+                // cannot be evaluated at all (a wrong argument count, no common type) still raises. One that raises
+                // before any conjunct the reader answers row by row raises here, as it would on the file's first row;
+                // after one, it is deferred to its place (see Deferred), unless it raises over no rows too, which no
+                // value caused. A file with no live row is skipped without asking any of them.
+                async ValueTask<bool> FileConstantConjunctsAsync()
+                {
+                    bool rowLevelBefore = false;
+                    foreach (var step in steps)
+                    {
+                        if (step.Conjunct is null)
+                            continue;
+                        if (step.FileColumns is not { Count: 0 })
+                        {
+                            rowLevelBefore = true;
+                            continue;
+                        }
+
+                        if (!await LiveAsync().ConfigureAwait(false))
+                            return false;
+
+                        bool? answer;
+                        try
+                        {
+                            answer = OneRowAnswer(step.Condition);
+                        }
+                        catch (Exception e) when (rowLevelBefore)
+                        {
+                            // Deferred only for an error the row's values cause (see above).
+                            FileConstantAnswer(step.Condition, 0);
+                            step.Deferred = System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(e);
+                            continue;
+                        }
+
+                        if (answer != true)
+                        {
+                            foreach (var other in steps)
+                            {
+                                if (other.Conjunct is not null && other != step && !other.Dropped)
+                                    FileConstantAnswer(other.Condition, 0);
+                            }
+
+                            return false;
+                        }
+
+                        step.Dropped = true;
+                    }
+
+                    return true;
+                }
+
+                // The pending run of adjacent row-level conjuncts, as one row predicate: their AND, whose NULL
+                // answers stay live for the predicates after it.
+                void FlushRun()
+                {
+                    if (run.Count == 0)
+                        return;
+                    var condition = run[0].Condition;
+                    var runPredicate = run[0].Conjunct!;
+                    IReadOnlyList<string>? runFileColumns = run[0].FileColumns;
+                    if (run.Count > 1)
+                    {
+                        var conjuncts = run.Select(s => s.Conjunct!).ToList();
+                        var and = new Expressions.AndPredicate(conjuncts);
+                        runPredicate = and;
+                        var logical = run.Any(s => s.Condition.Columns is null) ? null
+                            : snapshot.ArrowSchema.FieldsList
+                                .Where(f => run.Any(s => s.Condition.Columns!.Contains(f.Name)))
+                                .Select(f => f.Name)
+                                .ToList();
+                        condition = new RowCondition(logical, batch => RowEvaluator.EvaluatePredicate(and, batch));
+                        runFileColumns = run.Any(s => s.FileColumns is null) ? null
+                            : run.SelectMany(s => s.FileColumns!).Distinct(StringComparer.Ordinal).ToList();
+                    }
+
+                    predicates.Add(new RowPredicate(runFileColumns ?? everyColumn!, ConditionMask(
+                        condition, snapshot, addFile, mappingMode, physicalToLogical, logicalToPhysical,
+                        partitionColumns, hasPartitions, keepNulls: true,
+                        byteArrays: _options.ParquetReadOptions.ByteArrayOutput))
+                    {
+                        // Each conjunct's answer for a row depends on that row's values alone (#502 phase 4c), so the
+                        // reader may answer it from a dictionary.
+                        ValueWise = AnswersFromDictionaries && run.All(s => IsValueWise(s.Conjunct!)),
+                        // A run that cannot raise may be asked about rows earlier predicates dropped (#502 phase 5a).
+                        EvaluateWholeBatch = WholeBatchMask(
+                            runPredicate, condition.Columns, snapshot, addFile, mappingMode, physicalToLogical,
+                            logicalToPhysical, partitionColumns, hasPartitions),
+                        Proof = ProofFor(runPredicate, snapshot, mappingMode, proofSchema),
+                    });
+                    run.Clear();
+                    afterFilter = true;
+                }
+            }
+
             return new DataFileRead
             {
                 AddFile = addFile, Snapshot = snapshot, Columns = columns, MappingMode = mappingMode,
                 PhysicalToLogical = physicalToLogical, LogicalToPhysical = logicalToPhysical,
                 DeletedRows = deletedRows, PartitionColumns = partitionColumns, HasPartitions = hasPartitions,
                 File = file, Reader = reader, FileColumns = fileColumns, FilePredicate = filePredicate,
+                Selected = selected, NoRowsMatch = noRowsMatch,
             };
         }
         catch
@@ -13160,7 +13844,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     reservation, cancellationToken);
             }
 
-            await foreach (var processed in ProcessDataFileBatchesAsync(source, read, wantPositions, wantTracking, cancellationToken)
+            await foreach (var processed in ProcessDataFileBatchesAsync(source, read, wantPositions, wantTracking, byteArrays: null, cancellationToken)
                 .ConfigureAwait(false))
             {
                 yield return processed;
@@ -13180,20 +13864,552 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             cancellationToken), reservation, cancellationToken);
 
     /// <summary>
+    /// A row condition as the Parquet read's row predicate (#502): over the condition's physical columns as the file
+    /// holds them, it answers the LOGICAL condition, so the batch is first brought to the table's shape as a scan's
+    /// batches are (logical names, widened types, partition values, schema-evolution NULLs) for exactly the
+    /// condition's columns (<see cref="RowCondition.Columns"/>; null for every column).
+    /// </summary>
+    private static Func<RecordBatch, BooleanArray> ConditionMask(
+        RowCondition condition, Snapshot.Snapshot snapshot, AddFile addFile, ColumnMappingMode mappingMode,
+        Dictionary<string, string> physicalToLogical, Dictionary<string, string> logicalToPhysical,
+        IReadOnlyList<string> partitionColumns, bool hasPartitions, bool keepNulls = false,
+        ByteArrayOutputKind? byteArrays = null) =>
+        batch =>
+        {
+            var logical = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
+            logical = ColumnMappingRecursive.StripParquetFieldIds(logical);
+
+            logical = ReconcileToTableShape(
+                logical, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
+                logicalToPhysical, addFile.Path, byteArrays, borrowed: batch);
+            var answer = condition.Evaluate(logical);
+            answer = keepNulls ? answer : NullAsFalse(answer, logical);
+
+            // What the reshaping built for this answer, which nothing else holds (#822 review round 4).
+            ByteArrayRepresentation.ReleaseReshaped(logical, batch, answer);
+            return answer;
+        };
+
+    /// <summary>
+    /// <see cref="ConditionMask"/> for <see cref="RowPredicate.EvaluateWholeBatch"/> (#502 phase 5a): the same batch,
+    /// brought to the table's shape the same way, answered by <paramref name="predicate"/> only where the evaluator can
+    /// do so with no row's value able to raise (<see cref="Expressions.Arrow.ArrowRowEvaluator.TryEvaluateWithoutRaising"/>);
+    /// null otherwise. Not offered at all for a form that always declines. NULL answers are kept; a whole condition's
+    /// NULL drops its row as FALSE does, and no predicate follows one that this is set for but the conjuncts of the same
+    /// expression. Null when <see cref="EvaluatesWholeBatches"/> is off.
+    /// <para>Bringing the whole batch to the table's shape can itself raise on a value that a gather of the live rows
+    /// never reaches: a DATE widened to TIMESTAMP_NTZ overflows, checked, on a far-future day count. So any error while
+    /// shaping declines, and the reader asks the live rows instead, where a live row's value raises as before (review
+    /// round 1).</para>
+    /// </summary>
+    private Func<RecordBatch, BooleanArray?>? WholeBatchMask(
+        Expressions.Predicate predicate, IReadOnlyList<string>? columns, Snapshot.Snapshot snapshot, AddFile addFile,
+        ColumnMappingMode mappingMode, Dictionary<string, string> physicalToLogical,
+        Dictionary<string, string> logicalToPhysical, IReadOnlyList<string> partitionColumns, bool hasPartitions)
+    {
+        if (!EvaluatesWholeBatches || !Expressions.Arrow.ArrowRowEvaluator.MayEvaluateWithoutRaising(predicate))
+            return null;
+        return batch =>
+        {
+            RecordBatch logical;
+            try
+            {
+                logical = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
+                logical = ColumnMappingRecursive.StripParquetFieldIds(logical);
+                logical = ReconcileToTableShape(
+                    logical, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions,
+                    logicalToPhysical, addFile.Path, _options.ParquetReadOptions.ByteArrayOutput, borrowed: batch);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                return null;
+            }
+
+            var answer = RowEvaluator.TryEvaluateWithoutRaising(predicate, logical);
+
+            // What the reshaping built for this answer, which nothing else holds (#822 review round 4).
+            ByteArrayRepresentation.ReleaseReshaped(logical, batch, answer);
+            return answer;
+        };
+    }
+
+    /// <summary>
+    /// <see cref="RowPredicate.Proof"/> for <paramref name="predicate"/> (#502 phase 5c): the predicate over the file's
+    /// columns, for the reader to prove TRUE for every row of a row group from its statistics and drop there. Only when
+    /// the table trusts statistics proofs (<paramref name="fileSchema"/> is null otherwise) and the predicate is one a
+    /// proof may stand in for (<see cref="EvaluatesEverywhere"/>: plain comparisons and null tests of the table's own
+    /// columns, none casting a string, so skipping it raises nothing it would have raised). The translation never
+    /// strengthens a proof: a reference the file cannot answer (a column the file lacks or holds in an older type)
+    /// evaluates Unknown, which proves nothing.
+    /// <para>Nor for a predicate that references a partition column (review round 2). Its value comes from the log as
+    /// a string and is decoded only when the predicate is asked, which raises on a malformed one (`abc` for a DATE
+    /// partition); an OR proven by its other branch would skip that. DELETE's file proof refuses partition columns in
+    /// its leaves too, and evaluates a partition-only part for real (#511).</para>
+    /// </summary>
+    private static Expressions.Predicate? ProofFor(
+        Expressions.Predicate predicate, Snapshot.Snapshot snapshot, ColumnMappingMode mappingMode,
+        Parquet.Schema.SchemaDescriptor? fileSchema) =>
+        fileSchema is null || !EvaluatesEverywhere(predicate, snapshot.Schema)
+        || ReferencesAnyPartitionColumn(predicate, snapshot.Metadata.PartitionColumns)
+            ? null
+            : RowGroupPushdown.ToFileColumns(
+                predicate, snapshot.Schema, mappingMode, fileSchema, snapshot.Metadata.PartitionColumns);
+
+    /// <summary>
+    /// Whether <paramref name="predicate"/> refers to any of <paramref name="partitionColumns"/>, by name ignoring case
+    /// as <see cref="EvaluatesEverywhere"/> resolves one.
+    /// </summary>
+    private static bool ReferencesAnyPartitionColumn(
+        Expressions.Predicate predicate, IReadOnlyList<string> partitionColumns)
+    {
+        if (partitionColumns.Count == 0)
+            return false;
+        var partitions = new HashSet<string>(partitionColumns, StringComparer.OrdinalIgnoreCase);
+        return Visit(predicate);
+
+        bool Visit(Expressions.Expression expression) => expression switch
+        {
+            Expressions.AndPredicate and => and.Children.Any(Visit),
+            Expressions.OrPredicate or => or.Children.Any(Visit),
+            Expressions.NotPredicate not => Visit(not.Child),
+            Expressions.ComparisonPredicate cmp => Visit(cmp.Left) || Visit(cmp.Right),
+            Expressions.UnaryPredicate unary => Visit(unary.Operand),
+            Expressions.SetPredicate set => Visit(set.Operand) || set.Values.Any(Visit),
+            Expressions.FunctionCall call => call.Arguments.Any(Visit),
+            Expressions.UnboundReference reference => partitions.Contains(reference.NameParts[0]),
+            _ => false,
+        };
+    }
+
+    /// <summary>Whether a predicate the scan built carries a statistics proof, for tests.</summary>
+    internal static bool OffersProof(RowPredicate predicate) => predicate.Proof is not null;
+
+    /// <summary>
+    /// How many row groups this table's scans and DELETEs have read with a predicate dropped on its statistics proof
+    /// (#502 phase 5c): for tests, so that a proof is shown to hold, not only to be offered.
+    /// </summary>
+    internal int ProvenRowGroups => Volatile.Read(ref _provenRowGroups);
+
+    private int _provenRowGroups;
+
+    private void CountProvenRowGroup() => Interlocked.Increment(ref _provenRowGroups);
+
+    /// <summary>
+    /// Whether filter conjuncts and DELETE predicates that cannot raise are offered to the reader for whole batches
+    /// (<see cref="WholeBatchMask"/>). On by default; off for the A/B (#502 phase 5a) and as the tests' oracle.
+    /// </summary>
+    internal bool EvaluatesWholeBatches { get; set; } = true;
+
+    /// <summary>Whether a predicate the scan built offers whole-batch answers, for tests (which cannot see Parquet's
+    /// internals).</summary>
+    internal static bool OffersWholeBatch(RowPredicate predicate) => predicate.EvaluateWholeBatch is not null;
+
+    /// <summary>
+    /// <see cref="ParquetFileReader.WholeBatchLiveShare"/> for this table's data-file reads, for the A/B sweep: the share
+    /// of a batch's rows that must still be live for a predicate to be asked about the whole batch.
+    /// </summary>
+    internal double WholeBatchLiveShare { get; set; } = BatchSelector.DefaultWholeBatchLiveShare;
+
+    /// <summary>
+    /// <see cref="ParquetFileReader.FusesAnswers"/> for this table's data-file reads: whether adjacent value-wise conjuncts
+    /// over one column are answered from its dictionary together (#502 phase 5b). On by default; off for the A/B and as
+    /// the tests' oracle.
+    /// </summary>
+    internal bool FusesAnswers { get; set; } = true;
+
+    /// <summary>One answer for every row of a batch.</summary>
+    private static BooleanArray Repeat(bool answer, int length)
+    {
+        var mask = new BooleanArray.Builder().Reserve(length);
+        for (int i = 0; i < length; i++)
+            mask.Append(answer);
+        return mask.Build();
+    }
+
+    /// <summary>
+    /// A finished condition's answer, with NULL as FALSE. The Parquet <see cref="RowFilter"/> keeps a row its
+    /// predicate answers NULL for live for the predicates after it, which is right for conjuncts split out of one
+    /// expression (their AND is three-valued), but each row condition is a whole one: its NULL already drops the
+    /// row, and the conditions after it — a host mask that reads a nullable column, say — must not be asked about it.
+    /// </summary>
+    private static BooleanArray NullAsFalse(BooleanArray answer, RecordBatch input)
+    {
+        if (answer.NullCount == 0)
+            return answer;
+        var keep = new BooleanArray.Builder().Reserve(answer.Length);
+        for (int i = 0; i < answer.Length; i++)
+            keep.Append(answer.GetValue(i) == true);
+        var result = keep.Build();
+        BatchSelector.Release(answer, input);
+        return result;
+    }
+
+    /// <summary>
+    /// One row condition of a scan (#502): the exact <see cref="DeltaReadOptions.Filter"/>, or a host's
+    /// <see cref="DeltaRowMask"/>. <see cref="Evaluate"/> answers a LOGICAL batch of the table's shape that holds at
+    /// least <see cref="Columns"/> (null: the condition may read any column, so the batch holds every one); TRUE keeps
+    /// a row, FALSE or NULL drops it (see <see cref="NullAsFalse"/>).
+    /// </summary>
+    internal sealed record RowCondition(IReadOnlyList<string>? Columns, Func<RecordBatch, BooleanArray> Evaluate)
+    {
+        /// <summary>
+        /// The <see cref="DeltaReadOptions.FilterRows"/> filter this condition evaluates, if it is that one: the
+        /// built-in reader splits it into its top-level conjuncts (#502 phase 4a). Null for a host mask.
+        /// </summary>
+        public Expressions.Predicate? Filter { get; init; }
+
+        /// <summary>A host mask's <see cref="DeltaRowMask.ValueWise"/>; false for the filter, whose conjuncts are
+        /// judged one by one (<see cref="IsValueWise"/>).</summary>
+        public bool ValueWise { get; init; }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="expression"/>'s answer for a row depends only on that row's values, so the Parquet
+    /// reader may evaluate it once over a column chunk's dictionary (#502 phase 4c,
+    /// <see cref="RowPredicate.ValueWise"/>): column references, literals, the predicate forms, and calls to
+    /// functions the registry declares foldable (<see cref="Expressions.Arrow.IFoldableFunctions"/>: deterministic, and
+    /// reading nothing but their arguments). Anything else, a variant path included, answers false, which costs
+    /// only the speed-up.
+    /// </summary>
+    internal static bool IsValueWise(Expressions.Expression expression) => expression switch
+    {
+        Expressions.UnboundReference or Expressions.BoundReference or Expressions.LiteralExpression
+            or Expressions.TruePredicate or Expressions.FalsePredicate => true,
+        Expressions.AndPredicate and => and.Children.All(IsValueWise),
+        Expressions.OrPredicate or => or.Children.All(IsValueWise),
+        Expressions.NotPredicate not => IsValueWise(not.Child),
+        Expressions.ComparisonPredicate cmp => IsValueWise(cmp.Left) && IsValueWise(cmp.Right),
+        Expressions.UnaryPredicate unary => IsValueWise(unary.Operand),
+        Expressions.SetPredicate set => IsValueWise(set.Operand) && set.Values.All(IsValueWise),
+        Expressions.FunctionCall call => Functions.IsRegistered(call.Name) && Functions.IsFoldable(call.Name)
+            && call.Arguments.All(IsValueWise),
+        _ => false,
+    };
+
+    /// <summary>
+    /// One step of a file's row conditions, as the built-in reader applies them: a conjunct of the filter
+    /// (<see cref="Conjunct"/> set), or a whole host mask.
+    /// </summary>
+    private sealed class ConditionStep(
+        RowCondition condition, Expressions.Predicate? conjunct, IReadOnlyList<string>? fileColumns)
+    {
+        public RowCondition Condition { get; } = condition;
+        public Expressions.Predicate? Conjunct { get; } = conjunct;
+
+        /// <summary>The file's physical columns the step reads; empty for none, null for every column.</summary>
+        public IReadOnlyList<string>? FileColumns { get; } = fileColumns;
+
+        /// <summary>A file-constant conjunct answered TRUE for the file: nothing left to ask.</summary>
+        public bool Dropped { get; set; }
+
+        /// <summary>
+        /// A file-constant conjunct that raised over the file's one row, after a conjunct answered row by row: it is
+        /// raised only once a row survives the conjuncts before it.
+        /// </summary>
+        public System.Runtime.ExceptionServices.ExceptionDispatchInfo? Deferred { get; set; }
+    }
+
+    /// <summary>A filter's top-level conjuncts, in source order, nested ANDs flattened.</summary>
+    private static IEnumerable<Expressions.Predicate> Conjuncts(Expressions.Predicate predicate) =>
+        predicate is Expressions.AndPredicate and ? and.Children.SelectMany(Conjuncts) : [predicate];
+
+    /// <summary>
+    /// Evaluates adjacent row-level conjuncts of a <see cref="DeltaReadOptions.FilterRows"/> filter together, as one
+    /// AND, rather than each as its own row predicate. For tests and the ConjunctSplitBenchmarks A/B; the
+    /// file-constant conjuncts are answered up front either way.
+    /// </summary>
+    internal bool EvaluatesConjunctsTogether { get; set; }
+
+    /// <summary>
+    /// Whether the scan and DELETE mark a value-wise conjunct, predicate or host mask as such, letting the Parquet
+    /// reader answer it from a column chunk's dictionary (#502 phase 4c). True by default; false for the
+    /// ValueWiseBenchmarks A/B and as the tests' oracle.
+    /// </summary>
+    internal bool AnswersFromDictionaries { get; set; } = true;
+
+    /// <summary>Shown each <see cref="RowFilter"/> a scan or DELETE hands the Parquet reader, for tests.</summary>
+    internal Action<RowFilter>? RowFilterObserver { get; set; }
+
+    private RowFilter Observed(RowFilter filter)
+    {
+        RowFilterObserver?.Invoke(filter);
+        return filter;
+    }
+
+    /// <summary>The scan's row conditions, in the order they apply: the exact filter, then the host's masks.</summary>
+    private static IReadOnlyList<RowCondition>? RowConditions(DeltaReadOptions options, Snapshot.Snapshot snapshot)
+    {
+        var conditions = new List<RowCondition>();
+        if (options.FilterRows && options.Filter is { } filter)
+        {
+            conditions.Add(new RowCondition(
+                PredicateColumns(filter, snapshot.ArrowSchema), batch => RowEvaluator.EvaluatePredicate(filter, batch))
+            {
+                Filter = filter,
+            });
+        }
+
+        foreach (var mask in options.RowMasks ?? [])
+        {
+            conditions.Add(new RowCondition(mask.Columns, batch => AskHostMask(mask, batch))
+            {
+                ValueWise = mask.ValueWise,
+            });
+        }
+        return conditions.Count == 0 ? null : conditions;
+    }
+
+    /// <summary>A host mask over exactly its own columns of <paramref name="batch"/>, in its order.</summary>
+    private static BooleanArray AskHostMask(DeltaRowMask mask, RecordBatch batch)
+    {
+        var fields = new List<Field>(mask.Columns.Count);
+        var arrays = new List<IArrowArray>(mask.Columns.Count);
+        foreach (var name in mask.Columns)
+        {
+            int index = -1;
+            for (int i = 0; i < batch.ColumnCount && index < 0; i++)
+            {
+                if (string.Equals(batch.Schema.GetFieldByIndex(i).Name, name, StringComparison.Ordinal))
+                    index = i;
+            }
+
+            if (index < 0)
+                throw new InvalidOperationException($"Row mask column '{name}' is missing from the batch read for it.");
+            fields.Add(batch.Schema.GetFieldByIndex(index));
+            arrays.Add(batch.Column(index));
+        }
+
+        var asked = new RecordBatch(new Apache.Arrow.Schema(fields, null), arrays, batch.Length);
+        var answer = mask.Mask(asked) ?? throw new InvalidOperationException("A row mask returned null.");
+        if (answer.Length != batch.Length)
+        {
+            // The scan owns the answer even when it refuses it.
+            BatchSelector.Release(answer, asked);
+            throw new InvalidOperationException(
+                $"A row mask answered {answer.Length} rows for a batch of {batch.Length}.");
+        }
+
+        return answer;
+    }
+
+    /// <summary>Refuses a host mask naming a column the table doesn't have, before any file is read.</summary>
+    private static void RefuseUnknownMaskColumns(IReadOnlyList<DeltaRowMask>? masks, Snapshot.Snapshot snapshot)
+    {
+        if (masks is null)
+            return;
+        var known = new HashSet<string>(snapshot.ArrowSchema.FieldsList.Select(f => f.Name), StringComparer.Ordinal);
+        foreach (var mask in masks)
+        {
+            if (mask is null)
+                throw new ArgumentException("A row mask is null.", nameof(DeltaReadOptions.RowMasks));
+            foreach (var name in mask.Columns)
+            {
+                if (!known.Contains(name))
+                {
+                    throw new ArgumentException(
+                        $"Row mask column '{name}' is not a column of the table.", nameof(DeltaReadOptions.RowMasks));
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// <see cref="ProcessFileBatchesAsync"/> for an exact filter's selected read (#502): the reader has already
+    /// removed the deletion vector's rows and the filter's, and says where each kept row is, so this only brings the
+    /// batch to the table's shape and derives each row's position, id and commit version from its position.
+    /// </summary>
+    private static async IAsyncEnumerable<FileBatch> ProcessSelectedFileBatchesAsync(
+        IAsyncEnumerable<SelectedRecordBatch> source,
+        DataFileRead read,
+        bool wantPositions,
+        bool wantTracking,
+        ByteArrayOutputKind byteArrays,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var snapshot = read.Snapshot;
+        var addFile = read.AddFile;
+        var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
+            .TryGetMaterializedColumnNames(snapshot.Metadata.Configuration);
+        bool hasMaterialized = matRowIdName is not null || matRowVerName is not null;
+
+        await foreach (var selected in source.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            var where = selected.Positions;
+            var result = ToLogicalBatch(selected.Batch, snapshot.Schema, read.MappingMode, read.PhysicalToLogical);
+            result = ColumnMappingRecursive.StripParquetFieldIds(result);
+            Int64Array? rawMatIds = null, rawMatVers = null;
+            if (hasMaterialized)
+            {
+                (result, rawMatIds, rawMatVers) = RowTracking.RowTrackingWriter
+                    .StripMaterializedColumns(result, matRowIdName, matRowVerName);
+            }
+
+            int rows = result.Length;
+            Int64Array? positions = null, rowIds = null, versions = null;
+            if (wantTracking)
+            {
+                var idb = new Int64Array.Builder().Reserve(rows);
+                var vrb = new Int64Array.Builder().Reserve(rows);
+                for (int i = 0; i < rows; i++)
+                {
+                    long? mid = rawMatIds is not null && !rawMatIds.IsNull(i) ? rawMatIds.GetValue(i) : null;
+                    long? id = mid ?? (addFile.BaseRowId is { } ab ? ab + where[i] : (long?)null);
+                    if (id is { } iv) idb.Append(iv); else idb.AppendNull();
+
+                    long? mv = rawMatVers is not null && !rawMatVers.IsNull(i) ? rawMatVers.GetValue(i) : null;
+                    long? ver = mv ?? addFile.DefaultRowCommitVersion;
+                    if (ver is { } vv) vrb.Append(vv); else vrb.AppendNull();
+                }
+
+                rowIds = idb.Build();
+                versions = vrb.Build();
+            }
+
+            if (wantPositions)
+            {
+                if (where.Explicit is { } explicitPositions)
+                {
+                    positions = explicitPositions;
+                }
+                else
+                {
+                    var pb = new Int64Array.Builder().Reserve(rows);
+                    for (int i = 0; i < rows; i++)
+                        pb.Append(where.FirstRow + i);
+                    positions = pb.Build();
+                }
+            }
+            else
+            {
+                where.Explicit?.Dispose();
+            }
+
+            var shaped = ReconcileToTableShape(
+                result, snapshot, addFile.PartitionValues, read.Columns, read.PartitionColumns, read.HasPartitions,
+                read.LogicalToPhysical, addFile.Path, byteArrays);
+            yield return new FileBatch(shaped, positions, rowIds, versions);
+        }
+    }
+
+    /// <summary>
     /// The per-batch pipeline below, for the raw batches of <paramref name="read"/>'s file: any run of them, in file order, each with its file
     /// position. The pipeline keeps no state from one batch to the next, so a scan split by row group runs it
     /// once per row group.
     /// </summary>
+    /// <param name="byteArrays">The representation to put the string and binary columns in (#793): the table's
+    /// <see cref="ParquetReadOptions.ByteArrayOutput"/> for a read that hands its batches to the caller; null for a
+    /// DML read, which keeps the representations it always had (review round 2: partition routing and other DML
+    /// steps don't take a view for a partition or backfilled column).</param>
     private IAsyncEnumerable<FileBatch> ProcessDataFileBatchesAsync(
         IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> source,
         DataFileRead read,
         bool wantPositions,
         bool wantTracking,
-        CancellationToken cancellationToken) =>
-        ProcessFileBatchesAsync(
+        ByteArrayOutputKind? byteArrays,
+        CancellationToken cancellationToken)
+    {
+        var batches = ProcessFileBatchesAsync(
             source, read.AddFile, read.Snapshot, read.Columns, read.MappingMode, read.PhysicalToLogical,
             read.LogicalToPhysical, read.DeletedRows, read.PartitionColumns, read.HasPartitions,
-            wantPositions, wantTracking, cancellationToken);
+            wantPositions: wantPositions || read.SeamConditions is not null, wantTracking, byteArrays, cancellationToken);
+        return read.SeamConditions is { } conditions
+            ? FilterSeamBatchesAsync(batches, conditions, read.FilterColumns, wantPositions, cancellationToken)
+            : batches;
+    }
+
+    /// <summary>
+    /// The scan's row conditions through the codec seam (#502): the seam returns every row, so each condition is
+    /// applied in turn to each batch once it has the table's shape, over the rows the ones before it kept, and the
+    /// batch is then cut back to <paramref name="returned"/>, the caller's projection (null: every column), dropping
+    /// the columns read only for the conditions. The positions, ids and versions follow the rows kept.
+    /// </summary>
+    private static async IAsyncEnumerable<FileBatch> FilterSeamBatchesAsync(
+        IAsyncEnumerable<FileBatch> batches,
+        IReadOnlyList<RowCondition> conditions,
+        IReadOnlyList<string>? returned,
+        bool wantPositions,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (var fb in batches.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            RecordBatch? batch = fb.Batch;
+            Int64Array? positions = fb.Positions, rowIds = fb.RowIds, versions = fb.Versions;
+            foreach (var condition in conditions)
+            {
+                int[] kept;
+                var mask = condition.Evaluate(batch);
+                kept = ArrowCompute.SelectedIndices(mask);
+                BatchSelector.Release(mask, batch);
+                if (kept.Length == batch.Length)
+                    continue;
+                if (kept.Length == 0)
+                {
+                    // Nothing to emit, so nothing to gather: a gather of every column would be wasted work, and
+                    // fails outright on a column type ArrowCompute.Take doesn't gather.
+                    batch.Dispose();
+                    positions?.Dispose();
+                    rowIds?.Dispose();
+                    versions?.Dispose();
+                    batch = null;
+                    break;
+                }
+
+                var gathered = ArrowCompute.Take(batch, batch.Schema, kept);
+                var (p, r, v) = (positions, rowIds, versions);
+                positions = p is null ? null : (Int64Array)ArrowCompute.Take(p, kept);
+                rowIds = r is null ? null : (Int64Array)ArrowCompute.Take(r, kept);
+                versions = v is null ? null : (Int64Array)ArrowCompute.Take(v, kept);
+
+                // The superseded arrays: a fixed-width gather copies, so the metadata goes outright; the batch
+                // keeps any column the gather shares a buffer with (a view's data, a dictionary).
+                BatchSelector.ReleaseAfterGather(batch, gathered);
+                p?.Dispose();
+                r?.Dispose();
+                v?.Dispose();
+                batch = gathered;
+            }
+
+            if (batch is null)
+                continue;
+            if (batch.Length == 0)
+            {
+                batch.Dispose();
+                positions?.Dispose();
+                rowIds?.Dispose();
+                versions?.Dispose();
+                continue;
+            }
+
+            if (!wantPositions)
+            {
+                positions?.Dispose();
+                positions = null;
+            }
+
+            // By name, not by count: a projection naming a column the table lacks returns fewer columns than it
+            // names, so a filter column could make up the difference and survive a count comparison.
+            if (returned is not null && batch.Schema.FieldsList.Any(f => !returned.Contains(f.Name)))
+            {
+                var fields = new List<Field>(returned.Count);
+                var arrays = new List<IArrowArray>(returned.Count);
+                for (int i = 0; i < batch.ColumnCount; i++)
+                {
+                    var field = batch.Schema.GetFieldByIndex(i);
+                    if (returned.Contains(field.Name))
+                    {
+                        fields.Add(field);
+                        arrays.Add(batch.Column(i));
+                    }
+                }
+
+                // Not disposed: the dropped columns may share buffers with the kept ones (a gather of a view or a
+                // dictionary column does), so they are left to the GC with the batch that held them.
+                batch = new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), arrays, batch.Length);
+            }
+
+            yield return new FileBatch(batch, positions, rowIds, versions);
+        }
+    }
 
     /// <summary>
     /// The per-batch read pipeline shared by the built-in <c>ParquetFileReader</c> and a pluggable
@@ -13216,6 +14432,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool hasPartitions,
         bool wantPositions,
         bool wantTracking,
+        ByteArrayOutputKind? byteArrays,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         // Hidden materialized row-tracking columns (a copy-on-write rewrite wrote each moved row's original id +
@@ -13258,9 +14475,25 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 int survivors = deletedRows is null ? batch.Length : kept.Count;
                 if (survivors == 0)
-                    continue; // All rows in this batch were deleted (no surviving ids to emit either)
+                {
+                    // All rows in this batch were deleted (no surviving ids to emit either): nothing reads it again.
+                    // The renames above reuse the source's arrays, so disposing `result` releases its buffers (#791).
+                    result.Dispose();
+                    rawMatIds?.Dispose();
+                    rawMatVers?.Dispose();
+                    continue;
+                }
+
                 if (deletedRows is not null && !kept.AllKept)
-                    result = ArrowCompute.Take(result, result.Schema, kept.Indices);
+                {
+                    // Release what the gather supersedes (#791): every column of the batch gathered from, except one
+                    // the output still shares a buffer with (a view's data, a dictionary). The renames above reuse
+                    // their input's arrays, so these are the source's own. The stripped row-tracking columns are not
+                    // among them; they are read below, and released after.
+                    var gatheredFrom = result;
+                    result = ArrowCompute.Take(gatheredFrom, gatheredFrom.Schema, kept.Indices);
+                    BatchSelector.ReleaseAfterGather(gatheredFrom, result);
+                }
 
                 // Surface each surviving row's RESOLVED id + commit version (row-aligned with the emitted batch):
                 // the materialized value where present, else add.baseRowId + absolute position /
@@ -13293,10 +14526,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 }
             }
 
+            // The stripped row-tracking columns have fed the ids above, and the caller never sees them (#791).
+            rawMatIds?.Dispose();
+            rawMatVers?.Dispose();
+
             // The materialized row-tracking columns were already stripped up front (above).
             var cleanResult = ReconcileToTableShape(
                 result, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions, logicalToPhysical,
-                addFile.Path);
+                addFile.Path, byteArrays);
 
             yield return new FileBatch(cleanResult, positions, rowIds, versions);
         }
@@ -13317,7 +14554,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     internal static RecordBatch ReconcileToTableShape(
         RecordBatch result, Snapshot.Snapshot snapshot, IReadOnlyDictionary<string, string>? partitionValues,
         IReadOnlyList<string>? columns, IReadOnlyList<string> partitionColumns, bool hasPartitions,
-        IReadOnlyDictionary<string, string> logicalToPhysical, string? filePath = null)
+        IReadOnlyDictionary<string, string> logicalToPhysical, string? filePath = null,
+        ByteArrayOutputKind? byteArrays = null, RecordBatch? borrowed = null)
     {
         // Apply type widening — convert narrow types from old files to current schema types
         if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
@@ -13365,7 +14603,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // file (Spark 4.0.x, a spec-minimal writer, or our own output under
         // EmitVariantLogicalType=false) yields a bare struct-of-binary that the parquet reader did
         // not wrap. Without this the column would silently read as a struct rather than a variant.
-        return VariantColumnCoercion.Coerce(result, expectedSchema);
+        result = VariantColumnCoercion.Coerce(result, expectedSchema);
+
+        // A read's string and binary columns all in the representation ByteArrayOutput asks for (#793): the Parquet
+        // reader decodes a data column in it, but a partition column, a backfilled one and a codec-seam host's are
+        // built elsewhere. After the variant coercion, whose storage this leaves alone (an extension type). The
+        // metadata columns a scan appends later keep their documented types. A row mask's batch is a view of arrays the
+        // reader still reads (`borrowed`), which the conversion must not release.
+        return byteArrays is { } kind ? ByteArrayRepresentation.Apply(result, kind, borrowed) : result;
     }
 
     /// <summary>

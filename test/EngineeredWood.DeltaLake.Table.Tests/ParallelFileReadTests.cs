@@ -858,9 +858,14 @@ public class ParallelFileReadTests : IDisposable
     /// round trip: planned one file at a time, the scan paid one round trip per file, in series. Every row group
     /// is pruned, so the only reads besides the footers are the planning's, and several files must have one in
     /// flight at once. Measured before the fix: 1.
+    /// <para>The same with an exact filter and a limit (#502 phase 5f review round 1): a bounded limit opens files ahead
+    /// as its units are granted, and a file whose row groups are all pruned grants none, so a run of them must still be
+    /// opened in parallel.</para>
     /// </summary>
-    [Fact]
-    public async Task AFilteredScan_PlansTheFilesItOpenedAhead_AtOnce()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AFilteredScan_PlansTheFilesItOpenedAhead_AtOnce(bool exactWithLimit)
     {
         const int files = 8;
         await CreateTagTableAsync(files);
@@ -868,7 +873,10 @@ public class ParallelFileReadTests : IDisposable
         var fs = new PlanningReadsFileSystem(_fs, delayMs: 50);
         await using var table = await DeltaTable.OpenAsync(fs, Options(files));
         long rows = 0;
-        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Filter = Ex.Equal("tag", LiteralValue.Of("b")) }))
+        var options = new DeltaReadOptions { Filter = Ex.Equal("tag", LiteralValue.Of("b")) };
+        if (exactWithLimit)
+            options = options with { FilterRows = true, Limit = 5 };
+        await foreach (var batch in table.ReadAsync(options))
         {
             rows += batch.Length;
             batch.Dispose();

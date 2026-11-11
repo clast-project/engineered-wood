@@ -1147,6 +1147,19 @@ internal sealed class ColumnBuildState : IDisposable
     public bool IsViewMode => _byteArrayOutput == ByteArrayOutputKind.ViewType;
 
     /// <summary>
+    /// True when the state collects a dictionary-encoded chunk's indices, as INT32 values, rather than its values
+    /// (a dictionary answer, #502 phase 4b). The state is then an INT32 one.
+    /// </summary>
+    public bool DictionaryIndices { get; init; }
+
+    /// <summary>
+    /// A second, INT32 state that collects each dictionary-encoded value's index as the value itself is written
+    /// (#502 phase 4d): a returned column answered from its dictionary is decoded once, to its values and to the
+    /// indices its answers are mapped from. Disposed with this state.
+    /// </summary>
+    public ColumnBuildState? IndexSink { get; init; }
+
+    /// <summary>
     /// Creates a new column build state.
     /// </summary>
     /// <param name="physicalType">Parquet physical type.</param>
@@ -1232,6 +1245,321 @@ internal sealed class ColumnBuildState : IDisposable
                 }
                 break;
         }
+    }
+
+    // ---- A row selection, applied page by page as the column decodes (#502 phase 2) ----------------------------
+
+    private byte[]? _keepRows;        // one byte per row of the chunk, 1 to keep
+    private int _selectionCursor;     // rows the pages so far covered
+    private int _keptRows;            // rows of those kept
+    private byte[]? _pageMask;        // the current page's values, 1 to keep (one spare slot, see BeginPage)
+    private int _pageValues;
+    private int _pageKept;
+    private bool _pageHasDrops;
+
+    /// <summary>
+    /// Builds only the rows whose <paramref name="keep"/> byte is 1 (one byte per row of a flat column chunk): each
+    /// page's dropped rows are removed as the page decodes (<see cref="BeginPage"/>), so the built arrays hold only
+    /// the kept rows. A selected read's second pass, which knows its rows before it decodes (#502 phase 2).
+    /// </summary>
+    internal void SetRowSelection(byte[] keep)
+    {
+        if (MaxRepLevel > 0)
+            throw new InvalidOperationException("A row selection applies only to a flat column.");
+        _keepRows = keep;
+    }
+
+    /// <summary>Whether a row selection is set.</summary>
+    internal bool HasRowSelection => _keepRows is not null;
+
+    /// <summary>The rows the pages decoded so far covered, kept or not.</summary>
+    internal int SelectionRowsSeen => _selectionCursor;
+
+    /// <summary>The rows kept so far: the built arrays' length.</summary>
+    internal int KeptRows => _keptRows;
+
+    /// <summary>Whether the page begun last drops any of its values, so they must be skipped or compacted.</summary>
+    internal bool PageHasDrops => _pageHasDrops;
+
+    /// <summary>The page's values, one byte each, 1 to keep; meaningful while <see cref="PageHasDrops"/>.</summary>
+    internal ReadOnlySpan<byte> PageValueMask => _pageMask.AsSpan(0, _pageValues);
+
+    /// <summary>How many of the page's values are kept.</summary>
+    internal int PageKeptValues => _pageKept;
+
+    /// <summary>
+    /// Applies the selection to the page whose <paramref name="rows"/> definition levels were just reserved (one
+    /// per row; a flat column's levels are its rows) and which holds <paramref name="nonNullCount"/> values: drops
+    /// the deselected rows' levels and sets <see cref="PageValueMask"/> for its values. Without a selection, nothing.
+    /// </summary>
+    internal void BeginPage(int rows, int nonNullCount)
+    {
+        if (_keepRows is null)
+            return;
+        if (rows > _keepRows.Length - _selectionCursor)
+            throw new ParquetFormatException("A data page holds more rows than its row group.");
+
+        var keep = _keepRows.AsSpan(_selectionCursor, rows);
+        _selectionCursor += rows;
+        if (_pageMask is null || _pageMask.Length < nonNullCount + 1)
+        {
+            if (_pageMask is not null)
+                ArrayPool<byte>.Shared.Return(_pageMask);
+            _pageMask = ArrayPool<byte>.Shared.Rent(nonNullCount + 1);
+        }
+
+        var mask = _pageMask.AsSpan(0, nonNullCount + 1);
+        int keptRows, keptValues;
+        if (MaxDefLevel == 0)
+        {
+            keep.CopyTo(mask);
+            keptRows = 0;
+            for (int r = 0; r < rows; r++)
+                keptRows += keep[r];
+            keptValues = keptRows;
+        }
+        else
+        {
+            // Branch-free: nulls and dropped rows are interleaved at random (the 10-22 prototype measured a branchy
+            // loop 30-70% slower at 50% kept). The mask is written at every row and advanced past values only, so a
+            // null's write is overwritten by the next value's; hence the spare slot.
+            var defs = _defLevels.AsSpan(_defLevelCount - rows, rows);
+            byte max = (byte)MaxDefLevel;
+            int write = 0, value = 0;
+            keptValues = 0;
+            for (int r = 0; r < rows; r++)
+            {
+                byte d = defs[r];
+                int k = keep[r];
+                int isValue = d == max ? 1 : 0;
+                mask[value] = (byte)k;
+                value += isValue;
+                keptValues += k & isValue;
+                defs[write] = d;
+                write += k;
+            }
+
+            _defLevelCount -= rows - write;
+            keptRows = write;
+        }
+
+        _keptRows += keptRows;
+        _pageValues = nonNullCount;
+        _pageKept = keptValues;
+        _pageHasDrops = keptValues < nonNullCount;
+    }
+
+    /// <summary>Ends the page begun last.</summary>
+    internal void EndPage()
+    {
+        _pageHasDrops = false;
+        _pageValues = 0;
+        _pageKept = 0;
+    }
+
+    /// <summary>
+    /// Drops the values <see cref="PageValueMask"/> does not keep from those the page just decoded whole, in place:
+    /// for an encoding no decoder skips values of.
+    /// </summary>
+    internal void CompactPage() => CompactValues(_valueCount - _pageValues, PageValueMask, _pageKept);
+
+    /// <summary>
+    /// Appends the kept values of a page's BYTE_ARRAY values, which lie in <paramref name="source"/> with value
+    /// <c>i</c> at <c>stride * (i + 1) + offsets[i]</c> (stride 4 for PLAIN's length prefixes, 0 for
+    /// DELTA_LENGTH_BYTE_ARRAY's contiguous data) and <c>offsets[i + 1] - offsets[i]</c> bytes long: the decoders'
+    /// own measured offsets, so their validation of every value stands, and only the kept ones are copied.
+    /// </summary>
+    internal void AddSelectedByteArrayValues(ReadOnlySpan<int> offsets, ReadOnlySpan<byte> source, int stride)
+    {
+        var mask = PageValueMask;
+        int count = mask.Length, kept = _pageKept;
+        if (_byteArrayOutput == ByteArrayOutputKind.ViewType)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                if (mask[i] != 0)
+                    WriteOneStringView(source.Slice(stride * (i + 1) + offsets[i], offsets[i + 1] - offsets[i]));
+            }
+
+            return;
+        }
+
+        int[] keptOffsets = ArrayPool<int>.Shared.Rent(kept + 1);
+        try
+        {
+            int total = 0, write = 0;
+            keptOffsets[0] = 0;
+            for (int i = 0; i < count; i++)
+            {
+                if (mask[i] == 0)
+                    continue;
+                total += offsets[i + 1] - offsets[i];
+                keptOffsets[++write] = total;
+            }
+
+            var dest = ReserveByteArrayData(total);
+            write = 0;
+            for (int i = 0; i < count; i++)
+            {
+                if (mask[i] == 0)
+                    continue;
+                int length = offsets[i + 1] - offsets[i];
+                source.Slice(stride * (i + 1) + offsets[i], length).CopyTo(dest.Slice(keptOffsets[write++]));
+            }
+
+            CommitByteArrayData(keptOffsets.AsSpan(0, kept + 1), kept, total);
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(keptOffsets);
+        }
+    }
+
+    // Compacts the decoded values [first, first + mask.Length) to those `mask` keeps (1 keep, 0 drop), in place, in
+    // their layout; the values before `first` stay as they are.
+    private void CompactValues(int first, ReadOnlySpan<byte> mask, int kept)
+    {
+        int count = mask.Length;
+        if (count == 0 || kept == count)
+            return;
+
+        if (_physicalType == PhysicalType.Boolean)
+        {
+            // In place: bit `write` is never past bit `i`, and bit i is read before bit `write` is written.
+            var bits = _valueBuffer!.ByteSpan;
+            int write = first;
+            for (int i = 0; i < count; i++)
+            {
+                if (mask[i] == 0)
+                    continue;
+                int from = first + i;
+                bool set = (bits[from >> 3] & (1 << (from & 7))) != 0;
+                if (set)
+                    bits[write >> 3] |= (byte)(1 << (write & 7));
+                else
+                    bits[write >> 3] &= (byte)~(1 << (write & 7));
+                write++;
+            }
+
+            // AddBoolValues sets bits with |=, so the ones past the kept values must not be left set.
+            for (int b = write; b < first + count; b++)
+                bits[b >> 3] &= (byte)~(1 << (b & 7));
+            _boolBitOffset = write;
+        }
+        else if (_physicalType == PhysicalType.ByteArray && _byteArrayOutput == ByteArrayOutputKind.ViewType)
+        {
+            // A view is self-describing (length, then inline bytes or a prefix and an offset into the data
+            // buffer), so a view moves as 16 bytes and its data stays put.
+            var views = _viewsBuffer!.ByteSpan;
+            int write = first;
+            for (int i = 0; i < count; i++)
+            {
+                if (mask[i] == 0)
+                    continue;
+                int from = first + i;
+                if (write != from)
+                    views.Slice(from * ViewEntrySize, ViewEntrySize).CopyTo(views.Slice(write * ViewEntrySize));
+                write++;
+            }
+
+            _viewsCount = write;
+        }
+        else if (_physicalType == PhysicalType.ByteArray)
+        {
+            // Offsets [first, first + count], each value's bytes moved down to follow the last kept value's.
+            var data = _dataBuffer!.ByteSpan;
+            if (_byteArrayOutput == ByteArrayOutputKind.LargeOffsets)
+            {
+                var offsets = _largeOffsetsBuffer!.Span;
+                long writeData = offsets[first], previous = offsets[first];
+                int writeOffset = first + 1;
+                for (int i = 0; i < count; i++)
+                {
+                    long start = previous, end = offsets[first + i + 1];
+                    previous = end;
+                    if (mask[i] == 0)
+                        continue;
+                    int length = checked((int)(end - start));
+                    if (writeData != start)
+                        data.Slice(checked((int)start), length).CopyTo(data.Slice(checked((int)writeData)));
+                    writeData += length;
+                    offsets[writeOffset++] = writeData;
+                }
+
+                _offsetsCount = writeOffset;
+                _dataByteOffset = checked((int)writeData);
+            }
+            else
+            {
+                var offsets = _offsetsBuffer!.Span;
+                int writeData = offsets[first], previous = offsets[first];
+                int writeOffset = first + 1;
+                for (int i = 0; i < count; i++)
+                {
+                    int start = previous, end = offsets[first + i + 1];
+                    previous = end;
+                    if (mask[i] == 0)
+                        continue;
+                    int length = end - start;
+                    if (writeData != start)
+                        data.Slice(start, length).CopyTo(data.Slice(writeData));
+                    writeData += length;
+                    offsets[writeOffset++] = writeData;
+                }
+
+                _offsetsCount = writeOffset;
+                _dataByteOffset = writeData;
+            }
+        }
+        else
+        {
+            // Fixed width: INT32/INT64/FLOAT/DOUBLE, INT96 (12), FIXED_LEN_BYTE_ARRAY (its length).
+            int width = _valueByteOffset / _valueCount;
+            var bytes = _valueBuffer!.ByteSpan.Slice(first * width);
+            int write = 0;
+            switch (width)
+            {
+                case 4:
+                {
+                    var values = MemoryMarshal.Cast<byte, int>(bytes.Slice(0, count * 4));
+                    for (int i = 0; i < count; i++)
+                    {
+                        values[write] = values[i];
+                        write += mask[i];
+                    }
+
+                    break;
+                }
+
+                case 8:
+                {
+                    var values = MemoryMarshal.Cast<byte, long>(bytes.Slice(0, count * 8));
+                    for (int i = 0; i < count; i++)
+                    {
+                        values[write] = values[i];
+                        write += mask[i];
+                    }
+
+                    break;
+                }
+
+                default:
+                    for (int i = 0; i < count; i++)
+                    {
+                        if (mask[i] == 0)
+                            continue;
+                        if (write != i)
+                            bytes.Slice(i * width, width).CopyTo(bytes.Slice(write * width));
+                        write++;
+                    }
+
+                    break;
+            }
+
+            _valueByteOffset = (first + write) * width;
+        }
+
+        _valueCount = first + kept;
     }
 
     /// <summary>Returns true if the value at position <paramref name="rowIndex"/> is null.</summary>
@@ -1845,6 +2173,13 @@ internal sealed class ColumnBuildState : IDisposable
 
     public void Dispose()
     {
+        IndexSink?.Dispose();
+        if (_pageMask != null)
+        {
+            ArrayPool<byte>.Shared.Return(_pageMask);
+            _pageMask = null;
+        }
+
         if (_defLevels != null)
         {
             ArrayPool<byte>.Shared.Return(_defLevels);
