@@ -39,7 +39,7 @@ public sealed partial class DeltaTable
     /// (the rows still needed over their average) and lets that many go, up to the window. A limit the first unit meets
     /// reads that unit alone. Before any unit has yielded a row, the units in flight double.</para>
     /// </remarks>
-    private sealed class ScanLimit
+    internal sealed class ScanLimit
     {
         private readonly long[]? _hintedBefore;
         private readonly SemaphoreSlim? _permits;
@@ -53,7 +53,13 @@ public sealed partial class DeltaTable
         private readonly int _window;
         private long _unitsDone;
         private long _rowsDone;
+        private long _rowsConsumed;
         private bool _consumerWaiting;
+
+        // Bounded: how many files ahead the planner may open, beside the units granted. Files whose row groups are all
+        // pruned yield no unit, so grant nothing; each one doubles this, so a run of them is opened in parallel
+        // (review round 1).
+        private int _openAhead = 1;
 
         public ScanLimit(long offset, long? limit, bool counted, bool ramp, int window, IReadOnlyList<AddFile> files)
         {
@@ -70,12 +76,20 @@ public sealed partial class DeltaTable
                 _permits = new SemaphoreSlim(_granted);
             }
 
-            // The rows the log's statistics say come before each file, when they say: a hint for opening files ahead.
-            if (counted && limit is not null)
+            // The rows the log's statistics say come before each file, when they say: a hint for opening files ahead,
+            // so only for a parallel scan with a positive limit. Parsed only until they cover Need: every file after
+            // that is past it (review round 1).
+            if (counted && limit is > 0 && _window > 1)
             {
                 _hintedBefore = new long[files.Count + 1];
                 for (int i = 0; i < files.Count; i++)
                 {
+                    if (_hintedBefore[i] >= Need)
+                    {
+                        _hintedBefore.AsSpan(i + 1).Fill(long.MaxValue);
+                        break;
+                    }
+
                     long live = files[i].GetNumRecords() is { } records
                         ? Math.Max(0, records - (files[i].DeletionVector?.Cardinality ?? 0))
                         : 0;
@@ -83,6 +97,9 @@ public sealed partial class DeltaTable
                 }
             }
         }
+
+        /// <summary>Units granted so far (bounded), for tests.</summary>
+        internal int Granted => Volatile.Read(ref _granted);
 
         public long Offset { get; }
         public long? Limit { get; }
@@ -95,15 +112,35 @@ public sealed partial class DeltaTable
         public long Skipped => Volatile.Read(ref _skipped);
 
         /// <summary>
+        /// Counted: the units handed out cover <see cref="Need"/>, so the planner opens no further file (review round 1:
+        /// the file it is about to plan is opened whatever the lookahead says).
+        /// </summary>
+        public bool Covered => Counted && Volatile.Read(ref _covered);
+
+        /// <summary>
         /// Whether the planner may open file <paramref name="file"/> ahead of the one it is planning: counted, unless
         /// the log's statistics say the files before it already cover <see cref="Need"/> (a file it turns out to need
-        /// is opened when its turn comes); bounded, as far ahead as the units granted.
+        /// is opened when its turn comes); bounded, as far ahead as the units granted, or as the files that yielded no
+        /// unit have opened (<see cref="FileWithoutUnits"/>).
         /// </summary>
         public bool MayOpenAhead(int file, int current)
         {
             if (_hintedBefore is not null)
                 return _hintedBefore[file] < Need;
-            return _permits is null || file - current < Volatile.Read(ref _granted);
+            return _permits is null
+                || file - current < Math.Max(Volatile.Read(ref _granted), Volatile.Read(ref _openAhead));
+        }
+
+        /// <summary>
+        /// A file yielded no unit (every row group pruned): bounded, the planner may open twice as many files ahead,
+        /// up to the window.
+        /// </summary>
+        public void FileWithoutUnits()
+        {
+            if (_permits is null)
+                return;
+            lock (_gate)
+                Volatile.Write(ref _openAhead, Math.Min(_window, 2 * _openAhead));
         }
 
         /// <summary>
@@ -114,7 +151,7 @@ public sealed partial class DeltaTable
         {
             if (Counted && live is not null)
             {
-                if (_covered)
+                if (Volatile.Read(ref _covered))
                     return UnitAdmission.Stop;
                 long rows = await live().ConfigureAwait(false);
                 if (_planned + rows <= Offset && Volatile.Read(ref _skipped) == _planned)
@@ -126,7 +163,7 @@ public sealed partial class DeltaTable
 
                 _planned += rows;
                 if (_planned >= Need)
-                    _covered = true;
+                    Volatile.Write(ref _covered, true);
                 return UnitAdmission.Yield;
             }
 
@@ -166,12 +203,14 @@ public sealed partial class DeltaTable
         }
 
         /// <summary>
-        /// The output is about to wait for a batch (<paramref name="waiting"/>), or has one. A wait while every unit
-        /// granted has ended would never end, since only units grant more: one more is granted then. The tally above
-        /// says no more is needed once the units yield what the output needs, so this only matters if the two disagree,
-        /// but the scan must not hang on that.
+        /// The output is about to wait for a batch (<paramref name="waiting"/>), or has received one of
+        /// <paramref name="rows"/> rows. A wait with no unit in flight and every row the ended units yielded already
+        /// received would never end, since only units grant more: one more is granted then. The tally above says no more
+        /// is needed once the units yield what the output needs, so this only matters if the two disagree, but the scan
+        /// must not hang on that. A wait whose batch is already queued is not one: a unit that ends before the output
+        /// wakes for its batch grants nothing (review round 1, where it granted a cascade of units on a slow runner).
         /// </summary>
-        public void ConsumerWaiting(bool waiting)
+        public void ConsumerWaiting(bool waiting, long rows = 0)
         {
             if (_permits is null)
                 return;
@@ -179,6 +218,7 @@ public sealed partial class DeltaTable
             lock (_gate)
             {
                 _consumerWaiting = waiting;
+                _rowsConsumed += rows;
                 release = GrantLocked(0);
             }
 
@@ -186,12 +226,12 @@ public sealed partial class DeltaTable
                 _permits.Release(release);
         }
 
-        // Grants units up to `target` in flight; and one, whatever the target, when the output waits with none in
-        // flight. Returns how many to release.
+        // Grants units up to `target` in flight; and one, whatever the target, when the output waits with none in flight
+        // and nothing queued for it. Returns how many to release.
         private int GrantLocked(long target)
         {
             long outstanding = _granted - _unitsDone;
-            if (_consumerWaiting && outstanding <= 0)
+            if (_consumerWaiting && outstanding <= 0 && _rowsConsumed >= _rowsDone)
                 target = Math.Max(target, 1);
             if (target <= outstanding)
                 return 0;
@@ -201,7 +241,7 @@ public sealed partial class DeltaTable
         }
     }
 
-    private enum UnitAdmission
+    internal enum UnitAdmission
     {
         Skip,
         Yield,
@@ -300,7 +340,7 @@ public sealed partial class DeltaTable
             {
                 limit.ConsumerWaiting(waiting: true);
                 bool more = await e.MoveNextAsync().ConfigureAwait(false);
-                limit.ConsumerWaiting(waiting: false);
+                limit.ConsumerWaiting(waiting: false, more ? e.Current.Length : 0);
                 if (!more)
                     yield break;
                 var batch = e.Current;

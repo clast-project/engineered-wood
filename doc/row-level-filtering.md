@@ -1233,7 +1233,7 @@ There are three layers, and only the first decides which rows come back:
    - As units end, it estimates the units still needed (rows still needed over the rows per unit so far), and grants that many, up to the window. With no row yet, the units in flight double.
    - A first version doubled from one unit regardless. That cost a deep filtered page 14% locally and 60% on the simulated store: several round trips to reach the window the consumer's own read had from the start.
 
-**Liveness.** In bounded mode only a unit that ends grants more. A first version therefore deadlocked when the output still wanted rows after the units had yielded `Offset + Limit`: the planner waited for a grant and the output for a batch. Correct code cannot get there, but a mutation of the output's arithmetic did, and its tests hung instead of failing. The output now tells the limit when it waits for a batch (`ConsumerWaiting`). A wait with no unit in flight grants one, which never happens in a correct scan.
+**Liveness.** In bounded mode only a unit that ends grants more. A first version therefore deadlocked when the output still wanted rows after the units had yielded `Offset + Limit`: the planner waited for a grant and the output for a batch. Correct code cannot get there, but a mutation of the output's arithmetic did, and its tests hung instead of failing. The output now tells the limit when it waits for a batch (`ConsumerWaiting`), and how many rows each batch held. A wait with no unit in flight, after the output has received every row the ended units yielded, grants one; that never happens in a correct scan. (The first version of this granted on any wait with no unit in flight: see review round 1.)
 
 ### Measured
 
@@ -1273,3 +1273,10 @@ Each of these mutations fails tests:
 - the output taking one row too few (9; it hung before the liveness fix).
 
 The benchmarks' table guard now checks for a commit, not just a `_delta_log` directory: an interrupted build had left an empty one that made every case fail.
+
+### Review round 1
+
+- **CI: a filtered `Limit = 1` read 11 units at window 8** (net10.0 on CI; it passed locally, and on net8.0 and net472 there). The liveness reserve granted a unit whenever the output waited with none in flight. But a unit can end with its batch queued before the output wakes to take it, so the output "waited" with nothing in flight and was granted a unit. On a slow runner, each new unit ended before the output ran too, and granted the next. The reserve now also needs the output to have received every row the ended units yielded. `AUnitEndingBeforeTheOutputTakesItsBatchGrantsNothing` replays that sequence deterministically on `ScanLimit`; the real race depends on thread scheduling. The ramp test ran 30 times without a failure.
+- **Statistics were parsed for every file** for the open-ahead hints, even for `Limit = 1`, a serial scan or `Limit = 0`. They are now built only for a parallel scan with a positive limit, and parsing stops once the hints cover `Offset + Limit`.
+- **Fully pruned files stalled a bounded scan's lookahead.** Opening files ahead followed the units granted, and a file whose row groups are all pruned yields no unit, so grants none. A run of them was opened one at a time. Each such file now doubles the open-ahead allowance, up to the window. `AFilteredScan_PlansTheFilesItOpenedAhead_AtOnce` covers an exact filter with a limit too, and fails without the fix.
+- **A covered counted limit still opened the next file**: the file about to be planned is opened whatever the lookahead says. The planner now checks for a covered limit before opening it. `ACoveredLimitOpensNoFurtherFile` (one-row-group files, serial and parallel) fails without the check.

@@ -6,6 +6,7 @@ using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Table;
 using EngineeredWood.Expressions.Sql;
+using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 
@@ -171,6 +172,125 @@ public class OffsetLimitTests : IDisposable
 
         // Without an offset or a limit, the superset filter is as before.
         Assert.NotEmpty(await ReadAsync(table, new DeltaReadOptions { Filter = superset }));
+    }
+
+    // ---- The bounded ramp's grants (review round 1) ----------------------------------------------------------------
+
+    private static DeltaTable.ScanLimit Bounded(long offset, long limit) =>
+        new(offset, limit, counted: false, ramp: true, window: 8, files: []);
+
+    /// <summary>
+    /// CI's failure: a unit that ends before the output wakes for its queued batch is not a starved output. The old
+    /// rule granted a unit whenever the output waited with none in flight, and on a slow runner each unit ended before
+    /// the output ran, granting the next: 11 units for a limit of 1.
+    /// </summary>
+    [Fact]
+    public void AUnitEndingBeforeTheOutputTakesItsBatchGrantsNothing()
+    {
+        var limit = Bounded(offset: 0, limit: 1);
+        Assert.Equal(1, limit.Granted);
+        limit.ConsumerWaiting(waiting: true);
+        limit.UnitDone(rows: 500);              // ended; its batch is queued, the output not yet awake
+        Assert.Equal(1, limit.Granted);
+        limit.ConsumerWaiting(waiting: false, rows: 500);
+        Assert.Equal(1, limit.Granted);
+    }
+
+    /// <summary>
+    /// The deadlock the reserve exists for: the output has received every row the ended units yielded, still wants
+    /// more (an accounting disagreement), and nothing is in flight. One unit is granted.
+    /// </summary>
+    [Fact]
+    public void AnOutputThatHasEveryRowAndStillWaitsIsGrantedAUnit()
+    {
+        var limit = Bounded(offset: 0, limit: 1);
+        limit.ConsumerWaiting(waiting: true);
+        limit.UnitDone(rows: 500);
+        limit.ConsumerWaiting(waiting: false, rows: 500);
+        limit.ConsumerWaiting(waiting: true);
+        Assert.Equal(2, limit.Granted);
+    }
+
+    /// <summary>Units are granted as the rows still needed suggest: a limit far past the first unit's rows opens the window.</summary>
+    [Fact]
+    public void TheRampGrantsWhatTheRowsStillNeededSuggest()
+    {
+        var limit = Bounded(offset: 0, limit: 2_000);
+        limit.UnitDone(rows: 100);              // 1,900 still needed at 100 a unit: the window, 8
+        Assert.Equal(1 + 8, limit.Granted);
+
+        var paged = Bounded(offset: 5, limit: 1);
+        Assert.Equal(8, paged.Granted);         // an offset starts with the window
+    }
+
+    /// <summary>
+    /// A counted limit the first file covers opens no other file (review round 1: the file about to be planned was
+    /// opened whatever the lookahead said). Each file is one row group of 2,000 rows here.
+    /// </summary>
+    [Fact]
+    public async Task ACoveredLimitOpensNoFurtherFile()
+    {
+        string root = Path.Combine(_tempDir, $"onegroup_{Guid.NewGuid():N}");
+        var fs = new OpenCountingFileSystem(new LocalTableFileSystem(root));
+        await using (var writer = await DeltaTable.CreateAsync(fs, TableSchema,
+                         new DeltaTableOptions { TargetFileSize = long.MaxValue }, partitionColumns: ["p"]))
+        {
+            for (int f = 0; f < Files; f++)
+            {
+                var id = new Int64Array.Builder();
+                var cat = new StringArray.Builder();
+                var p = new StringArray.Builder();
+                for (long i = f * RowsPerFile; i < (f + 1) * RowsPerFile; i++)
+                {
+                    id.Append(i);
+                    cat.Append("c");
+                    p.Append("q" + f.ToString(CultureInfo.InvariantCulture));
+                }
+
+                await writer.WriteAsync([new RecordBatch(TableSchema, [id.Build(), cat.Build(), p.Build()], RowsPerFile)]);
+            }
+        }
+
+        foreach (int concurrency in new[] { 1, 4 })
+        {
+            await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions { MaxConcurrentReads = concurrency });
+            fs.Reset();
+            var rows = await ReadAsync(table, new DeltaReadOptions { Columns = ["id"], Limit = 10 });
+            Assert.Equal(10, rows.Count);
+            Assert.Equal(1, fs.Opened.Count(path => path.EndsWith(".parquet", StringComparison.Ordinal)));
+        }
+    }
+
+    /// <summary>A table's file system, recording each file opened for reading.</summary>
+    private sealed class OpenCountingFileSystem(ITableFileSystem inner) : ITableFileSystem
+    {
+        public System.Collections.Concurrent.ConcurrentQueue<string> Opened { get; private set; } = new();
+
+        // ConcurrentQueue has no Clear on net472.
+        public void Reset() => Opened = new();
+
+        public PathNameConstraints PathConstraints => inner.PathConstraints;
+
+        public ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
+        {
+            Opened.Enqueue(path);
+            return inner.OpenReadAsync(path, cancellationToken);
+        }
+
+        public IAsyncEnumerable<TableFileInfo> ListAsync(string prefix, CancellationToken cancellationToken = default)
+            => inner.ListAsync(prefix, cancellationToken);
+        public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ReadAllBytesAsync(path, cancellationToken);
+        public ValueTask<ISequentialFile> CreateAsync(string path, bool overwrite = false, CancellationToken cancellationToken = default)
+            => inner.CreateAsync(path, overwrite, cancellationToken);
+        public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
+            => inner.DeleteAsync(path, cancellationToken);
+        public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
+            => inner.ExistsAsync(path, cancellationToken);
+        public ValueTask<bool> TryWriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.TryWriteAllBytesAsync(path, data, cancellationToken);
+        public ValueTask WriteAllBytesAsync(string path, ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
+            => inner.WriteAllBytesAsync(path, data, cancellationToken);
     }
 
     // ---- The table --------------------------------------------------------------------------------------------------

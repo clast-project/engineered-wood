@@ -6936,6 +6936,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             for (int f = 0; f < files.Count; f++)
             {
+                // A counted limit the units handed out already cover opens no further file (#502 phase 5f).
+                if (limit is { Covered: true })
+                    yield break;
+
                 // With a limit, a file is opened ahead only while it may be needed (#502 phase 5f); the one being
                 // planned always is.
                 while (next < files.Count && opening.Count < Math.Max(1, lookahead)
@@ -6953,6 +6957,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 var opened = await opening.Dequeue().ConfigureAwait(false);
                 var read = opened.Read;
                 IAsyncEnumerator<ParquetFileReader.RowGroupPlan>? rest = null;
+                bool yieldedUnit = false;
                 try
                 {
                     if (read.NoRowsMatch)
@@ -6964,6 +6969,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         if (limit is not null && await limit.AdmitAsync(null, cancellationToken).ConfigureAwait(false) == UnitAdmission.Stop)
                             yield break;
                         read.AddRef();
+                        yieldedUnit = true;
                         yield return new ScanUnit(f, read, null);
                     }
                     else
@@ -6977,6 +6983,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                             if (admission == UnitAdmission.Skip)
                                 continue;
                             read.AddRef();
+                            yieldedUnit = true;
                             yield return new ScanUnit(f, read, plan);
                         }
                         opened.Error?.Throw();
@@ -6997,6 +7004,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                             if (admission == UnitAdmission.Skip)
                                 continue;
                             read.AddRef();
+                            yieldedUnit = true;
                             yield return new ScanUnit(f, read, plan);
                         }
                     }
@@ -7007,6 +7015,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         await rest.DisposeAsync().ConfigureAwait(false);
                     read.Release();
                 }
+
+                // A file that yielded no unit lets a bounded limit open further ahead (#502 phase 5f review round 1).
+                if (!yieldedUnit)
+                    limit?.FileWithoutUnits();
             }
         }
         finally
