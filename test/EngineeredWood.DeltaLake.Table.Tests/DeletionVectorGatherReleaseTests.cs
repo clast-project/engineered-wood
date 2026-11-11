@@ -70,7 +70,11 @@ public class DeletionVectorGatherReleaseTests : IDisposable
     {
         public const int ChunkRows = 2;
 
-        public CountingAllocator Allocator { get; } = new();
+        /// <summary>
+        /// Replaced before the read under test, so it counts that read's buffers alone: the setup's UPDATE and DELETE
+        /// read through this seam too, and buffers they leave to finalization can be released during the read.
+        /// </summary>
+        public CountingAllocator Allocator { get; set; } = new();
 
         public async IAsyncEnumerable<RecordBatch> ReadAsync(
             string relativePath, IReadOnlyList<string>? physicalColumns,
@@ -184,7 +188,7 @@ public class DeletionVectorGatherReleaseTests : IDisposable
             });
         }
 
-        int before = seam.Allocator.Live;
+        seam.Allocator = new CountingAllocator();
         var read = new List<long>();
         await foreach (var batch in table.ReadAsync(new DeltaReadOptions()))
         {
@@ -196,7 +200,7 @@ public class DeletionVectorGatherReleaseTests : IDisposable
             }
         }
 
-        Assert.Equal(Enumerable.Range(0, 8).Select(i => (long)i).Where(i => !deleted.Contains(i)), read.Order());
-        Assert.Equal(before, seam.Allocator.Live);
+        Assert.Equal(Enumerable.Range(0, 8).Select(i => (long)i).Where(i => !deleted.Contains(i)), read.OrderBy(i => i));
+        Assert.Equal(0, seam.Allocator.Live);
     }
 }
