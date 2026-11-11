@@ -25,8 +25,8 @@ public static partial class StatisticsEvaluator
     };
 
     /// <summary>
-    /// Whether a leaf (a comparison of a top-level column with a literal of the column's own type, or
-    /// <c>IS [NOT] NULL</c> of one) is TRUE for every row of the unit. <c>IN</c> is never proven: for a column whose
+    /// Whether a leaf (a comparison of a top-level column with a literal of the column's own type, or of one it widens
+    /// to exactly, or <c>IS [NOT] NULL</c> of one) is TRUE for every row of the unit. <c>IN</c> is never proven: for a column whose
     /// bounds meet, write <c>=</c>.
     /// </summary>
     /// <remarks>
@@ -36,8 +36,12 @@ public static partial class StatisticsEvaluator
     /// combines leaves itself (AND and OR only, <see cref="ProvesEveryRowTrue"/>), and every leaf but <c>IS NULL</c>
     /// also needs a null count of 0: a NULL row answers NULL, which is not TRUE.</para>
     /// <para>A literal of another type would hand the decision to cross-type comparison rules a row evaluator need not
-    /// share, so it is not answered. A NaN outside the bounds is the evaluator's to rule on: it answers Unknown when
-    /// one may hide there and would answer otherwise.</para>
+    /// share, so it is not answered, but for a literal that widens to the column's type exactly (#808): an INT over a
+    /// BIGINT column (<c>id &gt;= 2500</c>, as SQL types the literal) or a FLOAT over a DOUBLE one. Every comparison
+    /// meets there: Spark casts the narrower side to the wider, and the statistics compare the two exactly
+    /// (<see cref="LiteralValue.CompareTo(LiteralValue, out bool)"/>), so both answer as for a literal of the column's
+    /// own type and value. A float widens with its NaN and -0.0 intact. A NaN outside the bounds is the evaluator's to
+    /// rule on: it answers Unknown when one may hide there and would answer otherwise.</para>
     /// </remarks>
     public static bool ProvesLeafEveryRowTrue<TStats>(
         Predicate leaf, TStats stats, IStatisticsAccessor<TStats> accessor)
@@ -76,7 +80,7 @@ public static partial class StatisticsEvaluator
                 return false;
             foreach (var literal in literals)
             {
-                if (literal is not LiteralExpression { Value: var value } || value.Type != min.Type)
+                if (literal is not LiteralExpression { Value: var value } || !ComparesAsColumnType(value.Type, min.Type))
                     return false;
             }
         }
@@ -85,4 +89,11 @@ public static partial class StatisticsEvaluator
             return false;
         return isNull || accessor.GetNullCount(stats, column) == 0;
     }
+
+    // A literal of this kind compares with a column of that one as a literal of the column's own kind would: the same
+    // kind, or one that widens to it exactly (#808).
+    private static bool ComparesAsColumnType(LiteralValue.Kind literal, LiteralValue.Kind column) =>
+        literal == column
+        || (literal == LiteralValue.Kind.Int32 && column == LiteralValue.Kind.Int64)
+        || (literal == LiteralValue.Kind.Float && column == LiteralValue.Kind.Double);
 }
