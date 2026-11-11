@@ -6645,7 +6645,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             throw new ArgumentNullException(nameof(options));
         var snapshot = ResolveReadSnapshot(options) ?? CurrentSnapshot;
         ValidateReadMetadata(snapshot, options.Metadata, options.MetadataPrefix);
-        return BuildReadSchema(snapshot, options);
+        return BuildReadSchema(snapshot, options, _options.ParquetReadOptions.ByteArrayOutput);
     }
 
     /// <summary>
@@ -7138,7 +7138,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var rows = growth is null
                 ? selected.ReadAsync(plan, cancellationToken)
                 : selected.ReadAsync(plan, reservation, growth, cancellationToken);
-            await foreach (var fb in ProcessSelectedFileBatchesAsync(rows, read, wantPositions, scan.WantTracking, cancellationToken)
+            await foreach (var fb in ProcessSelectedFileBatchesAsync(
+                               rows, read, wantPositions, scan.WantTracking, _options.ParquetReadOptions.ByteArrayOutput,
+                               cancellationToken)
                                .ConfigureAwait(false))
             {
                 yield return WithMetadataColumns(fb, scan, ordinal, pathBytes);
@@ -7148,7 +7150,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         var source = UnitSource(unit, reservation, growth, cancellationToken);
-        await foreach (var fb in ProcessDataFileBatchesAsync(source, read, wantPositions, scan.WantTracking, cancellationToken)
+        await foreach (var fb in ProcessDataFileBatchesAsync(
+                               source, read, wantPositions, scan.WantTracking, _options.ParquetReadOptions.ByteArrayOutput,
+                               cancellationToken)
                            .ConfigureAwait(false))
         {
             yield return WithMetadataColumns(fb, scan, ordinal, pathBytes);
@@ -7322,11 +7326,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     private static Apache.Arrow.Schema BuildReadSchema(
-        Snapshot.Snapshot snapshot, DeltaReadOptions options)
+        Snapshot.Snapshot snapshot, DeltaReadOptions options, ByteArrayOutputKind byteArrays)
     {
         var baseSchema = options.Columns is not null
             ? BuildProjectedSchema(snapshot.ArrowSchema, options.Columns)
             : snapshot.ArrowSchema;
+
+        // The table's string and binary columns in the representation the scan emits them in (#793).
+        if (ByteArrayRepresentation.Fields(baseSchema.FieldsList, byteArrays) is { } represented)
+            baseSchema = new Apache.Arrow.Schema(represented, baseSchema.Metadata);
 
         var metadataFields = MetadataFields(options.Metadata, options.MetadataPrefix);
         if (metadataFields.Count == 0)
@@ -12081,7 +12089,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // a scan does. Only the rows the planner kept are decoded, but a kept run still holds unselected ones.
         var source = UnitSource(unit, reservation, growth, cancellationToken);
         await foreach (var fb in ProcessDataFileBatchesAsync(
-                           source, read, wantPositions: true, wantTracking, cancellationToken).ConfigureAwait(false))
+                           source, read, wantPositions: true, wantTracking, _options.ParquetReadOptions.ByteArrayOutput,
+                           cancellationToken).ConfigureAwait(false))
         {
             // Most batches of a file hold no selected row. Every one is released here rather than left to the
             // finalizer: its native buffers would otherwise outlive the budget reservation that covered them.
@@ -13567,7 +13576,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
                     predicates.Add(new RowPredicate(conditionFileColumns ?? everyColumn!, ConditionMask(
                         condition, snapshot, addFile, mappingMode, physicalToLogical, logicalToPhysical,
-                        partitionColumns, hasPartitions))
+                        partitionColumns, hasPartitions, byteArrays: _options.ParquetReadOptions.ByteArrayOutput))
                     {
                         DropsEarlierNulls = dropsEarlierNulls,
                         ValueWise = AnswersFromDictionaries && condition.ValueWise,
@@ -13601,7 +13610,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     var empty = new RecordBatch(new Apache.Arrow.Schema.Builder().Build(), [], rows);
                     using var shaped = ReconcileToTableShape(
                         empty, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
-                        logicalToPhysical, addFile.Path);
+                        logicalToPhysical, addFile.Path, _options.ParquetReadOptions.ByteArrayOutput);
                     var answer = condition.Evaluate(shaped);
                     try
                     {
@@ -13716,7 +13725,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
                     predicates.Add(new RowPredicate(runFileColumns ?? everyColumn!, ConditionMask(
                         condition, snapshot, addFile, mappingMode, physicalToLogical, logicalToPhysical,
-                        partitionColumns, hasPartitions, keepNulls: true))
+                        partitionColumns, hasPartitions, keepNulls: true,
+                        byteArrays: _options.ParquetReadOptions.ByteArrayOutput))
                     {
                         // Each conjunct's answer for a row depends on that row's values alone (#502 phase 4c), so the
                         // reader may answer it from a dictionary.
@@ -13797,7 +13807,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     reservation, cancellationToken);
             }
 
-            await foreach (var processed in ProcessDataFileBatchesAsync(source, read, wantPositions, wantTracking, cancellationToken)
+            await foreach (var processed in ProcessDataFileBatchesAsync(source, read, wantPositions, wantTracking, byteArrays: null, cancellationToken)
                 .ConfigureAwait(false))
             {
                 yield return processed;
@@ -13825,7 +13835,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private static Func<RecordBatch, BooleanArray> ConditionMask(
         RowCondition condition, Snapshot.Snapshot snapshot, AddFile addFile, ColumnMappingMode mappingMode,
         Dictionary<string, string> physicalToLogical, Dictionary<string, string> logicalToPhysical,
-        IReadOnlyList<string> partitionColumns, bool hasPartitions, bool keepNulls = false) =>
+        IReadOnlyList<string> partitionColumns, bool hasPartitions, bool keepNulls = false,
+        ByteArrayOutputKind? byteArrays = null) =>
         batch =>
         {
             var logical = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
@@ -13833,9 +13844,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             logical = ReconcileToTableShape(
                 logical, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
-                logicalToPhysical, addFile.Path);
+                logicalToPhysical, addFile.Path, byteArrays, borrowed: batch);
             var answer = condition.Evaluate(logical);
-            return keepNulls ? answer : NullAsFalse(answer, logical);
+            answer = keepNulls ? answer : NullAsFalse(answer, logical);
+
+            // What the reshaping built for this answer, which nothing else holds (#822 review round 4).
+            ByteArrayRepresentation.ReleaseReshaped(logical, batch, answer);
+            return answer;
         };
 
     /// <summary>
@@ -13866,14 +13881,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 logical = ColumnMappingRecursive.StripParquetFieldIds(logical);
                 logical = ReconcileToTableShape(
                     logical, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions,
-                    logicalToPhysical, addFile.Path);
+                    logicalToPhysical, addFile.Path, _options.ParquetReadOptions.ByteArrayOutput, borrowed: batch);
             }
             catch (Exception e) when (e is not OperationCanceledException)
             {
                 return null;
             }
 
-            return RowEvaluator.TryEvaluateWithoutRaising(predicate, logical);
+            var answer = RowEvaluator.TryEvaluateWithoutRaising(predicate, logical);
+
+            // What the reshaping built for this answer, which nothing else holds (#822 review round 4).
+            ByteArrayRepresentation.ReleaseReshaped(logical, batch, answer);
+            return answer;
         };
     }
 
@@ -14167,6 +14186,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         DataFileRead read,
         bool wantPositions,
         bool wantTracking,
+        ByteArrayOutputKind byteArrays,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var snapshot = read.Snapshot;
@@ -14229,7 +14249,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             var shaped = ReconcileToTableShape(
                 result, snapshot, addFile.PartitionValues, read.Columns, read.PartitionColumns, read.HasPartitions,
-                read.LogicalToPhysical, addFile.Path);
+                read.LogicalToPhysical, addFile.Path, byteArrays);
             yield return new FileBatch(shaped, positions, rowIds, versions);
         }
     }
@@ -14239,17 +14259,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// position. The pipeline keeps no state from one batch to the next, so a scan split by row group runs it
     /// once per row group.
     /// </summary>
+    /// <param name="byteArrays">The representation to put the string and binary columns in (#793): the table's
+    /// <see cref="ParquetReadOptions.ByteArrayOutput"/> for a read that hands its batches to the caller; null for a
+    /// DML read, which keeps the representations it always had (review round 2: partition routing and other DML
+    /// steps don't take a view for a partition or backfilled column).</param>
     private IAsyncEnumerable<FileBatch> ProcessDataFileBatchesAsync(
         IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> source,
         DataFileRead read,
         bool wantPositions,
         bool wantTracking,
+        ByteArrayOutputKind? byteArrays,
         CancellationToken cancellationToken)
     {
         var batches = ProcessFileBatchesAsync(
             source, read.AddFile, read.Snapshot, read.Columns, read.MappingMode, read.PhysicalToLogical,
             read.LogicalToPhysical, read.DeletedRows, read.PartitionColumns, read.HasPartitions,
-            wantPositions: wantPositions || read.SeamConditions is not null, wantTracking, cancellationToken);
+            wantPositions: wantPositions || read.SeamConditions is not null, wantTracking, byteArrays, cancellationToken);
         return read.SeamConditions is { } conditions
             ? FilterSeamBatchesAsync(batches, conditions, read.FilterColumns, wantPositions, cancellationToken)
             : batches;
@@ -14370,6 +14395,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool hasPartitions,
         bool wantPositions,
         bool wantTracking,
+        ByteArrayOutputKind? byteArrays,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         // Hidden materialized row-tracking columns (a copy-on-write rewrite wrote each moved row's original id +
@@ -14470,7 +14496,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // The materialized row-tracking columns were already stripped up front (above).
             var cleanResult = ReconcileToTableShape(
                 result, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions, logicalToPhysical,
-                addFile.Path);
+                addFile.Path, byteArrays);
 
             yield return new FileBatch(cleanResult, positions, rowIds, versions);
         }
@@ -14491,7 +14517,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     internal static RecordBatch ReconcileToTableShape(
         RecordBatch result, Snapshot.Snapshot snapshot, IReadOnlyDictionary<string, string>? partitionValues,
         IReadOnlyList<string>? columns, IReadOnlyList<string> partitionColumns, bool hasPartitions,
-        IReadOnlyDictionary<string, string> logicalToPhysical, string? filePath = null)
+        IReadOnlyDictionary<string, string> logicalToPhysical, string? filePath = null,
+        ByteArrayOutputKind? byteArrays = null, RecordBatch? borrowed = null)
     {
         // Apply type widening — convert narrow types from old files to current schema types
         if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
@@ -14539,7 +14566,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // file (Spark 4.0.x, a spec-minimal writer, or our own output under
         // EmitVariantLogicalType=false) yields a bare struct-of-binary that the parquet reader did
         // not wrap. Without this the column would silently read as a struct rather than a variant.
-        return VariantColumnCoercion.Coerce(result, expectedSchema);
+        result = VariantColumnCoercion.Coerce(result, expectedSchema);
+
+        // A read's string and binary columns all in the representation ByteArrayOutput asks for (#793): the Parquet
+        // reader decodes a data column in it, but a partition column, a backfilled one and a codec-seam host's are
+        // built elsewhere. After the variant coercion, whose storage this leaves alone (an extension type). The
+        // metadata columns a scan appends later keep their documented types. A row mask's batch is a view of arrays the
+        // reader still reads (`borrowed`), which the conversion must not release.
+        return byteArrays is { } kind ? ByteArrayRepresentation.Apply(result, kind, borrowed) : result;
     }
 
     /// <summary>
