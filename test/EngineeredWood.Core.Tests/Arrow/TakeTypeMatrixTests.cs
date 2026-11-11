@@ -426,21 +426,9 @@ public class TakeTypeMatrixTests
         Assert.Equal(3, result.Length);
     }
 
-    [Fact]
-    public void UnsupportedType_Throws()
-    {
-        // A dictionary-encoded column is genuinely not gatherable here. It must throw rather than pass the
-        // column through unfiltered — an unfiltered column has the wrong length for the batch it lands in.
-        var indices = new Int32Array.Builder().Append(0).Append(1).Append(0).Build();
-        var dictionary = new StringArray.Builder().Append("alpha").Append("bravo").Build();
-        var dict = new DictionaryArray(
-            new DictionaryType(Int32Type.Default, StringType.Default, ordered: false),
-            indices, dictionary);
-
-        var ex = Assert.Throws<NotSupportedException>(() => ArrowCompute.Take(dict, (int[])[1, 0]));
-        Assert.Contains("ArrowCompute", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("Dictionary", ex.Message, StringComparison.OrdinalIgnoreCase);
-    }
+    // A type Take can't gather must throw rather than pass the column through unfiltered: an unfiltered column has
+    // the wrong length for the batch it lands in. Interval_ThrowsRatherThanGuessingItsWidth below pins that; a
+    // dictionary, the example here before, now gathers (#794, DictionaryTakeTests).
 
     [Fact]
     public void Interval_ThrowsRatherThanGuessingItsWidth()
