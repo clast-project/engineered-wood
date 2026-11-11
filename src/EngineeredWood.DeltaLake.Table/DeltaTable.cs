@@ -6645,7 +6645,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             throw new ArgumentNullException(nameof(options));
         var snapshot = ResolveReadSnapshot(options) ?? CurrentSnapshot;
         ValidateReadMetadata(snapshot, options.Metadata, options.MetadataPrefix);
-        return BuildReadSchema(snapshot, options);
+        return BuildReadSchema(snapshot, options, _options.ParquetReadOptions.ByteArrayOutput);
     }
 
     /// <summary>
@@ -6790,7 +6790,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 included.Add((ordinal, ordered[ordinal]));
         }
 
-        var scan = new ScanFileShape(options, metadataFields, wantAddress, wantLocator, wantTracking);
+        var scan = new ScanFileShape(options, metadataFields, wantAddress, wantLocator, wantTracking,
+            _options.ParquetReadOptions.ByteArrayOutput);
         var includedFiles = included.ConvertAll(i => i.File);
 
         // The scan's unit of work is one row group of one file (#612), so that a few large files, or one large
@@ -7213,7 +7214,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<Field> MetadataFields,
         bool WantAddress,
         bool WantLocator,
-        bool WantTracking);
+        bool WantTracking,
+        ByteArrayOutputKind ByteArrays);
 
     /// <summary>
     /// A scanned batch with the metadata columns the scan asked for appended, built from the
@@ -7222,7 +7224,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     private static RecordBatch WithMetadataColumns(FileBatch fb, ScanFileShape scan, int ordinal, byte[]? pathBytes)
     {
-        var batch = fb.Batch;
+        // The table's columns in the representation ByteArrayOutput asks for, whichever built them (#793). The
+        // metadata columns keep the types they document: an update by locator requires its path column as utf8.
+        var batch = ByteArrayRepresentation.Apply(fb.Batch, scan.ByteArrays);
         if (scan.MetadataFields.Count == 0)
             return batch;
 
@@ -7322,11 +7326,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     private static Apache.Arrow.Schema BuildReadSchema(
-        Snapshot.Snapshot snapshot, DeltaReadOptions options)
+        Snapshot.Snapshot snapshot, DeltaReadOptions options, ByteArrayOutputKind byteArrays)
     {
         var baseSchema = options.Columns is not null
             ? BuildProjectedSchema(snapshot.ArrowSchema, options.Columns)
             : snapshot.ArrowSchema;
+
+        // The table's string and binary columns in the representation the scan emits them in (#793).
+        if (ByteArrayRepresentation.Fields(baseSchema.FieldsList, byteArrays) is { } represented)
+            baseSchema = new Apache.Arrow.Schema(represented, baseSchema.Metadata);
 
         var metadataFields = MetadataFields(options.Metadata, options.MetadataPrefix);
         if (metadataFields.Count == 0)
@@ -11988,7 +11996,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // run of rows inside a kept one wherever its pages can be read alone: the same skip a deletion vector
         // drives. For a point lookup that is most of the file.
         var scanOptions = new DeltaReadOptions();
-        var shape = new ScanFileShape(scanOptions, metadataFields, wantAddress, wantLocator, wantTracking);
+        var shape = new ScanFileShape(scanOptions, metadataFields, wantAddress, wantLocator, wantTracking,
+            _options.ParquetReadOptions.ByteArrayOutput);
         RowSkipPredicate? SkipUnselected(int f) => NoTargetIn(targets[f]);
 
         int window = EffectiveConcurrentReads;
