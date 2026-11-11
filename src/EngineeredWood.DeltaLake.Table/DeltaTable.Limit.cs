@@ -154,14 +154,16 @@ public sealed partial class DeltaTable
                 if (Volatile.Read(ref _covered))
                     return UnitAdmission.Stop;
                 long rows = await live().ConfigureAwait(false);
-                if (_planned + rows <= Offset && Volatile.Read(ref _skipped) == _planned)
+
+                // Compared and summed without overflowing (review round 2): the offset may be anything a long holds.
+                if (_planned <= Offset && rows <= Offset - _planned && Volatile.Read(ref _skipped) == _planned)
                 {
                     _planned += rows;
                     Volatile.Write(ref _skipped, _planned);
                     return UnitAdmission.Skip;
                 }
 
-                _planned += rows;
+                _planned = rows > long.MaxValue - _planned ? long.MaxValue : _planned + rows;
                 if (_planned >= Need)
                     Volatile.Write(ref _covered, true);
                 return UnitAdmission.Yield;
@@ -269,7 +271,10 @@ public sealed partial class DeltaTable
                 nameof(options));
         }
 
-        bool counted = !options.FilterRows && options.RowMasks is not { Count: > 0 } && _options.DataFileReader is null;
+        // Counted when no row condition stands between a row group's live rows and the rows returned: no exact filter
+        // (FilterRows without a Filter is none, review round 2), no mask, and the built-in reader.
+        bool exactFilter = options.FilterRows && options.Filter is not null;
+        bool counted = !exactFilter && options.RowMasks is not { Count: > 0 } && _options.DataFileReader is null;
         return new ScanLimit(options.Offset, options.Limit, counted, ramp: !counted && window > 1, window, files);
     }
 

@@ -133,6 +133,37 @@ public class OffsetLimitTests : IDisposable
     }
 
     /// <summary>
+    /// FilterRows with no Filter is no row condition (review round 2): an offset still skips the row groups it covers
+    /// unread, and the rows are those of the same read without FilterRows.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task FilterRowsWithoutAFilterIsCounted(int concurrency)
+    {
+        await using var table = await CreateAsync(concurrency);
+        var plain = new DeltaReadOptions { Columns = ["id"], Offset = 2_000, Limit = 10 };
+
+        int before = table.ScanUnitsRead;
+        var rows = await ReadAsync(table, plain with { FilterRows = true });
+        Assert.Equal(1, table.ScanUnitsRead - before);
+        Assert.Equal(await ReadAsync(table, plain), rows);
+    }
+
+    /// <summary>
+    /// An offset as large as a long holds returns nothing, rather than wrapping the planner's tally (review round 2).
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task AnOffsetOfLongMaxValueReturnsNothing(int concurrency)
+    {
+        await using var table = await CreateAsync(concurrency);
+        Assert.Empty(await ReadAsync(table, new DeltaReadOptions { Columns = ["id"], Offset = long.MaxValue, Limit = 5 }));
+        Assert.Empty(await ReadAsync(table, new DeltaReadOptions { Columns = ["id"], Offset = long.MaxValue }));
+    }
+
+    /// <summary>
     /// With an exact filter, a parallel scan's limit reads one row group first, then two more for each that ends, so a
     /// limit the first row group meets reads at most three, not the window's eight.
     /// </summary>

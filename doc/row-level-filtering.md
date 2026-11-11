@@ -1224,7 +1224,7 @@ The conjuncts keep their source order (§7). A host that knows its selectivities
 
 There are three layers, and only the first decides which rows come back:
 1. **The output** (`LimitRowsAsync`) skips the offset's rows and stops after the limit's, which ends the scan and cancels what is in flight. A batch cut in two is gathered (`BatchSelector.Gather` / `ReleaseAfterGather`, so a view column's shared buffers stay alive). This alone makes every mode exact.
-2. **Counted mode** (no `FilterRows`, no masks, the built-in reader). Each planned row group's live rows are its plan's rows less those the file's deletion vector deletes among them (counted by clearing a selection bitmap). They come from the file, never from the log's statistics.
+2. **Counted mode** (no exact filter, no masks, the built-in reader; `FilterRows` without a `Filter` is no filter). Each planned row group's live rows are its plan's rows less those the file's deletion vector deletes among them (counted by clearing a selection bitmap). They come from the file, never from the log's statistics.
    - The planner drops the units wholly inside the offset, crediting their rows to it. Every skip comes before the first unit handed out, so the output reads the credit once.
    - It stops planning once the units handed out cover `Offset + Limit`.
    - The log's `numRecords`, less the deletion vectors' cardinality, only decides how many files are opened ahead. A wrong statistic can make the scan open fewer files ahead; it cannot change a row.
@@ -1280,3 +1280,8 @@ The benchmarks' table guard now checks for a commit, not just a `_delta_log` dir
 - **Statistics were parsed for every file** for the open-ahead hints, even for `Limit = 1`, a serial scan or `Limit = 0`. They are now built only for a parallel scan with a positive limit, and parsing stops once the hints cover `Offset + Limit`.
 - **Fully pruned files stalled a bounded scan's lookahead.** Opening files ahead followed the units granted, and a file whose row groups are all pruned yields no unit, so grants none. A run of them was opened one at a time. Each such file now doubles the open-ahead allowance, up to the window. `AFilteredScan_PlansTheFilesItOpenedAhead_AtOnce` covers an exact filter with a limit too, and fails without the fix.
 - **A covered counted limit still opened the next file**: the file about to be planned is opened whatever the lookahead says. The planner now checks for a covered limit before opening it. `ACoveredLimitOpensNoFurtherFile` (one-row-group files, serial and parallel) fails without the check.
+
+### Review round 2
+
+- **`FilterRows` without a `Filter` counts as no filter.** Counted mode was keyed on `FilterRows` alone. So such a read, which has no row condition, lost row-group skipping for its offset and the open-ahead hints for its limit. It now keys on an exact filter being present. `FilterRowsWithoutAFilterIsCounted` (serial and parallel) reads one unit for `Offset = 2,000, Limit = 10`, returns the same rows as the read without `FilterRows`, and fails with the old classification.
+- **The planner's tally no longer adds without bound.** `_planned + rows <= Offset` would wrap if the tally neared `long.MaxValue`. The tally sums real row counts, so that needs a table of about 9.2 x 10^18 rows; unreachable, but it is now compared by subtraction and saturated, as `Need` already was. `AnOffsetOfLongMaxValueReturnsNothing` pins the edge it guards (it passed before too).
