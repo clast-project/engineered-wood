@@ -25,11 +25,33 @@ internal static class DeltaLengthByteArrayDecoder
         var lengths = new int[count];
         lengthDecoder.DecodeInt32s(lengths);
 
-        // Step 2: Build offsets array (count + 1 entries, Arrow format)
+        // Step 2: Build offsets array (count + 1 entries, Arrow format). Every length is checked here, before any
+        // value is written and whether or not a row selection keeps it: a negative length, or lengths adding up past
+        // the page's bytes, is a corrupt page. Unchecked, the offset-buffer outputs wrote such offsets as given
+        // (non-monotonic, or wrapped past int.MaxValue) without complaint, and a selection that dropped the bad value
+        // hid it from the view output's per-value slice too (#787 review).
+        long available = data.Length - lengthDecoder.BytesConsumed;
         var offsets = new int[count + 1];
         offsets[0] = 0;
+        long total = 0;
         for (int i = 0; i < count; i++)
-            offsets[i + 1] = offsets[i] + lengths[i];
+        {
+            int length = lengths[i];
+            if (length < 0)
+            {
+                throw new ParquetFormatException(
+                    $"DELTA_LENGTH_BYTE_ARRAY page: value {i} has a negative length ({length}).");
+            }
+
+            total += length;
+            if (total > available)
+            {
+                throw new ParquetFormatException(
+                    $"DELTA_LENGTH_BYTE_ARRAY page: its lengths add up to more than the {available} bytes it holds.");
+            }
+
+            offsets[i + 1] = (int)total;
+        }
 
         // Step 3: Raw byte data follows immediately after the length block
         int totalDataBytes = offsets[count];
