@@ -162,6 +162,119 @@ public class ByteArrayOutputScanTests : IDisposable
             rows);
     }
 
+    /// <summary>
+    /// DML on a partitioned table under each representation (#822 review round 2): an UPDATE reads the files it rewrites
+    /// through the same pipeline as a scan, and routes each row by its string partition value, whether or not that
+    /// changes. It must not fail on the representation, and a scan afterwards sees the new values.
+    /// </summary>
+    [Theory]
+    [InlineData(ByteArrayOutputKind.Default)]
+    [InlineData(ByteArrayOutputKind.ViewType)]
+    [InlineData(ByteArrayOutputKind.LargeOffsets)]
+    public async Task APartitionedUpdateWorksUnderEachRepresentation(ByteArrayOutputKind kind)
+    {
+        string path = await WriteTableAsync();
+        var fs = new LocalTableFileSystem(path);
+        await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions
+        {
+            ParquetReadOptions = new ParquetReadOptions { ByteArrayOutput = kind },
+        });
+
+        static BooleanArray Where(RecordBatch batch, Func<long, bool> predicate)
+        {
+            var ids = (Int64Array)batch.Column(batch.Schema.GetFieldIndex("id"));
+            var mask = new BooleanArray.Builder();
+            for (int i = 0; i < batch.Length; i++)
+                mask.Append(predicate(ids.GetValue(i)!.Value));
+            return mask.Build();
+        }
+
+        // An updater may hand back a column as a view: the second UPDATE sets the partition column that way.
+        static RecordBatch Set(RecordBatch batch, string column, string value, bool asView = false)
+        {
+            int index = batch.Schema.GetFieldIndex(column);
+            IArrowArray replacement;
+            if (asView)
+            {
+                var views = new StringViewArray.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                    views.Append(value);
+                replacement = views.Build();
+            }
+            else
+            {
+                var builder = new StringArray.Builder();
+                for (int i = 0; i < batch.Length; i++)
+                    builder.Append(value);
+                replacement = builder.Build();
+            }
+
+            var columns = Enumerable.Range(0, batch.ColumnCount).Select(c => c == index ? replacement : batch.Column(c)).ToArray();
+            var fields = batch.Schema.FieldsList.Select((f, c) => c == index ? new Field(f.Name, replacement.Data.DataType, f.IsNullable) : f);
+            return new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), columns, batch.Length);
+        }
+
+        // The partition unchanged, then a row moved to another partition.
+        await table.UpdateAsync(b => Where(b, id => id == 1), b => Set(b, "note", "changed"));
+        await table.UpdateAsync(b => Where(b, id => id == 2), b => Set(b, "region", "north", asView: true));
+
+        var rows = new Dictionary<long, string>();
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Columns = ["id", "region", "note"] }))
+        {
+            using (batch)
+            {
+                for (int r = 0; r < batch.Length; r++)
+                {
+                    long id = ((Int64Array)batch.Column(0)).GetValue(r)!.Value;
+                    rows[id] = Value(batch.Column(1), r) + "|" + Value(batch.Column(2), r);
+                }
+            }
+        }
+
+        Assert.Equal("west|changed", rows[1]);
+        Assert.Equal("north|note-2", rows[2]);
+        Assert.Equal("west|null", rows[3]);
+        Assert.Equal(6, rows.Count);
+    }
+
+    /// <summary>
+    /// A partition value in a string view is routed like any other string (review round 2): partition routing read
+    /// only plain and large strings, and refused a view.
+    /// </summary>
+    [Fact]
+    public async Task AWriteRoutesAStringViewPartitionValue()
+    {
+        var fs = new LocalTableFileSystem(Path.Combine(_tempDir, "views"));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("region", StringType.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(fs, schema, partitionColumns: ["region"]);
+
+        var viewSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("region", StringViewType.Default, true))
+            .Build();
+        var regions = new StringViewArray.Builder().Append("east").Append("west").Append("east").Build();
+        await table.WriteAsync([new RecordBatch(viewSchema,
+            [new Int64Array.Builder().Append(0).Append(1).Append(2).Build(), regions], 3)]);
+
+        Assert.Equal(["region=east", "region=west"],
+            table.CurrentSnapshot.ActiveFiles.Keys.Select(k => k.Split('/')[0]).Distinct().OrderBy(k => k, StringComparer.Ordinal));
+        var rows = new List<string>();
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions()))
+        {
+            using (batch)
+            {
+                for (int r = 0; r < batch.Length; r++)
+                    rows.Add(((Int64Array)batch.Column(0)).GetValue(r) + "|" + Value(batch.Column(1), r));
+            }
+        }
+
+        rows.Sort(StringComparer.Ordinal);
+        Assert.Equal(["0|east", "1|west", "2|east"], rows);
+    }
+
     private static string Render(Apache.Arrow.Schema schema) =>
         string.Join(", ", schema.FieldsList.Select(f => f.Name + ":" + Render(f.DataType)));
 

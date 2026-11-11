@@ -7150,7 +7150,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         var source = UnitSource(unit, reservation, growth, cancellationToken);
-        await foreach (var fb in ProcessDataFileBatchesAsync(source, read, wantPositions, scan.WantTracking, cancellationToken)
+        await foreach (var fb in ProcessDataFileBatchesAsync(
+                               source, read, wantPositions, scan.WantTracking, _options.ParquetReadOptions.ByteArrayOutput,
+                               cancellationToken)
                            .ConfigureAwait(false))
         {
             yield return WithMetadataColumns(fb, scan, ordinal, pathBytes);
@@ -12087,7 +12089,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // a scan does. Only the rows the planner kept are decoded, but a kept run still holds unselected ones.
         var source = UnitSource(unit, reservation, growth, cancellationToken);
         await foreach (var fb in ProcessDataFileBatchesAsync(
-                           source, read, wantPositions: true, wantTracking, cancellationToken).ConfigureAwait(false))
+                           source, read, wantPositions: true, wantTracking, _options.ParquetReadOptions.ByteArrayOutput,
+                           cancellationToken).ConfigureAwait(false))
         {
             // Most batches of a file hold no selected row. Every one is released here rather than left to the
             // finalizer: its native buffers would otherwise outlive the budget reservation that covered them.
@@ -13804,7 +13807,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     reservation, cancellationToken);
             }
 
-            await foreach (var processed in ProcessDataFileBatchesAsync(source, read, wantPositions, wantTracking, cancellationToken)
+            await foreach (var processed in ProcessDataFileBatchesAsync(source, read, wantPositions, wantTracking, byteArrays: null, cancellationToken)
                 .ConfigureAwait(false))
             {
                 yield return processed;
@@ -14248,17 +14251,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// position. The pipeline keeps no state from one batch to the next, so a scan split by row group runs it
     /// once per row group.
     /// </summary>
+    /// <param name="byteArrays">The representation to put the string and binary columns in (#793): the table's
+    /// <see cref="ParquetReadOptions.ByteArrayOutput"/> for a read that hands its batches to the caller; null for a
+    /// DML read, which keeps the representations it always had (review round 2: partition routing and other DML
+    /// steps don't take a view for a partition or backfilled column).</param>
     private IAsyncEnumerable<FileBatch> ProcessDataFileBatchesAsync(
         IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> source,
         DataFileRead read,
         bool wantPositions,
         bool wantTracking,
+        ByteArrayOutputKind? byteArrays,
         CancellationToken cancellationToken)
     {
         var batches = ProcessFileBatchesAsync(
             source, read.AddFile, read.Snapshot, read.Columns, read.MappingMode, read.PhysicalToLogical,
             read.LogicalToPhysical, read.DeletedRows, read.PartitionColumns, read.HasPartitions,
-            wantPositions: wantPositions || read.SeamConditions is not null, wantTracking, cancellationToken);
+            wantPositions: wantPositions || read.SeamConditions is not null, wantTracking, byteArrays, cancellationToken);
         return read.SeamConditions is { } conditions
             ? FilterSeamBatchesAsync(batches, conditions, read.FilterColumns, wantPositions, cancellationToken)
             : batches;
@@ -14379,6 +14387,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool hasPartitions,
         bool wantPositions,
         bool wantTracking,
+        ByteArrayOutputKind? byteArrays,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
         // Hidden materialized row-tracking columns (a copy-on-write rewrite wrote each moved row's original id +
@@ -14479,7 +14488,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // The materialized row-tracking columns were already stripped up front (above).
             var cleanResult = ReconcileToTableShape(
                 result, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions, logicalToPhysical,
-                addFile.Path, _options.ParquetReadOptions.ByteArrayOutput);
+                addFile.Path, byteArrays);
 
             yield return new FileBatch(cleanResult, positions, rowIds, versions);
         }

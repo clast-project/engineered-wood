@@ -434,6 +434,7 @@ internal static class PartitionUtils
         {
             StringArray sa => sa.GetString(row),
             LargeStringArray lsa => lsa.GetString(row),
+            StringViewArray sva => sva.GetString(row),
             Int64Array i64 => i64.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
             Int32Array i32 => i32.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
             Int16Array i16 => i16.GetValue(row)!.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
