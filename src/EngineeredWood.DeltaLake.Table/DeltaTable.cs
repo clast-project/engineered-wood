@@ -13844,9 +13844,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             logical = ReconcileToTableShape(
                 logical, snapshot, addFile.PartitionValues, condition.Columns, partitionColumns, hasPartitions,
-                logicalToPhysical, addFile.Path, byteArrays, ownsBatch: false);
+                logicalToPhysical, addFile.Path, byteArrays, borrowed: batch);
             var answer = condition.Evaluate(logical);
-            return keepNulls ? answer : NullAsFalse(answer, logical);
+            answer = keepNulls ? answer : NullAsFalse(answer, logical);
+
+            // What the reshaping built for this answer, which nothing else holds (#822 review round 4).
+            ByteArrayRepresentation.ReleaseReshaped(logical, batch, answer);
+            return answer;
         };
 
     /// <summary>
@@ -13877,14 +13881,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 logical = ColumnMappingRecursive.StripParquetFieldIds(logical);
                 logical = ReconcileToTableShape(
                     logical, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions,
-                    logicalToPhysical, addFile.Path, _options.ParquetReadOptions.ByteArrayOutput, ownsBatch: false);
+                    logicalToPhysical, addFile.Path, _options.ParquetReadOptions.ByteArrayOutput, borrowed: batch);
             }
             catch (Exception e) when (e is not OperationCanceledException)
             {
                 return null;
             }
 
-            return RowEvaluator.TryEvaluateWithoutRaising(predicate, logical);
+            var answer = RowEvaluator.TryEvaluateWithoutRaising(predicate, logical);
+
+            // What the reshaping built for this answer, which nothing else holds (#822 review round 4).
+            ByteArrayRepresentation.ReleaseReshaped(logical, batch, answer);
+            return answer;
         };
     }
 
@@ -14510,7 +14518,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         RecordBatch result, Snapshot.Snapshot snapshot, IReadOnlyDictionary<string, string>? partitionValues,
         IReadOnlyList<string>? columns, IReadOnlyList<string> partitionColumns, bool hasPartitions,
         IReadOnlyDictionary<string, string> logicalToPhysical, string? filePath = null,
-        ByteArrayOutputKind? byteArrays = null, bool ownsBatch = true)
+        ByteArrayOutputKind? byteArrays = null, RecordBatch? borrowed = null)
     {
         // Apply type widening — convert narrow types from old files to current schema types
         if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
@@ -14564,8 +14572,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // reader decodes a data column in it, but a partition column, a backfilled one and a codec-seam host's are
         // built elsewhere. After the variant coercion, whose storage this leaves alone (an extension type). The
         // metadata columns a scan appends later keep their documented types. A row mask's batch is a view of arrays the
-        // reader still reads (`ownsBatch` false), so what the conversion replaces there is not released.
-        return byteArrays is { } kind ? ByteArrayRepresentation.Apply(result, kind, releaseReplaced: ownsBatch) : result;
+        // reader still reads (`borrowed`), which the conversion must not release.
+        return byteArrays is { } kind ? ByteArrayRepresentation.Apply(result, kind, borrowed) : result;
     }
 
     /// <summary>

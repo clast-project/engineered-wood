@@ -101,9 +101,10 @@ internal static class ByteArrayRepresentation
     /// </summary>
     /// <param name="batch">The batch.</param>
     /// <param name="kind">The representation.</param>
-    /// <param name="releaseReplaced">Whether the caller owns <paramref name="batch"/>, so that the arrays the conversion
-    /// replaces are released. False where the batch is only a view of one someone else still reads, as a row mask's
-    /// is: the reader gathers its rows from the same arrays afterwards (review round 3).</param>
+    /// <param name="borrowed">Arrays the caller does not own, which must survive: a row mask's batch is a view of the
+    /// reader's, which gathers its rows from the same arrays afterwards (review round 3). A replaced array sharing a
+    /// buffer with it is not released; one built from it (a partition value, a widened column) still is (review round
+    /// 4). Null when the caller owns every array of <paramref name="batch"/>.</param>
     /// <remarks>
     /// The replaced arrays, at any depth (a nested column's string child as much as a string column: review round 3),
     /// are released once every column is converted, each array once, and only those that share no buffer with the
@@ -111,11 +112,11 @@ internal static class ByteArrayRepresentation
     /// columns, so releasing one as soon as it was converted freed bytes a later conversion, or an unchanged column,
     /// still read.
     /// </remarks>
-    public static RecordBatch Apply(RecordBatch batch, ByteArrayOutputKind kind, bool releaseReplaced = true)
+    public static RecordBatch Apply(RecordBatch batch, ByteArrayOutputKind kind, RecordBatch? borrowed = null)
     {
         IArrowArray[]? columns = null;
         Field[]? fields = null;
-        var replaced = releaseReplaced ? new List<ArrayData>() : null;
+        var replaced = new List<ArrayData>();
         for (int i = 0; i < batch.ColumnCount; i++)
         {
             var column = batch.Column(i);
@@ -134,8 +135,7 @@ internal static class ByteArrayRepresentation
             return batch;
 
         var result = new RecordBatch(new Apache.Arrow.Schema(fields!, batch.Schema.Metadata), columns, batch.Length);
-        if (replaced is not null)
-            Release(replaced, result);
+        Release(replaced, result, borrowed);
         return result;
     }
 
@@ -143,11 +143,13 @@ internal static class ByteArrayRepresentation
     // before anything is disposed: a disposed array's buffers can't be inspected. Distinct arrays over the same
     // buffers (slices) are each disposed: Arrow counts their references to the buffers, which are freed with the last.
     // A nested column's original is left to the collector: its own buffers and unconverted children are the result's.
-    private static void Release(List<ArrayData> replaced, RecordBatch result)
+    private static void Release(List<ArrayData> replaced, RecordBatch result, RecordBatch? borrowed)
     {
         var kept = new HashSet<ReadOnlyMemory<byte>>();
         for (int i = 0; i < result.ColumnCount; i++)
             Parquet.BatchSelector.CollectBuffers(result.Column(i).Data, kept);
+        for (int i = 0; i < (borrowed?.ColumnCount ?? 0); i++)
+            Parquet.BatchSelector.CollectBuffers(borrowed!.Column(i).Data, kept);
 
         var doomed = new List<ArrayData>();
         foreach (var original in replaced)
@@ -159,6 +161,37 @@ internal static class ByteArrayRepresentation
 
         foreach (var original in doomed)
             original.Dispose();
+    }
+
+    /// <summary>
+    /// Releases what a row mask built to answer (review round 4): every column of <paramref name="reshaped"/>, the batch
+    /// it evaluated, that shares no buffer with <paramref name="borrowed"/> (the reader's arrays, which it gathers from
+    /// afterwards) or with <paramref name="answer"/> (a predicate may answer with one of its own input columns). These
+    /// are the partition values, backfilled NULLs, widened columns and conversions the reshaping created, which nothing
+    /// else holds once the mask has answered. Each array once; every decision before anything is disposed.
+    /// </summary>
+    public static void ReleaseReshaped(RecordBatch reshaped, RecordBatch borrowed, IArrowArray? answer)
+    {
+        if (ReferenceEquals(reshaped, borrowed))
+            return;
+
+        var kept = new HashSet<ReadOnlyMemory<byte>>();
+        for (int i = 0; i < borrowed.ColumnCount; i++)
+            Parquet.BatchSelector.CollectBuffers(borrowed.Column(i).Data, kept);
+        if (answer is not null)
+            Parquet.BatchSelector.CollectBuffers(answer.Data, kept);
+
+        var doomed = new List<IArrowArray>();
+        for (int i = 0; i < reshaped.ColumnCount; i++)
+        {
+            var column = reshaped.Column(i);
+            if (doomed.Exists(d => ReferenceEquals(d, column)) || Parquet.BatchSelector.SharesAny(column.Data, kept))
+                continue;
+            doomed.Add(column);
+        }
+
+        foreach (var column in doomed)
+            column.Dispose();
     }
 
     private static bool IsLeaf(IArrowType type) =>

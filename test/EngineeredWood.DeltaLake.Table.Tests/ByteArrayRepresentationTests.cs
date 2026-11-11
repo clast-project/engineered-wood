@@ -125,7 +125,7 @@ public class ByteArrayRepresentationTests
     }
 
     /// <summary>
-    /// A conversion that does not own its batch, as a row mask's (review round 3), releases nothing: the reader gathers
+    /// A conversion over arrays it borrows, as a row mask's (review round 3), releases none of them: the reader gathers
     /// its rows from the same arrays afterwards.
     /// </summary>
     [Fact]
@@ -136,13 +136,94 @@ public class ByteArrayRepresentationTests
         var batch = new RecordBatch(new Apache.Arrow.Schema([new Field("s", StringType.Default, true)], null), [source], source.Length);
         int before = allocator.Live;
 
-        using (var result = ByteArrayRepresentation.Apply(batch, ByteArrayOutputKind.ViewType, releaseReplaced: false))
+        using (var result = ByteArrayRepresentation.Apply(batch, ByteArrayOutputKind.ViewType, borrowed: batch))
             Assert.Equal(Values, Read(result.Column(0)));
 
         Assert.Equal(before, allocator.Live);
         Assert.Equal(Values, Read(source)); // still readable: not poisoned
         source.Dispose();
         Assert.Equal(0, allocator.Live);
+    }
+
+    /// <summary>
+    /// What a row mask's reshaping built is released once the mask has answered (review round 4): an array it created
+    /// (a partition value, say) and the conversion of it, but neither the reader's array it borrowed nor a column the
+    /// answer shares buffers with.
+    /// </summary>
+    [Fact]
+    public void AMasksReshapedBatchReleasesOnlyWhatItBuilt()
+    {
+        var readerAllocator = new PoisoningAllocator();
+        var builtAllocator = new PoisoningAllocator();
+        var raw = Strings(readerAllocator);
+        var flag = new BooleanArray.Builder().Append(true).Append(false).Append(true).Append(true).Build(readerAllocator);
+        var borrowed = new RecordBatch(
+            new Apache.Arrow.Schema([new Field("s", StringViewType.Default, true), new Field("flag", BooleanType.Default, false)], null),
+            [raw, flag], raw.Length);
+
+        // The reshaped batch: the reader's columns, plus a partition column the reshaping built, as plain utf8.
+        var partition = Strings(builtAllocator);
+        var shaped = new RecordBatch(
+            new Apache.Arrow.Schema([.. borrowed.Schema.FieldsList, new Field("p", StringType.Default, true)], null),
+            [raw, flag, partition], raw.Length);
+        int readerBefore = readerAllocator.Live;
+
+        // Converted with the reader's batch borrowed: the built partition column is replaced, and released.
+        var converted = ByteArrayRepresentation.Apply(shaped, ByteArrayOutputKind.ViewType, borrowed);
+        Assert.Equal(0, builtAllocator.Live);
+        Assert.Equal(Values, Read(converted.Column(2)));
+
+        // The answer is the reader's own flag column (WHERE flag), so it stays too.
+        ByteArrayRepresentation.ReleaseReshaped(converted, borrowed, flag);
+
+        Assert.Equal(readerBefore, readerAllocator.Live);
+        Assert.Equal(Values, Read(raw));
+        Assert.Equal([true, false, true, true], Enumerable.Range(0, 4).Select(i => flag.GetValue(i)!.Value));
+        Assert.Equal(0, readerAllocator.DoubleReleases + builtAllocator.DoubleReleases);
+    }
+
+    /// <summary>
+    /// <see cref="ByteArrayRepresentation.ReleaseReshaped"/> releases a column the reshaping built that kept its
+    /// representation, too: a widened column or a backfilled NULL is the mask's alone once it has answered.
+    /// </summary>
+    [Fact]
+    public void AMasksBuiltColumnIsReleasedWhetherOrNotItWasConverted()
+    {
+        var readerAllocator = new PoisoningAllocator();
+        var builtAllocator = new PoisoningAllocator();
+        var raw = new Int32Array.Builder().Append(1).Append(2).Build(readerAllocator);
+        var widened = new Int64Array.Builder().Append(1).Append(2).Build(builtAllocator);
+        var borrowed = new RecordBatch(new Apache.Arrow.Schema([new Field("n", Int32Type.Default, false)], null), [raw], 2);
+        var shaped = new RecordBatch(new Apache.Arrow.Schema([new Field("n", Int64Type.Default, false)], null), [widened], 2);
+        int readerBefore = readerAllocator.Live;
+
+        ByteArrayRepresentation.ReleaseReshaped(shaped, borrowed, answer: null);
+
+        Assert.Equal(0, builtAllocator.Live);
+        Assert.Equal(readerBefore, readerAllocator.Live);
+    }
+
+    /// <summary>
+    /// A mask may answer with a column the reshaping built (<c>WHERE flag</c> over a boolean partition column): that
+    /// column is returned, so it is not released.
+    /// </summary>
+    [Fact]
+    public void AMasksAnswerIsNotReleasedEvenWhenItWasBuilt()
+    {
+        var readerAllocator = new PoisoningAllocator();
+        var builtAllocator = new PoisoningAllocator();
+        var raw = new Int32Array.Builder().Append(1).Append(2).Build(readerAllocator);
+        var partitionFlag = new BooleanArray.Builder().Append(true).Append(false).Build(builtAllocator);
+        var borrowed = new RecordBatch(new Apache.Arrow.Schema([new Field("n", Int32Type.Default, false)], null), [raw], 2);
+        var shaped = new RecordBatch(
+            new Apache.Arrow.Schema([new Field("n", Int32Type.Default, false), new Field("flag", BooleanType.Default, false)], null),
+            [raw, partitionFlag], 2);
+        int builtBefore = builtAllocator.Live;
+
+        ByteArrayRepresentation.ReleaseReshaped(shaped, borrowed, partitionFlag);
+
+        Assert.Equal(builtBefore, builtAllocator.Live);
+        Assert.Equal([true, false], Enumerable.Range(0, 2).Select(i => partitionFlag.GetValue(i)!.Value));
     }
 
     [Fact]
