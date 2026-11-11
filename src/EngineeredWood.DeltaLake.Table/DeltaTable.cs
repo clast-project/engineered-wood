@@ -12989,16 +12989,6 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Every physical column name a data file may carry the row-tracking materialization under: the two the
-    /// table DECLARES (<c>delta.rowTracking.materializedRowIdColumnName</c> /
-    /// <c>…materializedRowCommitVersionColumnName</c>) plus the legacy internal names a pre-1.0 EngineeredWood
-    /// wrote — deliberately the same set
-    /// <see cref="RowTracking.RowTrackingWriter.StripMaterializedColumns"/> is prepared to strip, because a
-    /// read that does not ASK for what the strip would take resolves ids off the wrong values entirely.
-    /// <para>Empty when the table declares neither name (no row tracking, or a spec-invalid table that cannot
-    /// materialize anyway) — a read must then name no extra column at all.</para>
-    /// </summary>
-    /// <summary>
     /// Whether <paramref name="addFile"/>'s statistics name every one of <paramref name="physicalColumns"/>, so that
     /// the file holds them: a writer records a null count for each column it wrote, keyed by physical name at the top
     /// level of <c>nullCount</c>, a struct's as an object of its fields' counts. A column added after the file was
@@ -13063,6 +13053,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
     }
 
+    /// <summary>
+    /// Every physical column name a data file may carry the row-tracking materialization under: the two the
+    /// table DECLARES (<c>delta.rowTracking.materializedRowIdColumnName</c> /
+    /// <c>…materializedRowCommitVersionColumnName</c>) plus the legacy internal names a pre-1.0 EngineeredWood
+    /// wrote — deliberately the same set
+    /// <see cref="RowTracking.RowTrackingWriter.StripMaterializedColumns"/> is prepared to strip, because a
+    /// read that does not ASK for what the strip would take resolves ids off the wrong values entirely.
+    /// <para>Empty when the table declares neither name (no row tracking, or a spec-invalid table that cannot
+    /// materialize anyway) — a read must then name no extra column at all.</para>
+    /// </summary>
     private static IReadOnlyList<string> MaterializedRowTrackingColumnNames(Snapshot.Snapshot snapshot)
     {
         var (rowIdName, rowVerName) = DeltaLake.RowTracking.RowTrackingConfig
