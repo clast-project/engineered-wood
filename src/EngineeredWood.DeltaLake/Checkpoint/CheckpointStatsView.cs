@@ -94,14 +94,18 @@ internal sealed class CheckpointStatsView
             numRecords, minValues, maxValues, nullCounts, minStruct, maxStruct, nullCountStruct);
     }
 
-    /// <summary>Number of records in the file at <paramref name="row"/>.</summary>
+    /// <summary>Number of records in the file at <paramref name="row"/>; null when unknown, a negative count among
+    /// it (#825 review: as the JSON path reads one, so the answer doesn't depend on which copy was read).</summary>
     public long? GetNumRecords(int row) =>
-        _numRecords is not null && !_numRecords.IsNull(row) ? _numRecords.GetValue(row) : null;
+        _numRecords is not null && !_numRecords.IsNull(row) && _numRecords.GetValue(row) is >= 0 and var records
+            ? records
+            : null;
 
-    /// <summary>Null count for one column of the file at <paramref name="row"/>.</summary>
+    /// <summary>Null count for one column of the file at <paramref name="row"/>; null when unknown, a negative count
+    /// among it (#825 review).</summary>
     public long? GetNullCount(string column, int row) =>
-        _nullCounts.TryGetValue(column, out var counts) && !counts.IsNull(row)
-            ? counts.GetValue(row)
+        _nullCounts.TryGetValue(column, out var counts) && !counts.IsNull(row) && counts.GetValue(row) is >= 0 and var count
+            ? count
             : null;
 
     /// <summary>
@@ -158,35 +162,38 @@ internal sealed class CheckpointStatsView
     /// </remarks>
     public string? BuildStatsJson(int row)
     {
-        bool hasNumRecords = _numRecords is not null && !_numRecords.IsNull(row);
-        if (!hasNumRecords && _minStruct is null && _maxStruct is null && _nullCountStruct is null)
+        // The counts as the getters read them (#825 review): a negative one is unknown, and omitted rather than passed on.
+        long? numRecords = GetNumRecords(row);
+        if (numRecords is null && _minStruct is null && _maxStruct is null && _nullCountStruct is null)
             return null;
 
         using var stream = new MemoryStream();
         using (var writer = new Utf8JsonWriter(stream))
         {
             writer.WriteStartObject();
-            if (hasNumRecords)
-                writer.WriteNumber("numRecords", _numRecords!.GetValue(row)!.Value);
+            if (numRecords is { } records)
+                writer.WriteNumber("numRecords", records);
             WriteGroup(writer, "minValues", _minStruct, row);
             WriteGroup(writer, "maxValues", _maxStruct, row);
-            WriteGroup(writer, "nullCount", _nullCountStruct, row);
+            WriteGroup(writer, "nullCount", _nullCountStruct, row, counts: true);
             writer.WriteEndObject();
         }
 
         return System.Text.Encoding.UTF8.GetString(stream.ToArray());
     }
 
-    private static void WriteGroup(Utf8JsonWriter writer, string name, StructArray? group, int row)
+    // `counts`: the group holds counts (nullCount), whose negative integer leaves are unknown and omitted (#825 review).
+    // A bound group keeps its negatives.
+    private static void WriteGroup(Utf8JsonWriter writer, string name, StructArray? group, int row, bool counts = false)
     {
         if (group is null || group.IsNull(row))
             return;
 
         writer.WritePropertyName(name);
-        WriteStruct(writer, group, row);
+        WriteStruct(writer, group, row, counts);
     }
 
-    private static void WriteStruct(Utf8JsonWriter writer, StructArray group, int row)
+    private static void WriteStruct(Utf8JsonWriter writer, StructArray group, int row, bool counts = false)
     {
         writer.WriteStartObject();
         var type = (ArrowStructType)group.Data.DataType;
@@ -194,6 +201,9 @@ internal sealed class CheckpointStatsView
         {
             var child = group.Fields[i];
             if (child.IsNull(row))
+                continue;
+            if (counts && child is Int64Array { } longs && longs.GetValue(row) < 0
+                || counts && child is Int32Array { } ints && ints.GetValue(row) < 0)
                 continue;
 
             string fieldName = type.Fields[i].Name;
@@ -208,7 +218,7 @@ internal sealed class CheckpointStatsView
             else if (child is StructArray nested)
             {
                 writer.WritePropertyName(fieldName);
-                WriteStruct(writer, nested, row);
+                WriteStruct(writer, nested, row, counts);
             }
             else
             {
