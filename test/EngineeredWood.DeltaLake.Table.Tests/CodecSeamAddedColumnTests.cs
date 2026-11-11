@@ -227,6 +227,45 @@ public class CodecSeamAddedColumnTests : IDisposable
     }
 
     /// <summary>
+    /// The statistics check reads <c>nullCount</c>'s top-level names exactly, and declines (so the file is read whole)
+    /// on anything it cannot trust, rather than throwing or guessing (review round 1). A column literally named
+    /// <c>s.a</c> is not struct <c>s</c>'s field <c>a</c>, either way round.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "id", false)]
+    [InlineData("", "id", false)]
+    [InlineData("not json", "id", false)]
+    [InlineData("[]", "id", false)]                                       // a root that is not an object
+    [InlineData("{\"numRecords\":2}", "id", false)]                       // no null counts
+    [InlineData("{\"nullCount\":[]}", "id", false)]
+    [InlineData("{\"nullCount\":{\"id\":0}}", "id", true)]
+    [InlineData("{\"nullCount\":{\"id\":0}}", "id,score", false)]      // a column added later
+    [InlineData("{\"nullCount\":{\"id\":1.5}}", "id", false)]           // not an integer
+    [InlineData("{\"nullCount\":{\"id\":-1}}", "id", false)]
+    [InlineData("{\"nullCount\":{\"id\":1e30}}", "id", false)]          // out of range
+    [InlineData("{\"nullCount\":{\"id\":\"0\"}}", "id", false)]
+    [InlineData("{\"nullCount\":{\"id\":null}}", "id", false)]
+    [InlineData("{\"nullCount\":{\"s\":{\"a\":0,\"b\":1}}}", "s", true)] // a struct, by its fields' counts
+    [InlineData("{\"nullCount\":{\"s\":{}}}", "s", false)]               // a struct with no count beneath
+    [InlineData("{\"nullCount\":{\"s\":{\"a\":{\"x\":0}}}}", "s", true)]
+    [InlineData("{\"nullCount\":{\"s.a\":0}}", "s", false)]             // literal "s.a"; struct s added later
+    [InlineData("{\"nullCount\":{\"s\":{\"a\":0}}}", "s.a", false)]    // struct s; literal "s.a" added later
+    [InlineData("{\"nullCount\":{\"s.a\":0}}", "s.a", true)]
+    public void TheStatisticsCheckReadsExactNamesAndDeclinesWhatItCannotTrust(string? stats, string columns, bool expected)
+    {
+        var addFile = new EngineeredWood.DeltaLake.Actions.AddFile
+        {
+            Path = "part-0.parquet",
+            PartitionValues = new Dictionary<string, string>(),
+            Size = 1,
+            ModificationTime = 0,
+            DataChange = true,
+            Stats = stats,
+        };
+        Assert.Equal(expected, DeltaTable.StatisticsNameEveryColumn(addFile, columns.Split(',')));
+    }
+
+    /// <summary>
     /// An exact filter on the added column, not projected: the older files are read whole (the filter's column is
     /// NULL there), and the file holding it keeps the projection plus the filter's column.
     /// </summary>

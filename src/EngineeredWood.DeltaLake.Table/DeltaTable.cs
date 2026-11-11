@@ -13000,28 +13000,67 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     /// <summary>
     /// Whether <paramref name="addFile"/>'s statistics name every one of <paramref name="physicalColumns"/>, so that
-    /// the file holds them: a writer records a null count for each column it wrote, keyed by physical name, a
-    /// struct's as its leaves (<c>s.a</c>). A column added after the file was written has none (#790). False when the
-    /// file has no statistics, or they leave a column out (one past <c>delta.dataSkippingNumIndexedCols</c>, say):
-    /// the caller then reads every column, which is always safe.
+    /// the file holds them: a writer records a null count for each column it wrote, keyed by physical name at the top
+    /// level of <c>nullCount</c>, a struct's as an object of its fields' counts. A column added after the file was
+    /// written has none (#790). False whenever the statistics cannot show it: none at all, a column left out (one past
+    /// <c>delta.dataSkippingNumIndexedCols</c>, say), or statistics that are not what the protocol describes. The
+    /// caller then reads every column, which is always safe.
     /// </summary>
-    private static bool StatisticsNameEveryColumn(AddFile addFile, IReadOnlyList<string> physicalColumns)
+    /// <remarks>
+    /// Reads the JSON itself rather than through <see cref="ColumnStats.Parse"/> (review round 1): that flattens a
+    /// struct's counts into dotted keys, which cannot tell a struct <c>s</c>'s field <c>a</c> from a top-level column
+    /// literally named <c>s.a</c>, and it throws on a root that is not an object or a count that is not an integer,
+    /// where this must decline.
+    /// </remarks>
+    internal static bool StatisticsNameEveryColumn(AddFile addFile, IReadOnlyList<string> physicalColumns)
     {
         if (physicalColumns.Count == 0)
             return true;
-        if (ColumnStats.Parse(addFile.GetStatsJson())?.NullCount is not { } nullCounts)
+        if (addFile.GetStatsJson() is not { Length: > 0 } json)
             return false;
 
-        foreach (string column in physicalColumns)
+        try
         {
-            if (nullCounts.ContainsKey(column))
-                continue;
-            string prefix = column + ".";
-            if (!nullCounts.Keys.Any(k => k.StartsWith(prefix, StringComparison.Ordinal)))
+            using var document = System.Text.Json.JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object
+                || !document.RootElement.TryGetProperty("nullCount", out var nullCounts)
+                || nullCounts.ValueKind != System.Text.Json.JsonValueKind.Object)
+            {
                 return false;
+            }
+
+            foreach (string column in physicalColumns)
+            {
+                if (!nullCounts.TryGetProperty(column, out var count) || !HoldsACount(count))
+                    return false;
+            }
+
+            return true;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return false;
         }
 
-        return true;
+        // A column's entry: a non-negative integer count, or a struct's object holding at least one.
+        static bool HoldsACount(System.Text.Json.JsonElement entry)
+        {
+            switch (entry.ValueKind)
+            {
+                case System.Text.Json.JsonValueKind.Number:
+                    return entry.TryGetInt64(out long value) && value >= 0;
+                case System.Text.Json.JsonValueKind.Object:
+                    foreach (var field in entry.EnumerateObject())
+                    {
+                        if (HoldsACount(field.Value))
+                            return true;
+                    }
+
+                    return false;
+                default:
+                    return false;
+            }
+        }
     }
 
     private static IReadOnlyList<string> MaterializedRowTrackingColumnNames(Snapshot.Snapshot snapshot)
