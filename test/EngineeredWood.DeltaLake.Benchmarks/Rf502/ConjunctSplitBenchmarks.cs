@@ -86,6 +86,12 @@ public class ConjunctSplitBenchmarks
         _table.EvaluatesWholeBatches = Mode is EvaluationMode.SplitWhole or EvaluationMode.SplitDefault;
         if (Mode == EvaluationMode.SplitWhole)
             _table.WholeBatchLiveShare = 0;
+
+        // Dictionary answers off in every mode (#832 review): a split leaves a single-column conjunct that `qty` or
+        // `category`'s dictionary can answer, which a together-evaluated AND over several columns cannot, so with them
+        // on the comparison credits splitting with what the dictionary saves. Phase 4b measures those separately
+        // (ValueWiseBenchmarks), and WholeBatchShareBenchmarks turns them off for the same reason.
+        _table.AnswersFromDictionaries = false;
         _predicate = SparkSqlParser.ParsePredicate(Filter);
         if (Scan().GetAwaiter().GetResult() == 0)
             throw new InvalidOperationException($"{Filter}: no row matched");

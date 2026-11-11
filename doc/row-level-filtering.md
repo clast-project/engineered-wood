@@ -904,13 +904,19 @@ As §15 found, two passes win nearly everywhere locally. The exception is a sele
 
 Hence the default of 0.4. The whole batch also allocates 18-32% less managed memory from 40% live up.
 
-`ConjunctSplitBenchmarks`, §19's regression (12 iterations; "whole" asks for the whole batch at any live share):
+`ConjunctSplitBenchmarks`, §19's regression, with dictionary answers off in every mode (12 iterations; "whole" asks for the whole batch at any live share, "default" at 5a's 0.4):
 
-| Filter | Kept | Together | Split | Split, whole |
-|---|---|---|---|---|
-| `amount < 990 AND qty < 99 AND id >= 0` | 94% | 20.6 ms | 18.2 ms | 15.3 ms |
+| Filter | Kept | Together | Split | Split, whole | Split, default |
+|---|---|---|---|---|---|
+| `amount < 100 AND qty < 90` | 9% | 15.2 ms | 8.8 ms | 8.8 ms | 8.7 ms |
+| `amount < 500 AND qty < 50` | 25% | 24.6 ms | 14.6 ms | 13.5 ms | 12.8 ms |
+| `amount < 900 AND qty < 90 AND category <> 'cat_03'` | 76% | 29.3 ms | 22.6 ms | 16.0 ms | 15.9 ms |
+| `amount < 990 AND qty < 99 AND id >= 0` | 94% | 21.2 ms | 23.7 ms | 14.2 ms | 13.9 ms |
+| `amount < 990` | (one conjunct) | 11.3 ms | 11.1 ms | 11.4 ms | 11.1 ms |
 
-Splitting now costs less than evaluating together at 94% kept: -26%, where §19 measured +12%. Since 4b, the benchmark's other filters reach no gather that 5a removes: `qty` (100 values) and `category` are dictionary-encoded and answered from their dictionaries. Its 2-conjunct rows therefore moved only within noise (±2 ms at 12 iterations), and the sweep above turns dictionary answers off for that reason.
+At 94% kept, splitting alone still costs more than evaluating together, +12% as §19 measured; 5a's whole-batch answers turn that into -33%, and at 76% kept -45%. At low live shares the default threshold gathers, as it should, and matches the whole batch within noise.
+
+Corrected 2026-11-11 (#832 review). This table was first measured with dictionary answers on, their default since 4b: Together 20.6 ms, Split 18.2 ms, Split whole 15.3 ms at 94% kept. That read as splitting itself costing 26% less than evaluating together. It didn't: a split leaves `qty < 99` as a single-column conjunct that `qty`'s dictionary answers, which an AND over three columns cannot use, so the comparison credited splitting with what the dictionary saved. The benchmark now turns dictionary answers off in every mode, as `WholeBatchShareBenchmarks` does; 4b's dictionary answers are measured on their own in §20-§21 (`ValueWiseBenchmarks`).
 
 ### Tests
 
