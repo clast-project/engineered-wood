@@ -1,7 +1,10 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using Apache.Arrow;
+using Apache.Arrow.Types;
 using EngineeredWood.DeltaLake.Actions;
+using EngineeredWood.DeltaLake.Checkpoint;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.Expressions;
 using Ex = EngineeredWood.Expressions.Expressions;
@@ -26,7 +29,7 @@ public class MalformedStatsTests
         Stats = stats,
     };
 
-    private static readonly StructType Schema = new()
+    private static readonly EngineeredWood.DeltaLake.Schema.StructType Schema = new()
     {
         Fields =
         [
@@ -130,6 +133,53 @@ public class MalformedStatsTests
         Assert.True(pruner.ShouldInclude(File(stats), Ex.IsNull("id")));
         Assert.True(pruner.ShouldInclude(File(stats), Ex.IsNotNull("id")));
         Assert.False(pruner.ShouldInclude(File(stats), Ex.GreaterThan("id", 100L)));
+    }
+
+    /// <summary>
+    /// The typed copy a checkpoint writes (<c>stats_parsed</c>) reads counts as counts too (#825 review): a negative
+    /// <c>numRecords</c> or null count is written null, as the JSON path reads it, while a BIGINT column's negative
+    /// bounds are kept.
+    /// </summary>
+    [Fact]
+    public void ACheckpointsTypedStatisticsWriteANegativeCountAsUnknown()
+    {
+        var add = File("{\"numRecords\":-1,\"minValues\":{\"id\":-5},\"maxValues\":{\"id\":-1},\"nullCount\":{\"id\":-1,\"v\":2}}");
+        using var stats = StatsParsedBuilder.BuildStatsColumn([add], 1, Schema)!;
+
+        var type = (Apache.Arrow.Types.StructType)stats.Data.DataType;
+        StructArray Child(string name) => (StructArray)stats.Fields[type.GetFieldIndex(name)];
+        Int64Array Leaf(StructArray parent, string name) =>
+            (Int64Array)parent.Fields[((Apache.Arrow.Types.StructType)parent.Data.DataType).GetFieldIndex(name)];
+
+        Assert.True(((Int64Array)stats.Fields[type.GetFieldIndex("numRecords")]).IsNull(0));
+        Assert.True(Leaf(Child("nullCount"), "id").IsNull(0));
+        Assert.Equal(2, Leaf(Child("nullCount"), "v").GetValue(0));
+        Assert.Equal(-5, Leaf(Child("minValues"), "id").GetValue(0));
+        Assert.Equal(-1, Leaf(Child("maxValues"), "id").GetValue(0));
+    }
+
+    /// <summary>
+    /// A typed copy another writer put in a checkpoint with negative counts reads them as unknown (#825 review): a
+    /// file's row count comes from it before the JSON, and fed row ids.
+    /// </summary>
+    [Fact]
+    public void ACheckpointsTypedStatisticsReadANegativeCountAsUnknown()
+    {
+        var nullCountType = new Apache.Arrow.Types.StructType([new Field("id", Int64Type.Default, true), new Field("v", Int64Type.Default, true)]);
+        var statsType = new Apache.Arrow.Types.StructType([
+            new Field("numRecords", Int64Type.Default, true), new Field("nullCount", nullCountType, true)]);
+        var nullCount = new StructArray(nullCountType, 1,
+            [new Int64Array.Builder().Append(-2).Build(), new Int64Array.Builder().Append(3).Build()], ArrowBuffer.Empty, 0);
+        var stats = new StructArray(statsType, 1, [new Int64Array.Builder().Append(-1).Build(), nullCount], ArrowBuffer.Empty, 0);
+        var addType = new Apache.Arrow.Types.StructType([new Field("stats_parsed", statsType, true)]);
+        var addStruct = new StructArray(addType, 1, [stats], ArrowBuffer.Empty, 0);
+
+        var view = CheckpointStatsView.TryCreate(addStruct)!;
+
+        Assert.Null(view.GetNumRecords(0));
+        Assert.Null(view.GetNullCount("id", 0));
+        Assert.Equal(3, view.GetNullCount("v", 0));
+        Assert.Null((File(null) with { TypedStats = new ParsedStatsRef(view, 0) }).GetNumRecords());
     }
 
     /// <summary>Usable statistics still prune: the fix declines only what it can't read.</summary>

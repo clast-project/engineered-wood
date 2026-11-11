@@ -62,10 +62,11 @@ internal static class StatsParsedBuilder
         var boundFields = BuildBoundFields(deltaSchema, variantBounds);
         var nullCountFields = BuildNullCountFields(deltaSchema);
 
-        var numRecords = new FixedStatColumn<long>(count, Int64Type.Default, TryReadInt64);
+        // Counts are read as counts (#825 review): a negative one is unknown, written null, as the JSON path reads it.
+        var numRecords = new FixedStatColumn<long>(count, Int64Type.Default, TryReadCount);
         var minValues = boundFields.Count > 0 ? new StructStatColumn(boundFields, count) : null;
         var maxValues = boundFields.Count > 0 ? new StructStatColumn(boundFields, count) : null;
-        var nullCounts = nullCountFields.Count > 0 ? new StructStatColumn(nullCountFields, count) : null;
+        var nullCounts = nullCountFields.Count > 0 ? new StructStatColumn(nullCountFields, count, counts: true) : null;
         using var validity = new ValidityBuilder(count);
 
         try
@@ -273,12 +274,14 @@ internal static class StatsParsedBuilder
         private readonly (string Name, IStatColumn Column)[] _children;
         private int _count;
 
-        public StructStatColumn(List<Field> fields, int rowCount)
+        /// <param name="counts">Whether the struct holds counts (<c>nullCount</c>), whose INT64 leaves are read as
+        /// counts: a negative one is unknown.</param>
+        public StructStatColumn(List<Field> fields, int rowCount, bool counts = false)
         {
             _type = new ArrowStructType(fields);
             _children = new (string, IStatColumn)[fields.Count];
             for (int i = 0; i < fields.Count; i++)
-                _children[i] = (fields[i].Name, CreateColumn(fields[i], rowCount));
+                _children[i] = (fields[i].Name, CreateColumn(fields[i], rowCount, counts));
         }
 
         public void AppendValue(JsonElement value)
@@ -323,11 +326,12 @@ internal static class StatsParsedBuilder
         }
     }
 
-    private static IStatColumn CreateColumn(Field field, int rowCount) => field.DataType switch
+    private static IStatColumn CreateColumn(Field field, int rowCount, bool counts = false) => field.DataType switch
     {
-        ArrowStructType s => new StructStatColumn([.. s.Fields], rowCount),
+        ArrowStructType s => new StructStatColumn([.. s.Fields], rowCount, counts),
         // Decimal types derive from FixedSizeBinaryType — keep them ahead of anything binary-shaped.
         Decimal128Type d => new DecimalStatColumn(rowCount, d),
+        Int64Type when counts => new FixedStatColumn<long>(rowCount, Int64Type.Default, TryReadCount),
         Int64Type => new FixedStatColumn<long>(rowCount, Int64Type.Default, TryReadInt64),
         Int32Type => new FixedStatColumn<int>(rowCount, Int32Type.Default, TryReadInt32),
         Int16Type => new FixedStatColumn<short>(rowCount, Int16Type.Default, TryReadInt16),
@@ -350,6 +354,11 @@ internal static class StatsParsedBuilder
         converted = 0;
         return value.ValueKind == JsonValueKind.Number && value.TryGetInt64(out converted);
     }
+
+    // A count: a non-negative INT64. Anything else is unknown (#820, #825 review). Not for a BIGINT column's bounds,
+    // which may be negative.
+    private static bool TryReadCount(JsonElement value, out long converted) =>
+        TryReadInt64(value, out converted) && converted >= 0;
 
     private static bool TryReadInt32(JsonElement value, out int converted)
     {

@@ -94,14 +94,18 @@ internal sealed class CheckpointStatsView
             numRecords, minValues, maxValues, nullCounts, minStruct, maxStruct, nullCountStruct);
     }
 
-    /// <summary>Number of records in the file at <paramref name="row"/>.</summary>
+    /// <summary>Number of records in the file at <paramref name="row"/>; null when unknown, a negative count among
+    /// it (#825 review: as the JSON path reads one, so the answer doesn't depend on which copy was read).</summary>
     public long? GetNumRecords(int row) =>
-        _numRecords is not null && !_numRecords.IsNull(row) ? _numRecords.GetValue(row) : null;
+        _numRecords is not null && !_numRecords.IsNull(row) && _numRecords.GetValue(row) is >= 0 and var records
+            ? records
+            : null;
 
-    /// <summary>Null count for one column of the file at <paramref name="row"/>.</summary>
+    /// <summary>Null count for one column of the file at <paramref name="row"/>; null when unknown, a negative count
+    /// among it (#825 review).</summary>
     public long? GetNullCount(string column, int row) =>
-        _nullCounts.TryGetValue(column, out var counts) && !counts.IsNull(row)
-            ? counts.GetValue(row)
+        _nullCounts.TryGetValue(column, out var counts) && !counts.IsNull(row) && counts.GetValue(row) is >= 0 and var count
+            ? count
             : null;
 
     /// <summary>
