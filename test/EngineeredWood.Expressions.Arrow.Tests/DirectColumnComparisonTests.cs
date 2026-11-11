@@ -200,14 +200,14 @@ public class DirectColumnComparisonTests
         try
         {
             var mask = evaluator.EvaluatePredicate(predicate, batch);
-            directCount = evaluator.DirectComparisons;
+            directCount = evaluator.DirectComparisons + evaluator.DirectSets;
             // The null count too: the direct path writes the array's bitmaps itself (#608).
             return string.Join(",", Enumerable.Range(0, mask.Length)
                 .Select(i => mask.GetValue(i) is { } v ? (v ? "T" : "F") : "n")) + $" ({mask.NullCount} null)";
         }
         catch (Exception e)
         {
-            directCount = evaluator.DirectComparisons;
+            directCount = evaluator.DirectComparisons + evaluator.DirectSets;
             return $"{e.GetType().Name}: {e.Message}";
         }
     }
@@ -476,6 +476,168 @@ public class DirectColumnComparisonTests
             Assert.Equal(expected, Enumerable.Range(0, 3).Select(i => mask.GetValue(i)));
             Assert.Equal(1, evaluator.DirectComparisons);
         }
+    }
+
+    // ---- Set membership (#799) --------------------------------------------------------------------------------
+
+    /// <summary>
+    /// <c>IN</c> and <c>NOT IN</c> over every column, with members drawn from <see cref="Constants"/> (pairs and
+    /// triples, with and without a NULL member) and the SQL forms below: the direct set path must answer exactly what
+    /// the general path answers, or decline.
+    /// </summary>
+    private static IEnumerable<(string Name, Predicate Predicate)> SetCases(RecordBatch batch)
+    {
+        var constants = Constants().ToList();
+        string[] sqlForms =
+        [
+            "{0} IN ('abc', 'ab')",
+            "{0} IN ('abc', NULL)",
+            "{0} NOT IN ('abc', 'ab')",
+            "{0} NOT IN ('abc', NULL)",
+            "{0} IN (0, 1, 5)",
+            "{0} IN (1, 5, NULL)",
+            "{0} NOT IN (0, 1)",
+            "{0} NOT IN (0, NULL)",
+            "{0} IN (1.5, 2)",
+            "{0} IN (1, 'abc')",               // a string among numbers: the set coerces, so declines
+            "{0} IN (1.5BD, 2)",               // a decimal: likewise
+            "{0} IN (DATE'2026-10-01', DATE'2026-10-02')", // members that are casts: not literals
+            "{0} IN (true)",
+            "{0} NOT IN (false, NULL)",
+            "{0} IN (NULL)",
+            "{0} NOT IN (NULL, NULL)",
+            "{0} IN ('2026-10-01')",
+            "{0} IN (X'61', 'a')",
+        ];
+
+        foreach (var field in batch.Schema.FieldsList)
+        {
+            var column = Expressions.Ref(field.Name);
+            for (int a = 0; a < constants.Count; a++)
+            {
+                for (int b = a + 1; b < constants.Count; b += 3)
+                {
+                    Expression[] pair = [Expressions.Lit(constants[a]), Expressions.Lit(constants[b])];
+                    Expression[] withNull = [.. pair, Expressions.Lit(LiteralValue.Null)];
+                    Expression[] triple = b + 1 < constants.Count ? [.. pair, Expressions.Lit(constants[b + 1])] : pair;
+                    foreach (var (members, label) in new[] { (pair, "pair"), (withNull, "pair+null"), (triple, "triple") })
+                    {
+                        foreach (var op in new[] { SetOperator.In, SetOperator.NotIn })
+                            yield return ($"{field.Name} {op} {label} [{constants[a]}, {constants[b]}]", new SetPredicate(column, members, op));
+                    }
+                }
+            }
+
+            foreach (var form in sqlForms)
+            {
+                var sql = string.Format(form, field.Name);
+                yield return (sql, SparkSqlParser.ParsePredicate(sql));
+            }
+        }
+    }
+
+    [Fact]
+    public void ADirectSetAnswersAsTheGeneralPathDoes()
+    {
+        var batch = Batch();
+        var mismatches = new List<string>();
+        int cases = 0, direct = 0;
+
+        foreach (var (name, predicate) in SetCases(batch))
+        {
+            for (int e = 0; e < Evaluators.Length; e++)
+            {
+                cases++;
+                var expected = Outcome(Evaluators[e], false, predicate, batch, out _);
+                var actual = Outcome(Evaluators[e], true, predicate, batch, out int used);
+                direct += used;
+                if (!Equals(expected, actual))
+                    mismatches.Add($"[{EvaluatorNames[e]}] {name}\n  general: {expected}\n  direct:  {actual}");
+            }
+        }
+
+        Assert.True(mismatches.Count == 0,
+            $"{mismatches.Count} of {cases} differ:\n" + string.Join("\n", mismatches.Take(25)));
+        // Not vacuous. A lower bar than the comparisons': most pairs drawn from Constants mix kinds (a string with a
+        // number, a decimal, a date with an integer), which the set coerces and the direct path declines by design.
+        Assert.True(direct > cases / 20, $"direct path answered {direct} of {cases}");
+    }
+
+    [Fact]
+    public void ADirectSetOverSlicedColumnsAnswersAsTheGeneralPathDoes()
+    {
+        var full = Batch();
+        var columns = full.Arrays.Select(a => ArrowArrayFactory.Slice(a, 2, full.Length - 3)).ToList();
+        var batch = new RecordBatch(full.Schema, columns, full.Length - 3);
+        var mismatches = new List<string>();
+        int direct = 0;
+
+        foreach (var (name, predicate) in SetCases(batch))
+        {
+            for (int e = 0; e < Evaluators.Length; e++)
+            {
+                var expected = Outcome(Evaluators[e], false, predicate, batch, out _);
+                var actual = Outcome(Evaluators[e], true, predicate, batch, out int used);
+                direct += used;
+                if (!Equals(expected, actual))
+                    mismatches.Add($"[{EvaluatorNames[e]}] {name}\n  general: {expected}\n  direct:  {actual}");
+            }
+        }
+
+        Assert.True(mismatches.Count == 0, string.Join("\n", mismatches.Take(25)));
+        Assert.True(direct > 0);
+    }
+
+    /// <summary>
+    /// A set in a compound predicate (EvalSet's bool?[] path, and the selected-rows path an AND's later operand takes)
+    /// and across byte boundaries, with nulls either side of them.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void ADirectSetInACompoundPredicateAndAcrossBytesAnswersAsTheGeneralPathDoes(bool withNulls)
+    {
+        var full = LongBatch(withNulls);
+        string[] predicates =
+        [
+            "s IN ('abc')", "s NOT IN ('abc', NULL)", "i32 IN (1, 3)", "i32 NOT IN (0, 2, 4)", "i32 IN (1, NULL)",
+            "b IN (true)", "f64 IN (1.5, 2.5)", "d32 IN (DATE'2026-10-01')",
+            "i32 > 1 AND s IN ('ab')", "s IN ('abc') OR i32 IN (4)", "NOT (i32 IN (1, 2))",
+            "i32 <> 0 AND s NOT IN ('ab', NULL)",
+        ];
+
+        var mismatches = new List<string>();
+        int direct = 0;
+        foreach (var (offset, length) in new[] { (0, 37), (1, 35), (3, 17), (7, 9), (8, 24), (9, 28), (13, 1) })
+        {
+            var columns = full.Arrays.Select(a => ArrowArrayFactory.Slice(a, offset, length)).ToList();
+            var batch = new RecordBatch(full.Schema, columns, length);
+            foreach (var sql in predicates)
+            {
+                var predicate = SparkSqlParser.ParsePredicate(sql);
+                for (int e = 0; e < Evaluators.Length; e++)
+                {
+                    var expected = Outcome(Evaluators[e], false, predicate, batch, out _);
+                    var actual = Outcome(Evaluators[e], true, predicate, batch, out int used);
+                    direct += used;
+                    if (!Equals(expected, actual))
+                        mismatches.Add($"[{EvaluatorNames[e]}] {sql} @{offset}+{length}\n  general: {expected}\n  direct:  {actual}");
+                }
+            }
+        }
+
+        Assert.True(mismatches.Count == 0, string.Join("\n", mismatches.Take(25)));
+        Assert.True(direct > 0);
+    }
+
+    [Fact]
+    public void ASetOfStringsIsAnsweredDirectly()
+    {
+        var evaluator = new ArrowRowEvaluator(new SparkFunctionRegistry());
+        var mask = evaluator.EvaluatePredicate(SparkSqlParser.ParsePredicate("s IN ('ab', 'abc', 'zz')"), Batch());
+
+        Assert.Equal(1, evaluator.DirectSets);
+        Assert.Equal([false, true, true, false, false, false, null], Enumerable.Range(0, 7).Select(i => mask.GetValue(i)));
     }
 
     [Fact]
