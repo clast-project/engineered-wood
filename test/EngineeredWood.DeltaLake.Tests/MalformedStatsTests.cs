@@ -180,6 +180,16 @@ public class MalformedStatsTests
         Assert.Null(view.GetNullCount("id", 0));
         Assert.Equal(3, view.GetNullCount("v", 0));
         Assert.Null((File(null) with { TypedStats = new ParsedStatsRef(view, 0) }).GetNumRecords());
+
+        // Turned back into JSON (a stats_parsed-only checkpoint's file, re-emitted), the negative counts are omitted,
+        // not passed on: the JSON says what the getters do (#825 review).
+        string json = (File(null) with { TypedStats = new ParsedStatsRef(view, 0) }).GetStatsJson()!;
+        Assert.DoesNotContain("-1", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("-2", json, StringComparison.Ordinal);
+        var reparsed = ColumnStats.Parse(json)!;
+        Assert.Null(reparsed.NumRecords);
+        Assert.False(reparsed.NullCount!.ContainsKey("id"));
+        Assert.Equal(3, reparsed.NullCount["v"]);
     }
 
     /// <summary>Usable statistics still prune: the fix declines only what it can't read.</summary>
