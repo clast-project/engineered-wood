@@ -12998,6 +12998,32 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <para>Empty when the table declares neither name (no row tracking, or a spec-invalid table that cannot
     /// materialize anyway) — a read must then name no extra column at all.</para>
     /// </summary>
+    /// <summary>
+    /// Whether <paramref name="addFile"/>'s statistics name every one of <paramref name="physicalColumns"/>, so that
+    /// the file holds them: a writer records a null count for each column it wrote, keyed by physical name, a
+    /// struct's as its leaves (<c>s.a</c>). A column added after the file was written has none (#790). False when the
+    /// file has no statistics, or they leave a column out (one past <c>delta.dataSkippingNumIndexedCols</c>, say):
+    /// the caller then reads every column, which is always safe.
+    /// </summary>
+    private static bool StatisticsNameEveryColumn(AddFile addFile, IReadOnlyList<string> physicalColumns)
+    {
+        if (physicalColumns.Count == 0)
+            return true;
+        if (ColumnStats.Parse(addFile.GetStatsJson())?.NullCount is not { } nullCounts)
+            return false;
+
+        foreach (string column in physicalColumns)
+        {
+            if (nullCounts.ContainsKey(column))
+                continue;
+            string prefix = column + ".";
+            if (!nullCounts.Keys.Any(k => k.StartsWith(prefix, StringComparison.Ordinal)))
+                return false;
+        }
+
+        return true;
+    }
+
     private static IReadOnlyList<string> MaterializedRowTrackingColumnNames(Snapshot.Snapshot snapshot)
     {
         var (rowIdName, rowVerName) = DeltaLake.RowTracking.RowTrackingConfig
@@ -13311,14 +13337,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     .Select(c => logicalToPhysical.TryGetValue(c, out var p) ? p : c)
                     .ToList();
             }
-            else if (hasPartitions)
-            {
-                var partSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
-                seamColumns = snapshot.Schema.Fields
-                    .Where(f => !partSet.Contains(f.Name))
-                    .Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
-                    .ToList();
-            }
+
+            // Without a projection the seam is asked for every column (null), partitioned or not: naming the
+            // schema's non-partition fields instead named a column added after this file was written, which the
+            // file lacks (#790).
 
             // Row tracking: the hidden materialized columns are NOT schema fields, so neither projection above
             // ever names them — and reading a rewrite output without them silently re-derives every row's id
@@ -13330,11 +13352,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (seamColumns is not null && MaterializedRowTrackingColumnNames(snapshot).Count > 0)
                 seamColumns = null;
 
-            // The same holds for the conditions' columns when the caller didn't project them: one added after this
-            // file was written is absent from it, and naming it would fail the read before the backfill could
-            // supply its NULLs — a failure the caller's own projection never asked for. Read every column.
-            if (seamColumns is not null && conditions is not null && returned is not null
-                && columns is not null && columns.Any(c => !returned.Contains(c)))
+            // A column added after this file was written is absent from it, and naming it fails the read in a host
+            // that binds columns by name, before the backfill can supply its NULLs (#790). The seam hides the file's
+            // schema, but the file's statistics name the columns it was written with: keep the projection only when
+            // they name every column asked for, and otherwise read every column.
+            if (seamColumns is not null && !StatisticsNameEveryColumn(addFile, seamColumns))
                 seamColumns = null;
 
             return new DataFileRead
