@@ -75,6 +75,29 @@ public class MalformedStatsTests
         Assert.Equal(1, parsed.NullCount["s.b"]);
     }
 
+    /// <summary>
+    /// A key whose count is unusable still marks the key ambiguous (#825 review): a usable copy of it, under the same
+    /// name or as a literal dotted name beside a nested path, is dropped with it, whichever comes first. Keeping that
+    /// copy alone let <c>IS NULL</c> prune a file on a count of 0 its statistics also contradict.
+    /// </summary>
+    [Theory]
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"id\":0,\"id\":-1}}", "id")]
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"id\":-1,\"id\":0}}", "id")]
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"id\":0,\"id\":1.5}}", "id")]
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"s.a\":-1,\"s\":{\"a\":0}}}", "s.a")]
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"s\":{\"a\":0},\"s.a\":-1}}", "s.a")]
+    public void AnUnusableCountMakesItsKeyAmbiguous(string stats, string key)
+    {
+        var counts = ColumnStats.Parse(stats)!.NullCount!;
+        Assert.False(counts.ContainsKey(key));
+    }
+
+    [Theory]
+    [InlineData("{\"numRecords\":3,\"minValues\":{\"id\":0},\"maxValues\":{\"id\":9},\"nullCount\":{\"id\":0,\"id\":-1}}")]
+    [InlineData("{\"numRecords\":3,\"minValues\":{\"id\":0},\"maxValues\":{\"id\":9},\"nullCount\":{\"id\":-1,\"id\":0}}")]
+    public void AnAmbiguousCountDoesNotPruneIsNull(string stats) =>
+        Assert.True(new DeltaFilePruner(Schema, []).ShouldInclude(File(stats), Ex.IsNull("id")));
+
     /// <summary>A pruned scan over a file whose statistics are no object at all keeps it, rather than failing.</summary>
     [Fact]
     public void APrunedScanKeepsAFileWhoseStatisticsAreNoObject()

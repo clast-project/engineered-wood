@@ -141,9 +141,14 @@ public sealed record ColumnStats
             string key = prefix.Length == 0 ? prop.Name : prefix + "." + prop.Name;
             if (prop.Value.ValueKind == JsonValueKind.Number)
             {
-                // A count that isn't a non-negative 64-bit integer is unknown: left out (#820).
+                // A count that isn't a non-negative 64-bit integer is unknown (#820), and makes its key ambiguous: a
+                // usable copy of it (the same name twice, or a literal dotted name beside a nested path) is dropped
+                // with it, in either order (#825 review).
                 if (!prop.Value.TryGetInt64(out long count) || count < 0)
+                {
+                    collided.Add(key);
                     continue;
+                }
                 if (map.ContainsKey(key))
                     collided.Add(key);
                 else
