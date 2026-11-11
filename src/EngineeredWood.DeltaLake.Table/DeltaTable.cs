@@ -14412,9 +14412,25 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 int survivors = deletedRows is null ? batch.Length : kept.Count;
                 if (survivors == 0)
-                    continue; // All rows in this batch were deleted (no surviving ids to emit either)
+                {
+                    // All rows in this batch were deleted (no surviving ids to emit either): nothing reads it again.
+                    // The renames above reuse the source's arrays, so disposing `result` releases its buffers (#791).
+                    result.Dispose();
+                    rawMatIds?.Dispose();
+                    rawMatVers?.Dispose();
+                    continue;
+                }
+
                 if (deletedRows is not null && !kept.AllKept)
-                    result = ArrowCompute.Take(result, result.Schema, kept.Indices);
+                {
+                    // Release what the gather supersedes (#791): every column of the batch gathered from, except one
+                    // the output still shares a buffer with (a view's data, a dictionary). The renames above reuse
+                    // their input's arrays, so these are the source's own. The stripped row-tracking columns are not
+                    // among them; they are read below, and released after.
+                    var gatheredFrom = result;
+                    result = ArrowCompute.Take(gatheredFrom, gatheredFrom.Schema, kept.Indices);
+                    BatchSelector.ReleaseAfterGather(gatheredFrom, result);
+                }
 
                 // Surface each surviving row's RESOLVED id + commit version (row-aligned with the emitted batch):
                 // the materialized value where present, else add.baseRowId + absolute position /
@@ -14446,6 +14462,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     positions = pb.Build();
                 }
             }
+
+            // The stripped row-tracking columns have fed the ids above, and the caller never sees them (#791).
+            rawMatIds?.Dispose();
+            rawMatVers?.Dispose();
 
             // The materialized row-tracking columns were already stripped up front (above).
             var cleanResult = ReconcileToTableShape(
