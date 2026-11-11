@@ -811,6 +811,83 @@ public class ExactFilterTests : IDisposable
         Assert.Equal(0, rows);
     }
 
+    /// <summary>
+    /// #794: a dictionary column from the seam survives the pipeline's row gathers. A deletion vector thins its
+    /// batches, both for a DELETE that reads the file again (DML) and for a scan, and the gathered column keeps its
+    /// dictionary encoding and its values.
+    /// </summary>
+    [Fact]
+    public async Task ASeamDictionaryColumnSurvivesADeletionVector()
+    {
+        var fs = new LocalTableFileSystem(Path.Combine(_tempDir, $"t_{Guid.NewGuid():N}"));
+        await using var table = await DeltaTable.CreateAsync(
+            fs, TableSchema, new DeltaTableOptions { DataFileReader = new DictionaryNoteReader(fs) },
+            enableDeletionVectors: true);
+        await table.WriteAsync([Rows(0, 300)]);
+
+        BooleanArray Where(RecordBatch b, Func<long, bool> doomed)
+        {
+            var ids = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
+            return Answer(b.Length, i => doomed(ids.GetValue(i)!.Value));
+        }
+
+        // The first DELETE writes a deletion vector; the second reads the file through it, gathering.
+        await table.DeleteAsync(b => Where(b, id => id % 10 == 0));
+        await table.DeleteAsync(b => Where(b, id => id % 10 == 1));
+
+        var notes = new Dictionary<long, string>();
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { Columns = ["id", "note"] }))
+        {
+            using (b)
+            {
+                Assert.IsType<DictionaryArray>(b.Column(1));
+                for (int i = 0; i < b.Length; i++)
+                    notes[((Int64Array)b.Column(0)).GetValue(i)!.Value] = DictionaryValue(b.Column(1), i);
+            }
+        }
+
+        var expected = Enumerable.Range(0, 300).Where(i => i % 10 > 1).ToList();
+        Assert.Equal(expected.Select(i => (long)i), notes.Keys.OrderBy(k => k));
+        Assert.All(expected, i => Assert.Equal("note-" + i.ToString(CultureInfo.InvariantCulture), notes[i]));
+    }
+
+    /// <summary>
+    /// #794: an exact filter through the seam that keeps some rows of a batch gathers them, a dictionary column with
+    /// them.
+    /// </summary>
+    [Fact]
+    public async Task ASeamDictionaryColumnSurvivesAPartialExactFilter()
+    {
+        var fs = new LocalTableFileSystem(Path.Combine(_tempDir, $"t_{Guid.NewGuid():N}"));
+        await using var table = await DeltaTable.CreateAsync(
+            fs, TableSchema, new DeltaTableOptions { DataFileReader = new DictionaryNoteReader(fs) });
+        await table.WriteAsync([Rows(0, 300)]);
+
+        var notes = new Dictionary<long, string>();
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions
+        {
+            Columns = ["id", "note"], Filter = Filters["data"], FilterRows = true,
+        }))
+        {
+            using (b)
+            {
+                for (int i = 0; i < b.Length; i++)
+                    notes[((Int64Array)b.Column(0)).GetValue(i)!.Value] = DictionaryValue(b.Column(1), i);
+            }
+        }
+
+        var expected = Enumerable.Range(0, 300).Where(i => i % 100 < 30).ToList();
+        Assert.Equal(expected.Select(i => (long)i), notes.Keys.OrderBy(k => k));
+        Assert.All(expected, i => Assert.Equal("note-" + i.ToString(CultureInfo.InvariantCulture), notes[i]));
+    }
+
+    private static string DictionaryValue(IArrowArray column, int row) => column switch
+    {
+        DictionaryArray d => ((StringArray)d.Dictionary).GetString(((Int32Array)d.Indices).GetValue(row)!.Value),
+        StringArray a => a.GetString(row),
+        _ => throw new NotSupportedException(column.GetType().Name),
+    };
+
     [Theory]
     [InlineData(1, false)]
     [InlineData(4, false)]
@@ -1050,7 +1127,7 @@ public class ExactFilterTests : IDisposable
         return new RecordBatch(TableSchema, [id.Build(), region.Build(), v.Build(), n.Build(), note.Build()], count);
     }
 
-    /// <summary>A codec seam that returns <c>note</c> dictionary-encoded, a type <c>ArrowCompute.Take</c> doesn't gather.</summary>
+    /// <summary>A codec seam that returns <c>note</c> dictionary-encoded, as Arrow hosts commonly do.</summary>
     private sealed class DictionaryNoteReader(ITableFileSystem fs) : IDataFileReader
     {
         public async IAsyncEnumerable<RecordBatch> ReadAsync(
