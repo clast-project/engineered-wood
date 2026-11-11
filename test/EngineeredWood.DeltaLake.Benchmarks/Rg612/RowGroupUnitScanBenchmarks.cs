@@ -61,8 +61,13 @@ public class RowGroupUnitScanBenchmarks
     public void Setup()
     {
         string root = Path.Combine(Path.GetTempPath(), "ew-rg612-scan", Layout.ToString());
-        if (!Directory.Exists(Path.Combine(root, "_delta_log")))
+        // A commit, not just the directory: an interrupted build leaves an empty _delta_log behind.
+        if (!RowGroupUnitScanBenchmarks.HasCommit(root))
+        {
+            if (Directory.Exists(root))
+                Directory.Delete(root, recursive: true);
             Build(root, Layout).GetAwaiter().GetResult();
+        }
 
         var options = new DeltaTableOptions { MaxConcurrentReads = Window };
         _table = DeltaTable.OpenAsync(
@@ -78,7 +83,12 @@ public class RowGroupUnitScanBenchmarks
     [GlobalCleanup]
     public void Cleanup() => _table.DisposeAsync().AsTask().GetAwaiter().GetResult();
 
-    private static async Task Build(string root, RgLayout layout)
+    /// <summary>Whether <paramref name="root"/> holds a Delta table with at least one commit.</summary>
+    internal static bool HasCommit(string root) =>
+        Directory.Exists(Path.Combine(root, "_delta_log"))
+        && Directory.EnumerateFiles(Path.Combine(root, "_delta_log"), "*.json").Any();
+
+    internal static async Task Build(string root, RgLayout layout)
     {
         Directory.CreateDirectory(root);
         var options = new DeltaTableOptions

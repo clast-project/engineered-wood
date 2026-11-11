@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24, 5b in §25, 5c in §26, 5d in §27; 5e measured and closed in §28. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24, 5b in §25, 5c in §26, 5d in §27; 5e measured and closed in §28; 5f (offset and limit) in §29. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -1195,3 +1195,93 @@ So the most reordering can save is about one cheap kernel over the batch per mis
 - **Upstream.** Neither upstream project reorders adaptively. arrow-rs keeps the caller's order. DataFusion's selectivity-tracking prototypes (#19639, #21752) were closed with mixed results.
 
 The conjuncts keep their source order (§7). A host that knows its selectivities can order its filter itself. `ConjunctOrderBenchmarks` stays, to repeat the measurement if evaluation gets more expensive relative to decoding.
+
+## 29. Phase 5f: offset and limit (2026-11-10)
+
+### The gate: what an early stop wastes
+
+§24 planned limit pushdown only if the read-ahead a consumer's early stop wastes turned out material. `LimitScanBenchmarks` (new, Delta benchmarks) measured it on `RowGroupUnitScanBenchmarks`' `FourLarge` table (4 files x 8 row groups x 131,072 rows; the object store simulated at 20 ms per GET and 100 MB/s). A consumer takes 10 rows and leaves the `await foreach`; the time includes disposing the scan.
+
+| Consumer takes 10 rows | Window 1 (serial) | Window 4 | Window 8 |
+|---|---|---|---|
+| Local, time | 0.71 ms | 2.40 ms | 4.00 ms |
+| Local, data read | 1.1 MB, 3 GETs | 5.5 MB, 16 | 17.1 MB, 36 |
+| Object store, time | 61 ms | 64 ms | 64 ms |
+| Object store, data read | 1.1 MB, 2 GETs | 8.7 MB, 12 | 17.1 MB, 20 |
+
+- On object storage, cancellation is prompt, so the cost is not latency but **6-15x the bytes and GETs**.
+- Locally, disposal waits for the row groups already decoding (`OrderedScan` cancels its producers and then waits for them), at 3-6x the time.
+- A smaller window cannot fix it: a full scan of the same table with a 0.1% filter took 1.32 s serially and 0.23 s at window 8 on the simulated store.
+
+**Decided (2026-11-10):** build both `Offset` and `Limit`, as arrow-rs (`with_offset`, `with_limit`), Spark's DSv2 (`SupportsPushDownOffset`, `SupportsPushDownLimit`), Polars (slice pushdown) and Lance do. DataFusion pushes only a fetch of `offset + limit` into its scans. The offset is the pagination case: with exact row counts it is almost free.
+
+### What it does
+
+**`DeltaReadOptions.Offset` and `.Limit`** (public, `long` and `long?`) apply to the rows the scan returns, in its order: files in path order, row groups and rows in file order, whatever the window.
+- A negative value is refused.
+- So is either with a superset `Filter` (no `FilterRows`): the rows skipped would depend on what pruning kept.
+- `Limit = 0` returns nothing and reads nothing.
+
+There are three layers, and only the first decides which rows come back:
+1. **The output** (`LimitRowsAsync`) skips the offset's rows and stops after the limit's, which ends the scan and cancels what is in flight. A batch cut in two is gathered (`BatchSelector.Gather` / `ReleaseAfterGather`, so a view column's shared buffers stay alive). This alone makes every mode exact.
+2. **Counted mode** (no exact filter, no masks, the built-in reader; `FilterRows` without a `Filter` is no filter). Each planned row group's live rows are its plan's rows less those the file's deletion vector deletes among them (counted by clearing a selection bitmap). They come from the file, never from the log's statistics.
+   - The planner drops the units wholly inside the offset, crediting their rows to it. Every skip comes before the first unit handed out, so the output reads the credit once.
+   - It stops planning once the units handed out cover `Offset + Limit`.
+   - The log's `numRecords`, less the deletion vectors' cardinality, only decides how many files are opened ahead. A wrong statistic can make the scan open fewer files ahead; it cannot change a row.
+3. **Bounded mode** (an exact filter, masks, or the codec seam). Matches are not known ahead.
+   - A parallel scan starts with one unit when there is no offset, and with a whole window when there is one, since the offset's rows have to be read and evaluated anyway.
+   - As units end, it estimates the units still needed (rows still needed over the rows per unit so far), and grants that many, up to the window. With no row yet, the units in flight double.
+   - A first version doubled from one unit regardless. That cost a deep filtered page 14% locally and 60% on the simulated store: several round trips to reach the window the consumer's own read had from the start.
+
+**Liveness.** In bounded mode only a unit that ends grants more. A first version therefore deadlocked when the output still wanted rows after the units had yielded `Offset + Limit`: the planner waited for a grant and the output for a batch. Correct code cannot get there, but a mutation of the output's arithmetic did, and its tests hung instead of failing. The output now tells the limit when it waits for a batch (`ConsumerWaiting`), and how many rows each batch held. A wait with no unit in flight, after the output has received every row the ended units yielded, grants one; that never happens in a correct scan. (The first version of this granted on any wait with no unit in flight: see review round 1.)
+
+### Measured
+
+`LimitScanBenchmarks`, window 8, 10 rows taken by the consumer stopping itself against `Offset`/`Limit` pushed. "Page" starts 2,000,000 rows in, or 2,000 rows into the filter's ~4,200 matches (`amount < 1`, 0.1%, scattered). 12 iterations.
+
+| Case | Consumer stops itself | Pushed | Change |
+|---|---|---|---|
+| First 10, local | 4.0 ms, 17.1 MB | 0.74 ms, 1.1 MB | -82% |
+| Page, local | 7.1 ms, 32.8 MB | 0.90 ms, 1.2 MB | -87% |
+| Filtered, first 10, local | 4.2 ms, 17.1 MB | 1.15 ms, 1.1 MB | -72% |
+| Filtered page, local | 8.5 ms, 31.8 MB | 6.4 ms, 19.2 MB | -24% |
+| First 10, object store | 64 ms, 17.1 MB / 20 GETs | 64 ms, 1.1 MB / 2 | bytes -94% |
+| Page, object store | 107 ms, 25.4 MB / 28 GETs | 64 ms, 1.2 MB / 4 | -40%, bytes -95% |
+| Filtered, first 10, object store | 95 ms, 12.9 MB / 21 GETs | 96 ms, 1.1 MB / 3 | bytes -91% |
+| Filtered page, object store | 159 ms, 29.7 MB / 39 GETs | 159 ms, 18.1 MB / 26 | bytes -39% |
+
+The pushed options are never slower than the consumer stopping itself, and read less in every case.
+
+### Tests
+
+`OffsetLimitTests` (Delta). The table has 3 files x 4 row groups x 500 rows, a deletion vector deleting every 13th row of two files and a whole row group, and a partition. The oracle is the same scan without offset or limit, skipped and taken in order, row addresses included.
+- 8 offsets (0, 1, 499, 500, 1,001, 2,000, 3,500, past the end) x 6 limits (none, 0, 1, 10, 501, 2,500), over {plain, exact filter, host mask} x {serial, 4 at once}.
+- With no row condition, a limit inside the first row group reads one unit, an offset past the first file reads none of its row groups, and an offset-only read reads fewer units than a full one (`DeltaTable.ScanUnitsRead`, internal).
+- A filtered limit at window 8 reads at most 3 units.
+- `Limit = 0` reads nothing.
+- A negative offset or limit, and either with a superset filter, are refused.
+
+Each of these mutations fails tests:
+- the output ignoring the offset (6);
+- skipped units not credited (4);
+- live rows ignoring the deletion vector (2);
+- the planner never stopping (1);
+- never skipping (2);
+- no ramp (1);
+- the ramp opening the full window (1);
+- a superset filter accepted (1);
+- the output taking one row too few (9; it hung before the liveness fix).
+
+The benchmarks' table guard now checks for a commit, not just a `_delta_log` directory: an interrupted build had left an empty one that made every case fail.
+
+### Review round 1
+
+- **CI: a filtered `Limit = 1` read 11 units at window 8** (net10.0 on CI; it passed locally, and on net8.0 and net472 there). The liveness reserve granted a unit whenever the output waited with none in flight. But a unit can end with its batch queued before the output wakes to take it, so the output "waited" with nothing in flight and was granted a unit. On a slow runner, each new unit ended before the output ran too, and granted the next. The reserve now also needs the output to have received every row the ended units yielded. `AUnitEndingBeforeTheOutputTakesItsBatchGrantsNothing` replays that sequence deterministically on `ScanLimit`; the real race depends on thread scheduling. The ramp test ran 30 times without a failure.
+- **Statistics were parsed for every file** for the open-ahead hints, even for `Limit = 1`, a serial scan or `Limit = 0`. They are now built only for a parallel scan with a positive limit, and parsing stops once the hints cover `Offset + Limit`.
+- **Fully pruned files stalled a bounded scan's lookahead.** Opening files ahead followed the units granted, and a file whose row groups are all pruned yields no unit, so grants none. A run of them was opened one at a time. Each such file now doubles the open-ahead allowance, up to the window. `AFilteredScan_PlansTheFilesItOpenedAhead_AtOnce` covers an exact filter with a limit too, and fails without the fix.
+- **A covered counted limit still opened the next file**: the file about to be planned is opened whatever the lookahead says. The planner now checks for a covered limit before opening it. `ACoveredLimitOpensNoFurtherFile` (one-row-group files, serial and parallel) fails without the check.
+
+### Review round 2
+
+- **`FilterRows` without a `Filter` counts as no filter.** Counted mode was keyed on `FilterRows` alone. So such a read, which has no row condition, lost row-group skipping for its offset and the open-ahead hints for its limit. It now keys on an exact filter being present. `FilterRowsWithoutAFilterIsCounted` (serial and parallel) reads one unit for `Offset = 2,000, Limit = 10`, returns the same rows as the read without `FilterRows`, and fails with the old classification.
+- **The planner's tally no longer adds without bound.** `_planned + rows <= Offset` would wrap if the tally neared `long.MaxValue`. The tally sums real row counts, so that needs a table of about 9.2 x 10^18 rows; unreachable, but it is now compared by subtraction and saturated, as `Need` already was. `AnOffsetOfLongMaxValueReturnsNothing` pins the edge it guards (it passed before too).

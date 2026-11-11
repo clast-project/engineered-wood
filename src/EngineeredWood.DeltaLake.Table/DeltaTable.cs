@@ -6797,35 +6797,61 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         // file among small ones, still keep every reader busy. A file read through the codec seam is one unit:
         // the seam hides its row groups.
         int window = EffectiveConcurrentReads;
-        if (window <= 1)
+
+        // An offset and a limit (#502 phase 5f): applied to the rows returned, which makes them exact; the planner
+        // only saves reading. A limit of 0 reads nothing.
+        var limit = ScanLimitFor(options, includedFiles, window);
+        if (limit?.Limit == 0)
+            yield break;
+
+        var rows = window <= 1
+            ? SerialScanAsync(snapshot, options, scan, included, includedFiles, limit, cancellationToken)
+            : ParallelScanAsync(snapshot, options, scan, included, includedFiles, window, limit, cancellationToken);
+        if (limit is not null)
+            rows = LimitRowsAsync(rows, limit, cancellationToken);
+        await foreach (var batch in rows.ConfigureAwait(false))
+            yield return batch;
+    }
+
+    private async IAsyncEnumerable<RecordBatch> SerialScanAsync(
+        Snapshot.Snapshot snapshot, DeltaReadOptions options, ScanFileShape scan,
+        List<(int Ordinal, AddFile File)> included, List<AddFile> includedFiles, ScanLimit? limit,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (var unit in PlanScanUnitsAsync(
+                           snapshot, options, includedFiles, lookahead: 1, cancellationToken, limit: limit)
+                           .ConfigureAwait(false))
         {
-            await foreach (var unit in PlanScanUnitsAsync(snapshot, options, includedFiles, lookahead: 1, cancellationToken)
-                               .ConfigureAwait(false))
+            try
             {
-                try
+                await foreach (var batch in ReadScanUnitAsync(
+                                   unit, scan, included[unit.File].Ordinal, ScanReservation.None, growth: null,
+                                   cancellationToken).ConfigureAwait(false))
                 {
-                    await foreach (var batch in ReadScanUnitAsync(
-                                       unit, scan, included[unit.File].Ordinal, ScanReservation.None, growth: null,
-                                       cancellationToken).ConfigureAwait(false))
-                    {
-                        yield return batch;
-                    }
-                }
-                finally
-                {
-                    unit.Read.Release();
+                    yield return batch;
                 }
             }
-            yield break;
+            finally
+            {
+                unit.Read.Release();
+            }
         }
+    }
 
+    private async IAsyncEnumerable<RecordBatch> ParallelScanAsync(
+        Snapshot.Snapshot snapshot, DeltaReadOptions options, ScanFileShape scan,
+        List<(int Ordinal, AddFile File)> included, List<AddFile> includedFiles, int window, ScanLimit? limit,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
         var budget = new ScanMemoryBudget(_options.MaxBufferedReadBytes, _options.MemoryBudget);
         LastScanBudget = budget;
         var growth = new ParquetFileReader.DecodedGrowth();
         await foreach (var batch in OrderedScan.RunAsync(
-                           PlanScanUnitsAsync(snapshot, options, includedFiles, lookahead: window, cancellationToken),
-                           (unit, reservation, ct) => ReadScanUnitAsync(
-                               unit, scan, included[unit.File].Ordinal, reservation, growth, ct),
+                           PlanScanUnitsAsync(snapshot, options, includedFiles, lookahead: window, cancellationToken, limit: limit),
+                           (unit, reservation, ct) => limit is null
+                               ? ReadScanUnitAsync(unit, scan, included[unit.File].Ordinal, reservation, growth, ct)
+                               : LimitedUnit(
+                                   ReadScanUnitAsync(unit, scan, included[unit.File].Ordinal, reservation, growth, ct), limit),
                            RollingDataFileWriter.EstimatedBytes,
                            static b => b.Dispose(),
                            window,
@@ -6834,6 +6860,27 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                            cancellationToken: cancellationToken).ConfigureAwait(false))
         {
             yield return batch;
+        }
+    }
+
+    /// <summary>
+    /// A unit's batches, telling <paramref name="limit"/> how many rows it yielded when its read has ended (a bounded
+    /// scan's ramp).
+    /// </summary>
+    private static async IAsyncEnumerable<RecordBatch> LimitedUnit(IAsyncEnumerable<RecordBatch> batches, ScanLimit limit)
+    {
+        long rows = 0;
+        try
+        {
+            await foreach (var batch in batches.ConfigureAwait(false))
+            {
+                rows += batch.Length;
+                yield return batch;
+            }
+        }
+        finally
+        {
+            limit.UnitDone(rows);
         }
     }
 
@@ -6876,7 +6923,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         IReadOnlyList<AddFile> files,
         int lookahead,
         [EnumeratorCancellation] CancellationToken cancellationToken,
-        Func<int, RowSkipPredicate?>? skipRows = null)
+        Func<int, RowSkipPredicate?>? skipRows = null,
+        ScanLimit? limit = null)
     {
         var opening = new Queue<Task<OpenedFile>>();
         int next = 0;
@@ -6888,7 +6936,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             for (int f = 0; f < files.Count; f++)
             {
-                while (next < files.Count && opening.Count < Math.Max(1, lookahead))
+                // A counted limit the units handed out already cover opens no further file (#502 phase 5f).
+                if (limit is { Covered: true })
+                    yield break;
+
+                // With a limit, a file is opened ahead only while it may be needed (#502 phase 5f); the one being
+                // planned always is.
+                while (next < files.Count && opening.Count < Math.Max(1, lookahead)
+                       && (next == f || limit is null || limit.MayOpenAhead(next, f)))
                 {
                     // The scan forwards its predicate to the row-group level: it promises only a superset of the
                     // matching rows (so does a predicate DELETE, which prunes in ComputeDeleteActionsAsync).
@@ -6902,6 +6957,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 var opened = await opening.Dequeue().ConfigureAwait(false);
                 var read = opened.Read;
                 IAsyncEnumerator<ParquetFileReader.RowGroupPlan>? rest = null;
+                bool yieldedUnit = false;
                 try
                 {
                     if (read.NoRowsMatch)
@@ -6910,14 +6966,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     }
                     else if (read.Reader is null)
                     {
+                        if (limit is not null && await limit.AdmitAsync(null, cancellationToken).ConfigureAwait(false) == UnitAdmission.Stop)
+                            yield break;
                         read.AddRef();
+                        yieldedUnit = true;
                         yield return new ScanUnit(f, read, null);
                     }
                     else
                     {
                         foreach (var plan in opened.Planned)
                         {
+                            var admission = limit is null ? UnitAdmission.Yield : await limit.AdmitAsync(
+                                () => LiveRowsAsync(read, plan, cancellationToken), cancellationToken).ConfigureAwait(false);
+                            if (admission == UnitAdmission.Stop)
+                                yield break;
+                            if (admission == UnitAdmission.Skip)
+                                continue;
                             read.AddRef();
+                            yieldedUnit = true;
                             yield return new ScanUnit(f, read, plan);
                         }
                         opened.Error?.Throw();
@@ -6930,8 +6996,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                             .GetAsyncEnumerator(cancellationToken);
                         while (await rest.MoveNextAsync().ConfigureAwait(false))
                         {
+                            var plan = rest.Current;
+                            var admission = limit is null ? UnitAdmission.Yield : await limit.AdmitAsync(
+                                () => LiveRowsAsync(read, plan, cancellationToken), cancellationToken).ConfigureAwait(false);
+                            if (admission == UnitAdmission.Stop)
+                                yield break;
+                            if (admission == UnitAdmission.Skip)
+                                continue;
                             read.AddRef();
-                            yield return new ScanUnit(f, read, rest.Current);
+                            yieldedUnit = true;
+                            yield return new ScanUnit(f, read, plan);
                         }
                     }
                 }
@@ -6941,6 +7015,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         await rest.DisposeAsync().ConfigureAwait(false);
                     read.Release();
                 }
+
+                // A file that yielded no unit lets a bounded limit open further ahead (#502 phase 5f review round 1).
+                if (!yieldedUnit)
+                    limit?.FileWithoutUnits();
             }
         }
         finally
@@ -7048,6 +7126,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         ParquetFileReader.DecodedGrowth? growth,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _scanUnitsRead);
         var read = unit.Read;
         bool wantPositions = scan.WantAddress || scan.WantLocator;
         byte[]? pathBytes = scan.WantLocator ? System.Text.Encoding.UTF8.GetBytes(read.AddFile.Path) : null;

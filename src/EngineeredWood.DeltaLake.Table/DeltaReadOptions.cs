@@ -52,6 +52,40 @@ public sealed record DeltaReadOptions
     public bool FilterRows { get; init; }
 
     /// <summary>
+    /// Rows of the scan's result to skip before the first one returned. 0 (the default) skips none.
+    /// </summary>
+    /// <remarks>
+    /// <para>The result's order is the scan's: files in path order, row groups and rows in file order, whatever
+    /// <see cref="DeltaTableOptions.MaxConcurrentReads"/> is. An offset past the last row returns nothing.</para>
+    /// <para>Applied to the rows the scan returns, so with a <see cref="Filter"/> only when it is exact
+    /// (<see cref="FilterRows"/>); with a superset filter the rows skipped would depend on which ones pruning happened
+    /// to keep, and setting an offset or a limit then throws. <see cref="RowMasks"/> apply first.</para>
+    /// <para>With no row condition (no exact filter, no mask) and the built-in reader, each row group's live rows
+    /// are known from the file's footer and deletion vector, so the row groups the offset covers are not read at
+    /// all. Otherwise skipped rows are read and evaluated to know which they are. Metadata columns are those of the
+    /// rows returned.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">Negative.</exception>
+    public long Offset { get; init; }
+
+    /// <summary>
+    /// The most rows the scan returns, after <see cref="Offset"/>. Null (the default) returns every row; 0 returns
+    /// none and reads nothing.
+    /// </summary>
+    /// <remarks>
+    /// <para>The scan stops reading once the rows are returned. A consumer that stops enumerating early gets that
+    /// too, but only after the scan has read ahead (<see cref="DeltaTableOptions.MaxConcurrentReads"/> row groups);
+    /// with a limit it reads ahead only what it needs. With no row condition and the built-in reader, the row groups
+    /// that hold the rows are known from their footers and deletion vectors, and only those are read, in parallel.
+    /// With an exact filter, masks or a <see cref="DeltaTableOptions.DataFileReader"/>, how many rows match is not
+    /// known ahead: the scan reads one row group first (a whole window when there is an offset, which has to be read
+    /// through anyway), then as many more as the rows still needed suggest, up to its window.</para>
+    /// <para>Same conditions as <see cref="Offset"/>.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">Negative.</exception>
+    public long? Limit { get; init; }
+
+    /// <summary>
     /// The host's own row conditions (#502): a scan returns only the rows every mask answers TRUE for. Null or empty
     /// for none. They apply whether or not <see cref="FilterRows"/> is set, after the exact <see cref="Filter"/>
     /// when it is, in the order given. Each mask's columns are refused before any file is read unless the table has
