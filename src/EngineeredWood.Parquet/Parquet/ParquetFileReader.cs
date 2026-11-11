@@ -1026,6 +1026,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     try
                     {
                         var results = new ColumnResult[ctx.Count];
+                        bool[]? declined = null;
                         ForEachColumn(ctx.Count, i =>
                         {
                             var cursor = cursors[i];
@@ -1049,18 +1050,30 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
                                 var buffer = pageBytes[dataSlots[i]];
                                 int startPage = startPages[i];
-                                var decoded = ColumnChunkReader.ReadColumnBatchFromSlice(
-                                    buffer.Span,
-                                    pageMaps[i].Pages[startPage].Offset,
-                                    ctx.Columns[i],
-                                    ctx.Chunks[i].MetaData!,
-                                    pageMaps[i],
-                                    startPage, endPages[i],
-                                    ctx.LeafArrowFields[i],
-                                    ctx.HasNestedColumns,
-                                    _options.PageChecksumValidation,
-                                    _options.MaxPageUncompressedSize,
-                                    answer: answerModes[i] == 1 ? dictionaryAnswers![i] : null);
+                                ColumnResult decoded;
+                                try
+                                {
+                                    decoded = ColumnChunkReader.ReadColumnBatchFromSlice(
+                                        buffer.Span,
+                                        pageMaps[i].Pages[startPage].Offset,
+                                        ctx.Columns[i],
+                                        ctx.Chunks[i].MetaData!,
+                                        pageMaps[i],
+                                        startPage, endPages[i],
+                                        ctx.LeafArrowFields[i],
+                                        ctx.HasNestedColumns,
+                                        _options.PageChecksumValidation,
+                                        _options.MaxPageUncompressedSize,
+                                        answer: answerModes[i] == 1 ? dictionaryAnswers![i] : null);
+                                }
+                                catch (DictionaryAnswer.DeclinedException) when (answerModes[i] == 1)
+                                {
+                                    // A page that fell back from the dictionary could not be answered (#804). The
+                                    // column is read as values from this batch on, below.
+                                    lock (results)
+                                        (declined ??= new bool[ctx.Count])[i] = true;
+                                    return;
+                                }
 
                                 // A returned answered column holds its answers as it holds its values.
                                 var answerCursor = answerModes[i] == 1 ? answerCursors[i] : null;
@@ -1092,6 +1105,64 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                                 results[i] = new ColumnResult(cursor.Take(actualBatchRows), null, null);
                             }
                         });
+
+                        // A column whose fallback page declined (#804) holds answers for rows this batch still
+                        // needs, so it is decoded again as values from the page holding the batch's first row, and
+                        // read as values from then on. The predicates are then asked over its live rows, which
+                        // decide whether the error is raised. Earlier batches never used this page's rows: a page
+                        // is decoded by the first batch that reaches it.
+                        for (int i = 0; declined is not null && i < ctx.Count; i++)
+                        {
+                            if (!declined[i])
+                                continue;
+
+                            answerModes[i] = 2;
+                            answerCursors[i]?.Dispose();
+                            answerCursors[i] = null;
+
+                            var map = pageMaps[i];
+                            int firstPage = map.FindPageForRow(batchStartRow);
+                            int lastPage = endPages[i];
+                            ReadOnlyMemory<byte> bytes;
+                            long baseOffset;
+                            IMemoryOwner<byte>? refetched = null;
+                            if (held[i] is { } chunk)
+                            {
+                                bytes = chunk.Memory;
+                                baseOffset = 0;
+                            }
+                            else if (firstPage >= startPages[i])
+                            {
+                                bytes = pageBytes[dataSlots[i]];
+                                baseOffset = map.Pages[startPages[i]].Offset;
+                            }
+                            else
+                            {
+                                long start = map.Pages[firstPage].Offset;
+                                long end = map.Pages[lastPage].Offset + map.Pages[lastPage].CompressedSize;
+                                var fetched = await file.ReadRangesAsync(
+                                        [new FileRange(ctx.Ranges[i].Offset + start, end - start)], cancellationToken)
+                                    .ConfigureAwait(false);
+                                refetched = fetched[0];
+                                bytes = refetched.Memory;
+                                baseOffset = start;
+                            }
+
+                            try
+                            {
+                                var values = ColumnChunkReader.ReadColumnBatchFromSlice(
+                                    bytes.Span, baseOffset, ctx.Columns[i], ctx.Chunks[i].MetaData!, map,
+                                    firstPage, lastPage, ctx.LeafArrowFields[i], ctx.HasNestedColumns,
+                                    _options.PageChecksumValidation, _options.MaxPageUncompressedSize);
+                                cursors[i].Restart(values.Array, map.CumulativeRows[firstPage], lastPage + 1);
+                            }
+                            finally
+                            {
+                                refetched?.Dispose();
+                            }
+
+                            results[i] = new ColumnResult(cursors[i].Take(actualBatchRows), null, null);
+                        }
 
                         yield return AssembleRecordBatch(
                             ctx with { RowCount = actualBatchRows }, results, dictionaryAnswers);
@@ -2016,8 +2087,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// The columns of <paramref name="ctx"/> a selected read answers from their dictionaries (#502 phase 4b), by
-    /// position: those <paramref name="answers"/> names, flat, whose chunk's encoding_stats prove every data page
-    /// dictionary-encoded. Null when there are none. <paramref name="rows"/> is how many rows the read decodes.
+    /// position: those <paramref name="answers"/> names, flat, whose chunk has dictionary-encoded pages
+    /// (<see cref="DictionaryAnswer.MayAnswer"/>). Pages that fell back from the dictionary are answered from their
+    /// values (#804). Null when there are none. <paramref name="rows"/> is how many rows the read decodes.
     /// </summary>
     private DictionaryAnswer?[]? DictionaryAnswersFor(
         RowGroupContext ctx, IReadOnlyDictionary<string, AnswerPlan>? answers, int rows)
@@ -2031,7 +2103,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             var column = ctx.Columns[i];
             if (column.Path.Count == 1 && column.MaxRepetitionLevel == 0
                 && answers.TryGetValue(column.Path[0], out var plan)
-                && ctx.Chunks[i].MetaData is { } meta && MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta))
+                && ctx.Chunks[i].MetaData is { } meta && DictionaryAnswer.MayAnswer(meta))
             {
                 (result ??= new DictionaryAnswer?[ctx.Count])[i] = new DictionaryAnswer(
                     plan.Predicates, column, ctx.LeafArrowFields[i], RestoreDeclaredUnit, rows, plan.KeepValues);

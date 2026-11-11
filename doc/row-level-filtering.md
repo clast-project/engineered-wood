@@ -1324,3 +1324,88 @@ Against, and deciding:
 Issues opened along the way:
 - #804: dictionary answers for chunks that mix dictionary and PLAIN pages, or lack `encoding_stats`.
 - #808: a statistics proof refuses an INT literal over a BIGINT column, so `id >= 2500` is never proven. Fixed: an exactly widening literal is now proven.
+
+## 31. Chunks that fall back from the dictionary (#804, 2026-11-11)
+
+Before #804, a chunk was answered from its dictionary only when its `encoding_stats` proved every data page dictionary-encoded (§20). Two kinds of chunk were always asked row by row:
+- **Chunks that fall back to another encoding partway through.** parquet-mr, arrow-cpp and arrow-rs all do this once the dictionary passes a size limit. That is the common case in other engines' files: the TPC-H key columns in #502's DuckDB benchmark are written this way.
+- **Chunks with no `encoding_stats`.** The field is optional.
+
+### What it does
+
+§6 step 2, as proposed: the dictionary is evaluated once per chunk, as before. The pages that fell back have their values decoded and asked.
+- **Which chunks.** Any flat chunk with dictionary-encoded pages (`DictionaryAnswer.MayAnswer`). With `encoding_stats`, they must show a dictionary page and a dictionary-encoded data page. Without them, a dictionary encoding in the chunk's `encodings`, or a dictionary page offset, is enough. A chunk that turns out to have no dictionary page declines at its first data page and is read as values.
+- **A fallback page.** Its values are decoded apart (`FallbackValueState`), and every predicate of the run is asked over them (`AnswerValues`). Their answers join the lookup table as entries past the dictionary's. The page's values take those entries as their indices. `Map` then treats both kinds of page alike, and nothing downstream changes: the answers column, `BatchSelector`, and the batched read's cursors. The extra entries are for one `Map` (one chunk, or one batch's pages) and are reused after it. A fallback page may be in any encoding: PLAIN, or DELTA_BYTE_ARRAY from parquet-mr's V2 writer.
+- **A returned column.** The values decoded apart are appended to the read's values (`ColumnBuildState.TryAppendValuesOf`), so the page is decoded once. A BOOLEAN column, or a string read as a view or with large offsets, decodes the page again instead.
+- **Errors.** A predicate that raises over a fallback page's values, or values that cannot be built apart, makes the chunk decline (`DictionaryAnswer.DeclinedException`, not a decode failure). The rows then decide, as when the dictionary itself raises (§20). Over the whole row group, the chunk is read again as values. In the batched read, the answers already held cover rows this batch still needs. So the column is decoded again as values from the page holding the batch's first row: from the held chunk, from the window, or from a range fetched again. It is read as values from then on. Batches already returned used only pages that answered; a page is decoded by the first batch that reaches it.
+- **The all-false prune** (§6) is still not built. When it is, it must stay limited to wholly dictionary-encoded chunks: a fallback page can hold values the dictionary does not. Dictionary pruning (#57) keeps `IsWhollyDictionaryEncoded` for the same reason.
+
+Mapping the masks into the table also changed. `Evaluate` writes each predicate's answers straight from the mask's bitmaps into the table's two bits per entry. It no longer goes through a byte per row and `BooleanArray.GetValue`, since a fallback page puts every value through it.
+
+### Measured
+
+`fallback-ab` (new, Parquet benchmarks). arrow-cpp (ParquetSharp) writes 4 row groups x 500,000 rows: `id`, `amount`, and `category` (50 values). In each row group, one filler value larger than the 64 KiB dictionary page limit makes the rest of the chunk PLAIN from the chosen point. `rows` asks the predicate row by row, which is what every mixed chunk got before #804. `dict` marks it value-wise. The host probe is a hash-set delegate, as a join filter would be. i9-12900K (24 logical), net10.0, local file, median of 9.
+
+| PLAIN | Case | Kept | rows ms | dict ms | dict vs rows |
+|---|---|---|---|---|---|
+| 0% | `= 'cat-07'`, returns `id, amount` | 2% | 16.7 | 11.2 | -33% |
+| 0% | host probe, returns `id, amount` | 10% | 33.7 | 11.1 | -67% |
+| 0% | `= 'cat-07'`, returns `id, category` | 2% | 9.6 | 9.7 | +1% |
+| 0% | host probe, returns `id, category` | 10% | 28.5 | 11.4 | -60% |
+| 10% | `= 'cat-07'`, returns `id, amount` | 2% | 13.8 | 11.2 | -19% |
+| 10% | `IN` 5, returns `id, amount` | 10% | 18.7 | 12.8 | -32% |
+| 10% | `<> 'cat-07'`, returns `id, amount` | 98% | 25.1 | 21.6 | -14% |
+| 10% | host probe, returns `id, amount` | 10% | 32.2 | 13.6 | -58% |
+| 10% | `= 'cat-07'`, returns `id, category` | 2% | 9.8 | 10.5 | +7% |
+| 10% | `<> 'cat-07'`, returns `id, category` | 98% | 22.1 | 22.6 | +2% |
+| 10% | host probe, returns `id, category` | 10% | 37.3 | 13.6 | -63% |
+| 50% | `= 'cat-07'`, returns `id, amount` | 2% | 14.1 | 12.7 | -10% |
+| 50% | `<> 'cat-07'`, returns `id, amount` | 98% | 25.4 | 24.5 | -4% |
+| 50% | host probe, returns `id, amount` | 10% | 32.5 | 22.5 | -31% |
+| 50% | `= 'cat-07'`, returns `id, category` | 2% | 10.7 | 12.4 | +16% |
+| 50% | `<> 'cat-07'`, returns `id, category` | 98% | 22.4 | 24.3 | +9% |
+| 50% | host probe, returns `id, category` | 10% | 29.1 | 22.3 | -23% |
+| 90% | `= 'cat-07'`, returns `id, amount` | 2% | 15.5 | 15.8 | +2% |
+| 90% | `<> 'cat-07'`, returns `id, amount` | 98% | 26.7 | 26.5 | -1% |
+| 90% | host probe, returns `id, amount` | 10% | 34.9 | 32.8 | -6% |
+| 90% | `= 'cat-07'`, returns `id, category` | 2% | 12.4 | 15.1 | +22% |
+| 90% | `IN` 5, returns `id, category` | 10% | 17.6 | 19.7 | +12% |
+| 90% | `<> 'cat-07'`, returns `id, category` | 98% | 23.1 | 26.8 | +16% |
+| 90% | host probe, returns `id, category` | 10% | 30.5 | 32.3 | +6% |
+
+(The full run, every case at every point, is in the PR.)
+
+- **A dropped column** gains or breaks even at every fallback point. The gain shrinks as the PLAIN share grows, since the fallback pages are asked value by value either way.
+- **A host delegate** is the case #804 was raised for. Answered pages skip the delegate, so it gains 58-67% at 10% PLAIN, 23-31% at 50%, and breaks even at 90%.
+- **A returned column under a cheap kernel** (`=`, `<>` and `IN`, which now has a kernel of its own) costs more once most pages are PLAIN: +9-16% at 50%, +12-22% at 90%. Each fallback value pays the bookkeeping of a table entry, an index and a lookup in `Map`, on top of the comparison the row path also pays.
+
+Two changes on the way cut that cost. Before them, the same file measured +27% (50%) and +43% (90%) for a returned `=`, and +9% at 90% for a dropped one:
+- decoding a returned column's fallback page once, not twice;
+- writing the masks' bits straight into the table.
+
+**Left open: choosing the row path for a returned column that is mostly PLAIN.** The reader cannot tell a chunk's PLAIN share before decoding it. `encoding_stats` counts pages, and a dictionary-encoded page holds many more rows than a PLAIN page of the same size. It also cannot tell a cheap kernel from an expensive delegate. A per-chunk switch, once the first fallback page shows how much remains, is possible but not built.
+
+### Tests
+
+`FallbackPageAnswerTests` (new, Parquet). arrow-cpp (ParquetSharp) writes the fixtures with a 6,000-byte dictionary page limit and 1 KiB pages. Unique filler values overflow each chunk's dictionary partway through. There are four variants: data page V1, V2, V1 with a page index, and V1 with `encoding_stats` stripped from the footer.
+- The fixture's chunks of `s`, `k` and `e` hold both kinds of page; the stripped variant has no stats.
+- An oracle sweep: 7 answers x 4 variants x 4 shapes (one batch or 700-row batches, dropped or returned, serial or 4-way with 5% excluded and a later predicate, one pass or two). Each returns the same rows as the predicate asked row by row, and the later predicate sees the same rows. The dictionary is asked once per row group, and fallback values are asked with no NULLs among them. Under three quarters of the rows are asked at all. One answer is NULL only for values on fallback pages, which needs a validity bitmap no dictionary entry calls for.
+- A returned view-type or large-offset column (decoded twice), and an INT32 column with no NULL row, across the variants.
+- A mask that sets a NULL answer's value bit.
+- A chunk whose `encodings` claims a dictionary but has no dictionary page is read as values.
+- Errors: a value only an excluded row holds, on a fallback page, does not fail the read. This is tested over the whole row group and in batches of 70 to 2,500 rows, which between them take all three recovery routes (held chunk, window, fetched again). One a live row holds raises.
+
+`SparkFallbackPageInteropTests` (new, Delta tier 3). Spark writes a table with `parquet.dictionary.page.size` 4096 and 500-row pages, set as session confs: a Delta write's options do not reach parquet-mr. The V1 writer falls back to PLAIN and the V2 writer to DELTA_BYTE_ARRAY. Six filters x two projections return the same rows with `AnswersFromDictionaries` on and off. The fillers start halfway through each file, because parquet-mr rewrites a chunk PLAIN whole if its dictionary overflows before the first page is written.
+
+Each of these mutations fails tests:
+- the old wholly-encoded gate (108);
+- fallback values answered TRUE (91; and both Spark cases);
+- a fallback error ignored (13);
+- the whole-row-group read propagating a decline (2);
+- each batched recovery route made to throw: held chunk (6), window (4), fetched again (2);
+- FALSE not winning over NULL in a run (12);
+- the fallback entries' NULLs given no validity bitmap (8);
+- no decline before a missing dictionary page (1);
+- a returned column's appended byte arrays skipped (65), and its fixed-width values zeroed (3).
+
+One mutation passes, and is equivalent: taking a NULL answer's value bit as TRUE. Every consumer reads the value bit only where the validity bit is set.

@@ -102,6 +102,13 @@ internal static class ColumnChunkReader
                 if (page.NumValues > capacity - valuesRead)
                     throw TooManyValues(column, page, capacity - valuesRead);
 
+                // A data page before any dictionary (a chunk whose metadata only suggested one): no answer.
+                if (answer is not null && !answer.IsPrepared
+                    && pageHeader.Type is PageType.DataPage or PageType.DataPageV2)
+                {
+                    return default;
+                }
+
                 try
                 {
                     switch (pageHeader.Type)
@@ -140,6 +147,12 @@ internal static class ColumnChunkReader
                     throw UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
                 }
             }
+        }
+        catch (DictionaryAnswer.DeclinedException) when (answer is not null)
+        {
+            // A page that fell back from the dictionary could not be answered (#804): the caller reads the chunk's
+            // values instead, and the predicates are asked over its live rows.
+            return default;
         }
         finally
         {
@@ -242,7 +255,8 @@ internal static class ColumnChunkReader
     /// too, which is why the original is kept as the inner exception.
     /// </remarks>
     internal static bool IsDecodeFailure(Exception ex) =>
-        ex is not (ParquetFormatException or NotSupportedException or OutOfMemoryException or OperationCanceledException);
+        ex is not (ParquetFormatException or NotSupportedException or OutOfMemoryException or OperationCanceledException
+            or DictionaryAnswer.DeclinedException);
 
     /// <summary>A page whose data could not be decoded, for <paramref name="inner"/>, what the decoder threw.</summary>
     /// <param name="ordinal">The data page's ordinal, which names it, or -1 for another kind of page.</param>
@@ -687,7 +701,7 @@ internal static class ColumnChunkReader
         ColumnDescriptor column, int capacity, ByteArrayOutputKind byteArrayOutput, DictionaryAnswer? answer)
     {
         if (answer is { KeepsValues: false })
-            return DictionaryAnswer.IndexState(column, capacity);
+            return DictionaryAnswer.IndexState(column, capacity, answer);
 
         return new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
@@ -696,6 +710,7 @@ internal static class ColumnChunkReader
             IndexSink = answer is null
                 ? null
                 : new ColumnBuildState(PhysicalType.Int32, column.MaxDefinitionLevel, maxRepLevel: 0, capacity),
+            Answerer = answer,
         };
     }
 
@@ -1152,26 +1167,41 @@ internal static class ColumnChunkReader
     {
         bool isDictEncoded = encoding == Encoding.PlainDictionary || encoding == Encoding.RleDictionary;
 
-        // A returned column answered from its dictionary collects every value's index too (phase 4d), so every
-        // data page must be dictionary-encoded, as the chunk's encoding_stats said when it was chosen.
-        if (state.IndexSink is not null && !isDictEncoded)
+        // A chunk answered from its dictionary collects an index for every value. It collects only its indices
+        // (#502 phase 4b), or its values with an index sink beside them (phase 4d). A page that fell back from the
+        // dictionary (#804) has its values decoded apart and answered, and those values take the answers' entries
+        // as their indices. A returned column takes the values decoded apart as its own, or, where it cannot (a
+        // BOOLEAN column, or a view or large-offset string), decodes the page again.
+        if ((state.DictionaryIndices || state.IndexSink is not null) && !isDictEncoded)
         {
-            throw new ParquetFormatException(
-                $"Column '{column.DottedPath}': a data page is {encoding}-encoded, but the chunk's encoding_stats " +
-                "say every data page is dictionary-encoded.");
+            var answerer = state.Answerer
+                ?? throw new InvalidOperationException("A state collecting dictionary indices has no answer.");
+            bool appended;
+            using (var values = answerer.FallbackValueState(nonNullCount))
+            {
+                try
+                {
+                    DecodeValues(data, encoding, column, dictionary, symbolTable, nonNullCount, values);
+                }
+                catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
+                {
+                    // Decoding the page apart can fail where decoding it in sequence does not: a DELTA_BYTE_ARRAY
+                    // page can build on its predecessor's last value. The values read decides.
+                    throw new DictionaryAnswer.DeclinedException(ex);
+                }
+
+                // Before the answers are built from the values, which hands their buffers to Arrow.
+                appended = !state.DictionaryIndices && state.TryAppendValuesOf(values);
+                var indices = (state.DictionaryIndices ? state : state.IndexSink!).ReserveValues<int>(nonNullCount);
+                answerer.AnswerValues(values, nonNullCount, indices);
+            }
+
+            if (state.DictionaryIndices || appended)
+                return;
         }
 
         if (state.DictionaryIndices)
         {
-            // A chunk read for its dictionary indices (a dictionary answer, #502 phase 4b) was chosen because its
-            // encoding_stats say every data page is dictionary-encoded. A page that is not contradicts them.
-            if (!isDictEncoded)
-            {
-                throw new ParquetFormatException(
-                    $"Column '{column.DottedPath}': a data page is {encoding}-encoded, but the chunk's encoding_stats " +
-                    "say every data page is dictionary-encoded.");
-            }
-
             if (dictionary == null)
                 throw new ParquetFormatException(
                     $"Dictionary-encoded data page but no dictionary page found for column '{column.DottedPath}'.");

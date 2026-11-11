@@ -1160,6 +1160,12 @@ internal sealed class ColumnBuildState : IDisposable
     public ColumnBuildState? IndexSink { get; init; }
 
     /// <summary>
+    /// The dictionary answer this state's indices are for, when <see cref="DictionaryIndices"/> or
+    /// <see cref="IndexSink"/> is set. It answers the pages that fell back from the dictionary (#804).
+    /// </summary>
+    public DictionaryAnswer? Answerer { get; init; }
+
+    /// <summary>
     /// Creates a new column build state.
     /// </summary>
     /// <param name="physicalType">Parquet physical type.</param>
@@ -1605,6 +1611,41 @@ internal sealed class ColumnBuildState : IDisposable
         _valueByteOffset += byteSize;
         _valueCount += count;
         return MemoryMarshal.Cast<byte, T>(byteSpan);
+    }
+
+    /// <summary>
+    /// Appends the dense non-null values of <paramref name="source"/>, a state of the same physical type that has not
+    /// been built, as if they had been decoded into this one. A page that fell back from the dictionary is decoded
+    /// once, apart, and its values are both answered and returned (#804). False, having changed nothing, for a BOOLEAN
+    /// column or a BYTE_ARRAY source not in offset mode; the caller then decodes the page again.
+    /// </summary>
+    public bool TryAppendValuesOf(ColumnBuildState source)
+    {
+        if (source._physicalType != _physicalType || source._int96Converted)
+            return false;
+
+        int count = source._valueCount;
+        switch (_physicalType)
+        {
+            case PhysicalType.Boolean:
+                return false;
+
+            case PhysicalType.ByteArray:
+                if (source._byteArrayOutput != ByteArrayOutputKind.Default)
+                    return false;
+                if (count > 0)
+                    AddByteArrayValues(source.GetOffsetsSpan(), source.GetDataSpan(), count);
+                return true;
+
+            default:
+                if (count > 0)
+                {
+                    var bytes = source._valueBuffer!.ByteSpan.Slice(0, source._valueByteOffset);
+                    bytes.CopyTo(ReserveFixedBytes(count, bytes.Length / count));
+                }
+
+                return true;
+        }
     }
 
     /// <summary>

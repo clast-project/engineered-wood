@@ -14,6 +14,11 @@ namespace EngineeredWood.Parquet.Data;
 /// and each row's answer is its index's entry in a lookup table. The column's values are never built.
 /// </summary>
 /// <remarks>
+/// <para>A chunk that falls back from its dictionary partway through is answered too (#804). Writers do this once
+/// the dictionary passes a size limit (parquet-mr, arrow-cpp and arrow-rs all do). Each page that is not
+/// dictionary-encoded has its values decoded apart, and the predicates are asked over them
+/// (<see cref="AnswerValues"/>). Their answers join the lookup table as entries past the dictionary's, and the
+/// page's values take those entries as their indices. So <see cref="Map"/> treats both kinds of page alike.</para>
 /// <para>One instance per chunk read. <see cref="Prepare"/> evaluates the dictionary; when it declines (no
 /// dictionary, one no smaller than the rows it would answer, or a predicate that raises or answers wrongly
 /// over it), the chunk is read as values and the predicate asked row by row as usual. So an error raised by an
@@ -41,7 +46,7 @@ internal sealed class DictionaryAnswer
     private readonly Func<Field, IArrowArray, (Field Field, IArrowArray Array)> _restore;
     private readonly int _rows;
     private readonly bool _keepValues;
-    private byte[]? _table;
+    private bool _prepared;
     private byte _nullAnswer;
 
     // The table as two bits per entry, for Map's inner loop: TRUE, and known (not NULL). And whether any entry, or the
@@ -49,6 +54,12 @@ internal sealed class DictionaryAnswer
     private byte[] _trueBits = [];
     private byte[] _knownBits = [];
     private bool _anyNull;
+
+    // The dictionary's entries. Past them are the answers for the values on fallback pages decoded since the last
+    // Map (#804). Map takes them, and the next batch starts afresh.
+    private int _entries;
+    private int _extra;
+    private bool _extraAnyNull;
 
     /// <param name="predicates">The predicates, value-wise, over this one column: a run whose answers are their Kleene AND
     /// (see <see cref="AnswerPlan"/>).</param>
@@ -83,8 +94,44 @@ internal sealed class DictionaryAnswer
     /// </summary>
     internal static string AnswerColumnName(string column) => "\0answer:" + column;
 
+    /// <summary>
+    /// Whether a chunk may be answered from its dictionary: it has dictionary-encoded data pages, and possibly pages
+    /// that fell back from the dictionary too (#804). With <c>encoding_stats</c>, those decide. Without them, the
+    /// chunk's encodings (writers list a dictionary encoding when any page uses one) or its dictionary page offset do.
+    /// A chunk that turns out to have no dictionary page declines at its first data page.
+    /// </summary>
+    internal static bool MayAnswer(ColumnMetaData meta)
+    {
+        if (meta.EncodingStats is { Count: > 0 } stats)
+        {
+            bool dictionaryPage = false, dictionaryData = false;
+            foreach (var entry in stats)
+            {
+                if (entry.Count <= 0)
+                    continue;
+                if (entry.PageType == PageType.DictionaryPage)
+                    dictionaryPage = true;
+                else if (entry.PageType is PageType.DataPage or PageType.DataPageV2
+                         && entry.Encoding is Encoding.RleDictionary or Encoding.PlainDictionary)
+                    dictionaryData = true;
+            }
+
+            return dictionaryPage && dictionaryData;
+        }
+
+        if (meta.DictionaryPageOffset is not null)
+            return true;
+        foreach (var encoding in meta.Encodings)
+        {
+            if (encoding is Encoding.RleDictionary or Encoding.PlainDictionary)
+                return true;
+        }
+
+        return false;
+    }
+
     /// <summary>Whether <see cref="Prepare"/> has built the lookup table.</summary>
-    internal bool IsPrepared => _table is not null;
+    internal bool IsPrepared => _prepared;
 
     /// <summary>The field of a column of answers named <paramref name="name"/>.</summary>
     internal static Field AnswerField(string name) => new(name, BooleanType.Default, nullable: true, AnswerMetadata);
@@ -93,12 +140,84 @@ internal sealed class DictionaryAnswer
     internal static bool IsAnswerField(Field field) =>
         field.HasMetadata && field.Metadata.TryGetValue(AnswerKey, out var value) && value == "1";
 
-    /// <summary>A build state collecting a chunk's indices.</summary>
-    internal static ColumnBuildState IndexState(ColumnDescriptor column, int capacity) =>
+    /// <summary>A build state collecting a chunk's indices for <paramref name="answer"/>.</summary>
+    internal static ColumnBuildState IndexState(ColumnDescriptor column, int capacity, DictionaryAnswer answer) =>
         new(PhysicalType.Int32, column.MaxDefinitionLevel, maxRepLevel: 0, capacity, columnPath: column.DottedPath)
         {
             DictionaryIndices = true,
+            Answerer = answer,
         };
+
+    /// <summary>
+    /// Raised while a chunk is decoded when a page that fell back from the dictionary cannot be answered: its values
+    /// cannot be built apart, or a predicate raises over them. The chunk's rows are then read as values and the
+    /// predicates asked over the live ones, as when the dictionary itself declines. It is not a decode failure.
+    /// </summary>
+    internal sealed class DeclinedException(Exception? inner = null)
+        : Exception("A page that fell back from the dictionary could not be answered.", inner);
+
+    /// <summary>A build state for the <paramref name="count"/> non-NULL values of a page that fell back from the
+    /// dictionary, which are decoded apart for <see cref="AnswerValues"/>.</summary>
+    internal ColumnBuildState FallbackValueState(int count) =>
+        new(_column.PhysicalType, maxDefLevel: 0, maxRepLevel: 0, Math.Max(1, count),
+            ByteArrayOutputOf(_field.DataType), _column.DottedPath, ExtendedTimestamp.DeclaredUnit(_column));
+
+    /// <summary>
+    /// Answers the <paramref name="count"/> non-NULL values in <paramref name="values"/>, which were decoded from a
+    /// page that fell back from the dictionary (#804), by asking every predicate over them. Their answers join the
+    /// lookup table as entries of their own, and <paramref name="indices"/> receives those entries in order, so
+    /// <see cref="Map"/> maps them as it maps the dictionary's. Raises <see cref="DeclinedException"/> when the values
+    /// cannot be built, or when a predicate raises over them or answers wrongly; the chunk is then read as values.
+    /// </summary>
+    internal void AnswerValues(ColumnBuildState values, int count, Span<int> indices)
+    {
+        if (!_prepared)
+            throw new InvalidOperationException("The dictionary has not been evaluated.");
+        if (count == 0)
+            return;
+
+        RecordBatch batch;
+        try
+        {
+            var (field, array) = _restore(_field, ArrowArrayBuilder.Build(values, _field, count));
+            batch = new RecordBatch(new Apache.Arrow.Schema([field], null), [array], count);
+        }
+        catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
+        {
+            throw new DeclinedException(ex);
+        }
+
+        // The answers go straight into the table, as entries past the dictionary's and earlier pages'.
+        int first = _entries + _extra;
+        EnsureEntries(first + count);
+        bool answered, anyNull;
+        try
+        {
+            answered = Evaluate(batch, count, _trueBits.AsSpan(first, count), _knownBits.AsSpan(first, count), out anyNull);
+        }
+        finally
+        {
+            batch.Dispose();
+        }
+
+        if (!answered)
+            throw new DeclinedException();
+
+        _extraAnyNull |= anyNull;
+        for (int i = 0; i < count; i++)
+            indices[i] = first + i;
+        _extra += count;
+    }
+
+    private void EnsureEntries(int entries)
+    {
+        if (_trueBits.Length >= entries)
+            return;
+
+        int size = Math.Max(entries, _trueBits.Length * 2);
+        System.Array.Resize(ref _trueBits, size);
+        System.Array.Resize(ref _knownBits, size);
+    }
 
     /// <summary>
     /// Evaluates every predicate over <paramref name="dictionary"/>'s values, and over one NULL when the column is
@@ -108,7 +227,7 @@ internal sealed class DictionaryAnswer
     /// </summary>
     internal bool Prepare(DictionaryDecoder? dictionary)
     {
-        _table = null;
+        _prepared = false;
         if (dictionary is null || dictionary.Count >= _rows)
             return false;
 
@@ -142,57 +261,102 @@ internal sealed class DictionaryAnswer
             return false;
         }
 
+        var trueBits = new byte[rows];
+        var knownBits = new byte[rows];
+        bool answered;
         try
         {
-            // Every entry starts TRUE; each predicate's answer is ANDed in (Kleene: FALSE wins, then NULL).
-            var answers = new byte[rows];
-            answers.AsSpan().Fill(True);
-            foreach (var predicate in _predicates)
-            {
-                BooleanArray mask;
-                try
-                {
-                    mask = predicate.Evaluate(batch);
-                }
-                catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
-                {
-                    // An entry no row may use can raise (a cast of a value since deleted): the rows decide.
-                    return false;
-                }
-
-                if (mask is null)
-                    return false;
-                try
-                {
-                    if (mask.Length != rows)
-                        return false;
-                    for (int i = 0; i < rows; i++)
-                        answers[i] = And(answers[i], AnswerOf(mask, i));
-                }
-                finally
-                {
-                    BatchSelector.Release(mask, batch);
-                }
-            }
-
-            _table = answers.AsSpan(0, entries).ToArray();
-            _nullAnswer = nullable ? answers[entries] : Null;
-            _trueBits = new byte[entries];
-            _knownBits = new byte[entries];
-            _anyNull = false;
-            for (int i = 0; i < entries; i++)
-            {
-                _trueBits[i] = _table[i] == True ? (byte)1 : (byte)0;
-                _knownBits[i] = _table[i] == Null ? (byte)0 : (byte)1;
-                _anyNull |= _table[i] == Null;
-            }
-
-            return true;
+            answered = Evaluate(batch, rows, trueBits, knownBits, out _);
         }
         finally
         {
             batch.Dispose();
         }
+
+        if (!answered)
+            return false;
+
+        // The NULL row's answer apart. Past the entries, the table's slots are free for fallback pages' values.
+        _nullAnswer = !nullable ? Null
+            : knownBits[entries] == 0 ? Null
+            : trueBits[entries] == 1 ? True
+            : False;
+        _entries = entries;
+        _extra = 0;
+        _extraAnyNull = false;
+        _trueBits = trueBits;
+        _knownBits = knownBits;
+        _anyNull = knownBits.AsSpan(0, entries).IndexOf((byte)0) >= 0;
+        _prepared = true;
+        return true;
+    }
+
+    /// <summary>
+    /// Every predicate's answers over the <paramref name="rows"/> rows of <paramref name="batch"/>, combined per row by
+    /// Kleene AND: FALSE if any answers FALSE, else NULL if any answers NULL, else TRUE. Each row's answer is written as
+    /// two bits, one byte each: <paramref name="trueBits"/> (TRUE) and <paramref name="knownBits"/> (not NULL), the
+    /// form <see cref="Map"/> reads. False when a predicate raises or returns a mask of the wrong length; the rows then
+    /// decide.
+    /// </summary>
+    private bool Evaluate(RecordBatch batch, int rows, Span<byte> trueBits, Span<byte> knownBits, out bool anyNull)
+    {
+        anyNull = false;
+
+        // Every row starts TRUE. Each predicate's answer is ANDed in: the row stays TRUE while every answer is TRUE,
+        // and is known while every answer is known, or once any is FALSE (Kleene: FALSE wins, then NULL).
+        trueBits.Fill(1);
+        knownBits.Fill(1);
+        byte[]? falseSeen = _predicates.Count > 1 ? new byte[rows] : null;
+        foreach (var predicate in _predicates)
+        {
+            BooleanArray mask;
+            try
+            {
+                mask = predicate.Evaluate(batch);
+            }
+            catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
+            {
+                // A value no live row holds can raise (a cast of a value since deleted): the rows decide.
+                return false;
+            }
+
+            if (mask is null)
+                return false;
+            try
+            {
+                if (mask.Length != rows)
+                    return false;
+
+                // Straight from the mask's bitmaps: a fallback page puts every value through here (#804).
+                var values = mask.ValueBuffer.Span;
+                var validity = mask.NullCount > 0 ? mask.NullBitmapBuffer.Span : default;
+                int offset = mask.Offset;
+                for (int i = 0; i < rows; i++)
+                {
+                    int bit = offset + i;
+                    int known = validity.IsEmpty ? 1 : (validity[bit >> 3] >> (bit & 7)) & 1;
+                    int isTrue = (values[bit >> 3] >> (bit & 7)) & known & 1; // a NULL's value bit means nothing
+                    trueBits[i] &= (byte)isTrue;
+                    knownBits[i] &= (byte)known;
+                    if (falseSeen is not null)
+                        falseSeen[i] |= (byte)(known & (isTrue ^ 1));
+                }
+            }
+            finally
+            {
+                BatchSelector.Release(mask, batch);
+            }
+        }
+
+        // A FALSE from any predicate decides the row, whatever another answered NULL.
+        if (falseSeen is not null)
+        {
+            for (int i = 0; i < rows; i++)
+                knownBits[i] |= falseSeen[i];
+        }
+
+        anyNull = knownBits.IndexOf((byte)0) >= 0;
+        return true;
     }
 
     /// <summary>
@@ -204,7 +368,7 @@ internal sealed class DictionaryAnswer
     internal BooleanArray Map(
         ReadOnlySpan<int> denseIndices, ReadOnlySpan<byte> definitionLevels, int maxDefinitionLevel, int rows)
     {
-        if (_table is null)
+        if (!_prepared)
             throw new InvalidOperationException("The dictionary has not been evaluated.");
 
         bool nullRows = denseIndices.Length != rows;
@@ -215,7 +379,7 @@ internal sealed class DictionaryAnswer
         var values = new byte[bytes];
         byte nullTrue = _nullAnswer == True ? (byte)1 : (byte)0;
         byte nullKnown = _nullAnswer == Null ? (byte)0 : (byte)1;
-        bool needValidity = _anyNull || (nullRows && nullKnown == 0);
+        bool needValidity = _anyNull || _extraAnyNull || (nullRows && nullKnown == 0);
         var validity = needValidity ? new byte[bytes] : null;
         var trueBits = _trueBits;
         var knownBits = _knownBits;
@@ -273,6 +437,10 @@ internal sealed class DictionaryAnswer
             }
         }
 
+        // The fallback pages' entries were for these rows only (#804).
+        _extra = 0;
+        _extraAnyNull = false;
+
         int nulls = validity is null ? 0 : rows - known;
         return new BooleanArray(
             new ArrowBuffer(values), nulls == 0 ? ArrowBuffer.Empty : new ArrowBuffer(validity!), rows, nulls, 0);
@@ -290,16 +458,6 @@ internal sealed class DictionaryAnswer
         return (b + (b >> 4)) & 0x0F;
 #endif
     }
-
-    // Kleene AND of two answers.
-    private static byte And(byte a, byte b) => a == False || b == False ? False : a == Null || b == Null ? Null : True;
-
-    private static byte AnswerOf(BooleanArray mask, int i) => mask.GetValue(i) switch
-    {
-        null => Null,
-        true => True,
-        false => False,
-    };
 
     private static ByteArrayOutputKind ByteArrayOutputOf(IArrowType type) => type switch
     {
