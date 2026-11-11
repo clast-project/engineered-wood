@@ -27,6 +27,10 @@ public class RowEvaluatorBenchmarks
     [Params(1_000_000)]
     public int Rows { get; set; }
 
+    /// <summary>Whether the direct paths (#560, #799) may run; false measures the general path they replace.</summary>
+    [Params(true, false)]
+    public bool Direct { get; set; }
+
     private RecordBatch _batch = null!;
     private readonly ArrowRowEvaluator _plain = new();
     private readonly ArrowRowEvaluator _spark = new(new SparkFunctionRegistry());
@@ -39,6 +43,9 @@ public class RowEvaluatorBenchmarks
     private Predicate _dateRangeSql = null!;
     private Predicate _idTyped = null!;
     private Predicate _amountSql = null!;
+    private Predicate _categoryInSql = null!;
+    private Predicate _categoryOrSql = null!;
+    private Predicate _idInTyped = null!;
 
     // A typed calendar date where the target has one; .NET Framework has no DateOnly, and a UTC-midnight
     // instant compares the same against a date column.
@@ -82,6 +89,17 @@ public class RowEvaluatorBenchmarks
             "date >= DATE'2026-10-01' AND date < DATE'2026-10-08'");
         _idTyped = LessThan("id", LiteralValue.Of(500_000L));
         _amountSql = SparkSqlParser.ParsePredicate("amount > 1000.5");
+
+        // #799: five strings, as an IN and as the ORed equalities it means.
+        _categoryInSql = SparkSqlParser.ParsePredicate(
+            "category IN ('cat_01', 'cat_04', 'cat_07', 'cat_10', 'cat_13')");
+        _categoryOrSql = SparkSqlParser.ParsePredicate(
+            "category = 'cat_01' OR category = 'cat_04' OR category = 'cat_07' OR category = 'cat_10' OR category = 'cat_13'");
+        _idInTyped = In("id", LiteralValue.Of(5L), LiteralValue.Of(50_000L), LiteralValue.Of(500_000L),
+            LiteralValue.Of(900_000L), LiteralValue.Of(999_999L));
+
+        _plain.DirectColumnComparison = Direct;
+        _spark.DirectColumnComparison = Direct;
     }
 
     [Benchmark(Description = "category = 'cat_03', plain")]
@@ -101,4 +119,13 @@ public class RowEvaluatorBenchmarks
 
     [Benchmark(Description = "amount > 1000.5, Spark SQL")]
     public BooleanArray AmountSpark() => _spark.EvaluatePredicate(_amountSql, _batch);
+
+    [Benchmark(Description = "category IN (5 strings), Spark SQL")]
+    public BooleanArray CategoryInSpark() => _spark.EvaluatePredicate(_categoryInSql, _batch);
+
+    [Benchmark(Description = "category = .. OR (5 strings), Spark SQL")]
+    public BooleanArray CategoryOrSpark() => _spark.EvaluatePredicate(_categoryOrSql, _batch);
+
+    [Benchmark(Description = "id IN (5 longs), plain")]
+    public BooleanArray IdInPlain() => _plain.EvaluatePredicate(_idInTyped, _batch);
 }

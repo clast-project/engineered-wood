@@ -141,24 +141,7 @@ public sealed partial class ArrowRowEvaluator
         }
 
         var op = columnOnLeft ? cmp.Op : Mirror(cmp.Op);
-        var answer = column switch
-        {
-            StringArray a => CompareStrings(a, op, constant),
-            Int8Array a => CompareIntegers(a, a.Values, op, constant),
-            Int16Array a => CompareIntegers(a, a.Values, op, constant),
-            Int32Array a => CompareIntegers(a, a.Values, op, constant),
-            Int64Array a => CompareIntegers(a, a.Values, op, constant),
-            UInt8Array a => CompareIntegers(a, a.Values, op, constant),
-            UInt16Array a => CompareIntegers(a, a.Values, op, constant),
-            UInt32Array a => CompareIntegers(a, a.Values, op, constant),
-            FloatArray a => CompareFloating(a, a.Values, op, constant),
-            DoubleArray a => CompareFloating(a, a.Values, op, constant),
-            BooleanArray a => CompareBooleans(a, op, constant),
-            Date32Array a => CompareInstants(a, a.Values, TimeSpan.TicksPerDay, op, constant),
-            Date64Array a => CompareInstants(a, a.Values, TimeSpan.TicksPerMillisecond, op, constant),
-            TimestampArray a => CompareTimestamps(a, op, constant),
-            _ => null,
-        };
+        var answer = Kernel(column, op, constant);
 
         // The kernels read raw spans over the column's buffers -- Answer reads its null bitmap after
         // an allocation -- and a caller's array may be backed by native memory that its finalizer
@@ -169,6 +152,30 @@ public sealed partial class ArrowRowEvaluator
             DirectComparisons++;
         return answer;
     }
+
+    /// <summary>
+    /// The kernel for <paramref name="column"/>'s type, comparing every row against
+    /// <paramref name="constant"/> (column on the left); null when it declines. Shared with a set
+    /// membership test (#799), which asks each member under <c>=</c>. The caller roots the column.
+    /// </summary>
+    private static DirectAnswer? Kernel(IArrowArray column, ComparisonOperator op, LiteralValue constant) => column switch
+    {
+        StringArray a => CompareStrings(a, op, constant),
+        Int8Array a => CompareIntegers(a, a.Values, op, constant),
+        Int16Array a => CompareIntegers(a, a.Values, op, constant),
+        Int32Array a => CompareIntegers(a, a.Values, op, constant),
+        Int64Array a => CompareIntegers(a, a.Values, op, constant),
+        UInt8Array a => CompareIntegers(a, a.Values, op, constant),
+        UInt16Array a => CompareIntegers(a, a.Values, op, constant),
+        UInt32Array a => CompareIntegers(a, a.Values, op, constant),
+        FloatArray a => CompareFloating(a, a.Values, op, constant),
+        DoubleArray a => CompareFloating(a, a.Values, op, constant),
+        BooleanArray a => CompareBooleans(a, op, constant),
+        Date32Array a => CompareInstants(a, a.Values, TimeSpan.TicksPerDay, op, constant),
+        Date64Array a => CompareInstants(a, a.Values, TimeSpan.TicksPerMillisecond, op, constant),
+        TimestampArray a => CompareTimestamps(a, op, constant),
+        _ => null,
+    };
 
     /// <summary>
     /// The column's stand-in on the coercion path. Never read: the column's declared type answers
@@ -294,6 +301,12 @@ public sealed partial class ArrowRowEvaluator
             _nullCount = nullCount;
             _length = length;
         }
+
+        /// <summary>The value bits, a null row's cleared.</summary>
+        public byte[] Values => _values;
+
+        /// <summary>The validity bits, or null when every row is valid.</summary>
+        public byte[]? Validity => _validity;
 
         public BooleanArray ToBooleanArray() => new(
             new ArrowBuffer(_values),

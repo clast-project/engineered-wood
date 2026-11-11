@@ -99,6 +99,15 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
             return ToBooleanArray(EvalComparisonOverRows(cmp, batch, asked), batch.Length);
         }
 
+        // A lone IN over a column, likewise (#799), in EvalSet's order.
+        if (predicate is SetPredicate set)
+        {
+            bool askedFromTree = CheckSetFromTree(set, batch);
+            if (TrySetOverColumn(set, batch, askedFromTree) is { } directSet)
+                return directSet.ToBooleanArray();
+            return ToBooleanArray(EvalSetOverRows(set, batch, askedFromTree), batch.Length);
+        }
+
         return ToBooleanArray(EvalPredicate(predicate, batch), batch.Length);
     }
 
@@ -594,26 +603,7 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         ref LiteralValue?[] operand, IArrowType? operandType,
         SetMember[] members, IArrowType?[] memberTypes, int rowCount)
     {
-        if (_coercion is null)
-            return;
-
-        bool anyString = IsString(operandType, operand);
-        bool anyOther = !anyString && (operandType is not null || FirstKind(operand) is not null);
-        bool anyDecimal = MightRound(operandType, operand);
-
-        for (var k = 0; k < members.Length; k++)
-        {
-            if (IsMemberString(members[k], memberTypes[k])) anyString = true;
-            else if (MemberIsTyped(members[k], memberTypes[k])) anyOther = true;
-
-            if (MemberMightRound(members[k], memberTypes[k])) anyDecimal = true;
-        }
-
-        // A string mixed with anything else takes the promotion rule; a set with no string at
-        // all takes it only when a decimal is present, because that is the one case where the
-        // type the set resolves through can round a member away. Everything else is one kind
-        // throughout, or exact, and is compared as it stands.
-        if (anyString ? !anyOther : !anyDecimal)
+        if (_coercion is null || !SetCoerces(operandType, operand, members, memberTypes))
             return;
 
         // Resolved once and reused, because the type decides two things: which target the set
@@ -656,6 +646,31 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
                     new[] { members[k].Constant }, resolved[k], target, 1)[0])
                 : new SetMember(CastMember(members[k].PerRow, resolved[k], target, rowCount));
         }
+    }
+
+    /// <summary>
+    /// Whether <see cref="CoerceSet"/> resolves the set through a common type, which can cast the operand. A string mixed
+    /// with anything else takes the promotion rule; a set with no string at all takes it only when a decimal is present,
+    /// because that is the one case where the type the set resolves through can round a member away. Everything else is
+    /// one kind throughout, or exact, and is compared as it stands. Shared with the direct set path (#799), which
+    /// declines a set this resolves.
+    /// </summary>
+    private static bool SetCoerces(
+        IArrowType? operandType, LiteralValue?[] operand, SetMember[] members, IArrowType?[] memberTypes)
+    {
+        bool anyString = IsString(operandType, operand);
+        bool anyOther = !anyString && (operandType is not null || FirstKind(operand) is not null);
+        bool anyDecimal = MightRound(operandType, operand);
+
+        for (var k = 0; k < members.Length; k++)
+        {
+            if (IsMemberString(members[k], memberTypes[k])) anyString = true;
+            else if (MemberIsTyped(members[k], memberTypes[k])) anyOther = true;
+
+            if (MemberMightRound(members[k], memberTypes[k])) anyDecimal = true;
+        }
+
+        return anyString ? anyOther : anyDecimal;
     }
 
     /// <summary>Whether a set member could make the set's common type round a value away.</summary>
@@ -1284,6 +1299,20 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         // raises must not displace the refusal of a member whose type is already wrong.
         bool askedFromTree = CheckSetFromTree(set, batch);
 
+        // A column against literals -- `category IN ('a', 'b')` -- is answered straight off the Arrow
+        // buffers when that is provably the same answer (#799).
+        if (TrySetOverColumn(set, batch, askedFromTree) is { } direct)
+            return direct.ToNullable();
+
+        return EvalSetOverRows(set, batch, askedFromTree);
+    }
+
+    /// <summary>
+    /// The general path of <see cref="EvalSet"/>, with the analysis already asked
+    /// (<paramref name="askedFromTree"/>), so a caller that asked it first does not ask it twice.
+    /// </summary>
+    private bool?[] EvalSetOverRows(SetPredicate set, RecordBatch batch, bool askedFromTree)
+    {
         var (operand, operandType) = EvalOperand(set.Operand, batch);
 
         // A member is an expression, so `x IN (a, b)` compares row i of x against row i of a and
@@ -1718,8 +1747,15 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         // A comparison the direct path takes reads no row it could raise on, so it is evaluated
         // over the whole batch and the unselected rows are discarded -- far cheaper than gathering
         // the selected ones. The analysis is asked over the whole batch, which has the same types.
-        if (predicate is ComparisonPredicate cmp
-            && TryCompareColumnToConstant(cmp, batch, CheckComparableFromTree(cmp, batch)) is { } direct)
+        // An IN the direct path takes, likewise (#799).
+        DirectAnswer? taken = predicate switch
+        {
+            ComparisonPredicate cmp => TryCompareColumnToConstant(cmp, batch, CheckComparableFromTree(cmp, batch)),
+            // Asked only for a set the direct path could take, so any other is asked once, by EvalSet.
+            SetPredicate set when MayTakeSetDirectly(set) => TrySetOverColumn(set, batch, CheckSetFromTree(set, batch)),
+            _ => null,
+        };
+        if (taken is { } direct)
         {
             var answer = direct.ToNullable();
             for (var i = 0; i < answer.Length; i++)
