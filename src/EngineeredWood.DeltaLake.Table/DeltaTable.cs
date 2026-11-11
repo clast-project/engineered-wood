@@ -12989,6 +12989,71 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// Whether <paramref name="addFile"/>'s statistics name every one of <paramref name="physicalColumns"/>, so that
+    /// the file holds them: a writer records a null count for each column it wrote, keyed by physical name at the top
+    /// level of <c>nullCount</c>, a struct's as an object of its fields' counts. A column added after the file was
+    /// written has none (#790). False whenever the statistics cannot show it: none at all, a column left out (one past
+    /// <c>delta.dataSkippingNumIndexedCols</c>, say), or statistics that are not what the protocol describes. The
+    /// caller then reads every column, which is always safe.
+    /// </summary>
+    /// <remarks>
+    /// Reads the JSON itself rather than through <see cref="ColumnStats.Parse"/> (review round 1): that flattens a
+    /// struct's counts into dotted keys, which cannot tell a struct <c>s</c>'s field <c>a</c> from a top-level column
+    /// literally named <c>s.a</c>, and it throws on a root that is not an object or a count that is not an integer,
+    /// where this must decline.
+    /// </remarks>
+    internal static bool StatisticsNameEveryColumn(AddFile addFile, IReadOnlyList<string> physicalColumns)
+    {
+        if (physicalColumns.Count == 0)
+            return true;
+        if (addFile.GetStatsJson() is not { Length: > 0 } json)
+            return false;
+
+        try
+        {
+            using var document = System.Text.Json.JsonDocument.Parse(json);
+            if (document.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object
+                || !document.RootElement.TryGetProperty("nullCount", out var nullCounts)
+                || nullCounts.ValueKind != System.Text.Json.JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            foreach (string column in physicalColumns)
+            {
+                if (!nullCounts.TryGetProperty(column, out var count) || !HoldsACount(count))
+                    return false;
+            }
+
+            return true;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return false;
+        }
+
+        // A column's entry: a non-negative integer count, or a struct's object holding at least one.
+        static bool HoldsACount(System.Text.Json.JsonElement entry)
+        {
+            switch (entry.ValueKind)
+            {
+                case System.Text.Json.JsonValueKind.Number:
+                    return entry.TryGetInt64(out long value) && value >= 0;
+                case System.Text.Json.JsonValueKind.Object:
+                    foreach (var field in entry.EnumerateObject())
+                    {
+                        if (HoldsACount(field.Value))
+                            return true;
+                    }
+
+                    return false;
+                default:
+                    return false;
+            }
+        }
+    }
+
+    /// <summary>
     /// Every physical column name a data file may carry the row-tracking materialization under: the two the
     /// table DECLARES (<c>delta.rowTracking.materializedRowIdColumnName</c> /
     /// <c>…materializedRowCommitVersionColumnName</c>) plus the legacy internal names a pre-1.0 EngineeredWood
@@ -13311,14 +13376,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     .Select(c => logicalToPhysical.TryGetValue(c, out var p) ? p : c)
                     .ToList();
             }
-            else if (hasPartitions)
-            {
-                var partSet = new HashSet<string>(partitionColumns, StringComparer.Ordinal);
-                seamColumns = snapshot.Schema.Fields
-                    .Where(f => !partSet.Contains(f.Name))
-                    .Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
-                    .ToList();
-            }
+
+            // Without a projection the seam is asked for every column (null), partitioned or not: naming the
+            // schema's non-partition fields instead named a column added after this file was written, which the
+            // file lacks (#790).
 
             // Row tracking: the hidden materialized columns are NOT schema fields, so neither projection above
             // ever names them — and reading a rewrite output without them silently re-derives every row's id
@@ -13330,11 +13391,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (seamColumns is not null && MaterializedRowTrackingColumnNames(snapshot).Count > 0)
                 seamColumns = null;
 
-            // The same holds for the conditions' columns when the caller didn't project them: one added after this
-            // file was written is absent from it, and naming it would fail the read before the backfill could
-            // supply its NULLs — a failure the caller's own projection never asked for. Read every column.
-            if (seamColumns is not null && conditions is not null && returned is not null
-                && columns is not null && columns.Any(c => !returned.Contains(c)))
+            // A column added after this file was written is absent from it, and naming it fails the read in a host
+            // that binds columns by name, before the backfill can supply its NULLs (#790). The seam hides the file's
+            // schema, but the file's statistics name the columns it was written with: keep the projection only when
+            // they name every column asked for, and otherwise read every column.
+            if (seamColumns is not null && !StatisticsNameEveryColumn(addFile, seamColumns))
                 seamColumns = null;
 
             return new DataFileRead
