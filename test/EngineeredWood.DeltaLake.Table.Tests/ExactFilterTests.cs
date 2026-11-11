@@ -995,12 +995,13 @@ public class ExactFilterTests : IDisposable
         }
     }
 
-    private static string DictionaryValue(IArrowArray column, int row) => column switch
+    // The value at `row` of a column that must still be dictionary-encoded: a gather that decoded it fails here (#823
+    // review), not only one that lost or mixed up its values.
+    private static string DictionaryValue(IArrowArray column, int row)
     {
-        DictionaryArray d => ((StringArray)d.Dictionary).GetString(((Int32Array)d.Indices).GetValue(row)!.Value),
-        StringArray a => a.GetString(row),
-        _ => throw new NotSupportedException(column.GetType().Name),
-    };
+        var d = Assert.IsType<DictionaryArray>(column);
+        return ((StringArray)d.Dictionary).GetString(((Int32Array)d.Indices).GetValue(row)!.Value);
+    }
 
     [Theory]
     [InlineData(1, false)]
