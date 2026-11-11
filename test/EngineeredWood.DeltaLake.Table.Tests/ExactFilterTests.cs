@@ -811,6 +811,198 @@ public class ExactFilterTests : IDisposable
         Assert.Equal(0, rows);
     }
 
+    /// <summary>
+    /// #794: a dictionary column from the seam survives the pipeline's row gathers. A deletion vector thins its
+    /// batches, both for a DELETE that reads the file again (DML) and for a scan, and the gathered column keeps its
+    /// dictionary encoding and its values.
+    /// </summary>
+    [Fact]
+    public async Task ASeamDictionaryColumnSurvivesADeletionVector()
+    {
+        var fs = new LocalTableFileSystem(Path.Combine(_tempDir, $"t_{Guid.NewGuid():N}"));
+        await using var table = await DeltaTable.CreateAsync(
+            fs, TableSchema, new DeltaTableOptions { DataFileReader = new DictionaryNoteReader(fs) },
+            enableDeletionVectors: true);
+        await table.WriteAsync([Rows(0, 300)]);
+
+        BooleanArray Where(RecordBatch b, Func<long, bool> doomed)
+        {
+            var ids = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
+            return Answer(b.Length, i => doomed(ids.GetValue(i)!.Value));
+        }
+
+        // The first DELETE writes a deletion vector; the second reads the file through it, gathering.
+        await table.DeleteAsync(b => Where(b, id => id % 10 == 0));
+        await table.DeleteAsync(b => Where(b, id => id % 10 == 1));
+
+        var notes = new Dictionary<long, string>();
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions { Columns = ["id", "note"] }))
+        {
+            using (b)
+            {
+                Assert.IsType<DictionaryArray>(b.Column(1));
+                for (int i = 0; i < b.Length; i++)
+                    notes[((Int64Array)b.Column(0)).GetValue(i)!.Value] = DictionaryValue(b.Column(1), i);
+            }
+        }
+
+        var expected = Enumerable.Range(0, 300).Where(i => i % 10 > 1).ToList();
+        Assert.Equal(expected.Select(i => (long)i), notes.Keys.OrderBy(k => k));
+        Assert.All(expected, i => Assert.Equal("note-" + i.ToString(CultureInfo.InvariantCulture), notes[i]));
+    }
+
+    /// <summary>
+    /// #794: an exact filter through the seam that keeps some rows of a batch gathers them, a dictionary column with
+    /// them.
+    /// </summary>
+    [Fact]
+    public async Task ASeamDictionaryColumnSurvivesAPartialExactFilter()
+    {
+        var fs = new LocalTableFileSystem(Path.Combine(_tempDir, $"t_{Guid.NewGuid():N}"));
+        await using var table = await DeltaTable.CreateAsync(
+            fs, TableSchema, new DeltaTableOptions { DataFileReader = new DictionaryNoteReader(fs) });
+        await table.WriteAsync([Rows(0, 300)]);
+
+        var notes = new Dictionary<long, string>();
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions
+        {
+            Columns = ["id", "note"], Filter = Filters["data"], FilterRows = true,
+        }))
+        {
+            using (b)
+            {
+                for (int i = 0; i < b.Length; i++)
+                    notes[((Int64Array)b.Column(0)).GetValue(i)!.Value] = DictionaryValue(b.Column(1), i);
+            }
+        }
+
+        var expected = Enumerable.Range(0, 300).Where(i => i % 100 < 30).ToList();
+        Assert.Equal(expected.Select(i => (long)i), notes.Keys.OrderBy(k => k));
+        Assert.All(expected, i => Assert.Equal("note-" + i.ToString(CultureInfo.InvariantCulture), notes[i]));
+    }
+
+    /// <summary>
+    /// #823 review: a point read (<see cref="DeltaTable.ReadRowsAsync"/>) gathers the selected rows of a dictionary
+    /// column and must not release the source's dictionary under them: the gathered column shares it. Every batch is
+    /// collected before any is read, so the producer has moved past (and released) each source first; the dictionary
+    /// comes from an allocator that overwrites its bytes when released, so a read after release shows as wrong values.
+    /// </summary>
+    [Fact]
+    public async Task APointReadKeepsTheDictionaryItsGatheredRowsShare()
+    {
+        var fs = new LocalTableFileSystem(Path.Combine(_tempDir, $"t_{Guid.NewGuid():N}"));
+        var seam = new PoisoningDictionaryNoteReader(fs);
+        await using var table = await DeltaTable.CreateAsync(fs, TableSchema, new DeltaTableOptions { DataFileReader = seam });
+        await table.WriteAsync([Rows(0, 300)]);
+
+        var addresses = new List<long>();
+        var snapshot = table.CurrentSnapshot;
+        await foreach (var b in table.ReadAsync(new DeltaReadOptions
+        {
+            Columns = ["id"], Metadata = DeltaRowMetadata.RowAddress, Snapshot = snapshot,
+        }))
+        {
+            using (b)
+            {
+                var ids = (Int64Array)b.Column(0);
+                var address = (Int64Array)b.Column(b.Schema.GetFieldIndex(TransientRowAddress.ColumnName));
+                for (int i = 0; i < b.Length; i++)
+                {
+                    if (ids.GetValue(i)!.Value % 7 == 0)
+                        addresses.Add(address.GetValue(i)!.Value);
+                }
+            }
+        }
+
+        var batches = new List<RecordBatch>();
+        await foreach (var b in table.ReadRowsAsync(
+            RowSelection.FromRowAddresses(addresses, snapshot)))
+        {
+            batches.Add(b);
+        }
+
+        var notes = new Dictionary<long, string>();
+        foreach (var b in batches)
+        {
+            using (b)
+            {
+                var ids = (Int64Array)b.Column(b.Schema.GetFieldIndex("id"));
+                var note = b.Column(b.Schema.GetFieldIndex("note"));
+                for (int i = 0; i < b.Length; i++)
+                    notes[ids.GetValue(i)!.Value] = DictionaryValue(note, i);
+            }
+        }
+
+        var expected = Enumerable.Range(0, 300).Where(i => i % 7 == 0).ToList();
+        Assert.Equal(expected.Select(i => (long)i), notes.Keys.OrderBy(k => k));
+        Assert.All(expected, i => Assert.Equal("note-" + i.ToString(CultureInfo.InvariantCulture), notes[i]));
+    }
+
+    /// <summary>
+    /// <see cref="DictionaryNoteReader"/> whose dictionary and indices are copied into memory that is overwritten when
+    /// released, so reading it afterwards returns wrong values rather than stale right ones.
+    /// </summary>
+    private sealed class PoisoningDictionaryNoteReader(ITableFileSystem fs) : IDataFileReader
+    {
+        private readonly PoisoningAllocator _allocator = new();
+
+        public async IAsyncEnumerable<RecordBatch> ReadAsync(
+            string relativePath, IReadOnlyList<string>? physicalColumns,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await foreach (var b in new PassThroughReader(fs).ReadAsync(relativePath, physicalColumns, cancellationToken))
+            {
+                int note = b.Schema.GetFieldIndex("note");
+                if (note < 0)
+                {
+                    yield return b;
+                    continue;
+                }
+
+                var source = (StringArray)b.Column(note);
+                var values = new StringArray.Builder();
+                var indices = new Int32Array.Builder();
+                for (int i = 0; i < b.Length; i++)
+                {
+                    values.Append(source.GetString(i));
+                    indices.Append(i);
+                }
+
+                var type = new DictionaryType(Int32Type.Default, StringType.Default, false);
+                var fields = b.Schema.FieldsList.ToList();
+                var arrays = Enumerable.Range(0, b.ColumnCount).Select(b.Column).ToList();
+                fields[note] = new Field("note", type, fields[note].IsNullable, fields[note].Metadata);
+                arrays[note] = new DictionaryArray(type, indices.Build(_allocator), values.Build(_allocator));
+                source.Dispose();
+                yield return new RecordBatch(new Apache.Arrow.Schema(fields, b.Schema.Metadata), arrays, b.Length);
+            }
+        }
+
+        private sealed class PoisoningAllocator : Apache.Arrow.Memory.MemoryAllocator
+        {
+            protected override System.Buffers.IMemoryOwner<byte> AllocateInternal(int length, out int bytesAllocated)
+            {
+                bytesAllocated = length;
+                return new Owner(new byte[length]);
+            }
+
+            private sealed class Owner(byte[] bytes) : System.Buffers.IMemoryOwner<byte>
+            {
+                public Memory<byte> Memory => bytes;
+
+                public void Dispose() => bytes.AsSpan().Fill(0xEE);
+            }
+        }
+    }
+
+    // The value at `row` of a column that must still be dictionary-encoded: a gather that decoded it fails here (#823
+    // review), not only one that lost or mixed up its values.
+    private static string DictionaryValue(IArrowArray column, int row)
+    {
+        var d = Assert.IsType<DictionaryArray>(column);
+        return ((StringArray)d.Dictionary).GetString(((Int32Array)d.Indices).GetValue(row)!.Value);
+    }
+
     [Theory]
     [InlineData(1, false)]
     [InlineData(4, false)]
@@ -1050,7 +1242,7 @@ public class ExactFilterTests : IDisposable
         return new RecordBatch(TableSchema, [id.Build(), region.Build(), v.Build(), n.Build(), note.Build()], count);
     }
 
-    /// <summary>A codec seam that returns <c>note</c> dictionary-encoded, a type <c>ArrowCompute.Take</c> doesn't gather.</summary>
+    /// <summary>A codec seam that returns <c>note</c> dictionary-encoded, as Arrow hosts commonly do.</summary>
     private sealed class DictionaryNoteReader(ITableFileSystem fs) : IDataFileReader
     {
         public async IAsyncEnumerable<RecordBatch> ReadAsync(

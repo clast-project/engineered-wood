@@ -12174,7 +12174,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     /// <summary>Whether <see cref="ArrowCompute.Take(RecordBatch, Apache.Arrow.Schema, List{int})"/> over a
     /// batch of this schema can return arrays that share the source's buffers: a binary or string VIEW column
-    /// (at any depth) keeps the source's variadic data buffers, so the source must not be disposed under it.</summary>
+    /// (at any depth) keeps the source's variadic data buffers, and a DICTIONARY column its dictionary (#794, #823
+    /// review), so the source must not be disposed under it.</summary>
     private static bool TakeSharesBuffers(Apache.Arrow.Schema schema)
     {
         foreach (var field in schema.FieldsList)
@@ -12188,6 +12189,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     private static bool TakeSharesBuffers(Apache.Arrow.Types.IArrowType type) => type switch
     {
         Apache.Arrow.Types.StringViewType or Apache.Arrow.Types.BinaryViewType => true,
+        Apache.Arrow.Types.DictionaryType => true,
         Apache.Arrow.ExtensionType ext => TakeSharesBuffers(ext.StorageType),
         Apache.Arrow.Types.NestedType nested => nested.Fields.Any(f => TakeSharesBuffers(f.DataType)),
         _ => false,
