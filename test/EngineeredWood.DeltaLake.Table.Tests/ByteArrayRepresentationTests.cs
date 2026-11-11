@@ -66,6 +66,18 @@ public class ByteArrayRepresentationTests
         return builder.Build(allocator);
     }
 
+    private static StringViewArray Views(MemoryAllocator allocator)
+    {
+        var builder = new StringViewArray.Builder();
+        foreach (var value in Values)
+        {
+            if (value is null) builder.AppendNull();
+            else builder.Append(value);
+        }
+
+        return builder.Build(allocator);
+    }
+
     private static string?[] Read(IArrowArray array) =>
         [.. Enumerable.Range(0, array.Length).Select(i => array.IsNull(i) ? null : array switch
         {
@@ -155,7 +167,7 @@ public class ByteArrayRepresentationTests
     {
         var readerAllocator = new PoisoningAllocator();
         var builtAllocator = new PoisoningAllocator();
-        var raw = Strings(readerAllocator);
+        var raw = Views(readerAllocator); // decoded as the scan asks: the conversion leaves it as it is
         var flag = new BooleanArray.Builder().Append(true).Append(false).Append(true).Append(true).Build(readerAllocator);
         var borrowed = new RecordBatch(
             new Apache.Arrow.Schema([new Field("s", StringViewType.Default, true), new Field("flag", BooleanType.Default, false)], null),
