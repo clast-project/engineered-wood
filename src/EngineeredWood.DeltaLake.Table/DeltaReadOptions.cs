@@ -29,9 +29,20 @@ public sealed record DeltaReadOptions
     /// <see cref="DeltaTableOptions.ParquetReadOptions"/>. Row groups and pages are pruned only by the built-in
     /// reader: a <see cref="DeltaTableOptions.DataFileReader"/> gets file pruning alone, because the codec seam
     /// hides the footer. The reader does NOT re-apply this per row, so
-    /// surviving batches still contain non-matching rows — filter them yourself. Metadata columns are
-    /// unaffected: a row keeps its file position and row id however many rows before it were skipped.
+    /// surviving batches still contain non-matching rows — filter them yourself, or set <see cref="FilterRows"/>.
+    /// Metadata columns are unaffected: a row keeps its file position and row id however many rows before it were
+    /// skipped.
     /// </summary>
+    /// <remarks>
+    /// Set <see cref="FilterRows"/> whenever you would otherwise filter the returned rows by this predicate yourself:
+    /// it is exact, and cheaper than filtering afterwards, since it can skip decoding the other columns of rows it
+    /// rejects and can answer a predicate from a column's dictionary. Leave it off when something above the scan
+    /// applies its own filter anyway (a query engine re-checking pushed filters): then the superset is all the scan
+    /// needs to return, and an exact filter would evaluate the rows twice. It is off by default because it changes
+    /// what a scan returns and what it can raise. The filter is then evaluated with Spark's ANSI rules on every row,
+    /// so a value that fails to evaluate raises, and a filter Spark's analyzer refuses is refused before any file is
+    /// read (doc/row-level-filtering.md §30).
+    /// </remarks>
     public Expressions.Predicate? Filter { get; init; }
 
     /// <summary>
