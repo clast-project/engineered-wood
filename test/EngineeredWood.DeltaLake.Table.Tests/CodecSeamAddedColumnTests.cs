@@ -194,6 +194,39 @@ public class CodecSeamAddedColumnTests : IDisposable
     }
 
     /// <summary>
+    /// A struct column's statistics are its leaves' (<c>s.a</c>, <c>s.b</c>), never <c>s</c> itself: a projection of
+    /// the struct is still kept.
+    /// </summary>
+    [Fact]
+    public async Task AProjectionOfAStructColumnIsKept()
+    {
+        var fs = new LocalTableFileSystem(_tempDir);
+        var seam = new ByNameReader(fs);
+        var sType = new Apache.Arrow.Types.StructType([new Field("a", Int64Type.Default, true), new Field("b", StringType.Default, true)]);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("s", sType, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(fs, schema,
+            new DeltaTableOptions { CheckpointInterval = 0, DataFileReader = seam });
+        var a = new Int64Array.Builder().Append(1).Append(2).Build();
+        var b = new StringArray.Builder().Append("x").Append("y").Build();
+        await table.WriteAsync([new RecordBatch(table.ArrowSchema,
+            [new Int64Array.Builder().Append(10).Append(20).Build(), new StructArray(sType, 2, [a, b], ArrowBuffer.Empty, 0)], 2)]);
+
+        int rows = 0;
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Columns = ["s"] }))
+        {
+            using (batch)
+                rows += batch.Length;
+        }
+
+        Assert.Equal(2, rows);
+        var read = Assert.Single(seam.Reads);
+        Assert.Equal(["s"], read.Columns);
+    }
+
+    /// <summary>
     /// An exact filter on the added column, not projected: the older files are read whole (the filter's column is
     /// NULL there), and the file holding it keeps the projection plus the filter's column.
     /// </summary>
