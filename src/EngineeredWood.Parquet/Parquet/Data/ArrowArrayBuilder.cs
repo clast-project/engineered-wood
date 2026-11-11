@@ -1326,7 +1326,8 @@ internal sealed class ColumnBuildState : IDisposable
                 int end = sourceOffsets[i + 1];
                 WriteOneStringView(sourceData.Slice(start, end - start));
             }
-            _valueCount += count;
+
+            // WriteOneStringView counts each value itself; adding `count` here as well counted every value twice.
             return;
         }
 
