@@ -2184,7 +2184,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     private static (IReadOnlyList<ColumnDescriptor>, IReadOnlyList<ColumnChunk>) NormalizeNestedSelection(
         SchemaDescriptor schema, RowGroup rowGroup, List<ColumnDescriptor> columns, List<ColumnChunk> chunks)
     {
-        if (columns.TrueForAll(c => c.Path.Count == 1))
+        // Flat only when assembled flat: a bare repeated top-level column has a one-segment path but is assembled as
+        // nested, against a root that holds it once (review round 2).
+        if (columns.TrueForAll(c => c.Path.Count == 1 && c.MaxRepetitionLevel == 0))
             return (columns, chunks);
 
         var indexOf = new Dictionary<ColumnDescriptor, int>(schema.Columns.Count);
@@ -2257,7 +2259,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         && (node.Element.RepetitionType == FieldRepetitionType.Repeated
             || Data.ArrowSchemaConverter.IsListNode(node)
             || Data.ArrowSchemaConverter.IsMapNode(node)
-            || node.Element.LogicalType is LogicalType.VariantType);
+            || ShreddedVariantPath.IsVariantGroup(node));
 
     // A node's path from the schema root, its own name last.
     private static List<string> PathOf(SchemaNode node)

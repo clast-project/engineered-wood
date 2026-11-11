@@ -143,6 +143,78 @@ public class NestedProjectionTests : IDisposable
         Assert.Equal(zone, ((TimestampType)column.Fields[0].Data.DataType).Timezone);
     }
 
+    public static IEnumerable<object[]> RepeatedCases()
+    {
+        foreach (var projection in new[]
+        {
+            new[] { "Int32_list", "Int32_list", "String_list" },
+            new[] { "String_list", "Int32_list", "String_list" },
+        })
+        {
+            foreach (string read in new[] { "row group", "all", "all, batched", "positions" })
+                yield return [projection, read];
+        }
+    }
+
+    /// <summary>
+    /// A bare repeated top-level column (a list with no LIST annotation) has a one-segment path but is assembled as
+    /// nested, so naming a column twice beside one reads it once, as beside a struct (review round 2: the second copy
+    /// was assembled as the next column).
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(RepeatedCases))]
+    public async Task ABareRepeatedColumnNamedTwiceIsReadOnce(string[] projection, string read)
+    {
+        string path = TestData.GetPath("repeated_primitive_no_list.parquet");
+        var expected = await ExpectedAsync(path, projection);
+        var actual = await ReadAsync(path, projection, read);
+        Assert.Equal(expected.Schema, actual.Schema);
+        Assert.Equal(expected.Rows, actual.Rows);
+    }
+
+    /// <summary>
+    /// A variant written without the VARIANT annotation (a binary <c>metadata</c> beside a binary <c>value</c>, as Spark
+    /// 4.0 writes it) is kept whole like an annotated one: a leaf under it selects the whole group, since a variant's
+    /// parts mean nothing apart (review round 2: <c>v.metadata</c> came back without <c>value</c>).
+    /// </summary>
+    [Theory]
+    [InlineData("v.metadata")]
+    [InlineData("v.value")]
+    public async Task AnUnannotatedVariantIsKeptWhole(string leaf)
+    {
+        string path = Path.Combine(_tempDir, "variant.parquet");
+        var vType = new StructType([
+            new Field("metadata", BinaryType.Default, false),
+            new Field("value", BinaryType.Default, true)]);
+        var schema = new Apache.Arrow.Schema([new Field("id", Int32Type.Default, false), new Field("v", vType, true)], null);
+        var metadata = new BinaryArray.Builder();
+        var value = new BinaryArray.Builder();
+        var ids = new Int32Array.Builder();
+        for (int r = 0; r < 3; r++)
+        {
+            ids.Append(r);
+            metadata.Append(new byte[] { 1, 0, 0 });
+            value.Append(new byte[] { 0x0C, (byte)r }); // int8 r
+        }
+
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            using var batch = new RecordBatch(schema,
+                [ids.Build(), new StructArray(vType, 3, [metadata.Build(), value.Build()], ArrowBuffer.Empty, 0)], 3);
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        using var whole = await reader.ReadRowGroupAsync(0, ["v"]);
+        using var projected = await reader.ReadRowGroupAsync(0, [leaf]);
+        Assert.Equal(RenderSchema(whole.Schema, null), RenderSchema(projected.Schema, null));
+        for (int r = 0; r < 3; r++)
+            Assert.Equal(RenderRow(whole, r, null), RenderRow(projected, r, null));
+    }
+
     // ---- The oracle and the reads ------------------------------------------------------------------------------
 
     private sealed record Rendered(string Schema, List<string> Rows);
@@ -192,7 +264,8 @@ public class NestedProjectionTests : IDisposable
         switch (read)
         {
             case "row group":
-                for (int g = 0; g < Rows / RowsPerGroup; g++)
+                int groups = (await reader.ReadMetadataAsync()).RowGroups.Count;
+                for (int g = 0; g < groups; g++)
                 {
                     using var batch = await reader.ReadRowGroupAsync(g, projection);
                     Add(batch);
