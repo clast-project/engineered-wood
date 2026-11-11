@@ -53,6 +53,8 @@ public class NestedProjectionTests : IDisposable
         [new[] { "l.list.element.a" }],         // under a list: the whole list
         [new[] { "m.key_value.value" }],        // under a map: the whole map
         [new[] { "m", "pt.y", "l" }],
+        [new[] { "id", "pt", "id" }],           // a flat column twice beside a nested one: once (review round 1)
+        [new[] { "id", "pt.x", "id", "l" }],
     ];
 
     public static IEnumerable<object[]> Cases()
@@ -89,6 +91,56 @@ public class NestedProjectionTests : IDisposable
         var fields = ((StructType)pt.DataType).Fields;
         Assert.Equal(["x", "inner"], fields.Select(f => f.Name));
         Assert.Equal(["v"], ((StructType)fields[1].DataType).Fields.Select(f => f.Name));
+    }
+
+    /// <summary>
+    /// A pruned struct's leaves keep the time zone the writer declared for them in <c>ARROW:schema</c>, matched by
+    /// field name: projecting <c>pt.b</c> alone restores b's zone, not a's, and not none (review round 1).
+    /// </summary>
+    [Theory]
+    [InlineData("pt.a", "America/New_York")]
+    [InlineData("pt.b", "Asia/Tokyo")]
+    public async Task APrunedStructsTimestampKeepsItsOwnDeclaredZone(string leaf, string zone)
+    {
+        string path = Path.Combine(_tempDir, "zones.parquet");
+        var ptType = new StructType([
+            new Field("a", new TimestampType(TimeUnit.Microsecond, "America/New_York"), true),
+            new Field("b", new TimestampType(TimeUnit.Microsecond, "Asia/Tokyo"), true)]);
+        var schema = new Apache.Arrow.Schema([new Field("pt", ptType, true)], null);
+        var a = new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, "America/New_York"));
+        var b = new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, "Asia/Tokyo"));
+        for (int r = 0; r < 3; r++)
+        {
+            a.Append(new DateTimeOffset(2026, 1, 1 + r, 0, 0, 0, TimeSpan.Zero));
+            b.Append(new DateTimeOffset(2026, 2, 1 + r, 0, 0, 0, TimeSpan.Zero));
+        }
+
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            using var batch = new RecordBatch(schema,
+                [new StructArray(ptType, 3, [a.Build(), b.Build()], ArrowBuffer.Empty, 0)], 3);
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        // The whole struct, as a premise: the zones round-trip at all.
+        using (var whole = await reader.ReadRowGroupAsync(0, ["pt"]))
+        {
+            var wholeFields = ((StructType)whole.Schema.FieldsList[0].DataType).Fields;
+            Assert.Equal("America/New_York", ((TimestampType)wholeFields[0].DataType).Timezone);
+            Assert.Equal("Asia/Tokyo", ((TimestampType)wholeFields[1].DataType).Timezone);
+        }
+
+        using var pruned = await reader.ReadRowGroupAsync(0, [leaf]);
+        var field = Assert.Single(((StructType)pruned.Schema.FieldsList[0].DataType).Fields);
+        Assert.Equal(leaf[3..], field.Name);
+        Assert.Equal(zone, ((TimestampType)field.DataType).Timezone);
+        var column = (StructArray)pruned.Column(0);
+        Assert.Equal(zone, ((TimestampType)column.Fields[0].Data.DataType).Timezone);
     }
 
     // ---- The oracle and the reads ------------------------------------------------------------------------------

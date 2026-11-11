@@ -2171,8 +2171,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// otherwise handed y's values to x, and <c>["pt.x"]</c> left the assembler looking for a y it never decoded.
     /// </summary>
     /// <remarks>
-    /// <para>Top-level columns keep the order they were first named in, and a flat column named twice is still read
-    /// twice, as before. Within a nested column, a leaf under a list, a map, a variant or another repeated group selects
+    /// <para>Top-level columns keep the order they were first named in, and each is read once, however often it or its
+    /// leaves are named: the pruned root holds each top-level column once, so a flat column read twice beside a nested
+    /// one handed its second copy to the nested column's first leaf (review round 1 of #815). A selection of flat
+    /// columns alone is left as it is, duplicates and all, since its assembly takes each leaf as named. Within a nested
+    /// column, a leaf under a list, a map, a variant or another repeated group selects
     /// the whole of the outermost such group: a map needs its key, a variant all its parts, and a list's repeated group
     /// can change meaning when its children change (a legacy two-level list). A leaf under structs alone selects just
     /// that leaf, and the struct comes back holding only the leaves selected, as Spark and arrow-rs return a nested
@@ -2188,34 +2191,24 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         for (int i = 0; i < schema.Columns.Count; i++)
             indexOf[schema.Columns[i]] = i;
 
-        // Per top-level column, in the order first named: a flat column's occurrences, or a nested one's leaves.
+        // Per top-level column, in the order first named: its selected leaves, in schema order, once each.
         var order = new List<string>();
-        var flat = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-        var nested = new Dictionary<string, SortedSet<int>>(StringComparer.Ordinal);
+        var selected = new Dictionary<string, SortedSet<int>>(StringComparer.Ordinal);
+        var expanded = new HashSet<SchemaNode>(); // atomic groups already expanded: once each, not once per leaf
         foreach (var column in columns)
         {
             string top = column.Path[0];
-            int index = indexOf[column];
-            if (column.Path.Count == 1)
+            if (!selected.TryGetValue(top, out var leaves))
             {
-                if (!flat.TryGetValue(top, out var occurrences))
-                {
-                    flat[top] = occurrences = [];
-                    order.Add(top);
-                }
-
-                occurrences.Add(index);
-                continue;
-            }
-
-            if (!nested.TryGetValue(top, out var leaves))
-            {
-                nested[top] = leaves = [];
+                selected[top] = leaves = [];
                 order.Add(top);
             }
 
-            if (OutermostAtomicGroup(column.SchemaNode) is { } group)
+            if (column.Path.Count > 1 && OutermostAtomicGroup(column.SchemaNode) is { } group)
             {
+                if (!expanded.Add(group))
+                    continue;
+
                 var prefix = PathOf(group);
                 for (int i = 0; i < schema.Columns.Count; i++)
                 {
@@ -2225,7 +2218,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             }
             else
             {
-                leaves.Add(index);
+                leaves.Add(indexOf[column]);
             }
         }
 
@@ -2233,8 +2226,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var resultChunks = new List<ColumnChunk>(columns.Count);
         foreach (var top in order)
         {
-            IEnumerable<int> indices = flat.TryGetValue(top, out var occurrences) ? occurrences : nested[top];
-            foreach (int i in indices)
+            foreach (int i in selected[top])
             {
                 resultColumns.Add(schema.Columns[i]);
                 resultChunks.Add(rowGroup.Columns[i]);

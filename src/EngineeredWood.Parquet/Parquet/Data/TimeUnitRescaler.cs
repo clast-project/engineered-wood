@@ -190,13 +190,15 @@ internal static class TimeUnitRescaler
                     ? derived
                     : new TimestampType(actual.Unit, target.Timezone);
 
-            case StructType actual when declared is StructType target
-                && target.Fields.Count == actual.Fields.Count:
+            case StructType actual when declared is StructType target:
             {
                 Field[]? fields = null;
                 for (int i = 0; i < actual.Fields.Count; i++)
                 {
-                    var type = ToDeclaredUnits(actual.Fields[i].DataType, target.Fields[i].DataType);
+                    if (DeclaredChild(target, actual.Fields[i].Name, i) is not { } targetType)
+                        continue;
+
+                    var type = ToDeclaredUnits(actual.Fields[i].DataType, targetType);
                     if (!ReferenceEquals(type, actual.Fields[i].DataType))
                     {
                         fields ??= [.. actual.Fields];
@@ -288,16 +290,16 @@ internal static class TimeUnitRescaler
     {
         switch (array)
         {
-            case StructArray sa when Structural(target, sa.Fields.Count) is StructType or null:
+            case StructArray sa:
             {
                 var declared = target as StructType;
+                var source = (StructType)sa.Data.DataType;
                 var children = RewriteChildren(
-                    sa.Data, i => declared?.Fields[i].DataType, rewrite);
+                    sa.Data, i => DeclaredChild(declared, source.Fields[i].Name, i), rewrite);
                 if (children is null)
                     return array;
 
                 var fields = new Field[children.Length];
-                var source = (StructType)sa.Data.DataType;
                 for (int i = 0; i < fields.Length; i++)
                 {
                     fields[i] = new Field(
@@ -412,11 +414,28 @@ internal static class TimeUnitRescaler
     }
 
     /// <summary>
-    /// A declared type only guides the rewrite when it still describes the same shape. Metadata that
-    /// disagrees with the assembled array is ignored rather than trusted into a type mismatch.
+    /// The declared type of the struct child named <paramref name="name"/>, at <paramref name="index"/> in the
+    /// assembled struct, matched by name: a projection that selects some of a struct's leaves assembles a struct with
+    /// only those children (#783), so the assembled child at index 1 can be the declared child at index 3. Matching by
+    /// position handed a pruned child its declared sibling's zone (review round 1 of #815). The child at the same
+    /// position is tried first, the usual case and the one that tells duplicate names apart. Null when no declared
+    /// child has that name: metadata that disagrees with the assembled array is ignored, not trusted into a type
+    /// mismatch.
     /// </summary>
-    private static IArrowType? Structural(IArrowType? target, int childCount) =>
-        target is StructType structType && structType.Fields.Count == childCount ? structType : null;
+    private static IArrowType? DeclaredChild(StructType? declared, string name, int index)
+    {
+        if (declared is null)
+            return null;
+        if (index < declared.Fields.Count && string.Equals(declared.Fields[index].Name, name, StringComparison.Ordinal))
+            return declared.Fields[index].DataType;
+        foreach (var field in declared.Fields)
+        {
+            if (string.Equals(field.Name, name, StringComparison.Ordinal))
+                return field.DataType;
+        }
+
+        return null;
+    }
 
     private static ArrayData Retyped(IArrowArray array, IArrowType type) =>
         new(type, array.Length, array.Data.NullCount, array.Data.Offset,
