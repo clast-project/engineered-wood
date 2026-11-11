@@ -1,6 +1,6 @@
 # Exact row-level filtering in the Parquet reader (#502): proposed API and approach
 
-Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24, 5b in §25, 5c in §26, 5d in §27; 5e measured and closed in §28; 5f (offset and limit) in §29. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
+Status: proposal, 2026-11-09, revised after phase 0 (§11); phases 1a-3c built (§12-§18), phase 4 built (§19-§22); end-of-arc checks in §23; phase 5 planned and 5a built in §24, 5b in §25, 5c in §26, 5d in §27; 5e measured and closed in §28; 5f (offset and limit) in §29; 5g decided in §30, which closes phase 5. A design note: check the code before relying on it. Covers #502's three parts, cmettler's host-mask request (comment on #502), #608 part 2 (as a non-goal), and the Delta wiring. Written from origin/main at 7370fc4c and arrow-rs at 3db18f75b.
 
 ## 1. Where things stand
 
@@ -1285,3 +1285,36 @@ The benchmarks' table guard now checks for a commit, not just a `_delta_log` dir
 
 - **`FilterRows` without a `Filter` counts as no filter.** Counted mode was keyed on `FilterRows` alone. So such a read, which has no row condition, lost row-group skipping for its offset and the open-ahead hints for its limit. It now keys on an exact filter being present. `FilterRowsWithoutAFilterIsCounted` (serial and parallel) reads one unit for `Offset = 2,000, Limit = 10`, returns the same rows as the read without `FilterRows`, and fails with the old classification.
 - **The planner's tally no longer adds without bound.** `_planned + rows <= Offset` would wrap if the tally neared `long.MaxValue`. The tally sums real row counts, so that needs a table of about 9.2 x 10^18 rows; unreachable, but it is now compared by subtraction and saturated, as `Need` already was. `AnOffsetOfLongMaxValueReturnsNothing` pins the edge it guards (it passed before too).
+
+## 30. Phase 5g: `FilterRows` stays off by default (2026-11-10)
+
+§8 ended phase 5 with a decision on whether `FilterRows` should default on.
+
+**Decided (2026-11-10): no.** `Filter` keeps its superset contract by default, and `FilterRows` stays opt-in. Its documentation now says when to set it: whenever the caller would otherwise filter the returned rows itself.
+
+For turning it on:
+- **Faster than filtering afterwards.** It is 6-36% faster than reading and then filtering (§23), and much faster where a dictionary answers the predicate (§20-§22, §25, §27). It also skips decoding the other columns of rows it rejects.
+- **Offset and limit.** `Offset` and `Limit` (§29) are refused with a superset filter, so default-on would let them combine with a `Filter` without a second option.
+- **Timing.** The library is pre-1.0, which is when a behaviour change costs least.
+
+Against, and deciding:
+- **It changes what a scan returns.** `Filter` is documented as a superset ("filter them yourself"). A caller passing a predicate meant only for pruning, or one whose own evaluation differs from Spark's rules, would silently get fewer rows.
+- **It changes what a scan can raise.** The filter would be refused before any file is read where Spark's analyzer refuses it, and evaluated on every row under ANSI rules. A scan that succeeds today could start throwing on one row's value, a cast that fails for instance.
+- **The main hosts filter anyway.** A query engine above the scan (DuckDB, the host this work started from) re-applies its pushed filters. Default-on would evaluate each row twice, once in EW and once in the host, for nothing.
+- **Upstream defaults to the superset.** DataFusion's `pushdown_filters` is off by default (§2, §24). Spark treats a pushed filter as best effort and re-evaluates it.
+
+### Phase 5, summed up
+
+| Part | What | PR |
+|---|---|---|
+| 5a | Conjuncts that cannot raise asked about whole batches, not gathers of the live rows (§24) | #805 |
+| 5b | Adjacent conjuncts over one column answered from its dictionary together (§25) | #806 |
+| 5c | A conjunct its row group's statistics prove dropped there, under `TrustStatisticsProofs`; two passes locally only where proofs are offered (§26) | #807 |
+| 5d | Dictionary answers mapped to rows in one pass (§27) | #809 |
+| 5e | Reordering by selectivity measured, and not built (§28) | #810 |
+| 5f | `DeltaReadOptions.Offset` and `Limit` (§29) | #811 |
+| 5g | `FilterRows` stays off by default (this section) | |
+
+Issues opened along the way:
+- #804: dictionary answers for chunks that mix dictionary and PLAIN pages, or lack `encoding_stats`.
+- #808: a statistics proof refuses an INT literal over a BIGINT column, so `id >= 2500` is never proven.
