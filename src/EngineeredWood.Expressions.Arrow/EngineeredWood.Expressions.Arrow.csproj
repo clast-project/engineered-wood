@@ -37,6 +37,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="EngineeredWood.Expressions.Arrow.Tests" />
+    <InternalsVisibleTo Include="EngineeredWood.DeltaLake.Benchmarks" />
   </ItemGroup>
 
 </Project>
