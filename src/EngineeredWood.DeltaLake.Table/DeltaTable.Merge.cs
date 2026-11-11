@@ -113,6 +113,7 @@ public sealed partial class DeltaTable
         IReadOnlyDictionary<string, long>? identityHighWaterMarks = null,
         Apache.Arrow.Schema? boundSchema = null)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         if (source is null)
             throw new ArgumentNullException(nameof(source));
         if (options is null)
@@ -1735,11 +1736,24 @@ public sealed partial class DeltaTable
     /// <summary>One clause of a MERGE, checked against the table.</summary>
     private sealed class MergeClausePlan
     {
-        public MergeClausePlan(MergeAction action) => Action = action;
+        /// <param name="now">The instant the MERGE reads its clock words at, once for all of it (#801).</param>
+        public MergeClausePlan(MergeAction action, DateTimeOffset now)
+        {
+            Action = action;
+            Now = now;
+            Condition = action.Condition is { } condition
+                ? Expressions.Arrow.Spark.SparkClockWords.Resolve(condition, now)
+                : null;
+        }
 
         public MergeAction Action { get; }
         public MergeActionKind Kind => Action.Kind;
-        public Expressions.Predicate? Condition => Action.Condition;
+
+        /// <summary>The action's condition, its clock words read at <see cref="Now"/>.</summary>
+        public Expressions.Predicate? Condition { get; }
+
+        /// <summary>The instant the MERGE reads its clock words at; its assigned values are read at it too.</summary>
+        public DateTimeOffset Now { get; }
 
         /// <summary>The columns an update or insert writes, by the table's names, each with its value: null to copy
         /// the source column of that name, else the expression assigned. Empty for a delete. Set by
@@ -1857,7 +1871,7 @@ public sealed partial class DeltaTable
                 foreach (var assignment in assignments)
                 {
                     string column = TableColumn(assignment.Column, schema, verb);
-                    writes[column] = assignment.Value;
+                    writes[column] = Expressions.Arrow.Spark.SparkClockWords.Resolve(assignment.Value, clause.Now);
                     order.Add(column);
                 }
             }
@@ -1957,6 +1971,9 @@ public sealed partial class DeltaTable
         public static MergePlan Validate(
             MergeOptions options, Schema.StructType schema, bool columnsMayBeAdded = false)
         {
+            // Every clock word of the MERGE's conditions and values is read at this one instant (#801).
+            var now = OperationClock.Now;
+
             if (options.Keys is not { Count: > 0 } keys)
                 throw new ArgumentException("MERGE needs at least one key column.", nameof(options));
             if (keys.Distinct(StringComparer.Ordinal).Count() != keys.Count)
@@ -2012,7 +2029,7 @@ public sealed partial class DeltaTable
 
             // As in Spark, only the last clause of a kind may be unconditional: one before it would take every row
             // and leave the clauses after it unreachable.
-            static List<MergeClausePlan> Check(
+            List<MergeClausePlan> Check(
                 IReadOnlyList<MergeAction>? actions, string clause, params MergeActionKind[] allowed)
             {
                 if (actions is null)
@@ -2035,7 +2052,7 @@ public sealed partial class DeltaTable
                             + "apply. Only the last clause of a kind may be unconditional.",
                             nameof(options));
                     }
-                    plans.Add(new MergeClausePlan(action));
+                    plans.Add(new MergeClausePlan(action, now));
                 }
                 return plans;
             }

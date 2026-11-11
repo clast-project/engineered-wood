@@ -4663,6 +4663,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         batch => RowEvaluator.EvaluatePredicate(predicate, batch);
 
     /// <summary>
+    /// <paramref name="predicate"/> with its clock words (<c>CAST('now' AS TIMESTAMP)</c>, <c>CAST('today' AS
+    /// DATE)</c>) read now, once, for the operation it is handed to (#801): Spark resolves them once per query, and
+    /// the registry folds them per evaluation, which is per batch. An operation calls this where it takes its
+    /// predicate, before anything evaluates it.
+    /// </summary>
+    internal static Expressions.Predicate ResolveClockWords(Expressions.Predicate predicate) =>
+        Expressions.Arrow.Spark.SparkClockWords.Resolve(predicate, OperationClock.Now);
+
+    /// <summary>
     /// Refuses a DML predicate Spark's analyzer would refuse -- one naming a column the table does not have
     /// (<see cref="DeltaTableErrorCodes.UnresolvedColumn"/>), or whose types it refuses (<c>dt = 5</c>) -- before
     /// any file is pruned or read.
@@ -5595,8 +5604,21 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default,
         CommitProperties? commitProperties = null,
         RowDeleteMode? mode = null)
-        => UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
-            readPredicates: [predicate], opaquePredicate: false, cancellationToken, commitProperties, mode);
+    {
+        // Its clock words read once for the whole UPDATE (#801), at the instant its constraints and generated
+        // columns read theirs too.
+        predicate = predicate ?? throw new ArgumentNullException(nameof(predicate));
+        return UpdatePinnedAsync();
+
+        async ValueTask<(long RowsUpdated, long Version)> UpdatePinnedAsync()
+        {
+            using var operationClock = OperationClock.Begin();
+            var resolved = ResolveClockWords(predicate);
+            return await UpdateCoreAsync(MaskFor(resolved), updater, prunePredicate: resolved,
+                readPredicates: [resolved], opaquePredicate: false, cancellationToken, commitProperties, mode)
+                .ConfigureAwait(false);
+        }
+    }
 
     private async ValueTask<(long RowsUpdated, long Version)> UpdateCoreAsync(
         Func<RecordBatch, BooleanArray> predicate,
@@ -5678,6 +5700,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         WrittenFileLedger? written = null,
         RowDeleteMode? mode = null)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         if (prunePredicate is not null)
             RefuseUnanalyzable(prunePredicate, snapshot);
 
@@ -6601,6 +6624,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         DeltaReadOptions options,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        // The filter's clock words read once for the whole scan (#801). Pruning alone never evaluates a cast, but
+        // a filter evaluated per batch would read the clock per batch.
+        if (options.Filter is { } filter)
+        {
+            var resolved = ResolveClockWords(filter);
+            if (!ReferenceEquals(resolved, filter))
+                options = options with { Filter = resolved };
+        }
+
         var metadata = options.Metadata;
         ValidateReadMetadata(snapshot, metadata, options.MetadataPrefix);
 
@@ -7434,6 +7466,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         WrittenRowsObserver? rowsWritten = null,
         IDictionary<string, long>? rowCounts = null)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         // The shared chokepoint for both the auto-committing path and a transaction's append. This path
         // converts no schema, so a column the table does not declare would ride into the data file unnoticed.
         // (Nothing here evolves the schema — the write schema is always the snapshot's — so an unknown column
@@ -11396,6 +11429,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         CommitProperties? commitProperties)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         ValidateWriteSupport(CurrentSnapshot);
 
         var snapshot = CurrentSnapshot;

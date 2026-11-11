@@ -52,14 +52,21 @@ internal static class SparkSpecialDatetimeValues
     /// Spark's <c>convertSpecialDate</c>, where <c>now</c> is today, since a date has no time to
     /// carry the current instant.
     /// </remarks>
-    public static bool TryReadDate(ReadOnlySpan<char> text, out DateTimeOffset value)
+    public static bool TryReadDate(ReadOnlySpan<char> text, out DateTimeOffset value) =>
+        TryReadDate(text, DateTimeOffset.UtcNow, out value);
+
+    /// <summary>
+    /// <see cref="TryReadDate(ReadOnlySpan{char}, out DateTimeOffset)"/> at the instant <paramref name="now"/>
+    /// rather than the clock's: one operation reads every word against one instant, as Spark's query does (#801).
+    /// </summary>
+    public static bool TryReadDate(ReadOnlySpan<char> text, DateTimeOffset now, out DateTimeOffset value)
     {
         switch (ExtractSpecialValue(text))
         {
             case Word.Epoch: value = Epoch; return true;
-            case Word.Now or Word.Today: value = Today(); return true;
-            case Word.Tomorrow: value = Today().AddDays(1); return true;
-            case Word.Yesterday: value = Today().AddDays(-1); return true;
+            case Word.Now or Word.Today: value = Today(now); return true;
+            case Word.Tomorrow: value = Today(now).AddDays(1); return true;
+            case Word.Yesterday: value = Today(now).AddDays(-1); return true;
             default: value = default; return false;
         }
     }
@@ -70,17 +77,24 @@ internal static class SparkSpecialDatetimeValues
     /// </summary>
     /// <remarks>
     /// Spark's <c>convertSpecialTimestamp</c>. <c>now</c> is the current instant here and today's
-    /// date in <see cref="TryReadDate"/> — the one word the two conversions disagree about.
+    /// date in <see cref="TryReadDate(ReadOnlySpan{char}, out DateTimeOffset)"/> — the one word the two conversions disagree about.
     /// </remarks>
-    public static bool TryReadTimestamp(ReadOnlySpan<char> text, out DateTimeOffset value)
+    public static bool TryReadTimestamp(ReadOnlySpan<char> text, out DateTimeOffset value) =>
+        TryReadTimestamp(text, DateTimeOffset.UtcNow, out value);
+
+    /// <summary>
+    /// <see cref="TryReadTimestamp(ReadOnlySpan{char}, out DateTimeOffset)"/> at the instant <paramref name="now"/>
+    /// rather than the clock's (#801).
+    /// </summary>
+    public static bool TryReadTimestamp(ReadOnlySpan<char> text, DateTimeOffset now, out DateTimeOffset value)
     {
         switch (ExtractSpecialValue(text))
         {
             case Word.Epoch: value = Epoch; return true;
-            case Word.Now: value = DateTimeOffset.UtcNow; return true;
-            case Word.Today: value = Today(); return true;
-            case Word.Tomorrow: value = Today().AddDays(1); return true;
-            case Word.Yesterday: value = Today().AddDays(-1); return true;
+            case Word.Now: value = now; return true;
+            case Word.Today: value = Today(now); return true;
+            case Word.Tomorrow: value = Today(now).AddDays(1); return true;
+            case Word.Yesterday: value = Today(now).AddDays(-1); return true;
             default: value = default; return false;
         }
     }
@@ -92,10 +106,10 @@ internal static class SparkSpecialDatetimeValues
     /// With <see cref="SparkTemporalText.SessionTimeZone"/> fixed at UTC the two spellings
     /// coincide; writing it out keeps this right if #133 makes the zone configurable.
     /// </remarks>
-    private static DateTimeOffset Today()
+    private static DateTimeOffset Today(DateTimeOffset now)
     {
         var zone = SparkTemporalText.SessionTimeZone;
-        var midnight = TimeZoneInfo.ConvertTime(DateTimeOffset.UtcNow, zone).DateTime.Date;
+        var midnight = TimeZoneInfo.ConvertTime(now, zone).DateTime.Date;
         return new DateTimeOffset(midnight, zone.GetUtcOffset(midnight));
     }
 

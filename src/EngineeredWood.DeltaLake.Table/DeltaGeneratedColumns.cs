@@ -65,6 +65,7 @@ internal sealed class DeltaGeneratedColumns
     public static DeltaGeneratedColumns? Create(Snapshot.Snapshot snapshot)
     {
         var columns = new List<Generated>();
+        var now = OperationClock.Now;   // the one instant this operation's clock words are read at (#801)
 
         foreach (var field in snapshot.ArrowSchema.FieldsList)
         {
@@ -107,7 +108,8 @@ internal sealed class DeltaGeneratedColumns
                     + "support variant_get or try_variant_get in a generated column.");
             }
 
-            columns.Add(new Generated(field.Name, sql, expression, field));
+            // Each instance serves one operation, which reads every clock word at one instant (#801).
+            columns.Add(new Generated(field.Name, sql, SparkClockWords.Resolve(expression, now), field));
         }
 
         return columns.Count == 0 ? null : new DeltaGeneratedColumns(columns);
