@@ -625,6 +625,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         CancellationToken cancellationToken = default,
         RowDeleteMode? mode = null)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         EnsureOpen();
 
         // ComputeUpdateActionsAsync re-validates the post-image and recomputes generated
@@ -666,6 +667,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         CancellationToken cancellationToken = default,
         RowDeleteMode? mode = null)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         EnsureOpen();
         predicate = ResolveNonNull(predicate);
 
@@ -712,6 +714,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
     public async ValueTask<MergeMetrics> MergeAsync(
         IReadOnlyList<RecordBatch> source, MergeOptions options, CancellationToken cancellationToken = default)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         EnsureOpen();
 
         // The rewrite re-validates the post-image and the insert goes through the append path, so a
@@ -818,6 +821,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         IReadOnlyList<RecordBatch> batches, Expressions.Predicate predicate,
         CancellationToken cancellationToken = default)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         EnsureOpen();
         if (batches is null)
             throw new ArgumentNullException(nameof(batches));

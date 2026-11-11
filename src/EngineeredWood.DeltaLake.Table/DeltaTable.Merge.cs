@@ -113,6 +113,7 @@ public sealed partial class DeltaTable
         IReadOnlyDictionary<string, long>? identityHighWaterMarks = null,
         Apache.Arrow.Schema? boundSchema = null)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         if (source is null)
             throw new ArgumentNullException(nameof(source));
         if (options is null)

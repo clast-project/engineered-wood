@@ -157,7 +157,16 @@ public static class SparkClockWords
     private static string DateText(DateTimeOffset date) =>
         date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
 
+    private static readonly long EpochTicks = new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+
     // The instant in UTC, to the microsecond a TIMESTAMP holds; the explicit zone makes the session zone irrelevant.
-    private static string TimestampText(DateTimeOffset instant) =>
-        instant.UtcDateTime.ToString("yyyy-MM-dd HH:mm:ss.ffffff", CultureInfo.InvariantCulture) + "Z";
+    // Truncated as the fold's TIMESTAMP is built, toward zero from the epoch, before formatting (#828 review):
+    // formatting six digits of the calendar's fraction truncates toward the past instead, which before 1970 named the
+    // microsecond below the fold's.
+    private static string TimestampText(DateTimeOffset instant)
+    {
+        long micros = (instant.UtcTicks - EpochTicks) / 10;
+        var truncated = new DateTime(EpochTicks + micros * 10, DateTimeKind.Utc);
+        return truncated.ToString("yyyy-MM-dd HH:mm:ss.ffffff", CultureInfo.InvariantCulture) + "Z";
+    }
 }

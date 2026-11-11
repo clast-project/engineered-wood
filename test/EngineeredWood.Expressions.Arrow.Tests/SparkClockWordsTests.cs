@@ -29,6 +29,11 @@ public class SparkClockWordsTests
         [new DateTimeOffset(2026, 12, 31, 23, 59, 59, TimeSpan.Zero).AddTicks(9_999_999)],
         [new DateTimeOffset(2028, 2, 29, 0, 0, 0, TimeSpan.Zero)],
         [new DateTimeOffset(2026, 3, 1, 0, 0, 0, TimeSpan.Zero).AddTicks(5)],
+
+        // Before the epoch, with sub-microsecond ticks: a TIMESTAMP truncates toward the epoch there, not toward the
+        // past (#828 review).
+        [new DateTimeOffset(1969, 12, 31, 23, 59, 59, TimeSpan.Zero).AddTicks(9_999_999)],
+        [new DateTimeOffset(1900, 1, 1, 12, 0, 0, TimeSpan.Zero).AddTicks(5)],
     ];
 
     /// <summary>

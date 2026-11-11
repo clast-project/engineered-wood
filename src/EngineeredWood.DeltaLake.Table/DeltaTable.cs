@@ -5605,10 +5605,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         CommitProperties? commitProperties = null,
         RowDeleteMode? mode = null)
     {
-        // Its clock words read once for the whole UPDATE (#801).
-        predicate = ResolveClockWords(predicate ?? throw new ArgumentNullException(nameof(predicate)));
-        return UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
-            readPredicates: [predicate], opaquePredicate: false, cancellationToken, commitProperties, mode);
+        // Its clock words read once for the whole UPDATE (#801), at the instant its constraints and generated
+        // columns read theirs too.
+        predicate = predicate ?? throw new ArgumentNullException(nameof(predicate));
+        return UpdatePinnedAsync();
+
+        async ValueTask<(long RowsUpdated, long Version)> UpdatePinnedAsync()
+        {
+            using var operationClock = OperationClock.Begin();
+            var resolved = ResolveClockWords(predicate);
+            return await UpdateCoreAsync(MaskFor(resolved), updater, prunePredicate: resolved,
+                readPredicates: [resolved], opaquePredicate: false, cancellationToken, commitProperties, mode)
+                .ConfigureAwait(false);
+        }
     }
 
     private async ValueTask<(long RowsUpdated, long Version)> UpdateCoreAsync(
@@ -5691,6 +5700,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         WrittenFileLedger? written = null,
         RowDeleteMode? mode = null)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         if (prunePredicate is not null)
             RefuseUnanalyzable(prunePredicate, snapshot);
 
@@ -7456,6 +7466,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         WrittenRowsObserver? rowsWritten = null,
         IDictionary<string, long>? rowCounts = null)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         // The shared chokepoint for both the auto-committing path and a transaction's append. This path
         // converts no schema, so a column the table does not declare would ride into the data file unnoticed.
         // (Nothing here evolves the schema — the write schema is always the snapshot's — so an unknown column
@@ -11418,6 +11429,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         CommitProperties? commitProperties)
     {
+        using var operationClock = OperationClock.Begin();   // one instant for the operation (#801, #828 review)
         ValidateWriteSupport(CurrentSnapshot);
 
         var snapshot = CurrentSnapshot;

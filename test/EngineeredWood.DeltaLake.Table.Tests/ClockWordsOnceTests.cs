@@ -206,6 +206,46 @@ public class ClockWordsOnceTests : IDisposable
         Assert.DoesNotContain(200L, await IdsAsync(table));
     }
 
+    /// <summary>
+    /// One instant per operation, shared by its predicate, generated columns and constraints (#828 review): with a clock
+    /// that moves on every read, a generated <c>g = CAST('now' AS TIMESTAMP)</c> still satisfies
+    /// <c>CHECK (g = CAST('now' AS TIMESTAMP))</c>, in a write, an UPDATE and a MERGE.
+    /// </summary>
+    [Fact]
+    public async Task EveryPartOfAnOperationReadsTheSameInstant()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("ts", Timestamp, true))
+            .Field(new Field("g", Timestamp, true,
+                new Dictionary<string, string> { ["delta.generationExpression"] = "CAST('now' AS TIMESTAMP)" }))
+            .Build();
+        var writeSchema = new Apache.Arrow.Schema.Builder().Field(schema.FieldsList[0]).Field(schema.FieldsList[1]).Build();
+        await using var table = await DeltaTable.CreateAsync(new LocalTableFileSystem(_tempDir), schema);
+
+        int reads = 0;
+        using (OperationClock.Use(() => Now.AddSeconds(Interlocked.Increment(ref reads))))
+        {
+            await table.AddConstraintAsync("g_is_now", "g = CAST('now' AS TIMESTAMP)");
+            await table.WriteAsync([Rows(writeSchema, 0, 4)]);
+
+            var (updated, _) = await table.UpdateAsync(
+                SparkSqlParser.ParsePredicate("ts < CAST('now' AS TIMESTAMP)"), batch => batch);
+            Assert.Equal(2, updated);
+
+            await table.MergeAsync([Rows(writeSchema, 2, 4)], new MergeOptions
+            {
+                Keys = ["id"],
+                WhenMatched = [MergeAction.UpdateColumns("ts").When(SparkSqlParser.ParsePredicate("target.ts < CAST('now' AS TIMESTAMP)"))],
+                WhenNotMatched = [MergeAction.InsertColumns("id", "ts")],
+            });
+        }
+
+        // The clock was read, and moved, many times; each operation still read one instant.
+        Assert.True(reads >= 4, $"{reads} reads");
+        Assert.Equal([0L, 1, 2, 3, 4, 5], await IdsAsync(table));
+    }
+
     /// <summary>A generated column defined by a clock word takes the value it names at the write's one instant.</summary>
     [Fact]
     public async Task AGeneratedColumnReadsTodayOncePerWrite()
