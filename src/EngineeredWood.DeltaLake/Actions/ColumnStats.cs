@@ -139,22 +139,23 @@ public sealed record ColumnStats
         foreach (var prop in obj.EnumerateObject())
         {
             string key = prefix.Length == 0 ? prop.Name : prefix + "." + prop.Name;
-            if (prop.Value.ValueKind == JsonValueKind.Number)
+            if (prop.Value.ValueKind == JsonValueKind.Number
+                && prop.Value.TryGetInt64(out long count) && count >= 0)
             {
-                // A count that isn't a non-negative 64-bit integer is unknown (#820), and makes its key ambiguous: a
-                // usable copy of it (the same name twice, or a literal dotted name beside a nested path) is dropped
-                // with it, in either order (#825 review).
-                if (!prop.Value.TryGetInt64(out long count) || count < 0)
-                {
-                    collided.Add(key);
-                    continue;
-                }
                 if (map.ContainsKey(key))
                     collided.Add(key);
                 else
                     map[key] = count;
             }
-            else if (prop.Value.ValueKind == JsonValueKind.Object)
+            else if (prop.Value.ValueKind != JsonValueKind.Object)
+            {
+                // A count that isn't a non-negative 64-bit integer (a fraction, a negative, a string, null, a
+                // boolean, an array) is unknown (#820), and makes its key ambiguous: a usable copy of it (the same
+                // name twice, or a literal dotted name beside a nested path) is dropped with it, in either order (#825
+                // review rounds 1 and 2).
+                collided.Add(key);
+            }
+            else
             {
                 // Nested (struct) null counts: an object per struct, numbers at the leaves.
                 FlattenCounts(map, collided, key, prop.Value);

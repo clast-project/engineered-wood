@@ -84,6 +84,13 @@ public class MalformedStatsTests
     [InlineData("{\"numRecords\":3,\"nullCount\":{\"id\":0,\"id\":-1}}", "id")]
     [InlineData("{\"numRecords\":3,\"nullCount\":{\"id\":-1,\"id\":0}}", "id")]
     [InlineData("{\"numRecords\":3,\"nullCount\":{\"id\":0,\"id\":1.5}}", "id")]
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"id\":0,\"id\":\"3\"}}", "id")]     // not a number at all (round 2)
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"id\":\"3\",\"id\":0}}", "id")]
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"id\":0,\"id\":null}}", "id")]
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"id\":0,\"id\":true}}", "id")]
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"id\":0,\"id\":[0]}}", "id")]
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"s.a\":\"0\",\"s\":{\"a\":0}}}", "s.a")]
+    [InlineData("{\"numRecords\":3,\"nullCount\":{\"s\":{\"a\":\"0\"},\"s.a\":0}}", "s.a")]
     [InlineData("{\"numRecords\":3,\"nullCount\":{\"s.a\":-1,\"s\":{\"a\":0}}}", "s.a")]
     [InlineData("{\"numRecords\":3,\"nullCount\":{\"s\":{\"a\":0},\"s.a\":-1}}", "s.a")]
     public void AnUnusableCountMakesItsKeyAmbiguous(string stats, string key)
@@ -95,6 +102,7 @@ public class MalformedStatsTests
     [Theory]
     [InlineData("{\"numRecords\":3,\"minValues\":{\"id\":0},\"maxValues\":{\"id\":9},\"nullCount\":{\"id\":0,\"id\":-1}}")]
     [InlineData("{\"numRecords\":3,\"minValues\":{\"id\":0},\"maxValues\":{\"id\":9},\"nullCount\":{\"id\":-1,\"id\":0}}")]
+    [InlineData("{\"numRecords\":3,\"minValues\":{\"id\":0},\"maxValues\":{\"id\":9},\"nullCount\":{\"id\":0,\"id\":\"3\"}}")]
     public void AnAmbiguousCountDoesNotPruneIsNull(string stats) =>
         Assert.True(new DeltaFilePruner(Schema, []).ShouldInclude(File(stats), Ex.IsNull("id")));
 
