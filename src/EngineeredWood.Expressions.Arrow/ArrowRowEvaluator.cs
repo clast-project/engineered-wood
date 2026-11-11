@@ -99,10 +99,14 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
             return ToBooleanArray(EvalComparisonOverRows(cmp, batch, asked), batch.Length);
         }
 
-        // A lone IN over a column, likewise (#799).
-        if (predicate is SetPredicate set
-            && TrySetOverColumn(set, batch, CheckSetFromTree(set, batch)) is { } directSet)
-            return directSet.ToBooleanArray();
+        // A lone IN over a column, likewise (#799), in EvalSet's order.
+        if (predicate is SetPredicate set)
+        {
+            bool askedFromTree = CheckSetFromTree(set, batch);
+            if (TrySetOverColumn(set, batch, askedFromTree) is { } directSet)
+                return directSet.ToBooleanArray();
+            return ToBooleanArray(EvalSetOverRows(set, batch, askedFromTree), batch.Length);
+        }
 
         return ToBooleanArray(EvalPredicate(predicate, batch), batch.Length);
     }
@@ -1300,6 +1304,15 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         if (TrySetOverColumn(set, batch, askedFromTree) is { } direct)
             return direct.ToNullable();
 
+        return EvalSetOverRows(set, batch, askedFromTree);
+    }
+
+    /// <summary>
+    /// The general path of <see cref="EvalSet"/>, with the analysis already asked
+    /// (<paramref name="askedFromTree"/>), so a caller that asked it first does not ask it twice.
+    /// </summary>
+    private bool?[] EvalSetOverRows(SetPredicate set, RecordBatch batch, bool askedFromTree)
+    {
         var (operand, operandType) = EvalOperand(set.Operand, batch);
 
         // A member is an expression, so `x IN (a, b)` compares row i of x against row i of a and
@@ -1738,7 +1751,8 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         DirectAnswer? taken = predicate switch
         {
             ComparisonPredicate cmp => TryCompareColumnToConstant(cmp, batch, CheckComparableFromTree(cmp, batch)),
-            SetPredicate set => TrySetOverColumn(set, batch, CheckSetFromTree(set, batch)),
+            // Asked only for a set the direct path could take, so any other is asked once, by EvalSet.
+            SetPredicate set when MayTakeSetDirectly(set) => TrySetOverColumn(set, batch, CheckSetFromTree(set, batch)),
             _ => null,
         };
         if (taken is { } direct)

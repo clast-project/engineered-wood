@@ -39,9 +39,14 @@ public sealed partial class ArrowRowEvaluator
     /// <summary>How many membership tests the direct path answered, so a test can tell it ran.</summary>
     internal int DirectSets { get; private set; }
 
+    /// <summary>Whether <paramref name="set"/> has the shape the direct path takes: a column against literals.</summary>
+    private bool MayTakeSetDirectly(SetPredicate set) =>
+        DirectColumnComparison && set.Values.Count > 0 && IsReference(set.Operand)
+        && set.Values.All(v => v is LiteralExpression);
+
     private DirectAnswer? TrySetOverColumn(SetPredicate set, RecordBatch batch, bool askedFromTree)
     {
-        if (!DirectColumnComparison || batch.Length == 0 || set.Values.Count == 0 || !IsReference(set.Operand))
+        if (batch.Length == 0 || !MayTakeSetDirectly(set))
             return null;
 
         var members = new SetMember[set.Values.Count];
