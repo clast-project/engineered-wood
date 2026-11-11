@@ -66,7 +66,7 @@ public class SparkClockWordsTests
                         {
                             var stamp = Assert.IsType<TimestampArray>(value);
                             // A TIMESTAMP holds microseconds: the instant truncated to one.
-                            long micros = (expected.UtcTicks - DateTimeOffset.UnixEpoch.UtcTicks) / 10;
+                            long micros = (expected.UtcTicks - new DateTimeOffset(1970, 1, 1, 0, 0, 0, TimeSpan.Zero).UtcTicks) / 10;
                             Assert.Equal(micros, stamp.GetValue(0));
                         }
                     }
