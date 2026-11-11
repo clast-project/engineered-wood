@@ -2331,13 +2331,134 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     $"Column '{name}' was not found in the schema.", nameof(columnNames));
         }
 
-        return (columns, chunks);
+        return NormalizeNestedSelection(schema, rowGroup, columns, chunks);
     }
 
     /// <summary>
-    /// Builds a pruned schema root containing only the top-level children
-    /// that have at least one descendant leaf in the selected columns.
-    /// Preserves the original subtrees — only filters at the top level.
+    /// Puts the leaves a read selects in the order its assembly consumes them (#783). <see cref="NestedAssembler"/>
+    /// walks each top-level column's (pruned, <see cref="PruneSchemaRoot"/>) subtree depth first, taking one leaf array
+    /// per leaf, so a nested column's selected leaves must come in schema order, once each: <c>["pt.y", "pt.x"]</c>
+    /// otherwise handed y's values to x, and <c>["pt.x"]</c> left the assembler looking for a y it never decoded.
+    /// </summary>
+    /// <remarks>
+    /// <para>Top-level columns keep the order they were first named in, and each is read once, however often it or its
+    /// leaves are named: the pruned root holds each top-level column once, so a flat column read twice beside a nested
+    /// one handed its second copy to the nested column's first leaf (review round 1 of #815). A selection of flat
+    /// columns alone is left as it is, duplicates and all, since its assembly takes each leaf as named. Within a nested
+    /// column, a leaf under a list, a map, a variant or another repeated group selects
+    /// the whole of the outermost such group: a map needs its key, a variant all its parts, and a list's repeated group
+    /// can change meaning when its children change (a legacy two-level list). A leaf under structs alone selects just
+    /// that leaf, and the struct comes back holding only the leaves selected, as Spark and arrow-rs return a nested
+    /// projection.</para>
+    /// </remarks>
+    private static (IReadOnlyList<ColumnDescriptor>, IReadOnlyList<ColumnChunk>) NormalizeNestedSelection(
+        SchemaDescriptor schema, RowGroup rowGroup, List<ColumnDescriptor> columns, List<ColumnChunk> chunks)
+    {
+        // Flat only when assembled flat: a bare repeated top-level column has a one-segment path but is assembled as
+        // nested, against a root that holds it once (review round 2).
+        if (columns.TrueForAll(c => c.Path.Count == 1 && c.MaxRepetitionLevel == 0))
+            return (columns, chunks);
+
+        var indexOf = new Dictionary<ColumnDescriptor, int>(schema.Columns.Count);
+        for (int i = 0; i < schema.Columns.Count; i++)
+            indexOf[schema.Columns[i]] = i;
+
+        // Per top-level column, in the order first named: its selected leaves, in schema order, once each.
+        var order = new List<string>();
+        var selected = new Dictionary<string, SortedSet<int>>(StringComparer.Ordinal);
+        var expanded = new HashSet<SchemaNode>(); // atomic groups already expanded: once each, not once per leaf
+        foreach (var column in columns)
+        {
+            string top = column.Path[0];
+            if (!selected.TryGetValue(top, out var leaves))
+            {
+                selected[top] = leaves = [];
+                order.Add(top);
+            }
+
+            if (column.Path.Count > 1 && OutermostAtomicGroup(column.SchemaNode) is { } group)
+            {
+                if (!expanded.Add(group))
+                    continue;
+
+                var prefix = PathOf(group);
+                for (int i = 0; i < schema.Columns.Count; i++)
+                {
+                    if (StartsWith(schema.Columns[i].Path, prefix))
+                        leaves.Add(i);
+                }
+            }
+            else
+            {
+                leaves.Add(indexOf[column]);
+            }
+        }
+
+        var resultColumns = new List<ColumnDescriptor>(columns.Count);
+        var resultChunks = new List<ColumnChunk>(columns.Count);
+        foreach (var top in order)
+        {
+            foreach (int i in selected[top])
+            {
+                resultColumns.Add(schema.Columns[i]);
+                resultChunks.Add(rowGroup.Columns[i]);
+            }
+        }
+
+        return (resultColumns, resultChunks);
+    }
+
+    /// <summary>
+    /// The outermost group above <paramref name="leaf"/> that a projection cannot cut into: a list, a map, a variant or
+    /// a repeated group. Null when only structs lie above it.
+    /// </summary>
+    private static SchemaNode? OutermostAtomicGroup(SchemaNode leaf)
+    {
+        SchemaNode? outermost = null;
+        for (var node = leaf.Parent; node?.Parent is not null; node = node.Parent)
+        {
+            if (IsAtomicGroup(node))
+                outermost = node;
+        }
+
+        return outermost;
+    }
+
+    private static bool IsAtomicGroup(SchemaNode node) =>
+        !node.IsLeaf
+        && (node.Element.RepetitionType == FieldRepetitionType.Repeated
+            || Data.ArrowSchemaConverter.IsListNode(node)
+            || Data.ArrowSchemaConverter.IsMapNode(node)
+            || ShreddedVariantPath.IsVariantGroup(node));
+
+    // A node's path from the schema root, its own name last.
+    private static List<string> PathOf(SchemaNode node)
+    {
+        var path = new List<string>();
+        for (var current = node; current.Parent is not null; current = current.Parent)
+            path.Add(current.Name);
+        path.Reverse();
+        return path;
+    }
+
+    private static bool StartsWith(IReadOnlyList<string> path, List<string> prefix)
+    {
+        if (path.Count < prefix.Count)
+            return false;
+        for (int i = 0; i < prefix.Count; i++)
+        {
+            if (!string.Equals(path[i], prefix[i], StringComparison.Ordinal))
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Builds a pruned schema root containing only the top-level children that have at least one descendant leaf in
+    /// the selected columns, each pruned to those leaves (#783): a struct keeps only the children holding a selected
+    /// leaf. A list, map, variant or repeated group is kept whole; <see cref="NormalizeNestedSelection"/> selected all
+    /// of its leaves.
     /// </summary>
     private static SchemaNode PruneSchemaRoot(
         SchemaNode fullRoot,
@@ -2352,6 +2473,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 topLevelNames.Add(col.Path[0]);
         }
 
+        var selected = new HashSet<SchemaNode>();
+        foreach (var col in selectedColumns)
+            selected.Add(col.SchemaNode);
+
         // Pick matching children from the full root in the requested order
         var children = new List<SchemaNode>(topLevelNames.Count);
         foreach (var name in topLevelNames)
@@ -2360,7 +2485,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             {
                 if (child.Name == name)
                 {
-                    children.Add(child);
+                    children.Add(PruneToSelected(child, selected));
                     break;
                 }
             }
@@ -2372,6 +2497,49 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             Parent = null,
             Children = children,
         };
+    }
+
+    /// <summary>
+    /// <paramref name="node"/> with only the children that hold a selected leaf, or the node itself when nothing is cut.
+    /// A copy keeps its original parent, and its kept children theirs: the assembler reads levels from the ancestors'
+    /// schema elements (<c>Parent</c>), which pruning does not change.
+    /// </summary>
+    private static SchemaNode PruneToSelected(SchemaNode node, HashSet<SchemaNode> selected)
+    {
+        if (node.IsLeaf || IsAtomicGroup(node))
+            return node;
+
+        var kept = new List<SchemaNode>(node.Children.Count);
+        bool cut = false;
+        foreach (var child in node.Children)
+        {
+            if (!HoldsSelected(child, selected))
+            {
+                cut = true;
+                continue;
+            }
+
+            var pruned = PruneToSelected(child, selected);
+            cut |= !ReferenceEquals(pruned, child);
+            kept.Add(pruned);
+        }
+
+        return cut
+            ? new SchemaNode { Element = node.Element, Parent = node.Parent, Children = kept, AnnotationIgnored = node.AnnotationIgnored }
+            : node;
+    }
+
+    private static bool HoldsSelected(SchemaNode node, HashSet<SchemaNode> selected)
+    {
+        if (node.IsLeaf)
+            return selected.Contains(node);
+        foreach (var child in node.Children)
+        {
+            if (HoldsSelected(child, selected))
+                return true;
+        }
+
+        return false;
     }
 
 #if NET8_0_OR_GREATER

@@ -71,9 +71,10 @@ public class SelectedReadTests : IDisposable
         ["id, note"] = ["id", "note"],
         ["note, k, flag, id"] = ["note", "k", "flag", "id"],
 
-        // Not swept: a dotted path into a struct ("pt.x"). Reading one leaf of a two-leaf struct throws
-        // IndexOutOfRangeException in NestedAssembler on main, with or without a filter (#783). Add it back
-        // once that is fixed.
+        // Dotted paths into a struct (#783): one leaf, leaves out of schema order, a flat column named twice beside one.
+        ["pt.x"] = ["pt.x"],
+        ["pt.y, id, pt.x"] = ["pt.y", "id", "pt.x"],
+        ["id, pt.x, id"] = ["id", "pt.x", "id"],
     };
 
     public static IEnumerable<object[]> Cases()

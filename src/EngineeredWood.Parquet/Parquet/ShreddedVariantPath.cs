@@ -122,14 +122,22 @@ internal sealed class ShreddedVariantPath
             node = Child(node, part);
         }
 
-        if (node is null || node.IsLeaf || node.Element.RepetitionType == FieldRepetitionType.Repeated)
-            return null;
+        return node is not null && IsVariantGroup(node) ? node : null;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="node"/> is a variant group: annotated VARIANT, or with the spec's shape and no
+    /// annotation (a binary <c>metadata</c> leaf beside a binary <c>value</c> leaf), as older Spark writes it. Shared
+    /// with the reader's projection pruning, which keeps a variant whole (#783).
+    /// </summary>
+    internal static bool IsVariantGroup(SchemaNode node)
+    {
+        if (node.IsLeaf || node.Element.RepetitionType == FieldRepetitionType.Repeated)
+            return false;
         if (Child(node, "metadata") is not { IsLeaf: true, Element.Type: PhysicalType.ByteArray })
-            return null;
+            return false;
         return node.Element.LogicalType is LogicalType.VariantType
-            || Child(node, "value") is { IsLeaf: true, Element.Type: PhysicalType.ByteArray }
-            ? node
-            : null;
+            || Child(node, "value") is { IsLeaf: true, Element.Type: PhysicalType.ByteArray };
     }
 
     private static SchemaNode? Child(SchemaNode node, string name)
