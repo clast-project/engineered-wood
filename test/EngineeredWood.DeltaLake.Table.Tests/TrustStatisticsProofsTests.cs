@@ -336,13 +336,29 @@ public class TrustStatisticsProofsTests : IDisposable
         Assert.Equal(15, outcome.Deleted);
     }
 
-    /// <summary>A literal of another type than the column's is left to the read, and its comparison rules.</summary>
+    /// <summary>
+    /// A literal of another type than the column's is left to the read, and its comparison rules: a DOUBLE over the
+    /// BIGINT <c>id</c>. (An INT literal was the example here before #808; it now widens exactly, below.)
+    /// </summary>
     [Fact]
     public async Task LiteralOfAnotherType_IsRead()
     {
-        var outcome = await DeleteAsync(new Shape(), Ex.GreaterThanOrEqual("id", LiteralValue.Of(100)));
+        var outcome = await DeleteAsync(new Shape(), Ex.GreaterThanOrEqual("id", LiteralValue.Of(100.0)));
 
         Assert.Equal(["F1", "F2", "F3"], outcome.Opened);
+        Assert.Equal(30, outcome.Deleted);
+    }
+
+    /// <summary>
+    /// #808: an INT literal over the BIGINT <c>id</c> (<c>id &gt;= 100</c>, as SQL types it) widens to BIGINT exactly,
+    /// so it proves the files as <c>100L</c> does (<see cref="ProvenFiles_AreRemovedUnread"/>).
+    /// </summary>
+    [Fact]
+    public async Task AnIntLiteralOverABigintColumn_IsProven()
+    {
+        var outcome = await DeleteAsync(new Shape(), Ex.GreaterThanOrEqual("id", LiteralValue.Of(100)));
+
+        Assert.Empty(outcome.Opened);
         Assert.Equal(30, outcome.Deleted);
     }
 

@@ -359,15 +359,20 @@ public class ValueWiseTests : IDisposable
 
     // ---- Statistics proofs (#502 phase 5c) ---------------------------------------------------------------------------
 
-    // id is BIGINT: a proof holds only for a literal of the column's own type, so these are BIGINT literals (2500L).
-    // `id >= 2500` (an INT literal) is offered a proof that never holds.
+    // id is BIGINT. A proof holds for a literal of the column's own type (2500L) and, since #808, for an INT literal
+    // (2500, as SQL types it), which widens to BIGINT exactly: each filter is asked both ways.
     public static IEnumerable<object[]> ProofFilters() =>
     [
         ["id >= 2500L"],                         // groups 3-5 proven, group 2 partly
+        ["id >= 2500"],
         ["id >= 2500L AND cat = 'c3'"],          // split: the id conjunct is proven for groups 3-5, cat never
+        ["id >= 2500 AND cat = 'c3'"],
         ["id >= 100L AND id < 5900L"],
+        ["id >= 100 AND id < 5900"],
         ["cat <> 'c1' AND id > 1000L"],          // the id conjunct alone is proven for groups 2-5
+        ["cat <> 'c1' AND id > 1000"],
         ["id < 5000L OR cat IS NULL"],           // OR: proven by its first branch for groups 0-4
+        ["id < 5000 OR cat IS NULL"],
     ];
 
     /// <summary>
@@ -429,6 +434,8 @@ public class ValueWiseTests : IDisposable
     [Theory]
     [InlineData("id >= 2500L")]               // file 2 removed on its file proof, row group 3 on its row-group proof
     [InlineData("id >= 2500L AND id < 4500L")] // row group 3
+    [InlineData("id >= 2500")]                // the same with INT literals (#808)
+    [InlineData("id >= 2500 AND id < 4500")]
     public async Task ADeleteMatchesTheSameRowsWithStatisticsProofs(string sql)
     {
         var results = new List<(long Deleted, List<string> Left)>();

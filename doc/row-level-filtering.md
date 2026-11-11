@@ -1026,13 +1026,13 @@ Dropping a predicate where statistics prove it TRUE for every row trusts the sta
 
 - **One set of rules for every proof** (`StatisticsEvaluator.ProvesEveryRowTrue` / `ProvesLeafEveryRowTrue`, public, `EngineeredWood.Expressions`). They are DELETE's rules, moved out of `DeltaFilePruner`:
   - AND needs every child proven, and OR one;
-  - a leaf is a comparison of a top-level column with a literal of the column's own type, or `IS [NOT] NULL`;
+  - a leaf is a comparison of a top-level column with a literal of the column's own type (or, since #808, one that widens to it exactly), or `IS [NOT] NULL`;
   - every leaf but `IS NULL` also needs a null count of 0;
   - NOT and `IN` are never proven.
 
   The pruning evaluator's AlwaysTrue is unsound for this in two places, which the rules avoid. Under NOT, its AlwaysFalse ignores NULL rows: `NOT (x < 5)` over [10, 20] with NULLs answers AlwaysTrue, and a test pins that. A prefix test is answered without the null count. A NaN outside the bounds is the evaluator's to settle, and it already answers Unknown when one may hide there. `DeltaFilePruner.ProvesEveryRowTrue` keeps only its partition-column refusal (#511) and calls the shared leaf.
 - **Parquet:** `RowPredicate.Proof` (internal) is a predicate over the file's column paths. For each planned row group, `SelectedPlanReader` drops the predicates its statistics prove (`ParquetStatisticsAccessor`, with pruning's trust rules: no bounds under an undefined column order, legacy min/max only for signed numerics). The group is then read with the remaining filter and only the columns it still needs (`ReadWithout`, cached per set of proven predicates). A group with none left is a plain read: one pass, no evaluation. A positions-only read (a DELETE's) of such a group reads no column at all.
-- **A proof holds only for a literal of the column's own type** (DELETE's rule): `id >= 2500` over a BIGINT `id` compares with an INT literal and is never proven; `id >= 2500L` is. Spark SQL types an unsuffixed integer literal as INT, so this is the common case for BIGINT columns. Widening such a literal losslessly before proving is possible, and is left for later: it would change DELETE's file proofs too.
+- **A proof holds only for a literal of the column's own type** (DELETE's rule): `id >= 2500` over a BIGINT `id` compares with an INT literal and was never proven; `id >= 2500L` was. Spark SQL types an unsuffixed integer literal as INT, so this is the common case for BIGINT columns. **Since #808** a literal that widens to the column's type exactly is taken too: an INT over a BIGINT column, a FLOAT over a DOUBLE one. Spark compares in the wider type and the statistics compare the two exactly, so both answer as for a literal of the column's own type. This changes DELETE's and ADD CONSTRAINT's file proofs as well, in the same direction: more files proven, never a different answer.
 - **Delta:** a run of filter conjuncts, and an expression DELETE's predicate, carry a proof only when the table trusts statistics proofs and `EvaluatesEverywhere` holds (plain comparisons and null tests of the table's own columns, none casting a string, so dropping it raises nothing it would have raised). The proof is translated by `RowGroupPushdown.ToFileColumns`, which never strengthens it: a reference the file cannot answer (a partition column, a missing column, a changed type) evaluates Unknown and proves nothing.
 
 ### Measured
@@ -1317,4 +1317,4 @@ Against, and deciding:
 
 Issues opened along the way:
 - #804: dictionary answers for chunks that mix dictionary and PLAIN pages, or lack `encoding_stats`.
-- #808: a statistics proof refuses an INT literal over a BIGINT column, so `id >= 2500` is never proven.
+- #808: a statistics proof refuses an INT literal over a BIGINT column, so `id >= 2500` is never proven. Fixed: an exactly widening literal is now proven.
