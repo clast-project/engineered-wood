@@ -2095,10 +2095,17 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         public int Count => Columns.Count;
     }
 
+    /// <summary>
+    /// The leaves <paramref name="columnNames"/> select, with their chunks. For a read (<paramref name="forAssembly"/>),
+    /// in the order its assembly consumes them (<see cref="NormalizeNestedSelection"/>); otherwise as named, one entry
+    /// per leaf named and in that order, as <see cref="ReadPageIndexAsync"/> promises (#816 review: assembly order
+    /// reordered and expanded its entries).
+    /// </summary>
     private static (IReadOnlyList<ColumnDescriptor>, IReadOnlyList<ColumnChunk>) ResolveColumns(
         SchemaDescriptor schema,
         RowGroup rowGroup,
-        IReadOnlyList<string>? columnNames)
+        IReadOnlyList<string>? columnNames,
+        bool forAssembly = true)
     {
         if (columnNames == null)
         {
@@ -2161,7 +2168,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                     $"Column '{name}' was not found in the schema.", nameof(columnNames));
         }
 
-        return NormalizeNestedSelection(schema, rowGroup, columns, chunks);
+        return forAssembly ? NormalizeNestedSelection(schema, rowGroup, columns, chunks) : (columns, chunks);
     }
 
     /// <summary>
@@ -3176,7 +3183,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 $"The file has {metadata.RowGroups.Count} row groups.");
 
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-        var (descriptors, chunks) = ResolveColumns(schema, metadata.RowGroups[rowGroupIndex], columnNames);
+        var (descriptors, chunks) = ResolveColumns(schema, metadata.RowGroups[rowGroupIndex], columnNames, forAssembly: false);
 
         // Up to two ranges per column, remembering which entry and which index each one is.
         var ranges = new List<FileRange>(chunks.Count * 2);
