@@ -538,7 +538,10 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// </summary>
     public ValueTask<long> DeleteAsync(
         Expressions.Predicate predicate, CancellationToken cancellationToken = default)
-        => StageDeleteAsync(MaskForNonNull(predicate), predicate, mode: null, cancellationToken);
+    {
+        predicate = ResolveNonNull(predicate);
+        return StageDeleteAsync(MaskForNonNull(predicate), predicate, mode: null, cancellationToken);
+    }
 
     /// <summary>
     /// Stages a delete of the rows matching an analyzable <see cref="Expressions.Predicate"/>, as
@@ -548,10 +551,17 @@ public sealed class DeltaTransaction : IAsyncDisposable
     /// </summary>
     public ValueTask<long> DeleteAsync(
         Expressions.Predicate predicate, RowDeleteMode mode, CancellationToken cancellationToken = default)
-        => StageDeleteAsync(MaskForNonNull(predicate), predicate, mode, cancellationToken);
+    {
+        predicate = ResolveNonNull(predicate);
+        return StageDeleteAsync(MaskForNonNull(predicate), predicate, mode, cancellationToken);
+    }
 
     private static Func<RecordBatch, BooleanArray> MaskForNonNull(Expressions.Predicate predicate) =>
         DeltaTable.MaskFor(predicate ?? throw new ArgumentNullException(nameof(predicate)));
+
+    // The predicate an operation takes, with its clock words read once for all of it (#801).
+    private static Expressions.Predicate ResolveNonNull(Expressions.Predicate predicate) =>
+        DeltaTable.ResolveClockWords(predicate ?? throw new ArgumentNullException(nameof(predicate)));
 
     /// <param name="predicate">The row mask: TRUE marks a row for deletion.</param>
     /// <param name="analyzable">The predicate <paramref name="predicate"/> evaluates, when the caller gave one: it
@@ -657,6 +667,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         RowDeleteMode? mode = null)
     {
         EnsureOpen();
+        predicate = ResolveNonNull(predicate);
 
         // ComputeUpdateActionsAsync re-validates the post-image and recomputes generated
         // columns, so a constrained table is writable here.
@@ -810,6 +821,7 @@ public sealed class DeltaTransaction : IAsyncDisposable
         EnsureOpen();
         if (batches is null)
             throw new ArgumentNullException(nameof(batches));
+        predicate = ResolveNonNull(predicate);   // the window's clock words read once (#801)
         if (predicate is null)
             throw new ArgumentNullException(nameof(predicate));
 

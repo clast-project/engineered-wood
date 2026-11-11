@@ -4663,6 +4663,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         batch => RowEvaluator.EvaluatePredicate(predicate, batch);
 
     /// <summary>
+    /// <paramref name="predicate"/> with its clock words (<c>CAST('now' AS TIMESTAMP)</c>, <c>CAST('today' AS
+    /// DATE)</c>) read now, once, for the operation it is handed to (#801): Spark resolves them once per query, and
+    /// the registry folds them per evaluation, which is per batch. An operation calls this where it takes its
+    /// predicate, before anything evaluates it.
+    /// </summary>
+    internal static Expressions.Predicate ResolveClockWords(Expressions.Predicate predicate) =>
+        Expressions.Arrow.Spark.SparkClockWords.Resolve(predicate, OperationClock.Now);
+
+    /// <summary>
     /// Refuses a DML predicate Spark's analyzer would refuse -- one naming a column the table does not have
     /// (<see cref="DeltaTableErrorCodes.UnresolvedColumn"/>), or whose types it refuses (<c>dt = 5</c>) -- before
     /// any file is pruned or read.
@@ -5595,8 +5604,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken = default,
         CommitProperties? commitProperties = null,
         RowDeleteMode? mode = null)
-        => UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
+    {
+        // Its clock words read once for the whole UPDATE (#801).
+        predicate = ResolveClockWords(predicate ?? throw new ArgumentNullException(nameof(predicate)));
+        return UpdateCoreAsync(MaskFor(predicate), updater, prunePredicate: predicate,
             readPredicates: [predicate], opaquePredicate: false, cancellationToken, commitProperties, mode);
+    }
 
     private async ValueTask<(long RowsUpdated, long Version)> UpdateCoreAsync(
         Func<RecordBatch, BooleanArray> predicate,
@@ -6601,6 +6614,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         DeltaReadOptions options,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
+        // The filter's clock words read once for the whole scan (#801). Pruning alone never evaluates a cast, but
+        // a filter evaluated per batch would read the clock per batch.
+        if (options.Filter is { } filter)
+        {
+            var resolved = ResolveClockWords(filter);
+            if (!ReferenceEquals(resolved, filter))
+                options = options with { Filter = resolved };
+        }
+
         var metadata = options.Metadata;
         ValidateReadMetadata(snapshot, metadata, options.MetadataPrefix);
 

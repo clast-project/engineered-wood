@@ -59,12 +59,15 @@ internal sealed class DeltaConstraintEnforcer
     {
         var rules = new List<Rule>();
 
+        // Each enforcer serves one operation, which reads every clock word of its rules at this instant (#801).
+        var now = OperationClock.Now;
+
         foreach (var pair in snapshot.Metadata.Configuration ?? EmptyConfiguration)
         {
             if (!pair.Key.StartsWith("delta.constraints.", StringComparison.Ordinal))
                 continue;
 
-            rules.Add(Parse($"CHECK constraint '{pair.Key}'", pair.Value));
+            rules.Add(Parse($"CHECK constraint '{pair.Key}'", pair.Value, now));
         }
 
         foreach (var field in snapshot.ArrowSchema.FieldsList)
@@ -76,7 +79,7 @@ internal sealed class DeltaConstraintEnforcer
             }
 
             rules.Add(Parse(
-                $"invariant on column '{field.Name}'", UnwrapInvariant(field.Name, invariant)));
+                $"invariant on column '{field.Name}'", UnwrapInvariant(field.Name, invariant), now));
         }
 
         return rules.Count == 0 ? null : new DeltaConstraintEnforcer(rules, snapshot);
@@ -219,8 +222,8 @@ internal sealed class DeltaConstraintEnforcer
         }
 
         // The form Create parses a declared constraint into, so the rows are checked against what later writes
-        // will be.
-        return Parse(description, sql).Predicate;
+        // will be: with its clock words read once, for every row ADD CONSTRAINT checks (#801).
+        return Parse(description, sql, OperationClock.Now).Predicate;
     }
 
     /// <summary>
@@ -254,11 +257,12 @@ internal sealed class DeltaConstraintEnforcer
         return violations;
     }
 
-    private static Rule Parse(string description, string sql)
+    // `now`: the instant the rule's clock words are read at, once for the operation it serves (#801).
+    private static Rule Parse(string description, string sql, DateTimeOffset now)
     {
         try
         {
-            return new Rule(description, sql, SparkSqlParser.ParsePredicate(sql));
+            return new Rule(description, sql, SparkClockWords.Resolve(SparkSqlParser.ParsePredicate(sql), now));
         }
         catch (SparkSqlParseException ex)
         {
