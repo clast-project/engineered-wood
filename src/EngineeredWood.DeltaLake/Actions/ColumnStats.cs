@@ -30,8 +30,14 @@ public sealed record ColumnStats
     /// <summary>
     /// Parses a Delta stats JSON string (the value of <see cref="AddFile.Stats"/>)
     /// into a <see cref="ColumnStats"/>. Returns <c>null</c> if the input is
-    /// null, empty, or doesn't parse.
+    /// null, empty, or doesn't parse, or isn't a JSON object.
     /// </summary>
+    /// <remarks>
+    /// Statistics a reader can't use count as absent, never as an error (#820): a root that isn't an object is no
+    /// statistics at all, and a row count or null count that isn't a non-negative 64-bit integer (<c>1.5</c>,
+    /// <c>1e30</c>, <c>-1</c>, <c>"3"</c>) is unknown. Both used to throw, failing a pruned scan and anything that
+    /// asked for a file's row count.
+    /// </remarks>
     public static ColumnStats? Parse(string? json)
     {
         if (string.IsNullOrEmpty(json))
@@ -41,11 +47,14 @@ public sealed record ColumnStats
         {
             using var doc = JsonDocument.Parse(json!);
             var root = doc.RootElement;
+            if (root.ValueKind != JsonValueKind.Object)
+                return null;
 
             long? numRecords = null;
             if (root.TryGetProperty("numRecords", out var nr)
                 && nr.ValueKind == JsonValueKind.Number
-                && nr.TryGetInt64(out long n))
+                && nr.TryGetInt64(out long n)
+                && n >= 0)
                 numRecords = n;
 
             return new ColumnStats
@@ -132,10 +141,13 @@ public sealed record ColumnStats
             string key = prefix.Length == 0 ? prop.Name : prefix + "." + prop.Name;
             if (prop.Value.ValueKind == JsonValueKind.Number)
             {
+                // A count that isn't a non-negative 64-bit integer is unknown: left out (#820).
+                if (!prop.Value.TryGetInt64(out long count) || count < 0)
+                    continue;
                 if (map.ContainsKey(key))
                     collided.Add(key);
                 else
-                    map[key] = prop.Value.GetInt64();
+                    map[key] = count;
             }
             else if (prop.Value.ValueKind == JsonValueKind.Object)
             {
