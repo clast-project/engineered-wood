@@ -96,9 +96,15 @@ internal static class ByteArrayRepresentation
 
     /// <summary>
     /// <paramref name="batch"/> with every column in <paramref name="kind"/>'s representation: the same batch when
-    /// all already are. A string or binary column that is converted whole is copied, and its original disposed (the
-    /// scan owns it); a nested column is rebuilt around its converted children, sharing the rest of its buffers.
+    /// all already are. A string or binary column that is converted whole is copied; a nested column is rebuilt around
+    /// its converted children, sharing the rest of its buffers.
     /// </summary>
+    /// <remarks>
+    /// The originals of the columns converted whole are released once every column is converted, each array once, and
+    /// only those that share no buffer with the result (review round 1): a codec-seam host may hand one array, or arrays
+    /// over the same buffers, for several columns, so releasing one as soon as it was converted freed bytes a later
+    /// conversion, or an unchanged column, still read.
+    /// </remarks>
     public static RecordBatch Apply(RecordBatch batch, ByteArrayOutputKind kind)
     {
         IArrowArray[]? columns = null;
@@ -115,14 +121,39 @@ internal static class ByteArrayRepresentation
             columns[i] = ArrowArrayFactory.BuildArray(Convert(column.Data, kind));
             var field = batch.Schema.FieldsList[i];
             fields[i] = new Field(field.Name, columns[i].Data.DataType, field.IsNullable, field.Metadata);
-            if (IsLeaf(column.Data.DataType))
-                column.Dispose();
         }
 
         if (columns is null)
             return batch;
 
-        return new RecordBatch(new Apache.Arrow.Schema(fields!, batch.Schema.Metadata), columns, batch.Length);
+        var result = new RecordBatch(new Apache.Arrow.Schema(fields!, batch.Schema.Metadata), columns, batch.Length);
+        Release(batch, result);
+        return result;
+    }
+
+    // Disposes the original of each leaf column Apply copied, once per array, unless the result still holds one of
+    // its buffers. Every decision is made before anything is disposed: a disposed array's buffers can't be inspected.
+    // Distinct arrays over the same buffers (slices) are each disposed: Arrow counts their references to the buffers,
+    // which are freed with the last.
+    private static void Release(RecordBatch batch, RecordBatch result)
+    {
+        var kept = new HashSet<ReadOnlyMemory<byte>>();
+        for (int i = 0; i < result.ColumnCount; i++)
+            Parquet.BatchSelector.CollectBuffers(result.Column(i).Data, kept);
+
+        var doomed = new List<IArrowArray>();
+        for (int i = 0; i < batch.ColumnCount; i++)
+        {
+            var original = batch.Column(i);
+            if (ReferenceEquals(original, result.Column(i)) || !IsLeaf(original.Data.DataType))
+                continue;
+            if (doomed.Exists(d => ReferenceEquals(d, original)) || Parquet.BatchSelector.SharesAny(original.Data, kept))
+                continue;
+            doomed.Add(original);
+        }
+
+        foreach (var original in doomed)
+            original.Dispose();
     }
 
     private static bool IsLeaf(IArrowType type) =>
@@ -178,14 +209,12 @@ internal static class ByteArrayRepresentation
 
             case LargeStringType:
             {
-                var builder = new LargeStringArray.Builder();
-                for (int i = 0; i < length; i++)
-                {
-                    if (source.IsNull(i)) builder.AppendNull();
-                    else builder.Append(System.Text.Encoding.UTF8.GetString(Bytes(source, i).ToArray()));
-                }
-
-                return builder.Build();
+                // The bytes copied as they are (review round 1: not decoded to a string and encoded back per value),
+                // then the large-binary layout, which a large string shares, relabelled.
+                var binary = (LargeBinaryArray)ConvertLeaf(source, LargeBinaryType.Default);
+                var data = binary.Data;
+                return new LargeStringArray(new ArrayData(
+                    LargeStringType.Default, data.Length, data.NullCount, data.Offset, data.Buffers, data.Children));
             }
 
             case BinaryType:
