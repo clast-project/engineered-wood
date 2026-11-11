@@ -9269,7 +9269,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// <see cref="StatsWithLooseBounds(string?)"/> for a file re-added under a deletion vector whose physical row count
     /// the caller knows: the protocol requires such a file to carry a correct <c>numRecords</c>, so statistics that
     /// lack one, or a file with none at all, are given <paramref name="physicalRows"/>. A count already there is kept,
-    /// unless it is not an integer the log could read.
+    /// unless it is not a count the log could read: a non-negative integer (#820, #825 review).
     /// </summary>
     private static string StatsWithLooseBounds(string? stats, long physicalRows)
     {
@@ -9297,10 +9297,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             using (var writer = new System.Text.Json.Utf8JsonWriter(stream))
             {
                 writer.WriteStartObject();
-                // Kept only when it reads as the count the log reads (ColumnStats.Parse takes an Int64): 2.5 is no
-                // count, and is replaced rather than written back beside the new one.
+                // Kept only when it reads as the count the log reads (ColumnStats.Parse takes a non-negative Int64):
+                // 2.5 or -1 is no count, and is replaced rather than written back beside the new one.
                 bool keepCount = doc is not null && doc.RootElement.TryGetProperty("numRecords", out var count)
-                    && count.ValueKind == System.Text.Json.JsonValueKind.Number && count.TryGetInt64(out _);
+                    && count.ValueKind == System.Text.Json.JsonValueKind.Number && count.TryGetInt64(out long kept)
+                    && kept >= 0;
                 if (!keepCount)
                     writer.WriteNumber("numRecords", physicalRows);
                 writer.WriteBoolean("tightBounds", false);

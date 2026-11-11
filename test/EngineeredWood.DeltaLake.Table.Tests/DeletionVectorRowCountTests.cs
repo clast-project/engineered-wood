@@ -98,6 +98,8 @@ public class DeletionVectorRowCountTests : IDisposable
         { null, true },
         // Not an integer, so no count the log can read: replaced, not written back beside the new one.
         { "{\"numRecords\":2.5,\"minValues\":{\"id\":1}}", false },
+        // Negative: no count either since #820, so replaced too (#825 review).
+        { "{\"numRecords\":-1,\"minValues\":{\"id\":1}}", false },
     };
 
     [Theory]
