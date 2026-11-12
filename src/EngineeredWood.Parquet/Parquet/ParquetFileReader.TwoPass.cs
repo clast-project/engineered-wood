@@ -167,9 +167,10 @@ public sealed partial class ParquetFileReader
     /// <param name="reservation">A parallel read's reservation, or null for a serial read. The first pass's
     /// decoded predicate columns, kept for the whole group when the read returns them, are held against it, and
     /// every decoded batch's RAW size sets its estimate, as the one-pass read's raw batches do.</param>
-    /// <param name="growth">A parallel read's decoded-size learning, or null; taught from a group decoded in one
-    /// batch per pass, against <paramref name="plannedDecoded"/>, the estimate its first batch reserved
-    /// (<see cref="DecodedBytes"/>).</param>
+    /// <param name="growth">A parallel read's decoded-size learning, or null; taught by each pass on its own, against
+    /// its baseline in <paramref name="estimate"/>: the first pass from a group it decoded in one batch, the second
+    /// from one it decoded whole in one batch, every row built (#848 review round 2).</param>
+    /// <param name="estimate">What the first step reserved, and each pass's decoded estimate before growth.</param>
     /// <param name="filterIo">The predicate columns' chunks fetched ahead, or null to fetch them as pass 1 reads.
     /// Not disposed here.</param>
     /// <param name="outputIo">The output columns' chunks fetched ahead, or null to start fetching them here. Not
@@ -180,7 +181,7 @@ public sealed partial class ParquetFileReader
         BatchSelector selector,
         ScanReservation? reservation,
         DecodedGrowth? growth,
-        long plannedDecoded,
+        TwoPassEstimate estimate,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
         CancellationToken cancellationToken,
         PrefetchedFile? filterIo = null,
@@ -197,7 +198,7 @@ public sealed partial class ParquetFileReader
         var selection = new ulong[SelectionMask.WordCount(groupRows)];
         RecordBatch? first = null;
         bool[] moved = [];
-        long decoded = 0;
+        long firstPassDecoded = 0, secondPassDecoded = 0;
         int firstPassBatches = 0, secondPassBatches = 0;
         try
         {
@@ -216,7 +217,7 @@ public sealed partial class ParquetFileReader
                 row += batch.Length;
                 firstPassBatches++;
                 long size = ArrowSizes.EstimatedBytes(batch);
-                decoded += size;
+                firstPassDecoded += size;
                 reservation?.Observe(size);
                 // Never yielded, so never settled: charged now where it outgrows the reservation, as when a
                 // dictionary declines to answer and the pass decodes values (#848 review).
@@ -250,6 +251,12 @@ public sealed partial class ParquetFileReader
                     batch.Dispose();
                 }
             }
+
+            // Each pass learns against its own estimate: one ratio learnt from both summed is diluted by the pass
+            // that grew less, and then applied to each alone could leave the one that grew more short (#848 review
+            // round 2). The first pass decodes every row, so it learns from any group it read in one batch.
+            if (growth is not null && firstPassBatches == 1)
+                growth.Observe(estimate.FilterBaseline, firstPassDecoded);
 
             if (kept == 0)
                 yield break;
@@ -288,7 +295,7 @@ public sealed partial class ParquetFileReader
 
                     secondPassBatches++;
                     long size = ArrowSizes.EstimatedBytes(batch);
-                    decoded += size;
+                    secondPassDecoded += size;
                     reservation?.Observe(size);
                     // Settled at the selected rows' size; the raw batch exists until then.
                     reservation?.Cover(size);
@@ -305,10 +312,10 @@ public sealed partial class ParquetFileReader
                     ArrayPool<byte>.Shared.Return(keepRows);
             }
 
-            // Learnt only from a group each pass decoded whole in one batch, every row built: then `decoded` is the
-            // group's. A second pass that kept rows as it decoded measured less than it decoded.
-            if (growth is not null && passTwoRanges is null && keepRows is null && firstPassBatches == 1 && secondPassBatches == 1)
-                growth.Observe(plannedDecoded, decoded);
+            // The second pass, only from a group it decoded whole in one batch, every row built: one that kept rows as
+            // it decoded, or read only some blocks, measured less than it decoded.
+            if (growth is not null && passTwoRanges is null && keepRows is null && secondPassBatches == 1)
+                growth.Observe(estimate.OutputBaseline, secondPassDecoded);
         }
         finally
         {
@@ -550,9 +557,9 @@ public sealed partial class ParquetFileReader
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
         long compressed = PlannedBytes(metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges).Compressed;
-        long planned = DecodedBytes(metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges);
-        reservation.SetInitialEstimate(TwoPassFirstBatchBytes(
-            metadata.RowGroups[plan.Index], schema, columns, selector.Answerable, growth, plan.Ranges));
+        var estimate = TwoPassFirstBatchEstimate(
+            metadata.RowGroups[plan.Index], schema, columns, selector.Answerable, growth, plan.Ranges);
+        reservation.SetInitialEstimate(estimate.Reserved);
 
         PrefetchedFile? filterIo = null, outputIo = null;
         IAsyncEnumerator<SelectedRecordBatch>? e = null;
@@ -565,7 +572,7 @@ public sealed partial class ParquetFileReader
             var outputCtx = await PrepareRowGroupAsync(plan.Index, columns.OutputOnly, cancellationToken).ConfigureAwait(false);
             // Null likewise: the read then starts its own output prefetch, as before #829.
             outputIo = TryPrefetch(outputCtx.Ranges, cancellationToken);
-            e = ReadTwoPassAsync(plan, columns, selector, reservation, growth, planned, cancellationToken, filterIo, outputIo)
+            e = ReadTwoPassAsync(plan, columns, selector, reservation, growth, estimate, cancellationToken, filterIo, outputIo)
                 .GetAsyncEnumerator(cancellationToken);
             while (true)
             {
@@ -606,9 +613,10 @@ public sealed partial class ParquetFileReader
     /// </list>
     /// A dictionary can still decline (one no smaller than the batch's rows, or an entry that raises), and the pass then
     /// decodes values: each raw batch is charged as it is measured (<see cref="ScanReservation.Cover"/>). Both passes'
-    /// decoded estimates are grown by <paramref name="growth"/>.
+    /// decoded estimates are grown by <paramref name="growth"/>, which each pass teaches against its own baseline
+    /// (<see cref="TwoPassEstimate"/>).
     /// </summary>
-    internal long TwoPassFirstBatchBytes(
+    internal TwoPassEstimate TwoPassFirstBatchEstimate(
         Metadata.RowGroup rowGroup, SchemaDescriptor schema, TwoPassColumns columns,
         IReadOnlyDictionary<string, AnswerPlan>? answers, DecodedGrowth growth, IReadOnlyList<RowRange>? ranges)
     {
@@ -637,18 +645,28 @@ public sealed partial class ParquetFileReader
 
         long filterFooter = PlannedBytes(rowGroup, schema, decodedFilter, ranges).Uncompressed;
         long filterGroup = growth.Apply(DecodedBytes(rowGroup, schema, decodedFilter, ranges));
+        // Every filter column's values, answered or not: a dictionary that declines decodes them, and measuring that
+        // against the answers alone would teach a growth of 30x or more, which every later reservation would carry.
+        long filterBaseline = DecodedBytes(rowGroup, schema, columns.Filter, ranges) + answerBytes;
         long firstPass = wholeFirstPass
             ? filterGroup
             : FirstBatchBytes(filterGroup, filterFooter, rowGroup, schema, decodedFilter, ranges);
         firstPass += answerBytes;
 
         long outputFooter = PlannedBytes(rowGroup, schema, columns.OutputOnly, ranges).Uncompressed;
+        long outputBaseline = DecodedBytes(rowGroup, schema, columns.OutputOnly, ranges);
         long secondPass = FirstBatchBytes(
-            growth.Apply(DecodedBytes(rowGroup, schema, columns.OutputOnly, ranges)), outputFooter, rowGroup, schema,
-            columns.OutputOnly, ranges);
+            growth.Apply(outputBaseline), outputFooter, rowGroup, schema, columns.OutputOnly, ranges);
 
-        return Math.Max(firstPass, secondPass);
+        return new TwoPassEstimate(Math.Max(firstPass, secondPass), filterBaseline, outputBaseline);
     }
+
+    /// <summary>
+    /// A two-pass read's first-step reservation (<see cref="TwoPassFirstBatchEstimate"/>), and each pass's decoded
+    /// estimate before growth, which <see cref="DecodedGrowth"/> measures that pass against: the first pass's over
+    /// every filter column's values plus the answers, the second pass's over the output columns.
+    /// </summary>
+    internal readonly record struct TwoPassEstimate(long Reserved, long FilterBaseline, long OutputBaseline);
 
     /// <summary>A selected batch's size for the scan budget: its columns and its explicit positions.</summary>
     internal static long SelectedBytes(SelectedRecordBatch batch) =>

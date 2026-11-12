@@ -216,7 +216,7 @@ public sealed partial class ParquetFileReader
         {
             var read = ReadFor(plan);
             return _reader.ReadsInTwoPasses(plan, read.TwoPass, _metadata.RowGroups[plan.Index], _proofs.Length > 0)
-                ? _reader.ReadTwoPassAsync(plan, read.TwoPass!, read.Selector, reservation: null, growth: null, 0, cancellationToken)
+                ? _reader.ReadTwoPassAsync(plan, read.TwoPass!, read.Selector, reservation: null, growth: null, default, cancellationToken)
                 : read.Selector.SelectAsync(
                     _reader.ReadPlannedAsync(plan, read.ReadColumns, cancellationToken, read.Selector.Answerable));
         }
