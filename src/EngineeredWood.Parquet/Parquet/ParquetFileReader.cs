@@ -537,10 +537,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// ran serially at fetch-plus-decode per row group. A read of some rows only fetches the pages it needs, as
     /// it decodes them, and so does a read with a chunk too large to fetch in one buffer
     /// (<see cref="TryPrefetch"/>).</item>
-    /// <item>The first batch reserves its share (<see cref="FirstBatchBytes"/>) of the row group's estimated
-    /// decoded size (<see cref="DecodedBytes"/>), grown by how far decoded row groups have exceeded theirs so far
-    /// (<paramref name="growth"/>). Later batches of the same row group reserve the largest batch it has
-    /// produced.</item>
+    /// <item>The first batch reserves what the pages it decodes hold when the read's page maps come from
+    /// OffsetIndexes, else its share (<see cref="FirstBatchBytes"/>) of the row group's estimated decoded size
+    /// (<see cref="DecodedBytes"/>) (<see cref="FirstBatchReservationAsync"/>); either grown by how far decoded row
+    /// groups have exceeded theirs so far (<paramref name="growth"/>). Later batches of the same row group reserve
+    /// the largest batch it has produced.</item>
     /// </list>
     /// </summary>
     internal async IAsyncEnumerable<PositionedRecordBatch> ReadPlannedAsync(
@@ -913,8 +914,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// group under the limit is read in one batch however large it decodes (#845 review).</item>
     /// </list>
     /// A batch is a slice of whole decoded pages and holds their buffers, so a page larger than the batch makes the
-    /// batch larger than its share of rows; how many rows a page holds is not known before the page maps are read.
-    /// So the share is never taken below <paramref name="footerBytes"/>, what a first batch reserved before (#845
+    /// batch larger than its share of rows. How many rows a page holds is known only from an OffsetIndex
+    /// (<see cref="FirstBatchFromPagesAsync"/>, used instead of this where there is one); without it, the share is never taken below <paramref name="footerBytes"/>, what a first batch reserved before (#845
     /// review): a single 100,000-row int64 page read in 1,000-row batches reserves its 800 KB, not 8 KB. A read
     /// with a nested column decodes the whole group before slicing it, so it reserves the whole group.
     /// </summary>
