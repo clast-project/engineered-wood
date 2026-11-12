@@ -10,9 +10,10 @@ namespace EngineeredWood.DeltaLake.Benchmarks.Rf502;
 /// <summary>
 /// A local table that reads like an object store (#830): every file it opens reports
 /// <see cref="IReadConcurrencyHint.PreferredConcurrentReads"/>, as the S3, Azure and GCS readers do, and every read
-/// request waits <see cref="Latency"/> plus its bytes at <see cref="BytesPerSecond"/> before the local read. The ranges
-/// of one <see cref="IRandomAccessFile.ReadRangesAsync"/> wait concurrently, as parallel ranged GETs would. Writes and
-/// listing go straight through.
+/// request waits <see cref="Latency"/> plus its bytes at <see cref="BytesPerSecond"/> before the local read. An
+/// <see cref="IRandomAccessFile.ReadRangesAsync"/> goes through <see cref="CoalescingFileReader"/> with its default
+/// options, as the S3 reader's does: nearby ranges are merged, and the merged requests wait concurrently, as parallel
+/// ranged GETs would. Writes and listing go straight through.
 /// </summary>
 internal sealed class SimulatedObjectStore(
     ITableFileSystem inner, TimeSpan latency, long bytesPerSecond, int preferredConcurrentReads = 4) : ITableFileSystem
@@ -73,12 +74,11 @@ internal sealed class SimulatedObjectStore(
             return await file.ReadAsync(range, cancellationToken).ConfigureAwait(false);
         }
 
-        public async ValueTask<IReadOnlyList<IMemoryOwner<byte>>> ReadRangesAsync(
-            IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
-        {
-            await Task.WhenAll(ranges.Select(r => store.WaitAsync(r.Length, cancellationToken))).ConfigureAwait(false);
-            return await file.ReadRangesAsync(ranges, cancellationToken).ConfigureAwait(false);
-        }
+        // As S3RandomAccessFile does: nearby ranges merged into fewer requests, each a ReadAsync (so each waits),
+        // the merged requests in parallel (#840 review).
+        public ValueTask<IReadOnlyList<IMemoryOwner<byte>>> ReadRangesAsync(
+            IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default) =>
+            new CoalescingFileReader(this).ReadRangesAsync(ranges, cancellationToken);
 
         public ValueTask DisposeAsync() => file.DisposeAsync();
 

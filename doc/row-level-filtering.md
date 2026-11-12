@@ -1495,7 +1495,7 @@ What fits is a host mask over a low-cardinality column whose values are local to
 
 Two benchmarks share one orders-shaped table: 8M rows, 2 files of 4 row groups of 1M rows. `orderkey` is sorted, `custkey` is random over 1.5M values (so its dictionary falls back to PLAIN), and `comment` is a short string. The scan returns all three, as Q13's does. The mask is a value-wise hash-set probe of `custkey` that keeps a set share of the rows.
 - `UnselectiveMaskBenchmarks`: a local file, with two passes forced on or off (`DeltaTable.TwoPassReads`, internal).
-- `UnselectiveMaskStoreBenchmarks`: the same scan over `SimulatedObjectStore`. The files report `PreferredConcurrentReads`, so the scan takes two passes by default as on S3. Each request waits 5 or 25 ms plus its bytes at 200 MB/s, and the ranges of one request wait concurrently.
+- `UnselectiveMaskStoreBenchmarks`: the same scan over `SimulatedObjectStore`. The files report `PreferredConcurrentReads`, so the scan takes two passes by default as on S3. Each request waits 5 or 25 ms plus its bytes at 200 MB/s. A multi-range read goes through `CoalescingFileReader` with its defaults, as `S3RandomAccessFile`'s does: ranges less than 1 MB apart merge into one request, and the merged requests wait concurrently.
 
 i9-12900K, net10.0, warm cache. This machine was noisy: two runs of identical configurations differ by up to 60 ms locally and 90 ms over the store. The differences below are the ones that held across runs.
 
@@ -1519,21 +1519,24 @@ The cost two passes add when nothing is dropped suggested a switch. A scan-wide 
 
 It worked as designed: the rows did not change, and row groups short of whole kept two passes. Locally it saved about 5% at 100% kept, inside the noise (medians 376 ms with two passes, 359 adaptive, 349 one pass). But a local mask scan takes one pass by default anyway, so the switch would only ever fire on an object store, and there it lost.
 
-Simulated store, mask keeping 100%, ms:
+Simulated store, ms, and requests per scan:
 
-| Read | 5 ms latency | 25 ms latency |
-|---|---|---|
-| two passes (default) | 472 ±26 | 598 ±22 |
-| adaptive | 563 ±21 | 661 ±16 |
-| one pass forced | 610 ±55 | 715 ±61 |
-| no mask | 481 | 582 |
+| Mask keeps | Read | 5 ms latency | 25 ms latency | Requests |
+|---|---|---|---|---|
+| 100% | two passes (default) | 486 ±43 | 597 ±22 | 26 |
+| 100% | one pass forced | 667 ±64 | 782 ±67 | 10 |
+| 95% | two passes (default) | 495 ±37 | 524 ±6 | 26 |
+| 95% | one pass forced | 745 ±91 | 817 ±147 | 10 |
+| no mask | (one pass, unfiltered) | 533-543 | 626-632 | 10 |
 
-Every variant made the same 26 requests per scan, so the difference is not round trips. Over a store, the two-pass read requests a row group's bytes up front and decodes the predicate column while the rest arrive; the second decode pass hides behind the I/O. One pass did not overlap as well. The simulation returns all of a request's ranges at once, which a real S3 client may not, but the direction is clear enough.
+With coalescing, a one-pass read fetches each row group's columns as one merged request, limited to one request's bandwidth. The two-pass read asks for the predicate column and the rest separately, so the same bytes arrive over several requests in parallel, and the first pass decodes while the rest arrive. At 100% kept, one pass is 30-37% slower than two. The switch settles into one pass after its first two row groups, so it loses by nearly as much: it was measured at 13-19% slower against an earlier version of the simulation that charged each range as its own request (#840 review), and was not rebuilt to measure again.
+
+An aside, a hypothesis rather than a result: under this model a mask scan keeping every row beats the unfiltered scan (486 against 533-543 ms), because the unfiltered read coalesces each row group into one request too. Whether S3 behaves this way depends on how close 200 MB/s per request is to S3's per-connection throughput. If it is, `CoalescingOptions.MaxRequestBytes` (64 MB) is too coarse for a read that wants bandwidth more than fewer round trips. That is its own issue, measured against a real store.
 
 ### Decided: not built
 
 The switch was reverted. Two findings stand:
-- **Over an object store, a mask that keeps every row costs nothing against no mask** (472 against 481 ms, inside the noise). The two-pass read is not what made Q13 slower on S3.
+- **Over an object store, a mask that keeps every row costs nothing against no mask.** It was faster here (486 against 533-543 ms). The two-pass read is not what made Q13 slower on S3.
 - **What remains is the mask call itself.** Under DuckDB it is the key column handed over the Arrow C data interface and a bitmap back, which our in-process hash probe cannot show. Only skipping the mask saves it. That needs the host's say-so, since `DeltaReadOptions.RowMasks` promises only rows every mask keeps, and `Offset`/`Limit` rely on that. One shape: a per-mask opt-in meaning "the host rechecks these rows", honoured only without an offset or limit. Build it once the host measures how much of Q13's time the mask call takes.
 
 The one-pass gather of a dense selection (about 100 ms and 650 MB here) is a separate cost, paid by exact filters too: a copy by runs of kept rows, rather than by index, would cut it.
