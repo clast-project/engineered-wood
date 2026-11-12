@@ -16,9 +16,16 @@ namespace EngineeredWood.DeltaLake.Benchmarks.Rf502;
 /// ranged GETs would. Writes and listing go straight through.
 /// </summary>
 internal sealed class SimulatedObjectStore(
-    ITableFileSystem inner, TimeSpan latency, long bytesPerSecond, int preferredConcurrentReads = 4) : ITableFileSystem
+    ITableFileSystem inner, TimeSpan latency, long bytesPerSecond, int preferredConcurrentReads = 4)
+    : ITableFileSystem, IReadConcurrencyHint
 {
     private readonly int _preferred = preferredConcurrentReads;
+
+    /// <summary>
+    /// The scan's window, as <c>S3TableFileSystem</c> reports it: a Delta scan sizes its reads in flight from the file
+    /// system, not the file (#840 review round 2).
+    /// </summary>
+    public int? PreferredConcurrentReads => _preferred;
 
     public TimeSpan Latency { get; } = latency;
 

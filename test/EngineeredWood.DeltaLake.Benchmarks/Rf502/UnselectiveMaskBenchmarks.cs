@@ -48,8 +48,7 @@ public class UnselectiveMaskBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        if (!Directory.Exists(Path.Combine(TableRoot, "_delta_log")))
-            Build(TableRoot).GetAwaiter().GetResult();
+        EnsureTable();
 
         _table = DeltaTable.OpenAsync(new LocalTableFileSystem(TableRoot), new DeltaTableOptions { MaxConcurrentReads = 4 })
             .AsTask().GetAwaiter().GetResult();
@@ -99,6 +98,19 @@ public class UnselectiveMaskBenchmarks
         }
 
         return rows;
+    }
+
+    /// <summary>
+    /// Builds the table unless it holds a commit: an interrupted build leaves an empty <c>_delta_log</c> behind, which
+    /// is removed and built again (#840 review round 2).
+    /// </summary>
+    internal static void EnsureTable()
+    {
+        if (Rg612.RowGroupUnitScanBenchmarks.HasCommit(TableRoot))
+            return;
+        if (Directory.Exists(TableRoot))
+            Directory.Delete(TableRoot, recursive: true);
+        Build(TableRoot).GetAwaiter().GetResult();
     }
 
     internal static async Task Build(string root)

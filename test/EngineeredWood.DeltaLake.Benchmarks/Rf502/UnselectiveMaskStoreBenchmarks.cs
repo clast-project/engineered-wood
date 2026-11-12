@@ -37,9 +37,8 @@ public class UnselectiveMaskStoreBenchmarks
     [GlobalSetup]
     public void Setup()
     {
+        UnselectiveMaskBenchmarks.EnsureTable();
         string root = UnselectiveMaskBenchmarks.TableRoot;
-        if (!Directory.Exists(Path.Combine(root, "_delta_log")))
-            UnselectiveMaskBenchmarks.Build(root).GetAwaiter().GetResult();
 
         SimulatedObjectStore.BeginHighResolutionTimers();
         var store = new SimulatedObjectStore(
