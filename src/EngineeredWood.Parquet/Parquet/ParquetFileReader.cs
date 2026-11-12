@@ -537,9 +537,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// ran serially at fetch-plus-decode per row group. A read of some rows only fetches the pages it needs, as
     /// it decodes them, and so does a read with a chunk too large to fetch in one buffer
     /// (<see cref="TryPrefetch"/>).</item>
-    /// <item>The first batch reserves the row group's footer size (<see cref="PlannedBytes"/>), grown by how far
-    /// decoded row groups have exceeded theirs so far (<paramref name="growth"/>). Later batches of the same row
-    /// group reserve the largest batch it has produced.</item>
+    /// <item>The first batch reserves its share (<see cref="FirstBatchBytes"/>) of the row group's estimated
+    /// decoded size (<see cref="DecodedBytes"/>), grown by how far decoded row groups have exceeded theirs so far
+    /// (<paramref name="growth"/>). Later batches of the same row group reserve the largest batch it has
+    /// produced.</item>
     /// </list>
     /// </summary>
     internal async IAsyncEnumerable<PositionedRecordBatch> ReadPlannedAsync(
@@ -553,8 +554,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-        var (uncompressed, compressed) = PlannedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges);
-        reservation.SetInitialEstimate(growth.Apply(uncompressed));
+        var (_, compressed) = PlannedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges);
+        long planned = DecodedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges);
+        reservation.SetInitialEstimate(
+            FirstBatchBytes(growth.Apply(planned), metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges));
 
         long decoded = 0;
         int batches = 0;
@@ -598,7 +601,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // decoded whole, then sliced; a flat run shared by the batches that slice it) each count the whole
         // buffers they share, so summing them would count the same memory many times over.
         if (batches == 1)
-            growth.Observe(uncompressed, decoded);
+            growth.Observe(planned, decoded);
     }
 
     /// <summary>Whether <paramref name="plan"/> reads every row of its group: no ranges, or the one range of
@@ -662,11 +665,103 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// How much larger decoded batches have come out than their row group's Parquet uncompressed size, across
-    /// the row groups of one parallel read: the largest ratio seen, never below 1. Parquet's uncompressed size
-    /// is close to the Arrow size for plain data and an UNDERestimate for dictionary-encoded strings, so without
-    /// this every row group would reserve too little before its decode, not only the first. Shared by the
-    /// read's producers, hence the lock.
+    /// What the read of <paramref name="columnNames"/> in <paramref name="rowGroup"/> will decode to, in bytes of
+    /// Arrow buffers, before anything is read: the reservation for its first batch (#829). The footer's
+    /// uncompressed size measures ENCODED pages, so it falls far short of the decoded size wherever an encoding
+    /// shrinks the values: a dictionary- or run-length-encoded int64 column of 788K rows was 0.3 MiB in the
+    /// footer and 6 MiB decoded. A whole first wave of a wide window reserved that little, decoded at once, and
+    /// overran the budget several times over. So each flat column is sized by what Arrow will hold:
+    /// <list type="bullet">
+    /// <item>a fixed-width type, its width times the rows (exact);</item>
+    /// <item>strings and binary, their offsets or views from the rows, plus the footer's uncompressed size for
+    /// the bytes themselves (close for plain data, short for a dictionary, which <see cref="DecodedGrowth"/>
+    /// then learns);</item>
+    /// <item>anything else, the footer's uncompressed size;</item>
+    /// </list>
+    /// plus a validity bitmap for a column that may be null, and never less than the footer's size. Rows are the
+    /// ones <paramref name="ranges"/> keeps. A read with a nested column is decoded whole and then sliced, and is
+    /// sized by the footer as before (<see cref="PlannedBytes"/>).
+    /// </summary>
+    internal long DecodedBytes(
+        RowGroup rowGroup, SchemaDescriptor schema, IReadOnlyList<string>? columnNames, IReadOnlyList<RowRange>? ranges)
+    {
+        var (columns, chunks) = ResolveColumns(schema, rowGroup, columnNames);
+        for (int c = 0; c < columns.Count; c++)
+        {
+            if (columns[c].Path.Count > 1 || columns[c].MaxRepetitionLevel > 0)
+                return PlannedBytes(rowGroup, schema, columnNames, ranges).Uncompressed;
+        }
+
+        long rows = KeptRows(rowGroup, ranges);
+        double share = rowGroup.NumRows > 0 ? (double)rows / rowGroup.NumRows : 1.0;
+
+        long total = 0;
+        for (int c = 0; c < chunks.Count; c++)
+        {
+            if (chunks[c].MetaData is not { } meta)
+                continue;
+            long footer = (long)(meta.TotalUncompressedSize * share);
+            var type = ArrowSchemaConverter.ToArrowField(columns[c], _options).DataType;
+            long values = type switch
+            {
+                Apache.Arrow.Types.FixedWidthType fixedWidth => (rows * fixedWidth.BitWidth + 7) / 8,
+                Apache.Arrow.Types.StringType or Apache.Arrow.Types.BinaryType => (rows + 1) * sizeof(int) + footer,
+                Apache.Arrow.Types.LargeStringType or Apache.Arrow.Types.LargeBinaryType =>
+                    (rows + 1) * sizeof(long) + footer,
+                Apache.Arrow.Types.StringViewType or Apache.Arrow.Types.BinaryViewType => rows * 16 + footer,
+                _ => footer,
+            };
+            long validity = columns[c].MaxDefinitionLevel > 0 ? (rows + 7) / 8 : 0;
+            total += Math.Max(values + validity, footer);
+        }
+        return total;
+    }
+
+    /// <summary>The rows of <paramref name="rowGroup"/> that <paramref name="ranges"/> keeps; all of them for
+    /// null.</summary>
+    private static long KeptRows(RowGroup rowGroup, IReadOnlyList<RowRange>? ranges)
+    {
+        if (ranges is null)
+            return rowGroup.NumRows;
+        long rows = 0;
+        foreach (var r in ranges)
+            rows += r.End - r.Start;
+        return Math.Min(rows, rowGroup.NumRows);
+    }
+
+    /// <summary>
+    /// The reservation for a read's first batch, from <paramref name="groupBytes"/>, what the whole read decodes
+    /// to: the share of it one batch holds when <see cref="ParquetReadOptions.BatchSize"/> cuts the read into
+    /// several, and never more than <see cref="ParquetReadOptions.MaxBatchByteSize"/>. Reserving the whole group
+    /// for a batch a sixth its size held a wide window to a sixth of the reads the budget has room for (#829). A
+    /// read with a nested column decodes the whole group before slicing it, so it reserves the whole group.
+    /// </summary>
+    internal long FirstBatchBytes(
+        long groupBytes, RowGroup rowGroup, SchemaDescriptor schema, IReadOnlyList<string>? columnNames,
+        IReadOnlyList<RowRange>? ranges)
+    {
+        var (columns, _) = ResolveColumns(schema, rowGroup, columnNames);
+        foreach (var column in columns)
+        {
+            if (column.Path.Count > 1 || column.MaxRepetitionLevel > 0)
+                return groupBytes;
+        }
+
+        long bytes = groupBytes;
+        long rows = KeptRows(rowGroup, ranges);
+        if (_options.BatchSize is int batchSize && batchSize > 0 && rows > batchSize)
+            bytes = (long)(groupBytes * ((double)batchSize / rows));
+        if (_options.MaxBatchByteSize is long maxBytes && maxBytes > 0)
+            bytes = Math.Min(bytes, maxBytes);
+        return bytes;
+    }
+
+    /// <summary>
+    /// How much larger decoded batches have come out than their row group's estimate (<see cref="DecodedBytes"/>),
+    /// across the row groups of one parallel read: the largest ratio seen, never below 1. The estimate is exact
+    /// for fixed-width columns but takes a string column's bytes from the footer, which UNDERestimates
+    /// dictionary-encoded strings, so without this every row group would reserve too little before its decode,
+    /// not only the first. Shared by the read's producers, hence the lock.
     /// </summary>
     internal sealed class DecodedGrowth
     {

@@ -486,6 +486,122 @@ public class ParallelRowGroupReadTests : IDisposable
             ParquetFileReader.PlannedBytes(group, parquetSchema, null, quarter).Uncompressed);
     }
 
+    private const int EncodedRows = 100_000;
+
+    /// <summary>A key of few distinct values and a nullable double: both encode to a sliver of what they decode
+    /// to, so the footer's uncompressed size is far below the decoded batch.</summary>
+    private async Task<string> WriteEncodedAsync()
+    {
+        const int rows = EncodedRows;
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("key", Int64Type.Default, false))
+            .Field(new Field("price", DoubleType.Default, true))
+            .Build();
+        var keys = new Int64Array.Builder();
+        var prices = new DoubleArray.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            keys.Append(i / 1000);
+            if (i % 10 == 0)
+                prices.AppendNull();
+            else
+                prices.Append(i % 7 * 1.5);
+        }
+        string path = Path.Combine(_tempDir, "encoded.parquet");
+        using (var batch = new RecordBatch(schema, [keys.Build(), prices.Build()], rows))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+        return path;
+    }
+
+    private static async Task<long> DecodedSizeAsync(ParquetFileReader reader)
+    {
+        long decoded = 0;
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            using (batch)
+                decoded += EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(batch);
+        }
+        return decoded;
+    }
+
+    [Fact]
+    public async Task TheDecodedEstimate_CoversWhatDictionaryEncodedNumbersDecodeTo()
+    {
+        // #829: a column of few distinct values encodes to a sliver of its decoded size, so the footer's
+        // uncompressed size reserved a fraction of the first batch, and a wide window's first wave overran the
+        // budget. The estimate sizes fixed-width columns by their Arrow width instead.
+        const int rows = EncodedRows;
+        await using var file = new LocalRandomAccessFile(await WriteEncodedAsync());
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long decoded = await DecodedSizeAsync(reader);
+
+        long footer = ParquetFileReader.PlannedBytes(group, parquetSchema, null, null).Uncompressed;
+        long estimate = reader.DecodedBytes(group, parquetSchema, null, null);
+        Assert.True(footer < decoded / 4, $"the footer says {footer}, the batch decodes to {decoded}: no gap to test");
+        Assert.True(estimate >= decoded, $"estimates {estimate}, decodes to {decoded}");
+        Assert.True(estimate <= decoded * 11 / 10, $"estimates {estimate}, decodes to {decoded}: fixed widths are exact");
+
+        // Ranges scale it by the rows they keep.
+        RowRange[] quarter = [new RowRange(0, rows / 4)];
+        long scaled = reader.DecodedBytes(group, parquetSchema, null, quarter);
+        Assert.InRange(scaled, estimate / 4 - 64, estimate / 4 + 64);
+
+        // The first batch reserves its own share of the group, not the whole of it: with BatchSize cutting the
+        // group in four, a quarter; under MaxBatchByteSize, at most that.
+        Assert.Equal(estimate, reader.FirstBatchBytes(estimate, group, parquetSchema, null, null));
+        using var batched = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = rows / 4 });
+        Assert.InRange(batched.FirstBatchBytes(estimate, group, parquetSchema, null, null), estimate / 4 - 1, estimate / 4 + 1);
+        using var capped = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { MaxBatchByteSize = 1000 });
+        Assert.Equal(1000, capped.FirstBatchBytes(estimate, group, parquetSchema, null, null));
+    }
+
+    [Fact]
+    public async Task APlannedRead_WaitsForRoomForWhatItWillDecode_NotWhatTheFooterSays()
+    {
+        // #829: room for the footer's size, beside the front unit, is not room for the batch. A read that took it
+        // decoded at once and overran the budget by the difference; a wide window's whole first wave did.
+        await using var file = new LocalRandomAccessFile(await WriteEncodedAsync());
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var (footer, compressed) = ParquetFileReader.PlannedBytes(group, await reader.GetSchemaAsync(), null, null);
+        long decoded = await DecodedSizeAsync(reader);
+        Assert.True(footer * 2 < decoded, $"the footer says {footer}, the batch decodes to {decoded}: no gap to test");
+        ParquetFileReader.RowGroupPlan? plan = null;
+        await foreach (var p in reader.PlanRowGroupsAsync(null, null, null, default))
+            plan ??= p;
+
+        // Unit 0, the front, holds a batch; beside it there is room for unit 1's hold and twice its footer size,
+        // but not for the batch it will decode.
+        const long front = 1L << 20;
+        var budget = new EngineeredWood.Scans.ScanMemoryBudget(front + compressed + 2 * footer);
+        budget.SetHead(0);
+        await budget.ReserveAsync(0, front, CancellationToken.None);
+        var reservation = new EngineeredWood.Scans.ScanReservation(budget, 1);
+
+        await using var e = reader.ReadPlannedAsync(
+                plan!.Value, null, reservation, new ParquetFileReader.DecodedGrowth(), default)
+            .GetAsyncEnumerator();
+        var next = e.MoveNextAsync().AsTask();
+        await Task.WhenAny(next, Task.Delay(TimeSpan.FromSeconds(1)));
+        bool waited = !next.IsCompleted;
+
+        // The consumer takes unit 0's batch and moves on to unit 1, which as the front is admitted however large.
+        budget.Adjust(-front);
+        budget.SetHead(1);
+        Assert.Same(next, await Task.WhenAny(next, Task.Delay(TimeSpan.FromSeconds(30))));
+        Assert.True(waited, "the read should wait for room for its decoded size");
+        Assert.True(await next);
+        e.Current.Batch.Dispose();
+        Assert.False(await e.MoveNextAsync());
+    }
+
     [Fact]
     public async Task APlannedRead_ReservesForItsRawBatches_WhateverTheCallerDoesWithThem()
     {
