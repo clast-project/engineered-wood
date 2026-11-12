@@ -5,7 +5,8 @@ Reads build output on stdin; prints each removed line as file(line): name, for m
 import re
 import sys
 
-pattern = re.compile(r"^(?P<file>[A-Za-z]:[^(]+)\((?P<line>\d+),\d+\): error CS0103: The name '(?P<name>\w+)' does not exist")
+# Any path up to the (line,column) suffix: C:\... on Windows, /home/... elsewhere (review round 2).
+pattern = re.compile(r"^(?P<file>.+?)\((?P<line>\d+),\d+\): error CS0103: The name '(?P<name>\w+)' does not exist")
 hits = {}
 for raw in sys.stdin:
     m = pattern.match(raw.strip())

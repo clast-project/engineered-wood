@@ -135,6 +135,9 @@ foreach (var tree in trees)
         if (body is null)
             continue;
 
+        // Mentions count only after the span's last read, so a keep-alive placed before a stored span is read does not
+        // pass for protection (review round 2).
+        int end = LastRead(site, body, model);
         bool dead;
         if (ownerSymbol is null)
         {
@@ -148,10 +151,15 @@ foreach (var tree in trees)
         {
             // In fix mode a keep-alive is not a use: one placed too early must be found to be moved.
             bool fixing = Environment.GetEnvironmentVariable("SPANSCAN_FIX") == "1";
+            // A later mention keeps the owner alive only if it can run after the site on the same path: not in a
+            // branch exclusive with the site's (the other side of an if/else, ?: or switch; review round 2). Within a
+            // loop, a mention after the site runs later in the same iteration, so it counts; one before the site (the
+            // loop's condition, or earlier in its body) runs only on the next iteration, and is never counted.
             dead = !body.DescendantNodes().OfType<IdentifierNameSyntax>()
-                .Where(id => id.SpanStart >= site.Span.End && id.Identifier.ValueText == ownerName)
+                .Where(id => id.SpanStart >= end && id.Identifier.ValueText == ownerName)
                 .Where(id => !fixing || id.Ancestors().OfType<ExpressionStatementSyntax>().FirstOrDefault() is not { } s
                              || !IsKeepAliveOf(s, ownerName))
+                .Where(id => !Exclusive(site, id))
                 .Any(id => SymbolEqualityComparer.Default.Equals(model.GetSymbolInfo(id).Symbol, ownerSymbol));
             if (ownerKind == "this")
                 dead = false; // an instance method's `this` is the caller's problem
@@ -173,56 +181,6 @@ foreach (var tree in trees)
         {
             manual.Add($"{tree.FilePath}({line}): owner is a {ownerKind}");
             continue;
-        }
-
-        // A span stored in a span-typed local, directly or through an expression (MemoryMarshal.Cast, Slice), is read
-        // until that local's last use; so is any span local initialized from one of those.
-        var tracked = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
-        foreach (var declarator in site.Ancestors().OfType<VariableDeclaratorSyntax>().Take(1))
-        {
-            if (declarator.Initializer is { } init && init.Span.Contains(site.Span)
-                && model.GetDeclaredSymbol(declarator) is ILocalSymbol local && IsSpan(local.Type))
-            {
-                tracked.Add(local);
-            }
-        }
-
-        foreach (var assignment in site.Ancestors().OfType<AssignmentExpressionSyntax>().Take(1))
-        {
-            if (assignment.Right.Span.Contains(site.Span)
-                && model.GetSymbolInfo(assignment.Left).Symbol is ILocalSymbol local && IsSpan(local.Type))
-            {
-                tracked.Add(local);
-            }
-        }
-
-        bool grew = tracked.Count > 0;
-        while (grew)
-        {
-            grew = false;
-            foreach (var declarator in body.DescendantNodes().OfType<VariableDeclaratorSyntax>())
-            {
-                if (declarator.Initializer is not { } init
-                    || model.GetDeclaredSymbol(declarator) is not ILocalSymbol local || !IsSpan(local.Type)
-                    || tracked.Contains(local))
-                {
-                    continue;
-                }
-
-                if (init.DescendantNodes().OfType<IdentifierNameSyntax>()
-                    .Any(id => model.GetSymbolInfo(id).Symbol is ILocalSymbol l && tracked.Contains(l)))
-                {
-                    tracked.Add(local);
-                    grew = true;
-                }
-            }
-        }
-
-        int end = site.Span.End;
-        foreach (var id in body.DescendantNodes().OfType<IdentifierNameSyntax>())
-        {
-            if (model.GetSymbolInfo(id).Symbol is ILocalSymbol l && tracked.Contains(l))
-                end = Math.Max(end, id.Span.End);
         }
 
         var key = (body, ownerSymbol);
@@ -324,6 +282,62 @@ foreach (var tree in trees)
 
 Console.Error.WriteLine($"{projectName}: {reported} sites");
 return 0;
+
+
+// Where the span the site takes is last read: the site itself, or the last use of a span local it is stored in,
+// directly or through an expression (MemoryMarshal.Cast, Slice), or of any span local initialized from one of those.
+static int LastRead(ExpressionSyntax site, SyntaxNode body, SemanticModel model)
+{
+    var tracked = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+    foreach (var declarator in site.Ancestors().OfType<VariableDeclaratorSyntax>().Take(1))
+    {
+        if (declarator.Initializer is { } init && init.Span.Contains(site.Span)
+            && model.GetDeclaredSymbol(declarator) is ILocalSymbol local && IsSpan(local.Type))
+        {
+            tracked.Add(local);
+        }
+    }
+
+    foreach (var assignment in site.Ancestors().OfType<AssignmentExpressionSyntax>().Take(1))
+    {
+        if (assignment.Right.Span.Contains(site.Span)
+            && model.GetSymbolInfo(assignment.Left).Symbol is ILocalSymbol local && IsSpan(local.Type))
+        {
+            tracked.Add(local);
+        }
+    }
+
+    bool grew = tracked.Count > 0;
+    while (grew)
+    {
+        grew = false;
+        foreach (var declarator in body.DescendantNodes().OfType<VariableDeclaratorSyntax>())
+        {
+            if (declarator.Initializer is not { } init
+                || model.GetDeclaredSymbol(declarator) is not ILocalSymbol local || !IsSpan(local.Type)
+                || tracked.Contains(local))
+            {
+                continue;
+            }
+
+            if (init.DescendantNodes().OfType<IdentifierNameSyntax>()
+                .Any(id => model.GetSymbolInfo(id).Symbol is ILocalSymbol l && tracked.Contains(l)))
+            {
+                tracked.Add(local);
+                grew = true;
+            }
+        }
+    }
+
+    int end = site.Span.End;
+    foreach (var id in body.DescendantNodes().OfType<IdentifierNameSyntax>())
+    {
+        if (model.GetSymbolInfo(id).Symbol is ILocalSymbol l && tracked.Contains(l))
+            end = Math.Max(end, id.Span.End);
+    }
+
+    return end;
+}
 
 static bool IsKeepAliveOf(ExpressionStatementSyntax statement, string name) =>
     statement.Expression is InvocationExpressionSyntax
@@ -444,6 +458,36 @@ static bool IsUsingLocal(ILocalSymbol local, SyntaxNode body)
             return true;
         if (declaration.Parent is UsingStatementSyntax us && us.Declaration == declaration)
             return true;
+    }
+
+    return false;
+}
+
+// Whether the two nodes sit in branches that exclude each other: the two sides of an if/else or a ?:, or two sections
+// of a switch statement, or two arms of a switch expression.
+static bool Exclusive(SyntaxNode a, SyntaxNode b)
+{
+    var ancestorsOfB = new HashSet<SyntaxNode>(b.AncestorsAndSelf());
+    SyntaxNode? childOfCommon = null;
+    foreach (var n in a.AncestorsAndSelf())
+    {
+        if (ancestorsOfB.Contains(n))
+        {
+            var branchOfA = childOfCommon;
+            var branchOfB = b.AncestorsAndSelf().FirstOrDefault(x => x.Parent == n);
+            return n switch
+            {
+                IfStatementSyntax ifs => branchOfA is not null && branchOfB is not null
+                    && ((branchOfA == ifs.Statement && branchOfB == ifs.Else) || (branchOfA == ifs.Else && branchOfB == ifs.Statement)),
+                ConditionalExpressionSyntax c => branchOfA is not null && branchOfB is not null
+                    && branchOfA != c.Condition && branchOfB != c.Condition && branchOfA != branchOfB,
+                SwitchStatementSyntax => branchOfA is SwitchSectionSyntax && branchOfB is SwitchSectionSyntax && branchOfA != branchOfB,
+                SwitchExpressionSyntax => branchOfA is SwitchExpressionArmSyntax && branchOfB is SwitchExpressionArmSyntax && branchOfA != branchOfB,
+                _ => false,
+            };
+        }
+
+        childOfCommon = n;
     }
 
     return false;

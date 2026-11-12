@@ -101,6 +101,7 @@ public class VortexZstdTests
                 Assert.Equal(Encoding.UTF8.GetBytes(row), b.GetBytes(i).ToArray());
             else
                 Assert.True(b.IsNull(i), $"row {i}");
+            GC.KeepAlive(b);
         }
     }
 

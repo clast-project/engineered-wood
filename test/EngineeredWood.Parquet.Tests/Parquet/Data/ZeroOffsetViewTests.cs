@@ -230,6 +230,7 @@ public class ZeroOffsetViewTests : IDisposable
                 AssertZeroOffsetThroughout(data.Children[0], length * fixedSize.ListSize);
                 break;
         }
+        GC.KeepAlive(data);
     }
 
     private async Task<byte[]> WriteAsync(string name, IArrowArray column) =>

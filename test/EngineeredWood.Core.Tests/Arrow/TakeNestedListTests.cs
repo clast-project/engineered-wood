@@ -100,6 +100,7 @@ public class TakeNestedListTests
         var offsets = MemoryMarshal.Cast<byte, int>(result.Data.Buffers[1].Span);
         for (int i = 0; i < result.Length; i++)
             Assert.True(offsets[i + 1] >= offsets[i], $"offset {i + 1} went backwards");
+        GC.KeepAlive(result);
     }
 
     [Fact]

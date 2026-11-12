@@ -21,7 +21,10 @@ Each line gives the site, the owner, and how the span is consumed where it is ta
 `length` mean no call runs between taking the span and reading it, so such sites are left alone.
 
 Its limits:
-- **Liveness is lexical.** An owner mentioned later on another path counts as alive.
+- **Liveness is lexical, with two refinements.** A mention counts only after the span's last read (a span stored in a
+  local is read until that local's last use), and not in a branch exclusive with the site's: the other side of an
+  `if`/`else` or `?:`, or another `switch` section or arm. Other paths are not followed, so a mention after a
+  `return` on another path still counts as alive.
 - **A captured variable is reported.** A lambda's captured local lives in a closure the running delegate
   references, so such reports are false positives.
 - **Ownership is not followed into callers.** A helper that reads spans off its parameter is reported even
@@ -74,6 +77,11 @@ dotnet build -c Release -f net10.0 2>&1 | python build/span-lifetime-scan/prune_
 
 # Two owners read in one statement can leave a repeated keep-alive: keep each name's last.
 python build/span-lifetime-scan/dedupe_runs.py test
+
+# Fix mode sees only the active branch of an #if, so a keep-alive it inserts there protects only the targets that
+# compile it. List every keep-alive inside a conditional branch, and move each one below its #endif unless the
+# code it protects exists only in that branch.
+python build/span-lifetime-scan/keepalive_in_if.py test
 ```
 
 Then rebuild every target framework, and read the diff. For a shared helper, rooting the array once at its

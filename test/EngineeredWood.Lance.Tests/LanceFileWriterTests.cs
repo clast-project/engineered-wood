@@ -665,14 +665,18 @@ public class LanceFileWriterTests
                 var fw = (FixedWidthType)a.Data.DataType;
                 Assert.Equal(32, fw.BitWidth);
                 var span = MemoryMarshal.Cast<byte, int>(a.Data.Buffers[1].Span.Slice(0, a.Length * 4));
-                return span.ToArray();
+                int[] values = span.ToArray();
+                GC.KeepAlive(a); // the span reads the array's buffer (#834)
+                return values;
             }
             long[] ReadLongs(IArrowArray a)
             {
                 var fw = (FixedWidthType)a.Data.DataType;
                 Assert.Equal(64, fw.BitWidth);
                 var span = MemoryMarshal.Cast<byte, long>(a.Data.Buffers[1].Span.Slice(0, a.Length * 8));
-                return span.ToArray();
+                long[] values = span.ToArray();
+                GC.KeepAlive(a); // the span reads the array's buffer (#834)
+                return values;
             }
 
             Assert.Equal(new[] { 0, 19000, 20000 }, ReadInts(await reader.ReadColumnAsync(0)));

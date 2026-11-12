@@ -118,8 +118,9 @@ to run it, and how its fix mode inserts `GC.KeepAlive` after the last read of th
 span into locals (`Cast`, `Slice`).
 
 Its limits, so that a clean run is not read as proof:
-- **Liveness is lexical.** An owner mentioned later on another path (in a `throw` after a `return`,
-  say) counts as alive.
+- **Liveness is lexical.** A mention counts only after the span's last read, and not in a branch
+  exclusive with the site's (the other side of an `if`/`else`, `?:` or `switch`). Beyond that, an owner
+  mentioned later on another path (in a `throw` after a `return`, say) counts as alive.
 - **A captured variable is reported.** A lambda's captured local lives in a closure the running
   delegate references, so it is alive. Such reports are false positives.
 - **A span indexed or measured where it is taken** (`array.ValueOffsets[i]`, `.Length`) is reported,

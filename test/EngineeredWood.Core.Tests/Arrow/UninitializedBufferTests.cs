@@ -206,6 +206,7 @@ public class UninitializedBufferTests
         {
             if (result.IsNull(i))
                 Assert.Equal(0L, raw[i]);
+            GC.KeepAlive(result);
         }
     }
 
