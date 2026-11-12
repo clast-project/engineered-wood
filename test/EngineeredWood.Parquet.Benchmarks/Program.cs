@@ -53,6 +53,12 @@ if (args.Length > 0 && args[0] == "rowgroup-parallel-ab")
     return;
 }
 
+if (args.Length > 0 && args[0] == "allfalse-ab")
+{
+    Environment.ExitCode = await AllFalsePruneAb.RunAsync(args);
+    return;
+}
+
 if (args.Length > 0 && args[0] == "fallback-ab")
 {
     Environment.ExitCode = await FallbackAnswerAb.RunAsync(args);
