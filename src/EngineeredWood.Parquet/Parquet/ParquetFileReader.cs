@@ -726,6 +726,34 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// The reservation for the first batch of a read of whole row groups, before one has been measured: the largest
+    /// first batch (<see cref="FirstBatchBytes"/> of <see cref="DecodedBytes"/>) of any row group the read decodes.
+    /// <paramref name="skipped"/>, given a row group's first row and row count, says whether the read skips it unread
+    /// (a deletion vector deleting it in full). For a host that reads the file through this reader but outside a
+    /// planned parallel read, such as Delta's change feed and compaction (#846): the footer's uncompressed size it
+    /// reserved before was 10-20x short for dictionary or run-length-encoded columns.
+    /// </summary>
+    internal async ValueTask<long> LargestFirstBatchBytesAsync(
+        IReadOnlyList<string>? columnNames, Func<long, long, bool>? skipped, CancellationToken cancellationToken)
+    {
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        long largest = 0;
+        long groupStart = 0;
+        foreach (var group in metadata.RowGroups)
+        {
+            long start = groupStart;
+            groupStart += group.NumRows;
+            if (skipped is not null && group.NumRows > 0 && skipped(start, group.NumRows))
+                continue;
+            long footer = PlannedBytes(group, schema, columnNames, null).Uncompressed;
+            long decoded = DecodedBytes(group, schema, columnNames, null);
+            largest = Math.Max(largest, FirstBatchBytes(decoded, footer, group, schema, columnNames, null));
+        }
+        return largest;
+    }
+
+    /// <summary>
     /// What <paramref name="rows"/> rows of the flat <paramref name="column"/> decode to in Arrow buffers, as
     /// <see cref="DecodedBytes"/> sizes them: <paramref name="encodedBytes"/> is the encoded size of the same rows,
     /// the floor and the size of anything not sized by type, and <paramref name="byteArrayBytes"/> the bytes of

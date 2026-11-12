@@ -563,6 +563,45 @@ public class ParallelRowGroupReadTests : IDisposable
             estimate / 4 - 1, estimate / 4 + 1);
     }
 
+    [Fact]
+    public async Task AWholeFileRead_ReservesItsLargestDecodedRowGroup()
+    {
+        // #846: a host reading the file whole (Delta's change feed, compaction) reserves its first batch before any
+        // is read: the largest row group's decoded estimate, not its footer size, and only over the row groups the
+        // read decodes.
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("key", Int64Type.Default, false)).Build();
+        string path = Path.Combine(_tempDir, "two-groups.parquet");
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            foreach (int rows in new[] { 1_000, 30_000, 4_000 })
+            {
+                var keys = new Int64Array.Builder();
+                for (int i = 0; i < rows; i++)
+                    keys.Append(i / 1000);
+                using var batch = new RecordBatch(schema, [keys.Build()], rows);
+                await writer.WriteRowGroupAsync(batch);
+            }
+            await writer.CloseAsync();
+        }
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var groups = (await reader.ReadMetadataAsync()).RowGroups;
+        Assert.Equal(3, groups.Count);
+        long footer = ParquetFileReader.PlannedBytes(groups[1], await reader.GetSchemaAsync(), null, null).Uncompressed;
+
+        Assert.Equal(30_000 * 8, await reader.LargestFirstBatchBytesAsync(null, null, default));
+        Assert.True(footer < 30_000 * 8 / 4, $"the footer says {footer}: no gap to test");
+        Assert.Equal(30_000 * 8, await reader.LargestFirstBatchBytesAsync(["key"], null, default));
+        // The middle group skipped unread (rows 1,000 to 31,000): the last group is the largest left.
+        Assert.Equal(4_000 * 8, await reader.LargestFirstBatchBytesAsync(
+            null, (start, rows) => start == 1_000 && rows == 30_000, default));
+        // A BatchSize cuts the first batch to its share of the group.
+        using var batched = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 3_000 });
+        Assert.Equal(Math.Max(3_000 * 8, footer), await batched.LargestFirstBatchBytesAsync(null, null, default));
+    }
+
     /// <summary>The reservation a reader makes for the first batch of row group 0 of <paramref name="path"/>,
     /// and the size of the first batch it actually decodes.</summary>
     private static async Task<(long Reserved, long FirstBatch)> FirstBatchAsync(string path, ParquetReadOptions options)

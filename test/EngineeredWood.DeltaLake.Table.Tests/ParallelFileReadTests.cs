@@ -1434,4 +1434,116 @@ public class ParallelFileReadTests : IDisposable
         Assert.Equal(skip, DeltaTable.NoTargetIn(new HashSet<long> { 20, 5, 10 })(first, count));
         Assert.True(DeltaTable.NoTargetIn(new HashSet<long>())(first, count));
     }
+
+    private const int RunLengthFiles = 8;
+    private const int RunLengthRows = 40_000;
+
+    private static readonly Apache.Arrow.Schema RunLengthSchema = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("k", Int64Type.Default, false))
+        .Field(new Field("v", Int64Type.Default, false))
+        .Build();
+
+    /// <summary>
+    /// Eight files of one row group each, whose two int64 columns hold three and five distinct values: they encode
+    /// to a dictionary and run lengths, a sliver of the 640 KB a file decodes to. Returns options reading the eight
+    /// at once under a budget of two batches, all of it drawn from <paramref name="shared"/>, and the largest raw
+    /// batch in the bytes the budget counts.
+    /// </summary>
+    private async Task<(DeltaTableOptions Options, long Largest)> CreateRunLengthTableAsync(
+        bool changeFeed, EngineeredWood.Memory.MemoryBudget shared)
+    {
+        var options = new DeltaTableOptions
+        {
+            ParquetWriteOptions = new ParquetWriteOptions { RowGroupMaxRows = RunLengthRows },
+            MaxConcurrentReads = 1,
+        };
+        await using var table = await DeltaTable.CreateAsync(
+            _fs, RunLengthSchema, options,
+            configuration: changeFeed ? new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" } : null);
+        for (int f = 0; f < RunLengthFiles; f++)
+        {
+            var k = new Int64Array.Builder();
+            var v = new Int64Array.Builder();
+            for (int r = 0; r < RunLengthRows; r++)
+            {
+                k.Append(r % 3);
+                v.Append((r + f) % 5);
+            }
+            await table.WriteAsync([new RecordBatch(RunLengthSchema, [k.Build(), v.Build()], RunLengthRows)]);
+        }
+
+        long largest = 0;
+        await foreach (var b in table.ReadAsync())
+        {
+            largest = Math.Max(largest, RollingDataFileWriter.EstimatedBytes(b));
+            b.Dispose();
+        }
+
+        // The premise: the footer's uncompressed size, which these reads used to reserve, is far short of it.
+        long footer = 0;
+        foreach (var add in table.CurrentSnapshot.ActiveFiles.Values)
+        {
+            await using var file = new LocalRandomAccessFile(Path.Combine(_tempDir, add.Path));
+            using var reader = new ParquetFileReader(file, ownsFile: false);
+            var meta = await reader.ReadMetadataAsync();
+            footer = Math.Max(footer, meta.RowGroups.Max(g => g.Columns.Sum(c => c.MetaData!.TotalUncompressedSize)));
+        }
+        Assert.True(footer < largest / 8, $"the footer says {footer}, a batch decodes to {largest}: no gap to test");
+
+        return (options with
+        {
+            MaxConcurrentReads = RunLengthFiles,
+            MaxBufferedReadBytes = 2 * largest,
+            MemoryBudget = shared,
+        }, largest);
+    }
+
+    /// <summary>
+    /// #846: the change feed reads each file whole, and reserved its first batch by the footer's uncompressed size.
+    /// For run-length-encoded columns that is a sliver of the batch, so a window of eight took all eight files under
+    /// a budget of two batches and decoded them at once. Reserving what a file decodes to holds the feed to its
+    /// budget, plus the one batch the front file may run over by.
+    /// </summary>
+    [Fact]
+    public async Task TheChangeFeed_ReservesWhatAFileDecodesTo()
+    {
+        var shared = new EngineeredWood.Memory.MemoryBudget(long.MaxValue);
+        var (options, largest) = await CreateRunLengthTableAsync(changeFeed: true, shared);
+        await using var table = await DeltaTable.OpenAsync(_fs, options);
+
+        int rows = 0;
+        long largestOut = 0;
+        await foreach (var b in table.ReadChangesAsync(
+            new DeltaChangeReadOptions { StartVersion = 1, EndVersion = RunLengthFiles }))
+        {
+            rows += b.Length;
+            largestOut = Math.Max(largestOut, RollingDataFileWriter.EstimatedBytes(b));
+            b.Dispose();
+            await Task.Delay(20);
+        }
+
+        Assert.Equal(RunLengthFiles * RunLengthRows, rows);
+        // The budget holds the feed's batches, which carry its three columns too, so each is charged more than the
+        // raw batch it reserved and none fits the budget alone: a few are held at once, not all eight (reserving by
+        // the footer held all eight, 13.4 MB here).
+        Assert.InRange(shared.PeakBytes, 1, 4 * largestOut);
+        Assert.Equal(0, shared.UsedBytes);
+    }
+
+    /// <summary>#846: compaction's reads of its source files reserved by the footer as well (see
+    /// <see cref="TheChangeFeed_ReservesWhatAFileDecodesTo"/>).</summary>
+    [Fact]
+    public async Task Compaction_ReservesWhatAFileDecodesTo()
+    {
+        var shared = new EngineeredWood.Memory.MemoryBudget(long.MaxValue);
+        var (options, largest) = await CreateRunLengthTableAsync(changeFeed: false, shared);
+        await using var table = await DeltaTable.OpenAsync(_fs, options);
+
+        long? version = await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+
+        Assert.NotNull(version);
+        Assert.Single(table.CurrentSnapshot.ActiveFiles);
+        Assert.InRange(shared.PeakBytes, 1, 3 * largest);
+        Assert.Equal(0, shared.UsedBytes);
+    }
 }
