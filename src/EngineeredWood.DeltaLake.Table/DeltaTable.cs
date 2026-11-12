@@ -5239,6 +5239,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 WholeBatchLiveShare = WholeBatchLiveShare,
                 FusesAnswers = FusesAnswers,
+                TwoPassReads = TwoPassReads,
                 OnProvenRowGroup = CountProvenRowGroup,
             };
 
@@ -13466,6 +13467,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 WholeBatchLiveShare = WholeBatchLiveShare,
                 FusesAnswers = FusesAnswers,
+                TwoPassReads = TwoPassReads,
                 OnProvenRowGroup = CountProvenRowGroup,
             };
 
@@ -14016,6 +14018,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// the tests' oracle.
     /// </summary>
     internal bool FusesAnswers { get; set; } = true;
+
+    /// <summary>
+    /// <see cref="ParquetFileReader.TwoPassReads"/> for this table's data-file reads: true or false forces two-pass
+    /// selected reads on or off, null (the default) lets the reader decide. For the A/B benchmarks (#830).
+    /// </summary>
+    internal bool? TwoPassReads { get; set; }
 
     /// <summary>One answer for every row of a batch.</summary>
     private static BooleanArray Repeat(bool answer, int length)

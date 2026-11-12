@@ -1486,3 +1486,54 @@ The prune needs three things together, and the common case lacks one:
 - **Values clustered by row group,** so that whole groups miss.
 
 What fits is a host mask over a low-cardinality column whose values are local to row groups: data sorted, clustered or Z-ordered on a category-like column. Build it when a host needs that case. It is a check before a group's data pages are read, plus the rule about earlier predicates that can raise, and `allfalse-ab` is ready to measure it.
+
+## 33. An unselective host mask, measured, and the switch to one pass not built (#830, 2026-11-11)
+
+#830: in cmettler's DuckDB benchmark (TPC-H SF10, local S3), every query got faster or stayed level with runtime-filter masks on, except Q13: 1.83 s to 2.09 s. Q13 is `customer LEFT OUTER JOIN orders`, so its `o_custkey` mask keeps every order. The issue listed three costs a mask that drops nothing still pays: the two-pass read, the mask call, and the gather of the kept rows.
+
+### Measured
+
+Two benchmarks share one orders-shaped table: 8M rows, 2 files of 4 row groups of 1M rows. `orderkey` is sorted, `custkey` is random over 1.5M values (so its dictionary falls back to PLAIN), and `comment` is a short string. The scan returns all three, as Q13's does. The mask is a value-wise hash-set probe of `custkey` that keeps a set share of the rows.
+- `UnselectiveMaskBenchmarks`: a local file, with two passes forced on or off (`DeltaTable.TwoPassReads`, internal).
+- `UnselectiveMaskStoreBenchmarks`: the same scan over `SimulatedObjectStore`. The files report `PreferredConcurrentReads`, so the scan takes two passes by default as on S3. Each request waits 5 or 25 ms plus its bytes at 200 MB/s, and the ranges of one request wait concurrently.
+
+i9-12900K, net10.0, warm cache. This machine was noisy: two runs of identical configurations differ by up to 60 ms locally and 90 ms over the store. The differences below are the ones that held across runs.
+
+Local file, ms (first run):
+
+| Mask keeps | One pass | Two passes |
+|---|---|---|
+| no mask | 269 | 208 |
+| 100% | 337 | 389 |
+| 99% | 430 | 401 |
+| 95% | 436 | 368 |
+| 80% | 439 | 361 |
+
+- **The mask call: about 70 ms**, the 100% one-pass row against no mask. Nothing is dropped there, so nothing is gathered; this is the cost of asking the mask over 8M rows.
+- **The one-pass gather: about 100 ms and 650 MB allocated** from 80% to 99% kept. A batch the mask keeps whole is returned as it is, but one row dropped means every column is gathered by index.
+- **Two passes over a group kept whole: 30-50 ms more than one pass** locally. The second pass decodes everything the first did not, after it (§23).
+
+### Built and measured: one pass once row groups come back whole
+
+The cost two passes add when nothing is dropped suggested a switch. A scan-wide record of whether each finished row group kept every row would read the next row groups in one pass after two whole ones in a row, and go back to two at the first row group that drops a row. The record has to span the scan, not the file: with 4 reads in flight and 4 row groups per file, a file's row groups have all started before its first one ends. "Kept every row" rather than "most rows", since a one-pass read at 99% gathers and is slower than two passes (table above).
+
+It worked as designed: the rows did not change, and row groups short of whole kept two passes. Locally it saved about 5% at 100% kept, inside the noise (medians 376 ms with two passes, 359 adaptive, 349 one pass). But a local mask scan takes one pass by default anyway, so the switch would only ever fire on an object store, and there it lost.
+
+Simulated store, mask keeping 100%, ms:
+
+| Read | 5 ms latency | 25 ms latency |
+|---|---|---|
+| two passes (default) | 472 ±26 | 598 ±22 |
+| adaptive | 563 ±21 | 661 ±16 |
+| one pass forced | 610 ±55 | 715 ±61 |
+| no mask | 481 | 582 |
+
+Every variant made the same 26 requests per scan, so the difference is not round trips. Over a store, the two-pass read requests a row group's bytes up front and decodes the predicate column while the rest arrive; the second decode pass hides behind the I/O. One pass did not overlap as well. The simulation returns all of a request's ranges at once, which a real S3 client may not, but the direction is clear enough.
+
+### Decided: not built
+
+The switch was reverted. Two findings stand:
+- **Over an object store, a mask that keeps every row costs nothing against no mask** (472 against 481 ms, inside the noise). The two-pass read is not what made Q13 slower on S3.
+- **What remains is the mask call itself.** Under DuckDB it is the key column handed over the Arrow C data interface and a bitmap back, which our in-process hash probe cannot show. Only skipping the mask saves it. That needs the host's say-so, since `DeltaReadOptions.RowMasks` promises only rows every mask keeps, and `Offset`/`Limit` rely on that. One shape: a per-mask opt-in meaning "the host rechecks these rows", honoured only without an offset or limit. Build it once the host measures how much of Q13's time the mask call takes.
+
+The one-pass gather of a dense selection (about 100 ms and 650 MB here) is a separate cost, paid by exact filters too: a copy by runs of kept rows, rather than by index, would cut it.
