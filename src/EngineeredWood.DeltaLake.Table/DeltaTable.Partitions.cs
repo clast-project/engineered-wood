@@ -156,9 +156,11 @@ public sealed partial class DeltaTable
     /// <see cref="DeltaScanUnits.NextAsync"/> to whoever asks, in plan order. Same files, pruning, row masks and
     /// metadata columns as <see cref="ReadAsync"/>; the caller decides how many units it reads at once. Offset and
     /// limit are not supported here.
+    /// <para><paramref name="readers"/>: how many units the caller reads at once, if it knows. The planner then opens
+    /// that many files ahead instead of the table's read concurrency, so that readers do not wait for footers.</para>
     /// </summary>
     public async ValueTask<DeltaScanUnits> OpenScanUnitsAsync(
-        DeltaReadOptions? options, CancellationToken cancellationToken = default)
+        DeltaReadOptions? options, CancellationToken cancellationToken = default, int? readers = null)
     {
         ThrowIfDisposed();
         options ??= new DeltaReadOptions();
@@ -191,7 +193,8 @@ public sealed partial class DeltaTable
         var includedFiles = included.ConvertAll(i => i.File);
 
         var planner = new SharedScanUnits(
-            ct => PlanScanUnitsAsync(snapshot, options, includedFiles, lookahead: Math.Max(1, EffectiveConcurrentReads), ct));
+            ct => PlanScanUnitsAsync(snapshot, options, includedFiles,
+                                     lookahead: Math.Max(1, readers ?? EffectiveConcurrentReads), ct));
 
         IAsyncEnumerable<RecordBatch> Read(ScanUnit unit, CancellationToken ct)
             => ReadScanUnitAsync(unit, scan, included[unit.File].Ordinal, ScanReservation.None, growth: null, ct);
