@@ -48,6 +48,82 @@ public sealed class DeltaScanPartitions : IAsyncDisposable
     public ValueTask DisposeAsync() => _dispose();
 }
 
+/// <summary>
+/// A scan read by its units (<see cref="DeltaTable.OpenScanUnitsAsync"/>): <see cref="NextAsync"/> hands out the next
+/// planned unit to whichever caller asks, so the caller decides how many it reads at once. Dispose after the units:
+/// it closes the files the planner opened ahead.
+/// </summary>
+public sealed class DeltaScanUnits : IAsyncDisposable
+{
+    private readonly DeltaTable.SharedScanUnits _planner;
+    private readonly Func<DeltaTable.ScanUnit, CancellationToken, IAsyncEnumerable<RecordBatch>> _read;
+
+    internal DeltaScanUnits(DeltaTable.SharedScanUnits planner,
+                            Func<DeltaTable.ScanUnit, CancellationToken, IAsyncEnumerable<RecordBatch>> read)
+    {
+        _planner = planner;
+        _read = read;
+    }
+
+    /// <summary>The next unit in plan order, or null when the scan has none left. Safe to call concurrently.</summary>
+    public async ValueTask<DeltaScanUnit?> NextAsync(CancellationToken cancellationToken = default)
+    {
+        var (got, unit, number) = await _planner.NextAsync(cancellationToken).ConfigureAwait(false);
+        return got ? new DeltaScanUnit(number, unit, _read) : null;
+    }
+
+    /// <inheritdoc />
+    public ValueTask DisposeAsync() => _planner.DisposeAsync();
+}
+
+/// <summary>
+/// One unit of a <see cref="DeltaScanUnits"/>: its number in plan order (file after file, row group after row group)
+/// and its rows. Read it once; disposing an unread unit releases what the planner holds for it.
+/// </summary>
+public sealed class DeltaScanUnit : IAsyncDisposable
+{
+    private readonly DeltaTable.ScanUnit _unit;
+    private readonly Func<DeltaTable.ScanUnit, CancellationToken, IAsyncEnumerable<RecordBatch>> _read;
+    private int _released;
+
+    internal DeltaScanUnit(long number, DeltaTable.ScanUnit unit, Func<DeltaTable.ScanUnit, CancellationToken, IAsyncEnumerable<RecordBatch>> read)
+    {
+        Number = number;
+        _unit = unit;
+        _read = read;
+    }
+
+    /// <summary>The unit's number in plan order.</summary>
+    public long Number { get; }
+
+    /// <summary>The unit's rows.</summary>
+    public async IAsyncEnumerable<RecordBatch> ReadAsync([EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            await foreach (var batch in _read(_unit, cancellationToken).ConfigureAwait(false))
+                yield return batch;
+        }
+        finally
+        {
+            Release();
+        }
+    }
+
+    private void Release()
+    {
+        if (Interlocked.Exchange(ref _released, 1) == 0)
+            _unit.Read.Release();
+    }
+
+    /// <inheritdoc />
+    public ValueTask DisposeAsync()
+    {
+        Release();
+        return default;
+    }
+}
+
 public sealed partial class DeltaTable
 {
     /// <summary>
@@ -59,12 +135,35 @@ public sealed partial class DeltaTable
     public async ValueTask<DeltaScanPartitions> OpenPartitionsAsync(
         DeltaReadOptions? options, int partitions, CancellationToken cancellationToken = default)
     {
-        ThrowIfDisposed();
         if (partitions < 1)
             throw new ArgumentOutOfRangeException(nameof(partitions), partitions, "Must be at least 1.");
+        var units = await OpenScanUnitsAsync(options, cancellationToken).ConfigureAwait(false);
+
+        async IAsyncEnumerable<DeltaScanBatch> Partition(int index, [EnumeratorCancellation] CancellationToken ct)
+        {
+            while (await units.NextAsync(ct).ConfigureAwait(false) is { } unit)
+            {
+                await foreach (var batch in unit.ReadAsync(ct).ConfigureAwait(false))
+                    yield return new DeltaScanBatch(unit.Number, batch);
+            }
+        }
+
+        return new DeltaScanPartitions(partitions, Partition, units.DisposeAsync);
+    }
+
+    /// <summary>
+    /// Opens a scan as its planned units (one row group of one file each), handed out one at a time by
+    /// <see cref="DeltaScanUnits.NextAsync"/> to whoever asks, in plan order. Same files, pruning, row masks and
+    /// metadata columns as <see cref="ReadAsync"/>; the caller decides how many units it reads at once. Offset and
+    /// limit are not supported here.
+    /// </summary>
+    public async ValueTask<DeltaScanUnits> OpenScanUnitsAsync(
+        DeltaReadOptions? options, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
         options ??= new DeltaReadOptions();
         if (options.Offset != 0 || options.Limit is not null)
-            throw new ArgumentException("A partitioned scan takes no offset or limit.", nameof(options));
+            throw new ArgumentException("A scan read by units takes no offset or limit.", nameof(options));
 
         var snapshot = ResolveReadSnapshot(options)
                        ?? await GetSnapshotAtVersionAsync(options.AtVersion!.Value, cancellationToken).ConfigureAwait(false);
@@ -94,37 +193,17 @@ public sealed partial class DeltaTable
         var planner = new SharedScanUnits(
             ct => PlanScanUnitsAsync(snapshot, options, includedFiles, lookahead: Math.Max(1, EffectiveConcurrentReads), ct));
 
-        async IAsyncEnumerable<DeltaScanBatch> Partition(int index, [EnumeratorCancellation] CancellationToken ct)
-        {
-            while (true)
-            {
-                var (got, unit, number) = await planner.NextAsync(ct).ConfigureAwait(false);
-                if (!got)
-                    yield break;
-                try
-                {
-                    await foreach (var batch in ReadScanUnitAsync(
-                                       unit, scan, included[unit.File].Ordinal, ScanReservation.None, growth: null, ct)
-                                       .ConfigureAwait(false))
-                    {
-                        yield return new DeltaScanBatch(number, batch);
-                    }
-                }
-                finally
-                {
-                    unit.Read.Release();
-                }
-            }
-        }
+        IAsyncEnumerable<RecordBatch> Read(ScanUnit unit, CancellationToken ct)
+            => ReadScanUnitAsync(unit, scan, included[unit.File].Ordinal, ScanReservation.None, growth: null, ct);
 
-        return new DeltaScanPartitions(partitions, Partition, planner.DisposeAsync);
+        return new DeltaScanUnits(planner, Read);
     }
 
     /// <summary>
     /// The planner's units handed out one at a time to whichever partition asks, each with its number in plan order.
     /// The planner itself stays serial (it is enumerated under a gate); only the reads run concurrently.
     /// </summary>
-    private sealed class SharedScanUnits : IAsyncDisposable
+    internal sealed class SharedScanUnits : IAsyncDisposable
     {
         private readonly SemaphoreSlim _gate = new(1, 1);
         private readonly CancellationTokenSource _cts = new();

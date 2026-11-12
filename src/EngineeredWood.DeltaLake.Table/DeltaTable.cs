@@ -6923,7 +6923,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// files the scan reads), or, through the codec seam (<see cref="Plan"/> null), the whole file. Holds one
     /// share of the file's <see cref="DataFileRead"/>, which whoever ends the unit releases.
     /// </summary>
-    private readonly record struct ScanUnit(int File, DataFileRead Read, ParquetFileReader.RowGroupPlan? Plan);
+    internal readonly record struct ScanUnit(int File, DataFileRead Read, ParquetFileReader.RowGroupPlan? Plan);
 
     /// <summary>
     /// The units of a scan of <paramref name="files"/>, file after file and, within a file, row group after row
@@ -13178,7 +13178,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// safe to decode different row groups from at once. Reference-counted: whoever holds a share releases it,
     /// and the last release closes the file.
     /// </summary>
-    private sealed class DataFileRead : IDisposable
+    internal sealed class DataFileRead : IDisposable
     {
         /// <summary>What reshaping adds to this file's batches in a scan (<see cref="ReconcileAddedBytesPerRow"/>),
         /// once its first unit has asked; null before. Every unit of the file asks, and two at once both compute the
