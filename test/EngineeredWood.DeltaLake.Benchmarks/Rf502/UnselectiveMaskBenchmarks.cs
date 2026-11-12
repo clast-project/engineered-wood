@@ -101,12 +101,17 @@ public class UnselectiveMaskBenchmarks
     }
 
     /// <summary>
-    /// Builds the table unless it holds a commit: an interrupted build leaves an empty <c>_delta_log</c> behind, which
-    /// is removed and built again (#840 review round 2).
+    /// Written beside the table once <see cref="Build"/> has committed every file. The build commits once per file, so
+    /// a build interrupted part way leaves a table that has commits but not all its rows (#840 review rounds 2-3).
+    /// </summary>
+    private static string CompleteMarker => Path.Combine(TableRoot, "_build_complete");
+
+    /// <summary>
+    /// Builds the table unless a finished build is there; a partial one is removed and built again.
     /// </summary>
     internal static void EnsureTable()
     {
-        if (Rg612.RowGroupUnitScanBenchmarks.HasCommit(TableRoot))
+        if (File.Exists(CompleteMarker))
             return;
         if (Directory.Exists(TableRoot))
             Directory.Delete(TableRoot, recursive: true);
@@ -146,5 +151,8 @@ public class UnselectiveMaskBenchmarks
 
             await table.WriteAsync([new RecordBatch(Schema, [orderKeys.Build(), custKeys.Build(), comments.Build()], rows)]);
         }
+
+        // Last, so that it is there only when every file is.
+        File.WriteAllText(Path.Combine(root, "_build_complete"), $"{Files * GroupsPerFile * RowsPerGroup} rows");
     }
 }
