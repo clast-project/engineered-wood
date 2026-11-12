@@ -544,10 +544,10 @@ public sealed partial class ParquetFileReader
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-        var (_, compressed) = PlannedBytes(metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges);
+        var (footer, compressed) = PlannedBytes(metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges);
         long planned = DecodedBytes(metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges);
-        reservation.SetInitialEstimate(
-            FirstBatchBytes(growth.Apply(planned), metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges));
+        reservation.SetInitialEstimate(FirstBatchBytes(
+            growth.Apply(planned), footer, metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges));
 
         PrefetchedFile? filterIo = null, outputIo = null;
         IAsyncEnumerator<SelectedRecordBatch>? e = null;

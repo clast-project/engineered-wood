@@ -554,10 +554,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-        var (_, compressed) = PlannedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges);
+        var (footer, compressed) = PlannedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges);
         long planned = DecodedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges);
-        reservation.SetInitialEstimate(
-            FirstBatchBytes(growth.Apply(planned), metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges));
+        reservation.SetInitialEstimate(FirstBatchBytes(
+            growth.Apply(planned), footer, metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges));
 
         long decoded = 0;
         int batches = 0;
@@ -731,14 +731,24 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
     /// <summary>
     /// The reservation for a read's first batch, from <paramref name="groupBytes"/>, what the whole read decodes
-    /// to: the share of it one batch holds when <see cref="ParquetReadOptions.BatchSize"/> cuts the read into
-    /// several, and never more than <see cref="ParquetReadOptions.MaxBatchByteSize"/>. Reserving the whole group
-    /// for a batch a sixth its size held a wide window to a sixth of the reads the budget has room for (#829). A
-    /// read with a nested column decodes the whole group before slicing it, so it reserves the whole group.
+    /// to, and <paramref name="footerBytes"/>, the footer's uncompressed size of the same read: the share of the
+    /// group's rows one batch holds when the read is cut into several. Reserving the whole group for a batch a
+    /// sixth its size held a wide window to a sixth of the reads the budget has room for (#829).
+    /// <list type="bullet">
+    /// <item><see cref="ParquetReadOptions.BatchSize"/> cuts by rows.</item>
+    /// <item><see cref="ParquetReadOptions.MaxBatchByteSize"/> cuts by the pages' ENCODED uncompressed sizes, as
+    /// the footer counts them, so its share is the limit over <paramref name="footerBytes"/>: a dictionary-encoded
+    /// group under the limit is read in one batch however large it decodes (#845 review).</item>
+    /// </list>
+    /// A batch is a slice of whole decoded pages and holds their buffers, so a page larger than the batch makes the
+    /// batch larger than its share of rows; how many rows a page holds is not known before the page maps are read.
+    /// So the share is never taken below <paramref name="footerBytes"/>, what a first batch reserved before (#845
+    /// review): a single 100,000-row int64 page read in 1,000-row batches reserves its 800 KB, not 8 KB. A read
+    /// with a nested column decodes the whole group before slicing it, so it reserves the whole group.
     /// </summary>
     internal long FirstBatchBytes(
-        long groupBytes, RowGroup rowGroup, SchemaDescriptor schema, IReadOnlyList<string>? columnNames,
-        IReadOnlyList<RowRange>? ranges)
+        long groupBytes, long footerBytes, RowGroup rowGroup, SchemaDescriptor schema,
+        IReadOnlyList<string>? columnNames, IReadOnlyList<RowRange>? ranges)
     {
         var (columns, _) = ResolveColumns(schema, rowGroup, columnNames);
         foreach (var column in columns)
@@ -747,13 +757,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 return groupBytes;
         }
 
-        long bytes = groupBytes;
+        double share = 1.0;
         long rows = KeptRows(rowGroup, ranges);
         if (_options.BatchSize is int batchSize && batchSize > 0 && rows > batchSize)
-            bytes = (long)(groupBytes * ((double)batchSize / rows));
-        if (_options.MaxBatchByteSize is long maxBytes && maxBytes > 0)
-            bytes = Math.Min(bytes, maxBytes);
-        return bytes;
+            share = (double)batchSize / rows;
+        if (_options.MaxBatchByteSize is long maxBytes && maxBytes > 0 && footerBytes > maxBytes)
+            share = Math.Min(share, (double)maxBytes / footerBytes);
+        long bytes = (long)(groupBytes * share);
+        return Math.Max(bytes, Math.Min(footerBytes, groupBytes));
     }
 
     /// <summary>

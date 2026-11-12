@@ -554,12 +554,84 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.InRange(scaled, estimate / 4 - 64, estimate / 4 + 64);
 
         // The first batch reserves its own share of the group, not the whole of it: with BatchSize cutting the
-        // group in four, a quarter; under MaxBatchByteSize, at most that.
-        Assert.Equal(estimate, reader.FirstBatchBytes(estimate, group, parquetSchema, null, null));
+        // group in four, a quarter (here above the footer's size, which is the floor).
+        Assert.Equal(estimate, reader.FirstBatchBytes(estimate, footer, group, parquetSchema, null, null));
         using var batched = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = rows / 4 });
-        Assert.InRange(batched.FirstBatchBytes(estimate, group, parquetSchema, null, null), estimate / 4 - 1, estimate / 4 + 1);
-        using var capped = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { MaxBatchByteSize = 1000 });
-        Assert.Equal(1000, capped.FirstBatchBytes(estimate, group, parquetSchema, null, null));
+        Assert.InRange(batched.FirstBatchBytes(estimate, footer, group, parquetSchema, null, null),
+            estimate / 4 - 1, estimate / 4 + 1);
+    }
+
+    /// <summary>The reservation a reader makes for the first batch of row group 0 of <paramref name="path"/>,
+    /// and the size of the first batch it actually decodes.</summary>
+    private static async Task<(long Reserved, long FirstBatch)> FirstBatchAsync(string path, ParquetReadOptions options)
+    {
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, options);
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var schema = await reader.GetSchemaAsync();
+        long footer = ParquetFileReader.PlannedBytes(group, schema, null, null).Uncompressed;
+        long reserved = reader.FirstBatchBytes(reader.DecodedBytes(group, schema, null, null), footer, group, schema, null, null);
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            using (batch)
+                return (reserved, EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(batch));
+        }
+        throw new InvalidOperationException("No batch.");
+    }
+
+    [Fact]
+    public async Task TheFirstBatchReservation_CoversAPageLargerThanTheBatch()
+    {
+        // #845 review: a batch is a slice of whole decoded pages and holds their buffers. One PLAIN 100,000-row
+        // double page read in 1,000-row batches decodes the whole 800 KB page for the first batch, so reserving the
+        // batch's 1/100 share of rows (8 KB) under-reserved what main had reserved by the footer. (An encoding that
+        // shrinks the page shrinks the footer too, and is still under-reserved, as on main: how many rows a page
+        // holds is not known before the page maps are read.)
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("id", DoubleType.Default, false)).Build();
+        var ids = new DoubleArray.Builder();
+        var random = new Random(845);
+        for (int i = 0; i < 100_000; i++)
+            ids.Append(random.NextDouble());
+        string path = Path.Combine(_tempDir, "one-page.parquet");
+        using (var batch = new RecordBatch(schema, [ids.Build()], 100_000))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false, ParquetWriteOptions.Default with
+                     {
+                         DictionaryEnabled = false,
+                         DataPageSize = 16 << 20,
+                         DataPageRowCountLimit = 1_000_000,
+                     }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        var (reserved, first) = await FirstBatchAsync(path, new ParquetReadOptions { BatchSize = 1_000 });
+        Assert.True(first > 100_000 * 4, $"the first batch holds {first} bytes: not a page larger than the batch");
+        Assert.True(reserved >= first, $"reserved {reserved} for a first batch of {first}");
+    }
+
+    [Fact]
+    public async Task TheFirstBatchReservation_CoversAMaxBatchByteSizeBetweenFooterAndDecodedSize()
+    {
+        // #845 review: MaxBatchByteSize cuts batches by the pages' ENCODED sizes. A dictionary-encoded group under the
+        // limit is read in one batch however large it decodes, so capping the reservation at the limit
+        // under-reserved it.
+        string path = await WriteEncodedAsync();
+        long footer, decoded;
+        await using (var file = new LocalRandomAccessFile(path))
+        using (var reader = new ParquetFileReader(file, ownsFile: false))
+        {
+            footer = ParquetFileReader.PlannedBytes(
+                (await reader.ReadMetadataAsync()).RowGroups[0], await reader.GetSchemaAsync(), null, null).Uncompressed;
+            decoded = await DecodedSizeAsync(reader);
+        }
+        long limit = footer * 2;
+        Assert.True(limit < decoded, $"limit {limit} is not below the decoded size {decoded}");
+
+        var (reserved, first) = await FirstBatchAsync(path, new ParquetReadOptions { MaxBatchByteSize = limit });
+        Assert.True(first > limit, $"the first batch holds {first} bytes, within the limit {limit}: nothing to test");
+        Assert.True(reserved >= first, $"reserved {reserved} for a first batch of {first}");
     }
 
     [Fact]
