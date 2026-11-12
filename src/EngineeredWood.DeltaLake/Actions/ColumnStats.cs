@@ -82,12 +82,15 @@ public sealed record ColumnStats
         // dotted keys ("s.a") so evaluators can resolve nested references with the same flat lookup.
         // The top-level object entry is kept as-is for any consumer that inspects it directly.
         var map = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        // Every path reached, nested objects included, so a leaf named like an object's path collides with it
+        // whichever comes first (#841 review); `map` alone holds no nested object paths.
+        var seen = new HashSet<string>(StringComparer.Ordinal);
         var collided = new HashSet<string>(StringComparer.Ordinal);
         foreach (var prop in element.EnumerateObject())
         {
-            AddValue(map, collided, prop.Name, prop.Value);
+            AddValue(map, seen, collided, prop.Name, prop.Value);
             if (prop.Value.ValueKind == JsonValueKind.Object)
-                FlattenValues(map, collided, prop.Name, prop.Value);
+                FlattenValues(map, seen, collided, prop.Name, prop.Value);
         }
         // A literal dotted column name colliding with a flattened struct path is ambiguous —
         // drop the key entirely (no stat => no pruning on it; pruning must never guess).
@@ -97,22 +100,30 @@ public sealed record ColumnStats
     }
 
     private static void FlattenValues(
-        Dictionary<string, JsonElement> map, HashSet<string> collided, string prefix, JsonElement obj)
+        Dictionary<string, JsonElement> map, HashSet<string> seen, HashSet<string> collided,
+        string prefix, JsonElement obj)
     {
         foreach (var prop in obj.EnumerateObject())
         {
             string key = prefix + "." + prop.Name;
             if (prop.Value.ValueKind == JsonValueKind.Object)
-                FlattenValues(map, collided, key, prop.Value);
+            {
+                if (!seen.Add(key))
+                    collided.Add(key);
+                FlattenValues(map, seen, collided, key, prop.Value);
+            }
             else
-                AddValue(map, collided, key, prop.Value);
+            {
+                AddValue(map, seen, collided, key, prop.Value);
+            }
         }
     }
 
     private static void AddValue(
-        Dictionary<string, JsonElement> map, HashSet<string> collided, string key, JsonElement value)
+        Dictionary<string, JsonElement> map, HashSet<string> seen, HashSet<string> collided,
+        string key, JsonElement value)
     {
-        if (map.ContainsKey(key))
+        if (!seen.Add(key))
             collided.Add(key);
         else
             map[key] = value.Clone();
@@ -126,25 +137,29 @@ public sealed record ColumnStats
             return null;
 
         var map = new Dictionary<string, long>(StringComparer.Ordinal);
+        // Every path reached, objects included, so a count named like a struct's path is ambiguous too (#841 review).
+        var seen = new HashSet<string>(StringComparer.Ordinal);
         var collided = new HashSet<string>(StringComparer.Ordinal);
-        FlattenCounts(map, collided, "", element);
+        FlattenCounts(map, seen, collided, "", element);
         foreach (var key in collided)
             map.Remove(key);
         return map;
     }
 
     private static void FlattenCounts(
-        Dictionary<string, long> map, HashSet<string> collided, string prefix, JsonElement obj)
+        Dictionary<string, long> map, HashSet<string> seen, HashSet<string> collided,
+        string prefix, JsonElement obj)
     {
         foreach (var prop in obj.EnumerateObject())
         {
             string key = prefix.Length == 0 ? prop.Name : prefix + "." + prop.Name;
+            bool repeated = !seen.Add(key);
+            if (repeated)
+                collided.Add(key);
             if (prop.Value.ValueKind == JsonValueKind.Number
                 && prop.Value.TryGetInt64(out long count) && count >= 0)
             {
-                if (map.ContainsKey(key))
-                    collided.Add(key);
-                else
+                if (!repeated)
                     map[key] = count;
             }
             else if (prop.Value.ValueKind != JsonValueKind.Object)
@@ -158,7 +173,7 @@ public sealed record ColumnStats
             else
             {
                 // Nested (struct) null counts: an object per struct, numbers at the leaves.
-                FlattenCounts(map, collided, key, prop.Value);
+                FlattenCounts(map, seen, collided, key, prop.Value);
             }
         }
     }
