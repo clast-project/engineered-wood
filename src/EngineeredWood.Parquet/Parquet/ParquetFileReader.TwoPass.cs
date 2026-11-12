@@ -544,10 +544,10 @@ public sealed partial class ParquetFileReader
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-        var (footer, compressed) = PlannedBytes(metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges);
+        long compressed = PlannedBytes(metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges).Compressed;
         long planned = DecodedBytes(metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges);
-        reservation.SetInitialEstimate(FirstBatchBytes(
-            growth.Apply(planned), footer, metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges));
+        reservation.SetInitialEstimate(TwoPassFirstBatchBytes(
+            metadata.RowGroups[plan.Index], schema, columns, selector.Answerable, growth, plan.Ranges));
 
         PrefetchedFile? filterIo = null, outputIo = null;
         IAsyncEnumerator<SelectedRecordBatch>? e = null;
@@ -580,6 +580,65 @@ public sealed partial class ParquetFileReader
                 await filterIo.DisposeAsync().ConfigureAwait(false);
             reservation.ReleaseHeld();
         }
+    }
+
+    /// <summary>
+    /// What a two-pass read of <paramref name="rowGroup"/> reserves before its first batch (#846). That first step
+    /// decodes the first pass, then the second pass's first batch. The first pass's batches are gone by then, or, when
+    /// it keeps the returned predicate columns for the whole group, held apart (<see cref="ScanReservation.HoldAsync"/>).
+    /// So the reservation is the larger of the two, not their sum. Summing the filter and output columns, values
+    /// included where the first pass decodes only answers, reserved 3-140x what a TPC-H Q6 scan decoded, and slowed
+    /// it ~30% at a window of 16 (0.74 -> 0.52 s with this).
+    /// <list type="bullet">
+    /// <item>The first pass is one batch of the whole group when it keeps returned predicate columns, else its
+    /// <see cref="FirstBatchBytes"/> share. A predicate column it answers from a wholly dictionary-encoded chunk
+    /// decodes to the answers (a Boolean column and its validity), not the values, unless the read returns the column
+    /// too, when it holds both (<see cref="Data.DictionaryAnswer"/>).</item>
+    /// <item>The second pass's first batch is its <see cref="FirstBatchBytes"/> share of the output columns, as if no
+    /// row were dropped: how many survive is known only after the first pass.</item>
+    /// </list>
+    /// A chunk whose dictionary declines to answer (an entry raises) is decoded after all, and charged in full once
+    /// measured. Both passes' decoded estimates are grown by <paramref name="growth"/>.
+    /// </summary>
+    internal long TwoPassFirstBatchBytes(
+        Metadata.RowGroup rowGroup, SchemaDescriptor schema, TwoPassColumns columns,
+        IReadOnlyDictionary<string, AnswerPlan>? answers, DecodedGrowth growth, IReadOnlyList<RowRange>? ranges)
+    {
+        long rows = KeptRows(rowGroup, ranges);
+        bool wholeFirstPass = columns.FilterOutputs.Count > 0 || !SplitsGroup(rows);
+        long bitmap = ((wholeFirstPass ? rows : _options.BatchSize!.Value) + 7) / 8;
+
+        var decodedFilter = new List<string>(columns.Filter.Count);
+        long answerBytes = 0;
+        var (filterColumns, filterChunks) = ResolveColumns(schema, rowGroup, columns.Filter);
+        for (int i = 0; i < filterColumns.Count; i++)
+        {
+            var column = filterColumns[i];
+            string name = column.Path[0];
+            bool answered = answers is not null && column.Path.Count == 1 && column.MaxRepetitionLevel == 0
+                            && answers.ContainsKey(name)
+                            && filterChunks[i].MetaData is { } meta
+                            && MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta);
+            // Values and validity of the answers' Boolean column.
+            if (answered)
+                answerBytes += 2 * bitmap;
+            if (!answered || answers![name].KeepValues)
+                decodedFilter.Add(name);
+        }
+
+        long filterFooter = PlannedBytes(rowGroup, schema, decodedFilter, ranges).Uncompressed;
+        long filterGroup = growth.Apply(DecodedBytes(rowGroup, schema, decodedFilter, ranges));
+        long firstPass = wholeFirstPass
+            ? filterGroup
+            : FirstBatchBytes(filterGroup, filterFooter, rowGroup, schema, decodedFilter, ranges);
+        firstPass += answerBytes;
+
+        long outputFooter = PlannedBytes(rowGroup, schema, columns.OutputOnly, ranges).Uncompressed;
+        long secondPass = FirstBatchBytes(
+            growth.Apply(DecodedBytes(rowGroup, schema, columns.OutputOnly, ranges)), outputFooter, rowGroup, schema,
+            columns.OutputOnly, ranges);
+
+        return Math.Max(firstPass, secondPass);
     }
 
     /// <summary>A selected batch's size for the scan budget: its columns and its explicit positions.</summary>
