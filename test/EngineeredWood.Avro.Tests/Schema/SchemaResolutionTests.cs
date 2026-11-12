@@ -530,6 +530,7 @@ public class SchemaResolutionTests
         var result = ReadWithSchema(data, new AvroSchema(readerSchemaJson));
         var arr = (BinaryArray)result.Column(0);
         Assert.Equal(System.Text.Encoding.UTF8.GetBytes("hello"), arr.GetBytes(0).ToArray());
+        GC.KeepAlive(arr);
     }
 
     [Fact]

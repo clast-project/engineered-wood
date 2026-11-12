@@ -825,6 +825,7 @@ public class ParquetFileWriterTests : IDisposable
             Assert.Equal(new byte[] { 4, 5 }, col.GetBytes(1).ToArray());
             Assert.Empty(col.GetBytes(2).ToArray());
             Assert.Equal(new byte[] { 6 }, col.GetBytes(3).ToArray());
+            GC.KeepAlive(col);
         });
     }
 

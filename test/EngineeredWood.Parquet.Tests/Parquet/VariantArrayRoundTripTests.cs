@@ -171,6 +171,7 @@ public class VariantArrayRoundTripTests : IDisposable
         {
             var got = va.GetValueBytes(i);
             Assert.Equal(values[i], got.ToArray());
+            GC.KeepAlive(va);
         }
     }
 
@@ -216,6 +217,7 @@ public class VariantArrayRoundTripTests : IDisposable
             var variant = Assert.IsType<VariantArray>(read.Column(0));
             for (int i = 0; i < variant.Length; i++, row++)
                 Assert.Equal(values[row], variant.GetValueBytes(i).ToArray());
+            GC.KeepAlive(variant);
         }
         Assert.Equal(values.Length, row);
     }
@@ -414,6 +416,7 @@ public class VariantArrayRoundTripTests : IDisposable
         var outVar = Assert.IsType<VariantArray>(outStruct.Fields[0]);
         Assert.Equal(VTrue, outVar.GetValueBytes(0).ToArray());
         Assert.Equal(VFalse, outVar.GetValueBytes(1).ToArray());
+        GC.KeepAlive(outVar);
     }
 
     [Fact]
@@ -434,6 +437,7 @@ public class VariantArrayRoundTripTests : IDisposable
         Assert.Equal(VTrue, outVar.GetValueBytes(0).ToArray());
         Assert.Equal(VFalse, outVar.GetValueBytes(1).ToArray());
         Assert.Equal(VTrue, outVar.GetValueBytes(2).ToArray());
+        GC.KeepAlive(outVar);
     }
 
     [Fact]
@@ -458,6 +462,7 @@ public class VariantArrayRoundTripTests : IDisposable
         var outVar = Assert.IsType<VariantArray>(outMap.KeyValues.Fields[1]);
         Assert.Equal(VTrue, outVar.GetValueBytes(0).ToArray());
         Assert.Equal(VFalse, outVar.GetValueBytes(1).ToArray());
+        GC.KeepAlive(outVar);
     }
 
     [Fact]
@@ -748,6 +753,7 @@ public class VariantArrayRoundTripTests : IDisposable
                 rows.Add(va.IsNull(i)
                     ? null
                     : (va.GetMetadataBytes(i).ToArray(), va.GetValueBytes(i).ToArray()));
+                GC.KeepAlive(va);
             }
         }
 

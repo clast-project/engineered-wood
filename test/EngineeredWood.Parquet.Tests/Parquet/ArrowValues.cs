@@ -16,6 +16,15 @@ internal static class ArrowValues
 {
     public static string Render(IArrowArray array, int row)
     {
+        // RenderValue reads spans off the array and its children, which may be in native memory that nothing else
+        // keeps alive (#834, doc/arrow-span-lifetime.md). Rooting the array here covers the whole call tree.
+        string text = RenderValue(array, row);
+        GC.KeepAlive(array);
+        return text;
+    }
+
+    private static string RenderValue(IArrowArray array, int row)
+    {
         if (array.IsNull(row))
             return "null";
 

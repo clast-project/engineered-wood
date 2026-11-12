@@ -607,6 +607,12 @@ public class PageIndexPruningTests : IDisposable
         {
             return null; // a decimal wider than System.Decimal, or a timestamp outside DateTimeOffset
         }
+        finally
+        {
+            // The binary arms read spans of the array's buffers, which may be in native memory nothing else keeps
+            // alive (#834, doc/arrow-span-lifetime.md).
+            GC.KeepAlive(array);
+        }
     }
 
     private static LiteralValue? LiteralOf(IArrowArray array, int row) => array switch

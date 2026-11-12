@@ -80,6 +80,7 @@ public class MakeNullArrayTests
         Assert.Equal(5 * width, result.Data.Buffers[1].Length);
         foreach (byte b in result.Data.Buffers[1].Span)
             Assert.Equal(0, b);
+        GC.KeepAlive(result);
     }
 
     [Fact]
@@ -96,6 +97,7 @@ public class MakeNullArrayTests
         Assert.Equal(2, result.Data.Buffers[1].Length);
         foreach (byte b in result.Data.Buffers[1].Span)
             Assert.Equal(0, b);
+        GC.KeepAlive(result);
     }
 
     [Fact]
@@ -113,6 +115,7 @@ public class MakeNullArrayTests
         Assert.Equal(5, offsets.Length);
         for (int i = 0; i < 5; i++)
             Assert.Equal(0, offsets[i]);
+        GC.KeepAlive(result);
     }
 
     [Fact]
@@ -158,6 +161,7 @@ public class MakeNullArrayTests
         Assert.Equal(4 * 16, result.Data.Buffers[1].Length);
         foreach (byte b in result.Data.Buffers[1].Span.ToArray())
             Assert.Equal(0, b);
+        GC.KeepAlive(result);
     }
 
     [Fact]
@@ -426,6 +430,7 @@ public class MakeNullArrayTests
             .Cast<byte, int>(result.Data.Buffers[1].Span);
         Assert.Equal(1, offsets.Length);
         Assert.Equal(0, offsets[0]);
+        GC.KeepAlive(result);
     }
 
     // ── Unions ──

@@ -1497,7 +1497,9 @@ public sealed class SparkFunctionRegistryTests
     {
         // The byte[] overload rather than the span one: it reads signed little-endian two's
         // complement, which is Arrow's decimal layout, and net472 has only this one.
-        return new System.Numerics.BigInteger(array.ValueBuffer.Span.Slice(0, 16).ToArray());
+        var value = new System.Numerics.BigInteger(array.ValueBuffer.Span.Slice(0, 16).ToArray());
+        GC.KeepAlive(array); // the bytes are a span of the array's buffer (#834)
+        return value;
     }
 
     [Fact]
@@ -2863,9 +2865,13 @@ public sealed class SparkFunctionRegistryTests
     }
 
     /// <summary>The hex of the single cell of a binary result.</summary>
-    private static string Hex(IArrowArray array) =>
-        BitConverter.ToString(
+    private static string Hex(IArrowArray array)
+    {
+        string hex = BitConverter.ToString(
             Assert.IsType<BinaryArray>(array).GetBytes(0).ToArray()).Replace("-", string.Empty);
+        GC.KeepAlive(array); // the bytes are a span of the array's buffer (#834)
+        return hex;
+    }
 
     [Theory]
     // A string is a UTF-8 encode, in both dialects, and the empty string is bytes rather than null.

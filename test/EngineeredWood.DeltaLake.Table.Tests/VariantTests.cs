@@ -96,6 +96,7 @@ public class VariantTests : IDisposable
         Assert.Equal(True, v.GetValueBytes(0).ToArray());
         Assert.Equal(False, v.GetValueBytes(1).ToArray());
         Assert.Equal(EmptyMetadata, v.GetMetadataBytes(0).ToArray());
+        GC.KeepAlive(v);
     }
 
     /// <summary>Reads the sole data file's parquet schema and returns whether the <c>v</c> group carries
@@ -170,6 +171,7 @@ public class VariantTests : IDisposable
         var v = Assert.IsType<VariantArray>(coerced.Column(0));
         Assert.Equal(Int8Val, v.GetValueBytes(0).ToArray());        // value, not metadata
         Assert.Equal(EmptyMetadata, v.GetMetadataBytes(0).ToArray());
+        GC.KeepAlive(v);
     }
 
     [Fact]
@@ -227,6 +229,7 @@ public class VariantTests : IDisposable
         var v = Assert.IsType<VariantArray>(s.Fields[0]);
         Assert.Equal(True, v.GetValueBytes(0).ToArray());
         Assert.Equal(Int8Val, v.GetValueBytes(1).ToArray());
+        GC.KeepAlive(v);
     }
 
     [Fact]
@@ -292,6 +295,7 @@ public class VariantTests : IDisposable
         var v = Assert.IsType<VariantArray>(read[0].Column(1));
         Assert.Equal(True, v.GetValueBytes(0).ToArray());
         Assert.Equal(Int8Val, v.GetValueBytes(1).ToArray());
+        GC.KeepAlive(v);
     }
 
     [Fact]
@@ -454,6 +458,7 @@ public class VariantTests : IDisposable
             var v = Assert.IsType<VariantArray>(batch.Column("v"));
             for (int i = 0; i < batch.Length; i++)
                 byId[ids.GetValue(i)!.Value] = v.IsNull(i) ? null : v.GetValueBytes(i).ToArray();
+            GC.KeepAlive(v);
         }
 
         Assert.Equal(True, byId[1]);

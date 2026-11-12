@@ -60,6 +60,7 @@ public class DecimalRescaleWideningTests
             {
                 Assert.True(actual.IsValid(i), $"row {i} should be valid");
                 Assert.Equal(expected[i]!.Value, FromLE16(actual.GetBytes(i)));
+                GC.KeepAlive(actual);
             }
         }
     }

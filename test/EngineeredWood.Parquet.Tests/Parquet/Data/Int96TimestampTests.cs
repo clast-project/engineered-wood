@@ -45,6 +45,7 @@ public class Int96TimestampTests
         // INT96 carries no zone, and every reader that decodes it presents the result as naive.
         Assert.Null(type.Timezone);
         Assert.Equal(AllTypesPlainMicros, timestamps.Values.ToArray());
+        GC.KeepAlive(timestamps);
     }
 
     [Fact]
@@ -59,6 +60,7 @@ public class Int96TimestampTests
         Assert.Equal(TimeUnit.Nanosecond, type.Unit);
         Assert.Null(type.Timezone);
         Assert.Equal(AllTypesPlainMicros.Select(us => us * 1000), timestamps.Values.ToArray());
+        GC.KeepAlive(timestamps);
     }
 
     [Fact]
@@ -74,6 +76,7 @@ public class Int96TimestampTests
 
         // 8 bytes of nanoseconds-within-day, then a 4-byte Julian day — the first value is midnight.
         var first = bytes.GetBytes(0).ToArray();
+        GC.KeepAlive(bytes);
         Assert.Equal(0, BitConverter.ToInt64(first, 0));
         Assert.Equal(2454892, BitConverter.ToInt32(first, 8));
     }
@@ -89,6 +92,7 @@ public class Int96TimestampTests
 
         var timestamps = Assert.IsType<TimestampArray>(array);
         Assert.Equal(new[] { 1230768000000000L, 1230768060000000L }, timestamps.Values.ToArray());
+        GC.KeepAlive(timestamps);
     }
 
     [Fact]
@@ -103,6 +107,7 @@ public class Int96TimestampTests
         {
             using (batch)
                 seen.AddRange(Assert.IsType<TimestampArray>(batch.Column(0)).Values.ToArray());
+            GC.KeepAlive(batch);
         }
 
         Assert.Equal(AllTypesPlainMicros, seen);

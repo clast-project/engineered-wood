@@ -43,6 +43,7 @@ public class ConcatenateTests
         Assert.True(result.IsNull(1));
         Assert.Equal(values[1], result.GetValueBytes(2).ToArray());
         Assert.Equal(values[2], result.GetValueBytes(3).ToArray());
+        GC.KeepAlive(result);
     }
 
     [Fact]
@@ -266,6 +267,7 @@ public class ConcatenateTests
             [OneRowUnion(UnionMode.Sparse, [3, 5], pick: 3), OneRowUnion(UnionMode.Sparse, [3, 5], pick: 5)]));
 
         Assert.Equal(new byte[] { 3, 5 }, result.TypeIds.ToArray());
+        GC.KeepAlive(result);
     }
 
     /// <summary>

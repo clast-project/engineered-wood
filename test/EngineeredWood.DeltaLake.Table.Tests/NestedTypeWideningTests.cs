@@ -202,6 +202,7 @@ public class NestedTypeWideningTests : IDisposable
         var l = Assert.IsType<ListArray>(batch.Column(0));
         var got = Assert.IsType<Int64Array>(l.Values);
         Assert.Equal([1L, 2L, 3L], got.Values.ToArray());
+        GC.KeepAlive(got);
         Assert.Equal(2, l.GetValueLength(0));
         Assert.IsType<Int64Type>(((ListType)batch.Schema.FieldsList[0].DataType).ValueDataType);
     }
@@ -229,6 +230,7 @@ public class NestedTypeWideningTests : IDisposable
         var s = Assert.IsType<StructArray>(((ListArray)batch.Column(0)).Values);
         var a = Assert.IsType<Int64Array>(s.Fields[0]);
         Assert.Equal([4L, 5L, 6L], a.Values.ToArray());
+        GC.KeepAlive(a);
     }
 
     [Fact]
@@ -280,6 +282,7 @@ public class NestedTypeWideningTests : IDisposable
         var batch = await ReadSingleAsync(fs);
         var m = Assert.IsType<MapArray>(batch.Column(0));
         Assert.Equal([1L, 2L], Assert.IsType<Int64Array>(m.Keys).Values.ToArray());
+        GC.KeepAlive(m);
     }
 
     // ── Reconcile inside lists and maps ──────────────────────────────────────────────────────────────

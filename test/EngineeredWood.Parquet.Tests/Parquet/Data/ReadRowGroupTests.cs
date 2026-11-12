@@ -836,6 +836,8 @@ public class ReadRowGroupTests
                 Assert.Equal(plain.IsNull(i), bss.IsNull(i));
                 if (!plain.IsNull(i))
                     Assert.Equal(plain.GetBytes(i).ToArray(), bss.GetBytes(i).ToArray());
+                GC.KeepAlive(plain);
+                GC.KeepAlive(bss);
             }
         }
 
@@ -1064,6 +1066,7 @@ public class ReadRowGroupTests
             var arr = (BinaryArray)batch.Column(1);
             for (int i = 0; i < 4; i++)
                 Assert.Equal(expected[i], arr.GetBytes(i).ToArray());
+            GC.KeepAlive(arr);
         }
         {
             using var col = rg.Column(2).LogicalReader<double?>();
@@ -1129,6 +1132,7 @@ public class ReadRowGroupTests
             var arr = (BinaryArray)batch.Column(1);
             for (int i = 0; i < 4; i++)
                 Assert.Equal(expected[i], arr.GetBytes(i).ToArray());
+            GC.KeepAlive(arr);
         }
         {
             using var col = rg.Column(2).LogicalReader<double?>();
@@ -1953,6 +1957,8 @@ public class ReadRowGroupTests
         Assert.Equal(defaultArr.Length, viewArr.Length);
         for (int i = 0; i < defaultArr.Length; i++)
             Assert.Equal(defaultArr.GetBytes(i).ToArray(), viewArr.GetBytes(i).ToArray());
+        GC.KeepAlive(defaultArr);
+        GC.KeepAlive(viewArr);
     }
 
     [Fact]
@@ -2076,6 +2082,8 @@ public class ReadRowGroupTests
         Assert.Equal(defaultArr.Length, largeArr.Length);
         for (int i = 0; i < defaultArr.Length; i++)
             Assert.Equal(defaultArr.GetBytes(i).ToArray(), largeArr.GetBytes(i).ToArray());
+        GC.KeepAlive(defaultArr);
+        GC.KeepAlive(largeArr);
     }
 
     [Fact]

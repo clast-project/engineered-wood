@@ -177,6 +177,7 @@ public class ExtendedTimestampReadTests
             }
 
             Assert.Equal(expected, bytes.GetBytes(i).ToArray());
+            GC.KeepAlive(bytes);
         }
     }
 

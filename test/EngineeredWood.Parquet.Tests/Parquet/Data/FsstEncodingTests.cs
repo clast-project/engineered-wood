@@ -619,6 +619,7 @@ public class FsstEncodingTests : IDisposable
         var arr = (BinaryArray)read.Column(0);
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], arr.GetBytes(i).ToArray());
+        GC.KeepAlive(arr);
     }
 
     [Fact]

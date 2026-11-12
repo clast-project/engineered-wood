@@ -110,6 +110,7 @@ public class V20DecoderUnitTests
         Assert.Equal("AAAA"u8.ToArray(), arr.GetBytes(0).ToArray());
         Assert.Equal("BBBB"u8.ToArray(), arr.GetBytes(1).ToArray());
         Assert.Equal("CCCC"u8.ToArray(), arr.GetBytes(2).ToArray());
+        GC.KeepAlive(arr);
     }
 
     [Fact]

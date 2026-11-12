@@ -40,6 +40,7 @@ public class VortexZonedFixtureTests
 
         var column = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
         Assert.Equal(expected, column.Values.ToArray());
+        GC.KeepAlive(column);
     }
 
     [Fact]
@@ -51,6 +52,7 @@ public class VortexZonedFixtureTests
         var column = Assert.IsType<UInt64Array>(await reader.ReadColumnAsync(0));
         var expected = Enumerable.Range(0, 64).Select(i => ulong.MaxValue - 5 - 3UL * (ulong)i);
         Assert.Equal(expected, column.Values.ToArray());
+        GC.KeepAlive(column);
     }
 
     [Fact]
@@ -71,9 +73,11 @@ public class VortexZonedFixtureTests
 
         var id = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(0));
         Assert.Equal(Enumerable.Range(0, Rows).Select(i => (long)i), id.Values.ToArray());
+        GC.KeepAlive(id);
 
         var val = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(1));
         Assert.Equal(ExpectedVal(), val.Values.ToArray());
+        GC.KeepAlive(val);
 
         var f = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(2));
         for (int i = 0; i < Rows; i++)
@@ -209,6 +213,7 @@ public class VortexZonedFixtureTests
         var n = await reader.GetZoneStatsAsync(5);
         Assert.NotNull(n);
         Assert.Equal(new ulong[] { 2731, 2731, 1205 }, n!.NullCount!.Values.ToArray());
+        GC.KeepAlive(n);
     }
 
     [Theory]

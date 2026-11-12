@@ -313,6 +313,7 @@ public class ExtendedTimestampTests
         var bytes = Assert.IsType<FixedSizeBinaryArray>(encoded);
         Assert.Equal("30", ExtendedTimestamp.Read(bytes.GetBytes(0)).ToString());
         Assert.Equal("50", ExtendedTimestamp.Read(bytes.GetBytes(2)).ToString());
+        GC.KeepAlive(bytes);
     }
 
     [Fact]

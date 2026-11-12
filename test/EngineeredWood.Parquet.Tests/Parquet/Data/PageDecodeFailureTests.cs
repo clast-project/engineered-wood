@@ -69,6 +69,7 @@ public class PageDecodeFailureTests : IDisposable
             Assert.Equal(30, ((Int32Array)whole).GetValue(0));
         else
             Assert.Equal("ccc"u8.ToArray(), ((BinaryArray)whole).GetBytes(0).ToArray());
+        GC.KeepAlive(whole);
     }
 
     [Fact]
@@ -132,8 +133,13 @@ public class PageDecodeFailureTests : IDisposable
     public void APageDecompressingToItsDeclaredSize_Reads()
     {
         var chunk = PlainSnappyChunk(declaredUncompressed: 16);
-        Assert.Equal([1, 2, 3, 4], ((Int32Array)ReadWhole(chunk)).Values.ToArray());
-        Assert.Equal([1, 2, 3, 4], ((Int32Array)ReadBatched(chunk)).Values.ToArray());
+        // The decoded arrays, not the encoded chunk, own the memory the spans read (#834 review round 1).
+        var whole = (Int32Array)ReadWhole(chunk);
+        Assert.Equal([1, 2, 3, 4], whole.Values.ToArray());
+        var batched = (Int32Array)ReadBatched(chunk);
+        Assert.Equal([1, 2, 3, 4], batched.Values.ToArray());
+        GC.KeepAlive(whole);
+        GC.KeepAlive(batched);
     }
 
     /// <summary>
@@ -165,8 +171,13 @@ public class PageDecodeFailureTests : IDisposable
         byte[] payload = Plain(1, 2, 3, 4);
         var chunk = Chunk(PhysicalType.Int32, CompressionCodec.Uncompressed, numValues: 4,
             (DataPage(4, Encoding.Plain, payload.Length, uncompressed: 50_000_000), payload));
-        Assert.Equal([1, 2, 3, 4], ((Int32Array)ReadWhole(chunk)).Values.ToArray());
-        Assert.Equal([1, 2, 3, 4], ((Int32Array)ReadBatched(chunk)).Values.ToArray());
+        // The decoded arrays, not the encoded chunk, own the memory the spans read (#834 review round 1).
+        var whole = (Int32Array)ReadWhole(chunk);
+        Assert.Equal([1, 2, 3, 4], whole.Values.ToArray());
+        var batched = (Int32Array)ReadBatched(chunk);
+        Assert.Equal([1, 2, 3, 4], batched.Values.ToArray());
+        GC.KeepAlive(whole);
+        GC.KeepAlive(batched);
     }
 
     /// <summary>

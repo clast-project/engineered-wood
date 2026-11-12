@@ -185,7 +185,11 @@ public class RowGroupBoundaryTests
             Assert.All((await reader.ReadRowIndexAsync(0))[1].Entry, e => Assert.Equal(2, e.Positions.Count)); // DATA only
             var read = new List<int>();
             await foreach (var batch in reader.CreateRowReader())
+            {
                 read.AddRange(((Int32Array)batch.Column(0)).Values.ToArray());
+                GC.KeepAlive(batch);
+            }
+
             Assert.Equal([0, 1, 2, 3, 4, 5], read);
         }
         finally

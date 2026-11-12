@@ -371,6 +371,15 @@ public sealed class SparkVariantGetTests
 
     private static object? ValueAt(IArrowArray array, int index)
     {
+        // The binary arm reads a span of the array's buffer, which may be in native memory nothing else keeps
+        // alive (#834, doc/arrow-span-lifetime.md): rooted here, for the whole call.
+        object? value = ValueOf(array, index);
+        GC.KeepAlive(array);
+        return value;
+    }
+
+    private static object? ValueOf(IArrowArray array, int index)
+    {
         if (array.IsNull(index))
             return null;
         return array switch

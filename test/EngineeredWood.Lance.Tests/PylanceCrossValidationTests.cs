@@ -151,5 +151,6 @@ public class PylanceCrossValidationTests
         Assert.Equal("abcd"u8.ToArray(), arr.GetBytes(0).ToArray());
         Assert.Equal("efgh"u8.ToArray(), arr.GetBytes(1).ToArray());
         Assert.Equal("ijkl"u8.ToArray(), arr.GetBytes(2).ToArray());
+        GC.KeepAlive(arr);
     }
 }

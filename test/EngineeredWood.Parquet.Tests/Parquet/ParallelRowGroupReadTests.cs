@@ -148,6 +148,7 @@ public class ParallelRowGroupReadTests : IDisposable
             {
                 using (batch)
                     ids.Add([.. ((Int64Array)batch.Column(0)).Values.ToArray()]);
+                GC.KeepAlive(batch);
             }
             return ids;
         }

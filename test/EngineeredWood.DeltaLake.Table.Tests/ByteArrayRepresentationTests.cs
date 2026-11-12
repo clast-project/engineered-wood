@@ -271,6 +271,7 @@ public class ByteArrayRepresentationTests
         Assert.Equal(0, builtAllocator.Live);
         Assert.Equal(readerBefore, readerAllocator.Live);
         Assert.Equal([1, 2, 3, 4], n.Values.ToArray());
+        GC.KeepAlive(n);
         Assert.Equal(Values, Read(s));
         Assert.Equal(0, readerAllocator.DoubleReleases + builtAllocator.DoubleReleases);
     }

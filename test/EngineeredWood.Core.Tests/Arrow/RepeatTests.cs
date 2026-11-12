@@ -141,6 +141,7 @@ public class RepeatTests
         {
             Assert.Equal(pattern, result.GetBytes(i).ToArray());
             Assert.Equal(big, new System.Numerics.BigInteger(result.GetBytes(i).ToArray()));
+            GC.KeepAlive(result);
         }
     }
 
@@ -200,6 +201,7 @@ public class RepeatTests
         Assert.Equal(5, offsets.Length);
         for (int i = 0; i <= 4; i++)
             Assert.Equal(i * len, offsets[i]);
+        GC.KeepAlive(result);
     }
 
     [Fact]
@@ -226,6 +228,7 @@ public class RepeatTests
 
         for (int i = 0; i < 3; i++)
             Assert.Equal(value, result.GetBytes(i).ToArray());
+        GC.KeepAlive(result);
     }
 
     [Fact]
@@ -314,6 +317,7 @@ public class RepeatTests
         Assert.Equal(expectedDataBuffers, result.DataBufferCount);
         for (int i = 0; i < 4; i++)
             Assert.Equal(value, result.GetBytes(i).ToArray());
+        GC.KeepAlive(result);
     }
 
     [Fact]
@@ -357,6 +361,7 @@ public class RepeatTests
         var view = (BinaryViewArray)result;
         for (int i = 0; i < 3; i++)
             Assert.Equal(value, view.GetBytes(i).ToArray());
+        GC.KeepAlive(view);
     }
 
     [Fact]

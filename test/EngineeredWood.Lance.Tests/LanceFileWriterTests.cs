@@ -175,6 +175,7 @@ public class LanceFileWriterTests
             Assert.Equal(System.Array.Empty<byte>(), rb.GetBytes(2).ToArray());
             Assert.Equal(new byte[] { 0xBE, 0xEF, 0xCA, 0xFE }, rb.GetBytes(3).ToArray());
             Assert.Equal(new byte[] { 0x00 }, rb.GetBytes(4).ToArray());
+            GC.KeepAlive(rb);
         }
         finally
         {
@@ -664,14 +665,18 @@ public class LanceFileWriterTests
                 var fw = (FixedWidthType)a.Data.DataType;
                 Assert.Equal(32, fw.BitWidth);
                 var span = MemoryMarshal.Cast<byte, int>(a.Data.Buffers[1].Span.Slice(0, a.Length * 4));
-                return span.ToArray();
+                int[] values = span.ToArray();
+                GC.KeepAlive(a); // the span reads the array's buffer (#834)
+                return values;
             }
             long[] ReadLongs(IArrowArray a)
             {
                 var fw = (FixedWidthType)a.Data.DataType;
                 Assert.Equal(64, fw.BitWidth);
                 var span = MemoryMarshal.Cast<byte, long>(a.Data.Buffers[1].Span.Slice(0, a.Length * 8));
-                return span.ToArray();
+                long[] values = span.ToArray();
+                GC.KeepAlive(a); // the span reads the array's buffer (#834)
+                return values;
             }
 
             Assert.Equal(new[] { 0, 19000, 20000 }, ReadInts(await reader.ReadColumnAsync(0)));
@@ -2615,6 +2620,7 @@ public class LanceFileWriterTests
                 if (i == 2) continue;
                 long value = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(
                     read.Data.Buffers[1].Span.Slice(i * 16, 8));
+                GC.KeepAlive(read);
                 Assert.Equal(scaled[i], value);
             }
         }
@@ -2659,6 +2665,7 @@ public class LanceFileWriterTests
             Assert.False(read.IsNull(2));
             Assert.Equal(new byte[] { 1, 2, 3, 4 }, read.GetBytes(0).ToArray());
             Assert.Equal(new byte[] { 9, 10, 11, 12 }, read.GetBytes(2).ToArray());
+            GC.KeepAlive(read);
         }
         finally
         {

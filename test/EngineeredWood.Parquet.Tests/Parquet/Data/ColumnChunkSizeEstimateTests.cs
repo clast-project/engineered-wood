@@ -141,6 +141,8 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         {
             Assert.Equal(expected.IsNull(i), actual.IsNull(i));
             Assert.True(expected.GetBytes(i).SequenceEqual(actual.GetBytes(i)), $"row {i} differs");
+            GC.KeepAlive(expected);
+            GC.KeepAlive(actual);
         }
 
         int nonNull = RowCount - array.NullCount;
@@ -330,6 +332,8 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         Assert.Equal(
             array.Data.Buffers[1].Span.ToArray(),
             read.Data.Buffers[1].Span.Slice(0, RowCount * typeLength).ToArray());
+        GC.KeepAlive(array);
+        GC.KeepAlive(read);
     }
 
     [Fact]
@@ -340,6 +344,7 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         var builder = new BinaryArray.Builder();
         for (int i = 0; i < rows; i++)
             builder.Append(flba.Data.Buffers[1].Span.Slice(i * 16, 16));
+        GC.KeepAlive(flba);
         var array = builder.Build();
         var options = Options(CompressionCodec.Uncompressed, dictionary: false)
             with { ByteArrayEncoding = ByteArrayEncoding.DeltaByteArray };
@@ -349,6 +354,8 @@ public class ColumnChunkSizeEstimateTests : IDisposable
         var binary = (BinaryArray)read;
         for (int i = 0; i < rows; i++)
             Assert.True(array.GetBytes(i).SequenceEqual(binary.GetBytes(i)), $"row {i} differs");
+        GC.KeepAlive(array);
+        GC.KeepAlive(binary);
     }
 
     private static Int32Array Int32Values(string shape, int rows, bool nullable)

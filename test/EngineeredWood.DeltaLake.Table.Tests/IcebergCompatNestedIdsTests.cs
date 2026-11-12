@@ -289,6 +289,7 @@ public class IcebergCompatNestedIdsTests : IDisposable
         Assert.Equal(["arr", "m", "structs"], read.Schema.FieldsList.Select(f => f.Name));
         var readArr = (ListArray)read.Column(0);
         Assert.Equal([1L, 2L], ((Int64Array)readArr.Values).Values.ToArray());
+        GC.KeepAlive(readArr);
         var readMap = (MapArray)read.Column(1);
         Assert.Equal("k", ((StringArray)readMap.Keys).GetString(0));
         Assert.Equal(7L, ((Int64Array)readMap.Values).GetValue(0));

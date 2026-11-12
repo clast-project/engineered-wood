@@ -121,6 +121,7 @@ public class VortexFileReaderTests
         Assert.Equal(batches * rowsPerBatch, reader.NumberOfRows);
         var read = Assert.IsType<Apache.Arrow.Int32Array>(await reader.ReadColumnAsync(0));
         Assert.Equal(Enumerable.Range(0, batches * rowsPerBatch), read.Values.ToArray());
+        GC.KeepAlive(read);
     }
 
     private static bool PostscriptSegmentStraddlesTail(byte[] file)

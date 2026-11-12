@@ -371,6 +371,7 @@ internal static class CorpusEvaluation
             case BinaryArray a:
             {
                 var got = BitConverter.ToString(a.GetBytes(row).ToArray()).Replace("-", string.Empty);
+                GC.KeepAlive(a);
                 return string.Equals(expected.GetString(), got, StringComparison.OrdinalIgnoreCase)
                     ? null
                     : $"expected {expected}, got X'{got}'";
@@ -530,7 +531,16 @@ internal static class CorpusEvaluation
     /// what we produced nor what is wrong with it. Anything still unlisted keeps the fallback,
     /// which the type name beside it makes readable enough.
     /// </remarks>
-    public static string Show(IArrowArray array, int row) => array switch
+    public static string Show(IArrowArray array, int row)
+    {
+        // Some arms read spans of the array's buffers, which may be in native memory nothing else keeps alive
+        // (#834, doc/arrow-span-lifetime.md): rooted here, for the whole call.
+        string text = ShowValue(array, row);
+        GC.KeepAlive(array);
+        return text;
+    }
+
+    private static string ShowValue(IArrowArray array, int row) => array switch
     {
         BooleanArray a => a.GetValue(row)?.ToString() ?? "null",
 

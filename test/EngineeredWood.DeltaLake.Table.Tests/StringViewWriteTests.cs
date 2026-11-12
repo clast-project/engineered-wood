@@ -222,6 +222,7 @@ public class StringViewWriteTests : IDisposable
         Assert.Equal(new byte[] { 1, 2 }, b.GetBytes(0).ToArray());
         Assert.True(b.IsNull(1));
         Assert.Equal(longBytes, b.GetBytes(2).ToArray());
+        GC.KeepAlive(b);
     }
 
     [Fact]

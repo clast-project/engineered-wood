@@ -64,6 +64,7 @@ public class DecimalWideningTests
 #else
         var bi = new BigInteger(bytes.ToArray());
 #endif
+        GC.KeepAlive(array); // after either branch reads the span (#834 review round 2)
         return (decimal)bi / (decimal)Math.Pow(10, type.Scale);
     }
 

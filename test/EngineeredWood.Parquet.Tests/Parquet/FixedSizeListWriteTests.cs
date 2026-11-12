@@ -93,6 +93,7 @@ public class FixedSizeListWriteTests : IDisposable
 
             int start = offsets[slot];
             int length = offsets[slot + 1] - start;
+            GC.KeepAlive(read);
             observed.Add([.. Enumerable.Range(start, length).Select(items.GetValue)]);
         }
 

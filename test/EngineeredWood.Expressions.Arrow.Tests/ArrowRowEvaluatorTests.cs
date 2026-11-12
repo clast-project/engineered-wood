@@ -747,10 +747,12 @@ public class ArrowRowEvaluatorTests
     {
         var bytes = a.ValueBuffer.Span.Slice(i * 16, 16);
 #if NET6_0_OR_GREATER
-        return new BigInteger(bytes, isUnsigned: false, isBigEndian: false);
+        var value = new BigInteger(bytes, isUnsigned: false, isBigEndian: false);
 #else
-        return new BigInteger(bytes.ToArray());
+        var value = new BigInteger(bytes.ToArray());
 #endif
+        GC.KeepAlive(a); // after either branch reads the span (#834 review round 2)
+        return value;
     }
 
     [Fact]
