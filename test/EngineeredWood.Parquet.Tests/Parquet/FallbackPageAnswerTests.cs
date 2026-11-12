@@ -219,6 +219,111 @@ public class FallbackPageAnswerTests : IDisposable
     }
 
     /// <summary>
+    /// The header walk that measures the fallback share refuses a page whose declared payload the chunk cannot hold
+    /// (review round 1). A compressed size of minus the header's own length used to leave the walk where it was, and
+    /// loop forever. The share is then unknown, and the read reports the corruption itself.
+    /// </summary>
+    [Theory]
+    [InlineData("minus its header")]
+    [InlineData("negative")]
+    [InlineData("past the end")]
+    public async Task TheHeaderWalkRefusesAPayloadTheChunkCannotHold(string size)
+    {
+        var meta = new ColumnMetaData
+        {
+            Type = PhysicalType.ByteArray,
+            Encodings = [Encoding.Plain, Encoding.RleDictionary],
+            Codec = EngineeredWood.Compression.CompressionCodec.Uncompressed,
+            NumValues = 10,
+            TotalUncompressedSize = 1,
+            TotalCompressedSize = 1,
+            DataPageOffset = 4,
+        };
+
+        byte[] Header(int compressed) => EngineeredWood.Parquet.Metadata.MetadataEncoder.EncodePageHeader(
+            new EngineeredWood.Parquet.Data.PageHeader
+            {
+                Type = PageType.DataPage,
+                UncompressedPageSize = 0,
+                CompressedPageSize = compressed,
+                DataPageHeader = new EngineeredWood.Parquet.Data.DataPageHeader
+                {
+                    NumValues = 10,
+                    Encoding = Encoding.Plain,
+                    DefinitionLevelEncoding = Encoding.Rle,
+                    RepetitionLevelEncoding = Encoding.Rle,
+                },
+            });
+
+        // A size that cancels the header's own length, so the walk would not move: the n whose header, declaring -n
+        // bytes, is n bytes long.
+        byte[] SelfCancelling()
+        {
+            for (int n = 1; n < 64; n++)
+            {
+                byte[] header = Header(-n);
+                if (header.Length == n)
+                    return header;
+            }
+
+            throw new InvalidOperationException("No size cancels the header's length.");
+        }
+
+        byte[] chunk = size switch
+        {
+            "minus its header" => [.. SelfCancelling(), 0, 0, 0, 0],
+            "negative" => [.. Header(-1_000), 0, 0, 0, 0],
+            _ => [.. Header(1_000), 0, 0, 0, 0],
+        };
+
+        var walk = Task.Run(() => EngineeredWood.Parquet.Data.DictionaryAnswer.FallbackRowShare(meta, chunk));
+        Assert.True(await Task.WhenAny(walk, Task.Delay(TimeSpan.FromSeconds(10))) == walk, "the walk did not finish");
+        Assert.Null(await walk);
+    }
+
+    /// <summary>
+    /// For a page map built from the OffsetIndex, the fallback share counts <c>encoding_stats</c>' dictionary-encoded
+    /// pages, which come from the footer. Counts whose sum overflows an int must not index the map out of range and
+    /// fail the read (review round 1). The sum is a long, past the pages, so the share reads as zero and the
+    /// dictionary answers. A negative count never gets that far: the footer decoder drops the whole list. The
+    /// share is then unknown, and the dictionary answers too.
+    /// </summary>
+    [Theory]
+    [InlineData(-1_000_000, true)]
+    [InlineData(int.MaxValue, true)]
+    public async Task ACorruptEncodingStatsCountDoesNotFailTheRead(int count, bool answered)
+    {
+        string path = Path.Combine(_tempDir, $"corrupt-stats-{count}.parquet");
+        File.Copy(WriteFile("v1 page index"), path);
+        FooterRewrite.Rewrite(path, metadata => FooterRewrite.With(metadata, nameof(FileMetaData.RowGroups),
+            metadata.RowGroups.Select(rowGroup => FooterRewrite.With(rowGroup, nameof(RowGroup.Columns),
+                rowGroup.Columns.Select(chunk => chunk.MetaData!.PathInSchema[0] != "s" ? chunk
+                    : FooterRewrite.With(chunk, nameof(ColumnChunk.MetaData), FooterRewrite.With(
+                        chunk.MetaData, nameof(ColumnMetaData.EncodingStats),
+                        (IReadOnlyList<PageEncodingStats>)[
+                            .. chunk.MetaData.EncodingStats!,
+                            new PageEncodingStats(PageType.DataPage, Encoding.RleDictionary, count),
+                            new PageEncodingStats(PageType.DataPage, Encoding.RleDictionary, count)])))
+                    .ToArray())).ToArray()));
+
+        var options = new ParquetReadOptions { BatchSize = 700 };
+        Func<string?, bool?> answer = v => v is null ? null : v.EndsWith("3", StringComparison.Ordinal);
+        var expected = await ReadAsync(path, options, new ParquetScan
+        {
+            Columns = ["id", "s"], RowFilter = new RowFilter([Over("s", answer, valueWise: false, new())]),
+        }, twoPass: false);
+        var asked = new ConcurrentBag<string?[]>();
+        var actual = await ReadAsync(path, options, new ParquetScan
+        {
+            Columns = ["id", "s"], RowFilter = new RowFilter([Over("s", answer, valueWise: true, asked)]),
+        }, twoPass: false, fallbackShareLimit: 0.05);
+
+        Assert.NotEmpty(expected);
+        Assert.Equal(expected, actual);
+        Assert.Equal(answered, asked.Sum(values => values.Length) < Rows);
+    }
+
+    /// <summary>
     /// A returned column read as a view or large-offset type: a fallback page's values, decoded apart for the answers,
     /// are not in the read's layout, so the page is decoded again for the values the read returns.
     /// </summary>

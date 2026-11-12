@@ -1435,3 +1435,9 @@ Each of these mutations fails tests:
 - an OffsetIndex map's share taken as zero (1); every page counted as fallback in the header walk (36) and in a header-built map (32).
 
 One mutation passes, and is equivalent: taking a NULL answer's value bit as TRUE. Every consumer reads the value bit only where the validity bit is set.
+
+### Review round 1
+
+- **The header walk could loop forever (Copilot).** `PageHeaderDecoder` accepts any compressed size. A page declaring minus its own header's length left the one-batch read's walk at the same offset forever, with no cancellation check. The walk now refuses a negative size, or one past the chunk's end, as `PageReader` does. The share is then unknown, and the read reports the corrupt page itself.
+  - Two related fixes: the walk now stops once it has counted the chunk's values, as the read does, rather than reading on into whatever bytes follow the last data page. And the OffsetIndex share sums `encoding_stats` counts as a long. Two counts of `int.MaxValue` summed to -2 and indexed the page map out of range. A negative count never reaches it: the footer decoder drops the list.
+  - Tests: a header declaring minus its own length, a negative size, and a size past the end each give no share (the first hung before the fix). A footer whose `encoding_stats` counts overflow an int is read correctly. Each of these mutations fails tests: the size unchecked (3), the walk past the chunk's values (4), the sum as an int (1).

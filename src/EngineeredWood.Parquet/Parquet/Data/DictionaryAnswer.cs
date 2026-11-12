@@ -134,28 +134,36 @@ internal sealed class DictionaryAnswer
     /// The share of a chunk's rows on pages that fell back from the dictionary, from its bytes (<paramref name="chunk"/>,
     /// the whole chunk), by walking the page headers without decoding a page. Zero, with no walk, when the chunk's
     /// <c>encoding_stats</c> prove it wholly dictionary-encoded. Null when it holds no data page, or a header does
-    /// not decode; the read then reports the corrupt page itself.
+    /// not decode or declares a payload the chunk cannot hold; the read then reports the corrupt page itself.
     /// </summary>
     internal static double? FallbackRowShare(ColumnMetaData meta, ReadOnlySpan<byte> chunk)
     {
         if (MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta))
             return 0;
 
-        long fallback = 0, total = 0;
+        long fallback = 0, total = 0, values = 0;
         try
         {
-            for (int offset = 0; offset < chunk.Length;)
+            // Until the chunk's values are all counted, as the read stops: bytes may follow the last data page.
+            for (int offset = 0; offset < chunk.Length && values < meta.NumValues;)
             {
                 var header = PageHeaderDecoder.Decode(chunk.Slice(offset), out int consumed);
-                offset += consumed + header.CompressedPageSize;
+
+                // The decoder takes any size. A negative one would step back, or not move at all, and loop forever
+                // (review round 1). One past the chunk's end is as corrupt. PageReader refuses both the same way.
+                int payload = offset + consumed;
+                if (header.CompressedPageSize < 0 || header.CompressedPageSize > chunk.Length - payload)
+                    return null;
+                offset = payload + header.CompressedPageSize;
 
                 // A flat column's V1 page holds one value, NULL or not, per row.
-                var (rows, encoding) = header switch
+                var (rows, pageValues, encoding) = header switch
                 {
-                    { DataPageHeader: { } v1 } => (v1.NumValues, v1.Encoding),
-                    { DataPageHeaderV2: { } v2 } => (v2.NumRows, v2.Encoding),
-                    _ => (0, Encoding.Plain),
+                    { DataPageHeader: { } v1 } => (v1.NumValues, v1.NumValues, v1.Encoding),
+                    { DataPageHeaderV2: { } v2 } => (v2.NumRows, v2.NumValues, v2.Encoding),
+                    _ => (0, 0, Encoding.Plain),
                 };
+                values += pageValues;
                 total += rows;
                 if (!IsDictionaryEncoding(encoding))
                     fallback += rows;
@@ -198,16 +206,22 @@ internal sealed class DictionaryAnswer
         if (meta.EncodingStats is not { Count: > 0 } stats)
             return null;
 
-        int dictionaryPages = 0;
+        // The counts come from the footer, and a corrupt one can hold counts whose sum overflows an int (review round
+        // 1). The sum is a long, so the index stays in range. The footer decoder drops a list holding a negative count;
+        // one is skipped here too, as MayAnswer skips it.
+        long dictionaryPages = 0;
         foreach (var entry in stats)
         {
-            if (entry.PageType is PageType.DataPage or PageType.DataPageV2 && IsDictionaryEncoding(entry.Encoding))
+            if (entry.Count > 0 && entry.PageType is PageType.DataPage or PageType.DataPageV2
+                && IsDictionaryEncoding(entry.Encoding))
+            {
                 dictionaryPages += entry.Count;
+            }
         }
 
         return dictionaryPages >= map.Pages.Length
             ? 0
-            : (double)(map.TotalRows - map.CumulativeRows[dictionaryPages]) / map.TotalRows;
+            : (double)(map.TotalRows - map.CumulativeRows[(int)dictionaryPages]) / map.TotalRows;
     }
 
     private static bool IsDictionaryEncoding(Encoding encoding) =>
