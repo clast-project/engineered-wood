@@ -317,6 +317,7 @@ internal static class ArrowSchemaConverter
             LogicalType.DateType => Date32Type.Default,
             LogicalType.IntType intType => intType switch
             {
+                { BitWidth: 8 or 16, IsSigned: true } when ReadsStoredInt32(column, options) => Int32Type.Default,
                 { BitWidth: 8, IsSigned: true } => Int8Type.Default,
                 { BitWidth: 8, IsSigned: false } => UInt8Type.Default,
                 { BitWidth: 16, IsSigned: true } => Int16Type.Default,
@@ -366,6 +367,12 @@ internal static class ArrowSchemaConverter
         };
     }
 
+    // A leaf the caller asked to read as its stored INT32 values (ParquetReadOptions.StoredInt32Columns, #839).
+    private static bool ReadsStoredInt32(ColumnDescriptor column, ParquetReadOptions? options) =>
+        options?.StoredInt32Columns is { } columns
+        && column.PhysicalType == PhysicalType.Int32
+        && columns.Contains(column.SchemaElement);
+
     private static IArrowType? FromConvertedType(
         ConvertedType convertedType, ColumnDescriptor column, ParquetReadOptions? options)
     {
@@ -387,6 +394,7 @@ internal static class ArrowSchemaConverter
                 => new TimestampType(Apache.Arrow.Types.TimeUnit.Microsecond, "UTC"),
             ConvertedType.TimeMillis => new Time32Type(Apache.Arrow.Types.TimeUnit.Millisecond),
             ConvertedType.TimeMicros => new Time64Type(Apache.Arrow.Types.TimeUnit.Microsecond),
+            ConvertedType.Int8 or ConvertedType.Int16 when ReadsStoredInt32(column, options) => Int32Type.Default,
             ConvertedType.Int8 => Int8Type.Default,
             ConvertedType.Int16 => Int16Type.Default,
             ConvertedType.Int32 => Int32Type.Default,

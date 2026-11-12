@@ -33,7 +33,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
     private readonly IRandomAccessFile _file;
     private readonly bool _ownsFile;
-    private readonly ParquetReadOptions _options;
+    // Not readonly only for ReadStoredInt32, which may replace it before the first read.
+    private ParquetReadOptions _options;
     // The lazy caches below may be filled by one thread and read by another (row groups are decoded
     // concurrently, #612), so each is PUBLISHED with Volatile.Write once everything it depends on is set,
     // and read with Volatile.Read: a reader that sees the reference also sees what was written before it.
@@ -58,6 +59,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         _ownsFile = ownsFile;
         _options = options ?? ParquetReadOptions.Default;
     }
+
+    /// <summary>
+    /// Reads the given INT(8)/INT(16)-annotated INT32 leaves of this file as <see cref="Apache.Arrow.Types.Int32Type"/>, the values
+    /// they store, instead of narrowing them (see <see cref="ParquetReadOptions.StoredInt32Columns"/>). The
+    /// elements are this reader's own, from <see cref="GetSchemaAsync"/>. Call it before the first read: it
+    /// changes the type every later batch and schema carries.
+    /// </summary>
+    internal void ReadStoredInt32(HashSet<SchemaElement> elements) =>
+        _options = _options with { StoredInt32Columns = elements.Count > 0 ? elements : null };
 
     /// <summary>
     /// Reads and caches the file metadata from the Parquet footer.

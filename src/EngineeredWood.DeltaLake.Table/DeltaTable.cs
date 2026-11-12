@@ -13476,6 +13476,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             await DataFileFooter.ReadAsync(
                 reader, file, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken).ConfigureAwait(false);
 
+            // A byte/short column the table widened reads as the INT32 it stores, not narrowed and widened back
+            // (#839). Before any read: it changes the type every batch carries.
+            await TypeWidening.StoredInt32Columns.ApplyAsync(reader, snapshot, mappingMode, cancellationToken)
+                .ConfigureAwait(false);
+
             var fileColumns = await FileColumnsAsync(
                     reader, snapshot, columns, mappingMode, logicalToPhysical, withRowTracking: true, cancellationToken)
                 .ConfigureAwait(false);
@@ -14558,8 +14563,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         ByteArrayOutputKind? byteArrays = null, RecordBatch? borrowed = null)
     {
         // Apply type widening — convert narrow types from old files to current schema types
-        if (Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) ||
-            HasTypeChanges(snapshot.Schema))
+        if (ReadsWiden(snapshot))
         {
             var targetSchema = columns is not null
                 ? BuildProjectedSchema(snapshot.ArrowSchema, columns,
@@ -14824,6 +14828,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     // At EVERY depth: Spark records a nested widening on the struct child itself, or on the nearest struct field
     // with a fieldPath for a list element or map key/value. A table can turn delta.enableTypeWidening off after
     // widening; its old files must still be read widened.
+    /// <summary>Whether a read of <paramref name="snapshot"/> widens old files' values to the schema's types.</summary>
+    internal static bool ReadsWiden(Snapshot.Snapshot snapshot) =>
+        Schema.TypeWidening.IsEnabled(snapshot.Metadata.Configuration) || HasTypeChanges(snapshot.Schema);
+
     private static bool HasTypeChanges(Schema.DeltaDataType type) => type switch
     {
         Schema.StructType st => st.Fields.Any(f =>

@@ -513,6 +513,20 @@ public sealed record ParquetReadOptions
     public EngineeredWood.Memory.MemoryBudget? MemoryBudget { get; init; }
 
     /// <summary>
+    /// Leaves read as the INT32 values they store rather than as the Arrow type their INT(8)/INT(16) (or
+    /// INT_8/INT_16) annotation names: each listed leaf comes back as <see cref="Apache.Arrow.Types.Int32Type"/>.
+    /// Keyed by the <see cref="Metadata.SchemaElement"/> INSTANCE of one file's footer, so it only means anything
+    /// on that file's reader; see <see cref="ParquetFileReader.ReadStoredInt32"/>. Null: none.
+    /// </summary>
+    /// <remarks>
+    /// For a Delta table that widened a <c>byte</c>/<c>short</c> column to <c>int</c> or wider (#839): the read
+    /// would otherwise narrow every value with a checked cast, and the table widen it straight back. Only
+    /// signed INT(8)/INT(16) on physical INT32 is honoured, where the relabel is lossless. It drops the checked
+    /// cast's range check, so a value outside the annotation's range reads as itself instead of throwing.
+    /// </remarks>
+    internal HashSet<Metadata.SchemaElement>? StoredInt32Columns { get; init; }
+
+    /// <summary>
     /// Shorthand for <c>ByteArrayOutput == ByteArrayOutputKind.ViewType</c>.
     /// When set to <see langword="true"/>, sets <see cref="ByteArrayOutput"/> to
     /// <see cref="ByteArrayOutputKind.ViewType"/>; setting to <see langword="false"/>
