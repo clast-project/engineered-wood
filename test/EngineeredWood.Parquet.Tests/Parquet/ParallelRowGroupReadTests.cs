@@ -635,6 +635,89 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.True(reserved >= first, $"reserved {reserved} for a first batch of {first}");
     }
 
+    /// <summary>100,000 random doubles, PLAIN, in pages of <paramref name="pageRows"/> rows.</summary>
+    private async Task<string> WriteDoublesAsync(string name, int pageRows)
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("id", DoubleType.Default, false)).Build();
+        var ids = new DoubleArray.Builder();
+        var random = new Random(846);
+        for (int i = 0; i < 100_000; i++)
+            ids.Append(random.NextDouble());
+        string path = Path.Combine(_tempDir, name);
+        using (var batch = new RecordBatch(schema, [ids.Build()], 100_000))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false, ParquetWriteOptions.Default with
+                     {
+                         DictionaryEnabled = false,
+                         DataPageSize = 16 << 20,
+                         DataPageRowCountLimit = pageRows,
+                     }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+        return path;
+    }
+
+    /// <summary>What a parallel read of row group 0 of <paramref name="path"/> reserves for its first batch, and
+    /// the size of the first batch the read decodes.</summary>
+    private static async Task<(long Reserved, long FirstBatch)> PlannedFirstBatchAsync(
+        string path, ParquetReadOptions options, IReadOnlyList<RowRange>? ranges = null)
+    {
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, options);
+        var plan = new ParquetFileReader.RowGroupPlan(0, 0, ranges, null);
+        var (reserved, _) = await reader.FirstBatchReservationAsync(
+            plan, null, new ParquetFileReader.DecodedGrowth(), CancellationToken.None);
+        await foreach (var positioned in reader.ReadPlannedAsync(plan, null, CancellationToken.None))
+        {
+            using (positioned.Batch)
+                return (reserved, EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(positioned.Batch));
+        }
+        throw new InvalidOperationException("No batch.");
+    }
+
+    [Fact]
+    public async Task TheFirstBatchReservation_FromTheOffsetIndex_CoversADictionaryPageLargerThanTheBatch()
+    {
+        // #846: a dictionary shrinks the pages, and the footer with them, so a batch of 1,000 rows that holds a page
+        // of many more decoded rows reserved too little. The OffsetIndex says how many rows each page holds.
+        string path = await WriteEncodedAsync();
+        var options = new ParquetReadOptions { BatchSize = 1_000 };
+        var (footerBased, _) = await FirstBatchAsync(path, options);
+        var (reserved, first) = await PlannedFirstBatchAsync(path, options);
+        Assert.True(footerBased < first, $"the footer reserved {footerBased} for {first}: no shortfall to test");
+        Assert.True(reserved >= first, $"reserved {reserved} for a first batch of {first}");
+        Assert.True(reserved <= first * 5 / 4, $"reserved {reserved} for a first batch of {first}");
+    }
+
+    [Fact]
+    public async Task TheFirstBatchReservation_FromTheOffsetIndex_CoversARangeInsideALargePage()
+    {
+        // #846: a read of 1,000 rows from one 100,000-row page decodes and holds the whole page; scaled by the rows
+        // kept, the reservation was 1% of it.
+        string path = await WriteDoublesAsync("one-page-range.parquet", pageRows: 1_000_000);
+        RowRange[] ranges = [new RowRange(50_000, 51_000)];
+        var (reserved, first) = await PlannedFirstBatchAsync(path, ParquetReadOptions.Default, ranges);
+        Assert.True(first > 100_000 * 4, $"the first batch holds {first} bytes: not the whole page");
+        Assert.True(reserved >= first, $"reserved {reserved} for a first batch of {first}");
+    }
+
+    [Fact]
+    public async Task TheFirstBatchReservation_FromTheOffsetIndex_IsNotFlooredAtTheFooter()
+    {
+        // #846: without page sizes, a batched read's first batch never reserved less than the footer's size of the
+        // whole group (#845 review), which cost a wide window its batched gain. With pages of 1,000 rows, a
+        // 1,000-row batch holds one page, and reserves about that.
+        string path = await WriteDoublesAsync("small-pages.parquet", pageRows: 1_000);
+        var options = new ParquetReadOptions { BatchSize = 1_000 };
+        var (footerBased, _) = await FirstBatchAsync(path, options);
+        var (reserved, first) = await PlannedFirstBatchAsync(path, options);
+        Assert.True(reserved >= first, $"reserved {reserved} for a first batch of {first}");
+        Assert.True(reserved <= first * 5 / 4, $"reserved {reserved} for a first batch of {first}");
+        Assert.True(footerBased > first * 10, $"the footer reserved {footerBased} for {first}: no floor to lift");
+    }
+
     [Fact]
     public async Task TheDecodedEstimate_SizesAnExtensionTypeByItsStorage()
     {
