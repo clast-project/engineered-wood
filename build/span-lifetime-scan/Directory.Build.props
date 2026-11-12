@@ -1,0 +1,3 @@
+<Project>
+  <!-- Stops MSBuild's upward search: the repository's signing, analyzers and target frameworks do not apply to this tool. -->
+</Project>

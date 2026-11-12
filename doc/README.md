@@ -26,7 +26,7 @@ but are not kept up to date as the code changes. Check the code before relying o
 | Document | Kind | Contents |
 |---|---|---|
 | [predicate-pushdown-design.md](predicate-pushdown-design.md) | design | The shared expression library and pushdown into Parquet, Delta, Iceberg and Lance |
-| [row-level-filtering.md](row-level-filtering.md) | design | Exact row-level filtering and late materialization in the Parquet reader (#502): proposed API and phasing (not started) |
+| [row-level-filtering.md](row-level-filtering.md) | design | Exact row-level filtering and late materialization in the Parquet reader and Delta scans (#502): design, per-phase record and measurements (implemented through phase 5; follow-ups #804 and the all-false prune in §31-§32) |
 | [parquet-page-index.md](parquet-page-index.md) | design | ColumnIndex / OffsetIndex plan and per-phase record (implemented) |
 | [parquet-pfor.md](parquet-pfor.md) | design | Experimental PFOR encoding: layout, divergences from the proposal, testing |
 | [parquet-fsst.md](parquet-fsst.md) | design | Experimental FSST / FSST_16: the spec versus the proofs of concept, validation |

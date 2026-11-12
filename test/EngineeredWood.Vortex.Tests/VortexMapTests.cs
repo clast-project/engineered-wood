@@ -91,6 +91,7 @@ public class VortexMapTests
         var items = new List<string>();
         for (int i = offsets[row]; i < offsets[row + 1]; i++)
             items.Add($"{Cell(entries.Fields[0], i)}={Cell(entries.Fields[1], i)}");
+        GC.KeepAlive(map);
         return string.Join(", ", items);
     }
 

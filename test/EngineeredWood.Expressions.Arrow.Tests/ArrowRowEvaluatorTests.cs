@@ -746,6 +746,7 @@ public class ArrowRowEvaluatorTests
     private static BigInteger Unscaled(Decimal128Array a, int i)
     {
         var bytes = a.ValueBuffer.Span.Slice(i * 16, 16);
+        GC.KeepAlive(a);
 #if NET6_0_OR_GREATER
         return new BigInteger(bytes, isUnsigned: false, isBigEndian: false);
 #else

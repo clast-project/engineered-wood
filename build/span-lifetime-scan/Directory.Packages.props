@@ -1,0 +1,6 @@
+<Project>
+  <!-- Stops the upward search for central package management: this tool names its own package versions. -->
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+  </PropertyGroup>
+</Project>

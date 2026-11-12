@@ -108,6 +108,7 @@ public class GuidArrayRoundTripTests : IDisposable
         {
             var bytes = fsb.GetBytes(i);
             Guid decoded = GuidArray.RFC4122ToGuid(bytes);
+            GC.KeepAlive(fsb);
             Assert.Equal(values[i], decoded);
         }
     }

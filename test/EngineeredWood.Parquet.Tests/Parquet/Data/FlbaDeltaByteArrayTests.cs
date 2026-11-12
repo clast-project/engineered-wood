@@ -125,6 +125,7 @@ public sealed class FlbaDeltaByteArrayTests : IDisposable
         for (int i = 0; i < values.Length; i++)
         {
             Assert.Equal(values[i], array.GetBytes(i).ToArray());
+            GC.KeepAlive(array);
         }
     }
 
@@ -145,6 +146,7 @@ public sealed class FlbaDeltaByteArrayTests : IDisposable
         for (int i = 0; i < values.Length; i++)
         {
             Assert.Equal(values[i], array.GetBytes(i).ToArray());
+            GC.KeepAlive(array);
         }
     }
 
@@ -164,6 +166,7 @@ public sealed class FlbaDeltaByteArrayTests : IDisposable
             if (valid[i])
             {
                 Assert.Equal(values[i], array.GetBytes(i).ToArray());
+                GC.KeepAlive(array);
             }
         }
     }

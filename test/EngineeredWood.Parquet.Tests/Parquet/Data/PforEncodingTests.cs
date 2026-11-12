@@ -684,6 +684,7 @@ public class PforEncodingTests : IDisposable
 
         Assert.Equal(keys, ((Int32Array)read.Column(0)).Values.ToArray());
         Assert.Equal(stamps, ((Int64Array)read.Column(1)).Values.ToArray());
+        GC.KeepAlive(read);
 
         foreach (var column in metadata.RowGroups[0].Columns)
             Assert.Contains(Encoding.Pfor, column.MetaData!.Encodings);
@@ -751,6 +752,7 @@ public class PforEncodingTests : IDisposable
         var (read, metadata) = await ReadAsync(path);
 
         Assert.Equal(values, ((Int32Array)read.Column(0)).Values.ToArray());
+        GC.KeepAlive(read);
         Assert.Contains(Encoding.Plain, metadata.RowGroups[0].Columns[0].MetaData!.Encodings);
         Assert.DoesNotContain(Encoding.Pfor, metadata.RowGroups[0].Columns[0].MetaData!.Encodings);
     }

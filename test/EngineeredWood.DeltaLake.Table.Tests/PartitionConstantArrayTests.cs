@@ -48,8 +48,12 @@ public class PartitionConstantArrayTests
         return result.Column(1);
     }
 
-    private static BigInteger Unscaled(Decimal128Array array, int row) =>
-        new BigInteger(array.GetBytes(row).ToArray());
+    private static BigInteger Unscaled(Decimal128Array array, int row)
+    {
+        var value = new BigInteger(array.GetBytes(row).ToArray());
+        GC.KeepAlive(array); // the bytes are a span of the array's buffer (#834)
+        return value;
+    }
 
     // ── Decimals: the two defects the builder round-trip caused. ──
 

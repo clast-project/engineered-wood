@@ -324,6 +324,7 @@ public class CrossValidationTests
         var expected = new byte[16];
         for (int j = 0; j < 16; j++) expected[j] = (byte)j;
         Assert.Equal(expected, fixedCol.GetBytes(0).ToArray());
+        GC.KeepAlive(fixedCol);
     }
 
     [Fact]

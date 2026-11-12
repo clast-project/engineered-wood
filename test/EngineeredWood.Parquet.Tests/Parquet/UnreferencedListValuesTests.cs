@@ -140,6 +140,7 @@ public class UnreferencedListValuesTests : IDisposable
         var innerRead = (ListArray)read.Values;
         Assert.Equal(1, innerRead.Length);
         Assert.Equal([0L, 3L], ((Int64Array)innerRead.GetSlicedValues(0)).Values.ToArray());
+        GC.KeepAlive(innerRead);
     }
 
     [Fact]
@@ -212,7 +213,16 @@ public class UnreferencedListValuesTests : IDisposable
         _ => throw new ArgumentOutOfRangeException(nameof(layout)),
     };
 
-    private static string Render(IArrowArray array, int i) => array switch
+    private static string Render(IArrowArray array, int i)
+    {
+        // The binary arms read spans of the array's buffers, which may be in native memory nothing else keeps alive
+        // (#834, doc/arrow-span-lifetime.md): rooted here, for the whole call.
+        string text = RenderValue(array, i);
+        GC.KeepAlive(array);
+        return text;
+    }
+
+    private static string RenderValue(IArrowArray array, int i) => array switch
     {
         StringArray a => a.GetString(i),
         LargeStringArray a => a.GetString(i),
@@ -276,6 +286,7 @@ public class UnreferencedListValuesTests : IDisposable
         var leaf = read.Values is RunEndEncodedArray ree ? RunEndEncoding.Expand(ree) : read.Values;
         Assert.Equal([7L, 7L, 9L], Enumerable.Range(0, 3).Select(i => ((Int64Array)leaf).GetValue(i)!.Value));
         Assert.Equal([0, 2, 2, 3], read.ValueOffsets.ToArray());
+        GC.KeepAlive(read);
     }
 
     [Fact]
@@ -294,6 +305,7 @@ public class UnreferencedListValuesTests : IDisposable
 
         var leaf = read.Values is RunEndEncodedArray ree ? RunEndEncoding.Expand(ree) : read.Values;
         Assert.Equal([0, 2, 3], read.ValueOffsets.ToArray());
+        GC.KeepAlive(read);
         Assert.Equal(7L, ((Int64Array)leaf).GetValue(0));
         Assert.True(leaf.IsNull(1));
         Assert.True(leaf.IsNull(2));

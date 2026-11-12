@@ -657,6 +657,7 @@ public class AvroPhase6Tests
 #if NET8_0_OR_GREATER
         long low = BitConverter.ToInt64(bytes);
         long high = BitConverter.ToInt64(bytes[8..]);
+        GC.KeepAlive(array);
 #else
         long low = MemoryMarshal.Read<long>(bytes);
         long high = MemoryMarshal.Read<long>(bytes.Slice(8));

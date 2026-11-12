@@ -377,6 +377,15 @@ public class BatchedPageReuseTests : IDisposable
 
     private static string Cell(IArrowArray array, int i)
     {
+        // The value is read off spans of the array, which may be in native memory nothing else keeps alive
+        // (#834, doc/arrow-span-lifetime.md): rooted here, for the whole call.
+        string text = CellValue(array, i);
+        GC.KeepAlive(array);
+        return text;
+    }
+
+    private static string CellValue(IArrowArray array, int i)
+    {
         if (array.IsNull(i))
             return "<null>";
 

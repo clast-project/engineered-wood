@@ -122,6 +122,7 @@ public sealed class ExtendedTimestampWriteTests : IDisposable
         for (int i = 0; i < count; i++)
         {
             result[i] = array.GetBytes(i).ToArray();
+            GC.KeepAlive(array);
         }
 
         return result;
@@ -206,6 +207,7 @@ public sealed class ExtendedTimestampWriteTests : IDisposable
 
         Assert.Equal(TimeUnit.Microsecond, ((TimestampType)array.Data.DataType).Unit);
         Assert.Equal(values, array.Values.ToArray());
+        GC.KeepAlive(array);
     }
 
     [Fact]

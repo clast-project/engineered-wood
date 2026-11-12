@@ -182,6 +182,7 @@ public class TakeTypeMatrixTests
         Assert.Equal(System.Text.Encoding.UTF8.GetBytes("xyz"), result.GetBytes(0).ToArray());
         Assert.Equal(System.Text.Encoding.UTF8.GetBytes("q"), result.GetBytes(1).ToArray());
         Assert.Empty(result.GetBytes(2).ToArray());
+        GC.KeepAlive(result);
     }
 
     [Fact]
@@ -298,6 +299,7 @@ public class TakeTypeMatrixTests
         {
             for (int b = 0; b < 16; b++)
                 Assert.Equal(0, views[row * 16 + b]);
+            GC.KeepAlive(result);
         }
     }
 
@@ -336,6 +338,7 @@ public class TakeTypeMatrixTests
             System.Text.Encoding.UTF8.GetBytes("a value long enough to go out of line"),
             view.GetBytes(0).ToArray());
         Assert.Equal(System.Text.Encoding.UTF8.GetBytes("cc"), view.GetBytes(1).ToArray());
+        GC.KeepAlive(view);
     }
 
     [Fact]

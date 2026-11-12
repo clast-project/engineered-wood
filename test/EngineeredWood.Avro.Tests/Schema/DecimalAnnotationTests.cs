@@ -104,6 +104,7 @@ public class DecimalAnnotationTests
         var read = Assert.IsType<BinaryArray>(result.Column(0));
         Assert.Equal([0x01, 0x02], read.GetBytes(0).ToArray());
         Assert.Equal([0xFF], read.GetBytes(1).ToArray());
+        GC.KeepAlive(read);
     }
 
     private const string HugeDecimalWriterSchema = """
@@ -222,6 +223,7 @@ public class DecimalAnnotationTests
         var batch = ReadUnder(ms, OneField("\"bytes\""));
 
         Assert.Equal([0x30, 0x39], Assert.IsType<BinaryArray>(batch.Column(0)).GetBytes(0).ToArray());
+        GC.KeepAlive(batch);
     }
 
     // ── Writer decimal under reader decimal (#767) ──────────────────────────────────────────────────
@@ -403,5 +405,6 @@ public class DecimalAnnotationTests
         var read = Assert.IsType<BinaryArray>(result.Column(0));
         Assert.Equal([0x01, 0x02], read.GetBytes(0).ToArray());
         Assert.Equal([0xFF], read.GetBytes(1).ToArray());
+        GC.KeepAlive(read);
     }
 }

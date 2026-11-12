@@ -1180,6 +1180,7 @@ public class OrcWriterTests
                 Assert.Equal(System.Array.Empty<byte>(), col.GetBytes(0).ToArray());
                 Assert.Equal(new byte[] { 0x01, 0x02 }, col.GetBytes(1).ToArray());
                 Assert.Equal(new byte[] { 0xFF }, col.GetBytes(2).ToArray());
+                GC.KeepAlive(col);
             }
         }
         finally
@@ -1216,6 +1217,7 @@ public class OrcWriterTests
                 Assert.False(col.IsValid(1));
                 Assert.True(col.IsValid(2));
                 Assert.Equal(new byte[] { 0x03 }, col.GetBytes(2).ToArray());
+                GC.KeepAlive(col);
             }
         }
         finally
@@ -1712,6 +1714,7 @@ public class OrcWriterTests
                 long v0 = BinaryPrimitives.ReadInt64LittleEndian(col.ValueBuffer.Span.Slice(0, 16));
                 long v1 = BinaryPrimitives.ReadInt64LittleEndian(col.ValueBuffer.Span.Slice(16, 16));
                 long v2 = BinaryPrimitives.ReadInt64LittleEndian(col.ValueBuffer.Span.Slice(32, 16));
+                GC.KeepAlive(col);
                 Assert.Equal(1234L, v0);
                 Assert.Equal(5678L, v1);
                 Assert.Equal(-999L, v2);
@@ -1753,6 +1756,7 @@ public class OrcWriterTests
 
                 long v0 = BinaryPrimitives.ReadInt64LittleEndian(col.ValueBuffer.Span.Slice(0, 16));
                 long v2 = BinaryPrimitives.ReadInt64LittleEndian(col.ValueBuffer.Span.Slice(32, 16));
+                GC.KeepAlive(col);
                 Assert.Equal(100L, v0);
                 Assert.Equal(300L, v2);
             }
@@ -3307,6 +3311,7 @@ public class OrcWriterTests
                 var v1 = BinaryPrimitives.ReadInt64LittleEndian(col.ValueBuffer.Span.Slice(16, 8));
                 Assert.Equal(-999999L, v1);
                 var v2 = BinaryPrimitives.ReadInt64LittleEndian(col.ValueBuffer.Span.Slice(32, 8));
+                GC.KeepAlive(col);
                 Assert.Equal(0L, v2);
             }
         }
@@ -3353,6 +3358,7 @@ public class OrcWriterTests
                 var v0 = BinaryPrimitives.ReadInt64LittleEndian(col.ValueBuffer.Span.Slice(0, 8));
                 Assert.Equal(1234L, v0);
                 var v2 = BinaryPrimitives.ReadInt64LittleEndian(col.ValueBuffer.Span.Slice(32, 8));
+                GC.KeepAlive(col);
                 Assert.Equal(-5678L, v2);
             }
         }
@@ -4303,6 +4309,7 @@ public class OrcWriterTests
 
                 var ints = Assert.IsType<Int32Array>(col.Fields[0]);
                 Assert.Equal([10, 20, 30], ints.Values.ToArray());
+                GC.KeepAlive(ints);
 
                 // The union declares branch 1 as date32, so its empty child must be a Date32Array.
                 var dates = Assert.IsType<Date32Array>(col.Fields[1]);

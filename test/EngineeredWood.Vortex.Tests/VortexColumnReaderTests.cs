@@ -88,6 +88,7 @@ public class VortexColumnReaderTests
             u64.Data.Buffers[1].Span);
         for (int i = 0; i < 2048; i++)
             Assert.Equal(expected[i], raw[i]);
+        GC.KeepAlive(u64);
     }
 
     [Fact]
@@ -116,6 +117,7 @@ public class VortexColumnReaderTests
             u64.Data.Buffers[1].Span);
         for (int i = 0; i < 2000; i++)
             Assert.Equal(allValues[10 + i], raw[i]);
+        GC.KeepAlive(u64);
     }
 
     [Fact]
@@ -138,6 +140,7 @@ public class VortexColumnReaderTests
             u32.Data.Buffers[1].Span);
         for (int i = 0; i < 2048; i++)
             Assert.Equal(expected[i], raw[i]);
+        GC.KeepAlive(u32);
     }
 
     [Fact]
@@ -163,6 +166,7 @@ public class VortexColumnReaderTests
             f64.Data.Buffers[1].Span);
         for (int i = 0; i < 2048; i++)
             Assert.Equal(expected[i], raw[i]);
+        GC.KeepAlive(f64);
     }
 
     [Fact]
@@ -186,6 +190,7 @@ public class VortexColumnReaderTests
             u32.Data.Buffers[1].Span);
         for (int i = 0; i < 2000; i++)
             Assert.Equal(allValues[10 + i], raw[i]);
+        GC.KeepAlive(u32);
     }
 
     [Fact]
@@ -288,6 +293,7 @@ public class VortexColumnReaderTests
         Assert.Equal(expected.Length, raw.Length);
         for (int i = 0; i < expected.Length; i++)
             Assert.Equal(expected[i], raw[i]);
+        GC.KeepAlive(fsbArr);
     }
 
     [Fact]
@@ -380,6 +386,7 @@ public class VortexColumnReaderTests
             listArr.Data.Buffers[1].Span);
         for (int i = 0; i <= 2048; i++)
             Assert.Equal(expectedOffsets[i], offsetsSpan[i]);
+        GC.KeepAlive(listArr);
 
         for (int i = 0; i < expectedElements.Count; i++)
             Assert.Equal(expectedElements[i], inner.GetValue(i));
@@ -422,6 +429,7 @@ public class VortexColumnReaderTests
             listArr.Data.Buffers[1].Span);
         for (int i = 0; i <= 2048; i++)
             Assert.Equal(expectedOffsets[i], offsetsSpan[i]);
+        GC.KeepAlive(listArr);
 
         for (int i = 0; i < expectedElements.Count; i++)
             Assert.Equal(expectedElements[i], inner.GetValue(i));
@@ -480,6 +488,7 @@ public class VortexColumnReaderTests
             dateArr.Data.Buffers[1].Span);
         for (int i = 0; i < 2048; i++)
             Assert.Equal(expected[i], raw[i]);
+        GC.KeepAlive(dateArr);
     }
 
     [Fact]
@@ -508,6 +517,7 @@ public class VortexColumnReaderTests
             timeArr.Data.Buffers[1].Span);
         for (int i = 0; i < 2048; i++)
             Assert.Equal(expected[i], raw[i]);
+        GC.KeepAlive(timeArr);
     }
 
     [Fact]
@@ -544,6 +554,7 @@ public class VortexColumnReaderTests
             tsArr.Data.Buffers[1].Span);
         for (int i = 0; i < 2048; i++)
             Assert.Equal(expected[i], raw[i]);
+        GC.KeepAlive(tsArr);
     }
 
     [Fact]
@@ -579,6 +590,7 @@ public class VortexColumnReaderTests
         {
             var lo = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(data.Slice(i * 16, 8));
             var hi = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(data.Slice(i * 16 + 8, 8));
+            GC.KeepAlive(decArr);
             Assert.Equal(expected[i], lo);
             // Sign-extension: hi should be 0 for non-negative, -1 for negative.
             Assert.Equal(expected[i] < 0 ? -1L : 0L, hi);
@@ -631,6 +643,7 @@ public class VortexColumnReaderTests
             var w1 = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(data.Slice(i * 32 + 8, 8));
             var w2 = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(data.Slice(i * 32 + 16, 8));
             var w3 = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(data.Slice(i * 32 + 24, 8));
+            GC.KeepAlive(decArr);
             Assert.Equal(expectedLow[i], w0);
             Assert.Equal(expectedMid[i], w1);
             // Upper 16 bytes are sign-fill of the i128 value.

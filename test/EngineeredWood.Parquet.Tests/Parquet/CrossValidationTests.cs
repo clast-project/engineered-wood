@@ -1506,6 +1506,8 @@ public class CrossValidationTests : IDisposable
 
         for (int i = 0; i < count; i++)
             Assert.True(flbaArray.GetBytes(i).SequenceEqual(result.GetBytes(i)));
+        GC.KeepAlive(flbaArray);
+        GC.KeepAlive(result);
     }
 
     // ────────────────────────────────────────────────────────────────────

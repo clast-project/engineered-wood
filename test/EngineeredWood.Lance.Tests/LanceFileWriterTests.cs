@@ -175,6 +175,7 @@ public class LanceFileWriterTests
             Assert.Equal(System.Array.Empty<byte>(), rb.GetBytes(2).ToArray());
             Assert.Equal(new byte[] { 0xBE, 0xEF, 0xCA, 0xFE }, rb.GetBytes(3).ToArray());
             Assert.Equal(new byte[] { 0x00 }, rb.GetBytes(4).ToArray());
+            GC.KeepAlive(rb);
         }
         finally
         {
@@ -2615,6 +2616,7 @@ public class LanceFileWriterTests
                 if (i == 2) continue;
                 long value = System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(
                     read.Data.Buffers[1].Span.Slice(i * 16, 8));
+                GC.KeepAlive(read);
                 Assert.Equal(scaled[i], value);
             }
         }
@@ -2659,6 +2661,7 @@ public class LanceFileWriterTests
             Assert.False(read.IsNull(2));
             Assert.Equal(new byte[] { 1, 2, 3, 4 }, read.GetBytes(0).ToArray());
             Assert.Equal(new byte[] { 9, 10, 11, 12 }, read.GetBytes(2).ToArray());
+            GC.KeepAlive(read);
         }
         finally
         {

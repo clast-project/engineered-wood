@@ -106,6 +106,8 @@ public class ConcatenateSizedTests
                 {
                     if (!e.IsNull(i))
                         Assert.Equal(e.GetBytes(i).ToArray(), a.GetBytes(i).ToArray());
+                    GC.KeepAlive(e);
+                    GC.KeepAlive(a);
                 }
                 break;
             case LargeStringArray e:

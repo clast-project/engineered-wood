@@ -42,6 +42,7 @@ public class VortexZstdTests
         Assert.Equal(0, b.NullCount);
         foreach (var i in rows)
             Assert.Equal(Encoding.UTF8.GetBytes(Row(i)).Concat(new byte[] { 0xff }), b.GetBytes(i).ToArray());
+        GC.KeepAlive(b);
 
         var n = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(2));
         Assert.Equal(rows.Count(i => i % 7 == 0), n.NullCount);

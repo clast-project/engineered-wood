@@ -101,6 +101,15 @@ public class LargeAndViewByteArrayTests : IDisposable
     // Any byte-array layout the reader hands back, as text.
     private static string? Text(IArrowArray array, int i)
     {
+        // The binary arms read spans of the array's buffers, which may be in native memory nothing else keeps alive
+        // (#834, doc/arrow-span-lifetime.md): rooted here, for the whole call.
+        string? text = TextOf(array, i);
+        GC.KeepAlive(array);
+        return text;
+    }
+
+    private static string? TextOf(IArrowArray array, int i)
+    {
         if (array is ExtensionArray extension)
             return Text(extension.Storage, i);
         if (array.IsNull(i))

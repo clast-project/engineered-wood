@@ -2542,6 +2542,7 @@ public class VortexFileWriterTests
                     Assert.Equal(expected, descRead.GetString(i));
                 }
                 Assert.Equal(new byte[] { (byte)i, (byte)(i * 2), (byte)(i * 3) }, blobRead.GetBytes(i).ToArray());
+                GC.KeepAlive(blobRead);
             }
         }
         finally
@@ -6944,6 +6945,7 @@ public class VortexFileWriterTests
                     Assert.True(read.IsValid(i));
                     var actual = read.GetBytes(i);
                     for (int k = 0; k < 16; k++) Assert.Equal(expected[i][k], actual[k]);
+                    GC.KeepAlive(read);
                 }
             }
         }
@@ -7235,6 +7237,7 @@ public class VortexFileWriterTests
                     Assert.Equal(expected[i].Length, actual.Length);
                     for (int k = 0; k < expected[i].Length; k++)
                         Assert.Equal(expected[i][k], actual[k]);
+                    GC.KeepAlive(read);
                 }
             }
         }
@@ -7294,6 +7297,7 @@ public class VortexFileWriterTests
                     Assert.Equal(expected[i].Length, actual.Length);
                     for (int k = 0; k < expected[i].Length; k++)
                         Assert.Equal(expected[i][k], actual[k]);
+                    GC.KeepAlive(read);
                 }
             }
         }
@@ -7855,6 +7859,7 @@ public class VortexFileWriterTests
                 Assert.Equal(0x10, bytes[0]);
                 Assert.Equal((byte)i, bytes[1]);
                 for (int k = 2; k < 8; k++) Assert.Equal(0, bytes[k]);
+                GC.KeepAlive(col);
             }
         }
         finally

@@ -681,6 +681,7 @@ public class DictionaryPushdownTests : IDisposable
                 BinaryArray a => LiteralValue.Of(a.GetBytes(i).ToArray()),
                 _ => null,
             };
+            GC.KeepAlive(column);
             if (value is null)
                 return [];
             if (!values.Contains(value.Value))

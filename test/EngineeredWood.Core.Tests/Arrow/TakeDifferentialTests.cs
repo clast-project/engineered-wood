@@ -211,6 +211,8 @@ public class TakeDifferentialTests
             Assert.Equal(viaBuilder.IsNull(i), viaTake.IsNull(i));
             if (!viaBuilder.IsNull(i))
                 Assert.Equal(viaBuilder.GetBytes(i).ToArray(), viaTake.GetBytes(i).ToArray());
+            GC.KeepAlive(viaBuilder);
+            GC.KeepAlive(viaTake);
         }
     }
 }

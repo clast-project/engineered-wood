@@ -28,12 +28,16 @@ public class VortexZigZagTests
 
         var i8 = Assert.IsType<Int8Array>(await reader.ReadColumnAsync(0));
         Assert.Equal(rows.Select(i => (sbyte)Row(i, sbyte.MinValue, sbyte.MaxValue)), i8.Values.ToArray());
+        GC.KeepAlive(i8);
         var i16 = Assert.IsType<Int16Array>(await reader.ReadColumnAsync(1));
         Assert.Equal(rows.Select(i => (short)Row(i, short.MinValue, short.MaxValue)), i16.Values.ToArray());
+        GC.KeepAlive(i16);
         var i32 = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(2));
         Assert.Equal(rows.Select(i => (int)Row(i, int.MinValue, int.MaxValue)), i32.Values.ToArray());
+        GC.KeepAlive(i32);
         var i64 = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(3));
         Assert.Equal(rows.Select(i => Row(i, long.MinValue, long.MaxValue)), i64.Values.ToArray());
+        GC.KeepAlive(i64);
 
         var n32 = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(4));
         Assert.Equal(rows.Count(i => i % 6 == 0), n32.NullCount);

@@ -106,6 +106,7 @@ public class PartitionTakeFidelityTests
         // Compare raw storage bytes: rows 0 and 2 of the source, in order.
         Assert.Equal(bytes.AsSpan(0, 16).ToArray(), us.GetBytes(0).ToArray());
         Assert.Equal(bytes.AsSpan(32, 16).ToArray(), us.GetBytes(1).ToArray());
+        GC.KeepAlive(us);
     }
 
     [Fact]

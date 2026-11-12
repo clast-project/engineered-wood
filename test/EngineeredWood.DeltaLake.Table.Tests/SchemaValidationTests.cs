@@ -428,6 +428,7 @@ public class SchemaValidationTests : IDisposable
             var col = Assert.IsType<BinaryArray>(b.Column(0));
             for (int i = 0; i < col.Length; i++)
                 rows.Add(col.IsNull(i) ? "null" : string.Join(",", col.GetBytes(i).ToArray()));
+            GC.KeepAlive(col);
         }
         rows.Sort(StringComparer.Ordinal);
         Assert.Equal(["1,2,3,4", "9,10,11,12", "9,10,11,12", "9,10,11,12", "null", "null"], rows);
@@ -449,9 +450,11 @@ public class SchemaValidationTests : IDisposable
         var batch = Assert.Single(await ReadAllAsync(table));
         var child = Assert.IsType<BinaryArray>(((StructArray)batch.Column(0)).Fields[0]);
         Assert.Equal(new byte[] { 7, 8 }, child.GetBytes(0).ToArray());
+        GC.KeepAlive(child);
         var elements = Assert.IsType<BinaryArray>(((ListArray)batch.Column(1)).Values);
         Assert.Equal(new byte[] { 5, 6 }, elements.GetBytes(0).ToArray());
         Assert.Equal(new byte[] { 7, 8 }, elements.GetBytes(1).ToArray());
+        GC.KeepAlive(elements);
     }
 
     [Fact]
@@ -1009,6 +1012,7 @@ public class SchemaValidationTests : IDisposable
         Assert.Equal(2 * sizeof(int), fsb.Buffers[1].Length); // offsets
         Assert.Equal(4, fsb.Buffers[2].Length);                // the slice's bytes, shared
         Assert.Equal(new byte[] { 0, 0, 0, 9 }, ((BinaryArray)ArrowArrayFactory.BuildArray(fsb)).GetBytes(0).ToArray());
+        GC.KeepAlive(fsb);
 
         var date = WriteTypeNormalization.Normalize(LastRowOf(
             new Field("d", Date64Type.Default, true), Date64s(Enumerable.Repeat(2 * Day, Big).ToArray()))).Column(0).Data;

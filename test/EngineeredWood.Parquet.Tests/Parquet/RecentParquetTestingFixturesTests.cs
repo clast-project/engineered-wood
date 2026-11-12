@@ -138,6 +138,7 @@ public sealed class RecentParquetTestingFixturesTests
         Assert.Equal(
             [86_399_999_999L, 86_400_000_000L, -50_803_200_000_000L, 1L],
             values.Values.ToArray());
+        GC.KeepAlive(values);
 
         // The minimum is floored to the microsecond, as the reader floors the value it returns.
         var accessor = new ParquetStatisticsAccessor(await reader.GetSchemaAsync());

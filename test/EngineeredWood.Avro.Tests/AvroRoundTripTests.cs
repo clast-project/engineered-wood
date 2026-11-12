@@ -142,6 +142,8 @@ public class AvroRoundTripTests
         Assert.Equal(3, result.Length);
         for (int i = 0; i < 3; i++)
             Assert.Equal(src.GetBytes(i).ToArray(), dst.GetBytes(i).ToArray());
+        GC.KeepAlive(src);
+        GC.KeepAlive(dst);
     }
 
     [Fact]
@@ -409,6 +411,7 @@ public class AvroRoundTripTests
         var resultFixed = (FixedSizeBinaryArray)result.Column(0);
         Assert.Equal(new byte[] { 1, 2, 3, 4 }, resultFixed.GetBytes(0).ToArray());
         Assert.Equal(new byte[] { 5, 6, 7, 8 }, resultFixed.GetBytes(1).ToArray());
+        GC.KeepAlive(resultFixed);
     }
 
     [Fact]

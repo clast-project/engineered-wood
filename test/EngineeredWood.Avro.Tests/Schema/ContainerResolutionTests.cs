@@ -35,6 +35,7 @@ public class ContainerResolutionTests
 
         var items = Assert.IsType<DoubleArray>(((ListArray)batch.Column(0)).Values);
         Assert.Equal([1.5, -2.25], items.Values.ToArray());
+        GC.KeepAlive(items);
     }
 
     [Fact]

@@ -162,6 +162,8 @@ public class ZeroOffsetViewTests : IDisposable
         var source = MemoryMarshal.Cast<byte, int>(array.Data.Buffers[1].Span);
         var viewed = MemoryMarshal.Cast<byte, int>(view.Data.Buffers[1].Span);
         Assert.True(Same(source.Slice(9), viewed));
+        GC.KeepAlive(array);
+        GC.KeepAlive(view);
     }
 
     [Fact]

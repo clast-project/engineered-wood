@@ -54,6 +54,10 @@ internal static class ArrowValues
     {
         var sb = new StringBuilder();
         Append(sb, array, index);
+
+        // Append reads spans off the array and its children, which may be in native memory that nothing else
+        // keeps alive (#834, doc/arrow-span-lifetime.md). Rooting the array here covers the whole call tree.
+        GC.KeepAlive(array);
         return sb.ToString();
     }
 

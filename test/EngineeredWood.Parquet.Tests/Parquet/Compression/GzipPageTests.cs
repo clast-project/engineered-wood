@@ -61,6 +61,7 @@ public class GzipPageTests : IDisposable
         Assert.Equal(
             array.Data.Buffers[1].Span.ToArray(),
             read.Data.Buffers[1].Span.Slice(0, array.Data.Buffers[1].Length).ToArray());
+        GC.KeepAlive(read);
     }
 
     // An all-null V2 page has an empty values section, which is still compressed: a 0-byte payload

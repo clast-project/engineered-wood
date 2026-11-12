@@ -304,7 +304,7 @@ public class ByteArrayOutputScanTests : IDisposable
     {
         if (column.IsNull(r))
             return "null";
-        return column switch
+        string text = column switch
         {
             StringArray a => a.GetString(r),
             StringViewArray a => a.GetString(r),
@@ -314,5 +314,9 @@ public class ByteArrayOutputScanTests : IDisposable
             LargeBinaryArray a => Hex(a.GetBytes(r)),
             _ => throw new NotSupportedException(column.GetType().Name),
         };
+
+        // Hex reads a span of the column's buffer, which may be in native memory nothing else keeps alive (#834).
+        GC.KeepAlive(column);
+        return text;
     }
 }

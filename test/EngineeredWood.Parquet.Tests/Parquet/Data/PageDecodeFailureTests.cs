@@ -69,6 +69,7 @@ public class PageDecodeFailureTests : IDisposable
             Assert.Equal(30, ((Int32Array)whole).GetValue(0));
         else
             Assert.Equal("ccc"u8.ToArray(), ((BinaryArray)whole).GetBytes(0).ToArray());
+        GC.KeepAlive(whole);
     }
 
     [Fact]
@@ -134,6 +135,7 @@ public class PageDecodeFailureTests : IDisposable
         var chunk = PlainSnappyChunk(declaredUncompressed: 16);
         Assert.Equal([1, 2, 3, 4], ((Int32Array)ReadWhole(chunk)).Values.ToArray());
         Assert.Equal([1, 2, 3, 4], ((Int32Array)ReadBatched(chunk)).Values.ToArray());
+        GC.KeepAlive(chunk);
     }
 
     /// <summary>
@@ -167,6 +169,7 @@ public class PageDecodeFailureTests : IDisposable
             (DataPage(4, Encoding.Plain, payload.Length, uncompressed: 50_000_000), payload));
         Assert.Equal([1, 2, 3, 4], ((Int32Array)ReadWhole(chunk)).Values.ToArray());
         Assert.Equal([1, 2, 3, 4], ((Int32Array)ReadBatched(chunk)).Values.ToArray());
+        GC.KeepAlive(chunk);
     }
 
     /// <summary>
