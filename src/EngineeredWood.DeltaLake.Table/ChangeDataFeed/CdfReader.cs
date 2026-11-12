@@ -379,8 +379,9 @@ internal static class CdfReader
             file = await KnownLengthRandomAccessFile.OpenAsync(fs, diskPath, size, cancellationToken)
                 .ConfigureAwait(false);
             reader = new ParquetFileReader(file, ownsFile: false, readOptions);
-            var footer = await DataFileFooter.ReadAsync(reader, file, diskPath, cancellationToken).ConfigureAwait(false);
-            return new OpenedFile(file, reader, footer);
+            // The reader caches the footer for the read.
+            _ = await DataFileFooter.ReadAsync(reader, file, diskPath, cancellationToken).ConfigureAwait(false);
+            return new OpenedFile(file, reader);
         }
         catch (Exception) when (missingMeansVacuumed && !cancellationToken.IsCancellationRequested)
         {
@@ -400,12 +401,11 @@ internal static class CdfReader
         }
     }
 
-    /// <summary>An open file, its reader, and its footer. Disposing it disposes the reader, then the file.</summary>
-    private sealed class OpenedFile(IRandomAccessFile file, ParquetFileReader reader, Parquet.Metadata.FileMetaData footer)
-        : IAsyncDisposable
+    /// <summary>An open file and its reader, which has read the footer. Disposing it disposes the reader, then the
+    /// file.</summary>
+    private sealed class OpenedFile(IRandomAccessFile file, ParquetFileReader reader) : IAsyncDisposable
     {
         public ParquetFileReader Reader { get; } = reader;
-        public Parquet.Metadata.FileMetaData Footer { get; } = footer;
 
         public async ValueTask DisposeAsync()
         {

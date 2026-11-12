@@ -301,7 +301,7 @@ internal static class CompactionExecutor
                     .ConfigureAwait(false);
                 reader = new ParquetFileReader(file, ownsFile: false, parquetReadOptions);
                 // The footer first, so that a size the log records wrongly says so (the reader caches it).
-                var footer = await DataFileFooter.ReadAsync(
+                _ = await DataFileFooter.ReadAsync(
                         reader, file, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
                     .ConfigureAwait(false);
                 // Widened byte/short columns read as their stored INT32 (#839), before the first read, and before
