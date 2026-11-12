@@ -5,6 +5,7 @@ using System.Buffers;
 using Apache.Arrow;
 using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
+using EngineeredWood.Compression;
 using EngineeredWood.Expressions;
 using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
@@ -667,8 +668,8 @@ public class ParallelRowGroupReadTests : IDisposable
         await using var file = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(file, ownsFile: false, options);
         var plan = new ParquetFileReader.RowGroupPlan(0, 0, ranges, null);
-        var (reserved, _) = await reader.FirstBatchReservationAsync(
-            plan, null, new ParquetFileReader.DecodedGrowth(), CancellationToken.None);
+        long reserved = (await reader.FirstBatchReservationAsync(
+            plan, null, new ParquetFileReader.DecodedGrowth(), CancellationToken.None)).Reserved;
         await foreach (var positioned in reader.ReadPlannedAsync(plan, null, CancellationToken.None))
         {
             using (positioned.Batch)
@@ -701,6 +702,102 @@ public class ParallelRowGroupReadTests : IDisposable
         var (reserved, first) = await PlannedFirstBatchAsync(path, ParquetReadOptions.Default, ranges);
         Assert.True(first > 100_000 * 4, $"the first batch holds {first} bytes: not the whole page");
         Assert.True(reserved >= first, $"reserved {reserved} for a first batch of {first}");
+    }
+
+    /// <summary>Reads <paramref name="plan"/> as one unit of a parallel read that shares <paramref name="growth"/>,
+    /// and returns the size of its first batch.</summary>
+    private static async Task<long> ReadUnitAsync(
+        ParquetFileReader reader, ParquetFileReader.RowGroupPlan plan, ParquetFileReader.DecodedGrowth growth)
+    {
+        long first = -1;
+        await foreach (var positioned in reader.ReadPlannedAsync(
+                           plan, null, EngineeredWood.Scans.ScanReservation.None, growth, CancellationToken.None))
+        {
+            using (positioned.Batch)
+            {
+                if (first < 0)
+                    first = EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(positioned.Batch);
+            }
+        }
+        return first;
+    }
+
+    [Fact]
+    public async Task TheFirstBatchReservation_FromTheOffsetIndex_GrowsAgainstItsOwnBaseline()
+    {
+        // #847 review: growth was learnt against the rows a range keeps, and applied to the pages it touches. A
+        // 1,000-row range inside a 100,000-row page learnt ~100x, and the next such range reserved ~100x its page.
+        string path = await WriteDoublesAsync("one-page-growth.parquet", pageRows: 1_000_000);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var growth = new ParquetFileReader.DecodedGrowth();
+        var plan = new ParquetFileReader.RowGroupPlan(0, 0, [new RowRange(50_000, 51_000)], null);
+
+        long first = await ReadUnitAsync(reader, plan, growth);
+        long reserved = (await reader.FirstBatchReservationAsync(plan, null, growth, CancellationToken.None)).Reserved;
+        Assert.True(reserved >= first, $"reserved {reserved} for a first batch of {first}");
+        Assert.True(reserved <= first * 5 / 4, $"reserved {reserved} for a first batch of {first}");
+    }
+
+    /// <summary>100,000 strings in pages of 1,000 rows, written with <paramref name="options"/>.</summary>
+    private async Task<string> WriteStringsAsync(string name, Func<int, string> value, ParquetWriteOptions options)
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("s", StringType.Default, false)).Build();
+        var values = new StringArray.Builder();
+        for (int i = 0; i < 100_000; i++)
+            values.Append(value(i));
+        string path = Path.Combine(_tempDir, name);
+        using (var batch = new RecordBatch(schema, [values.Build()], 100_000))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false, options with
+                     {
+                         DataPageSize = 16 << 20,
+                         DataPageRowCountLimit = 1_000,
+                     }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+        return path;
+    }
+
+    [Fact]
+    public async Task TheFirstBatchReservation_FromTheOffsetIndex_CoversACompressibleFirstPage()
+    {
+        // #847 review: a page's uncompressed size is estimated by the chunk's compression ratio, so a first page that
+        // compresses far better than the rest is undercounted.
+        var random = new Random(847);
+        string path = await WriteStringsAsync(
+            "compressible-first.parquet",
+            i => i < 1_000 ? new string('a', 100) : random.Next().ToString("x8") + random.NextDouble(),
+            ParquetWriteOptions.Default with { DictionaryEnabled = false, Compression = CompressionCodec.Zstd });
+        var options = new ParquetReadOptions { BatchSize = 1_000 };
+        var (footerBased, _) = await FirstBatchAsync(path, options);
+        var (reserved, first) = await PlannedFirstBatchAsync(path, options);
+        Assert.True(reserved >= first, $"reserved {reserved} (footer: {footerBased}) for a first batch of {first}");
+    }
+
+    [Fact]
+    public async Task TheFirstBatchReservation_FromTheOffsetIndex_CoversDictionaryStrings()
+    {
+        // #847 review: a dictionary-encoded string page holds indices; the strings they decode to are longer, and
+        // nothing before the decode says how much (the footer fell short as well). A batched read never learnt it
+        // (#846 gap 1): growth was measured only from a row group read as one batch. A first batch sized from its
+        // pages is measured against that size, so the next unit of the read reserves enough.
+        string[] distinct = Enumerable.Range(0, 8).Select(k => new string((char)('a' + k), 200)).ToArray();
+        string path = await WriteStringsAsync(
+            "dictionary-strings.parquet", i => distinct[i % distinct.Length], ParquetWriteOptions.Default);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 1_000 });
+        var growth = new ParquetFileReader.DecodedGrowth();
+        var plan = new ParquetFileReader.RowGroupPlan(0, 0, null, null);
+
+        long before = (await reader.FirstBatchReservationAsync(plan, null, growth, CancellationToken.None)).Reserved;
+        long first = await ReadUnitAsync(reader, plan, growth);
+        Assert.True(before < first, $"reserved {before} for a first batch of {first}: nothing to learn");
+        long reserved = (await reader.FirstBatchReservationAsync(plan, null, growth, CancellationToken.None)).Reserved;
+        Assert.True(reserved >= first, $"reserved {reserved} for a first batch of {first}");
+        Assert.True(reserved <= first * 5 / 4, $"reserved {reserved} for a first batch of {first}");
     }
 
     [Fact]

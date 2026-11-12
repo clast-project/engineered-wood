@@ -556,10 +556,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
         var compressed = PlannedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges).Compressed;
-        long planned = DecodedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges);
 
         long decoded = 0;
         int batches = 0;
+        FirstBatchEstimate estimate = default;
         PrefetchedFile? prefetched = null;
         IAsyncEnumerator<PositionedRecordBatch>? e = null;
         try
@@ -572,11 +572,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             }
 
             // The first batch is sized once the fetch is under way: the OffsetIndexes it may read take a round trip.
-            var (first, offsetIndexes) = await FirstBatchReservationAsync(plan, columnNames, growth, cancellationToken)
+            estimate = await FirstBatchReservationAsync(plan, columnNames, growth, cancellationToken)
                 .ConfigureAwait(false);
-            if (offsetIndexes is not null)
+            if (estimate.OffsetIndexes is { } offsetIndexes)
                 plan = plan with { OffsetIndexes = offsetIndexes };
-            reservation.SetInitialEstimate(first);
+            reservation.SetInitialEstimate(estimate.Reserved);
 
             e = ReadPlannedAsync(plan, columnNames, cancellationToken, answers, prefetched)
                 .GetAsyncEnumerator(cancellationToken);
@@ -591,6 +591,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 // may shrink a batch before handing it on (a Delta scan drops a deletion vector's rows), and
                 // a shrunken size must not lower the reservation for the full-size batch after it.
                 reservation.Observe(decoded);
+                // A first batch sized from its pages is measured against that size: the same buffers (#847 review).
+                if (batches == 0 && estimate.FromPages)
+                    growth.Observe(estimate.Baseline, decoded);
                 batches++;
                 yield return e.Current;
             }
@@ -604,11 +607,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             reservation.ReleaseHeld();
         }
 
-        // Learnt only from a row group read as ONE batch. Batches split from one decode (a nested row group
-        // decoded whole, then sliced; a flat run shared by the batches that slice it) each count the whole
-        // buffers they share, so summing them would count the same memory many times over.
-        if (batches == 1)
-            growth.Observe(planned, decoded);
+        // Otherwise learnt only from a row group read as ONE batch, against the estimate of the whole read. Batches
+        // split from one decode (a nested row group decoded whole, then sliced; a flat run shared by the batches
+        // that slice it) each count the whole buffers they share, so summing them would count the same memory
+        // many times over.
+        if (batches == 1 && !estimate.FromPages)
+            growth.Observe(estimate.Baseline, decoded);
     }
 
     /// <summary>Whether <paramref name="plan"/> reads every row of its group: no ranges, or the one range of
@@ -749,21 +753,34 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// share of the row group's decoded estimate (<see cref="FirstBatchBytes"/>); either grown by
     /// <paramref name="growth"/>. Also the OffsetIndex bytes read on the way, for the read to reuse.
     /// </summary>
-    internal async ValueTask<(long Bytes, Dictionary<long, byte[]>? OffsetIndexes)> FirstBatchReservationAsync(
+    internal async ValueTask<FirstBatchEstimate> FirstBatchReservationAsync(
         RowGroupPlan plan, IReadOnlyList<string>? columnNames, DecodedGrowth growth, CancellationToken cancellationToken)
     {
         var (pages, offsetIndexes) = await FirstBatchFromPagesAsync(plan, columnNames, cancellationToken)
             .ConfigureAwait(false);
         if (pages is long bytes)
-            return (growth.Apply(bytes), offsetIndexes);
+            return new FirstBatchEstimate(growth.Apply(bytes), bytes, FromPages: true, offsetIndexes);
 
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
         var group = metadata.RowGroups[plan.Index];
         long footer = PlannedBytes(group, schema, columnNames, plan.Ranges).Uncompressed;
         long planned = DecodedBytes(group, schema, columnNames, plan.Ranges);
-        return (FirstBatchBytes(growth.Apply(planned), footer, group, schema, columnNames, plan.Ranges), offsetIndexes);
+        return new FirstBatchEstimate(
+            FirstBatchBytes(growth.Apply(planned), footer, group, schema, columnNames, plan.Ranges), planned,
+            FromPages: false, offsetIndexes);
     }
+
+    /// <summary>
+    /// A first batch's reservation (<see cref="FirstBatchReservationAsync"/>), and what <see cref="DecodedGrowth"/>
+    /// measures decoded sizes against: <paramref name="Baseline"/>, the estimate before growth, of the same
+    /// buffers as the measurement (#847 review). From pages, that is the first batch, which holds the whole pages
+    /// it touches; otherwise the whole read's <see cref="DecodedBytes"/>, measured only when it is read as one
+    /// batch. Measuring a range inside a large page against the rows it kept learnt ~100x, which the page
+    /// estimate, already covering the page, then multiplied.
+    /// </summary>
+    internal readonly record struct FirstBatchEstimate(
+        long Reserved, long Baseline, bool FromPages, Dictionary<long, byte[]>? OffsetIndexes);
 
     /// <summary>
     /// The reservation for the first batch of a batched read of a flat row group, from the pages that batch
@@ -866,6 +883,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         int spanEnd = plan.Ranges is null ? ctx.RowCount : checked((int)plan.Ranges[0].End);
         int end = start + ComputeBatchRowCount(maps, start, spanEnd, batchSize, maxBytes);
 
+        long kept = ctx.RowCount;
+        if (plan.Ranges is not null)
+        {
+            kept = 0;
+            foreach (var r in plan.Ranges)
+                kept += r.End - r.Start;
+        }
+        double keptShare = Math.Min(1.0, (double)kept / ctx.RowCount);
         long total = 0;
         for (int i = 0; i < ctx.Count; i++)
         {
@@ -877,13 +902,21 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             for (int p = firstPage; p <= lastPage; p++)
                 encoded += map.Pages[p].UncompressedSize;
 
-            long byteArrayBytes = encoded;
+            long byteArrayBytes;
             if (decodedIndexes[i].UnencodedByteArrayDataBytes is { } unencoded
                 && unencoded.Count == map.Pages.Length)
             {
                 byteArrayBytes = 0;
                 for (int p = firstPage; p <= lastPage; p++)
                     byteArrayBytes += unencoded[p];
+            }
+            else
+            {
+                // Without the writer's count, a page's size is only an estimate (the chunk's compression ratio over
+                // its compressed size: short for a page that compresses better than the rest) and a dictionary page
+                // counts indices, not strings. The column's footer size for the rows kept, as a footer-sized read
+                // reserves it, stays the floor (#847 review).
+                byteArrayBytes = Math.Max(encoded, (long)(ctx.Chunks[i].MetaData!.TotalUncompressedSize * keptShare));
             }
             total += ColumnDecodedBytes(ctx.Columns[i], rows, encoded, byteArrayBytes);
         }
