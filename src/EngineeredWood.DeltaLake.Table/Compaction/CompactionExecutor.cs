@@ -209,18 +209,20 @@ internal static class CompactionExecutor
         DeletionVectors.DeletionVectorReader dvReader,
         ParquetReadOptions parquetReadOptions,
         IDataFileReader? dataFileReader,
+        DeltaSnapshot snapshot,
+        ColumnMappingMode mappingMode,
         int maxConcurrentReads,
         long maxBufferedReadBytes,
         EngineeredWood.Memory.MemoryBudget? memoryBudget,
         CancellationToken cancellationToken)
     {
         if (maxConcurrentReads <= 1 || group.Count == 1)
-            return SeriallyAsync(fs, group, dvReader, parquetReadOptions, dataFileReader, cancellationToken);
+            return SeriallyAsync(fs, group, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode, cancellationToken);
 
         return OrderedScan.RunAsync(
             UnitsAsync(group),
             (addFile, reservation, ct) => ReadSourceAsync(
-                fs, addFile, dvReader, parquetReadOptions, dataFileReader, reservation, ct),
+                fs, addFile, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode, reservation, ct),
             static b => RollingDataFileWriter.EstimatedBytes(b.Batch),
             static b => b.Batch.Dispose(),
             maxConcurrentReads,
@@ -234,12 +236,15 @@ internal static class CompactionExecutor
         DeletionVectors.DeletionVectorReader dvReader,
         ParquetReadOptions parquetReadOptions,
         IDataFileReader? dataFileReader,
+        DeltaSnapshot snapshot,
+        ColumnMappingMode mappingMode,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
         foreach (var addFile in group)
         {
             await foreach (var batch in ReadSourceAsync(
-                               fs, addFile, dvReader, parquetReadOptions, dataFileReader, ScanReservation.None,
+                               fs, addFile, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode,
+                               ScanReservation.None,
                                cancellationToken).ConfigureAwait(false))
             {
                 yield return batch;
@@ -267,6 +272,8 @@ internal static class CompactionExecutor
         DeletionVectors.DeletionVectorReader dvReader,
         ParquetReadOptions parquetReadOptions,
         IDataFileReader? dataFileReader,
+        DeltaSnapshot snapshot,
+        ColumnMappingMode mappingMode,
         ScanReservation reservation,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
@@ -299,6 +306,9 @@ internal static class CompactionExecutor
                     .ConfigureAwait(false);
                 if (reservation != ScanReservation.None)
                     reservation.SetInitialEstimate(DeltaTable.LargestRowGroupBytes(footer, null, deletedRows));
+                // Widened byte/short columns read as their stored INT32 (#839), before the first read.
+                await TypeWidening.StoredInt32Columns.ApplyAsync(reader, snapshot, mappingMode, cancellationToken)
+                    .ConfigureAwait(false);
                 rawBatches = Positioned(reader, deletedRows, cancellationToken);
             }
 
@@ -403,7 +413,7 @@ internal static class CompactionExecutor
             // maxConcurrentReads ahead (each open, deletion vector and decode is round trips against an object
             // store), but their batches arrive here in group order, so what is written is what a serial read wrote.
             await foreach (var source in ReadGroupAsync(
-                               fs, group, dvReader, parquetReadOptions, dataFileReader,
+                               fs, group, dvReader, parquetReadOptions, dataFileReader, snapshot, mappingMode,
                                maxConcurrentReads, maxBufferedReadBytes, memoryBudget, cancellationToken).ConfigureAwait(false))
             {
                 var (batch, batchStartRow, deletedRows) = (source.Batch, source.FirstRow, source.DeletedRows);

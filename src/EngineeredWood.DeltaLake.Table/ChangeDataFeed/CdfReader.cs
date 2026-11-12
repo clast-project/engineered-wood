@@ -438,6 +438,9 @@ internal static class CdfReader
             fs, EngineeredWood.DeltaLake.DeltaPath.Decode(unit.Path), unit.Size, readOptions,
             missingMeansVacuumed: false, cancellationToken).ConfigureAwait(false))!;
         var reader = opened.Reader;
+        // Widened byte/short columns read as their stored INT32 (#839), before the first read.
+        await TypeWidening.StoredInt32Columns.ApplyAsync(reader, ctx.SchemaSnapshot, ctx.MappingMode, cancellationToken)
+            .ConfigureAwait(false);
 
         // Every column of every row group is read, so the largest row group bounds the first reservation.
         if (reservation != ScanReservation.None)
@@ -737,6 +740,9 @@ internal static class CdfReader
         if (opened is null)
             yield break;
         var reader = opened.Reader;
+        // Widened byte/short columns read as their stored INT32 (#839), before the first read.
+        await TypeWidening.StoredInt32Columns.ApplyAsync(reader, ctx.SchemaSnapshot, ctx.MappingMode, cancellationToken)
+            .ConfigureAwait(false);
 
         filter = await filter.ResolveAsync(dvReader, cancellationToken).ConfigureAwait(false);
 
