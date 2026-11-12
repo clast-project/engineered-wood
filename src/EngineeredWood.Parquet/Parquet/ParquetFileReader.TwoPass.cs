@@ -218,6 +218,9 @@ public sealed partial class ParquetFileReader
                 long size = ArrowSizes.EstimatedBytes(batch);
                 decoded += size;
                 reservation?.Observe(size);
+                // Never yielded, so never settled: charged now where it outgrows the reservation, as when a
+                // dictionary declines to answer and the pass decodes values (#848 review).
+                reservation?.Cover(size);
                 try
                 {
                     if (start == 0 && batch.Length == groupRows)
@@ -287,6 +290,8 @@ public sealed partial class ParquetFileReader
                     long size = ArrowSizes.EstimatedBytes(batch);
                     decoded += size;
                     reservation?.Observe(size);
+                    // Settled at the selected rows' size; the raw batch exists until then.
+                    reservation?.Cover(size);
                     var selected = keepRows is null
                         ? SecondPass(batch, start, selection, first, plan.GroupStart, columns, moved)
                         : SecondPass(batch, start: 0, selection, first, plan.GroupStart, columns, moved, groupRows);
@@ -591,14 +596,17 @@ public sealed partial class ParquetFileReader
     /// it ~30% at a window of 16 (0.74 -> 0.52 s with this).
     /// <list type="bullet">
     /// <item>The first pass is one batch of the whole group when it keeps returned predicate columns, else its
-    /// <see cref="FirstBatchBytes"/> share. A predicate column it answers from a wholly dictionary-encoded chunk
-    /// decodes to the answers (a Boolean column and its validity), not the values, unless the read returns the column
-    /// too, when it holds both (<see cref="Data.DictionaryAnswer"/>).</item>
+    /// <see cref="FirstBatchBytes"/> share. A predicate column the read may answer from its dictionary
+    /// (<see cref="Data.DictionaryAnswer.MayAnswer"/>) adds the answers (a Boolean column and its validity); its values
+    /// are left out only when the read drops it and the chunk is wholly dictionary-encoded, when the answers stand in
+    /// for them. A fallback page's values are decoded (#804), and a returned column keeps them beside its answers
+    /// (<see cref="Data.DictionaryAnswer"/>).</item>
     /// <item>The second pass's first batch is its <see cref="FirstBatchBytes"/> share of the output columns, as if no
     /// row were dropped: how many survive is known only after the first pass.</item>
     /// </list>
-    /// A chunk whose dictionary declines to answer (an entry raises) is decoded after all, and charged in full once
-    /// measured. Both passes' decoded estimates are grown by <paramref name="growth"/>.
+    /// A dictionary can still decline (one no smaller than the batch's rows, or an entry that raises), and the pass then
+    /// decodes values: each raw batch is charged as it is measured (<see cref="ScanReservation.Cover"/>). Both passes'
+    /// decoded estimates are grown by <paramref name="growth"/>.
     /// </summary>
     internal long TwoPassFirstBatchBytes(
         Metadata.RowGroup rowGroup, SchemaDescriptor schema, TwoPassColumns columns,
@@ -615,14 +623,15 @@ public sealed partial class ParquetFileReader
         {
             var column = filterColumns[i];
             string name = column.Path[0];
+            var meta = filterChunks[i].MetaData;
             bool answered = answers is not null && column.Path.Count == 1 && column.MaxRepetitionLevel == 0
-                            && answers.ContainsKey(name)
-                            && filterChunks[i].MetaData is { } meta
-                            && MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta);
+                            && answers.ContainsKey(name) && meta is not null && Data.DictionaryAnswer.MayAnswer(meta);
             // Values and validity of the answers' Boolean column.
             if (answered)
                 answerBytes += 2 * bitmap;
-            if (!answered || answers![name].KeepValues)
+            bool answersStandIn = answered && !answers![name].KeepValues
+                                  && MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta!);
+            if (!answersStandIn)
                 decodedFilter.Add(name);
         }
 

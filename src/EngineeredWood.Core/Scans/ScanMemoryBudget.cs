@@ -81,6 +81,23 @@ internal sealed class ScanReservation
     }
 
     /// <summary>
+    /// A raw batch the read is decoding now measured <paramref name="bytes"/>: the pending reservation is raised to
+    /// cover it, charged at once without waiting (it already exists), as <see cref="Settle"/> charges an item larger
+    /// than its reservation. For memory an item's read decodes but never yields, which no <see cref="Settle"/> would
+    /// ever measure: a two-pass read's first pass (#848 review). <see cref="Settle"/> or <see cref="ReleasePending"/>
+    /// lets it go with the rest of the reservation.</summary>
+    internal void Cover(long bytes)
+    {
+        if (_budget is null)
+            return;
+        bytes = Math.Min(bytes, MemoryBudget.MaxCharge); // as in Observe
+        if (bytes <= _pending)
+            return;
+        _budget.Adjust(bytes - _pending);
+        _pending = bytes;
+    }
+
+    /// <summary>
     /// Waits until the budget can take <paramref name="bytes"/> more, and holds them until
     /// <see cref="ReleaseHeld"/>: memory the unit's read keeps for its whole life rather than per item — a
     /// Parquet row group's compressed column chunks, which its read holds across the batches it yields. Unlike
