@@ -3,6 +3,7 @@
 
 using System.Buffers;
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
 using EngineeredWood.Expressions;
 using EngineeredWood.IO;
@@ -632,6 +633,49 @@ public class ParallelRowGroupReadTests : IDisposable
         var (reserved, first) = await FirstBatchAsync(path, new ParquetReadOptions { MaxBatchByteSize = limit });
         Assert.True(first > limit, $"the first batch holds {first} bytes, within the limit {limit}: nothing to test");
         Assert.True(reserved >= first, $"reserved {reserved} for a first batch of {first}");
+    }
+
+    [Fact]
+    public async Task TheDecodedEstimate_SizesAnExtensionTypeByItsStorage()
+    {
+        // #845 review round 2: a registered arrow.uuid column is decoded as FixedSizeBinary(16) storage. Matched only
+        // by its outer type, it fell back to the footer's size, which a dictionary shrinks to a sliver.
+        const int rows = 50_000;
+        Guid[] distinct = [Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid(), Guid.NewGuid()];
+        var builder = new GuidArray.Builder();
+        for (int i = 0; i < rows; i++)
+            builder.Append(distinct[i % distinct.Length]);
+        var guids = builder.Build(allocator: null);
+        var schema = new Apache.Arrow.Schema([new Field("g", guids.Data.DataType, nullable: false)], metadata: null);
+        string path = Path.Combine(_tempDir, "guids.parquet");
+        using (var batch = new RecordBatch(schema, [guids], rows))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        var registry = new ExtensionTypeRegistry();
+        registry.Register(GuidExtensionDefinition.Instance);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { ExtensionRegistry = registry });
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long decoded = 0;
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            using (batch)
+            {
+                Assert.IsType<GuidArray>(batch.Column(0));
+                decoded += EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(batch);
+            }
+        }
+
+        long footer = ParquetFileReader.PlannedBytes(group, parquetSchema, null, null).Uncompressed;
+        long estimate = reader.DecodedBytes(group, parquetSchema, null, null);
+        Assert.True(footer < decoded / 4, $"the footer says {footer}, the batch decodes to {decoded}: no gap to test");
+        Assert.True(estimate >= decoded, $"estimates {estimate}, decodes to {decoded}");
     }
 
     [Fact]

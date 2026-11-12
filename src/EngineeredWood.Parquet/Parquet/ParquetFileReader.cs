@@ -672,7 +672,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// footer and 6 MiB decoded. A whole first wave of a wide window reserved that little, decoded at once, and
     /// overran the budget several times over. So each flat column is sized by what Arrow will hold:
     /// <list type="bullet">
-    /// <item>a fixed-width type, its width times the rows (exact);</item>
+    /// <item>a fixed-width type, its width times the rows (exact), an extension type by its storage type;</item>
     /// <item>strings and binary, their offsets or views from the rows, plus the footer's uncompressed size for
     /// the bytes themselves (close for plain data, short for a dictionary, which <see cref="DecodedGrowth"/>
     /// then learns);</item>
@@ -702,6 +702,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 continue;
             long footer = (long)(meta.TotalUncompressedSize * share);
             var type = ArrowSchemaConverter.ToArrowField(columns[c], _options).DataType;
+            // A registered extension type (arrow.uuid over FixedSizeBinary(16)) is decoded into its storage type, so
+            // that is what is sized (#845 review round 2).
+            while (type is Apache.Arrow.ExtensionType extension)
+                type = extension.StorageType;
             long values = type switch
             {
                 Apache.Arrow.Types.FixedWidthType fixedWidth => (rows * fixedWidth.BitWidth + 7) / 8,
