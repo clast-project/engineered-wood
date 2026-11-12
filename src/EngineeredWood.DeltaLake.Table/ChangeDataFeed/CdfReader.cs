@@ -57,8 +57,8 @@ internal static class CdfReader
     /// (Spark's rule depends on column mapping) is the caller's decision.</para>
     /// <para>The files the feed reads (change files, and the data files changes are inferred from) are read
     /// up to <paramref name="maxConcurrentReads"/> at once, holding at most
-    /// <paramref name="maxBufferedReadBytes"/> of decoded batches the caller has not taken, as a scan does
-    /// (<see cref="OrderedScan"/>). Batches come in the order a serial read gives: by version, then file. On an
+    /// <paramref name="maxBufferedReadBytes"/> of decoded batches the caller has not taken (within
+    /// <paramref name="memoryBudget"/>, when given), as a scan does (<see cref="OrderedScan"/>). Batches come in the order a serial read gives: by version, then file. On an
     /// object store each file costs a few round trips, and read one after another they set the feed's time.</para>
     /// <para>Which commits the range has comes from ONE listing of the log, as delta-spark's does (measured
     /// against delta-spark 4.0.0): a version with no commit file inside the range is skipped (unless the caller
@@ -84,6 +84,7 @@ internal static class CdfReader
         int maxConcurrentReads = 1,
         long maxBufferedReadBytes = DefaultMaxBufferedReadBytes,
         long latestVersion = -1,
+        EngineeredWood.Memory.MemoryBudget? memoryBudget = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var versions = await CommitsInRangeAsync(log, startVersion, endVersion, latestVersion, cancellationToken)
@@ -116,7 +117,7 @@ internal static class CdfReader
                 static b => RollingDataFileWriter.EstimatedBytes(b),
                 static b => b.Dispose(),
                 maxConcurrentReads,
-                new ScanMemoryBudget(maxBufferedReadBytes),
+                new ScanMemoryBudget(maxBufferedReadBytes, memoryBudget),
                 cancellationToken: cancellationToken);
 
         await foreach (var batch in batches.WithCancellation(cancellationToken).ConfigureAwait(false))
@@ -378,8 +379,9 @@ internal static class CdfReader
             file = await KnownLengthRandomAccessFile.OpenAsync(fs, diskPath, size, cancellationToken)
                 .ConfigureAwait(false);
             reader = new ParquetFileReader(file, ownsFile: false, readOptions);
-            var footer = await DataFileFooter.ReadAsync(reader, file, diskPath, cancellationToken).ConfigureAwait(false);
-            return new OpenedFile(file, reader, footer);
+            // The reader caches the footer for the read.
+            _ = await DataFileFooter.ReadAsync(reader, file, diskPath, cancellationToken).ConfigureAwait(false);
+            return new OpenedFile(file, reader);
         }
         catch (Exception) when (missingMeansVacuumed && !cancellationToken.IsCancellationRequested)
         {
@@ -399,12 +401,11 @@ internal static class CdfReader
         }
     }
 
-    /// <summary>An open file, its reader, and its footer. Disposing it disposes the reader, then the file.</summary>
-    private sealed class OpenedFile(IRandomAccessFile file, ParquetFileReader reader, Parquet.Metadata.FileMetaData footer)
-        : IAsyncDisposable
+    /// <summary>An open file and its reader, which has read the footer. Disposing it disposes the reader, then the
+    /// file.</summary>
+    private sealed class OpenedFile(IRandomAccessFile file, ParquetFileReader reader) : IAsyncDisposable
     {
         public ParquetFileReader Reader { get; } = reader;
-        public Parquet.Metadata.FileMetaData Footer { get; } = footer;
 
         public async ValueTask DisposeAsync()
         {
@@ -444,7 +445,10 @@ internal static class CdfReader
 
         // Every column of every row group is read, so the largest row group bounds the first reservation.
         if (reservation != ScanReservation.None)
-            reservation.SetInitialEstimate(DeltaTable.LargestRowGroupBytes(opened.Footer, null, null));
+        {
+            reservation.SetInitialEstimate(await DeltaTable.LargestFirstBatchBytesAsync(
+                reader, null, null, cancellationToken).ConfigureAwait(false));
+        }
 
         await foreach (var (batch, _) in DeltaTable.Reserving(
             PositionedAsync(reader.ReadWithPositionsAsync(null, null, cancellationToken), cancellationToken),
@@ -750,8 +754,8 @@ internal static class CdfReader
         // reservation; one a keep-only filter skips is still counted, which can only overestimate.
         if (reservation != ScanReservation.None)
         {
-            reservation.SetInitialEstimate(DeltaTable.LargestRowGroupBytes(
-                opened.Footer, null, filter.KeepOnlyPositions ? null : filter.Positions));
+            reservation.SetInitialEstimate(await DeltaTable.LargestFirstBatchBytesAsync(
+                reader, null, filter.KeepOnlyPositions ? null : filter.Positions, cancellationToken).ConfigureAwait(false));
         }
 
         // DV positions are absolute within the file, and so is a row's positional id: each batch's first row comes

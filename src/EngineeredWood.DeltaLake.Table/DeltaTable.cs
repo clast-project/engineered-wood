@@ -6386,6 +6386,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             options.MetadataPrefix + DeltaMetadataColumns.RowCommitVersionSuffix,
             EffectiveConcurrentRequests, _options.MaxBufferedReadBytes,
             latestVersion: snapshot.Version,
+            memoryBudget: _options.MemoryBudget,
             cancellationToken: cancellationToken);
 
         // Keep set for the projection, if one was asked for. The feed's own three columns are never dropped
@@ -13840,10 +13841,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 if (reservation != ScanReservation.None)
                 {
-                    // Reserve for the first batch before decoding it: the largest row group's uncompressed size
-                    // over the columns read. Later batches reserve what the previous one measured.
-                    var footer = await read.Reader.ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
-                    reservation.SetInitialEstimate(LargestRowGroupBytes(footer, read.FileColumns, read.DeletedRows));
+                    // Reserve for the first batch before decoding it: the largest row group's estimated decoded
+                    // size over the columns read. Later batches reserve what the previous one measured.
+                    reservation.SetInitialEstimate(await LargestFirstBatchBytesAsync(
+                        read.Reader, read.FileColumns, read.DeletedRows, cancellationToken).ConfigureAwait(false));
                 }
 
                 source = Reserving(
@@ -14688,41 +14689,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// The largest row group's uncompressed size over the top-level columns <paramref name="fileColumns"/>
-    /// names (every column when null): the reservation for a file's first batch, before one has been
-    /// measured. Parquet's uncompressed size is close to the Arrow size for plain data and an UNDERestimate
-    /// for dictionary-encoded strings; the reservation is trued up to the measured size once decoded.
+    /// The reservation for a file's first batch, before one has been measured: the largest first batch of any row
+    /// group the read of <paramref name="fileColumns"/> (every column when null) decodes, sized by type from the
+    /// footer (<see cref="ParquetFileReader.LargestFirstBatchBytesAsync"/>). The footer's uncompressed size alone,
+    /// reserved before, measures ENCODED pages and was 10-20x short for dictionary or run-length-encoded columns, so
+    /// a change feed or a compaction read at a wide window ran several times over its budget (#846). A string
+    /// column's bytes still come from the footer, short for a dictionary; the reservation is trued up to the
+    /// measured size once a batch is decoded.
     /// </summary>
-    internal static long LargestRowGroupBytes(
-        Parquet.Metadata.FileMetaData footer, IReadOnlyList<string>? fileColumns, DeletionVectorBitmap? deletedRows)
+    internal static ValueTask<long> LargestFirstBatchBytesAsync(
+        ParquetFileReader reader, IReadOnlyList<string>? fileColumns, DeletionVectorBitmap? deletedRows,
+        CancellationToken cancellationToken)
     {
-        HashSet<string>? wanted = fileColumns is null
-            ? null : new HashSet<string>(fileColumns, StringComparer.Ordinal);
-        long largest = 0;
-        long groupStart = 0;
-        foreach (var rowGroup in footer.RowGroups)
-        {
-            // A group the deletion vector deletes in full is skipped unread (ReadPositionedAsync), so it is never
-            // decoded and needs no reservation.
-            long start = groupStart;
-            groupStart += rowGroup.NumRows;
-            if (deletedRows is { IsEmpty: false } && rowGroup.NumRows > 0 && deletedRows.ContainsRange(start, rowGroup.NumRows))
-                continue;
-
-            long bytes = 0;
-            foreach (var chunk in rowGroup.Columns)
-            {
-                if (chunk.MetaData is not { } meta)
-                    continue;
-                if (wanted is not null
-                    && (meta.PathInSchema is not { Count: > 0 } path || !wanted.Contains(path[0])))
-                    continue;
-                bytes += meta.TotalUncompressedSize;
-            }
-            if (bytes > largest)
-                largest = bytes;
-        }
-        return largest;
+        // A group the deletion vector deletes in full is skipped unread (ReadPositionedAsync), so it is never
+        // decoded and needs no reservation.
+        Func<long, long, bool>? skipped = deletedRows is { IsEmpty: false }
+            ? (start, rows) => deletedRows.ContainsRange(start, rows)
+            : null;
+        return reader.LargestFirstBatchBytesAsync(fileColumns, skipped, cancellationToken);
     }
 
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(
