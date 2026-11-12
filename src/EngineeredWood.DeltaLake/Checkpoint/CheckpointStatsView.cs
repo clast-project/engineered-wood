@@ -35,6 +35,11 @@ internal sealed class CheckpointStatsView
     private readonly StructArray? _minStruct;
     private readonly StructArray? _maxStruct;
     private readonly StructArray? _nullCountStruct;
+    // The paths each group reaches twice (#826): dropped from the lookups above, and left out of the JSON
+    // BuildStatsJson writes, so a synthesised string says what the getters do.
+    private readonly HashSet<string> _minCollided;
+    private readonly HashSet<string> _maxCollided;
+    private readonly HashSet<string> _nullCountCollided;
 
     private CheckpointStatsView(
         Int64Array? numRecords,
@@ -43,7 +48,10 @@ internal sealed class CheckpointStatsView
         Dictionary<string, Int64Array> nullCounts,
         StructArray? minStruct,
         StructArray? maxStruct,
-        StructArray? nullCountStruct)
+        StructArray? nullCountStruct,
+        HashSet<string> minCollided,
+        HashSet<string> maxCollided,
+        HashSet<string> nullCountCollided)
     {
         _numRecords = numRecords;
         _minValues = minValues;
@@ -52,6 +60,9 @@ internal sealed class CheckpointStatsView
         _minStruct = minStruct;
         _maxStruct = maxStruct;
         _nullCountStruct = nullCountStruct;
+        _minCollided = minCollided;
+        _maxCollided = maxCollided;
+        _nullCountCollided = nullCountCollided;
     }
 
     /// <summary>
@@ -76,11 +87,15 @@ internal sealed class CheckpointStatsView
         var maxStruct = Child(stats, statsType, "maxValues") as StructArray;
         var nullCountStruct = Child(stats, statsType, "nullCount") as StructArray;
 
-        Flatten(minStruct, prefix: null, minValues);
-        Flatten(maxStruct, prefix: null, maxValues);
+        var minCollided = FlattenGroup(minStruct, minValues, opaqueVariants: true);
+        var maxCollided = FlattenGroup(maxStruct, maxValues, opaqueVariants: true);
 
+        // Collisions are settled before the Int64 filter, so a count of another type still makes its path
+        // ambiguous rather than leaving a usable copy alone (as ColumnStats.FlattenCounts does since #825).
         var nullCountLeaves = new Dictionary<string, IArrowArray>(StringComparer.Ordinal);
-        Flatten(nullCountStruct, prefix: null, nullCountLeaves);
+        // A variant's null count is one number, never a group, so every struct here is walked: a struct shaped like
+        // a variant bound is malformed, and its children's paths must still meet the collision check (#841 review).
+        var nullCountCollided = FlattenGroup(nullCountStruct, nullCountLeaves, opaqueVariants: false);
         foreach (var kvp in nullCountLeaves)
         {
             if (kvp.Value is Int64Array counts)
@@ -91,7 +106,8 @@ internal sealed class CheckpointStatsView
             return null;
 
         return new CheckpointStatsView(
-            numRecords, minValues, maxValues, nullCounts, minStruct, maxStruct, nullCountStruct);
+            numRecords, minValues, maxValues, nullCounts, minStruct, maxStruct, nullCountStruct,
+            minCollided, maxCollided, nullCountCollided);
     }
 
     /// <summary>Number of records in the file at <paramref name="row"/>; null when unknown, a negative count among
@@ -132,13 +148,15 @@ internal sealed class CheckpointStatsView
     }
 
     /// <summary>
-    /// True when the view carries min/max for this column. Asked separately from
+    /// True when the view carries this side's bound (min or max) for this column. Asked per side because a path can
+    /// collide in one group and not the other (#826): a view that claimed a column on its max alone would hide a
+    /// usable JSON min (#841 review). Asked separately from
     /// <see cref="HasNullCount"/> because the two cover different column sets: stats_parsed counts
     /// nulls for every column but bounds only the orderable ones, so a boolean is present in one and
     /// absent from the other, and a caller that conflated them would silently lose the JSON bound.
     /// </summary>
-    public bool HasBound(string column) =>
-        _minValues.ContainsKey(column) || _maxValues.ContainsKey(column);
+    public bool HasBound(string column, bool isMin) =>
+        (isMin ? _minValues : _maxValues).ContainsKey(column);
 
     /// <summary>True when the view carries a null count for this column.</summary>
     public bool HasNullCount(string column) => _nullCounts.ContainsKey(column);
@@ -173,9 +191,9 @@ internal sealed class CheckpointStatsView
             writer.WriteStartObject();
             if (numRecords is { } records)
                 writer.WriteNumber("numRecords", records);
-            WriteGroup(writer, "minValues", _minStruct, row);
-            WriteGroup(writer, "maxValues", _maxStruct, row);
-            WriteGroup(writer, "nullCount", _nullCountStruct, row, counts: true);
+            WriteGroup(writer, "minValues", _minStruct, row, _minCollided);
+            WriteGroup(writer, "maxValues", _maxStruct, row, _maxCollided);
+            WriteGroup(writer, "nullCount", _nullCountStruct, row, _nullCountCollided, counts: true);
             writer.WriteEndObject();
         }
 
@@ -183,17 +201,22 @@ internal sealed class CheckpointStatsView
     }
 
     // `counts`: the group holds counts (nullCount), whose negative integer leaves are unknown and omitted (#825 review).
-    // A bound group keeps its negatives.
-    private static void WriteGroup(Utf8JsonWriter writer, string name, StructArray? group, int row, bool counts = false)
+    // A bound group keeps its negatives. `collided`: the group's ambiguous paths (#826), whose leaves are omitted, as
+    // the lookups drop them; otherwise a duplicate the writer skips (null, or a negative count) would leave its twin
+    // alone in the JSON, unambiguous (#841 review). A struct at a collided path is still written: its own children
+    // are judged by their own paths.
+    private static void WriteGroup(
+        Utf8JsonWriter writer, string name, StructArray? group, int row, HashSet<string> collided, bool counts = false)
     {
         if (group is null || group.IsNull(row))
             return;
 
         writer.WritePropertyName(name);
-        WriteStruct(writer, group, row, counts);
+        WriteStruct(writer, group, row, prefix: null, collided, counts);
     }
 
-    private static void WriteStruct(Utf8JsonWriter writer, StructArray group, int row, bool counts = false)
+    private static void WriteStruct(
+        Utf8JsonWriter writer, StructArray group, int row, string? prefix, HashSet<string> collided, bool counts)
     {
         writer.WriteStartObject();
         var type = (ArrowStructType)group.Data.DataType;
@@ -202,23 +225,27 @@ internal sealed class CheckpointStatsView
             var child = group.Fields[i];
             if (child.IsNull(row))
                 continue;
+            string path = prefix is null ? type.Fields[i].Name : prefix + "." + type.Fields[i].Name;
+            bool walked = child is StructArray && (counts || !IsVariantGroup(child));
+            if (!walked && collided.Contains(path))
+                continue;
             if (counts && child is Int64Array { } longs && longs.GetValue(row) < 0
                 || counts && child is Int32Array { } ints && ints.GetValue(row) < 0)
                 continue;
 
             string fieldName = type.Fields[i].Name;
-            if (VariantBound(child, row) is { } bound)
+            if (!counts && VariantBound(child, row) is { } bound)
             {
                 writer.WriteString(fieldName, bound);
             }
-            else if (IsVariantGroup(child))
+            else if (!counts && IsVariantGroup(child))
             {
                 // A variant bound that does not encode: omitted, a missing bound rather than a wrong one.
             }
             else if (child is StructArray nested)
             {
                 writer.WritePropertyName(fieldName);
-                WriteStruct(writer, nested, row, counts);
+                WriteStruct(writer, nested, row, path, collided, counts);
             }
             else
             {
@@ -295,7 +322,27 @@ internal sealed class CheckpointStatsView
     /// Flattens a bounds struct into dotted leaf paths ("payload.score"), matching the keys
     /// <see cref="Actions.ColumnStats"/> produces from the JSON so both feed the same lookups.
     /// </summary>
-    private static void Flatten(IArrowArray? array, string? prefix, Dictionary<string, IArrowArray> into)
+    /// <remarks>
+    /// A path reached twice (the same field name twice in one struct, or a literal dotted field <c>s.a</c> beside a
+    /// struct <c>s</c> with a child <c>a</c>) is ambiguous and dropped from the map, as the JSON path drops it
+    /// (#826): keeping whichever copy came last could prune on a bound or null count the statistics also
+    /// contradict. A dropped path has no typed statistics, so the pruner asks the JSON copy instead.
+    /// </remarks>
+    /// <returns>The paths dropped as ambiguous.</returns>
+    private static HashSet<string> FlattenGroup(
+        StructArray? group, Dictionary<string, IArrowArray> into, bool opaqueVariants)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var collided = new HashSet<string>(StringComparer.Ordinal);
+        Flatten(group, prefix: null, into, seen, collided, opaqueVariants);
+        foreach (string path in collided)
+            into.Remove(path);
+        return collided;
+    }
+
+    private static void Flatten(
+        IArrowArray? array, string? prefix, Dictionary<string, IArrowArray> into,
+        HashSet<string> seen, HashSet<string> collided, bool opaqueVariants)
     {
         if (array is not StructArray group)
             return;
@@ -306,8 +353,12 @@ internal sealed class CheckpointStatsView
             string name = type.Fields[i].Name;
             string path = prefix is null ? name : prefix + "." + name;
             var child = group.Fields[i];
-            if (child is StructArray && !IsVariantGroup(child))
-                Flatten(child, path, into);
+            // Struct paths are recorded too, so a leaf named like a struct (the same name twice, once each way)
+            // is ambiguous as well; a struct's own path is never a key, so dropping it removes nothing.
+            if (!seen.Add(path))
+                collided.Add(path);
+            if (child is StructArray && !(opaqueVariants && IsVariantGroup(child)))
+                Flatten(child, path, into, seen, collided, opaqueVariants);
             else
                 into[path] = child;
         }

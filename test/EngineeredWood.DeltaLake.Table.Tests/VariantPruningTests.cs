@@ -395,7 +395,7 @@ public class VariantPruningTests : IDisposable
         // Answered from the typed copy of the bounds: check that the checkpoint carries them, then that it prunes.
         var reader = new CheckpointReader(new LocalTableFileSystem(_tempDir));
         var adds = (await reader.ReadCheckpointAsync((await reader.ReadLastCheckpointAsync())!)).OfType<AddFile>().ToList();
-        Assert.Contains(adds, a => a.TypedStats?.View.HasBound("v") == true);
+        Assert.Contains(adds, a => a.TypedStats?.View.HasBound("v", isMin: true) == true);
         var pruner = new DeltaFilePruner(
             (await Snapshot.SnapshotBuilder.BuildAsync(new TransactionLog(new LocalTableFileSystem(_tempDir)))).Schema, []);
         var filter = SparkSqlParser.ParsePredicate("v:a::bigint > 5");

@@ -443,7 +443,7 @@ internal sealed class DeltaFileStatsAccessor
 
         LiteralValue? bound;
         if (TypedFor(stats.AddFile) is { } typed
-            && TryResolveTyped(typed, column, typed.View.HasBound, out string resolved))
+            && TryResolveTyped(typed, column, c => typed.View.HasBound(c, isMin), out string resolved))
         {
             bound = typed.View.GetBound(resolved, typed.Row, isMin, typeName);
         }
@@ -497,7 +497,7 @@ internal sealed class DeltaFileStatsAccessor
     {
         byte[] metadata, value;
         if (TypedFor(stats.AddFile) is { } typed
-            && TryResolveTyped(typed, column, typed.View.HasBound, out string resolved))
+            && TryResolveTyped(typed, column, c => typed.View.HasBound(c, isMin), out string resolved))
         {
             if (!typed.View.TryGetVariantBound(resolved, typed.Row, isMin, out metadata, out value))
                 return null;

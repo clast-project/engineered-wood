@@ -361,9 +361,10 @@ public class VariantStatisticsTests : IDisposable
     {
         var add = await CheckpointedAddAsync(SparkStats, shredding: false);
 
-        Assert.False(add.TypedStats!.View.HasBound("v"));
+        Assert.False(add.TypedStats!.View.HasBound("v", isMin: true));
+        Assert.False(add.TypedStats.View.HasBound("v", isMin: false));
         Assert.True(add.TypedStats.View.HasNullCount("v"));
-        Assert.True(add.TypedStats.View.HasBound("id"));
+        Assert.True(add.TypedStats.View.HasBound("id", isMin: true));
     }
 
     [Fact]
