@@ -535,7 +535,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// only then waits for room to decode (#829). Reserving first made the fetch wait too: with a budget that
     /// takes one decoded row group at a time, nothing was fetched while the one before it decoded, and the read
     /// ran serially at fetch-plus-decode per row group. A read of some rows only fetches the pages it needs, as
-    /// it decodes them.</item>
+    /// it decodes them, and so does a read with a chunk too large to fetch in one buffer
+    /// (<see cref="TryPrefetch"/>).</item>
     /// <item>The first batch reserves the row group's footer size (<see cref="PlannedBytes"/>), grown by how far
     /// decoded row groups have exceeded theirs so far (<paramref name="growth"/>). Later batches of the same row
     /// group reserve the largest batch it has produced.</item>
@@ -562,10 +563,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         try
         {
             await reservation.HoldAsync(compressed, cancellationToken).ConfigureAwait(false);
-            if (plan.Ranges is null)
+            if (CoversWholeGroup(plan, metadata.RowGroups[plan.Index]))
             {
                 var ctx = await PrepareRowGroupAsync(plan.Index, columnNames, cancellationToken).ConfigureAwait(false);
-                prefetched = new PrefetchedFile(_file, ctx.Ranges, cancellationToken);
+                prefetched = TryPrefetch(ctx.Ranges, cancellationToken);
             }
             e = ReadPlannedAsync(plan, columnNames, cancellationToken, answers, prefetched)
                 .GetAsyncEnumerator(cancellationToken);
@@ -598,6 +599,30 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // buffers they share, so summing them would count the same memory many times over.
         if (batches == 1)
             growth.Observe(uncompressed, decoded);
+    }
+
+    /// <summary>Whether <paramref name="plan"/> reads every row of its group: no ranges, or the one range of
+    /// every row that page-index pruning returns when it narrows nothing.</summary>
+    private static bool CoversWholeGroup(RowGroupPlan plan, RowGroup rowGroup) =>
+        plan.Ranges is null
+        || (plan.Ranges.Count == 1 && plan.Ranges[0].Start == 0 && plan.Ranges[0].End == rowGroup.NumRows);
+
+    /// <summary>The largest byte array .NET allocates (<c>Array.MaxLength</c>, which .NET Framework lacks).</summary>
+    private const long MaxPrefetchRangeBytes = 0x7FFFFFC7;
+
+    /// <summary>
+    /// Starts fetching <paramref name="ranges"/> ahead of their decode (#829), or returns null when one is too
+    /// large to fetch into a single buffer. Such a chunk can still be read when a batch size and an OffsetIndex
+    /// let the read take it in page windows, which a whole-chunk fetch would turn into an overflow.
+    /// </summary>
+    private PrefetchedFile? TryPrefetch(IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken)
+    {
+        foreach (var range in ranges)
+        {
+            if (range.Length > MaxPrefetchRangeBytes)
+                return null;
+        }
+        return new PrefetchedFile(_file, ranges, cancellationToken);
     }
 
     /// <summary>

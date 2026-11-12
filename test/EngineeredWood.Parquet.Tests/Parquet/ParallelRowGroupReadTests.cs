@@ -536,8 +536,10 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.Equal(0, budget.Used);
     }
 
-    [Fact]
-    public async Task APlannedRead_FetchesItsChunks_WhileItWaitsForRoomToDecode()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task APlannedRead_FetchesItsChunks_WhileItWaitsForRoomToDecode(bool unselectiveFilter)
     {
         // #829: a row group whose hold fits the budget but whose decode does not yet must still fetch its chunks
         // while it waits, so the fetch overlaps the decode ahead of it. Reserving before fetching made a scan whose
@@ -546,11 +548,19 @@ public class ParallelRowGroupReadTests : IDisposable
         await using var local = new LocalRandomAccessFile(_path);
         var watched = new WatchingFile(local, dataOffset);
         using var reader = new ParquetFileReader(watched, ownsFile: false);
+        // A filter that prunes nothing plans the group as one range of every row rather than none (#843 review):
+        // that is still a whole-group read, and fetches ahead the same way.
+        var filter = unselectiveFilter ? Ex.GreaterThanOrEqual("id", LiteralValue.Of(0L)) : null;
         ParquetFileReader.RowGroupPlan? plan = null;
-        await foreach (var p in reader.PlanRowGroupsAsync(null, null, null, default))
+        await foreach (var p in reader.PlanRowGroupsAsync(filter, null, null, default))
         {
             if (p.Index == 1)
                 plan = p;
+        }
+        if (unselectiveFilter)
+        {
+            var ranges = Assert.Single(plan!.Value.Ranges!);
+            Assert.Equal(new RowRange(0, _groupStarts[2] - _groupStarts[1]), ranges);
         }
         var (uncompressed, compressed) = ParquetFileReader.PlannedBytes(
             (await reader.ReadMetadataAsync()).RowGroups[1], await reader.GetSchemaAsync(), null, null);
