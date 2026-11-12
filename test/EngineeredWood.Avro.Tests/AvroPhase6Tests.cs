@@ -657,11 +657,11 @@ public class AvroPhase6Tests
 #if NET8_0_OR_GREATER
         long low = BitConverter.ToInt64(bytes);
         long high = BitConverter.ToInt64(bytes[8..]);
-        GC.KeepAlive(array);
 #else
         long low = MemoryMarshal.Read<long>(bytes);
         long high = MemoryMarshal.Read<long>(bytes.Slice(8));
 #endif
+        GC.KeepAlive(array); // after both branches' reads of the span (#834 review round 1)
         // For values that fit in a long, high should be sign extension
         if (expected >= 0)
         {

@@ -11,8 +11,11 @@ key so that `InternalsVisibleTo` grants resolve. It finds every `Span<T>`/`ReadO
 a member of an `Apache.Arrow` type (`Values`, `GetBytes`, `ValueOffsets`, `ArrowBuffer.Span`, …). It
 walks the receiver to its root (a local, a parameter, `this` or a temporary) and reports the site when
 nothing mentions the root later in the enclosing method, lambda, local function or accessor. A `using`
-local counts as alive, and so does an owner reached through `this` (a field): the instance is the
-caller's to keep alive.
+resource counts as alive (`using var x`, or the declaration of a `using (...)` statement, but not a local merely
+declared in its body), and so does an owner reached through `this` (a field): the instance is the caller's to
+keep alive. A static call's result is owned by its first argument only for helpers known to return it
+(`Assert.IsType`, `Assert.IsAssignableFrom`, `Assert.Single`, `Unsafe.As`); any other call's result is a
+temporary.
 
 Each line gives the site, the owner, and how the span is consumed where it is taken. `indexed` and
 `length` mean no call runs between taking the span and reading it, so such sites are left alone.
@@ -42,7 +45,14 @@ $scan test/EngineeredWood.Avro.Tests test/EngineeredWood.Avro.Tests/bin/Release/
 
 # A library, against its tests' output:
 $scan src/EngineeredWood.Avro test/EngineeredWood.Avro.Tests/bin/Release/net10.0
+
+# The .NET Framework branches (#else of `#if NET…`), which a net10.0 scan never sees:
+$scan test/EngineeredWood.Avro.Tests test/EngineeredWood.Avro.Tests/bin/Release/net10.0 net472
 ```
+
+The optional third argument picks the preprocessor symbols: `net10.0` (the default) or `net472`, each with the
+SDK's cumulative `…_OR_GREATER` symbols, or a comma-separated list of your own. Scan both, since a keep-alive
+inside one branch of an `#if` protects only the targets that compile it.
 
 Sites go to stdout as `path(line): owner kind and name | consumption | source line`. A summary per project
 goes to stderr, with the compile-error count. About a dozen errors are normal: native DLLs that can't be

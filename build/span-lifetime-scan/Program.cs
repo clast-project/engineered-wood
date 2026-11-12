@@ -20,7 +20,17 @@ if (args.Length < 2)
 
 string projectDir = Path.GetFullPath(args[0]);
 string binDir = Path.GetFullPath(args[1]);
-var symbols = (args.Length > 2 ? args[2] : "NET,NET8_0_OR_GREATER,NET9_0_OR_GREATER,NET10_0_OR_GREATER,NET10_0,RELEASE")
+// The preprocessor symbols the SDK defines for a target, cumulative (`NET6_0_OR_GREATER` holds on net10.0 too), so the
+// branches scanned are the ones that target builds (review round 1). `net472` scans .NET Framework's #else branches;
+// anything else is taken as a comma-separated list.
+const string net10 = "NET,NETCOREAPP,NET10_0,NETCOREAPP1_0_OR_GREATER,NETCOREAPP1_1_OR_GREATER,NETCOREAPP2_0_OR_GREATER," +
+    "NETCOREAPP2_1_OR_GREATER,NETCOREAPP2_2_OR_GREATER,NETCOREAPP3_0_OR_GREATER,NETCOREAPP3_1_OR_GREATER," +
+    "NET5_0_OR_GREATER,NET6_0_OR_GREATER,NET7_0_OR_GREATER,NET8_0_OR_GREATER,NET9_0_OR_GREATER,NET10_0_OR_GREATER,RELEASE";
+const string net472 = "NETFRAMEWORK,NET472,NET20_OR_GREATER,NET30_OR_GREATER,NET35_OR_GREATER,NET40_OR_GREATER," +
+    "NET45_OR_GREATER,NET451_OR_GREATER,NET452_OR_GREATER,NET46_OR_GREATER,NET461_OR_GREATER,NET462_OR_GREATER," +
+    "NET47_OR_GREATER,NET471_OR_GREATER,NET472_OR_GREATER,RELEASE";
+string symbolArg = args.Length > 2 ? args[2] : "net10.0";
+var symbols = (symbolArg switch { "net10.0" => net10, "net472" => net472, _ => symbolArg })
     .Split(',', StringSplitOptions.RemoveEmptyEntries);
 var parse = new CSharpParseOptions(LanguageVersion.Preview, preprocessorSymbols: symbols);
 
@@ -361,9 +371,11 @@ static (string Kind, string Name, ISymbol? Symbol) Root(ExpressionSyntax expr, S
                     break;
                 }
 
-                // A static call such as Assert.IsType<T>(x) or Assert.Single(x) hands back (part of) its first
-                // argument: the owner is that argument's root.
-                if (model.GetSymbolInfo(inv).Symbol is IMethodSymbol { IsStatic: true } && inv.ArgumentList.Arguments.Count > 0)
+                // Only a static call known to hand back its first argument, or an element of it (Assert.IsType<T>(x),
+                // Assert.Single(xs)), makes that argument the owner. Any other call's result is a temporary: a
+                // ReadWhole(chunk) builds a new array, which keeping `chunk` alive does nothing for (review round 1).
+                if (model.GetSymbolInfo(inv).Symbol is IMethodSymbol { IsStatic: true } identity
+                    && IsIdentityHelper(identity) && inv.ArgumentList.Arguments.Count > 0)
                 {
                     expr = inv.ArgumentList.Arguments[0].Expression;
                     break;
@@ -420,21 +432,29 @@ static SyntaxNode? EnclosingBody(SyntaxNode node)
     return null;
 }
 
+// Whether the local is itself a using resource (`using var x = …`, or `using (var x = …)`), whose disposal at the end of
+// its scope is a use. A local merely declared inside a using statement's body is not (review round 1).
 static bool IsUsingLocal(ILocalSymbol local, SyntaxNode body)
 {
     foreach (var decl in local.DeclaringSyntaxReferences)
     {
-        var syntax = decl.GetSyntax();
-        for (var n = syntax.Parent; n is not null && n != body; n = n.Parent)
-        {
-            if (n is LocalDeclarationStatementSyntax lds && lds.UsingKeyword.RawKind != 0)
-                return true;
-            if (n is UsingStatementSyntax)
-                return true;
-        }
+        if (decl.GetSyntax() is not VariableDeclaratorSyntax { Parent: VariableDeclarationSyntax declaration })
+            continue;
+        if (declaration.Parent is LocalDeclarationStatementSyntax lds && lds.UsingKeyword.RawKind != 0)
+            return true;
+        if (declaration.Parent is UsingStatementSyntax us && us.Declaration == declaration)
+            return true;
     }
 
     return false;
+}
+
+// Static helpers that return their first argument, or an element of it, so that argument owns the result.
+static bool IsIdentityHelper(IMethodSymbol method)
+{
+    string type = method.ContainingType?.ToDisplayString() ?? "";
+    return (type == "Xunit.Assert" && method.Name is "IsType" or "IsAssignableFrom" or "Single")
+        || (type == "System.Runtime.CompilerServices.Unsafe" && method.Name == "As");
 }
 
 // How the span is used right where it is taken: indexed (no call between), passed on, or stored.
