@@ -2132,7 +2132,8 @@ internal sealed class ColumnBuildState : IDisposable
     /// <summary>Transfers the data buffer to an ArrowBuffer.</summary>
     public ArrowBuffer BuildDataBuffer()
     {
-        return _dataBuffer!.Build();
+        // Only the bytes written: the buffer was sized at 32 bytes a value, which short strings come nowhere near.
+        return _dataBuffer!.Build(_dataByteOffset);
     }
 
     /// <summary>

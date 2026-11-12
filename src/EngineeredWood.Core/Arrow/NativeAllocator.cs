@@ -63,11 +63,31 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
     /// <summary>
     /// Transfers ownership to an <see cref="ArrowBuffer"/>. This instance becomes unusable.
     /// </summary>
+    /// <param name="usedBytes">How many leading bytes were written, or -1 for all of them. When at most half the
+    /// buffer was used, the used bytes are copied into a buffer of their own size and this one is freed: a buffer
+    /// sized ahead by a guess (a string column's data, at 32 bytes a value) would otherwise be handed on whole,
+    /// holding — and reporting as its length — memory nothing uses.</param>
     public ArrowBuffer Build(int usedBytes = -1)
     {
         var inner = _inner ?? throw new ObjectDisposedException(nameof(NativeBuffer<T>));
         _inner = null;
-        return inner.Build();
+        int capacity = inner.ByteSpan.Length;
+        if (usedBytes < 0 || usedBytes > capacity / 2)
+            return inner.Build();
+
+        try
+        {
+            if (usedBytes == 0)
+                return ArrowBuffer.Empty;
+            var trimmed = new Apache.Arrow.Memory.NativeBuffer<byte, EngineeredWoodAllocationTracker>(
+                usedBytes, zeroFill: false, default);
+            inner.ByteSpan.Slice(0, usedBytes).CopyTo(trimmed.ByteSpan);
+            return trimmed.Build();
+        }
+        finally
+        {
+            inner.Dispose();
+        }
     }
 
     /// <summary>
