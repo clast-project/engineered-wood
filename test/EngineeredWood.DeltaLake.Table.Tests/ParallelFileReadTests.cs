@@ -1438,38 +1438,68 @@ public class ParallelFileReadTests : IDisposable
     private const int RunLengthFiles = 8;
     private const int RunLengthRows = 40_000;
 
-    private static readonly Apache.Arrow.Schema RunLengthSchema = new Apache.Arrow.Schema.Builder()
-        .Field(new Field("k", Int64Type.Default, false))
-        .Field(new Field("v", Int64Type.Default, false))
+    private static Apache.Arrow.Schema RunLengthSchema(IArrowType type) => new Apache.Arrow.Schema.Builder()
+        .Field(new Field("k", type, false))
+        .Field(new Field("v", type, false))
         .Build();
 
     /// <summary>
     /// Eight files of one row group each, whose two int64 columns hold three and five distinct values: they encode
     /// to a dictionary and run lengths, a sliver of the 640 KB a file decodes to. Returns options reading the eight
     /// at once under a budget of two batches, all of it drawn from <paramref name="shared"/>, and the largest raw
-    /// batch in the bytes the budget counts.
+    /// batch in the bytes the budget counts. <paramref name="widened"/> writes the columns as byte instead, then
+    /// widens them to int with a ninth, one-row file: the eight are read as the INT32 they store (#839), four times
+    /// what their byte type decodes to.
     /// </summary>
     private async Task<(DeltaTableOptions Options, long Largest)> CreateRunLengthTableAsync(
-        bool changeFeed, EngineeredWood.Memory.MemoryBudget shared)
+        bool changeFeed, EngineeredWood.Memory.MemoryBudget shared, bool widened = false)
     {
+        var configuration = new Dictionary<string, string>();
+        if (changeFeed)
+            configuration["delta.enableChangeDataFeed"] = "true";
+        if (widened)
+            configuration[DeltaLake.Schema.TypeWidening.EnableKey] = "true";
+        var schema = RunLengthSchema(widened ? Int8Type.Default : Int64Type.Default);
         var options = new DeltaTableOptions
         {
             ParquetWriteOptions = new ParquetWriteOptions { RowGroupMaxRows = RunLengthRows },
             MaxConcurrentReads = 1,
         };
         await using var table = await DeltaTable.CreateAsync(
-            _fs, RunLengthSchema, options,
-            configuration: changeFeed ? new Dictionary<string, string> { ["delta.enableChangeDataFeed"] = "true" } : null);
+            _fs, schema, options, configuration: configuration);
         for (int f = 0; f < RunLengthFiles; f++)
         {
-            var k = new Int64Array.Builder();
-            var v = new Int64Array.Builder();
-            for (int r = 0; r < RunLengthRows; r++)
+            IArrowArray k, v;
+            if (widened)
             {
-                k.Append(r % 3);
-                v.Append((r + f) % 5);
+                var kb = new Int8Array.Builder();
+                var vb = new Int8Array.Builder();
+                for (int r = 0; r < RunLengthRows; r++)
+                {
+                    kb.Append((sbyte)(r % 3));
+                    vb.Append((sbyte)((r + f) % 5));
+                }
+                (k, v) = (kb.Build(), vb.Build());
             }
-            await table.WriteAsync([new RecordBatch(RunLengthSchema, [k.Build(), v.Build()], RunLengthRows)]);
+            else
+            {
+                var kb = new Int64Array.Builder();
+                var vb = new Int64Array.Builder();
+                for (int r = 0; r < RunLengthRows; r++)
+                {
+                    kb.Append(r % 3);
+                    vb.Append((r + f) % 5);
+                }
+                (k, v) = (kb.Build(), vb.Build());
+            }
+            await table.WriteAsync([new RecordBatch(schema, [k, v], RunLengthRows)]);
+        }
+        if (widened)
+        {
+            var wide = RunLengthSchema(Int32Type.Default);
+            await table.WriteAsync(
+                [new RecordBatch(wide, [new Int32Array.Builder().Append(1).Build(), new Int32Array.Builder().Append(1).Build()], 1)],
+                mergeSchema: true);
         }
 
         long largest = 0;
@@ -1537,6 +1567,25 @@ public class ParallelFileReadTests : IDisposable
     {
         var shared = new EngineeredWood.Memory.MemoryBudget(long.MaxValue);
         var (options, largest) = await CreateRunLengthTableAsync(changeFeed: false, shared);
+        await using var table = await DeltaTable.OpenAsync(_fs, options);
+
+        long? version = await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });
+
+        Assert.NotNull(version);
+        Assert.Single(table.CurrentSnapshot.ActiveFiles);
+        Assert.InRange(shared.PeakBytes, 1, 3 * largest);
+        Assert.Equal(0, shared.UsedBytes);
+    }
+
+    /// <summary>#849 review: a byte column the table widened to int is read as the INT32 it stores, which changes
+    /// the type the estimate sizes, so compaction must estimate after it applies that, as the change feed and the
+    /// scan do. Estimated as byte, each of the eight files reserved a quarter of its first batch.</summary>
+    [Fact]
+    public async Task Compaction_ReservesAWidenedColumnAsTheInt32ItReads()
+    {
+        var shared = new EngineeredWood.Memory.MemoryBudget(long.MaxValue);
+        var (options, largest) = await CreateRunLengthTableAsync(changeFeed: false, shared, widened: true);
+        Assert.Equal(2 * RunLengthRows * sizeof(int), largest);
         await using var table = await DeltaTable.OpenAsync(_fs, options);
 
         long? version = await table.CompactAsync(new CompactionOptions { MinFileSize = long.MaxValue });

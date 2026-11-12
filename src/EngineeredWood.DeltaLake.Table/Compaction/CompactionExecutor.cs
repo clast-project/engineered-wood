@@ -304,14 +304,15 @@ internal static class CompactionExecutor
                 var footer = await DataFileFooter.ReadAsync(
                         reader, file, EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), cancellationToken)
                     .ConfigureAwait(false);
+                // Widened byte/short columns read as their stored INT32 (#839), before the first read, and before
+                // the estimate, which sizes each column by the type the read gives it (#849 review).
+                await TypeWidening.StoredInt32Columns.ApplyAsync(reader, snapshot, mappingMode, cancellationToken)
+                    .ConfigureAwait(false);
                 if (reservation != ScanReservation.None)
                 {
                     reservation.SetInitialEstimate(await DeltaTable.LargestFirstBatchBytesAsync(
                         reader, null, deletedRows, cancellationToken).ConfigureAwait(false));
                 }
-                // Widened byte/short columns read as their stored INT32 (#839), before the first read.
-                await TypeWidening.StoredInt32Columns.ApplyAsync(reader, snapshot, mappingMode, cancellationToken)
-                    .ConfigureAwait(false);
                 rawBatches = Positioned(reader, deletedRows, cancellationToken);
             }
 
