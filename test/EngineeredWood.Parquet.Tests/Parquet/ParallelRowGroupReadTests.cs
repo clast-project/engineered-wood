@@ -800,6 +800,25 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.True(reserved <= first * 5 / 4, $"reserved {reserved} for a first batch of {first}");
     }
 
+    [Theory]
+    // Its writer points DataPageOffset at the dictionary page, so the index and the footer disagree on where the
+    // first data page is: the read checks the bytes before it, and may set the index aside for a header scan.
+    [InlineData("alltypes_tiny_pages.parquet", false)]
+    // No dictionaries: each index starts where its chunk does.
+    [InlineData("alltypes_tiny_pages_plain.parquet", true)]
+    public async Task TheFirstBatchReservation_IsSizedFromPagesOnlyWhereTheReadUsesTheIndex(string name, bool fromPages)
+    {
+        // #847 review: sizing from an index the read may not use could reserve for pages the batch does not hold.
+        await using var file = new LocalRandomAccessFile(TestData.GetPath(name));
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 100 });
+        var plan = new ParquetFileReader.RowGroupPlan(0, 0, null, null);
+        var estimate = await reader.FirstBatchReservationAsync(
+            plan, null, new ParquetFileReader.DecodedGrowth(), CancellationToken.None);
+        Assert.Equal(fromPages, estimate.FromPages);
+        // The indexes read are handed on either way, so the read does not fetch them again.
+        Assert.NotNull(estimate.OffsetIndexes);
+    }
+
     [Fact]
     public async Task TheFirstBatchReservation_FromTheOffsetIndex_IsNotFlooredAtTheFooter()
     {

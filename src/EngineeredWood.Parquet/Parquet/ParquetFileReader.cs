@@ -583,7 +583,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             while (true)
             {
                 await reservation.ReserveNextAsync(cancellationToken).ConfigureAwait(false);
-                if (!await e.MoveNextAsync().ConfigureAwait(false))
+                bool more = await e.MoveNextAsync().ConfigureAwait(false);
+                // The read builds its page maps before its first batch and never reads the indexes again, so the
+                // bytes read for the estimate, which the budget does not count, are let go (#847 review).
+                if (batches == 0)
+                    estimate.OffsetIndexes?.Clear();
+                if (!more)
                     break;
                 decoded = EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(e.Current.Batch);
                 // The RAW batch is what the next decode of this row group will produce, so it is what the next
@@ -875,6 +880,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             {
                 return (null, indexes);
             }
+
+            // Where the index and the footer disagree on the first data page, the read checks the bytes before it
+            // and scans the headers instead when they are not only side pages (BuildPageMapsFromOffsetIndexesAsync),
+            // so the batch may not hold the pages the index lists. Telling would take a read of those bytes before
+            // the reservation, a round trip after the index's; the footer estimate stands instead (#847 review).
+            if (first.Offset != range.Offset && first.Offset != ctx.Chunks[i].MetaData!.DataPageOffset)
+                return (null, indexes);
+
             maps[i] = map;
             decodedIndexes[i] = index;
         }
