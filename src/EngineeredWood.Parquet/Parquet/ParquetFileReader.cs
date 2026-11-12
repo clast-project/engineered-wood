@@ -537,10 +537,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// ran serially at fetch-plus-decode per row group. A read of some rows only fetches the pages it needs, as
     /// it decodes them, and so does a read with a chunk too large to fetch in one buffer
     /// (<see cref="TryPrefetch"/>).</item>
-    /// <item>The first batch reserves its share (<see cref="FirstBatchBytes"/>) of the row group's estimated
-    /// decoded size (<see cref="DecodedBytes"/>), grown by how far decoded row groups have exceeded theirs so far
-    /// (<paramref name="growth"/>). Later batches of the same row group reserve the largest batch it has
-    /// produced.</item>
+    /// <item>The first batch reserves what the pages it decodes hold when the read's page maps come from
+    /// OffsetIndexes, else its share (<see cref="FirstBatchBytes"/>) of the row group's estimated decoded size
+    /// (<see cref="DecodedBytes"/>) (<see cref="FirstBatchReservationAsync"/>); either grown by how far decoded row
+    /// groups have exceeded theirs so far (<paramref name="growth"/>). Later batches of the same row group reserve
+    /// the largest batch it has produced.</item>
     /// </list>
     /// </summary>
     internal async IAsyncEnumerable<PositionedRecordBatch> ReadPlannedAsync(
@@ -554,13 +555,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-        var (footer, compressed) = PlannedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges);
-        long planned = DecodedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges);
-        reservation.SetInitialEstimate(FirstBatchBytes(
-            growth.Apply(planned), footer, metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges));
+        var compressed = PlannedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges).Compressed;
 
         long decoded = 0;
         int batches = 0;
+        FirstBatchEstimate estimate = default;
         PrefetchedFile? prefetched = null;
         IAsyncEnumerator<PositionedRecordBatch>? e = null;
         try
@@ -571,12 +570,25 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 var ctx = await PrepareRowGroupAsync(plan.Index, columnNames, cancellationToken).ConfigureAwait(false);
                 prefetched = TryPrefetch(ctx.Ranges, cancellationToken);
             }
+
+            // The first batch is sized once the fetch is under way: the OffsetIndexes it may read take a round trip.
+            estimate = await FirstBatchReservationAsync(plan, columnNames, growth, cancellationToken)
+                .ConfigureAwait(false);
+            if (estimate.OffsetIndexes is { } offsetIndexes)
+                plan = plan with { OffsetIndexes = offsetIndexes };
+            reservation.SetInitialEstimate(estimate.Reserved);
+
             e = ReadPlannedAsync(plan, columnNames, cancellationToken, answers, prefetched)
                 .GetAsyncEnumerator(cancellationToken);
             while (true)
             {
                 await reservation.ReserveNextAsync(cancellationToken).ConfigureAwait(false);
-                if (!await e.MoveNextAsync().ConfigureAwait(false))
+                bool more = await e.MoveNextAsync().ConfigureAwait(false);
+                // The read builds its page maps before its first batch and never reads the indexes again, so the
+                // bytes read for the estimate, which the budget does not count, are let go (#847 review).
+                if (batches == 0)
+                    estimate.OffsetIndexes?.Clear();
+                if (!more)
                     break;
                 decoded = EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(e.Current.Batch);
                 // The RAW batch is what the next decode of this row group will produce, so it is what the next
@@ -584,6 +596,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 // may shrink a batch before handing it on (a Delta scan drops a deletion vector's rows), and
                 // a shrunken size must not lower the reservation for the full-size batch after it.
                 reservation.Observe(decoded);
+                // A first batch sized from its pages is measured against that size: the same buffers (#847 review).
+                if (batches == 0 && estimate.FromPages)
+                    growth.Observe(estimate.Baseline, decoded);
                 batches++;
                 yield return e.Current;
             }
@@ -597,18 +612,22 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             reservation.ReleaseHeld();
         }
 
-        // Learnt only from a row group read as ONE batch. Batches split from one decode (a nested row group
-        // decoded whole, then sliced; a flat run shared by the batches that slice it) each count the whole
-        // buffers they share, so summing them would count the same memory many times over.
-        if (batches == 1)
-            growth.Observe(planned, decoded);
+        // Otherwise learnt only from a row group read as ONE batch, against the estimate of the whole read. Batches
+        // split from one decode (a nested row group decoded whole, then sliced; a flat run shared by the batches
+        // that slice it) each count the whole buffers they share, so summing them would count the same memory
+        // many times over.
+        if (batches == 1 && !estimate.FromPages)
+            growth.Observe(estimate.Baseline, decoded);
     }
 
     /// <summary>Whether <paramref name="plan"/> reads every row of its group: no ranges, or the one range of
     /// every row that page-index pruning returns when it narrows nothing.</summary>
     private static bool CoversWholeGroup(RowGroupPlan plan, RowGroup rowGroup) =>
+        CoversWholeGroup(plan, rowGroup.NumRows);
+
+    private static bool CoversWholeGroup(RowGroupPlan plan, long rowCount) =>
         plan.Ranges is null
-        || (plan.Ranges.Count == 1 && plan.Ranges[0].Start == 0 && plan.Ranges[0].End == rowGroup.NumRows);
+        || (plan.Ranges.Count == 1 && plan.Ranges[0].Start == 0 && plan.Ranges[0].End == rowCount);
 
     /// <summary>The largest byte array .NET allocates (<c>Array.MaxLength</c>, which .NET Framework lacks).</summary>
     private const long MaxPrefetchRangeBytes = 0x7FFFFFC7;
@@ -701,24 +720,220 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             if (chunks[c].MetaData is not { } meta)
                 continue;
             long footer = (long)(meta.TotalUncompressedSize * share);
-            var type = ArrowSchemaConverter.ToArrowField(columns[c], _options).DataType;
-            // A registered extension type (arrow.uuid over FixedSizeBinary(16)) is decoded into its storage type, so
-            // that is what is sized (#845 review round 2).
-            while (type is Apache.Arrow.ExtensionType extension)
-                type = extension.StorageType;
-            long values = type switch
-            {
-                Apache.Arrow.Types.FixedWidthType fixedWidth => (rows * fixedWidth.BitWidth + 7) / 8,
-                Apache.Arrow.Types.StringType or Apache.Arrow.Types.BinaryType => (rows + 1) * sizeof(int) + footer,
-                Apache.Arrow.Types.LargeStringType or Apache.Arrow.Types.LargeBinaryType =>
-                    (rows + 1) * sizeof(long) + footer,
-                Apache.Arrow.Types.StringViewType or Apache.Arrow.Types.BinaryViewType => rows * 16 + footer,
-                _ => footer,
-            };
-            long validity = columns[c].MaxDefinitionLevel > 0 ? (rows + 7) / 8 : 0;
-            total += Math.Max(values + validity, footer);
+            total += ColumnDecodedBytes(columns[c], rows, footer, footer);
         }
         return total;
+    }
+
+    /// <summary>
+    /// What <paramref name="rows"/> rows of the flat <paramref name="column"/> decode to in Arrow buffers, as
+    /// <see cref="DecodedBytes"/> sizes them: <paramref name="encodedBytes"/> is the encoded size of the same rows,
+    /// the floor and the size of anything not sized by type, and <paramref name="byteArrayBytes"/> the bytes of
+    /// a string or binary column's values.
+    /// </summary>
+    private long ColumnDecodedBytes(ColumnDescriptor column, long rows, long encodedBytes, long byteArrayBytes)
+    {
+        var type = ArrowSchemaConverter.ToArrowField(column, _options).DataType;
+        // A registered extension type (arrow.uuid over FixedSizeBinary(16)) is decoded into its storage type, so
+        // that is what is sized (#845 review round 2).
+        while (type is Apache.Arrow.ExtensionType extension)
+            type = extension.StorageType;
+        long values = type switch
+        {
+            Apache.Arrow.Types.FixedWidthType fixedWidth => (rows * fixedWidth.BitWidth + 7) / 8,
+            Apache.Arrow.Types.StringType or Apache.Arrow.Types.BinaryType =>
+                (rows + 1) * sizeof(int) + byteArrayBytes,
+            Apache.Arrow.Types.LargeStringType or Apache.Arrow.Types.LargeBinaryType =>
+                (rows + 1) * sizeof(long) + byteArrayBytes,
+            Apache.Arrow.Types.StringViewType or Apache.Arrow.Types.BinaryViewType => rows * 16 + byteArrayBytes,
+            _ => encodedBytes,
+        };
+        long validity = column.MaxDefinitionLevel > 0 ? (rows + 7) / 8 : 0;
+        return Math.Max(values + validity, encodedBytes);
+    }
+
+    /// <summary>
+    /// What a parallel read of <paramref name="plan"/> reserves for its first batch: from the pages it decodes
+    /// where the read builds its page maps from OffsetIndexes (<see cref="FirstBatchFromPagesAsync"/>), else its
+    /// share of the row group's decoded estimate (<see cref="FirstBatchBytes"/>); either grown by
+    /// <paramref name="growth"/>. Also the OffsetIndex bytes read on the way, for the read to reuse.
+    /// </summary>
+    internal async ValueTask<FirstBatchEstimate> FirstBatchReservationAsync(
+        RowGroupPlan plan, IReadOnlyList<string>? columnNames, DecodedGrowth growth, CancellationToken cancellationToken)
+    {
+        var (pages, offsetIndexes) = await FirstBatchFromPagesAsync(plan, columnNames, cancellationToken)
+            .ConfigureAwait(false);
+        if (pages is long bytes)
+            return new FirstBatchEstimate(growth.Apply(bytes), bytes, FromPages: true, offsetIndexes);
+
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        var group = metadata.RowGroups[plan.Index];
+        long footer = PlannedBytes(group, schema, columnNames, plan.Ranges).Uncompressed;
+        long planned = DecodedBytes(group, schema, columnNames, plan.Ranges);
+        return new FirstBatchEstimate(
+            FirstBatchBytes(growth.Apply(planned), footer, group, schema, columnNames, plan.Ranges), planned,
+            FromPages: false, offsetIndexes);
+    }
+
+    /// <summary>
+    /// A first batch's reservation (<see cref="FirstBatchReservationAsync"/>), and what <see cref="DecodedGrowth"/>
+    /// measures decoded sizes against: <paramref name="Baseline"/>, the estimate before growth, of the same
+    /// buffers as the measurement (#847 review). From pages, that is the first batch, which holds the whole pages
+    /// it touches; otherwise the whole read's <see cref="DecodedBytes"/>, measured only when it is read as one
+    /// batch. Measuring a range inside a large page against the rows it kept learnt ~100x, which the page
+    /// estimate, already covering the page, then multiplied.
+    /// </summary>
+    internal readonly record struct FirstBatchEstimate(
+        long Reserved, long Baseline, bool FromPages, Dictionary<long, byte[]>? OffsetIndexes);
+
+    /// <summary>
+    /// The reservation for the first batch of a batched read of a flat row group, from the pages that batch
+    /// decodes (#846), and the OffsetIndex bytes it read to find them, for the read's page maps; a null size
+    /// when the read is not cut into batches by page maps, or a column has no usable OffsetIndex, and
+    /// <see cref="FirstBatchBytes"/> stands.
+    /// <para>A batch is a slice of whole decoded pages and keeps their buffers (<c>DecodedRows</c>), so it holds
+    /// every row of each page it touches, not only its own. The footer cannot say how many that is;
+    /// an OffsetIndex can. Each column is sized by type over those rows (<see cref="ColumnDecodedBytes"/>), a
+    /// string column's bytes taken from the index's <c>unencoded_byte_array_data_bytes</c> where the writer
+    /// recorded them (exact), else from the pages' sizes. The batch's rows are found as the read finds them
+    /// (<see cref="ComputeBatchRowCount"/>, over maps built the same way).</para>
+    /// <para>Only the indexes a read would fetch for its page maps are fetched, in one request, and handed on to
+    /// it: the round trip moves before the first reservation and is not added.</para>
+    /// </summary>
+    private async ValueTask<(long? Bytes, Dictionary<long, byte[]>? OffsetIndexes)> FirstBatchFromPagesAsync(
+        RowGroupPlan plan, IReadOnlyList<string>? columnNames, CancellationToken cancellationToken)
+    {
+        int? batchSize = _options.BatchSize;
+        long? maxBytes = _options.MaxBatchByteSize;
+        var ctx = await PrepareRowGroupAsync(plan.Index, columnNames, cancellationToken).ConfigureAwait(false);
+        if (ctx.HasNestedColumns || ctx.Count == 0 || ctx.RowCount == 0)
+            return (null, null);
+
+        // As ReadBatchesAsync decides: a read of the whole group in one batch is sized by DecodedBytes, and one with
+        // no batch limit set over a chunk too large for Arrow scans its headers rather than reading an index.
+        if (batchSize is not > 0 && maxBytes is not > 0 && HasChunkOverArrowLimit(ctx))
+            return (null, null);
+        bool fitsInOneBatch = CoversWholeGroup(plan, ctx.RowCount);
+        if (batchSize is > 0 && ctx.RowCount > batchSize.Value)
+            fitsInOneBatch = false;
+        if (maxBytes is > 0)
+        {
+            long footerTotal = 0;
+            for (int i = 0; i < ctx.Count; i++)
+                footerTotal += ctx.Chunks[i].MetaData!.TotalUncompressedSize;
+            if (footerTotal > maxBytes.Value)
+                fitsInOneBatch = false;
+        }
+        if (fitsInOneBatch)
+            return (null, null);
+
+        // Every column's index, or none is used.
+        var indexRanges = new FileRange[ctx.Count];
+        for (int i = 0; i < ctx.Count; i++)
+        {
+            var chunk = ctx.Chunks[i];
+            if (chunk.OffsetIndexOffset is not { } offset || chunk.OffsetIndexLength is not { } length
+                || offset < 0 || length <= 0 || offset > _fileLength - length)
+            {
+                return (null, null);
+            }
+            indexRanges[i] = new FileRange(offset, length);
+        }
+
+        var indexes = plan.OffsetIndexes is { } known
+            ? new Dictionary<long, byte[]>(known)
+            : new Dictionary<long, byte[]>(ctx.Count);
+        var missing = new List<FileRange>();
+        foreach (var range in indexRanges)
+        {
+            if (!indexes.ContainsKey(range.Offset) && !missing.Exists(r => r.Offset == range.Offset))
+                missing.Add(range);
+        }
+        if (missing.Count > 0)
+        {
+            var read = await ReadPageIndexBytesAsync(missing, cancellationToken).ConfigureAwait(false);
+            for (int k = 0; k < missing.Count; k++)
+                indexes[missing[k].Offset] = read[k];
+        }
+
+        var maps = new ColumnPageMap[ctx.Count];
+        var decodedIndexes = new OffsetIndex[ctx.Count];
+        for (int i = 0; i < ctx.Count; i++)
+        {
+            OffsetIndex index;
+            try
+            {
+                index = MetadataDecoder.DecodeOffsetIndex(indexes[indexRanges[i].Offset]);
+            }
+            catch (ParquetFormatException)
+            {
+                return (null, indexes);
+            }
+
+            var range = ctx.Ranges[i];
+            if (index.PageLocations is not [var first, ..]
+                || first.Offset < range.Offset || first.Offset > range.Offset + range.Length
+                || PageMapBuilder.BuildLayoutFromOffsetIndex(
+                        checked((int)(first.Offset - range.Offset)), range.Offset, range.Offset + range.Length,
+                        index, ctx.RowCount, ctx.Columns[i], ctx.Chunks[i].MetaData!) is not { } map)
+            {
+                return (null, indexes);
+            }
+
+            // Where the index and the footer disagree on the first data page, the read checks the bytes before it
+            // and scans the headers instead when they are not only side pages (BuildPageMapsFromOffsetIndexesAsync),
+            // so the batch may not hold the pages the index lists. Telling would take a read of those bytes before
+            // the reservation, a round trip after the index's; the footer estimate stands instead (#847 review).
+            if (first.Offset != range.Offset && first.Offset != ctx.Chunks[i].MetaData!.DataPageOffset)
+                return (null, indexes);
+
+            maps[i] = map;
+            decodedIndexes[i] = index;
+        }
+
+        int start = plan.Ranges is null ? 0 : checked((int)plan.Ranges[0].Start);
+        int spanEnd = plan.Ranges is null ? ctx.RowCount : checked((int)plan.Ranges[0].End);
+        int end = start + ComputeBatchRowCount(maps, start, spanEnd, batchSize, maxBytes);
+
+        long kept = ctx.RowCount;
+        if (plan.Ranges is not null)
+        {
+            kept = 0;
+            foreach (var r in plan.Ranges)
+                kept += r.End - r.Start;
+        }
+        double keptShare = Math.Min(1.0, (double)kept / ctx.RowCount);
+        long total = 0;
+        for (int i = 0; i < ctx.Count; i++)
+        {
+            var map = maps[i];
+            int firstPage = map.FindPageForRow(start);
+            int lastPage = map.FindPageForRow(end - 1);
+            long rows = map.CumulativeRows[lastPage + 1] - map.CumulativeRows[firstPage];
+            long encoded = 0;
+            for (int p = firstPage; p <= lastPage; p++)
+                encoded += map.Pages[p].UncompressedSize;
+
+            long byteArrayBytes;
+            if (decodedIndexes[i].UnencodedByteArrayDataBytes is { } unencoded
+                && unencoded.Count == map.Pages.Length)
+            {
+                byteArrayBytes = 0;
+                for (int p = firstPage; p <= lastPage; p++)
+                    byteArrayBytes += unencoded[p];
+            }
+            else
+            {
+                // Without the writer's count, a page's size is only an estimate (the chunk's compression ratio over
+                // its compressed size: short for a page that compresses better than the rest) and a dictionary page
+                // counts indices, not strings. The column's footer size for the rows kept, as a footer-sized read
+                // reserves it, stays the floor (#847 review).
+                byteArrayBytes = Math.Max(encoded, (long)(ctx.Chunks[i].MetaData!.TotalUncompressedSize * keptShare));
+            }
+            total += ColumnDecodedBytes(ctx.Columns[i], rows, encoded, byteArrayBytes);
+        }
+        return (total, indexes);
     }
 
     /// <summary>The rows of <paramref name="rowGroup"/> that <paramref name="ranges"/> keeps; all of them for
@@ -745,8 +960,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// group under the limit is read in one batch however large it decodes (#845 review).</item>
     /// </list>
     /// A batch is a slice of whole decoded pages and holds their buffers, so a page larger than the batch makes the
-    /// batch larger than its share of rows; how many rows a page holds is not known before the page maps are read.
-    /// So the share is never taken below <paramref name="footerBytes"/>, what a first batch reserved before (#845
+    /// batch larger than its share of rows. How many rows a page holds is known only from an OffsetIndex
+    /// (<see cref="FirstBatchFromPagesAsync"/>, used instead of this where there is one); without it, the share is never taken below <paramref name="footerBytes"/>, what a first batch reserved before (#845
     /// review): a single 100,000-row int64 page read in 1,000-row batches reserves its 800 KB, not 8 KB. A read
     /// with a nested column decodes the whole group before slicing it, so it reserves the whole group.
     /// </summary>
