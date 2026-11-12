@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Runtime.CompilerServices;
 using EngineeredWood.DeltaLake.Schema;
 using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.Data;
@@ -137,30 +138,43 @@ internal static class StoredInt32Columns
     // (and then ONLY by id), otherwise by physical name across every field, then by logical name.
     private static StructField? FindField(StructType table, SchemaElement element, ColumnMappingMode mode)
     {
+        var index = Indexes.GetValue(table, static s => new FieldIndex(s));
         if (mode == ColumnMappingMode.Id && element.FieldId is { } id)
-        {
-            foreach (var f in table.Fields)
-            {
-                if (ColumnMapping.GetFieldId(f) == id)
-                    return f;
-            }
-            return null;
-        }
+            return index.ById.TryGetValue(id, out var byId) ? byId : null;
 
-        foreach (var f in table.Fields)
+        return index.ByPhysical.TryGetValue(element.Name, out var field)
+            || index.ByLogical.TryGetValue(element.Name, out field)
+            ? field
+            : null;
+    }
+
+    // Every file of a scan is matched against the same schema levels, so each level is indexed once (as
+    // ColumnMappingRecursive does): scanning the level per file node made matching a wide table quadratic in its
+    // column count, per file. Keyed weakly on the StructType instance, which lives as long as its snapshot. A key's
+    // FIRST field wins, as a linear scan's would.
+    private static readonly ConditionalWeakTable<StructType, FieldIndex> Indexes = new();
+
+    private sealed class FieldIndex
+    {
+        public readonly Dictionary<int, StructField> ById = new();
+        public readonly Dictionary<string, StructField> ByPhysical = new(StringComparer.Ordinal);
+        public readonly Dictionary<string, StructField> ByLogical = new(StringComparer.Ordinal);
+
+        public FieldIndex(StructType schema)
         {
-            if (f.Metadata is { } md
-                && md.TryGetValue(ColumnMapping.PhysicalNameKey, out var physical)
-                && string.Equals(physical, element.Name, StringComparison.Ordinal))
+            foreach (var f in schema.Fields)
             {
-                return f;
+                if (ColumnMapping.GetFieldId(f) is { } id && !ById.ContainsKey(id))
+                    ById[id] = f;
+                if (f.Metadata is { } md
+                    && md.TryGetValue(ColumnMapping.PhysicalNameKey, out var physical)
+                    && !ByPhysical.ContainsKey(physical))
+                {
+                    ByPhysical[physical] = f;
+                }
+                if (!ByLogical.ContainsKey(f.Name))
+                    ByLogical[f.Name] = f;
             }
         }
-        foreach (var f in table.Fields)
-        {
-            if (string.Equals(f.Name, element.Name, StringComparison.Ordinal))
-                return f;
-        }
-        return null;
     }
 }
