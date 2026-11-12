@@ -169,6 +169,10 @@ public sealed partial class ParquetFileReader
     /// every decoded batch's RAW size sets its estimate, as the one-pass read's raw batches do.</param>
     /// <param name="growth">A parallel read's decoded-size learning, or null; taught from a group decoded in one
     /// batch per pass, against <paramref name="plannedUncompressed"/>.</param>
+    /// <param name="filterIo">The predicate columns' chunks fetched ahead, or null to fetch them as pass 1 reads.
+    /// Not disposed here.</param>
+    /// <param name="outputIo">The output columns' chunks fetched ahead, or null to start fetching them here. Not
+    /// disposed here.</param>
     private async IAsyncEnumerable<SelectedRecordBatch> ReadTwoPassAsync(
         RowGroupPlan plan,
         TwoPassColumns columns,
@@ -177,11 +181,14 @@ public sealed partial class ParquetFileReader
         DecodedGrowth? growth,
         long plannedUncompressed,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        PrefetchedFile? filterIo = null,
+        PrefetchedFile? outputIo = null)
     {
         var outputCtx = await PrepareRowGroupAsync(plan.Index, columns.OutputOnly, cancellationToken).ConfigureAwait(false);
         int groupRows = outputCtx.RowCount;
-        await using var prefetched = new PrefetchedFile(_file, outputCtx.Ranges, cancellationToken);
+        await using var ownPrefetch = outputIo is null ? new PrefetchedFile(_file, outputCtx.Ranges, cancellationToken) : null;
+        var prefetched = outputIo ?? ownPrefetch!;
 
         // Pass 1: the predicates' columns, in BatchSize batches unless the returned ones must be kept for the
         // whole group (then one batch, which eligibility allowed only where BatchSize would not split it).
@@ -200,6 +207,7 @@ public sealed partial class ParquetFileReader
                                // does: a first pass cut into batches builds page maps from them, and would otherwise
                                // fetch them again.
                                plan.Index, columns.Filter, ranges: null, plan.OffsetIndexes, cancellationToken,
+                               io: filterIo,
                                batchRows: keep || !SplitsGroup(groupRows) ? groupRows : null,
                                answers: selector.Answerable).ConfigureAwait(false))
             {
@@ -520,7 +528,8 @@ public sealed partial class ParquetFileReader
     /// A two-pass read as one unit of a parallel read: reserves scan memory as
     /// <see cref="ReadPlannedAsync(RowGroupPlan, IReadOnlyList{string}?, ScanReservation, DecodedGrowth, CancellationToken, IReadOnlyDictionary{string, AnswerPlan}?)"/>
     /// does, holding the row group's compressed bytes for the whole read; the read itself holds what its first
-    /// pass keeps and reports raw decoded sizes.
+    /// pass keeps and reports raw decoded sizes. As there, both passes' chunks start fetching once the hold is
+    /// granted, before the read waits for room to decode (#829).
     /// </summary>
     private async IAsyncEnumerable<SelectedRecordBatch> ReadTwoPassAsync(
         RowGroupPlan plan,
@@ -537,11 +546,19 @@ public sealed partial class ParquetFileReader
         var (uncompressed, compressed) = PlannedBytes(metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges);
         reservation.SetInitialEstimate(growth.Apply(uncompressed));
 
-        var e = ReadTwoPassAsync(plan, columns, selector, reservation, growth, uncompressed, cancellationToken)
-            .GetAsyncEnumerator(cancellationToken);
+        PrefetchedFile? filterIo = null, outputIo = null;
+        IAsyncEnumerator<SelectedRecordBatch>? e = null;
         try
         {
             await reservation.HoldAsync(compressed, cancellationToken).ConfigureAwait(false);
+            var filterCtx = await PrepareRowGroupAsync(plan.Index, columns.Filter, cancellationToken).ConfigureAwait(false);
+            // Null when a chunk is too large for one buffer: pass 1 then reads it as it decodes, as before.
+            filterIo = TryPrefetch(filterCtx.Ranges, cancellationToken);
+            var outputCtx = await PrepareRowGroupAsync(plan.Index, columns.OutputOnly, cancellationToken).ConfigureAwait(false);
+            // Null likewise: the read then starts its own output prefetch, as before #829.
+            outputIo = TryPrefetch(outputCtx.Ranges, cancellationToken);
+            e = ReadTwoPassAsync(plan, columns, selector, reservation, growth, uncompressed, cancellationToken, filterIo, outputIo)
+                .GetAsyncEnumerator(cancellationToken);
             while (true)
             {
                 await reservation.ReserveNextAsync(cancellationToken).ConfigureAwait(false);
@@ -552,7 +569,12 @@ public sealed partial class ParquetFileReader
         }
         finally
         {
-            await e.DisposeAsync().ConfigureAwait(false);
+            if (e is not null)
+                await e.DisposeAsync().ConfigureAwait(false);
+            if (outputIo is not null)
+                await outputIo.DisposeAsync().ConfigureAwait(false);
+            if (filterIo is not null)
+                await filterIo.DisposeAsync().ConfigureAwait(false);
             reservation.ReleaseHeld();
         }
     }

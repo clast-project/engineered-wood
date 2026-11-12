@@ -536,6 +536,102 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.Equal(0, budget.Used);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task APlannedRead_FetchesItsChunks_WhileItWaitsForRoomToDecode(bool unselectiveFilter)
+    {
+        // #829: a row group whose hold fits the budget but whose decode does not yet must still fetch its chunks
+        // while it waits, so the fetch overlaps the decode ahead of it. Reserving before fetching made a scan whose
+        // budget takes one decoded row group at a time run serially at fetch-plus-decode per row group.
+        long dataOffset = await DataOffsetAsync(1);
+        await using var local = new LocalRandomAccessFile(_path);
+        var watched = new WatchingFile(local, dataOffset);
+        using var reader = new ParquetFileReader(watched, ownsFile: false);
+        // A filter that prunes nothing plans the group as one range of every row rather than none (#843 review):
+        // that is still a whole-group read, and fetches ahead the same way.
+        var filter = unselectiveFilter ? Ex.GreaterThanOrEqual("id", LiteralValue.Of(0L)) : null;
+        ParquetFileReader.RowGroupPlan? plan = null;
+        await foreach (var p in reader.PlanRowGroupsAsync(filter, null, null, default))
+        {
+            if (p.Index == 1)
+                plan = p;
+        }
+        if (unselectiveFilter)
+        {
+            var ranges = Assert.Single(plan!.Value.Ranges!);
+            Assert.Equal(new RowRange(0, _groupStarts[2] - _groupStarts[1]), ranges);
+        }
+        var (uncompressed, compressed) = ParquetFileReader.PlannedBytes(
+            (await reader.ReadMetadataAsync()).RowGroups[1], await reader.GetSchemaAsync(), null, null);
+
+        // Unit 0, the front, holds a decoded batch; unit 1's hold fits beside it, its decode does not.
+        const long front = 1L << 20;
+        var budget = new EngineeredWood.Scans.ScanMemoryBudget(front + compressed + uncompressed / 2);
+        budget.SetHead(0);
+        await budget.ReserveAsync(0, front, CancellationToken.None);
+        var reservation = new EngineeredWood.Scans.ScanReservation(budget, 1);
+
+        await using var e = reader.ReadPlannedAsync(
+                plan!.Value, null, reservation, new ParquetFileReader.DecodedGrowth(), default)
+            .GetAsyncEnumerator();
+        var next = e.MoveNextAsync().AsTask();
+
+        bool fetched = await Task.WhenAny(watched.Requested, Task.Delay(TimeSpan.FromSeconds(10))) == watched.Requested;
+        bool waited = !next.IsCompleted;
+
+        // The consumer takes unit 0's batch, which lets unit 1 decode however the read went, so the enumerator is
+        // never disposed with a MoveNextAsync pending.
+        budget.Adjust(-front);
+        Assert.Same(next, await Task.WhenAny(next, Task.Delay(TimeSpan.FromSeconds(30))));
+        Assert.True(fetched, "the chunks should be requested while the decode waits for room");
+        Assert.True(waited, "the decode should have waited for room");
+        Assert.True(await next);
+        using (e.Current.Batch)
+        {
+            Assert.Equal(_groupStarts[1], e.Current.FirstRow);
+            Assert.Equal(_groupStarts[2] - _groupStarts[1], e.Current.Batch.Length);
+        }
+        Assert.False(await e.MoveNextAsync());
+    }
+
+    /// <summary>Completes <see cref="Requested"/> once a request covers the byte at <c>offset</c>.</summary>
+    private sealed class WatchingFile(IRandomAccessFile inner, long offset) : IRandomAccessFile
+    {
+        private readonly TaskCompletionSource<bool> _requested = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task Requested => _requested.Task;
+
+        private void See(FileRange range)
+        {
+            if (range.Offset <= offset && offset < range.Offset + range.Length)
+                _requested.TrySetResult(true);
+        }
+
+        public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default) =>
+            inner.GetLengthAsync(cancellationToken);
+
+        public ValueTask<IMemoryOwner<byte>> ReadAsync(FileRange range, CancellationToken cancellationToken = default)
+        {
+            See(range);
+            return inner.ReadAsync(range, cancellationToken);
+        }
+
+        public ValueTask<IReadOnlyList<IMemoryOwner<byte>>> ReadRangesAsync(
+            IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
+        {
+            foreach (var range in ranges)
+                See(range);
+            return inner.ReadRangesAsync(ranges, cancellationToken);
+        }
+
+        public ValueTask DisposeAsync() => default;
+
+        public void Dispose()
+        {
+        }
+    }
+
     private async Task<long> DataOffsetAsync(int rowGroup)
     {
         await using var file = new LocalRandomAccessFile(_path);

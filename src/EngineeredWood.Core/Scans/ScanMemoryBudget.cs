@@ -127,6 +127,12 @@ internal sealed class ScanReservation
 /// over the budget by the one item it is decoding — over EVERY level, since a shared parent may be full of
 /// other scans' items, and another scan's consumer may be waiting on this one.</item>
 /// </list>
+/// <para><b>Order.</b> Room goes to units in unit order: a unit is not admitted while one nearer the front of
+/// this scan waits, even if its own reservation would fit (#829). Otherwise the units furthest back, of which
+/// a wide window dispatches many, take the room as it frees: they decode items the consumer will not want for
+/// a long time, and the units just behind the front cannot read until each in turn becomes the front — a wider
+/// window then runs SLOWER than a narrow one. The ordering is within one scan; scans sharing a parent still
+/// compete for the parent's room as before.</para>
 /// <para><b>Underestimates.</b> A reservation is an estimate made before the decode, and an item that comes
 /// out larger is charged in full without waiting (it already exists). Each unit reserves the largest size it
 /// has seen (<see cref="ScanReservation.Observe"/>), so this happens only on a unit's first item — reserved
@@ -139,6 +145,9 @@ internal sealed class ScanMemoryBudget
     private readonly MemoryBudget _memory;
     private readonly object _gate;
     private readonly Dictionary<int, int> _queued = [];
+    // The units waiting for room, by ordinal, so the nearest the front is First(); the count is how many of a
+    // unit's reservations wait (one, in practice: a unit reserves from one logical flow).
+    private readonly SortedDictionary<int, int> _waiting = new();
     private int _head;
     private bool _cancelled;
     private bool _closed;
@@ -159,24 +168,71 @@ internal sealed class ScanMemoryBudget
 
     internal async ValueTask ReserveAsync(int unit, long bytes, CancellationToken cancellationToken)
     {
-        while (true)
+        bool waiting = false;
+        try
         {
-            Task changed;
-            lock (_gate)
+            while (true)
             {
-                if (_cancelled)
-                    cancellationToken.ThrowIfCancellationRequested();
-                bool front = unit == _head && QueuedLocked(unit) == 0;
-                if (_memory.TryReserveLocked(bytes, force: front, out var blocking))
-                    return;
-                // This scan's own budget signals releases, head changes and cancellation; a full parent
-                // signals only releases, so a wait on one also watches this scan's.
-                changed = ReferenceEquals(blocking, _memory)
-                    ? _memory.ChangedLocked
-                    : Task.WhenAny(blocking!.ChangedLocked, _memory.ChangedLocked);
+                Task changed;
+                lock (_gate)
+                {
+                    if (_cancelled)
+                        cancellationToken.ThrowIfCancellationRequested();
+                    bool front = unit == _head && QueuedLocked(unit) == 0;
+                    // In unit order: while a unit nearer the front waits, room that frees up is its, not this
+                    // one's (#829). Taking it would decode this unit's item early, to sit in the budget until the
+                    // consumer gets this far, while the units in between wait for room to read at all.
+                    MemoryBudget? blocking = _memory;
+                    if ((front || !EarlierWaiterLocked(unit))
+                        && _memory.TryReserveLocked(bytes, force: front, out blocking))
+                    {
+                        if (waiting)
+                        {
+                            StopWaitingLocked(unit);
+                            waiting = false;
+                        }
+                        return;
+                    }
+                    if (!waiting)
+                    {
+                        _waiting[unit] = WaitingLocked(unit) + 1;
+                        waiting = true;
+                    }
+                    // This scan's own budget signals releases, head changes, cancellation and an earlier unit
+                    // ceasing to wait; a full parent signals only releases, so a wait on one also watches this
+                    // scan's.
+                    changed = ReferenceEquals(blocking, _memory)
+                        ? _memory.ChangedLocked
+                        : Task.WhenAny(blocking!.ChangedLocked, _memory.ChangedLocked);
+                }
+                await WaitAsync(changed, cancellationToken).ConfigureAwait(false);
             }
-            await WaitAsync(changed, cancellationToken).ConfigureAwait(false);
         }
+        finally
+        {
+            if (waiting)
+            {
+                lock (_gate)
+                    StopWaitingLocked(unit);
+            }
+        }
+    }
+
+    /// <summary>Whether a unit nearer the front than <paramref name="unit"/> is waiting for room.</summary>
+    private bool EarlierWaiterLocked(int unit) => _waiting.Count != 0 && _waiting.Keys.First() < unit;
+
+    private int WaitingLocked(int unit) => _waiting.TryGetValue(unit, out int n) ? n : 0;
+
+    /// <summary>Takes one wait of <paramref name="unit"/> off the list, and wakes the waiters behind it: one of
+    /// them may now be first in line.</summary>
+    private void StopWaitingLocked(int unit)
+    {
+        int left = WaitingLocked(unit) - 1;
+        if (left <= 0)
+            _waiting.Remove(unit);
+        else
+            _waiting[unit] = left;
+        _memory.SignalLocked();
     }
 
     internal void Adjust(long delta)
