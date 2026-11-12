@@ -76,11 +76,13 @@ internal sealed class CheckpointStatsView
         var maxStruct = Child(stats, statsType, "maxValues") as StructArray;
         var nullCountStruct = Child(stats, statsType, "nullCount") as StructArray;
 
-        Flatten(minStruct, prefix: null, minValues);
-        Flatten(maxStruct, prefix: null, maxValues);
+        FlattenGroup(minStruct, minValues);
+        FlattenGroup(maxStruct, maxValues);
 
+        // Collisions are settled before the Int64 filter, so a count of another type still makes its path
+        // ambiguous rather than leaving a usable copy alone (as ColumnStats.FlattenCounts does since #825).
         var nullCountLeaves = new Dictionary<string, IArrowArray>(StringComparer.Ordinal);
-        Flatten(nullCountStruct, prefix: null, nullCountLeaves);
+        FlattenGroup(nullCountStruct, nullCountLeaves);
         foreach (var kvp in nullCountLeaves)
         {
             if (kvp.Value is Int64Array counts)
@@ -295,7 +297,24 @@ internal sealed class CheckpointStatsView
     /// Flattens a bounds struct into dotted leaf paths ("payload.score"), matching the keys
     /// <see cref="Actions.ColumnStats"/> produces from the JSON so both feed the same lookups.
     /// </summary>
-    private static void Flatten(IArrowArray? array, string? prefix, Dictionary<string, IArrowArray> into)
+    /// <remarks>
+    /// A path reached twice (the same field name twice in one struct, or a literal dotted field <c>s.a</c> beside a
+    /// struct <c>s</c> with a child <c>a</c>) is ambiguous and dropped from the map, as the JSON path drops it
+    /// (#826): keeping whichever copy came last could prune on a bound or null count the statistics also
+    /// contradict. A dropped path has no typed statistics, so the pruner asks the JSON copy instead.
+    /// </remarks>
+    private static void FlattenGroup(StructArray? group, Dictionary<string, IArrowArray> into)
+    {
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var collided = new HashSet<string>(StringComparer.Ordinal);
+        Flatten(group, prefix: null, into, seen, collided);
+        foreach (string path in collided)
+            into.Remove(path);
+    }
+
+    private static void Flatten(
+        IArrowArray? array, string? prefix, Dictionary<string, IArrowArray> into,
+        HashSet<string> seen, HashSet<string> collided)
     {
         if (array is not StructArray group)
             return;
@@ -306,8 +325,12 @@ internal sealed class CheckpointStatsView
             string name = type.Fields[i].Name;
             string path = prefix is null ? name : prefix + "." + name;
             var child = group.Fields[i];
+            // Struct paths are recorded too, so a leaf named like a struct (the same name twice, once each way)
+            // is ambiguous as well; a struct's own path is never a key, so dropping it removes nothing.
+            if (!seen.Add(path))
+                collided.Add(path);
             if (child is StructArray && !IsVariantGroup(child))
-                Flatten(child, path, into);
+                Flatten(child, path, into, seen, collided);
             else
                 into[path] = child;
         }

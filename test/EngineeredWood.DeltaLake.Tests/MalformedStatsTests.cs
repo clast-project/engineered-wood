@@ -192,6 +192,111 @@ public class MalformedStatsTests
         Assert.Equal(3, reparsed.NullCount["v"]);
     }
 
+    private static Int64Array Longs(long value) => new Int64Array.Builder().Append(value).Build();
+
+    private static (Field Field, IArrowArray Array) Leaf(string name, IArrowArray array) =>
+        (new Field(name, array.Data.DataType, true), array);
+
+    private static (Field Field, IArrowArray Array) Group(string name, params (Field Field, IArrowArray Array)[] children)
+    {
+        var type = new Apache.Arrow.Types.StructType(children.Select(c => c.Field).ToList());
+        return (new Field(name, type, true), new StructArray(type, 1, children.Select(c => c.Array), ArrowBuffer.Empty, 0));
+    }
+
+    /// <summary>A one-file checkpoint view over a hand-built <c>stats_parsed</c> with the given groups.</summary>
+    private static CheckpointStatsView TypedView(params (Field Field, IArrowArray Array)[] groups)
+    {
+        var stats = Group("stats_parsed", [Leaf("numRecords", Longs(3)), .. groups]);
+        var addType = new Apache.Arrow.Types.StructType([stats.Field]);
+        return CheckpointStatsView.TryCreate(new StructArray(addType, 1, [stats.Array], ArrowBuffer.Empty, 0))!;
+    }
+
+    /// <summary>
+    /// A typed path reached twice is ambiguous, as the JSON's is (#826): the same field name twice, or a literal dotted
+    /// field beside a struct child of that path, in either order, drops the path rather than keeping the last copy.
+    /// </summary>
+    [Fact]
+    public void ACollidingTypedNullCountMakesItsPathAmbiguous()
+    {
+        var cases = new[]
+        {
+            Group("nullCount", Leaf("id", Longs(0)), Leaf("id", Longs(3)), Leaf("v", Longs(2))),
+            Group("nullCount", Leaf("id", Longs(3)), Leaf("id", Longs(0)), Leaf("v", Longs(2))),
+            // A copy of another type is unusable, and still makes the path ambiguous (as the JSON's does since #825).
+            Group("nullCount", Leaf("id", Longs(0)), Leaf("id", new StringArray.Builder().Append("3").Build()), Leaf("v", Longs(2))),
+            Group("nullCount", Leaf("id", new Int32Array.Builder().Append(3).Build()), Leaf("id", Longs(0)), Leaf("v", Longs(2))),
+            // A leaf and a struct under one name.
+            Group("nullCount", Leaf("id", Longs(0)), Group("id", Leaf("a", Longs(0))), Leaf("v", Longs(2))),
+        };
+        foreach (var nullCount in cases)
+        {
+            var view = TypedView(nullCount);
+            Assert.False(view.HasNullCount("id"));
+            Assert.Null(view.GetNullCount("id", 0));
+            Assert.Equal(2, view.GetNullCount("v", 0));
+        }
+
+        foreach (var nullCount in new[]
+        {
+            Group("nullCount", Leaf("s.a", Longs(0)), Group("s", Leaf("a", Longs(3)), Leaf("b", Longs(1)))),
+            Group("nullCount", Group("s", Leaf("a", Longs(3)), Leaf("b", Longs(1))), Leaf("s.a", Longs(0))),
+        })
+        {
+            var view = TypedView(nullCount);
+            Assert.False(view.HasNullCount("s.a"));
+            Assert.Equal(1, view.GetNullCount("s.b", 0));
+        }
+    }
+
+    [Fact]
+    public void ACollidingTypedBoundMakesItsPathAmbiguous()
+    {
+        var view = TypedView(
+            Group("minValues", Leaf("id", Longs(0)), Leaf("id", Longs(50)), Leaf("v", Longs(1))),
+            Group("maxValues", Leaf("id", Longs(9)), Leaf("v", Longs(2))));
+
+        Assert.Null(view.GetBound("id", 0, isMin: true, "long"));
+        Assert.NotNull(view.GetBound("id", 0, isMin: false, "long"));
+        Assert.NotNull(view.GetBound("v", 0, isMin: true, "long"));
+
+        var dotted = TypedView(
+            Group("minValues", Leaf("s.a", Longs(100)), Group("s", Leaf("a", Longs(0)))),
+            Group("maxValues", Group("s", Leaf("a", Longs(9))), Leaf("s.a", Longs(200))));
+        Assert.False(dotted.HasBound("s.a"));
+    }
+
+    /// <summary>
+    /// End to end: a file whose only statistics are a typed copy with a colliding null count, or colliding bounds, is
+    /// kept. Before #826 the last copy won, so <c>IS NULL</c> pruned on a count of 0 and <c>id &gt; 100</c> on a max
+    /// of 9 that a second max of 500 contradicts.
+    /// </summary>
+    [Fact]
+    public void ACollidingTypedCopyDoesNotPrune()
+    {
+        var view = TypedView(
+            Group("minValues", Leaf("id", Longs(0)), Leaf("v", Longs(0))),
+            Group("maxValues", Leaf("id", Longs(500)), Leaf("id", Longs(9)), Leaf("v", Longs(9))),
+            Group("nullCount", Leaf("id", Longs(3)), Leaf("id", Longs(0)), Leaf("v", Longs(0))));
+        var add = File(null) with { TypedStats = new ParsedStatsRef(view, 0) };
+        var pruner = new DeltaFilePruner(Schema, []);
+
+        Assert.True(pruner.ShouldInclude(add, Ex.IsNull("id")));
+        Assert.True(pruner.ShouldInclude(add, Ex.GreaterThan("id", 100L)));
+        // A column beside them that doesn't collide still prunes.
+        Assert.False(pruner.ShouldInclude(add, Ex.GreaterThan("v", 100L)));
+        Assert.False(pruner.ShouldInclude(add, Ex.IsNull("v")));
+    }
+
+    /// <summary>A path the typed copy drops as ambiguous falls back to the file's JSON copy, which may be fine.</summary>
+    [Fact]
+    public void ACollidingTypedPathFallsBackToTheJson()
+    {
+        var view = TypedView(Group("nullCount", Leaf("id", Longs(3)), Leaf("id", Longs(0))));
+        var add = File("{\"numRecords\":3,\"nullCount\":{\"id\":0}}") with { TypedStats = new ParsedStatsRef(view, 0) };
+
+        Assert.False(new DeltaFilePruner(Schema, []).ShouldInclude(add, Ex.IsNull("id")));
+    }
+
     /// <summary>Usable statistics still prune: the fix declines only what it can't read.</summary>
     [Fact]
     public void UsableStatisticsStillPrune()
