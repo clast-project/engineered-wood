@@ -355,12 +355,16 @@ public class FallbackPageAnswerTests : IDisposable
 
     /// <summary>
     /// A mask is free to set a NULL answer's value bit: that bit means nothing, so the row is still answered NULL. Here
-    /// every NULL answer's value bit is set, over the dictionary and the fallback pages alike.
+    /// every NULL answer's value bit is set, over the dictionary and the fallback pages alike. A mask is also free to
+    /// leave its null count uncounted (-1, Arrow's "recalculate"). Its validity bitmap still holds the NULLs, so it
+    /// must still be read (review round 2).
     /// </summary>
     [Theory]
-    [InlineData(0)]
-    [InlineData(700)]
-    public async Task ANullAnswersValueBitIsIgnored(int batchSize)
+    [InlineData(0, false)]
+    [InlineData(700, false)]
+    [InlineData(0, true)]
+    [InlineData(700, true)]
+    public async Task ANullAnswersValueBitIsIgnored(int batchSize, bool uncounted)
     {
         string path = WriteFile("v1");
         var options = new ParquetReadOptions { BatchSize = batchSize > 0 ? batchSize : null };
@@ -368,7 +372,7 @@ public class FallbackPageAnswerTests : IDisposable
         RowFilter Filter(bool valueWise)
         {
             var inner = Over("s", answer, valueWise, new());
-            var predicate = new RowPredicate(["s"], batch => SetNullValueBits(inner.Evaluate(batch))) { ValueWise = valueWise };
+            var predicate = new RowPredicate(["s"], batch => SetNullValueBits(inner.Evaluate(batch), uncounted)) { ValueWise = valueWise };
 
             // A later predicate keeps the rows answered NULL live, so a NULL read as TRUE or FALSE changes what it sees.
             var later = new RowPredicate(["k"], batch => Map((Int32Array)batch.Column(0), v => v % 3 != 0));
@@ -381,7 +385,7 @@ public class FallbackPageAnswerTests : IDisposable
         Assert.NotEmpty(expected);
         Assert.Equal(expected, actual);
 
-        static BooleanArray SetNullValueBits(BooleanArray mask)
+        static BooleanArray SetNullValueBits(BooleanArray mask, bool uncounted)
         {
             var values = new byte[(mask.Length + 7) / 8];
             for (int i = 0; i < mask.Length; i++)
@@ -398,7 +402,7 @@ public class FallbackPageAnswerTests : IDisposable
             }
 
             return new BooleanArray(
-                new ArrowBuffer(values), new ArrowBuffer(validity), mask.Length, mask.NullCount, 0);
+                new ArrowBuffer(values), new ArrowBuffer(validity), mask.Length, uncounted ? -1 : mask.NullCount, 0);
         }
     }
 

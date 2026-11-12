@@ -426,7 +426,9 @@ internal sealed class DictionaryAnswer
 
                 // Straight from the mask's bitmaps: a fallback page puts every value through here (#804).
                 var values = mask.ValueBuffer.Span;
-                var validity = mask.NullCount > 0 ? mask.NullBitmapBuffer.Span : default;
+                // != 0, as SelectionMask has it: -1 is Arrow's "not yet counted". Arrow 23 counts on first read,
+                // so the property never returns it, but the convention costs nothing (review round 2).
+                var validity = mask.NullCount != 0 ? mask.NullBitmapBuffer.Span : default;
                 int offset = mask.Offset;
                 for (int i = 0; i < rows; i++)
                 {
