@@ -492,13 +492,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         }
     }
 
-    /// <summary>Reads one planned row group, pairing each batch with the file position of its first row.</summary>
+    /// <summary>Reads one planned row group, pairing each batch with the file position of its first row.
+    /// <paramref name="io"/>, when given, is read in place of the file: one holding bytes fetched ahead.</summary>
     internal async IAsyncEnumerable<PositionedRecordBatch> ReadPlannedAsync(
         RowGroupPlan plan,
         IReadOnlyList<string>? columnNames,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
         CancellationToken cancellationToken,
-        IReadOnlyDictionary<string, AnswerPlan>? answers = null)
+        IReadOnlyDictionary<string, AnswerPlan>? answers = null,
+        IRandomAccessFile? io = null)
     {
         var ranges = plan.Ranges;
 
@@ -513,7 +515,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // cap for an over-sized chunk is decided. Routing around it here would put that decision in
         // two places and leave ReadAllAsync unable to read a file ReadRowGroupBatchesAsync can.
         await foreach (var batch in ReadBatchesAsync(
-                               plan.Index, columnNames, ranges, plan.OffsetIndexes, cancellationToken, answers: answers)
+                               plan.Index, columnNames, ranges, plan.OffsetIndexes, cancellationToken, io: io,
+                               answers: answers)
             .ConfigureAwait(false))
         {
             yield return new PositionedRecordBatch(batch, plan.GroupStart + cursor);
@@ -528,6 +531,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <list type="bullet">
     /// <item>Its compressed bytes are HELD for the whole read of the row group: the read keeps its column chunks
     /// (or page windows) across the batches it yields, not only while one decodes.</item>
+    /// <item>A read of the whole row group starts fetching its column chunks as soon as the hold is granted, and
+    /// only then waits for room to decode (#829). Reserving first made the fetch wait too: with a budget that
+    /// takes one decoded row group at a time, nothing was fetched while the one before it decoded, and the read
+    /// ran serially at fetch-plus-decode per row group. A read of some rows only fetches the pages it needs, as
+    /// it decodes them.</item>
     /// <item>The first batch reserves the row group's footer size (<see cref="PlannedBytes"/>), grown by how far
     /// decoded row groups have exceeded theirs so far (<paramref name="growth"/>). Later batches of the same row
     /// group reserve the largest batch it has produced.</item>
@@ -549,10 +557,18 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         long decoded = 0;
         int batches = 0;
-        var e = ReadPlannedAsync(plan, columnNames, cancellationToken, answers).GetAsyncEnumerator(cancellationToken);
+        PrefetchedFile? prefetched = null;
+        IAsyncEnumerator<PositionedRecordBatch>? e = null;
         try
         {
             await reservation.HoldAsync(compressed, cancellationToken).ConfigureAwait(false);
+            if (plan.Ranges is null)
+            {
+                var ctx = await PrepareRowGroupAsync(plan.Index, columnNames, cancellationToken).ConfigureAwait(false);
+                prefetched = new PrefetchedFile(_file, ctx.Ranges, cancellationToken);
+            }
+            e = ReadPlannedAsync(plan, columnNames, cancellationToken, answers, prefetched)
+                .GetAsyncEnumerator(cancellationToken);
             while (true)
             {
                 await reservation.ReserveNextAsync(cancellationToken).ConfigureAwait(false);
@@ -570,7 +586,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         }
         finally
         {
-            await e.DisposeAsync().ConfigureAwait(false);
+            if (e is not null)
+                await e.DisposeAsync().ConfigureAwait(false);
+            if (prefetched is not null)
+                await prefetched.DisposeAsync().ConfigureAwait(false);
             reservation.ReleaseHeld();
         }
 
@@ -869,7 +888,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             // offsets and validity correctly for nested types. The trade-off is that the full row
             // group is decoded up front; true per-page subsetting for nested columns is future work.
             await foreach (var b in ReadNestedRowGroupInBatchesAsync(
-                ctx, spans, batchSize, maxBytes, cancellationToken).ConfigureAwait(false))
+                file, ctx, spans, batchSize, maxBytes, cancellationToken).ConfigureAwait(false))
             {
                 yield return b;
             }
@@ -1214,6 +1233,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// the rows in <paramref name="spans"/> are yielded, a batch never spanning two of them.
     /// </summary>
     private async IAsyncEnumerable<RecordBatch> ReadNestedRowGroupInBatchesAsync(
+        IRandomAccessFile file,
         RowGroupContext ctx,
         (int Start, int End)[] spans,
         int? batchSize,
@@ -1229,7 +1249,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         ColumnPageMap[] pageMaps = new ColumnPageMap[ctx.Count];
         bool needPageMaps = maxBytes is > 0;
 
-        var buffers = await _file.ReadRangesAsync(ctx.Ranges, cancellationToken).ConfigureAwait(false);
+        // Through the read's file, not _file: it may hold these chunks fetched ahead (#829).
+        var buffers = await file.ReadRangesAsync(ctx.Ranges, cancellationToken).ConfigureAwait(false);
         try
         {
             var results = new ColumnResult[ctx.Count];
