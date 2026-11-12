@@ -171,7 +171,7 @@ An all-false lookup table proves that no row of the group can pass, but only whe
 - the chunk is **wholly** dictionary-encoded, as `MembershipPredicateEvaluator.IsWhollyDictionaryEncoded` decides from `encoding_stats`. A chunk that fell back to PLAIN partway through can hold matching values the dictionary doesn't;
 - it is the first predicate, or every predicate before it cannot raise (the rule for reordering in §7). Skipping the group skips evaluating the earlier predicates over its rows, which would suppress an error one of them raises.
 
-Then treat it as a prune, and skip the group before any data page is read. If any of the three fails, keep evaluating: fallback pages are decoded and evaluated row by row. This is the only way an opaque filter (a host's Bloom probe) can prune a row group. `MembershipPredicateEvaluator` can't, because it needs a `Predicate`.
+Then treat it as a prune, and skip the group before any data page is read. If any of the three fails, keep evaluating: fallback pages are decoded and evaluated row by row. This is the only way an opaque filter (a host's Bloom probe) can prune a row group. `MembershipPredicateEvaluator` can't, because it needs a `Predicate`. *(Measured and not built: §32.)*
 
 ### Where Bloom filters fit
 
@@ -1338,7 +1338,7 @@ Before #804, a chunk was answered from its dictionary only when its `encoding_st
 - **A fallback page.** Its values are decoded apart (`FallbackValueState`), and every predicate of the run is asked over them (`AnswerValues`). Their answers join the lookup table as entries past the dictionary's. The page's values take those entries as their indices. `Map` then treats both kinds of page alike, and nothing downstream changes: the answers column, `BatchSelector`, and the batched read's cursors. The extra entries are for one `Map` (one chunk, or one batch's pages) and are reused after it. A fallback page may be in any encoding: PLAIN, or DELTA_BYTE_ARRAY from parquet-mr's V2 writer.
 - **A returned column.** The values decoded apart are appended to the read's values (`ColumnBuildState.TryAppendValuesOf`), so the page is decoded once. A BOOLEAN column, or a string read as a view or with large offsets, decodes the page again instead.
 - **Errors.** A predicate that raises over a fallback page's values, or values that cannot be built apart, makes the chunk decline (`DictionaryAnswer.DeclinedException`, not a decode failure). The rows then decide, as when the dictionary itself raises (§20). Over the whole row group, the chunk is read again as values. In the batched read, the answers already held cover rows this batch still needs. So the column is decoded again as values from the page holding the batch's first row: from the held chunk, from the window, or from a range fetched again. It is read as values from then on. Batches already returned used only pages that answered; a page is decoded by the first batch that reaches it.
-- **The all-false prune** (§6) is still not built. When it is, it must stay limited to wholly dictionary-encoded chunks: a fallback page can hold values the dictionary does not. Dictionary pruning (#57) keeps `IsWhollyDictionaryEncoded` for the same reason.
+- **The all-false prune** (§6) is not built: §32 measured it and decided against it for now. If it is built, it must stay limited to wholly dictionary-encoded chunks: a fallback page can hold values the dictionary does not. Dictionary pruning (#57) keeps `IsWhollyDictionaryEncoded` for the same reason.
 
 Mapping the masks into the table also changed. `Evaluate` writes each predicate's answers straight from the mask's bitmaps into the table's two bits per entry. It no longer goes through a byte per row and `BooleanArray.GetValue`, since a fallback page puts every value through it.
 
@@ -1445,3 +1445,44 @@ One mutation passes, and is equivalent: taking a NULL answer's value bit as TRUE
 ### Review round 2
 
 - **A mask with an uncounted null count (Copilot).** `Evaluate` read a mask's validity bitmap only when `NullCount > 0`. Arrow uses -1 for "not yet counted", so such a mask would have had its NULL answers read as TRUE or FALSE. That is not a live bug: Arrow 23's `NullCount` counts on first read and never returns -1 (measured: a mask built with -1 and four NULLs reports 4). The check is now `!= 0`, as `SelectionMask` and the rest of the repo have it. `ANullAnswersValueBitIsIgnored` now also passes masks built with a null count of -1. It passes either way under Arrow 23, and pins the behaviour should Arrow stop counting lazily.
+
+## 32. The all-false prune, measured and not built (2026-11-12)
+
+§6 proposed treating an all-false dictionary table as a row-group prune: when every entry, and the NULL row, answers FALSE, skip the group before reading any data page. Its conditions:
+- the chunk is wholly dictionary-encoded;
+- the predicate is the first, or none before it can raise.
+
+Before building it, this measures what it could save.
+
+### Measured
+
+`allfalse-ab` (new, Parquet benchmarks). EW writes 8 row groups x 250,000 rows: `id`, `key`, `amount`, `qty`, `ts` and `note`. `key` holds 20 values local to each row group, so every chunk of it is wholly dictionary-encoded, as the benchmark checks. The predicate is an opaque value-wise host probe: a hash set of 3 keys that only row group 0 holds. Dictionary pruning (#57) cannot see it, since it needs an `Eq` or `In` expression. The variants:
+- `rows`: the probe asked row by row.
+- `dict`: today's reader, answering every group from its dictionary but still reading it.
+- `ideal`: `dict` plus a statistics prune on `id` that skips groups 1-7. This is an upper bound on the all-false prune, which would also read each skipped group's dictionary page.
+
+i9-12900K, net10.0, local file, warm cache, median of 9. Every variant returns the same 37,384 rows.
+
+| Projection | Variant | ms | vs `dict` | MB allocated |
+|---|---|---|---|---|
+| `id, amount, qty, ts, note` | `rows` | 41.0 | +145% | 83.1 |
+| | `dict` | 16.8 | | 19.0 |
+| | `dict`, two passes | 11.0 | -34% | 3.1 |
+| | `ideal` | 6.1 | -63% | 4.4 |
+| | `ideal`, two passes | 5.9 | -65% | 2.5 |
+| `id` | `rows` | 33.1 | +707% | 65.3 |
+| | `dict` | 4.1 | | 1.1 |
+| | `dict`, two passes | 4.0 | -3% | 1.0 |
+| | `ideal` | 2.1 | -49% | 0.7 |
+| | `ideal`, two passes | 2.6 | -37% | 0.4 |
+
+The ceiling is large where it applies. With a wide projection it saves 63% against a one-pass read and 46% against a two-pass one (11.0 against 5.9 ms), since two passes already skip decoding the other columns of rejected rows. With `id` alone it saves about half. The saving scales with the share of row groups rejected whole: 7 of 8 here is the best case, and a file where every group holds some match gains nothing.
+
+### Decided (2026-11-12): not built
+
+The prune needs three things together, and the common case lacks one:
+- **A predicate only the dictionary can answer:** an opaque value-wise delegate. An `Eq` or `In` filter already gets dictionary pruning (#57).
+- **Chunks wholly dictionary-encoded.** Join keys, the main source of host masks, are usually high-cardinality. EW writes them without a dictionary past 20% distinct, and other writers fall back mid-chunk (§31), so the prune would never fire on them.
+- **Values clustered by row group,** so that whole groups miss.
+
+What fits is a host mask over a low-cardinality column whose values are local to row groups: data sorted, clustered or Z-ordered on a category-like column. Build it when a host needs that case. It is a check before a group's data pages are read, plus the rule about earlier predicates that can raise, and `allfalse-ab` is ready to measure it.
