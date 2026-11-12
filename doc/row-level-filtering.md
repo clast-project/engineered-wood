@@ -1383,7 +1383,30 @@ Two changes on the way cut that cost. Before them, the same file measured +27% (
 - decoding a returned column's fallback page once, not twice;
 - writing the masks' bits straight into the table.
 
-**Left open: choosing the row path for a returned column that is mostly PLAIN.** The reader cannot tell a chunk's PLAIN share before decoding it. `encoding_stats` counts pages, and a dictionary-encoded page holds many more rows than a PLAIN page of the same size. It also cannot tell a cheap kernel from an expensive delegate. A per-chunk switch, once the first fallback page shows how much remains, is possible but not built.
+The table above was measured without the switch below. It shows what the dictionary path costs at each fallback point.
+
+### Asking a mostly-PLAIN returned column row by row
+
+A returned column whose chunk has at least `ParquetFileReader.ReturnedFallbackShareLimit` of its rows on fallback pages (default 0.75) is asked row by row. A dropped column is always answered, since it gains or breaks even at every point.
+
+The share is a count of rows, not a guess from sizes. Byte sizes would mislead, since a dictionary-encoded page holds many more rows than a PLAIN page of the same size. `DictionaryAnswer.FallbackRowShare` gets it from what the read already has:
+- **`encoding_stats` prove the chunk wholly dictionary-encoded:** zero, with no further work.
+- **The one-batch read** holds the whole chunk, so it walks the page headers (encoding and rows) without decoding a page.
+- **The batched read's page map,** built from the page headers, already holds each page's encoding and rows.
+- **A page map built from the OffsetIndex** knows each page's rows but not its encoding. `encoding_stats` counts the dictionary-encoded data pages. Writers fall back once per chunk and never return to the dictionary, so those are the first pages, and the fallback rows start at the next page's first row. If a writer did return to the dictionary, only the choice of path would be wrong, not the rows.
+- **Neither** (an OffsetIndex map and no `encoding_stats`): unknown, and the dictionary answers.
+
+It is a choice per chunk, made before the chunk's first data page is decoded. The reader still cannot tell a cheap kernel from an expensive delegate, so the limit is where even a delegate stops gaining. `fallback-ab` with the switch off (`EW_FALLBACK_SHARE_LIMIT=2`), returned `id, category`:
+
+| PLAIN | `=` | `IN` 5 | `<>` | host probe |
+|---|---|---|---|---|
+| 50% | +16% | -3% | +9% | -23% |
+| 60% | +14% | +4% | +11% | -33% |
+| 70% | +18% | +8% | +10% | -12% |
+| 80% | +17% | +9% | +11% | -3% |
+| 90% | +22% | +12% | +16% | +6% |
+
+From 80% up a delegate gains nothing, while the kernels lose 9-22%. Between 50% and 70% the two pull apart, and the dictionary keeps them. With the switch on at 0.75, the returned column at 80% and 90% measures -4% to +2% against the rows for every case, since both now take the row path.
 
 ### Tests
 
@@ -1394,6 +1417,7 @@ Two changes on the way cut that cost. Before them, the same file measured +27% (
 - A mask that sets a NULL answer's value bit.
 - A chunk whose `encodings` claims a dictionary but has no dictionary page is read as values.
 - Errors: a value only an excluded row holds, on a fallback page, does not fail the read. This is tested over the whole row group and in batches of 70 to 2,500 rows, which between them take all three recovery routes (held chunk, window, fetched again). One a live row holds raises.
+- The switch to rows, across the variants, one batch and batched, plus an OffsetIndex map without `encoding_stats`. At a limit of 5%, a returned `s` is asked row by row (every row once). At 95% it is answered from the dictionary. A dropped `s` is answered at 5% too. With an OffsetIndex map and no stats, the share is unknown, and the dictionary answers.
 
 `SparkFallbackPageInteropTests` (new, Delta tier 3). Spark writes a table with `parquet.dictionary.page.size` 4096 and 500-row pages, set as session confs: a Delta write's options do not reach parquet-mr. The V1 writer falls back to PLAIN and the V2 writer to DELTA_BYTE_ARRAY. Six filters x two projections return the same rows with `AnswersFromDictionaries` on and off. The fillers start halfway through each file, because parquet-mr rewrites a chunk PLAIN whole if its dictionary overflows before the first page is written.
 
@@ -1406,6 +1430,8 @@ Each of these mutations fails tests:
 - FALSE not winning over NULL in a run (12);
 - the fallback entries' NULLs given no validity bitmap (8);
 - no decline before a missing dictionary page (1);
-- a returned column's appended byte arrays skipped (65), and its fixed-width values zeroed (3).
+- a returned column's appended byte arrays skipped (65), and its fixed-width values zeroed (3);
+- the switch to rows never taken (8), taken for a dropped column too (8), or taken when the share is unknown (1);
+- an OffsetIndex map's share taken as zero (1); every page counted as fallback in the header walk (36) and in a header-built map (32).
 
 One mutation passes, and is equivalent: taking a NULL answer's value bit as TRUE. Every consumer reads the value bit only where the validity bit is set.

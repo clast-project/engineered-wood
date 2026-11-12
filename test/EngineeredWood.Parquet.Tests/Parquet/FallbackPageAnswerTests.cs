@@ -165,6 +165,60 @@ public class FallbackPageAnswerTests : IDisposable
     }
 
     /// <summary>
+    /// A returned column whose chunks have mostly fallen back is asked row by row
+    /// (<see cref="ParquetFileReader.ReturnedFallbackShareLimit"/>). The share of <c>s</c>'s rows on fallback pages
+    /// lies between 5% and 95% in every chunk, so a limit of 5% asks the rows and one of 95% answers from the
+    /// dictionary. The share comes from the page headers (the one-batch read walks them, and the batched read's map
+    /// holds them), or, for a map built from the OffsetIndex, from <c>encoding_stats</c>. With neither (an OffsetIndex
+    /// map and no stats) it is unknown, and the dictionary answers. A dropped column is answered whatever the share.
+    /// </summary>
+    [Theory]
+    [InlineData("v1", 0, true)]
+    [InlineData("v1", 700, true)]
+    [InlineData("v2", 700, true)]
+    [InlineData("v1 page index", 0, true)]
+    [InlineData("v1 page index", 700, true)]
+    [InlineData("v1 no encoding_stats", 0, true)]
+    [InlineData("v1 no encoding_stats", 700, true)]
+    [InlineData("v1 page index no encoding_stats", 0, true)] // the one-batch read walks the headers
+    [InlineData("v1 page index no encoding_stats", 700, false)] // an OffsetIndex map, and no stats
+    public async Task AReturnedColumnMostlyFallenBackIsAskedRowByRow(string variant, int batchSize, bool shareKnown)
+    {
+        string path = WriteFile(variant);
+        var options = new ParquetReadOptions { BatchSize = batchSize > 0 ? batchSize : null };
+        Func<string?, bool?> answer = v => v is null ? null : v.EndsWith("3", StringComparison.Ordinal);
+        var expected = await ReadAsync(path, options, new ParquetScan
+        {
+            Columns = ["id", "s"], RowFilter = new RowFilter([Over("s", answer, valueWise: false, new())]),
+        }, twoPass: false);
+
+        async Task<ConcurrentBag<string?[]>> AskedAsync(string[] projection, double limit)
+        {
+            var asked = new ConcurrentBag<string?[]>();
+            var rows = await ReadAsync(path, options, new ParquetScan
+            {
+                Columns = projection, RowFilter = new RowFilter([Over("s", answer, valueWise: true, asked)]),
+            }, twoPass: false, fallbackShareLimit: limit);
+            if (projection.Length == 2)
+                Assert.Equal(expected, rows);
+            return asked;
+        }
+
+        // Answered from the dictionary: asked over each row group's dictionary, which ends in the NULL row.
+        static bool Answered(ConcurrentBag<string?[]> asked) =>
+            asked.Count(values => values.Length > 0 && values[^1] is null) == Groups
+            && asked.Sum(values => values.Length) < Rows * 3 / 4;
+
+        Assert.True(Answered(await AskedAsync(["id", "s"], limit: 0.95)));
+        var low = await AskedAsync(["id", "s"], limit: 0.05);
+        if (shareKnown)
+            Assert.Equal(Rows, low.Sum(values => values.Length)); // every row asked, once
+        else
+            Assert.True(Answered(low));
+        Assert.True(Answered(await AskedAsync(["id"], limit: 0.05)));
+    }
+
+    /// <summary>
     /// A returned column read as a view or large-offset type: a fallback page's values, decoded apart for the answers,
     /// are not in the read's layout, so the page is decoded again for the values the read returns.
     /// </summary>
@@ -435,10 +489,15 @@ public class FallbackPageAnswerTests : IDisposable
         return await reader.ReadMetadataAsync();
     }
 
-    private static async Task<List<string>> ReadAsync(string path, ParquetReadOptions options, ParquetScan scan, bool twoPass)
+    private static async Task<List<string>> ReadAsync(
+        string path, ParquetReadOptions options, ParquetScan scan, bool twoPass,
+        double fallbackShareLimit = ParquetFileReader.DefaultReturnedFallbackShareLimit)
     {
         await using var file = new LocalRandomAccessFile(path);
-        using var reader = new ParquetFileReader(file, ownsFile: false, options) { TwoPassReads = twoPass };
+        using var reader = new ParquetFileReader(file, ownsFile: false, options)
+        {
+            TwoPassReads = twoPass, ReturnedFallbackShareLimit = fallbackShareLimit,
+        };
         var rows = new List<string>();
         await foreach (var selected in reader.ReadSelectedAsync(scan))
         {

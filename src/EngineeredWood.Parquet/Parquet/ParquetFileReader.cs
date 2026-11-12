@@ -811,7 +811,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 var wholeAnswers = keepRows is null ? DictionaryAnswersFor(ctx, answers, ctx.RowCount) : null;
                 ForEachColumn(ctx.Count, i =>
                 {
-                    if (wholeAnswers?[i] is { } answer)
+                    if (wholeAnswers?[i] is { } answer
+                        && !AsksRowsInstead(answer,
+                            () => DictionaryAnswer.FallbackRowShare(ctx.Chunks[i].MetaData!, buffers[i].Memory.Span)))
                     {
                         var result = ColumnChunkReader.ReadColumn(
                             buffers[i].Memory.Span, ctx.Columns[i],
@@ -1043,6 +1045,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                                 if (answerModes[i] == 0)
                                 {
                                     answerModes[i] = dictionaryAnswers?[i] is { } answer
+                                                     && !AsksRowsInstead(answer,
+                                                         () => DictionaryAnswer.FallbackRowShare(ctx.Chunks[i].MetaData!, pageMaps[i]))
                                                      && answer.Prepare(pageMaps[i].Dictionary)
                                         ? (byte)1
                                         : (byte)2;
@@ -1358,6 +1362,23 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
     /// <summary>The default <see cref="HeaderScanBudgetBytes"/>.</summary>
     internal const long DefaultHeaderScanBudgetBytes = 64L * 1024 * 1024;
+
+    /// <summary>
+    /// The share of a chunk's rows on pages that fell back from the dictionary at which a column the read returns is
+    /// asked row by row rather than answered from its dictionary (#804, doc/row-level-filtering.md §31). Each fallback
+    /// value costs a table entry, an index and a lookup on top of the predicate. For a returned column under a cheap
+    /// kernel, that outweighs what the dictionary saves once most rows have fallen back, and by then even a costly
+    /// delegate gains little. A dropped column is always answered. Above 1, never. Tests and benchmarks set it.
+    /// </summary>
+    internal double ReturnedFallbackShareLimit { get; set; } = DefaultReturnedFallbackShareLimit;
+
+    /// <summary>The default <see cref="ReturnedFallbackShareLimit"/>.</summary>
+    internal const double DefaultReturnedFallbackShareLimit = 0.75;
+
+    // Whether a returned column is asked row by row for the share of its chunk's rows that fell back (measured only for
+    // a returned column). An unknown share keeps the dictionary.
+    private bool AsksRowsInstead(DictionaryAnswer answer, Func<double?> fallbackShare) =>
+        answer.KeepsValues && fallbackShare() is { } share && share >= ReturnedFallbackShareLimit;
 
     /// <summary>
     /// The gap between two chunks of one scan request that a coalescing reader is taken to fetch with

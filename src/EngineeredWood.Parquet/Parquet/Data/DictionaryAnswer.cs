@@ -130,6 +130,89 @@ internal sealed class DictionaryAnswer
         return false;
     }
 
+    /// <summary>
+    /// The share of a chunk's rows on pages that fell back from the dictionary, from its bytes (<paramref name="chunk"/>,
+    /// the whole chunk), by walking the page headers without decoding a page. Zero, with no walk, when the chunk's
+    /// <c>encoding_stats</c> prove it wholly dictionary-encoded. Null when it holds no data page, or a header does
+    /// not decode; the read then reports the corrupt page itself.
+    /// </summary>
+    internal static double? FallbackRowShare(ColumnMetaData meta, ReadOnlySpan<byte> chunk)
+    {
+        if (MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta))
+            return 0;
+
+        long fallback = 0, total = 0;
+        try
+        {
+            for (int offset = 0; offset < chunk.Length;)
+            {
+                var header = PageHeaderDecoder.Decode(chunk.Slice(offset), out int consumed);
+                offset += consumed + header.CompressedPageSize;
+
+                // A flat column's V1 page holds one value, NULL or not, per row.
+                var (rows, encoding) = header switch
+                {
+                    { DataPageHeader: { } v1 } => (v1.NumValues, v1.Encoding),
+                    { DataPageHeaderV2: { } v2 } => (v2.NumRows, v2.Encoding),
+                    _ => (0, Encoding.Plain),
+                };
+                total += rows;
+                if (!IsDictionaryEncoding(encoding))
+                    fallback += rows;
+            }
+        }
+        catch (Exception ex) when (ex is not (OutOfMemoryException or OperationCanceledException))
+        {
+            return null;
+        }
+
+        return total == 0 ? null : (double)fallback / total;
+    }
+
+    /// <summary>
+    /// The share of a chunk's rows on pages that fell back from the dictionary, from its page map. A map read from the
+    /// page headers knows each page's encoding. A map built from the OffsetIndex knows only each page's rows. Writers
+    /// fall back once per chunk and never return to the dictionary, so the dictionary-encoded data pages that
+    /// <c>encoding_stats</c> counts are the first ones. Null without <c>encoding_stats</c> for such a map, or for a
+    /// map with no rows.
+    /// </summary>
+    internal static double? FallbackRowShare(ColumnMetaData meta, ColumnPageMap map)
+    {
+        if (MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta))
+            return 0;
+        if (map.TotalRows == 0)
+            return null;
+
+        if (map.HeadersResolved)
+        {
+            long fallback = 0;
+            foreach (var page in map.Pages)
+            {
+                if (!IsDictionaryEncoding(page.Encoding))
+                    fallback += page.NumRows;
+            }
+
+            return (double)fallback / map.TotalRows;
+        }
+
+        if (meta.EncodingStats is not { Count: > 0 } stats)
+            return null;
+
+        int dictionaryPages = 0;
+        foreach (var entry in stats)
+        {
+            if (entry.PageType is PageType.DataPage or PageType.DataPageV2 && IsDictionaryEncoding(entry.Encoding))
+                dictionaryPages += entry.Count;
+        }
+
+        return dictionaryPages >= map.Pages.Length
+            ? 0
+            : (double)(map.TotalRows - map.CumulativeRows[dictionaryPages]) / map.TotalRows;
+    }
+
+    private static bool IsDictionaryEncoding(Encoding encoding) =>
+        encoding is Encoding.RleDictionary or Encoding.PlainDictionary;
+
     /// <summary>Whether <see cref="Prepare"/> has built the lookup table.</summary>
     internal bool IsPrepared => _prepared;
 

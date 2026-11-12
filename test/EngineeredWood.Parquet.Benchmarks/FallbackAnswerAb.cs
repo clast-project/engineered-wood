@@ -24,7 +24,9 @@ namespace EngineeredWood.Benchmarks;
 /// <para>arrow-cpp (ParquetSharp) writes 4 row groups x 500,000 rows: <c>id</c>, <c>amount</c>, and <c>category</c>
 /// (50 values). In each row group, one filler value larger than the 64 KiB dictionary page limit, at the fallback
 /// point, makes the rest of the chunk PLAIN. 0% PLAIN is a wholly dictionary-encoded control.</para>
-/// <para>Run with: dotnet run -c Release -f net10.0 -- fallback-ab [rounds]</para>
+/// <para>Run with: dotnet run -c Release -f net10.0 -- fallback-ab [rounds]. <c>EW_FALLBACK_POINTS</c> sets the PLAIN
+/// shares (default 0,10,50,90), and <c>EW_FALLBACK_SHARE_LIMIT</c> sets <see cref="ParquetFileReader.ReturnedFallbackShareLimit"/>
+/// (above 1 turns the switch to rows off).</para>
 /// </remarks>
 internal static class FallbackAnswerAb
 {
@@ -33,6 +35,15 @@ internal static class FallbackAnswerAb
     private const int Rows = Groups * RowsPerGroup;
 
     private static readonly ArrowRowEvaluator Evaluator = new();
+
+    private static readonly int[] Points =
+        (Environment.GetEnvironmentVariable("EW_FALLBACK_POINTS") ?? "0,10,50,90")
+        .Split(',').Select(p => int.Parse(p, CultureInfo.InvariantCulture)).ToArray();
+
+    private static readonly double ShareLimit =
+        Environment.GetEnvironmentVariable("EW_FALLBACK_SHARE_LIMIT") is { Length: > 0 } limit
+            ? double.Parse(limit, CultureInfo.InvariantCulture)
+            : ParquetFileReader.DefaultReturnedFallbackShareLimit;
 
     // Filter is the predicate the evaluator asks, and Prune; Probe, when set, is asked instead, as a host's delegate
     // (a hash-set probe, like a join filter) would be.
@@ -82,7 +93,7 @@ internal static class FallbackAnswerAb
             Console.WriteLine();
             Console.WriteLine("| PLAIN | Case | Kept | rows ms | dict ms | dict vs rows | rows MB alloc | dict MB alloc |");
             Console.WriteLine("|---|---|---|---|---|---|---|---|");
-            foreach (int plainPercent in new[] { 0, 10, 50, 90 })
+            foreach (int plainPercent in Points)
             {
                 string path = Path.Combine(dir, $"plain-{plainPercent}.parquet");
                 Write(path, plainPercent);
@@ -196,7 +207,10 @@ internal static class FallbackAnswerAb
     private static async Task<(double Ms, long Alloc, long Rows, long Sum)> RunOnceAsync(string path, Case c, bool dictionary)
     {
         await using var file = new LocalRandomAccessFile(path);
-        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions());
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions())
+        {
+            ReturnedFallbackShareLimit = ShareLimit,
+        };
         var scan = new ParquetScan
         {
             Columns = c.Projection,
