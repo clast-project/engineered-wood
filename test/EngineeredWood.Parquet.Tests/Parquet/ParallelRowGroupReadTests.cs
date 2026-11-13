@@ -1563,6 +1563,49 @@ public class ParallelRowGroupReadTests : IDisposable
         }
     }
 
+    /// <summary>#852 review round 2: a top-level column's most leaf values a row, from its chunks' <c>num_values</c>:
+    /// one for a flat column, a list's elements for a list.</summary>
+    [Fact]
+    public async Task LeafValuesPerRow_CountsAListsElements()
+    {
+        var listType = new ListType(new Field("element", Int32Type.Default, true));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("l", listType, true))
+            .Build();
+        const int rows = 1_000;
+        var ids = new Int64Array.Builder();
+        var values = new Int32Array.Builder();
+        var offsets = new ArrowBuffer.Builder<int>(rows + 1);
+        offsets.Append(0);
+        for (int r = 0; r < rows; r++)
+        {
+            ids.Append(r);
+            for (int e = 0; e < 3; e++)
+                values.Append(r * 3 + e);
+            offsets.Append((r + 1) * 3);
+        }
+        string path = Path.Combine(_tempDir, "lists.parquet");
+        using (var batch = new RecordBatch(schema,
+                   [ids.Build(), new ListArray(listType, rows, offsets.Build(), values.Build(), ArrowBuffer.Empty, 0)], rows))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var perRow = await reader.LeafValuesPerRowAsync(default);
+        Assert.Equal(1.0, perRow["id"]);
+        Assert.Equal(3.0, perRow["l"]);
+
+        // The host's bytes saturate rather than wrap (#852 review round 2).
+        Assert.Equal(EngineeredWood.Memory.MemoryBudget.MaxCharge,
+            await reader.LargestFirstBatchBytesAsync(null, null, default, addedBytesPerRow: long.MaxValue / 2));
+    }
+
     /// <summary>Completes <see cref="Requested"/> once a request covers the byte at <c>offset</c>.</summary>
     private sealed class WatchingFile(IRandomAccessFile inner, long offset) : IRandomAccessFile
     {

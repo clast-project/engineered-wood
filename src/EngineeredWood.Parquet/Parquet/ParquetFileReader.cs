@@ -577,7 +577,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             if (estimate.OffsetIndexes is { } offsetIndexes)
                 plan = plan with { OffsetIndexes = offsetIndexes };
             reservation.SetInitialEstimate(
-                estimate.Reserved, FirstBatchRowBound(metadata.RowGroups[plan.Index], plan.Ranges));
+                estimate.Reserved, FirstBatchRowBound(metadata.RowGroups[plan.Index], plan.Ranges),
+                metadata.RowGroups[plan.Index].NumRows);
 
             e = ReadPlannedAsync(plan, columnNames, cancellationToken, answers, prefetched)
                 .GetAsyncEnumerator(cancellationToken);
@@ -734,11 +735,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// planned parallel read, such as Delta's change feed and compaction (#846): the footer's uncompressed size it
     /// reserved before was 10-20x short for dictionary or run-length-encoded columns.
     /// <paramref name="addedBytesPerRow"/> is what the host adds to each row before it hands the batch on, which is
-    /// the size its scan settles: a change feed's columns.
+    /// the size its scan settles: a change feed's columns; <paramref name="addedBytesPerDecodedRow"/> what it adds per
+    /// row decoded (<see cref="ScanReservation.AddedBytesPerDecodedRow"/>).
     /// </summary>
     internal async ValueTask<long> LargestFirstBatchBytesAsync(
         IReadOnlyList<string>? columnNames, Func<long, long, bool>? skipped, CancellationToken cancellationToken,
-        long addedBytesPerRow = 0)
+        long addedBytesPerRow = 0, long addedBytesPerDecodedRow = 0)
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
@@ -756,8 +758,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             // would otherwise swallow them (#850 review). The host adds them to every row the batch holds, at most
             // BatchSize: a MaxBatchByteSize cut stops at page boundaries, so its share of the encoded bytes says
             // nothing of the rows (#850 review round 2).
-            long added = addedBytesPerRow * FirstBatchRowBound(group, null);
-            largest = Math.Max(largest, FirstBatchBytes(decoded, footer, group, schema, columnNames, null) + added);
+            long first = ScanReservation.WithAddedBytes(
+                FirstBatchBytes(decoded, footer, group, schema, columnNames, null), addedBytesPerRow,
+                FirstBatchRowBound(group, null));
+            largest = Math.Max(largest, ScanReservation.WithAddedBytes(first, addedBytesPerDecodedRow, group.NumRows));
         }
         return largest;
     }
@@ -1021,6 +1025,32 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             share = Math.Min(share, (double)maxBytes / footerBytes);
         long bytes = (long)(groupBytes * share);
         return Math.Max(bytes, Math.Min(footerBytes, groupBytes));
+    }
+
+    /// <summary>
+    /// For each top-level column, the most leaf values a row of it holds in any row group: a column chunk's
+    /// <c>num_values</c>, which counts every leaf slot (nulls and empty lists included), over its group's rows. One
+    /// for a flat column; for a list or map, at least its elements a row, at any depth. For a host sizing what it adds
+    /// inside nested elements (#852 review round 2).
+    /// </summary>
+    internal async ValueTask<Dictionary<string, double>> LeafValuesPerRowAsync(CancellationToken cancellationToken)
+    {
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var result = new Dictionary<string, double>(StringComparer.Ordinal);
+        foreach (var group in metadata.RowGroups)
+        {
+            if (group.NumRows <= 0)
+                continue;
+            foreach (var chunk in group.Columns)
+            {
+                if (chunk.MetaData is not { PathInSchema: { Count: > 0 } path } meta)
+                    continue;
+                double perRow = (double)meta.NumValues / group.NumRows;
+                if (!result.TryGetValue(path[0], out var seen) || perRow > seen)
+                    result[path[0]] = perRow;
+            }
+        }
+        return result;
     }
 
     /// <summary>

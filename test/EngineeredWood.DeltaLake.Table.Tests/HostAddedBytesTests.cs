@@ -41,8 +41,11 @@ public class HostAddedBytesTests : IDisposable
             Directory.Delete(_tempDir, recursive: true);
     }
 
+    private static readonly Apache.Arrow.Types.StructType Point = new([new Field("a", Int32Type.Default, true)]);
+
     private static readonly Apache.Arrow.Schema PartitionedSchema = new Apache.Arrow.Schema.Builder()
         .Field(new Field("v", Int64Type.Default, false))
+        .Field(new Field("s", Point, true))
         .Field(new Field("region", StringType.Default, true))
         .Field(new Field("bucket", Int32Type.Default, true))
         .Field(new Field("tag", StringType.Default, true))
@@ -62,20 +65,25 @@ public class HostAddedBytesTests : IDisposable
         for (int f = 0; f < files; f++)
         {
             var v = new Int64Array.Builder();
+            var a = new Int32Array.Builder();
             var region = new StringArray.Builder();
             var bucket = new Int32Array.Builder();
             var tag = new StringArray.Builder();
             for (int r = 0; r < Rows; r++)
             {
                 v.Append(r % 3);
+                a.Append(r);
                 region.Append(Region);
                 bucket.Append(f);
                 tag.AppendNull();
             }
-            await table.WriteAsync([new RecordBatch(PartitionedSchema, [v.Build(), region.Build(), bucket.Build(), tag.Build()], Rows)]);
+            var s = new StructArray(Point, Rows, [a.Build()], ArrowBuffer.Empty, 0);
+            await table.WriteAsync([new RecordBatch(PartitionedSchema, [v.Build(), s, region.Build(), bucket.Build(), tag.Build()], Rows)]);
         }
         if (!evolve)
             return;
+        // Inside a struct the files hold, as well as beside it (#852 review round 2).
+        await table.AddFieldAsync(["s"], new Field("b", StringType.Default, true));
         await table.AddColumnAsync(new Field("x_id", Int64Type.Default, true));
         await table.AddColumnAsync(new Field("x_note", StringType.Default, true));
         await table.AddColumnAsync(new Field("x_flag", BooleanType.Default, true));
@@ -126,14 +134,16 @@ public class HostAddedBytesTests : IDisposable
         Assert.Equal(Rows, rows);
 
         var partitionColumns = snapshot.Metadata.PartitionColumns;
-        long perRow = DeltaTable.ReconcileAddedBytesPerRow(
+        var reshape = DeltaTable.ReconcileAddedBytesPerRow(
             snapshot, null, add.PartitionValues, partitionColumns, partitionColumns.Count > 0, mapping,
             ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mapping), await reader.GetArrowSchemaAsync(), kind);
 
+        // One batch of the whole decode: both parts are per row of it.
+        long perRow = reshape.PerRow + reshape.PerDecodedRow;
         long added = shaped - raw;
         Assert.True(added > 50L * Rows, $"reshaping added {added} bytes: nothing to estimate");
-        // Never short, beyond each buffer's padding; over by no more than the rounding of a row's bits to bytes.
-        Assert.True(perRow * Rows >= added - 4096 && perRow * Rows <= added + Rows, $"estimated {perRow} B/row = {perRow * Rows}, reshaping added {added} ({added / (double)Rows:F3} B/row)");
+        // Never short, beyond each buffer's padding; over by no more than the rounding of each part's bits to bytes.
+        Assert.True(perRow * Rows >= added - 4096 && perRow * Rows <= added + 2 * Rows, $"estimated {perRow} B/row = {perRow * Rows}, reshaping added {added} ({added / (double)Rows:F3} B/row)");
     }
 
     /// <summary>
@@ -183,11 +193,116 @@ public class HostAddedBytesTests : IDisposable
             raw, snapshot.ArrowSchema, values, partitionColumns, logicalToPhysical);
         long added = RollingDataFileWriter.EstimatedBytes(shaped) - RollingDataFileWriter.EstimatedBytes(raw);
 
-        long perRow = DeltaTable.ReconcileAddedBytesPerRow(
+        var reshape = DeltaTable.ReconcileAddedBytesPerRow(
             snapshot, null, values, partitionColumns, true, ColumnMappingMode.Name, logicalToPhysical, data,
             byteArrays: null);
-        Assert.True(perRow * Rows >= added - 4096 && perRow * Rows <= added + Rows,
+        long perRow = reshape.PerRow;
+        Assert.Equal(0, reshape.PerDecodedRow);
+        Assert.True(perRow * Rows >= added - 4096 && perRow * Rows <= added + 2 * Rows,
             $"estimated {perRow} B/row = {perRow * Rows}, the partition columns hold {added} ({added / (double)Rows:F3} B/row)");
+    }
+
+    /// <summary>
+    /// #852 review round 2: what reshaping adds INSIDE a column the file holds (<see cref="SchemaEvolution"/> recurses
+    /// through structs, lists and maps), sized against the reshaping itself on a batch of the file's older shape. A
+    /// field added inside a list or map element costs it once per element: here three a row, as the file's leaf
+    /// counts say. What it builds there is sized by the column's children, which a batch sliced from a larger decode
+    /// shares unsliced: a quarter of a decode costs what the whole decode does, so it is counted per row decoded.
+    /// </summary>
+    [Theory]
+    [InlineData("struct, two levels", false)]
+    [InlineData("list element", false)]
+    [InlineData("map value", false)]
+    [InlineData("widened inside a struct", false)]
+    [InlineData("struct, two levels", true)]
+    [InlineData("list element", true)]
+    [InlineData("map value", true)]
+    [InlineData("widened inside a struct", true)]
+    public async Task TheEstimate_CountsWhatReshapingAddsInsideAColumn(string scenario, bool sliced)
+    {
+        const int elements = 3;
+        IArrowType Element(bool evolved) => new Apache.Arrow.Types.StructType(evolved
+            ? [new Field("a", Int32Type.Default, true), new Field("b", Int64Type.Default, true), new Field("c", StringType.Default, true)]
+            : [new Field("a", Int32Type.Default, true)]);
+        IArrowType Column(bool evolved) => scenario switch
+        {
+            "struct, two levels" => new Apache.Arrow.Types.StructType(
+            [
+                new Field("x", Int32Type.Default, true),
+                new Field("inner", Element(evolved), true),
+            ]),
+            "list element" => new ListType(new Field("element", Element(evolved), true)),
+            "map value" => new Apache.Arrow.Types.MapType(
+                new Field("key", StringType.Default, false), new Field("value", Element(evolved), true)),
+            _ => new Apache.Arrow.Types.StructType(
+                [new Field("a", evolved ? Int64Type.Default : Int32Type.Default, true)]),
+        };
+
+        var tableSchema = new Apache.Arrow.Schema.Builder().Field(new Field("c", Column(true), true)).Build();
+        var configuration = scenario.StartsWith("widened", StringComparison.Ordinal)
+            ? new Dictionary<string, string> { [EngineeredWood.DeltaLake.Schema.TypeWidening.EnableKey] = "true" }
+            : null;
+        await using var table = await DeltaTable.CreateAsync(_fs, tableSchema, configuration: configuration);
+        var snapshot = table.CurrentSnapshot;
+        if (configuration is not null)
+            Assert.True(DeltaTable.ReadsWiden(snapshot), "the table should read widened types");
+
+        var fileSchema = new Apache.Arrow.Schema.Builder().Field(new Field("c", Column(false), true)).Build();
+        // Sliced: the second quarter of a decode of four times the rows.
+        int decoded = sliced ? 4 * Rows : Rows;
+        using var whole = new RecordBatch(fileSchema, [OldShape(Column(false), decoded, elements)], decoded);
+        using var raw = sliced ? whole.Slice(Rows, Rows) : whole;
+        using var shaped = DeltaTable.ReconcileToTableShape(
+            raw, snapshot, null, null, [], false, new Dictionary<string, string>());
+        long added = RollingDataFileWriter.EstimatedBytes(shaped) - RollingDataFileWriter.EstimatedBytes(raw);
+
+        var reshape = DeltaTable.ReconcileAddedBytesPerRow(
+            snapshot, null, null, [], false, ColumnMappingMode.None, new Dictionary<string, string>(), fileSchema,
+            byteArrays: null, new Dictionary<string, double> { ["c"] = scenario is "list element" or "map value" ? elements : 1 });
+        long estimate = reshape.PerRow * Rows + reshape.PerDecodedRow * decoded;
+        Assert.True(added > Rows, $"reshaping added {added} bytes: nothing to estimate");
+        Assert.True(estimate >= added - 4096 && estimate <= added + 2 * decoded,
+            $"estimated {reshape} = {estimate} for {Rows} of {decoded} rows decoded, reshaping added {added}");
+    }
+
+    /// <summary>A column of <paramref name="type"/> (the file's older shape), <paramref name="elements"/> entries to a
+    /// list or map, every leaf set.</summary>
+    private static IArrowArray OldShape(IArrowType type, int length, int elements)
+    {
+        switch (type)
+        {
+            case Apache.Arrow.Types.MapType map:
+            {
+                var keys = new StringArray.Builder();
+                for (int i = 0; i < length * elements; i++)
+                    keys.Append($"k{i % elements}");
+                var entries = new StructArray(
+                    new Apache.Arrow.Types.StructType([map.KeyField, map.ValueField]), length * elements,
+                    [keys.Build(), OldShape(map.ValueField.DataType, length * elements, elements)], ArrowBuffer.Empty, 0);
+                return new MapArray(map, length, Offsets(length, elements), entries, ArrowBuffer.Empty, 0);
+            }
+            case ListType list:
+                return new ListArray(list, length, Offsets(length, elements),
+                    OldShape(list.ValueDataType, length * elements, elements), ArrowBuffer.Empty, 0);
+            case Apache.Arrow.Types.StructType structType:
+                return new StructArray(structType, length,
+                    structType.Fields.Select(f => OldShape(f.DataType, length, elements)).ToList(), ArrowBuffer.Empty, 0);
+            default:
+            {
+                var values = new Int32Array.Builder();
+                for (int i = 0; i < length; i++)
+                    values.Append(i);
+                return values.Build();
+            }
+        }
+    }
+
+    private static ArrowBuffer Offsets(int length, int elements)
+    {
+        var offsets = new ArrowBuffer.Builder<int>(length + 1);
+        for (int i = 0; i <= length; i++)
+            offsets.Append(i * elements);
+        return offsets.Build();
     }
 
     /// <summary>
@@ -246,12 +361,13 @@ public class HostAddedBytesTests : IDisposable
             }
         }
 
-        long perRow = DeltaTable.ReconcileAddedBytesPerRow(
+        var reshape = DeltaTable.ReconcileAddedBytesPerRow(
             snapshot, null, add.PartitionValues, [], false, ColumnMappingMode.None,
             new Dictionary<string, string>(), await reader.GetArrowSchemaAsync(), byteArrays: null);
+        long perRow = reshape.PerRow + reshape.PerDecodedRow;
         long added = shaped - raw;
         Assert.True(added >= 3L * Rows, $"reshaping added {added} bytes: the int is not widened");
-        Assert.True(perRow * Rows >= added - 4096 && perRow * Rows <= added + Rows,
+        Assert.True(perRow * Rows >= added - 4096 && perRow * Rows <= added + 2 * Rows,
             $"estimated {perRow} B/row = {perRow * Rows}, reshaping added {added} ({added / (double)Rows:F3} B/row)");
     }
 
@@ -293,8 +409,9 @@ public class HostAddedBytesTests : IDisposable
         }
 
         Assert.Equal(Files * Rows, rows);
-        // The budget, plus the one batch the front may run over by.
-        Assert.InRange(shared.PeakBytes, 1, 3 * largest);
+        // The budget, plus the one batch the front may run over by, within 2% of a batch: what the estimate leaves out
+        // is each buffer's padding and the raw decode's own small misses, beside the ninth of a batch it once reserved.
+        Assert.InRange(shared.PeakBytes, 1, 3 * largest + largest / 50);
         Assert.Equal(0, shared.UsedBytes);
     }
 
@@ -330,7 +447,7 @@ public class HostAddedBytesTests : IDisposable
         }
 
         Assert.Equal(Files * Rows, rows);
-        Assert.InRange(shared.PeakBytes, 1, 3 * largest);
+        Assert.InRange(shared.PeakBytes, 1, 3 * largest + largest / 50);
         Assert.Equal(0, shared.UsedBytes);
     }
 }

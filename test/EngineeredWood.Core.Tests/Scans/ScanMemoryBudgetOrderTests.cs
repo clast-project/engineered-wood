@@ -147,4 +147,15 @@ public class ScanMemoryBudgetOrderTests
         reservation.SetInitialEstimate(long.MaxValue / 2, long.MaxValue / 2);
         Assert.Equal(EngineeredWood.Memory.MemoryBudget.MaxCharge, reservation.Estimate);
     }
+
+    /// <summary>#852 review round 2: the bytes a host adds saturate at the most any estimate is, as a product and as a
+    /// sum, rather than wrap below the raw estimate.</summary>
+    [Theory]
+    [InlineData(1_000L, 27L, 50L, 1_000L + 27 * 50)]
+    [InlineData(1_000L, 0L, 50L, 1_000L)]
+    [InlineData(1_000L, 1L << 40, 1L << 40, EngineeredWood.Memory.MemoryBudget.MaxCharge)]
+    [InlineData(EngineeredWood.Memory.MemoryBudget.MaxCharge - 10, 1L, 100L, EngineeredWood.Memory.MemoryBudget.MaxCharge)]
+    [InlineData(1_000L, long.MaxValue, 2L, EngineeredWood.Memory.MemoryBudget.MaxCharge)]
+    public void AddedBytes_Saturate(long bytes, long perRow, long rows, long expected) =>
+        Assert.Equal(expected, ScanReservation.WithAddedBytes(bytes, perRow, rows));
 }
