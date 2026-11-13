@@ -52,10 +52,10 @@ public class DmlRawReleaseTests : IDisposable
     public static TheoryData<Op, bool, bool, Layout> Cases()
     {
         var data = new TheoryData<Op, bool, bool, Layout>();
-        foreach (var op in Enum.GetValues<Op>())
+        foreach (var op in new[] { Op.Delete, Op.DeleteRows, Op.Update, Op.Merge })
             foreach (bool dv in new[] { false, true })
                 foreach (bool cdf in new[] { false, true })
-                    foreach (var layout in Enum.GetValues<Layout>())
+                    foreach (var layout in new[] { Layout.Whole, Layout.BatchedTracked, Layout.BatchedViews })
                         data.Add(op, dv, cdf, layout);
         return data;
     }
@@ -156,7 +156,7 @@ public class DmlRawReleaseTests : IDisposable
                     Assert.InRange(id, First, Last - 1);
                     Assert.Equal(Gone(id), gone);
                     string type = types.GetString(row++)!;
-                    changes[type] = changes.GetValueOrDefault(type) + 1;
+                    changes[type] = (changes.TryGetValue(type, out int count) ? count : 0) + 1;
                 }
             }
         }
