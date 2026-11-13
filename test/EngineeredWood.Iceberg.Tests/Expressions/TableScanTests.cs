@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using EngineeredWood.Expressions;
+using EngineeredWood.Expressions.Sql;
 using EngineeredWood.Iceberg.Expressions;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Iceberg.Manifest;
@@ -240,5 +241,72 @@ public class TableScanTests : IDisposable
         Assert.Equal(3, result.TotalFilesScanned);
         Assert.Equal(2, result.FilesSkipped);
         Assert.Equal(1, result.FilesMatched);
+    }
+
+    // #776: a top-level column literally named "s.x" beside a struct "s" with
+    // field "x". The backticked name must prune by the top-level column's
+    // bounds; the struct path must never borrow them. Nested fields aren't
+    // pruned today, so the struct predicate keeps every file (Unknown). If
+    // nested pruning lands, the struct case must use field 12's own bounds,
+    // which here also admit 500, so this test keeps passing.
+    private static readonly Schema DottedSchema = new(0, [
+        new NestedField(1, "s.x", IcebergType.Long, false),
+        new NestedField(10, "s", new StructType([
+            new NestedField(12, "x", IcebergType.Long, false),
+        ]), false),
+    ]);
+
+    private static readonly DataFile[] DottedFiles =
+    [
+        // Top-level s.x in 1-100 (rules out 500); struct s.x in 0-1000.
+        new()
+        {
+            FilePath = "data/d1.parquet", RecordCount = 10, FileSizeInBytes = 1000,
+            NullValueCounts = new Dictionary<int, long> { [1] = 0, [12] = 0 },
+            ColumnLowerBounds = new Dictionary<int, LiteralValue>
+                { [1] = LiteralValue.Of(1L), [12] = LiteralValue.Of(0L) },
+            ColumnUpperBounds = new Dictionary<int, LiteralValue>
+                { [1] = LiteralValue.Of(100L), [12] = LiteralValue.Of(1000L) },
+        },
+        // Top-level s.x in 101-200 (rules out 500); no stats for the struct field.
+        new()
+        {
+            FilePath = "data/d2.parquet", RecordCount = 10, FileSizeInBytes = 1000,
+            NullValueCounts = new Dictionary<int, long> { [1] = 0 },
+            ColumnLowerBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(101L) },
+            ColumnUpperBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(200L) },
+        },
+        // Top-level s.x in 400-600 (admits 500).
+        new()
+        {
+            FilePath = "data/d3.parquet", RecordCount = 10, FileSizeInBytes = 1000,
+            NullValueCounts = new Dictionary<int, long> { [1] = 0 },
+            ColumnLowerBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(400L) },
+            ColumnUpperBounds = new Dictionary<int, LiteralValue> { [1] = LiteralValue.Of(600L) },
+        },
+    ];
+
+    private ScanResult PlanDotted(string sql) =>
+        new TableScan(TableMetadata.Create(DottedSchema, location: Path.Combine(_tempDir, "dotted")), _fs)
+            .Filter(SparkSqlParser.ParsePredicate(sql))
+            .PlanFiles(DottedFiles);
+
+    [Fact]
+    public void Filter_BacktickedDottedTopLevelColumn_PrunesByItsOwnBounds()
+    {
+        var result = PlanDotted("`s.x` = 500");
+
+        Assert.Equal(1, result.FilesMatched);
+        Assert.Equal(2, result.FilesSkipped);
+        Assert.Equal("data/d3.parquet", result.DataFiles[0].FilePath);
+    }
+
+    [Fact]
+    public void Filter_StructFieldPath_NeverUsesDottedTopLevelColumnBounds()
+    {
+        var result = PlanDotted("s.x = 500");
+
+        Assert.Equal(3, result.FilesMatched);
+        Assert.Equal(0, result.FilesSkipped);
     }
 }
