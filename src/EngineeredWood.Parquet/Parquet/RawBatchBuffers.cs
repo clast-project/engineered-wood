@@ -41,16 +41,19 @@ internal sealed class RawBatchBuffers
 
     /// <summary>
     /// Releases every recorded buffer that <paramref name="output"/> and <paramref name="alsoKept"/> (arrays handed on
-    /// beside the batch: positions, row ids) don't hold. Null <paramref name="output"/> releases all but those.
+    /// beside the batch: positions, row ids, or another batch) don't hold. Null <paramref name="output"/> releases all
+    /// but those.
     /// </summary>
     public void ReleaseAllBut(RecordBatch? output, params IArrowArray?[] alsoKept)
     {
         var kept = new HashSet<ReadOnlyMemory<byte>>();
-        for (int i = 0; i < (output?.ColumnCount ?? 0); i++)
-            BatchSelector.CollectBuffers(output!.Column(i).Data, kept);
+        Collect(output, kept);
         foreach (var array in alsoKept)
         {
-            if (array is not null)
+            // A RecordBatch is an IArrowArray whose Data throws: its columns are what it holds.
+            if (array is RecordBatch batch)
+                Collect(batch, kept);
+            else if (array is not null)
                 BatchSelector.CollectBuffers(array.Data, kept);
         }
 
@@ -59,6 +62,12 @@ internal sealed class RawBatchBuffers
             if (!kept.Contains(memory))
                 buffer.Dispose();
         }
+    }
+
+    private static void Collect(RecordBatch? batch, HashSet<ReadOnlyMemory<byte>> into)
+    {
+        for (int i = 0; i < (batch?.ColumnCount ?? 0); i++)
+            BatchSelector.CollectBuffers(batch!.Column(i).Data, into);
     }
 
     private void Add(ArrayData data)
