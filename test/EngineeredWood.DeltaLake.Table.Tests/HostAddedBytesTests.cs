@@ -137,6 +137,60 @@ public class HostAddedBytesTests : IDisposable
     }
 
     /// <summary>
+    /// #852 review: a partition column is sized from the value the reshaping tiles down it, resolved as it resolves
+    /// it (<see cref="Partitioning.PartitionUtils.AddPartitionColumns"/>, the oracle here).
+    /// <list type="bullet">
+    /// <item>Hive's sentinel is NULL for an int column (validity and values), but text in a string column.</item>
+    /// <item>A logical-keyed map after chained renames (logical <c>x</c> physical <c>p1</c>, logical <c>p1</c>
+    /// physical <c>p2</c>): a physical-first lookup sized <c>x</c> from <c>p1</c>'s one-byte value.</item>
+    /// </list>
+    /// </summary>
+    [Theory]
+    [InlineData("sentinel")]
+    [InlineData("chained renames")]
+    [InlineData("empty and missing")]
+    public async Task TheEstimate_SizesAPartitionValueAsReshapingResolvesIt(string scenario)
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("v", Int64Type.Default, false))
+            .Field(new Field("x", StringType.Default, true))
+            .Field(new Field("p1", StringType.Default, true))
+            .Field(new Field("n", Int32Type.Default, true))
+            .Build();
+        await using var table = await DeltaTable.CreateAsync(_fs, schema, partitionColumns: ["x", "p1", "n"]);
+        var snapshot = table.CurrentSnapshot;
+        var partitionColumns = snapshot.Metadata.PartitionColumns;
+        string longValue = new('z', 100);
+        var (values, logicalToPhysical) = scenario switch
+        {
+            "sentinel" => (
+                new Dictionary<string, string> { ["x"] = "__HIVE_DEFAULT_PARTITION__", ["p1"] = "B", ["n"] = "__HIVE_DEFAULT_PARTITION__" },
+                new Dictionary<string, string>()),
+            "chained renames" => (
+                new Dictionary<string, string> { ["x"] = longValue, ["p1"] = "B", ["n"] = "7" },
+                new Dictionary<string, string> { ["x"] = "p1", ["p1"] = "p2", ["n"] = "n" }),
+            _ => (
+                new Dictionary<string, string> { ["x"] = "", ["n"] = "" },
+                new Dictionary<string, string>()),
+        };
+
+        var data = new Apache.Arrow.Schema.Builder().Field(new Field("v", Int64Type.Default, false)).Build();
+        var v = new Int64Array.Builder();
+        for (int r = 0; r < Rows; r++)
+            v.Append(r);
+        using var raw = new RecordBatch(data, [v.Build()], Rows);
+        using var shaped = Partitioning.PartitionUtils.AddPartitionColumns(
+            raw, snapshot.ArrowSchema, values, partitionColumns, logicalToPhysical);
+        long added = RollingDataFileWriter.EstimatedBytes(shaped) - RollingDataFileWriter.EstimatedBytes(raw);
+
+        long perRow = DeltaTable.ReconcileAddedBytesPerRow(
+            snapshot, null, values, partitionColumns, true, ColumnMappingMode.Name, logicalToPhysical, data,
+            byteArrays: null);
+        Assert.True(perRow * Rows >= added - 4096 && perRow * Rows <= added + Rows,
+            $"estimated {perRow} B/row = {perRow * Rows}, the partition columns hold {added} ({added / (double)Rows:F3} B/row)");
+    }
+
+    /// <summary>
     /// A widened column adds the wider type's width over the one the file holds: an int32 read as int64 four bytes a
     /// row. A short widened to int adds nothing, because the read already decodes it as the INT32 it stores (#839).
     /// </summary>

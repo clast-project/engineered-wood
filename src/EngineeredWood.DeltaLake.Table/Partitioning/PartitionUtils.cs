@@ -457,6 +457,24 @@ internal static class PartitionUtils
     }
 
     /// <summary>
+    /// The value <see cref="AddPartitionColumns"/> tiles down <paramref name="field"/>'s column, or null where it
+    /// builds the column as NULL: the map's own spelling (<see cref="PartitionValueKeys"/>), then
+    /// <see cref="PartitionNulls"/>. For an estimate of what that column holds (#852 review), so that the two
+    /// cannot resolve a value differently.
+    /// </summary>
+    internal static string? ConstantValueOf(
+        Field field, IReadOnlyDictionary<string, string>? partitionValues, IReadOnlyList<string> partitionColumns,
+        IReadOnlyDictionary<string, string>? logicalToPhysical)
+    {
+        if (partitionValues is null
+            || !PartitionValueKeys.TryGet(partitionValues, field.Name, partitionColumns, logicalToPhysical, out var value))
+        {
+            return null;
+        }
+        return PartitionNulls.IsNull(value, isString: field.DataType is StringType) ? null : value;
+    }
+
+    /// <summary>
     /// Builds a constant-value array of the given type and length.
     /// Used to materialize partition columns on read. A value <see cref="PartitionNulls"/> reads as NULL
     /// decodes as SQL NULL, and in a non-nullable column is refused: the file breaks the column's constraint,

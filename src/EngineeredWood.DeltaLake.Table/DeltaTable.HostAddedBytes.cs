@@ -51,7 +51,10 @@ public sealed partial class DeltaTable
             var type = byteArrays is { } kind ? ByteArrayRepresentation.Of(field.DataType, kind) : field.DataType;
             if (hasPartitions && partitionColumns.Contains(field.Name))
             {
-                string? value = PartitionValueOf(partitionValues, field.Name, logicalToPhysical);
+                // Resolved as the reshaping resolves it: the map's spelling decided from all its keys, and the values
+                // that read as NULL, the Hive sentinel for a column that is not a string included (#852 review).
+                string? value = Partitioning.PartitionUtils.ConstantValueOf(
+                    field, partitionValues, partitionColumns, logicalToPhysical);
                 bits += value is null ? NullBitsPerRow(type, converted) : ConstantBitsPerRow(type, value);
                 continue;
             }
@@ -105,22 +108,6 @@ public sealed partial class DeltaTable
         if (scan.WantTracking)
             bits += 2 * (64 + 1);
         return (bits + 7) / 8;
-    }
-
-    /// <summary>A partition column's value in <paramref name="partitionValues"/>, keyed by its physical name under
-    /// column mapping or, for files written before that convention, its logical one; an empty value is NULL.</summary>
-    private static string? PartitionValueOf(
-        IReadOnlyDictionary<string, string>? partitionValues, string logical,
-        IReadOnlyDictionary<string, string> logicalToPhysical)
-    {
-        if (partitionValues is null)
-            return null;
-        if (!(logicalToPhysical.TryGetValue(logical, out var physical) && partitionValues.TryGetValue(physical, out var value))
-            && !partitionValues.TryGetValue(logical, out value))
-        {
-            return null;
-        }
-        return string.IsNullOrEmpty(value) ? null : value;
     }
 
     /// <summary>Bits per row of a constant column of <paramref name="value"/> (<see cref="EngineeredWood.Arrow.ArrowCompute.Repeat"/>,
