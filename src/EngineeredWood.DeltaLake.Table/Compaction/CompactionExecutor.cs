@@ -163,23 +163,6 @@ internal static class CompactionExecutor
         return new CompactionPlan(actions, assignRowIds);
     }
 
-    /// <summary>
-    /// The file's raw batches with the position of each one's first row. A row group <paramref name="deletedRows"/>
-    /// deletes in full is skipped unread (#618): none of its rows survive the compaction, and the reader still
-    /// counts them towards the positions after it, which the survivors' row ids are derived from.
-    /// </summary>
-    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> Positioned(
-        ParquetFileReader reader, DeletionVectors.DeletionVectorBitmap? deletedRows,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
-    {
-        RowSkipPredicate? skip = deletedRows is { IsEmpty: false } ? deletedRows.ContainsRange : null;
-        await foreach (var positioned in reader.ReadWithPositionsAsync(null, null, skip, cancellationToken)
-            .ConfigureAwait(false))
-        {
-            yield return (positioned.Batch, positioned.FirstRow);
-        }
-    }
-
     /// <summary>A pluggable reader's batches, which come whole and in file order, positioned by counting them.</summary>
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(
         IAsyncEnumerable<RecordBatch> source,
@@ -290,8 +273,10 @@ internal static class CompactionExecutor
             IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> rawBatches;
             if (dataFileReader is not null)
             {
-                rawBatches = InFileOrder(dataFileReader.ReadAsync(
-                    EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), null, cancellationToken), cancellationToken);
+                rawBatches = DeltaTable.Reserving(
+                    InFileOrder(dataFileReader.ReadAsync(
+                        EngineeredWood.DeltaLake.DeltaPath.Decode(addFile.Path), null, cancellationToken), cancellationToken),
+                    reservation, cancellationToken);
             }
             else
             {
@@ -313,11 +298,14 @@ internal static class CompactionExecutor
                     reservation.SetInitialEstimate(await DeltaTable.LargestFirstBatchBytesAsync(
                         reader, null, deletedRows, cancellationToken).ConfigureAwait(false));
                 }
-                rawBatches = Positioned(reader, deletedRows, cancellationToken);
+                // A row group the vector deletes in full is skipped unread (#618): none of its rows survive the
+                // compaction, and the reader still counts them towards the positions after it, which the
+                // survivors' row ids are derived from.
+                RowSkipPredicate? skip = deletedRows is { IsEmpty: false } ? deletedRows.ContainsRange : null;
+                rawBatches = DeltaTable.ReadFileReserving(reader, skip, reservation, cancellationToken);
             }
 
-            await foreach (var (batch, firstRow) in DeltaTable.Reserving(rawBatches, reservation, cancellationToken)
-                .ConfigureAwait(false))
+            await foreach (var (batch, firstRow) in rawBatches.ConfigureAwait(false))
             {
                 yield return new SourceBatch(addFile, deletedRows, batch, firstRow);
             }

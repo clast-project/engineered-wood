@@ -732,9 +732,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// (a deletion vector deleting it in full). For a host that reads the file through this reader but outside a
     /// planned parallel read, such as Delta's change feed and compaction (#846): the footer's uncompressed size it
     /// reserved before was 10-20x short for dictionary or run-length-encoded columns.
+    /// <paramref name="addedBytesPerRow"/> is what the host adds to each row before it hands the batch on, which is
+    /// the size its scan settles: a change feed's columns.
     /// </summary>
     internal async ValueTask<long> LargestFirstBatchBytesAsync(
-        IReadOnlyList<string>? columnNames, Func<long, long, bool>? skipped, CancellationToken cancellationToken)
+        IReadOnlyList<string>? columnNames, Func<long, long, bool>? skipped, CancellationToken cancellationToken,
+        long addedBytesPerRow = 0)
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
@@ -747,7 +750,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             if (skipped is not null && group.NumRows > 0 && skipped(start, group.NumRows))
                 continue;
             long footer = PlannedBytes(group, schema, columnNames, null).Uncompressed;
-            long decoded = DecodedBytes(group, schema, columnNames, null);
+            long decoded = DecodedBytes(group, schema, columnNames, null) + addedBytesPerRow * group.NumRows;
             largest = Math.Max(largest, FirstBatchBytes(decoded, footer, group, schema, columnNames, null));
         }
         return largest;

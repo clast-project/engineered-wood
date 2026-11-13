@@ -414,14 +414,17 @@ internal static class CdfReader
         }
     }
 
-    /// <summary>A Parquet read's batches, each with the file position of its first row.</summary>
-    private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> PositionedAsync(
-        IAsyncEnumerable<PositionedRecordBatch> source,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
-    {
-        await foreach (var positioned in source.WithCancellation(cancellationToken).ConfigureAwait(false))
-            yield return (positioned.Batch, positioned.FirstRow);
-    }
+    /// <summary>
+    /// What the feed adds to each row of a file before handing it on, which is the size its scan settles: so that a
+    /// file's FIRST reservation, made before anything is measured, covers it too (#846). Later ones are the largest
+    /// batch measured so far, which counts them. <c>_commit_version</c> and <c>_commit_timestamp</c>, the emitted
+    /// row-tracking pair, and for a data file the <c>_change_type</c> it lacks (<paramref name="changeType"/>), tiled
+    /// as a string per row (<see cref="CdfWriter.AddChangeTypeColumn"/>); a change file carries its own.
+    /// </summary>
+    private static long AddedBytesPerRow(string? changeType, CdfSchemaContext ctx) =>
+        2 * sizeof(long)
+        + (ctx.EmitRowTracking ? 2 * sizeof(long) : 0)
+        + (changeType is null ? 0 : sizeof(int) + System.Text.Encoding.UTF8.GetByteCount(changeType));
 
     private static async IAsyncEnumerable<RecordBatch> ReadCdcFileAsync(
         ITableFileSystem fs,
@@ -447,12 +450,11 @@ internal static class CdfReader
         if (reservation != ScanReservation.None)
         {
             reservation.SetInitialEstimate(await DeltaTable.LargestFirstBatchBytesAsync(
-                reader, null, null, cancellationToken).ConfigureAwait(false));
+                reader, null, null, cancellationToken, AddedBytesPerRow(null, ctx)).ConfigureAwait(false));
         }
 
-        await foreach (var (batch, _) in DeltaTable.Reserving(
-            PositionedAsync(reader.ReadWithPositionsAsync(null, null, cancellationToken), cancellationToken),
-            reservation, cancellationToken).ConfigureAwait(false))
+        await foreach (var (batch, _) in DeltaTable.ReadFileReserving(reader, null, reservation, cancellationToken)
+            .ConfigureAwait(false))
         {
             // The file already carries _change_type (per-row); split it off so the physical data columns can be
             // mapped to logical + interleaved with the re-materialized partition columns, then re-attach it.
@@ -755,14 +757,14 @@ internal static class CdfReader
         if (reservation != ScanReservation.None)
         {
             reservation.SetInitialEstimate(await DeltaTable.LargestFirstBatchBytesAsync(
-                reader, null, filter.KeepOnlyPositions ? null : filter.Positions, cancellationToken).ConfigureAwait(false));
+                reader, null, filter.KeepOnlyPositions ? null : filter.Positions, cancellationToken,
+                AddedBytesPerRow(changeType, ctx)).ConfigureAwait(false));
         }
 
         // DV positions are absolute within the file, and so is a row's positional id: each batch's first row comes
         // from the reader, which counts the row groups the filter lets it skip unread (#618).
-        await foreach (var (rawBatch, thisBatchStart) in DeltaTable.Reserving(
-            PositionedAsync(reader.ReadWithPositionsAsync(null, null, filter.SkipRows, cancellationToken), cancellationToken),
-            reservation, cancellationToken).ConfigureAwait(false))
+        await foreach (var (rawBatch, thisBatchStart) in DeltaTable.ReadFileReserving(
+            reader, filter.SkipRows, reservation, cancellationToken).ConfigureAwait(false))
         {
 
             // Hidden row-tracking columns off first — a data file carries them for every row a rewrite moved,
