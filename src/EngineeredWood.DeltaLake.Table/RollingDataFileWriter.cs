@@ -248,9 +248,18 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             return batchRows;
         // The exact integer form wherever the product fits (byteRoom below 2^32 for any batch of int rows); past
         // that, decimal, whose 28 digits may land one row off a whole-row boundary: the bytes are an estimate.
-        long rows = byteRoom <= long.MaxValue / batchRows
-            ? (byteRoom * batchRows + batchBytes - 1) / batchBytes
-            : (long)Math.Ceiling((decimal)byteRoom * batchRows / batchBytes);
+        // The ceiling is taken from the remainder, not by adding batchBytes - 1: a product just under long.MaxValue
+        // passes the guard and the addition would overflow it (#871 review).
+        long rows;
+        if (byteRoom <= long.MaxValue / batchRows)
+        {
+            long product = byteRoom * batchRows;
+            rows = product / batchBytes + (product % batchBytes == 0 ? 0 : 1);
+        }
+        else
+        {
+            rows = (long)Math.Ceiling((decimal)byteRoom * batchRows / batchBytes);
+        }
         return Math.Min(batchRows, Math.Max(1, rows));
     }
 

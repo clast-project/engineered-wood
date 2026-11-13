@@ -214,6 +214,8 @@ public class TargetFileSizeTests : IDisposable
     [InlineData(333L, 1000L, 999L, 334L)]
     [InlineData((1L << 61) + 1, 8L, 1L << 62, 5L)]
     [InlineData(long.MaxValue - 1, int.MaxValue, long.MaxValue, int.MaxValue)]
+    // The product (long.MaxValue - 1) fits, but adding batchBytes - 1 to round up would not (#871 review).
+    [InlineData(4294967298L, int.MaxValue, 8589934592L, 1073741824L)]
     public void TheByteRoom_IsTheRowsShareRoundedUp(long byteRoom, long rows, long batchBytes, long expected) =>
         Assert.Equal(expected, RollingDataFileWriter.RowsInByteRoom(byteRoom, rows, batchBytes));
 
