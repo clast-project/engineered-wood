@@ -1058,6 +1058,28 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.Equal(0, used);
     }
 
+    /// <summary>#851: a two-pass read's first reservation adds what the host adds to each row of the batch it hands
+    /// on, for the rows that batch can hold: the batch size, else the row group.</summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData(10_000)]
+    public async Task ATwoPassRead_AddsTheHostsBytesForTheRowsOfItsFirstBatch(int? batchSize)
+    {
+        string path = await WriteKeysAndValuesAsync("two-pass-host-bytes", i => i % 10);
+        var predicate = KeyPredicate(k => k < 3, false);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = batchSize })
+        {
+            TwoPassReads = true,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        long reserved = TwoPassReservation(reader, group, await reader.GetSchemaAsync(), predicate, false, false);
+
+        var (_, estimate, _, used) = await ReadTwoPassUnitAsync(reader, predicate, false, addedBytesPerRow: 100);
+        Assert.Equal(reserved + 100L * (batchSize ?? KeyRows), estimate);
+        Assert.Equal(0, used);
+    }
+
     /// <summary>
     /// A dictionary that declines to answer (here, a predicate that raises over its entries) leaves the first pass to
     /// decode the column's values, which the reservation sized as answers. Those batches are never yielded, so no
@@ -1257,7 +1279,7 @@ public class ParallelRowGroupReadTests : IDisposable
     /// </summary>
     private static async Task<(long Returned, long Estimate, long Peak, long Used)> ReadTwoPassUnitAsync(
         ParquetFileReader reader, RowPredicate predicate, bool returnPredicateColumn,
-        ParquetFileReader.DecodedGrowth? growth = null)
+        ParquetFileReader.DecodedGrowth? growth = null, long addedBytesPerRow = 0)
     {
         var scan = new ParquetScan
         {
@@ -1269,7 +1291,7 @@ public class ParallelRowGroupReadTests : IDisposable
         await foreach (var p in reader.PlanRowGroupsAsync(null, selected.ReadColumns, null, default))
             first ??= p;
         var budget = new EngineeredWood.Scans.ScanMemoryBudget(1L << 30);
-        var reservation = new EngineeredWood.Scans.ScanReservation(budget, 0);
+        var reservation = new EngineeredWood.Scans.ScanReservation(budget, 0) { AddedBytesPerRow = addedBytesPerRow };
         long returned = 0;
         await foreach (var batch in selected.ReadAsync(
                            first!.Value, reservation, growth ?? new ParquetFileReader.DecodedGrowth(), default))
@@ -1539,6 +1561,76 @@ public class ParallelRowGroupReadTests : IDisposable
                 break;
             }
         }
+    }
+
+    /// <summary>#852 review round 2: a top-level column's most leaf values a row, from its chunks' <c>num_values</c>:
+    /// one for a flat column, a list's elements for a list.</summary>
+    [Fact]
+    public async Task LeafValuesPerRow_CountsAListsElements()
+    {
+        var listType = new ListType(new Field("element", Int32Type.Default, true));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("l", listType, true))
+            .Build();
+        const int rows = 1_000;
+        var ids = new Int64Array.Builder();
+        var values = new Int32Array.Builder();
+        var offsets = new ArrowBuffer.Builder<int>(rows + 1);
+        offsets.Append(0);
+        for (int r = 0; r < rows; r++)
+        {
+            ids.Append(r);
+            for (int e = 0; e < 3; e++)
+                values.Append(r * 3 + e);
+            offsets.Append((r + 1) * 3);
+        }
+        string path = Path.Combine(_tempDir, "lists.parquet");
+        using (var batch = new RecordBatch(schema,
+                   [ids.Build(), new ListArray(listType, rows, offsets.Build(), values.Build(), ArrowBuffer.Empty, 0)], rows))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        // The same file with a footer that leaves out path_in_schema, as some writers do (#852 review round 4): the
+        // read maps chunks to leaves by position, and so does the count.
+        string pathless = Path.Combine(_tempDir, "lists-no-path.parquet");
+        {
+            byte[] bytes = File.ReadAllBytes(path);
+            int footerLength = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(bytes.Length - 8, 4));
+            int footerStart = bytes.Length - 8 - footerLength;
+            var decoded = EngineeredWood.Parquet.Metadata.MetadataDecoder.DecodeFileMetaData(bytes.AsSpan(footerStart, footerLength));
+            byte[] footer = EngineeredWood.Parquet.Metadata.MetadataEncoder.EncodeFileMetaData(decoded, writePathInSchema: false);
+            var rewritten = new List<byte>(bytes.AsSpan(0, footerStart).ToArray());
+            rewritten.AddRange(footer);
+            var length = new byte[4];
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(length, footer.Length);
+            rewritten.AddRange(length);
+            rewritten.AddRange("PAR1"u8.ToArray());
+            File.WriteAllBytes(pathless, rewritten.ToArray());
+        }
+        await using (var stripped = new LocalRandomAccessFile(pathless))
+        using (var strippedReader = new ParquetFileReader(stripped, ownsFile: false))
+        {
+            var meta = await strippedReader.ReadMetadataAsync();
+            Assert.All(meta.RowGroups[0].Columns, c => Assert.Null(c.MetaData!.PathInSchema));
+            var counted = await strippedReader.LeafValuesPerRowAsync(default);
+            Assert.Equal(1.0, counted["id"]);
+            Assert.Equal(3.0, counted["l"]);
+        }
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var perRow = await reader.LeafValuesPerRowAsync(default);
+        Assert.Equal(1.0, perRow["id"]);
+        Assert.Equal(3.0, perRow["l"]);
+
+        // The host's bytes saturate rather than wrap (#852 review round 2).
+        Assert.Equal(EngineeredWood.Memory.MemoryBudget.MaxCharge,
+            await reader.LargestFirstBatchBytesAsync(null, null, default, addedBytesPerRow: long.MaxValue / 2));
     }
 
     /// <summary>Completes <see cref="Requested"/> once a request covers the byte at <c>offset</c>.</summary>

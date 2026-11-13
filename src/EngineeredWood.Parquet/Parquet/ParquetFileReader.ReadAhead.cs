@@ -19,7 +19,7 @@ public sealed partial class ParquetFileReader
     /// compaction's file), reserving scan memory before each batch is decoded. Batches are as
     /// <see cref="ReadWithPositionsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken)"/>
     /// returns them, and each reservation is the largest raw batch seen, from the caller's first estimate
-    /// (<see cref="ScanReservation.SetInitialEstimate"/>).
+    /// (<see cref="ScanReservation.SetInitialEstimate(long)"/>).
     /// <para>Row groups are fetched AHEAD of their decode (#846), as a row group of a scan is (#829): a row group's
     /// compressed bytes are held, and its column chunks fetched, before the reservation for its first batch, and up
     /// to <paramref name="readAhead"/> row groups are held or fetched at once. Fetching each row group only once

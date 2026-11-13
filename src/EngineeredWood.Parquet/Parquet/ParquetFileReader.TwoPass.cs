@@ -559,7 +559,10 @@ public sealed partial class ParquetFileReader
         long compressed = PlannedBytes(metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges).Compressed;
         var estimate = TwoPassFirstBatchEstimate(
             metadata.RowGroups[plan.Index], schema, columns, selector.Answerable, growth, plan.Ranges);
-        reservation.SetInitialEstimate(estimate.Reserved);
+        // The batches it hands on hold the selected rows of the second pass's first batch, at most its rows.
+        reservation.SetInitialEstimate(
+            estimate.Reserved, FirstBatchRowBound(metadata.RowGroups[plan.Index], plan.Ranges),
+            metadata.RowGroups[plan.Index].NumRows);
 
         PrefetchedFile? filterIo = null, outputIo = null;
         IAsyncEnumerator<SelectedRecordBatch>? e = null;

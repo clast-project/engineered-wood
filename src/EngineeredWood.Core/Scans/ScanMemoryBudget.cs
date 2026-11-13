@@ -35,6 +35,48 @@ internal sealed class ScanReservation
     internal void SetInitialEstimate(long bytes) => Observe(bytes);
 
     /// <summary>
+    /// Bytes the unit's HOST adds to each row of a decoded batch before handing it on: columns its read never
+    /// decodes but the item the scan settles carries, such as a Delta table's partition values, the NULLs of a
+    /// column a file predates, or a scan's metadata columns (#851). Set by the host before the read; the reader's
+    /// first reservation adds them for the rows its first batch can hold (<see cref="SetInitialEstimate(long, long)"/>).
+    /// Later reservations need not: they are the largest item measured, which carries them.
+    /// </summary>
+    internal long AddedBytesPerRow { get; set; }
+
+    /// <summary>
+    /// As <see cref="AddedBytesPerRow"/>, for bytes the host adds per row the reader DECODES rather than per row of
+    /// the batch: what it builds inside a nested column, whose children a batch shares unsliced with the whole decoded
+    /// run (a Delta struct field the file predates is backfilled at the struct's physical length, #852 review round 2).
+    /// </summary>
+    internal long AddedBytesPerDecodedRow { get; set; }
+
+    /// <summary>
+    /// <see cref="SetInitialEstimate(long)"/> for a reader whose first batch decodes to <paramref name="bytes"/> and
+    /// holds at most <paramref name="rows"/> rows, to which the host adds <see cref="AddedBytesPerRow"/> each.
+    /// </summary>
+    internal void SetInitialEstimate(long bytes, long rows) => SetInitialEstimate(bytes, rows, rows);
+
+    /// <summary>
+    /// <see cref="SetInitialEstimate(long, long)"/> for a first batch of at most <paramref name="rows"/> rows sliced from
+    /// a decode of at most <paramref name="decodedRows"/>, to which the host adds <see cref="AddedBytesPerRow"/> and
+    /// <see cref="AddedBytesPerDecodedRow"/>.
+    /// </summary>
+    internal void SetInitialEstimate(long bytes, long rows, long decodedRows) =>
+        Observe(WithAddedBytes(WithAddedBytes(bytes, AddedBytesPerRow, rows), AddedBytesPerDecodedRow, decodedRows));
+
+    /// <summary><paramref name="bytes"/> plus <paramref name="addedBytesPerRow"/> for each of <paramref name="rows"/>
+    /// rows, saturating at <see cref="MemoryBudget.MaxCharge"/> as every estimate does rather than wrapping (#852
+    /// review round 2).</summary>
+    internal static long WithAddedBytes(long bytes, long addedBytesPerRow, long rows)
+    {
+        bytes = Math.Min(Math.Max(bytes, 0), MemoryBudget.MaxCharge);
+        long added = addedBytesPerRow > 0 && rows > 0
+            ? (rows > MemoryBudget.MaxCharge / addedBytesPerRow ? MemoryBudget.MaxCharge : addedBytesPerRow * rows)
+            : 0;
+        return added > MemoryBudget.MaxCharge - bytes ? MemoryBudget.MaxCharge : bytes + added;
+    }
+
+    /// <summary>
     /// A size this unit's reads have been seen to reach — a RAW decoded batch, before a deletion vector or a
     /// row selection shrinks it. Reservations are the LARGEST size seen, never the last one: reserving the
     /// last would let a small batch (a deletion vector's survivors, a short final row group) set up an

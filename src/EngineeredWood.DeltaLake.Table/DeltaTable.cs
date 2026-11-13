@@ -7165,6 +7165,20 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool wantPositions = scan.WantAddress || scan.WantLocator;
         byte[]? pathBytes = scan.WantLocator ? System.Text.Encoding.UTF8.GetBytes(read.AddFile.Path) : null;
 
+        // The batch the scan settles carries what reshaping and the metadata columns add to the decoded one (#851).
+        if (reservation != ScanReservation.None)
+        {
+            var reshaped = Volatile.Read(ref read.ScanAddedBytes);
+            if (reshaped is null)
+            {
+                reshaped = new ReshapeBytesBox(await ReconcileAddedBytesPerRowAsync(
+                    read, _options.ParquetReadOptions.ByteArrayOutput, cancellationToken).ConfigureAwait(false));
+                Volatile.Write(ref read.ScanAddedBytes, reshaped);
+            }
+            reservation.AddedBytesPerRow = reshaped.Value.PerRow + MetadataAddedBytesPerRow(scan, pathBytes);
+            reservation.AddedBytesPerDecodedRow = reshaped.Value.PerDecodedRow;
+        }
+
         // An exact filter through the built-in reader: the Parquet read selects the rows (deletion vector and filter
         // both) and says where each one is (#502).
         if (read.Selected is { } selected && unit.Plan is { } plan)
@@ -13166,6 +13180,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     private sealed class DataFileRead : IDisposable
     {
+        /// <summary>What reshaping adds to this file's batches in a scan (<see cref="ReconcileAddedBytesPerRow"/>),
+        /// once its first unit has asked; null before. Every unit of the file asks, and two at once both compute the
+        /// same value.</summary>
+        internal ReshapeBytesBox? ScanAddedBytes;
+
         private int _refs = 1;
 
         internal required AddFile AddFile { get; init; }
@@ -13843,8 +13862,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     // Reserve for the first batch before decoding it: the largest row group's estimated decoded
                     // size over the columns read. Later batches reserve what the previous one measured.
+                    var reshaped = await ReconcileAddedBytesPerRowAsync(read, byteArrays: null, cancellationToken)
+                        .ConfigureAwait(false);
                     reservation.SetInitialEstimate(await LargestFirstBatchBytesAsync(
-                        read.Reader, read.FileColumns, read.DeletedRows, cancellationToken).ConfigureAwait(false));
+                        read.Reader, read.FileColumns, read.DeletedRows, cancellationToken, reshaped.PerRow,
+                        reshaped.PerDecodedRow).ConfigureAwait(false));
                 }
 
                 source = Reserving(
@@ -14715,14 +14737,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     internal static ValueTask<long> LargestFirstBatchBytesAsync(
         ParquetFileReader reader, IReadOnlyList<string>? fileColumns, DeletionVectorBitmap? deletedRows,
-        CancellationToken cancellationToken, long addedBytesPerRow = 0)
+        CancellationToken cancellationToken, long addedBytesPerRow = 0, long addedBytesPerDecodedRow = 0)
     {
         // A group the deletion vector deletes in full is skipped unread (ReadPositionedAsync), so it is never
         // decoded and needs no reservation.
         Func<long, long, bool>? skipped = deletedRows is { IsEmpty: false }
             ? (start, rows) => deletedRows.ContainsRange(start, rows)
             : null;
-        return reader.LargestFirstBatchBytesAsync(fileColumns, skipped, cancellationToken, addedBytesPerRow);
+        return reader.LargestFirstBatchBytesAsync(
+            fileColumns, skipped, cancellationToken, addedBytesPerRow, addedBytesPerDecodedRow);
     }
 
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(

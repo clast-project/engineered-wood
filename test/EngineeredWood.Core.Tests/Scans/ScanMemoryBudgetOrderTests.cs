@@ -125,4 +125,37 @@ public class ScanMemoryBudgetOrderTests
         second.ReleaseHeld();
         Assert.Equal(30, budget.Used);
     }
+
+    /// <summary>#851: a first reservation covers what the host adds to each row its first batch can hold, and stays
+    /// the largest estimate seen.</summary>
+    [Fact]
+    public void AFirstReservation_AddsTheHostsBytesForItsRows()
+    {
+        var budget = new ScanMemoryBudget(1L << 40);
+        var reservation = new ScanReservation(budget, 0);
+        reservation.SetInitialEstimate(1_000, 50);
+        Assert.Equal(1_000, reservation.Estimate);
+
+        reservation.AddedBytesPerRow = 27;
+        reservation.SetInitialEstimate(1_000, 50);
+        Assert.Equal(1_000 + 27 * 50, reservation.Estimate);
+        reservation.SetInitialEstimate(500, 10);
+        Assert.Equal(1_000 + 27 * 50, reservation.Estimate);
+
+        // Capped, as any estimate is, rather than wrapping.
+        reservation.AddedBytesPerRow = long.MaxValue / 2;
+        reservation.SetInitialEstimate(long.MaxValue / 2, long.MaxValue / 2);
+        Assert.Equal(EngineeredWood.Memory.MemoryBudget.MaxCharge, reservation.Estimate);
+    }
+
+    /// <summary>#852 review round 2: the bytes a host adds saturate at the most any estimate is, as a product and as a
+    /// sum, rather than wrap below the raw estimate.</summary>
+    [Theory]
+    [InlineData(1_000L, 27L, 50L, 1_000L + 27 * 50)]
+    [InlineData(1_000L, 0L, 50L, 1_000L)]
+    [InlineData(1_000L, 1L << 40, 1L << 40, EngineeredWood.Memory.MemoryBudget.MaxCharge)]
+    [InlineData(EngineeredWood.Memory.MemoryBudget.MaxCharge - 10, 1L, 100L, EngineeredWood.Memory.MemoryBudget.MaxCharge)]
+    [InlineData(1_000L, long.MaxValue, 2L, EngineeredWood.Memory.MemoryBudget.MaxCharge)]
+    public void AddedBytes_Saturate(long bytes, long perRow, long rows, long expected) =>
+        Assert.Equal(expected, ScanReservation.WithAddedBytes(bytes, perRow, rows));
 }
