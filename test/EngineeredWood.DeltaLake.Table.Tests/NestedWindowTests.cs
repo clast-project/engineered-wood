@@ -4,7 +4,9 @@
 using System.Text;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Arrow;
 using EngineeredWood.IO.Local;
+using EngineeredWood.Parquet;
 
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
@@ -102,6 +104,75 @@ public class NestedWindowTests : IDisposable
         // Built over the slice's rows: no child holds more entries than the slice's own.
         Assert.True(LargestChild(shaped.Column(0).Data) <= MaxEntries(raw.Column(0), length),
             $"a child of the reshaped slice holds {LargestChild(shaped.Column(0).Data)} entries");
+    }
+
+    /// <summary>
+    /// #854 review round 3: the reshaping end to end, through the Parquet reader's own (native, reference-counted)
+    /// buffers. Old files hold a struct with a struct inside it and a list of structs; a merge-schema write then adds a
+    /// field at every level and widens the ints inside them. Read in batches of a quarter of a row group, each batch
+    /// sliced from one decode, every batch disposed (and a collection run) before the next is read, the values are an
+    /// unbatched read's: the rebuilt children a batch hands on outlive the batches before it.
+    /// </summary>
+    [Fact]
+    public async Task ABatchedRead_OfANestedEvolvedTable_SurvivesDisposingEachBatch()
+    {
+        const int rows = 4_000, rowGroup = 1_000, batch = rowGroup / 4;
+        IArrowType Inner(bool evolved) => new StructType(evolved
+            ? [new Field("a", Int64Type.Default, true), new Field("c", Int64Type.Default, true)]
+            : [new Field("a", Int32Type.Default, true)]);
+        IArrowType Point(bool evolved) => new StructType(evolved
+            ? [new Field("a", Int64Type.Default, true), new Field("inner", Inner(true), true), new Field("b", StringType.Default, true)]
+            : [new Field("a", Int32Type.Default, true), new Field("inner", Inner(false), true)]);
+        Apache.Arrow.Schema SchemaOf(bool evolved) => new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int32Type.Default, true))
+            .Field(new Field("s", Point(evolved), true))
+            .Field(new Field("l", new ListType(new Field("element", Inner(evolved), true)), true))
+            .Build();
+
+        await using (var create = await DeltaTable.CreateAsync(
+                         _fs, SchemaOf(false),
+                         new DeltaTableOptions { ParquetWriteOptions = new ParquetWriteOptions { RowGroupMaxRows = rowGroup } },
+                         configuration: new Dictionary<string, string> { [EngineeredWood.DeltaLake.Schema.TypeWidening.EnableKey] = "true" }))
+        {
+            int seed = 0;
+            var old = SchemaOf(false);
+            var ids = new Int32Array.Builder();
+            for (int i = 0; i < rows; i++)
+                ids.Append(i);
+            await create.WriteAsync([new RecordBatch(old,
+                [ids.Build(), Build(old.FieldsList[1].DataType, rows, ref seed), Build(old.FieldsList[2].DataType, rows, ref seed)], rows)]);
+            var evolved = SchemaOf(true);
+            await create.WriteAsync(
+                [new RecordBatch(evolved, evolved.FieldsList.Select(f => ArrowCompute.MakeNullArray(f.DataType, 1)), 1)],
+                mergeSchema: true);
+        }
+
+        async Task<List<string>> ReadAsync(int? batchSize)
+        {
+            await using var table = await DeltaTable.OpenAsync(_fs, new DeltaTableOptions
+            {
+                ParquetReadOptions = new ParquetReadOptions { BatchSize = batchSize },
+                MaxConcurrentReads = 1,
+            });
+            Assert.Equal(SchemaOf(true).ToString(), table.CurrentSnapshot.ArrowSchema.ToString());
+            var rendered = new List<string>();
+            await foreach (var b in table.ReadAsync())
+            {
+                for (int r = 0; r < b.Length; r++)
+                    rendered.Add(string.Join("|", Enumerable.Range(0, b.ColumnCount).Select(c => Render(b.Column(c), r))));
+                b.Dispose();
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+            }
+            rendered.Sort(StringComparer.Ordinal);
+            return rendered;
+        }
+
+        var whole = await ReadAsync(null);
+        var batched = await ReadAsync(batch);
+        Assert.Equal(rows + 1, whole.Count);
+        Assert.Contains(whole, r => r.Contains("c:null", StringComparison.Ordinal) && r.Contains("b:null", StringComparison.Ordinal));
+        Assert.Equal(whole, batched);
     }
 
     // The most entries any array under `data` holds (its own length included).
