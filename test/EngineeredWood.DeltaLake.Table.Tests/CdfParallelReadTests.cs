@@ -414,6 +414,7 @@ public class CdfParallelReadTests : IDisposable
 
         private sealed class CountingFile(IRandomAccessFile file, CountingFileSystem owner) : IRandomAccessFile
         {
+            private readonly object _gate = new();
             private int _inFlight;
 
             public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
@@ -452,12 +453,17 @@ public class CdfParallelReadTests : IDisposable
 
             private async Task EnterAsync(CancellationToken cancellationToken)
             {
-                if (Interlocked.Increment(ref _inFlight) == 1)
+                // Under the file's lock, so that its last read leaving and its next arriving cannot count it twice
+                // (#850 review).
+                lock (_gate)
                 {
-                    int now = Interlocked.Increment(ref owner._reading);
-                    int seen;
-                    while (now > (seen = Volatile.Read(ref owner._maxReading)))
-                        Interlocked.CompareExchange(ref owner._maxReading, now, seen);
+                    if (++_inFlight == 1)
+                    {
+                        int now = Interlocked.Increment(ref owner._reading);
+                        int seen;
+                        while (now > (seen = Volatile.Read(ref owner._maxReading)))
+                            Interlocked.CompareExchange(ref owner._maxReading, now, seen);
+                    }
                 }
                 if (owner.DelayMs > 0)
                     await Task.Delay(owner.DelayMs, cancellationToken).ConfigureAwait(false);
@@ -465,8 +471,11 @@ public class CdfParallelReadTests : IDisposable
 
             private void Leave()
             {
-                if (Interlocked.Decrement(ref _inFlight) == 0)
-                    Interlocked.Decrement(ref owner._reading);
+                lock (_gate)
+                {
+                    if (--_inFlight == 0)
+                        Interlocked.Decrement(ref owner._reading);
+                }
             }
 
             public void Dispose() => file.Dispose();

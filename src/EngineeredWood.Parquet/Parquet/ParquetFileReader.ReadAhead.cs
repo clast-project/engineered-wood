@@ -1,6 +1,7 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Runtime.ExceptionServices;
 using EngineeredWood.Scans;
 
 namespace EngineeredWood.Parquet;
@@ -36,6 +37,10 @@ public sealed partial class ParquetFileReader
     /// decodes them, and so does one with a chunk too large to fetch in one buffer (<see cref="TryPrefetch"/>). It
     /// still holds its compressed bytes.</item>
     /// </list>
+    /// <para>An error planning a row group surfaces where the serial read raises it, after every batch before that row
+    /// group (#850 review): planning it ahead only records the error, and stops planning; a read that stops before
+    /// that row group never sees it. Preparing one ahead that fails leaves it unfetched, and its own read raises the
+    /// failure when it gets there. Cancellation is never deferred.</para>
     /// </summary>
     internal async IAsyncEnumerable<PositionedRecordBatch> ReadFileReservingAsync(
         IReadOnlyList<string>? columnNames,
@@ -53,6 +58,7 @@ public sealed partial class ParquetFileReader
         var held = new Queue<(RowGroupPlan Plan, long Compressed, PrefetchedFile? Io)>();
         (RowGroupPlan Plan, long Compressed)? next = null;
         bool planned = false;
+        ExceptionDispatchInfo? planningError = null;
         var plans = PlanRowGroupsAsync(metadata, _options.Filter, columnNames, skipRows, cancellationToken)
             .GetAsyncEnumerator(cancellationToken);
         IAsyncEnumerator<PositionedRecordBatch>? e = null;
@@ -80,6 +86,7 @@ public sealed partial class ParquetFileReader
                     await head.Io.DisposeAsync().ConfigureAwait(false);
                 reservation.ReleaseHeld(head.Compressed);
             }
+            planningError?.Throw();
         }
         finally
         {
@@ -103,13 +110,25 @@ public sealed partial class ParquetFileReader
             {
                 if (next is null)
                 {
-                    if (planned || !await plans.MoveNextAsync().ConfigureAwait(false))
+                    if (planned)
+                        break;
+                    try
                     {
+                        if (!await plans.MoveNextAsync().ConfigureAwait(false))
+                        {
+                            planned = true;
+                            break;
+                        }
+                        var plan = plans.Current;
+                        next = (plan, PlannedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges).Compressed);
+                    }
+                    catch (Exception error) when (held.Count > 0 && !cancellationToken.IsCancellationRequested)
+                    {
+                        // Planning ahead: the row groups held come first, so the error waits for them.
+                        planningError = ExceptionDispatchInfo.Capture(error);
                         planned = true;
                         break;
                     }
-                    var plan = plans.Current;
-                    next = (plan, PlannedBytes(metadata.RowGroups[plan.Index], schema, columnNames, plan.Ranges).Compressed);
                 }
 
                 var (toHold, compressed) = next.Value;
@@ -128,6 +147,10 @@ public sealed partial class ParquetFileReader
                             .ConfigureAwait(false);
                         io = TryPrefetch(ctx.Ranges, cancellationToken);
                     }
+                }
+                catch (Exception) when (!cancellationToken.IsCancellationRequested)
+                {
+                    // Read unfetched: its own read prepares it again, and raises the failure at its row group.
                 }
                 finally
                 {

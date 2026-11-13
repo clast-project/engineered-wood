@@ -750,8 +750,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             if (skipped is not null && group.NumRows > 0 && skipped(start, group.NumRows))
                 continue;
             long footer = PlannedBytes(group, schema, columnNames, null).Uncompressed;
-            long decoded = DecodedBytes(group, schema, columnNames, null) + addedBytesPerRow * group.NumRows;
-            largest = Math.Max(largest, FirstBatchBytes(decoded, footer, group, schema, columnNames, null));
+            long decoded = DecodedBytes(group, schema, columnNames, null);
+            // Added to the batch as sized, not to the group before it: the batch's floor at the pages it holds
+            // would otherwise swallow them (#850 review). The host adds them to the rows it emits, its share.
+            long added = (long)(addedBytesPerRow * group.NumRows * BatchRowShare(group, footer, null));
+            largest = Math.Max(largest, FirstBatchBytes(decoded, footer, group, schema, columnNames, null) + added);
         }
         return largest;
     }
@@ -1007,14 +1010,22 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 return groupBytes;
         }
 
+        long bytes = (long)(groupBytes * BatchRowShare(rowGroup, footerBytes, ranges));
+        return Math.Max(bytes, Math.Min(footerBytes, groupBytes));
+    }
+
+    /// <summary>The share of <paramref name="rowGroup"/>'s kept rows its first batch holds: what
+    /// <see cref="ParquetReadOptions.BatchSize"/> and <see cref="ParquetReadOptions.MaxBatchByteSize"/> cut it to
+    /// (see <see cref="FirstBatchBytes"/>).</summary>
+    private double BatchRowShare(RowGroup rowGroup, long footerBytes, IReadOnlyList<RowRange>? ranges)
+    {
         double share = 1.0;
         long rows = KeptRows(rowGroup, ranges);
         if (_options.BatchSize is int batchSize && batchSize > 0 && rows > batchSize)
             share = (double)batchSize / rows;
         if (_options.MaxBatchByteSize is long maxBytes && maxBytes > 0 && footerBytes > maxBytes)
             share = Math.Min(share, (double)maxBytes / footerBytes);
-        long bytes = (long)(groupBytes * share);
-        return Math.Max(bytes, Math.Min(footerBytes, groupBytes));
+        return share;
     }
 
     /// <summary>
