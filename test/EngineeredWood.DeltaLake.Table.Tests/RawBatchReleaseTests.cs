@@ -1,10 +1,12 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Runtime.CompilerServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Arrow;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
+using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 using Ex = EngineeredWood.Expressions.Expressions;
@@ -75,16 +77,49 @@ public class RawBatchReleaseTests : IDisposable
         Assert.Equal(Rows, await ScanReleasingAsync(batchSize, null));
     }
 
-    // An exact filter reads through the built-in reader's selected read (#502), a pipeline of its own.
+    // An exact filter reads through the built-in reader's selected read (#502), a pipeline of its own. One that keeps
+    // some rows gathers them; one that keeps every row hands on the decode itself.
     [Theory]
-    [InlineData("name")]
-    [InlineData("id")]
-    public async Task AFilteredScanOfADroppedColumn_ReleasesItsDecode(string mapping)
+    [InlineData("name", false)]
+    [InlineData("name", true)]
+    [InlineData("id", false)]
+    [InlineData("id", true)]
+    public async Task AFilteredScanOfADroppedColumn_ReleasesItsDecode(string mapping, bool everyRow)
     {
         await using (var table = await CreateAsync(new() { ["delta.columnMapping.mode"] = mapping }))
             await table.DropColumnAsync("gone");
 
-        Assert.Equal(Rows / 4, await ScanReleasingAsync(null, Ex.Equal("tag", "t1")));
+        var filter = everyRow
+            ? Ex.Or(Ex.Or(Ex.Equal("tag", "t0"), Ex.Equal("tag", "t1")), Ex.Or(Ex.Equal("tag", "t2"), Ex.Equal("tag", "t3")))
+            : Ex.Equal("tag", "t1");
+        Assert.Equal(everyRow ? Rows : Rows / 4, await ScanReleasingAsync(null, filter));
+    }
+
+    // Through the codec seam a filter's column is read with the projection and dropped after the filter, a step of its
+    // own. A filter that keeps every row hands on the decode itself, so the dropped column is the reader's.
+    [Fact]
+    public async Task ASeamScanFilteredOnAnUnprojectedColumn_ReleasesThatColumn()
+    {
+        await (await CreateAsync([])).DisposeAsync();
+
+        long rows = 0;
+        await AssertReleasedAsync(async table =>
+        {
+            var options = new DeltaReadOptions
+            {
+                Columns = ["id"],
+                Filter = Ex.Or(Ex.Or(Ex.Equal("tag", "t0"), Ex.Equal("tag", "t1")), Ex.Or(Ex.Equal("tag", "t2"), Ex.Equal("tag", "t3"))),
+                FilterRows = true,
+            };
+            await foreach (var b in table.ReadAsync(options))
+            {
+                Assert.Equal(["id"], b.Schema.FieldsList.Select(f => f.Name));
+                rows += b.Length;
+                b.Dispose();
+            }
+        }, batchSize: null, seam: true);
+
+        Assert.Equal(Rows, rows);
     }
 
     // The feed reshapes both kinds of file itself: the data file an insert is inferred from and the change file an
@@ -170,7 +205,7 @@ public class RawBatchReleaseTests : IDisposable
 
     // Runs `read` over the table and checks that every native byte it allocated is free again, with no collection in
     // between to finalize what it dropped.
-    private async Task AssertReleasedAsync(Func<DeltaTable, Task> read, int? batchSize)
+    private async Task AssertReleasedAsync(Func<DeltaTable, Task> read, int? batchSize, bool seam = false)
     {
         for (int i = 0; i < 3; i++)
         {
@@ -184,6 +219,7 @@ public class RawBatchReleaseTests : IDisposable
                      {
                          ParquetReadOptions = new ParquetReadOptions { BatchSize = batchSize },
                          MaxConcurrentReads = 1,
+                         DataFileReader = seam ? new SeamReader(_fs) : null,
                      }))
         {
             await read(table);
@@ -191,5 +227,19 @@ public class RawBatchReleaseTests : IDisposable
 
         Assert.True(NativeMemoryTracker.TotalAllocated > allocated, "The read decoded nothing natively.");
         Assert.Equal(before, NativeMemoryTracker.LiveBytes);
+    }
+
+    // A codec-seam host over the built-in reader, which hands each batch over as the seam's contract says.
+    private sealed class SeamReader(ITableFileSystem fs) : IDataFileReader
+    {
+        public async IAsyncEnumerable<RecordBatch> ReadAsync(
+            string relativePath, IReadOnlyList<string>? physicalColumns,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            await using var file = await fs.OpenReadAsync(relativePath, cancellationToken);
+            using var reader = new ParquetFileReader(file, ownsFile: false);
+            await foreach (var b in reader.ReadAllAsync(columnNames: physicalColumns, cancellationToken: cancellationToken))
+                yield return b;
+        }
     }
 }
