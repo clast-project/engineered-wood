@@ -1595,6 +1595,33 @@ public class ParallelRowGroupReadTests : IDisposable
             await writer.CloseAsync();
         }
 
+        // The same file with a footer that leaves out path_in_schema, as some writers do (#852 review round 4): the
+        // read maps chunks to leaves by position, and so does the count.
+        string pathless = Path.Combine(_tempDir, "lists-no-path.parquet");
+        {
+            byte[] bytes = File.ReadAllBytes(path);
+            int footerLength = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(bytes.AsSpan(bytes.Length - 8, 4));
+            int footerStart = bytes.Length - 8 - footerLength;
+            var decoded = EngineeredWood.Parquet.Metadata.MetadataDecoder.DecodeFileMetaData(bytes.AsSpan(footerStart, footerLength));
+            byte[] footer = EngineeredWood.Parquet.Metadata.MetadataEncoder.EncodeFileMetaData(decoded, writePathInSchema: false);
+            var rewritten = new List<byte>(bytes.AsSpan(0, footerStart).ToArray());
+            rewritten.AddRange(footer);
+            var length = new byte[4];
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(length, footer.Length);
+            rewritten.AddRange(length);
+            rewritten.AddRange("PAR1"u8.ToArray());
+            File.WriteAllBytes(pathless, rewritten.ToArray());
+        }
+        await using (var stripped = new LocalRandomAccessFile(pathless))
+        using (var strippedReader = new ParquetFileReader(stripped, ownsFile: false))
+        {
+            var meta = await strippedReader.ReadMetadataAsync();
+            Assert.All(meta.RowGroups[0].Columns, c => Assert.Null(c.MetaData!.PathInSchema));
+            var counted = await strippedReader.LeafValuesPerRowAsync(default);
+            Assert.Equal(1.0, counted["id"]);
+            Assert.Equal(3.0, counted["l"]);
+        }
+
         await using var file = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(file, ownsFile: false);
         var perRow = await reader.LeafValuesPerRowAsync(default);

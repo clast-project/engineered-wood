@@ -1031,19 +1031,21 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// For each top-level column, the most leaf values a row of it holds in any row group: a column chunk's
     /// <c>num_values</c>, which counts every leaf slot (nulls and empty lists included), over its group's rows. One
     /// for a flat column; for a list or map, at least its elements a row, at any depth. For a host sizing what it adds
-    /// inside nested elements (#852 review round 2).
+    /// inside nested elements (#852 review round 2). A chunk is named by the schema's leaf at its position, as the read
+    /// maps it, not by its <c>path_in_schema</c>, which a footer may leave out (#852 review round 4).
     /// </summary>
     internal async ValueTask<Dictionary<string, double>> LeafValuesPerRowAsync(CancellationToken cancellationToken)
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
         var result = new Dictionary<string, double>(StringComparer.Ordinal);
         foreach (var group in metadata.RowGroups)
         {
             if (group.NumRows <= 0)
                 continue;
-            foreach (var chunk in group.Columns)
+            for (int c = 0; c < group.Columns.Count && c < schema.Columns.Count; c++)
             {
-                if (chunk.MetaData is not { PathInSchema: { Count: > 0 } path } meta)
+                if (group.Columns[c].MetaData is not { } meta || schema.Columns[c].Path is not { Count: > 0 } path)
                     continue;
                 double perRow = (double)meta.NumValues / group.NumRows;
                 if (!result.TryGetValue(path[0], out var seen) || perRow > seen)
