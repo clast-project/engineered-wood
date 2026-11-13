@@ -56,6 +56,14 @@ exposed. That stopped being true when the decoders moved to native buffers, and 
   `RecordBatchAssembler` and the Delta checkpoint builders build their output in `NativeBuffer<T>`.
 - **Builders inside `src/`:** Arrow builders are used throughout, for instance for the expression
   evaluator's results, in the Delta table layer, and in the Parquet and Vortex libraries.
+- **`ArrowCompute.Concatenate`** joins strings, binaries and structs itself, into managed buffers, but
+  hands every other type to Arrow's concatenator, whose result is native.
+
+The Vortex and Lance decoders are the exception: they build their output from `byte[]`. In Vortex that
+is a rule the decoders rely on, since they read their children through spans without rooting them. The
+reader (everything outside `Writer/`) therefore uses no Arrow builder. Validity and boolean bitmaps
+(the decoders' and the zone map's) and chunk joins go through `Vortex.Encodings.ManagedArrays` instead
+(#837). A join that `ArrowCompute.Concatenate` makes for a nested type is copied wherever it is native.
 
 So **every consumer of a decoded array is exposed**: tests, a host, and the library's own code
 downstream of a reader. A write path is exposed too, since it receives arrays the caller built.
@@ -77,6 +85,17 @@ array's liveness over everything above it — including spans taken by callees, 
 reachable through the array. The root therefore goes at the **outermost method that receives the
 caller's array**, not at each of the ~325 places a span is taken; one root covers the whole call
 tree beneath it.
+
+An `async` entry point roots its parameters already: the compiler copies every parameter into the state
+machine, which stays reachable until the method completes. A local of an `async` method is different. It is
+hoisted only if it is used across an `await`, and otherwise dies at its last use like any other.
+
+The arrays most often left unrooted are **intermediates**: an array a method builds, hands to a callee that
+reads spans off it, and holds nowhere else. Nothing upstream can root it, because nothing upstream has
+it. The expression evaluator is the main example. A nested call's answer is the outer function's
+argument, and a materialized operand is the input to a coercing cast. So `ArrowRowEvaluator` roots these
+where it hands them on: `InvokeFunction` (the arguments, for every registered function, a host's
+included), `CastForComparison` and `ArrowToLiteralValues`.
 
 Where a call tree has more than one way in — `DictionaryEncoder.TryEncode` is reachable both from
 `ColumnChunkWriter.WriteColumn` and directly from tests — each entry point roots for itself rather
@@ -129,5 +148,19 @@ Its limits, so that a clean run is not read as proof:
 
 **Swept so far (#834):** every test project. Spans read off an array that nothing used afterwards now
 end with `GC.KeepAlive(owner)`. The shared renderers (`ArrowValues.Render` in the Parquet and Vortex
-tests, and the helpers like them) root their array once, at the entry point. The library itself
-(`src/`, about 210 sites the scan reports) is the follow-up, tracked in #837.
+tests, and the helpers like them) root their array once, at the entry point.
+
+**Swept (#837):** the library, `src/`. The scan reports 369 sites there, counting both symbol sets and
+leaving out indexed and measured spans. Each was resolved by following the array to its owner:
+- **Writer entry points.** Each keeps the caller's batch reachable until its encoders have read it:
+  - Parquet's `WriteRowGroupAsync` roots the batch. `BufferedParquetWriter.AppendAsync` is `async`.
+  - ORC's `WriteBatchAsync` and Avro's `Encode` use the batch after their loops.
+  - Vortex's `WriteBatch` uses the batch after its loop, and `LanceFileWriter` roots its columns.
+- **Long-lived owners.** The checkpoint statistics arrays are held by `CheckpointStatsView`, and each
+  `AddFile` in the snapshot holds the view.
+- **Intermediates.** The rooted sites are in the expression evaluator. Vortex now builds its validity
+  bitmaps and chunk joins in managed memory instead, as described above.
+- **Scanner false positives.** These include `foreach` over a list, a captured local, and an owner used
+  later under another name.
+
+Those sites still appear in the scan, because it does not follow ownership into callers.

@@ -721,11 +721,23 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
                 : StringType.Default)
             : OperandType(declared, member.PerRow);
 
+    /// <summary>
+    /// <see cref="IComparisonCoercion.CastForComparison"/>, with <paramref name="operand"/> kept alive until the
+    /// cast returns. Every caller hands it an array it has just materialized and holds nowhere else, built in
+    /// native memory a finalizer frees, and a cast reads spans off it (#837; doc/arrow-span-lifetime.md).
+    /// </summary>
+    private IArrowArray CastForComparison(IArrowArray operand, IArrowType target, int rowCount)
+    {
+        var cast = _coercion!.CastForComparison(operand, target, rowCount);
+        GC.KeepAlive(operand);
+        return cast;
+    }
+
     /// <summary>Rebuilds one member of a set as <paramref name="target"/>.</summary>
     private LiteralValue?[] CastMember(
         LiteralValue?[] values, IArrowType type, IArrowType target, int rowCount) =>
         ArrowToLiteralValues(
-            _coercion!.CastForComparison(
+            CastForComparison(
                 MaterializeAsArray(values, rowCount, type), target, rowCount),
             rowCount);
 
@@ -901,7 +913,7 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         var staying = castTheCandidate ? other : candidate;
         int rowCount = moving.Length;
 
-        var coerced = _coercion.CastForComparison(
+        var coerced = CastForComparison(
             MaterializeAsArray(
                 cmp.Op == ComparisonOperator.NullSafeEqual ? moving : NulledWhere(moving, staying),
                 rowCount),
@@ -1029,7 +1041,7 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
     private LiteralValue?[] Rounded(
         LiteralValue?[] values, IArrowType type, IArrowType target, int rowCount) =>
         ArrowToLiteralValues(
-            _coercion!.CastForComparison(
+            CastForComparison(
                 MaterializeAsArray(values, rowCount, type), target, rowCount),
             rowCount);
 
@@ -1475,13 +1487,19 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
         if (_constantFolded is not null && AllConstant(call.Arguments))
         {
             var folded = _constantFolded.InvokeOverConstants(call.Name, arguments, batch.Length);
+            GC.KeepAlive(arguments); // as for Invoke below
             if (folded is not null)
                 return folded;
         }
 
         PickMinimumPrecision(call, arguments);
 
-        return _functions.Invoke(call.Name, arguments, batch.Length);
+        // The entry point for every registered function, ours or a host's: the arguments are often answers of
+        // nested calls that nothing else holds, built in native memory a finalizer frees, and a function reads spans
+        // off them row by row. Rooted here, once, so that no function has to (#837; doc/arrow-span-lifetime.md).
+        var answer = _functions.Invoke(call.Name, arguments, batch.Length);
+        GC.KeepAlive(arguments);
+        return answer;
     }
 
     /// <summary>
@@ -2389,6 +2407,13 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
                 throw new NotSupportedException(
                     $"Cannot evaluate over Arrow array of type {array.Data.DataType.Name}.");
         }
+
+        // The cases above copy each value out of a span over the array's buffers, and the copy allocates
+        // (GetBytes(i).ToArray(), and GetString, which takes its span before allocating the string). On the last row
+        // nothing else uses the array, and a caller may hand in one only this call holds: a function's answer
+        // (InvokeFunction) or a coerced column, built by an Arrow builder in native memory its finalizer frees
+        // (#837). See doc/arrow-span-lifetime.md.
+        GC.KeepAlive(array);
         return result;
     }
 

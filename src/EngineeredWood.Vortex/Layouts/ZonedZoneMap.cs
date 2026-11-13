@@ -282,9 +282,8 @@ internal static class ZonedZoneMap
     /// </summary>
     private static BooleanArray BoundedMinInexact(IArrowArray bound, ulong maxBytes, int zoneCount)
     {
-        var builder = new BooleanArray.Builder();
-        builder.Reserve(zoneCount);
-        for (int z = 0; z < zoneCount; z++)
+        // Managed, as every buffer the Vortex reader hands out (see Encodings.ManagedArrays).
+        var values = Encodings.ManagedArrays.Bitmap(zoneCount, z =>
         {
             int? length = bound switch
             {
@@ -292,18 +291,13 @@ internal static class ZonedZoneMap
                 BinaryArray b when b.IsValid(z) => b.GetValueLength(z),
                 _ => null,
             };
-            builder.Append(length is null || (ulong)length.Value + 3 >= maxBytes);
-        }
-        return builder.Build();
+            return length is null || (ulong)length.Value + 3 >= maxBytes;
+        });
+        return new BooleanArray(values, ArrowBuffer.Empty, zoneCount, 0, 0);
     }
 
-    private static BooleanArray Constant(bool value, int length)
-    {
-        var builder = new BooleanArray.Builder();
-        builder.Reserve(length);
-        for (int i = 0; i < length; i++) builder.Append(value);
-        return builder.Build();
-    }
+    private static BooleanArray Constant(bool value, int length) =>
+        new(Encodings.ManagedArrays.Bitmap(length, _ => value), ArrowBuffer.Empty, length, 0, 0);
 
     /// <summary>
     /// The upper bound of each zone from a <c>vortex.bounded_max</c> partial
@@ -326,14 +320,10 @@ internal static class ZonedZoneMap
             return bound;
 
         var data = bound.Data;
-        var bitmap = new ArrowBuffer.BitmapBuilder(data.Offset + length);
-        for (int i = 0; i < data.Offset; i++)
-            bitmap.Append(false);
-        for (int i = 0; i < length; i++)
-            bitmap.Append(Valid(i));
-
+        // Managed, as every buffer the Vortex reader hands out (see Encodings.ManagedArrays).
         var buffers = data.Buffers.ToArray();
-        buffers[0] = bitmap.Build();
+        buffers[0] = Encodings.ManagedArrays.Bitmap(
+            data.Offset + length, i => i >= data.Offset && Valid(i - data.Offset));
         return ArrowArrayFactory.BuildArray(new ArrayData(
             data.DataType, data.Length, nulls, data.Offset, buffers, data.Children, data.Dictionary));
     }

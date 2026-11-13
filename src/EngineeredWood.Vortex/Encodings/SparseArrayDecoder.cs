@@ -107,7 +107,7 @@ internal static class SparseArrayDecoder
         IArrowType type, int rowCount, ScalarValueProto fill,
         IArrowArray indices, IArrowArray values, int patchesOffset)
     {
-        var source = ArrowCompute.Concatenate(new[]
+        var source = ManagedArrays.Concatenate(new[]
         {
             ConstantArrayDecoder.BuildArray(type, 1, fill),
             values,
