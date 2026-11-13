@@ -83,7 +83,8 @@ public sealed partial class ArrowRowEvaluator
         IArrowType? constantType;
         try
         {
-            column = columnExpression is UnboundReference u ? GetColumn(batch, u) : GetColumn(batch, ((BoundReference)columnExpression).Name);
+            // As the batch holds it: a view or large string is compared in place, not copied (#859).
+            column = columnExpression is UnboundReference u ? FindColumn(batch, u) : FindColumn(batch, ((BoundReference)columnExpression).Name);
             if (!HasKernel(column))
                 return null;
 
@@ -100,7 +101,8 @@ public sealed partial class ArrowRowEvaluator
             return null;
         }
 
-        var columnType = column.Data.DataType;
+        // Typed as GetColumn would convert it, which is what the general path analyses and coerces.
+        var columnType = ByteArrayOffsets.TypeOf(column.Data.DataType);
         var columnSide = new LiteralValue?[] { Placeholder };
         var constantSide = new LiteralValue?[] { constant };
         var left = columnOnLeft ? columnSide : constantSide;
@@ -161,6 +163,8 @@ public sealed partial class ArrowRowEvaluator
     private static DirectAnswer? Kernel(IArrowArray column, ComparisonOperator op, LiteralValue constant) => column switch
     {
         StringArray a => CompareStrings(a, op, constant),
+        LargeStringArray a => CompareStrings(a, new LargeStrings(a), op, constant),
+        StringViewArray a => CompareStrings(a, new StringViews(a), op, constant),
         Int8Array a => CompareIntegers(a, a.Values, op, constant),
         Int16Array a => CompareIntegers(a, a.Values, op, constant),
         Int32Array a => CompareIntegers(a, a.Values, op, constant),
@@ -224,7 +228,7 @@ public sealed partial class ArrowRowEvaluator
     }
 
     private static bool HasKernel(IArrowArray column) => column is
-        StringArray or Int8Array or Int16Array or Int32Array or Int64Array
+        StringArray or LargeStringArray or StringViewArray or Int8Array or Int16Array or Int32Array or Int64Array
         or UInt8Array or UInt16Array or UInt32Array or FloatArray or DoubleArray
         or BooleanArray or Date32Array or Date64Array or TimestampArray;
 
@@ -461,6 +465,78 @@ public sealed partial class ArrowRowEvaluator
 
                 int start = offsets[i];
                 Set(result, i, Decide(op, data.Slice(start, offsets[i + 1] - start).SequenceCompareTo(target)));
+            }
+        }
+
+        return Answer(column, op, result);
+    }
+
+    /// <summary>A string column's values by row, for a layout without 32-bit offsets (#859).</summary>
+    private interface IStringValues
+    {
+        ReadOnlySpan<byte> Get(int index);
+    }
+
+    private readonly struct LargeStrings(LargeStringArray array) : IStringValues
+    {
+        public ReadOnlySpan<byte> Get(int index) => array.GetBytes(index);
+    }
+
+    private readonly struct StringViews(StringViewArray array) : IStringValues
+    {
+        public ReadOnlySpan<byte> Get(int index) => array.GetBytes(index);
+    }
+
+    /// <summary>
+    /// <see cref="CompareStrings(StringArray, ComparisonOperator, LiteralValue)"/> over a <c>large_utf8</c> or
+    /// <c>utf8view</c> column, read in place rather than copied into offsets first (#859). Same rules, same answers.
+    /// </summary>
+    private static DirectAnswer? CompareStrings<TValues>(
+        IArrowArray column, TValues values, ComparisonOperator op, LiteralValue constant)
+        where TValues : struct, IStringValues
+    {
+        if (constant.Type != LiteralValue.Kind.String)
+            return null;
+
+        bool startsWith = op is ComparisonOperator.StartsWith or ComparisonOperator.NotStartsWith;
+        if (!startsWith && !IsOrdering(op))
+            return null;
+
+        byte[] literal;
+        try
+        {
+            literal = StrictUtf8.GetBytes(constant.AsString);
+        }
+        catch (EncoderFallbackException)
+        {
+            return null;
+        }
+
+        int length = column.Length;
+        var result = new byte[BitmapBytes(length)];
+        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
+        var target = new ReadOnlySpan<byte>(literal);
+
+        if (startsWith || op is ComparisonOperator.Equal or ComparisonOperator.NullSafeEqual or ComparisonOperator.NotEqual)
+        {
+            bool want = op is ComparisonOperator.StartsWith or ComparisonOperator.Equal or ComparisonOperator.NullSafeEqual;
+            for (int i = 0; i < length; i++)
+            {
+                if (hasNulls && column.IsNull(i))
+                    continue;
+
+                var value = values.Get(i);
+                Set(result, i, (startsWith ? value.StartsWith(target) : value.SequenceEqual(target)) == want);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < length; i++)
+            {
+                if (hasNulls && column.IsNull(i))
+                    continue;
+
+                Set(result, i, Decide(op, values.Get(i).SequenceCompareTo(target)));
             }
         }
 

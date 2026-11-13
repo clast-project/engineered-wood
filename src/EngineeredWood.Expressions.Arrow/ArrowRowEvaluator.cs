@@ -113,6 +113,16 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
 
     public IArrowArray EvaluateExpression(Expression expression, RecordBatch batch)
     {
+        // A bare reference is the batch's own array, in whatever layout it holds: nothing here reads it, so there is
+        // nothing to convert it for, and a view or large string a caller hands on (a MERGE assignment) is not copied.
+        switch (expression)
+        {
+            case UnboundReference u:
+                return FindColumn(batch, u);
+            case BoundReference b:
+                return FindColumn(batch, b.Name);
+        }
+
         var result = EvalExpressionAsArray(expression, batch);
 
         // A literal is built at least one row long even over an empty batch (see ConstantArray),
@@ -449,11 +459,13 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
     {
         switch (expression)
         {
+            // The type GetColumn would give the column, without converting it (#863 review): this runs before a
+            // direct kernel that reads a view or large string in place, and the copy would be thrown away.
             case UnboundReference u:
-                return GetColumn(batch, u).Data.DataType;
+                return ByteArrayOffsets.TypeOf(FindColumn(batch, u).Data.DataType);
 
             case BoundReference b:
-                return GetColumn(batch, b.Name).Data.DataType;
+                return ByteArrayOffsets.TypeOf(FindColumn(batch, b.Name).Data.DataType);
 
             case LiteralExpression literal:
                 return literal.Value.IsNull
@@ -2121,10 +2133,17 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
     /// The values a reference names: its top-level column, then, for a nested path, a field of each struct below
     /// it, every part matched case-insensitively. A field of a null struct row is null there, as in Spark.
     /// </summary>
-    private static IArrowArray GetColumn(RecordBatch batch, UnboundReference reference)
+    private static IArrowArray GetColumn(RecordBatch batch, UnboundReference reference) =>
+        ByteArrayOffsets.Of(FindColumn(batch, reference));
+
+    /// <summary>
+    /// <see cref="GetColumn(RecordBatch, UnboundReference)"/> without the conversion to the offset layout: the
+    /// column as the batch holds it, for a kernel that reads a view or large string in place (#859).
+    /// </summary>
+    private static IArrowArray FindColumn(RecordBatch batch, UnboundReference reference)
     {
         var parts = reference.NameParts;
-        var array = GetColumn(batch, parts[0]);
+        var array = FindColumn(batch, parts[0]);
         for (var p = 1; p < parts.Count; p++)
         {
             string path = string.Join(".", parts.Take(p));
@@ -2192,7 +2211,15 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
             data.DataType, data.Length, nulls, data.Offset, buffers, data.Children, data.Dictionary));
     }
 
-    private static IArrowArray GetColumn(RecordBatch batch, string name)
+    /// <summary>
+    /// The top-level column <paramref name="name"/>, its large and view strings and binaries in the offset layout
+    /// every type test, cast and function here reads (#859).
+    /// </summary>
+    private static IArrowArray GetColumn(RecordBatch batch, string name) =>
+        ByteArrayOffsets.Of(FindColumn(batch, name));
+
+    /// <summary>The top-level column <paramref name="name"/> as the batch holds it.</summary>
+    private static IArrowArray FindColumn(RecordBatch batch, string name)
     {
         var fields = batch.Schema.FieldsList;
         var match = -1;
@@ -2287,6 +2314,30 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
                     result[i] = a.IsNull(i) ? null : (LiteralValue?)LiteralValue.Of(a.GetString(i));
                 break;
             case BinaryArray a:
+                for (int i = 0; i < length; i++)
+                {
+                    if (a.IsNull(i)) result[i] = null;
+                    else result[i] = LiteralValue.Of(a.GetBytes(i).ToArray());
+                }
+                break;
+            // A column arrives in the offset layout (GetColumn), but a registered function may answer in another
+            // (#859). Each string type derives from its binary type, so it is matched first.
+            case LargeStringArray a:
+                for (int i = 0; i < length; i++)
+                    result[i] = a.IsNull(i) ? null : (LiteralValue?)LiteralValue.Of(a.GetString(i));
+                break;
+            case LargeBinaryArray a:
+                for (int i = 0; i < length; i++)
+                {
+                    if (a.IsNull(i)) result[i] = null;
+                    else result[i] = LiteralValue.Of(a.GetBytes(i).ToArray());
+                }
+                break;
+            case StringViewArray a:
+                for (int i = 0; i < length; i++)
+                    result[i] = a.IsNull(i) ? null : (LiteralValue?)LiteralValue.Of(a.GetString(i));
+                break;
+            case BinaryViewArray a:
                 for (int i = 0; i < length; i++)
                 {
                     if (a.IsNull(i)) result[i] = null;
