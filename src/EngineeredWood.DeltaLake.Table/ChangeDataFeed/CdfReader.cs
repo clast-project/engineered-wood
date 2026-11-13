@@ -532,13 +532,17 @@ internal static class CdfReader
     /// batch's rows in the table's LOGICAL shape (the shape <see cref="CdfWriter.PrepareRows"/> takes), its
     /// <c>_change_type</c> values, and the materialized row-tracking columns exactly as stored (a NULL commit version
     /// stays NULL, so it still resolves to whichever version the file is finally committed in).
+    /// <para><paramref name="readOptions"/> must not change what the rows read as (a filter, an output kind): the rows
+    /// are written again as they are. <see cref="DeltaTable.ChangeFileRewriteReadOptions"/> takes only the table's
+    /// batching.</para>
     /// </summary>
     internal static async IAsyncEnumerable<(RecordBatch Rows, StringArray ChangeTypes, Int64Array? RowIds,
         Int64Array? RowCommitVersions)> ReadWrittenChangeFileAsync(
         ITableFileSystem fs,
         Snapshot.Snapshot snapshot,
         CdcFile file,
-        [EnumeratorCancellation] CancellationToken cancellationToken)
+        [EnumeratorCancellation] CancellationToken cancellationToken,
+        ParquetReadOptions? readOptions = null)
     {
         var mappingMode = ColumnMapping.GetMode(snapshot.Metadata.Configuration);
         var (rowIdName, rowVersionName) = DeltaLake.RowTracking.RowTrackingConfig
@@ -553,7 +557,7 @@ internal static class CdfReader
             DeltaLake.RowTracking.RowTrackingConfig.RowCommitVersionColumnName);
 
         await using var opened = (await OpenAsync(
-            fs, EngineeredWood.DeltaLake.DeltaPath.Decode(file.Path), file.Size, readOptions: null,
+            fs, EngineeredWood.DeltaLake.DeltaPath.Decode(file.Path), file.Size, readOptions,
             missingMeansVacuumed: false, cancellationToken).ConfigureAwait(false))!;
         await foreach (var batch in opened.Reader.ReadAllAsync(cancellationToken: cancellationToken)
             .ConfigureAwait(false))

@@ -10939,7 +10939,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         foreach (var file in files)
         {
             await foreach (var (rows, changeTypes, ids, versions) in ChangeDataFeed.CdfReader
-                .ReadWrittenChangeFileAsync(_fs, snapshot, file, cancellationToken).ConfigureAwait(false))
+                .ReadWrittenChangeFileAsync(_fs, snapshot, file, cancellationToken, ChangeFileRewriteReadOptions)
+                .ConfigureAwait(false))
             {
                 var movedIds = ids is null ? null : MoveInsertRowIds(ids, changeTypes, sorted);
                 // The rows as read are handed over: the sink's writers release them once every run is written (#860),
@@ -10964,6 +10965,18 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
         return (await sink.CompleteAsync(cancellationToken).ConfigureAwait(false)).ToList();
     }
+
+    /// <summary>
+    /// How <see cref="RewriteInsertRowIdsAsync"/> reads a change file back: in the table's batches
+    /// (<see cref="ParquetReadOptions.BatchSize"/>, <see cref="ParquetReadOptions.MaxBatchByteSize"/>), and otherwise
+    /// as written. The table's other read options would change the rows it writes again (an output kind's types, which
+    /// the change type's <c>StringArray</c> check also refuses).
+    /// </summary>
+    internal ParquetReadOptions ChangeFileRewriteReadOptions => new()
+    {
+        BatchSize = _options.ParquetReadOptions.BatchSize,
+        MaxBatchByteSize = _options.ParquetReadOptions.MaxBatchByteSize,
+    };
 
     private static Int64Array MoveInsertRowIds(
         Int64Array ids, StringArray changeTypes, (long OldBase, long Rows, long NewBase)[] sortedMoves)

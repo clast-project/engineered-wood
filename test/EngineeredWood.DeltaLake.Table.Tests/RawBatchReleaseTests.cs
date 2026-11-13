@@ -319,7 +319,8 @@ public class RawBatchReleaseTests : IDisposable
 
     // Rewriting the change file hands the rows it reads to the change-file writer, which releases them once they are
     // written (#860). Each change type's run is a slice of the rows read, so they stay alive until the last run is
-    // written. A row group smaller than the file, so its rows are written in several.
+    // written. A row group smaller than the file, so its rows are written in several. Batched, the rewrite reads the
+    // file in the table's batches (#866 review round 1), slices of one decoded row group.
     [Theory]
     [InlineData(null)]
     [InlineData(RowGroup / 4)]
@@ -333,6 +334,21 @@ public class RawBatchReleaseTests : IDisposable
         IReadOnlyList<CdcFile>? rewritten = null;
         await AssertReleasedAsync(async table =>
         {
+            // The rewrite reads in the table's batches.
+            var batches = new List<int>();
+            await foreach (var (batch, changeTypes, ids, versions) in ChangeDataFeed.CdfReader.ReadWrittenChangeFileAsync(
+                               _fs, table.CurrentSnapshot, file, CancellationToken.None, table.ChangeFileRewriteReadOptions))
+            {
+                batches.Add(batch.Length);
+                batch.Dispose();
+                changeTypes.Dispose();
+                ids?.Dispose();
+                versions?.Dispose();
+            }
+            // Unbatched, a batch per row group of the change file; batched, none larger than the batch size.
+            int largest = batchSize ?? RowGroup;
+            Assert.True(batches.Count >= 2 * (Rows / 4) / largest && batches.Max() == largest, string.Join(",", batches));
+
             rewritten = await table.RewriteInsertRowIdsAsync(
                 table.CurrentSnapshot, [file], [], CancellationToken.None, written: null);
         }, batchSize, writeOptions: new ParquetWriteOptions { RowGroupMaxRows = RowGroup / 3 });
