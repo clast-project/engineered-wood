@@ -13,13 +13,6 @@ using Ex = EngineeredWood.Expressions.Expressions;
 
 namespace EngineeredWood.DeltaLake.Table.Tests;
 
-/// <summary>Reads whose native memory is counted: none may run beside them.</summary>
-[CollectionDefinition(Name, DisableParallelization = true)]
-public sealed class NativeMemoryCollection
-{
-    public const string Name = "Native memory";
-}
-
 /// <summary>
 /// A read releases every native buffer it decoded once its batches are disposed, including those it dropped while
 /// bringing a file's batches to the table's shape (#855): a widened column's narrow values, a dropped column's whole
