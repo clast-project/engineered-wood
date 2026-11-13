@@ -60,9 +60,10 @@ exposed. That stopped being true when the decoders moved to native buffers, and 
   hands every other type to Arrow's concatenator, whose result is native.
 
 The Vortex and Lance decoders are the exception: they build their output from `byte[]`. In Vortex that
-is a rule the decoders rely on, since they read their children through spans without rooting them. Its
-two uses of Arrow's helpers (a validity `BitmapBuilder`, and the concatenator for a chunked child) go
-through `Vortex.Encodings.ManagedArrays` instead (#837).
+is a rule the decoders rely on, since they read their children through spans without rooting them. The
+reader (everything outside `Writer/`) therefore uses no Arrow builder. Validity and boolean bitmaps
+(the decoders' and the zone map's) and chunk joins go through `Vortex.Encodings.ManagedArrays` instead
+(#837). A join that `ArrowCompute.Concatenate` makes for a nested type is copied wherever it is native.
 
 So **every consumer of a decoded array is exposed**: tests, a host, and the library's own code
 downstream of a reader. A write path is exposed too, since it receives arrays the caller built.
