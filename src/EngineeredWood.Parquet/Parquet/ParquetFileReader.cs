@@ -1768,18 +1768,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// column failing is the ordinary case, so that one is rethrown in place, stack intact. Genuine
     /// multi-column failures keep the aggregate, which is the only honest shape for them.
     /// </remarks>
-    private static readonly bool SerialColumns =
-        Environment.GetEnvironmentVariable("EW_SERIAL_COLUMNS") == "1";
-
     private static void ForEachColumn(int count, Action<int> body)
     {
-        if (SerialColumns)
-        {
-            // PROTOTYPE: decode on the calling thread (a host running one scan stream per thread)
-            for (int i = 0; i < count; i++)
-                body(i);
-            return;
-        }
         try
         {
             Parallel.For(0, count, body);
