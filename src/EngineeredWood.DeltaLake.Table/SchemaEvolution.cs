@@ -94,52 +94,57 @@ internal static class SchemaEvolution
     // Reconciles ONE column against its expected type: a STRUCT whose child set differs from the expected
     // struct (nested ADD/DROP after the file was written) is rebuilt — missing children backfilled as typed
     // all-NULL arrays, extra children dropped, children recursed. Non-structs (and matching structs) pass
-    // through unchanged (reference-equal). Struct children are NOT sliced with the parent, so backfilled
-    // child arrays are sized to the PHYSICAL child length (parent offset + length; see the TakeRows
-    // convention) and the parent's offset/validity are preserved on the rebuilt array.
+    // through unchanged (reference-equal).
     //
     // Lists and maps are recursed through too: a struct INSIDE a list element or a map key/value evolves the same
     // way (Spark: ALTER TABLE ADD COLUMNS (l.element.b ...)), and an old file's element structs must come back in
-    // the table's shape. Only the child is rebuilt; the container keeps its offsets, validity and offset.
+    // the table's shape.
+    //
+    // Only the rows the column covers are reconciled (NestedWindow, #853). A struct's children are not sliced with
+    // it and a list's values span what its offsets index, so a batch sliced from a larger decode shares children
+    // spanning the whole decode: reconciling those built a whole row group's NULL child for every batch. So each
+    // container's children are windowed to its own rows, and one that changes is rebuilt at offset 0 over them.
     private static IArrowArray ReconcileColumn(IArrowArray column, IArrowType expectedType, int logicalLength)
     {
         switch (expectedType, column.Data.DataType)
         {
-            // MapType derives from ListType, so it has to be matched first.
+            // MapType is not a ListType in Apache.Arrow (pinned by MapType_IsNotAListType_SoTheWalkArmOrderIsIrrelevant), so the arm order is free.
             case (MapType em, MapType am):
             {
-                var entries = column.Data.Children[0];
-                var key = ReconcileChild(entries.Children[0], em.KeyField.DataType);
-                var value = ReconcileChild(entries.Children[1], em.ValueField.DataType);
-                if (ReferenceEquals(key, entries.Children[0]) && ReferenceEquals(value, entries.Children[1]))
+                var range = NestedWindow.ElementRange(column.Data);
+                var entries = NestedWindow.Elements(column.Data, range);
+                var pair = NestedWindow.StructChildren(entries);
+                var key = ReconcileChild(pair[0], em.KeyField.DataType);
+                var value = ReconcileChild(pair[1], em.ValueField.DataType);
+                if (ReferenceEquals(key, pair[0]) && ReferenceEquals(value, pair[1]))
                     return column;
                 var mapType = new MapType(
                     WithType(em.KeyField, key.DataType), WithType(em.ValueField, value.DataType), am.KeySorted);
-                var newEntries = new ArrayData(mapType.KeyValueType, entries.Length, entries.NullCount,
-                    entries.Offset, entries.Buffers, [key, value]);
-                return ArrowArrayFactory.BuildArray(new ArrayData(mapType, column.Data.Length,
-                    column.Data.NullCount, column.Data.Offset, column.Data.Buffers, [newEntries]));
+                var newEntries = NestedWindow.Struct(entries, mapType.KeyValueType, [key, value]);
+                return ArrowArrayFactory.BuildArray(NestedWindow.List(column.Data, mapType, range, newEntries));
             }
             case (MapType, _):
             case (_, MapType):
                 return column;
             case (ListType el, ListType):
             {
-                var values = ReconcileChild(column.Data.Children[0], el.ValueDataType);
-                return ReferenceEquals(values, column.Data.Children[0])
+                var range = NestedWindow.ElementRange(column.Data);
+                var elements = NestedWindow.Elements(column.Data, range);
+                var values = ReconcileChild(elements, el.ValueDataType);
+                return ReferenceEquals(values, elements)
                     ? column
-                    : ArrowArrayFactory.BuildArray(new ArrayData(
-                        new ListType(WithType(el.ValueField, values.DataType)), column.Data.Length,
-                        column.Data.NullCount, column.Data.Offset, column.Data.Buffers, [values]));
+                    : ArrowArrayFactory.BuildArray(NestedWindow.List(
+                        column.Data, new ListType(WithType(el.ValueField, values.DataType)), range, values));
             }
             case (LargeListType el, LargeListType):
             {
-                var values = ReconcileChild(column.Data.Children[0], el.ValueDataType);
-                return ReferenceEquals(values, column.Data.Children[0])
+                var range = NestedWindow.ElementRange(column.Data);
+                var elements = NestedWindow.Elements(column.Data, range);
+                var values = ReconcileChild(elements, el.ValueDataType);
+                return ReferenceEquals(values, elements)
                     ? column
-                    : ArrowArrayFactory.BuildArray(new ArrayData(
-                        new LargeListType(WithType(el.ValueField, values.DataType)), column.Data.Length,
-                        column.Data.NullCount, column.Data.Offset, column.Data.Buffers, [values]));
+                    : ArrowArrayFactory.BuildArray(NestedWindow.List(
+                        column.Data, new LargeListType(WithType(el.ValueField, values.DataType)), range, values));
             }
         }
 
@@ -151,38 +156,27 @@ internal static class SchemaEvolution
         for (int i = 0; i < actualStruct.Fields.Count; i++)
             childIndex[actualStruct.Fields[i].Name] = i;
 
-        // The UNSLICED children, from Data.Children: the rebuilt struct keeps sa's offset, and StructArray.Fields
-        // returns each child already sliced by that offset, so building from Fields applied it twice and a sliced
-        // struct read its siblings shifted (or past their end).
-        var unsliced = new IArrowArray[sa.Data.Children.Length];
-        for (int i = 0; i < unsliced.Length; i++)
-            unsliced[i] = ArrowArrayFactory.BuildArray(sa.Data.Children[i]);
-
-        int physicalLength = sa.Data.Offset + sa.Length;
-        foreach (var child in unsliced)
-            physicalLength = System.Math.Max(physicalLength, child.Length);
+        // The children over the struct's own rows: the rebuilt struct starts at offset 0.
+        var windowed = NestedWindow.StructChildren(sa.Data);
 
         bool changed = actualStruct.Fields.Count != expectedStruct.Fields.Count;
-        var children = new List<IArrowArray>(expectedStruct.Fields.Count);
+        var children = new ArrayData[expectedStruct.Fields.Count];
         for (int i = 0; i < expectedStruct.Fields.Count; i++)
         {
             var expectedChild = expectedStruct.Fields[i];
-            IArrowArray reconciled;
             if (childIndex.TryGetValue(expectedChild.Name, out int idx))
             {
                 if (idx != i)
                     changed = true; // reordered relative to the expected layout
-                var child = unsliced[idx];
-                reconciled = ReconcileColumn(child, expectedChild.DataType, child.Length);
-                if (!ReferenceEquals(reconciled, child))
+                children[i] = ReconcileChild(windowed[idx], expectedChild.DataType);
+                if (!ReferenceEquals(children[i], windowed[idx]))
                     changed = true;
             }
             else
             {
-                reconciled = ArrowCompute.MakeNullArray(expectedChild.DataType, physicalLength);
+                children[i] = ArrowCompute.MakeNullArray(expectedChild.DataType, sa.Length).Data;
                 changed = true;
             }
-            children.Add(reconciled);
         }
         if (!changed)
             return column;
@@ -190,16 +184,15 @@ internal static class SchemaEvolution
         // The expected children's names and order, each with the type its array actually has: a child passed
         // through unchanged may carry a type the reconcile does not convert (an old file's millisecond timestamp
         // under a microsecond schema), and declaring the expected one would contradict the buffers.
-        var fields = new List<Field>(children.Count);
-        for (int i = 0; i < children.Count; i++)
-            fields.Add(WithType(expectedStruct.Fields[i], children[i].Data.DataType));
-        return new StructArray(
-            new Apache.Arrow.Types.StructType(fields), sa.Length, children, sa.NullBitmapBuffer, sa.NullCount,
-            sa.Data.Offset);
+        var fields = new List<Field>(children.Length);
+        for (int i = 0; i < children.Length; i++)
+            fields.Add(WithType(expectedStruct.Fields[i], children[i].DataType));
+        return ArrowArrayFactory.BuildArray(
+            NestedWindow.Struct(sa.Data, new Apache.Arrow.Types.StructType(fields), children));
     }
 
-    // A container's child (list values, map keys or values) reconciled against its expected type; `data` itself
-    // when nothing changed.
+    // A container's child (struct field, list values, map keys or values) reconciled against its expected type;
+    // `data` itself when nothing changed.
     private static ArrayData ReconcileChild(ArrayData data, IArrowType expectedType)
     {
         var child = ArrowArrayFactory.BuildArray(data);

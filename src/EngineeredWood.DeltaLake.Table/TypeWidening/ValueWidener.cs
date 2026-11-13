@@ -141,59 +141,62 @@ internal static class ValueWidener
 
     // Widens every leaf under `data` whose type the target puts at the same place, returning `data` itself when
     // nothing changes. Struct children are matched BY NAME, as the top level is: a file's struct may lack a child
-    // added since, or still carry one dropped, and that set is reconciled afterwards. Only the CHILDREN are
-    // rebuilt; each container keeps its own length, offset, validity and offsets buffers. A widened child comes
-    // back with offset 0 and the same length as before, so element i is unchanged and the parent's indexing into
-    // it still holds.
+    // added since, or still carry one dropped, and that set is reconciled afterwards. Only the rows `data` covers are
+    // widened (NestedWindow, #853): a batch sliced from a larger decode shares children spanning the whole decode,
+    // and widening those widened the whole row group for every batch. A container that changes is rebuilt at offset
+    // 0 over its own rows, its children windowed to them.
     private static ArrayData WidenData(ArrayData data, IArrowType target)
     {
         switch (data.DataType, target)
         {
-            // MapType derives from ListType, so it has to be matched first.
+            // MapType is not a ListType in Apache.Arrow (pinned by MapType_IsNotAListType_SoTheWalkArmOrderIsIrrelevant), so the arm order is free.
             case (MapType sm, MapType tm):
             {
-                var entries = data.Children[0];
-                var key = WidenData(entries.Children[0], tm.KeyField.DataType);
-                var value = WidenData(entries.Children[1], tm.ValueField.DataType);
-                if (ReferenceEquals(key, entries.Children[0]) && ReferenceEquals(value, entries.Children[1]))
+                var range = NestedWindow.ElementRange(data);
+                var entries = NestedWindow.Elements(data, range);
+                var pair = NestedWindow.StructChildren(entries);
+                var key = WidenData(pair[0], tm.KeyField.DataType);
+                var value = WidenData(pair[1], tm.ValueField.DataType);
+                if (ReferenceEquals(key, pair[0]) && ReferenceEquals(value, pair[1]))
                     return data;
                 var mapType = new MapType(
                     WithType(sm.KeyField, key.DataType), WithType(sm.ValueField, value.DataType), sm.KeySorted);
-                var newEntries = new ArrayData(mapType.KeyValueType, entries.Length, entries.NullCount,
-                    entries.Offset, entries.Buffers, [key, value]);
-                return new ArrayData(mapType, data.Length, data.NullCount, data.Offset, data.Buffers, [newEntries]);
+                return NestedWindow.List(data, mapType, range, NestedWindow.Struct(entries, mapType.KeyValueType, [key, value]));
             }
             case (MapType, _):
             case (_, MapType):
                 return data;
             case (ListType sl, ListType tl):
             {
-                var values = WidenData(data.Children[0], tl.ValueDataType);
-                return ReferenceEquals(values, data.Children[0])
+                var range = NestedWindow.ElementRange(data);
+                var elements = NestedWindow.Elements(data, range);
+                var values = WidenData(elements, tl.ValueDataType);
+                return ReferenceEquals(values, elements)
                     ? data
-                    : new ArrayData(new ListType(WithType(sl.ValueField, values.DataType)), data.Length,
-                        data.NullCount, data.Offset, data.Buffers, [values]);
+                    : NestedWindow.List(data, new ListType(WithType(sl.ValueField, values.DataType)), range, values);
             }
             case (LargeListType sl, LargeListType tl):
             {
-                var values = WidenData(data.Children[0], tl.ValueDataType);
-                return ReferenceEquals(values, data.Children[0])
+                var range = NestedWindow.ElementRange(data);
+                var elements = NestedWindow.Elements(data, range);
+                var values = WidenData(elements, tl.ValueDataType);
+                return ReferenceEquals(values, elements)
                     ? data
-                    : new ArrayData(new LargeListType(WithType(sl.ValueField, values.DataType)), data.Length,
-                        data.NullCount, data.Offset, data.Buffers, [values]);
+                    : NestedWindow.List(data, new LargeListType(WithType(sl.ValueField, values.DataType)), range, values);
             }
             case (StructType ss, StructType ts):
             {
+                var windowed = NestedWindow.StructChildren(data);
                 ArrayData[]? children = null;
                 for (int i = 0; i < ss.Fields.Count; i++)
                 {
                     int t = ts.GetFieldIndex(ss.Fields[i].Name, StringComparer.Ordinal);
                     if (t < 0)
                         continue;
-                    var child = WidenData(data.Children[i], ts.Fields[t].DataType);
-                    if (ReferenceEquals(child, data.Children[i]))
+                    var child = WidenData(windowed[i], ts.Fields[t].DataType);
+                    if (ReferenceEquals(child, windowed[i]))
                         continue;
-                    children ??= (ArrayData[])data.Children.Clone();
+                    children ??= windowed;
                     children[i] = child;
                 }
                 if (children is null)
@@ -201,8 +204,7 @@ internal static class ValueWidener
                 var fields = new List<Field>(ss.Fields.Count);
                 for (int i = 0; i < ss.Fields.Count; i++)
                     fields.Add(WithType(ss.Fields[i], children[i].DataType));
-                return new ArrayData(new StructType(fields), data.Length, data.NullCount, data.Offset,
-                    data.Buffers, children);
+                return NestedWindow.Struct(data, new StructType(fields), children);
             }
             case (NestedType, _):
             case (_, NestedType):

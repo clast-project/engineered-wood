@@ -45,8 +45,9 @@ internal sealed class ScanReservation
 
     /// <summary>
     /// As <see cref="AddedBytesPerRow"/>, for bytes the host adds per row the reader DECODES rather than per row of
-    /// the batch: what it builds inside a nested column, whose children a batch shares unsliced with the whole decoded
-    /// run (a Delta struct field the file predates is backfilled at the struct's physical length, #852 review round 2).
+    /// the batch: what it adds per element of a list or map, whose elements per row the host knows only on average
+    /// over a row group. A batch's elements may be the row group's in any share (#854 review), but never more than
+    /// all of them, which this many decoded rows bound.
     /// </summary>
     internal long AddedBytesPerDecodedRow { get; set; }
 

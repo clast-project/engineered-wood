@@ -11,8 +11,8 @@ namespace EngineeredWood.DeltaLake.Table;
 public sealed partial class DeltaTable
 {
     /// <summary>What reshaping adds (<see cref="ReconcileAddedBytesPerRow"/>): per row of the batch, and per row the
-    /// read decodes, which is what it builds inside a nested column costs, since a batch shares that column's children
-    /// unsliced with the whole decoded run (<see cref="EngineeredWood.Scans.ScanReservation.AddedBytesPerDecodedRow"/>).</summary>
+    /// read decodes, which is what it adds per element of a list or map
+    /// (<see cref="EngineeredWood.Scans.ScanReservation.AddedBytesPerDecodedRow"/>).</summary>
     internal readonly record struct ReshapeBytes(long PerRow, long PerDecodedRow);
 
     /// <summary>
@@ -32,6 +32,11 @@ public sealed partial class DeltaTable
     /// per struct row; inside a list or map element, per element, taken as <paramref name="leafValuesPerRow"/> of the
     /// file's top-level column (the most leaf values a row holds, which bounds its elements at any depth; one when
     /// unknown). A column the file holds unchanged, or one dropped from the table, adds nothing.
+    /// <para>The reshaping rebuilds a nested column over the batch's own rows (<see cref="NestedWindow"/>, #853), even
+    /// where the batch is sliced from a larger decode, so what it adds is the batch's own. The validity bits and offsets
+    /// that rebuild copies stand in for the raw batch's, so they add nothing. What it adds per element of a list or map
+    /// is per row DECODED, though: the elements per row are a row group's average, and a batch may hold far more than
+    /// its share of them (#854 review). A batch holds no more than the whole row group's, which that bounds.</para>
     /// <para>The file's columns are matched in the names the read gives them: its schema is renamed by the read's own
     /// rule (<see cref="ToLogicalBatch"/>), physical names or field ids to logical, nested ones included.</para>
     /// </summary>
@@ -74,12 +79,12 @@ public sealed partial class DeltaTable
             {
                 elements = Math.Max(1, perRow);
             }
+            // The part under a list or map: what the column adds with its elements counted, less what it adds with
+            // none (EvolvedBits counts what is inside an element per element).
             double evolved = EvolvedBits(type, heldField.DataType, converted, widens, rowsPerRow: 1, elements);
-            // Inside a struct, list or map, the reshaping builds at the children's length: the whole decoded run.
-            if (IsNested(type))
-                decodedBits += evolved;
-            else
-                bits += evolved;
+            double flat = EvolvedBits(type, heldField.DataType, converted, widens, rowsPerRow: 1, elements: 0);
+            bits += flat;
+            decodedBits += evolved - flat;
         }
         return new ReshapeBytes(Bytes(bits), Bytes(decodedBits));
 
@@ -94,13 +99,6 @@ public sealed partial class DeltaTable
 
     /// <summary>A <see cref="ReshapeBytes"/> a reference can publish whole to the units that share a file.</summary>
     private sealed record ReshapeBytesBox(ReshapeBytes Value);
-
-    private static bool IsNested(IArrowType type)
-    {
-        while (type is ExtensionType extension)
-            type = extension.StorageType;
-        return type is Apache.Arrow.Types.StructType or Apache.Arrow.Types.MapType or ListType or LargeListType or FixedSizeListType;
-    }
 
     /// <summary>
     /// The file's top-level fields by the names the read gives them: its schema renamed as a batch of it is
@@ -173,7 +171,7 @@ public sealed partial class DeltaTable
             held = h.StorageType;
         switch (expected, held)
         {
-            // MapType derives from ListType, so it is matched first.
+            // MapType is not a ListType in Apache.Arrow (pinned by MapType_IsNotAListType_SoTheWalkArmOrderIsIrrelevant), so the arm order is free.
             case (Apache.Arrow.Types.MapType em, Apache.Arrow.Types.MapType hm):
                 return EvolvedBits(em.KeyField.DataType, hm.KeyField.DataType, converted, widens, elements, elements)
                     + EvolvedBits(em.ValueField.DataType, hm.ValueField.DataType, converted, widens, elements, elements);
