@@ -97,6 +97,8 @@ internal sealed class ChangeDataFileSink : IAsyncDisposable
     /// <summary>
     /// Adds change rows (in the table's LOGICAL shape, as <see cref="CdfWriter.WriteAsync"/> takes them) under the
     /// partition <paramref name="partitionValues"/> names. Rows of one partition share files in the order added.
+    /// <para>With a <paramref name="lease"/> over the rows and their ids and versions, the caller hands them over: the
+    /// partition's writer lets go of it once they are written (#860). Without one they stay the caller's.</para>
     /// </summary>
     public async ValueTask AddAsync(
         RecordBatch rows,
@@ -104,7 +106,8 @@ internal sealed class ChangeDataFileSink : IAsyncDisposable
         IReadOnlyDictionary<string, string> partitionValues,
         CancellationToken cancellationToken,
         Int64Array? rowIds = null,
-        Int64Array? rowCommitVersions = null)
+        Int64Array? rowCommitVersions = null,
+        BatchLease? lease = null)
     {
         if (rows.Length == 0)
             return;
@@ -116,7 +119,7 @@ internal sealed class ChangeDataFileSink : IAsyncDisposable
         if (string.Equals(changeType, CdfConfig.Insert, StringComparison.Ordinal))
             partition.HoldsInserts = true;
         // No stats are collected for a change file, so the stats batch is never read.
-        await partition.Writer.AddAsync(prepared, prepared, cancellationToken).ConfigureAwait(false);
+        await partition.Writer.AddAsync(prepared, prepared, cancellationToken, lease).ConfigureAwait(false);
         Track(partition);
 
         // A non-positive limit (unvalidated) is taken as one byte. Every pass empties a holding partition, so the

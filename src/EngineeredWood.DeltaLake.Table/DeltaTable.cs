@@ -10942,6 +10942,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 .ReadWrittenChangeFileAsync(_fs, snapshot, file, cancellationToken).ConfigureAwait(false))
             {
                 var movedIds = ids is null ? null : MoveInsertRowIds(ids, changeTypes, sorted);
+                // The rows as read are handed over: the sink's writers release them once every run is written (#860),
+                // and the change types are read here only.
+                using var lease = BatchLease.Of(rows, changeTypes, ids, versions, movedIds);
                 // One AddAsync per run of a change type, so the rows keep their order.
                 int start = 0;
                 for (int i = 1; i <= rows.Length; i++)
@@ -10953,7 +10956,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         rows.Slice(start, length), changeTypes.GetString(start), file.PartitionValues,
                         cancellationToken,
                         (Int64Array?)movedIds?.Slice(start, length),
-                        (Int64Array?)versions?.Slice(start, length)).ConfigureAwait(false);
+                        (Int64Array?)versions?.Slice(start, length),
+                        lease).ConfigureAwait(false);
                     start = i;
                 }
             }
