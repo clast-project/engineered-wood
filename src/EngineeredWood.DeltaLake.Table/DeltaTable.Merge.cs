@@ -290,20 +290,14 @@ public sealed partial class DeltaTable
                     continue; // no row here can hold a source key
 
                 readPaths.Add(addFile.Path);
-                var batches = new List<RecordBatch>();
+                // Each batch is processed as it is read, so a file is never held whole for the MERGE's sake (#728):
+                // with deletion vectors only the post-images are kept; copy-on-write keeps what the rewrite will write.
                 var srcIds = materializeIds ? new List<Int64Array?>() : null;
                 var srcVers = materializeIds ? new List<Int64Array?>() : null;
                 // A deletion vector addresses rows by their position in the file.
                 var srcPositions = copyOnWrite ? null : new List<Int64Array?>();
-                await foreach (var batch in ReadFileAsync(
-                    addFile, null, snapshot, cancellationToken, srcIds, srcVers, srcPositions).ConfigureAwait(false))
-                {
-                    batches.Add(batch);
-                }
-
-                long liveRows = batches.Sum(b => (long)b.Length);
-                var router = new PartitionRouter(
-                    snapshot, mappingMode, batches.FirstOrDefault(b => b.Length > 0), materializeIds);
+                long liveRows = 0;
+                var router = new PartitionRouter(snapshot, mappingMode, materializeIds);
                 bool fileModified = false;
                 long copiedHere = 0;
                 // With deletion vectors: how many live rows the MERGE left alone, and the positions of those it changed.
@@ -314,303 +308,350 @@ public sealed partial class DeltaTable
                 var deletes = new List<RecordBatch>();
                 var updateTracking = new List<(Int64Array? Ids, Int64Array? Vers)>();
                 var deleteTracking = new List<(Int64Array? Ids, Int64Array? Vers)>();
-
-                for (int bi = 0; bi < batches.Count; bi++)
+                var readBuffers = new DmlReadBuffers();
+                BatchLease? changeLease = null;
+                try
                 {
-                    var batch = batches[bi];
-                    var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
-                    var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
-                    int n = batch.Length;
-                    // Each row's fate; for an update or delete, the clause that took it (an index into its kind's
-                    // clauses); and for a matched row, the source row that matched it.
-                    var fate = new byte[n];
-                    var fateClause = new int[n];
-                    var fateSource = new int[n];
-                    var hit = new bool[n];
-
-                    // ON: every (target, source) pair whose keys are equal.
-                    var targetKeys = plan.Keys.Select(k => batch.Column(batch.Schema.GetFieldIndex(k))).ToArray();
-                    var pairTarget = new List<int>();
-                    var pairSource = new List<int>();
-                    for (int i = 0; i < n; i++)
+                    int bi = -1;
+                    await foreach (var batch in ReadFileAsync(
+                        addFile, null, snapshot, cancellationToken, srcIds, srcVers, srcPositions).ConfigureAwait(false))
                     {
-                        if (MergeKeys.Encode(targetKeys, i) is not { } key || !head.TryGetValue(key, out int s))
-                            continue;
-                        hit[i] = true;
-                        if (refuseMultipleMatches && next[s] >= 0)
-                            throw MultipleSourceRowsMatched(addFile.Path);
-                        for (; s >= 0; s = next[s])
+                        bi++;
+                        var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
+                        var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
+                        var positions = srcPositions is not null && bi < srcPositions.Count ? srcPositions[bi] : null;
+                        var raw = readBuffers.Add(batch, positions, batchIds, batchVers);
+                        // What this batch's rows are handed on in, for the rewrite or the change files.
+                        var handedOn = new List<IArrowArray?>();
+                        bool keptWhole = false;
+                        try
                         {
-                            sourceMatched[s] = true;
-                            if (anyMatched)
-                            {
-                                pairTarget.Add(i);
-                                pairSource.Add(s);
-                            }
-                        }
-                    }
+                            int n = batch.Length;
+                            liveRows += n;
+                            router.See(batch);
+                            // Each row's fate; for an update or delete, the clause that took it (an index into its kind's
+                            // clauses); and for a matched row, the source row that matched it.
+                            var fate = new byte[n];
+                            var fateClause = new int[n];
+                            var fateSource = new int[n];
+                            var hit = new bool[n];
 
-                    // WHEN MATCHED [AND condition], in order: a pair takes the first clause whose condition holds,
-                    // and a clause sees only the pairs no earlier one took. Only an unconditional DELETE can see a
-                    // target row twice here.
-                    if (pairTarget.Count > 0)
-                    {
-                        var remaining = Enumerable.Range(0, pairTarget.Count).ToList();
-                        for (int c = 0; c < plan.Matched.Count && remaining.Count > 0; c++)
-                        {
-                            var pending = remaining;
-                            var taken = TakeClause(plan.Matched[c], pending, () => MergeConditionBatch(
-                                plan.AsBound(TakeRowsFromBatch(batch, pending.Select(p => pairTarget[p]).ToList())),
-                                TakeRowsFromBatch(src!, pending.Select(p => pairSource[p]).ToList())), out remaining);
-                            byte kind = plan.Matched[c].Kind == MergeActionKind.Delete ? MergeMatchedDelete : MergeUpdate;
-                            foreach (int p in taken)
+                            // ON: every (target, source) pair whose keys are equal.
+                            var targetKeys = plan.Keys.Select(k => batch.Column(batch.Schema.GetFieldIndex(k))).ToArray();
+                            var pairTarget = new List<int>();
+                            var pairSource = new List<int>();
+                            for (int i = 0; i < n; i++)
                             {
-                                int t = pairTarget[p];
-                                if (fate[t] != MergeCopy)
+                                if (MergeKeys.Encode(targetKeys, i) is not { } key || !head.TryGetValue(key, out int s))
                                     continue;
-                                fate[t] = kind;
-                                fateClause[t] = c;
-                                fateSource[t] = pairSource[p];
+                                hit[i] = true;
+                                if (refuseMultipleMatches && next[s] >= 0)
+                                    throw MultipleSourceRowsMatched(addFile.Path);
+                                for (; s >= 0; s = next[s])
+                                {
+                                    sourceMatched[s] = true;
+                                    if (anyMatched)
+                                    {
+                                        pairTarget.Add(i);
+                                        pairSource.Add(s);
+                                    }
+                                }
                             }
-                        }
-                    }
 
-                    // WHEN NOT MATCHED BY SOURCE [AND condition], in order, over the target rows no source row's
-                    // keys equal.
-                    if (plan.NotMatchedBySource.Count > 0)
-                    {
-                        var remaining = new List<int>();
-                        for (int i = 0; i < n; i++)
-                        {
-                            if (!hit[i])
-                                remaining.Add(i);
-                        }
-                        for (int c = 0; c < plan.NotMatchedBySource.Count && remaining.Count > 0; c++)
-                        {
-                            var pending = remaining;
-                            var taken = TakeClause(plan.NotMatchedBySource[c], pending,
-                                () => MergeConditionBatch(
-                                    plan.AsBound(pending.Count == n ? batch : TakeRowsFromBatch(batch, pending)), null),
-                                out remaining);
-                            byte kind = plan.NotMatchedBySource[c].Kind == MergeActionKind.Delete
-                                ? MergeSourcelessDelete : MergeSourcelessUpdate;
-                            foreach (int t in taken)
+                            // WHEN MATCHED [AND condition], in order: a pair takes the first clause whose condition holds,
+                            // and a clause sees only the pairs no earlier one took. Only an unconditional DELETE can see a
+                            // target row twice here.
+                            if (pairTarget.Count > 0)
                             {
-                                fate[t] = kind;
-                                fateClause[t] = c;
+                                var remaining = Enumerable.Range(0, pairTarget.Count).ToList();
+                                for (int c = 0; c < plan.Matched.Count && remaining.Count > 0; c++)
+                                {
+                                    var pending = remaining;
+                                    var taken = TakeClause(plan.Matched[c], pending, () => MergeConditionBatch(
+                                        plan.AsBound(TakeRowsFromBatch(batch, pending.Select(p => pairTarget[p]).ToList())),
+                                        TakeRowsFromBatch(src!, pending.Select(p => pairSource[p]).ToList())), out remaining);
+                                    byte kind = plan.Matched[c].Kind == MergeActionKind.Delete ? MergeMatchedDelete : MergeUpdate;
+                                    foreach (int p in taken)
+                                    {
+                                        int t = pairTarget[p];
+                                        if (fate[t] != MergeCopy)
+                                            continue;
+                                        fate[t] = kind;
+                                        fateClause[t] = c;
+                                        fateSource[t] = pairSource[p];
+                                    }
+                                }
                             }
-                        }
-                    }
 
-                    var keepRows = new List<int>();
-                    var deleteRows = new List<int>();
-                    // The updated rows, grouped by the clause that took them: each clause sets its own columns.
-                    var updateGroups = new SortedDictionary<(byte Fate, int Clause), (List<int> Rows, List<int> Sources)>();
-                    for (int i = 0; i < n; i++)
-                    {
-                        switch (fate[i])
-                        {
-                            case MergeUpdate:
-                            case MergeSourcelessUpdate:
-                                if (!updateGroups.TryGetValue((fate[i], fateClause[i]), out var group))
-                                    updateGroups[(fate[i], fateClause[i])] = group = (new List<int>(), new List<int>());
-                                group.Rows.Add(i);
-                                group.Sources.Add(fateSource[i]);
-                                break;
-                            case MergeMatchedDelete:
-                                matchedDeleted++;
-                                deleteRows.Add(i);
-                                break;
-                            case MergeSourcelessDelete:
-                                sourcelessDeleted++;
-                                deleteRows.Add(i);
-                                break;
-                            default:
-                                keepRows.Add(i);
-                                break;
-                        }
-                    }
+                            // WHEN NOT MATCHED BY SOURCE [AND condition], in order, over the target rows no source row's
+                            // keys equal.
+                            if (plan.NotMatchedBySource.Count > 0)
+                            {
+                                var remaining = new List<int>();
+                                for (int i = 0; i < n; i++)
+                                {
+                                    if (!hit[i])
+                                        remaining.Add(i);
+                                }
+                                for (int c = 0; c < plan.NotMatchedBySource.Count && remaining.Count > 0; c++)
+                                {
+                                    var pending = remaining;
+                                    var taken = TakeClause(plan.NotMatchedBySource[c], pending,
+                                        () => MergeConditionBatch(
+                                            plan.AsBound(pending.Count == n ? batch : TakeRowsFromBatch(batch, pending)), null),
+                                        out remaining);
+                                    byte kind = plan.NotMatchedBySource[c].Kind == MergeActionKind.Delete
+                                        ? MergeSourcelessDelete : MergeSourcelessUpdate;
+                                    foreach (int t in taken)
+                                    {
+                                        fate[t] = kind;
+                                        fateClause[t] = c;
+                                    }
+                                }
+                            }
 
-                    if (updateGroups.Count == 0 && deleteRows.Count == 0)
-                    {
-                        if (copyOnWrite)
-                        {
-                            router.Add(batch, batchIds is not null && batchVers is not null
-                                ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null, mayMove: false);
-                            copiedHere += n;
-                        }
-                        else
-                        {
-                            keptHere += n;
-                        }
-                        continue;
-                    }
+                            var keepRows = new List<int>();
+                            var deleteRows = new List<int>();
+                            // The updated rows, grouped by the clause that took them: each clause sets its own columns.
+                            var updateGroups = new SortedDictionary<(byte Fate, int Clause), (List<int> Rows, List<int> Sources)>();
+                            for (int i = 0; i < n; i++)
+                            {
+                                switch (fate[i])
+                                {
+                                    case MergeUpdate:
+                                    case MergeSourcelessUpdate:
+                                        if (!updateGroups.TryGetValue((fate[i], fateClause[i]), out var group))
+                                            updateGroups[(fate[i], fateClause[i])] = group = (new List<int>(), new List<int>());
+                                        group.Rows.Add(i);
+                                        group.Sources.Add(fateSource[i]);
+                                        break;
+                                    case MergeMatchedDelete:
+                                        matchedDeleted++;
+                                        deleteRows.Add(i);
+                                        break;
+                                    case MergeSourcelessDelete:
+                                        sourcelessDeleted++;
+                                        deleteRows.Add(i);
+                                        break;
+                                    default:
+                                        keepRows.Add(i);
+                                        break;
+                                }
+                            }
 
-                    if (changedPositions is not null)
-                    {
-                        var positions = bi < srcPositions!.Count ? srcPositions[bi] : null;
-                        for (int i = 0; i < n; i++)
-                        {
-                            if (fate[i] == MergeCopy)
+                            if (updateGroups.Count == 0 && deleteRows.Count == 0)
+                            {
+                                if (copyOnWrite)
+                                {
+                                    // Released with the file, once the rewrite has written it.
+                                    router.Add(batch, batchIds is not null && batchVers is not null
+                                        ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null, mayMove: false);
+                                    copiedHere += n;
+                                    keptWhole = true;
+                                }
+                                else
+                                {
+                                    keptHere += n;
+                                }
                                 continue;
-                            if (positions is null || positions.IsNull(i))
-                            {
-                                throw new InvalidOperationException(
-                                    $"MERGE could not resolve the position of a row it changed in '{addFile.Path}', "
-                                    + "which a deletion vector needs. Pass RowDeleteMode.CopyOnWrite in "
-                                    + "MergeOptions.DeleteMode to rewrite the file instead.");
                             }
-                            changedPositions.Add(positions.GetValue(i)!.Value);
+
+                            if (changedPositions is not null)
+                            {
+                                for (int i = 0; i < n; i++)
+                                {
+                                    if (fate[i] == MergeCopy)
+                                        continue;
+                                    if (positions is null || positions.IsNull(i))
+                                    {
+                                        throw new InvalidOperationException(
+                                            $"MERGE could not resolve the position of a row it changed in '{addFile.Path}', "
+                                            + "which a deletion vector needs. Pass RowDeleteMode.CopyOnWrite in "
+                                            + "MergeOptions.DeleteMode to rewrite the file instead.");
+                                    }
+                                    changedPositions.Add(positions.GetValue(i)!.Value);
+                                }
+                            }
+
+                            if (!fileModified)
+                            {
+                                // Before this file writes anything. (The transaction takes back what earlier files wrote.)
+                                ThrowIfAppendOnly(snapshot, "MERGE");
+                                fileModified = true;
+                            }
+
+                            foreach (var entry in updateGroups)
+                            {
+                                bool isMatched = entry.Key.Fate == MergeUpdate;
+                                var clause = isMatched ? plan.Matched[entry.Key.Clause] : plan.NotMatchedBySource[entry.Key.Clause];
+                                var (updateRows, updateSources) = entry.Value;
+                                if (isMatched)
+                                    matchedUpdated += updateRows.Count;
+                                else
+                                    sourcelessUpdated += updateRows.Count;
+                                var preimage = TakeRowsFromBatch(batch, updateRows);
+                                // Kept for the change files alone: the post-image's own entries keep what the rewrite reads.
+                                if (cdfEnabled)
+                                    handedOn.Add(preimage);
+                                var postimage = MergePostImage(
+                                    preimage,
+                                    isMatched
+                                        ? TakeRowsFromBatch(
+                                            clause.SourceColumns is { } read ? ProjectColumns(src!, read) : src!, updateSources)
+                                        : null,
+                                    clause, snapshot);
+                                handedOn.Add(postimage);
+                                ThrowIfUpdaterChangedTypes(preimage, postimage, snapshot.Schema, "MERGE");
+                                ThrowIfPartitionColumnsRetyped(postimage, snapshot, "MERGE");
+                                postimage = PreparePostImage(
+                                    postimage, snapshot, generatedColumns, constraints, clause.WrittenColumns);
+                                handedOn.Add(postimage);
+
+                                // An updated row keeps its id; its commit version advances to this commit, materialized as
+                                // NULL so it follows the new file's defaultRowCommitVersion through a rebase (see UPDATE).
+                                var ids = batchIds is not null ? TakeIds(batchIds, updateRows) : null;
+                                handedOn.Add(ids);
+                                router.Add(postimage, ids is not null
+                                    ? (ids, AllNullInt64(updateRows.Count))
+                                    : ((Int64Array, Int64Array)?)null, mayMove: true);
+
+                                if (cdfEnabled)
+                                {
+                                    preimages.Add(preimage);
+                                    postimages.Add(postimage);
+                                    var vers = batchVers is not null ? TakeIds(batchVers, updateRows) : null;
+                                    handedOn.Add(vers);
+                                    updateTracking.Add((ids, vers));
+                                }
+                            }
+
+                            if (deleteRows.Count > 0 && cdfEnabled)
+                            {
+                                var deleted = TakeRowsFromBatch(batch, deleteRows);
+                                var tracking = (
+                                    batchIds is not null ? TakeIds(batchIds, deleteRows) : null,
+                                    batchVers is not null ? TakeIds(batchVers, deleteRows) : null);
+                                deletes.Add(deleted);
+                                deleteTracking.Add(tracking);
+                                handedOn.AddRange([deleted, tracking.Item1, tracking.Item2]);
+                            }
+
+                            if (keepRows.Count > 0 && !copyOnWrite)
+                            {
+                                // They stay in the file, whose deletion vector masks only the changed rows.
+                                keptHere += keepRows.Count;
+                            }
+                            else if (keepRows.Count > 0)
+                            {
+                                // Unchanged rows of a changed file: original id and commit version.
+                                var kept = TakeRowsFromBatch(batch, keepRows);
+                                var keptTracking = batchIds is not null && batchVers is not null
+                                    ? (TakeIds(batchIds, keepRows), TakeIds(batchVers, keepRows))
+                                    : ((Int64Array, Int64Array)?)null;
+                                handedOn.AddRange([kept, keptTracking?.Item1, keptTracking?.Item2]);
+                                router.Add(kept, keptTracking, mayMove: false);
+                                copiedHere += keepRows.Count;
+                            }
+                        }
+                        finally
+                        {
+                            // A batch gathered from is released now, but what its gathers share.
+                            if (!keptWhole)
+                                DmlReadBuffers.ReleaseBatch(raw, handedOn);
                         }
                     }
 
                     if (!fileModified)
+                        continue;
+
+                    if (copyOnWrite || keptHere == 0)
                     {
-                        // Before this file writes anything. (The transaction takes back what earlier files wrote.)
-                        ThrowIfAppendOnly(snapshot, "MERGE");
-                        fileModified = true;
+                        // Rewritten without its changed rows; or, with none of its live rows left alone, removed, with the
+                        // post-images written to a new file, as Spark removes such a file even with deletion vectors.
+                        copied += copiedHere;
+                        rowId = await WriteRewriteGroupsAsync(
+                            snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
+                            assignRowIds, rowId, newVersion, rewriteActions, written, cancellationToken)
+                            .ConfigureAwait(false);
                     }
-
-                    foreach (var entry in updateGroups)
+                    else
                     {
-                        bool isMatched = entry.Key.Fate == MergeUpdate;
-                        var clause = isMatched ? plan.Matched[entry.Key.Clause] : plan.NotMatchedBySource[entry.Key.Clause];
-                        var (updateRows, updateSources) = entry.Value;
-                        if (isMatched)
-                            matchedUpdated += updateRows.Count;
-                        else
-                            sourcelessUpdated += updateRows.Count;
-                        var preimage = TakeRowsFromBatch(batch, updateRows);
-                        var postimage = MergePostImage(
-                            preimage,
-                            isMatched
-                                ? TakeRowsFromBatch(
-                                    clause.SourceColumns is { } read ? ProjectColumns(src!, read) : src!, updateSources)
-                                : null,
-                            clause, snapshot);
-                        ThrowIfUpdaterChangedTypes(preimage, postimage, snapshot.Schema, "MERGE");
-                        ThrowIfPartitionColumnsRetyped(postimage, snapshot, "MERGE");
-                        postimage = PreparePostImage(
-                            postimage, snapshot, generatedColumns, constraints, clause.WrittenColumns);
-
-                        // An updated row keeps its id; its commit version advances to this commit, materialized as
-                        // NULL so it follows the new file's defaultRowCommitVersion through a rebase (see UPDATE).
-                        var ids = batchIds is not null ? TakeIds(batchIds, updateRows) : null;
-                        router.Add(postimage, ids is not null
-                            ? (ids, AllNullInt64(updateRows.Count))
-                            : ((Int64Array, Int64Array)?)null, mayMove: true);
-
-                        if (cdfEnabled)
+                        // Before anything of this file is written: a vector a foreign reader would ignore is never
+                        // written into a table that does not enable them (#524).
+                        if (!deletionVectorsEnabled)
                         {
-                            preimages.Add(preimage);
-                            postimages.Add(postimage);
-                            updateTracking.Add((ids, batchVers is not null ? TakeIds(batchVers, updateRows) : null));
+                            throw new InvalidOperationException(
+                                "MERGE was asked to mask rows of a data file with a deletion vector, and this table does not "
+                                + "have deletion vectors enabled. Pass RowDeleteMode.CopyOnWrite (or no mode) in "
+                                + "MergeOptions.DeleteMode to rewrite the affected files instead, or create the table with "
+                                + "DeltaTable.CreateAsync(..., enableDeletionVectors: true).");
                         }
+
+                        // The post-images alone: the unchanged rows stay where they are.
+                        rowId = await WriteRewriteGroupsAsync(
+                            snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
+                            assignRowIds, rowId, newVersion, rewriteActions, written, cancellationToken,
+                            removeSource: false).ConfigureAwait(false);
+
+                        var existing = addFile.DeletionVector is not null
+                            ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
+                            : DeletionVectorBitmap.Empty;
+                        var newDv = await dvWriter!.CreateAsync(
+                            existing.Union(DeletionVectors.DeletionVectorBuilder.SortedDistinct(changedPositions!), null),
+                            cancellationToken).ConfigureAwait(false);
+                        // The vector is ours; the file it masks is not: the re-add names live table data.
+                        written?.RecordDeletionVector(newDv);
+                        rewriteActions.Add(RemoveOf(addFile));
+                        rewriteActions.Add(addFile with
+                        {
+                            DeletionVector = newDv,
+                            DataChange = true,
+                            // The read skipped only the rows the existing vector hid, so the two give the physical count.
+                            Stats = StatsWithLooseBounds(addFile.GetStatsJson(), liveRows + existing.Count),
+                        });
+                        maskedPaths.Add(addFile.Path);
                     }
+                    removedPaths.Add(addFile.Path);
 
-                    if (deleteRows.Count > 0 && cdfEnabled)
-                    {
-                        deletes.Add(TakeRowsFromBatch(batch, deleteRows));
-                        deleteTracking.Add((
-                            batchIds is not null ? TakeIds(batchIds, deleteRows) : null,
-                            batchVers is not null ? TakeIds(batchVers, deleteRows) : null));
-                    }
+                    if (changeData is null)
+                        continue;
 
-                    if (keepRows.Count > 0 && !copyOnWrite)
-                    {
-                        // They stay in the file, whose deletion vector masks only the changed rows.
-                        keptHere += keepRows.Count;
-                    }
-                    else if (keepRows.Count > 0)
-                    {
-                        // Unchanged rows of a changed file: original id and commit version.
-                        router.Add(TakeRowsFromBatch(batch, keepRows), batchIds is not null && batchVers is not null
-                            ? (TakeIds(batchIds, keepRows), TakeIds(batchVers, keepRows))
-                            : ((Int64Array, Int64Array)?)null, mayMove: false);
-                        copiedHere += keepRows.Count;
-                    }
-                }
-
-                if (!fileModified)
-                    continue;
-
-                if (copyOnWrite || keptHere == 0)
-                {
-                    // Rewritten without its changed rows; or, with none of its live rows left alone, removed, with the
-                    // post-images written to a new file, as Spark removes such a file even with deletion vectors.
-                    copied += copiedHere;
-                    rowId = await WriteRewriteGroupsAsync(
-                        snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
-                        assignRowIds, rowId, newVersion, rewriteActions, written, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                else
-                {
-                    // Before anything of this file is written: a vector a foreign reader would ignore is never
-                    // written into a table that does not enable them (#524).
-                    if (!deletionVectorsEnabled)
-                    {
-                        throw new InvalidOperationException(
-                            "MERGE was asked to mask rows of a data file with a deletion vector, and this table does not "
-                            + "have deletion vectors enabled. Pass RowDeleteMode.CopyOnWrite (or no mode) in "
-                            + "MergeOptions.DeleteMode to rewrite the affected files instead, or create the table with "
-                            + "DeltaTable.CreateAsync(..., enableDeletionVectors: true).");
-                    }
-
-                    // The post-images alone: the unchanged rows stay where they are.
-                    rowId = await WriteRewriteGroupsAsync(
-                        snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
-                        assignRowIds, rowId, newVersion, rewriteActions, written, cancellationToken,
-                        removeSource: false).ConfigureAwait(false);
-
-                    var existing = addFile.DeletionVector is not null
-                        ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
-                        : DeletionVectorBitmap.Empty;
-                    var newDv = await dvWriter!.CreateAsync(
-                        existing.Union(DeletionVectors.DeletionVectorBuilder.SortedDistinct(changedPositions!), null),
-                        cancellationToken).ConfigureAwait(false);
-                    // The vector is ours; the file it masks is not: the re-add names live table data.
-                    written?.RecordDeletionVector(newDv);
-                    rewriteActions.Add(RemoveOf(addFile));
-                    rewriteActions.Add(addFile with
-                    {
-                        DeletionVector = newDv,
-                        DataChange = true,
-                        // The read skipped only the rows the existing vector hid, so the two give the physical count.
-                        Stats = StatsWithLooseBounds(addFile.GetStatsJson(), liveRows + existing.Count),
-                    });
-                    maskedPaths.Add(addFile.Path);
-                }
-                removedPaths.Add(addFile.Path);
-
-                if (changeData is null)
-                    continue;
-
-                // The change rows, each from the one read that also fed the rewrite, so a row's stable id in the
-                // feed is the id the rewrite preserved.
-                for (int b = 0; b < deletes.Count; b++)
-                {
-                    await changeData.AddAsync(
-                        deletes[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete, addFile.PartitionValues,
-                        cancellationToken, deleteTracking[b].Ids, deleteTracking[b].Vers).ConfigureAwait(false);
-                }
-                for (int b = 0; b < preimages.Count; b++)
-                {
-                    var (ids, vers) = updateTracking[b];
-                    await changeData.AddAsync(
-                        preimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage, addFile.PartitionValues,
-                        cancellationToken, ids, vers).ConfigureAwait(false);
-
-                    // A post-image row belongs to the partition the row now lives in.
-                    // NULL: the change file's reader resolves it to the commit that wrote it, wherever a rebase lands it.
-                    var postVers = ids is not null ? AllNullInt64(postimages[b].Length) : null;
-                    foreach (var (target, _, post, aligned) in router.Split(postimages[b], ids, postVers))
+                    // The change rows, each from the one read that also fed the rewrite, so a row's stable id in the
+                    // feed is the id the rewrite preserved.
+                    changeLease = readBuffers.HandToChangeFiles(ChangeRowsOf());
+                    for (int b = 0; b < deletes.Count; b++)
                     {
                         await changeData.AddAsync(
-                            post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage, target ?? addFile.PartitionValues,
-                            cancellationToken, aligned[0], aligned[1]).ConfigureAwait(false);
+                            deletes[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete, addFile.PartitionValues,
+                            cancellationToken, deleteTracking[b].Ids, deleteTracking[b].Vers, changeLease)
+                            .ConfigureAwait(false);
+                    }
+                    for (int b = 0; b < preimages.Count; b++)
+                    {
+                        var (ids, vers) = updateTracking[b];
+                        await changeData.AddAsync(
+                            preimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage, addFile.PartitionValues,
+                            cancellationToken, ids, vers, changeLease).ConfigureAwait(false);
+
+                        // A post-image row belongs to the partition the row now lives in.
+                        // NULL: the change file's reader resolves it to the commit that wrote it, wherever a rebase lands it.
+                        var postVers = ids is not null ? AllNullInt64(postimages[b].Length) : null;
+                        foreach (var (target, _, post, aligned) in router.Split(postimages[b], ids, postVers))
+                        {
+                            await changeData.AddAsync(
+                                post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage, target ?? addFile.PartitionValues,
+                                cancellationToken, aligned[0], aligned[1], changeLease).ConfigureAwait(false);
+                        }
                     }
                 }
+                finally
+                {
+                    // The change files release their rows once written; without any, everything read goes now.
+                    (changeLease ?? readBuffers.HandToChangeFiles(ChangeRowsOf())).Dispose();
+                }
+
+                IEnumerable<IArrowArray?> ChangeRowsOf() => ChangeRows(
+                    deletes.Concat(preimages).Concat(postimages), deleteTracking.Concat(updateTracking));
             }
 
             return rowId;

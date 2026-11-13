@@ -5137,6 +5137,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             snapshot.Metadata.Configuration);
         // Every file's deleted rows go to the same change files, one per partition (#723).
         await using var changeData = cdfEnabled ? NewChangeDataSink(snapshot, written) : null;
+        // Captured change rows not yet handed to the change files: released however the delete ends (#867 review).
+        using var unhanded = new UnhandedCaptures();
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             snapshot.Metadata.Configuration);
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
@@ -5226,6 +5228,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
             var newDeletedIndices = new List<long>(); // ascending: batches come in file order
             var deletedRowBatches = new List<RecordBatch>(); // For CDC
+            // Paired 1:1 with deletedRowBatches: the buffers of the selected batch each was built from, released once
+            // its change file is written. A gather of a view column shares the read's data buffers (#865).
+            var deletedRowBuffers = new List<RawBatchBuffers>();
             // Paired 1:1 with deletedRowBatches: each deleted row's STABLE id + commit version, for the change
             // file. A deletion vector moves no row, so a row's identity here is exactly what it already was.
             var deletedRowTracking = new List<(Int64Array Ids, Int64Array Vers)>();
@@ -5441,8 +5446,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // A selected batch holds only the deleted rows, each at the file position `where` gives.
             void CaptureSelected(RecordBatch batch, RowPositions where)
             {
+                var raw = RawBatchBuffers.Of(batch);
                 var (logicalBatch, rawMatIds, rawMatVers) = ToDeletedRowsShape(batch);
                 deletedRowBatches.Add(logicalBatch);
+                deletedRowBuffers.Add(raw);
+                unhanded.Add(raw);
                 if (!rowTrackingEnabled)
                     return;
                 var ids = new Int64Array.Builder().Reserve(batch.Length);
@@ -5542,9 +5550,12 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 for (int b = 0; b < deletedRowBatches.Count; b++)
                 {
                     var trk = b < deletedRowTracking.Count ? deletedRowTracking[b] : ((Int64Array, Int64Array)?)null;
+                    // Handed over: the change file releases what the read decoded for them once they are written.
+                    unhanded.Hand(deletedRowBuffers[b]);
+                    using var lease = new BatchLease(deletedRowBuffers[b]);
                     await changeData.AddAsync(
                         deletedRowBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                        addFile.PartitionValues, cancellationToken, trk?.Item1, trk?.Item2).ConfigureAwait(false);
+                        addFile.PartitionValues, cancellationToken, trk?.Item1, trk?.Item2, lease).ConfigureAwait(false);
                 }
             }
         }
@@ -5941,23 +5952,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             if (pruner is not null && !pruner.ShouldInclude(addFile, prunePredicate!))
                 continue; // stats prove no row here matches — nothing to update, skip the read
 
-            // Read file data with DV filtering. When materializing row ids, ask ReadFileAsync to surface each
-            // surviving row's resolved id + commit version, row-aligned per emitted batch.
-            var batches = new List<RecordBatch>();
+            // Each batch is processed as it is read, so a file is never held whole for the UPDATE's sake (#728): with
+            // deletion vectors only the post-images are kept; copy-on-write keeps what the rewrite will write. When
+            // materializing row ids, ReadFileAsync surfaces each surviving row's resolved id + commit version,
+            // row-aligned per emitted batch.
             var srcIds = materializeIds ? new List<Int64Array?>() : null;
             var srcVers = materializeIds ? new List<Int64Array?>() : null;
             // A deletion vector addresses rows by their position in the file.
             var srcPositions = copyOnWrite ? null : new List<Int64Array?>();
-            await foreach (var batch in ReadFileAsync(
-                addFile, null, snapshot, cancellationToken, srcIds, srcVers, srcPositions).ConfigureAwait(false))
-            {
-                batches.Add(batch);
-            }
-
-            if (batches.Count == 0)
-                continue;
-
-            long liveRows = batches.Sum(b => (long)b.Length);
+            long liveRows = 0;
 
             // Evaluate predicate and apply updates
             bool fileModified = false;
@@ -5969,203 +5972,247 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // no tracking). An UPDATE keeps EVERY row (matched rows updated in place, the rest copied), so each
             // output row carries its source id; a matched row's version is NULL (the new add's default, so this
             // commit's), an untouched row keeps its original.
-            var router = new PartitionRouter(
-                snapshot, mappingMode, batches.FirstOrDefault(b => b.Length > 0), materializeIds);
+            var router = new PartitionRouter(snapshot, mappingMode, materializeIds);
             var preimages = new List<RecordBatch>();
             var postimages = new List<RecordBatch>();
             // Paired 1:1 with preimages/postimages: the identity to materialize in each change file.
             var changeTracking = new List<(Int64Array PreIds, Int64Array PreVers,
                                            Int64Array PostIds, Int64Array PostVers)>();
-
-            for (int bi = 0; bi < batches.Count; bi++)
+            var read = new DmlReadBuffers();
+            BatchLease? changeLease = null;
+            try
             {
-                var batch = batches[bi];
-                var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
-                var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
-                var mask = predicate(batch);
-                int matchCount = CountTrue(mask);
-
-                if (matchCount == 0)
+                int bi = -1;
+                await foreach (var batch in ReadFileAsync(
+                    addFile, null, snapshot, cancellationToken, srcIds, srcVers, srcPositions).ConfigureAwait(false))
                 {
-                    if (copyOnWrite)
+                    bi++;
+                    var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
+                    var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
+                    var positions = srcPositions is not null && bi < srcPositions.Count ? srcPositions[bi] : null;
+                    var raw = read.Add(batch, positions, batchIds, batchVers);
+                    // What this batch's rows are handed on in, for the rewrite or the change files.
+                    var handedOn = new List<IArrowArray?>();
+                    bool keptWhole = false;
+                    try
                     {
-                        // Untouched but (once the file is modified) rewritten: keep every row's original id + version.
-                        router.Add(batch, batchIds is not null && batchVers is not null
-                            ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null, mayMove: false);
+                        liveRows += batch.Length;
+                        router.See(batch);
+                        var mask = predicate(batch);
+                        int matchCount = CountTrue(mask);
+
+                        if (matchCount == 0)
+                        {
+                            if (copyOnWrite)
+                            {
+                                // Untouched but (once the file is modified) rewritten: keep every row's original id +
+                                // version. Released with the file, once the rewrite has written it.
+                                router.Add(batch, batchIds is not null && batchVers is not null
+                                    ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null, mayMove: false);
+                                keptWhole = true;
+                            }
+                            else
+                            {
+                                keptHere += batch.Length; // they stay in the file
+                            }
+                            continue;
+                        }
+
+                        fileModified = true;
+                        totalUpdated += matchCount;
+
+                        var matchRows = new List<int>();
+                        var keepRows = new List<int>();
+
+                        for (int i = 0; i < batch.Length; i++)
+                        {
+                            if (!mask.IsNull(i) && mask.GetValue(i) == true)
+                                matchRows.Add(i);
+                            else
+                                keepRows.Add(i);
+                        }
+
+                        if (changedPositions is not null)
+                        {
+                            foreach (int i in matchRows)
+                            {
+                                if (positions is null || positions.IsNull(i))
+                                {
+                                    throw new InvalidOperationException(
+                                        $"UPDATE could not resolve the position of a row it changed in '{addFile.Path}', "
+                                        + "which a deletion vector needs. Pass RowDeleteMode.CopyOnWrite as the UPDATE's "
+                                        + "mode to rewrite the file instead.");
+                                }
+                                changedPositions.Add(positions.GetValue(i)!.Value);
+                            }
+                        }
+
+                        if (matchRows.Count > 0)
+                        {
+                            var matchBatch = TakeRowsFromBatch(batch, matchRows);
+                            // Kept for the change files alone: the post-image's own entries keep what the rewrite reads.
+                            if (cdfEnabled)
+                                handedOn.Add(matchBatch);
+                            var updatedBatch = updater(matchBatch);
+                            handedOn.Add(updatedBatch);
+                            ThrowIfUpdaterChangedTypes(matchBatch, updatedBatch, snapshot.Schema);
+                            ThrowIfUpdaterChangedIdentity(matchBatch, updatedBatch, snapshot.Schema);
+                            ThrowIfPartitionColumnsRetyped(updatedBatch, snapshot, "UPDATE");
+
+                            // Only the post-image. Rows the predicate did not match are copied through
+                            // untouched: they were already in the table, so re-checking them would refuse
+                            // an unrelated UPDATE over data another engine wrote under semantics we do not
+                            // share, and would be work with nothing to find.
+                            // As the write path does: partition values as stored before any expression reads them, then
+                            // a NULL the table declares impossible refused. The partition columns in their canonical
+                            // Arrow forms first, as on the write path: the rule reads only those (a StringView's empty
+                            // string went through unrefused).
+                            updatedBatch = PreparePostImage(updatedBatch, snapshot, generatedColumns, constraints);
+                            handedOn.Add(updatedBatch);
+
+                            // Matched rows keep their id; their commit version advances to this commit (they changed). It is
+                            // materialized as NULL, so a reader takes the new file's defaultRowCommitVersion, as Spark's
+                            // UPDATE leaves it: a commit that rebases past a concurrent one re-derives that default for the
+                            // version it lands at, and a materialized value would keep the version first attempted.
+                            var matchIds = batchIds is not null ? TakeIds(batchIds, matchRows) : null;
+                            handedOn.Add(matchIds);
+                            router.Add(updatedBatch, matchIds is not null
+                                ? (matchIds, AllNullInt64(matchRows.Count))
+                                : ((Int64Array, Int64Array)?)null, mayMove: true);
+
+                            // Collect preimage and postimage for CDC, each with the touched rows' identity. Both images
+                            // are the SAME rows, so both carry the same ids; only the commit version differs — the
+                            // pre-image belongs to the version that last wrote it, the post-image to this one (NULL, which
+                            // a change file's reader resolves to the commit that wrote it, wherever a rebase lands it).
+                            if (cdfEnabled)
+                            {
+                                preimages.Add(matchBatch);
+                                postimages.Add(updatedBatch);
+                                if (rowTrackingEnabled)
+                                {
+                                    var ids = matchIds ?? AllNullInt64(matchRows.Count);
+                                    var trk = (
+                                        ids,
+                                        batchVers is not null ? TakeIds(batchVers, matchRows) : AllNullInt64(matchRows.Count),
+                                        ids,
+                                        AllNullInt64(matchRows.Count));
+                                    changeTracking.Add(trk);
+                                    handedOn.AddRange([trk.Item1, trk.Item2, trk.Item4]);
+                                }
+                            }
+                        }
+
+                        if (keepRows.Count > 0 && !copyOnWrite)
+                        {
+                            // They stay in the file, whose deletion vector masks only the updated rows.
+                            keptHere += keepRows.Count;
+                        }
+                        else if (keepRows.Count > 0)
+                        {
+                            // Untouched rows in a modified file: original id + original commit version.
+                            var kept = TakeRowsFromBatch(batch, keepRows);
+                            var keptTracking = batchIds is not null && batchVers is not null
+                                ? (TakeIds(batchIds, keepRows), TakeIds(batchVers, keepRows))
+                                : ((Int64Array, Int64Array)?)null;
+                            handedOn.AddRange([kept, keptTracking?.Item1, keptTracking?.Item2]);
+                            router.Add(kept, keptTracking, mayMove: false);
+                        }
                     }
-                    else
+                    finally
                     {
-                        keptHere += batch.Length; // they stay in the file
+                        // A batch gathered from is released now, but what its gathers share.
+                        if (!keptWhole)
+                            DmlReadBuffers.ReleaseBatch(raw, handedOn);
                     }
+                }
+
+                if (!fileModified)
                     continue;
-                }
 
-                fileModified = true;
-                totalUpdated += matchCount;
-
-                var matchRows = new List<int>();
-                var keepRows = new List<int>();
-
-                for (int i = 0; i < batch.Length; i++)
+                if (copyOnWrite || keptHere == 0)
                 {
-                    if (!mask.IsNull(i) && mask.GetValue(i) == true)
-                        matchRows.Add(i);
-                    else
-                        keepRows.Add(i);
+                    // Each destination as its own file: the stayers under the source's partition directory, each moved
+                    // group under its new one. The remove, adds and statistics are built as the row-level rewrites build
+                    // them. With deletion vectors and no live row left alone, the file is removed and the post-images
+                    // written to a new file, as Spark removes such a file.
+                    nextRowId = await WriteRewriteGroupsAsync(
+                        snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
+                        assignRowIds, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
                 }
-
-                if (changedPositions is not null)
+                else
                 {
-                    var positions = bi < srcPositions!.Count ? srcPositions[bi] : null;
-                    foreach (int i in matchRows)
+                    // Before anything of this file is written: a vector a foreign reader would ignore is never written
+                    // into a table that does not enable them (#524).
+                    if (!deletionVectorsEnabled)
                     {
-                        if (positions is null || positions.IsNull(i))
-                        {
-                            throw new InvalidOperationException(
-                                $"UPDATE could not resolve the position of a row it changed in '{addFile.Path}', "
-                                + "which a deletion vector needs. Pass RowDeleteMode.CopyOnWrite as the UPDATE's "
-                                + "mode to rewrite the file instead.");
-                        }
-                        changedPositions.Add(positions.GetValue(i)!.Value);
+                        throw new InvalidOperationException(
+                            "UPDATE was asked to mask rows of a data file with a deletion vector, and this table does not "
+                            + "have deletion vectors enabled. Pass RowDeleteMode.CopyOnWrite (or no mode) as the UPDATE's "
+                            + "mode to rewrite the affected files instead, or create the table with "
+                            + "DeltaTable.CreateAsync(..., enableDeletionVectors: true).");
                     }
-                }
 
-                if (matchRows.Count > 0)
-                {
-                    var matchBatch = TakeRowsFromBatch(batch, matchRows);
-                    var updatedBatch = updater(matchBatch);
-                    ThrowIfUpdaterChangedTypes(matchBatch, updatedBatch, snapshot.Schema);
-                    ThrowIfUpdaterChangedIdentity(matchBatch, updatedBatch, snapshot.Schema);
-                    ThrowIfPartitionColumnsRetyped(updatedBatch, snapshot, "UPDATE");
+                    // The post-images alone, each under the partition its row now belongs to: the other rows stay put.
+                    nextRowId = await WriteRewriteGroupsAsync(
+                        snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
+                        assignRowIds, nextRowId, newVersion, actions, written, cancellationToken,
+                        removeSource: false).ConfigureAwait(false);
 
-                    // Only the post-image. Rows the predicate did not match are copied through
-                    // untouched: they were already in the table, so re-checking them would refuse
-                    // an unrelated UPDATE over data another engine wrote under semantics we do not
-                    // share, and would be work with nothing to find.
-                    // As the write path does: partition values as stored before any expression reads them, then
-                    // a NULL the table declares impossible refused. The partition columns in their canonical
-                    // Arrow forms first, as on the write path: the rule reads only those (a StringView's empty
-                    // string went through unrefused).
-                    updatedBatch = PreparePostImage(updatedBatch, snapshot, generatedColumns, constraints);
-
-                    // Matched rows keep their id; their commit version advances to this commit (they changed). It is
-                    // materialized as NULL, so a reader takes the new file's defaultRowCommitVersion, as Spark's
-                    // UPDATE leaves it: a commit that rebases past a concurrent one re-derives that default for the
-                    // version it lands at, and a materialized value would keep the version first attempted.
-                    router.Add(updatedBatch, batchIds is not null
-                        ? (TakeIds(batchIds, matchRows), AllNullInt64(matchRows.Count))
-                        : ((Int64Array, Int64Array)?)null, mayMove: true);
-
-                    // Collect preimage and postimage for CDC, each with the touched rows' identity. Both images
-                    // are the SAME rows, so both carry the same ids; only the commit version differs — the
-                    // pre-image belongs to the version that last wrote it, the post-image to this one (NULL, which
-                    // a change file's reader resolves to the commit that wrote it, wherever a rebase lands it).
-                    if (cdfEnabled)
+                    var existing = addFile.DeletionVector is not null
+                        ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
+                        : DeletionVectors.DeletionVectorBitmap.Empty;
+                    var newDv = await dvWriter!.CreateAsync(
+                        existing.Union(DeletionVectors.DeletionVectorBuilder.SortedDistinct(changedPositions!), null),
+                        cancellationToken).ConfigureAwait(false);
+                    // The vector is ours; the file it masks is not: the re-add names live table data.
+                    written?.RecordDeletionVector(newDv);
+                    actions.Add(RemoveOf(addFile));
+                    actions.Add(addFile with
                     {
-                        preimages.Add(matchBatch);
-                        postimages.Add(updatedBatch);
-                        if (rowTrackingEnabled)
-                        {
-                            var ids = batchIds is not null
-                                ? TakeIds(batchIds, matchRows) : AllNullInt64(matchRows.Count);
-                            changeTracking.Add((
-                                ids,
-                                batchVers is not null ? TakeIds(batchVers, matchRows) : AllNullInt64(matchRows.Count),
-                                ids,
-                                AllNullInt64(matchRows.Count)));
-                        }
-                    }
+                        DeletionVector = newDv,
+                        DataChange = true,
+                        // The read skipped only the rows the existing vector hid, so the two give the physical count.
+                        Stats = StatsWithLooseBounds(addFile.GetStatsJson(), liveRows + existing.Count),
+                    });
                 }
+                removedPaths.Add(addFile.Path);
 
-                if (keepRows.Count > 0 && !copyOnWrite)
+                // The update pre- and post-images, into the operation's change files.
+                if (changeData is not null)
                 {
-                    // They stay in the file, whose deletion vector masks only the updated rows.
-                    keptHere += keepRows.Count;
-                }
-                else if (keepRows.Count > 0)
-                {
-                    // Untouched rows in a modified file: original id + original commit version.
-                    router.Add(TakeRowsFromBatch(batch, keepRows), batchIds is not null && batchVers is not null
-                        ? (TakeIds(batchIds, keepRows), TakeIds(batchVers, keepRows))
-                        : ((Int64Array, Int64Array)?)null, mayMove: false);
-                }
-            }
-
-            if (!fileModified)
-                continue;
-
-            if (copyOnWrite || keptHere == 0)
-            {
-                // Each destination as its own file: the stayers under the source's partition directory, each moved
-                // group under its new one. The remove, adds and statistics are built as the row-level rewrites build
-                // them. With deletion vectors and no live row left alone, the file is removed and the post-images
-                // written to a new file, as Spark removes such a file.
-                nextRowId = await WriteRewriteGroupsAsync(
-                    snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
-                    assignRowIds, nextRowId, newVersion, actions, written, cancellationToken).ConfigureAwait(false);
-            }
-            else
-            {
-                // Before anything of this file is written: a vector a foreign reader would ignore is never written
-                // into a table that does not enable them (#524).
-                if (!deletionVectorsEnabled)
-                {
-                    throw new InvalidOperationException(
-                        "UPDATE was asked to mask rows of a data file with a deletion vector, and this table does not "
-                        + "have deletion vectors enabled. Pass RowDeleteMode.CopyOnWrite (or no mode) as the UPDATE's "
-                        + "mode to rewrite the affected files instead, or create the table with "
-                        + "DeltaTable.CreateAsync(..., enableDeletionVectors: true).");
-                }
-
-                // The post-images alone, each under the partition its row now belongs to: the other rows stay put.
-                nextRowId = await WriteRewriteGroupsAsync(
-                    snapshot, addFile, mappingMode, router, materializeIds, matRowIdName, matRowVerName,
-                    assignRowIds, nextRowId, newVersion, actions, written, cancellationToken,
-                    removeSource: false).ConfigureAwait(false);
-
-                var existing = addFile.DeletionVector is not null
-                    ? await _dvReader.ReadAsync(addFile.DeletionVector, cancellationToken).ConfigureAwait(false)
-                    : DeletionVectors.DeletionVectorBitmap.Empty;
-                var newDv = await dvWriter!.CreateAsync(
-                    existing.Union(DeletionVectors.DeletionVectorBuilder.SortedDistinct(changedPositions!), null),
-                    cancellationToken).ConfigureAwait(false);
-                // The vector is ours; the file it masks is not: the re-add names live table data.
-                written?.RecordDeletionVector(newDv);
-                actions.Add(RemoveOf(addFile));
-                actions.Add(addFile with
-                {
-                    DeletionVector = newDv,
-                    DataChange = true,
-                    // The read skipped only the rows the existing vector hid, so the two give the physical count.
-                    Stats = StatsWithLooseBounds(addFile.GetStatsJson(), liveRows + existing.Count),
-                });
-            }
-            removedPaths.Add(addFile.Path);
-
-            // The update pre- and post-images, into the operation's change files.
-            if (changeData is not null)
-            {
-                for (int b = 0; b < preimages.Count; b++)
-                {
-                    var trk = b < changeTracking.Count ? changeTracking[b] : default;
-                    await changeData.AddAsync(
-                        preimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
-                        addFile.PartitionValues, cancellationToken, trk.PreIds, trk.PreVers).ConfigureAwait(false);
-                }
-                for (int b = 0; b < postimages.Count; b++)
-                {
-                    var trk = b < changeTracking.Count ? changeTracking[b] : default;
-                    // A post-image row belongs to the partition the row now lives in, so the change files split
-                    // as the data did.
-                    foreach (var (target, _, post, aligned) in router.Split(postimages[b], trk.PostIds, trk.PostVers))
+                    changeLease = read.HandToChangeFiles(ChangeRowsOf());
+                    for (int b = 0; b < preimages.Count; b++)
                     {
+                        var trk = b < changeTracking.Count ? changeTracking[b] : default;
                         await changeData.AddAsync(
-                            post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
-                            target ?? addFile.PartitionValues, cancellationToken, aligned[0], aligned[1])
+                            preimages[b], DeltaLake.ChangeDataFeed.CdfConfig.UpdatePreimage,
+                            addFile.PartitionValues, cancellationToken, trk.PreIds, trk.PreVers, changeLease)
                             .ConfigureAwait(false);
                     }
+                    for (int b = 0; b < postimages.Count; b++)
+                    {
+                        var trk = b < changeTracking.Count ? changeTracking[b] : default;
+                        // A post-image row belongs to the partition the row now lives in, so the change files split
+                        // as the data did.
+                        foreach (var (target, _, post, aligned) in router.Split(postimages[b], trk.PostIds, trk.PostVers))
+                        {
+                            await changeData.AddAsync(
+                                post, DeltaLake.ChangeDataFeed.CdfConfig.UpdatePostimage,
+                                target ?? addFile.PartitionValues, cancellationToken, aligned[0], aligned[1], changeLease)
+                                .ConfigureAwait(false);
+                        }
+                    }
                 }
             }
+            finally
+            {
+                // The change files release their rows once written; without any, everything read goes now.
+                (changeLease ?? read.HandToChangeFiles(ChangeRowsOf())).Dispose();
+            }
+
+            IEnumerable<IArrowArray?> ChangeRowsOf() => ChangeRows(
+                preimages.Concat(postimages),
+                changeTracking.SelectMany(t => new[] { ((Int64Array?)t.PreIds, (Int64Array?)t.PreVers), (t.PostIds, t.PostVers) }));
         }
 
         if (changeData is not null)
@@ -6313,6 +6360,93 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
 
     private static RecordBatch TakeRowsFromBatch(RecordBatch batch, List<int> rows) =>
         ArrowCompute.Take(batch, batch.Schema, rows);
+
+    /// <summary>
+    /// The decoded buffers of the batches a DML reads from one file, with the per-row arrays the read hands with each
+    /// (positions, row ids, versions), released once nothing reads them (#865). Nothing disposed them before, so each
+    /// file a DML read left its whole decode for the collector, out of sight of the memory budget.
+    /// <para>A batch whose rows are only gathered is released as soon as its gathers are built, keeping what they share
+    /// (a gather of a view or dictionary column shares the read's buffers): <see cref="ReleaseBatch"/>. A batch kept
+    /// whole, for the rewrite to write, is released with the file, once the rewrite is written:
+    /// <see cref="HandToChangeFiles"/>. The operation's change files write their rows later, so those rows, and the
+    /// read's buffers they share, go to them under a lease, and are released once written. Releasing a buffer twice
+    /// releases it once, so a batch released early is safely recorded for the file too.</para>
+    /// </summary>
+    private sealed class DmlReadBuffers
+    {
+        private RawBatchBuffers? _file;
+
+        /// <summary>Records <paramref name="batch"/> as read, with <paramref name="alongside"/>; returns its buffers,
+        /// for <see cref="ReleaseBatch"/>.</summary>
+        public RawBatchBuffers Add(RecordBatch batch, params Int64Array?[] alongside)
+        {
+            var raw = RawBatchBuffers.Of(batch);
+            _file = _file is null ? RawBatchBuffers.Of(batch) : _file.And(batch);
+            foreach (var array in alongside)
+            {
+                raw.And(array);
+                _file.And(array);
+            }
+            return raw;
+        }
+
+        /// <summary>Releases one batch's buffers but those <paramref name="handedOn"/> holds: what was built from the
+        /// batch and kept for the rewrite or the change files.</summary>
+        public static void ReleaseBatch(RawBatchBuffers raw, List<IArrowArray?> handedOn) =>
+            raw.ReleaseAllBut(null, handedOn.ToArray());
+
+        /// <summary>
+        /// Once the rewrite is written (or abandoned): releases every batch read from the file but the buffers
+        /// <paramref name="changeRows"/> share, and returns a lease, held by the caller, over those. The caller hands
+        /// the change rows to the change files under it and disposes it; the last change file to write them releases
+        /// them. Disposing it at once releases them too.
+        /// <para>Only what the read decoded: a change row's other buffers are gathers (managed), or may be the caller's
+        /// own (a MERGE source's column, an array an UPDATE's updater hands back for every batch), which are not this
+        /// operation's to release.</para>
+        /// </summary>
+        public BatchLease HandToChangeFiles(IEnumerable<IArrowArray?> changeRows)
+        {
+            var held = _file?.ReleaseAllBut(null, changeRows.ToArray()) ?? RawBatchBuffers.None();
+            _file = null;
+            return new BatchLease(held);
+        }
+    }
+
+    /// <summary>
+    /// What a deletion-vector DELETE's scan captured for the change files and has not handed them yet (#865). A capture
+    /// is handed to the change files under a lease once its file's deletion vector is decided; one still here when the
+    /// delete ends, because a scan, a vector write or a change file failed or was cancelled, is released then.
+    /// </summary>
+    private sealed class UnhandedCaptures : IDisposable
+    {
+        private readonly List<RawBatchBuffers> _captures = [];
+
+        public void Add(RawBatchBuffers capture) => _captures.Add(capture);
+
+        /// <summary>The capture is the change files' now, under a lease.</summary>
+        public void Hand(RawBatchBuffers capture) => _captures.Remove(capture);
+
+        public void Dispose()
+        {
+            foreach (var capture in _captures)
+                capture.ReleaseAll();
+            _captures.Clear();
+        }
+    }
+
+    /// <summary>The change rows a DML hands its change files, with their ids and versions
+    /// (<see cref="DmlReadBuffers.HandToChangeFiles"/>).</summary>
+    private static IEnumerable<IArrowArray?> ChangeRows(
+        IEnumerable<RecordBatch>? rows, IEnumerable<(Int64Array? Ids, Int64Array? Vers)>? tracking)
+    {
+        foreach (var batch in rows ?? [])
+            yield return batch;
+        foreach (var (ids, vers) in tracking ?? [])
+        {
+            yield return ids;
+            yield return vers;
+        }
+    }
 
     #endregion
 
@@ -10854,33 +10988,42 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             bi++;
             var absPos = bi < absOut.Count ? absOut[bi] : null;
-            if (absPos is null)
-                continue;
-            var delRows = new List<int>();
-            for (int i = 0; i < batch.Length; i++)
+            var batchIds = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
+            var batchVers = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
+            // The change file is written whole before the next batch is read, so nothing reads this one after (#865).
+            var raw = RawBatchBuffers.Of(batch).And(absPos).And(batchIds).And(batchVers);
+            try
             {
-                if (absPos.IsNull(i))
+                if (absPos is null)
                     continue;
-                long position = absPos.GetValue(i)!.Value;
-                while (next < targets.Length && targets[next] < position)
-                    next++;
-                if (next < targets.Length && targets[next] == position)
-                    delRows.Add(i);
+                var delRows = new List<int>();
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    if (absPos.IsNull(i))
+                        continue;
+                    long position = absPos.GetValue(i)!.Value;
+                    while (next < targets.Length && targets[next] < position)
+                        next++;
+                    if (next < targets.Length && targets[next] == position)
+                        delRows.Add(i);
+                }
+                if (delRows.Count > 0)
+                {
+                    files.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
+                        _fs, snapshot, TakeRowsFromBatch(batch, delRows), DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                        addFile.PartitionValues, DataFileWriteOptions(snapshot),
+                        cancellationToken,
+                        batchIds is not null ? TakeIds(batchIds, delRows) : null,
+                        batchVers is not null ? TakeIds(batchVers, delRows) : null,
+                        written).ConfigureAwait(false));
+                    found += delRows.Count;
+                    if (found == targets.Length)
+                        break; // every deleted row is written; the rest of the file holds none
+                }
             }
-            if (delRows.Count > 0)
+            finally
             {
-                var batchIds = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
-                var batchVers = versOut is not null && bi < versOut.Count ? versOut[bi] : null;
-                files.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
-                    _fs, snapshot, TakeRowsFromBatch(batch, delRows), DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                    addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                    cancellationToken,
-                    batchIds is not null ? TakeIds(batchIds, delRows) : null,
-                    batchVers is not null ? TakeIds(batchVers, delRows) : null,
-                    written).ConfigureAwait(false));
-                found += delRows.Count;
-                if (found == targets.Length)
-                    break; // every deleted row is written; the rest of the file holds none
+                raw.ReleaseAll();
             }
         }
         return files;
@@ -10907,15 +11050,25 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                                                   strippedRowIdsOut: idsOut).ConfigureAwait(false))
         {
             bi++;
-            if (batch.Length == 0)
-                continue;
-            files.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
-                _fs, snapshot, batch, DeltaLake.ChangeDataFeed.CdfConfig.Insert,
-                addFile.PartitionValues, DataFileWriteOptions(snapshot),
-                cancellationToken,
-                idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null,
-                rowCommitVersions: null,
-                written).ConfigureAwait(false));
+            var batchIds = idsOut is not null && bi < idsOut.Count ? idsOut[bi] : null;
+            // The change file is written whole before the next batch is read, so nothing reads this one after (#865).
+            var raw = RawBatchBuffers.Of(batch).And(batchIds);
+            try
+            {
+                if (batch.Length == 0)
+                    continue;
+                files.Add(await ChangeDataFeed.CdfWriter.WriteAsync(
+                    _fs, snapshot, batch, DeltaLake.ChangeDataFeed.CdfConfig.Insert,
+                    addFile.PartitionValues, DataFileWriteOptions(snapshot),
+                    cancellationToken,
+                    batchIds,
+                    rowCommitVersions: null,
+                    written).ConfigureAwait(false));
+            }
+            finally
+            {
+                raw.ReleaseAll();
+            }
         }
         return files;
     }
@@ -11122,84 +11275,106 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var deletedTracking = cdfEnabled ? new List<(Int64Array? Ids, Int64Array? Vers)>() : null;
             long deletedHere = 0;
             int bi = -1;
-            await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
-                                                      srcIds, srcVers, absOut).ConfigureAwait(false))
+            var read = new DmlReadBuffers();
+            BatchLease? changeLease = null;
+            try
             {
-                bi++;
-                var absPos = bi < absOut.Count ? absOut[bi] : null;
-                var keepRows = new List<int>();
-                var delRows = cdfEnabled ? new List<int>() : null;
-                for (int i = 0; i < batch.Length; i++)
+                await foreach (var batch in ReadFileAsync(addFile, null, snapshot, cancellationToken,
+                                                          srcIds, srcVers, absOut).ConfigureAwait(false))
                 {
-                    long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
-                        ? absPos.GetValue(i)!.Value : i;
-                    if (targets.Contains(abs))
+                    bi++;
+                    var absPos = bi < absOut.Count ? absOut[bi] : null;
+                    var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
+                    var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
+                    var raw = read.Add(batch, absPos, batchIds, batchVers);
+                    var keepRows = new List<int>();
+                    var delRows = cdfEnabled ? new List<int>() : null;
+                    for (int i = 0; i < batch.Length; i++)
                     {
-                        deletedHere++;
-                        delRows?.Add(i);
+                        long abs = absPos is not null && i < absPos.Length && !absPos.IsNull(i)
+                            ? absPos.GetValue(i)!.Value : i;
+                        if (targets.Contains(abs))
+                        {
+                            deletedHere++;
+                            delRows?.Add(i);
+                        }
+                        else
+                        {
+                            keepRows.Add(i);
+                        }
                     }
-                    else
-                    {
-                        keepRows.Add(i);
-                    }
-                }
-                var batchIds = srcIds is not null && bi < srcIds.Count ? srcIds[bi] : null;
-                var batchVers = srcVers is not null && bi < srcVers.Count ? srcVers[bi] : null;
 
-                if (delRows is { Count: > 0 })
-                {
-                    deletedBatches!.Add(TakeRowsFromBatch(batch, delRows));
-                    deletedTracking!.Add((
-                        batchIds is not null ? TakeIds(batchIds, delRows) : null,
-                        batchVers is not null ? TakeIds(batchVers, delRows) : null));
+                    if (keepRows.Count == batch.Length && batch.Length > 0)
+                    {
+                        // Kept whole: released with the file, once the rewrite has written it.
+                        outputBatches.Add(batch);
+                        outTracking?.Add(batchIds is not null && batchVers is not null
+                            ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null);
+                        continue;
+                    }
+
+                    // Gathered from: released now, but what the gathers share.
+                    var handedOn = new List<IArrowArray?>(6);
+                    if (delRows is { Count: > 0 })
+                    {
+                        var deleted = TakeRowsFromBatch(batch, delRows);
+                        var tracking = (
+                            batchIds is not null ? TakeIds(batchIds, delRows) : null,
+                            batchVers is not null ? TakeIds(batchVers, delRows) : null);
+                        deletedBatches!.Add(deleted);
+                        deletedTracking!.Add(tracking);
+                        handedOn.AddRange([deleted, tracking.Item1, tracking.Item2]);
+                    }
+                    if (keepRows.Count > 0)
+                    {
+                        var kept = TakeRowsFromBatch(batch, keepRows);
+                        var tracking = batchIds is not null && batchVers is not null
+                            ? (TakeIds(batchIds, keepRows), TakeIds(batchVers, keepRows))
+                            : ((Int64Array, Int64Array)?)null;
+                        outputBatches.Add(kept);
+                        outTracking?.Add(tracking);
+                        handedOn.AddRange([kept, tracking?.Item1, tracking?.Item2]);
+                    }
+                    DmlReadBuffers.ReleaseBatch(raw, handedOn);
                 }
-                if (keepRows.Count == 0)
+
+                if (deletedHere == 0)
                     continue;
+                totalDeleted += deletedHere;
 
-                if (keepRows.Count == batch.Length)
+                var (remove, add, addedRows) = await RewriteRowsToNewFileAsync(
+                    snapshot, addFile, mappingMode, outputBatches, outTracking, materializeIds,
+                    matRowIdName, matRowVerName, assignRowIds, nextRowId, newVersion,
+                    cancellationToken, written).ConfigureAwait(false);
+                actions.Add(remove);
+                removedPaths.Add(addFile.Path);
+                if (add is not null)
                 {
-                    outputBatches.Add(batch);
-                    outTracking?.Add(batchIds is not null && batchVers is not null
-                        ? (batchIds, batchVers) : ((Int64Array, Int64Array)?)null);
+                    actions.Add(add);
+                    if (assignRowIds)
+                        nextRowId += addedRows;
                 }
-                else
+
+                // The deleted rows, into the operation's change files. Without them the reader would INFER the feed from
+                // remove(old)+add(new) — reporting every surviving row as deleted and re-inserted; a version that
+                // carries cdc actions is read cdc-only, so these rows are the whole truth of the change.
+                if (deletedBatches is not null)
                 {
-                    outputBatches.Add(TakeRowsFromBatch(batch, keepRows));
-                    outTracking?.Add(batchIds is not null && batchVers is not null
-                        ? (TakeIds(batchIds, keepRows), TakeIds(batchVers, keepRows))
-                        : ((Int64Array, Int64Array)?)null);
+                    changeLease = read.HandToChangeFiles(ChangeRows(deletedBatches, deletedTracking));
+                    for (int b = 0; b < deletedBatches.Count; b++)
+                    {
+                        var trk = deletedTracking![b];
+                        await changeData!.AddAsync(
+                            deletedBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
+                            addFile.PartitionValues, cancellationToken, trk.Ids, trk.Vers, changeLease)
+                            .ConfigureAwait(false);
+                    }
                 }
             }
-
-            if (deletedHere == 0)
-                continue;
-            totalDeleted += deletedHere;
-
-            var (remove, add, addedRows) = await RewriteRowsToNewFileAsync(
-                snapshot, addFile, mappingMode, outputBatches, outTracking, materializeIds,
-                matRowIdName, matRowVerName, assignRowIds, nextRowId, newVersion,
-                cancellationToken, written).ConfigureAwait(false);
-            actions.Add(remove);
-            removedPaths.Add(addFile.Path);
-            if (add is not null)
+            finally
             {
-                actions.Add(add);
-                if (assignRowIds)
-                    nextRowId += addedRows;
-            }
-
-            // The deleted rows, into the operation's change files. Without them the reader would INFER the feed from
-            // remove(old)+add(new) — reporting every surviving row as deleted and re-inserted; a version that
-            // carries cdc actions is read cdc-only, so these rows are the whole truth of the change.
-            if (deletedBatches is not null)
-            {
-                for (int b = 0; b < deletedBatches.Count; b++)
-                {
-                    var trk = deletedTracking![b];
-                    await changeData!.AddAsync(
-                        deletedBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
-                        addFile.PartitionValues, cancellationToken, trk.Ids, trk.Vers).ConfigureAwait(false);
-                }
+                // The change files release their rows once written; without any, everything read goes now.
+                (changeLease ?? read.HandToChangeFiles(ChangeRows(deletedBatches, deletedTracking))).Dispose();
             }
         }
 
@@ -11410,20 +11585,35 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     {
         private readonly IReadOnlyList<string> _partitionColumns;
         private readonly IReadOnlyDictionary<string, string> _logicalToPhysical;
-        private readonly string? _sourceKey;
+        private string? _sourceKey;
         private readonly Dictionary<string, RewriteGroup> _moved = new(StringComparer.Ordinal);
+
+        /// <summary>A router for a file routed as it is read: each batch is shown to <see cref="See"/> before it is
+        /// routed.</summary>
+        public PartitionRouter(Snapshot.Snapshot snapshot, ColumnMappingMode mappingMode, bool tracked)
+        {
+            _partitionColumns = snapshot.Metadata.PartitionColumns;
+            _logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
+            Stay = new RewriteGroup(null, tracked);
+            _tracked = tracked;
+        }
 
         /// <param name="sourceRow">A batch read from the source file, so carrying its partition values; null
         /// when nothing was read, in which case every row stays.</param>
         public PartitionRouter(
             Snapshot.Snapshot snapshot, ColumnMappingMode mappingMode, RecordBatch? sourceRow, bool tracked)
+            : this(snapshot, mappingMode, tracked)
         {
-            _partitionColumns = snapshot.Metadata.PartitionColumns;
-            _logicalToPhysical = ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mappingMode);
-            if (_partitionColumns.Count > 0 && sourceRow is { Length: > 0 })
+            if (sourceRow is not null)
+                See(sourceRow);
+        }
+
+        /// <summary>Takes the source file's partition values from <paramref name="sourceRow"/>, a batch read from it,
+        /// unless an earlier batch gave them. Until a batch with rows is seen, every row stays.</summary>
+        public void See(RecordBatch sourceRow)
+        {
+            if (_sourceKey is null && _partitionColumns.Count > 0 && sourceRow.Length > 0)
                 _sourceKey = Partitioning.PartitionUtils.GroupRows(sourceRow.Slice(0, 1), _partitionColumns)[0].Key;
-            Stay = new RewriteGroup(null, tracked);
-            _tracked = tracked;
         }
 
         private readonly bool _tracked;
