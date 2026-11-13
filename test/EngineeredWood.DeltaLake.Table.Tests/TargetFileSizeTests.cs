@@ -189,6 +189,62 @@ public class TargetFileSizeTests : IDisposable
         Assert.Equal(Range(0, 1000), await ReadIdsAsync(table));
     }
 
+    /// <summary>
+    /// A byte limit near <see cref="long.MaxValue"/> (cut by rows only) lets a whole batch through in one piece.
+    /// <c>byteRoom * rows</c> overflowed there, and the writer took one row per slice: the layout came out right,
+    /// but a write ran 10-40x slower (#870).
+    /// </summary>
+    [Theory]
+    [InlineData(long.MaxValue)]
+    [InlineData(long.MaxValue / 2)]
+    [InlineData(1L << 40)]
+    public void AHugeByteLimit_TakesTheWholeBatch(long byteRoom)
+    {
+        Assert.Equal(1_000_000, RollingDataFileWriter.RowsInByteRoom(byteRoom, 1_000_000, 150_000_000));
+        Assert.Equal(int.MaxValue, RollingDataFileWriter.RowsInByteRoom(byteRoom, int.MaxValue, 1L << 39));
+    }
+
+    /// <summary>Below the batch's bytes, the room is the rows' share rounded up to a whole row, at least one, also
+    /// where <c>byteRoom * rows</c> exceeds a <see langword="long"/>.</summary>
+    [Theory]
+    [InlineData(250L, 1000L, 1000L, 250L)]
+    [InlineData(251L, 1000L, 1000L, 251L)]
+    [InlineData(1L, 1000L, 1000L, 1L)]
+    [InlineData(1L, 1000L, 1_000_000L, 1L)]
+    [InlineData(333L, 1000L, 999L, 334L)]
+    [InlineData((1L << 61) + 1, 8L, 1L << 62, 5L)]
+    [InlineData(long.MaxValue - 1, int.MaxValue, long.MaxValue, int.MaxValue)]
+    public void TheByteRoom_IsTheRowsShareRoundedUp(long byteRoom, long rows, long batchBytes, long expected) =>
+        Assert.Equal(expected, RollingDataFileWriter.RowsInByteRoom(byteRoom, rows, batchBytes));
+
+    /// <summary>A slice is charged its rows' share of the batch's bytes, rounded down, exactly even where
+    /// <c>batchBytes * rows</c> exceeds a <see langword="long"/>.</summary>
+    [Theory]
+    [InlineData(1000L, 250L, 1000L, 250L)]
+    [InlineData(1000L, 1L, 3L, 333L)]
+    [InlineData(long.MaxValue, int.MaxValue - 1L, int.MaxValue, long.MaxValue - 4294967298L - 1)]
+    public void ASlicesBytes_AreItsShareOfTheBatch(long batchBytes, long rows, long batchRows, long expected) =>
+        Assert.Equal(expected, RollingDataFileWriter.ShareOfBytes(batchBytes, rows, batchRows));
+
+    /// <summary>End to end: with no byte limit to speak of, rows alone decide the row groups.</summary>
+    [Fact]
+    public async Task AHugeByteLimit_CutsByRowsAlone()
+    {
+        var options = new DeltaTableOptions
+        {
+            ParquetWriteOptions = ParquetWriteOptions.Default with { RowGroupMaxRows = 1000, RowGroupMaxBytes = long.MaxValue },
+        };
+        await using var table = await DeltaTable.CreateAsync(Fs, BuildSchema(), options);
+        await table.WriteAsync([Batch(0, 2500)]);
+
+        var file = Assert.Single(table.CurrentSnapshot.ActiveFiles.Values);
+        await using var stream = await Fs.OpenReadAsync(DeltaPath.Decode(file.Path));
+        using var reader = new ParquetFileReader(stream, ownsFile: false);
+        var groups = (await reader.ReadMetadataAsync()).RowGroups.Select(g => g.NumRows).ToList();
+        Assert.Equal([1000L, 1000L, 500L], groups);
+        Assert.Equal(Range(0, 2500), await ReadIdsAsync(table));
+    }
+
     /// <summary>Batches that straddle a row-group boundary are cut there, so every row group but the last is
     /// full.</summary>
     [Fact]
