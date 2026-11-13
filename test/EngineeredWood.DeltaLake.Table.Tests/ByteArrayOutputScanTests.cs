@@ -261,6 +261,64 @@ public class ByteArrayOutputScanTests : IDisposable
         Assert.Equal([0L, 2L, 3L], ids);
     }
 
+    /// <summary>
+    /// A MERGE assignment that is a bare column reference hands the column on in the layout the read gave it, a view
+    /// or a large string, uncopied by the evaluator (#863 review), and the write still takes it.
+    /// </summary>
+    [Theory]
+    [InlineData(ByteArrayOutputKind.Default)]
+    [InlineData(ByteArrayOutputKind.ViewType)]
+    [InlineData(ByteArrayOutputKind.LargeOffsets)]
+    public async Task AMergeAssigningStringColumnsWorksUnderEachRepresentation(ByteArrayOutputKind kind)
+    {
+        string path = await WriteTableAsync();
+        var fs = new LocalTableFileSystem(path);
+        await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions
+        {
+            ParquetReadOptions = new ParquetReadOptions { ByteArrayOutput = kind },
+        });
+
+        var sourceSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int64Type.Default, false))
+            .Field(new Field("note", StringViewType.Default, true))
+            .Build();
+        var source = new RecordBatch(sourceSchema,
+            [new Int64Array.Builder().Append(1).Append(4).Build(),
+             new StringViewArray.Builder().Append("source-1").Append("source-4").Build()], 2);
+
+        static EngineeredWood.Expressions.Expression Side(string side, string column) =>
+            EngineeredWood.Expressions.UnboundReference.FromParts([side, column]);
+
+        await table.MergeAsync([source], new MergeOptions
+        {
+            Keys = ["id"],
+            WhenMatched =
+            [
+                MergeAction.UpdateSet(
+                    new MergeAssignment("note", Side("source", "note")),
+                    new MergeAssignment("extra", Side("target", "note"))),
+            ],
+        });
+
+        var rows = new Dictionary<long, string>();
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Columns = ["id", "note", "extra"] }))
+        {
+            using (batch)
+            {
+                for (int r = 0; r < batch.Length; r++)
+                {
+                    long id = ((Int64Array)batch.Column(0)).GetValue(r)!.Value;
+                    rows[id] = Value(batch.Column(1), r) + "|" + Value(batch.Column(2), r);
+                }
+            }
+        }
+
+        Assert.Equal("source-1|note-1", rows[1]);
+        Assert.Equal("source-4|note-4", rows[4]);
+        Assert.Equal("note-0|null", rows[0]);
+        Assert.Equal(6, rows.Count);
+    }
+
     [Theory]
     [InlineData(ByteArrayOutputKind.Default)]
     [InlineData(ByteArrayOutputKind.ViewType)]

@@ -79,7 +79,7 @@ public sealed partial class ArrowRowEvaluator
         if (!HasKernel(column))
             return null;
 
-        var columnType = ByteArrayOffsets.TopLevel(column.Data.DataType);
+        var columnType = ByteArrayOffsets.TypeOf(column.Data.DataType);
         var placeholder = new LiteralValue?[] { Placeholder };
         CheckSetMembers(columnType, placeholder, members, memberTypes, askedFromTree);
         if (_coercion is not null && SetCoerces(columnType, placeholder, members, memberTypes))

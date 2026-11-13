@@ -32,14 +32,73 @@ internal static class ByteArrayOffsets
         return ReferenceEquals(data, array.Data) ? array : ArrowArrayFactory.BuildArray(data);
     }
 
-    /// <summary>The type <see cref="Of"/> gives a top-level column of <paramref name="type"/>, when it is a large or
-    /// view string or binary; otherwise <paramref name="type"/>.</summary>
-    public static IArrowType TopLevel(IArrowType type) => type switch
+    /// <summary>
+    /// The type <see cref="Of"/> gives a column of <paramref name="type"/>, without converting one: for a caller that
+    /// needs only the type (analysis, a kernel reading the column in place), whose copy would be thrown away (#863
+    /// review). The same instance when nothing changes.
+    /// </summary>
+    public static IArrowType TypeOf(IArrowType type)
     {
-        LargeStringType or StringViewType => StringType.Default,
-        LargeBinaryType or BinaryViewType => BinaryType.Default,
-        _ => type,
-    };
+        switch (type)
+        {
+            case LargeStringType or StringViewType:
+                return StringType.Default;
+            case LargeBinaryType or BinaryViewType:
+                return BinaryType.Default;
+
+            case StructType structType:
+            {
+                Field[]? fields = null;
+                for (int i = 0; i < structType.Fields.Count; i++)
+                {
+                    var field = structType.Fields[i];
+                    var converted = TypeOf(field.DataType);
+                    if (ReferenceEquals(converted, field.DataType))
+                        continue;
+                    fields ??= [.. structType.Fields];
+                    fields[i] = WithType(field, converted);
+                }
+                return fields is null ? type : new StructType(fields);
+            }
+
+            // MapType derives from ListType, so it has to be matched first.
+            case MapType mapType:
+            {
+                var key = TypeOf(mapType.KeyField.DataType);
+                var value = TypeOf(mapType.ValueField.DataType);
+                return ReferenceEquals(key, mapType.KeyField.DataType) && ReferenceEquals(value, mapType.ValueField.DataType)
+                    ? type
+                    : new MapType(WithType(mapType.KeyField, key), WithType(mapType.ValueField, value), mapType.KeySorted);
+            }
+
+            case ListType listType:
+            {
+                var element = TypeOf(listType.ValueDataType);
+                return ReferenceEquals(element, listType.ValueDataType)
+                    ? type
+                    : new ListType(WithType(listType.ValueField, element));
+            }
+
+            case LargeListType largeListType:
+            {
+                var element = TypeOf(largeListType.ValueDataType);
+                return ReferenceEquals(element, largeListType.ValueDataType)
+                    ? type
+                    : new LargeListType(WithType(largeListType.ValueField, element));
+            }
+
+            case FixedSizeListType fixedType:
+            {
+                var element = TypeOf(fixedType.ValueDataType);
+                return ReferenceEquals(element, fixedType.ValueDataType)
+                    ? type
+                    : new FixedSizeListType(WithType(fixedType.ValueField, element), fixedType.ListSize);
+            }
+
+            default:
+                return type;
+        }
+    }
 
     private static ArrayData Rewrite(ArrayData data)
     {

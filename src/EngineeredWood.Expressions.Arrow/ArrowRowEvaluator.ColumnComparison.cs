@@ -102,7 +102,7 @@ public sealed partial class ArrowRowEvaluator
         }
 
         // Typed as GetColumn would convert it, which is what the general path analyses and coerces.
-        var columnType = ByteArrayOffsets.TopLevel(column.Data.DataType);
+        var columnType = ByteArrayOffsets.TypeOf(column.Data.DataType);
         var columnSide = new LiteralValue?[] { Placeholder };
         var constantSide = new LiteralValue?[] { constant };
         var left = columnOnLeft ? columnSide : constantSide;

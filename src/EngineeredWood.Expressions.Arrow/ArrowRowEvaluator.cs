@@ -113,6 +113,16 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
 
     public IArrowArray EvaluateExpression(Expression expression, RecordBatch batch)
     {
+        // A bare reference is the batch's own array, in whatever layout it holds: nothing here reads it, so there is
+        // nothing to convert it for, and a view or large string a caller hands on (a MERGE assignment) is not copied.
+        switch (expression)
+        {
+            case UnboundReference u:
+                return FindColumn(batch, u);
+            case BoundReference b:
+                return FindColumn(batch, b.Name);
+        }
+
         var result = EvalExpressionAsArray(expression, batch);
 
         // A literal is built at least one row long even over an empty batch (see ConstantArray),
@@ -449,11 +459,13 @@ public sealed partial class ArrowRowEvaluator : IRowEvaluator
     {
         switch (expression)
         {
+            // The type GetColumn would give the column, without converting it (#863 review): this runs before a
+            // direct kernel that reads a view or large string in place, and the copy would be thrown away.
             case UnboundReference u:
-                return GetColumn(batch, u).Data.DataType;
+                return ByteArrayOffsets.TypeOf(FindColumn(batch, u).Data.DataType);
 
             case BoundReference b:
-                return GetColumn(batch, b.Name).Data.DataType;
+                return ByteArrayOffsets.TypeOf(FindColumn(batch, b.Name).Data.DataType);
 
             case LiteralExpression literal:
                 return literal.Value.IsNull

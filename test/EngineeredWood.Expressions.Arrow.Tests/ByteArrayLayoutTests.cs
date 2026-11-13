@@ -101,47 +101,107 @@ public class ByteArrayLayoutTests
     [InlineData(Layout.Views, "s = 'ab'")]
     [InlineData(Layout.Views, "s > 'a long'")]
     [InlineData(Layout.Views, "s IN ('ab', 'abc')")]
+    [InlineData(Layout.Views, "'ab' = s")]
     public void AStringComparison_TakesTheDirectKernel(Layout layout, string sql)
     {
-        var evaluator = new ArrowRowEvaluator();
-        evaluator.EvaluatePredicate(SparkSqlParser.ParsePredicate(sql), Batch(layout, false));
-        Assert.Equal(1, evaluator.DirectComparisons + evaluator.DirectSets);
+        foreach (var make in DirectColumnComparisonTests.Evaluators)
+        {
+            var evaluator = make();
+            evaluator.EvaluatePredicate(SparkSqlParser.ParsePredicate(sql), Batch(layout, false));
+            Assert.Equal(1, evaluator.DirectComparisons + evaluator.DirectSets);
+        }
     }
 
+#if NET
+    /// <summary>
+    /// ...and copies nothing on the way, under every evaluator: the Spark registry analyses a comparison's operand
+    /// types before the kernel runs, and asked for the converted column to read its type (#863 review).
+    /// </summary>
+    [Theory]
+    [InlineData(Layout.LargeOffsets, "s = 'x'")]
+    [InlineData(Layout.Views, "s = 'x'")]
+    [InlineData(Layout.Views, "s IN ('x', 'y')")]
+    [InlineData(Layout.Views, "st.s = 'x'")]
+    public void AStringComparison_CopiesNoValues(Layout layout, string sql)
+    {
+        const int rows = 20_000;
+        var value = new string('v', 100);   // past the view's inline limit: 2,000,000 bytes of values
+        IArrowArray column = layout == Layout.Views
+            ? new StringViewArray.Builder().AppendRange(Enumerable.Repeat(value, rows)).Build()
+            : new LargeStringArray.Builder().AppendRange(Enumerable.Repeat(value, rows)).Build();
+        var st = new StructArray(new StructType([new Field("s", column.Data.DataType, true)]), rows, [column],
+            ArrowBuffer.Empty, 0);
+        var batch = new RecordBatch(new Apache.Arrow.Schema(
+            [new Field("s", column.Data.DataType, true), new Field("st", st.Data.DataType, true)], null), [column, st], rows);
+        var predicate = SparkSqlParser.ParsePredicate(sql);
+
+        foreach (var make in DirectColumnComparisonTests.Evaluators)
+        {
+            var evaluator = make();
+            evaluator.EvaluatePredicate(predicate, batch);   // warm up
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            evaluator.EvaluatePredicate(predicate, batch);
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            Assert.True(allocated < 200_000, $"{sql}: {allocated} bytes allocated");
+        }
+    }
+#endif
+
+    /// <summary>A bare reference comes back as the batch's own array, its layout kept: nothing reads it here, so
+    /// there is nothing to convert it for.</summary>
+    [Theory]
+    [InlineData(Layout.LargeOffsets, "s")]
+    [InlineData(Layout.Views, "s")]
+    [InlineData(Layout.Views, "ls")]
+    public void AColumnReference_ComesBackAsTheBatchHoldsIt(Layout layout, string name)
+    {
+        var batch = Batch(layout, true);
+        var result = new ArrowRowEvaluator().EvaluateExpression(Expressions.Ref(name), batch);
+        Assert.Same(batch.Column(name), result);
+    }
+
+    /// <summary>A function's argument has its strings in the offset layout at any depth, which is the layout every
+    /// function here is written against.</summary>
     [Theory]
     [InlineData(Layout.LargeOffsets)]
     [InlineData(Layout.Views)]
-    public void AColumnReference_ComesBackWithTheSameValues(Layout layout)
+    public void AFunctionArgument_HasOffsetStringsAtAnyDepth(Layout layout)
     {
-        var plain = (StringArray)new ArrowRowEvaluator().EvaluateExpression(Expressions.Ref("s"), Batch(Layout.Offsets, true));
-        var other = new ArrowRowEvaluator().EvaluateExpression(Expressions.Ref("s"), Batch(layout, true));
-        var strings = Assert.IsType<StringArray>(other);
-        Assert.Equal(plain.Length, strings.Length);
-        for (int i = 0; i < plain.Length; i++)
-            Assert.Equal(plain.GetString(i), strings.GetString(i));
-    }
+        var probe = new Probe();
+        var result = new ArrowRowEvaluator(probe).EvaluateExpression(
+            Expressions.Call("probe", Expressions.Ref("s"), Expressions.Ref("ls"), Expressions.Ref("st")),
+            Batch(layout, true));
+        Assert.NotNull(result);
 
-    /// <summary>A nested column's strings are converted too, so that a registered function over a list reads the
-    /// layout every function here is written against.</summary>
-    [Theory]
-    [InlineData(Layout.LargeOffsets)]
-    [InlineData(Layout.Views)]
-    public void AListColumn_ComesBackWithOffsetStrings(Layout layout)
-    {
-        var plain = (ListArray)new ArrowRowEvaluator().EvaluateExpression(Expressions.Ref("ls"), Batch(Layout.Offsets, true));
-        var other = Assert.IsType<ListArray>(
-            new ArrowRowEvaluator().EvaluateExpression(Expressions.Ref("ls"), Batch(layout, true)));
-        Assert.IsType<StringType>(((ListType)other.Data.DataType).ValueDataType);
-        Assert.Equal(plain.Length, other.Length);
+        Assert.IsType<StringArray>(probe.Arguments![0]);
+        var list = Assert.IsType<ListArray>(probe.Arguments[1]);
+        Assert.IsType<StringType>(((ListType)list.Data.DataType).ValueDataType);
+        Assert.IsType<StringType>(((StructType)probe.Arguments[2].Data.DataType).Fields[0].DataType);
+
+        var plain = (ListArray)Batch(Layout.Offsets, true).Column("ls");
+        Assert.Equal(plain.Length, list.Length);
         for (int i = 0; i < plain.Length; i++)
         {
-            Assert.Equal(plain.IsNull(i), other.IsNull(i));
+            Assert.Equal(plain.IsNull(i), list.IsNull(i));
             if (plain.IsNull(i))
                 continue;
             var want = (StringArray)plain.GetSlicedValues(i);
-            var got = Assert.IsType<StringArray>(other.GetSlicedValues(i));
+            var got = Assert.IsType<StringArray>(list.GetSlicedValues(i));
             Assert.Equal(Enumerable.Range(0, want.Length).Select(j => want.GetString(j)),
                 Enumerable.Range(0, got.Length).Select(j => got.GetString(j)));
+        }
+    }
+
+    private sealed class Probe : IFunctionRegistry
+    {
+        public IReadOnlyList<IArrowArray>? Arguments { get; private set; }
+
+        public bool IsRegistered(string name) => name == "probe";
+
+        public IArrowArray Invoke(string name, IReadOnlyList<IArrowArray> args, int rowCount)
+        {
+            Arguments = args;
+            return args[0];
         }
     }
 
