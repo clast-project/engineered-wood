@@ -5,7 +5,9 @@ using System.Runtime.CompilerServices;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Arrow;
+using EngineeredWood.DeltaLake.Actions;
 using EngineeredWood.DeltaLake.ChangeDataFeed;
+using EngineeredWood.DeltaLake.Log;
 using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
@@ -276,6 +278,43 @@ public class RawBatchReleaseTests : IDisposable
 
         // The insert, then the update's pre- and post-images.
         Assert.Equal(Rows + 2 * (Rows / 4), rows);
+    }
+
+    // A transaction whose row ids were rebased writes its change files again (RewriteInsertRowIdsAsync), reading each
+    // through a reshaping path of its own: the change file still carries the column dropped since (#857 review round 2).
+    [Fact]
+    public async Task AWrittenChangeFileReadAgain_ReleasesItsDroppedColumn()
+    {
+        long updated;
+        await using (var table = await CreateAsync(new()
+                     {
+                         ["delta.columnMapping.mode"] = "name",
+                         [CdfConfig.EnableKey] = "true",
+                     }))
+        {
+            (_, updated) = await table.UpdateAsync(Ex.Equal("tag", "t1"), SetGone);
+            await table.DropColumnAsync("gone");
+        }
+
+        var file = Assert.Single((await new TransactionLog(_fs).ReadCommitAsync(updated)).OfType<CdcFile>());
+        long rows = 0;
+        await AssertReleasedAsync(async table =>
+        {
+            await foreach (var (batch, changeTypes, ids, versions) in ChangeDataFeed.CdfReader.ReadWrittenChangeFileAsync(
+                               _fs, table.CurrentSnapshot, file, CancellationToken.None))
+            {
+                Assert.Equal(-1, batch.Schema.GetFieldIndex("gone"));
+                Assert.Equal(batch.Length, changeTypes.Length);
+                rows += batch.Length;
+                batch.Dispose();
+                changeTypes.Dispose();
+                ids?.Dispose();
+                versions?.Dispose();
+            }
+        }, batchSize: null);
+
+        // The update's pre- and post-images.
+        Assert.Equal(2 * (Rows / 4), rows);
     }
 
     private async Task<DeltaTable> CreateAsync(Dictionary<string, string> configuration)
