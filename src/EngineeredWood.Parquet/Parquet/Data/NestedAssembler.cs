@@ -662,7 +662,20 @@ internal static class NestedAssembler
         }
 
         // Use Arrow's Take operation equivalent — build a new array from selected indices
-        return ArrowCompute.Take(denseArray, indices.AsSpan(0, elementCount));
+        return TakeAndRelease(denseArray, indices.AsSpan(0, elementCount));
+    }
+
+    /// <summary>
+    /// The entries of <paramref name="dense"/> at <paramref name="indices"/>, releasing what of
+    /// <paramref name="dense"/> the gather doesn't share (#856). The dense leaf is this assembly's own: the reader
+    /// decodes a nested row group whole for one assembly and slices only what the assembly returns. Released buffer by
+    /// buffer, since a gather shares a view column's data and a dictionary.
+    /// </summary>
+    private static IArrowArray TakeAndRelease(IArrowArray dense, ReadOnlySpan<int> indices)
+    {
+        var taken = ArrowCompute.Take(dense, indices);
+        RawBatchBuffers.Of(dense).ReleaseAllBut(null, taken);
+        return taken;
     }
 
     /// <summary>
@@ -764,7 +777,7 @@ internal static class NestedAssembler
 
             leafDefLevels[i] = FilterLevelArray(leafDefLevels[i], keepIndices);
             leafRepLevels[i] = FilterLevelArray(leafRepLevels[i], keepIndices);
-            leafArrays[i] = ArrowCompute.Take(leafArrays[i], keepIndices);
+            leafArrays[i] = TakeAndRelease(leafArrays[i], keepIndices);
         }
     }
 
