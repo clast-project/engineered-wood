@@ -14689,6 +14689,22 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
+    /// A Parquet data file read whole, in file order, with each batch's file position: a change feed's or a
+    /// compaction's read of one file. As one unit of a parallel read it reserves before each decode and fetches row
+    /// groups ahead (<see cref="ParquetFileReader.ReadFileReservingAsync"/>, #846); a read outside one
+    /// (<see cref="ScanReservation.None"/>) reads one row group at a time, as before.
+    /// </summary>
+    internal static IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> ReadFileReserving(
+        ParquetFileReader reader, RowSkipPredicate? skipRows, ScanReservation reservation,
+        CancellationToken cancellationToken) =>
+        Positioned(
+            reservation == ScanReservation.None
+                ? reader.ReadWithPositionsAsync(null, null, skipRows, cancellationToken)
+                : reader.ReadFileReservingAsync(
+                    null, skipRows, reservation, ParquetFileReader.WholeFileReadAhead, cancellationToken),
+            cancellationToken);
+
+    /// <summary>
     /// The reservation for a file's first batch, before one has been measured: the largest first batch of any row
     /// group the read of <paramref name="fileColumns"/> (every column when null) decodes, sized by type from the
     /// footer (<see cref="ParquetFileReader.LargestFirstBatchBytesAsync"/>). The footer's uncompressed size alone,
@@ -14699,14 +14715,14 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     internal static ValueTask<long> LargestFirstBatchBytesAsync(
         ParquetFileReader reader, IReadOnlyList<string>? fileColumns, DeletionVectorBitmap? deletedRows,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, long addedBytesPerRow = 0)
     {
         // A group the deletion vector deletes in full is skipped unread (ReadPositionedAsync), so it is never
         // decoded and needs no reservation.
         Func<long, long, bool>? skipped = deletedRows is { IsEmpty: false }
             ? (start, rows) => deletedRows.ContainsRange(start, rows)
             : null;
-        return reader.LargestFirstBatchBytesAsync(fileColumns, skipped, cancellationToken);
+        return reader.LargestFirstBatchBytesAsync(fileColumns, skipped, cancellationToken, addedBytesPerRow);
     }
 
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(

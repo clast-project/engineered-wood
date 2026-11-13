@@ -348,8 +348,9 @@ public class CdfParallelReadTests : IDisposable
     }
 
     /// <summary>Counts, for data and change files (Parquet outside the log): the opens, the size asks
-    /// (<see cref="IRandomAccessFile.GetLengthAsync"/>), the existence checks, and the most reads in flight
-    /// at once, each delayed by <paramref name="delayMs"/> so that overlapping reads are seen to overlap.</summary>
+    /// (<see cref="IRandomAccessFile.GetLengthAsync"/>), the existence checks, and the most FILES with a read in
+    /// flight at once, each read delayed by <paramref name="delayMs"/> so that overlapping reads are seen to overlap.
+    /// Files, not reads: a file read as one unit fetches several row groups at once (#846).</summary>
     private sealed class CountingFileSystem(ITableFileSystem inner, int delayMs = 0) : ITableFileSystem
     {
         private int _opened, _lengthAsks, _existsAsks, _reading, _maxReading, _commitReads;
@@ -413,6 +414,9 @@ public class CdfParallelReadTests : IDisposable
 
         private sealed class CountingFile(IRandomAccessFile file, CountingFileSystem owner) : IRandomAccessFile
         {
+            private readonly object _gate = new();
+            private int _inFlight;
+
             public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
             {
                 Interlocked.Increment(ref owner._lengthAsks);
@@ -429,7 +433,7 @@ public class CdfParallelReadTests : IDisposable
                 }
                 finally
                 {
-                    Interlocked.Decrement(ref owner._reading);
+                    Leave();
                 }
             }
 
@@ -443,18 +447,35 @@ public class CdfParallelReadTests : IDisposable
                 }
                 finally
                 {
-                    Interlocked.Decrement(ref owner._reading);
+                    Leave();
                 }
             }
 
             private async Task EnterAsync(CancellationToken cancellationToken)
             {
-                int now = Interlocked.Increment(ref owner._reading);
-                int seen;
-                while (now > (seen = Volatile.Read(ref owner._maxReading)))
-                    Interlocked.CompareExchange(ref owner._maxReading, now, seen);
+                // Under the file's lock, so that its last read leaving and its next arriving cannot count it twice
+                // (#850 review).
+                lock (_gate)
+                {
+                    if (++_inFlight == 1)
+                    {
+                        int now = Interlocked.Increment(ref owner._reading);
+                        int seen;
+                        while (now > (seen = Volatile.Read(ref owner._maxReading)))
+                            Interlocked.CompareExchange(ref owner._maxReading, now, seen);
+                    }
+                }
                 if (owner.DelayMs > 0)
                     await Task.Delay(owner.DelayMs, cancellationToken).ConfigureAwait(false);
+            }
+
+            private void Leave()
+            {
+                lock (_gate)
+                {
+                    if (--_inFlight == 0)
+                        Interlocked.Decrement(ref owner._reading);
+                }
             }
 
             public void Dispose() => file.Dispose();

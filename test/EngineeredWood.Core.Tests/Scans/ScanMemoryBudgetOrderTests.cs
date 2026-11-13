@@ -88,4 +88,41 @@ public class ScanMemoryBudgetOrderTests
         await second.WaitAsync(Timeout);
         Assert.Equal(120, budget.Used);
     }
+
+    /// <summary>#846: a read-ahead never waits. The front takes it over the budget, as it does its decode; a unit
+    /// behind it only when it fits and no unit nearer the front waits for room.</summary>
+    [Fact]
+    public async Task AReadAhead_IsForcedForTheFront_AndOtherwiseTakenOnlyFromRoomNobodyEarlierWaitsFor()
+    {
+        var budget = new ScanMemoryBudget(100);
+        budget.SetHead(0);
+        var front = new ScanReservation(budget, 0);
+        var second = new ScanReservation(budget, 1);
+        var third = new ScanReservation(budget, 2);
+        await budget.ReserveAsync(0, 60, CancellationToken.None);
+
+        Assert.True(second.TryHoldAhead(30)); // 90 <= 100
+        Assert.False(third.TryHoldAhead(20)); // 110 > 100
+        Assert.True(front.TryHoldAhead(50)); // the front: over the budget
+        Assert.Equal(140, budget.Used);
+
+        // Unit 1 waits for room (90 + 30 > 100); unit 2's read-ahead fits beside it (95), but is refused: the room
+        // is unit 1's when it frees.
+        front.ReleaseHeld(50);
+        var waiting = budget.ReserveAsync(1, 30, CancellationToken.None).AsTask();
+        await Settle();
+        Assert.False(waiting.IsCompleted);
+        Assert.False(third.TryHoldAhead(5));
+        budget.Adjust(-60);
+        await waiting.WaitAsync(Timeout);
+        Assert.Equal(60, budget.Used);
+        Assert.True(third.TryHoldAhead(20));
+
+        // A unit releases its read-ahead one hold at a time, or all at once.
+        second.ReleaseHeld(30);
+        Assert.Equal(50, budget.Used);
+        third.ReleaseHeld();
+        second.ReleaseHeld();
+        Assert.Equal(30, budget.Used);
+    }
 }

@@ -1340,6 +1340,207 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.False(await e.MoveNextAsync());
     }
 
+    /// <summary>#846: a whole-file read, one unit of a parallel read (a change feed's file), fetches the row groups
+    /// after the one it decodes while it waits for room to decode: up to its read-ahead, here as far as the budget
+    /// lets a unit behind the front hold them, and no further. It fetched each row group only after the batch before
+    /// it was handed on, so a file ran at fetch-plus-decode per row group.</summary>
+    [Fact]
+    public async Task AWholeFileRead_FetchesRowGroupsAhead_WhileItWaitsForRoomToDecode()
+    {
+        const int readAhead = 4;
+        var watched = new long[readAhead + 1];
+        for (int g = 0; g <= readAhead; g++)
+            watched[g] = await DataOffsetAsync(g);
+        await using var local = new LocalRandomAccessFile(_path);
+        var watchers = new WatchingFile[readAhead + 1];
+        IRandomAccessFile file = local;
+        for (int g = 0; g <= readAhead; g++)
+            file = watchers[g] = new WatchingFile(file, watched[g]);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        var schema = await reader.GetSchemaAsync();
+        long Compressed(int g) => ParquetFileReader.PlannedBytes(metadata.RowGroups[g], schema, null, null).Compressed;
+        long ahead = Enumerable.Range(0, readAhead).Sum(Compressed);
+
+        // Unit 0, the front, holds a decoded batch. Beside it, unit 1 can hold its first four row groups but not
+        // a fifth, nor decode one.
+        const long front = 1L << 20;
+        var budget = new EngineeredWood.Scans.ScanMemoryBudget(front + ahead + Compressed(readAhead) / 2);
+        budget.SetHead(0);
+        await budget.ReserveAsync(0, front, CancellationToken.None);
+        var reservation = new EngineeredWood.Scans.ScanReservation(budget, 1);
+        reservation.SetInitialEstimate(Compressed(readAhead));
+
+        var expected = await ReadAsync(Options(1));
+        var actual = new List<Snapshot>();
+        await using (var e = reader.ReadFileReservingAsync(null, null, reservation, readAhead, default).GetAsyncEnumerator())
+        {
+            var next = e.MoveNextAsync().AsTask();
+            var requested = Task.WhenAll(watchers.Take(readAhead).Select(w => w.Requested));
+            bool fetched = await Task.WhenAny(requested, Task.Delay(TimeSpan.FromSeconds(10))) == requested;
+            bool waited = !next.IsCompleted;
+            bool fifth = watchers[readAhead].Requested.IsCompleted;
+
+            // The consumer takes unit 0's batch, which lets unit 1 decode however the read went, so the enumerator
+            // is never disposed with a MoveNextAsync pending.
+            budget.Adjust(-front);
+            Assert.Same(next, await Task.WhenAny(next, Task.Delay(TimeSpan.FromSeconds(30))));
+            Assert.True(fetched, "the first four row groups should be requested while the decode waits for room");
+            Assert.True(waited, "the decode should have waited for room");
+            Assert.False(fifth, "a fifth row group is past the read-ahead and the budget");
+
+            // The rest of the file reads as the serial read does, and holds nothing once read.
+            budget.SetHead(1);
+            for (bool more = await next; more; more = await e.MoveNextAsync())
+            {
+                using var batch = e.Current.Batch;
+                actual.Add(Take(e.Current.FirstRow, batch));
+                reservation.Settle(EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(batch));
+                budget.Adjust(-EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(batch));
+            }
+        }
+        reservation.ReleasePending();
+        AssertSame(expected, actual);
+        Assert.Equal(0, budget.Used);
+    }
+
+    /// <summary>#846: a whole-file read cut by a skip predicate reads what the serial read does, its positions
+    /// included, whatever its read-ahead and budget, and leaves nothing held however it ends.</summary>
+    [Theory]
+    [InlineData(1, 1L, int.MaxValue)]
+    [InlineData(4, 1L, int.MaxValue)]
+    [InlineData(4, 256L << 20, int.MaxValue)]
+    [InlineData(4, 1L, 3)]
+    [InlineData(4, 256L << 20, 1)]
+    public async Task AWholeFileRead_IsTheSerialRead_AndLeavesNothingHeld(int readAhead, long budgetBytes, int take)
+    {
+        // Every row of group 2, and a run inside group 5, are skipped.
+        RowSkipPredicate skip = (start, rows) =>
+            (start >= _groupStarts[2] && start + rows <= _groupStarts[3])
+            || (start >= _groupStarts[5] + 300 && start + rows <= _groupStarts[5] + 800);
+        var expected = (await ReadAsync(Options(1), skip: skip)).Take(take).ToList();
+
+        await using var file = new LocalRandomAccessFile(_path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, Options(1));
+        var budget = new EngineeredWood.Scans.ScanMemoryBudget(budgetBytes);
+        budget.SetHead(0);
+        var reservation = new EngineeredWood.Scans.ScanReservation(budget, 0);
+        var actual = new List<Snapshot>();
+        await foreach (var positioned in reader.ReadFileReservingAsync(null, skip, reservation, readAhead, default))
+        {
+            using var batch = positioned.Batch;
+            actual.Add(Take(positioned.FirstRow, batch));
+            reservation.Settle(EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(batch));
+            budget.Adjust(-EngineeredWood.Arrow.ArrowSizes.EstimatedBytes(batch));
+            if (actual.Count == take)
+                break;
+        }
+        reservation.ReleasePending();
+
+        AssertSame(expected, actual);
+        Assert.Equal(0, budget.Used);
+    }
+
+    /// <summary>#850 review: a whole-file read plans row groups ahead of the one it decodes, but an error planning
+    /// one still surfaces where the serial read raises it, after every batch before it, and not at all for a read
+    /// that stops before it.</summary>
+    [Theory]
+    [InlineData(int.MaxValue)]
+    [InlineData(3)]
+    public async Task AWholeFileRead_RaisesAPlanningErrorAtItsRowGroup(int take)
+    {
+        // Reading four row groups ahead, group 5 is planned before group 2 is handed on: a read that stops after
+        // group 2 must not see its error.
+        const int failing = 5;
+        bool Skip(long first, long count)
+        {
+            if (first >= _groupStarts[failing] && first < _groupStarts[failing + 1]
+                && count < _groupStarts[failing + 1] - _groupStarts[failing])
+            {
+                throw new InvalidOperationException("Injected planning failure.");
+            }
+            return false;
+        }
+
+        await using var file = new LocalRandomAccessFile(_path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, Options(1));
+        var budget = new EngineeredWood.Scans.ScanMemoryBudget(256L << 20);
+        budget.SetHead(0);
+        var reservation = new EngineeredWood.Scans.ScanReservation(budget, 0);
+        var seen = new List<long>();
+        async Task ReadAsync()
+        {
+            await foreach (var positioned in reader.ReadFileReservingAsync(["id"], Skip, reservation, 4, default))
+            {
+                positioned.Batch.Dispose();
+                seen.Add(positioned.FirstRow);
+                reservation.ReleasePending();
+                if (seen.Count == take)
+                    break;
+            }
+        }
+
+        if (take > failing)
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(ReadAsync);
+            Assert.Equal(_groupStarts.Take(failing), seen);
+        }
+        else
+        {
+            await ReadAsync();
+            Assert.Equal(_groupStarts.Take(take), seen);
+        }
+        reservation.ReleasePending();
+        Assert.Equal(0, budget.Used);
+    }
+
+    /// <summary>#850 review: what a host adds to each row it emits is added to the first batch as sized, for the
+    /// rows it holds. Added to the group before the batch was sized, the floor of a page larger than the batch
+    /// swallowed it: one PLAIN 100,000-row page read in 1,000-row batches reserved its 800 KB either way. Round 2: a
+    /// MaxBatchByteSize cut stops at page boundaries, so the batch's share of the encoded bytes (here 1/8) is not
+    /// its share of rows: the one page cannot be cut, and the first batch holds all 100,000.</summary>
+    [Fact]
+    public async Task AWholeFileRead_AddsTheHostsBytesToTheRowsOfItsFirstBatch()
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("id", DoubleType.Default, false)).Build();
+        var ids = new DoubleArray.Builder();
+        for (int i = 0; i < 100_000; i++)
+            ids.Append(i * 0.5);
+        string path = Path.Combine(_tempDir, "one-page-host.parquet");
+        using (var batch = new RecordBatch(schema, [ids.Build()], 100_000))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false, ParquetWriteOptions.Default with
+                     {
+                         DictionaryEnabled = false,
+                         DataPageSize = 16 << 20,
+                         DataPageRowCountLimit = 1_000_000,
+                     }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var file = new LocalRandomAccessFile(path);
+        foreach (var (options, rows) in new (ParquetReadOptions, int)[]
+                 {
+                     (new ParquetReadOptions { BatchSize = 1_000 }, 1_000),
+                     (new ParquetReadOptions(), 100_000),
+                     (new ParquetReadOptions { MaxBatchByteSize = 100_000 }, 100_000),
+                 })
+        {
+            using var reader = new ParquetFileReader(file, ownsFile: false, options);
+            long raw = await reader.LargestFirstBatchBytesAsync(null, null, default);
+            Assert.True(raw >= 100_000 * 8, $"{raw}: the batch should reserve the page it holds");
+            Assert.Equal(raw + 26 * rows, await reader.LargestFirstBatchBytesAsync(null, null, default, addedBytesPerRow: 26));
+            await foreach (var batch in reader.ReadAllAsync())
+            {
+                using (batch)
+                    Assert.Equal(rows, batch.Length);
+                break;
+            }
+        }
+    }
+
     /// <summary>Completes <see cref="Requested"/> once a request covers the byte at <c>offset</c>.</summary>
     private sealed class WatchingFile(IRandomAccessFile inner, long offset) : IRandomAccessFile
     {

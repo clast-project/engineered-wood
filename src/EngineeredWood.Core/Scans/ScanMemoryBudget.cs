@@ -99,7 +99,7 @@ internal sealed class ScanReservation
 
     /// <summary>
     /// Waits until the budget can take <paramref name="bytes"/> more, and holds them until
-    /// <see cref="ReleaseHeld"/>: memory the unit's read keeps for its whole life rather than per item — a
+    /// <see cref="ReleaseHeld()"/>: memory the unit's read keeps for its whole life rather than per item — a
     /// Parquet row group's compressed column chunks, which its read holds across the batches it yields. Unlike
     /// a pending reservation, a hold is not replaced when an item is settled.
     /// </summary>
@@ -112,13 +112,45 @@ internal sealed class ScanReservation
         _held += bytes;
     }
 
-    /// <summary>Releases what <see cref="HoldAsync"/> held. Safe to call more than once.</summary>
+    /// <summary>
+    /// Holds <paramref name="bytes"/> as <see cref="HoldAsync"/> does, for bytes a read fetches AHEAD of the item it
+    /// decodes next, without waiting: true if they are held. The front unit takes them even over the budget, as it
+    /// does its decode — the consumer waits on it, so what it fetches ahead is wanted next — and its reader bounds
+    /// how far ahead it reads. Any other unit takes them only if they fit now and no unit before it waits for room,
+    /// so a read-ahead never delays an item the consumer wants sooner.
+    /// </summary>
+    internal bool TryHoldAhead(long bytes)
+    {
+        if (_budget is null || bytes <= 0)
+            return true;
+        bytes = Math.Min(bytes, MemoryBudget.MaxCharge); // as in Observe
+        if (!_budget.TryReserveAhead(_unit, bytes))
+            return false;
+        _held += bytes;
+        return true;
+    }
+
+    /// <summary>Releases what <see cref="HoldAsync"/> and <see cref="TryHoldAhead"/> held. Safe to call more than
+    /// once.</summary>
     internal void ReleaseHeld()
     {
         if (_budget is null || _held == 0)
             return;
         _budget.Adjust(-_held);
         _held = 0;
+    }
+
+    /// <summary>Releases <paramref name="bytes"/> of what <see cref="HoldAsync"/> and <see cref="TryHoldAhead"/>
+    /// held: one row group's, of a read that holds several.</summary>
+    internal void ReleaseHeld(long bytes)
+    {
+        if (_budget is null)
+            return;
+        bytes = Math.Min(Math.Min(bytes, MemoryBudget.MaxCharge), _held); // as held
+        if (bytes <= 0)
+            return;
+        _budget.Adjust(-bytes);
+        _held -= bytes;
     }
 
     internal void ReleasePending()
@@ -232,6 +264,21 @@ internal sealed class ScanMemoryBudget
                 lock (_gate)
                     StopWaitingLocked(unit);
             }
+        }
+    }
+
+    /// <summary>Reserves <paramref name="bytes"/> for <paramref name="unit"/>'s read-ahead without waiting
+    /// (<see cref="ScanReservation.TryHoldAhead"/>): forced for the head unit, otherwise only if they fit at every
+    /// level and no unit nearer the front waits.</summary>
+    internal bool TryReserveAhead(int unit, long bytes)
+    {
+        lock (_gate)
+        {
+            if (_cancelled)
+                return false;
+            if (unit == _head)
+                return _memory.TryReserveLocked(bytes, force: true, out _);
+            return !EarlierWaiterLocked(unit) && _memory.TryReserveLocked(bytes, force: false, out _);
         }
     }
 

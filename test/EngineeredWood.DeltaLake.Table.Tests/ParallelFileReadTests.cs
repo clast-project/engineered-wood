@@ -1560,6 +1560,44 @@ public class ParallelFileReadTests : IDisposable
         Assert.Equal(0, shared.UsedBytes);
     }
 
+    /// <summary>
+    /// #846: the scan settles a change feed's batch at the size it is handed, its <c>_change_type</c>,
+    /// <c>_commit_version</c> and <c>_commit_timestamp</c> included (26 bytes a row here, beside 16 of data). A
+    /// file's first reservation covered only the raw batch, so under a budget of two feed batches five files'
+    /// first batches were let in at once, each then charged over twice what it reserved.
+    /// </summary>
+    [Fact]
+    public async Task TheChangeFeed_ReservesItsFirstBatchWithTheColumnsTheFeedAdds()
+    {
+        var shared = new EngineeredWood.Memory.MemoryBudget(long.MaxValue);
+        var (options, _) = await CreateRunLengthTableAsync(changeFeed: true, shared);
+        var changes = new DeltaChangeReadOptions { StartVersion = 1, EndVersion = RunLengthFiles };
+
+        long feedBatch = 0;
+        await using (var serial = await DeltaTable.OpenAsync(_fs, options with { MaxConcurrentReads = 1, MemoryBudget = null }))
+        {
+            await foreach (var b in serial.ReadChangesAsync(changes))
+            {
+                feedBatch = Math.Max(feedBatch, RollingDataFileWriter.EstimatedBytes(b));
+                b.Dispose();
+            }
+        }
+
+        await using var table = await DeltaTable.OpenAsync(_fs, options with { MaxBufferedReadBytes = 2 * feedBatch });
+        int rows = 0;
+        await foreach (var b in table.ReadChangesAsync(changes))
+        {
+            rows += b.Length;
+            b.Dispose();
+            await Task.Delay(20);
+        }
+
+        Assert.Equal(RunLengthFiles * RunLengthRows, rows);
+        // The budget, plus the one batch the front may run over by.
+        Assert.InRange(shared.PeakBytes, 1, 3 * feedBatch);
+        Assert.Equal(0, shared.UsedBytes);
+    }
+
     /// <summary>#846: compaction's reads of its source files reserved by the footer as well (see
     /// <see cref="TheChangeFeed_ReservesWhatAFileDecodesTo"/>).</summary>
     [Fact]

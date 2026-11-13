@@ -732,9 +732,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// (a deletion vector deleting it in full). For a host that reads the file through this reader but outside a
     /// planned parallel read, such as Delta's change feed and compaction (#846): the footer's uncompressed size it
     /// reserved before was 10-20x short for dictionary or run-length-encoded columns.
+    /// <paramref name="addedBytesPerRow"/> is what the host adds to each row before it hands the batch on, which is
+    /// the size its scan settles: a change feed's columns.
     /// </summary>
     internal async ValueTask<long> LargestFirstBatchBytesAsync(
-        IReadOnlyList<string>? columnNames, Func<long, long, bool>? skipped, CancellationToken cancellationToken)
+        IReadOnlyList<string>? columnNames, Func<long, long, bool>? skipped, CancellationToken cancellationToken,
+        long addedBytesPerRow = 0)
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
@@ -748,7 +751,15 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 continue;
             long footer = PlannedBytes(group, schema, columnNames, null).Uncompressed;
             long decoded = DecodedBytes(group, schema, columnNames, null);
-            largest = Math.Max(largest, FirstBatchBytes(decoded, footer, group, schema, columnNames, null));
+            // Added to the batch as sized, not to the group before it: the batch's floor at the pages it holds
+            // would otherwise swallow them (#850 review). The host adds them to every row the batch holds, at most
+            // BatchSize: a MaxBatchByteSize cut stops at page boundaries, so its share of the encoded bytes says
+            // nothing of the rows (#850 review round 2).
+            long rows = _options.BatchSize is int batchSize && batchSize > 0
+                ? Math.Min(batchSize, group.NumRows)
+                : group.NumRows;
+            long added = addedBytesPerRow * rows;
+            largest = Math.Max(largest, FirstBatchBytes(decoded, footer, group, schema, columnNames, null) + added);
         }
         return largest;
     }
