@@ -10,6 +10,11 @@ namespace EngineeredWood.DeltaLake.Table;
 
 public sealed partial class DeltaTable
 {
+    /// <summary>What reshaping adds (<see cref="ReconcileAddedBytesPerRow"/>): per row of the batch, and per row the
+    /// read decodes, which is what it adds per element of a list or map
+    /// (<see cref="EngineeredWood.Scans.ScanReservation.AddedBytesPerDecodedRow"/>).</summary>
+    internal readonly record struct ReshapeBytes(long PerRow, long PerDecodedRow);
+
     /// <summary>
     /// The bytes per row that bringing a data file's batch to the table's shape (<see cref="ReconcileToTableShape"/>)
     /// adds to what the Parquet read decodes, for a first reservation to cover (#851,
@@ -27,13 +32,15 @@ public sealed partial class DeltaTable
     /// per struct row; inside a list or map element, per element, taken as <paramref name="leafValuesPerRow"/> of the
     /// file's top-level column (the most leaf values a row holds, which bounds its elements at any depth; one when
     /// unknown). A column the file holds unchanged, or one dropped from the table, adds nothing.
-    /// <para>Every part is per row of the batch, nested ones included: the reshaping rebuilds a nested column over the
-    /// batch's own rows (<see cref="NestedWindow"/>, #853), even where the batch is sliced from a larger decode. The
-    /// validity bits and offsets that rebuild copies stand in for the raw batch's, so they add nothing.</para>
+    /// <para>The reshaping rebuilds a nested column over the batch's own rows (<see cref="NestedWindow"/>, #853), even
+    /// where the batch is sliced from a larger decode, so what it adds is the batch's own. The validity bits and offsets
+    /// that rebuild copies stand in for the raw batch's, so they add nothing. What it adds per element of a list or map
+    /// is per row DECODED, though: the elements per row are a row group's average, and a batch may hold far more than
+    /// its share of them (#854 review). A batch holds no more than the whole row group's, which that bounds.</para>
     /// <para>The file's columns are matched in the names the read gives them: its schema is renamed by the read's own
     /// rule (<see cref="ToLogicalBatch"/>), physical names or field ids to logical, nested ones included.</para>
     /// </summary>
-    internal static long ReconcileAddedBytesPerRow(
+    internal static ReshapeBytes ReconcileAddedBytesPerRow(
         Snapshot.Snapshot snapshot, IReadOnlyList<string>? columns, IReadOnlyDictionary<string, string>? partitionValues,
         IReadOnlyList<string> partitionColumns, bool hasPartitions, ColumnMappingMode mappingMode,
         IReadOnlyDictionary<string, string> logicalToPhysical, Apache.Arrow.Schema fileSchema,
@@ -46,7 +53,7 @@ public sealed partial class DeltaTable
         // whose validity bitmap, where the column has nulls, is allocated with room to grow: up to twice its bits.
         bool converted = byteArrays is { } k && k != ByteArrayOutputKind.Default;
 
-        double bits = 0;
+        double bits = 0, decodedBits = 0;
         foreach (var field in expected.FieldsList)
         {
             var type = byteArrays is { } kind ? ByteArrayRepresentation.Of(field.DataType, kind) : field.DataType;
@@ -72,9 +79,14 @@ public sealed partial class DeltaTable
             {
                 elements = Math.Max(1, perRow);
             }
-            bits += EvolvedBits(type, heldField.DataType, converted, widens, rowsPerRow: 1, elements);
+            // The part under a list or map: what the column adds with its elements counted, less what it adds with
+            // none (EvolvedBits counts what is inside an element per element).
+            double evolved = EvolvedBits(type, heldField.DataType, converted, widens, rowsPerRow: 1, elements);
+            double flat = EvolvedBits(type, heldField.DataType, converted, widens, rowsPerRow: 1, elements: 0);
+            bits += flat;
+            decodedBits += evolved - flat;
         }
-        return Bytes(bits);
+        return new ReshapeBytes(Bytes(bits), Bytes(decodedBits));
 
         static long Bytes(double bits)
         {
@@ -85,8 +97,8 @@ public sealed partial class DeltaTable
         }
     }
 
-    /// <summary>A <see cref="ReconcileAddedBytesPerRow"/> a reference can publish whole to the units that share a file.</summary>
-    private sealed record ReshapeBytesBox(long Value);
+    /// <summary>A <see cref="ReshapeBytes"/> a reference can publish whole to the units that share a file.</summary>
+    private sealed record ReshapeBytesBox(ReshapeBytes Value);
 
     /// <summary>
     /// The file's top-level fields by the names the read gives them: its schema renamed as a batch of it is
@@ -184,12 +196,11 @@ public sealed partial class DeltaTable
             default:
                 return widens ? rowsPerRow * Math.Max(0, FixedBits(expected) - FixedBits(held)) : 0;
         }
-
     }
 
     /// <summary><see cref="ReconcileAddedBytesPerRow"/> for one data file's read through the built-in reader; 0 through
     /// the codec seam, whose host builds the batch.</summary>
-    private static async ValueTask<long> ReconcileAddedBytesPerRowAsync(
+    private static async ValueTask<ReshapeBytes> ReconcileAddedBytesPerRowAsync(
         DataFileRead read, ByteArrayOutputKind? byteArrays, CancellationToken cancellationToken)
     {
         if (read.Reader is not { } reader)

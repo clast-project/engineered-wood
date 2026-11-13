@@ -138,7 +138,8 @@ public class HostAddedBytesTests : IDisposable
             snapshot, null, add.PartitionValues, partitionColumns, partitionColumns.Count > 0, mapping,
             ColumnMapping.BuildLogicalToPhysicalMap(snapshot.Schema, mapping), await reader.GetArrowSchemaAsync(), kind);
 
-        long perRow = reshape;
+        // One batch of the whole decode: both parts are per row of it.
+        long perRow = reshape.PerRow + reshape.PerDecodedRow;
         long added = shaped - raw;
         Assert.True(added > 50L * Rows, $"reshaping added {added} bytes: nothing to estimate");
         // Never short, beyond each buffer's padding; over by no more than the rounding of each part's bits to bytes.
@@ -195,7 +196,8 @@ public class HostAddedBytesTests : IDisposable
         var reshape = DeltaTable.ReconcileAddedBytesPerRow(
             snapshot, null, values, partitionColumns, true, ColumnMappingMode.Name, logicalToPhysical, data,
             byteArrays: null);
-        long perRow = reshape;
+        long perRow = reshape.PerRow;
+        Assert.Equal(0, reshape.PerDecodedRow);
         Assert.True(perRow * Rows >= added - 4096 && perRow * Rows <= added + 2 * Rows,
             $"estimated {perRow} B/row = {perRow * Rows}, the partition columns hold {added} ({added / (double)Rows:F3} B/row)");
     }
@@ -204,9 +206,10 @@ public class HostAddedBytesTests : IDisposable
     /// #852 review round 2: what reshaping adds INSIDE a column the file holds (<see cref="SchemaEvolution"/> recurses
     /// through structs, lists and maps), sized against the reshaping itself on a batch of the file's older shape. A
     /// field added inside a list or map element costs it once per element: here three a row, as the file's leaf
-    /// counts say. Per row of the batch, whether the batch is decoded on its own or sliced from a larger decode, whose
-    /// children it shares unsliced: the reshaping rebuilds the column over the batch's own rows (#853), so a quarter of
-    /// a decode allocates for its own rows, not the whole decode's.
+    /// counts say. Whether the batch is decoded on its own or sliced from a larger decode, whose children it shares
+    /// unsliced, the reshaping rebuilds the column over the batch's own rows (#853), so a quarter of a decode allocates
+    /// for its own rows, not the whole decode's. A struct's part is estimated per row of the batch; a list's or map's
+    /// per row decoded, which bounds a batch's elements however they are spread (#854 review).
     /// </summary>
     [Theory]
     [InlineData("struct, two levels")]
@@ -261,12 +264,17 @@ public class HostAddedBytesTests : IDisposable
         var unaligned = whole.Slice(Rows + 3, Rows);
         long addedSliced = Math.Max(Added(sliced), Added(unaligned));
 
-        long estimate = DeltaTable.ReconcileAddedBytesPerRow(
+        var reshape = DeltaTable.ReconcileAddedBytesPerRow(
             snapshot, null, null, [], false, ColumnMappingMode.None, new Dictionary<string, string>(), fileSchema,
-            byteArrays: null, new Dictionary<string, double> { ["c"] = listed ? elements : 1 }) * Rows;
+            byteArrays: null, new Dictionary<string, double> { ["c"] = listed ? elements : 1 });
+        Assert.True(listed ? reshape.PerRow == 0 : reshape.PerDecodedRow == 0, $"estimated {reshape}");
+        long estimateOwn = reshape.PerRow * Rows + reshape.PerDecodedRow * Rows;
+        long estimateSliced = reshape.PerRow * Rows + reshape.PerDecodedRow * 4L * Rows;
         Assert.True(addedOwn > Rows, $"reshaping added {addedOwn} bytes: nothing to estimate");
-        Assert.True(estimate >= addedOwn - 4096 && estimate <= addedOwn + 2 * Rows && estimate >= addedSliced - 4096,
-            $"estimated {estimate} for {Rows} rows; reshaping added {addedOwn} on their own, {addedSliced} sliced");
+        Assert.True(estimateOwn >= addedOwn - 4096 && estimateOwn <= addedOwn + 2 * Rows,
+            $"estimated {reshape} = {estimateOwn} for {Rows} rows, reshaping added {addedOwn}");
+        Assert.True(estimateSliced >= addedSliced - 4096,
+            $"estimated {reshape} = {estimateSliced} for {Rows} of {4 * Rows} rows decoded, reshaping added {addedSliced}");
 
         // What a slice's reshaping allocates is its own rows' (#853), not the whole decode's: beyond the rows on their
         // own, only its copied offsets (four bytes a row) and validity.
@@ -277,6 +285,49 @@ public class HostAddedBytesTests : IDisposable
             Assert.True(allocated <= allocatedOwn + 5L * Rows,
                 $"a quarter of a decode allocated {allocated}, the rows on their own {allocatedOwn}");
         }
+    }
+
+    /// <summary>
+    /// #854 review: a list's elements spread unevenly over its rows. The elements per row the estimate is given are the
+    /// row group's average (<see cref="ParquetFileReader.LeafValuesPerRowAsync"/>), so a batch of the rows that hold
+    /// most of them adds far more than its share. Here the first quarter of the rows hold 1,000 elements each and the
+    /// rest one: the first batch's reshaping adds about four times what the average says, and the estimate, per row
+    /// decoded for what is inside a list, still covers it.
+    /// </summary>
+    [Fact]
+    public async Task TheEstimate_CoversABatchHoldingMostOfAListsElements()
+    {
+        const int rows = 400, batch = 100, heavy = 1_000;
+        IArrowType Element(bool evolved) => new Apache.Arrow.Types.StructType(evolved
+            ? [new Field("a", Int32Type.Default, true), new Field("b", Int64Type.Default, true)]
+            : [new Field("a", Int32Type.Default, true)]);
+        var tableSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("c", new ListType(new Field("element", Element(true), true)), true)).Build();
+        await using var table = await DeltaTable.CreateAsync(_fs, tableSchema);
+        var snapshot = table.CurrentSnapshot;
+        var listType = new ListType(new Field("element", Element(false), true));
+        var fileSchema = new Apache.Arrow.Schema.Builder().Field(new Field("c", listType, true)).Build();
+
+        var offsets = new ArrowBuffer.Builder<int>(rows + 1);
+        int at = 0;
+        offsets.Append(0);
+        for (int i = 0; i < rows; i++)
+            offsets.Append(at += i < batch ? heavy : 1);
+        var values = new Int32Array.Builder();
+        for (int i = 0; i < at; i++)
+            values.Append(i);
+        var elements = new StructArray((Apache.Arrow.Types.StructType)Element(false), at, [values.Build()], ArrowBuffer.Empty, 0);
+        using var whole = new RecordBatch(fileSchema, [new ListArray(listType, rows, offsets.Build(), elements, ArrowBuffer.Empty, 0)], rows);
+        var first = whole.Slice(0, batch);
+        long added = RollingDataFileWriter.EstimatedBytes(DeltaTable.ReconcileToTableShape(
+            first, snapshot, null, null, [], false, new Dictionary<string, string>())) - RollingDataFileWriter.EstimatedBytes(first);
+
+        var reshape = DeltaTable.ReconcileAddedBytesPerRow(
+            snapshot, null, null, [], false, ColumnMappingMode.None, new Dictionary<string, string>(), fileSchema,
+            byteArrays: null, new Dictionary<string, double> { ["c"] = at / (double)rows });
+        long estimate = reshape.PerRow * batch + reshape.PerDecodedRow * rows;
+        Assert.True(added > 8L * batch * heavy, $"reshaping added {added} bytes: the heavy rows were not backfilled");
+        Assert.True(estimate >= added - 4096, $"estimated {reshape} = {estimate} for the first {batch} of {rows} rows, reshaping added {added}");
     }
 
     /// <summary>The bytes of the buffers <paramref name="shaped"/> holds that <paramref name="raw"/> does not.</summary>
@@ -436,7 +487,8 @@ public class HostAddedBytesTests : IDisposable
         var reshape = DeltaTable.ReconcileAddedBytesPerRow(
             snapshot, null, add.PartitionValues, [], false, ColumnMappingMode.None,
             new Dictionary<string, string>(), await reader.GetArrowSchemaAsync(), byteArrays: null);
-        long perRow = reshape;
+        // One batch of the whole decode: both parts are per row of it.
+        long perRow = reshape.PerRow + reshape.PerDecodedRow;
         long added = shaped - raw;
         Assert.True(added >= 3L * Rows, $"reshaping added {added} bytes: the int is not widened");
         Assert.True(perRow * Rows >= added - 4096 && perRow * Rows <= added + 2 * Rows,

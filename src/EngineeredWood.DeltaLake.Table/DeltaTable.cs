@@ -7175,7 +7175,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     read, _options.ParquetReadOptions.ByteArrayOutput, cancellationToken).ConfigureAwait(false));
                 Volatile.Write(ref read.ScanAddedBytes, reshaped);
             }
-            reservation.AddedBytesPerRow = reshaped.Value + MetadataAddedBytesPerRow(scan, pathBytes);
+            reservation.AddedBytesPerRow = reshaped.Value.PerRow + MetadataAddedBytesPerRow(scan, pathBytes);
+            reservation.AddedBytesPerDecodedRow = reshaped.Value.PerDecodedRow;
         }
 
         // An exact filter through the built-in reader: the Parquet read selects the rows (deletion vector and filter
@@ -13864,8 +13865,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     var reshaped = await ReconcileAddedBytesPerRowAsync(read, byteArrays: null, cancellationToken)
                         .ConfigureAwait(false);
                     reservation.SetInitialEstimate(await LargestFirstBatchBytesAsync(
-                        read.Reader, read.FileColumns, read.DeletedRows, cancellationToken, reshaped)
-                        .ConfigureAwait(false));
+                        read.Reader, read.FileColumns, read.DeletedRows, cancellationToken, reshaped.PerRow,
+                        reshaped.PerDecodedRow).ConfigureAwait(false));
                 }
 
                 source = Reserving(
@@ -14736,7 +14737,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     internal static ValueTask<long> LargestFirstBatchBytesAsync(
         ParquetFileReader reader, IReadOnlyList<string>? fileColumns, DeletionVectorBitmap? deletedRows,
-        CancellationToken cancellationToken, long addedBytesPerRow = 0)
+        CancellationToken cancellationToken, long addedBytesPerRow = 0, long addedBytesPerDecodedRow = 0)
     {
         // A group the deletion vector deletes in full is skipped unread (ReadPositionedAsync), so it is never
         // decoded and needs no reservation.
@@ -14744,7 +14745,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             ? (start, rows) => deletedRows.ContainsRange(start, rows)
             : null;
         return reader.LargestFirstBatchBytesAsync(
-            fileColumns, skipped, cancellationToken, addedBytesPerRow);
+            fileColumns, skipped, cancellationToken, addedBytesPerRow, addedBytesPerDecodedRow);
     }
 
     private static async IAsyncEnumerable<(RecordBatch Batch, long FirstRow)> InFileOrder(

@@ -44,10 +44,26 @@ internal sealed class ScanReservation
     internal long AddedBytesPerRow { get; set; }
 
     /// <summary>
+    /// As <see cref="AddedBytesPerRow"/>, for bytes the host adds per row the reader DECODES rather than per row of
+    /// the batch: what it adds per element of a list or map, whose elements per row the host knows only on average
+    /// over a row group. A batch's elements may be the row group's in any share (#854 review), but never more than
+    /// all of them, which this many decoded rows bound.
+    /// </summary>
+    internal long AddedBytesPerDecodedRow { get; set; }
+
+    /// <summary>
     /// <see cref="SetInitialEstimate(long)"/> for a reader whose first batch decodes to <paramref name="bytes"/> and
     /// holds at most <paramref name="rows"/> rows, to which the host adds <see cref="AddedBytesPerRow"/> each.
     /// </summary>
-    internal void SetInitialEstimate(long bytes, long rows) => Observe(WithAddedBytes(bytes, AddedBytesPerRow, rows));
+    internal void SetInitialEstimate(long bytes, long rows) => SetInitialEstimate(bytes, rows, rows);
+
+    /// <summary>
+    /// <see cref="SetInitialEstimate(long, long)"/> for a first batch of at most <paramref name="rows"/> rows sliced from
+    /// a decode of at most <paramref name="decodedRows"/>, to which the host adds <see cref="AddedBytesPerRow"/> and
+    /// <see cref="AddedBytesPerDecodedRow"/>.
+    /// </summary>
+    internal void SetInitialEstimate(long bytes, long rows, long decodedRows) =>
+        Observe(WithAddedBytes(WithAddedBytes(bytes, AddedBytesPerRow, rows), AddedBytesPerDecodedRow, decodedRows));
 
     /// <summary><paramref name="bytes"/> plus <paramref name="addedBytesPerRow"/> for each of <paramref name="rows"/>
     /// rows, saturating at <see cref="MemoryBudget.MaxCharge"/> as every estimate does rather than wrapping (#852
