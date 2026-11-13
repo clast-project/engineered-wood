@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
 using EngineeredWood.Arrow;
 using EngineeredWood.IO.Local;
@@ -70,6 +71,78 @@ public class CompactionRawReleaseTests : IDisposable
         // The widened compaction writes its ids as new (managed) long arrays and releases the narrow ones it read; the
         // control writes the ints it read, which the writer keeps.
         Assert.True(await LeftAfterCompactingAsync(widened) < await LeftAfterCompactingAsync(control));
+    }
+
+    [Fact]
+    public async Task CompactingAFixedSizeBinaryColumn_KeepsTheValuesItWrites()
+    {
+        // Files a foreign writer left with a FIXED_LEN_BYTE_ARRAY column: compaction's normalization rewrites it as
+        // binary over a window of the values it read, so releasing what the written batch drops must keep them
+        // (#857 review round 4).
+        var dir = Path.Combine(_tempDir, "fsb");
+        Directory.CreateDirectory(dir);
+        var fs = new LocalTableFileSystem(dir);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int32Type.Default, false))
+            .Field(new Field("b", new FixedSizeBinaryType(4), true)).Build();
+#pragma warning disable EWDELTA0001 // codec seam is experimental
+        var hostOptions = DeltaTableOptions.Default with { DataFileWriter = new VerbatimWriter(dir) };
+#pragma warning restore EWDELTA0001
+        await using (var host = await DeltaTable.CreateAsync(fs, schema, hostOptions))
+        {
+            for (int part = 0; part < 2; part++)
+            {
+                var ids = new Int32Array.Builder();
+                var bytes = new byte[Rows / 2 * 4];
+                for (int i = 0; i < Rows / 2; i++)
+                {
+                    int id = part * Rows / 2 + i;
+                    ids.Append(id);
+                    BitConverter.GetBytes(id).CopyTo(bytes, i * 4);
+                }
+
+                var b = new FixedSizeBinaryArray(new ArrayData(
+                    new FixedSizeBinaryType(4), Rows / 2, 0, 0, [ArrowBuffer.Empty, new ArrowBuffer(bytes)]));
+                await host.WriteAsync([new RecordBatch(schema, [ids.Build(), b], Rows / 2)]);
+            }
+        }
+
+        await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions { MaxConcurrentReads = 1 });
+        Assert.NotNull(await table.CompactAsync(AlwaysCompact));
+
+        int seen = 0;
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            using (batch)
+            {
+                var ids = (Int32Array)batch.Column(batch.Schema.GetFieldIndex("id"));
+                var values = (BinaryArray)batch.Column(batch.Schema.GetFieldIndex("b"));
+                for (int i = 0; i < batch.Length; i++, seen++)
+                    Assert.Equal(ids.GetValue(i)!.Value, BitConverter.ToInt32(values.GetBytes(i).ToArray(), 0));
+            }
+        }
+        Assert.Equal(Rows, seen);
+    }
+
+    /// <summary>Writes the batches it is handed as they are, as a foreign writer would.</summary>
+#pragma warning disable EWDELTA0001 // codec seam is experimental
+    private sealed class VerbatimWriter(string root) : IDataFileWriter
+#pragma warning restore EWDELTA0001
+    {
+        public async ValueTask<long> WriteAsync(
+            IAsyncEnumerable<RecordBatch> batches, string relativePath, CancellationToken cancellationToken)
+        {
+            string path = Path.Combine(root, relativePath);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await using (var file = new LocalSequentialFile(path))
+            {
+                await using var writer = new ParquetFileWriter(file, ownsFile: false);
+                await foreach (var b in batches.WithCancellation(cancellationToken))
+                    await writer.WriteRowGroupAsync(b, cancellationToken);
+                await writer.CloseAsync(cancellationToken);
+            }
+            return new FileInfo(path).Length;
+        }
     }
 
     // A table of `Rows` rows in two files: an int `id` (every seventh NULL), a string `tag` and, `withGone`, a string
