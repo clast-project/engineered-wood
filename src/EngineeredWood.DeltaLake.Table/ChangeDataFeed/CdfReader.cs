@@ -486,6 +486,8 @@ internal static class CdfReader
         await foreach (var (batch, _) in DeltaTable.ReadFileReserving(reader, null, reservation, cancellationToken)
             .ConfigureAwait(false))
         {
+            var raw = RawBatchBuffers.Of(batch); // what the output drops is released once it is built (#855)
+
             // The file already carries _change_type (per-row); split it off so the physical data columns can be
             // mapped to logical + interleaved with the re-materialized partition columns, then re-attach it.
             var (physicalData, changeType) = SplitChangeType(batch);
@@ -514,12 +516,14 @@ internal static class CdfReader
             // A cdc action carries no baseRowId / defaultRowCommitVersion, so the materialized value is the
             // whole story for the id. The commit version falls back to this commit — that is what a null
             // means in a change file Spark wrote, and it is the version the row belongs to by definition.
-            yield return ctx.EmitRowTracking
+            var output = ctx.EmitRowTracking
                 ? ResolveRowTracking(
                     withMetadata, matIds, matVers,
                     baseRowId: null, defaultRowCommitVersion: commitVersion, absolutePositions: null,
                     ctx.EmittedRowIdName, ctx.EmittedRowVersionName)
                 : withMetadata;
+            raw.ReleaseAllBut(output);
+            yield return output;
         }
     }
 
@@ -554,6 +558,7 @@ internal static class CdfReader
         await foreach (var batch in opened.Reader.ReadAllAsync(cancellationToken: cancellationToken)
             .ConfigureAwait(false))
         {
+            var raw = RawBatchBuffers.Of(batch); // what the output drops is released once it is built (#855)
             var (physicalData, changeType) = SplitChangeType(batch);
             if (changeType is not StringArray changeTypes)
             {
@@ -568,7 +573,9 @@ internal static class CdfReader
                 (cleanPhysical, ids, versions) = RowTracking.RowTrackingWriter.StripMaterializedColumns(
                     physicalData, ctx.MaterializedRowIdName, ctx.MaterializedRowVersionName);
             }
-            yield return (ToTableShape(cleanPhysical, file.PartitionValues, ctx), changeTypes, ids, versions);
+            var shaped = ToTableShape(cleanPhysical, file.PartitionValues, ctx);
+            raw.ReleaseAllBut(shaped, changeTypes, ids, versions);
+            yield return (shaped, changeTypes, ids, versions);
         }
     }
 
@@ -798,6 +805,7 @@ internal static class CdfReader
         await foreach (var (rawBatch, thisBatchStart) in DeltaTable.ReadFileReserving(
             reader, filter.SkipRows, reservation, cancellationToken).ConfigureAwait(false))
         {
+            var raw = RawBatchBuffers.Of(rawBatch); // what the output drops is released once it is built (#855)
 
             // Hidden row-tracking columns off first — a data file carries them for every row a rewrite moved,
             // and they are indexed by RAW position, so they must be captured before the DV filter renumbers.
@@ -820,7 +828,10 @@ internal static class CdfReader
             if (filtered && survivorSrc!.Count < rawBatch2.Length)
             {
                 if (survivorSrc.Count == 0)
+                {
+                    raw.ReleaseAllBut(null);
                     continue; // no row of this batch is part of the change
+                }
                 var columns = new IArrowArray[rawBatch2.ColumnCount];
                 for (int col = 0; col < rawBatch2.ColumnCount; col++)
                     columns[col] = ArrowCompute.Take(rawBatch2.Column(col), survivorSrc);
@@ -836,6 +847,7 @@ internal static class CdfReader
 
             if (!ctx.EmitRowTracking)
             {
+                raw.ReleaseAllBut(withMetadata);
                 yield return withMetadata;
                 continue;
             }
@@ -846,11 +858,13 @@ internal static class CdfReader
             for (int k = 0; k < survivorSrc.Count; k++)
                 positions[k] = thisBatchStart + survivorSrc[k];
 
-            yield return ResolveRowTracking(
+            var tracked = ResolveRowTracking(
                 withMetadata,
                 Gather(rawMatIds, survivorSrc), Gather(rawMatVers, survivorSrc),
                 baseRowId, defaultRowCommitVersion, positions,
                 ctx.EmittedRowIdName, ctx.EmittedRowVersionName);
+            raw.ReleaseAllBut(tracked);
+            yield return tracked;
         }
     }
 

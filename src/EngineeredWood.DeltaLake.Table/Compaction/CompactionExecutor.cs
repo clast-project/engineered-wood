@@ -409,6 +409,10 @@ internal static class CompactionExecutor
                                maxConcurrentReads, maxBufferedReadBytes, memoryBudget, cancellationToken).ConfigureAwait(false))
             {
                 var (batch, batchStartRow, deletedRows) = (source.Batch, source.FirstRow, source.DeletedRows);
+                // What the batch holds as read, before anything below works on it: the buffers the written batch
+                // doesn't hold (a dropped column's, a widened column's narrow values, the arrays a deletion vector's
+                // gather replaced) are released once it is built (#855, #857 review round 3).
+                var raw = RawBatchBuffers.Of(batch);
                 long baseId = source.File.BaseRowId ?? 0;
                 long commitVer = source.File.DefaultRowCommitVersion ?? 0;
 
@@ -426,7 +430,10 @@ internal static class CompactionExecutor
                     : DeletionVectors.KeptRows.For(deletedRows, batchStartRow, batch.Length);
                 int survivors = deletedRows is null ? batch.Length : kept.Count;
                 if (survivors == 0)
+                {
+                    raw.ReleaseAllBut(null);
                     continue; // every row in this batch was deleted: nothing to map, gather or write
+                }
 
                 Int64Array? survivorIds = null, survivorVers = null;
                 if (materialize)
@@ -465,7 +472,10 @@ internal static class CompactionExecutor
                 if (deletedRows is not null && !kept.AllKept)
                     liveBatch = ArrowCompute.Take(liveBatch, liveBatch.Schema, kept.Indices);
                 if (liveBatch.Length == 0)
+                {
+                    raw.ReleaseAllBut(null);
                     continue; // every row in this batch was deleted
+                }
 
                 // Widen values from old files to match current schema
                 var outBatch = TypeWidening.ValueWidener.WidenBatch(liveBatch, targetSchema);
@@ -520,6 +530,7 @@ internal static class CompactionExecutor
                         writeBatch, partition.Values, snapshot.Schema, snapshot.Metadata.PartitionColumns,
                         partition.LogicalToPhysical);
                 }
+                raw.ReleaseAllBut(writeBatch, outBatch);
                 await output.AddAsync(writeBatch, outBatch, cancellationToken).ConfigureAwait(false);
             }
 
