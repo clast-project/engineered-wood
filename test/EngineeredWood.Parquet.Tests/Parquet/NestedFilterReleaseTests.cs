@@ -100,6 +100,31 @@ public class NestedFilterReleaseTests : IDisposable
         Assert.Equal(0, left);
     }
 
+    [Fact]
+    public async Task BareRepeatedLeaves_ReleaseTheirDenseLeaves()
+    {
+        // A repeated primitive with no LIST annotation is gathered by the element filter, not the subtree one.
+        for (int i = 0; i < 3; i++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+
+        long before = NativeMemoryTracker.LiveBytes;
+        await using (var input = new LocalRandomAccessFile(TestData.GetPath("repeated_primitive_no_list.parquet")))
+        await using (var reader = new ParquetFileReader(input, ownsFile: false))
+        {
+            var metadata = await reader.ReadMetadataAsync();
+            for (int rg = 0; rg < metadata.RowGroups.Count; rg++)
+            {
+                using var batch = await reader.ReadRowGroupAsync(rg);
+                Assert.True(batch.Length > 0);
+            }
+        }
+
+        Assert.Equal(0, NativeMemoryTracker.LiveBytes - before);
+    }
+
     private static string Text(int i) => "element value number " + i;
 
     private static ListArray List(Field element, Action<int> append, Func<IArrowArray> build)
