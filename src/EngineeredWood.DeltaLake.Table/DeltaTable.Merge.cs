@@ -490,7 +490,9 @@ public sealed partial class DeltaTable
                                 else
                                     sourcelessUpdated += updateRows.Count;
                                 var preimage = TakeRowsFromBatch(batch, updateRows);
-                                handedOn.Add(preimage);
+                                // Kept for the change files alone: the post-image's own entries keep what the rewrite reads.
+                                if (cdfEnabled)
+                                    handedOn.Add(preimage);
                                 var postimage = MergePostImage(
                                     preimage,
                                     isMatched

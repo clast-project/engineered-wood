@@ -5137,6 +5137,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             snapshot.Metadata.Configuration);
         // Every file's deleted rows go to the same change files, one per partition (#723).
         await using var changeData = cdfEnabled ? NewChangeDataSink(snapshot, written) : null;
+        // Captured change rows not yet handed to the change files: released however the delete ends (#867 review).
+        using var unhanded = new UnhandedCaptures();
         bool rowTrackingEnabled = DeltaLake.RowTracking.RowTrackingConfig.IsEnabled(
             snapshot.Metadata.Configuration);
         var (matRowIdName, matRowVerName) = DeltaLake.RowTracking.RowTrackingConfig
@@ -5448,6 +5450,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 var (logicalBatch, rawMatIds, rawMatVers) = ToDeletedRowsShape(batch);
                 deletedRowBatches.Add(logicalBatch);
                 deletedRowBuffers.Add(raw);
+                unhanded.Add(raw);
                 if (!rowTrackingEnabled)
                     return;
                 var ids = new Int64Array.Builder().Reserve(batch.Length);
@@ -5548,6 +5551,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 {
                     var trk = b < deletedRowTracking.Count ? deletedRowTracking[b] : ((Int64Array, Int64Array)?)null;
                     // Handed over: the change file releases what the read decoded for them once they are written.
+                    unhanded.Hand(deletedRowBuffers[b]);
                     using var lease = new BatchLease(deletedRowBuffers[b]);
                     await changeData.AddAsync(
                         deletedRowBatches[b], DeltaLake.ChangeDataFeed.CdfConfig.Delete,
@@ -6046,7 +6050,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         if (matchRows.Count > 0)
                         {
                             var matchBatch = TakeRowsFromBatch(batch, matchRows);
-                            handedOn.Add(matchBatch);
+                            // Kept for the change files alone: the post-image's own entries keep what the rewrite reads.
+                            if (cdfEnabled)
+                                handedOn.Add(matchBatch);
                             var updatedBatch = updater(matchBatch);
                             handedOn.Add(updatedBatch);
                             ThrowIfUpdaterChangedTypes(matchBatch, updatedBatch, snapshot.Schema);
@@ -6403,6 +6409,28 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var held = _file?.ReleaseAllBut(null, changeRows.ToArray()) ?? RawBatchBuffers.None();
             _file = null;
             return new BatchLease(held);
+        }
+    }
+
+    /// <summary>
+    /// What a deletion-vector DELETE's scan captured for the change files and has not handed them yet (#865). A capture
+    /// is handed to the change files under a lease once its file's deletion vector is decided; one still here when the
+    /// delete ends, because a scan, a vector write or a change file failed or was cancelled, is released then.
+    /// </summary>
+    private sealed class UnhandedCaptures : IDisposable
+    {
+        private readonly List<RawBatchBuffers> _captures = [];
+
+        public void Add(RawBatchBuffers capture) => _captures.Add(capture);
+
+        /// <summary>The capture is the change files' now, under a lease.</summary>
+        public void Hand(RawBatchBuffers capture) => _captures.Remove(capture);
+
+        public void Dispose()
+        {
+            foreach (var capture in _captures)
+                capture.ReleaseAll();
+            _captures.Clear();
         }
     }
 

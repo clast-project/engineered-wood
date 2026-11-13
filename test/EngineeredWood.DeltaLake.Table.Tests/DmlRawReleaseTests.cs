@@ -169,47 +169,146 @@ public class DmlRawReleaseTests : IDisposable
     // With deletion vectors an UPDATE or MERGE writes only its post-images, so it processes each batch as it is read and
     // keeps no more of the file than a read does: about a row group, here a sixteenth of the file (#728). It held the
     // whole file before.
+    // With string views it changes a row in every row group and replaces the values it gathered: a gathered row's view
+    // shares its row group's data buffer, which nothing but the change files would read (#867 review: a preimage kept
+    // with the change feed off held every row group's).
     [Theory]
-    [InlineData(Op.Update)]
-    [InlineData(Op.Merge)]
-    public async Task ADeletionVectorDmlHoldsNoMoreThanARead(Op op)
+    [InlineData(Op.Update, false)]
+    [InlineData(Op.Merge, false)]
+    [InlineData(Op.Update, true)]
+    [InlineData(Op.Merge, true)]
+    public async Task ADeletionVectorDmlHoldsNoMoreThanARead(Op op, bool views)
     {
-        const int rows = 64_000;
+        const int rows = 64_000, groupRows = rows / 16;
         var dir = Path.Combine(_tempDir, "groups");
         Directory.CreateDirectory(dir);
         var fs = new LocalTableFileSystem(dir);
-        var write = new DeltaTableOptions { ParquetWriteOptions = new ParquetWriteOptions { RowGroupMaxRows = rows / 16 } };
+        var write = new DeltaTableOptions { ParquetWriteOptions = new ParquetWriteOptions { RowGroupMaxRows = groupRows } };
         await using (var created = await DeltaTable.CreateAsync(fs, TableSchema, write, enableDeletionVectors: true))
             await created.WriteAsync([Source(0, rows)]);
+        var read = new DeltaTableOptions
+        {
+            MaxConcurrentReads = 1,
+            ParquetReadOptions = new ParquetReadOptions
+            {
+                ByteArrayOutput = views ? ByteArrayOutputKind.ViewType : ByteArrayOutputKind.Default,
+            },
+        };
 
-        long readPeak = await PeakOfAsync(fs, async table =>
+        // Without views, the rows of `Changed`; with them, the first row of every row group.
+        Func<RecordBatch, BooleanArray> changed = views ? FirstOfEveryGroup : Changed;
+        int changedRows = views ? rows / groupRows : Last - First;
+        RecordBatch source = views ? FirstsOfGroups() : Source(First, Last);
+
+        long readPeak = await PeakOfAsync(fs, read, async table =>
         {
             await foreach (var batch in table.ReadAllAsync())
                 batch.Dispose();
         });
-        long dmlPeak = await PeakOfAsync(fs, async table =>
+        long dmlPeak = await PeakOfAsync(fs, read, async table =>
         {
             if (op == Op.Update)
             {
-                var (updated, _) = await table.UpdateAsync(Changed, b => b, mode: RowDeleteMode.DeletionVector);
-                Assert.Equal(Last - First, updated);
+                var (updated, _) = await table.UpdateAsync(
+                    changed, views ? WithNewStrings : b => b, mode: RowDeleteMode.DeletionVector);
+                Assert.Equal(changedRows, updated);
             }
             else
             {
-                var (metrics, _) = await table.MergeAsync([Source(First, Last)], new MergeOptions
+                var (metrics, _) = await table.MergeAsync([source], new MergeOptions
                 {
                     Keys = ["id"], WhenMatched = [MergeAction.Update], DeleteMode = RowDeleteMode.DeletionVector,
                 });
-                Assert.Equal(Last - First, metrics.NumTargetRowsUpdated);
+                Assert.Equal(changedRows, metrics.NumTargetRowsUpdated);
             }
         });
 
         // Measured: the same peak as the read (465,016 B); 5,168,136 B when the file was held whole.
         Assert.True(dmlPeak < 2 * readPeak, $"Peak {dmlPeak:N0} B; a read of the table peaks at {readPeak:N0} B.");
+
+        static BooleanArray FirstOfEveryGroup(RecordBatch batch)
+        {
+            var ids = (Int32Array)batch.Column(batch.Schema.GetFieldIndex("id"));
+            var mask = new BooleanArray.Builder();
+            for (int i = 0; i < ids.Length; i++)
+                mask.Append(ids.GetValue(i) % groupRows == 0);
+            return mask.Build();
+        }
+
+        static RecordBatch FirstsOfGroups()
+        {
+            var ids = new Int32Array.Builder();
+            var tags = new StringArray.Builder();
+            var gone = new StringArray.Builder();
+            for (int i = 0; i < rows; i += groupRows)
+            {
+                ids.Append(i);
+                tags.Append("t" + (i % 4));
+                gone.Append(Gone(i));
+            }
+            return new RecordBatch(TableSchema, [ids.Build(), tags.Build(), gone.Build()], rows / groupRows);
+        }
+
+        // The same rows, with string columns built anew: nothing of the read's.
+        static RecordBatch WithNewStrings(RecordBatch matched)
+        {
+            var columns = new List<IArrowArray>(matched.ColumnCount);
+            for (int c = 0; c < matched.ColumnCount; c++)
+            {
+                if (matched.Column(c) is StringViewArray strings)
+                {
+                    var built = new StringViewArray.Builder();
+                    for (int i = 0; i < strings.Length; i++)
+                        built.Append(strings.GetString(i));
+                    columns.Add(built.Build());
+                }
+                else
+                {
+                    columns.Add(matched.Column(c));
+                }
+            }
+            return new RecordBatch(matched.Schema, columns, matched.Length);
+        }
+    }
+
+    // A deletion-vector DELETE's change rows are captured as its scan finds them and handed to the change files once
+    // the file's vector is decided. A delete that fails before then releases what it captured (#867 review).
+    [Fact]
+    public async Task AFailedVectorDeleteReleasesWhatItCaptured()
+    {
+        var dir = Path.Combine(_tempDir, "failed");
+        Directory.CreateDirectory(dir);
+        var fs = new LocalTableFileSystem(dir);
+        await CreateAsync(fs, deletionVectors: true, cdf: true, tracked: false);
+        for (int i = 0; i < 3; i++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+
+        long before = NativeMemoryTracker.LiveBytes;
+        await using (var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions
+        {
+            MaxConcurrentReads = 1,
+            ParquetReadOptions = new ParquetReadOptions { BatchSize = 1_000, ByteArrayOutput = ByteArrayOutputKind.ViewType },
+        }))
+        {
+            // Matches in the third batch, then fails on the fourth: the third's rows are captured by then.
+            var thrown = await Assert.ThrowsAsync<InvalidOperationException>(async () => await table.DeleteAsync(batch =>
+            {
+                var ids = (Int32Array)batch.Column(batch.Schema.GetFieldIndex("id"));
+                if (ids.GetValue(0) >= Last)
+                    throw new InvalidOperationException("The predicate failed.");
+                return Changed(batch);
+            }, RowDeleteMode.DeletionVector));
+            Assert.Equal("The predicate failed.", thrown.Message);
+        }
+
+        Assert.Equal(0, NativeMemoryTracker.LiveBytes - before);
     }
 
     // The highest native memory in use while `act` runs on the table, over what was in use before it.
-    private static async Task<long> PeakOfAsync(LocalTableFileSystem fs, Func<DeltaTable, Task> act)
+    private static async Task<long> PeakOfAsync(LocalTableFileSystem fs, DeltaTableOptions options, Func<DeltaTable, Task> act)
     {
         for (int i = 0; i < 3; i++)
         {
@@ -218,7 +317,7 @@ public class DmlRawReleaseTests : IDisposable
         }
 
         NativeMemoryTracker.Reset();
-        await using (var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions { MaxConcurrentReads = 1 }))
+        await using (var table = await DeltaTable.OpenAsync(fs, options))
             await act(table);
         return NativeMemoryTracker.PeakBytes;
     }
