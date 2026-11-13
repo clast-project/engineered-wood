@@ -223,30 +223,34 @@ public class DmlRawReleaseTests : IDisposable
         return NativeMemoryTracker.PeakBytes;
     }
 
-    // A MERGE's post-images gather the source's values, so with string views they share the source's data buffers. The
-    // source is the caller's: handing the change rows to the change files releases only what the MERGE itself read.
+    // An UPDATE's updater may hand back arrays of its own, which are the caller's: handing the post-images to the change
+    // files releases only what the UPDATE itself read. Here the updater's column was read natively, as views, by the
+    // caller, who still holds it.
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task AMergeLeavesItsSourceAlone(bool deletionVectors)
+    public async Task AnUpdatersOwnArraysStayTheCallers(bool deletionVectors)
     {
         var viewOptions = new DeltaTableOptions
         {
             MaxConcurrentReads = 1,
-            ParquetReadOptions = new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.ViewType },
+            ParquetReadOptions = new ParquetReadOptions { BatchSize = 1_000, ByteArrayOutput = ByteArrayOutputKind.ViewType },
         };
         var sourceDir = Path.Combine(_tempDir, "source");
         Directory.CreateDirectory(sourceDir);
         var sourceFs = new LocalTableFileSystem(sourceDir);
         await using (var created = await DeltaTable.CreateAsync(sourceFs, TableSchema))
             await created.WriteAsync([Source(First, Last)]);
-        // Read natively, as views, and held by the caller across the MERGE.
-        var source = new List<RecordBatch>();
+        RecordBatch? callers = null;
         await using (var sourceTable = await DeltaTable.OpenAsync(sourceFs, viewOptions))
         {
             await foreach (var batch in sourceTable.ReadAllAsync())
-                source.Add(batch);
+            {
+                Assert.Null(callers);
+                callers = batch;
+            }
         }
+        var gone = callers!.Column(callers.Schema.GetFieldIndex("gone"));
 
         var dir = Path.Combine(_tempDir, "target");
         Directory.CreateDirectory(dir);
@@ -256,30 +260,25 @@ public class DmlRawReleaseTests : IDisposable
         long before = NativeMemoryTracker.LiveBytes;
         await using (var table = await DeltaTable.OpenAsync(fs, viewOptions))
         {
-            var (metrics, _) = await table.MergeAsync(source, new MergeOptions
+            // The changed rows are one read batch's, so the updater sees them all at once, in order.
+            var (updated, _) = await table.UpdateAsync(Changed, matched =>
             {
-                Keys = ["id"],
-                WhenMatched = [MergeAction.Update],
-                DeleteMode = deletionVectors ? RowDeleteMode.DeletionVector : RowDeleteMode.CopyOnWrite,
-            });
-            Assert.Equal(Last - First, metrics.NumTargetRowsUpdated);
+                Assert.Equal(gone.Length, matched.Length);
+                int g = matched.Schema.GetFieldIndex("gone");
+                var columns = Enumerable.Range(0, matched.ColumnCount)
+                    .Select(i => i == g ? gone : matched.Column(i)).ToList();
+                return new RecordBatch(matched.Schema, columns, matched.Length);
+            }, mode: deletionVectors ? RowDeleteMode.DeletionVector : RowDeleteMode.CopyOnWrite);
+            Assert.Equal(Last - First, updated);
         }
 
-        // Nothing of the source was released (that would show as less than before), and nothing the MERGE read is left.
+        // Nothing of the caller's was released (that would show as less than before), and nothing the UPDATE read is left.
         Assert.Equal(0, NativeMemoryTracker.LiveBytes - before);
-        int seen = 0;
-        foreach (var batch in source)
+        using (callers)
         {
-            using (batch)
-            {
-                foreach (var (id, gone) in Values(batch))
-                {
-                    Assert.Equal(Gone(id), gone);
-                    seen++;
-                }
-            }
+            foreach (var (id, value) in Values(callers))
+                Assert.Equal(Gone(id), value);
         }
-        Assert.Equal(Last - First, seen);
     }
 
     private static BooleanArray Changed(RecordBatch batch)
