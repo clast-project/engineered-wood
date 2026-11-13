@@ -98,7 +98,7 @@ public sealed partial class DeltaTable
     }
 
     /// <summary>A <see cref="ReshapeBytes"/> a reference can publish whole to the units that share a file.</summary>
-    private sealed record ReshapeBytesBox(ReshapeBytes Value);
+    internal sealed record ReshapeBytesBox(ReshapeBytes Value);
 
     /// <summary>
     /// The file's top-level fields by the names the read gives them: its schema renamed as a batch of it is
