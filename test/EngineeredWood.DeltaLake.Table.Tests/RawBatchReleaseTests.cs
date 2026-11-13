@@ -317,6 +317,61 @@ public class RawBatchReleaseTests : IDisposable
         Assert.Equal(2 * (Rows / 4), rows);
     }
 
+    // Rewriting the change file hands the rows it reads to the change-file writer, which releases them once they are
+    // written (#860). Each change type's run is a slice of the rows read, so they stay alive until the last run is
+    // written. A row group smaller than the file, so its rows are written in several. Batched, the rewrite reads the
+    // file in the table's batches (#866 review round 1), slices of one decoded row group.
+    [Theory]
+    [InlineData(null)]
+    [InlineData(RowGroup / 4)]
+    public async Task RewritingAChangeFile_ReleasesTheRowsItWrites(int? batchSize)
+    {
+        long updated;
+        await using (var table = await CreateAsync(new() { [CdfConfig.EnableKey] = "true" }))
+            (_, updated) = await table.UpdateAsync(Ex.Equal("tag", "t1"), SetGone);
+
+        var file = Assert.Single((await new TransactionLog(_fs).ReadCommitAsync(updated)).OfType<CdcFile>());
+        IReadOnlyList<CdcFile>? rewritten = null;
+        await AssertReleasedAsync(async table =>
+        {
+            // The rewrite reads in the table's batches.
+            var batches = new List<int>();
+            await foreach (var (batch, changeTypes, ids, versions) in ChangeDataFeed.CdfReader.ReadWrittenChangeFileAsync(
+                               _fs, table.CurrentSnapshot, file, CancellationToken.None, table.ChangeFileRewriteReadOptions))
+            {
+                batches.Add(batch.Length);
+                batch.Dispose();
+                changeTypes.Dispose();
+                ids?.Dispose();
+                versions?.Dispose();
+            }
+            // Unbatched, a batch per row group of the change file; batched, none larger than the batch size.
+            int largest = batchSize ?? RowGroup;
+            Assert.True(batches.Count >= 2 * (Rows / 4) / largest && batches.Max() == largest, string.Join(",", batches));
+
+            rewritten = await table.RewriteInsertRowIdsAsync(
+                table.CurrentSnapshot, [file], [], CancellationToken.None, written: null);
+        }, batchSize, writeOptions: new ParquetWriteOptions { RowGroupMaxRows = RowGroup / 3 });
+
+        // The rewritten file holds what the original did.
+        long rows = 0, preimages = 0;
+        await using (var table = await DeltaTable.OpenAsync(_fs))
+        {
+            foreach (var cdc in rewritten!)
+            {
+                await foreach (var (batch, changeTypes, _, _) in ChangeDataFeed.CdfReader.ReadWrittenChangeFileAsync(
+                                   _fs, table.CurrentSnapshot, cdc, CancellationToken.None))
+                {
+                    rows += batch.Length;
+                    preimages += Enumerable.Range(0, changeTypes.Length)
+                        .Count(i => changeTypes.GetString(i) == CdfConfig.UpdatePreimage);
+                }
+            }
+        }
+        Assert.Equal(2 * (Rows / 4), rows);
+        Assert.Equal(Rows / 4, preimages);
+    }
+
     private async Task<DeltaTable> CreateAsync(Dictionary<string, string> configuration)
     {
         var schema = new Apache.Arrow.Schema.Builder()
@@ -371,7 +426,8 @@ public class RawBatchReleaseTests : IDisposable
     // Runs `read` over the table and checks that every native byte it allocated is free again, with no collection in
     // between to finalize what it dropped.
     private async Task AssertReleasedAsync(
-        Func<DeltaTable, Task> read, int? batchSize, bool seam = false, ByteArrayOutputKind byteArrays = ByteArrayOutputKind.Default)
+        Func<DeltaTable, Task> read, int? batchSize, bool seam = false, ByteArrayOutputKind byteArrays = ByteArrayOutputKind.Default,
+        ParquetWriteOptions? writeOptions = null)
     {
         for (int i = 0; i < 3; i++)
         {
@@ -386,6 +442,7 @@ public class RawBatchReleaseTests : IDisposable
                          ParquetReadOptions = new ParquetReadOptions { BatchSize = batchSize, ByteArrayOutput = byteArrays },
                          MaxConcurrentReads = 1,
                          DataFileReader = seam ? new SeamReader(_fs) : null,
+                         ParquetWriteOptions = writeOptions ?? ParquetWriteOptions.Default,
                      }))
         {
             await read(table);

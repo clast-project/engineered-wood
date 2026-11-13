@@ -12,11 +12,9 @@ namespace EngineeredWood.DeltaLake.Table.Tests;
 
 /// <summary>
 /// Compaction reshapes the batches it reads in a pipeline of its own, and releases what it drops (#855, #857 review
-/// round 3): a dropped column's decode, a widened column's narrow values.
-/// <para>Measured against a control, not against zero: the writer keeps the batches it is handed and never disposes
-/// them, so a compaction always leaves the decode of the columns it writes for the collector. A compaction must leave
-/// no more than that: exactly what compacting the same rows without the dropped column leaves, and less than compacting
-/// them unwidened.</para>
+/// round 3): a dropped column's decode, a widened column's narrow values. What it keeps it hands to the writer, which
+/// releases it once its row group is written (#860). So a compaction leaves no native memory behind, measured before any
+/// collection.
 /// </summary>
 [Collection(NativeMemoryCollection.Name)]
 public class CompactionRawReleaseTests : IDisposable
@@ -47,7 +45,44 @@ public class CompactionRawReleaseTests : IDisposable
             await table.DropColumnAsync("gone");
         var control = await CreateAsync("control", config, withGone: false);
 
-        Assert.Equal(await LeftAfterCompactingAsync(control), await LeftAfterCompactingAsync(dropped));
+        Assert.Equal(0, await LeftAfterCompactingAsync(control));
+        Assert.Equal(0, await LeftAfterCompactingAsync(dropped));
+    }
+
+    // Batches read in slices that the writer cuts across row groups: a batch whose first rows are written with one row
+    // group is released only with the row group holding its last (#860).
+    [Fact]
+    public async Task CompactingInRowGroupsSmallerThanABatch_ReleasesEveryBatch()
+    {
+        var fs = await CreateAsync("cut", [], withGone: true);
+        Assert.Equal(0, await LeftAfterCompactingAsync(fs, new DeltaTableOptions
+        {
+            MaxConcurrentReads = 1,
+            ParquetReadOptions = new ParquetReadOptions { BatchSize = 1_000 },
+            ParquetWriteOptions = new ParquetWriteOptions { RowGroupMaxRows = 1_500 },
+        }));
+
+        await using var table = await DeltaTable.OpenAsync(fs);
+        long rows = 0;
+        await foreach (var batch in table.ReadAllAsync())
+        {
+            using (batch)
+                rows += batch.Length;
+        }
+        Assert.Equal(Rows, rows);
+    }
+
+    // A host writer is handed the file's batches when it is cut, and they are released once it returns.
+    [Fact]
+    public async Task CompactingUnderAHostWriter_ReleasesWhatItWrote()
+    {
+        var fs = await CreateAsync("host", [], withGone: false);
+#pragma warning disable EWDELTA0001 // codec seam is experimental
+        Assert.Equal(0, await LeftAfterCompactingAsync(fs, new DeltaTableOptions
+        {
+            MaxConcurrentReads = 1, DataFileWriter = new VerbatimWriter(Path.Combine(_tempDir, "host")),
+        }));
+#pragma warning restore EWDELTA0001
     }
 
     [Fact]
@@ -69,8 +104,9 @@ public class CompactionRawReleaseTests : IDisposable
         }
 
         // The widened compaction writes its ids as new (managed) long arrays and releases the narrow ones it read; the
-        // control writes the ints it read, which the writer keeps.
-        Assert.True(await LeftAfterCompactingAsync(widened) < await LeftAfterCompactingAsync(control));
+        // control writes the ints it read, which the writer releases once written.
+        Assert.Equal(0, await LeftAfterCompactingAsync(widened));
+        Assert.Equal(0, await LeftAfterCompactingAsync(control));
     }
 
     [Fact]
@@ -186,7 +222,7 @@ public class CompactionRawReleaseTests : IDisposable
     }
 
     // The native bytes a compaction of the table leaves alive, before any collection.
-    private static async Task<long> LeftAfterCompactingAsync(LocalTableFileSystem fs)
+    private static async Task<long> LeftAfterCompactingAsync(LocalTableFileSystem fs, DeltaTableOptions? options = null)
     {
         for (int i = 0; i < 3; i++)
         {
@@ -195,8 +231,10 @@ public class CompactionRawReleaseTests : IDisposable
         }
 
         long before = NativeMemoryTracker.LiveBytes;
-        await using (var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions { MaxConcurrentReads = 1 }))
+        long allocated = NativeMemoryTracker.TotalAllocated;
+        await using (var table = await DeltaTable.OpenAsync(fs, options ?? new DeltaTableOptions { MaxConcurrentReads = 1 }))
             Assert.NotNull(await table.CompactAsync(AlwaysCompact));
+        Assert.True(NativeMemoryTracker.TotalAllocated > allocated, "The compaction decoded nothing natively.");
         return NativeMemoryTracker.LiveBytes - before;
     }
 }

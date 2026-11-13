@@ -52,6 +52,33 @@ internal sealed class RawBatchBuffers
         return buffers;
     }
 
+    /// <summary>Also records <paramref name="more"/>'s buffers, at every depth: what a step built from the batch and
+    /// handed on with it. Returns this.</summary>
+    public RawBatchBuffers And(RecordBatch more)
+    {
+        for (int i = 0; i < more.ColumnCount; i++)
+            Add(more.Column(i).Data);
+        return this;
+    }
+
+    /// <summary>Also records <paramref name="more"/>'s buffers, at every depth, when it is not null. Returns this.</summary>
+    public RawBatchBuffers And(IArrowArray? more)
+    {
+        // A RecordBatch is an IArrowArray whose Data throws: its columns are what it holds.
+        if (more is RecordBatch batch)
+            return And(batch);
+        if (more is not null)
+            Add(more.Data);
+        return this;
+    }
+
+    /// <summary>Releases every recorded buffer: nothing that reads them is left.</summary>
+    public void ReleaseAll()
+    {
+        foreach (var (buffer, _) in _buffers)
+            buffer.Dispose();
+    }
+
     /// <summary>
     /// Releases every recorded buffer that <paramref name="output"/> and <paramref name="alsoKept"/> (arrays handed on
     /// beside the batch: positions, row ids, or another batch) don't hold. Null <paramref name="output"/> releases all

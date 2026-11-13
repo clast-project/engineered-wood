@@ -10939,9 +10939,13 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         foreach (var file in files)
         {
             await foreach (var (rows, changeTypes, ids, versions) in ChangeDataFeed.CdfReader
-                .ReadWrittenChangeFileAsync(_fs, snapshot, file, cancellationToken).ConfigureAwait(false))
+                .ReadWrittenChangeFileAsync(_fs, snapshot, file, cancellationToken, ChangeFileRewriteReadOptions)
+                .ConfigureAwait(false))
             {
                 var movedIds = ids is null ? null : MoveInsertRowIds(ids, changeTypes, sorted);
+                // The rows as read are handed over: the sink's writers release them once every run is written (#860),
+                // and the change types are read here only.
+                using var lease = BatchLease.Of(rows, changeTypes, ids, versions, movedIds);
                 // One AddAsync per run of a change type, so the rows keep their order.
                 int start = 0;
                 for (int i = 1; i <= rows.Length; i++)
@@ -10953,13 +10957,26 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                         rows.Slice(start, length), changeTypes.GetString(start), file.PartitionValues,
                         cancellationToken,
                         (Int64Array?)movedIds?.Slice(start, length),
-                        (Int64Array?)versions?.Slice(start, length)).ConfigureAwait(false);
+                        (Int64Array?)versions?.Slice(start, length),
+                        lease).ConfigureAwait(false);
                     start = i;
                 }
             }
         }
         return (await sink.CompleteAsync(cancellationToken).ConfigureAwait(false)).ToList();
     }
+
+    /// <summary>
+    /// How <see cref="RewriteInsertRowIdsAsync"/> reads a change file back: in the table's batches
+    /// (<see cref="ParquetReadOptions.BatchSize"/>, <see cref="ParquetReadOptions.MaxBatchByteSize"/>), and otherwise
+    /// as written. The table's other read options would change the rows it writes again (an output kind's types, which
+    /// the change type's <c>StringArray</c> check also refuses).
+    /// </summary>
+    internal ParquetReadOptions ChangeFileRewriteReadOptions => new()
+    {
+        BatchSize = _options.ParquetReadOptions.BatchSize,
+        MaxBatchByteSize = _options.ParquetReadOptions.MaxBatchByteSize,
+    };
 
     private static Int64Array MoveInsertRowIds(
         Int64Array ids, StringArray changeTypes, (long OldBase, long Rows, long NewBase)[] sortedMoves)

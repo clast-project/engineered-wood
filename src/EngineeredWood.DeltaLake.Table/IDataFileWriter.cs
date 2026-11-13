@@ -37,7 +37,10 @@ public interface IDataFileWriter
     /// them incrementally (e.g. a streaming DuckDB <c>COPY</c>) instead of holding the whole file in memory; one
     /// that wants a materialized list can collect them itself. This is symmetric with the streaming
     /// <see cref="IDataFileReader.ReadAsync"/>. The implementation is responsible for placing the bytes at the
-    /// location the table's filesystem maps <paramref name="relativePath"/> to.</summary>
+    /// location the table's filesystem maps <paramref name="relativePath"/> to.
+    /// <para>The batches are lent, not handed over: the implementation must not dispose them, and must not keep them,
+    /// or any array or buffer of theirs, past its return. Once it returns, the table may release the batches it owns
+    /// (a compaction's, read from the files it replaces), and their memory is gone (#860).</para></summary>
     ValueTask<long> WriteAsync(IAsyncEnumerable<RecordBatch> batches, string relativePath,
                                CancellationToken cancellationToken);
 }

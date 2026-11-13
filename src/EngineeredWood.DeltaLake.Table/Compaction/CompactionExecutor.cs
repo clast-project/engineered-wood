@@ -531,7 +531,10 @@ internal static class CompactionExecutor
                         partition.LogicalToPhysical);
                 }
                 raw.ReleaseAllBut(writeBatch, outBatch);
-                await output.AddAsync(writeBatch, outBatch, cancellationToken).ConfigureAwait(false);
+                // What is left is handed to the writer, which releases it once its row group is written (#860): the
+                // batches as written and the raw buffers they read through windows of their own.
+                using var lease = new BatchLease(raw.And(writeBatch).And(outBatch));
+                await output.AddAsync(writeBatch, outBatch, cancellationToken, lease).ConfigureAwait(false);
             }
 
             rolled = await output.CompleteAsync(cancellationToken).ConfigureAwait(false);

@@ -119,6 +119,11 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     private long _pendingBytes;
     private long _retainedBytes;
 
+    // Leases of the batches given under one (#860): released once every row of theirs is written. The batch being added
+    // is among them, but its rows may not all be appended yet, so a row group flushed meanwhile keeps it.
+    private readonly List<BatchLease> _leases = new();
+    private BatchLease? _appending;
+
     /// <param name="partitionDirectory">The file's Hive-style directory relative to the table root, or empty.</param>
     /// <param name="collectStats">Whether to collect per-file stats, over the batches <see cref="AddAsync"/> is
     /// given for them, under <paramref name="statsSelection"/>.</param>
@@ -152,11 +157,33 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
     /// columns IcebergCompat materializes.</param>
     /// <param name="statsBatch">The same rows as the file's stats describe them (physical names, no materialized
     /// partition or row-tracking columns). Ignored unless stats are collected.</param>
-    public async ValueTask AddAsync(RecordBatch writeBatch, RecordBatch statsBatch, CancellationToken cancellationToken)
+    /// <param name="lease">The buffers of both batches, when the caller hands them over: the writer holds the lease
+    /// until every row of the batch is written (or the write is abandoned), then lets go of it. Without one the batches
+    /// stay the caller's, and the writer only reads them.</param>
+    public async ValueTask AddAsync(
+        RecordBatch writeBatch, RecordBatch statsBatch, CancellationToken cancellationToken, BatchLease? lease = null)
     {
         if (writeBatch.Length == 0)
             return;
 
+        if (lease is not null)
+        {
+            _leases.Add(lease.Acquire());
+            _appending = lease;
+        }
+        try
+        {
+            await AddCoreAsync(writeBatch, statsBatch, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Every row is appended, or the add failed: either way the next flush or the abandon lets go.
+            _appending = null;
+        }
+    }
+
+    private async ValueTask AddCoreAsync(RecordBatch writeBatch, RecordBatch statsBatch, CancellationToken cancellationToken)
+    {
         if (_columnFieldIds is not null)
             writeBatch = WithColumnFieldIds(writeBatch);
 
@@ -167,6 +194,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         if (_host is not null)
         {
             Append(writeBatch, statsBatch, batchBytes, batchBytes);
+            _appending = null;
             if (_pendingBytes >= _targetFileSize)
                 await CloseFileAsync(cancellationToken).ConfigureAwait(false);
             return;
@@ -196,6 +224,8 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
                 whole ? batchBytes : batchBytes * rows / writeBatch.Length,
                 batchBytes);
             offset += rows;
+            if (offset == writeBatch.Length)
+                _appending = null;
 
             if (_pendingRows >= maxRows || _pendingBytes >= _options.RowGroupMaxBytes)
             {
@@ -332,6 +362,17 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
         var rowGroup = Concatenate(_pending);
         ClearPending();
         await _writer.WriteRowGroupAsync(rowGroup, cancellationToken).ConfigureAwait(false);
+        ReleaseWrittenLeases();
+    }
+
+    // Lets go of the leases whose rows are all written: every lease but the batch still being appended (the last one
+    // taken), whose later rows are still to come. One lease may be held more than once, a hold per batch given under it.
+    private void ReleaseWrittenLeases()
+    {
+        int written = _appending is null ? _leases.Count : _leases.Count - 1;
+        for (int i = 0; i < written; i++)
+            _leases[i].Release();
+        _leases.RemoveRange(0, written);
     }
 
     /// <summary>Writes what is pending and closes the file being filled, so the next rows start a new one; also for a
@@ -350,6 +391,7 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             ClearPending();
             size = await _host.WriteAsync(batches.ToAsyncEnumerable(), fileName, cancellationToken)
                 .ConfigureAwait(false);
+            ReleaseWrittenLeases();
             await AddVariantBoundsAsync(writtenFooter: null, fileName, size, cancellationToken).ConfigureAwait(false);
         }
         else
@@ -410,7 +452,22 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             await file.DisposeAsync().ConfigureAwait(false);
     }
 
-    public ValueTask DisposeAsync() => DisposeOpenFileAsync();
+    /// <summary>Abandons the open file, unpublished, and lets go of every lease still held.</summary>
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            await DisposeOpenFileAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            foreach (var lease in _leases)
+                lease.Release();
+            _leases.Clear();
+            _appending = null;
+            ClearPending();
+        }
+    }
 
     private static RecordBatch Concatenate(List<RecordBatch> batches)
     {
