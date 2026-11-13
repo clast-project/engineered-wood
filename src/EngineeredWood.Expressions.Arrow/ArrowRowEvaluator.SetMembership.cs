@@ -63,7 +63,8 @@ public sealed partial class ArrowRowEvaluator
         IArrowArray column;
         try
         {
-            column = set.Operand is UnboundReference u ? GetColumn(batch, u) : GetColumn(batch, ((BoundReference)set.Operand).Name);
+            // As the batch holds it, as for a comparison: a view or large string is read in place (#859).
+            column = set.Operand is UnboundReference u ? FindColumn(batch, u) : FindColumn(batch, ((BoundReference)set.Operand).Name);
         }
         catch (ExpressionAnalysisException)
         {
@@ -78,7 +79,7 @@ public sealed partial class ArrowRowEvaluator
         if (!HasKernel(column))
             return null;
 
-        var columnType = column.Data.DataType;
+        var columnType = ByteArrayOffsets.TopLevel(column.Data.DataType);
         var placeholder = new LiteralValue?[] { Placeholder };
         CheckSetMembers(columnType, placeholder, members, memberTypes, askedFromTree);
         if (_coercion is not null && SetCoerces(columnType, placeholder, members, memberTypes))

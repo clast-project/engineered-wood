@@ -167,6 +167,100 @@ public class ByteArrayOutputScanTests : IDisposable
     /// through the same pipeline as a scan, and routes each row by its string partition value, whether or not that
     /// changes. It must not fail on the representation, and a scan afterwards sees the new values.
     /// </summary>
+    private static readonly string[] StringFilters =
+    [
+        "note = 'note-4'", "note IN ('note-1', 'note-5')", "note LIKE 'note-%' AND note <> 'note-0'",
+        "note IS NULL", "note < 'note-2'", "blob = X'02FF'", "info.tag = 'tag-3'", "region = 'east' AND note > 'note-1'",
+        "extra IS NULL AND note = concat('note-', '2')", "note = info.tag",
+    ];
+
+    public static IEnumerable<object[]> FilterCases()
+    {
+        foreach (var kind in new[] { ByteArrayOutputKind.Default, ByteArrayOutputKind.ViewType, ByteArrayOutputKind.LargeOffsets })
+        {
+            foreach (var seam in new[] { "none", "view host" })
+            {
+                foreach (var filter in StringFilters)
+                    yield return [kind, seam, filter];
+            }
+        }
+    }
+
+    /// <summary>
+    /// #859: an exact filter over string and binary columns answers the same under each representation. Under views
+    /// it raised "Cannot evaluate over Arrow array of type utf8view".
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(FilterCases))]
+    public async Task AStringFilterAnswersTheSameUnderEachRepresentation(ByteArrayOutputKind kind, string seam, string filter)
+    {
+        string path = await WriteTableAsync();
+
+        async Task<string> IdsAsync(ByteArrayOutputKind k, string s)
+        {
+            var fs = new LocalTableFileSystem(path);
+            await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions
+            {
+                ParquetReadOptions = new ParquetReadOptions { ByteArrayOutput = k },
+                DataFileReader = s == "view host" ? new FixedReader(fs, ByteArrayOutputKind.ViewType) : null,
+            });
+
+            var ids = new List<long>();
+            var read = new DeltaReadOptions
+            {
+                Columns = ["id"], Filter = EngineeredWood.Expressions.Sql.SparkSqlParser.ParsePredicate(filter), FilterRows = true,
+            };
+            await foreach (var batch in table.ReadAsync(read))
+            {
+                using (batch)
+                {
+                    var column = (Int64Array)batch.Column(0);
+                    for (int r = 0; r < batch.Length; r++)
+                        ids.Add(column.GetValue(r)!.Value);
+                }
+            }
+
+            ids.Sort();
+            return string.Join(",", ids);
+        }
+
+        string expected = await IdsAsync(ByteArrayOutputKind.Default, "none");
+        Assert.NotEqual("0,1,2,3,4,5", expected);   // every filter removes something
+        Assert.Equal(expected, await IdsAsync(kind, seam));
+    }
+
+    /// <summary>#859: a DELETE whose condition reads a string column, under each representation.</summary>
+    [Theory]
+    [InlineData(ByteArrayOutputKind.Default)]
+    [InlineData(ByteArrayOutputKind.ViewType)]
+    [InlineData(ByteArrayOutputKind.LargeOffsets)]
+    public async Task AStringDeleteWorksUnderEachRepresentation(ByteArrayOutputKind kind)
+    {
+        string path = await WriteTableAsync();
+        var fs = new LocalTableFileSystem(path);
+        await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions
+        {
+            ParquetReadOptions = new ParquetReadOptions { ByteArrayOutput = kind },
+        });
+
+        var (deleted, _) = await table.DeleteAsync(
+            EngineeredWood.Expressions.Sql.SparkSqlParser.ParsePredicate("note IN ('note-1', 'note-4') OR info.tag = 'tag-5'"));
+        Assert.Equal(3, deleted);
+
+        var ids = new List<long>();
+        await foreach (var batch in table.ReadAsync(new DeltaReadOptions { Columns = ["id"] }))
+        {
+            using (batch)
+            {
+                for (int r = 0; r < batch.Length; r++)
+                    ids.Add(((Int64Array)batch.Column(0)).GetValue(r)!.Value);
+            }
+        }
+
+        ids.Sort();
+        Assert.Equal([0L, 2L, 3L], ids);
+    }
+
     [Theory]
     [InlineData(ByteArrayOutputKind.Default)]
     [InlineData(ByteArrayOutputKind.ViewType)]

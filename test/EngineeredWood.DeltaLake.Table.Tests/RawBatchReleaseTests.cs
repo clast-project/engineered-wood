@@ -130,8 +130,8 @@ public class RawBatchReleaseTests : IDisposable
         long rows = 0;
         await AssertReleasedAsync(async table =>
         {
-            // On the int column: a string filter can't be evaluated over views.
-            await foreach (var b in table.ReadAsync(new DeltaReadOptions { Filter = Ex.IsNotNull("id"), FilterRows = true }))
+            // On the string column, itself a view (#859).
+            await foreach (var b in table.ReadAsync(new DeltaReadOptions { Filter = Ex.NotEqual("tag", "t1"), FilterRows = true }))
             {
                 var gone = (StringViewArray)b.Column(b.Schema.GetFieldIndex("gone"));
                 var ids = (Int32Array)b.Column(b.Schema.GetFieldIndex("id"));
@@ -146,8 +146,8 @@ public class RawBatchReleaseTests : IDisposable
             }
         }, batchSize: null, seam: seam, byteArrays: ByteArrayOutputKind.ViewType);
 
-        // Every id but each seventh row's (NULL).
-        Assert.Equal(Rows - (Rows + 6) / 7, rows);
+        // Every row but each fourth (t1).
+        Assert.Equal(Rows - Rows / 4, rows);
     }
 
     // Reshaping rebuilds a struct around the children it keeps: a widened child's narrow values and a dropped child's
