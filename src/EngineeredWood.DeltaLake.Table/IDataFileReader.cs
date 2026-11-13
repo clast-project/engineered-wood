@@ -37,6 +37,9 @@ public interface IDataFileReader
     /// (DV filtering, transient rowids, row-tracking materialization all count absolute row positions in read
     /// order). <paramref name="physicalColumns"/> optionally projects (by physical name); null reads all
     /// columns. Batch boundaries are the implementation's choice.
+    /// <para>Each batch is handed over: the table releases its buffers once it is done with them (those it passes on
+    /// with the batches it returns, the rest when they are dropped), so an implementation must neither use nor
+    /// dispose a batch after yielding it.</para>
     /// </summary>
     IAsyncEnumerable<RecordBatch> ReadAsync(string relativePath, IReadOnlyList<string>? physicalColumns,
                                             CancellationToken cancellationToken);

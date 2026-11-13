@@ -14271,6 +14271,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         await foreach (var selected in source.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
             var where = selected.Positions;
+            var raw = RawBatchBuffers.Of(selected.Batch); // what the output drops is released once it is built (#855)
             var result = ToLogicalBatch(selected.Batch, snapshot.Schema, read.MappingMode, read.PhysicalToLogical);
             result = ColumnMappingRecursive.StripParquetFieldIds(result);
             Int64Array? rawMatIds = null, rawMatVers = null;
@@ -14323,6 +14324,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var shaped = ReconcileToTableShape(
                 result, snapshot, addFile.PartitionValues, read.Columns, read.PartitionColumns, read.HasPartitions,
                 read.LogicalToPhysical, addFile.Path, byteArrays);
+            raw.ReleaseAllBut(shaped, positions);
             yield return new FileBatch(shaped, positions, rowIds, versions);
         }
     }
@@ -14438,9 +14440,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     }
                 }
 
-                // Not disposed: the dropped columns may share buffers with the kept ones (a gather of a view or a
-                // dictionary column does), so they are left to the GC with the batch that held them.
+                // The dropped columns are released buffer by buffer, keeping any the kept ones share (a gather of a view or
+                // a dictionary column does): a whole column's Dispose would free those too (#855).
+                var all = RawBatchBuffers.Of(batch);
                 batch = new RecordBatch(new Apache.Arrow.Schema(fields, batch.Schema.Metadata), arrays, batch.Length);
+                all.ReleaseAllBut(batch, positions, rowIds, versions);
             }
 
             yield return new FileBatch(batch, positions, rowIds, versions);
@@ -14484,6 +14488,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             // count of batch lengths: a pruned read skips row groups, and every position after the first
             // skipped one would be off by its row count.
             long thisBatchStart = firstRow;
+            // What the batch holds as read, before any step releases part of it: what the output drops is released
+            // once it is built (#855).
+            var raw = RawBatchBuffers.Of(batch);
 
             // Rename columns back to logical names.
             var result = ToLogicalBatch(batch, snapshot.Schema, mappingMode, physicalToLogical);
@@ -14517,6 +14524,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     result.Dispose();
                     rawMatIds?.Dispose();
                     rawMatVers?.Dispose();
+                    raw.ReleaseAllBut(null); // and a column the renames dropped (#855)
                     continue;
                 }
 
@@ -14570,6 +14578,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             var cleanResult = ReconcileToTableShape(
                 result, snapshot, addFile.PartitionValues, columns, partitionColumns, hasPartitions, logicalToPhysical,
                 addFile.Path, byteArrays);
+            raw.ReleaseAllBut(cleanResult);
 
             yield return new FileBatch(cleanResult, positions, rowIds, versions);
         }
