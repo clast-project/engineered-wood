@@ -108,7 +108,7 @@ internal static class SchemaEvolution
     {
         switch (expectedType, column.Data.DataType)
         {
-            // MapType derives from ListType, so it has to be matched first.
+            // MapType is not a ListType in Apache.Arrow (pinned by MapType_IsNotAListType_SoTheWalkArmOrderIsIrrelevant), so the arm order is free.
             case (MapType em, MapType am):
             {
                 var range = NestedWindow.ElementRange(column.Data);

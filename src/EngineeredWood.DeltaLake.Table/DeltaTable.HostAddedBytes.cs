@@ -171,7 +171,7 @@ public sealed partial class DeltaTable
             held = h.StorageType;
         switch (expected, held)
         {
-            // MapType derives from ListType, so it is matched first.
+            // MapType is not a ListType in Apache.Arrow (pinned by MapType_IsNotAListType_SoTheWalkArmOrderIsIrrelevant), so the arm order is free.
             case (Apache.Arrow.Types.MapType em, Apache.Arrow.Types.MapType hm):
                 return EvolvedBits(em.KeyField.DataType, hm.KeyField.DataType, converted, widens, elements, elements)
                     + EvolvedBits(em.ValueField.DataType, hm.ValueField.DataType, converted, widens, elements, elements);

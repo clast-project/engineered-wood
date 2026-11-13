@@ -149,7 +149,7 @@ internal static class ValueWidener
     {
         switch (data.DataType, target)
         {
-            // MapType derives from ListType, so it has to be matched first.
+            // MapType is not a ListType in Apache.Arrow (pinned by MapType_IsNotAListType_SoTheWalkArmOrderIsIrrelevant), so the arm order is free.
             case (MapType sm, MapType tm):
             {
                 var range = NestedWindow.ElementRange(data);
