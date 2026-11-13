@@ -213,15 +213,14 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
             if (batchBytes > 0)
             {
                 long byteRoom = Math.Max(1, _options.RowGroupMaxBytes - _pendingBytes);
-                long rowsInRoom = (byteRoom * writeBatch.Length + batchBytes - 1) / batchBytes;
-                take = Math.Min(take, Math.Max(1, rowsInRoom));
+                take = Math.Min(take, RowsInByteRoom(byteRoom, writeBatch.Length, batchBytes));
             }
             int rows = (int)take;
             bool whole = rows == writeBatch.Length;
             Append(
                 whole ? writeBatch : writeBatch.Slice(offset, rows),
                 whole ? statsBatch : statsBatch.Slice(offset, rows),
-                whole ? batchBytes : batchBytes * rows / writeBatch.Length,
+                whole ? batchBytes : ShareOfBytes(batchBytes, rows, writeBatch.Length),
                 batchBytes);
             offset += rows;
             if (offset == writeBatch.Length)
@@ -234,6 +233,44 @@ internal sealed class RollingDataFileWriter : IAsyncDisposable
                     await CloseFileAsync(cancellationToken).ConfigureAwait(false);
             }
         }
+    }
+
+    /// <summary>
+    /// How many of a batch's <paramref name="batchRows"/> rows fit in <paramref name="byteRoom"/> bytes, when the
+    /// whole batch is <paramref name="batchBytes"/>: the share rounded up to a whole row, at least 1, and never more
+    /// than the batch. Exact for any <see cref="ParquetWriteOptions.RowGroupMaxBytes"/>: the product
+    /// <c>byteRoom * batchRows</c> overflowed a <see langword="long"/> for a byte limit near
+    /// <see cref="long.MaxValue"/> (one that means "cut by rows only"), and the writer then took one row per slice (#870).
+    /// </summary>
+    internal static long RowsInByteRoom(long byteRoom, long batchRows, long batchBytes)
+    {
+        if (byteRoom >= batchBytes)
+            return batchRows;
+        // The exact integer form wherever the product fits (byteRoom below 2^32 for any batch of int rows); past
+        // that, decimal, whose 28 digits may land one row off a whole-row boundary: the bytes are an estimate.
+        // The ceiling is taken from the remainder, not by adding batchBytes - 1: a product just under long.MaxValue
+        // passes the guard and the addition would overflow it (#871 review).
+        long rows;
+        if (byteRoom <= long.MaxValue / batchRows)
+        {
+            long product = byteRoom * batchRows;
+            rows = product / batchBytes + (product % batchBytes == 0 ? 0 : 1);
+        }
+        else
+        {
+            rows = (long)Math.Ceiling((decimal)byteRoom * batchRows / batchBytes);
+        }
+        return Math.Min(batchRows, Math.Max(1, rows));
+    }
+
+    /// <summary><paramref name="rows"/> rows' share of a batch's <paramref name="batchBytes"/>, rounded down; computed
+    /// exactly, without the <see langword="long"/> overflow of <c>batchBytes * rows</c> (#870): with
+    /// <c>batchBytes = q * batchRows + r</c>, the share is <c>q * rows + r * rows / batchRows</c>, and neither product
+    /// can overflow while <paramref name="rows"/> &lt;= <paramref name="batchRows"/> &lt;= <see cref="int.MaxValue"/>.</summary>
+    internal static long ShareOfBytes(long batchBytes, long rows, long batchRows)
+    {
+        long q = batchBytes / batchRows, r = batchBytes % batchRows;
+        return q * rows + r * rows / batchRows;
     }
 
     private RecordBatch WithColumnFieldIds(RecordBatch batch)
