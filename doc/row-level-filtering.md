@@ -1540,3 +1540,36 @@ The switch was reverted. Two findings stand:
 - **What remains is the mask call itself.** Under DuckDB it is the key column handed over the Arrow C data interface and a bitmap back, which our in-process hash probe cannot show. Only skipping the mask saves it. That needs the host's say-so, since `DeltaReadOptions.RowMasks` promises only rows every mask keeps, and `Offset`/`Limit` rely on that. One shape: a per-mask opt-in meaning "the host rechecks these rows", honoured only without an offset or limit. Build it once the host measures how much of Q13's time the mask call takes.
 
 The one-pass gather of a dense selection (about 100 ms and 650 MB here) is a separate cost, paid by exact filters too: a copy by runs of kept rows, rather than by index, would cut it.
+
+## 34. String comparisons over views and large offsets (#859, 2026-11-13)
+
+#859 made the evaluator accept a string column in any of the three layouts a read can return (`ByteArrayOutput`, #793). The direct comparison and `IN` kernels (#560, #799) read a `utf8view` or `large_utf8` column in place, without converting it to 32-bit offsets. The first version read each value with the arrays' `GetBytes(i)`, and that was 1.9-5.0 times slower than the plain-offsets kernel (about 3.5 times on most cases). Per row, `GetBytes` checks bounds and nullness and re-derives its spans from the buffers (a virtual call for a native buffer). A view's data buffer is read even when the view alone settles the row.
+
+The kernels now read the raw layout:
+- **Large offsets:** the plain kernel's loop over 64-bit offsets.
+- **Views:** decided from the 16-byte view where it can be. A view holds the value's length and first four bytes, or the whole value up to twelve bytes. Equality rejects on the length, then on the prefix compared as one integer. A prefix test rejects the same way. An ordering is decided by the prefix compared big-endian, as one integer. Only a row whose prefix ties reads the data buffer, and only the bytes after the prefix.
+
+### Measured
+
+`StringLayoutComparisonBenchmarks` (new, DeltaLake benchmarks): 1,000,000 rows of one of 16 values, plain evaluator, direct path. "short" values fit in a view (`cat_03`). The two long values are 26 bytes and sit out of line. "distinct" ones differ in their first four bytes (`03_category_with_long_name`). "shared" ones differ only after them (`category_with_long_name_03`). BenchmarkDotNet short job, net10.0, i9-12900K. Times are in ms. "vs offsets" compares against the plain-offsets kernel in the same run.
+
+| Layout | Values | Op | `GetBytes` | raw | vs offsets |
+|---|---|---|---|---|---|
+| views | short | `=` | 6.11 | 1.79 | 0.99 |
+| | | `<` | 6.70 | 3.81 | 1.12 |
+| | | `IN` (5) | 30.7 | 9.2 | 1.00 |
+| | long, distinct | `=` | 7.20 | 1.56 | 0.75 |
+| | | `<` | 8.36 | 1.73 | 0.68 |
+| | | STARTSWITH | 7.32 | 1.65 | 0.80 |
+| | | `IN` (5) | 35.9 | 8.6 | 0.81 |
+| | long, shared | `=` | 7.43 | 3.13 | 1.21 |
+| | | `<` | 8.50 | 3.75 | 1.30 |
+| | | `IN` (5) | 37.4 | 16.0 | 1.23 |
+| large offsets | short | `=` | 8.88 | 1.94 | 1.07 |
+| | | `<` | 8.93 | 4.20 | 1.24 |
+| | long, distinct | `<` | 9.26 | 2.77 | 1.09 |
+| | long, shared | `IN` (5) | 46.0 | 13.8 | 1.06 |
+
+The view kernel beats plain offsets on every case where the prefix distinguishes values: the data buffer is never read for a rejected row. Where every value shares its first four bytes, each row follows its view into the data buffer, and that indirection costs 21-30%. Large offsets end within 1-9% of plain, except `<` on short values at 24%. The plain-offsets kernel is unchanged: it stayed within 4% of the first run.
+
+Tried and dropped: forcing the out-of-line lookup inline changed nothing measurable.

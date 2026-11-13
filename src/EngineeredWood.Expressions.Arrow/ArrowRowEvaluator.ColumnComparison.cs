@@ -1,7 +1,9 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -163,8 +165,8 @@ public sealed partial class ArrowRowEvaluator
     private static DirectAnswer? Kernel(IArrowArray column, ComparisonOperator op, LiteralValue constant) => column switch
     {
         StringArray a => CompareStrings(a, op, constant),
-        LargeStringArray a => CompareStrings(a, new LargeStrings(a), op, constant),
-        StringViewArray a => CompareStrings(a, new StringViews(a), op, constant),
+        LargeStringArray a => CompareLargeStrings(a, op, constant),
+        StringViewArray a => CompareStringViews(a, op, constant),
         Int8Array a => CompareIntegers(a, a.Values, op, constant),
         Int16Array a => CompareIntegers(a, a.Values, op, constant),
         Int32Array a => CompareIntegers(a, a.Values, op, constant),
@@ -471,49 +473,19 @@ public sealed partial class ArrowRowEvaluator
         return Answer(column, op, result);
     }
 
-    /// <summary>A string column's values by row, for a layout without 32-bit offsets (#859).</summary>
-    private interface IStringValues
-    {
-        ReadOnlySpan<byte> Get(int index);
-    }
-
-    private readonly struct LargeStrings(LargeStringArray array) : IStringValues
-    {
-        public ReadOnlySpan<byte> Get(int index) => array.GetBytes(index);
-    }
-
-    private readonly struct StringViews(StringViewArray array) : IStringValues
-    {
-        public ReadOnlySpan<byte> Get(int index) => array.GetBytes(index);
-    }
-
     /// <summary>
-    /// <see cref="CompareStrings(StringArray, ComparisonOperator, LiteralValue)"/> over a <c>large_utf8</c> or
-    /// <c>utf8view</c> column, read in place rather than copied into offsets first (#859). Same rules, same answers.
+    /// <see cref="CompareStrings(StringArray, ComparisonOperator, LiteralValue)"/> over a <c>large_utf8</c> column: the
+    /// same loop over 64-bit offsets, read in place rather than copied into 32-bit ones (#859).
     /// </summary>
-    private static DirectAnswer? CompareStrings<TValues>(
-        IArrowArray column, TValues values, ComparisonOperator op, LiteralValue constant)
-        where TValues : struct, IStringValues
+    private static DirectAnswer? CompareLargeStrings(LargeStringArray column, ComparisonOperator op, LiteralValue constant)
     {
-        if (constant.Type != LiteralValue.Kind.String)
+        if (!StringTarget(op, constant, out byte[] literal, out bool startsWith))
             return null;
-
-        bool startsWith = op is ComparisonOperator.StartsWith or ComparisonOperator.NotStartsWith;
-        if (!startsWith && !IsOrdering(op))
-            return null;
-
-        byte[] literal;
-        try
-        {
-            literal = StrictUtf8.GetBytes(constant.AsString);
-        }
-        catch (EncoderFallbackException)
-        {
-            return null;
-        }
 
         int length = column.Length;
         var result = new byte[BitmapBytes(length)];
+        var offsets = column.ValueOffsets;
+        var data = column.ValueBuffer.Span;
         bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
         var target = new ReadOnlySpan<byte>(literal);
 
@@ -525,7 +497,9 @@ public sealed partial class ArrowRowEvaluator
                 if (hasNulls && column.IsNull(i))
                     continue;
 
-                var value = values.Get(i);
+                // A buffer holds at most int.MaxValue bytes, so every offset into it fits an int.
+                int start = (int)offsets[i];
+                var value = data.Slice(start, (int)offsets[i + 1] - start);
                 Set(result, i, (startsWith ? value.StartsWith(target) : value.SequenceEqual(target)) == want);
             }
         }
@@ -536,11 +510,165 @@ public sealed partial class ArrowRowEvaluator
                 if (hasNulls && column.IsNull(i))
                     continue;
 
-                Set(result, i, Decide(op, values.Get(i).SequenceCompareTo(target)));
+                int start = (int)offsets[i];
+                Set(result, i, Decide(op, data.Slice(start, (int)offsets[i + 1] - start).SequenceCompareTo(target)));
             }
         }
 
         return Answer(column, op, result);
+    }
+
+    /// <summary>The size of one view, the most bytes one holds inline, and the bytes of prefix one always holds.</summary>
+    private const int ViewSize = 16, MaxInline = 12, ViewPrefix = 4;
+
+    /// <summary>
+    /// <see cref="CompareStrings(StringArray, ComparisonOperator, LiteralValue)"/> over a <c>utf8view</c> column, read
+    /// from its views (#859). A view holds its value's length and first four bytes, or the whole value up to twelve
+    /// bytes, so a row whose length or prefix already decides it never reads the data buffers: equality rejects on
+    /// either, a prefix test on either, and an ordering on the prefix.
+    /// </summary>
+    /// <remarks>
+    /// A view is <c>[length:int32][prefix:4 bytes][buffer index:int32][offset:int32]</c>, or <c>[length:int32]
+    /// [value:12 bytes]</c> when the value fits; either way its bytes 4 to 8 start the value. Only bytes within the
+    /// value's length are read, so a producer's padding after a short inline value never decides a row.
+    /// </remarks>
+    private static DirectAnswer? CompareStringViews(StringViewArray column, ComparisonOperator op, LiteralValue constant)
+    {
+        if (!StringTarget(op, constant, out byte[] literal, out bool startsWith))
+            return null;
+
+        int length = column.Length;
+        var result = new byte[BitmapBytes(length)];
+        bool hasNulls = column.NullCount != 0;   // -1 is "not counted", so probe
+        var target = new ReadOnlySpan<byte>(literal);
+        int targetLength = target.Length;
+        int known = Math.Min(ViewPrefix, targetLength);
+        var targetPrefix = target.Slice(0, known);
+
+        // A target of four bytes or more has a whole prefix, compared as one integer: equal as stored, ordered
+        // big-endian, which is byte order. The bytes after it are all an out-of-line row still needs.
+        bool wholePrefix = targetLength >= ViewPrefix;
+        int prefixBits = wholePrefix ? MemoryMarshal.Read<int>(target) : 0;
+        uint prefixOrder = wholePrefix ? BinaryPrimitives.ReadUInt32BigEndian(target) : 0;
+        var targetRest = wholePrefix ? target.Slice(ViewPrefix) : default;
+        var views = column.ViewsBuffer.Span.Slice(column.Offset * ViewSize, length * ViewSize);
+        var buffers = column.Data.Buffers;
+
+        // One data buffer is the usual case; its span is taken once rather than per row.
+        var single = buffers.Length == 3 ? buffers[2].Span : default;
+
+        if (op is ComparisonOperator.Equal or ComparisonOperator.NullSafeEqual or ComparisonOperator.NotEqual)
+        {
+            bool want = op is not ComparisonOperator.NotEqual;
+            for (int i = 0; i < length; i++)
+            {
+                if (hasNulls && column.IsNull(i))
+                    continue;
+
+                var view = views.Slice(i * ViewSize, ViewSize);
+                bool equal;
+                if (MemoryMarshal.Read<int>(view) != targetLength)
+                    equal = false;
+                else if (targetLength <= MaxInline)
+                    equal = view.Slice(ViewPrefix, targetLength).SequenceEqual(target);
+                else
+                    equal = MemoryMarshal.Read<int>(view.Slice(ViewPrefix)) == prefixBits
+                        && OutOfLine(view, targetLength, single, buffers).Slice(ViewPrefix).SequenceEqual(targetRest);
+                Set(result, i, equal == want);
+            }
+        }
+        else if (startsWith)
+        {
+            bool want = op is ComparisonOperator.StartsWith;
+            for (int i = 0; i < length; i++)
+            {
+                if (hasNulls && column.IsNull(i))
+                    continue;
+
+                var view = views.Slice(i * ViewSize, ViewSize);
+                int valueLength = MemoryMarshal.Read<int>(view);
+                bool starts;
+                if (valueLength < targetLength)
+                    starts = false;
+                else if (valueLength <= MaxInline)
+                    starts = view.Slice(ViewPrefix, targetLength).SequenceEqual(target);
+                else if (!wholePrefix)
+                    starts = view.Slice(ViewPrefix, known).SequenceEqual(targetPrefix);
+                else
+                    starts = MemoryMarshal.Read<int>(view.Slice(ViewPrefix)) == prefixBits
+                        && (targetLength == ViewPrefix
+                            || OutOfLine(view, valueLength, single, buffers).Slice(ViewPrefix).StartsWith(targetRest));
+                Set(result, i, starts == want);
+            }
+        }
+        else
+        {
+            for (int i = 0; i < length; i++)
+            {
+                if (hasNulls && column.IsNull(i))
+                    continue;
+
+                var view = views.Slice(i * ViewSize, ViewSize);
+                int valueLength = MemoryMarshal.Read<int>(view);
+                int order;
+                if (valueLength <= MaxInline)
+                {
+                    order = view.Slice(ViewPrefix, valueLength).SequenceCompareTo(target);
+                }
+                else if (!wholePrefix)
+                {
+                    // The target is shorter than the prefix: the prefix orders the row unless it starts with the
+                    // whole target, and then the row, longer, is greater.
+                    order = view.Slice(ViewPrefix, known).SequenceCompareTo(targetPrefix);
+                    if (order == 0)
+                        order = 1;
+                }
+                else
+                {
+                    // The prefix orders the row unless it ties, and then the bytes after it do.
+                    uint prefix = BinaryPrimitives.ReadUInt32BigEndian(view.Slice(ViewPrefix));
+                    order = prefix != prefixOrder
+                        ? (prefix < prefixOrder ? -1 : 1)
+                        : OutOfLine(view, valueLength, single, buffers).Slice(ViewPrefix).SequenceCompareTo(targetRest);
+                }
+                Set(result, i, Decide(op, order));
+            }
+        }
+
+        return Answer(column, op, result);
+    }
+
+    /// <summary>An out-of-line view's value: <paramref name="length"/> bytes of the data buffer it names.</summary>
+    private static ReadOnlySpan<byte> OutOfLine(
+        ReadOnlySpan<byte> view, int length, ReadOnlySpan<byte> single, ArrowBuffer[] buffers)
+    {
+        int index = MemoryMarshal.Read<int>(view.Slice(8));
+        int offset = MemoryMarshal.Read<int>(view.Slice(12));
+        var data = buffers.Length == 3 ? single : buffers[2 + index].Span;
+        return data.Slice(offset, length);
+    }
+
+    /// <summary>
+    /// What a string kernel compares against: the constant's UTF-8 bytes, when the operator is one a kernel answers
+    /// and the constant is a string with a UTF-8 form. False declines.
+    /// </summary>
+    private static bool StringTarget(
+        ComparisonOperator op, LiteralValue constant, out byte[] literal, out bool startsWith)
+    {
+        literal = [];
+        startsWith = op is ComparisonOperator.StartsWith or ComparisonOperator.NotStartsWith;
+        if (constant.Type != LiteralValue.Kind.String || (!startsWith && !IsOrdering(op)))
+            return false;
+
+        try
+        {
+            literal = StrictUtf8.GetBytes(constant.AsString);
+            return true;
+        }
+        catch (EncoderFallbackException)
+        {
+            return false;
+        }
     }
 
     /// <summary>
