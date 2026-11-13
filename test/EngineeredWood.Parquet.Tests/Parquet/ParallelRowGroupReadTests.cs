@@ -1494,9 +1494,11 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.Equal(0, budget.Used);
     }
 
-    /// <summary>#850 review: what a host adds to each row it emits is added to the first batch as sized, for its
-    /// share of rows. Added to the group before the batch was sized, the floor of a page larger than the batch
-    /// swallowed it: one PLAIN 100,000-row page read in 1,000-row batches reserved its 800 KB either way.</summary>
+    /// <summary>#850 review: what a host adds to each row it emits is added to the first batch as sized, for the
+    /// rows it holds. Added to the group before the batch was sized, the floor of a page larger than the batch
+    /// swallowed it: one PLAIN 100,000-row page read in 1,000-row batches reserved its 800 KB either way. Round 2: a
+    /// MaxBatchByteSize cut stops at page boundaries, so the batch's share of the encoded bytes (here 1/8) is not
+    /// its share of rows: the one page cannot be cut, and the first batch holds all 100,000.</summary>
     [Fact]
     public async Task AWholeFileRead_AddsTheHostsBytesToTheRowsOfItsFirstBatch()
     {
@@ -1519,12 +1521,23 @@ public class ParallelRowGroupReadTests : IDisposable
         }
 
         await using var file = new LocalRandomAccessFile(path);
-        foreach (var (batchSize, rows) in new (int?, long)[] { (1_000, 1_000), (null, 100_000) })
+        foreach (var (options, rows) in new (ParquetReadOptions, int)[]
+                 {
+                     (new ParquetReadOptions { BatchSize = 1_000 }, 1_000),
+                     (new ParquetReadOptions(), 100_000),
+                     (new ParquetReadOptions { MaxBatchByteSize = 100_000 }, 100_000),
+                 })
         {
-            using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = batchSize });
+            using var reader = new ParquetFileReader(file, ownsFile: false, options);
             long raw = await reader.LargestFirstBatchBytesAsync(null, null, default);
             Assert.True(raw >= 100_000 * 8, $"{raw}: the batch should reserve the page it holds");
             Assert.Equal(raw + 26 * rows, await reader.LargestFirstBatchBytesAsync(null, null, default, addedBytesPerRow: 26));
+            await foreach (var batch in reader.ReadAllAsync())
+            {
+                using (batch)
+                    Assert.Equal(rows, batch.Length);
+                break;
+            }
         }
     }
 
