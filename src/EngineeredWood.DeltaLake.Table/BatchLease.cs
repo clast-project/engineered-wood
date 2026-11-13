@@ -55,6 +55,9 @@ internal sealed class BatchLease : IDisposable
             _buffers.ReleaseAll();
     }
 
+    /// <summary>Whether the last holder has let go, and the buffers are released.</summary>
+    internal bool Released => Volatile.Read(ref _holders) == 0;
+
     /// <summary>The creator's <see cref="Release"/>.</summary>
     public void Dispose() => Release();
 }
