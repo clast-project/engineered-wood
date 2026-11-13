@@ -561,8 +561,7 @@ public sealed partial class ParquetFileReader
             metadata.RowGroups[plan.Index], schema, columns, selector.Answerable, growth, plan.Ranges);
         // The batches it hands on hold the selected rows of the second pass's first batch, at most its rows.
         reservation.SetInitialEstimate(
-            estimate.Reserved, FirstBatchRowBound(metadata.RowGroups[plan.Index], plan.Ranges),
-            metadata.RowGroups[plan.Index].NumRows);
+            estimate.Reserved, FirstBatchRowBound(metadata.RowGroups[plan.Index], plan.Ranges));
 
         PrefetchedFile? filterIo = null, outputIo = null;
         IAsyncEnumerator<SelectedRecordBatch>? e = null;

@@ -577,8 +577,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             if (estimate.OffsetIndexes is { } offsetIndexes)
                 plan = plan with { OffsetIndexes = offsetIndexes };
             reservation.SetInitialEstimate(
-                estimate.Reserved, FirstBatchRowBound(metadata.RowGroups[plan.Index], plan.Ranges),
-                metadata.RowGroups[plan.Index].NumRows);
+                estimate.Reserved, FirstBatchRowBound(metadata.RowGroups[plan.Index], plan.Ranges));
 
             e = ReadPlannedAsync(plan, columnNames, cancellationToken, answers, prefetched)
                 .GetAsyncEnumerator(cancellationToken);
@@ -735,12 +734,11 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// planned parallel read, such as Delta's change feed and compaction (#846): the footer's uncompressed size it
     /// reserved before was 10-20x short for dictionary or run-length-encoded columns.
     /// <paramref name="addedBytesPerRow"/> is what the host adds to each row before it hands the batch on, which is
-    /// the size its scan settles: a change feed's columns; <paramref name="addedBytesPerDecodedRow"/> what it adds per
-    /// row decoded (<see cref="ScanReservation.AddedBytesPerDecodedRow"/>).
+    /// the size its scan settles: a change feed's columns.
     /// </summary>
     internal async ValueTask<long> LargestFirstBatchBytesAsync(
         IReadOnlyList<string>? columnNames, Func<long, long, bool>? skipped, CancellationToken cancellationToken,
-        long addedBytesPerRow = 0, long addedBytesPerDecodedRow = 0)
+        long addedBytesPerRow = 0)
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
@@ -758,10 +756,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             // would otherwise swallow them (#850 review). The host adds them to every row the batch holds, at most
             // BatchSize: a MaxBatchByteSize cut stops at page boundaries, so its share of the encoded bytes says
             // nothing of the rows (#850 review round 2).
-            long first = ScanReservation.WithAddedBytes(
+            largest = Math.Max(largest, ScanReservation.WithAddedBytes(
                 FirstBatchBytes(decoded, footer, group, schema, columnNames, null), addedBytesPerRow,
-                FirstBatchRowBound(group, null));
-            largest = Math.Max(largest, ScanReservation.WithAddedBytes(first, addedBytesPerDecodedRow, group.NumRows));
+                FirstBatchRowBound(group, null)));
         }
         return largest;
     }

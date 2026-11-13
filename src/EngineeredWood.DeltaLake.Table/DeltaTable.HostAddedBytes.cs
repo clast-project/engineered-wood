@@ -10,11 +10,6 @@ namespace EngineeredWood.DeltaLake.Table;
 
 public sealed partial class DeltaTable
 {
-    /// <summary>What reshaping adds (<see cref="ReconcileAddedBytesPerRow"/>): per row of the batch, and per row the
-    /// read decodes, which is what it builds inside a nested column costs, since a batch shares that column's children
-    /// unsliced with the whole decoded run (<see cref="EngineeredWood.Scans.ScanReservation.AddedBytesPerDecodedRow"/>).</summary>
-    internal readonly record struct ReshapeBytes(long PerRow, long PerDecodedRow);
-
     /// <summary>
     /// The bytes per row that bringing a data file's batch to the table's shape (<see cref="ReconcileToTableShape"/>)
     /// adds to what the Parquet read decodes, for a first reservation to cover (#851,
@@ -32,10 +27,13 @@ public sealed partial class DeltaTable
     /// per struct row; inside a list or map element, per element, taken as <paramref name="leafValuesPerRow"/> of the
     /// file's top-level column (the most leaf values a row holds, which bounds its elements at any depth; one when
     /// unknown). A column the file holds unchanged, or one dropped from the table, adds nothing.
+    /// <para>Every part is per row of the batch, nested ones included: the reshaping rebuilds a nested column over the
+    /// batch's own rows (<see cref="NestedWindow"/>, #853), even where the batch is sliced from a larger decode. The
+    /// validity bits and offsets that rebuild copies stand in for the raw batch's, so they add nothing.</para>
     /// <para>The file's columns are matched in the names the read gives them: its schema is renamed by the read's own
     /// rule (<see cref="ToLogicalBatch"/>), physical names or field ids to logical, nested ones included.</para>
     /// </summary>
-    internal static ReshapeBytes ReconcileAddedBytesPerRow(
+    internal static long ReconcileAddedBytesPerRow(
         Snapshot.Snapshot snapshot, IReadOnlyList<string>? columns, IReadOnlyDictionary<string, string>? partitionValues,
         IReadOnlyList<string> partitionColumns, bool hasPartitions, ColumnMappingMode mappingMode,
         IReadOnlyDictionary<string, string> logicalToPhysical, Apache.Arrow.Schema fileSchema,
@@ -48,7 +46,7 @@ public sealed partial class DeltaTable
         // whose validity bitmap, where the column has nulls, is allocated with room to grow: up to twice its bits.
         bool converted = byteArrays is { } k && k != ByteArrayOutputKind.Default;
 
-        double bits = 0, decodedBits = 0;
+        double bits = 0;
         foreach (var field in expected.FieldsList)
         {
             var type = byteArrays is { } kind ? ByteArrayRepresentation.Of(field.DataType, kind) : field.DataType;
@@ -74,14 +72,9 @@ public sealed partial class DeltaTable
             {
                 elements = Math.Max(1, perRow);
             }
-            double evolved = EvolvedBits(type, heldField.DataType, converted, widens, rowsPerRow: 1, elements);
-            // Inside a struct, list or map, the reshaping builds at the children's length: the whole decoded run.
-            if (IsNested(type))
-                decodedBits += evolved;
-            else
-                bits += evolved;
+            bits += EvolvedBits(type, heldField.DataType, converted, widens, rowsPerRow: 1, elements);
         }
-        return new ReshapeBytes(Bytes(bits), Bytes(decodedBits));
+        return Bytes(bits);
 
         static long Bytes(double bits)
         {
@@ -92,15 +85,8 @@ public sealed partial class DeltaTable
         }
     }
 
-    /// <summary>A <see cref="ReshapeBytes"/> a reference can publish whole to the units that share a file.</summary>
-    private sealed record ReshapeBytesBox(ReshapeBytes Value);
-
-    private static bool IsNested(IArrowType type)
-    {
-        while (type is ExtensionType extension)
-            type = extension.StorageType;
-        return type is Apache.Arrow.Types.StructType or Apache.Arrow.Types.MapType or ListType or LargeListType or FixedSizeListType;
-    }
+    /// <summary>A <see cref="ReconcileAddedBytesPerRow"/> a reference can publish whole to the units that share a file.</summary>
+    private sealed record ReshapeBytesBox(long Value);
 
     /// <summary>
     /// The file's top-level fields by the names the read gives them: its schema renamed as a batch of it is
@@ -198,11 +184,12 @@ public sealed partial class DeltaTable
             default:
                 return widens ? rowsPerRow * Math.Max(0, FixedBits(expected) - FixedBits(held)) : 0;
         }
+
     }
 
     /// <summary><see cref="ReconcileAddedBytesPerRow"/> for one data file's read through the built-in reader; 0 through
     /// the codec seam, whose host builds the batch.</summary>
-    private static async ValueTask<ReshapeBytes> ReconcileAddedBytesPerRowAsync(
+    private static async ValueTask<long> ReconcileAddedBytesPerRowAsync(
         DataFileRead read, ByteArrayOutputKind? byteArrays, CancellationToken cancellationToken)
     {
         if (read.Reader is not { } reader)

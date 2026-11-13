@@ -421,7 +421,7 @@ internal static class CdfReader
     /// row-tracking pair, and for a data file the <c>_change_type</c> it lacks (<paramref name="changeType"/>), tiled
     /// as a string per row (<see cref="CdfWriter.AddChangeTypeColumn"/>); a change file carries its own.
     /// </summary>
-    private static async ValueTask<DeltaTable.ReshapeBytes> AddedBytesPerRowAsync(
+    private static async ValueTask<long> AddedBytesPerRowAsync(
         ParquetFileReader reader, IReadOnlyDictionary<string, string>? partitionValues, string? changeType,
         CdfSchemaContext ctx, CancellationToken cancellationToken)
     {
@@ -433,7 +433,7 @@ internal static class CdfReader
             snapshot, null, partitionValues, partitionColumns, partitionColumns.Count > 0, ctx.MappingMode,
             ctx.LogicalToPhysical, await reader.GetArrowSchemaAsync(cancellationToken).ConfigureAwait(false),
             byteArrays: null, await reader.LeafValuesPerRowAsync(cancellationToken).ConfigureAwait(false));
-        return reshaped with { PerRow = reshaped.PerRow + FeedColumnsBytesPerRow(changeType, ctx.EmitRowTracking) };
+        return reshaped + FeedColumnsBytesPerRow(changeType, ctx.EmitRowTracking);
     }
 
     /// <summary>
@@ -480,7 +480,7 @@ internal static class CdfReader
             var added = await AddedBytesPerRowAsync(reader, unit.PartitionValues, null, ctx, cancellationToken)
                 .ConfigureAwait(false);
             reservation.SetInitialEstimate(await DeltaTable.LargestFirstBatchBytesAsync(
-                reader, null, null, cancellationToken, added.PerRow, added.PerDecodedRow).ConfigureAwait(false));
+                reader, null, null, cancellationToken, added).ConfigureAwait(false));
         }
 
         await foreach (var (batch, _) in DeltaTable.ReadFileReserving(reader, null, reservation, cancellationToken)
@@ -790,7 +790,7 @@ internal static class CdfReader
                 .ConfigureAwait(false);
             reservation.SetInitialEstimate(await DeltaTable.LargestFirstBatchBytesAsync(
                 reader, null, filter.KeepOnlyPositions ? null : filter.Positions, cancellationToken,
-                added.PerRow, added.PerDecodedRow).ConfigureAwait(false));
+                added).ConfigureAwait(false));
         }
 
         // DV positions are absolute within the file, and so is a row's positional id: each batch's first row comes
