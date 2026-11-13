@@ -105,10 +105,8 @@ internal static class DictReconstructor
         if (nullCount == 0)
             return (ArrowBuffer.Empty, 0);
 
-        var bitmap = new ArrowBuffer.BitmapBuilder(codes.Length);
-        foreach (var c in codes)
-            bitmap.Append(c >= 0);
-        return (bitmap.Build(), nullCount);
+        // Managed, as every other buffer a Vortex decoder builds (see ManagedArrays).
+        return (Encodings.ManagedArrays.Bitmap(codes.Length, i => codes[i] >= 0), nullCount);
     }
 
     /// <summary>

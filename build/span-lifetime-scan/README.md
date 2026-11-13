@@ -57,6 +57,10 @@ The optional third argument picks the preprocessor symbols: `net10.0` (the defau
 SDK's cumulative `…_OR_GREATER` symbols, or a comma-separated list of your own. Scan both, since a keep-alive
 inside one branch of an `#if` protects only the targets that compile it.
 
+Code generated at build time, such as the ORC and Lance protobuf classes, lives in `obj/`. The scan
+compiles it from `obj/Release/net10.0`, without scanning it, so the project must have been built there
+first. Otherwise every use of those types is unresolved.
+
 Sites go to stdout as `path(line): owner kind and name | consumption | source line`. A summary per project
 goes to stderr, with the compile-error count. About a dozen errors are normal: native DLLs that can't be
 referenced, and linked files outside the project directory. `SPANSCAN_ERRORS=1` lists the most common

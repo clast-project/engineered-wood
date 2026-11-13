@@ -111,9 +111,7 @@ internal static class ZigZagArrayDecoder
         if (encoded.Offset == 0)
             return (encoded.Data.Buffers[0], nulls);
 
-        var bitmap = new ArrowBuffer.BitmapBuilder(encoded.Length);
-        for (int i = 0; i < encoded.Length; i++)
-            bitmap.Append(encoded.IsValid(i));
-        return (bitmap.Build(), nulls);
+        // Managed, as every other buffer a Vortex decoder builds (see ManagedArrays).
+        return (ManagedArrays.Bitmap(encoded.Length, encoded.IsValid), nulls);
     }
 }

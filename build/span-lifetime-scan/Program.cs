@@ -78,7 +78,24 @@ var options = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, 
 if (snk is not null)
     options = options.WithCryptoKeyFile(snk).WithStrongNameProvider(new DesktopStrongNameProvider());
 refs.RemoveAll(r => r.Display is { } d && d.EndsWith(".Native.dll", StringComparison.OrdinalIgnoreCase));
-var compilation = CSharpCompilation.Create(projectName, trees, refs, options);
+// Code generated at build time (the ORC and Lance protobuf classes, from Grpc.Tools) lives only in obj. Without it
+// every use of those types is unresolved, and the sites that touch them are missed (#837). It is compiled from the
+// Release net10.0 output the README asks for, but not scanned or rewritten.
+var generated = new List<SyntaxTree>();
+string generatedDir = Path.Combine(projectDir, "obj", "Release", "net10.0");
+if (Directory.Exists(generatedDir))
+{
+    foreach (var f in Directory.EnumerateFiles(generatedDir, "*.cs", SearchOption.AllDirectories))
+    {
+        string name = Path.GetFileName(f);
+        if (name.EndsWith(".AssemblyAttributes.cs", StringComparison.Ordinal)
+            || name.EndsWith(".AssemblyInfo.cs", StringComparison.Ordinal)
+            || name.EndsWith(".GlobalUsings.g.cs", StringComparison.Ordinal))
+            continue;
+        generated.Add(CSharpSyntaxTree.ParseText(File.ReadAllText(f), parse, f));
+    }
+}
+var compilation = CSharpCompilation.Create(projectName, trees.Concat(generated), refs, options);
 
 var errors = compilation.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
 Console.Error.WriteLine($"{projectName}: {files.Count} files, {errors.Count} compile errors (unresolved symbols are skipped)");
