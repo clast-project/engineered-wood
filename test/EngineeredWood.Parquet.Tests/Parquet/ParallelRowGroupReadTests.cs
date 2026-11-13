@@ -1058,6 +1058,28 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.Equal(0, used);
     }
 
+    /// <summary>#851: a two-pass read's first reservation adds what the host adds to each row of the batch it hands
+    /// on, for the rows that batch can hold: the batch size, else the row group.</summary>
+    [Theory]
+    [InlineData(null)]
+    [InlineData(10_000)]
+    public async Task ATwoPassRead_AddsTheHostsBytesForTheRowsOfItsFirstBatch(int? batchSize)
+    {
+        string path = await WriteKeysAndValuesAsync("two-pass-host-bytes", i => i % 10);
+        var predicate = KeyPredicate(k => k < 3, false);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = batchSize })
+        {
+            TwoPassReads = true,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        long reserved = TwoPassReservation(reader, group, await reader.GetSchemaAsync(), predicate, false, false);
+
+        var (_, estimate, _, used) = await ReadTwoPassUnitAsync(reader, predicate, false, addedBytesPerRow: 100);
+        Assert.Equal(reserved + 100L * (batchSize ?? KeyRows), estimate);
+        Assert.Equal(0, used);
+    }
+
     /// <summary>
     /// A dictionary that declines to answer (here, a predicate that raises over its entries) leaves the first pass to
     /// decode the column's values, which the reservation sized as answers. Those batches are never yielded, so no
@@ -1257,7 +1279,7 @@ public class ParallelRowGroupReadTests : IDisposable
     /// </summary>
     private static async Task<(long Returned, long Estimate, long Peak, long Used)> ReadTwoPassUnitAsync(
         ParquetFileReader reader, RowPredicate predicate, bool returnPredicateColumn,
-        ParquetFileReader.DecodedGrowth? growth = null)
+        ParquetFileReader.DecodedGrowth? growth = null, long addedBytesPerRow = 0)
     {
         var scan = new ParquetScan
         {
@@ -1269,7 +1291,7 @@ public class ParallelRowGroupReadTests : IDisposable
         await foreach (var p in reader.PlanRowGroupsAsync(null, selected.ReadColumns, null, default))
             first ??= p;
         var budget = new EngineeredWood.Scans.ScanMemoryBudget(1L << 30);
-        var reservation = new EngineeredWood.Scans.ScanReservation(budget, 0);
+        var reservation = new EngineeredWood.Scans.ScanReservation(budget, 0) { AddedBytesPerRow = addedBytesPerRow };
         long returned = 0;
         await foreach (var batch in selected.ReadAsync(
                            first!.Value, reservation, growth ?? new ParquetFileReader.DecodedGrowth(), default))

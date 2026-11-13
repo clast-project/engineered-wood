@@ -576,7 +576,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 .ConfigureAwait(false);
             if (estimate.OffsetIndexes is { } offsetIndexes)
                 plan = plan with { OffsetIndexes = offsetIndexes };
-            reservation.SetInitialEstimate(estimate.Reserved);
+            reservation.SetInitialEstimate(
+                estimate.Reserved, FirstBatchRowBound(metadata.RowGroups[plan.Index], plan.Ranges));
 
             e = ReadPlannedAsync(plan, columnNames, cancellationToken, answers, prefetched)
                 .GetAsyncEnumerator(cancellationToken);
@@ -755,10 +756,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             // would otherwise swallow them (#850 review). The host adds them to every row the batch holds, at most
             // BatchSize: a MaxBatchByteSize cut stops at page boundaries, so its share of the encoded bytes says
             // nothing of the rows (#850 review round 2).
-            long rows = _options.BatchSize is int batchSize && batchSize > 0
-                ? Math.Min(batchSize, group.NumRows)
-                : group.NumRows;
-            long added = addedBytesPerRow * rows;
+            long added = addedBytesPerRow * FirstBatchRowBound(group, null);
             largest = Math.Max(largest, FirstBatchBytes(decoded, footer, group, schema, columnNames, null) + added);
         }
         return largest;
@@ -1023,6 +1021,18 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             share = Math.Min(share, (double)maxBytes / footerBytes);
         long bytes = (long)(groupBytes * share);
         return Math.Max(bytes, Math.Min(footerBytes, groupBytes));
+    }
+
+    /// <summary>
+    /// The most rows a read's first batch of <paramref name="rowGroup"/> can hold, for what a host adds to each:
+    /// <see cref="ParquetReadOptions.BatchSize"/>, which caps every batch's rows, else every row the read keeps. A
+    /// <see cref="ParquetReadOptions.MaxBatchByteSize"/> cut stops at page boundaries, so the batch's share of the
+    /// encoded bytes says nothing of its rows (#850 review round 2).
+    /// </summary>
+    internal long FirstBatchRowBound(RowGroup rowGroup, IReadOnlyList<RowRange>? ranges)
+    {
+        long rows = KeptRows(rowGroup, ranges);
+        return _options.BatchSize is int batchSize && batchSize > 0 ? Math.Min(batchSize, rows) : rows;
     }
 
     /// <summary>

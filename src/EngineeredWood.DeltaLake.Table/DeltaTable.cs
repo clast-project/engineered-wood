@@ -7165,6 +7165,19 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         bool wantPositions = scan.WantAddress || scan.WantLocator;
         byte[]? pathBytes = scan.WantLocator ? System.Text.Encoding.UTF8.GetBytes(read.AddFile.Path) : null;
 
+        // The batch the scan settles carries what reshaping and the metadata columns add to the decoded one (#851).
+        if (reservation != ScanReservation.None)
+        {
+            long reshaped = Interlocked.Read(ref read.ScanAddedBytesPerRow);
+            if (reshaped < 0)
+            {
+                reshaped = await ReconcileAddedBytesPerRowAsync(
+                    read, _options.ParquetReadOptions.ByteArrayOutput, cancellationToken).ConfigureAwait(false);
+                Interlocked.Exchange(ref read.ScanAddedBytesPerRow, reshaped);
+            }
+            reservation.AddedBytesPerRow = reshaped + MetadataAddedBytesPerRow(scan, pathBytes);
+        }
+
         // An exact filter through the built-in reader: the Parquet read selects the rows (deletion vector and filter
         // both) and says where each one is (#502).
         if (read.Selected is { } selected && unit.Plan is { } plan)
@@ -13166,6 +13179,11 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     private sealed class DataFileRead : IDisposable
     {
+        /// <summary>What reshaping adds to each row of this file's batches in a scan
+        /// (<see cref="ReconcileAddedBytesPerRow"/>), once its first unit has asked; -1 before. Every unit of the file
+        /// asks, and two at once both compute the same value.</summary>
+        internal long ScanAddedBytesPerRow = -1;
+
         private int _refs = 1;
 
         internal required AddFile AddFile { get; init; }
@@ -13844,7 +13862,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     // Reserve for the first batch before decoding it: the largest row group's estimated decoded
                     // size over the columns read. Later batches reserve what the previous one measured.
                     reservation.SetInitialEstimate(await LargestFirstBatchBytesAsync(
-                        read.Reader, read.FileColumns, read.DeletedRows, cancellationToken).ConfigureAwait(false));
+                        read.Reader, read.FileColumns, read.DeletedRows, cancellationToken,
+                        await ReconcileAddedBytesPerRowAsync(read, byteArrays: null, cancellationToken)
+                            .ConfigureAwait(false)).ConfigureAwait(false));
                 }
 
                 source = Reserving(
