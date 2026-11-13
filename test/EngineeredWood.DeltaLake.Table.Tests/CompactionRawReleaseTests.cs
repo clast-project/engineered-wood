@@ -107,7 +107,12 @@ public class CompactionRawReleaseTests : IDisposable
             }
         }
 
-        await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions { MaxConcurrentReads = 1 });
+        // Batched, so the reader hands out slices of each decoded row group at nonzero offsets: a window then is not the
+        // raw buffer's own memory.
+        await using var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions
+        {
+            MaxConcurrentReads = 1, ParquetReadOptions = new ParquetReadOptions { BatchSize = 1_000 },
+        });
         Assert.NotNull(await table.CompactAsync(AlwaysCompact));
 
         int seen = 0;
