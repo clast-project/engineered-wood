@@ -36,7 +36,8 @@ public class DmlRawReleaseTests : IDisposable
         try { Directory.Delete(_tempDir, true); } catch { }
     }
 
-    public enum Op { Delete, Update, Merge }
+    /// <summary>DELETE by predicate, DELETE by position (<see cref="RowSelection"/>), UPDATE, MERGE.</summary>
+    public enum Op { Delete, DeleteRows, Update, Merge }
 
     public enum Layout
     {
@@ -95,6 +96,13 @@ public class DmlRawReleaseTests : IDisposable
                     (long deleted, version) = await table.DeleteAsync(Changed, mode);
                     Assert.Equal(Last - First, deleted);
                     break;
+                case Op.DeleteRows:
+                    var file = table.CurrentSnapshot.ActiveFiles.Values.Single().Path;
+                    var positions = Enumerable.Range(First, Last - First).Select(i => (long)i).ToList();
+                    (long deletedRows, version) = await table.DeleteRowsAsync(
+                        RowSelection.ByPath(new Dictionary<string, IReadOnlyCollection<long>> { [file] = positions }), mode);
+                    Assert.Equal(Last - First, deletedRows);
+                    break;
                 case Op.Update:
                     // Identity: the post-images are the gathered rows themselves.
                     (long updated, version) = await table.UpdateAsync(Changed, b => b, mode: mode);
@@ -112,7 +120,9 @@ public class DmlRawReleaseTests : IDisposable
                     break;
             }
         }
-        Assert.True(NativeMemoryTracker.TotalAllocated > allocated, "The operation decoded nothing natively.");
+        // A vector delete by position reads the file only for its change rows.
+        if (op != Op.DeleteRows || !deletionVectors || cdf)
+            Assert.True(NativeMemoryTracker.TotalAllocated > allocated, "The operation decoded nothing natively.");
         Assert.Equal(0, NativeMemoryTracker.LiveBytes - before);
 
         // Nothing released was still read: the table and its change files hold every value as it was.
@@ -129,7 +139,8 @@ public class DmlRawReleaseTests : IDisposable
                 }
             }
         }
-        Assert.Equal(op == Op.Delete ? Rows - (Last - First) : Rows, seen.Count);
+        bool deletes = op is Op.Delete or Op.DeleteRows;
+        Assert.Equal(deletes ? Rows - (Last - First) : Rows, seen.Count);
 
         if (!cdf)
             return;
@@ -149,10 +160,67 @@ public class DmlRawReleaseTests : IDisposable
                 }
             }
         }
-        var expected = op == Op.Delete
+        var expected = deletes
             ? new Dictionary<string, int> { [CdfConfig.Delete] = Last - First }
             : new Dictionary<string, int> { [CdfConfig.UpdatePreimage] = Last - First, [CdfConfig.UpdatePostimage] = Last - First };
         Assert.Equal(expected.OrderBy(kv => kv.Key), changes.OrderBy(kv => kv.Key));
+    }
+
+    // With deletion vectors an UPDATE or MERGE writes only its post-images, so it processes each batch as it is read and
+    // keeps no more of the file than a read does: about a row group, here a sixteenth of the file (#728). It held the
+    // whole file before.
+    [Theory]
+    [InlineData(Op.Update)]
+    [InlineData(Op.Merge)]
+    public async Task ADeletionVectorDmlHoldsNoMoreThanARead(Op op)
+    {
+        const int rows = 64_000;
+        var dir = Path.Combine(_tempDir, "groups");
+        Directory.CreateDirectory(dir);
+        var fs = new LocalTableFileSystem(dir);
+        var write = new DeltaTableOptions { ParquetWriteOptions = new ParquetWriteOptions { RowGroupMaxRows = rows / 16 } };
+        await using (var created = await DeltaTable.CreateAsync(fs, TableSchema, write, enableDeletionVectors: true))
+            await created.WriteAsync([Source(0, rows)]);
+
+        long readPeak = await PeakOfAsync(fs, async table =>
+        {
+            await foreach (var batch in table.ReadAllAsync())
+                batch.Dispose();
+        });
+        long dmlPeak = await PeakOfAsync(fs, async table =>
+        {
+            if (op == Op.Update)
+            {
+                var (updated, _) = await table.UpdateAsync(Changed, b => b, mode: RowDeleteMode.DeletionVector);
+                Assert.Equal(Last - First, updated);
+            }
+            else
+            {
+                var (metrics, _) = await table.MergeAsync([Source(First, Last)], new MergeOptions
+                {
+                    Keys = ["id"], WhenMatched = [MergeAction.Update], DeleteMode = RowDeleteMode.DeletionVector,
+                });
+                Assert.Equal(Last - First, metrics.NumTargetRowsUpdated);
+            }
+        });
+
+        // Measured: the same peak as the read (465,016 B); 5,168,136 B when the file was held whole.
+        Assert.True(dmlPeak < 2 * readPeak, $"Peak {dmlPeak:N0} B; a read of the table peaks at {readPeak:N0} B.");
+    }
+
+    // The highest native memory in use while `act` runs on the table, over what was in use before it.
+    private static async Task<long> PeakOfAsync(LocalTableFileSystem fs, Func<DeltaTable, Task> act)
+    {
+        for (int i = 0; i < 3; i++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+
+        NativeMemoryTracker.Reset();
+        await using (var table = await DeltaTable.OpenAsync(fs, new DeltaTableOptions { MaxConcurrentReads = 1 }))
+            await act(table);
+        return NativeMemoryTracker.PeakBytes;
     }
 
     // A MERGE's post-images gather the source's values, so with string views they share the source's data buffers. The
