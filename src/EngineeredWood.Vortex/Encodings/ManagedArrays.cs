@@ -46,8 +46,11 @@ internal static class ManagedArrays
                 inputs.Add(chunk);
         }
 
+        // Anything else is joined (and its types checked, decimals widened) by ArrowCompute. That joins strings,
+        // binaries and structs into managed buffers, but leaves every other type, a struct's or list's primitive
+        // children included, to Arrow's native concatenator, so its result is copied wherever it is native.
         if (inputs.Count < 2 || !Joinable(inputs))
-            return ArrowCompute.Concatenate(chunks);
+            return ToManaged(ArrowCompute.Concatenate(chunks));
 
         var type = inputs[0].Data.DataType;
         int length = 0;
@@ -115,8 +118,9 @@ internal static class ManagedArrays
     }
 
     /// <summary>Whether every chunk is a fixed-width type of whole bytes, or boolean, laid out as validity and
-    /// values only, and of the first chunk's kind and width. A chunked node decodes every chunk at its own type, so
-    /// anything else is left to <see cref="ArrowCompute.Concatenate"/> to join or refuse.</summary>
+    /// values only, and of the very same type instance as the first. A chunked node decodes every chunk at its own
+    /// type, so that is the common case; anything else (a decimal of another scale or precision, say) is left to
+    /// <see cref="ArrowCompute.Concatenate"/>, which checks the whole type and widens a decimal's precision.</summary>
     private static bool Joinable(List<IArrowArray> inputs)
     {
         var type = inputs[0].Data.DataType;
@@ -127,8 +131,7 @@ internal static class ManagedArrays
         foreach (var chunk in inputs)
         {
             var data = chunk.Data;
-            if (data.DataType.TypeId != type.TypeId
-                || (!boolean && ((FixedWidthType)data.DataType).BitWidth != ((FixedWidthType)type).BitWidth)
+            if (!ReferenceEquals(data.DataType, type)
                 || data.Buffers.Length != 2
                 || data.Children is { Length: > 0 }
                 || data.Dictionary is not null)
@@ -136,6 +139,38 @@ internal static class ManagedArrays
         }
         return true;
     }
+
+    /// <summary><paramref name="array"/> itself when every buffer in it, at any depth, is managed; otherwise a copy
+    /// whose native buffers are copied into <c>byte[]</c> (managed ones are shared).</summary>
+    internal static IArrowArray ToManaged(IArrowArray array)
+    {
+        if (IsManaged(array.Data))
+            return array;
+        var copy = Apache.Arrow.ArrowArrayFactory.BuildArray(ToManaged(array.Data));
+        GC.KeepAlive(array); // its native buffers are read above
+        return copy;
+    }
+
+    private static ArrayData ToManaged(ArrayData data)
+    {
+        var buffers = new ArrowBuffer[data.Buffers.Length];
+        for (int i = 0; i < buffers.Length; i++)
+        {
+            var buffer = data.Buffers[i];
+            buffers[i] = IsManaged(buffer) ? buffer : new ArrowBuffer(buffer.Span.ToArray());
+        }
+        var children = data.Children?.Select(ToManaged).ToArray();
+        var dictionary = data.Dictionary is null ? null : ToManaged(data.Dictionary);
+        return new ArrayData(data.DataType, data.Length, data.NullCount, data.Offset, buffers, children, dictionary);
+    }
+
+    private static bool IsManaged(ArrayData data) =>
+        data.Buffers.All(IsManaged)
+        && (data.Children is null || data.Children.All(IsManaged))
+        && (data.Dictionary is null || IsManaged(data.Dictionary));
+
+    private static bool IsManaged(ArrowBuffer buffer) =>
+        buffer.IsEmpty || System.Runtime.InteropServices.MemoryMarshal.TryGetArray(buffer.Memory, out _);
 
     private static void CopyBits(ReadOnlySpan<byte> source, int sourceBit, Span<byte> target, int targetBit, int count)
     {
