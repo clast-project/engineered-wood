@@ -192,6 +192,141 @@ public class ByteArrayLayoutTests
         }
     }
 
+    /// <summary>
+    /// Every container the conversion rebuilds -- a map, a large list, a fixed-size list, a list of structs -- comes
+    /// to a function with offset-layout strings, the same values, and the type <see cref="ByteArrayOffsets.TypeOf"/>
+    /// predicts, sliced or not: each keeps its own offset and buffers over a converted child (#863 review round 2).
+    /// </summary>
+    [Theory]
+    [InlineData(Layout.LargeOffsets, false)]
+    [InlineData(Layout.LargeOffsets, true)]
+    [InlineData(Layout.Views, false)]
+    [InlineData(Layout.Views, true)]
+    public void ANestedContainer_ReachesAFunctionConvertedWithItsValues(Layout layout, bool slice)
+    {
+        string[] names = ["m", "ll", "fl", "ls"];
+        var plain = NestedBatch(Layout.Offsets, slice);
+        var other = NestedBatch(layout, slice);
+        var probe = new Probe();
+        new ArrowRowEvaluator(probe).EvaluateExpression(
+            Expressions.Call("probe", names.Select(n => (Expression)Expressions.Ref(n)).ToArray()), other);
+
+        for (int c = 0; c < names.Length; c++)
+        {
+            var original = other.Column(names[c]);
+            var argument = probe.Arguments![c];
+            Assert.False(HasAlternateLayout(argument.Data.DataType), $"{names[c]}: {TypeText(argument.Data.DataType)}");
+            Assert.Equal(TypeText(plain.Column(names[c]).Data.DataType), TypeText(argument.Data.DataType));
+            Assert.Equal(TypeText(ByteArrayOffsets.TypeOf(original.Data.DataType)), TypeText(argument.Data.DataType));
+            Assert.Equal(argument.Length, original.Length);
+            for (int i = 0; i < argument.Length; i++)
+                Assert.Equal(Format(plain.Column(names[c]), i), Format(argument, i));
+        }
+    }
+
+    private static readonly (string Key, string? Value)[]?[] MapRows =
+    [
+        [("k1", "short"), ("k2", "a value long enough to sit out of line")], null, [],
+        [("a key long enough to sit out of line", null)], [("k3", "v3")], [("k4", "v4"), ("k5", "v5"), ("k6", null)],
+    ];
+
+    private static RecordBatch NestedBatch(Layout layout, bool slice)
+    {
+        int rows = MapRows.Length;
+        var validity = new byte[(rows + 7) / 8];
+        int nulls = 0;
+        var offsets = new List<int> { 0 };
+        var keys = new List<string?>();
+        var values = new List<string?>();
+        for (int i = 0; i < rows; i++)
+        {
+            if (MapRows[i] is { } entries)
+            {
+                validity[i >> 3] |= (byte)(1 << (i & 7));
+                foreach (var (k, v) in entries) { keys.Add(k); values.Add(v); }
+            }
+            else
+            {
+                nulls++;
+            }
+            offsets.Add(keys.Count);
+        }
+
+        // A map of strings to strings.
+        var keyArray = Strings(layout, keys);
+        var valueArray = Strings(layout, values);
+        var keyField = new Field("key", keyArray.Data.DataType, false);
+        var valueField = new Field("value", valueArray.Data.DataType, true);
+        var entriesType = new StructType([keyField, valueField]);
+        var map = new MapArray(new MapType(keyField, valueField), rows, Buffer(offsets.ToArray()),
+            new StructArray(entriesType, keys.Count, [keyArray, valueArray], ArrowBuffer.Empty, 0),
+            new ArrowBuffer(validity), nulls);
+
+        // The values again, as a large list and as a list of structs, both over the same rows.
+        var element = Strings(layout, values);
+        var large = new LargeListArray(new LargeListType(new Field("element", element.Data.DataType, true)), rows,
+            Buffer(offsets.Select(o => (long)o).ToArray()), element, new ArrowBuffer(validity), nulls);
+        var structs = new StructArray(new StructType([new Field("s", element.Data.DataType, true)]), values.Count,
+            [element], ArrowBuffer.Empty, 0);
+        var listOfStructs = new ListArray(new ListType(new Field("element", structs.Data.DataType, true)), rows,
+            Buffer(offsets.ToArray()), structs, new ArrowBuffer(validity), nulls);
+
+        // Two of the keys per row, as a fixed-size list.
+        var pairs = Strings(layout, Enumerable.Range(0, rows * 2).Select(i => i % 5 == 4 ? null : $"pair-{i}-{new string('x', i)}").ToList());
+        var fixedList = new FixedSizeListArray(new FixedSizeListType(new Field("element", pairs.Data.DataType, true), 2),
+            rows, pairs, new ArrowBuffer(validity), nulls);
+
+        IArrowArray[] columns = [map, large, fixedList, listOfStructs];
+        if (slice)
+        {
+            for (int i = 0; i < columns.Length; i++)
+                columns[i] = ArrowArrayFactory.Slice(columns[i], 1, rows - 1);
+            rows--;
+        }
+
+        string[] names = ["m", "ll", "fl", "ls"];
+        var fields = names.Select((n, i) => new Field(n, columns[i].Data.DataType, true)).ToList();
+        return new RecordBatch(new Apache.Arrow.Schema(fields, null), columns, rows);
+    }
+
+    private static ArrowBuffer Buffer<T>(T[] values) where T : struct =>
+        new(MemoryMarshal.AsBytes(values.AsSpan()).ToArray());
+
+    private static bool HasAlternateLayout(IArrowType type) => type switch
+    {
+        LargeStringType or StringViewType or LargeBinaryType or BinaryViewType => true,
+        NestedType nested => nested.Fields.Any(f => HasAlternateLayout(f.DataType)),
+        _ => false,
+    };
+
+    private static string TypeText(IArrowType type) => type switch
+    {
+        NestedType nested => $"{type.Name}<{string.Join(", ", nested.Fields.Select(f => $"{f.Name}: {TypeText(f.DataType)}"))}>",
+        _ => type.Name,
+    };
+
+    /// <summary>Row <paramref name="index"/> of <paramref name="array"/> as text, at any depth.</summary>
+    private static string Format(IArrowArray array, int index)
+    {
+        if (array.IsNull(index))
+            return "null";
+
+        static string Elements(IArrowArray values) =>
+            "[" + string.Join(", ", Enumerable.Range(0, values.Length).Select(j => Format(values, j))) + "]";
+
+        return array switch
+        {
+            StringArray a => $"\"{a.GetString(index)}\"",
+            LargeStringArray a => $"\"{a.GetString(index)}\"",
+            StringViewArray a => $"\"{a.GetString(index)}\"",
+            ListArray a => Elements(a.GetSlicedValues(index)),
+            LargeListArray a => Elements(a.GetSlicedValues(index)),
+            FixedSizeListArray a => Elements(a.GetSlicedValues(index)),
+            StructArray a => "(" + string.Join(", ", a.Fields.Select(f => Format(f, index))) + ")",
+            _ => throw new InvalidOperationException(array.GetType().Name),
+        };
+    }
+
     private sealed class Probe : IFunctionRegistry
     {
         public IReadOnlyList<IArrowArray>? Arguments { get; private set; }
