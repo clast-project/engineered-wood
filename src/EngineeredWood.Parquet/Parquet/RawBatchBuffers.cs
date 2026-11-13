@@ -82,9 +82,9 @@ internal sealed class RawBatchBuffers
     /// <summary>
     /// Releases every recorded buffer that <paramref name="output"/> and <paramref name="alsoKept"/> (arrays handed on
     /// beside the batch: positions, row ids, or another batch) don't hold. Null <paramref name="output"/> releases all
-    /// but those.
+    /// but those. Returns the buffers it kept, for whoever releases the rest once nothing reads them (#865).
     /// </summary>
-    public void ReleaseAllBut(RecordBatch? output, params IArrowArray?[] alsoKept)
+    public RawBatchBuffers ReleaseAllBut(RecordBatch? output, params IArrowArray?[] alsoKept)
     {
         var held = new HashSet<ReadOnlyMemory<byte>>();
         Collect(output, held);
@@ -104,13 +104,20 @@ internal sealed class RawBatchBuffers
                 keptAllocations.Add(allocation);
         }
 
+        var kept = new RawBatchBuffers();
         foreach (var (buffer, memory) in _buffers)
         {
             // Memory with no allocation to compare by is kept: releasing it is only safe when nothing reads it.
             if (AllocationOf(memory) is { } allocation && !keptAllocations.Contains(allocation))
                 buffer.Dispose();
+            else
+                kept._buffers.Add((buffer, memory));
         }
+        return kept;
     }
+
+    /// <summary>No buffers, to record some with <see cref="And(IArrowArray?)"/>.</summary>
+    public static RawBatchBuffers None() => new();
 
     private static void Collect(RecordBatch? batch, HashSet<ReadOnlyMemory<byte>> into)
     {
