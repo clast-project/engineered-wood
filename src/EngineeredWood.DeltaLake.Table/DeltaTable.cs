@@ -13290,7 +13290,16 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                 var resolved = parquetSchema.ResolveFieldIds(fieldIds);
                 fileColumns = resolved.Where(n => n is not null).Select(n => n!).ToList();
             }
-            // else: read all columns, rename by field_id after
+            else
+            {
+                // Every column, renamed by field id after, but a dropped column's: one whose field id no field of the
+                // schema has, which the rename drops (ColumnMappingRecursive.DropStaleFields' rule). Decoding it was
+                // wasted (#855). A column without an id, and Iceberg's reserved row-lineage ids (IcebergCompatV3's
+                // materialized row tracking), are not a dropped column's.
+                var ids = new HashSet<int>(snapshot.Schema.Fields.Select(ColumnMapping.GetFieldId).OfType<int>());
+                fileColumns = WithoutDroppedColumns(parquetSchema, c => c.Element.FieldId is int id
+                    && !ids.Contains(id) && id != IcebergCompat.RowIdFieldId && id != IcebergCompat.RowCommitVersionFieldId);
+            }
         }
         else
         {
@@ -13315,6 +13324,17 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                     .Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
                     .ToList();
             }
+            else if (mappingMode == ColumnMappingMode.Name)
+            {
+                // Every column but a dropped column's: one named by no field of the schema, which the read drops after
+                // decoding it (#855). A hidden row-tracking column is no schema field either, and is kept.
+                parquetSchema = await reader.GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+                var known = new HashSet<string>(
+                    snapshot.Schema.Fields.Select(f => ColumnMapping.GetPhysicalName(f, mappingMode))
+                        .Concat(MaterializedRowTrackingColumnNames(snapshot)),
+                    StringComparer.Ordinal);
+                fileColumns = WithoutDroppedColumns(parquetSchema, c => !known.Contains(c.Name));
+            }
         }
 
         // Row tracking: the same omission as in OpenDataFileAsync's codec-seam branch — the hidden materialized
@@ -13330,7 +13350,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
             {
                 var withTracking = new List<string>(fileColumns.Count + trackingColumns.Count);
                 withTracking.AddRange(fileColumns);
-                withTracking.AddRange(trackingColumns);
+                // A list taken from the file's own columns may name them already.
+                withTracking.AddRange(trackingColumns.Where(c => !withTracking.Contains(c)));
                 fileColumns = withTracking;
             }
         }
@@ -13362,6 +13383,15 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         }
 
         return fileColumns;
+    }
+
+    // The file's top-level columns but those `dropped` names: null (every column) when it names none, so a file with no
+    // dropped column is read as it always was.
+    private static IReadOnlyList<string>? WithoutDroppedColumns(
+        Parquet.Schema.SchemaDescriptor schema, Func<Parquet.Schema.SchemaNode, bool> dropped)
+    {
+        var children = schema.Root.Children;
+        return children.Any(dropped) ? children.Where(c => !dropped(c)).Select(c => c.Name).ToList() : null;
     }
 
     /// <summary>
