@@ -44,6 +44,14 @@ internal sealed class RawBatchBuffers
         return buffers;
     }
 
+    /// <summary>Records <paramref name="raw"/>'s buffers, at every depth: an array a step replaces with one it builds.</summary>
+    public static RawBatchBuffers Of(IArrowArray raw)
+    {
+        var buffers = new RawBatchBuffers();
+        buffers.Add(raw.Data);
+        return buffers;
+    }
+
     /// <summary>
     /// Releases every recorded buffer that <paramref name="output"/> and <paramref name="alsoKept"/> (arrays handed on
     /// beside the batch: positions, row ids, or another batch) don't hold. Null <paramref name="output"/> releases all
