@@ -433,13 +433,25 @@ internal static class CdfReader
             snapshot, null, partitionValues, partitionColumns, partitionColumns.Count > 0, ctx.MappingMode,
             ctx.LogicalToPhysical, await reader.GetArrowSchemaAsync(cancellationToken).ConfigureAwait(false),
             byteArrays: null, await reader.LeafValuesPerRowAsync(cancellationToken).ConfigureAwait(false));
-        return reshaped with
-        {
-            PerRow = reshaped.PerRow
-                + 2 * sizeof(long)
-                + (ctx.EmitRowTracking ? 2 * sizeof(long) : 0)
-                + (changeType is null ? 0 : sizeof(int) + System.Text.Encoding.UTF8.GetByteCount(changeType)),
-        };
+        return reshaped with { PerRow = reshaped.PerRow + FeedColumnsBytesPerRow(changeType, ctx.EmitRowTracking) };
+    }
+
+    /// <summary>
+    /// The bytes per row of the columns the feed itself adds, validity included (#852 review round 3):
+    /// <c>_commit_version</c>, tiled with no validity (<see cref="AddMetadataColumns"/>); <c>_commit_timestamp</c>,
+    /// tiled, or all NULL with a validity bitmap for a commit with no timestamp, so a bit is counted either way; the
+    /// emitted row-tracking pair, each built by a builder whose validity, where a value is NULL, has room to grow, so
+    /// two bits each (<see cref="ResolveRowTracking"/>); and for a data file the <c>_change_type</c> it lacks, tiled as
+    /// a string per row (<see cref="CdfWriter.AddChangeTypeColumn"/>).
+    /// </summary>
+    internal static long FeedColumnsBytesPerRow(string? changeType, bool emitRowTracking)
+    {
+        long bits = 64 + (64 + 1);
+        if (emitRowTracking)
+            bits += 2 * (64 + 2);
+        if (changeType is not null)
+            bits += 32 + 8L * System.Text.Encoding.UTF8.GetByteCount(changeType);
+        return (bits + 7) / 8;
     }
 
     private static async IAsyncEnumerable<RecordBatch> ReadCdcFileAsync(
@@ -873,7 +885,7 @@ internal static class CdfReader
     /// <para>Both columns are nullable: a change touching a file that predates row tracking on the table has
     /// no identity to report, and reporting a fabricated one would be worse than reporting none.</para>
     /// </summary>
-    private static RecordBatch ResolveRowTracking(
+    internal static RecordBatch ResolveRowTracking(
         RecordBatch batch,
         Int64Array? materializedIds,
         Int64Array? materializedVersions,
@@ -929,7 +941,7 @@ internal static class CdfReader
             ctx.LogicalToPhysical);
     }
 
-    private static RecordBatch AddMetadataColumns(
+    internal static RecordBatch AddMetadataColumns(
         RecordBatch batch, long commitVersion, long? commitTimestamp)
     {
         // Both added columns are constant down the whole batch — one commit contributes one version and one

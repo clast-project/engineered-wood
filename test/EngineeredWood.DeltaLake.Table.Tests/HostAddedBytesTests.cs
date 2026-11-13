@@ -306,6 +306,41 @@ public class HostAddedBytesTests : IDisposable
     }
 
     /// <summary>
+    /// #852 review round 3: the feed's own columns, as its builders build them (the oracle here), validity included.
+    /// A commit with no timestamp gets an all-NULL <c>_commit_timestamp</c>, which carries a validity bitmap; the
+    /// emitted row-tracking pair is built by builders whose validity, where a value is NULL, has room to grow. Exact
+    /// within rounding where those are NULL, and never short where they are not.
+    /// </summary>
+    [Theory]
+    [InlineData("insert", false, true)]
+    [InlineData("insert", true, true)]
+    [InlineData(null, true, true)]
+    [InlineData("update_preimage", true, false)]
+    public void TheFeedsOwnColumns_AreSizedWithTheirValidity(string? changeType, bool emitRowTracking, bool nulls)
+    {
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("v", Int64Type.Default, false)).Build();
+        var v = new Int64Array.Builder();
+        for (int r = 0; r < Rows; r++)
+            v.Append(r);
+        using var raw = new RecordBatch(schema, [v.Build()], Rows);
+
+        var batch = changeType is null ? raw : ChangeDataFeed.CdfWriter.AddChangeTypeColumn(raw, changeType);
+        batch = ChangeDataFeed.CdfReader.AddMetadataColumns(batch, 7, nulls ? null : 1_794_486_519_997L);
+        if (emitRowTracking)
+        {
+            batch = ChangeDataFeed.CdfReader.ResolveRowTracking(
+                batch, null, null, baseRowId: nulls ? null : 100, defaultRowCommitVersion: nulls ? null : 3,
+                nulls ? null : Enumerable.Range(0, Rows).Select(i => (long)i).ToList(), "_row_id", "_row_commit_version");
+        }
+        long added = RollingDataFileWriter.EstimatedBytes(batch) - RollingDataFileWriter.EstimatedBytes(raw);
+
+        long estimate = ChangeDataFeed.CdfReader.FeedColumnsBytesPerRow(changeType, emitRowTracking) * Rows;
+        Assert.True(estimate >= added - 4096, $"estimated {estimate}, the feed added {added}");
+        if (nulls)
+            Assert.True(estimate <= added + Rows, $"estimated {estimate}, the feed added {added}");
+    }
+
+    /// <summary>
     /// A widened column adds the wider type's width over the one the file holds: an int32 read as int64 four bytes a
     /// row. A short widened to int adds nothing, because the read already decodes it as the INT32 it stores (#839).
     /// </summary>
