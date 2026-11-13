@@ -412,25 +412,15 @@ internal sealed class BatchSelector(
     }
 
     /// <summary>
-    /// Releases the decoded batch once <paramref name="output"/> is gathered from it: every column except those
-    /// the output still shares a buffer with. <see cref="ArrowCompute.Take(IArrowArray, ReadOnlySpan{int})"/>
-    /// copies most types but shares a view column's data buffers (and a dictionary), and the reader builds
-    /// those in native memory, so disposing such a column would free bytes the output reads. A column left
-    /// undisposed is released by its buffers' finalizers once nothing references them.
+    /// Releases the decoded batch once <paramref name="output"/> is gathered from it: every buffer except those the
+    /// output still holds. <see cref="ArrowCompute.Take(IArrowArray, ReadOnlySpan{int})"/> copies most types but
+    /// shares a view column's data buffers (and a dictionary), and the reader builds those in native memory, so
+    /// disposing such a column would free bytes the output reads. Decided buffer by buffer, not column by column
+    /// (#857 review): a view column the output shares data with still has views and validity the gather replaced,
+    /// which keeping the whole column left to the finalizers.
     /// </summary>
-    internal static void ReleaseAfterGather(RecordBatch batch, RecordBatch output)
-    {
-        var shared = new HashSet<ReadOnlyMemory<byte>>();
-        for (int i = 0; i < output.ColumnCount; i++)
-            CollectBuffers(output.Column(i).Data, shared);
-
-        for (int i = 0; i < batch.ColumnCount; i++)
-        {
-            var column = batch.Column(i);
-            if (!SharesAny(column.Data, shared))
-                column.Dispose();
-        }
-    }
+    internal static void ReleaseAfterGather(RecordBatch batch, RecordBatch output) =>
+        RawBatchBuffers.Of(batch).ReleaseAllBut(output);
 
     internal static void CollectBuffers(ArrayData data, HashSet<ReadOnlyMemory<byte>> into)
     {

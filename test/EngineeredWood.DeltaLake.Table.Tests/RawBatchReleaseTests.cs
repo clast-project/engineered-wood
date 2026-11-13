@@ -115,6 +115,139 @@ public class RawBatchReleaseTests : IDisposable
         Assert.Equal(Rows, rows);
     }
 
+    // A filter that keeps only some rows gathers them, and a gather of a view column shares the out-of-line string data
+    // with the column it gathers from, whose views and validity it supersedes. Those are released all the same, in the
+    // built-in reader's selected read and in the codec seam's filter alike (#857 review).
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ASelectiveFilterOverViewColumns_ReleasesTheSupersededViews(bool seam)
+    {
+        await (await CreateAsync([])).DisposeAsync();
+
+        long rows = 0;
+        await AssertReleasedAsync(async table =>
+        {
+            // On the int column: a string filter can't be evaluated over views.
+            await foreach (var b in table.ReadAsync(new DeltaReadOptions { Filter = Ex.IsNotNull("id"), FilterRows = true }))
+            {
+                var gone = (StringViewArray)b.Column(b.Schema.GetFieldIndex("gone"));
+                var ids = (Int32Array)b.Column(b.Schema.GetFieldIndex("id"));
+                for (int i = 0; i < b.Length; i++)
+                {
+                    if (ids.GetValue(i) is int id)
+                        Assert.Equal("dropped value " + id, gone.GetString(i));
+                }
+
+                rows += b.Length;
+                b.Dispose();
+            }
+        }, batchSize: null, seam: seam, byteArrays: ByteArrayOutputKind.ViewType);
+
+        // Every id but each seventh row's (NULL).
+        Assert.Equal(Rows - (Rows + 6) / 7, rows);
+    }
+
+    // Reshaping rebuilds a struct around the children it keeps: a widened child's narrow values and a dropped child's
+    // decode are released inside the struct too, in a batched read whose struct starts mid-decode (#857 review).
+    [Theory]
+    [InlineData(null)]
+    [InlineData(RowGroup / 4)]
+    public async Task AScanOfAStructWithAWidenedChild_ReleasesItsNarrowValues(int? batchSize)
+    {
+        await (await CreateStructAsync(new() { [EngineeredWood.DeltaLake.Schema.TypeWidening.EnableKey] = "true" })).DisposeAsync();
+        await using (var table = await DeltaTable.OpenAsync(_fs))
+        {
+            var wide = StructSchema(new Field("a", Int64Type.Default, true), new Field("b", StringType.Default, true),
+                new Field("c", StringType.Default, true));
+            await table.WriteAsync(
+                [new RecordBatch(wide, wide.FieldsList.Select(f => ArrowCompute.MakeNullArray(f.DataType, 1)), 1)],
+                mergeSchema: true);
+        }
+
+        Assert.Equal(Rows + 1, await ScanStructReleasingAsync(batchSize, ["a", "b", "c"]));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData(RowGroup / 4)]
+    public async Task AScanOfAStructWithADroppedChild_ReleasesItsDecode(int? batchSize)
+    {
+        await using (var table = await CreateStructAsync(new() { ["delta.columnMapping.mode"] = "name" }))
+            await table.DropFieldAsync(["s", "c"]);
+
+        Assert.Equal(Rows, await ScanStructReleasingAsync(batchSize, ["a", "b"]));
+    }
+
+    private static Apache.Arrow.Schema StructSchema(params Field[] children) => new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int32Type.Default, true))
+        .Field(new Field("s", new StructType(children), true)).Build();
+
+    // A nullable struct (every fifth row NULL) of an int `a` and two strings: `b` names the row, `c` is the one dropped.
+    private async Task<DeltaTable> CreateStructAsync(Dictionary<string, string> configuration)
+    {
+        var schema = StructSchema(new Field("a", Int32Type.Default, true), new Field("b", StringType.Default, true),
+            new Field("c", StringType.Default, true));
+        var ids = new Int32Array.Builder();
+        var a = new Int32Array.Builder();
+        var b = new StringArray.Builder();
+        var c = new StringArray.Builder();
+        var validity = new ArrowBuffer.BitmapBuilder();
+        for (int i = 0; i < Rows; i++)
+        {
+            ids.Append(i);
+            a.Append(i);
+            b.Append("row " + i);
+            c.Append("a dropped child's value " + i);
+            validity.Append(i % 5 != 0);
+        }
+
+        var s = new StructArray(schema.FieldsList[1].DataType, Rows, [a.Build(), b.Build(), c.Build()],
+            validity.Build(), Rows / 5);
+        var table = await DeltaTable.CreateAsync(
+            _fs, schema,
+            new DeltaTableOptions { ParquetWriteOptions = new ParquetWriteOptions { RowGroupMaxRows = RowGroup } },
+            configuration: configuration);
+        await table.WriteAsync([new RecordBatch(schema, [ids.Build(), s], Rows)]);
+        return table;
+    }
+
+    // Scans the struct table, checking each row's struct against its id: the children kept read as written.
+    private async Task<long> ScanStructReleasingAsync(int? batchSize, string[] children)
+    {
+        long rows = 0;
+        await AssertReleasedAsync(async table =>
+        {
+            await foreach (var batch in table.ReadAsync())
+            {
+                var ids = (Int32Array)batch.Column(0);
+                var s = (StructArray)batch.Column(1);
+                Assert.Equal(children, ((StructType)s.Data.DataType).Fields.Select(f => f.Name));
+                var b = (StringArray)s.Fields[1];
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    if (ids.GetValue(i) is not int id)
+                        continue; // the row the widening wrote
+                    Assert.Equal(id % 5 == 0, s.IsNull(i));
+                    if (!s.IsNull(i))
+                    {
+                        Assert.Equal((long)id, Convert.ToInt64(((IArrowArray)s.Fields[0]) switch
+                        {
+                            Int64Array l => l.GetValue(i),
+                            Int32Array n => n.GetValue(i),
+                            _ => null,
+                        }));
+                        Assert.Equal("row " + id, b.GetString(i));
+                    }
+                }
+
+                rows += batch.Length;
+                batch.Dispose();
+            }
+        }, batchSize);
+        return rows;
+    }
+
     // The feed reshapes both kinds of file itself: the data file an insert is inferred from and the change file an
     // update wrote, each still carrying the column dropped since.
     [Fact]
@@ -198,7 +331,8 @@ public class RawBatchReleaseTests : IDisposable
 
     // Runs `read` over the table and checks that every native byte it allocated is free again, with no collection in
     // between to finalize what it dropped.
-    private async Task AssertReleasedAsync(Func<DeltaTable, Task> read, int? batchSize, bool seam = false)
+    private async Task AssertReleasedAsync(
+        Func<DeltaTable, Task> read, int? batchSize, bool seam = false, ByteArrayOutputKind byteArrays = ByteArrayOutputKind.Default)
     {
         for (int i = 0; i < 3; i++)
         {
@@ -210,7 +344,7 @@ public class RawBatchReleaseTests : IDisposable
         long allocated = NativeMemoryTracker.TotalAllocated;
         await using (var table = await DeltaTable.OpenAsync(_fs, new DeltaTableOptions
                      {
-                         ParquetReadOptions = new ParquetReadOptions { BatchSize = batchSize },
+                         ParquetReadOptions = new ParquetReadOptions { BatchSize = batchSize, ByteArrayOutput = byteArrays },
                          MaxConcurrentReads = 1,
                          DataFileReader = seam ? new SeamReader(_fs) : null,
                      }))

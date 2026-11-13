@@ -3,11 +3,13 @@
 
 using Apache.Arrow;
 
-namespace EngineeredWood.DeltaLake.Table;
+namespace EngineeredWood.Parquet;
 
 /// <summary>
 /// The buffers of a batch as read, recorded before anything works on it, so that the buffers its output no longer holds
-/// can be released once the output is built (#855).
+/// can be released once the output is built (#855). A gather's release is one such case
+/// (<see cref="BatchSelector.ReleaseAfterGather"/>); a Delta read's pipeline, from the batch a file reader hands it to the
+/// one it returns, is another.
 /// <para>A read pipeline takes over each batch a file reader hands it and passes on only what it builds from it. Every
 /// step that drops something of the batch drops it unreleased: a column the table has dropped (renamed away by the column
 /// mapping), a narrow column a widening replaced, a container a nested rebuild replaced. The reader slices each batch with
@@ -45,11 +47,11 @@ internal sealed class RawBatchBuffers
     {
         var kept = new HashSet<ReadOnlyMemory<byte>>();
         for (int i = 0; i < (output?.ColumnCount ?? 0); i++)
-            Parquet.BatchSelector.CollectBuffers(output!.Column(i).Data, kept);
+            BatchSelector.CollectBuffers(output!.Column(i).Data, kept);
         foreach (var array in alsoKept)
         {
             if (array is not null)
-                Parquet.BatchSelector.CollectBuffers(array.Data, kept);
+                BatchSelector.CollectBuffers(array.Data, kept);
         }
 
         foreach (var (buffer, memory) in _buffers)
