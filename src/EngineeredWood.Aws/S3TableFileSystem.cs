@@ -41,6 +41,7 @@ public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint
     private readonly string _rootPrefix;
     private readonly BufferAllocator? _allocator;
     private readonly int _maxConcurrency;
+    private readonly CoalescingOptions? _coalescingOptions;
     private readonly UploadBufferPool? _uploadPool;
 
     /// <summary>
@@ -73,13 +74,18 @@ public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint
     /// its parts in turn, so this bounds the memory all of this filesystem's writers hold beyond their own one part
     /// each, however many are open. 0 uploads every part in turn. Defaults to <see cref="DefaultUploadBuffers"/>.
     /// </param>
+    /// <param name="coalescingOptions">
+    /// How each file opened via <see cref="OpenReadAsync"/> merges nearby ranges of one read into fewer requests.
+    /// Defaults to <see cref="CoalescingOptions"/>'s own defaults.
+    /// </param>
     public S3TableFileSystem(
         IAmazonS3 client,
         string bucket,
         string? rootPath = null,
         BufferAllocator? allocator = null,
         int maxConcurrency = 16,
-        int uploadBuffers = DefaultUploadBuffers)
+        int uploadBuffers = DefaultUploadBuffers,
+        CoalescingOptions? coalescingOptions = null)
     {
         if (maxConcurrency < 1)
             throw new ArgumentOutOfRangeException(nameof(maxConcurrency), maxConcurrency, "Must be at least 1.");
@@ -89,6 +95,7 @@ public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint
         _bucket = bucket ?? throw new ArgumentNullException(nameof(bucket));
         _allocator = allocator;
         _maxConcurrency = maxConcurrency;
+        _coalescingOptions = coalescingOptions;
         _uploadPool = uploadBuffers > 0 ? new UploadBufferPool(uploadBuffers) : null;
 
         string normalized = (rootPath ?? string.Empty).Replace('\\', '/').Trim('/');
@@ -167,7 +174,7 @@ public sealed class S3TableFileSystem : ITableFileSystem, IReadConcurrencyHint
     {
         cancellationToken.ThrowIfCancellationRequested();
         return new ValueTask<IRandomAccessFile>(
-            new S3RandomAccessFile(_client, _bucket, Resolve(path), _allocator, _maxConcurrency));
+            new S3RandomAccessFile(_client, _bucket, Resolve(path), _allocator, _maxConcurrency, _coalescingOptions));
     }
 
     /// <inheritdoc/>

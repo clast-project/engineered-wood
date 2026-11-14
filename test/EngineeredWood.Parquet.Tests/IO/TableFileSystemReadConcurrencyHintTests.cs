@@ -20,39 +20,39 @@ namespace EngineeredWood.Parquet.Tests.IO;
 /// </summary>
 public class TableFileSystemReadConcurrencyHintTests
 {
-    private static S3TableFileSystem S3(int? maxConcurrency)
+    private static S3TableFileSystem S3(int? maxConcurrency, CoalescingOptions? coalescing = null)
     {
         var client = new AmazonS3Client(
             new BasicAWSCredentials("key", "secret"),
             new AmazonS3Config { ServiceURL = "http://127.0.0.1:1", ForcePathStyle = true });
         return maxConcurrency is int m
-            ? new S3TableFileSystem(client, "bucket", maxConcurrency: m)
-            : new S3TableFileSystem(client, "bucket");
+            ? new S3TableFileSystem(client, "bucket", maxConcurrency: m, coalescingOptions: coalescing)
+            : new S3TableFileSystem(client, "bucket", coalescingOptions: coalescing);
     }
 
-    private static AzureTableFileSystem Azure(int? maxConcurrency)
+    private static AzureTableFileSystem Azure(int? maxConcurrency, CoalescingOptions? coalescing = null)
     {
         var container = new BlobContainerClient(new Uri("http://127.0.0.1:1/devstoreaccount1/container"));
         return maxConcurrency is int m
-            ? new AzureTableFileSystem(container, maxConcurrency: m)
-            : new AzureTableFileSystem(container);
+            ? new AzureTableFileSystem(container, maxConcurrency: m, coalescingOptions: coalescing)
+            : new AzureTableFileSystem(container, coalescingOptions: coalescing);
     }
 
-    private static GcsTableFileSystem Gcs(int? maxConcurrency)
+    private static GcsTableFileSystem Gcs(int? maxConcurrency, CoalescingOptions? coalescing = null)
     {
         var client = StorageClient.CreateUnauthenticated();
         return maxConcurrency is int m
-            ? new GcsTableFileSystem(client, "bucket", maxConcurrency: m)
-            : new GcsTableFileSystem(client, "bucket");
+            ? new GcsTableFileSystem(client, "bucket", maxConcurrency: m, coalescingOptions: coalescing)
+            : new GcsTableFileSystem(client, "bucket", coalescingOptions: coalescing);
     }
 
     public static TheoryData<string> Backends() => new() { "s3", "azure", "gcs" };
 
-    private static ITableFileSystem Create(string backend, int? maxConcurrency) => backend switch
+    private static ITableFileSystem Create(string backend, int? maxConcurrency, CoalescingOptions? coalescing = null) => backend switch
     {
-        "s3" => S3(maxConcurrency),
-        "azure" => Azure(maxConcurrency),
-        "gcs" => Gcs(maxConcurrency),
+        "s3" => S3(maxConcurrency, coalescing),
+        "azure" => Azure(maxConcurrency, coalescing),
+        "gcs" => Gcs(maxConcurrency, coalescing),
         _ => throw new ArgumentOutOfRangeException(nameof(backend)),
     };
 
@@ -67,6 +67,34 @@ public class TableFileSystemReadConcurrencyHintTests
 
             using var file = await fs.OpenReadAsync("dir/file.parquet");
             Assert.Equal(expected, ((IReadConcurrencyHint)file).PreferredConcurrentReads);
+        }
+    }
+
+    private static CoalescingOptions CoalescingOf(IRandomAccessFile file) => file switch
+    {
+        S3RandomAccessFile s3 => s3.CoalescingOptions,
+        AzureBlobRandomAccessFile azure => azure.CoalescingOptions,
+        GcsRandomAccessFile gcs => gcs.CoalescingOptions,
+        _ => throw new InvalidOperationException(file.GetType().Name),
+    };
+
+    /// <summary>
+    /// A table file system hands the files it opens the coalescing options it was given (#876), so a table scan's
+    /// request size can be tuned; given none, a file keeps the defaults it has on its own.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Backends))]
+    public async Task TheFilesItOpens_GetItsCoalescingOptions(string backend)
+    {
+        var options = new CoalescingOptions { MaxRequestBytes = 8 * 1024 * 1024, MaxGapBytes = 4096 };
+        using (var file = await Create(backend, null, options).OpenReadAsync("dir/file.parquet"))
+            Assert.Same(options, CoalescingOf(file));
+
+        using (var file = await Create(backend, null).OpenReadAsync("dir/file.parquet"))
+        {
+            var defaults = new CoalescingOptions();
+            Assert.Equal(defaults.MaxRequestBytes, CoalescingOf(file).MaxRequestBytes);
+            Assert.Equal(defaults.MaxGapBytes, CoalescingOf(file).MaxGapBytes);
         }
     }
 
