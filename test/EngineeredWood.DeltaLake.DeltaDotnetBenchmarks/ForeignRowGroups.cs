@@ -96,6 +96,11 @@ internal static class ForeignRowGroups
     /// </summary>
     public static async Task<int> UploadAsync(string[] args)
     {
+        if (BenchStorage.Current is LocalStorage)
+        {
+            Console.Error.WriteLine("--rg878-upload copies the local tables to a remote store: set EWDD_STORAGE=azure.");
+            return 2;
+        }
         string local = args.Length > 0 ? args[0] : Path.Combine(Path.GetTempPath(), "ew-rg878");
         string[] tables = args.Length > 1 ? args[1].Split(',') : ["fat_str", "skew_str", "wide_num", "huge_str"];
         const string commit = "_delta_log/00000000000000000000.json";
@@ -126,7 +131,8 @@ internal static class ForeignRowGroups
                     await output.WriteAsync(buffer.AsMemory(0, read));
                     bytes += read;
                 }
-                await output.FlushAsync();
+                // Publishes the file: disposing one that was never completed discards what was written.
+                await output.CompleteAsync();
             }
             Console.WriteLine($"{name}: {bytes / (1 << 20)} MiB in {watch.Elapsed.TotalSeconds:F0} s");
         }
