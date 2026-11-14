@@ -541,7 +541,7 @@ internal static class PageMapBuilder
             cumulativeRows[i] = (int)location.FirstRowIndex;
 
             pages[i] = new PageMapEntry(
-                Offset: checked((int)(location.Offset - chunkStart)),
+                Offset: location.Offset - chunkStart,
                 CompressedSize: location.CompressedPageSize,
                 UncompressedSize: (int)Math.Min(int.MaxValue, location.CompressedPageSize * ratio),
                 NumValues: rows, // flat: a value slot per row

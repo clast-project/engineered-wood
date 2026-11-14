@@ -158,6 +158,24 @@ public class UnbudgetedPrefetchTests : IDisposable
         Assert.Equal(1, requests);
     }
 
+    /// <summary>
+    /// A budgeted two-pass read caps its output columns' prefetch too: past the cap, the second pass reads them in
+    /// page windows, where it used to fetch them whole after all (#882 review).
+    /// </summary>
+    [Fact]
+    public async Task Budgeted_TwoPass_OutputChunksOverTheCap_StayInPageWindows()
+    {
+        var (requests, _) = await ReadTwoGroupsAsync(budget: g => g - 1, prefetchCap: 1, twoPass: true);
+        Assert.True(requests >= Rows / BatchRows, $"{requests} requests for the first group's output column");
+    }
+
+    [Fact]
+    public async Task Budgeted_TwoPass_OutputChunksWithinTheCap_AreFetchedWhole()
+    {
+        var (requests, _) = await ReadTwoGroupsAsync(budget: g => 2 * g, prefetchCap: 1, twoPass: true);
+        Assert.Equal(1, requests);
+    }
+
     /// <summary>A budget smaller than <see cref="ParquetFileReader.UnbudgetedPrefetchMaxBytes"/> does not stop a
     /// prefetch the read with no budget would make.</summary>
     [Fact]
@@ -172,7 +190,8 @@ public class UnbudgetedPrefetchTests : IDisposable
     /// <paramref name="budget"/> (given the first group's chunk bytes), and returns the requests that fetched the
     /// first group's chunks, with those bytes.
     /// </summary>
-    private async Task<(int Requests, long GroupBytes)> ReadTwoGroupsAsync(Func<long, long> budget, long prefetchCap)
+    private async Task<(int Requests, long GroupBytes)> ReadTwoGroupsAsync(
+        Func<long, long> budget, long prefetchCap, bool twoPass = false)
     {
         string path = Path.Combine(_tempDir, "two-groups.parquet");
         if (!File.Exists(path))
@@ -198,12 +217,19 @@ public class UnbudgetedPrefetchTests : IDisposable
 
         await using var local = new LocalRandomAccessFile(path);
         var file = new RecordingFile(local, hint: null);
-        long start, end;
+        long start, end, countStart = 0, countEnd = 0;
         using (var probe = new ParquetFileReader(local, ownsFile: false))
         {
-            var chunks = (await probe.ReadMetadataAsync()).RowGroups[0].Columns.Select(c => c.MetaData!).ToList();
-            start = chunks.Min(c => c.DictionaryPageOffset is long d and > 0 ? Math.Min(d, c.DataPageOffset) : c.DataPageOffset);
-            end = chunks.Max(c => (c.DictionaryPageOffset is long d and > 0 ? Math.Min(d, c.DataPageOffset) : c.DataPageOffset) + c.TotalCompressedSize);
+            var all = (await probe.ReadMetadataAsync()).RowGroups[0].Columns.Select(c => c.MetaData!).ToList();
+            start = all.Min(c => c.DictionaryPageOffset is long d and > 0 ? Math.Min(d, c.DataPageOffset) : c.DataPageOffset);
+            end = all.Max(c => (c.DictionaryPageOffset is long d and > 0 ? Math.Min(d, c.DataPageOffset) : c.DataPageOffset) + c.TotalCompressedSize);
+            // A two-pass read: the requests for the output column only the second pass reads.
+            if (twoPass)
+            {
+                var name = all.Single(c => c.PathInSchema[^1] == "name");
+                countStart = name.DictionaryPageOffset is long d and > 0 ? Math.Min(d, name.DataPageOffset) : name.DataPageOffset;
+                countEnd = countStart + name.TotalCompressedSize;
+            }
         }
 
         var options = new ParquetReadOptions
@@ -214,17 +240,49 @@ public class UnbudgetedPrefetchTests : IDisposable
         {
             BatchPageWindowBudgetBytes = 1, UnbudgetedPrefetchMaxBytes = prefetchCap,
         };
+        if (twoPass)
+        {
+            reader.TwoPassReads = true;
+            // The second pass maps its pages from their headers: windowed only for chunks past this budget, as the
+            // large chunks the cap is for are.
+            reader.HeaderScanBudgetBytes = 1;
+        }
+        else
+            (countStart, countEnd) = (start, end);
         await reader.ReadMetadataAsync();
         file.Clear();
         long rows = 0;
-        await foreach (var batch in reader.ReadAllAsync())
+        if (twoPass)
         {
-            rows += batch.Length;
-            batch.Dispose();
+            // Every row selected, so the second pass reads the output columns whole.
+            var scan = new ParquetScan
+            {
+                Columns = ["name", "value"],
+                RowFilter = new RowFilter(new RowPredicate(["id"], batch =>
+                {
+                    var builder = new BooleanArray.Builder().Reserve(batch.Length);
+                    for (int i = 0; i < batch.Length; i++)
+                        builder.Append(true);
+                    return builder.Build();
+                })),
+            };
+            await foreach (var selected in reader.ReadSelectedAsync(scan))
+            {
+                using (selected)
+                    rows += selected.Batch.Length;
+            }
+        }
+        else
+        {
+            await foreach (var batch in reader.ReadAllAsync())
+            {
+                rows += batch.Length;
+                batch.Dispose();
+            }
         }
 
         Assert.Equal(2L * Rows, rows);
-        int requests = file.Requests.Count(request => request.Any(r => Overlap(r, start, end) > 0));
+        int requests = file.Requests.Count(request => request.Any(r => Overlap(r, countStart, countEnd) > 0));
         return (requests, end - start);
     }
 
