@@ -145,7 +145,7 @@ public sealed partial class ParquetFileReader
                     {
                         var ctx = await PrepareRowGroupAsync(toHold.Index, columnNames, cancellationToken)
                             .ConfigureAwait(false);
-                        io = TryPrefetch(ctx.Ranges, cancellationToken);
+                        io = TryPrefetch(ctx.Ranges, cancellationToken, PrefetchCap(reservation));
                     }
                 }
                 catch (Exception) when (!cancellationToken.IsCancellationRequested)

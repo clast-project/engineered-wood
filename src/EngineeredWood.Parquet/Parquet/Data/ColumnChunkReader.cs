@@ -234,9 +234,13 @@ internal static class ColumnChunkReader
             "carry one entry per row.");
     }
 
-    internal static ParquetFormatException TooManyValues(ColumnDescriptor column, Page page, long remaining) => new(
-        $"Column '{column.DottedPath}': data page {page.Ordinal} at byte offset {page.Offset} holds " +
-        $"{page.NumValues} values, but the chunk's metadata leaves room for only {remaining} more.");
+    internal static ParquetFormatException TooManyValues(ColumnDescriptor column, Page page, long remaining) =>
+        TooManyValues(column, page.Ordinal, page.Offset, page.NumValues, remaining);
+
+    internal static ParquetFormatException TooManyValues(
+        ColumnDescriptor column, int ordinal, long offset, int values, long remaining) => new(
+        $"Column '{column.DottedPath}': data page {ordinal} at byte offset {offset} holds " +
+        $"{values} values, but the chunk's metadata leaves room for only {remaining} more.");
 
     internal static ParquetFormatException TooFewValues(ColumnDescriptor column, long expected, long read) => new(
         $"Column '{column.DottedPath}': expected {expected} values but only read {read}. The column data " +

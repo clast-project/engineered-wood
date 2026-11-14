@@ -194,6 +194,36 @@ public class OffsetIndexPageMapTests : IDisposable
         Assert.Null(Build(l => l[1] = l[1] with { CompressedPageSize = 0 }));
     }
 
+    /// <summary>
+    /// A page more than 2 GiB into its chunk keeps its offset: the layout built from an OffsetIndex threw
+    /// <see cref="OverflowException"/> narrowing it to an <c>int</c> (#882 review).
+    /// </summary>
+    [Fact]
+    public void BuildLayoutFromOffsetIndex_KeepsOffsetsPastTwoGiB()
+    {
+        string path = WriteAsync(DataPageVersion.V2, CompressionCodec.Uncompressed, false, ByteArrayEncoding.Plain, writePageIndex: true)
+            .GetAwaiter().GetResult();
+        var (file, metadata) = ReadFooter(path);
+        var schema = SchemaDescriptorFor(metadata);
+        var rowGroup = metadata.RowGroups[0];
+        var chunk = rowGroup.Columns[0];
+        var good = MetadataDecoder.DecodeOffsetIndex(Slice(file, chunk.OffsetIndexOffset!.Value, chunk.OffsetIndexLength!.Value)).PageLocations;
+        Assert.True(good.Count >= 3);
+
+        // The same pages, each 1 GiB long, so the third starts 2 GiB into the chunk.
+        const int pageBytes = 1 << 30;
+        long start = chunk.MetaData!.DataPageOffset;
+        var locations = good.Select((l, i) => l with { Offset = start + (long)i * pageBytes, CompressedPageSize = pageBytes }).ToArray();
+        long end = start + (long)locations.Length * pageBytes;
+
+        var map = PageMapBuilder.BuildLayoutFromOffsetIndex(
+            0, start, end, new OffsetIndex { PageLocations = locations }, (int)rowGroup.NumRows, schema.Columns[0], chunk.MetaData!);
+
+        Assert.NotNull(map);
+        Assert.Equal(locations.Select(l => l.Offset - start), map!.Pages.Select(p => p.Offset));
+        Assert.True(map.Pages[2].Offset > int.MaxValue);
+    }
+
     // ───── Fixtures from other writers ─────
 
     /// <summary>
@@ -392,7 +422,7 @@ public class OffsetIndexPageMapTests : IDisposable
                 {
                     var located = fromIndex.Pages[p];
                     var resolved = PageMapBuilder.ResolveEntry(
-                        fromIndex, p, chunkBytes.AsSpan(located.Offset, located.CompressedSize), column, meta, out int headerSize);
+                        fromIndex, p, chunkBytes.AsSpan(checked((int)located.Offset), located.CompressedSize), column, meta, out int headerSize);
                     Assert.Equal(scanned.Pages[p], resolved);
                     Assert.Equal(located.Offset + headerSize, resolved.Offset);
                 }

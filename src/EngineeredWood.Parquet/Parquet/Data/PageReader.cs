@@ -98,14 +98,7 @@ internal ref struct PageReader
     {
         _data = data;
         _column = column;
-        // An uncompressed chunk's pages are read in place, so their uncompressed size sizes nothing
-        // and is not read; other readers ignore it there, and so is a wrong one here. A footer that
-        // records no size checks nothing, rather than refusing every page.
-        bool decompressed = chunk?.Codec != CompressionCodec.Uncompressed;
-        _chunkUncompressedSize = decompressed && chunk is { TotalUncompressedSize: > 0 } meta
-            ? meta.TotalUncompressedSize
-            : long.MaxValue;
-        _maxUncompressedPageSize = decompressed ? maxUncompressedPageSize : null;
+        (_chunkUncompressedSize, _maxUncompressedPageSize) = UncompressedLimits(chunk, maxUncompressedPageSize);
         _position = 0;
         _nextOrdinal = firstOrdinal;
     }
@@ -129,58 +122,99 @@ internal ref struct PageReader
             return false;
         }
 
-        PageHeader header;
-        int headerSize;
-        try
-        {
-            header = PageHeaderDecoder.Decode(_data.Slice(_position), out headerSize);
-        }
-        catch (ParquetFormatException ex)
-        {
-            throw new ParquetFormatException(
-                $"Column '{_column.DottedPath}': corrupted page header at byte offset {_position} " +
-                $"(before data page {_nextOrdinal}).",
-                ex);
-        }
-
+        var header = ReadHeader(
+            _data.Slice(_position), _position, _data.Length - _position, _column, _chunkUncompressedSize,
+            _maxUncompressedPageSize, _nextOrdinal, out int headerSize);
         int payloadOffset = _position + headerSize;
-        if (header.CompressedPageSize < 0 || header.CompressedPageSize > _data.Length - payloadOffset)
-        {
-            throw new ParquetFormatException(
-                $"Column '{_column.DottedPath}': the {header.Type} at byte offset {_position} declares " +
-                $"{header.CompressedPageSize} bytes of data, but only {_data.Length - payloadOffset} remain. " +
-                "The column data may be truncated.");
-        }
-
-        if (Validate(header, repeated: _column.MaxRepetitionLevel > 0) is { } problem)
-        {
-            throw new ParquetFormatException(
-                $"Column '{_column.DottedPath}': the {header.Type} at byte offset {_position} is malformed: {problem}");
-        }
-
-        // A compressed page is decompressed into a buffer of its declared size, which nothing in the
-        // page bounds: a few bytes of zstd can declare 2 GiB. The chunk's own total is a bound that
-        // costs nothing; the caller's limit is the defense against a file built to lie about both.
-        if (header.UncompressedPageSize > _chunkUncompressedSize)
-        {
-            throw new ParquetFormatException(
-                $"Column '{_column.DottedPath}': the {header.Type} at byte offset {_position} declares " +
-                $"{header.UncompressedPageSize} uncompressed bytes, more than its whole column chunk " +
-                $"({_chunkUncompressedSize}).");
-        }
-        if (header.UncompressedPageSize > _maxUncompressedPageSize)
-        {
-            throw new ParquetFormatException(
-                $"Column '{_column.DottedPath}': the {header.Type} at byte offset {_position} declares " +
-                $"{header.UncompressedPageSize} uncompressed bytes, more than the " +
-                $"{_maxUncompressedPageSize} that MaxPageUncompressedSize allows.");
-        }
 
         int ordinal = header.Type is PageType.DataPage or PageType.DataPageV2 ? _nextOrdinal++ : -1;
         page = new Page(
             header, _data.Slice(payloadOffset, header.CompressedPageSize), _position, headerSize, ordinal);
         _position = payloadOffset + header.CompressedPageSize;
         return true;
+    }
+
+    /// <summary>
+    /// The bounds <see cref="ReadHeader"/> checks a page's uncompressed size against: the chunk's own total and the
+    /// caller's limit. An uncompressed chunk's pages are read in place, so their uncompressed size sizes nothing
+    /// and is not read; other readers ignore it there, and so is a wrong one here. A footer that records no size
+    /// checks nothing, rather than refusing every page.
+    /// </summary>
+    internal static (long ChunkUncompressedSize, int? MaxUncompressedPageSize) UncompressedLimits(
+        Metadata.ColumnMetaData? chunk, int? maxUncompressedPageSize)
+    {
+        bool decompressed = chunk?.Codec != CompressionCodec.Uncompressed;
+        long chunkSize = decompressed && chunk is { TotalUncompressedSize: > 0 } meta
+            ? meta.TotalUncompressedSize
+            : long.MaxValue;
+        return (chunkSize, decompressed ? maxUncompressedPageSize : null);
+    }
+
+    /// <summary>
+    /// Decodes and checks the page header at the start of <paramref name="data"/>: what <see cref="TryRead"/> does
+    /// before it slices the payload, for a walk that does not hold the payload (a header scan in windows).
+    /// </summary>
+    /// <param name="data">Bytes from the header's first byte; they need not reach the page's end.</param>
+    /// <param name="position">Where the header starts in the chunk, for messages.</param>
+    /// <param name="available">The chunk's bytes from the header's first byte to the chunk's end.</param>
+    /// <param name="nextOrdinal">The ordinal the page takes if it is a data page, for messages.</param>
+    internal static PageHeader ReadHeader(
+        ReadOnlySpan<byte> data,
+        long position,
+        long available,
+        ColumnDescriptor column,
+        long chunkUncompressedSize,
+        int? maxUncompressedPageSize,
+        int nextOrdinal,
+        out int headerSize)
+    {
+        PageHeader header;
+        try
+        {
+            header = PageHeaderDecoder.Decode(data, out headerSize);
+        }
+        catch (ParquetFormatException ex)
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}': corrupted page header at byte offset {position} " +
+                $"(before data page {nextOrdinal}).",
+                ex);
+        }
+
+        long remaining = available - headerSize;
+        if (header.CompressedPageSize < 0 || header.CompressedPageSize > remaining)
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}': the {header.Type} at byte offset {position} declares " +
+                $"{header.CompressedPageSize} bytes of data, but only {remaining} remain. " +
+                "The column data may be truncated.");
+        }
+
+        if (Validate(header, repeated: column.MaxRepetitionLevel > 0) is { } problem)
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}': the {header.Type} at byte offset {position} is malformed: {problem}");
+        }
+
+        // A compressed page is decompressed into a buffer of its declared size, which nothing in the
+        // page bounds: a few bytes of zstd can declare 2 GiB. The chunk's own total is a bound that
+        // costs nothing; the caller's limit is the defense against a file built to lie about both.
+        if (header.UncompressedPageSize > chunkUncompressedSize)
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}': the {header.Type} at byte offset {position} declares " +
+                $"{header.UncompressedPageSize} uncompressed bytes, more than its whole column chunk " +
+                $"({chunkUncompressedSize}).");
+        }
+        if (header.UncompressedPageSize > maxUncompressedPageSize)
+        {
+            throw new ParquetFormatException(
+                $"Column '{column.DottedPath}': the {header.Type} at byte offset {position} declares " +
+                $"{header.UncompressedPageSize} uncompressed bytes, more than the " +
+                $"{maxUncompressedPageSize} that MaxPageUncompressedSize allows.");
+        }
+
+        return header;
     }
 
     /// <summary>

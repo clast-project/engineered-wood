@@ -194,6 +194,9 @@ public sealed partial class ParquetFileReader
     /// Not disposed here.</param>
     /// <param name="outputIo">The output columns' chunks fetched ahead, or null to start fetching them here. Not
     /// disposed here.</param>
+    /// <param name="prefetchOutput">False when the caller declined to prefetch the output chunks (see
+    /// <see cref="TryPrefetch"/>): the second pass then reads them through the file, in page windows, rather than
+    /// whole (#882 review).</param>
     private async IAsyncEnumerable<SelectedRecordBatch> ReadTwoPassAsync(
         RowGroupPlan plan,
         TwoPassColumns columns,
@@ -204,12 +207,16 @@ public sealed partial class ParquetFileReader
         [System.Runtime.CompilerServices.EnumeratorCancellation]
         CancellationToken cancellationToken,
         PrefetchedFile? filterIo = null,
-        PrefetchedFile? outputIo = null)
+        PrefetchedFile? outputIo = null,
+        bool prefetchOutput = true)
     {
         var outputCtx = await PrepareRowGroupAsync(plan.Index, columns.OutputOnly, cancellationToken).ConfigureAwait(false);
         int groupRows = outputCtx.RowCount;
-        await using var ownPrefetch = outputIo is null ? new PrefetchedFile(_file, outputCtx.Ranges, cancellationToken) : null;
-        var prefetched = outputIo ?? ownPrefetch!;
+        // Unprefetched when a chunk is too large for one buffer: a >2 GiB chunk could not be fetched whole (#882 review).
+        await using var ownPrefetch = outputIo is null && prefetchOutput
+            ? TryPrefetch(outputCtx.Ranges, cancellationToken)
+            : null;
+        IRandomAccessFile prefetched = outputIo ?? ownPrefetch ?? _file;
 
         // Pass 1: the predicates' columns, in BatchSize batches unless the returned ones must be kept for the
         // whole group (then one batch, which eligibility allowed only where BatchSize would not split it).
@@ -611,11 +618,16 @@ public sealed partial class ParquetFileReader
             await reservation.HoldAsync(compressed, cancellationToken).ConfigureAwait(false);
             var filterCtx = await PrepareRowGroupAsync(plan.Index, columns.Filter, cancellationToken).ConfigureAwait(false);
             // Null when a chunk is too large for one buffer: pass 1 then reads it as it decodes, as before.
-            filterIo = TryPrefetch(filterCtx.Ranges, cancellationToken);
+            long prefetchCap = PrefetchCap(reservation);
+            filterIo = TryPrefetch(filterCtx.Ranges, cancellationToken, prefetchCap);
             var outputCtx = await PrepareRowGroupAsync(plan.Index, columns.OutputOnly, cancellationToken).ConfigureAwait(false);
-            // Null likewise: the read then starts its own output prefetch, as before #829.
-            outputIo = TryPrefetch(outputCtx.Ranges, cancellationToken);
-            e = ReadTwoPassAsync(plan, columns, selector, reservation, growth, estimate, cancellationToken, filterIo, outputIo)
+            // Null likewise, or past what remains of the cap: the second pass then reads them in page windows, never
+            // whole after all (#882 review).
+            long outputCap = prefetchCap - (filterIo is null ? 0 : filterCtx.Ranges.Sum(r => r.Length));
+            outputIo = TryPrefetch(outputCtx.Ranges, cancellationToken, outputCap);
+            e = ReadTwoPassAsync(
+                    plan, columns, selector, reservation, growth, estimate, cancellationToken, filterIo, outputIo,
+                    prefetchOutput: false)
                 .GetAsyncEnumerator(cancellationToken);
             while (true)
             {
