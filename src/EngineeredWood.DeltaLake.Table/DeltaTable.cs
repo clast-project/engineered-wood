@@ -294,6 +294,24 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </remarks>
     internal const int DefaultReadBatchSize = 262_144;
 
+    /// <summary>
+    /// How compaction reads its sources (#875). When the host sets no batch limit
+    /// (<see cref="ParquetReadOptions.BatchSize"/>, <see cref="ParquetReadOptions.MaxBatchByteSize"/>), it reads
+    /// batches of the output's <see cref="ParquetWriteOptions.RowGroupMaxRows"/>, and never fewer than
+    /// <see cref="DefaultReadBatchSize"/>, rather than the scan default. The rolling writer then joins fewer slices
+    /// into each row group it writes.
+    /// </summary>
+    /// <remarks>
+    /// Measured (#875: 12M lineitem rows, 2 files, compacted into one; local disk and a simulated object store): with
+    /// the 262,144-row default compaction took 4-17% longer than reading whole row groups and allocated 4.6 rather
+    /// than 3.3-4.2 GiB. Reading 1M-row batches brings 1M-row sources to within 2% and 4.1 GiB, and 6M-row
+    /// sources to 2-11%, while peak memory stays at the batched level (1.1-2.0 GiB, against 3.1-3.8 GiB unbatched).
+    /// </remarks>
+    internal ParquetReadOptions CompactionReadOptions(ParquetWriteOptions write) =>
+        _options.ParquetReadOptions is { BatchSize: null, MaxBatchByteSize: null }
+            ? _dataFileReadOptions with { BatchSize = Math.Max(DefaultReadBatchSize, write.RowGroupMaxRows) }
+            : _dataFileReadOptions;
+
     private sealed record StatsSelectionEntry(
         Schema.StructType Schema, MetadataAction Metadata, Stats.StatsColumnSelection Selection);
 
@@ -13098,9 +13116,10 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         return await CollectOnFailureAsync<long?>(
             async written =>
             {
+                var writeOptions = DataFileWriteOptions(snapshot);
                 var plan = await Compaction.CompactionExecutor.ExecuteAsync(
                     _fs, snapshot, options,
-                    DataFileWriteOptions(snapshot), _dataFileReadOptions,
+                    writeOptions, CompactionReadOptions(writeOptions),
                     cancellationToken, _options.DataFileWriter, _options.DataFileReader, written,
                     maxConcurrentReads: EffectiveConcurrentReads, maxBufferedReadBytes: _options.MaxBufferedReadBytes,
                     memoryBudget: _options.MemoryBudget)
