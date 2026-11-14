@@ -1231,9 +1231,9 @@ public class ParallelRowGroupReadTests : IDisposable
         long filter = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k"], null).Compressed;
         long output = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k", "v"], null).Compressed;
 
-        var (returned, _, peak, used) = await ReadTwoPassUnitAsync(reader, predicate, returnPredicateColumn: true);
+        var (returned, _, _, used, held) = await ReadTwoPassUnitHeldAsync(reader, predicate, returnPredicateColumn: true);
         Assert.Equal(KeyRows * 3 / 10, returned);
-        Assert.True(peak >= filter + output, $"peak {peak}: both prefetches ({filter} + {output}) were not counted");
+        Assert.True(held >= filter + output, $"held {held}: both prefetches ({filter} + {output}) were not counted");
         Assert.Equal(0, used);
     }
 
@@ -1259,10 +1259,10 @@ public class ParallelRowGroupReadTests : IDisposable
                       + ParquetFileReader.PlannedBytes(group, parquetSchema, ["k", "v"], null).Compressed;
         long wholeDecode = reader.DecodedBytes(group, parquetSchema, ["k", "v"], null);
 
-        var (returned, _, peak, used) = await ReadTwoPassUnitAsync(reader, predicate, returnPredicateColumn: true);
+        var (returned, _, _, used, held) = await ReadTwoPassUnitHeldAsync(reader, predicate, returnPredicateColumn: true);
         Assert.Equal(KeyRows / 10, returned);
-        Assert.True(peak >= chunks + wholeDecode,
-            $"peak {peak}: the chunks ({chunks}) and the whole-group decode ({wholeDecode}) were not both counted");
+        Assert.True(held >= chunks + wholeDecode,
+            $"held {held}: the chunks ({chunks}) and the whole-group decode ({wholeDecode}) were not both counted");
         Assert.Equal(0, used);
     }
 
@@ -1335,6 +1335,16 @@ public class ParallelRowGroupReadTests : IDisposable
         ParquetFileReader reader, RowPredicate predicate, bool returnPredicateColumn,
         ParquetFileReader.DecodedGrowth? growth = null, long addedBytesPerRow = 0)
     {
+        var (returned, estimate, peak, used, _) = await ReadTwoPassUnitHeldAsync(
+            reader, predicate, returnPredicateColumn, growth, addedBytesPerRow);
+        return (returned, estimate, peak, used);
+    }
+
+    /// <summary>As <see cref="ReadTwoPassUnitAsync"/>, with the most the unit held apart from its decodes.</summary>
+    private static async Task<(long Returned, long Estimate, long Peak, long Used, long HeldPeak)> ReadTwoPassUnitHeldAsync(
+        ParquetFileReader reader, RowPredicate predicate, bool returnPredicateColumn,
+        ParquetFileReader.DecodedGrowth? growth = null, long addedBytesPerRow = 0)
+    {
         var scan = new ParquetScan
         {
             Columns = returnPredicateColumn ? ["k", "v"] : ["v"],
@@ -1354,7 +1364,7 @@ public class ParallelRowGroupReadTests : IDisposable
                 returned += batch.Batch.Length;
         }
         reservation.ReleasePending();
-        return (returned, reservation.Estimate, budget.Peak, budget.Used);
+        return (returned, reservation.Estimate, budget.Peak, budget.Used, reservation.HeldPeak);
     }
 
     [Theory]
