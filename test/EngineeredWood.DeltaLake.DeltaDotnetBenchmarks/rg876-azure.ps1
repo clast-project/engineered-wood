@@ -29,11 +29,19 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'upload failed' }
 
     $out = "rg876-azure-$(Get-Date -Format yyyyMMdd-HHmmss).tsv"
-    "round`tcapMiB`tlayout`tquery`tbest_s`tmedian_s`trows" | Tee-Object -FilePath $out
+    # Rows go to the console and, as UTF-8, to the file (Windows PowerShell's Tee-Object writes UTF-16). The
+    # process's "// storage: ..." banner stays on the console only, so the file holds the header and results alone.
+    function Write-Row([string] $row) {
+        Write-Output $row
+        Add-Content -Path $out -Value $row -Encoding utf8
+    }
+    Write-Row "round`tcapMiB`tlayout`tquery`tbest_s`tmedian_s`trows"
     for ($round = 1; $round -le $Rounds; $round++) {
         foreach ($cap in $CapsMiB) {
             $env:EWDD_AZURE_MAX_REQUEST_MIB = $cap
-            & $exe --rg876 ($Layouts -join ',') 'all,q1' $Repeats | ForEach-Object { "$round`t$_" | Tee-Object -FilePath $out -Append }
+            & $exe --rg876 ($Layouts -join ',') 'all,q1' $Repeats | ForEach-Object {
+                if ($_ -like '//*') { Write-Host $_ } else { Write-Row "$round`t$_" }
+            }
             if ($LASTEXITCODE -ne 0) { throw "scan failed at cap $cap" }
         }
     }

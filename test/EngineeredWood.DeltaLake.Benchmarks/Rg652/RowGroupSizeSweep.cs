@@ -136,7 +136,7 @@ internal static class RowGroupSizeSweep
             }
             times.Sort();
             Console.WriteLine(
-                $"{layout}\t{query}\t{cloud}\t{batch}\t{window?.ToString() ?? "d"}\t{times[0]:F2}\t{times[times.Count / 2]:F2}\t{peak >> 20}\t{privPeak >> 20}\t{nBatches}\t{maxRows}\t{rows}\t{Gets}\t{GetBytes >> 20}\t{MaxInFlight}");
+                $"{layout}\t{query}\t{cloud}\t{batch}\t{window?.ToString() ?? "d"}\t{times[0]:F2}\t{Median(times):F2}\t{peak >> 20}\t{privPeak >> 20}\t{nBatches}\t{maxRows}\t{rows}\t{Gets}\t{GetBytes >> 20}\t{MaxInFlight}");
         }
         return 0;
     }
@@ -259,6 +259,11 @@ internal static class RowGroupSizeSweep
         return (files, groups, bytes);
     }
 
+    /// <summary>The median of <paramref name="sorted"/> (ascending): the mean of the middle two for an even count.</summary>
+    internal static double Median(List<double> sorted) => sorted.Count % 2 == 1
+        ? sorted[sorted.Count / 2]
+        : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2;
+
     [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateHardLink(string newFile, string existingFile, IntPtr security);
 
@@ -267,6 +272,12 @@ internal static class RowGroupSizeSweep
         Directory.CreateDirectory(Path.Combine(target, "_delta_log"));
         foreach (var f in Directory.EnumerateFiles(source, "*.parquet"))
         {
+            // Hard links keep a clone free on Windows; elsewhere copy (outside the measured compaction either way).
+            if (!OperatingSystem.IsWindows())
+            {
+                File.Copy(f, Path.Combine(target, Path.GetFileName(f)));
+                continue;
+            }
             if (!CreateHardLink(Path.Combine(target, Path.GetFileName(f)), f, IntPtr.Zero))
                 throw new IOException($"hard link failed: {System.Runtime.InteropServices.Marshal.GetLastWin32Error()}");
         }
@@ -347,8 +358,12 @@ internal static class RowGroupSizeSweep
     internal static long Gets, GetBytes;
     internal static int InFlight, MaxInFlight;
 
-    private sealed class SimulatedFileSystem(ITableFileSystem inner, bool cloud, int latencyMs) : ITableFileSystem
+    private sealed class SimulatedFileSystem(ITableFileSystem inner, bool cloud, int latencyMs)
+        : ITableFileSystem, IReadConcurrencyHint
     {
+        // A table takes its default window from its file system, as from S3/Azure/GCS; local disk suggests nothing.
+        public int? PreferredConcurrentReads => cloud ? 16 : null;
+
         public PathNameConstraints PathConstraints => inner.PathConstraints;
 
         public async ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
@@ -392,7 +407,7 @@ internal static class RowGroupSizeSweep
                 try
                 {
                     double ms = latencyMs + range.Length / (100.0 * 1000);
-                    if (latencyMs > 0)
+                    if (ms > 0)
                         await Task.Delay(TimeSpan.FromMilliseconds(ms), cancellationToken).ConfigureAwait(false);
                     return await inner.ReadAsync(range, cancellationToken).ConfigureAwait(false);
                 }

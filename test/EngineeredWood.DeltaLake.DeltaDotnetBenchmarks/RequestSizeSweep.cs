@@ -32,6 +32,11 @@ internal static class RequestSizeSweep
         ? ForeignRowGroups.RootFor("rg652")
         : ForeignRowGroups.RootFor("rg876");
 
+    /// <summary>The median of <paramref name="sorted"/> (ascending): the mean of the middle two for an even count.</summary>
+    private static double Median(List<double> sorted) => sorted.Count % 2 == 1
+        ? sorted[sorted.Count / 2]
+        : (sorted[sorted.Count / 2 - 1] + sorted[sorted.Count / 2]) / 2;
+
     public static Task<int> UploadAsync(string[] args)
     {
         string local = args.Length > 0 ? args[0] : Path.Combine(Path.GetTempPath(), "ew-rg652");
@@ -69,7 +74,7 @@ internal static class RequestSizeSweep
             }
 
             times.Sort();
-            Console.WriteLine($"{cap}\t{layout}\t{query}\t{times[0]:F2}\t{times[times.Count / 2]:F2}\t{rows}");
+            Console.WriteLine($"{cap}\t{layout}\t{query}\t{times[0]:F2}\t{Median(times):F2}\t{rows}");
         }
 
         return 0;
