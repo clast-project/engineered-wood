@@ -541,7 +541,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <summary>
     /// The most compressed bytes a read with no scan budget fetches whole ahead of a batched decode
     /// (<see cref="TryPrefetchUnbudgetedAsync"/>). Above it, the read keeps to page windows of
-    /// <see cref="BatchPageWindow.DefaultBudgetBytes"/>, so a foreign row group of a gigabyte on disk is not held whole.
+    /// <see cref="BatchPageWindowBudgetBytes"/>, so a foreign row group of a gigabyte on disk is not held whole.
     /// </summary>
     internal const long DefaultUnbudgetedPrefetchMaxBytes = 128L * 1024 * 1024;
 
@@ -3699,11 +3699,22 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </summary>
     internal long MembershipPrefetchBudgetBytes { get; set; } = MembershipPrefetch.DefaultBudgetBytes;
 
+    private long? _batchPageWindowBudgetBytes;
+
     /// <summary>
-    /// How many compressed bytes one request for the pages of a row group's batches may ask for. Tests
-    /// lower it to make a read span several windows.
+    /// How many compressed bytes one request for the pages of a row group's batches may ask for:
+    /// <see cref="BatchPageWindow.ObjectStoreBudgetBytes"/> from a file that gives a concurrency hint (an object
+    /// store's), else <see cref="BatchPageWindow.DefaultBudgetBytes"/>. Tests lower it to make a read span several
+    /// windows.
     /// </summary>
-    internal long BatchPageWindowBudgetBytes { get; set; } = BatchPageWindow.DefaultBudgetBytes;
+    internal long BatchPageWindowBudgetBytes
+    {
+        get => _batchPageWindowBudgetBytes
+            ?? (_file is IReadConcurrencyHint { PreferredConcurrentReads: >= 1 }
+                ? BatchPageWindow.ObjectStoreBudgetBytes
+                : BatchPageWindow.DefaultBudgetBytes);
+        set => _batchPageWindowBudgetBytes = value;
+    }
 
     /// <summary>The read-ahead for each membership source the options turn on.</summary>
     private readonly record struct Prefetches(MembershipPrefetch? Dictionary, MembershipPrefetch? BloomFilter);

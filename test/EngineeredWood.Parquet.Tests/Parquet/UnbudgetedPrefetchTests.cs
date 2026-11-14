@@ -190,6 +190,31 @@ public class UnbudgetedPrefetchTests : IDisposable
         Assert.Equal(DataLength(), result.DataBytes);
     }
 
+    /// <summary>Page windows are 32 MiB from an object store (round trips cost more than bytes held there), and
+    /// stay 8 MiB from a local file, where a window read long before its decode costs (#622, #652).</summary>
+    [Theory]
+    [InlineData(16, BatchPageWindow.ObjectStoreBudgetBytes)]
+    [InlineData(1, BatchPageWindow.ObjectStoreBudgetBytes)]
+    [InlineData(null, BatchPageWindow.DefaultBudgetBytes)]
+    [InlineData(0, BatchPageWindow.DefaultBudgetBytes)]
+    public async Task TheWindowBudget_FollowsTheFilesHint(int? hint, long expected)
+    {
+        await using var local = new LocalRandomAccessFile(_path);
+        using var reader = new ParquetFileReader(new RecordingFile(local, hint), ownsFile: false);
+        Assert.Equal(expected, reader.BatchPageWindowBudgetBytes);
+
+        reader.BatchPageWindowBudgetBytes = 5;
+        Assert.Equal(5, reader.BatchPageWindowBudgetBytes);
+    }
+
+    [Fact]
+    public async Task ALocalFile_KeepsTheEightMiBWindow()
+    {
+        await using var local = new LocalRandomAccessFile(_path);
+        using var reader = new ParquetFileReader(local, ownsFile: false);
+        Assert.Equal(8L * 1024 * 1024, reader.BatchPageWindowBudgetBytes);
+    }
+
     /// <summary>A file that records each request (a ReadRangesAsync is one) and its ranges, and optionally
     /// reports a concurrency hint, as an object store's file does.</summary>
     private sealed class RecordingFile(IRandomAccessFile inner, int? hint) : IRandomAccessFile, IReadConcurrencyHint
