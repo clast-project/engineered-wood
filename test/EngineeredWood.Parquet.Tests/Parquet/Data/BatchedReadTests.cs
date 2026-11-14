@@ -574,6 +574,42 @@ public class BatchedReadTests : IDisposable
         // With a 50-row limit the batch count should be at least 20.
         Assert.True(batches.Count >= 20,
             $"Expected ≥20 batches from row limit but got {batches.Count}");
+        Assert.All(batches, b => Assert.InRange(b.Length, 1, 50));
+    }
+
+    /// <summary>
+    /// The row limit holds with a byte limit set even when a page holds more rows than it: the byte walk takes pages
+    /// whole, and used to return all 300 of a page's rows for a 50-row limit (#874 review round 2).
+    /// </summary>
+    [Fact]
+    public async Task MaxBatchByteSize_WithRowLimit_CutsInsideAPageLargerThanTheLimit()
+    {
+        int totalRows = 1000;
+        var batch = MakeMultiColumnBatch(totalRows);
+        var path = await WriteFile(batch, "size_and_rows_big_pages.parquet", new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Uncompressed,
+            DataPageRowCountLimit = 300,
+        });
+
+        var readOptions = new ParquetReadOptions { BatchSize = 50, MaxBatchByteSize = 10_000_000 };
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false, readOptions);
+
+        var ids = new List<int>();
+        int batches = 0;
+        await foreach (var b in reader.ReadRowGroupBatchesAsync(0))
+        {
+            Assert.InRange(b.Length, 1, 50);
+            var column = (Int32Array)b.Column(0);
+            for (int i = 0; i < b.Length; i++)
+                ids.Add(column.GetValue(i)!.Value);
+            batches++;
+            b.Dispose();
+        }
+
+        Assert.Equal(20, batches);
+        Assert.Equal(Enumerable.Range(0, totalRows), ids);
     }
 
     [Fact]

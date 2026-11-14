@@ -907,7 +907,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         // As ReadBatchesAsync decides: a read of the whole group in one batch is sized by DecodedBytes, and one with
         // no batch limit set over a chunk too large for Arrow scans its headers rather than reading an index.
-        if (batchSize is not > 0 && maxBytes is not > 0 && HasChunkOverArrowLimit(ctx))
+        if (maxBytes is not > 0 && HasChunkOverArrowLimit(ctx))
             return (null, null);
         bool fitsInOneBatch = CoversWholeGroup(plan, ctx.RowCount);
         if (batchSize is > 0 && ctx.RowCount > batchSize.Value)
@@ -1282,8 +1282,13 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // failure into a success. Nested columns are excluded because the nested path decodes the whole
         // row group before slicing, so splitting does not help them (issue #157) — they still get the
         // NotSupportedException, which says so.
+        //
+        // A row limit with no byte limit (a Delta table's default, #874) engages it too: the rows alone can still
+        // return an array too large to build. Not by the batch's share of the chunk, which assumes values spread
+        // evenly over the rows; a group can hold nearly all its bytes in its first rows (#874 review round 2). The
+        // more restrictive limit wins, so a small row limit is kept where it is the smaller.
         bool implicitBudget = false;
-        if (batchSize is not > 0 && maxBytes is not > 0
+        if (maxBytes is not > 0
             && !ctx.HasNestedColumns
             && HasChunkOverArrowLimit(ctx))
         {
@@ -2225,8 +2230,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             cursor = stepEndRow;
         }
 
-        // Clamp to remaining rows and ensure at least 1.
-        return Math.Max(1, Math.Min(candidateRows, remaining));
+        // Clamp to the row limit (pages are taken whole, so the last can carry the count past BatchSize: the more
+        // restrictive limit wins, and a batch may end inside a page, as a row limit alone cuts it) and ensure at
+        // least 1 (#874 review round 2).
+        return Math.Max(1, Math.Min(candidateRows, rowLimit));
     }
 
     /// <summary>

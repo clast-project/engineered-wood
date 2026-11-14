@@ -35,6 +35,12 @@ public sealed record DeltaTableOptions
     /// always reads as the <c>Decimal128</c> the table's schema declares, whatever width the file stores it in.
     /// A <see cref="DataFileReader"/>, when set, does not use these options for the reads it serves, and its
     /// batches keep the decimal types it produces.
+    /// <para>With neither <see cref="ParquetReadOptions.BatchSize"/> nor <see cref="ParquetReadOptions.MaxBatchByteSize"/>
+    /// set, data files are read in batches of 262,144 rows, rather than one batch per row group as a
+    /// <see cref="ParquetFileReader"/> reads by default: a row group decoded whole can take gigabytes. Set
+    /// <see cref="ParquetReadOptions.BatchSize"/> to choose another size, or to <see cref="int.MaxValue"/> for one
+    /// batch per row group. Whatever the limits, a flat string or binary column chunk too large for one Arrow array
+    /// is still split, as the reader always splits it.</para>
     /// </summary>
     public ParquetReadOptions ParquetReadOptions { get; init; } = ParquetReadOptions.Default;
 

@@ -181,6 +181,70 @@ public class LargeByteArrayColumnTests
         }
     }
 
+    // A row limit alone (a Delta table's default, 262,144 rows, with no byte limit) must not switch the split off
+    // (#874 review): 2,200 rows fit the limit, so the rows alone would return the 2.2 GiB chunk as one array. Nor may
+    // a smaller row limit, judged by its share of the chunk, since values need not spread evenly (round 2): with
+    // 1,000 rows the byte cap still applies, and each batch keeps within both limits.
+    [Fact]
+    public async Task FlatOversizedChunk_IsSplitUnderARowLimitThatLeavesABatchTooLarge()
+    {
+        string path = Path.Combine(
+            Path.GetTempPath(), "ew-big-flat-" + Guid.NewGuid().ToString("N")[..8] + ".parquet");
+        try
+        {
+            long written = WriteOversizedFlatColumn(path);
+
+            var large = await ReadBatchRowsAsync(path, batchSize: 262_144);
+            Assert.True(large.Count > 1, $"expected the chunk to be split, got {large.Count} batch(es)");
+            Assert.Equal(ValueCount, large.Sum());
+
+            var small = await ReadBatchRowsAsync(path, batchSize: 1_000);
+            Assert.All(small, rows => Assert.InRange(rows, 1, 1_000));
+            Assert.True(small.Count > 3, $"expected the byte cap within the row limit, got {string.Join(",", small)}");
+            Assert.Equal(ValueCount, small.Sum());
+            Assert.True(written > 0);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    // Round 2 of the #874 review: values need not spread evenly over the rows. 2,200 values of 1 MiB and then a
+    // million of one byte: a 262,144-row batch's share of the chunk is about a quarter of it, under the limit, yet
+    // the first such batch holds every large value. Judged by that share, the cap stayed off and the read threw.
+    [Fact]
+    public async Task FlatOversizedChunk_WithItsBytesInItsFirstRows_IsSplitUnderARowLimit()
+    {
+        const int tail = 1_000_000;
+        string path = Path.Combine(
+            Path.GetTempPath(), "ew-big-skew-" + Guid.NewGuid().ToString("N")[..8] + ".parquet");
+        try
+        {
+            WriteOversizedFlatColumn(path, tail);
+            var rows = await ReadBatchRowsAsync(path, batchSize: 262_144);
+            Assert.All(rows, n => Assert.InRange(n, 1, 262_144));
+            Assert.Equal(ValueCount + tail, rows.Sum());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    private static async Task<List<int>> ReadBatchRowsAsync(string path, int batchSize)
+    {
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = batchSize });
+        var rows = new List<int>();
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            rows.Add(batch.Length);
+            batch.Dispose();
+        }
+        return rows;
+    }
+
     // The single-batch API cannot split, so it refuses — with the message issue #157 asked for.
     //
     // It refuses from the DECODER, having counted the actual bytes, not from a metadata estimate. An
@@ -220,7 +284,11 @@ public class LargeByteArrayColumnTests
     /// Writes one row group whose single BYTE_ARRAY chunk exceeds <see cref="int.MaxValue"/> decoded
     /// bytes, via ParquetSharp. Returns the total data bytes written.
     /// </summary>
-    private static long WriteOversizedFlatColumn(string path)
+    private static long WriteOversizedFlatColumn(string path) => WriteOversizedFlatColumn(path, tailRows: 0);
+
+    /// <summary>As above, followed in the same chunk by <paramref name="tailRows"/> one-byte values: the bytes sit
+    /// almost all in the first rows.</summary>
+    private static long WriteOversizedFlatColumn(string path, int tailRows)
     {
         var value = new byte[ValueSize];
         value.AsSpan().Fill((byte)'x');
@@ -241,9 +309,17 @@ public class LargeByteArrayColumnTests
         {
             for (int written = 0; written < ValueCount; written += WriteChunk)
                 column.WriteBatch(block);
+            if (tailRows > 0)
+            {
+                var tail = new byte[tailRows][];
+                var one = new byte[] { (byte)'y' };
+                for (int i = 0; i < tailRows; i++)
+                    tail[i] = one;
+                column.WriteBatch(tail);
+            }
         }
 
-        return (long)ValueCount * ValueSize;
+        return (long)ValueCount * ValueSize + tailRows;
     }
 
     // Batching is offered as the remedy, so the nested case must fail the same way THROUGH it rather
