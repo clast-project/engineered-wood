@@ -85,16 +85,26 @@ internal static class ForeignRowGroups
     }
 
     /// <summary>Where the tables are: <c>%TEMP%/ew-rg878</c> on local disk, else <c>rg878</c> under the store's root.</summary>
-    private static string DefaultRoot => BenchStorage.Current is LocalStorage
-        ? Path.Combine(Path.GetTempPath(), "ew-rg878")
-        : BenchStorage.Current.Combine(BenchStorage.Current.Root, "rg878");
+    private static string DefaultRoot => RootFor("rg878");
+
+    /// <summary>Where a sweep's tables are: <c>%TEMP%/ew-&lt;name&gt;</c> on local disk, else <c>&lt;name&gt;</c> under the store's root.</summary>
+    internal static string RootFor(string name) => BenchStorage.Current is LocalStorage
+        ? Path.Combine(Path.GetTempPath(), "ew-" + name)
+        : BenchStorage.Current.Combine(BenchStorage.Current.Root, name);
 
     /// <summary>
     /// Copies the local tables under <c>args[0]</c> to <see cref="DefaultRoot"/> on the configured store, streamed
     /// through EW's file system (a data file can be over 2 GiB). The commit goes last, so a table whose commit is
     /// there is complete and is skipped.
     /// </summary>
-    public static async Task<int> UploadAsync(string[] args)
+    public static Task<int> UploadAsync(string[] args) =>
+        UploadAsync(args, DefaultRoot, ["fat_str", "skew_str", "wide_num"]);
+
+    /// <summary>
+    /// <see cref="UploadAsync(string[])"/> for another sweep's tables: <paramref name="remoteRoot"/> is where they go,
+    /// <paramref name="defaultTables"/> the tables copied when <c>args[1]</c> names none.
+    /// </summary>
+    internal static async Task<int> UploadAsync(string[] args, string remoteRoot, string[] defaultTables)
     {
         if (BenchStorage.Current is LocalStorage)
         {
@@ -103,13 +113,13 @@ internal static class ForeignRowGroups
         }
         string local = args.Length > 0 ? args[0] : Path.Combine(Path.GetTempPath(), "ew-rg878");
         // The generator's default tables, as --rg878 scans: huge_str is written only when asked for.
-        string[] tables = args.Length > 1 ? args[1].Split(',') : ["fat_str", "skew_str", "wide_num"];
+        string[] tables = args.Length > 1 ? args[1].Split(',') : defaultTables;
         const string commit = "_delta_log/00000000000000000000.json";
         var buffer = new byte[8 << 20];
         foreach (string name in tables)
         {
             string source = Path.Combine(local, name);
-            var fs = BenchStorage.Current.FileSystem(BenchStorage.Current.Combine(DefaultRoot, name));
+            var fs = BenchStorage.Current.FileSystem(BenchStorage.Current.Combine(remoteRoot, name));
             if (await fs.ExistsAsync(commit))
             {
                 Console.WriteLine($"{name}: already uploaded");
