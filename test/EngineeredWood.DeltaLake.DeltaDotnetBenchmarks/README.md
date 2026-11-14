@@ -43,6 +43,7 @@ BenchmarkDotNet runs each benchmark in a child process that inherits the environ
 | `EWDD_AZURE_CONTAINER` | container, created if absent (default `ew-vs-delta-dotnet`) |
 | `EWDD_AZURE_PREFIX` | blob-name prefix all fixtures and scratch copies go under (default `bench`; must not be empty) |
 | `EWDD_AZURE_CONCURRENCY` | EW's `AzureTableFileSystem` `maxConcurrency` (default 16, its own default) |
+| `EWDD_AZURE_MAX_REQUEST_MIB` | EW's largest coalesced range request, `CoalescingOptions.MaxRequestBytes`, in MiB (default: its own, 64) — #876 |
 | `EWDD_AZURE_EMULATOR` | `1`: Azurite's well-known account on `127.0.0.1:10000`, for a smoke test without an account |
 
 The helper script sets them for the current PowerShell session, prompting for the key without echoing it:

@@ -248,13 +248,16 @@ internal sealed class AzureStorage : BenchStorage
     private readonly string _account;
     private readonly bool _emulator;
     private readonly int _concurrency;
+    private readonly CoalescingOptions? _coalescing;
     private readonly string _namespace;
 
-    private AzureStorage(string account, string key, string container, string prefix, bool emulator, int concurrency)
+    private AzureStorage(string account, string key, string container, string prefix, bool emulator, int concurrency,
+        CoalescingOptions? coalescing)
     {
         _account = account;
         _emulator = emulator;
         _concurrency = concurrency;
+        _coalescing = coalescing;
         Root = prefix;
 
         var credential = new StorageSharedKeyCredential(account, key);
@@ -313,7 +316,10 @@ internal sealed class AzureStorage : BenchStorage
                 "EWDD_AZURE_PREFIX must name a blob-name prefix (such as 'bench'); the container root is not supported.");
         }
         int concurrency = int.TryParse(Env("EWDD_AZURE_CONCURRENCY"), out int c) && c > 0 ? c : 16;
-        return new AzureStorage(account, key, container, prefix, emulator, concurrency);
+        CoalescingOptions? coalescing = int.TryParse(Env("EWDD_AZURE_MAX_REQUEST_MIB"), out int mib) && mib > 0
+            ? new CoalescingOptions { MaxRequestBytes = mib * 1024L * 1024 }
+            : null;
+        return new AzureStorage(account, key, container, prefix, emulator, concurrency, coalescing);
     }
 
     private static string? Env(string name) =>
@@ -323,14 +329,15 @@ internal sealed class AzureStorage : BenchStorage
 
     public override string Description =>
         $"Azure Blob{(_emulator ? " (Azurite emulator)" : "")}, account {_account} ({_namespace}), "
-        + $"container {_container.Name}, prefix {Root}/, EW maxConcurrency {_concurrency}";
+        + $"container {_container.Name}, prefix {Root}/, EW maxConcurrency {_concurrency}"
+        + (_coalescing is null ? "" : $", EW max request {_coalescing.MaxRequestBytes / (1024 * 1024)} MiB");
 
     public override string Combine(string location, string child) => location + "/" + child;
 
     public override string NameOf(string location) => location[(location.LastIndexOf('/') + 1)..];
 
     public override ITableFileSystem FileSystem(string location) =>
-        new AzureTableFileSystem(_container, location, maxConcurrency: _concurrency);
+        new AzureTableFileSystem(_container, location, maxConcurrency: _concurrency, coalescingOptions: _coalescing);
 
     public override string DeltaRsUri(string location) => $"az://{_container.Name}/{location}";
 

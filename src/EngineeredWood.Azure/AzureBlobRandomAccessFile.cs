@@ -21,6 +21,9 @@ public sealed class AzureBlobRandomAccessFile : IRandomAccessFile, IReadConcurre
     private readonly int _maxConcurrency;
     private readonly bool _ownsSemaphore;
     private readonly CoalescingOptions _coalescingOptions;
+
+    /// <summary>How this file merges nearby ranges of one read into fewer requests.</summary>
+    public CoalescingOptions CoalescingOptions => _coalescingOptions;
     private long _cachedLength = -1;
 
     public AzureBlobRandomAccessFile(

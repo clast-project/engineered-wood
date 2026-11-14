@@ -24,6 +24,9 @@ public sealed class GcsRandomAccessFile : IRandomAccessFile, IReadConcurrencyHin
     private readonly SemaphoreSlim _semaphore;
     private readonly int _maxConcurrency;
     private readonly CoalescingOptions _coalescingOptions;
+
+    /// <summary>How this file merges nearby ranges of one read into fewer requests.</summary>
+    public CoalescingOptions CoalescingOptions => _coalescingOptions;
     private long _cachedLength = -1;
 
     /// <summary>

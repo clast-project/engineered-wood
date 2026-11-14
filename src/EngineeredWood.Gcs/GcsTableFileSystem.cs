@@ -35,6 +35,7 @@ public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint
     private readonly string _rootPrefix;
     private readonly BufferAllocator? _allocator;
     private readonly int _maxConcurrency;
+    private readonly CoalescingOptions? _coalescingOptions;
 
     /// <summary>
     /// Creates a new filesystem rooted at <paramref name="bucket"/> and, optionally, an
@@ -53,12 +54,17 @@ public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint
     /// The range requests each file opened via <see cref="OpenReadAsync"/> lets be in flight at once, and
     /// the reads this filesystem suggests a table scan run at once (<see cref="PreferredConcurrentReads"/>).
     /// </param>
+    /// <param name="coalescingOptions">
+    /// How each file opened via <see cref="OpenReadAsync"/> merges nearby ranges of one read into fewer requests.
+    /// Defaults to <see cref="CoalescingOptions"/>'s own defaults.
+    /// </param>
     public GcsTableFileSystem(
         StorageClient client,
         string bucket,
         string? rootPath = null,
         BufferAllocator? allocator = null,
-        int maxConcurrency = 16)
+        int maxConcurrency = 16,
+        CoalescingOptions? coalescingOptions = null)
     {
         if (maxConcurrency < 1)
             throw new ArgumentOutOfRangeException(nameof(maxConcurrency), maxConcurrency, "Must be at least 1.");
@@ -66,6 +72,7 @@ public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint
         _bucket = bucket ?? throw new ArgumentNullException(nameof(bucket));
         _allocator = allocator;
         _maxConcurrency = maxConcurrency;
+        _coalescingOptions = coalescingOptions;
 
         string normalized = (rootPath ?? string.Empty).Replace('\\', '/').Trim('/');
         _rootPrefix = normalized.Length == 0 ? string.Empty : normalized + "/";
@@ -173,7 +180,7 @@ public sealed class GcsTableFileSystem : ITableFileSystem, IReadConcurrencyHint
     {
         cancellationToken.ThrowIfCancellationRequested();
         return new ValueTask<IRandomAccessFile>(
-            new GcsRandomAccessFile(_client, _bucket, Resolve(path), _allocator, _maxConcurrency));
+            new GcsRandomAccessFile(_client, _bucket, Resolve(path), _allocator, _maxConcurrency, _coalescingOptions));
     }
 
     /// <inheritdoc/>
