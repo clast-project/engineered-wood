@@ -4,13 +4,14 @@
 #     .\test\EngineeredWood.DeltaLake.DeltaDotnetBenchmarks\rg878-azure.ps1 -Account <name> [-Before <exe>] [-Tables fat_str,huge_str]
 #
 # Prompts for the account key (masked; see azure-env.ps1). Results go to the console and to rg878-azure-<time>.tsv
-# in the current directory. Uploading all four tables is ~5.8 GB; later runs skip tables already uploaded.
+# in the current directory. The default tables are the ones gen_foreign_rowgroups.py writes by default (~3.1 GB to
+# upload); add huge_str (2.6 GB, generated only when asked) with -Tables. Later runs skip tables already uploaded.
 param(
     [Parameter(Mandatory)] [string] $Account,
     [string] $Container = 'ew-vs-delta-dotnet',
     [string] $Prefix = 'bench',
     [string] $LocalRoot = (Join-Path $env:TEMP 'ew-rg878'),
-    [string[]] $Tables = @('fat_str', 'skew_str', 'wide_num', 'huge_str'),
+    [string[]] $Tables = @('fat_str', 'skew_str', 'wide_num'),
     [string[]] $Configs = @('ew-default', 'ew-serial', 'ew-256MiB', 'dd-select*'),
     [string] $Before,
     [int] $Repeats = 2

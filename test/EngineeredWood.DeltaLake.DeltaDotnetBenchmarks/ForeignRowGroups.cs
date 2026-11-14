@@ -102,7 +102,8 @@ internal static class ForeignRowGroups
             return 2;
         }
         string local = args.Length > 0 ? args[0] : Path.Combine(Path.GetTempPath(), "ew-rg878");
-        string[] tables = args.Length > 1 ? args[1].Split(',') : ["fat_str", "skew_str", "wide_num", "huge_str"];
+        // The generator's default tables, as --rg878 scans: huge_str is written only when asked for.
+        string[] tables = args.Length > 1 ? args[1].Split(',') : ["fat_str", "skew_str", "wide_num"];
         const string commit = "_delta_log/00000000000000000000.json";
         var buffer = new byte[8 << 20];
         foreach (string name in tables)
