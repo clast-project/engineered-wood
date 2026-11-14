@@ -128,8 +128,8 @@ public class TwoPassReadTests : IDisposable
 
     /// <summary>
     /// The first pass never hands a predicate more rows at once than <see cref="ParquetReadOptions.BatchSize"/>:
-    /// it follows the batch size when the predicate's column is not returned, and when it is (and so would be kept
-    /// whole for the group) the group is read in one pass, which follows it too. The rows are right either way.
+    /// it follows the batch size whether or not the predicate's column is returned. A returned one is not kept for
+    /// the group then; the second pass decodes it again (#652). The rows are right either way.
     /// </summary>
     [Theory]
     [InlineData(false)]
@@ -168,6 +168,91 @@ public class TwoPassReadTests : IDisposable
         Assert.NotEmpty(sizes);
         Assert.All(sizes, size => Assert.InRange(size, 0, 3_000));
         Assert.True(corruptFrom > 0); // the corrupted page is past the selection; validation is off here anyway
+    }
+
+    /// <summary>
+    /// A group a batch size splits is still read in two passes when the read returns its predicate column (#652): the
+    /// first pass reads the predicate column in batches, the second decodes it again beside the output column, and
+    /// the corrupted <c>note</c> page, far from any selected row, is never decoded. In one pass it is.
+    /// </summary>
+    [Fact]
+    public async Task ASplitGroupReturningItsPredicateColumn_IsStillReadInTwoPasses()
+    {
+        var (path, _) = await WriteCorruptedAsync();
+        var (ids, batches) = await ReadBatchedAsync(path, Scan(maxId: 1_000), batchSize: 3_000, twoPass: true);
+        Assert.Equal(Enumerable.Range(0, 1_000).Select(i => (long)i), ids);
+        Assert.All(batches, rows => Assert.InRange(rows, 1, 3_000));
+
+        await Assert.ThrowsAnyAsync<Exception>(() => ReadBatchedAsync(path, Scan(maxId: 1_000), batchSize: 3_000, twoPass: false));
+    }
+
+    /// <summary>
+    /// A dense selection in a split group is kept as the second pass decodes, in one batch, when the selected rows fit
+    /// the batch size: the batch holds only them, within the bound (#652). More selected rows than that come back in
+    /// batches of at most the batch size.
+    /// </summary>
+    [Theory]
+    [InlineData(40, 1_000, true)]   // a row in every block, 1,000 selected: fits one 3,000-row batch
+    [InlineData(4, 10_000, false)]  // 10,000 selected: more than one batch
+    public async Task ADenseSelectionInASplitGroup_IsKeptInOneBatch_WhenItFits(int every, int selected, bool oneBatch)
+    {
+        var (path, _) = await WriteCorruptedAsync(corrupt: false);
+        var scan = new ParquetScan
+        {
+            Columns = ["id", "note"],
+            RowFilter = new RowFilter(new RowPredicate(["id"], batch =>
+            {
+                var ids = (Int64Array)batch.Column(0);
+                var builder = new BooleanArray.Builder().Reserve(ids.Length);
+                for (int i = 0; i < ids.Length; i++)
+                    builder.Append(ids.GetValue(i) % every == 0);
+                return builder.Build();
+            })),
+        };
+
+        foreach (var columns in new[] { new[] { "id", "note" }, new[] { "note", "id" } })
+        {
+            var (ids, batches) = await ReadBatchedAsync(path, scan with { Columns = columns }, batchSize: 3_000, twoPass: true);
+            Assert.Equal(Enumerable.Range(0, selected).Select(i => (long)i * every), ids);
+            Assert.All(batches, rows => Assert.InRange(rows, 1, 3_000));
+            if (oneBatch)
+                Assert.Single(batches);
+            else
+                Assert.True(batches.Count > 1);
+        }
+    }
+
+    /// <summary>Reads with a batch size, checking each row's note against its id; returns the ids and each batch's
+    /// row count.</summary>
+    private static async Task<(List<long> Ids, List<int> Batches)> ReadBatchedAsync(
+        string path, ParquetScan scan, int batchSize, bool twoPass)
+    {
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false,
+            new ParquetReadOptions { BatchSize = batchSize, PageChecksumValidation = true })
+        {
+            TwoPassReads = twoPass,
+        };
+        var ids = new List<long>();
+        var batches = new List<int>();
+        await foreach (var selected in reader.ReadSelectedAsync(scan))
+        {
+            using (selected)
+            {
+                var batch = selected.Batch;
+                var idColumn = (Int64Array)batch.Column(batch.Schema.GetFieldIndex("id"));
+                var notes = (StringArray)batch.Column(batch.Schema.GetFieldIndex("note"));
+                Assert.Equal(scan.Columns, batch.Schema.FieldsList.Select(f => f.Name));
+                batches.Add(batch.Length);
+                for (int i = 0; i < batch.Length; i++)
+                {
+                    ids.Add(idColumn.GetValue(i)!.Value);
+                    Assert.Equal(NoteFor(idColumn.GetValue(i)!.Value), notes.GetString(i));
+                }
+            }
+        }
+
+        return (ids, batches);
     }
 
     /// <summary>
@@ -373,7 +458,7 @@ public class TwoPassReadTests : IDisposable
     /// One row group of 40,000 rows in 2,000-row pages, with page checksums, and one byte flipped at the end of the
     /// <c>note</c> page holding row 30,000. Returns the first row of that page.
     /// </summary>
-    private async Task<(string Path, long CorruptFrom)> WriteCorruptedAsync()
+    private async Task<(string Path, long CorruptFrom)> WriteCorruptedAsync(bool corrupt = true)
     {
         string path = Path.Combine(_tempDir, "data.parquet");
         var ids = new Int64Array.Builder();
@@ -411,9 +496,13 @@ public class TwoPassReadTests : IDisposable
             firstRow = page.FirstRowIndex;
         }
 
-        var bytes = File.ReadAllBytes(path);
-        bytes[offset] ^= 0xFF;
-        File.WriteAllBytes(path, bytes);
+        if (corrupt)
+        {
+            var bytes = File.ReadAllBytes(path);
+            bytes[offset] ^= 0xFF;
+            File.WriteAllBytes(path, bytes);
+        }
+
         return (path, firstRow);
     }
 }
