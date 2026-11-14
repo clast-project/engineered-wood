@@ -153,7 +153,12 @@ internal sealed class ScanReservation
         bytes = Math.Min(bytes, MemoryBudget.MaxCharge); // as in Observe
         await _budget.ReserveAsync(_unit, bytes, cancellationToken).ConfigureAwait(false);
         _held += bytes;
+        HeldPeak = Math.Max(HeldPeak, _held);
     }
+
+    /// <summary>The most this reservation has held at once (<see cref="HoldAsync"/>, <see cref="TryHoldAhead"/>): for
+    /// tests of what a read holds apart from its decodes.</summary>
+    internal long HeldPeak { get; private set; }
 
     /// <summary>
     /// Holds <paramref name="bytes"/> as <see cref="HoldAsync"/> does, for bytes a read fetches AHEAD of the item it
@@ -170,6 +175,7 @@ internal sealed class ScanReservation
         if (!_budget.TryReserveAhead(_unit, bytes))
             return false;
         _held += bytes;
+        HeldPeak = Math.Max(HeldPeak, _held);
         return true;
     }
 

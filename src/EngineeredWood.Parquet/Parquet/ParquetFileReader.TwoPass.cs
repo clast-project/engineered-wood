@@ -104,7 +104,8 @@ public sealed partial class ParquetFileReader
     /// <remarks>
     /// The first pass never decodes more rows at once than a one-pass read would. It follows
     /// <see cref="ParquetReadOptions.BatchSize"/> unless it must keep the predicate columns it returns, which it
-    /// decodes for the whole group; a group a batch size would split is then read in one pass. And a group with a
+    /// decodes for the whole group; for a group a batch size would split, <see cref="TwoPassColumnsForGroup"/> has
+    /// the second pass decode them again instead. And a group with a
     /// BYTE_ARRAY chunk past what one Arrow array can hold, which the one-pass read splits under its implicit
     /// budget (<see cref="HasChunkOverArrowLimit"/>), is read in one pass too.
     /// </remarks>
@@ -116,6 +117,24 @@ public sealed partial class ParquetFileReader
         && !rowGroup.Columns.Any(c => c.MetaData is { Type: PhysicalType.ByteArray } m
                                       && m.TotalUncompressedSize > Data.ByteArrayCapacity.MaxBytes)
         && (columns.FilterOutputs.Count == 0 || !SplitsGroup(rowGroup.NumRows));
+
+    /// <summary>
+    /// The two-pass columns for one row group: <paramref name="columns"/>, unless the read returns predicate
+    /// columns and a batch size splits the group. The first pass would keep those for the whole group, past the
+    /// batch bound, so instead it reads them in batches like the other predicate columns and lets them go, and the
+    /// second pass decodes them again beside the output columns (#652). That decodes them twice, but the group still
+    /// skips the output columns' unselected blocks; read in one pass instead, a selective filter over an object
+    /// store fetched and decoded every column whole (TPC-H Q6, one row group at a time: 1.50 s against 1.10 s
+    /// unbatched). Null stays null.
+    /// </summary>
+    internal TwoPassColumns? TwoPassColumnsForGroup(TwoPassColumns? columns, Metadata.RowGroup rowGroup) =>
+        columns is { FilterOutputs.Count: > 0 } && SplitsGroup(rowGroup.NumRows)
+            ? columns with
+            {
+                OutputOnly = columns.OutputOrder,
+                FilterOutputs = new HashSet<string>(StringComparer.Ordinal),
+            }
+            : columns;
 
     // Whether BatchSize cuts a group of `rows` rows into more than one batch.
     private bool SplitsGroup(long rows) => _options.BatchSize is int size && size > 0 && size < rows;
@@ -277,16 +296,31 @@ public sealed partial class ParquetFileReader
             // its deselected rows, skipping their values where the decoder can, so the batch comes back holding
             // only the selected rows, with nothing to gather. With decoders that skip, this beats the gather at
             // every selectivity measured (doc/row-level-filtering.md §15).
-            byte[]? keepRows = passTwoRanges is null && !SplitsGroup(groupRows) && kept < groupRows
+            // A group a batch size splits keeps rows too when the selected rows fit one batch: the one batch it
+            // decodes holds only those, within the bound (#652). Decoded in batches and gathered instead, a selective
+            // filter's second pass cost 60-70% more CPU than unbatched.
+            byte[]? keepRows = passTwoRanges is null && kept < groupRows
+                               && (!SplitsGroup(groupRows) || kept <= _options.BatchSize!.Value)
                 ? KeepMask(selection, groupRows)
                 : null;
+            // That one decode builds its columns at the whole group's size before it drops rows, past the batch-sized
+            // reservation: held for the pass, and let go after it (#873 review).
+            long wholeGroupHold = 0;
+            if (keepRows is not null && reservation is not null && SplitsGroup(groupRows))
+            {
+                var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+                var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+                wholeGroupHold = DecodedBytes(metadata.RowGroups[plan.Index], schema, columns.OutputOnly, null);
+                await reservation.HoldAsync(wholeGroupHold, cancellationToken).ConfigureAwait(false);
+            }
             try
             {
                 int range = 0;
                 long cursor = passTwoRanges?[0].Start ?? 0;
                 await foreach (var batch in ReadBatchesAsync(
                                    plan.Index, columns.OutputOnly, passTwoRanges, offsetIndexes: null, cancellationToken,
-                                   io: prefetched, useOffsetIndex: false, keepRows: keepRows).ConfigureAwait(false))
+                                   io: prefetched, batchRows: keepRows is null ? null : groupRows, useOffsetIndex: false,
+                                   keepRows: keepRows).ConfigureAwait(false))
                 {
                     int start = checked((int)cursor);
                     cursor += batch.Length;
@@ -310,6 +344,8 @@ public sealed partial class ParquetFileReader
             {
                 if (keepRows is not null)
                     ArrayPool<byte>.Shared.Return(keepRows);
+                if (wholeGroupHold > 0)
+                    reservation!.ReleaseHeld(wholeGroupHold);
             }
 
             // The second pass, only from a group it decoded whole in one batch, every row built: one that kept rows as
@@ -556,7 +592,11 @@ public sealed partial class ParquetFileReader
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-        long compressed = PlannedBytes(metadata.RowGroups[plan.Index], schema, readColumns, plan.Ranges).Compressed;
+        // Each pass's chunks are fetched apart, so a column both read (a returned predicate column in a group a batch
+        // size splits, TwoPassColumnsForGroup) is held twice and counted twice (#873 review). Disjoint otherwise, and
+        // then the same as the read's columns.
+        long compressed = PlannedBytes(metadata.RowGroups[plan.Index], schema, columns.Filter, plan.Ranges).Compressed
+                          + PlannedBytes(metadata.RowGroups[plan.Index], schema, columns.OutputOnly, plan.Ranges).Compressed;
         var estimate = TwoPassFirstBatchEstimate(
             metadata.RowGroups[plan.Index], schema, columns, selector.Answerable, growth, plan.Ranges);
         // The batches it hands on hold the selected rows of the second pass's first batch, at most its rows.

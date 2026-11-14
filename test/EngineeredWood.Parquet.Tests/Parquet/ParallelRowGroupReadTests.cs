@@ -1212,6 +1212,60 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.True(next >= largest, $"the next row group reserves {next}, its first pass decodes {largest}");
     }
 
+    /// <summary>
+    /// In a group a batch size splits, a returned predicate column is read by both passes (#652), so both passes'
+    /// prefetched chunks hold it: the hold counts it twice (#873 review).
+    /// </summary>
+    [Fact]
+    public async Task ASplitTwoPassRead_HoldsBothPassesChunks_WhenTheyShareAColumn()
+    {
+        string path = await WriteKeysAndValuesAsync("two-pass-overlap", i => i % 10);
+        var predicate = KeyPredicate(k => k < 3, false);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 3_000 })
+        {
+            TwoPassReads = true,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long filter = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k"], null).Compressed;
+        long output = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k", "v"], null).Compressed;
+
+        var (returned, _, _, used, held) = await ReadTwoPassUnitHeldAsync(reader, predicate, returnPredicateColumn: true);
+        Assert.Equal(KeyRows * 3 / 10, returned);
+        Assert.True(held >= filter + output, $"held {held}: both prefetches ({filter} + {output}) were not counted");
+        Assert.Equal(0, used);
+    }
+
+    /// <summary>
+    /// A split group whose selected rows fit one batch decodes its second pass as one batch that keeps them, and that
+    /// decode builds its columns at the whole group's size first: held for the pass beyond the batch-sized
+    /// reservation, then let go (#873 review).
+    /// </summary>
+    [Fact]
+    public async Task ASplitTwoPassRead_HoldsTheWholeGroupDecode_WhenItKeepsRowsInOneBatch()
+    {
+        string path = await WriteKeysAndValuesAsync("two-pass-keep-split", i => i % 10);
+        // 4,000 rows selected, a row in every block: dense, and within one 5,000-row batch.
+        var predicate = KeyPredicate(k => k < 1, false);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 5_000 })
+        {
+            TwoPassReads = true,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long chunks = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k"], null).Compressed
+                      + ParquetFileReader.PlannedBytes(group, parquetSchema, ["k", "v"], null).Compressed;
+        long wholeDecode = reader.DecodedBytes(group, parquetSchema, ["k", "v"], null);
+
+        var (returned, _, _, used, held) = await ReadTwoPassUnitHeldAsync(reader, predicate, returnPredicateColumn: true);
+        Assert.Equal(KeyRows / 10, returned);
+        Assert.True(held >= chunks + wholeDecode,
+            $"held {held}: the chunks ({chunks}) and the whole-group decode ({wholeDecode}) were not both counted");
+        Assert.Equal(0, used);
+    }
+
     private const int KeyRows = 40_000;
 
     // A Boolean column's values and validity, as TwoPassFirstBatchBytes sizes answers.
@@ -1281,6 +1335,16 @@ public class ParallelRowGroupReadTests : IDisposable
         ParquetFileReader reader, RowPredicate predicate, bool returnPredicateColumn,
         ParquetFileReader.DecodedGrowth? growth = null, long addedBytesPerRow = 0)
     {
+        var (returned, estimate, peak, used, _) = await ReadTwoPassUnitHeldAsync(
+            reader, predicate, returnPredicateColumn, growth, addedBytesPerRow);
+        return (returned, estimate, peak, used);
+    }
+
+    /// <summary>As <see cref="ReadTwoPassUnitAsync"/>, with the most the unit held apart from its decodes.</summary>
+    private static async Task<(long Returned, long Estimate, long Peak, long Used, long HeldPeak)> ReadTwoPassUnitHeldAsync(
+        ParquetFileReader reader, RowPredicate predicate, bool returnPredicateColumn,
+        ParquetFileReader.DecodedGrowth? growth = null, long addedBytesPerRow = 0)
+    {
         var scan = new ParquetScan
         {
             Columns = returnPredicateColumn ? ["k", "v"] : ["v"],
@@ -1300,7 +1364,7 @@ public class ParallelRowGroupReadTests : IDisposable
                 returned += batch.Batch.Length;
         }
         reservation.ReleasePending();
-        return (returned, reservation.Estimate, budget.Peak, budget.Used);
+        return (returned, reservation.Estimate, budget.Peak, budget.Used, reservation.HeldPeak);
     }
 
     [Theory]

@@ -215,8 +215,9 @@ public sealed partial class ParquetFileReader
         public IAsyncEnumerable<SelectedRecordBatch> ReadAsync(RowGroupPlan plan, CancellationToken cancellationToken)
         {
             var read = ReadFor(plan);
-            return _reader.ReadsInTwoPasses(plan, read.TwoPass, _metadata.RowGroups[plan.Index], _proofs.Length > 0)
-                ? _reader.ReadTwoPassAsync(plan, read.TwoPass!, read.Selector, reservation: null, growth: null, default, cancellationToken)
+            var twoPass = _reader.TwoPassColumnsForGroup(read.TwoPass, _metadata.RowGroups[plan.Index]);
+            return _reader.ReadsInTwoPasses(plan, twoPass, _metadata.RowGroups[plan.Index], _proofs.Length > 0)
+                ? _reader.ReadTwoPassAsync(plan, twoPass!, read.Selector, reservation: null, growth: null, default, cancellationToken)
                 : read.Selector.SelectAsync(
                     _reader.ReadPlannedAsync(plan, read.ReadColumns, cancellationToken, read.Selector.Answerable));
         }
@@ -226,8 +227,9 @@ public sealed partial class ParquetFileReader
             RowGroupPlan plan, ScanReservation reservation, DecodedGrowth growth, CancellationToken cancellationToken)
         {
             var read = ReadFor(plan);
-            return _reader.ReadsInTwoPasses(plan, read.TwoPass, _metadata.RowGroups[plan.Index], _proofs.Length > 0)
-                ? _reader.ReadTwoPassAsync(plan, read.ReadColumns, read.TwoPass!, read.Selector, reservation, growth, cancellationToken)
+            var twoPass = _reader.TwoPassColumnsForGroup(read.TwoPass, _metadata.RowGroups[plan.Index]);
+            return _reader.ReadsInTwoPasses(plan, twoPass, _metadata.RowGroups[plan.Index], _proofs.Length > 0)
+                ? _reader.ReadTwoPassAsync(plan, read.ReadColumns, twoPass!, read.Selector, reservation, growth, cancellationToken)
                 : read.Selector.SelectAsync(
                     _reader.ReadPlannedAsync(plan, read.ReadColumns, reservation, growth, cancellationToken, read.Selector.Answerable));
         }
