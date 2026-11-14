@@ -19,6 +19,9 @@ catch (TypeInitializationException e) when (e.InnerException is InvalidOperation
 if (args.Length > 0 && args[0] == "--verify")
     return await Verify.RunAsync(args.Skip(1).ToArray());
 
+if (args.Length > 0 && args[0] == "--rg878-upload")
+    return await ForeignRowGroups.UploadAsync(args.Skip(1).ToArray());
+
 if (args.Length > 0 && args[0] == "--rg878")
     return await ForeignRowGroups.RunAsync(args.Skip(1).ToArray());
 

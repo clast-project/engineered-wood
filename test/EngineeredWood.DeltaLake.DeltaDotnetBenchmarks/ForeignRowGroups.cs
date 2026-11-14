@@ -15,13 +15,17 @@ namespace DeltaDotnetComparison;
 /// with a 256 MiB budget, and through delta-dotnet's DataFusion scan. Reports time, the largest batch (rows and
 /// Arrow buffer bytes), and the process's peak private bytes, sampled every 10 ms.
 ///
-/// <code>dotnet run -c Release -- --rg878 &lt;root&gt; [table,...]</code>
+/// <code>dotnet run -c Release -- --rg878 [root|-] [table,...] [config,...]</code>
+///
+/// <para>The tables are read from whichever store <c>EWDD_STORAGE</c> names (see <see cref="BenchStorage"/>). On
+/// Azure, upload them first with <c>--rg878-upload &lt;local root&gt; [table,...]</c>; both modes then default to
+/// <c>&lt;prefix&gt;/rg878</c>. <c>-</c> for the root means that default.</para>
 /// </summary>
 internal static class ForeignRowGroups
 {
     public static async Task<int> RunAsync(string[] args)
     {
-        string root = args.Length > 0 ? args[0] : Path.Combine(Path.GetTempPath(), "ew-rg878");
+        string root = args.Length > 0 && args[0] != "-" ? args[0] : DefaultRoot;
         string[] tables = args.Length > 1 ? args[1].Split(',') : ["fat_str", "skew_str", "wide_num"];
         (string Name, EwOptions? Options)[] configs =
         [
@@ -37,7 +41,7 @@ internal static class ForeignRowGroups
         int failures = 0;
         foreach (string name in tables)
         {
-            string path = Path.Combine(root, name);
+            string path = BenchStorage.Current.Combine(root, name);
             foreach (var (config, options) in configs)
             {
                 GC.Collect();
@@ -78,6 +82,56 @@ internal static class ForeignRowGroups
         }
 
         return failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>Where the tables are: <c>%TEMP%/ew-rg878</c> on local disk, else <c>rg878</c> under the store's root.</summary>
+    private static string DefaultRoot => BenchStorage.Current is LocalStorage
+        ? Path.Combine(Path.GetTempPath(), "ew-rg878")
+        : BenchStorage.Current.Combine(BenchStorage.Current.Root, "rg878");
+
+    /// <summary>
+    /// Copies the local tables under <c>args[0]</c> to <see cref="DefaultRoot"/> on the configured store, streamed
+    /// through EW's file system (a data file can be over 2 GiB). The commit goes last, so a table whose commit is
+    /// there is complete and is skipped.
+    /// </summary>
+    public static async Task<int> UploadAsync(string[] args)
+    {
+        string local = args.Length > 0 ? args[0] : Path.Combine(Path.GetTempPath(), "ew-rg878");
+        string[] tables = args.Length > 1 ? args[1].Split(',') : ["fat_str", "skew_str", "wide_num", "huge_str"];
+        const string commit = "_delta_log/00000000000000000000.json";
+        var buffer = new byte[8 << 20];
+        foreach (string name in tables)
+        {
+            string source = Path.Combine(local, name);
+            var fs = BenchStorage.Current.FileSystem(BenchStorage.Current.Combine(DefaultRoot, name));
+            if (await fs.ExistsAsync(commit))
+            {
+                Console.WriteLine($"{name}: already uploaded");
+                continue;
+            }
+
+            var files = Directory.GetFiles(source, "*", SearchOption.AllDirectories)
+                .Select(f => Path.GetRelativePath(source, f).Replace(Path.DirectorySeparatorChar, '/'))
+                .OrderBy(f => f == commit ? 1 : 0)
+                .ToList();
+            var watch = Stopwatch.StartNew();
+            long bytes = 0;
+            foreach (string file in files)
+            {
+                await using var input = File.OpenRead(Path.Combine(source, file));
+                await using var output = await fs.CreateAsync(file, overwrite: true);
+                int read;
+                while ((read = await input.ReadAsync(buffer)) > 0)
+                {
+                    await output.WriteAsync(buffer.AsMemory(0, read));
+                    bytes += read;
+                }
+                await output.FlushAsync();
+            }
+            Console.WriteLine($"{name}: {bytes / (1 << 20)} MiB in {watch.Elapsed.TotalSeconds:F0} s");
+        }
+
+        return 0;
     }
 
     private sealed class ScanStats
