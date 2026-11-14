@@ -611,10 +611,12 @@ public sealed partial class ParquetFileReader
             await reservation.HoldAsync(compressed, cancellationToken).ConfigureAwait(false);
             var filterCtx = await PrepareRowGroupAsync(plan.Index, columns.Filter, cancellationToken).ConfigureAwait(false);
             // Null when a chunk is too large for one buffer: pass 1 then reads it as it decodes, as before.
-            filterIo = TryPrefetch(filterCtx.Ranges, cancellationToken);
+            long prefetchCap = PrefetchCap(reservation);
+            filterIo = TryPrefetch(filterCtx.Ranges, cancellationToken, prefetchCap);
             var outputCtx = await PrepareRowGroupAsync(plan.Index, columns.OutputOnly, cancellationToken).ConfigureAwait(false);
             // Null likewise: the read then starts its own output prefetch, as before #829.
-            outputIo = TryPrefetch(outputCtx.Ranges, cancellationToken);
+            outputIo = TryPrefetch(
+                outputCtx.Ranges, cancellationToken, prefetchCap - (filterIo is null ? 0 : filterCtx.Ranges.Sum(r => r.Length)));
             e = ReadTwoPassAsync(plan, columns, selector, reservation, growth, estimate, cancellationToken, filterIo, outputIo)
                 .GetAsyncEnumerator(cancellationToken);
             while (true)

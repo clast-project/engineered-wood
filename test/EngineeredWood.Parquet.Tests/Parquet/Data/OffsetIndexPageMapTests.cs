@@ -392,7 +392,7 @@ public class OffsetIndexPageMapTests : IDisposable
                 {
                     var located = fromIndex.Pages[p];
                     var resolved = PageMapBuilder.ResolveEntry(
-                        fromIndex, p, chunkBytes.AsSpan(located.Offset, located.CompressedSize), column, meta, out int headerSize);
+                        fromIndex, p, chunkBytes.AsSpan(checked((int)located.Offset), located.CompressedSize), column, meta, out int headerSize);
                     Assert.Equal(scanned.Pages[p], resolved);
                     Assert.Equal(located.Offset + headerSize, resolved.Offset);
                 }

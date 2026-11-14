@@ -29,6 +29,9 @@ internal sealed class ScanReservation
     /// <summary>A reservation that reserves nothing, for a read that is not part of a parallel scan.</summary>
     internal static ScanReservation None { get; } = new(null, 0);
 
+    /// <summary>The cap of the scan this reserves from, or null when it reserves from none.</summary>
+    internal long? BudgetBytes => _budget?.MaxBytes;
+
     /// <summary>A lower bound for every reservation of this unit — for a Parquet file, its largest row
     /// group's uncompressed size over the projected columns; for one row group, that row group's, scaled by
     /// how far decoded batches have exceeded the footer so far.</summary>
@@ -257,6 +260,9 @@ internal sealed class ScanMemoryBudget
         _memory = parent?.CreateChild(maxBytes) ?? new MemoryBudget(maxBytes);
         _gate = _memory.Gate;
     }
+
+    /// <summary>The cap the scan was given.</summary>
+    internal long MaxBytes => _memory.MaxBytes;
 
     /// <summary>Bytes reserved or queued right now.</summary>
     internal long Used => _memory.UsedBytes;

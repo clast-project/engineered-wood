@@ -622,7 +622,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             if (CoversWholeGroup(plan, metadata.RowGroups[plan.Index]))
             {
                 var ctx = await PrepareRowGroupAsync(plan.Index, columnNames, cancellationToken).ConfigureAwait(false);
-                prefetched = TryPrefetch(ctx.Ranges, cancellationToken);
+                prefetched = TryPrefetch(ctx.Ranges, cancellationToken, PrefetchCap(reservation));
             }
 
             // The first batch is sized once the fetch is under way: the OffsetIndexes it may read take a round trip.
@@ -693,15 +693,32 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// large to fetch into a single buffer. Such a chunk can still be read when a batch size and an OffsetIndex
     /// let the read take it in page windows, which a whole-chunk fetch would turn into an overflow.
     /// </summary>
-    private PrefetchedFile? TryPrefetch(IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken)
+    /// <param name="maxTotalBytes">The most all of <paramref name="ranges"/> may take together
+    /// (<see cref="PrefetchCap"/>); past it, null.</param>
+    private PrefetchedFile? TryPrefetch(
+        IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken, long maxTotalBytes = long.MaxValue)
     {
+        long total = 0;
         foreach (var range in ranges)
         {
             if (range.Length > MaxPrefetchRangeBytes)
                 return null;
+            total += range.Length;
         }
+        if (total > maxTotalBytes)
+            return null;
         return new PrefetchedFile(_file, ranges, cancellationToken);
     }
+
+    /// <summary>
+    /// The most a budgeted read prefetches of one row group (#878): its scan's budget, or
+    /// <see cref="UnbudgetedPrefetchMaxBytes"/> when that is larger. A row group whose compressed chunks pass the
+    /// budget is read alone, and fetching it whole would hold all of it, past the budget by however large the
+    /// writer made it (a foreign ~1 GB row group held 866 MiB against a 256 MiB budget). Unprefetched, a read split
+    /// into batches fetches its pages in windows. A read from no scan's budget is not capped.
+    /// </summary>
+    private long PrefetchCap(ScanReservation reservation) =>
+        reservation.BudgetBytes is { } budget ? Math.Max(budget, UnbudgetedPrefetchMaxBytes) : long.MaxValue;
 
     /// <summary>
     /// The Parquet footer's uncompressed and compressed sizes of the column chunks the read decodes in
@@ -1910,8 +1927,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <summary>
     /// Builds the page map of each of a flat row group's columns. Where
     /// <paramref name="useOffsetIndex"/> is set and a chunk has a usable OffsetIndex, the map comes
-    /// from that, so the data pages are not read to find them. Every other chunk is read whole to
-    /// scan its page headers.
+    /// from that, so the data pages are not read to find them. Every other chunk is read to scan its
+    /// page headers: whole, or in windows when it is larger than <see cref="HeaderScanBudgetBytes"/>.
     /// </summary>
     /// <remarks>
     /// The chunks to scan are read together, in requests of up to <see cref="HeaderScanBudgetBytes"/>
@@ -1920,7 +1937,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// would fetch with them (unprojected columns), as its merged buffers hold those too. As long as their total stays within that budget
     /// they are also returned, by column, for the batches to decode from: their pages are already in
     /// hand, and fetching them again read every byte twice. The caller disposes them. A chunk past the
-    /// budget is released once scanned, and its pages are fetched as a column with an index's are.
+    /// budget is released once scanned, and its pages are fetched as a column with an index's are. A chunk
+    /// larger than the budget on its own is never held, so it is scanned in windows of
+    /// <see cref="BatchPageWindowBudgetBytes"/> (<see cref="PageMapBuilder.BuildWindowedAsync"/>): the scan holds one
+    /// window rather than the chunk, which may be too large for one buffer (#878).
     /// </remarks>
     /// <param name="offsetIndexes">
     /// OffsetIndex bytes already read, by the index's file offset, as the page-index filter reads them
@@ -1942,11 +1962,23 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
             // The chunks to scan, in file order rather than the projection's, as a coalescing reader
             // merges them: a request then spans only the gaps between its own chunks, which it counts.
+            // A chunk larger than the budget is never held, so it is scanned in windows rather than read whole: the
+            // scan then holds one window, and a chunk too large for one buffer (#878) can be read at all.
             var toScan = new List<int>();
             for (int i = 0; i < ctx.Count; i++)
             {
-                if (pageMaps[i] is null)
-                    toScan.Add(i);
+                if (pageMaps[i] is not null)
+                    continue;
+                if (ctx.Ranges[i].Length > budget && ctx.Columns[i].MaxRepetitionLevel == 0)
+                {
+                    pageMaps[i] = await PageMapBuilder.BuildWindowedAsync(
+                            file, ctx.Ranges[i], ctx.Columns[i], ctx.Chunks[i].MetaData!,
+                            _options.PageChecksumValidation, _options.MaxPageUncompressedSize,
+                            BatchPageWindowBudgetBytes, cancellationToken)
+                        .ConfigureAwait(false);
+                    continue;
+                }
+                toScan.Add(i);
             }
 
             toScan.Sort((a, b) => ctx.Ranges[a].Offset.CompareTo(ctx.Ranges[b].Offset));

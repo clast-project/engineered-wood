@@ -3,6 +3,7 @@
 
 using System.Buffers;
 using EngineeredWood.Compression;
+using EngineeredWood.IO;
 using EngineeredWood.Parquet.Metadata;
 using EngineeredWood.Parquet.Schema;
 
@@ -13,7 +14,7 @@ namespace EngineeredWood.Parquet.Data;
 /// </summary>
 /// <param name="Ordinal">The page's position among the chunk's data pages (<see cref="Page.Ordinal"/>).</param>
 internal readonly record struct PageMapEntry(
-    int Offset,
+    long Offset,
     int CompressedSize,
     int UncompressedSize,
     int NumValues,
@@ -184,91 +185,276 @@ internal static class PageMapBuilder
         bool validateCrc = false,
         int? maxPageUncompressedSize = null)
     {
-        var pages = new List<PageMapEntry>();
-        DictionaryDecoder? dictionary = null;
-        FsstSymbolTable? symbolTable = null;
-
+        var scan = new Scan(column, columnMeta, validateCrc);
         var reader = new PageReader(data, column, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
-        long valuesRead = 0;
-
         try
         {
-            while (valuesRead < columnMeta.NumValues && reader.TryRead(out var page))
-            {
-                var pageHeader = page.Header;
-                var pageData = page.Payload;
-
-                try
-                {
-                    switch (pageHeader.Type)
-                    {
-                        case PageType.DictionaryPage:
-                            if (validateCrc)
-                                ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                            dictionary?.Dispose(); // a second dictionary page replaces the first
-                            dictionary = ColumnChunkReader.ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
-                            break;
-
-                        case PageType.SymbolTablePage:
-                            if (validateCrc)
-                                ColumnChunkReader.ValidateCrc(pageHeader.Crc, pageData, column);
-                            symbolTable = FsstPageDecoder.ReadSymbolTablePage(pageHeader, pageData, columnMeta);
-                            break;
-
-                        case PageType.DataPage:
-                        case PageType.DataPageV2:
-                        {
-                            // As ColumnChunkReader.ReadColumn does: the map sizes the batch buffers, so a
-                            // page may not claim more values than the chunk's metadata has left.
-                            if (page.NumValues > columnMeta.NumValues - valuesRead)
-                                throw ColumnChunkReader.TooManyValues(column, page, columnMeta.NumValues - valuesRead);
-
-                            var entry = EntryFromHeader(
-                                pageHeader, page.PayloadOffset, pageData, page.Ordinal, column, columnMeta);
-                            pages.Add(entry);
-                            valuesRead += entry.NumValues;
-                            break;
-                        }
-
-                        default:
-                            // Skip index pages and unknown page types
-                            break;
-                    }
-                }
-                catch (Exception ex) when (ColumnChunkReader.IsDecodeFailure(ex))
-                {
-                    // A dictionary, or a V1 page of a repeated column, whose levels are read for its rows.
-                    throw ColumnChunkReader.UndecodablePage(column, pageHeader.Type, page.Ordinal, page.Offset, ex);
-                }
-            }
-
-            if (valuesRead < columnMeta.NumValues)
-                throw ColumnChunkReader.TooFewValues(column, columnMeta.NumValues, valuesRead);
+            while (scan.NeedsMore && reader.TryRead(out var page))
+                scan.Add(page.Header, page.Offset, page.PayloadOffset, page.Payload, page.Ordinal);
+            return scan.Finish();
         }
         catch
         {
-            dictionary?.Dispose();
+            scan.Abandon();
             throw;
         }
+    }
 
-        var pagesArray = pages.ToArray();
-        var cumulativeRows = new int[pagesArray.Length + 1];
-        var cumulativeValues = new int[pagesArray.Length + 1];
-        int totalRows = 0;
-        int totalValues = 0;
+    /// <summary>
+    /// <see cref="Build"/> for a flat column's chunk read from <paramref name="file"/> in windows of
+    /// <paramref name="windowBytes"/>, rather than whole: the scan then holds one window, not the chunk, and a
+    /// chunk too large for one buffer (over 2 GiB on disk) can be scanned at all. A data page's payload is not
+    /// read here, a flat column's rows being its values; a dictionary or symbol-table page's is, from its
+    /// window or, when it runs past it, by a read of its own.
+    /// </summary>
+    /// <param name="chunk">The chunk's bytes in the file.</param>
+    public static async ValueTask<ColumnPageMap> BuildWindowedAsync(
+        IRandomAccessFile file,
+        FileRange chunk,
+        ColumnDescriptor column,
+        ColumnMetaData columnMeta,
+        bool validateCrc,
+        int? maxPageUncompressedSize,
+        long windowBytes,
+        CancellationToken cancellationToken)
+    {
+        if (column.MaxRepetitionLevel > 0)
+            throw new ArgumentException("A windowed header scan reads no payload, so it maps only a flat column.", nameof(column));
+        if (windowBytes <= 0)
+            throw new ArgumentOutOfRangeException(nameof(windowBytes));
 
-        for (int i = 0; i < pagesArray.Length; i++)
+        var scan = new Scan(column, columnMeta, validateCrc);
+        var (chunkUncompressed, maxPage) = PageReader.UncompressedLimits(columnMeta, maxPageUncompressedSize);
+        try
         {
-            cumulativeRows[i] = totalRows;
-            cumulativeValues[i] = totalValues;
-            totalRows += pagesArray[i].NumRows;
-            totalValues += pagesArray[i].NumValues;
-        }
-        cumulativeRows[pagesArray.Length] = totalRows;
-        cumulativeValues[pagesArray.Length] = totalValues;
+            long position = 0;
+            int ordinal = 0;
+            long size = windowBytes;
+            while (scan.NeedsMore && position < chunk.Length)
+            {
+                long length = Math.Min(size, chunk.Length - position);
+                bool last = position + length == chunk.Length;
+                bool canGrow = length < Math.Max(windowBytes, MaxHeaderWindowBytes);
+                long next;
+                SidePage? side;
+                using (var window = await file.ReadAsync(new FileRange(chunk.Offset + position, length), cancellationToken)
+                           .ConfigureAwait(false))
+                {
+                    next = ScanWindow(
+                        scan, window.Memory.Span, position, chunk.Length, last, canGrow, chunkUncompressed, maxPage,
+                        ref ordinal, out side);
+                }
 
-        return new ColumnPageMap(
-            dictionary, symbolTable, pagesArray, cumulativeRows, cumulativeValues, totalRows);
+                if (side is { } page)
+                {
+                    using var payload = await file.ReadAsync(
+                            new FileRange(chunk.Offset + page.PayloadOffset, page.Header.CompressedPageSize),
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    scan.Add(page.Header, page.Offset, page.PayloadOffset, payload.Memory.Span, -1);
+                }
+
+                // A window that did not hold even its first header whole is doubled for the next try.
+                size = next == position ? size * 2 : windowBytes;
+                position = next;
+            }
+
+            return scan.Finish();
+        }
+        catch
+        {
+            scan.Abandon();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// The largest window a windowed scan grows to for one page header (<see cref="BuildWindowedAsync"/>), when its
+    /// windows are smaller. A header that does not decode from this many bytes is taken to be corrupt.
+    /// </summary>
+    private const long MaxHeaderWindowBytes = 16L * 1024 * 1024;
+
+    /// <summary>A dictionary or symbol-table page whose payload a window did not hold: where its header and
+    /// payload start in the chunk, and its header.</summary>
+    private readonly record struct SidePage(long Offset, long PayloadOffset, PageHeader Header);
+
+    /// <summary>
+    /// Walks the headers in one window of a windowed scan (<see cref="BuildWindowedAsync"/>), which starts at a
+    /// header.
+    /// </summary>
+    /// <param name="start">Where the window starts in the chunk.</param>
+    /// <param name="last">Whether the window reaches the chunk's end.</param>
+    /// <param name="canGrow">Whether a larger window may be tried for a header at the window's start.</param>
+    /// <param name="side">
+    /// A side page whose payload runs past the window, for the caller to read and add. The walk stops there.
+    /// </param>
+    /// <returns>Where the next window starts: at the first header the window does not hold whole.</returns>
+    private static long ScanWindow(
+        Scan scan,
+        ReadOnlySpan<byte> window,
+        long start,
+        long chunkLength,
+        bool last,
+        bool canGrow,
+        long chunkUncompressed,
+        int? maxPage,
+        ref int ordinal,
+        out SidePage? side)
+    {
+        side = null;
+        int at = 0;
+        while (scan.NeedsMore && at < window.Length)
+        {
+            long position = start + at;
+            PageHeader header;
+            int headerSize;
+            try
+            {
+                header = PageReader.ReadHeader(
+                    window.Slice(at), position, chunkLength - position, scan.Column, chunkUncompressed, maxPage, ordinal,
+                    out headerSize);
+            }
+            catch (ParquetFormatException) when (!last && (at > 0 || canGrow))
+            {
+                // Most likely a header cut by the window's end: the next window starts with it, and is larger when
+                // this one held nothing before it. A header that fails at the start of the largest window, or of
+                // one that reaches the chunk's end, is not cut, and its error stands.
+                return position;
+            }
+
+            long payloadOffset = position + headerSize;
+            long pageEnd = payloadOffset + header.CompressedPageSize;
+            bool isData = header.Type is PageType.DataPage or PageType.DataPageV2;
+            bool needsPayload = header.Type is PageType.DictionaryPage or PageType.SymbolTablePage;
+            if (needsPayload && pageEnd - start > window.Length)
+            {
+                side = new SidePage(position, payloadOffset, header);
+                return pageEnd;
+            }
+
+            var payload = needsPayload ? window.Slice(at + headerSize, header.CompressedPageSize) : default;
+            scan.Add(header, position, payloadOffset, payload, isData ? ordinal++ : -1);
+            if (pageEnd - start >= window.Length)
+                return pageEnd; // the page's data reaches past the window, which holds no further header
+            at = (int)(pageEnd - start);
+        }
+
+        return start + at;
+    }
+
+    /// <summary>
+    /// The pages of one chunk as a header scan finds them, in file order: what <see cref="Build"/> and
+    /// <see cref="BuildWindowedAsync"/> share. It owns the dictionary until <see cref="Finish"/> hands it to the
+    /// map, or <see cref="Abandon"/> releases it.
+    /// </summary>
+    private sealed class Scan
+    {
+        private readonly ColumnMetaData _meta;
+        private readonly bool _validateCrc;
+        private readonly List<PageMapEntry> _pages = [];
+        private DictionaryDecoder? _dictionary;
+        private FsstSymbolTable? _symbolTable;
+        private long _valuesRead;
+
+        public Scan(ColumnDescriptor column, ColumnMetaData meta, bool validateCrc)
+        {
+            Column = column;
+            _meta = meta;
+            _validateCrc = validateCrc;
+        }
+
+        public ColumnDescriptor Column { get; }
+
+        /// <summary>Whether the chunk's metadata promises values not yet found.</summary>
+        public bool NeedsMore => _valuesRead < _meta.NumValues;
+
+        /// <summary>
+        /// Adds a page. <paramref name="payload"/> is read only for a side page, or a V1 data page of a repeated
+        /// column, whose levels count its rows.
+        /// </summary>
+        public void Add(PageHeader header, long offset, long payloadOffset, ReadOnlySpan<byte> payload, int ordinal)
+        {
+            try
+            {
+                switch (header.Type)
+                {
+                    case PageType.DictionaryPage:
+                        if (_validateCrc)
+                            ColumnChunkReader.ValidateCrc(header.Crc, payload, Column);
+                        _dictionary?.Dispose(); // a second dictionary page replaces the first
+                        _dictionary = ColumnChunkReader.ReadDictionaryPage(header, payload, Column, _meta);
+                        break;
+
+                    case PageType.SymbolTablePage:
+                        if (_validateCrc)
+                            ColumnChunkReader.ValidateCrc(header.Crc, payload, Column);
+                        _symbolTable = FsstPageDecoder.ReadSymbolTablePage(header, payload, _meta);
+                        break;
+
+                    case PageType.DataPage:
+                    case PageType.DataPageV2:
+                    {
+                        // As ColumnChunkReader.ReadColumn does: the map sizes the batch buffers, so a
+                        // page may not claim more values than the chunk's metadata has left.
+                        int values = header.Type == PageType.DataPage
+                            ? header.DataPageHeader!.NumValues
+                            : header.DataPageHeaderV2!.NumValues;
+                        if (values > _meta.NumValues - _valuesRead)
+                        {
+                            throw ColumnChunkReader.TooManyValues(
+                                Column, ordinal, offset, values, _meta.NumValues - _valuesRead);
+                        }
+
+                        var entry = EntryFromHeader(header, payloadOffset, payload, ordinal, Column, _meta);
+                        _pages.Add(entry);
+                        _valuesRead += entry.NumValues;
+                        break;
+                    }
+
+                    default:
+                        // Skip index pages and unknown page types
+                        break;
+                }
+            }
+            catch (Exception ex) when (ColumnChunkReader.IsDecodeFailure(ex))
+            {
+                // A dictionary, or a V1 page of a repeated column, whose levels are read for its rows.
+                throw ColumnChunkReader.UndecodablePage(Column, header.Type, ordinal, offset, ex);
+            }
+        }
+
+        public ColumnPageMap Finish()
+        {
+            if (NeedsMore)
+                throw ColumnChunkReader.TooFewValues(Column, _meta.NumValues, _valuesRead);
+
+            var pagesArray = _pages.ToArray();
+            var cumulativeRows = new int[pagesArray.Length + 1];
+            var cumulativeValues = new int[pagesArray.Length + 1];
+            int totalRows = 0;
+            int totalValues = 0;
+
+            for (int i = 0; i < pagesArray.Length; i++)
+            {
+                cumulativeRows[i] = totalRows;
+                cumulativeValues[i] = totalValues;
+                totalRows += pagesArray[i].NumRows;
+                totalValues += pagesArray[i].NumValues;
+            }
+            cumulativeRows[pagesArray.Length] = totalRows;
+            cumulativeValues[pagesArray.Length] = totalValues;
+
+            var map = new ColumnPageMap(
+                _dictionary, _symbolTable, pagesArray, cumulativeRows, cumulativeValues, totalRows);
+            _dictionary = null;
+            return map;
+        }
+
+        public void Abandon()
+        {
+            _dictionary?.Dispose();
+            _dictionary = null;
+        }
     }
 
     /// <summary>
@@ -567,7 +753,7 @@ internal static class PageMapBuilder
     /// </summary>
     private static PageMapEntry EntryFromHeader(
         PageHeader pageHeader,
-        int pageDataOffset,
+        long pageDataOffset,
         ReadOnlySpan<byte> pageData,
         int ordinal,
         ColumnDescriptor column,

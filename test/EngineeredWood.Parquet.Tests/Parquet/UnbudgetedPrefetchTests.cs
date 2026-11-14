@@ -139,6 +139,95 @@ public class UnbudgetedPrefetchTests : IDisposable
         Assert.True(expected.Requests >= Rows / BatchRows, $"{expected.Requests} requests");
     }
 
+    /// <summary>
+    /// A budgeted read (several row groups at once) prefetches a row group whole only within its scan's budget
+    /// (#878): one over it is read alone, and fetched whole it was held past the budget by its full size.
+    /// </summary>
+    [Fact]
+    public async Task Budgeted_ChunksOverTheBudget_StayInPageWindows()
+    {
+        var (requests, groupBytes) = await ReadTwoGroupsAsync(budget: g => g - 1, prefetchCap: 1);
+        Assert.True(requests >= Rows / BatchRows, $"{requests} requests for the first row group");
+        Assert.True(groupBytes > 0);
+    }
+
+    [Fact]
+    public async Task Budgeted_ChunksWithinTheBudget_AreFetchedWhole()
+    {
+        var (requests, _) = await ReadTwoGroupsAsync(budget: g => 2 * g, prefetchCap: 1);
+        Assert.Equal(1, requests);
+    }
+
+    /// <summary>A budget smaller than <see cref="ParquetFileReader.UnbudgetedPrefetchMaxBytes"/> does not stop a
+    /// prefetch the read with no budget would make.</summary>
+    [Fact]
+    public async Task Budgeted_TheUnbudgetedCapIsAFloor()
+    {
+        var (requests, _) = await ReadTwoGroupsAsync(budget: _ => 1, prefetchCap: long.MaxValue);
+        Assert.Equal(1, requests);
+    }
+
+    /// <summary>
+    /// Reads a copy of the fixture written as two row groups, two at once under a budget of
+    /// <paramref name="budget"/> (given the first group's chunk bytes), and returns the requests that fetched the
+    /// first group's chunks, with those bytes.
+    /// </summary>
+    private async Task<(int Requests, long GroupBytes)> ReadTwoGroupsAsync(Func<long, long> budget, long prefetchCap)
+    {
+        string path = Path.Combine(_tempDir, "two-groups.parquet");
+        if (!File.Exists(path))
+        {
+            await using var source = new LocalRandomAccessFile(_path);
+            using var whole = new ParquetFileReader(source, ownsFile: false);
+            var batches = new List<RecordBatch>();
+            await foreach (var b in whole.ReadAllAsync())
+                batches.Add(b);
+            using var output = new LocalSequentialFile(path);
+            using (var writer = new ParquetFileWriter(output, ownsFile: false,
+                       ParquetWriteOptions.Default with { DataPageRowCountLimit = 250 }))
+            {
+                foreach (var b in batches)
+                {
+                    await writer.WriteRowGroupAsync(b);
+                    await writer.WriteRowGroupAsync(b);
+                    b.Dispose();
+                }
+                await writer.CloseAsync();
+            }
+        }
+
+        await using var local = new LocalRandomAccessFile(path);
+        var file = new RecordingFile(local, hint: null);
+        long start, end;
+        using (var probe = new ParquetFileReader(local, ownsFile: false))
+        {
+            var chunks = (await probe.ReadMetadataAsync()).RowGroups[0].Columns.Select(c => c.MetaData!).ToList();
+            start = chunks.Min(c => c.DictionaryPageOffset is long d and > 0 ? Math.Min(d, c.DataPageOffset) : c.DataPageOffset);
+            end = chunks.Max(c => (c.DictionaryPageOffset is long d and > 0 ? Math.Min(d, c.DataPageOffset) : c.DataPageOffset) + c.TotalCompressedSize);
+        }
+
+        var options = new ParquetReadOptions
+        {
+            MaxConcurrentRowGroups = 2, BatchSize = BatchRows, MaxBufferedReadBytes = budget(end - start),
+        };
+        using var reader = new ParquetFileReader(file, ownsFile: false, options)
+        {
+            BatchPageWindowBudgetBytes = 1, UnbudgetedPrefetchMaxBytes = prefetchCap,
+        };
+        await reader.ReadMetadataAsync();
+        file.Clear();
+        long rows = 0;
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            rows += batch.Length;
+            batch.Dispose();
+        }
+
+        Assert.Equal(2L * Rows, rows);
+        int requests = file.Requests.Count(request => request.Any(r => Overlap(r, start, end) > 0));
+        return (requests, end - start);
+    }
+
     [Fact]
     public async Task ChunksOverTheCap_StayInPageWindows()
     {
