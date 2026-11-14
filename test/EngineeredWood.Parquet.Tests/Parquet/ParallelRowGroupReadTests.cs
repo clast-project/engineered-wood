@@ -1212,6 +1212,60 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.True(next >= largest, $"the next row group reserves {next}, its first pass decodes {largest}");
     }
 
+    /// <summary>
+    /// In a group a batch size splits, a returned predicate column is read by both passes (#652), so both passes'
+    /// prefetched chunks hold it: the hold counts it twice (#873 review).
+    /// </summary>
+    [Fact]
+    public async Task ASplitTwoPassRead_HoldsBothPassesChunks_WhenTheyShareAColumn()
+    {
+        string path = await WriteKeysAndValuesAsync("two-pass-overlap", i => i % 10);
+        var predicate = KeyPredicate(k => k < 3, false);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 3_000 })
+        {
+            TwoPassReads = true,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long filter = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k"], null).Compressed;
+        long output = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k", "v"], null).Compressed;
+
+        var (returned, _, peak, used) = await ReadTwoPassUnitAsync(reader, predicate, returnPredicateColumn: true);
+        Assert.Equal(KeyRows * 3 / 10, returned);
+        Assert.True(peak >= filter + output, $"peak {peak}: both prefetches ({filter} + {output}) were not counted");
+        Assert.Equal(0, used);
+    }
+
+    /// <summary>
+    /// A split group whose selected rows fit one batch decodes its second pass as one batch that keeps them, and that
+    /// decode builds its columns at the whole group's size first: held for the pass beyond the batch-sized
+    /// reservation, then let go (#873 review).
+    /// </summary>
+    [Fact]
+    public async Task ASplitTwoPassRead_HoldsTheWholeGroupDecode_WhenItKeepsRowsInOneBatch()
+    {
+        string path = await WriteKeysAndValuesAsync("two-pass-keep-split", i => i % 10);
+        // 4,000 rows selected, a row in every block: dense, and within one 5,000-row batch.
+        var predicate = KeyPredicate(k => k < 1, false);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 5_000 })
+        {
+            TwoPassReads = true,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long chunks = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k"], null).Compressed
+                      + ParquetFileReader.PlannedBytes(group, parquetSchema, ["k", "v"], null).Compressed;
+        long wholeDecode = reader.DecodedBytes(group, parquetSchema, ["k", "v"], null);
+
+        var (returned, _, peak, used) = await ReadTwoPassUnitAsync(reader, predicate, returnPredicateColumn: true);
+        Assert.Equal(KeyRows / 10, returned);
+        Assert.True(peak >= chunks + wholeDecode,
+            $"peak {peak}: the chunks ({chunks}) and the whole-group decode ({wholeDecode}) were not both counted");
+        Assert.Equal(0, used);
+    }
+
     private const int KeyRows = 40_000;
 
     // A Boolean column's values and validity, as TwoPassFirstBatchBytes sizes answers.
