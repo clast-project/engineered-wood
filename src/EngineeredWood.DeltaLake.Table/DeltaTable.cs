@@ -271,9 +271,28 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// wherever a whole file is read through the reader's own loop. A scan schedules each file's row groups
     /// itself (#612), within the table's one window and budget, and <c>ReadRowsAsync</c> reads several FILES at
     /// once; a row-group window inside each file would multiply both the reads and the memory held.</para>
+    /// <para>A read with neither <see cref="ParquetReadOptions.BatchSize"/> nor
+    /// <see cref="ParquetReadOptions.MaxBatchByteSize"/> set is cut into batches of
+    /// <see cref="DefaultReadBatchSize"/> rows (#652): one batch per row group held a whole row group decoded at once
+    /// (about 2 GB for 6M lineitem rows) and could pass Arrow's 2 GB limit for one array.</para>
     /// </summary>
-    private static ParquetReadOptions DataFileReadOptions(ParquetReadOptions options) =>
-        WithVariantExtension(options) with { DecimalOutput = DecimalOutputKind.Decimal128, MaxConcurrentRowGroups = 1 };
+    private static ParquetReadOptions DataFileReadOptions(ParquetReadOptions options)
+    {
+        var read = WithVariantExtension(options) with { DecimalOutput = DecimalOutputKind.Decimal128, MaxConcurrentRowGroups = 1 };
+        return read.BatchSize is null && read.MaxBatchByteSize is null ? read with { BatchSize = DefaultReadBatchSize } : read;
+    }
+
+    /// <summary>
+    /// The rows of a data file's batches when <see cref="DeltaTableOptions.ParquetReadOptions"/> sets no batch limit.
+    /// </summary>
+    /// <remarks>
+    /// Measured (#652: 12M lineitem rows in row groups of 1M and 6M rows, local disk and a simulated object store,
+    /// at the default reads in flight): against one batch per row group, 262,144 rows is within noise on local
+    /// disk, 15-20% faster for full scans from an object store, and 4-10% slower on 6M-row groups, while the scan
+    /// holds 3-10x less (198 MiB rather than 2 GiB on 6M-row groups). 122,880 rows cost 15-30% more on local disk
+    /// for narrow and filtered scans; 1M rows held twice as much and lost the object-store gain.
+    /// </remarks>
+    internal const int DefaultReadBatchSize = 262_144;
 
     private sealed record StatsSelectionEntry(
         Schema.StructType Schema, MetadataAction Metadata, Stats.StatsColumnSelection Selection);
