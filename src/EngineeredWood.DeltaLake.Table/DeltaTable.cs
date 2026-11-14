@@ -11146,8 +11146,9 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
     /// </summary>
     internal ParquetReadOptions ChangeFileRewriteReadOptions => new()
     {
-        BatchSize = _options.ParquetReadOptions.BatchSize,
-        MaxBatchByteSize = _options.ParquetReadOptions.MaxBatchByteSize,
+        // The data-file reads' batching, the default row limit included (#874 review round 2).
+        BatchSize = _dataFileReadOptions.BatchSize,
+        MaxBatchByteSize = _dataFileReadOptions.MaxBatchByteSize,
     };
 
     private static Int64Array MoveInsertRowIds(

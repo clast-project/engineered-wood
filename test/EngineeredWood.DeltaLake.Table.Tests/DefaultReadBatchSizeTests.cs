@@ -88,6 +88,25 @@ public class DefaultReadBatchSizeTests : IDisposable
         Assert.Equal([DeltaTable.DefaultReadBatchSize, 100_000], sizes);
     }
 
+    /// <summary>The change-file rewrite (a CDF row-id rebase) reads with the data files' batching, the default row
+    /// limit included (#874 review round 2).</summary>
+    [Theory]
+    [InlineData(null, null, DeltaTable.DefaultReadBatchSize, null)]
+    [InlineData(100_000, null, 100_000, null)]
+    [InlineData(null, 1L << 20, null, 1L << 20)]
+    public async Task TheChangeFileRewrite_ReadsWithTheDataFilesBatching(
+        int? batchSize, long? maxBytes, int? expectedRows, long? expectedBytes)
+    {
+        await CreateAsync();
+        await using var table = await DeltaTable.OpenAsync(Fs, new DeltaTableOptions
+        {
+            ParquetReadOptions = ParquetReadOptions.Default with { BatchSize = batchSize, MaxBatchByteSize = maxBytes },
+        });
+        var options = table.ChangeFileRewriteReadOptions;
+        Assert.Equal(expectedRows, options.BatchSize);
+        Assert.Equal(expectedBytes, options.MaxBatchByteSize);
+    }
+
     [Fact]
     public async Task AnExplicitBatchSize_IsKept()
     {
