@@ -176,6 +176,20 @@ public class UnbudgetedPrefetchTests : IDisposable
         Assert.Equal(1, requests);
     }
 
+    /// <summary>
+    /// A two-pass read whose output chunk is too large for one buffer reads it in page windows, budgeted or not: it
+    /// fell back to fetching it whole, which a chunk over 2 GiB cannot be (#882 review).
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task TwoPass_AnOutputChunkTooLargeForOneBuffer_StaysInPageWindows(bool budgeted)
+    {
+        var (requests, _) = await ReadTwoGroupsAsync(
+            budget: g => budgeted ? 2 * g : null, prefetchCap: long.MaxValue, twoPass: true, maxRangeBytes: 1);
+        Assert.True(requests >= Rows / BatchRows, $"{requests} requests for the first group's output column");
+    }
+
     /// <summary>A budget smaller than <see cref="ParquetFileReader.UnbudgetedPrefetchMaxBytes"/> does not stop a
     /// prefetch the read with no budget would make.</summary>
     [Fact]
@@ -187,11 +201,11 @@ public class UnbudgetedPrefetchTests : IDisposable
 
     /// <summary>
     /// Reads a copy of the fixture written as two row groups, two at once under a budget of
-    /// <paramref name="budget"/> (given the first group's chunk bytes), and returns the requests that fetched the
+    /// <paramref name="budget"/> (given the first group's chunk bytes; null reads one group at a time, unbudgeted), and returns the requests that fetched the
     /// first group's chunks, with those bytes.
     /// </summary>
     private async Task<(int Requests, long GroupBytes)> ReadTwoGroupsAsync(
-        Func<long, long> budget, long prefetchCap, bool twoPass = false)
+        Func<long, long?> budget, long prefetchCap, bool twoPass = false, long? maxRangeBytes = null)
     {
         string path = Path.Combine(_tempDir, "two-groups.parquet");
         if (!File.Exists(path))
@@ -232,10 +246,10 @@ public class UnbudgetedPrefetchTests : IDisposable
             }
         }
 
-        var options = new ParquetReadOptions
-        {
-            MaxConcurrentRowGroups = 2, BatchSize = BatchRows, MaxBufferedReadBytes = budget(end - start),
-        };
+        // No budget: one row group at a time, which reads with no scan reservation.
+        var options = budget(end - start) is long bytes
+            ? new ParquetReadOptions { MaxConcurrentRowGroups = 2, BatchSize = BatchRows, MaxBufferedReadBytes = bytes }
+            : new ParquetReadOptions { MaxConcurrentRowGroups = 1, BatchSize = BatchRows };
         using var reader = new ParquetFileReader(file, ownsFile: false, options)
         {
             BatchPageWindowBudgetBytes = 1, UnbudgetedPrefetchMaxBytes = prefetchCap,
@@ -248,7 +262,11 @@ public class UnbudgetedPrefetchTests : IDisposable
             reader.HeaderScanBudgetBytes = 1;
         }
         else
+        {
             (countStart, countEnd) = (start, end);
+        }
+        if (maxRangeBytes is long max)
+            reader.MaxPrefetchRangeBytes = max;
         await reader.ReadMetadataAsync();
         file.Clear();
         long rows = 0;

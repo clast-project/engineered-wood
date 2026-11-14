@@ -194,9 +194,9 @@ public sealed partial class ParquetFileReader
     /// Not disposed here.</param>
     /// <param name="outputIo">The output columns' chunks fetched ahead, or null to start fetching them here. Not
     /// disposed here.</param>
-    /// <param name="prefetchOutput">False when <paramref name="outputIo"/> is null because the chunks pass the scan's
-    /// prefetch cap: the second pass then reads them through the file, in page windows, rather than whole (#882
-    /// review).</param>
+    /// <param name="prefetchOutput">False when the caller declined to prefetch the output chunks (see
+    /// <see cref="TryPrefetch"/>): the second pass then reads them through the file, in page windows, rather than
+    /// whole (#882 review).</param>
     private async IAsyncEnumerable<SelectedRecordBatch> ReadTwoPassAsync(
         RowGroupPlan plan,
         TwoPassColumns columns,
@@ -212,8 +212,9 @@ public sealed partial class ParquetFileReader
     {
         var outputCtx = await PrepareRowGroupAsync(plan.Index, columns.OutputOnly, cancellationToken).ConfigureAwait(false);
         int groupRows = outputCtx.RowCount;
+        // Unprefetched when a chunk is too large for one buffer: a >2 GiB chunk could not be fetched whole (#882 review).
         await using var ownPrefetch = outputIo is null && prefetchOutput
-            ? new PrefetchedFile(_file, outputCtx.Ranges, cancellationToken)
+            ? TryPrefetch(outputCtx.Ranges, cancellationToken)
             : null;
         IRandomAccessFile prefetched = outputIo ?? ownPrefetch ?? _file;
 
@@ -620,14 +621,13 @@ public sealed partial class ParquetFileReader
             long prefetchCap = PrefetchCap(reservation);
             filterIo = TryPrefetch(filterCtx.Ranges, cancellationToken, prefetchCap);
             var outputCtx = await PrepareRowGroupAsync(plan.Index, columns.OutputOnly, cancellationToken).ConfigureAwait(false);
-            // Null likewise: the read then starts its own output prefetch, as before #829.
+            // Null likewise, or past what remains of the cap: the second pass then reads them in page windows, never
+            // whole after all (#882 review).
             long outputCap = prefetchCap - (filterIo is null ? 0 : filterCtx.Ranges.Sum(r => r.Length));
             outputIo = TryPrefetch(outputCtx.Ranges, cancellationToken, outputCap);
-            // Over the cap, the second pass must not fetch them whole after all (#882 review).
-            bool prefetchOutput = outputIo is not null || outputCtx.Ranges.Sum(r => r.Length) <= outputCap;
             e = ReadTwoPassAsync(
                     plan, columns, selector, reservation, growth, estimate, cancellationToken, filterIo, outputIo,
-                    prefetchOutput)
+                    prefetchOutput: false)
                 .GetAsyncEnumerator(cancellationToken);
             while (true)
             {

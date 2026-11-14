@@ -685,8 +685,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         plan.Ranges is null
         || (plan.Ranges.Count == 1 && plan.Ranges[0].Start == 0 && plan.Ranges[0].End == rowCount);
 
-    /// <summary>The largest byte array .NET allocates (<c>Array.MaxLength</c>, which .NET Framework lacks).</summary>
-    private const long MaxPrefetchRangeBytes = 0x7FFFFFC7;
+    /// <summary>The largest range prefetched into one buffer: the largest byte array .NET allocates
+    /// (<c>Array.MaxLength</c>, which .NET Framework lacks). Settable for tests.</summary>
+    internal long MaxPrefetchRangeBytes { get; set; } = 0x7FFFFFC7;
 
     /// <summary>
     /// Starts fetching <paramref name="ranges"/> ahead of their decode (#829), or returns null when one is too
