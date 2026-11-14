@@ -907,7 +907,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
         // As ReadBatchesAsync decides: a read of the whole group in one batch is sized by DecodedBytes, and one with
         // no batch limit set over a chunk too large for Arrow scans its headers rather than reading an index.
-        if (batchSize is not > 0 && maxBytes is not > 0 && HasChunkOverArrowLimit(ctx))
+        if (maxBytes is not > 0 && HasChunkOverArrowLimit(ctx, batchSize))
             return (null, null);
         bool fitsInOneBatch = CoversWholeGroup(plan, ctx.RowCount);
         if (batchSize is > 0 && ctx.RowCount > batchSize.Value)
@@ -1282,10 +1282,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // failure into a success. Nested columns are excluded because the nested path decodes the whole
         // row group before slicing, so splitting does not help them (issue #157) — they still get the
         // NotSupportedException, which says so.
+        //
+        // A row limit with no byte limit (a Delta table's default, #874) engages it too when a batch's share of
+        // the chunk is still over the limit: the rows alone would return an array too large to build. Where the
+        // row limit already brings each batch's share under it, nothing changes.
         bool implicitBudget = false;
-        if (batchSize is not > 0 && maxBytes is not > 0
+        if (maxBytes is not > 0
             && !ctx.HasNestedColumns
-            && HasChunkOverArrowLimit(ctx))
+            && HasChunkOverArrowLimit(ctx, batchSize))
         {
             maxBytes = ImplicitLargeChunkBatchBytes;
             implicitBudget = true;
@@ -1854,13 +1858,18 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// changes nothing about the data. Nothing REFUSES on this estimate; the refusal is made by the
     /// decoder, which counts the actual bytes.
     /// </remarks>
-    private static bool HasChunkOverArrowLimit(RowGroupContext ctx)
+    /// <param name="batchSize">A row limit on batches, or null: with one that splits the group, whether a batch's
+    /// share of a chunk (its rows' share of the group's) is over the limit. A row limit set without a byte limit,
+    /// as a Delta table's default is (#874 review), then still has an oversized chunk split by bytes, where the rows
+    /// alone would leave a batch too large for one array.</param>
+    private static bool HasChunkOverArrowLimit(RowGroupContext ctx, int? batchSize = null)
     {
+        double share = batchSize is int rows && rows > 0 && rows < ctx.RowCount ? (double)rows / ctx.RowCount : 1.0;
         for (int i = 0; i < ctx.Count; i++)
         {
             var meta = ctx.Chunks[i].MetaData!;
             if (meta.Type == PhysicalType.ByteArray
-                && meta.TotalUncompressedSize > Data.ByteArrayCapacity.MaxBytes)
+                && meta.TotalUncompressedSize * share > Data.ByteArrayCapacity.MaxBytes)
             {
                 return true;
             }

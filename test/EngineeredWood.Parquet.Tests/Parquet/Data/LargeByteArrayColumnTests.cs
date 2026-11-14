@@ -181,6 +181,45 @@ public class LargeByteArrayColumnTests
         }
     }
 
+    // A row limit alone (a Delta table's default, 262,144 rows, with no byte limit) must not switch the split off
+    // (#874 review): 2,200 rows fit the limit, so the rows alone would return the 2.2 GiB chunk as one array. A row
+    // limit that already brings each batch under the limit is left as it is: 1,000 rows of 1 MiB fit.
+    [Fact]
+    public async Task FlatOversizedChunk_IsSplitUnderARowLimitThatLeavesABatchTooLarge()
+    {
+        string path = Path.Combine(
+            Path.GetTempPath(), "ew-big-flat-" + Guid.NewGuid().ToString("N")[..8] + ".parquet");
+        try
+        {
+            long written = WriteOversizedFlatColumn(path);
+
+            var large = await ReadBatchRowsAsync(path, batchSize: 262_144);
+            Assert.True(large.Count > 1, $"expected the chunk to be split, got {large.Count} batch(es)");
+            Assert.Equal(ValueCount, large.Sum());
+
+            var fitting = await ReadBatchRowsAsync(path, batchSize: 1_000);
+            Assert.Equal([1_000, 1_000, 200], fitting);
+            Assert.True(written > 0);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    private static async Task<List<int>> ReadBatchRowsAsync(string path, int batchSize)
+    {
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = batchSize });
+        var rows = new List<int>();
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            rows.Add(batch.Length);
+            batch.Dispose();
+        }
+        return rows;
+    }
+
     // The single-batch API cannot split, so it refuses — with the message issue #157 asked for.
     //
     // It refuses from the DECODER, having counted the actual bytes, not from a metadata estimate. An
