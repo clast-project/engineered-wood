@@ -503,6 +503,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         IRandomAccessFile? io = null)
     {
         var ranges = plan.Ranges;
+        PrefetchedFile? prefetched = io is null
+            ? await TryPrefetchUnbudgetedAsync(plan, columnNames, cancellationToken).ConfigureAwait(false)
+            : null;
+        io ??= prefetched;
 
         // Batches follow the ranges in order and never span the gap between two, so a cursor over
         // the ranges places each one: its first row is the cursor, and the cursor moves on to the
@@ -514,16 +518,66 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         // the single-batch read itself when there is nothing to split, and it is where the implicit
         // cap for an over-sized chunk is decided. Routing around it here would put that decision in
         // two places and leave ReadAllAsync unable to read a file ReadRowGroupBatchesAsync can.
-        await foreach (var batch in ReadBatchesAsync(
-                               plan.Index, columnNames, ranges, plan.OffsetIndexes, cancellationToken, io: io,
-                               answers: answers)
-            .ConfigureAwait(false))
+        try
         {
-            yield return new PositionedRecordBatch(batch, plan.GroupStart + cursor);
-            cursor += batch.Length;
-            if (ranges is not null && cursor == ranges[range].End && range + 1 < ranges.Count)
-                cursor = ranges[++range].Start;
+            await foreach (var batch in ReadBatchesAsync(
+                                   plan.Index, columnNames, ranges, plan.OffsetIndexes, cancellationToken, io: io,
+                                   answers: answers)
+                .ConfigureAwait(false))
+            {
+                yield return new PositionedRecordBatch(batch, plan.GroupStart + cursor);
+                cursor += batch.Length;
+                if (ranges is not null && cursor == ranges[range].End && range + 1 < ranges.Count)
+                    cursor = ranges[++range].Start;
+            }
         }
+        finally
+        {
+            if (prefetched is not null)
+                await prefetched.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// The most compressed bytes a read with no scan budget fetches whole ahead of a batched decode
+    /// (<see cref="TryPrefetchUnbudgetedAsync"/>). Above it, the read keeps to page windows of
+    /// <see cref="BatchPageWindowBudgetBytes"/>, so a foreign row group of a gigabyte on disk is not held whole.
+    /// </summary>
+    internal const long DefaultUnbudgetedPrefetchMaxBytes = 128L * 1024 * 1024;
+
+    /// <summary><see cref="DefaultUnbudgetedPrefetchMaxBytes"/>, settable for tests.</summary>
+    internal long UnbudgetedPrefetchMaxBytes { get; set; } = DefaultUnbudgetedPrefetchMaxBytes;
+
+    /// <summary>
+    /// For a read with no scan budget (one row group at a time), the row group's chunks fetched whole and at once,
+    /// as a budgeted read fetches them (#843), when the batches would otherwise come from page windows: the file is an
+    /// object store's (it gives a <see cref="IReadConcurrencyHint"/>), the read covers the whole group, a batch limit
+    /// splits it, and the projected chunks fit <see cref="UnbudgetedPrefetchMaxBytes"/>. Windows fetched one after
+    /// another cost a round trip each, and a coalescing reader merged each window's per-column pages across the
+    /// columns' later pages, which later windows fetched again (#652: 487 MiB read for 259). Compressed chunks are a
+    /// fraction of what the group decodes to, so holding them keeps what batching saves. Null otherwise.
+    /// </summary>
+    private async ValueTask<PrefetchedFile?> TryPrefetchUnbudgetedAsync(
+        RowGroupPlan plan, IReadOnlyList<string>? columnNames, CancellationToken cancellationToken)
+    {
+        if (_file is not IReadConcurrencyHint { PreferredConcurrentReads: >= 1 })
+            return null;
+        if (_options.MaxBatchByteSize is null && (_options.BatchSize is not int size || size <= 0))
+            return null;
+
+        var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+        var rowGroup = metadata.RowGroups[plan.Index];
+        if (!CoversWholeGroup(plan, rowGroup))
+            return null;
+        if (_options.MaxBatchByteSize is null && !SplitsGroup(rowGroup.NumRows))
+            return null;
+
+        var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+        if (PlannedBytes(rowGroup, schema, columnNames, plan.Ranges).Compressed > UnbudgetedPrefetchMaxBytes)
+            return null;
+
+        var ctx = await PrepareRowGroupAsync(plan.Index, columnNames, cancellationToken).ConfigureAwait(false);
+        return TryPrefetch(ctx.Ranges, cancellationToken);
     }
 
     /// <summary>
@@ -3645,11 +3699,22 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </summary>
     internal long MembershipPrefetchBudgetBytes { get; set; } = MembershipPrefetch.DefaultBudgetBytes;
 
+    private long? _batchPageWindowBudgetBytes;
+
     /// <summary>
-    /// How many compressed bytes one request for the pages of a row group's batches may ask for. Tests
-    /// lower it to make a read span several windows.
+    /// How many compressed bytes one request for the pages of a row group's batches may ask for:
+    /// <see cref="BatchPageWindow.ObjectStoreBudgetBytes"/> from a file that gives a concurrency hint (an object
+    /// store's), else <see cref="BatchPageWindow.DefaultBudgetBytes"/>. Tests lower it to make a read span several
+    /// windows.
     /// </summary>
-    internal long BatchPageWindowBudgetBytes { get; set; } = BatchPageWindow.DefaultBudgetBytes;
+    internal long BatchPageWindowBudgetBytes
+    {
+        get => _batchPageWindowBudgetBytes
+            ?? (_file is IReadConcurrencyHint { PreferredConcurrentReads: >= 1 }
+                ? BatchPageWindow.ObjectStoreBudgetBytes
+                : BatchPageWindow.DefaultBudgetBytes);
+        set => _batchPageWindowBudgetBytes = value;
+    }
 
     /// <summary>The read-ahead for each membership source the options turn on.</summary>
     private readonly record struct Prefetches(MembershipPrefetch? Dictionary, MembershipPrefetch? BloomFilter);

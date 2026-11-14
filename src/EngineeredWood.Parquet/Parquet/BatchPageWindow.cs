@@ -30,6 +30,15 @@ internal sealed class BatchPageWindow : IDisposable
     /// </remarks>
     internal const long DefaultBudgetBytes = 8L * 1024 * 1024;
 
+    /// <summary>The window budget for a file from an object store (one that gives a concurrency hint).</summary>
+    /// <remarks>
+    /// Measured (#652, 12M lineitem rows in 6M-row groups of 128 MiB compressed, read one row group at a time over a
+    /// simulated store of 20 ms per GET and 100 MB/s per request, 122,880-row batches): 8 MiB windows took 3.07 s in
+    /// 758 GETs, 32 MiB 1.74 s in 152, against 1.85 s unbatched; the windows held 387 MiB at peak against 2 GiB
+    /// unbatched. Local disk keeps <see cref="DefaultBudgetBytes"/>, where 32 MiB cost 3-6% (above).
+    /// </remarks>
+    internal const long ObjectStoreBudgetBytes = 32L * 1024 * 1024;
+
     /// <summary>
     /// How many ranges one window may ask for, unless a single batch needs more. A coalescing reader
     /// issues a GET per range it cannot merge, all at once; this bounds how many, as
