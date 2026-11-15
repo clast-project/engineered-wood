@@ -456,6 +456,23 @@ Locally, two passes now beat one at almost every selectivity. The exceptions:
 
 Two passes are still the default only on object storage (§13), decided before this phase with a note to revisit. Locally they now win nearly everywhere; see the table above.
 
+### Memory: what a keep-rows decode holds (#880, #886, 2026-11-15)
+
+A keep-rows decode builds its columns for the kept rows plus its largest page, not for every row of the group (#880). When a batch size splits the group, the second pass holds budget for that decode (#873). The hold for each output column is the largest of:
+- its decoded size, scaled to the kept rows plus the page with the most rows;
+- its decoded size, scaled to the kept rows, plus its largest page by uncompressed bytes, at the column's average ratio of decoded to encoded bytes;
+- what its build state allocates before decoding (`ColumnBuildState.StartingBytes`: 32 bytes a slot for string data, plus offsets, views and levels).
+
+It then adds the dictionary page's uncompressed bytes, since a dictionary is decoded whole however few rows are kept.
+
+The page sizes come from the headers of the chunks fetched ahead, which the decode reads next anyway. Two kinds of column are held at their whole decoded size instead:
+- a column that was not fetched ahead (its headers would cost a read);
+- a chunk encoded with DELTA_BYTE_ARRAY or FSST, whose pages can decode to far more than their bytes suggest.
+
+**Not covered:** the decoders' scratch memory, such as decompression buffers, page buffers and the decoders' own temporaries. That is about a page for each read in flight. It is reserved nowhere, and whole-group reads leave it out too. Nor is the overshoot from a string buffer's doubling growth, where the old and new buffers are briefly live together (#888).
+
+`KeepRowsHoldAllocationTests` reads ten kinds of column (nullable, boolean, fixed-length, short and long strings in all three output kinds, uneven pages, shared prefixes, a large dictionary), each fetched ahead and not. It checks that the native memory the read allocates, plus any pooled dictionary, stays within the budget it reserved for decoding. The budget is not charged as buffers grow: a decode runs synchronously and cannot wait for room partway through a page, so a charge there could only overdraw the budget, not limit it.
+
 ## 16. Phase 3a: exact Delta scans (2026-11-09)
 
 Phase 3 is split in three: **3a**, exact scans (this); **3b**, host row masks (`RowMasks`); **3c**, DELETE through a positions-only selected read.
