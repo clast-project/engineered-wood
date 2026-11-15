@@ -44,7 +44,7 @@ public sealed class KeepRowsHoldAllocationTests : IDisposable
         string[] columns =
         [
             "int32-nullable", "boolean", "decimal-flba", "short-strings", "short-strings-view", "long-strings-large",
-            "uneven-delta", "uneven-fsst", "uneven-plain", "prefix-delta",
+            "uneven-delta", "uneven-fsst", "uneven-plain", "prefix-delta", "dictionary-large",
         ];
         foreach (string column in columns)
         {
@@ -84,13 +84,15 @@ public sealed class KeepRowsHoldAllocationTests : IDisposable
         NativeMemoryTracker.Reset();
         var (returned, _, peak, used, held) = await ParallelRowGroupReadTests.ReadTwoPassUnitHeldAsync(
             reader, predicate, returnPredicateColumn: true);
-        long allocated = NativeMemoryTracker.PeakBytes;
+        // A dictionary's values are pooled managed arrays, which the native tracker does not see: counted here at
+        // their bytes, 3,000 values of 300 (#886 review round 5). The other fixtures' dictionaries are a few bytes.
+        long allocated = NativeMemoryTracker.PeakBytes + (column == "dictionary-large" ? 3_000 * 300 : 0);
 
         Assert.Equal(Rows / 100, returned);
         Assert.Equal(0, used);
         Assert.True(held > 0, $"{column}: the second pass held nothing, so it did not keep rows in one batch");
         Assert.True(allocated <= peak - chunks,
-            $"{column} (prefetched: {prefetched}): the read allocated {allocated} native bytes, past the " +
+            $"{column} (prefetched: {prefetched}): the read allocated {allocated} bytes, past the " +
             $"{peak - chunks} its budget reserved at most for decoding (peak {peak}, chunks {chunks}, held {held})");
     }
 
@@ -145,6 +147,24 @@ public sealed class KeepRowsHoldAllocationTests : IDisposable
                 dictionary = false;
                 (values, type) = (Strings(i => 200, random), StringType.Default);
                 break;
+            case "dictionary-large":
+            {
+                // 3,000 distinct 300-character values: a dictionary near the writer's 1 MiB limit, decoded whole
+                // however few rows are kept.
+                var pool = new string[3_000];
+                var chars = new char[300];
+                for (int d = 0; d < pool.Length; d++)
+                {
+                    for (int c = 0; c < chars.Length; c++)
+                        chars[c] = (char)('a' + random.Next(26));
+                    pool[d] = new string(chars);
+                }
+                var b = new StringArray.Builder();
+                for (int i = 0; i < Rows; i++)
+                    b.Append(pool[random.Next(pool.Length)]);
+                (values, type) = (b.Build(), StringType.Default);
+                break;
+            }
             case "prefix-delta":
             {
                 // Random 200-character values, then a last page of 2,000-character values sharing all but their last

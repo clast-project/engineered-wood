@@ -153,7 +153,7 @@ public sealed partial class ParquetFileReader
         for (int i = 0; i < output.Count; i++)
         {
             long columnBytes = DecodedBytes(rowGroup, schema, [output.Columns[i].Path[0]], null);
-            (int Rows, long Bytes)? maxPage = null;
+            (int Rows, long Bytes, long DictionaryBytes)? maxPage = null;
             if (io is not null && io.Holds(output.Ranges[i]) && !DecodedSizeUnboundedByPage(output.Chunks[i]))
             {
                 using var chunk = await io.ReadAsync(output.Ranges[i], cancellationToken).ConfigureAwait(false);
@@ -179,7 +179,9 @@ public sealed partial class ParquetFileReader
             long starting = Data.ColumnBuildState.StartingBytes(
                 column.PhysicalType, column.MaxDefinitionLevel, (int)holds,
                 Data.ColumnChunkReader.ByteArrayOutputOf(output.LeafArrowFields[i]), column.TypeLength ?? 0);
-            total += Math.Max(scaled, starting);
+            // The dictionary is decoded whole, into pooled arrays about its page's size, beside the kept rows' buffers
+            // (#886 review round 5).
+            total += Math.Max(scaled, starting) + (maxPage?.DictionaryBytes ?? 0);
         }
 
         return total;

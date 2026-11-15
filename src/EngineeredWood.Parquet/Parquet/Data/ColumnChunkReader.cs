@@ -255,19 +255,23 @@ internal static class ColumnChunkReader
 
     /// <summary>
     /// <see cref="MaxDataPageRows"/>, and the most uncompressed bytes a data page holds: the page with the most rows
-    /// need not be the largest one when value sizes vary (#886 review round 3).
+    /// need not be the largest one when value sizes vary (#886 review round 3). And the dictionary page's uncompressed
+    /// bytes, which the decode holds whole however few rows it keeps (round 5).
     /// </summary>
-    internal static (int Rows, long Bytes) LargestDataPages(
+    internal static (int Rows, long Bytes, long DictionaryBytes) LargestDataPages(
         ReadOnlySpan<byte> data, ColumnDescriptor column, ColumnMetaData columnMeta, int? maxPageUncompressedSize)
     {
         var pages = new PageReader(data, column, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
         long values = 0;
         int max = 0;
         long bytes = 0;
+        long dictionaryBytes = 0;
         try
         {
             while (values < columnMeta.NumValues && pages.TryRead(out var page))
             {
+                if (page.Header.Type == PageType.DictionaryPage)
+                    dictionaryBytes += page.Header.UncompressedPageSize;
                 if (page.Header.Type is not (PageType.DataPage or PageType.DataPageV2))
                     continue;
                 max = Math.Max(max, page.NumValues);
@@ -279,7 +283,7 @@ internal static class ColumnChunkReader
         {
         }
 
-        return (max, bytes);
+        return (max, bytes, dictionaryBytes);
     }
 
     /// <summary>
