@@ -182,8 +182,13 @@ internal static class FsstPageDecoder
                     $"FSST decompression failed for a page of {count} values " +
                     $"({compressedTotal} compressed bytes).");
 
-            state.AddByteArrayValues(
-                valueOffsets.AsSpan(0, count + 1), decompressed.AsSpan(0, totalWritten), count);
+            // A page that drops rows appends only its kept values (#897).
+            if (state.PageHasDrops)
+                state.AddSelectedByteArrayValues(
+                    valueOffsets.AsSpan(0, count + 1), decompressed.AsSpan(0, totalWritten), stride: 0);
+            else
+                state.AddByteArrayValues(
+                    valueOffsets.AsSpan(0, count + 1), decompressed.AsSpan(0, totalWritten), count);
         }
         finally
         {

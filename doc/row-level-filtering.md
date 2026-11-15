@@ -471,7 +471,13 @@ The page sizes come from the headers of the chunks fetched ahead, which the deco
 
 **Not covered:** the decoders' scratch memory, such as decompression buffers, page buffers and the decoders' own temporaries. That is about a page for each read in flight. It is reserved nowhere, and whole-group reads leave it out too. Nor is the overshoot from a string buffer's doubling growth, where the old and new buffers are briefly live together (#888).
 
-`KeepRowsHoldAllocationTests` reads ten kinds of column (nullable, boolean, fixed-length, short and long strings in all three output kinds, uneven pages, shared prefixes, a large dictionary), each fetched ahead and not. It checks that the native memory the read allocates, plus any pooled dictionary, stays within the budget it reserved for decoding. The budget is not charged as buffers grow: a decode runs synchronously and cannot wait for room partway through a page, so a charge there could only overdraw the budget, not limit it.
+**Unbatched (#897):** a group read as one batch reserves its output columns' whole decoded size, not this hold. Two things kept a 1%-selective decode from fitting even that, and both are fixed:
+- DELTA_BYTE_ARRAY and FSST pages were appended whole, then compacted. The column's buffer grew to a whole decoded page by doubling, with the old and new buffers both live: 60 MB for a 480 KB result. Each of these decoders still rebuilds its page in a scratch buffer of its own, but now appends only the kept values, as PLAIN, DELTA_LENGTH_BYTE_ARRAY and dictionary pages already did.
+- String data started at 32 bytes a slot for the kept rows and a page's room: for 1-byte strings, more than the whole column. Since every BYTE_ARRAY decoder now appends only kept values, string data starts at the kept rows. The page's room is still allocated for levels, offsets and views.
+
+The hold above still takes a DELTA_BYTE_ARRAY or FSST column whole, and still counts the page's room in string data. Both are now over-reservations, and are left as they are. With many rows kept (half or more), the doubling growth can still pass the whole column's size, unbatched or not.
+
+`KeepRowsHoldAllocationTests` reads ten kinds of column (nullable, boolean, fixed-length, short and long strings in all three output kinds, uneven pages, shared prefixes, a large dictionary), each fetched ahead and not, batched and unbatched. It checks that the native memory the read allocates, plus any pooled dictionary, stays within the budget it reserved for decoding. The budget is not charged as buffers grow: a decode runs synchronously and cannot wait for room partway through a page, so a charge there could only overdraw the budget, not limit it.
 
 ## 16. Phase 3a: exact Delta scans (2026-11-09)
 
