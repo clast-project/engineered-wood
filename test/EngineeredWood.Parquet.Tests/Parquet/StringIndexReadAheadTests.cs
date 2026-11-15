@@ -149,6 +149,49 @@ public sealed class StringIndexReadAheadTests : IDisposable
         Assert.True(failing.Refusals > 0, "nothing read the string columns' OffsetIndexes: the read-ahead never ran");
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ADisposedReader_StopsTheReadsNothingAwaited(bool async)
+    {
+        // The first pass selects no row, so no second pass awaits the read-ahead, which hangs at the store until it is
+        // cancelled. The reader's disposal must stop it and wait for it: the file closes next (#896 review).
+        string path = await WriteAsync();
+        await using var local = new LocalRandomAccessFile(path);
+        await using var hanging = new HangingIndexReads(local);
+        // Serial: a parallel scan cancels its own token as it ends, which stops the read too, though nothing awaits it.
+        // A serial one reads under the caller's token, so only the disposal can stop it.
+        var reader = new ParquetFileReader(hanging, ownsFile: false, new ParquetReadOptions { MaxConcurrentRowGroups = 1 })
+        {
+            TwoPassReads = true,
+        };
+        var metadata = await reader.ReadMetadataAsync();
+        foreach (long offset in IndexOffsets(metadata, Enumerable.Range(0, Groups), "v", "x"))
+            hanging.Hung.Add(offset);
+
+        var scan = Scan(null) with
+        {
+            RowFilter = new RowFilter(ParallelRowGroupReadTests.KeyPredicate(_ => false, valueWise: false)),
+        };
+        long rows = 0;
+        await foreach (var selected in reader.ReadSelectedAsync(scan))
+        {
+            using (selected)
+                rows += selected.Batch.Length;
+        }
+        Assert.Equal(0, rows);
+        Assert.Same(hanging.Started.Task, await Task.WhenAny(hanging.Started.Task, Task.Delay(TimeSpan.FromSeconds(30))));
+        Assert.Equal(1, hanging.InFlight);
+
+        if (async)
+            await reader.DisposeAsync();
+        else
+            reader.Dispose();
+
+        Assert.Equal(0, hanging.InFlight);
+        Assert.True(hanging.Cancelled, "the read was not cancelled");
+    }
+
     // The selected read of v, w and x where k's position in its group is under 3,000: a leading run, so the second
     // pass reads only some blocks, in slices cut by its page maps. Returns a checksum of the rows and their strings.
     private static async Task<long> ReadAsync(ParquetFileReader reader)
@@ -259,6 +302,64 @@ public sealed class StringIndexReadAheadTests : IDisposable
         }
         await writer.CloseAsync();
         return path;
+    }
+
+    /// <summary>Holds any request that touches one of <see cref="Hung"/>'s offsets until it is cancelled.</summary>
+    private sealed class HangingIndexReads(IRandomAccessFile inner) : IRandomAccessFile
+    {
+        public HashSet<long> Hung { get; } = new();
+
+        public TaskCompletionSource<bool> Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int InFlight => Volatile.Read(ref _inFlight);
+
+        public bool Cancelled { get; private set; }
+
+        private int _inFlight;
+
+        public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default) => inner.GetLengthAsync(cancellationToken);
+
+        public async ValueTask<System.Buffers.IMemoryOwner<byte>> ReadAsync(FileRange range, CancellationToken cancellationToken = default)
+        {
+            if (Touches(range))
+                await HangAsync(cancellationToken);
+            return await inner.ReadAsync(range, cancellationToken);
+        }
+
+        public async ValueTask<IReadOnlyList<System.Buffers.IMemoryOwner<byte>>> ReadRangesAsync(
+            IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
+        {
+            if (ranges.Any(Touches))
+                await HangAsync(cancellationToken);
+            return await inner.ReadRangesAsync(ranges, cancellationToken);
+        }
+
+        private async Task HangAsync(CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref _inFlight);
+            Started.TrySetResult(true);
+            try
+            {
+                await Task.Delay(Timeout.Infinite, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                Cancelled = true;
+                throw;
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _inFlight);
+            }
+        }
+
+        private bool Touches(FileRange r) => Hung.Any(o => o >= r.Offset && o < r.Offset + r.Length);
+
+        public ValueTask DisposeAsync() => default; // the local file is disposed by its owner
+
+        public void Dispose()
+        {
+        }
     }
 
     /// <summary>Refuses any request that touches one of <see cref="Refused"/>'s offsets.</summary>

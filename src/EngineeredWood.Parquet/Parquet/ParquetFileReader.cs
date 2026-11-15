@@ -3752,6 +3752,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// consults (<see cref="NarrowByPageIndexAsync"/>), which read their projection's OffsetIndexes with it.</para>
     /// <para>A failed read yields null rather than failing the scan: the counts only size buffers, and a read that
     /// needs the file meets the failure itself.</para>
+    /// <para>Nothing need await the read: a group whose first pass selects no row, or that is read in one pass, never
+    /// does. So the reader owns it (<see cref="TrackReadAhead"/>), and its disposal stops and awaits it before the file
+    /// can close (#896 review).</para>
     /// </remarks>
     private (Task<Dictionary<long, byte[]>?>? Read, int End) StartStringIndexesAhead(
         int first, FileMetaData metadata, SchemaDescriptor schema, IReadOnlyList<string>? projection, bool[]? skipped,
@@ -3798,17 +3801,40 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             bytes += groupBytes;
         }
 
-        // Started off the planning's path: planning goes on while this waits for the store.
-        return (ranges.Count == 0 ? null : Task.Run(() => ReadStringIndexesAsync(ranges, cancellationToken)), end);
+        return (ranges.Count == 0 ? null : TrackReadAhead(ranges, cancellationToken), end);
+    }
+
+    // The string-index reads under way (StartStringIndexesAhead), which this reader's disposal stops and awaits; and
+    // what stops them. Guarded by the list's lock, as is the check that the reader is not yet disposed.
+    private readonly List<Task> _readAheads = new();
+    private readonly CancellationTokenSource _readAheadStop = new();
+
+    /// <summary>
+    /// Starts <see cref="ReadStringIndexesAsync"/> off the planning's path, so that planning goes on while it waits for
+    /// the store, and keeps it until this reader is disposed. Null once disposal has begun: there is no file to read.
+    /// </summary>
+    private Task<Dictionary<long, byte[]>?>? TrackReadAhead(List<FileRange> ranges, CancellationToken cancellationToken)
+    {
+        lock (_readAheads)
+        {
+            if (_disposed)
+                return null;
+            _readAheads.RemoveAll(t => t.IsCompleted);
+            var read = Task.Run(() => ReadStringIndexesAsync(ranges, cancellationToken));
+            _readAheads.Add(read);
+            return read;
+        }
     }
 
     private async Task<Dictionary<long, byte[]>?> ReadStringIndexesAsync(
         List<FileRange> ranges, CancellationToken cancellationToken)
     {
+        // The scan's token, or this reader's disposal: whichever comes first.
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _readAheadStop.Token);
         byte[][] read;
         try
         {
-            read = await ReadPageIndexBytesAsync(ranges, cancellationToken).ConfigureAwait(false);
+            read = await ReadPageIndexBytesAsync(ranges, stop.Token).ConfigureAwait(false);
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
@@ -4349,8 +4375,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (!BeginDispose())
+            return;
+        await StopReadAheadsAsync().ConfigureAwait(false);
 
         if (_ownsFile)
             await _file.DisposeAsync().ConfigureAwait(false);
@@ -4358,10 +4385,56 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (!BeginDispose())
+            return;
+        // As PrefetchedFile.Dispose: the reads are asynchronous, and must be over before the file can close.
+        StopReadAheadsAsync().AsTask().GetAwaiter().GetResult();
 
         if (_ownsFile)
             _file.Dispose();
+    }
+
+    // Marks the reader disposed, under the read-aheads' lock so that no read starts after: false if it already was.
+    private bool BeginDispose()
+    {
+        lock (_readAheads)
+        {
+            if (_disposed)
+                return false;
+            _disposed = true;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Stops the string-index reads still under way and waits for them (#896 review): a read nothing awaited would
+    /// otherwise still be reading the file as it closes, which a Delta scan's file read disposes right after this
+    /// reader. Its bytes are wanted by nothing now, so it is cancelled rather than waited out.
+    /// </summary>
+    private async ValueTask StopReadAheadsAsync()
+    {
+        Task[] pending;
+        lock (_readAheads)
+        {
+            pending = _readAheads.ToArray();
+            _readAheads.Clear();
+        }
+
+        try
+        {
+            if (pending.Length > 0)
+            {
+                _readAheadStop.Cancel();
+                await Task.WhenAll(pending).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            // A cancellation of this disposal's own, or a read the scan's token stopped: no result depends on it.
+        }
+        finally
+        {
+            _readAheadStop.Dispose();
+        }
     }
 }
