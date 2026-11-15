@@ -233,6 +233,28 @@ public sealed class StringBufferGrowthTests : IDisposable
     }
 
     [Fact]
+    public async Task ARecordedCountTooLarge_AllocatesNoMoreThanTheCeilingUpFront()
+    {
+        // A footer claiming almost 2 GiB of strings for a 5 MB chunk: what it says is not checked before the values
+        // decode, so it buys at most the up-front ceiling, not the allocation it names (#889 review round 4).
+        string path = await WriteAsync("delta");
+        RecordStringBytes(path, int.MaxValue - 64);
+        await AssertReadsWithinAsync(path, ByteArrayOutputKind.Default, slack: null);
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        await reader.ReadMetadataAsync();
+        NativeMemoryTracker.Reset();
+        using var batch = await reader.ReadRowGroupAsync(0);
+
+        // The ceiling, and what the values really decode to (their buffer and the decoder's own), not 2 GiB.
+        long ceiling = EngineeredWood.Parquet.Data.ColumnBuildState.MaxExpectedStartingBytes
+                       + 2L * Rows * Length + (Rows + 1L) * 4;
+        Assert.True(NativeMemoryTracker.PeakBytes <= ceiling,
+            $"the read peaked at {NativeMemoryTracker.PeakBytes} bytes, past the {ceiling} its footer can buy");
+    }
+
+    [Fact]
     public async Task ARecordedCountTooSmall_StillReadsEveryValue()
     {
         string path = await WriteAsync("delta");

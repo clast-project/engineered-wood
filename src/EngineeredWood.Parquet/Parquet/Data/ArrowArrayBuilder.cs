@@ -1189,10 +1189,14 @@ internal sealed class ColumnBuildState : IDisposable
         _columnPath = columnPath;
         _expectedDataBytes = Math.Min(Math.Max(expectedDataBytes ?? 0, 0), ByteArrayCapacity.MaxBytes);
         // A whole chunk's string data starts at what the chunk says it decodes to (#888), nothing for a chunk that
-        // records none (#889 review round 3), else at a guess.
+        // records none (#889 review round 3), else at a guess. The footer's word is not checked against the pages
+        // before they decode, so it buys at most MaxExpectedStartingBytes up front (or the guess, when that is more):
+        // a footer claiming 2 GiB cannot allocate it unread (#889 review round 4). Past that the buffer grows toward
+        // the estimate, never beyond it, as the values arrive.
+        int guessedDataBytes = capacity * ByteArrayStartingBytesPerValue;
         int startingDataBytes = expectedDataBytes.HasValue
-            ? (int)_expectedDataBytes
-            : capacity * ByteArrayStartingBytesPerValue;
+            ? (int)Math.Min(_expectedDataBytes, Math.Max(guessedDataBytes, MaxExpectedStartingBytes))
+            : guessedDataBytes;
 
         if (maxDefLevel > 0)
         {
@@ -1283,6 +1287,12 @@ internal sealed class ColumnBuildState : IDisposable
         else
             _dataBuffer!.Grow(needed);
     }
+
+    /// <summary>
+    /// The most string data a state allocates up front on the chunk's estimate (<see cref="ColumnChunkReader.ExpectedStringBytes"/>),
+    /// which the footer states and nothing checks until the values decode. A larger chunk grows the rest of the way.
+    /// </summary>
+    internal const int MaxExpectedStartingBytes = 64 << 20;
 
     /// <summary>The data bytes a BYTE_ARRAY state starts with per value, before any value is decoded.</summary>
     internal const int ByteArrayStartingBytesPerValue = 32;
