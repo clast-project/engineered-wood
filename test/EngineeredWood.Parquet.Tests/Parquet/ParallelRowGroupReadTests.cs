@@ -1449,7 +1449,7 @@ public class ParallelRowGroupReadTests : IDisposable
     }
 
     /// <summary>A predicate over <c>k</c>; it raises over a batch of <paramref name="raiseOnLength"/> rows.</summary>
-    private static RowPredicate KeyPredicate(Func<long, bool> keep, bool valueWise, int raiseOnLength = -1) =>
+    internal static RowPredicate KeyPredicate(Func<long, bool> keep, bool valueWise, int raiseOnLength = -1) =>
         new(["k"], batch =>
         {
             if (batch.Length == raiseOnLength)
@@ -1490,7 +1490,7 @@ public class ParallelRowGroupReadTests : IDisposable
     }
 
     /// <summary>As <see cref="ReadTwoPassUnitAsync"/>, with the most the unit held apart from its decodes.</summary>
-    private static async Task<(long Returned, long Estimate, long Peak, long Used, long HeldPeak)> ReadTwoPassUnitHeldAsync(
+    internal static async Task<(long Returned, long Estimate, long Peak, long Used, long HeldPeak)> ReadTwoPassUnitHeldAsync(
         ParquetFileReader reader, RowPredicate predicate, bool returnPredicateColumn,
         ParquetFileReader.DecodedGrowth? growth = null, long addedBytesPerRow = 0)
     {
