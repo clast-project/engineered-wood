@@ -96,6 +96,59 @@ public sealed class StringIndexReadAheadTests : IDisposable
     }
 
     [Fact]
+    public async Task GroupsAProofReadsInOnePass_AreLeftOut()
+    {
+        // The row filter keeps k >= 30,000, with that as its proof: statistics prove it for groups 3-5, which are then
+        // read without it, so in one pass, and never await a read-ahead (#896 review). Groups 0-2 still filter.
+        string path = await WriteAsync();
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false) { TwoPassReads = true };
+        var metadata = await reader.ReadMetadataAsync();
+        var proof = Expressions.Expressions.GreaterThanOrEqual("k", LiteralValue.Of(30_000L));
+        var predicate = new RowPredicate(["k"], ParallelRowGroupReadTests.KeyPredicate(k => k >= 30_000, valueWise: false).Evaluate)
+        {
+            Proof = proof,
+        };
+        var selected = await reader.PrepareSelectedAsync(Scan(null) with { RowFilter = new RowFilter(predicate) }, default);
+
+        var plans = new List<ParquetFileReader.RowGroupPlan>();
+        await foreach (var plan in reader.PlanRowGroupsAsync(
+                           null, selected.ReadColumns, null, default, stringIndexesAhead: selected.StringIndexesAhead))
+        {
+            plans.Add(plan);
+        }
+
+        Assert.Equal(Groups, plans.Count);
+        var read = plans[0].StringIndexes;
+        Assert.NotNull(read);
+        Assert.All(plans.Take(3), p => Assert.Same(read, p.StringIndexes));
+        Assert.All(plans.Skip(3), p => Assert.Null(p.StringIndexes));
+        Assert.Equal(IndexOffsets(metadata, [0, 1, 2], "v", "x"), (await read!)!.Keys.OrderBy(o => o));
+    }
+
+    [Fact]
+    public async Task AGroupWhosePageIndexLiesOutsideTheFile_IsReadAhead()
+    {
+        // Group 2's k ColumnIndex is placed past the end of the file. Statistics leave k >= 25,000 undecided there, but
+        // the narrowing refuses an index outside the file and reads no OffsetIndexes, so the read-ahead must cover the
+        // group rather than leave it to the narrowing (#896 review).
+        string path = await WriteAsync();
+        MoveColumnIndexOutside(path, group: 2, column: "k");
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false) { TwoPassReads = true };
+        var metadata = await reader.ReadMetadataAsync();
+
+        var plans = await PlanAsync(reader, Expressions.Expressions.GreaterThanOrEqual("k", LiteralValue.Of(25_000L)));
+
+        Assert.Equal([2, 3, 4, 5], plans.Select(p => p.Index));
+        Assert.Null(plans[0].OffsetIndexes);
+        var read = plans[0].StringIndexes;
+        Assert.NotNull(read);
+        Assert.All(plans, p => Assert.Same(read, p.StringIndexes));
+        Assert.Equal(IndexOffsets(metadata, [2, 3, 4, 5], "v", "x"), (await read!)!.Keys.OrderBy(o => o));
+    }
+
+    [Fact]
     public async Task AReadInOnePass_ReadsNothingAhead()
     {
         string path = await WriteAsync();
@@ -229,7 +282,7 @@ public sealed class StringIndexReadAheadTests : IDisposable
         var selected = await reader.PrepareSelectedAsync(Scan(prune), default);
         var plans = new List<ParquetFileReader.RowGroupPlan>();
         await foreach (var plan in reader.PlanRowGroupsAsync(
-                           prune, selected.ReadColumns, null, default, stringIndexesAhead: selected.MayReadInTwoPasses))
+                           prune, selected.ReadColumns, null, default, stringIndexesAhead: selected.StringIndexesAhead))
         {
             plans.Add(plan);
         }
@@ -302,6 +355,56 @@ public sealed class StringIndexReadAheadTests : IDisposable
         }
         await writer.CloseAsync();
         return path;
+    }
+
+    // Rewrites path's footer to place one chunk's ColumnIndex past the end of the file.
+    private static void MoveColumnIndexOutside(string path, int group, string column)
+    {
+        byte[] content = File.ReadAllBytes(path);
+        int footerLength = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(content.AsSpan(content.Length - 8));
+        int footerStart = content.Length - 8 - footerLength;
+        var footer = EngineeredWood.Parquet.Metadata.MetadataDecoder.DecodeFileMetaData(content.AsSpan(footerStart, footerLength));
+
+        var groups = footer.RowGroups.Select((g, gi) => gi != group ? g : new EngineeredWood.Parquet.Metadata.RowGroup
+        {
+            TotalByteSize = g.TotalByteSize,
+            NumRows = g.NumRows,
+            SortingColumns = g.SortingColumns,
+            TotalCompressedSize = g.TotalCompressedSize,
+            Ordinal = g.Ordinal,
+            Columns = g.Columns.Select(c => c.MetaData!.PathInSchema![0] != column ? c : new EngineeredWood.Parquet.Metadata.ColumnChunk
+            {
+                FilePath = c.FilePath,
+                FileOffset = c.FileOffset,
+                MetaData = c.MetaData,
+                OffsetIndexOffset = c.OffsetIndexOffset,
+                OffsetIndexLength = c.OffsetIndexLength,
+                ColumnIndexOffset = content.Length + 1_000,
+                ColumnIndexLength = c.ColumnIndexLength,
+            }).ToArray(),
+        }).ToArray();
+        var patched = new EngineeredWood.Parquet.Metadata.FileMetaData
+        {
+            Version = footer.Version,
+            Schema = footer.Schema,
+            NumRows = footer.NumRows,
+            RowGroups = groups,
+            KeyValueMetadata = footer.KeyValueMetadata,
+            CreatedBy = footer.CreatedBy,
+            ColumnOrders = footer.ColumnOrders,
+        };
+
+        byte[] encoded = EngineeredWood.Parquet.Metadata.MetadataEncoder.EncodeFileMetaData(patched);
+        using var output = File.Create(path);
+        output.Write(content, 0, footerStart);
+        output.Write(encoded, 0, encoded.Length);
+        var tail = new byte[8];
+        System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(tail, encoded.Length);
+        tail[4] = (byte)'P';
+        tail[5] = (byte)'A';
+        tail[6] = (byte)'R';
+        tail[7] = (byte)'1';
+        output.Write(tail, 0, 8);
     }
 
     /// <summary>Holds any request that touches one of <see cref="Hung"/>'s offsets until it is cancelled.</summary>

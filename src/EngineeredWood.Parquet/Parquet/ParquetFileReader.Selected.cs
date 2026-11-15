@@ -44,7 +44,7 @@ public sealed partial class ParquetFileReader
         var selected = await PrepareSelectedAsync(scan, cancellationToken).ConfigureAwait(false);
         var plans = PlanRowGroupsAsync(
             metadata, scan.Prune ?? _options.Filter, selected.ReadColumns, selected.SkipRows, cancellationToken,
-            stringIndexesAhead: selected.MayReadInTwoPasses);
+            stringIndexesAhead: selected.StringIndexesAhead);
 
         int concurrency = Math.Min(EffectiveConcurrentRowGroups, metadata.RowGroups.Count);
         if (concurrency <= 1 || metadata.RowGroups.Count <= 1)
@@ -106,7 +106,7 @@ public sealed partial class ParquetFileReader
     /// <summary>
     /// Everything a selected read of <paramref name="scan"/> decides once, before any row group: the columns it
     /// decodes, how it selects rows, whether it may go in two passes. A caller that schedules row groups itself (a
-    /// Delta scan, which plans them with <see cref="PlanRowGroupsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken, int, int, bool)"/>)
+    /// Delta scan, which plans them with <see cref="PlanRowGroupsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken, int, int, Func{int, bool}?)"/>)
     /// plans with <see cref="SelectedPlanReader.ReadColumns"/> and <see cref="SelectedPlanReader.SkipRows"/> and reads
     /// each plan with <see cref="SelectedPlanReader.ReadAsync(RowGroupPlan, CancellationToken)"/>, which may run
     /// concurrently for different plans.
@@ -196,21 +196,30 @@ public sealed partial class ParquetFileReader
         // How to read the planned row group: without the predicates its statistics prove TRUE for every row.
         private GroupRead ReadFor(RowGroupPlan plan)
         {
+            var read = ReadFor(plan.Index, out bool proven);
+            if (proven)
+                _reader.OnProvenRowGroup?.Invoke();
+            return read;
+        }
+
+        private GroupRead ReadFor(int rowGroupIndex, out bool proven)
+        {
+            proven = false;
             if (_proofs.Length == 0)
                 return _whole;
 
-            var rowGroup = _metadata.RowGroups[plan.Index];
-            ulong proven = 0;
+            var rowGroup = _metadata.RowGroups[rowGroupIndex];
+            ulong set = 0;
             foreach (var (index, proof) in _proofs)
             {
                 if (EngineeredWood.Expressions.StatisticsEvaluator.ProvesEveryRowTrue(proof, rowGroup, _accessor!))
-                    proven |= 1UL << index;
+                    set |= 1UL << index;
             }
 
-            if (proven == 0)
+            if (set == 0)
                 return _whole;
-            _reader.OnProvenRowGroup?.Invoke();
-            return _without.GetOrAdd(proven, set => _reader.ReadWithout(_schema, _scan, set));
+            proven = true;
+            return _without.GetOrAdd(set, s => _reader.ReadWithout(_schema, _scan, s));
         }
 
         /// <summary>The columns the read decodes, predicate columns included: what to plan row groups with.</summary>
@@ -220,9 +229,23 @@ public sealed partial class ParquetFileReader
         public RowSkipPredicate? SkipRows { get; }
 
         /// <summary>
+        /// What to plan with, as <c>stringIndexesAhead</c>, so that the second pass's string slices are sized from their
+        /// OffsetIndexes (#894): whether a read of a row group whole goes in two passes, as <see cref="ReadAsync(RowGroupPlan, CancellationToken)"/>
+        /// decides it, with the predicates its statistics prove dropped (#896 review). Null when no group's can.
+        /// </summary>
+        public Func<int, bool>? StringIndexesAhead => MayReadInTwoPasses ? ReadsWholeGroupInTwoPasses : null;
+
+        private bool ReadsWholeGroupInTwoPasses(int rowGroupIndex)
+        {
+            var rowGroup = _metadata.RowGroups[rowGroupIndex];
+            var twoPass = _reader.TwoPassColumnsForGroup(ReadFor(rowGroupIndex, out _).TwoPass, rowGroup);
+            return _reader.ReadsInTwoPasses(
+                new RowGroupPlan(rowGroupIndex, 0, null, null), twoPass, rowGroup, _proofs.Length > 0);
+        }
+
+        /// <summary>
         /// Whether a row group of this read may be read in two passes (<see cref="ReadsInTwoPasses"/>, before the group's
-        /// own conditions): what to plan with, as <c>stringIndexesAhead</c>, so that the second pass's string slices
-        /// are sized from their OffsetIndexes (#894).
+        /// own conditions and proofs).
         /// </summary>
         public bool MayReadInTwoPasses =>
             _reader.ReadsStringIndexesAhead && _whole.TwoPass is not null && _reader.UsesTwoPasses(_proofs.Length > 0)
