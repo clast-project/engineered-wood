@@ -91,6 +91,25 @@ internal sealed class NativeBuffer<T> : IDisposable where T : unmanaged
     }
 
     /// <summary>
+    /// Grows the buffer to hold exactly <paramref name="newElementCount"/> elements, preserving existing data, for a
+    /// caller that already sized the growth itself and must not be given more (#886 review). Newly added bytes are not
+    /// zero-filled. Does nothing when the buffer is already that large.
+    /// </summary>
+    public void GrowExact(int newElementCount)
+    {
+        var inner = _inner ?? throw new ObjectDisposedException(nameof(NativeBuffer<T>));
+        if (newElementCount <= inner.Length)
+            return;
+
+        // Not inner.Grow: Apache.Arrow's grows to at least twice the length, whatever is asked for.
+        var grown = new Apache.Arrow.Memory.NativeBuffer<T, EngineeredWoodAllocationTracker>(
+            newElementCount, zeroFill: false, default);
+        inner.Span.CopyTo(grown.Span);
+        inner.Dispose();
+        _inner = grown;
+    }
+
+    /// <summary>
     /// Grows the buffer to hold at least <paramref name="newElementCount"/> elements,
     /// preserving existing data. Newly added bytes are not zero-filled — callers that need
     /// zeroed memory must overwrite or zero them explicitly.

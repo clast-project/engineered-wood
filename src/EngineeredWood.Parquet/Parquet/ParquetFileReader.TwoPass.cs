@@ -136,6 +136,36 @@ public sealed partial class ParquetFileReader
             }
             : columns;
 
+    /// <summary>
+    /// What a keep-rows decode of <paramref name="output"/>'s columns builds: each column's decoded size, scaled to the
+    /// rows its buffers hold, the kept ones and room for its largest page (<see cref="Data.ColumnChunkReader.KeepRowsCapacity"/>).
+    /// The pages' sizes come from the headers of the chunks fetched ahead, which the decode reads next anyway; a column
+    /// not fetched ahead (too large for one buffer) is taken whole, rather than read twice (#886 review).
+    /// </summary>
+    private async ValueTask<long> KeepRowsDecodeBytesAsync(
+        Metadata.RowGroup rowGroup, SchemaDescriptor schema, RowGroupContext output, PrefetchedFile? io, long kept,
+        CancellationToken cancellationToken)
+    {
+        long total = 0;
+        int rows = output.RowCount;
+        for (int i = 0; i < output.Count; i++)
+        {
+            long columnBytes = DecodedBytes(rowGroup, schema, [output.Columns[i].Path[0]], null);
+            int? maxPage = null;
+            if (io is not null && io.Holds(output.Ranges[i]))
+            {
+                using var chunk = await io.ReadAsync(output.Ranges[i], cancellationToken).ConfigureAwait(false);
+                maxPage = Data.ColumnChunkReader.MaxDataPageRows(
+                    chunk.Memory.Span, output.Columns[i], output.Chunks[i].MetaData!, _options.MaxPageUncompressedSize);
+            }
+
+            long holds = maxPage is { } page ? Math.Min(rows, kept + page) : rows;
+            total += rows == 0 ? 0 : (long)((double)columnBytes * holds / rows);
+        }
+
+        return total;
+    }
+
     // Whether BatchSize cuts a group of `rows` rows into more than one batch.
     private bool SplitsGroup(long rows) => _options.BatchSize is int size && size > 0 && size < rows;
 
@@ -310,17 +340,16 @@ public sealed partial class ParquetFileReader
                                && (!SplitsGroup(groupRows) || kept <= _options.BatchSize!.Value)
                 ? KeepMask(selection, groupRows)
                 : null;
-            // That one decode builds its columns at the kept rows and a page's room (#880), past the batch-sized
-            // reservation: held for the pass, and let go after it (#873 review). A page larger than the room grows
-            // the buffers past what is held, by at most that page.
+            // That one decode builds its columns at the kept rows and room for each column's largest page (#880),
+            // past the batch-sized reservation: held for the pass, and let go after it (#873 review).
             long wholeGroupHold = 0;
             if (keepRows is not null && reservation is not null && SplitsGroup(groupRows))
             {
                 var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
                 var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-                long groupBytes = DecodedBytes(metadata.RowGroups[plan.Index], schema, columns.OutputOnly, null);
-                long startRows = Math.Min(groupRows, kept + Data.ColumnChunkReader.KeepRowsPageRoom);
-                wholeGroupHold = groupRows == 0 ? 0 : (long)((double)groupBytes * startRows / groupRows);
+                wholeGroupHold = await KeepRowsDecodeBytesAsync(
+                    metadata.RowGroups[plan.Index], schema, outputCtx, prefetched as PrefetchedFile, kept,
+                    cancellationToken).ConfigureAwait(false);
                 await reservation.HoldAsync(wholeGroupHold, cancellationToken).ConfigureAwait(false);
             }
             try

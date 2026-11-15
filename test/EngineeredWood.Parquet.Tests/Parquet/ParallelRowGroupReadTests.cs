@@ -1261,11 +1261,42 @@ public class ParallelRowGroupReadTests : IDisposable
 
         var (returned, _, _, used, held) = await ReadTwoPassUnitHeldAsync(reader, predicate, returnPredicateColumn: true);
         Assert.Equal(KeyRows / 10, returned);
-        long startRows = Math.Min(KeyRows, KeyRows / 10 + EngineeredWood.Parquet.Data.ColumnChunkReader.KeepRowsPageRoom);
-        long keptDecode = (long)((double)wholeDecode * startRows / KeyRows);
-        Assert.True(held >= chunks + keptDecode,
-            $"held {held}: the chunks ({chunks}) and the kept rows' decode ({keptDecode}) were not both counted");
-        Assert.True(held < chunks + wholeDecode, $"held {held}: the whole group's decode ({wholeDecode}) was held");
+        // 4 KiB pages hold at most ~1,000 rows: the kept 4,000 and a page are well under half the group.
+        Assert.True(held > chunks + wholeDecode / 10,
+            $"held {held}: the chunks ({chunks}) and the kept rows' decode were not both counted");
+        Assert.True(held < chunks + wholeDecode / 2, $"held {held}: more than the kept rows' decode ({wholeDecode} whole) was held");
+    }
+
+    /// <summary>
+    /// The same over pages far larger than the kept rows: the decode's buffers hold the kept rows and the largest page,
+    /// which the page headers size, so the hold must count that page (#886 review: a fixed guess of a page's room left
+    /// a 50,000-row page's buffers uncharged).
+    /// </summary>
+    [Fact]
+    public async Task ASplitTwoPassRead_HoldsTheLargestPage_WhenItKeepsRowsInOneBatch()
+    {
+        const int rows = 150_000, pageRows = 50_000;
+        string path = await WriteKeysAndValuesAsync("two-pass-keep-large-pages", i => i % 100, rows, pageRows);
+        // 1,500 rows selected, a row in every block: dense, and within one 5,000-row batch.
+        var predicate = KeyPredicate(k => k < 1, false);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 5_000 })
+        {
+            TwoPassReads = true,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long chunks = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k"], null).Compressed
+                      + ParquetFileReader.PlannedBytes(group, parquetSchema, ["k", "v"], null).Compressed;
+        long wholeDecode = reader.DecodedBytes(group, parquetSchema, ["k", "v"], null);
+        long keptDecode = (long)((double)wholeDecode * (rows / 100 + pageRows) / rows);
+
+        var (returned, _, _, used, held) = await ReadTwoPassUnitHeldAsync(reader, predicate, returnPredicateColumn: true);
+        Assert.Equal(rows / 100, returned);
+        Assert.True(held >= chunks + keptDecode - 2,
+            $"held {held}: the chunks ({chunks}) and the kept rows with the largest page ({keptDecode}) were not both counted");
+        Assert.True(held < chunks + wholeDecode / 2, $"held {held}: the whole group's decode ({wholeDecode}) was held");
+        Assert.Equal(0, used);
         Assert.Equal(0, used);
     }
 
@@ -1276,12 +1307,13 @@ public class ParallelRowGroupReadTests : IDisposable
 
     /// <summary>One row group of <see cref="KeyRows"/> rows: <c>k</c> (int64, from <paramref name="key"/>) and
     /// <c>v</c> (random int32, so PLAIN), in 4 KiB pages.</summary>
-    private async Task<string> WriteKeysAndValuesAsync(string name, Func<int, long> key)
+    private async Task<string> WriteKeysAndValuesAsync(
+        string name, Func<int, long> key, int rows = KeyRows, int? pageRows = null)
     {
         var random = new Random(846);
         var keys = new Int64Array.Builder();
         var values = new Int32Array.Builder();
-        for (int i = 0; i < KeyRows; i++)
+        for (int i = 0; i < rows; i++)
         {
             keys.Append(key(i));
             values.Append(random.Next());
@@ -1291,10 +1323,12 @@ public class ParallelRowGroupReadTests : IDisposable
             .Field(new Field("v", Int32Type.Default, false))
             .Build();
         string path = Path.Combine(_tempDir, name + ".parquet");
-        using (var batch = new RecordBatch(schema, [keys.Build(), values.Build()], KeyRows))
+        using (var batch = new RecordBatch(schema, [keys.Build(), values.Build()], rows))
         await using (var output = new LocalSequentialFile(path))
         await using (var writer = new ParquetFileWriter(
-                         output, ownsFile: false, new ParquetWriteOptions { DataPageSize = 4096 }))
+                         output, ownsFile: false, pageRows is { } limit
+                             ? new ParquetWriteOptions { DataPageSize = 64 << 20, DataPageRowCountLimit = limit }
+                             : new ParquetWriteOptions { DataPageSize = 4096 }))
         {
             await writer.WriteRowGroupAsync(batch);
             await writer.CloseAsync();

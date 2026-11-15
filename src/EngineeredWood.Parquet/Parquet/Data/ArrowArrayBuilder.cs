@@ -1256,7 +1256,8 @@ internal sealed class ColumnBuildState : IDisposable
 
     // ---- A row selection, applied page by page as the column decodes (#502 phase 2) ----------------------------
 
-    private byte[]? _keepRows;        // one byte per row of the chunk, 1 to keep
+    private byte[]? _keepRows;        // one byte per row of the chunk, 1 to keep; may be longer (pooled)
+    private int _selectionRows;       // the chunk's rows: how much of _keepRows is meaningful
     private int _selectionCursor;     // rows the pages so far covered
     private int _keptRows;            // rows of those kept
     private byte[]? _pageMask;        // the current page's values, 1 to keep (one spare slot, see BeginPage)
@@ -1269,11 +1270,16 @@ internal sealed class ColumnBuildState : IDisposable
     /// page's dropped rows are removed as the page decodes (<see cref="BeginPage"/>), so the built arrays hold only
     /// the kept rows. A selected read's second pass, which knows its rows before it decodes (#502 phase 2).
     /// </summary>
-    internal void SetRowSelection(byte[] keep)
+    /// <param name="rows">The chunk's rows, of which <paramref name="keep"/> (rented, perhaps longer) has one byte
+    /// each; all of <paramref name="keep"/> when null.</param>
+    internal void SetRowSelection(byte[] keep, int? rows = null)
     {
         if (MaxRepLevel > 0)
             throw new InvalidOperationException("A row selection applies only to a flat column.");
+        if (rows is < 0 || rows > keep.Length)
+            throw new ArgumentOutOfRangeException(nameof(rows));
         _keepRows = keep;
+        _selectionRows = rows ?? keep.Length;
     }
 
     /// <summary>Whether a row selection is set.</summary>
@@ -1303,7 +1309,7 @@ internal sealed class ColumnBuildState : IDisposable
     {
         if (_keepRows is null)
             return;
-        if (rows > _keepRows.Length - _selectionCursor)
+        if (rows > _selectionRows - _selectionCursor)
             throw new ParquetFormatException("A data page holds more rows than its row group.");
 
         var keep = _keepRows.AsSpan(_selectionCursor, rows);
@@ -1360,7 +1366,9 @@ internal sealed class ColumnBuildState : IDisposable
     /// Makes room for a page of <paramref name="pageRows"/> rows before its levels are reserved: a selected read
     /// starts at the rows it keeps and a page's room, not the whole group's (#880), and each page writes all its
     /// levels, and some decoders all its values, before <see cref="BeginPage"/> drops rows. Grows every buffer,
-    /// keeping what it holds, to at least twice its size, but not past the group's rows.
+    /// keeping what it holds, to at least twice its size, but not past the chunk's rows. The capacity a selected decode
+    /// starts with already fits its largest page (<see cref="ColumnChunkReader.KeepRowsCapacity"/>), so a sound chunk
+    /// never grows; this guards against one whose headers disagree with what the pages hold.
     /// </summary>
     internal void EnsurePageRoom(int pageRows)
     {
@@ -1368,7 +1376,7 @@ internal sealed class ColumnBuildState : IDisposable
         if (needed <= _capacity)
             return;
 
-        long doubled = Math.Min(2L * _capacity, _keepRows?.Length ?? int.MaxValue);
+        long doubled = Math.Min(2L * _capacity, _keepRows is null ? int.MaxValue : _selectionRows);
         int target = checked((int)Math.Max(needed, doubled));
 
         _defLevels = GrowLevels(_defLevels, _defLevelCount, target);
@@ -1378,21 +1386,21 @@ internal sealed class ColumnBuildState : IDisposable
         {
             // AddBoolValues sets bits with |=, and Grow leaves the new bytes as they were.
             int old = _valueBuffer!.Length;
-            _valueBuffer.Grow((target + 7) / 8);
+            _valueBuffer.GrowExact((target + 7) / 8);
             _valueBuffer.ByteSpan.Slice(old).Clear();
         }
         else if (_physicalType == PhysicalType.FixedLenByteArray)
         {
-            _valueBuffer?.Grow(checked(target * _fixedLength));
+            _valueBuffer?.GrowExact(checked(target * _fixedLength));
         }
         else if (_valueBuffer is not null)
         {
-            _valueBuffer.Grow(checked(target * _elementSize));
+            _valueBuffer.GrowExact(checked(target * _elementSize));
         }
 
-        _viewsBuffer?.Grow(checked(target * ViewEntrySize));
-        _offsetsBuffer?.Grow(target + 1);
-        _largeOffsetsBuffer?.Grow(target + 1);
+        _viewsBuffer?.GrowExact(checked(target * ViewEntrySize));
+        _offsetsBuffer?.GrowExact(target + 1);
+        _largeOffsetsBuffer?.GrowExact(target + 1);
         _capacity = target;
     }
 

@@ -72,9 +72,11 @@ internal static class ColumnChunkReader
 
         bool isRepeated = column.MaxRepetitionLevel > 0;
         int capacity = isRepeated ? checked((int)columnMeta.NumValues) : rowCount;
-        // A selected read builds only the rows it keeps, so its buffers start there and grow a page at a time
-        // (EnsurePageRoom), not at the whole group's size (#880).
-        int stateCapacity = keepRows is null ? capacity : KeepRowsCapacity(keepRows, rowCount);
+        // A selected read builds only the rows it keeps, and room for its largest page, which each page fills before
+        // its dropped rows go: not the whole group's size (#880). The page headers say how large that is.
+        int stateCapacity = keepRows is null
+            ? capacity
+            : KeepRowsCapacity(keepRows, rowCount, MaxDataPageRows(data, column, columnMeta, maxPageUncompressedSize));
         var byteArrayOutput = arrowField.DataType switch
         {
             StringViewType or BinaryViewType => ByteArrayOutputKind.ViewType,
@@ -84,7 +86,7 @@ internal static class ColumnChunkReader
 
         using var state = NewState(column, stateCapacity, byteArrayOutput, answer);
         if (keepRows is not null)
-            state.SetRowSelection(keepRows);
+            state.SetRowSelection(keepRows, rowCount);
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
 
@@ -214,12 +216,11 @@ internal static class ColumnChunkReader
     }
 
     /// <summary>
-    /// The rows a selected decode's buffers start with: those it keeps and room for a page, which
-    /// <see cref="ColumnBuildState.EnsurePageRoom"/> grows past when a page is larger.
+    /// The rows a selected decode's buffers hold: those it keeps and room for its largest page,
+    /// <paramref name="maxPageRows"/>. <see cref="ColumnBuildState.EnsurePageRoom"/> grows past that only for a chunk
+    /// whose headers disagree with its pages.
     /// </summary>
-    internal const int KeepRowsPageRoom = 20_000;
-
-    internal static int KeepRowsCapacity(byte[] keepRows, int rowCount)
+    internal static int KeepRowsCapacity(byte[] keepRows, int rowCount, int maxPageRows)
     {
         var keep = keepRows.AsSpan(0, rowCount);
 #if NET8_0_OR_GREATER
@@ -229,7 +230,35 @@ internal static class ColumnChunkReader
         foreach (byte k in keep)
             kept += k;
 #endif
-        return (int)Math.Min(rowCount, (long)kept + KeepRowsPageRoom);
+        return (int)Math.Min(rowCount, (long)kept + maxPageRows);
+    }
+
+    /// <summary>
+    /// The most values a data page of the chunk holds (a flat column's rows), from its page headers alone: nothing is
+    /// decompressed or decoded. Stops where the chunk's values are reached, as <see cref="ReadColumn"/> does. A chunk
+    /// whose headers cannot be read gives what was read before them; its decode then reports the fault.
+    /// </summary>
+    internal static int MaxDataPageRows(
+        ReadOnlySpan<byte> data, ColumnDescriptor column, ColumnMetaData columnMeta, int? maxPageUncompressedSize)
+    {
+        var pages = new PageReader(data, column, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
+        long values = 0;
+        int max = 0;
+        try
+        {
+            while (values < columnMeta.NumValues && pages.TryRead(out var page))
+            {
+                if (page.Header.Type is not (PageType.DataPage or PageType.DataPageV2))
+                    continue;
+                max = Math.Max(max, page.NumValues);
+                values += page.NumValues;
+            }
+        }
+        catch (ParquetFormatException)
+        {
+        }
+
+        return max;
     }
 
     /// <summary>
