@@ -1352,6 +1352,66 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.Equal(0, used);
     }
 
+    /// <summary>
+    /// Long strings in the last page only: the largest page in bytes is not one with the most rows, and a decoder
+    /// that does not skip (DELTA_BYTE_ARRAY) decodes it whole before its dropped rows go. The hold covers that page's
+    /// decoded bytes beside the kept rows (#886 review round 3).
+    /// </summary>
+    [Fact]
+    public async Task ASplitTwoPassRead_HoldsTheLargestPageInBytes_WhenItKeepsRowsInOneBatch()
+    {
+        const int rows = 150_000, pageRows = 50_000, longFrom = 140_000, longLength = 2_000;
+        var random = new Random(886);
+        var keys = new Int64Array.Builder();
+        var text = new StringArray.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            keys.Append(i % 100);
+            int length = i >= longFrom ? longLength : 1;
+            var chars = new char[length];
+            for (int c = 0; c < length; c++)
+                chars[c] = (char)('a' + random.Next(26));
+            text.Append(new string(chars));
+        }
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", Int64Type.Default, false))
+            .Field(new Field("v", StringType.Default, false))
+            .Build();
+        string path = Path.Combine(_tempDir, "two-pass-keep-uneven-pages.parquet");
+        using (var batch = new RecordBatch(schema, [keys.Build(), text.Build()], rows))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false, new ParquetWriteOptions
+                     {
+                         DataPageSize = 256 << 20, DataPageRowCountLimit = pageRows, DictionaryEnabled = false,
+                         ColumnEncodings = new Dictionary<string, ByteArrayEncoding> { ["v"] = ByteArrayEncoding.DeltaByteArray },
+                     }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        var predicate = KeyPredicate(k => k < 1, false);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 5_000 })
+        {
+            TwoPassReads = true,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long chunks = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k"], null).Compressed
+                      + ParquetFileReader.PlannedBytes(group, parquetSchema, ["k", "v"], null).Compressed;
+        // The last page's 10,000 long values, 20 MB, against the kept rows' and largest page's share of the column.
+        long longPage = (long)(rows - longFrom) * longLength;
+        long rowsShare = (long)((double)reader.DecodedBytes(group, parquetSchema, ["v"], null) * (rows / 100 + pageRows) / rows);
+        Assert.True(longPage > rowsShare, $"the long page ({longPage}) is above the rows' share ({rowsShare})");
+
+        var (returned, _, _, used, held) = await ReadTwoPassUnitHeldAsync(reader, predicate, returnPredicateColumn: true);
+        Assert.Equal(rows / 100, returned);
+        Assert.True(held >= chunks + longPage,
+            $"held {held}: the chunks ({chunks}) and the long page's values ({longPage}) were not both counted");
+        Assert.Equal(0, used);
+    }
+
     private const int KeyRows = 40_000;
 
     // A Boolean column's values and validity, as TwoPassFirstBatchBytes sizes answers.

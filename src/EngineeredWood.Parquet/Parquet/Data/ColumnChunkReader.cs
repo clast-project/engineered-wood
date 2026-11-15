@@ -250,11 +250,20 @@ internal static class ColumnChunkReader
     /// whose headers cannot be read gives what was read before them; its decode then reports the fault.
     /// </summary>
     internal static int MaxDataPageRows(
+        ReadOnlySpan<byte> data, ColumnDescriptor column, ColumnMetaData columnMeta, int? maxPageUncompressedSize) =>
+        LargestDataPages(data, column, columnMeta, maxPageUncompressedSize).Rows;
+
+    /// <summary>
+    /// <see cref="MaxDataPageRows"/>, and the most uncompressed bytes a data page holds: the page with the most rows
+    /// need not be the largest one when value sizes vary (#886 review round 3).
+    /// </summary>
+    internal static (int Rows, long Bytes) LargestDataPages(
         ReadOnlySpan<byte> data, ColumnDescriptor column, ColumnMetaData columnMeta, int? maxPageUncompressedSize)
     {
         var pages = new PageReader(data, column, chunk: columnMeta, maxUncompressedPageSize: maxPageUncompressedSize);
         long values = 0;
         int max = 0;
+        long bytes = 0;
         try
         {
             while (values < columnMeta.NumValues && pages.TryRead(out var page))
@@ -262,6 +271,7 @@ internal static class ColumnChunkReader
                 if (page.Header.Type is not (PageType.DataPage or PageType.DataPageV2))
                     continue;
                 max = Math.Max(max, page.NumValues);
+                bytes = Math.Max(bytes, page.Header.UncompressedPageSize);
                 values += page.NumValues;
             }
         }
@@ -269,7 +279,7 @@ internal static class ColumnChunkReader
         {
         }
 
-        return max;
+        return (max, bytes);
     }
 
     /// <summary>

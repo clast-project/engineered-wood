@@ -152,16 +152,26 @@ public sealed partial class ParquetFileReader
         for (int i = 0; i < output.Count; i++)
         {
             long columnBytes = DecodedBytes(rowGroup, schema, [output.Columns[i].Path[0]], null);
-            int? maxPage = null;
+            (int Rows, long Bytes)? maxPage = null;
             if (io is not null && io.Holds(output.Ranges[i]))
             {
                 using var chunk = await io.ReadAsync(output.Ranges[i], cancellationToken).ConfigureAwait(false);
-                maxPage = Data.ColumnChunkReader.MaxDataPageRows(
+                maxPage = Data.ColumnChunkReader.LargestDataPages(
                     chunk.Memory.Span, output.Columns[i], output.Chunks[i].MetaData!, _options.MaxPageUncompressedSize);
             }
 
-            long holds = maxPage is { } page ? Math.Min(rows, kept + page) : rows;
+            long holds = maxPage is { } page ? Math.Min(rows, kept + page.Rows) : rows;
             long scaled = rows == 0 ? 0 : (long)((double)columnBytes * holds / rows);
+            // A decoder that does not skip decodes a whole page before its dropped rows go, so the decode holds the
+            // kept rows and its largest page in bytes too, decoded at the column's own ratio of decoded to encoded
+            // bytes. With uneven values that is not the page with the most rows (#886 review round 3).
+            long chunkBytes = output.Chunks[i].MetaData?.TotalUncompressedSize ?? 0;
+            if (maxPage is { } largest && chunkBytes > 0 && rows > 0)
+            {
+                long pageDecoded = (long)((double)columnBytes * largest.Bytes / chunkBytes);
+                scaled = Math.Max(scaled, Math.Min(columnBytes, (long)((double)columnBytes * kept / rows) + pageDecoded));
+            }
+
             // The state's buffers are allocated at `holds` slots before a value is decoded: for short strings, more
             // than the decoded share (#886 review round 2).
             var column = output.Columns[i];
