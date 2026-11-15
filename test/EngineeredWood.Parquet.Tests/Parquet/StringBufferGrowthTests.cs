@@ -195,18 +195,30 @@ public sealed class StringBufferGrowthTests : IDisposable
         Assert.True(estimate >= (long)Rows * Length, $"the estimate {estimate} is short of the recorded strings");
     }
 
-    [Fact]
-    public async Task ABatchedRead_SizesEachSliceFromItsPages()
+    [Theory]
+    [InlineData("delta-length", false)]
+    [InlineData("delta-length", true)]
+    [InlineData("dictionary", true)]
+    [InlineData("delta", true)]
+    [InlineData("fsst", true)]
+    public async Task ABatchedRead_SizesEachSliceFromItsPages(string encoding, bool pageIndex)
     {
-        // 10,000-row batches over 5,000-row pages: each slice's buffer starts at its pages' bound, not at 32 bytes a
-        // value doubled to 64 (#889 review). Without an OffsetIndex, the page map is built from the page headers, so
-        // its page sizes are the pages' own. A map built from an OffsetIndex has only estimates; the index's per-page
-        // unencoded_byte_array_data_bytes (written since #890) could size those slices, but the read does not use them (#891).
-        string path = await WriteAsync("delta-length", new ParquetWriteOptions
+        // 10,000-row batches over 5,000-row pages: each slice's buffer starts at its pages' string bytes, not at 32
+        // bytes a value doubled to 64 (#889 review). Without an OffsetIndex, the page map is built from the page
+        // headers, whose sizes bound a chunk of whole strings. With one, the map is built from the index, whose
+        // sizes are only estimates, but whose per-page unencoded_byte_array_data_bytes (written since #890) are
+        // exact whatever the encoding (#891).
+        string path = await WriteAsync(encoding, new ParquetWriteOptions
         {
-            DictionaryEnabled = false,
+            DictionaryEnabled = encoding == "dictionary",
+            ColumnEncodings = encoding switch
+            {
+                "delta" => new Dictionary<string, ByteArrayEncoding> { ["v"] = ByteArrayEncoding.DeltaByteArray },
+                "fsst" => new Dictionary<string, ByteArrayEncoding> { ["v"] = ByteArrayEncoding.Fsst },
+                _ => null,
+            },
             DataPageRowCountLimit = 5_000,
-            WritePageIndex = false,
+            WritePageIndex = pageIndex,
         });
         const int batchRows = 10_000;
         await using var file = new LocalRandomAccessFile(path);

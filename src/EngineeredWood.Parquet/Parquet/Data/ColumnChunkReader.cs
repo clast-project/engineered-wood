@@ -795,16 +795,26 @@ internal static class ColumnChunkReader
     }
 
     /// <summary>
-    /// An upper bound on the string bytes that pages <paramref name="startPage"/> through <paramref name="endPage"/>
-    /// decode to: the sum of their uncompressed sizes. It applies only when the chunk stores its strings whole (see
-    /// <see cref="ExpectedStringBytes"/>) and the page map was built from the page headers, so the sizes are the pages'
-    /// own rather than estimates. Null otherwise.
+    /// The string bytes that pages <paramref name="startPage"/> through <paramref name="endPage"/> decode to. When the
+    /// page map carries the OffsetIndex's per-page counts (<see cref="ColumnPageMap.PageStringBytes"/>), it is their
+    /// sum, whatever the chunk's encoding (#891). Otherwise it is an upper bound, the sum of the pages' uncompressed
+    /// sizes, which applies only when the chunk stores its strings whole (see <see cref="ExpectedStringBytes"/>) and
+    /// the page map was built from the page headers, so the sizes are the pages' own rather than estimates. Null
+    /// otherwise.
     /// </summary>
     internal static long? SliceStringBytes(ColumnMetaData columnMeta, ColumnPageMap pageMap, int startPage, int endPage)
     {
-        if (!pageMap.HeadersResolved || columnMeta.Type != PhysicalType.ByteArray || !StoresStringsWhole(columnMeta))
+        if (columnMeta.Type != PhysicalType.ByteArray)
             return null;
         long bytes = 0;
+        if (pageMap.PageStringBytes is { } counts)
+        {
+            for (int p = startPage; p <= endPage; p++)
+                bytes += Math.Min(counts[p], int.MaxValue); // a page cannot hold more; no sum can overflow
+            return bytes;
+        }
+        if (!pageMap.HeadersResolved || !StoresStringsWhole(columnMeta))
+            return null;
         for (int p = startPage; p <= endPage; p++)
             bytes += pageMap.Pages[p].UncompressedSize;
         return bytes;
