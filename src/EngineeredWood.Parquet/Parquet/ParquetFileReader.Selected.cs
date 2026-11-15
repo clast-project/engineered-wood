@@ -43,7 +43,8 @@ public sealed partial class ParquetFileReader
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         var selected = await PrepareSelectedAsync(scan, cancellationToken).ConfigureAwait(false);
         var plans = PlanRowGroupsAsync(
-            metadata, scan.Prune ?? _options.Filter, selected.ReadColumns, selected.SkipRows, cancellationToken);
+            metadata, scan.Prune ?? _options.Filter, selected.ReadColumns, selected.SkipRows, cancellationToken,
+            stringIndexesAhead: selected.MayReadInTwoPasses);
 
         int concurrency = Math.Min(EffectiveConcurrentRowGroups, metadata.RowGroups.Count);
         if (concurrency <= 1 || metadata.RowGroups.Count <= 1)
@@ -77,6 +78,13 @@ public sealed partial class ParquetFileReader
     }
 
     /// <summary>
+    /// Whether a selected read that may go in two passes plans with its string columns' OffsetIndexes read ahead
+    /// (<see cref="SelectedPlanReader.MayReadInTwoPasses"/>, #894); off, its second pass's dictionary, DELTA_BYTE_ARRAY
+    /// and FSST slices start unsized unless the page index was read. For tests and the A/B.
+    /// </summary>
+    internal bool ReadsStringIndexesAhead { get; set; } = true;
+
+    /// <summary>
     /// The smallest share of a batch's rows still live at which a predicate that can answer every row without raising is
     /// asked about the whole batch rather than a gather of the live rows (#502 phase 5a); above 1, never. For tests and
     /// the A/B sweep.
@@ -98,7 +106,7 @@ public sealed partial class ParquetFileReader
     /// <summary>
     /// Everything a selected read of <paramref name="scan"/> decides once, before any row group: the columns it
     /// decodes, how it selects rows, whether it may go in two passes. A caller that schedules row groups itself (a
-    /// Delta scan, which plans them with <see cref="PlanRowGroupsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken, int, int)"/>)
+    /// Delta scan, which plans them with <see cref="PlanRowGroupsAsync(EngineeredWood.Expressions.Predicate?, IReadOnlyList{string}?, RowSkipPredicate?, CancellationToken, int, int, bool)"/>)
     /// plans with <see cref="SelectedPlanReader.ReadColumns"/> and <see cref="SelectedPlanReader.SkipRows"/> and reads
     /// each plan with <see cref="SelectedPlanReader.ReadAsync(RowGroupPlan, CancellationToken)"/>, which may run
     /// concurrently for different plans.
@@ -210,6 +218,15 @@ public sealed partial class ParquetFileReader
 
         /// <summary>The rows the excluded rows rule out whole, for planning to skip unread; null for none.</summary>
         public RowSkipPredicate? SkipRows { get; }
+
+        /// <summary>
+        /// Whether a row group of this read may be read in two passes (<see cref="ReadsInTwoPasses"/>, before the group's
+        /// own conditions): what to plan with, as <c>stringIndexesAhead</c>, so that the second pass's string slices
+        /// are sized from their OffsetIndexes (#894).
+        /// </summary>
+        public bool MayReadInTwoPasses =>
+            _reader.ReadsStringIndexesAhead && _whole.TwoPass is not null && _reader.UsesTwoPasses(_proofs.Length > 0)
+            && _reader._options.MaxBatchByteSize is not > 0;
 
         /// <summary>The selected rows of one planned row group, read without reserving scan memory.</summary>
         public IAsyncEnumerable<SelectedRecordBatch> ReadAsync(RowGroupPlan plan, CancellationToken cancellationToken)

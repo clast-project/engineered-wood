@@ -243,17 +243,22 @@ public sealed class StringBufferGrowthTests : IDisposable
     }
 
     [Theory]
-    [InlineData("delta-length")]
-    [InlineData("dictionary")]
-    [InlineData("delta")]
-    [InlineData("fsst")]
-    public async Task ATwoPassSecondPass_SizesItsSliceFromTheIndexPlanningRead(string encoding)
+    [InlineData("delta-length", true)]
+    [InlineData("dictionary", true)]
+    [InlineData("delta", true)]
+    [InlineData("fsst", true)]
+    [InlineData("delta-length", false)]
+    [InlineData("dictionary", false)]
+    [InlineData("delta", false)]
+    [InlineData("fsst", false)]
+    public async Task ATwoPassSecondPass_SizesItsSliceFromTheIndexPlanningRead(string encoding, bool prune)
     {
         // A selected read in two passes builds its second pass's page maps from the prefetched chunks' headers, which
-        // carry no string counts. Planning read the OffsetIndexes with the page index, which narrowed nothing (k != 75
-        // rules out no 5,000-row page), so their counts are in hand and size the slice of rows 0-40,960 that the
-        // selection (k < 40) covers. Without them a dictionary, DELTA_BYTE_ARRAY or FSST slice doubled: 2.70 times its
-        // decoded bytes (#894).
+        // carry no string counts. With a prune, planning read the OffsetIndexes with the page index, which narrowed
+        // nothing (k != 75 rules out no 5,000-row page). Without one, planning read the string columns' OffsetIndexes
+        // ahead, beside the first pass. Either way their counts are in hand and size the slice of rows 0-40,960 that
+        // the selection (k < 40) covers. Without them a dictionary, DELTA_BYTE_ARRAY or FSST slice doubled: 2.70 times
+        // its decoded bytes (#894).
         string path = Path.Combine(_tempDir, "two-pass-" + encoding + ".parquet");
         var keys = new Int64Array.Builder();
         var values = new StringArray.Builder();
@@ -295,7 +300,7 @@ public sealed class StringBufferGrowthTests : IDisposable
         var scan = new ParquetScan
         {
             Columns = ["v"],
-            Prune = EngineeredWood.Expressions.Expressions.NotEqual("k", EngineeredWood.Expressions.LiteralValue.Of(75L)),
+            Prune = prune ? EngineeredWood.Expressions.Expressions.NotEqual("k", EngineeredWood.Expressions.LiteralValue.Of(75L)) : null,
             RowFilter = new RowFilter(ParallelRowGroupReadTests.KeyPredicate(k => k < 40, valueWise: false)),
         };
         NativeMemoryTracker.Reset();
