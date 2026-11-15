@@ -101,6 +101,29 @@ any proxy works that answers `GET /__mark?label=…` (attribute what follows to 
 | `EWDD_EW_MAX_BUFFERED_MB` | EW's `MaxBufferedReadBytes` in the scan and change-feed benchmarks (default: EW's own); the snapshot benchmarks (open, history) always use the defaults |
 | `EWDD_EW_MAX_CONCURRENT_READS` | EW's `MaxConcurrentReads` in the scan and change-feed benchmarks (default: EW's own); the snapshot benchmarks (open, history) always use the defaults |
 
+### Request-size sweep (#876)
+
+How the largest coalesced range request (`CoalescingOptions.MaxRequestBytes`) affects scans of tables with small and
+large row groups. The input is #652's layouts: 12M lineitem-shaped rows in 2 files, at 100K, 1M and 6M rows per row
+group. They are written to `%TEMP%\ew-rg652` by the other benchmark project:
+
+```powershell
+dotnet run -c Release -f net10.0 --project test\EngineeredWood.DeltaLake.Benchmarks -- rg652 build layouts=w100k,w1m,w6m
+dotnet build -c Release test\EngineeredWood.DeltaLake.DeltaDotnetBenchmarks
+.\test\EngineeredWood.DeltaLake.DeltaDotnetBenchmarks\rg876-azure.ps1 -Account <name>
+```
+
+The script uploads the layouts to `<prefix>/rg876/` once (about 780 MB; later runs skip tables already there). It
+then runs `--rg876` once per cap (`-CapsMiB`, default 64,16,8,4) and per round (`-Rounds`, default 3), with the caps
+interleaved so network drift lands on every cap. Each process scans every layout with all columns and with Q1's seven,
+16 reads at once: one warm-up scan, then `-Repeats` timed ones (default 3). It prints the best and the median. With
+`EWDD_STORAGE` unset, `--rg876` scans the local tables instead.
+
+The same layouts can be swept without a cloud account through a simulated object store:
+`rg652 cloud=true maxreq=<bytes>` in `EngineeredWood.DeltaLake.Benchmarks`.
+
+Results for 2026-11-14, from a bandwidth-limited client, are on #876; the default moved to 16 MiB in #884.
+
 ## What is measured
 
 Every category has EW as the baseline, so **Ratio = delta-dotnet time / EW time** (above 1 means EW is faster).
