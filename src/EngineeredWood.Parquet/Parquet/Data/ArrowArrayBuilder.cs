@@ -1063,7 +1063,8 @@ internal sealed class ColumnBuildState : IDisposable
     private int _offsetsCount; // number of offset entries written (= _valueCount + 1 after first page)
     private NativeBuffer<byte>? _dataBuffer;
     private int _dataByteOffset;
-    // The string data the chunk says it decodes to, exactly or as an upper bound; 0 when it does not say (#888).
+    // The most the string data buffer grows to before falling back to doubling: the chunk's estimate, exact or an
+    // upper bound (#888). 0 means no cap.
     private long _expectedDataBytes;
 
     // Dotted column path, for the diagnostics in ByteArrayCapacity. Null when the caller had none to give.
@@ -1188,11 +1189,11 @@ internal sealed class ColumnBuildState : IDisposable
         _byteArrayOutput = byteArrayOutput;
         _columnPath = columnPath;
         _expectedDataBytes = Math.Min(Math.Max(expectedDataBytes ?? 0, 0), ByteArrayCapacity.MaxBytes);
-        // A whole chunk's string data starts at what the chunk says it decodes to (#888), nothing for a chunk that
-        // records none (#889 review round 3), else at a guess. The footer's word is not checked against the pages
-        // before they decode, so it buys at most MaxExpectedStartingBytes up front (or the guess, when that is more):
-        // a footer claiming 2 GiB cannot allocate it unread (#889 review round 4). Past that the buffer grows toward
-        // the estimate, never beyond it, as the values arrive.
+        // With an estimate (#888), the string buffer starts at it, which is empty for a recorded 0 (#889 review
+        // round 3); without one, at the per-value guess. Nothing checks a footer's estimate before the pages decode,
+        // so the starting size is capped at MaxExpectedStartingBytes, or the guess if that is larger: a footer that
+        // claims 2 GiB cannot allocate it before any value is read (#889 review round 4). Beyond the cap the buffer
+        // grows toward the estimate, never past it, as values arrive.
         int guessedDataBytes = capacity * ByteArrayStartingBytesPerValue;
         int startingDataBytes = expectedDataBytes.HasValue
             ? (int)Math.Min(_expectedDataBytes, Math.Max(guessedDataBytes, MaxExpectedStartingBytes))
@@ -1267,10 +1268,11 @@ internal sealed class ColumnBuildState : IDisposable
     }
 
     /// <summary>
-    /// Caps how far the string data buffer grows at <paramref name="expectedBytes"/>, what the chunk says it decodes
-    /// to (exact or an upper bound), for a read that keeps only some rows and so starts smaller: a grow goes to that
-    /// size rather than doubling past it (#888). A whole-chunk read passes it to the constructor instead, which starts
-    /// the buffer there. A grow the estimate cannot hold doubles, as without one.
+    /// Caps the growth of the string data buffer at <paramref name="expectedBytes"/>, the chunk's estimate of its
+    /// decoded strings (exact or an upper bound), for a read whose buffer starts smaller than that, such as one that
+    /// keeps only some rows (#888). A grow then stops at the estimate rather than doubling past it; a grow the
+    /// estimate cannot hold doubles as usual. A whole-chunk read passes the estimate to the constructor instead.
+    /// Null or 0 sets no cap.
     /// </summary>
     internal void ExpectStringData(long? expectedBytes)
     {
@@ -1278,8 +1280,8 @@ internal sealed class ColumnBuildState : IDisposable
             _expectedDataBytes = Math.Min(expectedBytes.Value, ByteArrayCapacity.MaxBytes);
     }
 
-    /// <summary>Grows the string data buffer to hold <paramref name="needed"/> bytes: to the expected size when that
-    /// holds them (no further than doubling would), doubling otherwise.</summary>
+    /// <summary>Grows the string data buffer to hold at least <paramref name="needed"/> bytes. Within the cap
+    /// (<c>_expectedDataBytes</c>) it doubles but stops at the cap; past the cap it doubles as usual.</summary>
     private void GrowData(int needed)
     {
         if (needed <= _expectedDataBytes)
@@ -1289,8 +1291,9 @@ internal sealed class ColumnBuildState : IDisposable
     }
 
     /// <summary>
-    /// The most string data a state allocates up front on the chunk's estimate (<see cref="ColumnChunkReader.ExpectedStringBytes"/>),
-    /// which the footer states and nothing checks until the values decode. A larger chunk grows the rest of the way.
+    /// The most string data a state allocates up front from a chunk's estimate
+    /// (<see cref="ColumnChunkReader.ExpectedStringBytes"/>), unless the per-value guess is larger. The estimate comes
+    /// from the footer and is unchecked until the values decode; a larger chunk grows the rest of the way.
     /// </summary>
     internal const int MaxExpectedStartingBytes = 64 << 20;
 
