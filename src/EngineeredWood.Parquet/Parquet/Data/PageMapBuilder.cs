@@ -77,6 +77,13 @@ internal sealed class ColumnPageMap
     /// </summary>
     public bool HeadersResolved { get; }
 
+    /// <summary>
+    /// The string bytes each data page decodes to, one entry per page of <see cref="Pages"/>, when the chunk's
+    /// OffsetIndex records them (<see cref="OffsetIndex.UnencodedByteArrayDataBytes"/>); otherwise null. They size a
+    /// batch slice's string buffer whatever the chunk's encoding (#891).
+    /// </summary>
+    public IReadOnlyList<long>? PageStringBytes { get; }
+
     public ColumnPageMap(
         DictionaryDecoder? dictionary,
         FsstSymbolTable? symbolTable,
@@ -85,7 +92,8 @@ internal sealed class ColumnPageMap
         int[] cumulativeValues,
         int totalRows,
         bool headersResolved = true,
-        int pendingPrefixLength = 0)
+        int pendingPrefixLength = 0,
+        IReadOnlyList<long>? pageStringBytes = null)
     {
         Dictionary = dictionary;
         SymbolTable = symbolTable;
@@ -95,6 +103,7 @@ internal sealed class ColumnPageMap
         TotalRows = totalRows;
         HeadersResolved = headersResolved;
         PendingPrefixLength = pendingPrefixLength;
+        PageStringBytes = pageStringBytes;
     }
 
     /// <summary>
@@ -499,7 +508,7 @@ internal static class PageMapBuilder
 
         return new ColumnPageMap(
             dictionary, symbolTable, layout.Pages, layout.CumulativeRows, layout.CumulativeValues, layout.TotalRows,
-            headersResolved: false);
+            headersResolved: false, pageStringBytes: layout.PageStringBytes);
     }
 
     /// <summary>
@@ -561,7 +570,23 @@ internal static class PageMapBuilder
 
         return new ColumnPageMap(
             null, null, pages, cumulativeRows, cumulativeRows, rowCount,
-            headersResolved: false, pendingPrefixLength: prefixLength);
+            headersResolved: false, pendingPrefixLength: prefixLength,
+            pageStringBytes: PageStringBytesOf(index, pages.Length, columnMeta));
+    }
+
+    // The index's per-page string bytes, when it has one sane count for each of its pages. The index is optional
+    // metadata, so counts that cannot be right are ignored: the slice then starts unsized, as without them.
+    private static IReadOnlyList<long>? PageStringBytesOf(OffsetIndex index, int pageCount, ColumnMetaData columnMeta)
+    {
+        if (columnMeta.Type != PhysicalType.ByteArray
+            || index.UnencodedByteArrayDataBytes is not { } counts || counts.Count != pageCount)
+            return null;
+        foreach (long count in counts)
+        {
+            if (count < 0)
+                return null;
+        }
+        return counts;
     }
 
     /// <summary>

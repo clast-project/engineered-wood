@@ -224,6 +224,44 @@ public class OffsetIndexPageMapTests : IDisposable
         Assert.True(map.Pages[2].Offset > int.MaxValue);
     }
 
+    /// <summary>
+    /// The index's per-page string bytes reach the map, and from it a slice's sizing, only when there is one count
+    /// for each page and none is negative: the index is optional metadata, so counts that cannot be right are
+    /// ignored (#891).
+    /// </summary>
+    [Fact]
+    public void BuildLayoutFromOffsetIndex_CarriesThePerPageStringBytes()
+    {
+        string path = WriteAsync(DataPageVersion.V2, CompressionCodec.Uncompressed, true, ByteArrayEncoding.Plain, writePageIndex: true)
+            .GetAwaiter().GetResult();
+        var (file, metadata) = ReadFooter(path);
+        var schema = SchemaDescriptorFor(metadata);
+        var rowGroup = metadata.RowGroups[0];
+        var chunk = rowGroup.Columns[2]; // s: nullable strings, dictionary-encoded
+        var meta = chunk.MetaData!;
+        var index = MetadataDecoder.DecodeOffsetIndex(Slice(file, chunk.OffsetIndexOffset!.Value, chunk.OffsetIndexLength!.Value));
+        var counts = index.UnencodedByteArrayDataBytes!;
+        Assert.True(counts.Count >= 3);
+        long start = meta.DictionaryPageOffset ?? meta.DataPageOffset;
+        int prefix = checked((int)(index.PageLocations[0].Offset - start));
+        long end = start + meta.TotalCompressedSize;
+
+        ColumnPageMap Build(IReadOnlyList<long>? recorded) => PageMapBuilder.BuildLayoutFromOffsetIndex(
+            prefix, start, end, new OffsetIndex { PageLocations = index.PageLocations, UnencodedByteArrayDataBytes = recorded },
+            (int)rowGroup.NumRows, schema.Columns[2], meta)!;
+
+        var map = Build(counts);
+        Assert.Equal(counts, map.PageStringBytes);
+        Assert.Equal(counts[1] + counts[2], ColumnChunkReader.SliceStringBytes(meta, map, 1, 2));
+        Assert.Equal(meta.UnencodedByteArrayDataBytes, ColumnChunkReader.SliceStringBytes(meta, map, 0, map.Pages.Length - 1));
+
+        Assert.Null(Build(null).PageStringBytes);
+        Assert.Null(Build(counts.Skip(1).ToArray()).PageStringBytes);
+        Assert.Null(Build(counts.Select((c, i) => i == 1 ? -1 : c).ToArray()).PageStringBytes);
+        // Without the counts, a dictionary chunk's slice has no bound: its pages store indices, not strings.
+        Assert.Null(ColumnChunkReader.SliceStringBytes(meta, Build(null), 1, 2));
+    }
+
     // ───── Fixtures from other writers ─────
 
     /// <summary>
