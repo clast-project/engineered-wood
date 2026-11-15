@@ -371,6 +371,10 @@ internal static class ColumnChunkWriter
         var defEncoder = maxDefLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxDefLevel), maxLiteralGroups: maxLiteralGroups) : null;
         var repEncoder = maxRepLevel > 0 ? new RleBitPackedEncoder(BitWidth(maxRepLevel), maxLiteralGroups: maxLiteralGroups) : null;
 
+        // SizeStatistics' unencoded_byte_array_data_bytes, per page and for the chunk (#890).
+        bool byteArray = RecordsUnencodedBytes(physicalType, options);
+        long chunkUnencodedBytes = 0;
+
         int offset = 0;
         int valueIndex = 0;
         while (offset < rowCount)
@@ -399,6 +403,11 @@ internal static class ColumnChunkWriter
                     valueDefLevels, options, defEncoder, repEncoder, out pageEncoding);
             }
 
+            long? pageUnencodedBytes = byteArray
+                ? ByteArrayDataBytes(array, offset, pageValues, valueDefLevels)
+                : null;
+            chunkUnencodedBytes += pageUnencodedBytes ?? 0;
+
             if (pageIndex != null)
             {
                 // The same scans the chunk statistics run, over this page's level positions.
@@ -408,7 +417,7 @@ internal static class ColumnChunkWriter
                         pageIndex.FloatingPointTotalOrder, pageIndex.Order)
                     : default;
                 pageIndex.AddPage(page, PageRows(repLevels, offset, pageValues, maxRepLevel),
-                    pageValues - pageNonNull, pageNonNull, bounds);
+                    pageValues - pageNonNull, pageNonNull, bounds, pageUnencodedBytes);
             }
 
             encodings.Add(pageEncoding);
@@ -429,6 +438,7 @@ internal static class ColumnChunkWriter
             DataPageOffset = 0, // set by caller
             SymbolTablePageOffset = symbolTablePageSize > 0 ? 0 : null, // set by caller
             SymbolTablePageLength = symbolTablePageSize > 0 ? symbolTablePageSize : null,
+            UnencodedByteArrayDataBytes = byteArray ? chunkUnencodedBytes : null,
         };
 
         return new ColumnChunkResult
@@ -453,7 +463,15 @@ internal static class ColumnChunkWriter
             truncateLength: options.PageIndexTruncateLength,
             utf8: valueType is StringType or LargeStringType or StringViewType,
             writeColumnIndex: options.GetWriteStatistics(pathInSchema)
-                && physicalType != PhysicalType.Int96);
+                && physicalType != PhysicalType.Int96,
+            recordsUnencodedBytes: RecordsUnencodedBytes(physicalType, options));
+
+    /// <summary>
+    /// Whether a chunk records its BYTE_ARRAY value bytes (SizeStatistics' unencoded_byte_array_data_bytes, #890):
+    /// a BYTE_ARRAY chunk under <see cref="ParquetWriteOptions.WriteSizeStatistics"/>.
+    /// </summary>
+    private static bool RecordsUnencodedBytes(PhysicalType physicalType, ParquetWriteOptions options) =>
+        physicalType == PhysicalType.ByteArray && options.WriteSizeStatistics;
 
     /// <summary>Rows that start in a page: every level entry for a flat column, rep = 0 for a repeated one.</summary>
     private static int PageRows(int[]? repLevels, int offset, int pageValues, int maxRepLevel) =>
@@ -688,6 +706,13 @@ internal static class ColumnChunkWriter
             ? new DictionaryPageBounds(dictResult, pageIndex)
             : null;
 
+        // SizeStatistics' unencoded_byte_array_data_bytes, per page and for the chunk (#890): each value
+        // counts its entry's length, so the entries are measured once and the indices summed.
+        int[]? entryLengths = RecordsUnencodedBytes(physicalType, options)
+            ? DictionaryEntryLengths(dictResult.DictionaryPageData, dictResult.DictionaryCount)
+            : null;
+        long chunkUnencodedBytes = 0;
+
         int offset = 0;
         int indexOffset = 0;
         while (offset < rowCount)
@@ -718,6 +743,16 @@ internal static class ColumnChunkWriter
                 bounds = dictionaryBounds.End();
             }
 
+            // Also before the indices are encoded, for the same reason.
+            long? pageUnencodedBytes = null;
+            if (entryLengths != null)
+            {
+                pageUnencodedBytes = dictResult.IndexRuns is null
+                    ? SumEntryLengths(dictResult.Indices.AsSpan(indexOffset, pageNonNull), entryLengths)
+                    : runCursor.SumEntryLengths(pageNonNull, entryLengths);
+                chunkUnencodedBytes += pageUnencodedBytes.Value;
+            }
+
             // Encoded up front rather than inside each page writer: both need the same bytes in the same
             // thread-static buffer, and only here is it known which form the indices arrived in.
             int valuesLen = dictResult.IndexRuns is null
@@ -741,7 +776,7 @@ internal static class ColumnChunkWriter
             }
 
             pageIndex?.AddPage(page, PageRows(repLevels, offset, pageValues, maxRepLevel),
-                pageValues - pageNonNull, pageNonNull, bounds);
+                pageValues - pageNonNull, pageNonNull, bounds, pageUnencodedBytes);
 
             offset += pageValues;
             indexOffset += pageNonNull;
@@ -763,6 +798,7 @@ internal static class ColumnChunkWriter
             EncodingStats = output.EncodingStats.ToArray(),
             DataPageOffset = 0, // set by caller
             DictionaryPageOffset = 0, // set by caller
+            UnencodedByteArrayDataBytes = entryLengths != null ? chunkUnencodedBytes : null,
         };
 
         return new ColumnChunkResult
@@ -1021,6 +1057,26 @@ internal static class ColumnChunkWriter
             }
         }
 
+        /// <summary>
+        /// The summed <paramref name="entryLengths"/> of the next <paramref name="count"/> indices, a run
+        /// at a time. Reads without advancing: the cursor is a struct, and this works on its own copy.
+        /// </summary>
+        public readonly long SumEntryLengths(int count, int[] entryLengths)
+        {
+            long total = 0;
+            int run = _run, taken = _taken;
+            while (count > 0 && run < _values.Length)
+            {
+                int take = Math.Min(_lengths[run] - taken, count);
+                total += (long)take * entryLengths[_values[run]];
+                count -= take;
+                run++;
+                taken = 0;
+            }
+
+            return total;
+        }
+
         /// <summary>Feeds the next <paramref name="count"/> indices to <paramref name="encoder"/> as runs.</summary>
         public void EncodeNext(int count, RleBitPackedEncoder encoder)
         {
@@ -1051,6 +1107,50 @@ internal static class ColumnChunkWriter
     }
 
     // ───── PLAIN encoding path ─────
+
+    /// <summary>
+    /// The bytes of the values at level positions [<paramref name="offset"/>, +<paramref name="numValues"/>)
+    /// of a BYTE_ARRAY column, length prefixes excluded: a page's <c>unencoded_byte_array_data_bytes</c>.
+    /// Indexed as the page encoders index it, one slot per level, nulls (<paramref name="defLevels"/> 0)
+    /// skipped.
+    /// </summary>
+    private static long ByteArrayDataBytes(IArrowArray array, int offset, int numValues, int[]? defLevels)
+    {
+        ReadOnlySpan<int> offsets = MemoryMarshal.Cast<byte, int>(array.Data.Buffers[1].Span);
+        if (defLevels == null)
+            return (long)offsets[offset + numValues] - offsets[offset];
+
+        long total = 0;
+        for (int i = offset, end = offset + numValues; i < end; i++)
+        {
+            if (defLevels[i] != 0)
+                total += offsets[i + 1] - offsets[i];
+        }
+
+        return total;
+    }
+
+    /// <summary>Each entry's length in a PLAIN BYTE_ARRAY dictionary page, whose entries each follow a 4-byte length.</summary>
+    private static int[] DictionaryEntryLengths(byte[] dictionaryPage, int count)
+    {
+        var lengths = new int[count];
+        int position = 0;
+        for (int i = 0; i < count; i++)
+        {
+            lengths[i] = BinaryPrimitives.ReadInt32LittleEndian(dictionaryPage.AsSpan(position));
+            position += 4 + lengths[i];
+        }
+
+        return lengths;
+    }
+
+    private static long SumEntryLengths(ReadOnlySpan<int> indices, int[] entryLengths)
+    {
+        long total = 0;
+        foreach (int index in indices)
+            total += entryLengths[index];
+        return total;
+    }
 
     private static int CountNonNull(int[] defLevels, int offset, int count, int maxDefLevel)
     {

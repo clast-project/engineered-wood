@@ -62,8 +62,9 @@ public sealed class StringBufferGrowthTests : IDisposable
     [InlineData("dictionary", ByteArrayOutputKind.Default)]
     public async Task AChunkThatRecordsItsStringBytes_IsSizedByThem(string encoding, ByteArrayOutputKind output)
     {
+        // The count is the writer's own (#890); until it wrote one, these chunks doubled to 1.84x.
         string path = await WriteAsync(encoding);
-        RecordStringBytes(path, (long)Rows * Length);
+        Assert.Equal((long)Rows * Length, await RecordedStringBytesAsync(path));
         await AssertReadsWithinAsync(path, output, Slack);
     }
 
@@ -144,7 +145,7 @@ public sealed class StringBufferGrowthTests : IDisposable
             await writer.WriteRowGroupAsync(batch);
             await writer.CloseAsync();
         }
-        RecordStringBytes(path, (long)Rows * Length);
+        Assert.Equal((long)Rows * Length, await RecordedStringBytesAsync(path));
 
         await using var file = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(file, ownsFile: false);
@@ -180,7 +181,7 @@ public sealed class StringBufferGrowthTests : IDisposable
             await writer.WriteRowGroupAsync(batch);
             await writer.CloseAsync();
         }
-        RecordStringBytes(path, (long)Rows * Length);
+        Assert.Equal((long)Rows * Length, await RecordedStringBytesAsync(path));
 
         await using var file = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(file, ownsFile: false);
@@ -199,8 +200,8 @@ public sealed class StringBufferGrowthTests : IDisposable
     {
         // 10,000-row batches over 5,000-row pages: each slice's buffer starts at its pages' bound, not at 32 bytes a
         // value doubled to 64 (#889 review). Without an OffsetIndex, the page map is built from the page headers, so
-        // its page sizes are the pages' own. A map built from an OffsetIndex has only estimates; sizing those slices
-        // needs the index's per-page unencoded_byte_array_data_bytes, which this writer does not record yet (#890).
+        // its page sizes are the pages' own. A map built from an OffsetIndex has only estimates; the index's per-page
+        // unencoded_byte_array_data_bytes (written since #890) could size those slices, but the read does not use them (#891).
         string path = await WriteAsync("delta-length", new ParquetWriteOptions
         {
             DictionaryEnabled = false,
@@ -252,7 +253,7 @@ public sealed class StringBufferGrowthTests : IDisposable
             await writer.WriteRowGroupAsync(batch);
             await writer.CloseAsync();
         }
-        RecordStringBytes(path, 0);
+        Assert.Equal(0L, await RecordedStringBytesAsync(path));
 
         await using var file = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { ByteArrayOutput = output });
@@ -420,8 +421,16 @@ public sealed class StringBufferGrowthTests : IDisposable
         return path;
     }
 
+    /// <summary>The string bytes <paramref name="path"/>'s one chunk records (<c>SizeStatistics</c>), or null.</summary>
+    private static async Task<long?> RecordedStringBytesAsync(string path)
+    {
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        return (await reader.ReadMetadataAsync()).RowGroups[0].Columns[0].MetaData!.UnencodedByteArrayDataBytes;
+    }
+
     /// <summary>Rewrites <paramref name="path"/>'s footer to record its one chunk's string bytes as
-    /// <paramref name="bytes"/>, as a writer of <c>SizeStatistics</c> does (EngineeredWood's does not).</summary>
+    /// <paramref name="bytes"/>: a count other than the true one, which the writer records itself (#890).</summary>
     private static void RecordStringBytes(string path, long bytes)
     {
         byte[] content = File.ReadAllBytes(path);

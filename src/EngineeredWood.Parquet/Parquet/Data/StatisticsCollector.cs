@@ -9,14 +9,14 @@ using EngineeredWood.Parquet.Metadata;
 namespace EngineeredWood.Parquet.Data;
 
 /// <summary>
-/// Computes column-level statistics (min, max, null_count) from Arrow arrays.
-/// </summary>
-/// <summary>
 /// One page's bounds and NaN count, in the physical type's encoding and untruncated. Both bounds are
 /// null when the page has no bound to give.
 /// </summary>
 internal readonly record struct PageBounds(byte[]? Min, byte[]? Max, long NanCount);
 
+/// <summary>
+/// Computes column-level statistics (min, max, null_count) from Arrow arrays.
+/// </summary>
 internal static class StatisticsCollector
 {
     /// <summary>

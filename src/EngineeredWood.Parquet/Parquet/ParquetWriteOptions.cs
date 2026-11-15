@@ -573,6 +573,21 @@ public sealed record ParquetWriteOptions
     public bool WritePageIndex { get; init; } = true;
 
     /// <summary>
+    /// Whether to record each BYTE_ARRAY column chunk's value bytes, length prefixes excluded: the
+    /// chunk's <c>SizeStatistics.unencoded_byte_array_data_bytes</c>, and each page's in the
+    /// OffsetIndex when <see cref="WritePageIndex"/> is on. Default is <see langword="true"/>, as in
+    /// parquet-mr (1.14 and later) and Arrow C++.
+    /// </summary>
+    /// <remarks>
+    /// A reader sizes a string column's buffers from these before decoding it. Without them a
+    /// dictionary, DELTA_BYTE_ARRAY or FSST chunk says nothing about what it decodes to, since its
+    /// stored size is no bound on that, and its buffers grow as values arrive. They cost a few bytes
+    /// per chunk and per page. The repetition and definition level histograms that
+    /// <c>SizeStatistics</c> can also carry are not written.
+    /// </remarks>
+    public bool WriteSizeStatistics { get; init; } = true;
+
+    /// <summary>
     /// The longest BYTE_ARRAY bound, in bytes, that a page index records. Longer bounds are shortened:
     /// a minimum to a prefix, a maximum to a prefix that is then incremented so it still bounds the
     /// page. UTF-8 strings are cut and incremented on code-point boundaries, so the result stays valid

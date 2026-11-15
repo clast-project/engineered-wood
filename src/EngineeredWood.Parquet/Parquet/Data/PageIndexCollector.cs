@@ -14,7 +14,13 @@ namespace EngineeredWood.Parquet.Data;
 /// </summary>
 /// <param name="PageLocations">One entry per data page; <see cref="PageLocation.Offset"/> is from the chunk start.</param>
 /// <param name="ColumnIndex">The page bounds, or null when this chunk gets no ColumnIndex.</param>
-internal sealed record ChunkPageIndex(IReadOnlyList<PageLocation> PageLocations, ColumnIndex? ColumnIndex);
+/// <param name="UnencodedByteArrayDataBytes">
+/// Each data page's BYTE_ARRAY value bytes, length prefixes excluded: the OffsetIndex's
+/// <c>unencoded_byte_array_data_bytes</c>. Null for a chunk of another physical type, or when
+/// <see cref="ParquetWriteOptions.WriteSizeStatistics"/> is off.
+/// </param>
+internal sealed record ChunkPageIndex(
+    IReadOnlyList<PageLocation> PageLocations, ColumnIndex? ColumnIndex, IReadOnlyList<long>? UnencodedByteArrayDataBytes);
 
 /// <summary>
 /// Collects a column chunk's page index, one data page at a time, as <see cref="ColumnChunkWriter"/>
@@ -35,6 +41,7 @@ internal sealed class PageIndexCollector
     private readonly List<byte[]> _maxes = new();
     private readonly List<long> _nullCounts = new();
     private readonly List<long> _nanCounts = new();
+    private List<long>? _unencodedBytes;
     private long _firstRowIndex;
 
     // The chunk's bounds, folded from the untruncated page bounds as the pages arrive, so the chunk
@@ -48,6 +55,10 @@ internal sealed class PageIndexCollector
     /// type whose bounds are not ordered correctly. The OffsetIndex is written either way.
     /// </param>
     /// <param name="utf8">Whether BYTE_ARRAY values are UTF-8, and so must be truncated on code points.</param>
+    /// <param name="recordsUnencodedBytes">
+    /// Whether each page passes its BYTE_ARRAY value bytes to <see cref="AddPage"/>: a BYTE_ARRAY chunk's
+    /// OffsetIndex carries them under <see cref="ParquetWriteOptions.WriteSizeStatistics"/>.
+    /// </param>
     public PageIndexCollector(
         PhysicalType physicalType,
         int typeLength,
@@ -55,8 +66,12 @@ internal sealed class PageIndexCollector
         bool floatingPointTotalOrder,
         int? truncateLength,
         bool utf8,
-        bool writeColumnIndex)
+        bool writeColumnIndex,
+        bool recordsUnencodedBytes)
     {
+        if (recordsUnencodedBytes && physicalType != PhysicalType.ByteArray)
+            throw new ArgumentException($"A {physicalType} chunk has no BYTE_ARRAY value bytes.", nameof(recordsUnencodedBytes));
+        RecordsUnencodedBytes = recordsUnencodedBytes;
         _physicalType = physicalType;
         _typeLength = typeLength;
         _order = order;
@@ -72,6 +87,9 @@ internal sealed class PageIndexCollector
 
     public bool FloatingPointTotalOrder { get; }
 
+    /// <summary>Whether each page's BYTE_ARRAY value bytes are recorded for the OffsetIndex.</summary>
+    public bool RecordsUnencodedBytes { get; }
+
     public PhysicalType PhysicalType => _physicalType;
 
     public int TypeLength => _typeLength;
@@ -85,13 +103,22 @@ internal sealed class PageIndexCollector
     /// <param name="rows">Rows that start in the page. Every page starts a row, so this sums to the chunk's rows.</param>
     /// <param name="nullCount">Level entries in the page that hold no value.</param>
     /// <param name="bounds">The page's bounds; ignored unless <see cref="WritesColumnIndex"/>.</param>
-    public void AddPage(EmittedPage page, int rows, int nullCount, int nonNullCount, in PageBounds bounds)
+    /// <param name="unencodedBytes">
+    /// The page's BYTE_ARRAY value bytes, length prefixes excluded; null unless
+    /// <see cref="RecordsUnencodedBytes"/>.
+    /// </param>
+    public void AddPage(
+        EmittedPage page, int rows, int nullCount, int nonNullCount, in PageBounds bounds, long? unencodedBytes)
     {
         if (page.Ordinal != _locations.Count)
             throw new InvalidOperationException($"Data page {page.Ordinal} recorded as page {_locations.Count}.");
+        if (unencodedBytes.HasValue != RecordsUnencodedBytes)
+            throw new InvalidOperationException($"A page's unencoded byte count was {(unencodedBytes.HasValue ? "given" : "omitted")}.");
 
         _locations.Add(new PageLocation(page.Offset, page.Size, _firstRowIndex));
         _firstRowIndex += rows;
+        if (unencodedBytes is { } bytes)
+            (_unencodedBytes ??= new()).Add(bytes);
 
         if (!WritesColumnIndex)
             return;
@@ -168,7 +195,8 @@ internal sealed class PageIndexCollector
             };
         }
 
-        return new ChunkPageIndex(_locations.ToArray(), columnIndex);
+        return new ChunkPageIndex(
+            _locations.ToArray(), columnIndex, RecordsUnencodedBytes ? _unencodedBytes?.ToArray() ?? [] : null);
     }
 
     private byte[] Truncate(byte[] value, bool max)
