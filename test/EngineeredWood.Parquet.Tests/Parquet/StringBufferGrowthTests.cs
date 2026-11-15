@@ -191,6 +191,47 @@ public sealed class StringBufferGrowthTests : IDisposable
             $"a batch's read peaked at {worst} bytes, {(double)worst / decoded:F2} times the {decoded} it decodes to");
     }
 
+    [Theory]
+    [InlineData(ByteArrayOutputKind.Default)]
+    [InlineData(ByteArrayOutputKind.ViewType)]
+    public async Task ARecordedZero_AllocatesNoStringData(ByteArrayOutputKind output)
+    {
+        // Every value empty: the chunk records 0 string bytes, which is known, not unknown. The read starts its data
+        // buffer at nothing rather than at the 4.8 MB guess (#889 review round 3).
+        var b = new StringArray.Builder();
+        for (int i = 0; i < Rows; i++)
+            b.Append(string.Empty);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("v", StringType.Default, false)).Build();
+        string path = Path.Combine(_tempDir, "empty.parquet");
+        using (var batch = new RecordBatch(schema, [b.Build()], Rows))
+        await using (var output2 = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output2, ownsFile: false, new ParquetWriteOptions
+                     {
+                         DictionaryEnabled = false,
+                         ColumnEncodings = new Dictionary<string, ByteArrayEncoding> { ["v"] = ByteArrayEncoding.DeltaByteArray },
+                     }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+        RecordStringBytes(path, 0);
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { ByteArrayOutput = output });
+        await reader.ReadMetadataAsync();
+        NativeMemoryTracker.Reset();
+        using var read = await reader.ReadRowGroupAsync(0);
+
+        Assert.Equal(Rows, read.Length);
+        var column = read.Column(0);
+        Assert.Equal(string.Empty, column is StringViewArray views ? views.GetString(5) : ((StringArray)column).GetString(5));
+        // The views or offsets themselves, and no string data beside them.
+        long structure = output == ByteArrayOutputKind.ViewType ? Rows * 16L : (Rows + 1L) * 4;
+        Assert.True(NativeMemoryTracker.PeakBytes <= structure,
+            $"the read peaked at {NativeMemoryTracker.PeakBytes} bytes, past the {structure} of its " +
+            $"{(output == ByteArrayOutputKind.ViewType ? "views" : "offsets")}");
+    }
+
     [Fact]
     public async Task ARecordedCountTooSmall_StillReadsEveryValue()
     {

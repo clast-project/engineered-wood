@@ -83,9 +83,9 @@ internal static class ColumnChunkReader
         // A whole chunk's string buffer starts at what it decodes to; a selected read's starts smaller and only grows
         // no further than that (#888).
         // An answer that returns the values too builds them as a read does; one that returns only indices builds none.
-        long expectedStringBytes = answer is { KeepsValues: false } ? 0 : ExpectedStringBytes(columnMeta);
+        long? expectedStringBytes = answer is { KeepsValues: false } ? null : ExpectedStringBytes(columnMeta);
         using var state = NewState(
-            column, stateCapacity, byteArrayOutput, answer, keepRows is null ? expectedStringBytes : 0);
+            column, stateCapacity, byteArrayOutput, answer, keepRows is null ? expectedStringBytes : null);
         if (keepRows is not null)
         {
             state.ExpectStringData(expectedStringBytes);
@@ -699,9 +699,9 @@ internal static class ColumnChunkReader
         var byteArrayOutput = ByteArrayOutputOf(arrowField);
 
         // A slice's string bytes, where its pages bound them; else the chunk's, which only cap its grows (#889 review).
-        long sliceStringBytes = answer is { KeepsValues: false } ? 0 : SliceStringBytes(columnMeta, pageMap, startPage, endPage);
+        long? sliceStringBytes = answer is { KeepsValues: false } ? null : SliceStringBytes(columnMeta, pageMap, startPage, endPage);
         using var state = NewState(column, capacity, byteArrayOutput, answer, sliceStringBytes);
-        if (sliceStringBytes == 0 && answer is not { KeepsValues: false })
+        if (sliceStringBytes is null && answer is not { KeepsValues: false })
             state.ExpectStringData(ExpectedStringBytes(columnMeta));
 
         int valuesLeft = capacity;
@@ -785,26 +785,27 @@ internal static class ColumnChunkReader
     /// The string bytes a BYTE_ARRAY chunk decodes to, for sizing its data buffer (#888): the writer's count when it
     /// recorded one, else, for a chunk of only PLAIN and DELTA_LENGTH_BYTE_ARRAY pages, whose strings are stored
     /// whole, its uncompressed size, which bounds them. A dictionary, DELTA_BYTE_ARRAY or FSST chunk can decode to
-    /// more than it stores: 0, unknown.
+    /// more than it stores: null, unknown. A recorded 0 (every value empty or null) is known, and sizes the buffer to
+    /// nothing (#889 review round 3).
     /// </summary>
-    internal static long ExpectedStringBytes(ColumnMetaData columnMeta)
+    internal static long? ExpectedStringBytes(ColumnMetaData columnMeta)
     {
         if (columnMeta.Type != PhysicalType.ByteArray)
-            return 0;
+            return null;
         if (columnMeta.UnencodedByteArrayDataBytes is { } recorded)
             return recorded;
-        return StoresStringsWhole(columnMeta) ? columnMeta.TotalUncompressedSize : 0;
+        return StoresStringsWhole(columnMeta) ? columnMeta.TotalUncompressedSize : null;
     }
 
     /// <summary>
     /// The string bytes pages <paramref name="startPage"/> to <paramref name="endPage"/> decode to at most: their
     /// uncompressed sizes, for a chunk whose strings are stored whole (as <see cref="ExpectedStringBytes"/>) and pages
-    /// whose headers were read, so that the sizes are the pages' own and not estimates. 0 when unknown.
+    /// whose headers were read, so that the sizes are the pages' own and not estimates. Null when unknown.
     /// </summary>
-    internal static long SliceStringBytes(ColumnMetaData columnMeta, ColumnPageMap pageMap, int startPage, int endPage)
+    internal static long? SliceStringBytes(ColumnMetaData columnMeta, ColumnPageMap pageMap, int startPage, int endPage)
     {
         if (!pageMap.HeadersResolved || columnMeta.Type != PhysicalType.ByteArray || !StoresStringsWhole(columnMeta))
-            return 0;
+            return null;
         long bytes = 0;
         for (int p = startPage; p <= endPage; p++)
             bytes += pageMap.Pages[p].UncompressedSize;
@@ -824,7 +825,7 @@ internal static class ColumnChunkReader
 
     private static ColumnBuildState NewState(
         ColumnDescriptor column, int capacity, ByteArrayOutputKind byteArrayOutput, DictionaryAnswer? answer,
-        long expectedStringBytes = 0)
+        long? expectedStringBytes = null)
     {
         if (answer is { KeepsValues: false })
             return DictionaryAnswer.IndexState(column, capacity, answer);

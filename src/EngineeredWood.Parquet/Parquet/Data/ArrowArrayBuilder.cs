@@ -1178,7 +1178,7 @@ internal sealed class ColumnBuildState : IDisposable
     /// <param name="byteArrayOutput">Controls the Arrow output type for BYTE_ARRAY columns.</param>
     public ColumnBuildState(PhysicalType physicalType, int maxDefLevel, int maxRepLevel, int capacity,
         ByteArrayOutputKind byteArrayOutput = ByteArrayOutputKind.Default, string? columnPath = null,
-        Metadata.TimeUnit? extendedTimestampUnit = null, long expectedDataBytes = 0)
+        Metadata.TimeUnit? extendedTimestampUnit = null, long? expectedDataBytes = null)
     {
         _physicalType = physicalType;
         _extendedTimestampUnit = extendedTimestampUnit;
@@ -1187,9 +1187,10 @@ internal sealed class ColumnBuildState : IDisposable
         _capacity = capacity;
         _byteArrayOutput = byteArrayOutput;
         _columnPath = columnPath;
-        _expectedDataBytes = Math.Min(Math.Max(expectedDataBytes, 0), ByteArrayCapacity.MaxBytes);
-        // A whole chunk's string data starts at what the chunk says it decodes to (#888), else at a guess.
-        int startingDataBytes = _expectedDataBytes > 0
+        _expectedDataBytes = Math.Min(Math.Max(expectedDataBytes ?? 0, 0), ByteArrayCapacity.MaxBytes);
+        // A whole chunk's string data starts at what the chunk says it decodes to (#888), nothing for a chunk that
+        // records none (#889 review round 3), else at a guess.
+        int startingDataBytes = expectedDataBytes.HasValue
             ? (int)_expectedDataBytes
             : capacity * ByteArrayStartingBytesPerValue;
 
@@ -1267,10 +1268,10 @@ internal sealed class ColumnBuildState : IDisposable
     /// size rather than doubling past it (#888). A whole-chunk read passes it to the constructor instead, which starts
     /// the buffer there. A grow the estimate cannot hold doubles, as without one.
     /// </summary>
-    internal void ExpectStringData(long expectedBytes)
+    internal void ExpectStringData(long? expectedBytes)
     {
-        if (_dataBuffer is not null && expectedBytes > 0)
-            _expectedDataBytes = Math.Min(expectedBytes, ByteArrayCapacity.MaxBytes);
+        if (_dataBuffer is not null && expectedBytes is > 0)
+            _expectedDataBytes = Math.Min(expectedBytes.Value, ByteArrayCapacity.MaxBytes);
     }
 
     /// <summary>Grows the string data buffer to hold <paramref name="needed"/> bytes: to the expected size when that
