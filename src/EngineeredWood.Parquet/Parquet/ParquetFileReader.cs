@@ -354,9 +354,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <para>Only row groups <paramref name="firstRowGroup"/> (inclusive) to <paramref name="endRowGroup"/>
     /// (exclusive) are planned, and nothing is read ahead for the others: a caller can plan a file in parts,
     /// each enumeration holding the dictionary and page-index windows of its own part only.</para>
-    /// <para>With <paramref name="stringIndexesAhead"/>, which says of a row group whether a read of it whole goes in two
-    /// passes, those groups' plans carry their string columns' OffsetIndexes, read ahead for a window of row groups at a
-    /// time (<see cref="RowGroupPlan.StringIndexes"/>).</para>
+    /// <para>With <paramref name="stringIndexColumns"/>, which gives of a row group the columns the second pass of a
+    /// two-pass read of it whole decodes (null when it is read in one pass), those groups' plans carry those columns'
+    /// string OffsetIndexes, read ahead for a window of row groups at a time (<see cref="RowGroupPlan.StringIndexes"/>).</para>
     /// </summary>
     internal async IAsyncEnumerable<RowGroupPlan> PlanRowGroupsAsync(
         EngineeredWood.Expressions.Predicate? filter,
@@ -366,14 +366,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         int firstRowGroup = 0,
         int endRowGroup = int.MaxValue,
-        Func<int, bool>? stringIndexesAhead = null)
+        Func<int, IReadOnlyList<string>?>? stringIndexColumns = null)
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
         // Built before any plan is handed out, so that concurrent reads of the plans find it cached.
         await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
         await foreach (var plan in PlanRowGroupsAsync(
                            metadata, filter, columnNames, skipRows, cancellationToken, firstRowGroup, endRowGroup,
-                           stringIndexesAhead)
+                           stringIndexColumns)
             .ConfigureAwait(false))
         {
             yield return plan;
@@ -423,7 +423,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         CancellationToken cancellationToken,
         int firstRowGroup = 0,
         int endRowGroup = int.MaxValue,
-        Func<int, bool>? stringIndexesAhead = null)
+        Func<int, IReadOnlyList<string>?>? stringIndexColumns = null)
     {
         // Decided for every group up front, from the footer alone, so that the read-ahead below can leave the
         // skipped groups out too: it would otherwise fetch their dictionaries or page indexes for nothing.
@@ -507,16 +507,16 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             // Only for a group read whole, in two passes. One the page index narrowed is read in one pass, from
             // index-built maps, which carry the counts already.
             Task<Dictionary<long, byte[]>?>? strings = null;
-            if (stringIndexesAhead is not null && offsetIndexes is null
+            if (stringIndexColumns is not null && offsetIndexes is null
                 && (ranges is null
                     || (ranges.Count == 1 && ranges[0].Start == 0 && ranges[0].End == metadata.RowGroups[i].NumRows))
-                && stringIndexesAhead(i))
+                && stringIndexColumns(i) is not null)
             {
                 if (i >= stringIndexesEnd)
                 {
                     schema ??= await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
                     (stringIndexes, stringIndexesEnd) = StartStringIndexesAhead(
-                        i, metadata, schema, columnNames, skipped, stringIndexesAhead, filter, accessor,
+                        i, metadata, schema, skipped, stringIndexColumns, filter, accessor,
                         indexReadAhead is not null, cancellationToken);
                 }
                 strings = stringIndexes;
@@ -3739,7 +3739,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Starts reading, in one request, the OffsetIndexes of the string columns of <paramref name="projection"/> for
+    /// Starts reading, in one request, the string OffsetIndexes of the columns each group's second pass decodes
+    /// (<paramref name="secondPassColumns"/>; predicate-only columns are not among them, #896 review) for
     /// row group <paramref name="first"/> and the groups after it, within <see cref="PageIndexReadAheadRowGroups"/> and
     /// <see cref="PageIndexReadAheadBudgetBytes"/> as <see cref="ReadPageIndexesAheadAsync"/> is, and returns the read
     /// and the row group after the last one covered (#894). Writers put a file's OffsetIndexes together, so a window's
@@ -3750,7 +3751,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// its second pass, so they arrive beside its first. Only flat BYTE_ARRAY chunks that do not store their strings
     /// whole are covered (<see cref="Data.ColumnChunkReader.StoresStringsWhole"/>): only their slices start unsized.
     /// With none, nothing is read. Left out too: skipped groups, groups read in one pass
-    /// (<paramref name="readsInTwoPasses"/>: one a row filter's proof holds for, say, #896 review), groups
+    /// (null <paramref name="secondPassColumns"/>: one a row filter's proof holds for, say, #896 review), groups
     /// <paramref name="filter"/>'s statistics rule out, and, when the filter uses the page index
     /// (<paramref name="filterUsesPageIndex"/>), the groups whose page index it consults
     /// (<see cref="NarrowByPageIndexAsync"/>), which read their projection's OffsetIndexes with it.</para>
@@ -3761,9 +3762,9 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// can close (#896 review).</para>
     /// </remarks>
     private (Task<Dictionary<long, byte[]>?>? Read, int End) StartStringIndexesAhead(
-        int first, FileMetaData metadata, SchemaDescriptor schema, IReadOnlyList<string>? projection, bool[]? skipped,
-        Func<int, bool> readsInTwoPasses, EngineeredWood.Expressions.Predicate? filter, ParquetStatisticsAccessor? accessor,
-        bool filterUsesPageIndex, CancellationToken cancellationToken)
+        int first, FileMetaData metadata, SchemaDescriptor schema, bool[]? skipped,
+        Func<int, IReadOnlyList<string>?> secondPassColumns, EngineeredWood.Expressions.Predicate? filter,
+        ParquetStatisticsAccessor? accessor, bool filterUsesPageIndex, CancellationToken cancellationToken)
     {
         var ranges = new List<FileRange>();
         var group = new List<FileRange>();
@@ -3772,7 +3773,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         for (; end < metadata.RowGroups.Count && end - first < PageIndexReadAheadRowGroups; end++)
         {
             var rowGroup = metadata.RowGroups[end];
-            if (rowGroup.NumRows <= 0 || (skipped is not null && skipped[end]) || !readsInTwoPasses(end))
+            if (rowGroup.NumRows <= 0 || (skipped is not null && skipped[end]) || secondPassColumns(end) is not { } columns)
                 continue;
             if (filter is not null)
             {
@@ -3788,7 +3789,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
 
             group.Clear();
             long groupBytes = 0;
-            foreach (var (range, chunk) in ProjectedOffsetIndexes(schema, rowGroup, projection))
+            foreach (var (range, chunk) in ProjectedOffsetIndexes(schema, rowGroup, columns))
             {
                 if (chunk.MetaData is { Type: PhysicalType.ByteArray } meta
                     && !Data.ColumnChunkReader.StoresStringsWhole(meta))

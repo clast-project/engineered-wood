@@ -113,7 +113,7 @@ public sealed class StringIndexReadAheadTests : IDisposable
 
         var plans = new List<ParquetFileReader.RowGroupPlan>();
         await foreach (var plan in reader.PlanRowGroupsAsync(
-                           null, selected.ReadColumns, null, default, stringIndexesAhead: selected.StringIndexesAhead))
+                           null, selected.ReadColumns, null, default, stringIndexColumns: selected.StringIndexColumns))
         {
             plans.Add(plan);
         }
@@ -124,6 +124,64 @@ public sealed class StringIndexReadAheadTests : IDisposable
         Assert.All(plans.Take(3), p => Assert.Same(read, p.StringIndexes));
         Assert.All(plans.Skip(3), p => Assert.Null(p.StringIndexes));
         Assert.Equal(IndexOffsets(metadata, [0, 1, 2], "v", "x"), (await read!)!.Keys.OrderBy(o => o));
+    }
+
+    [Fact]
+    public async Task GroupsOnlyAProofLetGoInTwoPasses_AreReadAhead()
+    {
+        // Read as string views, v cannot come back from a two-pass read as a returned predicate column (its gather
+        // shares buffers), so the scan as a whole reads in one pass. Where the proof k >= 30,000 holds (groups 3-5), the
+        // predicate on k and v is dropped, v is an output column, and those groups go in two passes (#896 review).
+        string path = await WriteAsync();
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(
+            file, ownsFile: false, new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.ViewType })
+        {
+            TwoPassReads = true,
+        };
+        var metadata = await reader.ReadMetadataAsync();
+        var proven = new RowPredicate(["k", "v"], ParallelRowGroupReadTests.KeyPredicate(k => k >= 30_000, valueWise: false).Evaluate)
+        {
+            Proof = Expressions.Expressions.GreaterThanOrEqual("k", LiteralValue.Of(30_000L)),
+        };
+        var leading = ParallelRowGroupReadTests.KeyPredicate(k => k % GroupRows < 3_000, valueWise: false);
+        var selected = await reader.PrepareSelectedAsync(
+            Scan(null) with { RowFilter = new RowFilter([proven, leading]) }, default);
+
+        var plans = await PlanAsync(reader, selected, prune: null);
+
+        Assert.Equal(Groups, plans.Count);
+        Assert.All(plans.Take(3), p => Assert.Null(p.StringIndexes));
+        var read = plans[3].StringIndexes;
+        Assert.NotNull(read);
+        Assert.All(plans.Skip(3), p => Assert.Same(read, p.StringIndexes));
+        Assert.Equal(IndexOffsets(metadata, [3, 4, 5], "v", "x"), (await read!)!.Keys.OrderBy(o => o));
+    }
+
+    [Fact]
+    public async Task APredicateOnlyStringColumn_IsNotReadAhead()
+    {
+        // The predicate reads x, which the scan does not return: only the first pass decodes it, so its OffsetIndexes
+        // would size nothing, and would take a share of the window's budget (#896 review).
+        string path = await WriteAsync();
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false) { TwoPassReads = true };
+        var metadata = await reader.ReadMetadataAsync();
+        var onX = new RowPredicate(["x"], batch =>
+        {
+            var keep = new BooleanArray.Builder().Reserve(batch.Length);
+            for (int i = 0; i < batch.Length; i++)
+                keep.Append(i % 3 == 0);
+            return keep.Build();
+        });
+        var selected = await reader.PrepareSelectedAsync(
+            Scan(null) with { Columns = ["v", "w"], RowFilter = new RowFilter(onX) }, default);
+
+        var plans = await PlanAsync(reader, selected, prune: null);
+
+        var read = plans[0].StringIndexes;
+        Assert.NotNull(read);
+        Assert.Equal(IndexOffsets(metadata, Enumerable.Range(0, Groups), "v"), (await read!)!.Keys.OrderBy(o => o));
     }
 
     [Fact]
@@ -277,12 +335,15 @@ public sealed class StringIndexReadAheadTests : IDisposable
         RowFilter = new RowFilter(ParallelRowGroupReadTests.KeyPredicate(k => k % GroupRows < 3_000, valueWise: false)),
     };
 
-    private static async Task<List<ParquetFileReader.RowGroupPlan>> PlanAsync(ParquetFileReader reader, Predicate? prune)
+    private static async Task<List<ParquetFileReader.RowGroupPlan>> PlanAsync(ParquetFileReader reader, Predicate? prune) =>
+        await PlanAsync(reader, await reader.PrepareSelectedAsync(Scan(prune), default), prune);
+
+    private static async Task<List<ParquetFileReader.RowGroupPlan>> PlanAsync(
+        ParquetFileReader reader, ParquetFileReader.SelectedPlanReader selected, Predicate? prune)
     {
-        var selected = await reader.PrepareSelectedAsync(Scan(prune), default);
         var plans = new List<ParquetFileReader.RowGroupPlan>();
         await foreach (var plan in reader.PlanRowGroupsAsync(
-                           prune, selected.ReadColumns, null, default, stringIndexesAhead: selected.StringIndexesAhead))
+                           prune, selected.ReadColumns, null, default, stringIndexColumns: selected.StringIndexColumns))
         {
             plans.Add(plan);
         }
