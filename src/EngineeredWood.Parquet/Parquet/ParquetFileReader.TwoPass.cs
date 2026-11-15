@@ -136,6 +136,78 @@ public sealed partial class ParquetFileReader
             }
             : columns;
 
+    /// <summary>
+    /// What a keep-rows decode of <paramref name="output"/>'s columns builds: each column's decoded size, scaled to the
+    /// rows its buffers hold, the kept ones and room for its largest page (<see cref="Data.ColumnChunkReader.KeepRowsCapacity"/>),
+    /// and never less than what those buffers start at (<see cref="Data.ColumnBuildState.StartingBytes"/>).
+    /// The pages' sizes come from the headers of the chunks fetched ahead, which the decode reads next anyway; a column
+    /// not fetched ahead (too large for one buffer) is taken whole, rather than read twice (#886 review), as is one
+    /// whose pages' decoded size the headers do not bound (<see cref="DecodedSizeUnboundedByPage"/>).
+    /// </summary>
+    private async ValueTask<long> KeepRowsDecodeBytesAsync(
+        Metadata.RowGroup rowGroup, SchemaDescriptor schema, RowGroupContext output, PrefetchedFile? io, long kept,
+        CancellationToken cancellationToken)
+    {
+        long total = 0;
+        int rows = output.RowCount;
+        for (int i = 0; i < output.Count; i++)
+        {
+            long columnBytes = DecodedBytes(rowGroup, schema, [output.Columns[i].Path[0]], null);
+            (int Rows, long Bytes, long DictionaryBytes)? maxPage = null;
+            if (io is not null && io.Holds(output.Ranges[i]) && !DecodedSizeUnboundedByPage(output.Chunks[i]))
+            {
+                using var chunk = await io.ReadAsync(output.Ranges[i], cancellationToken).ConfigureAwait(false);
+                maxPage = Data.ColumnChunkReader.LargestDataPages(
+                    chunk.Memory.Span, output.Columns[i], output.Chunks[i].MetaData!, _options.MaxPageUncompressedSize);
+            }
+
+            long holds = maxPage is { } page ? Math.Min(rows, kept + page.Rows) : rows;
+            long scaled = rows == 0 ? 0 : (long)((double)columnBytes * holds / rows);
+            // A decoder that does not skip decodes a whole page before its dropped rows go, so the decode holds the
+            // kept rows and its largest page in bytes too, decoded at the column's own ratio of decoded to encoded
+            // bytes. With uneven values that is not the page with the most rows (#886 review round 3).
+            long chunkBytes = output.Chunks[i].MetaData?.TotalUncompressedSize ?? 0;
+            if (maxPage is { } largest && chunkBytes > 0 && rows > 0)
+            {
+                long pageDecoded = (long)((double)columnBytes * largest.Bytes / chunkBytes);
+                scaled = Math.Max(scaled, Math.Min(columnBytes, (long)((double)columnBytes * kept / rows) + pageDecoded));
+            }
+
+            // The state's buffers are allocated at `holds` slots before a value is decoded: for short strings, more
+            // than the decoded share (#886 review round 2).
+            var column = output.Columns[i];
+            long starting = Data.ColumnBuildState.StartingBytes(
+                column.PhysicalType, column.MaxDefinitionLevel, (int)holds,
+                Data.ColumnChunkReader.ByteArrayOutputOf(output.LeafArrowFields[i]), column.TypeLength ?? 0);
+            // The dictionary is decoded whole, into pooled arrays about its page's size, beside the kept rows' buffers
+            // (#886 review round 5).
+            total += Math.Max(scaled, starting) + (maxPage?.DictionaryBytes ?? 0);
+        }
+
+        return total;
+    }
+
+    /// <summary>
+    /// Whether a chunk's pages may decode to far more than their bytes say, past the column's average ratio: a
+    /// DELTA_BYTE_ARRAY page stores a shared prefix once, and an FSST page one code for up to 8 bytes. Its largest page
+    /// cannot be sized from the headers, so a keep-rows decode holds the column whole (#886 review round 4: a page of
+    /// 2,000-character values differing in their last character decoded to 20 MB from a few bytes a value).
+    /// </summary>
+    private static bool DecodedSizeUnboundedByPage(Metadata.ColumnChunk chunk)
+    {
+        if (chunk.MetaData is not { } meta)
+            return true;
+        foreach (var encoding in meta.Encodings)
+        {
+#pragma warning disable EWPARQUET0003 // FSST: an evaluation encoding, checked here only to size its decode
+            if (encoding is Encoding.DeltaByteArray or Encoding.Fsst)
+                return true;
+#pragma warning restore EWPARQUET0003
+        }
+
+        return false;
+    }
+
     // Whether BatchSize cuts a group of `rows` rows into more than one batch.
     private bool SplitsGroup(long rows) => _options.BatchSize is int size && size > 0 && size < rows;
 
@@ -310,14 +382,16 @@ public sealed partial class ParquetFileReader
                                && (!SplitsGroup(groupRows) || kept <= _options.BatchSize!.Value)
                 ? KeepMask(selection, groupRows)
                 : null;
-            // That one decode builds its columns at the whole group's size before it drops rows, past the batch-sized
-            // reservation: held for the pass, and let go after it (#873 review).
+            // That one decode builds its columns at the kept rows and room for each column's largest page (#880),
+            // past the batch-sized reservation: held for the pass, and let go after it (#873 review).
             long wholeGroupHold = 0;
             if (keepRows is not null && reservation is not null && SplitsGroup(groupRows))
             {
                 var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
                 var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-                wholeGroupHold = DecodedBytes(metadata.RowGroups[plan.Index], schema, columns.OutputOnly, null);
+                wholeGroupHold = await KeepRowsDecodeBytesAsync(
+                    metadata.RowGroups[plan.Index], schema, outputCtx, prefetched as PrefetchedFile, kept,
+                    cancellationToken).ConfigureAwait(false);
                 await reservation.HoldAsync(wholeGroupHold, cancellationToken).ConfigureAwait(false);
             }
             try

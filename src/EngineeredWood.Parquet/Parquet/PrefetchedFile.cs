@@ -88,6 +88,18 @@ internal sealed class PrefetchedFile : IRandomAccessFile
         return result;
     }
 
+    /// <summary>Whether one range fetched ahead holds all of <paramref name="range"/>, so reading it costs no I/O.</summary>
+    public bool Holds(FileRange range)
+    {
+        foreach (var held in _ranges)
+        {
+            if (held.Offset <= range.Offset && range.Offset + range.Length <= held.Offset + held.Length)
+                return true;
+        }
+
+        return false;
+    }
+
     // The bytes of `range`, when one fetched range holds them all, as a buffer whose disposal releases nothing.
     private IMemoryOwner<byte>? TryServe(IReadOnlyList<IMemoryOwner<byte>> buffers, FileRange range)
     {

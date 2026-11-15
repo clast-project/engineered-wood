@@ -1081,7 +1081,8 @@ internal sealed class ColumnBuildState : IDisposable
     // long out of scope, and the target Arrow unit alone does not say what to rescale FROM.
     private readonly Metadata.TimeUnit? _extendedTimestampUnit;
 
-    private readonly int _capacity;
+    private int _capacity;
+    private int _fixedLength; // a FIXED_LEN_BYTE_ARRAY value's bytes, once its buffer is allocated
     private int _elementSize; // bytes per element for fixed-width types (12 → 8 once INT96 is narrowed)
 
     // View entry layout (16 bytes):
@@ -1233,29 +1234,60 @@ internal sealed class ColumnBuildState : IDisposable
                 if (byteArrayOutput == ByteArrayOutputKind.ViewType)
                 {
                     _viewsBuffer = new NativeBuffer<byte>(capacity * ViewEntrySize, zeroFill: false);
-                    _dataBuffer = new NativeBuffer<byte>(capacity * 32, zeroFill: false); // overflow
+                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false); // overflow
                 }
                 else if (byteArrayOutput == ByteArrayOutputKind.LargeOffsets)
                 {
                     _largeOffsetsBuffer = new NativeBuffer<long>(capacity + 1, zeroFill: false);
                     _largeOffsetsBuffer.Span[0] = 0;
                     _offsetsCount = 1;
-                    _dataBuffer = new NativeBuffer<byte>(capacity * 32, zeroFill: false);
+                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false);
                 }
                 else
                 {
                     _offsetsBuffer = new NativeBuffer<int>(capacity + 1, zeroFill: false);
                     _offsetsBuffer.Span[0] = 0;
                     _offsetsCount = 1;
-                    _dataBuffer = new NativeBuffer<byte>(capacity * 32, zeroFill: false);
+                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false);
                 }
                 break;
         }
     }
 
+    /// <summary>The data bytes a BYTE_ARRAY state starts with per value, before any value is decoded.</summary>
+    internal const int ByteArrayStartingBytesPerValue = 32;
+
+    /// <summary>
+    /// What a new state of <paramref name="capacity"/> slots allocates before it decodes anything: its levels, and
+    /// its value, offset, view and string data buffers. A budget that holds for a decode holds at least this, which
+    /// for short strings is more than the decoded column (#886 review round 2).
+    /// </summary>
+    internal static long StartingBytes(
+        PhysicalType physicalType, int maxDefLevel, int capacity, ByteArrayOutputKind byteArrayOutput, int typeLength)
+    {
+        long slots = capacity;
+        long levels = maxDefLevel > 0 ? slots : 0;
+        return levels + physicalType switch
+        {
+            PhysicalType.Boolean => (slots + 7) / 8,
+            PhysicalType.Int32 or PhysicalType.Float => slots * 4,
+            PhysicalType.Int64 or PhysicalType.Double => slots * 8,
+            PhysicalType.Int96 => slots * 12,
+            PhysicalType.FixedLenByteArray => slots * typeLength,
+            PhysicalType.ByteArray => slots * ByteArrayStartingBytesPerValue + byteArrayOutput switch
+            {
+                ByteArrayOutputKind.ViewType => slots * ViewEntrySize,
+                ByteArrayOutputKind.LargeOffsets => (slots + 1) * sizeof(long),
+                _ => (slots + 1) * sizeof(int),
+            },
+            _ => 0,
+        };
+    }
+
     // ---- A row selection, applied page by page as the column decodes (#502 phase 2) ----------------------------
 
-    private byte[]? _keepRows;        // one byte per row of the chunk, 1 to keep
+    private byte[]? _keepRows;        // one byte per row of the chunk, 1 to keep; may be longer (pooled)
+    private int _selectionRows;       // the chunk's rows: how much of _keepRows is meaningful
     private int _selectionCursor;     // rows the pages so far covered
     private int _keptRows;            // rows of those kept
     private byte[]? _pageMask;        // the current page's values, 1 to keep (one spare slot, see BeginPage)
@@ -1268,11 +1300,16 @@ internal sealed class ColumnBuildState : IDisposable
     /// page's dropped rows are removed as the page decodes (<see cref="BeginPage"/>), so the built arrays hold only
     /// the kept rows. A selected read's second pass, which knows its rows before it decodes (#502 phase 2).
     /// </summary>
-    internal void SetRowSelection(byte[] keep)
+    /// <param name="rows">The chunk's rows, of which <paramref name="keep"/> (rented, perhaps longer) has one byte
+    /// each; all of <paramref name="keep"/> when null.</param>
+    internal void SetRowSelection(byte[] keep, int? rows = null)
     {
         if (MaxRepLevel > 0)
             throw new InvalidOperationException("A row selection applies only to a flat column.");
+        if (rows is < 0 || rows > keep.Length)
+            throw new ArgumentOutOfRangeException(nameof(rows));
         _keepRows = keep;
+        _selectionRows = rows ?? keep.Length;
     }
 
     /// <summary>Whether a row selection is set.</summary>
@@ -1302,7 +1339,7 @@ internal sealed class ColumnBuildState : IDisposable
     {
         if (_keepRows is null)
             return;
-        if (rows > _keepRows.Length - _selectionCursor)
+        if (rows > _selectionRows - _selectionCursor)
             throw new ParquetFormatException("A data page holds more rows than its row group.");
 
         var keep = _keepRows.AsSpan(_selectionCursor, rows);
@@ -1353,6 +1390,58 @@ internal sealed class ColumnBuildState : IDisposable
         _pageValues = nonNullCount;
         _pageKept = keptValues;
         _pageHasDrops = keptValues < nonNullCount;
+    }
+
+    /// <summary>
+    /// Makes room for a page of <paramref name="pageRows"/> rows before its levels are reserved: a selected read
+    /// starts at the rows it keeps and a page's room, not the whole group's (#880), and each page writes all its
+    /// levels, and some decoders all its values, before <see cref="BeginPage"/> drops rows. Grows every buffer,
+    /// keeping what it holds, to at least twice its size, but not past the chunk's rows. The capacity a selected decode
+    /// starts with already fits its largest page (<see cref="ColumnChunkReader.KeepRowsCapacity"/>), so a sound chunk
+    /// never grows; this guards against one whose headers disagree with what the pages hold.
+    /// </summary>
+    internal void EnsurePageRoom(int pageRows)
+    {
+        long needed = (long)Math.Max(Math.Max(_defLevelCount, _repLevelCount), _valueCount) + pageRows;
+        if (needed <= _capacity)
+            return;
+
+        long doubled = Math.Min(2L * _capacity, _keepRows is null ? int.MaxValue : _selectionRows);
+        int target = checked((int)Math.Max(needed, doubled));
+
+        _defLevels = GrowLevels(_defLevels, _defLevelCount, target);
+        _repLevels = GrowLevels(_repLevels, _repLevelCount, target);
+
+        if (_physicalType == PhysicalType.Boolean)
+        {
+            // AddBoolValues sets bits with |=, and Grow leaves the new bytes as they were.
+            int old = _valueBuffer!.Length;
+            _valueBuffer.GrowExact((target + 7) / 8);
+            _valueBuffer.ByteSpan.Slice(old).Clear();
+        }
+        else if (_physicalType == PhysicalType.FixedLenByteArray)
+        {
+            _valueBuffer?.GrowExact(checked(target * _fixedLength));
+        }
+        else if (_valueBuffer is not null)
+        {
+            _valueBuffer.GrowExact(checked(target * _elementSize));
+        }
+
+        _viewsBuffer?.GrowExact(checked(target * ViewEntrySize));
+        _offsetsBuffer?.GrowExact(target + 1);
+        _largeOffsetsBuffer?.GrowExact(target + 1);
+        _capacity = target;
+    }
+
+    private static byte[]? GrowLevels(byte[]? levels, int count, int target)
+    {
+        if (levels is null || levels.Length >= target)
+            return levels;
+        var grown = ArrayPool<byte>.Shared.Rent(target);
+        levels.AsSpan(0, count).CopyTo(grown);
+        ArrayPool<byte>.Shared.Return(levels);
+        return grown;
     }
 
     /// <summary>Ends the page begun last.</summary>
@@ -1672,7 +1761,10 @@ internal sealed class ColumnBuildState : IDisposable
     {
         // Lazy init for FixedLenByteArray (needs typeLength from column descriptor)
         if (_valueBuffer == null)
+        {
             _valueBuffer = new NativeBuffer<byte>(_capacity * typeLength, zeroFill: false);
+            _fixedLength = typeLength;
+        }
 
         int byteSize = count * typeLength;
         var span = _valueBuffer.ByteSpan.Slice(_valueByteOffset, byteSize);

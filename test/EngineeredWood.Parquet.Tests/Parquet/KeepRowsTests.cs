@@ -5,6 +5,7 @@ using Apache.Arrow;
 using EngineeredWood.Arrow;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
+using EngineeredWood.Parquet.Data;
 using Xunit.Abstractions;
 
 namespace EngineeredWood.Tests.Parquet;
@@ -258,6 +259,100 @@ public class KeepRowsTests(ITestOutputHelper output)
                     var expected = ArrowCompute.Take(whole.Column(c), indices); // not disposed: may share view buffers
                     for (int r = 0; r < indices.Length; r++)
                         Assert.True(ArrowValues.Render(expected, r) == ArrowValues.Render(kept.Column(c), r), $"{label} column {c} row {r}");
+                    Assert.Equal(expected.NullCount, kept.Column(c).NullCount);
+                }
+            }
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    public static IEnumerable<object[]> LargePageCases()
+    {
+        foreach (bool dictionary in new[] { false, true })
+        {
+            foreach (var output in new[] { ByteArrayOutputKind.Default, ByteArrayOutputKind.ViewType, ByteArrayOutputKind.LargeOffsets })
+            {
+                foreach (int? room in new int?[] { null, 1_000 })
+                    yield return [dictionary, output, room];
+            }
+        }
+    }
+
+    /// <summary>
+    /// 50,000-row pages over each physical type, kept sparsely and in the last page only. A selected decode starts with
+    /// the kept rows and room for its largest page, read from the page headers (#880, #886 review), so it never grows
+    /// (<paramref name="room"/> null). Started with less room than a page (<paramref name="room"/> 1,000, as for a
+    /// chunk whose headers disagree with its pages), every buffer grows mid-chunk
+    /// (<see cref="ColumnBuildState.EnsurePageRoom"/>): the rows kept before a grow must survive it, and a boolean's
+    /// grown bits must start clear.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(LargePageCases))]
+    public async Task KeepingRowsAcrossLargePagesEqualsGatheringThem(bool dictionary, ByteArrayOutputKind output, int? room)
+    {
+        ColumnChunkReader.KeepRowsPageRoomForTests.Value = room;
+        const int rows = 150_000;
+        string path = Path.Combine(Path.GetTempPath(), "ew-keeprows-" + Guid.NewGuid().ToString("N")[..8] + ".parquet");
+        try
+        {
+            var random = new Random(41);
+            var ints = new Int32Array.Builder();
+            var longs = new Int64Array.Builder();
+            var doubles = new DoubleArray.Builder();
+            var flags = new BooleanArray.Builder();
+            var text = new StringArray.Builder();
+            var decimals = new Decimal128Array.Builder(new Apache.Arrow.Types.Decimal128Type(20, 2));
+            for (int r = 0; r < rows; r++)
+            {
+                ints.Append(r);
+                if (r % 11 == 0) longs.AppendNull(); else longs.Append(r * 3L);
+                doubles.Append(r / 4.0);
+                if (r % 13 == 0) flags.AppendNull(); else flags.Append(random.Next(2) == 0);
+                if (r % 7 == 0) text.AppendNull(); else text.Append("v" + (r % 500).ToString(System.Globalization.CultureInfo.InvariantCulture));
+                if (r % 5 == 0) decimals.AppendNull(); else decimals.Append((r % 1000) + 0.25m);
+            }
+
+            var schema = new Apache.Arrow.Schema.Builder()
+                .Field(new Field("i", Apache.Arrow.Types.Int32Type.Default, false))
+                .Field(new Field("l", Apache.Arrow.Types.Int64Type.Default, true))
+                .Field(new Field("d", Apache.Arrow.Types.DoubleType.Default, false))
+                .Field(new Field("b", Apache.Arrow.Types.BooleanType.Default, true))
+                .Field(new Field("s", Apache.Arrow.Types.StringType.Default, true))
+                .Field(new Field("m", new Apache.Arrow.Types.Decimal128Type(20, 2), true))
+                .Build();
+            string[] names = ["i", "l", "d", "b", "s", "m"];
+            using (var batch = new RecordBatch(schema,
+                       [ints.Build(), longs.Build(), doubles.Build(), flags.Build(), text.Build(), decimals.Build()], rows))
+            {
+                await using var outputFile = new LocalSequentialFile(path);
+                await using var writer = new ParquetFileWriter(outputFile, ownsFile: false, ParquetWriteOptions.Default with
+                {
+                    DictionaryEnabled = dictionary,
+                    DataPageRowCountLimit = 50_000,
+                    DataPageSize = 64 * 1024 * 1024,
+                });
+                await writer.WriteRowGroupAsync(batch);
+                await writer.CloseAsync();
+            }
+
+            await using var file = new LocalRandomAccessFile(path);
+            using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { ByteArrayOutput = output });
+            using var whole = await reader.ReadRowGroupAsync(0, names);
+            var sparse = Enumerable.Range(0, rows).Select(r => (byte)(r % 997 == 0 ? 1 : 0)).ToArray();
+            var lastPage = Enumerable.Range(0, rows).Select(r => (byte)(r >= 120_000 && r % 2 == 0 ? 1 : 0)).ToArray();
+            foreach (var (label, keep) in Masks(rows, seed: 9).Append(("sparse", sparse)).Append(("last-page", lastPage)))
+            {
+                var indices = Enumerable.Range(0, rows).Where(r => keep[r] != 0).ToArray();
+                using var kept = await reader.ReadRowGroupKeepingAsync(0, names, keep);
+                Assert.Equal(indices.Length, kept.Length);
+                for (int c = 0; c < names.Length; c++)
+                {
+                    var expected = ArrowCompute.Take(whole.Column(c), indices); // not disposed: may share view buffers
+                    for (int r = 0; r < indices.Length; r++)
+                        Assert.True(ArrowValues.Render(expected, r) == ArrowValues.Render(kept.Column(c), r), $"{label} {names[c]} row {r}");
                     Assert.Equal(expected.NullCount, kept.Column(c).NullCount);
                 }
             }
