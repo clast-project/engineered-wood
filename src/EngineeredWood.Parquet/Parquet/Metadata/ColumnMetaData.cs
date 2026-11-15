@@ -59,6 +59,13 @@ public sealed class ColumnMetaData
     /// </summary>
     public IReadOnlyList<PageEncodingStats>? EncodingStats { get; init; }
 
+    /// <summary>
+    /// The bytes of BYTE_ARRAY data this chunk's values decode to, not counting their lengths
+    /// (<c>SizeStatistics.unencoded_byte_array_data_bytes</c>), or <see langword="null"/> when the writer did not
+    /// record it. The reader sizes a string column's data buffer from it (#888).
+    /// </summary>
+    public long? UnencodedByteArrayDataBytes { get; init; }
+
     /// <summary>Byte offset of the Bloom filter block in the file, if present.</summary>
     public long? BloomFilterOffset { get; init; }
 

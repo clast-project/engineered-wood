@@ -782,7 +782,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         for (int c = 0; c < columns.Count; c++)
         {
             if (columns[c].Path.Count > 1 || columns[c].MaxRepetitionLevel > 0)
-                return PlannedBytes(rowGroup, schema, columnNames, ranges).Uncompressed;
+                return PlannedBytes(rowGroup, schema, columnNames, ranges).Uncompressed + RecordedStringExcess(chunks);
         }
 
         long rows = KeptRows(rowGroup, ranges);
@@ -794,9 +794,30 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             if (chunks[c].MetaData is not { } meta)
                 continue;
             long footer = (long)(meta.TotalUncompressedSize * share);
-            total += ColumnDecodedBytes(columns[c], rows, footer, footer);
+            // A chunk's recorded string bytes (SizeStatistics) size its read's buffer (#889 review), and a dictionary,
+            // DELTA_BYTE_ARRAY or FSST chunk can decode to far more than its footer size, so count them when present.
+            long strings = meta.UnencodedByteArrayDataBytes is { } recorded
+                ? Math.Max(footer, (long)(recorded * share))
+                : footer;
+            total += ColumnDecodedBytes(columns[c], rows, footer, strings);
         }
         return total;
+    }
+
+    /// <summary>
+    /// How far the recorded string bytes (SizeStatistics) of <paramref name="chunks"/> exceed their footer sizes, summed.
+    /// A nested read is estimated from the footer and decoded whole, but it sizes its string buffers from these counts,
+    /// which for a dictionary, DELTA_BYTE_ARRAY or FSST chunk can be far larger (#889 review round 5).
+    /// </summary>
+    private static long RecordedStringExcess(IReadOnlyList<ColumnChunk> chunks)
+    {
+        long excess = 0;
+        foreach (var chunk in chunks)
+        {
+            if (chunk.MetaData is { UnencodedByteArrayDataBytes: { } recorded } meta)
+                excess += Math.Max(0, recorded - meta.TotalUncompressedSize);
+        }
+        return excess;
     }
 
     /// <summary>
@@ -1038,11 +1059,14 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             }
             else
             {
-                // Without the writer's count, a page's size is only an estimate (the chunk's compression ratio over
-                // its compressed size: short for a page that compresses better than the rest) and a dictionary page
-                // counts indices, not strings. The column's footer size for the rows kept, as a footer-sized read
-                // reserves it, stays the floor (#847 review).
-                byteArrayBytes = Math.Max(encoded, (long)(ctx.Chunks[i].MetaData!.TotalUncompressedSize * keptShare));
+                // Without the OffsetIndex's per-page counts, a page's size is only an estimate (the chunk's
+                // compression ratio over its compressed size: short for a page that compresses better than the rest)
+                // and a dictionary page counts indices, not strings. So the floor is the chunk's share of the kept
+                // rows: of its recorded string bytes (SizeStatistics) when the chunk has them (#889 review), else of
+                // its footer size, as a footer-sized read reserves it (#847 review).
+                var chunkMeta = ctx.Chunks[i].MetaData!;
+                byteArrayBytes = Math.Max(encoded,
+                    (long)((chunkMeta.UnencodedByteArrayDataBytes ?? chunkMeta.TotalUncompressedSize) * keptShare));
             }
             total += ColumnDecodedBytes(ctx.Columns[i], rows, encoded, byteArrayBytes);
         }

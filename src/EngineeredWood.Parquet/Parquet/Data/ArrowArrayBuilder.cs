@@ -1063,6 +1063,9 @@ internal sealed class ColumnBuildState : IDisposable
     private int _offsetsCount; // number of offset entries written (= _valueCount + 1 after first page)
     private NativeBuffer<byte>? _dataBuffer;
     private int _dataByteOffset;
+    // The most the string data buffer grows to before falling back to doubling: the chunk's estimate, exact or an
+    // upper bound (#888). 0 means no cap.
+    private long _expectedDataBytes;
 
     // Dotted column path, for the diagnostics in ByteArrayCapacity. Null when the caller had none to give.
     private readonly string? _columnPath;
@@ -1176,7 +1179,7 @@ internal sealed class ColumnBuildState : IDisposable
     /// <param name="byteArrayOutput">Controls the Arrow output type for BYTE_ARRAY columns.</param>
     public ColumnBuildState(PhysicalType physicalType, int maxDefLevel, int maxRepLevel, int capacity,
         ByteArrayOutputKind byteArrayOutput = ByteArrayOutputKind.Default, string? columnPath = null,
-        Metadata.TimeUnit? extendedTimestampUnit = null)
+        Metadata.TimeUnit? extendedTimestampUnit = null, long? expectedDataBytes = null)
     {
         _physicalType = physicalType;
         _extendedTimestampUnit = extendedTimestampUnit;
@@ -1185,6 +1188,16 @@ internal sealed class ColumnBuildState : IDisposable
         _capacity = capacity;
         _byteArrayOutput = byteArrayOutput;
         _columnPath = columnPath;
+        _expectedDataBytes = Math.Min(Math.Max(expectedDataBytes ?? 0, 0), ByteArrayCapacity.MaxBytes);
+        // With an estimate (#888), the string buffer starts at it, which is empty for a recorded 0 (#889 review
+        // round 3); without one, at the per-value guess. Nothing checks a footer's estimate before the pages decode,
+        // so the starting size is capped at MaxExpectedStartingBytes, or the guess if that is larger: a footer that
+        // claims 2 GiB cannot allocate it before any value is read (#889 review round 4). Beyond the cap the buffer
+        // grows toward the estimate, never past it, as values arrive.
+        int guessedDataBytes = capacity * ByteArrayStartingBytesPerValue;
+        int startingDataBytes = expectedDataBytes.HasValue
+            ? (int)Math.Min(_expectedDataBytes, Math.Max(guessedDataBytes, MaxExpectedStartingBytes))
+            : guessedDataBytes;
 
         if (maxDefLevel > 0)
         {
@@ -1234,25 +1247,55 @@ internal sealed class ColumnBuildState : IDisposable
                 if (byteArrayOutput == ByteArrayOutputKind.ViewType)
                 {
                     _viewsBuffer = new NativeBuffer<byte>(capacity * ViewEntrySize, zeroFill: false);
-                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false); // overflow
+                    _dataBuffer = new NativeBuffer<byte>(startingDataBytes, zeroFill: false); // overflow
                 }
                 else if (byteArrayOutput == ByteArrayOutputKind.LargeOffsets)
                 {
                     _largeOffsetsBuffer = new NativeBuffer<long>(capacity + 1, zeroFill: false);
                     _largeOffsetsBuffer.Span[0] = 0;
                     _offsetsCount = 1;
-                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false);
+                    _dataBuffer = new NativeBuffer<byte>(startingDataBytes, zeroFill: false);
                 }
                 else
                 {
                     _offsetsBuffer = new NativeBuffer<int>(capacity + 1, zeroFill: false);
                     _offsetsBuffer.Span[0] = 0;
                     _offsetsCount = 1;
-                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false);
+                    _dataBuffer = new NativeBuffer<byte>(startingDataBytes, zeroFill: false);
                 }
                 break;
         }
     }
+
+    /// <summary>
+    /// Caps the growth of the string data buffer at <paramref name="expectedBytes"/>, the chunk's estimate of its
+    /// decoded strings (exact or an upper bound), for a read whose buffer starts smaller than that, such as one that
+    /// keeps only some rows (#888). A grow then stops at the estimate rather than doubling past it; a grow the
+    /// estimate cannot hold doubles as usual. A whole-chunk read passes the estimate to the constructor instead.
+    /// Null or 0 sets no cap.
+    /// </summary>
+    internal void ExpectStringData(long? expectedBytes)
+    {
+        if (_dataBuffer is not null && expectedBytes is > 0)
+            _expectedDataBytes = Math.Min(expectedBytes.Value, ByteArrayCapacity.MaxBytes);
+    }
+
+    /// <summary>Grows the string data buffer to hold at least <paramref name="needed"/> bytes. Within the cap
+    /// (<c>_expectedDataBytes</c>) it doubles but stops at the cap; past the cap it doubles as usual.</summary>
+    private void GrowData(int needed)
+    {
+        if (needed <= _expectedDataBytes)
+            _dataBuffer!.GrowExact((int)Math.Min(_expectedDataBytes, Math.Max(needed, 2L * _dataBuffer.Length)));
+        else
+            _dataBuffer!.Grow(needed);
+    }
+
+    /// <summary>
+    /// The most string data a state allocates up front from a chunk's estimate
+    /// (<see cref="ColumnChunkReader.ExpectedStringBytes"/>), unless the per-value guess is larger. The estimate comes
+    /// from the footer and is unchecked until the values decode; a larger chunk grows the rest of the way.
+    /// </summary>
+    internal const int MaxExpectedStartingBytes = 64 << 20;
 
     /// <summary>The data bytes a BYTE_ARRAY state starts with per value, before any value is decoded.</summary>
     internal const int ByteArrayStartingBytesPerValue = 32;
@@ -1795,7 +1838,7 @@ internal sealed class ColumnBuildState : IDisposable
         // Ensure data buffer has enough space
         int dataNeeded = CheckedDataBytes(sourceData.Length);
         if (dataNeeded > _dataBuffer!.ByteSpan.Length)
-            _dataBuffer.Grow(dataNeeded);
+            GrowData(dataNeeded);
 
         // Copy data
         sourceData.CopyTo(_dataBuffer.ByteSpan.Slice(_dataByteOffset));
@@ -1827,7 +1870,7 @@ internal sealed class ColumnBuildState : IDisposable
     {
         int needed = CheckedDataBytes(byteCount);
         if (needed > _dataBuffer!.ByteSpan.Length)
-            _dataBuffer.Grow(needed);
+            GrowData(needed);
         return _dataBuffer.ByteSpan.Slice(_dataByteOffset, byteCount);
     }
 
@@ -1917,7 +1960,7 @@ internal sealed class ColumnBuildState : IDisposable
             // Append to overflow buffer
             int needed = CheckedDataBytes(len);
             if (needed > _dataBuffer!.ByteSpan.Length)
-                _dataBuffer.Grow(needed);
+                GrowData(needed);
             value.CopyTo(_dataBuffer.ByteSpan.Slice(_dataByteOffset));
             _dataByteOffset += len;
         }
@@ -1948,7 +1991,7 @@ internal sealed class ColumnBuildState : IDisposable
         {
             int needed = _dataByteOffset + totalOverflow;
             if (needed > _dataBuffer!.ByteSpan.Length)
-                _dataBuffer.Grow(needed);
+                GrowData(needed);
         }
 
         // Second pass: write views with no growth checks

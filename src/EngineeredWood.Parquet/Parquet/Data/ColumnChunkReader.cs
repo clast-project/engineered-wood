@@ -80,9 +80,17 @@ internal static class ColumnChunkReader
                 ?? MaxDataPageRows(data, column, columnMeta, maxPageUncompressedSize));
         var byteArrayOutput = ByteArrayOutputOf(arrowField);
 
-        using var state = NewState(column, stateCapacity, byteArrayOutput, answer);
+        // A whole-chunk read starts its string buffer at the chunk's estimate. A selected read starts smaller and uses
+        // the estimate only to cap its growth (#888). An answer that returns indices only builds no strings; one that
+        // also returns the values builds them as a read does.
+        long? expectedStringBytes = answer is { KeepsValues: false } ? null : ExpectedStringBytes(columnMeta);
+        using var state = NewState(
+            column, stateCapacity, byteArrayOutput, answer, keepRows is null ? expectedStringBytes : null);
         if (keepRows is not null)
+        {
+            state.ExpectStringData(expectedStringBytes);
             state.SetRowSelection(keepRows, rowCount);
+        }
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
 
@@ -418,7 +426,7 @@ internal static class ColumnChunkReader
         // array builder takes its non-nullable dense path (no reverse scatter, no validity bitmap).
         using var state = new ColumnBuildState(
             column.PhysicalType, maxDefLevel: 0, maxRepLevel: 0, numValues, byteArrayOutput,
-            column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
+            column.DottedPath, ExtendedTimestamp.DeclaredUnit(column), ExpectedStringBytes(columnMeta));
 
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
@@ -690,7 +698,12 @@ internal static class ColumnChunkReader
 
         var byteArrayOutput = ByteArrayOutputOf(arrowField);
 
-        using var state = NewState(column, capacity, byteArrayOutput, answer);
+        // Start the slice's string buffer at its pages' bound when there is one; otherwise use the chunk's estimate
+        // only to cap its growth (#889 review).
+        long? sliceStringBytes = answer is { KeepsValues: false } ? null : SliceStringBytes(columnMeta, pageMap, startPage, endPage);
+        using var state = NewState(column, capacity, byteArrayOutput, answer, sliceStringBytes);
+        if (sliceStringBytes is null && answer is not { KeepsValues: false })
+            state.ExpectStringData(ExpectedStringBytes(columnMeta));
 
         int valuesLeft = capacity;
         for (int p = startPage; p <= endPage; p++)
@@ -766,18 +779,62 @@ internal static class ColumnChunkReader
     }
 
     /// <summary>
+    /// The string bytes a BYTE_ARRAY chunk decodes to, for sizing its data buffer (#888). This is the writer's recorded
+    /// count when there is one. Otherwise, for a chunk of only PLAIN and DELTA_LENGTH_BYTE_ARRAY pages, which store
+    /// their strings whole, it is the chunk's uncompressed size, an upper bound. Otherwise it is null (unknown): a
+    /// dictionary, DELTA_BYTE_ARRAY or FSST chunk can decode to more than it stores. A recorded 0 (every value empty
+    /// or null) is returned as 0, not null, so the buffer starts empty (#889 review round 3).
+    /// </summary>
+    internal static long? ExpectedStringBytes(ColumnMetaData columnMeta)
+    {
+        if (columnMeta.Type != PhysicalType.ByteArray)
+            return null;
+        if (columnMeta.UnencodedByteArrayDataBytes is { } recorded)
+            return recorded;
+        return StoresStringsWhole(columnMeta) ? columnMeta.TotalUncompressedSize : null;
+    }
+
+    /// <summary>
+    /// An upper bound on the string bytes that pages <paramref name="startPage"/> through <paramref name="endPage"/>
+    /// decode to: the sum of their uncompressed sizes. It applies only when the chunk stores its strings whole (see
+    /// <see cref="ExpectedStringBytes"/>) and the page map was built from the page headers, so the sizes are the pages'
+    /// own rather than estimates. Null otherwise.
+    /// </summary>
+    internal static long? SliceStringBytes(ColumnMetaData columnMeta, ColumnPageMap pageMap, int startPage, int endPage)
+    {
+        if (!pageMap.HeadersResolved || columnMeta.Type != PhysicalType.ByteArray || !StoresStringsWhole(columnMeta))
+            return null;
+        long bytes = 0;
+        for (int p = startPage; p <= endPage; p++)
+            bytes += pageMap.Pages[p].UncompressedSize;
+        return bytes;
+    }
+
+    // Whether every page of the chunk stores its strings whole (PLAIN, DELTA_LENGTH_BYTE_ARRAY), levels aside.
+    private static bool StoresStringsWhole(ColumnMetaData columnMeta)
+    {
+        foreach (var encoding in columnMeta.Encodings)
+        {
+            if (encoding is not (Encoding.Plain or Encoding.DeltaLengthByteArray or Encoding.Rle or Encoding.BitPacked))
+                return false;
+        }
+        return true;
+    }
+
+    /// <summary>
     /// The build state for a column chunk: its values', or, answered from its dictionary (#502 phase 4b), its
     /// indices', or, answered and returned too (phase 4d), its values' with an <see cref="ColumnBuildState.IndexSink"/>.
     /// </summary>
     private static ColumnBuildState NewState(
-        ColumnDescriptor column, int capacity, ByteArrayOutputKind byteArrayOutput, DictionaryAnswer? answer)
+        ColumnDescriptor column, int capacity, ByteArrayOutputKind byteArrayOutput, DictionaryAnswer? answer,
+        long? expectedStringBytes = null)
     {
         if (answer is { KeepsValues: false })
             return DictionaryAnswer.IndexState(column, capacity, answer);
 
         return new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column))
+            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column), expectedStringBytes)
         {
             IndexSink = answer is null
                 ? null

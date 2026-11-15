@@ -153,6 +153,22 @@ internal static class ExternalParquetReaders
             result.GetProperty("rows_matched").GetInt64()), null);
     }
 
+    /// <summary>
+    /// Has pyarrow write <paramref name="rows"/> non-null strings of <paramref name="length"/> characters to
+    /// <paramref name="path"/> in <paramref name="encoding"/> (a pyarrow <c>column_encoding</c> name). pyarrow records
+    /// SizeStatistics, which EngineeredWood's writer does not. The error is null on success, and says why otherwise;
+    /// <c>Available</c> is false when pyarrow is not installed (a skip).
+    /// </summary>
+    public static (bool Available, string? Error) PyArrowWriteStrings(string path, int rows, int length, string encoding)
+    {
+        var result = Driver.InvokeRaw("pyarrow_write_strings", new { path, rows, length, encoding });
+        if (!result.GetProperty("ok").GetBoolean())
+            return (true, result.TryGetProperty("error", out var e) ? e.GetString() : "(no message)");
+        if (!result.GetProperty("available").GetBoolean())
+            return (false, result.TryGetProperty("error", out var a) ? a.GetString() : "pyarrow is not installed");
+        return (true, null);
+    }
+
     /// <summary>pyarrow's view of which column chunks carry a ColumnIndex and an OffsetIndex.</summary>
     public static (IReadOnlyList<PageIndexPresence>? Chunks, string? Error) PyArrowPageIndexPresence(string path)
     {
