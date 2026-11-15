@@ -96,6 +96,49 @@ public sealed class KeepRowsHoldAllocationTests : IDisposable
             $"{peak - chunks} its budget reserved at most for decoding (peak {peak}, chunks {chunks}, held {held})");
     }
 
+    /// <summary>
+    /// The same, unbatched: the group is one batch, its reservation the output columns' whole decoded size. A keep-rows
+    /// decode building only the kept rows stays within that, but DELTA_BYTE_ARRAY and FSST pages appended whole before
+    /// their dropped rows went, and short strings started at 32 bytes a slot for a page's room too, past the whole
+    /// column (#897).
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Cases))]
+    public async Task AnUnbatchedKeepRowsSecondPass_AllocatesNoMoreThanItsBudgetReserved(string column, bool prefetched)
+    {
+        string path = await WriteAsync(column);
+        var output = column switch
+        {
+            "short-strings-view" => ByteArrayOutputKind.ViewType,
+            "long-strings-large" => ByteArrayOutputKind.LargeOffsets,
+            _ => ByteArrayOutputKind.Default,
+        };
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(
+            file, ownsFile: false, new ParquetReadOptions { BatchSize = null, ByteArrayOutput = output })
+        {
+            TwoPassReads = true,
+            MaxPrefetchRangeBytes = prefetched ? 0x7FFFFFC7 : 1,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        // Unsplit, the returned predicate column stays in pass 1, kept for the whole group; pass 2 reads v.
+        long chunks = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k"], null).Compressed
+                      + ParquetFileReader.PlannedBytes(group, parquetSchema, ["v"], null).Compressed;
+        // One row in 100: the second pass keeps rows.
+        var predicate = ParallelRowGroupReadTests.KeyPredicate(k => k < 1, false);
+        NativeMemoryTracker.Reset();
+        var (returned, _, peak, used, held) = await ParallelRowGroupReadTests.ReadTwoPassUnitHeldAsync(
+            reader, predicate, returnPredicateColumn: true);
+        long allocated = NativeMemoryTracker.PeakBytes + (column == "dictionary-large" ? 3_000 * 300 : 0);
+
+        Assert.Equal(Rows / 100, returned);
+        Assert.Equal(0, used);
+        Assert.True(allocated <= peak - chunks,
+            $"{column} (prefetched: {prefetched}): the read allocated {allocated} bytes, past the " +
+            $"{peak - chunks} its budget reserved at most for decoding (peak {peak}, chunks {chunks}, held {held})");
+    }
+
     // One row group of k (int64, i % 100) and v, in 50,000-row pages.
     private async Task<string> WriteAsync(string column)
     {

@@ -153,6 +153,11 @@ internal static class DeltaByteArrayDecoder
             return;
         }
 
-        state.AddByteArrayValues(offsets, outputData, count);
+        // A page that drops rows appends only its kept values: every value is still rebuilt above, since each one's
+        // prefix comes from the one before it (#897).
+        if (state.PageHasDrops)
+            state.AddSelectedByteArrayValues(offsets, outputData, stride: 0);
+        else
+            state.AddByteArrayValues(offsets, outputData, count);
     }
 }

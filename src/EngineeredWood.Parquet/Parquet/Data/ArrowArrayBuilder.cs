@@ -1177,9 +1177,12 @@ internal sealed class ColumnBuildState : IDisposable
     /// <param name="maxRepLevel">Maximum repetition level (0 for flat/struct-only columns).</param>
     /// <param name="capacity">Buffer capacity: rowCount for flat columns, numValues for repeated.</param>
     /// <param name="byteArrayOutput">Controls the Arrow output type for BYTE_ARRAY columns.</param>
+    /// <param name="dataSlots">The values a BYTE_ARRAY column's string data is first sized for, at
+    /// <see cref="ByteArrayStartingBytesPerValue"/> each, when not <paramref name="capacity"/>: a selected read's kept
+    /// rows, since its decoders append only those (#897).</param>
     public ColumnBuildState(PhysicalType physicalType, int maxDefLevel, int maxRepLevel, int capacity,
         ByteArrayOutputKind byteArrayOutput = ByteArrayOutputKind.Default, string? columnPath = null,
-        Metadata.TimeUnit? extendedTimestampUnit = null, long? expectedDataBytes = null)
+        Metadata.TimeUnit? extendedTimestampUnit = null, long? expectedDataBytes = null, int? dataSlots = null)
     {
         _physicalType = physicalType;
         _extendedTimestampUnit = extendedTimestampUnit;
@@ -1194,7 +1197,7 @@ internal sealed class ColumnBuildState : IDisposable
         // so the starting size is capped at MaxExpectedStartingBytes, or the guess if that is larger: a footer that
         // claims 2 GiB cannot allocate it before any value is read (#889 review round 4). Beyond the cap the buffer
         // grows toward the estimate, never past it, as values arrive.
-        int guessedDataBytes = capacity * ByteArrayStartingBytesPerValue;
+        int guessedDataBytes = (dataSlots ?? capacity) * ByteArrayStartingBytesPerValue;
         int startingDataBytes = expectedDataBytes.HasValue
             ? (int)Math.Min(_expectedDataBytes, Math.Max(guessedDataBytes, MaxExpectedStartingBytes))
             : guessedDataBytes;

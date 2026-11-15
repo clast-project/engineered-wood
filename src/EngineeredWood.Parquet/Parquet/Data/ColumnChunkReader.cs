@@ -84,8 +84,11 @@ internal static class ColumnChunkReader
         // the estimate only to cap its growth (#888). An answer that returns indices only builds no strings; one that
         // also returns the values builds them as a read does.
         long? expectedStringBytes = answer is { KeepsValues: false } ? null : ExpectedStringBytes(columnMeta);
+        // Every BYTE_ARRAY decoder appends only a page's kept values, so a selected read's string data starts at the
+        // kept rows: the page's room is for its levels, offsets and views (#897).
         using var state = NewState(
-            column, stateCapacity, byteArrayOutput, answer, keepRows is null ? expectedStringBytes : null);
+            column, stateCapacity, byteArrayOutput, answer, keepRows is null ? expectedStringBytes : null,
+            dataSlots: keepRows is null ? null : KeptRowCount(keepRows, rowCount));
         if (keepRows is not null)
         {
             state.ExpectStringData(expectedStringBytes);
@@ -239,17 +242,21 @@ internal static class ColumnChunkReader
     /// <paramref name="maxPageRows"/>. <see cref="ColumnBuildState.EnsurePageRoom"/> grows past that only for a chunk
     /// whose headers disagree with its pages.
     /// </summary>
-    internal static int KeepRowsCapacity(byte[] keepRows, int rowCount, int maxPageRows)
+    internal static int KeepRowsCapacity(byte[] keepRows, int rowCount, int maxPageRows) =>
+        (int)Math.Min(rowCount, (long)KeptRowCount(keepRows, rowCount) + maxPageRows);
+
+    // The rows of the first `rowCount` that `keepRows` keeps (one byte per row, 1 to keep).
+    private static int KeptRowCount(byte[] keepRows, int rowCount)
     {
         var keep = keepRows.AsSpan(0, rowCount);
 #if NET8_0_OR_GREATER
-        int kept = keep.Count((byte)1);
+        return keep.Count((byte)1);
 #else
         int kept = 0;
         foreach (byte k in keep)
             kept += k;
+        return kept;
 #endif
-        return (int)Math.Min(rowCount, (long)kept + maxPageRows);
     }
 
     /// <summary>
@@ -837,14 +844,14 @@ internal static class ColumnChunkReader
     /// </summary>
     private static ColumnBuildState NewState(
         ColumnDescriptor column, int capacity, ByteArrayOutputKind byteArrayOutput, DictionaryAnswer? answer,
-        long? expectedStringBytes = null)
+        long? expectedStringBytes = null, int? dataSlots = null)
     {
         if (answer is { KeepsValues: false })
             return DictionaryAnswer.IndexState(column, capacity, answer);
 
         return new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column), expectedStringBytes)
+            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column), expectedStringBytes, dataSlots)
         {
             IndexSink = answer is null
                 ? null
@@ -1265,6 +1272,16 @@ internal static class ColumnChunkReader
             else if (encoding == Encoding.DeltaLengthByteArray && column.PhysicalType == PhysicalType.ByteArray)
             {
                 DeltaLengthByteArrayDecoder.Decode(data, nonNullCount, state, selected: true);
+            }
+#pragma warning disable EWPARQUET0003 // FSST: an evaluation encoding, routed here only to keep rows as it decodes
+            else if (encoding is Encoding.DeltaByteArray or Encoding.Fsst && column.PhysicalType == PhysicalType.ByteArray)
+#pragma warning restore EWPARQUET0003
+            {
+                // These rebuild the whole page in a scratch buffer of their own, every value in turn, then append only
+                // the kept values (PageHasDrops). Appended whole and compacted afterwards, the column's buffer had to
+                // hold the whole decoded page, growing to it with the old and new buffers both live: 60 MB for a
+                // 480 KB result (#897).
+                DecodeValues(data, encoding, column, dictionary, symbolTable, nonNullCount, state);
             }
             else
             {
