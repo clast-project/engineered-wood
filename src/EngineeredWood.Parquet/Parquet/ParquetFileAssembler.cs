@@ -240,7 +240,11 @@ internal sealed class ParquetFileAssembler
             }
 
             offsetIndexes[(pending.RowGroup, pending.Column)] = await WritePageIndexStructureAsync(
-                MetadataEncoder.EncodeOffsetIndex(new OffsetIndex { PageLocations = locations }),
+                MetadataEncoder.EncodeOffsetIndex(new OffsetIndex
+                {
+                    PageLocations = locations,
+                    UnencodedByteArrayDataBytes = pending.Index.UnencodedByteArrayDataBytes,
+                }),
                 cancellationToken).ConfigureAwait(false);
         }
 

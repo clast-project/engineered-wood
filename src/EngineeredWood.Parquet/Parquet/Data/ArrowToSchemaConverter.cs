@@ -165,12 +165,6 @@ internal static class ArrowToSchemaConverter
     }
 
     /// <summary>
-    /// Maps an Arrow <see cref="ExtensionType"/> name to the Parquet logical
-    /// type annotation that should ride with the storage layout. Returns null
-    /// for any extension we don't have a specialised mapping for; callers
-    /// then write the bare storage with no annotation.
-    /// </summary>
-    /// <summary>
     /// Whether the written schema carries an annotation for <paramref name="ext"/>, from
     /// <see cref="GetExtensionLogicalType"/> or <see cref="MapExtensionType"/>. Every other extension
     /// is written as its bare storage.
@@ -178,6 +172,12 @@ internal static class ArrowToSchemaConverter
     internal static bool AnnotatesExtension(ExtensionType ext) =>
         ext.Name is "arrow.parquet.variant" or "arrow.uuid";
 
+    /// <summary>
+    /// Maps an Arrow <see cref="ExtensionType"/> name to the Parquet logical
+    /// type annotation that should ride with the storage layout. Returns null
+    /// for any extension we don't have a specialised mapping for; callers
+    /// then write the bare storage with no annotation.
+    /// </summary>
     private static LogicalType? GetExtensionLogicalType(ExtensionType ext) => ext.Name switch
     {
         "arrow.parquet.variant" => new LogicalType.VariantType(),

@@ -822,10 +822,12 @@ public class ParallelRowGroupReadTests : IDisposable
         // #847 review: a dictionary-encoded string page holds indices; the strings they decode to are longer, and
         // nothing before the decode says how much (the footer fell short as well). A batched read never learnt it
         // (#846 gap 1): growth was measured only from a row group read as one batch. A first batch sized from its
-        // pages is measured against that size, so the next unit of the read reserves enough.
+        // pages is measured against that size, so the next unit of the read reserves enough. Written without the
+        // SizeStatistics that would say (#890), as a writer that records none leaves it.
         string[] distinct = Enumerable.Range(0, 8).Select(k => new string((char)('a' + k), 200)).ToArray();
         string path = await WriteStringsAsync(
-            "dictionary-strings.parquet", i => distinct[i % distinct.Length], ParquetWriteOptions.Default);
+            "dictionary-strings.parquet", i => distinct[i % distinct.Length],
+            ParquetWriteOptions.Default with { WriteSizeStatistics = false });
         await using var file = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 1_000 });
         var growth = new ParquetFileReader.DecodedGrowth();
@@ -1181,9 +1183,11 @@ public class ParallelRowGroupReadTests : IDisposable
             .Field(new Field("v", Int32Type.Default, false))
             .Build();
         string path = Path.Combine(_tempDir, "two-pass-growth.parquet");
+        // Without SizeStatistics (#890), which would give the dictionary strings' size before any pass decodes them.
         using (var batch = new RecordBatch(schema, [keys.Build(), values.Build()], KeyRows))
         await using (var output = new LocalSequentialFile(path))
-        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        await using (var writer = new ParquetFileWriter(
+                         output, ownsFile: false, new ParquetWriteOptions { WriteSizeStatistics = false }))
         {
             await writer.WriteRowGroupAsync(batch);
             await writer.CloseAsync();
