@@ -82,7 +82,8 @@ internal static class ColumnChunkReader
 
         // A whole chunk's string buffer starts at what it decodes to; a selected read's starts smaller and only grows
         // no further than that (#888).
-        long expectedStringBytes = answer is null ? ExpectedStringBytes(columnMeta) : 0;
+        // An answer that returns the values too builds them as a read does; one that returns only indices builds none.
+        long expectedStringBytes = answer is { KeepsValues: false } ? 0 : ExpectedStringBytes(columnMeta);
         using var state = NewState(
             column, stateCapacity, byteArrayOutput, answer, keepRows is null ? expectedStringBytes : 0);
         if (keepRows is not null)
@@ -697,7 +698,11 @@ internal static class ColumnChunkReader
 
         var byteArrayOutput = ByteArrayOutputOf(arrowField);
 
-        using var state = NewState(column, capacity, byteArrayOutput, answer);
+        // A slice's string bytes, where its pages bound them; else the chunk's, which only cap its grows (#889 review).
+        long sliceStringBytes = answer is { KeepsValues: false } ? 0 : SliceStringBytes(columnMeta, pageMap, startPage, endPage);
+        using var state = NewState(column, capacity, byteArrayOutput, answer, sliceStringBytes);
+        if (sliceStringBytes == 0 && answer is not { KeepsValues: false })
+            state.ExpectStringData(ExpectedStringBytes(columnMeta));
 
         int valuesLeft = capacity;
         for (int p = startPage; p <= endPage; p++)
@@ -788,12 +793,33 @@ internal static class ColumnChunkReader
             return 0;
         if (columnMeta.UnencodedByteArrayDataBytes is { } recorded)
             return recorded;
+        return StoresStringsWhole(columnMeta) ? columnMeta.TotalUncompressedSize : 0;
+    }
+
+    /// <summary>
+    /// The string bytes pages <paramref name="startPage"/> to <paramref name="endPage"/> decode to at most: their
+    /// uncompressed sizes, for a chunk whose strings are stored whole (as <see cref="ExpectedStringBytes"/>) and pages
+    /// whose headers were read, so that the sizes are the pages' own and not estimates. 0 when unknown.
+    /// </summary>
+    internal static long SliceStringBytes(ColumnMetaData columnMeta, ColumnPageMap pageMap, int startPage, int endPage)
+    {
+        if (!pageMap.HeadersResolved || columnMeta.Type != PhysicalType.ByteArray || !StoresStringsWhole(columnMeta))
+            return 0;
+        long bytes = 0;
+        for (int p = startPage; p <= endPage; p++)
+            bytes += pageMap.Pages[p].UncompressedSize;
+        return bytes;
+    }
+
+    // Whether every page of the chunk stores its strings whole (PLAIN, DELTA_LENGTH_BYTE_ARRAY), levels aside.
+    private static bool StoresStringsWhole(ColumnMetaData columnMeta)
+    {
         foreach (var encoding in columnMeta.Encodings)
         {
             if (encoding is not (Encoding.Plain or Encoding.DeltaLengthByteArray or Encoding.Rle or Encoding.BitPacked))
-                return 0;
+                return false;
         }
-        return columnMeta.TotalUncompressedSize;
+        return true;
     }
 
     private static ColumnBuildState NewState(

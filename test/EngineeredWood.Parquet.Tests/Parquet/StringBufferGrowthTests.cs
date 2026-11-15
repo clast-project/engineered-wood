@@ -9,6 +9,7 @@ using EngineeredWood.Compression;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.Metadata;
+using EngineeredWood.Tests.Parquet.Interop;
 
 #pragma warning disable EWPARQUET0003 // FSST, an evaluation encoding
 
@@ -95,6 +96,99 @@ public sealed class StringBufferGrowthTests : IDisposable
         long guess = (long)Rows * 32;
         Assert.True(NativeMemoryTracker.PeakBytes < guess / 2,
             $"the read peaked at {NativeMemoryTracker.PeakBytes} bytes; the 32-a-value guess alone is {guess}");
+    }
+
+    [SkippableFact]
+    public async Task PyArrowsRecordedCount_IsReadAndSizesTheBuffer()
+    {
+        // Arrow C++ records SizeStatistics by default: an independent writer of the field this reads (#889 review,
+        // which took unencoded_byte_array_data_bytes for field 3; parquet.thrift has it as field 1).
+        ExternalParquetReaders.Require();
+        string path = Path.Combine(_tempDir, "pyarrow-delta.parquet");
+        var (available, error) = ExternalParquetReaders.PyArrowWriteStrings(path, Rows, Length, "DELTA_BYTE_ARRAY");
+        Skip.IfNot(available, $"pyarrow unavailable: {error}");
+        Assert.Null(error);
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var meta = (await reader.ReadMetadataAsync()).RowGroups[0].Columns[0].MetaData!;
+        Assert.Equal((long)Rows * Length, meta.UnencodedByteArrayDataBytes);
+
+        NativeMemoryTracker.Reset();
+        using var batch = await reader.ReadRowGroupAsync(0);
+        long decoded = (long)Rows * Length + (Rows + 1L) * 4;
+        Assert.Equal(new string('7', Length), ((StringArray)batch.Column(0)).GetString(7));
+        Assert.True(NativeMemoryTracker.PeakBytes <= decoded * Slack,
+            $"the read peaked at {NativeMemoryTracker.PeakBytes} bytes, past {Slack} times the {decoded} it decodes to");
+    }
+
+    [Fact]
+    public async Task TheBudgetsEstimate_CountsTheRecordedStringBytes()
+    {
+        // A DELTA_BYTE_ARRAY chunk of strings sharing all but their last byte stores a few bytes a value: the footer
+        // size alone reserved far less than the buffer the read now allocates from the recorded count (#889 review).
+        var b = new StringArray.Builder();
+        string prefix = new('p', Length - 1);
+        for (int i = 0; i < Rows; i++)
+            b.Append(prefix + (char)('a' + i % 26));
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("v", StringType.Default, false)).Build();
+        string path = Path.Combine(_tempDir, "prefixed.parquet");
+        using (var batch = new RecordBatch(schema, [b.Build()], Rows))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false, new ParquetWriteOptions
+                     {
+                         DictionaryEnabled = false,
+                         ColumnEncodings = new Dictionary<string, ByteArrayEncoding> { ["v"] = ByteArrayEncoding.DeltaByteArray },
+                     }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+        RecordStringBytes(path, (long)Rows * Length);
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        Assert.True(group.Columns[0].MetaData!.TotalUncompressedSize < (long)Rows * Length / 4);
+
+        long estimate = reader.DecodedBytes(group, await reader.GetSchemaAsync(), null, null);
+
+        Assert.True(estimate >= (long)Rows * Length, $"the estimate {estimate} is short of the recorded strings");
+    }
+
+    [Fact]
+    public async Task ABatchedRead_SizesEachSliceFromItsPages()
+    {
+        // 10,000-row batches over 5,000-row pages: each slice's buffer starts at its pages' bound, not at 32 bytes a
+        // value doubled to 64 (#889 review). Without an OffsetIndex, the page map is built from the page headers, so
+        // its page sizes are the pages' own. A map built from an OffsetIndex has only estimates; sizing those slices
+        // needs the index's per-page unencoded_byte_array_data_bytes, which this writer does not record yet (#890).
+        string path = await WriteAsync("delta-length", new ParquetWriteOptions
+        {
+            DictionaryEnabled = false,
+            DataPageRowCountLimit = 5_000,
+            WritePageIndex = false,
+        });
+        const int batchRows = 10_000;
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = batchRows });
+        await reader.ReadMetadataAsync();
+        NativeMemoryTracker.Reset();
+
+        long worst = 0;
+        int rows = 0;
+        await foreach (var batch in reader.ReadAllAsync())
+        {
+            rows += batch.Length;
+            batch.Dispose();
+            worst = Math.Max(worst, NativeMemoryTracker.PeakBytes);
+            NativeMemoryTracker.Reset();
+        }
+
+        Assert.Equal(Rows, rows);
+        long decoded = (long)batchRows * Length + (batchRows + 1L) * 4;
+        Assert.True(worst <= decoded * Slack,
+            $"a batch's read peaked at {worst} bytes, {(double)worst / decoded:F2} times the {decoded} it decodes to");
     }
 
     [Fact]
@@ -198,7 +292,9 @@ public sealed class StringBufferGrowthTests : IDisposable
         return values;
     }
 
-    private async Task<string> WriteAsync(string encoding)
+    private Task<string> WriteAsync(string encoding) => WriteAsync(encoding, null);
+
+    private async Task<string> WriteAsync(string encoding, ParquetWriteOptions? options)
     {
         var b = new StringArray.Builder();
         foreach (string value in Values(repeating: encoding == "dictionary"))
@@ -208,7 +304,7 @@ public sealed class StringBufferGrowthTests : IDisposable
         string path = Path.Combine(_tempDir, encoding + ".parquet");
         using var batch = new RecordBatch(schema, [b.Build()], Rows);
         await using var file = new LocalSequentialFile(path);
-        await using var writer = new ParquetFileWriter(file, ownsFile: false, new ParquetWriteOptions
+        await using var writer = new ParquetFileWriter(file, ownsFile: false, options ?? new ParquetWriteOptions
         {
             DictionaryEnabled = encoding == "dictionary",
             ColumnEncodings = encoding switch

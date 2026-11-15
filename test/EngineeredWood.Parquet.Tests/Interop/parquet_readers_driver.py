@@ -264,8 +264,27 @@ def cmd_page_index_presence(args):
     return {"available": True, "chunks": chunks}
 
 
+def cmd_pyarrow_write_strings(args):
+    """Has pyarrow write one non-null string column, unencoded by a dictionary, in the given encoding.
+
+    pyarrow is the WRITER here: Arrow C++ records SizeStatistics by default (PageAndColumnChunk), which
+    EngineeredWood's writer does not, so its files carry unencoded_byte_array_data_bytes for EW to read (#889).
+    """
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        return {"available": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    values = [str(i % 10) * args["length"] for i in range(args["rows"])]
+    pq.write_table(pa.table({"v": pa.array(values, pa.string())}), args["path"], use_dictionary=False,
+                   column_encoding={"v": args["encoding"]}, compression="NONE")
+    return {"available": True, "version": pa.__version__}
+
+
 COMMANDS = {
     "probe": cmd_probe,
+    "pyarrow_write_strings": cmd_pyarrow_write_strings,
     "read_digest": cmd_read_digest,
     "count_where": cmd_count_where,
     "duckdb_write_variant": cmd_duckdb_write_variant,

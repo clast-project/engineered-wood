@@ -794,7 +794,12 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             if (chunks[c].MetaData is not { } meta)
                 continue;
             long footer = (long)(meta.TotalUncompressedSize * share);
-            total += ColumnDecodedBytes(columns[c], rows, footer, footer);
+            // A chunk's recorded string bytes (SizeStatistics), which its read now allocates up front (#889 review):
+            // a dictionary, DELTA_BYTE_ARRAY or FSST chunk decodes to far more than its footer size.
+            long strings = meta.UnencodedByteArrayDataBytes is { } recorded
+                ? Math.Max(footer, (long)(recorded * share))
+                : footer;
+            total += ColumnDecodedBytes(columns[c], rows, footer, strings);
         }
         return total;
     }
@@ -1042,7 +1047,10 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 // its compressed size: short for a page that compresses better than the rest) and a dictionary page
                 // counts indices, not strings. The column's footer size for the rows kept, as a footer-sized read
                 // reserves it, stays the floor (#847 review).
-                byteArrayBytes = Math.Max(encoded, (long)(ctx.Chunks[i].MetaData!.TotalUncompressedSize * keptShare));
+                // The chunk's recorded string bytes, when it has them, before its footer size (#889 review).
+                var chunkMeta = ctx.Chunks[i].MetaData!;
+                byteArrayBytes = Math.Max(encoded,
+                    (long)((chunkMeta.UnencodedByteArrayDataBytes ?? chunkMeta.TotalUncompressedSize) * keptShare));
             }
             total += ColumnDecodedBytes(ctx.Columns[i], rows, encoded, byteArrayBytes);
         }
