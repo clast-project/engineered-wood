@@ -1234,24 +1234,54 @@ internal sealed class ColumnBuildState : IDisposable
                 if (byteArrayOutput == ByteArrayOutputKind.ViewType)
                 {
                     _viewsBuffer = new NativeBuffer<byte>(capacity * ViewEntrySize, zeroFill: false);
-                    _dataBuffer = new NativeBuffer<byte>(capacity * 32, zeroFill: false); // overflow
+                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false); // overflow
                 }
                 else if (byteArrayOutput == ByteArrayOutputKind.LargeOffsets)
                 {
                     _largeOffsetsBuffer = new NativeBuffer<long>(capacity + 1, zeroFill: false);
                     _largeOffsetsBuffer.Span[0] = 0;
                     _offsetsCount = 1;
-                    _dataBuffer = new NativeBuffer<byte>(capacity * 32, zeroFill: false);
+                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false);
                 }
                 else
                 {
                     _offsetsBuffer = new NativeBuffer<int>(capacity + 1, zeroFill: false);
                     _offsetsBuffer.Span[0] = 0;
                     _offsetsCount = 1;
-                    _dataBuffer = new NativeBuffer<byte>(capacity * 32, zeroFill: false);
+                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false);
                 }
                 break;
         }
+    }
+
+    /// <summary>The data bytes a BYTE_ARRAY state starts with per value, before any value is decoded.</summary>
+    internal const int ByteArrayStartingBytesPerValue = 32;
+
+    /// <summary>
+    /// What a new state of <paramref name="capacity"/> slots allocates before it decodes anything: its levels, and
+    /// its value, offset, view and string data buffers. A budget that holds for a decode holds at least this, which
+    /// for short strings is more than the decoded column (#886 review round 2).
+    /// </summary>
+    internal static long StartingBytes(
+        PhysicalType physicalType, int maxDefLevel, int capacity, ByteArrayOutputKind byteArrayOutput, int typeLength)
+    {
+        long slots = capacity;
+        long levels = maxDefLevel > 0 ? slots : 0;
+        return levels + physicalType switch
+        {
+            PhysicalType.Boolean => (slots + 7) / 8,
+            PhysicalType.Int32 or PhysicalType.Float => slots * 4,
+            PhysicalType.Int64 or PhysicalType.Double => slots * 8,
+            PhysicalType.Int96 => slots * 12,
+            PhysicalType.FixedLenByteArray => slots * typeLength,
+            PhysicalType.ByteArray => slots * ByteArrayStartingBytesPerValue + byteArrayOutput switch
+            {
+                ByteArrayOutputKind.ViewType => slots * ViewEntrySize,
+                ByteArrayOutputKind.LargeOffsets => (slots + 1) * sizeof(long),
+                _ => (slots + 1) * sizeof(int),
+            },
+            _ => 0,
+        };
     }
 
     // ---- A row selection, applied page by page as the column decodes (#502 phase 2) ----------------------------

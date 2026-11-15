@@ -76,13 +76,9 @@ internal static class ColumnChunkReader
         // its dropped rows go: not the whole group's size (#880). The page headers say how large that is.
         int stateCapacity = keepRows is null
             ? capacity
-            : KeepRowsCapacity(keepRows, rowCount, MaxDataPageRows(data, column, columnMeta, maxPageUncompressedSize));
-        var byteArrayOutput = arrowField.DataType switch
-        {
-            StringViewType or BinaryViewType => ByteArrayOutputKind.ViewType,
-            LargeStringType or LargeBinaryType => ByteArrayOutputKind.LargeOffsets,
-            _ => ByteArrayOutputKind.Default,
-        };
+            : KeepRowsCapacity(keepRows, rowCount, KeepRowsPageRoomForTests.Value
+                ?? MaxDataPageRows(data, column, columnMeta, maxPageUncompressedSize));
+        var byteArrayOutput = ByteArrayOutputOf(arrowField);
 
         using var state = NewState(column, stateCapacity, byteArrayOutput, answer);
         if (keepRows is not null)
@@ -214,6 +210,21 @@ internal static class ColumnChunkReader
 
         return new ColumnResult(array, defLevels, repLevels);
     }
+
+    /// <summary>How a BYTE_ARRAY column decodes into <paramref name="arrowField"/>'s type.</summary>
+    internal static ByteArrayOutputKind ByteArrayOutputOf(Field arrowField) => arrowField.DataType switch
+    {
+        StringViewType or BinaryViewType => ByteArrayOutputKind.ViewType,
+        LargeStringType or LargeBinaryType => ByteArrayOutputKind.LargeOffsets,
+        _ => ByteArrayOutputKind.Default,
+    };
+
+    /// <summary>
+    /// For tests: the page room a selected decode starts with in place of its largest page, so a decode whose pages
+    /// are larger exercises <see cref="ColumnBuildState.EnsurePageRoom"/>, as a chunk whose headers disagree with its
+    /// pages would. Null (always, outside tests) reads the room from the headers.
+    /// </summary>
+    internal static readonly AsyncLocal<int?> KeepRowsPageRoomForTests = new();
 
     /// <summary>
     /// The rows a selected decode's buffers hold: those it keeps and room for its largest page,
@@ -387,12 +398,7 @@ internal static class ColumnChunkReader
         int? maxPageUncompressedSize)
     {
         int numValues = checked((int)columnMeta.NumValues);
-        var byteArrayOutput = arrowField.DataType switch
-        {
-            StringViewType or BinaryViewType => ByteArrayOutputKind.ViewType,
-            LargeStringType or LargeBinaryType => ByteArrayOutputKind.LargeOffsets,
-            _ => ByteArrayOutputKind.Default,
-        };
+        var byteArrayOutput = ByteArrayOutputOf(arrowField);
 
         // maxDefLevel/maxRepLevel are declared as 0: no level arrays are rented or filled, and the
         // array builder takes its non-nullable dense path (no reverse scatter, no validity bitmap).
@@ -668,12 +674,7 @@ internal static class ColumnChunkReader
         int pageRowCount = pageMap.CumulativeRows[endPage + 1] - pageMap.CumulativeRows[startPage];
         int capacity = isRepeated ? pageNumValues : pageRowCount;
 
-        var byteArrayOutput = arrowField.DataType switch
-        {
-            StringViewType or BinaryViewType => ByteArrayOutputKind.ViewType,
-            LargeStringType or LargeBinaryType => ByteArrayOutputKind.LargeOffsets,
-            _ => ByteArrayOutputKind.Default,
-        };
+        var byteArrayOutput = ByteArrayOutputOf(arrowField);
 
         using var state = NewState(column, capacity, byteArrayOutput, answer);
 

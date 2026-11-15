@@ -5,6 +5,7 @@ using Apache.Arrow;
 using EngineeredWood.Arrow;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Parquet;
+using EngineeredWood.Parquet.Data;
 using Xunit.Abstractions;
 
 namespace EngineeredWood.Tests.Parquet;
@@ -273,19 +274,26 @@ public class KeepRowsTests(ITestOutputHelper output)
         foreach (bool dictionary in new[] { false, true })
         {
             foreach (var output in new[] { ByteArrayOutputKind.Default, ByteArrayOutputKind.ViewType, ByteArrayOutputKind.LargeOffsets })
-                yield return [dictionary, output];
+            {
+                foreach (int? room in new int?[] { null, 1_000 })
+                    yield return [dictionary, output, room];
+            }
         }
     }
 
     /// <summary>
-    /// Pages larger than the room a selected decode starts with (the kept rows and
-    /// <c>ColumnChunkReader.KeepRowsPageRoom</c>, #880), so every buffer grows mid-chunk, over each physical type: the
-    /// rows kept before a grow must survive it, and a boolean's grown bits must start clear.
+    /// 50,000-row pages over each physical type, kept sparsely and in the last page only. A selected decode starts with
+    /// the kept rows and room for its largest page, read from the page headers (#880, #886 review), so it never grows
+    /// (<paramref name="room"/> null). Started with less room than a page (<paramref name="room"/> 1,000, as for a
+    /// chunk whose headers disagree with its pages), every buffer grows mid-chunk
+    /// (<see cref="ColumnBuildState.EnsurePageRoom"/>): the rows kept before a grow must survive it, and a boolean's
+    /// grown bits must start clear.
     /// </summary>
     [Theory]
     [MemberData(nameof(LargePageCases))]
-    public async Task KeepingRowsAcrossPagesLargerThanTheStartingRoomEqualsGatheringThem(bool dictionary, ByteArrayOutputKind output)
+    public async Task KeepingRowsAcrossLargePagesEqualsGatheringThem(bool dictionary, ByteArrayOutputKind output, int? room)
     {
+        ColumnChunkReader.KeepRowsPageRoomForTests.Value = room;
         const int rows = 150_000;
         string path = Path.Combine(Path.GetTempPath(), "ew-keeprows-" + Guid.NewGuid().ToString("N")[..8] + ".parquet");
         try

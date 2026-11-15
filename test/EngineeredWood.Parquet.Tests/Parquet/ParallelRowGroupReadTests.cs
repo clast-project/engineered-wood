@@ -1297,6 +1297,58 @@ public class ParallelRowGroupReadTests : IDisposable
             $"held {held}: the chunks ({chunks}) and the kept rows with the largest page ({keptDecode}) were not both counted");
         Assert.True(held < chunks + wholeDecode / 2, $"held {held}: the whole group's decode ({wholeDecode}) was held");
         Assert.Equal(0, used);
+    }
+
+    /// <summary>
+    /// A keep-rows decode of short strings allocates its string buffers at their starting size, 32 bytes a slot, before
+    /// any value: more than the decoded column's share. The hold covers those, not just the decoded share (#886 review
+    /// round 2).
+    /// </summary>
+    [Fact]
+    public async Task ASplitTwoPassRead_HoldsTheStartingStringBuffers_WhenItKeepsRowsInOneBatch()
+    {
+        const int rows = 150_000, pageRows = 50_000;
+        var keys = new Int64Array.Builder();
+        var text = new StringArray.Builder();
+        for (int i = 0; i < rows; i++)
+        {
+            keys.Append(i % 100);
+            text.Append(((char)('a' + i % 26)).ToString());
+        }
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", Int64Type.Default, false))
+            .Field(new Field("v", StringType.Default, false))
+            .Build();
+        string path = Path.Combine(_tempDir, "two-pass-keep-short-strings.parquet");
+        using (var batch = new RecordBatch(schema, [keys.Build(), text.Build()], rows))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false,
+                         new ParquetWriteOptions { DataPageSize = 64 << 20, DataPageRowCountLimit = pageRows }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        var predicate = KeyPredicate(k => k < 1, false);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 5_000 })
+        {
+            TwoPassReads = true,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long chunks = ParquetFileReader.PlannedBytes(group, parquetSchema, ["k"], null).Compressed
+                      + ParquetFileReader.PlannedBytes(group, parquetSchema, ["k", "v"], null).Compressed;
+        int slots = rows / 100 + pageRows;
+        long starting = EngineeredWood.Parquet.Data.ColumnBuildState.StartingBytes(PhysicalType.Int64, 0, slots, ByteArrayOutputKind.Default, 0)
+                        + EngineeredWood.Parquet.Data.ColumnBuildState.StartingBytes(PhysicalType.ByteArray, 0, slots, ByteArrayOutputKind.Default, 0);
+        long keptDecode = (long)((double)reader.DecodedBytes(group, parquetSchema, ["k", "v"], null) * slots / rows);
+        Assert.True(starting > keptDecode, $"the fixture's strings start ({starting}) above their decoded share ({keptDecode})");
+
+        var (returned, _, _, used, held) = await ReadTwoPassUnitHeldAsync(reader, predicate, returnPredicateColumn: true);
+        Assert.Equal(rows / 100, returned);
+        Assert.True(held >= chunks + starting,
+            $"held {held}: the chunks ({chunks}) and the buffers' starting size ({starting}) were not both counted");
         Assert.Equal(0, used);
     }
 

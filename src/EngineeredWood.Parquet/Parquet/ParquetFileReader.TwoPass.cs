@@ -138,7 +138,8 @@ public sealed partial class ParquetFileReader
 
     /// <summary>
     /// What a keep-rows decode of <paramref name="output"/>'s columns builds: each column's decoded size, scaled to the
-    /// rows its buffers hold, the kept ones and room for its largest page (<see cref="Data.ColumnChunkReader.KeepRowsCapacity"/>).
+    /// rows its buffers hold, the kept ones and room for its largest page (<see cref="Data.ColumnChunkReader.KeepRowsCapacity"/>),
+    /// and never less than what those buffers start at (<see cref="Data.ColumnBuildState.StartingBytes"/>).
     /// The pages' sizes come from the headers of the chunks fetched ahead, which the decode reads next anyway; a column
     /// not fetched ahead (too large for one buffer) is taken whole, rather than read twice (#886 review).
     /// </summary>
@@ -160,7 +161,14 @@ public sealed partial class ParquetFileReader
             }
 
             long holds = maxPage is { } page ? Math.Min(rows, kept + page) : rows;
-            total += rows == 0 ? 0 : (long)((double)columnBytes * holds / rows);
+            long scaled = rows == 0 ? 0 : (long)((double)columnBytes * holds / rows);
+            // The state's buffers are allocated at `holds` slots before a value is decoded: for short strings, more
+            // than the decoded share (#886 review round 2).
+            var column = output.Columns[i];
+            long starting = Data.ColumnBuildState.StartingBytes(
+                column.PhysicalType, column.MaxDefinitionLevel, (int)holds,
+                Data.ColumnChunkReader.ByteArrayOutputOf(output.LeafArrowFields[i]), column.TypeLength ?? 0);
+            total += Math.Max(scaled, starting);
         }
 
         return total;
