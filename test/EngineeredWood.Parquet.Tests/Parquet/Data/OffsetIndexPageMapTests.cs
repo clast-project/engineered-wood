@@ -262,6 +262,54 @@ public class OffsetIndexPageMapTests : IDisposable
         Assert.Null(ColumnChunkReader.SliceStringBytes(meta, Build(null), 1, 2));
     }
 
+    /// <summary>
+    /// A map built from the page headers takes its OffsetIndex's per-page string bytes only when the index lists the
+    /// pages the headers found, each starting at the same row (#894).
+    /// </summary>
+    [Fact]
+    public void AttachStringBytes_TakesTheCountsOnlyOfAnIndexListingTheMapsPages()
+    {
+        string path = WriteAsync(DataPageVersion.V2, CompressionCodec.Uncompressed, true, ByteArrayEncoding.Plain, writePageIndex: true)
+            .GetAwaiter().GetResult();
+        var (file, metadata) = ReadFooter(path);
+        var schema = SchemaDescriptorFor(metadata);
+        var chunk = metadata.RowGroups[0].Columns[2]; // s: nullable strings, dictionary-encoded
+        var meta = chunk.MetaData!;
+        var index = MetadataDecoder.DecodeOffsetIndex(Slice(file, chunk.OffsetIndexOffset!.Value, chunk.OffsetIndexLength!.Value));
+        var counts = index.UnencodedByteArrayDataBytes!;
+        long start = meta.DictionaryPageOffset ?? meta.DataPageOffset;
+        // Only the layout and the counts are asserted, so each scan's dictionary goes back to the pool at once.
+        ColumnPageMap Scan()
+        {
+            var scanned = PageMapBuilder.Build(Slice(file, start, checked((int)meta.TotalCompressedSize)), schema.Columns[2], meta);
+            scanned.ReleaseDictionary();
+            return scanned;
+        }
+        Assert.Null(Scan().PageStringBytes);
+
+        var map = Scan();
+        Assert.True(PageMapBuilder.AttachStringBytes(map, index, meta));
+        Assert.Equal(counts, map.PageStringBytes);
+        Assert.Equal(counts[1] + counts[2], ColumnChunkReader.SliceStringBytes(meta, map, 1, 2));
+        // Once given, they are not replaced.
+        Assert.False(PageMapBuilder.AttachStringBytes(map, index, meta));
+
+        var locations = index.PageLocations;
+        OffsetIndex With(IReadOnlyList<PageLocation> pages, IReadOnlyList<long>? recorded) =>
+            new() { PageLocations = pages, UnencodedByteArrayDataBytes = recorded };
+        // One page fewer than the headers found.
+        Assert.False(PageMapBuilder.AttachStringBytes(Scan(), With(locations.Take(locations.Count - 1).ToArray(),
+            counts.Take(counts.Count - 1).ToArray()), meta));
+        // A page starting at another row.
+        var shifted = locations.Select((l, i) => i == 1 ? l with { FirstRowIndex = l.FirstRowIndex + 1 } : l).ToArray();
+        Assert.False(PageMapBuilder.AttachStringBytes(Scan(), With(shifted, counts), meta));
+        // No counts, or one that cannot be right.
+        Assert.False(PageMapBuilder.AttachStringBytes(Scan(), With(locations, null), meta));
+        var unsane = Scan();
+        Assert.False(PageMapBuilder.AttachStringBytes(unsane, With(locations, counts.Select((c, i) => i == 1 ? -1 : c).ToArray()), meta));
+        Assert.Null(unsane.PageStringBytes);
+    }
+
     // ───── Fixtures from other writers ─────
 
     /// <summary>
@@ -448,21 +496,29 @@ public class OffsetIndexPageMapTests : IDisposable
                 var fromIndex = PageMapBuilder.BuildFromOffsetIndex(
                     chunkBytes.AsSpan(0, (int)(index.PageLocations[0].Offset - start)), start, end, index,
                     (int)rowGroup.NumRows, column, meta);
-
-                string where = $"{Path.GetFileName(path)} column {column.DottedPath}";
-                Assert.True(fromIndex is not null, $"{where}: index map refused");
-                Assert.False(fromIndex!.HeadersResolved);
-                Assert.Equal(scanned.CumulativeRows, fromIndex.CumulativeRows);
-                Assert.Equal(scanned.Dictionary is null, fromIndex.Dictionary is null);
-                Assert.Equal(scanned.SymbolTable is null, fromIndex.SymbolTable is null);
-
-                for (int p = 0; p < fromIndex.Pages.Length; p++)
+                try
                 {
-                    var located = fromIndex.Pages[p];
-                    var resolved = PageMapBuilder.ResolveEntry(
-                        fromIndex, p, chunkBytes.AsSpan(checked((int)located.Offset), located.CompressedSize), column, meta, out int headerSize);
-                    Assert.Equal(scanned.Pages[p], resolved);
-                    Assert.Equal(located.Offset + headerSize, resolved.Offset);
+                    string where = $"{Path.GetFileName(path)} column {column.DottedPath}";
+                    Assert.True(fromIndex is not null, $"{where}: index map refused");
+                    Assert.False(fromIndex!.HeadersResolved);
+                    Assert.Equal(scanned.CumulativeRows, fromIndex.CumulativeRows);
+                    Assert.Equal(scanned.Dictionary is null, fromIndex.Dictionary is null);
+                    Assert.Equal(scanned.SymbolTable is null, fromIndex.SymbolTable is null);
+
+                    for (int p = 0; p < fromIndex.Pages.Length; p++)
+                    {
+                        var located = fromIndex.Pages[p];
+                        var resolved = PageMapBuilder.ResolveEntry(
+                            fromIndex, p, chunkBytes.AsSpan(checked((int)located.Offset), located.CompressedSize), column, meta, out int headerSize);
+                        Assert.Equal(scanned.Pages[p], resolved);
+                        Assert.Equal(located.Offset + headerSize, resolved.Offset);
+                    }
+                }
+                finally
+                {
+                    // Both decoded the chunk's dictionary from rented arrays.
+                    scanned.ReleaseDictionary();
+                    fromIndex?.ReleaseDictionary();
                 }
 
                 compared++;

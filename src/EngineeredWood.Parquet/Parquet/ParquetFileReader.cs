@@ -1283,7 +1283,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// <see cref="ParquetReadOptions.BatchSize"/> and <see cref="ParquetReadOptions.MaxBatchByteSize"/>, so that two
     /// reads of different columns cut the same rows into the same batches.</param>
     /// <param name="useOffsetIndex">False builds every page map by scanning page headers, never reading an
-    /// OffsetIndex: for a read whose chunks are fetched whole anyway.</param>
+    /// OffsetIndex: for a read whose chunks are fetched whole anyway. The indexes in
+    /// <paramref name="offsetIndexes"/> then only lend the maps their per-page string bytes (#894).</param>
     /// <param name="keepRows">One byte per row of the group, 1 to keep it: the only rows the batch holds. Only for a
     /// read of a whole flat group that comes back as one batch; the caller makes sure it does.</param>
     private async IAsyncEnumerable<RecordBatch> ReadBatchesAsync(
@@ -2078,7 +2079,43 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             throw;
         }
 
+        // A header-only build reads no index, but one may already be in hand: its string counts size the slices (#894).
+        // Not where indexes were consulted: a map scanned there is one whose index was set aside.
+        if (!useOffsetIndex && offsetIndexes is not null)
+            AttachStringBytes(ctx, (ColumnPageMap[])pageMaps!, offsetIndexes);
+
         return ((ColumnPageMap[])pageMaps!, held);
+    }
+
+    /// <summary>
+    /// Gives each BYTE_ARRAY chunk's header-built map the per-page string bytes of its OffsetIndex, where
+    /// <paramref name="offsetIndexes"/> holds that index and it lists the map's pages (<see cref="PageMapBuilder.AttachStringBytes"/>).
+    /// An index that does not decode is skipped, as the page maps skip it.
+    /// </summary>
+    private static void AttachStringBytes(
+        RowGroupContext ctx, ColumnPageMap[] pageMaps, IReadOnlyDictionary<long, byte[]> offsetIndexes)
+    {
+        for (int i = 0; i < ctx.Count; i++)
+        {
+            var chunk = ctx.Chunks[i];
+            if (chunk.MetaData is not { Type: PhysicalType.ByteArray } meta
+                || chunk.OffsetIndexOffset is not { } offset
+                || !offsetIndexes.TryGetValue(offset, out var bytes))
+            {
+                continue;
+            }
+
+            OffsetIndex index;
+            try
+            {
+                index = MetadataDecoder.DecodeOffsetIndex(bytes);
+            }
+            catch (ParquetFormatException)
+            {
+                continue;
+            }
+            PageMapBuilder.AttachStringBytes(pageMaps[i], index, meta);
+        }
     }
 
     /// <summary>
