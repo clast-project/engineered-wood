@@ -1354,8 +1354,9 @@ public class ParallelRowGroupReadTests : IDisposable
 
     /// <summary>
     /// Long strings in the last page only: the largest page in bytes is not one with the most rows, and a decoder
-    /// that does not skip (DELTA_BYTE_ARRAY) decodes it whole before its dropped rows go. The hold covers that page's
-    /// decoded bytes beside the kept rows (#886 review round 3).
+    /// that does not skip decodes it whole before its dropped rows go. The hold covers that page's decoded bytes
+    /// beside the kept rows (#886 review round 3). DELTA_LENGTH_BYTE_ARRAY: a DELTA_BYTE_ARRAY chunk is held whole
+    /// (round 4).
     /// </summary>
     [Fact]
     public async Task ASplitTwoPassRead_HoldsTheLargestPageInBytes_WhenItKeepsRowsInOneBatch()
@@ -1383,7 +1384,7 @@ public class ParallelRowGroupReadTests : IDisposable
         await using (var writer = new ParquetFileWriter(output, ownsFile: false, new ParquetWriteOptions
                      {
                          DataPageSize = 256 << 20, DataPageRowCountLimit = pageRows, DictionaryEnabled = false,
-                         ColumnEncodings = new Dictionary<string, ByteArrayEncoding> { ["v"] = ByteArrayEncoding.DeltaByteArray },
+                         ColumnEncodings = new Dictionary<string, ByteArrayEncoding> { ["v"] = ByteArrayEncoding.DeltaLengthByteArray },
                      }))
         {
             await writer.WriteRowGroupAsync(batch);

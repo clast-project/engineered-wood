@@ -141,7 +141,8 @@ public sealed partial class ParquetFileReader
     /// rows its buffers hold, the kept ones and room for its largest page (<see cref="Data.ColumnChunkReader.KeepRowsCapacity"/>),
     /// and never less than what those buffers start at (<see cref="Data.ColumnBuildState.StartingBytes"/>).
     /// The pages' sizes come from the headers of the chunks fetched ahead, which the decode reads next anyway; a column
-    /// not fetched ahead (too large for one buffer) is taken whole, rather than read twice (#886 review).
+    /// not fetched ahead (too large for one buffer) is taken whole, rather than read twice (#886 review), as is one
+    /// whose pages' decoded size the headers do not bound (<see cref="DecodedSizeUnboundedByPage"/>).
     /// </summary>
     private async ValueTask<long> KeepRowsDecodeBytesAsync(
         Metadata.RowGroup rowGroup, SchemaDescriptor schema, RowGroupContext output, PrefetchedFile? io, long kept,
@@ -153,7 +154,7 @@ public sealed partial class ParquetFileReader
         {
             long columnBytes = DecodedBytes(rowGroup, schema, [output.Columns[i].Path[0]], null);
             (int Rows, long Bytes)? maxPage = null;
-            if (io is not null && io.Holds(output.Ranges[i]))
+            if (io is not null && io.Holds(output.Ranges[i]) && !DecodedSizeUnboundedByPage(output.Chunks[i]))
             {
                 using var chunk = await io.ReadAsync(output.Ranges[i], cancellationToken).ConfigureAwait(false);
                 maxPage = Data.ColumnChunkReader.LargestDataPages(
@@ -182,6 +183,27 @@ public sealed partial class ParquetFileReader
         }
 
         return total;
+    }
+
+    /// <summary>
+    /// Whether a chunk's pages may decode to far more than their bytes say, past the column's average ratio: a
+    /// DELTA_BYTE_ARRAY page stores a shared prefix once, and an FSST page one code for up to 8 bytes. Its largest page
+    /// cannot be sized from the headers, so a keep-rows decode holds the column whole (#886 review round 4: a page of
+    /// 2,000-character values differing in their last character decoded to 20 MB from a few bytes a value).
+    /// </summary>
+    private static bool DecodedSizeUnboundedByPage(Metadata.ColumnChunk chunk)
+    {
+        if (chunk.MetaData is not { } meta)
+            return true;
+        foreach (var encoding in meta.Encodings)
+        {
+#pragma warning disable EWPARQUET0003 // FSST: an evaluation encoding, checked here only to size its decode
+            if (encoding is Encoding.DeltaByteArray or Encoding.Fsst)
+                return true;
+#pragma warning restore EWPARQUET0003
+        }
+
+        return false;
     }
 
     // Whether BatchSize cuts a group of `rows` rows into more than one batch.

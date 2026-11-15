@@ -44,7 +44,7 @@ public sealed class KeepRowsHoldAllocationTests : IDisposable
         string[] columns =
         [
             "int32-nullable", "boolean", "decimal-flba", "short-strings", "short-strings-view", "long-strings-large",
-            "uneven-delta", "uneven-fsst", "uneven-plain",
+            "uneven-delta", "uneven-fsst", "uneven-plain", "prefix-delta",
         ];
         foreach (string column in columns)
         {
@@ -145,6 +145,30 @@ public sealed class KeepRowsHoldAllocationTests : IDisposable
                 dictionary = false;
                 (values, type) = (Strings(i => 200, random), StringType.Default);
                 break;
+            case "prefix-delta":
+            {
+                // Random 200-character values, then a last page of 2,000-character values sharing all but their last
+                // character: DELTA_BYTE_ARRAY encodes that page in a few bytes a value and decodes it to 20 MB, far
+                // past the column's average ratio of decoded to encoded bytes.
+                dictionary = false;
+                encoding = ByteArrayEncoding.DeltaByteArray;
+                string prefix = new('p', 1_999);
+                var b = new StringArray.Builder();
+                var chars = new char[200];
+                for (int i = 0; i < Rows; i++)
+                {
+                    if (i >= Rows - 10_000)
+                    {
+                        b.Append(prefix + (char)('a' + random.Next(26)));
+                        continue;
+                    }
+                    for (int c = 0; c < chars.Length; c++)
+                        chars[c] = (char)('a' + random.Next(26));
+                    b.Append(new string(chars));
+                }
+                (values, type) = (b.Build(), StringType.Default);
+                break;
+            }
             default: // uneven-*: 2,000-character values in the last page only
                 dictionary = false;
                 encoding = column switch
