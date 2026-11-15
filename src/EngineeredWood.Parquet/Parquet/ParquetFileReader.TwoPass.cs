@@ -367,7 +367,8 @@ public sealed partial class ParquetFileReader
 
             // Pass 2: only the blocks holding a selected row, when they are few enough; otherwise everything. Page
             // maps come from the prefetched chunks' headers, never from an OffsetIndex read now: that would be the
-            // dependent request the prefetch is there to avoid.
+            // dependent request the prefetch is there to avoid. The OffsetIndexes planning read with the page index (one
+            // that narrowed nothing, or the group would not be read in two passes) still size the string slices (#894).
             var ranges = SelectedBlocks(selection, groupRows, out long covered);
             IReadOnlyList<RowRange>? passTwoRanges = covered <= groupRows * TwoPassMaxCoveredShare ? ranges : null;
 
@@ -399,7 +400,7 @@ public sealed partial class ParquetFileReader
                 int range = 0;
                 long cursor = passTwoRanges?[0].Start ?? 0;
                 await foreach (var batch in ReadBatchesAsync(
-                                   plan.Index, columns.OutputOnly, passTwoRanges, offsetIndexes: null, cancellationToken,
+                                   plan.Index, columns.OutputOnly, passTwoRanges, plan.OffsetIndexes, cancellationToken,
                                    io: prefetched, batchRows: keepRows is null ? null : groupRows, useOffsetIndex: false,
                                    keepRows: keepRows).ConfigureAwait(false))
                 {

@@ -243,6 +243,78 @@ public sealed class StringBufferGrowthTests : IDisposable
     }
 
     [Theory]
+    [InlineData("delta-length")]
+    [InlineData("dictionary")]
+    [InlineData("delta")]
+    [InlineData("fsst")]
+    public async Task ATwoPassSecondPass_SizesItsSliceFromTheIndexPlanningRead(string encoding)
+    {
+        // A selected read in two passes builds its second pass's page maps from the prefetched chunks' headers, which
+        // carry no string counts. Planning read the OffsetIndexes with the page index, which narrowed nothing (k != 75
+        // rules out no 5,000-row page), so their counts are in hand and size the slice of rows 0-40,960 that the
+        // selection (k < 40) covers. Without them a dictionary, DELTA_BYTE_ARRAY or FSST slice doubled: 2.70 times its
+        // decoded bytes (#894).
+        string path = Path.Combine(_tempDir, "two-pass-" + encoding + ".parquet");
+        var keys = new Int64Array.Builder();
+        var values = new StringArray.Builder();
+        string[] strings = Values(repeating: encoding == "dictionary");
+        for (int i = 0; i < Rows; i++)
+        {
+            keys.Append(i / 1_000);
+            values.Append(strings[i]);
+        }
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", Int64Type.Default, false))
+            .Field(new Field("v", StringType.Default, false))
+            .Build();
+        using (var batch = new RecordBatch(schema, [keys.Build(), values.Build()], Rows))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false, new ParquetWriteOptions
+                     {
+                         DictionaryEnabled = encoding == "dictionary",
+                         ColumnEncodings = new Dictionary<string, ByteArrayEncoding>
+                         {
+                             ["v"] = encoding switch
+                             {
+                                 "delta" => ByteArrayEncoding.DeltaByteArray,
+                                 "fsst" => ByteArrayEncoding.Fsst,
+                                 _ => ByteArrayEncoding.DeltaLengthByteArray,
+                             },
+                         },
+                         DataPageRowCountLimit = 5_000,
+                         WritePageIndex = true,
+                     }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false) { TwoPassReads = true };
+        await reader.ReadMetadataAsync();
+        var scan = new ParquetScan
+        {
+            Columns = ["v"],
+            Prune = EngineeredWood.Expressions.Expressions.NotEqual("k", EngineeredWood.Expressions.LiteralValue.Of(75L)),
+            RowFilter = new RowFilter(ParallelRowGroupReadTests.KeyPredicate(k => k < 40, valueWise: false)),
+        };
+        NativeMemoryTracker.Reset();
+        long rows = 0;
+        await foreach (var selected in reader.ReadSelectedAsync(scan))
+        {
+            using (selected)
+                rows += selected.Batch.Length;
+        }
+
+        Assert.Equal(40_000, rows);
+        // The slice decodes the nine whole pages holding rows 0-40,960: 45,000 values and their offsets.
+        long decoded = 45_000L * Length + 45_001L * 4;
+        Assert.True(NativeMemoryTracker.PeakBytes <= decoded * Slack,
+            $"the read peaked at {NativeMemoryTracker.PeakBytes} bytes, " +
+            $"{(double)NativeMemoryTracker.PeakBytes / decoded:F2} times the {decoded} its second pass decodes to");
+    }
+
+    [Theory]
     [InlineData(ByteArrayOutputKind.Default)]
     [InlineData(ByteArrayOutputKind.ViewType)]
     public async Task ARecordedZero_AllocatesNoStringData(ByteArrayOutputKind output)

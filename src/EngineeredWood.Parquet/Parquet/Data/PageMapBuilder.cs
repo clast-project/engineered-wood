@@ -80,9 +80,14 @@ internal sealed class ColumnPageMap
     /// <summary>
     /// The string bytes each data page decodes to, one entry per page of <see cref="Pages"/>, when the chunk's
     /// OffsetIndex records them (<see cref="OffsetIndex.UnencodedByteArrayDataBytes"/>); otherwise null. They size a
-    /// batch slice's string buffer whatever the chunk's encoding (#891).
+    /// batch slice's string buffer whatever the chunk's encoding (#891). A map built from the page headers takes them
+    /// from an index already in hand (<see cref="PageMapBuilder.AttachStringBytes"/>, #894).
     /// </summary>
-    public IReadOnlyList<long>? PageStringBytes { get; }
+    public IReadOnlyList<long>? PageStringBytes { get; private set; }
+
+    /// <summary>Sets <see cref="PageStringBytes"/> on a map built without them; only
+    /// <see cref="PageMapBuilder.AttachStringBytes"/> calls it, once it has checked that they fit the map.</summary>
+    internal void SetPageStringBytes(IReadOnlyList<long> counts) => PageStringBytes = counts;
 
     public ColumnPageMap(
         DictionaryDecoder? dictionary,
@@ -572,6 +577,33 @@ internal static class PageMapBuilder
             null, null, pages, cumulativeRows, cumulativeRows, rowCount,
             headersResolved: false, pendingPrefixLength: prefixLength,
             pageStringBytes: PageStringBytesOf(index, pages.Length, columnMeta));
+    }
+
+    /// <summary>
+    /// Gives <paramref name="map"/>, built by scanning its chunk's page headers, the per-page string bytes that the
+    /// chunk's OffsetIndex records, when the index lists the very pages the headers found: as many, each starting at the
+    /// row the map has it start at. A header-built map otherwise has none, and a dictionary, DELTA_BYTE_ARRAY or FSST
+    /// slice starts unsized and doubles (#894). False, leaving the map as it was, when the index does not fit it or
+    /// has no sane counts (<see cref="PageStringBytesOf"/>).
+    /// </summary>
+    /// <remarks>Only for an index the read did not set aside: one it rejected may not describe the chunk at all.</remarks>
+    internal static bool AttachStringBytes(ColumnPageMap map, OffsetIndex index, ColumnMetaData columnMeta)
+    {
+        if (map.PageStringBytes is not null)
+            return false;
+        var locations = index.PageLocations;
+        if (locations.Count != map.Pages.Length)
+            return false;
+        for (int i = 0; i < locations.Count; i++)
+        {
+            if (locations[i].FirstRowIndex != map.CumulativeRows[i])
+                return false;
+        }
+
+        if (PageStringBytesOf(index, map.Pages.Length, columnMeta) is not { } counts)
+            return false;
+        map.SetPageStringBytes(counts);
+        return true;
     }
 
     // The index's per-page string bytes, when it has one sane count for each of its pages. The index is optional
