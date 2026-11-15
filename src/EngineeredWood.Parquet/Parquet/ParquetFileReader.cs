@@ -782,7 +782,7 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         for (int c = 0; c < columns.Count; c++)
         {
             if (columns[c].Path.Count > 1 || columns[c].MaxRepetitionLevel > 0)
-                return PlannedBytes(rowGroup, schema, columnNames, ranges).Uncompressed;
+                return PlannedBytes(rowGroup, schema, columnNames, ranges).Uncompressed + RecordedStringExcess(chunks);
         }
 
         long rows = KeptRows(rowGroup, ranges);
@@ -802,6 +802,22 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             total += ColumnDecodedBytes(columns[c], rows, footer, strings);
         }
         return total;
+    }
+
+    /// <summary>
+    /// What <paramref name="chunks"/>' recorded string bytes (SizeStatistics) come to past their footer sizes: a nested
+    /// read, sized by the footer and decoded whole, allocates its string buffers from those counts (#889 review round
+    /// 5), and a dictionary, DELTA_BYTE_ARRAY or FSST chunk decodes to far more than it stores.
+    /// </summary>
+    private static long RecordedStringExcess(IReadOnlyList<ColumnChunk> chunks)
+    {
+        long excess = 0;
+        foreach (var chunk in chunks)
+        {
+            if (chunk.MetaData is { UnencodedByteArrayDataBytes: { } recorded } meta)
+                excess += Math.Max(0, recorded - meta.TotalUncompressedSize);
+        }
+        return excess;
     }
 
     /// <summary>

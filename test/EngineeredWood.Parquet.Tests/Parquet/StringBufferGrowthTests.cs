@@ -157,6 +157,44 @@ public sealed class StringBufferGrowthTests : IDisposable
     }
 
     [Fact]
+    public async Task TheBudgetsEstimate_CountsTheRecordedStringBytes_InANestedRead()
+    {
+        // A nested read is sized by its footer and decoded whole; its string buffers come from the recorded count, so
+        // the estimate counts that too (#889 review round 5). One struct of one prefix-compressed string field.
+        var b = new StringArray.Builder();
+        string prefix = new('p', Length - 1);
+        for (int i = 0; i < Rows; i++)
+            b.Append(prefix + (char)('a' + i % 26));
+        var structType = new StructType([new Field("v", StringType.Default, false)]);
+        var structArray = new StructArray(structType, Rows, [b.Build()], ArrowBuffer.Empty, nullCount: 0);
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("s", structType, false)).Build();
+        string path = Path.Combine(_tempDir, "nested.parquet");
+        using (var batch = new RecordBatch(schema, [structArray], Rows))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false, new ParquetWriteOptions
+                     {
+                         DictionaryEnabled = false,
+                         ColumnEncodings = new Dictionary<string, ByteArrayEncoding> { ["s.v"] = ByteArrayEncoding.DeltaByteArray },
+                     }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+        RecordStringBytes(path, (long)Rows * Length);
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var meta = group.Columns[0].MetaData!;
+        Assert.Contains(Encoding.DeltaByteArray, meta.Encodings);
+        Assert.True(meta.TotalUncompressedSize < (long)Rows * Length / 4);
+
+        long estimate = reader.DecodedBytes(group, await reader.GetSchemaAsync(), null, null);
+
+        Assert.True(estimate >= (long)Rows * Length, $"the estimate {estimate} is short of the recorded strings");
+    }
+
+    [Fact]
     public async Task ABatchedRead_SizesEachSliceFromItsPages()
     {
         // 10,000-row batches over 5,000-row pages: each slice's buffer starts at its pages' bound, not at 32 bytes a
