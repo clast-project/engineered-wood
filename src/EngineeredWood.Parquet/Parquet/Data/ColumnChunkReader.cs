@@ -821,7 +821,7 @@ internal static class ColumnChunkReader
     }
 
     // Whether every page of the chunk stores its strings whole (PLAIN, DELTA_LENGTH_BYTE_ARRAY), levels aside.
-    private static bool StoresStringsWhole(ColumnMetaData columnMeta)
+    internal static bool StoresStringsWhole(ColumnMetaData columnMeta)
     {
         foreach (var encoding in columnMeta.Encodings)
         {

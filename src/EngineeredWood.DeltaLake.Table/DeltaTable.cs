@@ -7197,7 +7197,8 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
                                 read.FilePredicate, read.PlanColumns,
                                 opened.PlannedAhead ? opened.Skip : SkipOf(read, skipRows?.Invoke(f)),
                                 cancellationToken,
-                                firstRowGroup: opened.PlannedAhead ? PlansAhead : 0)
+                                firstRowGroup: opened.PlannedAhead ? PlansAhead : 0,
+                                stringIndexColumns: read.Selected?.StringIndexColumns)
                             .GetAsyncEnumerator(cancellationToken);
                         while (await rest.MoveNextAsync().ConfigureAwait(false))
                         {
@@ -7295,7 +7296,7 @@ public sealed partial class DeltaTable : IAsyncDisposable, IDisposable
         {
             await foreach (var plan in read.Reader.PlanRowGroupsAsync(
                                    read.FilePredicate, read.PlanColumns, opened.Skip, cancellationToken,
-                                   endRowGroup: PlansAhead)
+                                   endRowGroup: PlansAhead, stringIndexColumns: read.Selected?.StringIndexColumns)
                                .ConfigureAwait(false))
             {
                 opened.Planned.Add(plan);
