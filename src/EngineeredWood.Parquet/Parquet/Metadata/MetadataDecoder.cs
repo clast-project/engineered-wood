@@ -622,6 +622,7 @@ internal static class MetadataDecoder
         int? bloomFilterLength = null;
         long? symbolTablePageOffset = null;
         int? symbolTablePageLength = null;
+        long? unencodedByteArrayDataBytes = null;
 
         while (true)
         {
@@ -675,6 +676,9 @@ internal static class MetadataDecoder
                 case 15 when type == ThriftType.I32: // bloom_filter_length: i32
                     bloomFilterLength = checked((int)reader.ReadZigZagInt32());
                     break;
+                case 16 when type == ThriftType.Struct: // size_statistics: SizeStatistics
+                    unencodedByteArrayDataBytes = ReadUnencodedByteArrayDataBytes(ref reader);
+                    break;
                 case 18 when type == ThriftType.I64: // symbol_table_page_offset: i64 (FSST proposal)
                     symbolTablePageOffset = reader.ReadZigZagInt64();
                     break;
@@ -710,7 +714,27 @@ internal static class MetadataDecoder
             BloomFilterLength = bloomFilterLength,
             SymbolTablePageOffset = symbolTablePageOffset,
             SymbolTablePageLength = symbolTablePageLength,
+            UnencodedByteArrayDataBytes = unencodedByteArrayDataBytes,
         };
+    }
+
+    /// <summary>A <c>SizeStatistics</c> struct's <c>unencoded_byte_array_data_bytes</c>, skipping its
+    /// histograms.</summary>
+    private static long? ReadUnencodedByteArrayDataBytes(ref ThriftCompactReader reader)
+    {
+        reader.PushStruct();
+        long? bytes = null;
+        while (true)
+        {
+            var (type, fid) = reader.ReadFieldHeader();
+            if (type == ThriftType.Stop) break;
+            if (fid == 1 && type == ThriftType.I64)
+                bytes = reader.ReadZigZagInt64();
+            else
+                reader.Skip(type);
+        }
+        reader.PopStruct();
+        return bytes;
     }
 
     private static Statistics ReadStatistics(ref ThriftCompactReader reader)

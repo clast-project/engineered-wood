@@ -81,6 +81,8 @@ internal static class ColumnChunkReader
         var byteArrayOutput = ByteArrayOutputOf(arrowField);
 
         using var state = NewState(column, stateCapacity, byteArrayOutput, answer);
+        if (answer is null)
+            state.ExpectStringData(ExpectedStringBytes(columnMeta), upFront: keepRows is null);
         if (keepRows is not null)
             state.SetRowSelection(keepRows, rowCount);
         DictionaryDecoder? dictionary = null;
@@ -419,6 +421,7 @@ internal static class ColumnChunkReader
         using var state = new ColumnBuildState(
             column.PhysicalType, maxDefLevel: 0, maxRepLevel: 0, numValues, byteArrayOutput,
             column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
+        state.ExpectStringData(ExpectedStringBytes(columnMeta), upFront: true);
 
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
@@ -769,6 +772,26 @@ internal static class ColumnChunkReader
     /// The build state for a column chunk: its values', or, answered from its dictionary (#502 phase 4b), its
     /// indices', or, answered and returned too (phase 4d), its values' with an <see cref="ColumnBuildState.IndexSink"/>.
     /// </summary>
+    /// <summary>
+    /// The string bytes a BYTE_ARRAY chunk decodes to, for sizing its data buffer (#888): the writer's count when it
+    /// recorded one, else, for a chunk of only PLAIN and DELTA_LENGTH_BYTE_ARRAY pages, whose strings are stored
+    /// whole, its uncompressed size, which bounds them. A dictionary, DELTA_BYTE_ARRAY or FSST chunk can decode to
+    /// more than it stores: 0, unknown.
+    /// </summary>
+    internal static long ExpectedStringBytes(ColumnMetaData columnMeta)
+    {
+        if (columnMeta.Type != PhysicalType.ByteArray)
+            return 0;
+        if (columnMeta.UnencodedByteArrayDataBytes is { } recorded)
+            return recorded;
+        foreach (var encoding in columnMeta.Encodings)
+        {
+            if (encoding is not (Encoding.Plain or Encoding.DeltaLengthByteArray or Encoding.Rle or Encoding.BitPacked))
+                return 0;
+        }
+        return columnMeta.TotalUncompressedSize;
+    }
+
     private static ColumnBuildState NewState(
         ColumnDescriptor column, int capacity, ByteArrayOutputKind byteArrayOutput, DictionaryAnswer? answer)
     {

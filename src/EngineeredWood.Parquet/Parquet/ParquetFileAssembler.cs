@@ -108,6 +108,7 @@ internal sealed class ParquetFileAssembler
                 BloomFilterLength = bloomFilterLength,
                 SymbolTablePageOffset = symbolTablePageOffset,
                 SymbolTablePageLength = result.MetaData.SymbolTablePageLength,
+                UnencodedByteArrayDataBytes = result.MetaData.UnencodedByteArrayDataBytes,
             };
 
             columnChunks[i] = new ColumnChunk { FileOffset = chunkStart, MetaData = meta };

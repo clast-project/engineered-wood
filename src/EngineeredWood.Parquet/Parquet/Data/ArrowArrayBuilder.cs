@@ -1254,6 +1254,39 @@ internal sealed class ColumnBuildState : IDisposable
         }
     }
 
+    // The string data the chunk says it decodes to, exactly or as an upper bound; 0 when it does not say (#888).
+    private long _expectedDataBytes;
+
+    /// <summary>
+    /// Sizes the string data buffer from what the chunk decodes to (<paramref name="expectedBytes"/>, exact or an
+    /// upper bound), so it is allocated once rather than doubled as values arrive, which left it up to twice the
+    /// decoded bytes (#888). With <paramref name="upFront"/> (a whole-chunk read) the buffer takes that size now, which
+    /// for views, whose buffer holds only the values too long to inline, is a bound. Otherwise (a read that keeps some
+    /// rows) it only caps how far a grow goes. A grow the estimate cannot hold doubles, as without one.
+    /// </summary>
+    internal void ExpectStringData(long expectedBytes, bool upFront)
+    {
+        if (_dataBuffer is null || expectedBytes <= 0)
+            return;
+        _expectedDataBytes = Math.Min(expectedBytes, ByteArrayCapacity.MaxBytes);
+        if (upFront && _dataByteOffset == 0
+            && _expectedDataBytes != _dataBuffer.Length)
+        {
+            _dataBuffer.Dispose();
+            _dataBuffer = new NativeBuffer<byte>((int)_expectedDataBytes, zeroFill: false);
+        }
+    }
+
+    /// <summary>Grows the string data buffer to hold <paramref name="needed"/> bytes: to the expected size when that
+    /// holds them (no further than doubling would), doubling otherwise.</summary>
+    private void GrowData(int needed)
+    {
+        if (needed <= _expectedDataBytes)
+            _dataBuffer!.GrowExact((int)Math.Min(_expectedDataBytes, Math.Max(needed, 2L * _dataBuffer.Length)));
+        else
+            _dataBuffer!.Grow(needed);
+    }
+
     /// <summary>The data bytes a BYTE_ARRAY state starts with per value, before any value is decoded.</summary>
     internal const int ByteArrayStartingBytesPerValue = 32;
 
@@ -1795,7 +1828,7 @@ internal sealed class ColumnBuildState : IDisposable
         // Ensure data buffer has enough space
         int dataNeeded = CheckedDataBytes(sourceData.Length);
         if (dataNeeded > _dataBuffer!.ByteSpan.Length)
-            _dataBuffer.Grow(dataNeeded);
+            GrowData(dataNeeded);
 
         // Copy data
         sourceData.CopyTo(_dataBuffer.ByteSpan.Slice(_dataByteOffset));
@@ -1827,7 +1860,7 @@ internal sealed class ColumnBuildState : IDisposable
     {
         int needed = CheckedDataBytes(byteCount);
         if (needed > _dataBuffer!.ByteSpan.Length)
-            _dataBuffer.Grow(needed);
+            GrowData(needed);
         return _dataBuffer.ByteSpan.Slice(_dataByteOffset, byteCount);
     }
 
@@ -1917,7 +1950,7 @@ internal sealed class ColumnBuildState : IDisposable
             // Append to overflow buffer
             int needed = CheckedDataBytes(len);
             if (needed > _dataBuffer!.ByteSpan.Length)
-                _dataBuffer.Grow(needed);
+                GrowData(needed);
             value.CopyTo(_dataBuffer.ByteSpan.Slice(_dataByteOffset));
             _dataByteOffset += len;
         }
@@ -1948,7 +1981,7 @@ internal sealed class ColumnBuildState : IDisposable
         {
             int needed = _dataByteOffset + totalOverflow;
             if (needed > _dataBuffer!.ByteSpan.Length)
-                _dataBuffer.Grow(needed);
+                GrowData(needed);
         }
 
         // Second pass: write views with no growth checks

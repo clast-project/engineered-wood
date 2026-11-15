@@ -542,6 +542,17 @@ internal static class MetadataEncoder
             writer.WriteZigZagInt32(meta.BloomFilterLength.Value);
         }
 
+        // Field 16: size_statistics (optional, SizeStatistics), only its unencoded_byte_array_data_bytes
+        if (meta.UnencodedByteArrayDataBytes.HasValue)
+        {
+            writer.WriteFieldHeader(ThriftType.Struct, 16);
+            writer.PushStruct();
+            writer.WriteFieldHeader(ThriftType.I64, 1);
+            writer.WriteZigZagInt64(meta.UnencodedByteArrayDataBytes.Value);
+            writer.WriteStructStop();
+            writer.PopStruct();
+        }
+
         // Field 18: symbol_table_page_offset (optional, i64, FSST proposal)
         if (meta.SymbolTablePageOffset.HasValue)
         {
