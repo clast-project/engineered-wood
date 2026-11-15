@@ -310,14 +310,17 @@ public sealed partial class ParquetFileReader
                                && (!SplitsGroup(groupRows) || kept <= _options.BatchSize!.Value)
                 ? KeepMask(selection, groupRows)
                 : null;
-            // That one decode builds its columns at the whole group's size before it drops rows, past the batch-sized
-            // reservation: held for the pass, and let go after it (#873 review).
+            // That one decode builds its columns at the kept rows and a page's room (#880), past the batch-sized
+            // reservation: held for the pass, and let go after it (#873 review). A page larger than the room grows
+            // the buffers past what is held, by at most that page.
             long wholeGroupHold = 0;
             if (keepRows is not null && reservation is not null && SplitsGroup(groupRows))
             {
                 var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
                 var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-                wholeGroupHold = DecodedBytes(metadata.RowGroups[plan.Index], schema, columns.OutputOnly, null);
+                long groupBytes = DecodedBytes(metadata.RowGroups[plan.Index], schema, columns.OutputOnly, null);
+                long startRows = Math.Min(groupRows, kept + Data.ColumnChunkReader.KeepRowsPageRoom);
+                wholeGroupHold = groupRows == 0 ? 0 : (long)((double)groupBytes * startRows / groupRows);
                 await reservation.HoldAsync(wholeGroupHold, cancellationToken).ConfigureAwait(false);
             }
             try

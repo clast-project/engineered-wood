@@ -1081,7 +1081,8 @@ internal sealed class ColumnBuildState : IDisposable
     // long out of scope, and the target Arrow unit alone does not say what to rescale FROM.
     private readonly Metadata.TimeUnit? _extendedTimestampUnit;
 
-    private readonly int _capacity;
+    private int _capacity;
+    private int _fixedLength; // a FIXED_LEN_BYTE_ARRAY value's bytes, once its buffer is allocated
     private int _elementSize; // bytes per element for fixed-width types (12 → 8 once INT96 is narrowed)
 
     // View entry layout (16 bytes):
@@ -1353,6 +1354,56 @@ internal sealed class ColumnBuildState : IDisposable
         _pageValues = nonNullCount;
         _pageKept = keptValues;
         _pageHasDrops = keptValues < nonNullCount;
+    }
+
+    /// <summary>
+    /// Makes room for a page of <paramref name="pageRows"/> rows before its levels are reserved: a selected read
+    /// starts at the rows it keeps and a page's room, not the whole group's (#880), and each page writes all its
+    /// levels, and some decoders all its values, before <see cref="BeginPage"/> drops rows. Grows every buffer,
+    /// keeping what it holds, to at least twice its size, but not past the group's rows.
+    /// </summary>
+    internal void EnsurePageRoom(int pageRows)
+    {
+        long needed = (long)Math.Max(Math.Max(_defLevelCount, _repLevelCount), _valueCount) + pageRows;
+        if (needed <= _capacity)
+            return;
+
+        long doubled = Math.Min(2L * _capacity, _keepRows?.Length ?? int.MaxValue);
+        int target = checked((int)Math.Max(needed, doubled));
+
+        _defLevels = GrowLevels(_defLevels, _defLevelCount, target);
+        _repLevels = GrowLevels(_repLevels, _repLevelCount, target);
+
+        if (_physicalType == PhysicalType.Boolean)
+        {
+            // AddBoolValues sets bits with |=, and Grow leaves the new bytes as they were.
+            int old = _valueBuffer!.Length;
+            _valueBuffer.Grow((target + 7) / 8);
+            _valueBuffer.ByteSpan.Slice(old).Clear();
+        }
+        else if (_physicalType == PhysicalType.FixedLenByteArray)
+        {
+            _valueBuffer?.Grow(checked(target * _fixedLength));
+        }
+        else if (_valueBuffer is not null)
+        {
+            _valueBuffer.Grow(checked(target * _elementSize));
+        }
+
+        _viewsBuffer?.Grow(checked(target * ViewEntrySize));
+        _offsetsBuffer?.Grow(target + 1);
+        _largeOffsetsBuffer?.Grow(target + 1);
+        _capacity = target;
+    }
+
+    private static byte[]? GrowLevels(byte[]? levels, int count, int target)
+    {
+        if (levels is null || levels.Length >= target)
+            return levels;
+        var grown = ArrayPool<byte>.Shared.Rent(target);
+        levels.AsSpan(0, count).CopyTo(grown);
+        ArrayPool<byte>.Shared.Return(levels);
+        return grown;
     }
 
     /// <summary>Ends the page begun last.</summary>
@@ -1672,7 +1723,10 @@ internal sealed class ColumnBuildState : IDisposable
     {
         // Lazy init for FixedLenByteArray (needs typeLength from column descriptor)
         if (_valueBuffer == null)
+        {
             _valueBuffer = new NativeBuffer<byte>(_capacity * typeLength, zeroFill: false);
+            _fixedLength = typeLength;
+        }
 
         int byteSize = count * typeLength;
         var span = _valueBuffer.ByteSpan.Slice(_valueByteOffset, byteSize);

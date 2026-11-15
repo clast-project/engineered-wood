@@ -1239,11 +1239,11 @@ public class ParallelRowGroupReadTests : IDisposable
 
     /// <summary>
     /// A split group whose selected rows fit one batch decodes its second pass as one batch that keeps them, and that
-    /// decode builds its columns at the whole group's size first: held for the pass beyond the batch-sized
-    /// reservation, then let go (#873 review).
+    /// decode builds its columns at the kept rows and a page's room (#880): that much held for the pass beyond the
+    /// batch-sized reservation, then let go (#873 review), and no longer the whole group's size.
     /// </summary>
     [Fact]
-    public async Task ASplitTwoPassRead_HoldsTheWholeGroupDecode_WhenItKeepsRowsInOneBatch()
+    public async Task ASplitTwoPassRead_HoldsTheKeptRowsDecode_WhenItKeepsRowsInOneBatch()
     {
         string path = await WriteKeysAndValuesAsync("two-pass-keep-split", i => i % 10);
         // 4,000 rows selected, a row in every block: dense, and within one 5,000-row batch.
@@ -1261,8 +1261,11 @@ public class ParallelRowGroupReadTests : IDisposable
 
         var (returned, _, _, used, held) = await ReadTwoPassUnitHeldAsync(reader, predicate, returnPredicateColumn: true);
         Assert.Equal(KeyRows / 10, returned);
-        Assert.True(held >= chunks + wholeDecode,
-            $"held {held}: the chunks ({chunks}) and the whole-group decode ({wholeDecode}) were not both counted");
+        long startRows = Math.Min(KeyRows, KeyRows / 10 + EngineeredWood.Parquet.Data.ColumnChunkReader.KeepRowsPageRoom);
+        long keptDecode = (long)((double)wholeDecode * startRows / KeyRows);
+        Assert.True(held >= chunks + keptDecode,
+            $"held {held}: the chunks ({chunks}) and the kept rows' decode ({keptDecode}) were not both counted");
+        Assert.True(held < chunks + wholeDecode, $"held {held}: the whole group's decode ({wholeDecode}) was held");
         Assert.Equal(0, used);
     }
 

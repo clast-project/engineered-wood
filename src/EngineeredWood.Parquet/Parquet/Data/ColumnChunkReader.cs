@@ -72,6 +72,9 @@ internal static class ColumnChunkReader
 
         bool isRepeated = column.MaxRepetitionLevel > 0;
         int capacity = isRepeated ? checked((int)columnMeta.NumValues) : rowCount;
+        // A selected read builds only the rows it keeps, so its buffers start there and grow a page at a time
+        // (EnsurePageRoom), not at the whole group's size (#880).
+        int stateCapacity = keepRows is null ? capacity : KeepRowsCapacity(keepRows, rowCount);
         var byteArrayOutput = arrowField.DataType switch
         {
             StringViewType or BinaryViewType => ByteArrayOutputKind.ViewType,
@@ -79,7 +82,7 @@ internal static class ColumnChunkReader
             _ => ByteArrayOutputKind.Default,
         };
 
-        using var state = NewState(column, capacity, byteArrayOutput, answer);
+        using var state = NewState(column, stateCapacity, byteArrayOutput, answer);
         if (keepRows is not null)
             state.SetRowSelection(keepRows);
         DictionaryDecoder? dictionary = null;
@@ -101,6 +104,8 @@ internal static class ColumnChunkReader
                 // The level and value buffers are sized from the chunk's metadata, not from the pages.
                 if (page.NumValues > capacity - valuesRead)
                     throw TooManyValues(column, page, capacity - valuesRead);
+                if (keepRows is not null && pageHeader.Type is PageType.DataPage or PageType.DataPageV2)
+                    state.EnsurePageRoom(page.NumValues);
 
                 // A data page before any dictionary (a chunk whose metadata only suggested one): no answer.
                 if (answer is not null && !answer.IsPrepared
@@ -206,6 +211,25 @@ internal static class ColumnChunkReader
         }
 
         return new ColumnResult(array, defLevels, repLevels);
+    }
+
+    /// <summary>
+    /// The rows a selected decode's buffers start with: those it keeps and room for a page, which
+    /// <see cref="ColumnBuildState.EnsurePageRoom"/> grows past when a page is larger.
+    /// </summary>
+    internal const int KeepRowsPageRoom = 20_000;
+
+    internal static int KeepRowsCapacity(byte[] keepRows, int rowCount)
+    {
+        var keep = keepRows.AsSpan(0, rowCount);
+#if NET8_0_OR_GREATER
+        int kept = keep.Count((byte)1);
+#else
+        int kept = 0;
+        foreach (byte k in keep)
+            kept += k;
+#endif
+        return (int)Math.Min(rowCount, (long)kept + KeepRowsPageRoom);
     }
 
     /// <summary>
