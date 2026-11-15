@@ -1063,6 +1063,8 @@ internal sealed class ColumnBuildState : IDisposable
     private int _offsetsCount; // number of offset entries written (= _valueCount + 1 after first page)
     private NativeBuffer<byte>? _dataBuffer;
     private int _dataByteOffset;
+    // The string data the chunk says it decodes to, exactly or as an upper bound; 0 when it does not say (#888).
+    private long _expectedDataBytes;
 
     // Dotted column path, for the diagnostics in ByteArrayCapacity. Null when the caller had none to give.
     private readonly string? _columnPath;
@@ -1176,7 +1178,7 @@ internal sealed class ColumnBuildState : IDisposable
     /// <param name="byteArrayOutput">Controls the Arrow output type for BYTE_ARRAY columns.</param>
     public ColumnBuildState(PhysicalType physicalType, int maxDefLevel, int maxRepLevel, int capacity,
         ByteArrayOutputKind byteArrayOutput = ByteArrayOutputKind.Default, string? columnPath = null,
-        Metadata.TimeUnit? extendedTimestampUnit = null)
+        Metadata.TimeUnit? extendedTimestampUnit = null, long expectedDataBytes = 0)
     {
         _physicalType = physicalType;
         _extendedTimestampUnit = extendedTimestampUnit;
@@ -1185,6 +1187,11 @@ internal sealed class ColumnBuildState : IDisposable
         _capacity = capacity;
         _byteArrayOutput = byteArrayOutput;
         _columnPath = columnPath;
+        _expectedDataBytes = Math.Min(Math.Max(expectedDataBytes, 0), ByteArrayCapacity.MaxBytes);
+        // A whole chunk's string data starts at what the chunk says it decodes to (#888), else at a guess.
+        int startingDataBytes = _expectedDataBytes > 0
+            ? (int)_expectedDataBytes
+            : capacity * ByteArrayStartingBytesPerValue;
 
         if (maxDefLevel > 0)
         {
@@ -1234,47 +1241,36 @@ internal sealed class ColumnBuildState : IDisposable
                 if (byteArrayOutput == ByteArrayOutputKind.ViewType)
                 {
                     _viewsBuffer = new NativeBuffer<byte>(capacity * ViewEntrySize, zeroFill: false);
-                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false); // overflow
+                    _dataBuffer = new NativeBuffer<byte>(startingDataBytes, zeroFill: false); // overflow
                 }
                 else if (byteArrayOutput == ByteArrayOutputKind.LargeOffsets)
                 {
                     _largeOffsetsBuffer = new NativeBuffer<long>(capacity + 1, zeroFill: false);
                     _largeOffsetsBuffer.Span[0] = 0;
                     _offsetsCount = 1;
-                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false);
+                    _dataBuffer = new NativeBuffer<byte>(startingDataBytes, zeroFill: false);
                 }
                 else
                 {
                     _offsetsBuffer = new NativeBuffer<int>(capacity + 1, zeroFill: false);
                     _offsetsBuffer.Span[0] = 0;
                     _offsetsCount = 1;
-                    _dataBuffer = new NativeBuffer<byte>(capacity * ByteArrayStartingBytesPerValue, zeroFill: false);
+                    _dataBuffer = new NativeBuffer<byte>(startingDataBytes, zeroFill: false);
                 }
                 break;
         }
     }
 
-    // The string data the chunk says it decodes to, exactly or as an upper bound; 0 when it does not say (#888).
-    private long _expectedDataBytes;
-
     /// <summary>
-    /// Sizes the string data buffer from what the chunk decodes to (<paramref name="expectedBytes"/>, exact or an
-    /// upper bound), so it is allocated once rather than doubled as values arrive, which left it up to twice the
-    /// decoded bytes (#888). With <paramref name="upFront"/> (a whole-chunk read) the buffer takes that size now, which
-    /// for views, whose buffer holds only the values too long to inline, is a bound. Otherwise (a read that keeps some
-    /// rows) it only caps how far a grow goes. A grow the estimate cannot hold doubles, as without one.
+    /// Caps how far the string data buffer grows at <paramref name="expectedBytes"/>, what the chunk says it decodes
+    /// to (exact or an upper bound), for a read that keeps only some rows and so starts smaller: a grow goes to that
+    /// size rather than doubling past it (#888). A whole-chunk read passes it to the constructor instead, which starts
+    /// the buffer there. A grow the estimate cannot hold doubles, as without one.
     /// </summary>
-    internal void ExpectStringData(long expectedBytes, bool upFront)
+    internal void ExpectStringData(long expectedBytes)
     {
-        if (_dataBuffer is null || expectedBytes <= 0)
-            return;
-        _expectedDataBytes = Math.Min(expectedBytes, ByteArrayCapacity.MaxBytes);
-        if (upFront && _dataByteOffset == 0
-            && _expectedDataBytes != _dataBuffer.Length)
-        {
-            _dataBuffer.Dispose();
-            _dataBuffer = new NativeBuffer<byte>((int)_expectedDataBytes, zeroFill: false);
-        }
+        if (_dataBuffer is not null && expectedBytes > 0)
+            _expectedDataBytes = Math.Min(expectedBytes, ByteArrayCapacity.MaxBytes);
     }
 
     /// <summary>Grows the string data buffer to hold <paramref name="needed"/> bytes: to the expected size when that

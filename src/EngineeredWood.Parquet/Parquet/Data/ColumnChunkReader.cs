@@ -80,11 +80,16 @@ internal static class ColumnChunkReader
                 ?? MaxDataPageRows(data, column, columnMeta, maxPageUncompressedSize));
         var byteArrayOutput = ByteArrayOutputOf(arrowField);
 
-        using var state = NewState(column, stateCapacity, byteArrayOutput, answer);
-        if (answer is null)
-            state.ExpectStringData(ExpectedStringBytes(columnMeta), upFront: keepRows is null);
+        // A whole chunk's string buffer starts at what it decodes to; a selected read's starts smaller and only grows
+        // no further than that (#888).
+        long expectedStringBytes = answer is null ? ExpectedStringBytes(columnMeta) : 0;
+        using var state = NewState(
+            column, stateCapacity, byteArrayOutput, answer, keepRows is null ? expectedStringBytes : 0);
         if (keepRows is not null)
+        {
+            state.ExpectStringData(expectedStringBytes);
             state.SetRowSelection(keepRows, rowCount);
+        }
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
 
@@ -420,8 +425,7 @@ internal static class ColumnChunkReader
         // array builder takes its non-nullable dense path (no reverse scatter, no validity bitmap).
         using var state = new ColumnBuildState(
             column.PhysicalType, maxDefLevel: 0, maxRepLevel: 0, numValues, byteArrayOutput,
-            column.DottedPath, ExtendedTimestamp.DeclaredUnit(column));
-        state.ExpectStringData(ExpectedStringBytes(columnMeta), upFront: true);
+            column.DottedPath, ExtendedTimestamp.DeclaredUnit(column), ExpectedStringBytes(columnMeta));
 
         DictionaryDecoder? dictionary = null;
         FsstSymbolTable? symbolTable = null;
@@ -793,14 +797,15 @@ internal static class ColumnChunkReader
     }
 
     private static ColumnBuildState NewState(
-        ColumnDescriptor column, int capacity, ByteArrayOutputKind byteArrayOutput, DictionaryAnswer? answer)
+        ColumnDescriptor column, int capacity, ByteArrayOutputKind byteArrayOutput, DictionaryAnswer? answer,
+        long expectedStringBytes = 0)
     {
         if (answer is { KeepsValues: false })
             return DictionaryAnswer.IndexState(column, capacity, answer);
 
         return new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column))
+            byteArrayOutput, column.DottedPath, ExtendedTimestamp.DeclaredUnit(column), expectedStringBytes)
         {
             IndexSink = answer is null
                 ? null

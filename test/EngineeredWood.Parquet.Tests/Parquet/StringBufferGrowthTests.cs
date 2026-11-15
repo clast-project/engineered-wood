@@ -67,6 +67,37 @@ public sealed class StringBufferGrowthTests : IDisposable
     }
 
     [Fact]
+    public async Task AChunkOfShortStrings_NeverAllocatesTheStartingGuess()
+    {
+        // 32 bytes a value would be 4.8 MB for these one-byte values; the chunk's bound is a few hundred KB. The read
+        // starts at the bound rather than allocating the guess and replacing it (#889 review).
+        var b = new StringArray.Builder();
+        for (int i = 0; i < Rows; i++)
+            b.Append(((char)('a' + i % 26)).ToString());
+        var schema = new Apache.Arrow.Schema.Builder().Field(new Field("v", StringType.Default, false)).Build();
+        string path = Path.Combine(_tempDir, "short.parquet");
+        using (var batch = new RecordBatch(schema, [b.Build()], Rows))
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(
+                         file, ownsFile: false, new ParquetWriteOptions { DictionaryEnabled = false }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+
+        await using var input = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(input, ownsFile: false);
+        await reader.ReadMetadataAsync();
+        NativeMemoryTracker.Reset();
+        using var read = await reader.ReadRowGroupAsync(0);
+
+        Assert.Equal("c", ((StringArray)read.Column(0)).GetString(2));
+        long guess = (long)Rows * 32;
+        Assert.True(NativeMemoryTracker.PeakBytes < guess / 2,
+            $"the read peaked at {NativeMemoryTracker.PeakBytes} bytes; the 32-a-value guess alone is {guess}");
+    }
+
+    [Fact]
     public async Task ARecordedCountTooSmall_StillReadsEveryValue()
     {
         string path = await WriteAsync("delta");
