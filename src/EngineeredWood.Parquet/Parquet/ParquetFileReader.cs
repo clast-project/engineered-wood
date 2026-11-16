@@ -968,9 +968,18 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// (<see cref="ComputeBatchRowCount"/>, over maps built the same way).</para>
     /// <para>Only the indexes a read would fetch for its page maps are fetched, in one request, and handed on to
     /// it: the round trip moves before the first reservation and is not added.</para>
+    /// <para>A two-pass read sizes each pass this way (<see cref="TwoPassFirstBatchesFromPagesAsync"/>): its first pass
+    /// cuts batches over every predicate column but decodes the values only of <paramref name="sized"/>, and the
+    /// answers of <paramref name="answered"/>, over the same whole pages as values (#900 review);
+    /// <paramref name="fetchAlso"/> names the second pass's columns, whose indexes the same request fetches, and
+    /// <paramref name="readAhead"/> holds indexes already read ahead, which are not fetched again (#900 review).
+    /// <paramref name="batches"/> says which batch is sized (<see cref="PageBatches"/>).</para>
     /// </summary>
     private async ValueTask<(long? Bytes, Dictionary<long, byte[]>? OffsetIndexes)> FirstBatchFromPagesAsync(
-        RowGroupPlan plan, IReadOnlyList<string>? columnNames, CancellationToken cancellationToken)
+        RowGroupPlan plan, IReadOnlyList<string>? columnNames, CancellationToken cancellationToken,
+        IReadOnlyCollection<string>? sized = null, IReadOnlyCollection<string>? answered = null,
+        IReadOnlyList<string>? fetchAlso = null, IReadOnlyDictionary<long, byte[]>? readAhead = null,
+        PageBatches batches = PageBatches.First)
     {
         int? batchSize = _options.BatchSize;
         long? maxBytes = _options.MaxBatchByteSize;
@@ -1013,10 +1022,29 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             ? new Dictionary<long, byte[]>(known)
             : new Dictionary<long, byte[]>(ctx.Count);
         var missing = new List<FileRange>();
-        foreach (var range in indexRanges)
+        void Want(FileRange range)
         {
-            if (!indexes.ContainsKey(range.Offset) && !missing.Exists(r => r.Offset == range.Offset))
+            if (indexes.ContainsKey(range.Offset) || missing.Exists(r => r.Offset == range.Offset))
+                return;
+            if (readAhead is not null && readAhead.TryGetValue(range.Offset, out var ahead))
+                indexes[range.Offset] = ahead;
+            else
                 missing.Add(range);
+        }
+        foreach (var range in indexRanges)
+            Want(range);
+        if (fetchAlso is { Count: > 0 })
+        {
+            var also = await PrepareRowGroupAsync(plan.Index, fetchAlso, cancellationToken).ConfigureAwait(false);
+            for (int i = 0; i < also.Count; i++)
+            {
+                var chunk = also.Chunks[i];
+                if (chunk.OffsetIndexOffset is { } offset && chunk.OffsetIndexLength is { } length
+                    && offset >= 0 && length > 0 && offset <= _fileLength - length)
+                {
+                    Want(new FileRange(offset, length));
+                }
+            }
         }
         if (missing.Count > 0)
         {
@@ -1060,9 +1088,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             decodedIndexes[i] = index;
         }
 
-        int start = plan.Ranges is null ? 0 : checked((int)plan.Ranges[0].Start);
+        int spanStart = plan.Ranges is null ? 0 : checked((int)plan.Ranges[0].Start);
         int spanEnd = plan.Ranges is null ? ctx.RowCount : checked((int)plan.Ranges[0].End);
-        int end = start + ComputeBatchRowCount(maps, start, spanEnd, batchSize, maxBytes);
 
         long kept = ctx.RowCount;
         if (plan.Ranges is not null)
@@ -1072,13 +1099,57 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 kept += r.End - r.Start;
         }
         double keptShare = Math.Min(1.0, (double)kept / ctx.RowCount);
-        long total = 0;
-        for (int i = 0; i < ctx.Count; i++)
+        long largest = 0;
+        if (batches == PageBatches.AnyStart)
         {
+            // A window of the batch's rows touches the most pages when it starts at a page's last row: as its start
+            // moves on through a page, its first page stays and its last can only move on. So each column's worst is
+            // over the windows starting at its pages' last rows, and the span's first; summed, a bound for any batch.
+            int window = batchSize is > 0 ? batchSize.Value : spanEnd - spanStart;
+            for (int i = 0; i < ctx.Count; i++)
+            {
+                var map = maps[i];
+                long worst = ColumnBytes(i, spanStart, Math.Min(spanEnd, spanStart + window));
+                for (int p = 0; p < map.Pages.Length; p++)
+                {
+                    long last = map.CumulativeRows[p + 1] - 1;
+                    if (last < spanStart || last >= spanEnd)
+                        continue;
+                    worst = Math.Max(worst, ColumnBytes(i, (int)last, (int)Math.Min(spanEnd, last + window)));
+                }
+                largest += worst;
+            }
+            return (largest, indexes);
+        }
+        for (int start = spanStart; start < spanEnd;)
+        {
+            int end = start + ComputeBatchRowCount(maps, start, spanEnd, batchSize, maxBytes);
+            long total = 0;
+            for (int i = 0; i < ctx.Count; i++)
+                total += ColumnBytes(i, start, end);
+            largest = Math.Max(largest, total);
+            if (batches == PageBatches.First || end <= start)
+                break;
+            start = end;
+        }
+        return (largest, indexes);
+
+        // What column i decodes for a batch of [start, end): the whole pages it touches.
+        long ColumnBytes(int i, int start, int end)
+        {
+            string name = ctx.Columns[i].Path[0];
+            bool values = sized is null || sized.Contains(name);
+            bool answers = answered is not null && answered.Contains(name);
+            if (!values && !answers)
+                return 0;
             var map = maps[i];
             int firstPage = map.FindPageForRow(start);
             int lastPage = map.FindPageForRow(end - 1);
             long rows = map.CumulativeRows[lastPage + 1] - map.CumulativeRows[firstPage];
+            // An answered column's answers: a Boolean column's values and validity, over the same pages.
+            long answerBytes = answers ? 2 * ((rows + 7) / 8) : 0;
+            if (!values)
+                return answerBytes;
             long encoded = 0;
             for (int p = firstPage; p <= lastPage; p++)
                 encoded += map.Pages[p].UncompressedSize;
@@ -1102,9 +1173,24 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 byteArrayBytes = Math.Max(encoded,
                     (long)((chunkMeta.UnencodedByteArrayDataBytes ?? chunkMeta.TotalUncompressedSize) * keptShare));
             }
-            total += ColumnDecodedBytes(ctx.Columns[i], rows, encoded, byteArrayBytes);
+            return ColumnDecodedBytes(ctx.Columns[i], rows, encoded, byteArrayBytes) + answerBytes;
         }
-        return (total, indexes);
+    }
+
+    /// <summary>Which batch <see cref="FirstBatchFromPagesAsync"/> sizes.</summary>
+    internal enum PageBatches
+    {
+        /// <summary>The first batch of the span, as a one-pass read reserves it: each later batch is reserved by the
+        /// largest seen.</summary>
+        First,
+
+        /// <summary>The largest of the batches cut from the span's first row: a two-pass read's first pass, which
+        /// decodes them all under its first reservation.</summary>
+        Largest,
+
+        /// <summary>A bound for a batch of the batch size starting at any row: a two-pass read's second pass, which
+        /// restarts its batches at each selected block (#900 review).</summary>
+        AnyStart,
     }
 
     /// <summary>The rows of <paramref name="rowGroup"/> that <paramref name="ranges"/> keeps; all of them for

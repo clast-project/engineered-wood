@@ -1039,7 +1039,7 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.True(MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(group.Columns[0].MetaData!),
             "the predicate column should be wholly dictionary-encoded, or nothing is answered");
 
-        long reserved = TwoPassReservation(reader, group, parquetSchema, predicate, returnPredicateColumn, answered);
+        long reserved = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, returnPredicateColumn, answered);
         long filterDecoded = reader.DecodedBytes(group, parquetSchema, ["k"], null);
         long outputDecoded = reader.DecodedBytes(group, parquetSchema, ["v"], null);
         Assert.True(reserved < filterDecoded + outputDecoded, $"reserves {reserved}: the sum of both passes");
@@ -1075,7 +1075,7 @@ public class ParallelRowGroupReadTests : IDisposable
             TwoPassReads = true,
         };
         var group = (await reader.ReadMetadataAsync()).RowGroups[0];
-        long reserved = TwoPassReservation(reader, group, await reader.GetSchemaAsync(), predicate, false, false);
+        long reserved = await TwoPassReservationAsync(reader, group, await reader.GetSchemaAsync(), predicate, false, false);
 
         var (_, estimate, _, used) = await ReadTwoPassUnitAsync(reader, predicate, false, addedBytesPerRow: 100);
         Assert.Equal(reserved + 100L * (batchSize ?? KeyRows), estimate);
@@ -1098,7 +1098,7 @@ public class ParallelRowGroupReadTests : IDisposable
         using var reader = new ParquetFileReader(file, ownsFile: false) { TwoPassReads = true };
         var group = (await reader.ReadMetadataAsync()).RowGroups[0];
         var parquetSchema = await reader.GetSchemaAsync();
-        long reserved = TwoPassReservation(reader, group, parquetSchema, predicate, returned: false, answered: true);
+        long reserved = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, returned: false, answered: true);
         long filterDecoded = reader.DecodedBytes(group, parquetSchema, ["k"], null);
         long compressed = ParquetFileReader.PlannedBytes(group, parquetSchema, ["v", "k"], null).Compressed;
         Assert.True(reserved < filterDecoded, $"reserves {reserved}, at least the values {filterDecoded}: nothing to test");
@@ -1149,7 +1149,7 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.True(EngineeredWood.Parquet.Data.DictionaryAnswer.MayAnswer(meta), "the chunk should be answerable");
         Assert.False(MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta), "the chunk should have fallen back");
 
-        long reserved = TwoPassReservation(reader, group, parquetSchema, predicate, returnPredicateColumn, answered: true);
+        long reserved = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, returnPredicateColumn, answered: true);
         long filterDecoded = reader.DecodedBytes(group, parquetSchema, ["k"], null);
         long outputDecoded = reader.DecodedBytes(group, parquetSchema, ["v"], null);
         Assert.Equal(Math.Max(filterDecoded + AnswerBytes(KeyRows), outputDecoded), reserved);
@@ -1209,10 +1209,10 @@ public class ParallelRowGroupReadTests : IDisposable
         var growth = new ParquetFileReader.DecodedGrowth();
         var (returned, largest, _, _) = await ReadTwoPassUnitAsync(reader, predicate, returnPredicateColumn: false, growth);
         Assert.Equal(KeyRows, returned);
-        long first = TwoPassReservation(reader, group, parquetSchema, predicate, returned: false, answered: false);
+        long first = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, returned: false, answered: false);
         Assert.True(first < largest / 4, $"reserved {first} before learning, decoded {largest}: no growth to learn");
 
-        long next = TwoPassReservation(reader, group, parquetSchema, predicate, returned: false, answered: false, growth);
+        long next = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, returned: false, answered: false, growth);
         Assert.True(next >= largest, $"the next row group reserves {next}, its first pass decodes {largest}");
     }
 
@@ -1422,6 +1422,172 @@ public class ParallelRowGroupReadTests : IDisposable
     // A Boolean column's values and validity, as TwoPassFirstBatchBytes sizes answers.
     private static long AnswerBytes(long rows) => 2 * ((rows + 7) / 8);
 
+    /// <summary>
+    /// #846 gap 2: a two-pass read whose first pass is cut into batches decodes, under its first reservation, every
+    /// batch of that pass, and each holds the whole pages it touches: a 10,000-row batch over 4,096-row pages holds
+    /// 12,288 or 16,384 rows. With an int8 output, the first pass is the larger, so its footer share (10,000 rows)
+    /// alone was reserved, and a raw batch of 16,384 rows was charged past the budget. Every raw batch must fit the
+    /// first reservation, and the largest batch of the pass, not its first, sets it.
+    /// </summary>
+    [Theory]
+    [InlineData(10_000)]
+    [InlineData(5_000)]
+    public async Task ABatchedTwoPassRead_WhoseFirstPassIsLarger_ReservesItsLargestBatch(int batchSize)
+    {
+        var random = new Random(887);
+        var keys = new Int64Array.Builder();
+        var values = new Int8Array.Builder();
+        for (int i = 0; i < KeyRows; i++)
+        {
+            keys.Append(i % 10);
+            values.Append((sbyte)random.Next());
+        }
+        var arrowSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", Int64Type.Default, false))
+            .Field(new Field("v", Int8Type.Default, false))
+            .Build();
+        string path = Path.Combine(_tempDir, "two-pass-first-pass-larger.parquet");
+        using (var batch = new RecordBatch(arrowSchema, [keys.Build(), values.Build()], KeyRows))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false, new ParquetWriteOptions { DataPageSize = 4096 }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+        var predicate = KeyPredicate(k => k < 3, false);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = batchSize })
+        {
+            TwoPassReads = true,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long reserved = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, false, false);
+        long footerShare = (long)batchSize * sizeof(long);
+        Assert.True(reserved > footerShare, $"reserved {reserved}: only the batch's footer share ({footerShare})");
+
+        var overdrawn = new System.Runtime.CompilerServices.StrongBox<long>();
+        var (returned, estimate, _, used, _) = await ReadTwoPassUnitHeldAsync(
+            reader, predicate, false, overdrawn: overdrawn);
+        Assert.Equal(KeyRows * 3 / 10, returned);
+        Assert.True(estimate == reserved, $"reserved {reserved}, but a raw batch reached {estimate}");
+        // The read's own first reservation, not only the helper's, covered every raw batch.
+        Assert.True(overdrawn.Value == 0, $"raw batches were charged {overdrawn.Value} past the reservation");
+        Assert.Equal(0, used);
+    }
+
+    /// <summary>
+    /// #900 review: a predicate column answered from its dictionary decodes its answers over the whole pages a batch
+    /// touches, as values are, not over the batch's rows. Written whole (one page a column), the answers' values and
+    /// validity for <c>k</c>'s page take two bits a row, the Boolean output's values one: the first pass is the larger,
+    /// and its answers, sized for a 1,000-row batch, left the reservation a page's worth short.
+    /// </summary>
+    [Fact]
+    public async Task ABatchedTwoPassRead_ReservesItsAnswersForTheWholePagesTheyTouch()
+    {
+        const int rows = 100_000;
+        var random = new Random(900);
+        var values = new BooleanArray.Builder();
+        for (int i = 0; i < rows; i++)
+            values.Append(random.Next(2) == 1);
+        string path = await WriteKeyAndValuesAsync(
+            "two-pass-answer-pages", rows, i => i / 4_000 % 10, values.Build(),
+            new ParquetWriteOptions { DataPageSize = 64 << 20 });
+        var predicate = KeyPredicate(k => k < 3, true);
+
+        // The writer's 20,000-row page limit makes the Boolean output's pages as long as k's, so the second pass's
+        // share still covers the first pass's raw batches here; what the first pass's own estimate counts is checked.
+        await using (var file = new LocalRandomAccessFile(path))
+        using (var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 1_000 }))
+        {
+            var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+            var pages = await reader.TwoPassFirstBatchesFromPagesAsync(
+                new ParquetFileReader.RowGroupPlan(0, 0, null, null), group, await reader.GetSchemaAsync(),
+                new ParquetFileReader.TwoPassColumns(["k"], ["v"], [], ["v"]),
+                new Dictionary<string, AnswerPlan> { ["k"] = new AnswerPlan([predicate], KeepValues: false) }, default);
+            var index = EngineeredWood.Parquet.Metadata.MetadataDecoder.DecodeOffsetIndex(File.ReadAllBytes(path).AsSpan(
+                checked((int)group.Columns[0].OffsetIndexOffset!.Value), group.Columns[0].OffsetIndexLength!.Value));
+            long pageRows = index.PageLocations.Count > 1 ? index.PageLocations[1].FirstRowIndex : rows;
+            Assert.True(pageRows > 10 * 1_000, $"k's pages hold {pageRows} rows: no more than a batch");
+            // A 1,000-row batch holds the answers' bitmaps for the whole page it falls in.
+            Assert.True(pages.FilterBytes >= 2 * ((pageRows + 7) / 8),
+                $"the first pass is sized {pages.FilterBytes}: not a {pageRows}-row page's answers");
+        }
+
+        // Rows 0-11,999 of every 40,000: three runs, in each of 2.5 cycles.
+        await AssertTwoPassReadCoversItsRawBatchesAsync(path, predicate, batchSize: 1_000, 36_000, answered: true);
+    }
+
+    /// <summary>
+    /// #900 review: a sparse second pass reads only the blocks holding a selected row, and restarts its batches at each
+    /// block's first row, so a batch can straddle page boundaries no batch counted from row 0 does: with 10,000-row
+    /// pages, the block [8192, 16384) holds two pages, where each batch from row 0 holds one.
+    /// </summary>
+    [Fact]
+    public async Task ASparseTwoPassRead_ReservesTheSecondPassForBatchesThatStartAtABlock()
+    {
+        var values = new Int64Array.Builder();
+        for (int i = 0; i < KeyRows; i++)
+            values.Append(i * 7L);
+        string path = await WriteKeyAndValuesAsync(
+            "two-pass-block-pages", KeyRows, i => i, values.Build(),
+            new ParquetWriteOptions { DataPageSize = 64 << 20, DataPageRowCountLimit = 10_000 });
+        // One row, in the second block: the second pass reads [8192, 16384) only.
+        var predicate = KeyPredicate(k => k == 9_000, false);
+        await AssertTwoPassReadCoversItsRawBatchesAsync(path, predicate, batchSize: 10_000, expectedRows: 1, answered: false);
+    }
+
+    /// <summary>A two-pass read of row group 0 (<c>k</c> filters, <c>v</c> returned) whose first reservation covers
+    /// every raw batch it decodes, as the read itself reserves it.</summary>
+    private static async Task AssertTwoPassReadCoversItsRawBatchesAsync(
+        string path, RowPredicate predicate, int batchSize, long expectedRows, bool answered)
+    {
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = batchSize })
+        {
+            TwoPassReads = true,
+        };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        if (answered)
+        {
+            Assert.True(MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(group.Columns[0].MetaData!),
+                "the predicate column should be wholly dictionary-encoded, or nothing is answered");
+        }
+        long reserved = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, false, answered);
+        var overdrawn = new System.Runtime.CompilerServices.StrongBox<long>();
+        var (returned, estimate, _, used, _) = await ReadTwoPassUnitHeldAsync(
+            reader, predicate, false, overdrawn: overdrawn);
+        Assert.Equal(expectedRows, returned);
+        Assert.True(overdrawn.Value == 0,
+            $"reserved {reserved}; raw batches reached {estimate} and were charged {overdrawn.Value} past it");
+        Assert.True(estimate == reserved, $"reserved {reserved}, but a raw batch reached {estimate}");
+        Assert.Equal(0, used);
+    }
+
+    /// <summary>One row group: <c>k</c> (int64, from <paramref name="key"/>, not null) and <c>v</c>
+    /// (<paramref name="values"/>), written with <paramref name="options"/>.</summary>
+    private async Task<string> WriteKeyAndValuesAsync(
+        string name, int rows, Func<int, long> key, IArrowArray values, ParquetWriteOptions options)
+    {
+        var keys = new Int64Array.Builder();
+        for (int i = 0; i < rows; i++)
+            keys.Append(key(i));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", Int64Type.Default, false))
+            .Field(new Field("v", values.Data.DataType, false))
+            .Build();
+        string path = Path.Combine(_tempDir, name + ".parquet");
+        using (var batch = new RecordBatch(schema, [keys.Build(), values], rows))
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+            await writer.CloseAsync();
+        }
+        return path;
+    }
+
     /// <summary>One row group of <see cref="KeyRows"/> rows: <c>k</c> (int64, from <paramref name="key"/>) and
     /// <c>v</c> (random int32, so PLAIN), in 4 KiB pages.</summary>
     private async Task<string> WriteKeysAndValuesAsync(
@@ -1467,8 +1633,9 @@ public class ParallelRowGroupReadTests : IDisposable
         }) { ValueWise = valueWise };
 
     /// <summary>What a parallel two-pass read of row group 0 reserves for its first step: <c>k</c> filters, <c>v</c>
-    /// is returned, and <c>k</c> too when <paramref name="returned"/>.</summary>
-    private static long TwoPassReservation(
+    /// is returned, and <c>k</c> too when <paramref name="returned"/>. Sized from the pages each pass's batches touch
+    /// where the first pass is cut into batches (#846 gap 2), as the read sizes it.</summary>
+    private static async Task<long> TwoPassReservationAsync(
         ParquetFileReader reader, EngineeredWood.Parquet.Metadata.RowGroup group, EngineeredWood.Parquet.Schema.SchemaDescriptor schema,
         RowPredicate predicate, bool returned, bool answered, ParquetFileReader.DecodedGrowth? growth = null)
     {
@@ -1477,7 +1644,11 @@ public class ParallelRowGroupReadTests : IDisposable
         Dictionary<string, AnswerPlan>? answers = answered
             ? new() { ["k"] = new AnswerPlan([predicate], KeepValues: returned) }
             : null;
-        return reader.TwoPassFirstBatchEstimate(group, schema, columns, answers, growth ?? new ParquetFileReader.DecodedGrowth(), null).Reserved;
+        var pages = await reader.TwoPassFirstBatchesFromPagesAsync(
+            new ParquetFileReader.RowGroupPlan(0, 0, null, null), group, schema, columns, answers, default);
+        return reader.TwoPassFirstBatchEstimate(
+            group, schema, columns, answers, growth ?? new ParquetFileReader.DecodedGrowth(), null,
+            pages.FilterBytes, pages.OutputBytes).Reserved;
     }
 
     /// <summary>
@@ -1497,7 +1668,8 @@ public class ParallelRowGroupReadTests : IDisposable
     /// <summary>As <see cref="ReadTwoPassUnitAsync"/>, with the most the unit held apart from its decodes.</summary>
     internal static async Task<(long Returned, long Estimate, long Peak, long Used, long HeldPeak)> ReadTwoPassUnitHeldAsync(
         ParquetFileReader reader, RowPredicate predicate, bool returnPredicateColumn,
-        ParquetFileReader.DecodedGrowth? growth = null, long addedBytesPerRow = 0)
+        ParquetFileReader.DecodedGrowth? growth = null, long addedBytesPerRow = 0,
+        System.Runtime.CompilerServices.StrongBox<long>? overdrawn = null)
     {
         var scan = new ParquetScan
         {
@@ -1518,6 +1690,8 @@ public class ParallelRowGroupReadTests : IDisposable
                 returned += batch.Batch.Length;
         }
         reservation.ReleasePending();
+        if (overdrawn is not null)
+            overdrawn.Value = reservation.Overdrawn;
         return (returned, reservation.Estimate, budget.Peak, budget.Used, reservation.HeldPeak);
     }
 
