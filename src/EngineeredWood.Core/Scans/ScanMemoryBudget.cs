@@ -140,8 +140,13 @@ internal sealed class ScanReservation
         if (bytes <= _pending)
             return;
         _budget.Adjust(bytes - _pending);
+        Overdrawn += bytes - _pending;
         _pending = bytes;
     }
+
+    /// <summary>What <see cref="Cover"/> has charged past the pending reservation, without waiting: for tests that a
+    /// read's reservation covered every raw batch it decoded.</summary>
+    internal long Overdrawn { get; private set; }
 
     /// <summary>
     /// Waits until the budget can take <paramref name="bytes"/> more, and holds them until

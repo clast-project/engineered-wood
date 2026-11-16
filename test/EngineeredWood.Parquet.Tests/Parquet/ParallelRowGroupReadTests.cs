@@ -1466,9 +1466,13 @@ public class ParallelRowGroupReadTests : IDisposable
         long footerShare = (long)batchSize * sizeof(long);
         Assert.True(reserved > footerShare, $"reserved {reserved}: only the batch's footer share ({footerShare})");
 
-        var (returned, estimate, _, used) = await ReadTwoPassUnitAsync(reader, predicate, false);
+        var overdrawn = new System.Runtime.CompilerServices.StrongBox<long>();
+        var (returned, estimate, _, used, _) = await ReadTwoPassUnitHeldAsync(
+            reader, predicate, false, overdrawn: overdrawn);
         Assert.Equal(KeyRows * 3 / 10, returned);
         Assert.True(estimate == reserved, $"reserved {reserved}, but a raw batch reached {estimate}");
+        // The read's own first reservation, not only the helper's, covered every raw batch.
+        Assert.True(overdrawn.Value == 0, $"raw batches were charged {overdrawn.Value} past the reservation");
         Assert.Equal(0, used);
     }
 
@@ -1552,7 +1556,8 @@ public class ParallelRowGroupReadTests : IDisposable
     /// <summary>As <see cref="ReadTwoPassUnitAsync"/>, with the most the unit held apart from its decodes.</summary>
     internal static async Task<(long Returned, long Estimate, long Peak, long Used, long HeldPeak)> ReadTwoPassUnitHeldAsync(
         ParquetFileReader reader, RowPredicate predicate, bool returnPredicateColumn,
-        ParquetFileReader.DecodedGrowth? growth = null, long addedBytesPerRow = 0)
+        ParquetFileReader.DecodedGrowth? growth = null, long addedBytesPerRow = 0,
+        System.Runtime.CompilerServices.StrongBox<long>? overdrawn = null)
     {
         var scan = new ParquetScan
         {
@@ -1573,6 +1578,8 @@ public class ParallelRowGroupReadTests : IDisposable
                 returned += batch.Batch.Length;
         }
         reservation.ReleasePending();
+        if (overdrawn is not null)
+            overdrawn.Value = reservation.Overdrawn;
         return (returned, reservation.Estimate, budget.Peak, budget.Used, reservation.HeldPeak);
     }
 
