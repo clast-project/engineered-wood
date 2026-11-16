@@ -303,6 +303,37 @@ public sealed class StringIndexReadAheadTests : IDisposable
         Assert.True(hanging.Cancelled, "the read was not cancelled");
     }
 
+    /// <summary>
+    /// #900 review: a two-pass read whose first pass is cut into batches sizes both passes from their OffsetIndexes
+    /// before its first reservation. The string columns' indexes the planner read ahead for the second pass are used,
+    /// not fetched and allocated again.
+    /// </summary>
+    [Fact]
+    public async Task SizingTheTwoPasses_ReusesTheStringIndexesReadAhead()
+    {
+        string path = await WriteAsync();
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = 1_000 })
+        {
+            TwoPassReads = true,
+        };
+        var metadata = await reader.ReadMetadataAsync();
+        var plans = await PlanAsync(reader, prune: null);
+        var ahead = await plans[0].StringIndexes!;
+        Assert.NotNull(ahead);
+        Assert.Null(plans[0].OffsetIndexes);
+
+        var pages = await reader.TwoPassFirstBatchesFromPagesAsync(
+            plans[0], metadata.RowGroups[0], await reader.GetSchemaAsync(),
+            new ParquetFileReader.TwoPassColumns(["k"], ["v", "w", "x"], [], ["v", "w", "x"]), null, default);
+
+        Assert.NotNull(pages.OutputBytes);
+        // The read-ahead's own bytes, handed on for the second pass's page maps: not a second fetch of them. (A request
+        // for k's and w's indexes may still span theirs, merged across the small gap between them: one request either
+        // way.)
+        Assert.All(IndexOffsets(metadata, [0], "v", "x"), o => Assert.Same(ahead![o], pages.OffsetIndexes![o]));
+    }
+
     // The selected read of v, w and x where k's position in its group is under 3,000: a leading run, so the second
     // pass reads only some blocks, in slices cut by its page maps. Returns a checksum of the rows and their strings.
     private static async Task<long> ReadAsync(ParquetFileReader reader)

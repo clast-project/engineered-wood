@@ -766,8 +766,8 @@ public sealed partial class ParquetFileReader
         long bitmap = ((wholeFirstPass ? rows : _options.BatchSize!.Value) + 7) / 8;
 
         var (decodedFilter, answeredColumns) = TwoPassDecodedFilter(rowGroup, schema, columns, answers);
-        // Values and validity of each answered column's Boolean answers.
-        long answerBytes = answeredColumns * 2 * bitmap;
+        // Values and validity of each answered column's Boolean answers. Sized from pages, they are in the pages' size.
+        long answerBytes = filterPageBytes is not null && !wholeFirstPass ? 0 : answeredColumns.Count * 2 * bitmap;
 
         long filterFooter = PlannedBytes(rowGroup, schema, decodedFilter, ranges).Uncompressed;
         long filterGroup = growth.Apply(DecodedBytes(rowGroup, schema, decodedFilter, ranges));
@@ -800,12 +800,12 @@ public sealed partial class ParquetFileReader
     /// dictionaries instead (<see cref="TwoPassFirstBatchEstimate"/>): an answered column's values are left out only
     /// when the read drops it and the chunk is wholly dictionary-encoded.
     /// </summary>
-    private static (List<string> Decoded, int Answered) TwoPassDecodedFilter(
+    private static (List<string> Decoded, List<string> Answered) TwoPassDecodedFilter(
         Metadata.RowGroup rowGroup, SchemaDescriptor schema, TwoPassColumns columns,
         IReadOnlyDictionary<string, AnswerPlan>? answers)
     {
         var decoded = new List<string>(columns.Filter.Count);
-        int answeredColumns = 0;
+        var answeredColumns = new List<string>();
         var (filterColumns, filterChunks) = ResolveColumns(schema, rowGroup, columns.Filter);
         for (int i = 0; i < filterColumns.Count; i++)
         {
@@ -815,7 +815,7 @@ public sealed partial class ParquetFileReader
             bool answered = answers is not null && column.Path.Count == 1 && column.MaxRepetitionLevel == 0
                             && answers.ContainsKey(name) && meta is not null && Data.DictionaryAnswer.MayAnswer(meta);
             if (answered)
-                answeredColumns++;
+                answeredColumns.Add(name);
             bool answersStandIn = answered && !answers![name].KeepValues
                                   && MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta!);
             if (!answersStandIn)
@@ -829,10 +829,10 @@ public sealed partial class ParquetFileReader
     /// pages it decodes (<see cref="FirstBatchFromPagesAsync"/>), and the OffsetIndex bytes read to find them, for the
     /// first pass's page maps. A batch is a slice of whole decoded pages and keeps their buffers, so a 10,000-row batch
     /// over 4,096-row pages decodes 12,288 or 16,384 rows; its footer share counted 10,000, and the raw batch was
-    /// charged past the budget. Each pass is sized by its LARGEST batch, not its first: the first pass decodes all its
-    /// batches under this one reservation, and a later batch of the second, which reserves by the largest seen as a
-    /// one-pass read does, may touch a page more than the first did. The second pass is sized as if no row were
-    /// dropped, as its footer share is. Both
+    /// charged past the budget. The first pass decodes all its batches under this one reservation, so it is sized by
+    /// its LARGEST batch, answers included, over whole pages too (#900 review). The second pass is sized as if no row
+    /// were dropped, as its footer share is, but for a batch starting at ANY row: it restarts its batches at each
+    /// selected block, and a batch of [8192, 18192) over 10,000-row pages holds two (#900 review). Both
     /// passes' indexes come in one request. Null sizes where a pass has no usable index (the footer share stands), and
     /// nothing read when the first pass is one batch of the group.
     /// </summary>
@@ -843,13 +843,17 @@ public sealed partial class ParquetFileReader
     {
         if (!SplitsFirstPass(columns, KeptRows(rowGroup, plan.Ranges)))
             return (null, null, null);
-        var decoded = TwoPassDecodedFilter(rowGroup, schema, columns, answers).Decoded;
+        var (decoded, answered) = TwoPassDecodedFilter(rowGroup, schema, columns, answers);
+        // The string columns' indexes the planner read ahead (#894), which the second pass would otherwise use: not
+        // fetched again. Without a page index the plan carries no OffsetIndexes, and these are already on the way.
+        var readAhead = plan.StringIndexes is { } ahead ? await ahead.ConfigureAwait(false) : null;
         var (filterBytes, indexes) = await FirstBatchFromPagesAsync(
             plan, columns.Filter, cancellationToken, sized: new HashSet<string>(decoded),
-            fetchAlso: columns.OutputOnly, largestBatch: true).ConfigureAwait(false);
+            answered: new HashSet<string>(answered), fetchAlso: columns.OutputOnly, readAhead: readAhead,
+            batches: PageBatches.Largest).ConfigureAwait(false);
         var (outputBytes, outputIndexes) = await FirstBatchFromPagesAsync(
             indexes is null ? plan : plan with { OffsetIndexes = indexes }, columns.OutputOnly, cancellationToken,
-            largestBatch: true).ConfigureAwait(false);
+            readAhead: readAhead, batches: PageBatches.AnyStart).ConfigureAwait(false);
         return (filterBytes, outputBytes, outputIndexes ?? indexes);
     }
 
