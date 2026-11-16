@@ -968,9 +968,16 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     /// (<see cref="ComputeBatchRowCount"/>, over maps built the same way).</para>
     /// <para>Only the indexes a read would fetch for its page maps are fetched, in one request, and handed on to
     /// it: the round trip moves before the first reservation and is not added.</para>
+    /// <para>A two-pass read sizes each pass this way (<see cref="TwoPassFirstBatchesFromPagesAsync"/>): its first pass
+    /// cuts batches over every predicate column but decodes only <paramref name="sized"/> (the others give answers), and
+    /// <paramref name="fetchAlso"/> names the second pass's columns, whose indexes the same request fetches. That
+    /// first pass decodes every batch under its one first reservation, yielding nothing between them, so
+    /// <paramref name="largestBatch"/> sizes the largest batch of the span rather than its first; the two-pass read
+    /// sizes its second pass so too.</para>
     /// </summary>
     private async ValueTask<(long? Bytes, Dictionary<long, byte[]>? OffsetIndexes)> FirstBatchFromPagesAsync(
-        RowGroupPlan plan, IReadOnlyList<string>? columnNames, CancellationToken cancellationToken)
+        RowGroupPlan plan, IReadOnlyList<string>? columnNames, CancellationToken cancellationToken,
+        IReadOnlyCollection<string>? sized = null, IReadOnlyList<string>? fetchAlso = null, bool largestBatch = false)
     {
         int? batchSize = _options.BatchSize;
         long? maxBytes = _options.MaxBatchByteSize;
@@ -1018,6 +1025,20 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             if (!indexes.ContainsKey(range.Offset) && !missing.Exists(r => r.Offset == range.Offset))
                 missing.Add(range);
         }
+        if (fetchAlso is { Count: > 0 })
+        {
+            var also = await PrepareRowGroupAsync(plan.Index, fetchAlso, cancellationToken).ConfigureAwait(false);
+            for (int i = 0; i < also.Count; i++)
+            {
+                var chunk = also.Chunks[i];
+                if (chunk.OffsetIndexOffset is { } offset && chunk.OffsetIndexLength is { } length
+                    && offset >= 0 && length > 0 && offset <= _fileLength - length
+                    && !indexes.ContainsKey(offset) && !missing.Exists(r => r.Offset == offset))
+                {
+                    missing.Add(new FileRange(offset, length));
+                }
+            }
+        }
         if (missing.Count > 0)
         {
             var read = await ReadPageIndexBytesAsync(missing, cancellationToken).ConfigureAwait(false);
@@ -1060,9 +1081,8 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             decodedIndexes[i] = index;
         }
 
-        int start = plan.Ranges is null ? 0 : checked((int)plan.Ranges[0].Start);
+        int spanStart = plan.Ranges is null ? 0 : checked((int)plan.Ranges[0].Start);
         int spanEnd = plan.Ranges is null ? ctx.RowCount : checked((int)plan.Ranges[0].End);
-        int end = start + ComputeBatchRowCount(maps, start, spanEnd, batchSize, maxBytes);
 
         long kept = ctx.RowCount;
         if (plan.Ranges is not null)
@@ -1072,39 +1092,55 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 kept += r.End - r.Start;
         }
         double keptShare = Math.Min(1.0, (double)kept / ctx.RowCount);
-        long total = 0;
-        for (int i = 0; i < ctx.Count; i++)
+        long largest = 0;
+        for (int start = spanStart; start < spanEnd;)
         {
-            var map = maps[i];
-            int firstPage = map.FindPageForRow(start);
-            int lastPage = map.FindPageForRow(end - 1);
-            long rows = map.CumulativeRows[lastPage + 1] - map.CumulativeRows[firstPage];
-            long encoded = 0;
-            for (int p = firstPage; p <= lastPage; p++)
-                encoded += map.Pages[p].UncompressedSize;
-
-            long byteArrayBytes;
-            if (decodedIndexes[i].UnencodedByteArrayDataBytes is { } unencoded
-                && unencoded.Count == map.Pages.Length)
-            {
-                byteArrayBytes = 0;
-                for (int p = firstPage; p <= lastPage; p++)
-                    byteArrayBytes += unencoded[p];
-            }
-            else
-            {
-                // Without the OffsetIndex's per-page counts, a page's size is only an estimate (the chunk's
-                // compression ratio over its compressed size: short for a page that compresses better than the rest)
-                // and a dictionary page counts indices, not strings. So the floor is the chunk's share of the kept
-                // rows: of its recorded string bytes (SizeStatistics) when the chunk has them (#889 review), else of
-                // its footer size, as a footer-sized read reserves it (#847 review).
-                var chunkMeta = ctx.Chunks[i].MetaData!;
-                byteArrayBytes = Math.Max(encoded,
-                    (long)((chunkMeta.UnencodedByteArrayDataBytes ?? chunkMeta.TotalUncompressedSize) * keptShare));
-            }
-            total += ColumnDecodedBytes(ctx.Columns[i], rows, encoded, byteArrayBytes);
+            int end = start + ComputeBatchRowCount(maps, start, spanEnd, batchSize, maxBytes);
+            largest = Math.Max(largest, BatchBytes(start, end));
+            if (!largestBatch || end <= start)
+                break;
+            start = end;
         }
-        return (total, indexes);
+        return (largest, indexes);
+
+        long BatchBytes(int start, int end)
+        {
+            long total = 0;
+            for (int i = 0; i < ctx.Count; i++)
+            {
+                if (sized is not null && !sized.Contains(ctx.Columns[i].Path[0]))
+                    continue;
+                var map = maps[i];
+                int firstPage = map.FindPageForRow(start);
+                int lastPage = map.FindPageForRow(end - 1);
+                long rows = map.CumulativeRows[lastPage + 1] - map.CumulativeRows[firstPage];
+                long encoded = 0;
+                for (int p = firstPage; p <= lastPage; p++)
+                    encoded += map.Pages[p].UncompressedSize;
+
+                long byteArrayBytes;
+                if (decodedIndexes[i].UnencodedByteArrayDataBytes is { } unencoded
+                    && unencoded.Count == map.Pages.Length)
+                {
+                    byteArrayBytes = 0;
+                    for (int p = firstPage; p <= lastPage; p++)
+                        byteArrayBytes += unencoded[p];
+                }
+                else
+                {
+                    // Without the OffsetIndex's per-page counts, a page's size is only an estimate (the chunk's
+                    // compression ratio over its compressed size: short for a page that compresses better than the rest)
+                    // and a dictionary page counts indices, not strings. So the floor is the chunk's share of the kept
+                    // rows: of its recorded string bytes (SizeStatistics) when the chunk has them (#889 review), else of
+                    // its footer size, as a footer-sized read reserves it (#847 review).
+                    var chunkMeta = ctx.Chunks[i].MetaData!;
+                    byteArrayBytes = Math.Max(encoded,
+                        (long)((chunkMeta.UnencodedByteArrayDataBytes ?? chunkMeta.TotalUncompressedSize) * keptShare));
+                }
+                total += ColumnDecodedBytes(ctx.Columns[i], rows, encoded, byteArrayBytes);
+            }
+            return total;
+        }
     }
 
     /// <summary>The rows of <paramref name="rowGroup"/> that <paramref name="ranges"/> keeps; all of them for
