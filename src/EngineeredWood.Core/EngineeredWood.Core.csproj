@@ -1,7 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>net10.0;net8.0;netstandard2.0</TargetFrameworks>
+    <!--
+      net11.0 for the span-based System.IO.Compression encoders and decoders new in .NET 11.
+      Only Core needs it: a net11 app gets this build of Core even through a library that
+      targets net10.0. Libraries built against Core's net10.0 build bind its internals
+      (InternalsVisibleTo below), so net11.0 code may change method bodies under
+      #if NET11_0_OR_GREATER but never an internal signature.
+    -->
+    <TargetFrameworks>net11.0;net10.0;net8.0;netstandard2.0</TargetFrameworks>
     <LangVersion>preview</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>

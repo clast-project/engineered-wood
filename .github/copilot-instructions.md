@@ -9,10 +9,14 @@ This project is a performance-critical C# codebase that targets multiple .NET ru
 | Priority | Framework | TFM | Notes |
 |----------|-----------|-----|-------|
 | **Primary** | .NET 10+ | `net10.0` | Optimize for this target; use latest APIs directly |
-| Near-term | .NET 8 | `net8.0` | LTS release; polyfill or conditional-compile where needed |
+| Core only | .NET 11 | `net11.0` | `EngineeredWood.Core` alone, for the span-based compression APIs new in .NET 11 |
+| Legacy | .NET 8 | `net8.0` | Out of support since November 2026, still shipped for apps that cannot move yet; polyfill or conditional-compile where needed |
 | Floor | .NET Standard 2.0 | `netstandard2.0` | The portability floor for every library; fallback implementations are expected to be slower |
 
-**Every library under `src/` targets `net10.0;net8.0;netstandard2.0`.** The
+**Every library under `src/` targets `net10.0;net8.0;netstandard2.0`**, and
+`EngineeredWood.Core` also targets `net11.0`. A net11 app gets Core's net11.0 build
+even through a library built for net10.0, and that library binds Core's internals, so
+net11.0-only code may change method bodies but never an internal signature. The
 `net472` TFM appears only in the test projects and the `Parquet.TestTool`
 executable — do not assume it when writing library code. Use `#if` preprocessor
 directives to provide the best implementation for each target:
@@ -241,6 +245,9 @@ Define custom symbols in the `.csproj` if finer-grained control is needed:
 
 ### Unit Tests
 
+- Test projects run on `net11.0`, `net10.0` and `net472` (the netstandard2.0 build) by default.
+  `net8.0` runs only with `-p:EwTestNet8=true`: pull requests skip it, and `release.yml` sets it,
+  so every release is tested on net8.0. The list lives in `test/Directory.Build.props`.
 - Tests must run and pass on **all target frameworks**. Use conditional `[Fact]` / `[Theory]` attributes or `#if` guards to skip tests that exercise framework-specific features.
 - Test both the optimized and fallback code paths — not just the one that runs on your dev machine.
 

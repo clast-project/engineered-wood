@@ -25,9 +25,12 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
+          # 11.0.x is the SDK and the net11.0 test runtime; 10.0.x and 8.0.x are the runtimes
+          # for the net10.0 and net8.0 tests. Releases are the one place the net8.0 tests run.
           dotnet-version: |
             8.0.x
             10.0.x
+            11.0.x
 
       - name: Derive version from tag
         id: version
@@ -68,16 +71,19 @@ jobs:
           "version=$prevVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Checking API compatibility against $prevVersion"
 
+      # EwTestNet8 adds net8.0 to the test projects' target frameworks (test/Directory.Build.props).
+      # Pull requests skip those tests; a release must not ship a net8.0 build nobody has tested.
+      # It changes the projects' frameworks, so restore, build and test must all see it.
       - name: Restore
         # ApiBaselineVersion here makes restore download the baseline packages that package
         # validation compares against in the Pack step, which runs with --no-build (so no restore).
-        run: dotnet restore engineered-wood.slnx -p:ApiBaselineVersion=${{ steps.baseline.outputs.version }}
+        run: dotnet restore engineered-wood.slnx -p:ApiBaselineVersion=${{ steps.baseline.outputs.version }} -p:EwTestNet8=true
 
       - name: Build
-        run: dotnet build engineered-wood.slnx --no-restore --configuration Release -p:Version=${{ steps.version.outputs.version }}
+        run: dotnet build engineered-wood.slnx --no-restore --configuration Release -p:Version=${{ steps.version.outputs.version }} -p:EwTestNet8=true
 
       - name: Test
-        run: dotnet test engineered-wood.slnx --no-build --configuration Release
+        run: dotnet test engineered-wood.slnx --no-build --configuration Release -p:EwTestNet8=true
 
       - name: Pack
         # Produces the 15 src/ libraries at the tag version (test/benchmark

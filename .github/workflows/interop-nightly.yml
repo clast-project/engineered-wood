@@ -74,9 +74,10 @@ jobs:
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
+          # 11.0.x for the SDK (Core targets net11.0); the tests below run on net10.0.
           dotnet-version: |
-            8.0.x
             10.0.x
+            11.0.x
 
       # Spark 4.0 and 4.1 need Java 17+.
       - name: Setup JDK
