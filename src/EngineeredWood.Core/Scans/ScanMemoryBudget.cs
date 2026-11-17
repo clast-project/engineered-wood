@@ -114,6 +114,27 @@ internal sealed class ScanReservation
         _pending = _estimate;
     }
 
+    /// <summary>
+    /// Raises the pending reservation, part-way through an item's read, to <paramref name="bytes"/> plus what the host
+    /// adds to a batch of at most <paramref name="rows"/> rows sliced from <paramref name="decodedRows"/>, waiting for
+    /// room as <see cref="ReserveNextAsync"/> does. For a read that learns what its item needs only once it has begun:
+    /// a two-pass read reserves its first pass, and its second once the first has said how many rows it keeps (#887).
+    /// The raised reservation is the item's like any other: <see cref="Cover"/> charges only past it, and
+    /// <see cref="Settle"/> or <see cref="ReleasePending"/> lets it go. It is also a lower bound for the unit's later
+    /// reservations, as <see cref="SetInitialEstimate(long)"/> is.
+    /// </summary>
+    internal async ValueTask RaisePendingAsync(long bytes, long rows, long decodedRows, CancellationToken cancellationToken)
+    {
+        if (_budget is null)
+            return;
+        long target = WithAddedBytes(WithAddedBytes(bytes, AddedBytesPerRow, rows), AddedBytesPerDecodedRow, decodedRows);
+        Observe(target);
+        if (target <= _pending)
+            return;
+        await _budget.ReserveAsync(_unit, target - _pending, cancellationToken).ConfigureAwait(false);
+        _pending = target;
+    }
+
     /// <summary>The decoded item measured <paramref name="actual"/> bytes: its charge replaces the pending
     /// reservation. An item LARGER than its reservation is charged in full without waiting — it already
     /// exists — which is the one way the budget can be exceeded (see <see cref="ScanMemoryBudget"/>).</summary>

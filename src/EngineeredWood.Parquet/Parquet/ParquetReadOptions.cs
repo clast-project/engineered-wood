@@ -487,6 +487,10 @@ public sealed record ParquetReadOptions
     /// waiting. The footer UNDERestimates dictionary-encoded strings, so the first row groups in flight can
     /// overrun their reservations; once one has been decoded, the ratio corrects the rest. A serial read
     /// (<see cref="MaxConcurrentRowGroups"/> of 1) does not use the budget at all.</para>
+    /// <para>A row group a row filter reads in two passes, the predicate's columns and then the rest for the rows it
+    /// keeps, reserves its first pass before the read and its second once the first has said how many rows survive. So
+    /// a selective filter reserves for the rows it keeps, but a row group may wait for budget between its two passes,
+    /// holding what its first pass keeps for the group.</para>
     /// </remarks>
     public long MaxBufferedReadBytes
     {

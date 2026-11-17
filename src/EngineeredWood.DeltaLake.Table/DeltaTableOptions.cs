@@ -127,6 +127,10 @@ public sealed record DeltaTableOptions
     /// than any before it. So the peak is this budget, plus one batch, plus how far each file in flight
     /// overran its first reservation. Through a <see cref="DataFileReader"/> there is no footer, and a file's
     /// first batch is not reserved for at all.</para>
+    /// <para>A row filter that the built-in reader applies in two passes, the predicate's columns and then the rest
+    /// for the rows it keeps, reserves each row group's second pass only once its first has said how many rows
+    /// survive (<c>ParquetReadOptions.MaxBufferedReadBytes</c>): a selective filter reserves for the rows it keeps,
+    /// and a file may wait for budget between the two passes.</para>
     /// <para>Not counted: each file's open reader and footer, a deletion vector's row set (#610), and the
     /// transient copies a batch goes through on its way out. A serial read (<see cref="MaxConcurrentReads"/>
     /// of 1) does not use the budget at all.</para>

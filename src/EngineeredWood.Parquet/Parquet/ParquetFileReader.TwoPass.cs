@@ -384,17 +384,42 @@ public sealed partial class ParquetFileReader
                                && (!SplitsGroup(groupRows) || kept <= _options.BatchSize!.Value)
                 ? KeepMask(selection, groupRows)
                 : null;
-            // That one decode builds its columns at the kept rows and room for each column's largest page (#880),
-            // past the batch-sized reservation: held for the pass, and let go after it (#873 review).
-            long wholeGroupHold = 0;
-            if (keepRows is not null && reservation is not null && SplitsGroup(groupRows))
+            // That one decode builds its columns at the kept rows and room for each column's largest page (#880).
+            long keepRowsBytes = 0;
+            if (keepRows is not null && reservation is not null)
             {
                 var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
                 var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-                wholeGroupHold = await KeepRowsDecodeBytesAsync(
+                keepRowsBytes = await KeepRowsDecodeBytesAsync(
                     metadata.RowGroups[plan.Index], schema, outputCtx, prefetched as PrefetchedFile, kept,
                     cancellationToken).ConfigureAwait(false);
+            }
+            // A group the batch size splits decodes past its batch-sized reservation: held for the pass, and let go
+            // after it (#873 review).
+            long wholeGroupHold = 0;
+            if (keepRows is not null && reservation is not null && SplitsGroup(groupRows))
+            {
+                wholeGroupHold = keepRowsBytes;
                 await reservation.HoldAsync(wholeGroupHold, cancellationToken).ConfigureAwait(false);
+            }
+            // The second pass's first batch is reserved only now, when the first pass has said how many rows it keeps
+            // (#887). Reserved up front as if no row were dropped, a selective filter held a whole batch's share of the
+            // output columns per group in flight: on a budget it binds, units waited for room their reads never used
+            // (TPC-H lineitem, l_quantity < 2, window 16, 256 MiB: 0.42 -> 0.20 s). A unit that waits here holds what
+            // its first pass keeps for the group, and the front unit is always admitted (ScanMemoryBudget).
+            if (reservation is not null && growth is not null)
+            {
+                long passTwo = keepRows is not null
+                    // A split group's decode is held whole above, and the one batch it yields is gathered from it.
+                    // Grown as SecondPass is: the footer underestimates dictionary-encoded strings.
+                    ? SplitsGroup(groupRows) ? 0 : growth.Apply(keepRowsBytes)
+                    // Only the selected blocks: a split group's SecondPass is already one batch's (any-start) share.
+                    : passTwoRanges is not null && !SplitsGroup(groupRows)
+                        ? (long)Math.Ceiling((double)estimate.SecondPass * covered / Math.Max(1, groupRows))
+                        : estimate.SecondPass;
+                long firstBatchRows = _options.BatchSize is int size && size > 0 ? Math.Min(size, kept) : kept;
+                await reservation.RaisePendingAsync(passTwo, firstBatchRows, groupRows, cancellationToken)
+                    .ConfigureAwait(false);
             }
             try
             {
@@ -707,8 +732,9 @@ public sealed partial class ParquetFileReader
                 plan = plan with { OffsetIndexes = offsetIndexes };
             var estimate = TwoPassFirstBatchEstimate(
                 group, schema, columns, selector.Answerable, growth, plan.Ranges, pages.FilterBytes, pages.OutputBytes);
-            // The batches it hands on hold the selected rows of the second pass's first batch, at most its rows.
-            reservation.SetInitialEstimate(estimate.Reserved, FirstBatchRowBound(group, plan.Ranges), group.NumRows);
+            // The first pass only: the second pass's first batch, and the host's bytes for the rows it hands on, are
+            // reserved once the first pass has said how many rows survive (#887).
+            reservation.SetInitialEstimate(estimate.FirstPass);
 
             e = ReadTwoPassAsync(
                     plan, columns, selector, reservation, growth, estimate, cancellationToken, filterIo, outputIo,
@@ -735,12 +761,13 @@ public sealed partial class ParquetFileReader
     }
 
     /// <summary>
-    /// What a two-pass read of <paramref name="rowGroup"/> reserves before its first batch (#846). That first step
-    /// decodes the first pass, then the second pass's first batch. The first pass's batches are gone by then, or, when
-    /// it keeps the returned predicate columns for the whole group, held apart (<see cref="ScanReservation.HoldAsync"/>).
-    /// So the reservation is the larger of the two, not their sum. Summing the filter and output columns, values
-    /// included where the first pass decodes only answers, reserved 3-140x what a TPC-H Q6 scan decoded, and slowed
-    /// it ~30% at a window of 16 (0.74 -> 0.52 s with this).
+    /// What a two-pass read of <paramref name="rowGroup"/> decodes for its first step (#846): the first pass, then the
+    /// second pass's first batch. The first pass's batches are gone by then, or, when it keeps the returned predicate
+    /// columns for the whole group, held apart (<see cref="ScanReservation.HoldAsync"/>). So the two are never summed:
+    /// summing the filter and output columns, values included where the first pass decodes only answers, reserved
+    /// 3-140x what a TPC-H Q6 scan decoded, and slowed it ~30% at a window of 16 (0.74 -> 0.52 s without). Only the
+    /// first pass is reserved before the read. The second is reserved after the first, sized by the rows it kept
+    /// (<see cref="ScanReservation.RaisePendingAsync"/>, #887).
     /// <list type="bullet">
     /// <item>The first pass is one batch of the whole group when it keeps returned predicate columns, else its
     /// <see cref="FirstBatchBytes"/> share. A predicate column the read may answer from its dictionary
@@ -749,7 +776,8 @@ public sealed partial class ParquetFileReader
     /// for them. A fallback page's values are decoded (#804), and a returned column keeps them beside its answers
     /// (<see cref="Data.DictionaryAnswer"/>).</item>
     /// <item>The second pass's first batch is its <see cref="FirstBatchBytes"/> share of the output columns, as if no
-    /// row were dropped: how many survive is known only after the first pass.</item>
+    /// row were dropped: an upper bound, which the read scales to the blocks it selects or replaces with a keep-rows
+    /// decode's size once the first pass has run.</item>
     /// </list>
     /// A dictionary can still decline (one no smaller than the batch's rows, or an entry that raises), and the pass then
     /// decodes values: each raw batch is charged as it is measured (<see cref="ScanReservation.Cover"/>). Both passes'
@@ -788,7 +816,7 @@ public sealed partial class ParquetFileReader
             ? growth.Apply(outputPages)
             : FirstBatchBytes(growth.Apply(outputBaseline), outputFooter, rowGroup, schema, columns.OutputOnly, ranges);
 
-        return new TwoPassEstimate(Math.Max(firstPass, secondPass), filterBaseline, outputBaseline);
+        return new TwoPassEstimate(firstPass, secondPass, filterBaseline, outputBaseline);
     }
 
     /// <summary>Whether a two-pass read's first pass is cut into batches: only when it keeps no returned predicate
@@ -858,11 +886,14 @@ public sealed partial class ParquetFileReader
     }
 
     /// <summary>
-    /// A two-pass read's first-step reservation (<see cref="TwoPassFirstBatchEstimate"/>), and each pass's decoded
-    /// estimate before growth, which <see cref="DecodedGrowth"/> measures that pass against: the first pass's over
-    /// every filter column's values plus the answers, the second pass's over the output columns.
+    /// A two-pass read's first-step sizes (<see cref="TwoPassFirstBatchEstimate"/>): its first pass, reserved before
+    /// the read, and its second pass's first batch as if no row were dropped, from which the read sizes what it reserves
+    /// once the first pass is done (#887). Also each pass's decoded estimate before growth, which
+    /// <see cref="DecodedGrowth"/> measures that pass against: the first pass's over every filter column's values plus
+    /// the answers, the second pass's over the output columns.
     /// </summary>
-    internal readonly record struct TwoPassEstimate(long Reserved, long FilterBaseline, long OutputBaseline);
+    internal readonly record struct TwoPassEstimate(
+        long FirstPass, long SecondPass, long FilterBaseline, long OutputBaseline);
 
     /// <summary>A selected batch's size for the scan budget: its columns and its explicit positions.</summary>
     internal static long SelectedBytes(SelectedRecordBatch batch) =>
