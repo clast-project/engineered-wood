@@ -1,6 +1,6 @@
 # Architecture
 
-EngineeredWood is a .NET monorepo (`net10.0`, `net8.0`, `netstandard2.0`) for reading and writing columnar
+EngineeredWood is a .NET monorepo (`net10.0`, `net8.0`, `netstandard2.0`; Core also `net11.0`) for reading and writing columnar
 file formats — Apache Parquet, Apache ORC, Apache Avro, Lance, and Vortex — and table formats — Delta Lake,
 Apache Iceberg, and Lance datasets — as Apache Arrow `RecordBatch` objects. It is built around cloud storage
 access patterns (batched range reads, concurrent column chunk I/O, pooled buffers) rather than a

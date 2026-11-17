@@ -9,20 +9,21 @@
 
   <!--
     Validate AOT / trim compatibility for the net10.0 builds of every library
-    under src/. Setting IsAotCompatible enables the trim, single-file, and AOT
-    analyzers, which flag reflection / dynamic-codegen patterns that would not
-    survive native AOT publishing. Scoped to net10.0 because the analyzers are
-    not supported on netstandard2.0 and the user targets net10.0 for this check.
+    under src/, and for the net11.0 build of any library that targets it (Core,
+    for the .NET 11 compression APIs). Setting IsAotCompatible enables the trim,
+    single-file, and AOT analyzers, which flag reflection / dynamic-codegen
+    patterns that would not survive native AOT publishing. Not applied to
+    netstandard2.0 (the analyzers do not support it) or net8.0.
   -->
-  <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0'">
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0' or '$(TargetFramework)' == 'net11.0'">
     <IsAotCompatible>true</IsAotCompatible>
 
     <!--
       Enforce the AOT/trim check as a build gate. The trim/AOT/single-file analyzers
       emit IL2xxx/IL3xxx warnings, and WarningsAsErrors matches only exact IDs (the trim
       family alone is ~60 codes), so the robust, self-maintaining policy is: the net10.0
-      AOT-validation leg must stay warning-free. Any new trim/AOT incompatibility then
-      fails the build. Scoped to net10.0 so net8.0/netstandard2.0 are unaffected.
+      and net11.0 AOT-validation legs must stay warning-free. Any new trim/AOT
+      incompatibility then fails the build. net8.0/netstandard2.0 are unaffected.
     -->
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
@@ -60,7 +61,7 @@
       CS1591 (missing XML comment on a public member) — ~1850 sites. Requiring a comment on
              every public member is a separate decision from shipping the ones we have.
       CS1573 (a parameter has no matching param tag)  — ~700 sites, same argument.
-    Everything else stays on, and TreatWarningsAsErrors (net10.0) makes it a gate.
+    Everything else stays on, and TreatWarningsAsErrors (net10.0, net11.0) makes it a gate.
   -->
   <PropertyGroup>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>

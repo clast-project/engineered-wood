@@ -17,4 +17,21 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
+  <!--
+    The frameworks the test projects run on. net472 exercises the libraries'
+    netstandard2.0 build.
+
+    net8.0 is out of support (November 2026), but the libraries still ship a net8.0
+    build for apps that cannot move yet, and the netstandard2.0 fallback would be a
+    large step down for them. Its tests are not worth their time on every pull
+    request, so they run only when EwTestNet8 is true. release.yml sets it, so no
+    release ships an untested net8.0 build. To run them locally:
+      dotnet test -p:EwTestNet8=true
+    net8.0 still COMPILES on every build, because the libraries target it.
+  -->
+  <PropertyGroup>
+    <EwTestTargetFrameworks>net11.0;net10.0;net472</EwTestTargetFrameworks>
+    <EwTestTargetFrameworks Condition="'$(EwTestNet8)' == 'true'">$(EwTestTargetFrameworks);net8.0</EwTestTargetFrameworks>
+  </PropertyGroup>
+
 </Project>
