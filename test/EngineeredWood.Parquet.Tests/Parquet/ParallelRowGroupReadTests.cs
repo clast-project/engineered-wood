@@ -1575,10 +1575,29 @@ public class ParallelRowGroupReadTests : IDisposable
         await AssertTwoPassReadCoversItsRawBatchesAsync(path, predicate, batchSize: 10_000, expectedRows: 1, answered: false);
     }
 
+    /// <summary>
+    /// #903 review: the same unbatched, the first pass answered from <c>k</c>'s dictionary, so it decodes only bitmaps
+    /// and its reservation covers next to nothing of the second's. The selected block [8192, 16384) is 8,192 rows, but
+    /// the pages it decodes, [0, 20000), are 20,000: the second pass must be reserved for those, not the block's rows.
+    /// </summary>
+    [Fact]
+    public async Task AnUnbatchedSparseTwoPassRead_ReservesTheWholePagesItsBlocksTouch()
+    {
+        var values = new Int64Array.Builder();
+        for (int i = 0; i < KeyRows; i++)
+            values.Append(i * 7L);
+        string path = await WriteKeyAndValuesAsync(
+            "two-pass-block-pages-unbatched", KeyRows, i => i / 100, values.Build(),
+            new ParquetWriteOptions { DataPageSize = 64 << 20, DataPageRowCountLimit = 10_000 });
+        // Rows 9,000-9,099, in the second block only.
+        var predicate = KeyPredicate(k => k == 90, true);
+        await AssertTwoPassReadCoversItsRawBatchesAsync(path, predicate, batchSize: null, expectedRows: 100, answered: true);
+    }
+
     /// <summary>A two-pass read of row group 0 (<c>k</c> filters, <c>v</c> returned) whose reservations, the first
     /// pass's and then the second's, cover every raw batch it decodes, as the read itself reserves them.</summary>
     private static async Task AssertTwoPassReadCoversItsRawBatchesAsync(
-        string path, RowPredicate predicate, int batchSize, long expectedRows, bool answered)
+        string path, RowPredicate predicate, int? batchSize, long expectedRows, bool answered)
     {
         await using var file = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = batchSize })

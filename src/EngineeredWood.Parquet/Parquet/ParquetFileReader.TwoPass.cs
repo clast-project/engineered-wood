@@ -384,45 +384,49 @@ public sealed partial class ParquetFileReader
                                && (!SplitsGroup(groupRows) || kept <= _options.BatchSize!.Value)
                 ? KeepMask(selection, groupRows)
                 : null;
-            // That one decode builds its columns at the kept rows and room for each column's largest page (#880).
-            long keepRowsBytes = 0;
-            if (keepRows is not null && reservation is not null)
-            {
-                var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
-                var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
-                keepRowsBytes = await KeepRowsDecodeBytesAsync(
-                    metadata.RowGroups[plan.Index], schema, outputCtx, prefetched as PrefetchedFile, kept,
-                    cancellationToken).ConfigureAwait(false);
-            }
-            // A group the batch size splits decodes past its batch-sized reservation: held for the pass, and let go
-            // after it (#873 review).
             long wholeGroupHold = 0;
-            if (keepRows is not null && reservation is not null && SplitsGroup(groupRows))
-            {
-                wholeGroupHold = keepRowsBytes;
-                await reservation.HoldAsync(wholeGroupHold, cancellationToken).ConfigureAwait(false);
-            }
-            // The second pass's first batch is reserved only now, when the first pass has said how many rows it keeps
-            // (#887). Reserved up front as if no row were dropped, a selective filter held a whole batch's share of the
-            // output columns per group in flight: on a budget it binds, units waited for room their reads never used
-            // (TPC-H lineitem, l_quantity < 2, window 16, 256 MiB: 0.42 -> 0.20 s). A unit that waits here holds what
-            // its first pass keeps for the group, and the front unit is always admitted (ScanMemoryBudget).
-            if (reservation is not null && growth is not null)
-            {
-                long passTwo = keepRows is not null
-                    // A split group's decode is held whole above, and the one batch it yields is gathered from it.
-                    // Grown as SecondPass is: the footer underestimates dictionary-encoded strings.
-                    ? SplitsGroup(groupRows) ? 0 : growth.Apply(keepRowsBytes)
-                    // Only the selected blocks: a split group's SecondPass is already one batch's (any-start) share.
-                    : passTwoRanges is not null && !SplitsGroup(groupRows)
-                        ? (long)Math.Ceiling((double)estimate.SecondPass * covered / Math.Max(1, groupRows))
-                        : estimate.SecondPass;
-                long firstBatchRows = _options.BatchSize is int size && size > 0 ? Math.Min(size, kept) : kept;
-                await reservation.RaisePendingAsync(passTwo, firstBatchRows, groupRows, cancellationToken)
-                    .ConfigureAwait(false);
-            }
+            // From the mask's rent on: a wait below that is cancelled (a consumer that stops early) still returns it,
+            // and lets go only of what was held (#903 review).
             try
             {
+                // That one decode builds its columns at the kept rows and room for each column's largest page (#880).
+                long keepRowsBytes = 0;
+                if (keepRows is not null && reservation is not null)
+                {
+                    var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
+                    var schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+                    keepRowsBytes = await KeepRowsDecodeBytesAsync(
+                        metadata.RowGroups[plan.Index], schema, outputCtx, prefetched as PrefetchedFile, kept,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                // A group the batch size splits decodes past its batch-sized reservation: held for the pass, and let go
+                // after it (#873 review).
+                if (keepRows is not null && reservation is not null && SplitsGroup(groupRows))
+                {
+                    await reservation.HoldAsync(keepRowsBytes, cancellationToken).ConfigureAwait(false);
+                    wholeGroupHold = keepRowsBytes;
+                }
+                // The second pass's first batch is reserved only now, when the first pass has said how many rows it
+                // keeps (#887). Reserved up front as if no row were dropped, a selective filter held a whole batch's
+                // share of the output columns per group in flight: on a budget it binds, units waited for room their
+                // reads never used (TPC-H lineitem, l_quantity < 2, window 16, 256 MiB: 0.42 -> 0.20 s). A unit that
+                // waits here holds what its first pass keeps for the group, and the front unit is always admitted
+                // (ScanMemoryBudget).
+                if (reservation is not null && growth is not null)
+                {
+                    long passTwo = keepRows is not null
+                        // A split group's decode is held whole above, and the one batch it yields is gathered from it.
+                        // Grown as SecondPass is: the footer underestimates dictionary-encoded strings.
+                        ? SplitsGroup(groupRows) ? 0 : growth.Apply(keepRowsBytes)
+                        // Selected blocks or not, the whole share: a block's batch holds the whole pages it touches,
+                        // which its rows do not bound (block [8192, 16384) over 10,000-row pages decodes 20,000 rows,
+                        // #903 review); and a split group's SecondPass is already one batch's (any-start) share (#900).
+                        : estimate.SecondPass;
+                    long firstBatchRows = _options.BatchSize is int size && size > 0 ? Math.Min(size, kept) : kept;
+                    await reservation.RaisePendingAsync(passTwo, firstBatchRows, groupRows, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
                 int range = 0;
                 long cursor = passTwoRanges?[0].Start ?? 0;
                 var passTwoIndexes = plan.OffsetIndexes
@@ -776,8 +780,8 @@ public sealed partial class ParquetFileReader
     /// for them. A fallback page's values are decoded (#804), and a returned column keeps them beside its answers
     /// (<see cref="Data.DictionaryAnswer"/>).</item>
     /// <item>The second pass's first batch is its <see cref="FirstBatchBytes"/> share of the output columns, as if no
-    /// row were dropped: an upper bound, which the read scales to the blocks it selects or replaces with a keep-rows
-    /// decode's size once the first pass has run.</item>
+    /// row were dropped: an upper bound, which the read replaces with a keep-rows decode's size once the first pass has
+    /// run, and otherwise reserves whole.</item>
     /// </list>
     /// A dictionary can still decline (one no smaller than the batch's rows, or an entry that raises), and the pass then
     /// decodes values: each raw batch is charged as it is measured (<see cref="ScanReservation.Cover"/>). Both passes'
