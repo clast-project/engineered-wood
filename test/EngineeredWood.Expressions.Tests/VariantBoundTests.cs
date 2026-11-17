@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Numerics;
+using EngineeredWood.Tests;
 
 namespace EngineeredWood.Expressions.Tests;
 
@@ -240,17 +241,17 @@ public class VariantBoundTests
     [Fact]
     public void Invert_EnormousLiteral_DeclinesAtOnce()
     {
-        var watch = System.Diagnostics.Stopwatch.StartNew();
         Declines(VariantBoundKind.Int64, "bigint", LiteralValue.HighPrecisionDecimalOf(BigInteger.One, 50_000_000));
         Declines(VariantBoundKind.Int64, "bigint", LiteralValue.HighPrecisionDecimalOf(BigInteger.Zero, 50_000_000));
         Declines(VariantBoundKind.Decimal, "decimal(38,2)", LiteralValue.HighPrecisionDecimalOf(BigInteger.One, 50_000_000), scale: 2);
         // A 200,000-digit unscaled value: counting its digits one division at a time is quadratic.
         var huge = BigInteger.Pow(10, 200_000);
-        watch.Restart();
         // TryInvert directly: Declines would format the literal into its message, which is slow itself.
-        Assert.False(VariantBound.TryInvert(VariantBoundKind.Int64, 0, "bigint", LiteralValue.HighPrecisionDecimalOf(huge, 0), out _));
-        Assert.False(VariantBound.TryInvert(VariantBoundKind.Decimal, 2, "decimal(38,2)",
-            LiteralValue.HighPrecisionDecimalOf(huge, 2), out _));
-        Assert.True(watch.Elapsed < TimeSpan.FromSeconds(1), $"took {watch.Elapsed}");
+        Timing.AssertQuick(() =>
+        {
+            Assert.False(VariantBound.TryInvert(VariantBoundKind.Int64, 0, "bigint", LiteralValue.HighPrecisionDecimalOf(huge, 0), out _));
+            Assert.False(VariantBound.TryInvert(VariantBoundKind.Decimal, 2, "decimal(38,2)",
+                LiteralValue.HighPrecisionDecimalOf(huge, 2), out _));
+        });
     }
 }

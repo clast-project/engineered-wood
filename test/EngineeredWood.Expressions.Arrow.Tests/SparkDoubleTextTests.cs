@@ -3,6 +3,7 @@
 
 using System.Globalization;
 using EngineeredWood.Expressions.Arrow.Spark;
+using EngineeredWood.Tests;
 
 namespace EngineeredWood.Expressions.Arrow.Tests;
 
@@ -245,11 +246,7 @@ public class SparkDoubleTextTests
     {
         var text = prefix + new string('1', 1_000_000) + suffix;
 
-        var watch = System.Diagnostics.Stopwatch.StartNew();
-        AssertParses(text, expected);
-        watch.Stop();
-
-        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+        Timing.AssertQuick(() => AssertParses(text, expected));
     }
 
     /// <summary>
@@ -271,12 +268,11 @@ public class SparkDoubleTextTests
     {
         var text = prefix + new string('1', 1_000_000) + suffix;
 
-        var watch = System.Diagnostics.Stopwatch.StartNew();
-        Assert.True(SparkDoubleText.TryParse(text, out var parsed));
-        watch.Stop();
-
-        Assert.Equal(expected, BitConverter.DoubleToInt64Bits(parsed));
-        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+        Timing.AssertQuick(() =>
+        {
+            Assert.True(SparkDoubleText.TryParse(text, out var parsed));
+            Assert.Equal(expected, BitConverter.DoubleToInt64Bits(parsed));
+        });
     }
 
     private static void AssertParses(string text, long expected)

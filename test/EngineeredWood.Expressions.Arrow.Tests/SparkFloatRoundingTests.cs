@@ -7,6 +7,7 @@ using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.Expressions.Arrow.Spark;
 using EngineeredWood.Expressions.Sql;
+using EngineeredWood.Tests;
 
 namespace EngineeredWood.Expressions.Arrow.Tests;
 
@@ -158,12 +159,11 @@ public class SparkFloatRoundingTests
     {
         var text = "0." + new string('1', 1_000_000);
 
-        var watch = System.Diagnostics.Stopwatch.StartNew();
-        Assert.True(SparkDoubleText.TryParseExactSingle(text, out var parsed));
-        watch.Stop();
-
-        Assert.True(Bits(parsed) == Bits(1f / 9f), $"{Hex(parsed)} against {Hex(1f / 9f)}");
-        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+        Timing.AssertQuick(() =>
+        {
+            Assert.True(SparkDoubleText.TryParseExactSingle(text, out var parsed));
+            Assert.True(Bits(parsed) == Bits(1f / 9f), $"{Hex(parsed)} against {Hex(1f / 9f)}");
+        });
     }
 
     /// <summary>
@@ -179,12 +179,11 @@ public class SparkFloatRoundingTests
     {
         var text = prefix + new string('1', 1_000_000) + suffix;
 
-        var watch = System.Diagnostics.Stopwatch.StartNew();
-        Assert.True(SparkDoubleText.TryParseSingle(text, out var parsed));
-        watch.Stop();
-
-        Assert.True(Bits(parsed) == expected, $"{Hex(parsed)} against {Hex(expected)}");
-        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+        Timing.AssertQuick(() =>
+        {
+            Assert.True(SparkDoubleText.TryParseSingle(text, out var parsed));
+            Assert.True(Bits(parsed) == expected, $"{Hex(parsed)} against {Hex(expected)}");
+        });
     }
 
     /// <summary>

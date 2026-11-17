@@ -3,6 +3,7 @@
 
 using System.Globalization;
 using System.Numerics;
+using EngineeredWood.Tests;
 
 namespace EngineeredWood.Expressions.Tests;
 
@@ -400,18 +401,16 @@ public class ScaledDecimalTests
         // what that is depends on the runtime. .NET Framework's BigInteger multiplies by
         // schoolbook, and a fixed 1 s failed there at 200000 digits in CI (#904). Dividing by ten
         // once per digit, as before #902, costs hundreds of times the build on every runtime.
-        ScaledDecimal.DigitCount(BigInteger.Pow(10, 100) - 1); // JIT both paths first
-
-        var watch = System.Diagnostics.Stopwatch.StartNew();
+        //
+        // Both sides are the fastest of several warm runs (see Timing): a single timed run of each
+        // let one stall on a busy CI runner fail the test, at 893 ms counting against 49 ms building.
         var value = BigInteger.Pow(10, 100_000) - 1;
-        var build = watch.Elapsed;
-
-        watch.Restart();
-        Assert.Equal(100_000, ScaledDecimal.DigitCount(value));
-        var count = watch.Elapsed;
+        var build = Timing.Fastest(() => _ = BigInteger.Pow(10, 100_000) - 1);
+        var count = Timing.Fastest(() => Assert.Equal(100_000, ScaledDecimal.DigitCount(value)));
 
         Assert.True(
             count < TimeSpan.FromTicks(4 * build.Ticks) + TimeSpan.FromMilliseconds(250),
-            $"counting took {count.TotalMilliseconds:F0} ms, building {build.TotalMilliseconds:F0} ms");
+            $"counting took {count.TotalMilliseconds:F0} ms, building {build.TotalMilliseconds:F0} ms, " +
+            $"each at best of {Timing.Attempts} warm runs");
     }
 }

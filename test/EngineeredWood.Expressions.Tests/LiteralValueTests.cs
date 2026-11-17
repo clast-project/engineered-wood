@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Numerics;
+using EngineeredWood.Tests;
 
 namespace EngineeredWood.Expressions.Tests;
 
@@ -505,9 +506,7 @@ public class LiteralValueTests
         var left = LiteralValue.HighPrecisionDecimalOf(BigInteger.Parse(a), ascale);
         var right = LiteralValue.HighPrecisionDecimalOf(BigInteger.Parse(b), bscale);
 
-        var watch = System.Diagnostics.Stopwatch.StartNew();
-        Assert.Equal(expected, Math.Sign(left.CompareTo(right)));
-        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+        Timing.AssertQuick(() => Assert.Equal(expected, Math.Sign(left.CompareTo(right))));
     }
 
     /// <summary>

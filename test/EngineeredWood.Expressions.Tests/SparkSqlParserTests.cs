@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using EngineeredWood.Expressions.Sql;
+using EngineeredWood.Tests;
 
 namespace EngineeredWood.Expressions.Tests;
 
@@ -885,10 +886,9 @@ public sealed class SparkSqlParserTests
     [InlineData("0e-2147483648BD")]
     public void AnAbsurdDecimalExponentIsRefusedAtOnce(string sql)
     {
-        var watch = System.Diagnostics.Stopwatch.StartNew();
-        Assert.Contains("38", Assert.Throws<SparkSqlParseException>(() => Parse(sql)).Reason,
-            StringComparison.Ordinal);
-        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+        Timing.AssertQuick(() =>
+            Assert.Contains("38", Assert.Throws<SparkSqlParseException>(() => Parse(sql)).Reason,
+                StringComparison.Ordinal));
     }
 
     [Theory]

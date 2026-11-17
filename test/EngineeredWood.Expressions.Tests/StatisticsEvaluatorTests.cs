@@ -1,6 +1,8 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using EngineeredWood.Tests;
+
 namespace EngineeredWood.Expressions.Tests;
 
 public class StatisticsEvaluatorTests
@@ -735,12 +737,7 @@ public class StatisticsEvaluatorTests
             nullCount: 0);
         var literal = LiteralValue.HighPrecisionDecimalOf(System.Numerics.BigInteger.Pow(10, exponent), scale);
 
-        var watch = System.Diagnostics.Stopwatch.StartNew();
-        var result = Eval(Compare("d", ComparisonOperator.Equal, literal), stats);
-        watch.Stop();
-
-        Assert.Equal(expected, result);
-        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+        Timing.AssertQuick(() => Assert.Equal(expected, Eval(Compare("d", ComparisonOperator.Equal, literal), stats)));
     }
 
     /// <summary>
@@ -763,19 +760,17 @@ public class StatisticsEvaluatorTests
         var justPastMin = LiteralValue.HighPrecisionDecimalOf((125 * tail) + 1, 20_002);
         var below = LiteralValue.HighPrecisionDecimalOf(5 * tail, 20_001); // 0.5
 
-        var watch = System.Diagnostics.Stopwatch.StartNew();
+        Timing.AssertQuick(() =>
+        {
+            // Far from both bounds, so rounding cannot reach them and the answer is exact.
+            Assert.Equal(FilterResult.AlwaysFalse, Eval(Compare("d", ComparisonOperator.LessThan, below), stats));
+            Assert.Equal(FilterResult.Unknown, Eval(Compare("d", ComparisonOperator.Equal, inside), stats));
+            Assert.Equal(FilterResult.AlwaysTrue, Eval(Compare("d", ComparisonOperator.GreaterThan, below), stats));
 
-        // Far from both bounds, so rounding cannot reach them and the answer is exact.
-        Assert.Equal(FilterResult.AlwaysFalse, Eval(Compare("d", ComparisonOperator.LessThan, below), stats));
-        Assert.Equal(FilterResult.Unknown, Eval(Compare("d", ComparisonOperator.Equal, inside), stats));
-        Assert.Equal(FilterResult.AlwaysTrue, Eval(Compare("d", ComparisonOperator.GreaterThan, below), stats));
-
-        // Within half a unit of the min, where rounding could move the literal onto it: refused.
-        Assert.NotEqual(FilterResult.AlwaysFalse, Eval(Compare("d", ComparisonOperator.Equal, atMin), stats));
-        Assert.NotEqual(FilterResult.AlwaysFalse, Eval(Compare("d", ComparisonOperator.Equal, justPastMin), stats));
-
-        watch.Stop();
-        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+            // Within half a unit of the min, where rounding could move the literal onto it: refused.
+            Assert.NotEqual(FilterResult.AlwaysFalse, Eval(Compare("d", ComparisonOperator.Equal, atMin), stats));
+            Assert.NotEqual(FilterResult.AlwaysFalse, Eval(Compare("d", ComparisonOperator.Equal, justPastMin), stats));
+        });
     }
 
     private static FilterResult EvalLiterals(LiteralValue a, LiteralValue b) =>
