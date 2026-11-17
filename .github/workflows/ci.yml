@@ -726,3 +726,95 @@ jobs:
         with:
           name: parquet-alp-interop-test-results
           path: '**/parquet-alp-interop-results.trx'
+
+  # Every other job runs on x64, so nothing ARM64-specific was ever executed in CI: the
+  # AdvSimd branches in Core (BYTE_STREAM_SPLIT's 128-bit kernel since #916) had only run on
+  # a developer's machine. This job runs EngineeredWood.Core.Tests on an ARM64 Linux runner,
+  # where those branches are the ones taken. Linux rather than macOS because the runners start
+  # faster and the instructions are the same; Core has no OS-specific code that macOS would add.
+  #
+  # Core.Tests only: it holds the SIMD kernels' tests, needs no submodule or oracle, and is
+  # quick. net11.0 and net10.0, as on pull requests elsewhere; net8.0 tests gate releases.
+  #
+  # It runs when the project selection includes Core.Tests (any change to Core does, and so
+  # does a full run). Like the interop jobs it is not a required check, so it always reports
+  # and skips its remaining steps when nothing relevant changed.
+  arm64:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the project selection can diff against the base commit.
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Select affected projects
+        id: select
+        shell: bash
+        run: |
+          python .github/scripts/select_projects.py \
+            --base "${{ github.event.pull_request.base.sha || github.event.before }}" \
+            --head "${{ github.sha }}" \
+            --slnf /dev/null \
+            ${{ github.event_name == 'push' && '--full' || '' }} \
+          || echo "scope=full" >> "$GITHUB_OUTPUT"
+          echo "::group::arm64 relevance"
+          if grep -qx 'scope=full' "$GITHUB_OUTPUT" \
+             || grep -q '^tests=.*EngineeredWood\.Core\.Tests\.csproj' "$GITHUB_OUTPUT"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "EngineeredWood.Core.Tests is not affected; skipping the ARM64 run."
+          fi
+          echo "::endgroup::"
+
+      - name: Setup .NET
+        if: steps.select.outputs.run == 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.x
+            11.0.x
+
+      # The point of the job is native ARM64 execution. If a runner image change ever gave us
+      # an x64 runtime under emulation, the SIMD tests would quietly take the x64 paths and
+      # still pass, so refuse to continue unless the runtime itself is linux-arm64.
+      - name: Check the runtime is ARM64
+        if: steps.select.outputs.run == 'true'
+        run: |
+          uname -m
+          dotnet --info | grep -E '^\s*RID:\s*linux-arm64$'
+
+      - name: Restore
+        if: steps.select.outputs.run == 'true'
+        run: dotnet restore test/EngineeredWood.Core.Tests/EngineeredWood.Core.Tests.csproj
+
+      - name: Build
+        if: steps.select.outputs.run == 'true'
+        run: >
+          dotnet build test/EngineeredWood.Core.Tests/EngineeredWood.Core.Tests.csproj
+          --no-restore --configuration Release --framework net11.0
+          && dotnet build test/EngineeredWood.Core.Tests/EngineeredWood.Core.Tests.csproj
+          --no-restore --configuration Release --framework net10.0
+
+      - name: Test
+        if: steps.select.outputs.run == 'true'
+        run: |
+          for tfm in net11.0 net10.0; do
+            dotnet test test/EngineeredWood.Core.Tests/EngineeredWood.Core.Tests.csproj \
+              --no-build --configuration Release --framework "$tfm" \
+              --logger "trx;LogFileName=arm64-core-$tfm.trx" || exit 1
+          done
+
+      - name: Upload test results
+        if: always() && steps.select.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm64-test-results
+          path: '**/arm64-core-*.trx'
