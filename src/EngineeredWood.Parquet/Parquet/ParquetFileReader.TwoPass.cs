@@ -415,9 +415,14 @@ public sealed partial class ParquetFileReader
                 if (reservation is not null && growth is not null)
                 {
                     long passTwo = keepRows is not null
-                        // A split group's decode is held whole above, and the one batch it yields is gathered from it.
-                        // Grown as SecondPass is: the footer underestimates dictionary-encoded strings.
-                        ? SplitsGroup(groupRows) ? 0 : growth.Apply(keepRowsBytes)
+                        // The keep-rows decode, grown as SecondPass is: the footer underestimates dictionary-encoded
+                        // strings. A split group holds that decode above, but the one batch it yields is charged against
+                        // this reservation, which the hold does not count (#903 review: after a first pass answered
+                        // from a dictionary, 193,500 bytes past it). That batch is built in the decode's buffers and
+                        // holds at most one batch's rows, so either bounds it.
+                        ? SplitsGroup(groupRows)
+                            ? Math.Min(estimate.SecondPass, growth.Apply(keepRowsBytes))
+                            : growth.Apply(keepRowsBytes)
                         // Selected blocks or not, the whole share: a block's batch holds the whole pages it touches,
                         // which its rows do not bound (block [8192, 16384) over 10,000-row pages decodes 20,000 rows,
                         // #903 review); and a split group's SecondPass is already one batch's (any-start) share (#900).

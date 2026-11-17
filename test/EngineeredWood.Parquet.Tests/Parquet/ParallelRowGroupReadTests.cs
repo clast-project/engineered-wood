@@ -1594,6 +1594,21 @@ public class ParallelRowGroupReadTests : IDisposable
         await AssertTwoPassReadCoversItsRawBatchesAsync(path, predicate, batchSize: null, expectedRows: 100, answered: true);
     }
 
+    /// <summary>
+    /// #903 review: a group the batch size splits, whose kept rows fit one batch, keeps them as it decodes, and holds
+    /// that decode apart (#873). The one batch it yields is still charged against the pending reservation, which the
+    /// hold does not count, so the second pass must still reserve for that batch. With the first pass answered from
+    /// <c>k</c>'s dictionary, the pending reservation is only the answers' bitmaps.
+    /// </summary>
+    [Fact]
+    public async Task AnAnsweredSplitTwoPassRead_ReservesTheBatchItKeeps_BesideTheDecodeItHolds()
+    {
+        // 1,500 rows kept, one in every 100, within one 5,000-row batch.
+        string path = await WriteKeysAndValuesAsync("two-pass-keep-answered", i => i % 100, 150_000, 50_000);
+        var predicate = KeyPredicate(k => k < 1, true);
+        await AssertTwoPassReadCoversItsRawBatchesAsync(path, predicate, batchSize: 5_000, expectedRows: 1_500, answered: true);
+    }
+
     /// <summary>A two-pass read of row group 0 (<c>k</c> filters, <c>v</c> returned) whose reservations, the first
     /// pass's and then the second's, cover every raw batch it decodes, as the read itself reserves them.</summary>
     private static async Task AssertTwoPassReadCoversItsRawBatchesAsync(
