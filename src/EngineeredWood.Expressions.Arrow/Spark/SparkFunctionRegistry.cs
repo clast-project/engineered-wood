@@ -50,6 +50,12 @@ public sealed class SparkFunctionRegistry
     /// <summary>The resolution Spark's TIMESTAMP carries, and the one a numeric cast lands on.</summary>
     private const decimal MicrosecondsPerSecond = 1_000_000m;
 
+    /// <summary>-2^63, <see cref="long.MinValue"/>, which a double holds exactly.</summary>
+    private const double LongMinAsDouble = -9223372036854775808d;
+
+    /// <summary>2^63: the first double past <see cref="long.MaxValue"/>, which a double cannot hold.</summary>
+    private const double LongMaxExclusiveAsDouble = 9223372036854775808d;
+
     /// <summary>
     /// <c>TimeSpan.TicksPerMicrosecond</c>, spelled out because it is .NET 7 and this library
     /// still builds for netstandard2.0 — where a <c>cref</c> to it does not resolve either.
@@ -1754,8 +1760,25 @@ public sealed class SparkFunctionRegistry
             // A number is epoch seconds, which is the inverse of casting a timestamp to a number.
             if (value.Value.IsNumeric)
             {
-                // From the exact decimal, not the double: past 2^53 a double can no longer hold
-                // every integer, and a shifted instant is worse than a refused one.
+                // A float or double is Spark's doubleToTimestamp, `(d * MICROS_PER_SECOND).toLong`:
+                // the product is rounded to a double BEFORE it is truncated, so 0.3 is 300000 µs
+                // although the binary 0.3 lies just below it (#911). The bound is checked first, on
+                // the same seconds as the exact path, and a NaN fails it.
+                if (value.Value.IsFloating)
+                {
+                    var asDouble = value.Value.AsDouble;
+                    if (!(asDouble >= (double)MinEpochSecond && asDouble <= (double)MaxEpochSecond))
+                    {
+                        if (!raising) continue;
+                        throw SparkEvaluationException.CastOverflow(value.Value.Text, "TIMESTAMP");
+                    }
+
+                    instants[i] = FromEpochMicroseconds((long)(asDouble * (double)MicrosecondsPerSecond));
+                    continue;
+                }
+
+                // Otherwise from the exact decimal, not the double: past 2^53 a double can no
+                // longer hold every integer, and a shifted instant is worse than a refused one.
                 if (value.Value.Exact is not { } seconds
                     || seconds < MinEpochSecond || seconds > MaxEpochSecond)
                 {
@@ -1865,6 +1888,27 @@ public sealed class SparkFunctionRegistry
             {
                 if (!raising) continue;
                 throw SparkEvaluationException.InvalidCast(value.Value.Text, described);
+            }
+
+            // A float or double truncates the double itself, as Spark's `d.toInt` and `d.toLong` do,
+            // and is range-checked on the truncated double (#911). Through a System.Decimal it
+            // could not be: rounded to 15 digits, 2.9999999999999996 truncated to 3. The upper
+            // bound is strict because 2^63, long.MaxValue as a double, does not fit a long; a NaN
+            // or an infinity fails it and takes the dialect's overflow answer.
+            if (value.Value.IsFloating)
+            {
+                var whole = Math.Truncate(value.Value.AsDouble);
+                if (!(whole >= LongMinAsDouble && whole < LongMaxExclusiveAsDouble)
+                    || !SparkArrays.FitsIn((long)whole, target))
+                {
+                    if (raising) throw Refuse(value.Value.Text);
+
+                    values[i] = Overflowed(i, value.Value.AsDouble);
+                    continue;
+                }
+
+                values[i] = (long)whole;
+                continue;
             }
 
             // No exact form means the magnitude is past decimal's range, and so past every

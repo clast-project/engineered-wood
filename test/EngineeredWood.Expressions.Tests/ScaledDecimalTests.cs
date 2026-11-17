@@ -93,30 +93,48 @@ public class ScaledDecimalTests
     /// </remarks>
     private static readonly decimal NarrowDecimal = 5814944.01700257601m;
 
+    /// <summary>
+    /// Whether the RUNTIME's own decimal-to-double conversions are correctly rounded, as they are
+    /// from .NET 11 on.
+    /// </summary>
+    /// <remarks>
+    /// The runtime, not the target framework: a net10.0 build running on .NET 11 gets .NET 11's
+    /// conversions, so <c>#if</c> would answer for the wrong thing. .NET Framework reports 4.x.
+    /// </remarks>
+    private static bool RuntimeConvertsCorrectly => Environment.Version.Major >= 11;
+
     [Fact]
     public void TheRejectedRoutesReallyDoRoundTwice()
     {
         // Neither of these is a strawman: one was the code in SparkArrays and the other was the
-        // narrow path it preferred. If .NET ever fixes them this test fails, which is the right
-        // moment to revisit the comments in ScaledDecimal.
+        // narrow path it preferred. Both are wrong through .NET 10 and correctly rounded from
+        // .NET 11 on (#911), so this asserts whichever the runtime under test does. ScaledDecimal
+        // keeps its own conversion either way: the libraries run on .NET 10 and earlier too.
         var unscaled = BigInteger.Pow(10, 30);
-        Assert.Equal(9.999999999999999e29d, (double)unscaled / Math.Pow(10, 0));
+        var viaBigInteger = (double)unscaled / Math.Pow(10, 0);
 
-        // (double)decimal double-rounds too, on a value well inside decimal's range. The decimal
-        // holds 5814944.01700257601 to the digit, so the ulp is lost in the conversion and not
-        // before it: 5814944.017002576 is the correctly rounded double and the cast answers
-        // ...577. Measured, the cast is wrong on 17.4% of the decimals that fit exactly, and on
-        // integral ones -- scale 0, where nothing has to be divided away -- on 0.2%.
-        //
-        // The .NET 11 runtime fixed the cast; net8.0, net10.0 and net472 still double-round, and
-        // they are what this assembly ships to. So a net11.0 target will fail this test, and that
-        // is the moment to make it conditional.
+        // (double)decimal double-rounds through .NET 10, on a value well inside decimal's range.
+        // The decimal holds 5814944.01700257601 to the digit, so the ulp is lost in the
+        // conversion and not before it: 5814944.017002576 is the correctly rounded double and the
+        // cast answers ...577. Measured, the cast is wrong on 17.4% of the decimals that fit
+        // exactly, and on integral ones -- scale 0, where nothing has to be divided away -- on 0.2%.
         var narrow = NarrowDecimal;
         var exact = BitConverter.Int64BitsToDouble(0x41562EA8011691F9L);
 
-        Assert.False(
-            exact.Equals((double)narrow),
-            $"(double){narrow}m no longer double-rounds: it now gives {(double)narrow:R}");
+        if (RuntimeConvertsCorrectly)
+        {
+            Assert.Equal(1e30d, viaBigInteger);
+            Assert.Equal(exact, (double)narrow);
+        }
+        else
+        {
+            Assert.Equal(9.999999999999999e29d, viaBigInteger);
+            Assert.False(
+                exact.Equals((double)narrow),
+                $"(double){narrow}m no longer double-rounds: it now gives {(double)narrow:R}");
+        }
+
+        Assert.Equal(1e30d, ScaledDecimal.ToDouble(unscaled, 0));
         Assert.Equal(exact, ScaledDecimal.ToDouble(narrow));
     }
 
