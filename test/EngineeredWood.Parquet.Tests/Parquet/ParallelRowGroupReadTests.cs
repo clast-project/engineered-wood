@@ -324,6 +324,92 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.Equal(0, reader.LastScanBudget!.Used);
     }
 
+    /// <summary>
+    /// #887 / #903 review: a two-pass read reserves its second pass between its passes, so on a budget that binds, the
+    /// units behind the front one wait there, holding their chunks and what their first pass kept. A scan stopped
+    /// early, by cancellation or by its consumer leaving, must let all of it go, whatever each unit was waiting for:
+    /// each unit's own releases must balance what it charged before the scan's close hands back the rest
+    /// (<see cref="EngineeredWood.Scans.ScanMemoryBudget.LeftAtClose"/>). The first pass is answered from <c>k</c>'s dictionary, so it is a bitmap,
+    /// and the second, <c>v</c>, is what the budget cannot hold for every unit at once.
+    /// </summary>
+    [Theory]
+    [InlineData(300_000, false, false, null)]
+    [InlineData(300_000, true, false, null)]
+    [InlineData(600_000, false, false, null)]
+    [InlineData(600_000, true, false, null)]
+    [InlineData(1_200_000, false, false, null)]
+    [InlineData(300_000, false, true, null)]
+    [InlineData(600_000, true, true, null)]
+    // Split groups keeping rows in one batch: each holds its keep-rows decode before the wait, too.
+    [InlineData(300_000, false, false, 5_000)]
+    [InlineData(300_000, true, false, 5_000)]
+    [InlineData(600_000, true, true, 5_000)]
+    public async Task ATwoPassScanStoppedEarly_LeavesNothingHeld_WhereverItsUnitsWaited(
+        long budget, bool cancel, bool shared, int? batchSize)
+    {
+        const int groups = 12, groupRows = 20_000;
+        string path = Path.Combine(_tempDir, "two-pass-stopped.parquet");
+        var arrowSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", Int64Type.Default, false))
+            .Field(new Field("v", Int64Type.Default, false))
+            .Build();
+        var random = new Random(903);
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            for (int g = 0; g < groups; g++)
+            {
+                var keys = new Int64Array.Builder();
+                var values = new Int64Array.Builder();
+                for (int i = 0; i < groupRows; i++)
+                {
+                    keys.Append(i % 100);
+                    // Random.NextInt64 is not on .NET Framework.
+                    values.Append(((long)random.Next() << 32) | (uint)random.Next());
+                }
+                using var batch = new RecordBatch(arrowSchema, [keys.Build(), values.Build()], groupRows);
+                await writer.WriteRowGroupAsync(batch);
+            }
+            await writer.CloseAsync();
+        }
+
+        var parent = shared ? new EngineeredWood.Memory.MemoryBudget(budget) : null;
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(
+            file, ownsFile: false, Options(8, shared ? 1L << 30 : budget) with { MemoryBudget = parent, BatchSize = batchSize })
+        {
+            TwoPassReads = true,
+        };
+        var scan = new ParquetScan { Columns = ["v"], RowFilter = new RowFilter(KeyPredicate(k => k < 5, true)) };
+        using var cts = new CancellationTokenSource();
+        int taken = 0;
+        try
+        {
+            await foreach (var selected in reader.ReadSelectedAsync(scan, cts.Token))
+            {
+                selected.Dispose();
+                // Long enough for the units behind to reach their waits.
+                await Task.Delay(20);
+                if (++taken == 2)
+                {
+                    if (!cancel)
+                        break;
+                    cts.Cancel();
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancel)
+        {
+        }
+
+        Assert.Equal(2, taken);
+        // Close hands back anything still charged, so Used is 0 after any scan: what it found is the test.
+        Assert.Equal(0, reader.LastScanBudget!.LeftAtClose);
+        Assert.Equal(0, reader.LastScanBudget.Used);
+        if (parent is not null)
+            Assert.Equal(0, parent.UsedBytes);
+    }
+
     [Fact]
     public async Task AReadError_SurfacesAtItsRowGroup_AfterEveryBatchBeforeIt()
     {
@@ -1010,9 +1096,10 @@ public class ParallelRowGroupReadTests : IDisposable
 
     /// <summary>
     /// #846: a two-pass read's first step decodes the first pass, then the second pass's first batch, never both at
-    /// once, so it reserves the larger, not their sum. A predicate column answered from its dictionary decodes to
-    /// its answers, a bitmap, unless the read returns it too. The reservation must still cover every raw batch either
-    /// pass decodes: a larger one would raise <see cref="EngineeredWood.Scans.ScanReservation.Estimate"/> above it.
+    /// once, so it never reserves their sum. #887: it reserves the first pass before the read, and the second once the
+    /// first has run. A predicate column answered from its dictionary decodes to its answers, a bitmap, unless the read
+    /// returns it too. Every raw batch either pass decodes must still fit what was reserved for it: one that did not
+    /// would be charged past it (<see cref="EngineeredWood.Scans.ScanReservation.Overdrawn"/>).
     /// </summary>
     [Theory]
     [InlineData(false, false, null)]
@@ -1021,7 +1108,7 @@ public class ParallelRowGroupReadTests : IDisposable
     [InlineData(true, true, null)]
     [InlineData(false, false, 10_000)]
     [InlineData(false, true, 10_000)]
-    public async Task ATwoPassRead_ReservesTheLargerPass_AndCoversWhatItDecodes(
+    public async Task ATwoPassRead_ReservesEachPassInTurn_AndCoversWhatItDecodes(
         bool returnPredicateColumn, bool answered, int? batchSize)
     {
         // The predicate column (int64, ten values, so dictionary-encoded) decodes to twice the output column (int32,
@@ -1039,33 +1126,64 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.True(MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(group.Columns[0].MetaData!),
             "the predicate column should be wholly dictionary-encoded, or nothing is answered");
 
-        long reserved = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, returnPredicateColumn, answered);
+        var sizes = await TwoPassEstimateAsync(reader, group, parquetSchema, predicate, returnPredicateColumn, answered);
         long filterDecoded = reader.DecodedBytes(group, parquetSchema, ["k"], null);
         long outputDecoded = reader.DecodedBytes(group, parquetSchema, ["v"], null);
-        Assert.True(reserved < filterDecoded + outputDecoded, $"reserves {reserved}: the sum of both passes");
         if (batchSize is null)
         {
             long expected = (returnPredicateColumn, answered) switch
             {
-                (false, true) => outputDecoded,                         // the answers are smaller than v
+                (false, true) => AnswerBytes(KeyRows),                  // the answers only
                 (true, true) => filterDecoded + AnswerBytes(KeyRows),   // k's values and its answers
                 _ => filterDecoded,
             };
-            Assert.Equal(expected, reserved);
+            Assert.Equal(expected, sizes.FirstPass);
+            Assert.Equal(outputDecoded, sizes.SecondPass);
         }
 
-        var (returned, estimate, _, used) = await ReadTwoPassUnitAsync(reader, predicate, returnPredicateColumn);
+        var overdrawn = new System.Runtime.CompilerServices.StrongBox<long>();
+        var (returned, _, _, used, _) = await ReadTwoPassUnitHeldAsync(
+            reader, predicate, returnPredicateColumn, overdrawn: overdrawn);
         Assert.Equal(KeyRows * 3 / 10, returned);
-        Assert.True(estimate == reserved, $"reserved {reserved}, but a raw batch reached {estimate}");
+        Assert.True(overdrawn.Value == 0, $"raw batches were charged {overdrawn.Value} past their reservation");
         Assert.Equal(0, used);
     }
 
-    /// <summary>#851: a two-pass read's first reservation adds what the host adds to each row of the batch it hands
-    /// on, for the rows that batch can hold: the batch size, else the row group.</summary>
+    /// <summary>
+    /// #887: a selective two-pass read reserves its second pass for the rows its first pass kept, not as if none were
+    /// dropped. 10% of the rows kept: the budget never held the output column whole beside what the read holds apart
+    /// (its chunks), and every raw batch still fit its reservation.
+    /// </summary>
+    [Fact]
+    public async Task ASelectiveTwoPassRead_ReservesItsSecondPassForTheRowsItKept()
+    {
+        string path = await WriteKeysAndValuesAsync("two-pass-deferred", i => i % 10);
+        var predicate = KeyPredicate(k => k < 1, true);
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false) { TwoPassReads = true };
+        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
+        var parquetSchema = await reader.GetSchemaAsync();
+        long outputDecoded = reader.DecodedBytes(group, parquetSchema, ["v"], null);
+        var sizes = await TwoPassEstimateAsync(reader, group, parquetSchema, predicate, returned: false, answered: true);
+        Assert.Equal(outputDecoded, sizes.SecondPass);
+
+        var overdrawn = new System.Runtime.CompilerServices.StrongBox<long>();
+        var (returned, _, peak, used, held) = await ReadTwoPassUnitHeldAsync(
+            reader, predicate, returnPredicateColumn: false, overdrawn: overdrawn);
+        Assert.Equal(KeyRows / 10, returned);
+        Assert.True(peak - held < outputDecoded / 2,
+            $"the budget peaked at {peak}, {held} of it held apart: the second pass was reserved whole ({outputDecoded})");
+        Assert.True(overdrawn.Value == 0, $"raw batches were charged {overdrawn.Value} past their reservation");
+        Assert.Equal(0, used);
+    }
+
+    /// <summary>#851: a two-pass read's second-pass reservation adds what the host adds to each row of the batch it
+    /// hands on, for the rows that batch can hold: the kept rows, at most the batch size (#887: the first pass hands
+    /// nothing on, and reserves none).</summary>
     [Theory]
-    [InlineData(null)]
-    [InlineData(10_000)]
-    public async Task ATwoPassRead_AddsTheHostsBytesForTheRowsOfItsFirstBatch(int? batchSize)
+    [InlineData(null, 12_000)]
+    [InlineData(10_000, 10_000)]
+    public async Task ATwoPassRead_AddsTheHostsBytesForTheRowsOfItsFirstBatch(int? batchSize, long firstBatchRows)
     {
         string path = await WriteKeysAndValuesAsync("two-pass-host-bytes", i => i % 10);
         var predicate = KeyPredicate(k => k < 3, false);
@@ -1074,11 +1192,12 @@ public class ParallelRowGroupReadTests : IDisposable
         {
             TwoPassReads = true,
         };
-        var group = (await reader.ReadMetadataAsync()).RowGroups[0];
-        long reserved = await TwoPassReservationAsync(reader, group, await reader.GetSchemaAsync(), predicate, false, false);
 
-        var (_, estimate, _, used) = await ReadTwoPassUnitAsync(reader, predicate, false, addedBytesPerRow: 100);
-        Assert.Equal(reserved + 100L * (batchSize ?? KeyRows), estimate);
+        // The largest reservation the unit made, against which a raw batch of either pass may rise; at 100 bytes a row
+        // and more, the second pass's reservation is the larger, so twice the bytes a row adds once more.
+        var (_, once, _, _) = await ReadTwoPassUnitAsync(reader, predicate, false, addedBytesPerRow: 100);
+        var (_, twice, _, used) = await ReadTwoPassUnitAsync(reader, predicate, false, addedBytesPerRow: 200);
+        Assert.Equal(once + 100L * firstBatchRows, twice);
         Assert.Equal(0, used);
     }
 
@@ -1098,7 +1217,8 @@ public class ParallelRowGroupReadTests : IDisposable
         using var reader = new ParquetFileReader(file, ownsFile: false) { TwoPassReads = true };
         var group = (await reader.ReadMetadataAsync()).RowGroups[0];
         var parquetSchema = await reader.GetSchemaAsync();
-        long reserved = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, returned: false, answered: true);
+        long reserved = (await TwoPassEstimateAsync(
+            reader, group, parquetSchema, predicate, returned: false, answered: true)).FirstPass;
         long filterDecoded = reader.DecodedBytes(group, parquetSchema, ["k"], null);
         long compressed = ParquetFileReader.PlannedBytes(group, parquetSchema, ["v", "k"], null).Compressed;
         Assert.True(reserved < filterDecoded, $"reserves {reserved}, at least the values {filterDecoded}: nothing to test");
@@ -1149,14 +1269,17 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.True(EngineeredWood.Parquet.Data.DictionaryAnswer.MayAnswer(meta), "the chunk should be answerable");
         Assert.False(MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(meta), "the chunk should have fallen back");
 
-        long reserved = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, returnPredicateColumn, answered: true);
+        var sizes = await TwoPassEstimateAsync(reader, group, parquetSchema, predicate, returnPredicateColumn, answered: true);
         long filterDecoded = reader.DecodedBytes(group, parquetSchema, ["k"], null);
         long outputDecoded = reader.DecodedBytes(group, parquetSchema, ["v"], null);
-        Assert.Equal(Math.Max(filterDecoded + AnswerBytes(KeyRows), outputDecoded), reserved);
+        Assert.Equal(filterDecoded + AnswerBytes(KeyRows), sizes.FirstPass);
+        Assert.Equal(outputDecoded, sizes.SecondPass);
 
-        var (returned, estimate, _, used) = await ReadTwoPassUnitAsync(reader, predicate, returnPredicateColumn);
+        var overdrawn = new System.Runtime.CompilerServices.StrongBox<long>();
+        var (returned, _, _, used, _) = await ReadTwoPassUnitHeldAsync(
+            reader, predicate, returnPredicateColumn, overdrawn: overdrawn);
         Assert.Equal(KeyRows / 2 * 3 / 10, returned);
-        Assert.True(estimate == reserved, $"reserved {reserved}, but a raw batch reached {estimate}");
+        Assert.True(overdrawn.Value == 0, $"raw batches were charged {overdrawn.Value} past their reservation");
         Assert.Equal(0, used);
     }
 
@@ -1209,10 +1332,12 @@ public class ParallelRowGroupReadTests : IDisposable
         var growth = new ParquetFileReader.DecodedGrowth();
         var (returned, largest, _, _) = await ReadTwoPassUnitAsync(reader, predicate, returnPredicateColumn: false, growth);
         Assert.Equal(KeyRows, returned);
-        long first = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, returned: false, answered: false);
+        long first = (await TwoPassEstimateAsync(
+            reader, group, parquetSchema, predicate, returned: false, answered: false)).FirstPass;
         Assert.True(first < largest / 4, $"reserved {first} before learning, decoded {largest}: no growth to learn");
 
-        long next = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, returned: false, answered: false, growth);
+        long next = (await TwoPassEstimateAsync(
+            reader, group, parquetSchema, predicate, returned: false, answered: false, growth)).FirstPass;
         Assert.True(next >= largest, $"the next row group reserves {next}, its first pass decodes {largest}");
     }
 
@@ -1462,15 +1587,14 @@ public class ParallelRowGroupReadTests : IDisposable
         };
         var group = (await reader.ReadMetadataAsync()).RowGroups[0];
         var parquetSchema = await reader.GetSchemaAsync();
-        long reserved = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, false, false);
+        long reserved = (await TwoPassEstimateAsync(reader, group, parquetSchema, predicate, false, false)).FirstPass;
         long footerShare = (long)batchSize * sizeof(long);
         Assert.True(reserved > footerShare, $"reserved {reserved}: only the batch's footer share ({footerShare})");
 
         var overdrawn = new System.Runtime.CompilerServices.StrongBox<long>();
-        var (returned, estimate, _, used, _) = await ReadTwoPassUnitHeldAsync(
+        var (returned, _, _, used, _) = await ReadTwoPassUnitHeldAsync(
             reader, predicate, false, overdrawn: overdrawn);
         Assert.Equal(KeyRows * 3 / 10, returned);
-        Assert.True(estimate == reserved, $"reserved {reserved}, but a raw batch reached {estimate}");
         // The read's own first reservation, not only the helper's, covered every raw batch.
         Assert.True(overdrawn.Value == 0, $"raw batches were charged {overdrawn.Value} past the reservation");
         Assert.Equal(0, used);
@@ -1537,10 +1661,44 @@ public class ParallelRowGroupReadTests : IDisposable
         await AssertTwoPassReadCoversItsRawBatchesAsync(path, predicate, batchSize: 10_000, expectedRows: 1, answered: false);
     }
 
-    /// <summary>A two-pass read of row group 0 (<c>k</c> filters, <c>v</c> returned) whose first reservation covers
-    /// every raw batch it decodes, as the read itself reserves it.</summary>
+    /// <summary>
+    /// #903 review: the same unbatched, the first pass answered from <c>k</c>'s dictionary, so it decodes only bitmaps
+    /// and its reservation covers next to nothing of the second's. The selected block [8192, 16384) is 8,192 rows, but
+    /// the pages it decodes, [0, 20000), are 20,000: the second pass must be reserved for those, not the block's rows.
+    /// </summary>
+    [Fact]
+    public async Task AnUnbatchedSparseTwoPassRead_ReservesTheWholePagesItsBlocksTouch()
+    {
+        var values = new Int64Array.Builder();
+        for (int i = 0; i < KeyRows; i++)
+            values.Append(i * 7L);
+        string path = await WriteKeyAndValuesAsync(
+            "two-pass-block-pages-unbatched", KeyRows, i => i / 100, values.Build(),
+            new ParquetWriteOptions { DataPageSize = 64 << 20, DataPageRowCountLimit = 10_000 });
+        // Rows 9,000-9,099, in the second block only.
+        var predicate = KeyPredicate(k => k == 90, true);
+        await AssertTwoPassReadCoversItsRawBatchesAsync(path, predicate, batchSize: null, expectedRows: 100, answered: true);
+    }
+
+    /// <summary>
+    /// #903 review: a group the batch size splits, whose kept rows fit one batch, keeps them as it decodes, and holds
+    /// that decode apart (#873). The one batch it yields is still charged against the pending reservation, which the
+    /// hold does not count, so the second pass must still reserve for that batch. With the first pass answered from
+    /// <c>k</c>'s dictionary, the pending reservation is only the answers' bitmaps.
+    /// </summary>
+    [Fact]
+    public async Task AnAnsweredSplitTwoPassRead_ReservesTheBatchItKeeps_BesideTheDecodeItHolds()
+    {
+        // 1,500 rows kept, one in every 100, within one 5,000-row batch.
+        string path = await WriteKeysAndValuesAsync("two-pass-keep-answered", i => i % 100, 150_000, 50_000);
+        var predicate = KeyPredicate(k => k < 1, true);
+        await AssertTwoPassReadCoversItsRawBatchesAsync(path, predicate, batchSize: 5_000, expectedRows: 1_500, answered: true);
+    }
+
+    /// <summary>A two-pass read of row group 0 (<c>k</c> filters, <c>v</c> returned) whose reservations, the first
+    /// pass's and then the second's, cover every raw batch it decodes, as the read itself reserves them.</summary>
     private static async Task AssertTwoPassReadCoversItsRawBatchesAsync(
-        string path, RowPredicate predicate, int batchSize, long expectedRows, bool answered)
+        string path, RowPredicate predicate, int? batchSize, long expectedRows, bool answered)
     {
         await using var file = new LocalRandomAccessFile(path);
         using var reader = new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { BatchSize = batchSize })
@@ -1554,14 +1712,13 @@ public class ParallelRowGroupReadTests : IDisposable
             Assert.True(MembershipPredicateEvaluator.IsWhollyDictionaryEncoded(group.Columns[0].MetaData!),
                 "the predicate column should be wholly dictionary-encoded, or nothing is answered");
         }
-        long reserved = await TwoPassReservationAsync(reader, group, parquetSchema, predicate, false, answered);
+        var sizes = await TwoPassEstimateAsync(reader, group, parquetSchema, predicate, false, answered);
         var overdrawn = new System.Runtime.CompilerServices.StrongBox<long>();
         var (returned, estimate, _, used, _) = await ReadTwoPassUnitHeldAsync(
             reader, predicate, false, overdrawn: overdrawn);
         Assert.Equal(expectedRows, returned);
         Assert.True(overdrawn.Value == 0,
-            $"reserved {reserved}; raw batches reached {estimate} and were charged {overdrawn.Value} past it");
-        Assert.True(estimate == reserved, $"reserved {reserved}, but a raw batch reached {estimate}");
+            $"sized {sizes.FirstPass} then up to {sizes.SecondPass}; raw batches reached {estimate} and were charged {overdrawn.Value} past it");
         Assert.Equal(0, used);
     }
 
@@ -1632,10 +1789,12 @@ public class ParallelRowGroupReadTests : IDisposable
             return result.Build();
         }) { ValueWise = valueWise };
 
-    /// <summary>What a parallel two-pass read of row group 0 reserves for its first step: <c>k</c> filters, <c>v</c>
-    /// is returned, and <c>k</c> too when <paramref name="returned"/>. Sized from the pages each pass's batches touch
-    /// where the first pass is cut into batches (#846 gap 2), as the read sizes it.</summary>
-    private static async Task<long> TwoPassReservationAsync(
+    /// <summary>How a parallel two-pass read of row group 0 sizes its first step: <c>k</c> filters, <c>v</c> is
+    /// returned, and <c>k</c> too when <paramref name="returned"/>. Its first pass is reserved before the read, and its
+    /// second pass's first batch, as if no row were dropped, bounds what it reserves after the first pass (#887). Sized
+    /// from the pages each pass's batches touch where the first pass is cut into batches (#846 gap 2), as the read
+    /// sizes it.</summary>
+    private static async Task<ParquetFileReader.TwoPassEstimate> TwoPassEstimateAsync(
         ParquetFileReader reader, EngineeredWood.Parquet.Metadata.RowGroup group, EngineeredWood.Parquet.Schema.SchemaDescriptor schema,
         RowPredicate predicate, bool returned, bool answered, ParquetFileReader.DecodedGrowth? growth = null)
     {
@@ -1648,7 +1807,7 @@ public class ParallelRowGroupReadTests : IDisposable
             new ParquetFileReader.RowGroupPlan(0, 0, null, null), group, schema, columns, answers, default);
         return reader.TwoPassFirstBatchEstimate(
             group, schema, columns, answers, growth ?? new ParquetFileReader.DecodedGrowth(), null,
-            pages.FilterBytes, pages.OutputBytes).Reserved;
+            pages.FilterBytes, pages.OutputBytes);
     }
 
     /// <summary>
