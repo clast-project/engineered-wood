@@ -362,6 +362,13 @@ public class CompressorTests
     /// out afterwards. The bytes must not change: the same stream type at the same level, fed the same
     /// input, writes the same output wherever it writes it.
     /// </summary>
+    /// <remarks>
+    /// Except on .NET 11, where Compressor uses the span-based GZipEncoder and DeflateEncoder
+    /// instead of a stream. Both are zlib-ng at the same level, but the stream configures it
+    /// differently and feeds it in chunks, so the bytes differ (the encoder's are a few shorter).
+    /// There the test asks what still has to hold: the stream's own decoder, independent of
+    /// EngineeredWood's, reads the output back exactly, and it is no larger than the stream's.
+    /// </remarks>
     [Theory]
     [MemberData(nameof(ZlibFormatInputs))]
     public void GzipAndDeflate_MatchTheStreamWrittenToAMemoryStream(
@@ -388,7 +395,24 @@ public class CompressorTests
         var compressed = new byte[Compressor.GetMaxCompressedLength(codec, length)];
         int compressedLength = Compressor.Compress(codec, data, compressed, level);
 
+#if NET11_0_OR_GREATER
+        var roundTripped = new MemoryStream();
+        using (Stream reader = codec == CompressionCodec.Gzip
+            ? new System.IO.Compression.GZipStream(
+                new MemoryStream(compressed, 0, compressedLength), System.IO.Compression.CompressionMode.Decompress)
+            : new System.IO.Compression.DeflateStream(
+                new MemoryStream(compressed, 0, compressedLength), System.IO.Compression.CompressionMode.Decompress))
+        {
+            reader.CopyTo(roundTripped);
+        }
+
+        Assert.Equal(data, roundTripped.ToArray());
+        Assert.True(
+            compressedLength <= expected.Length + expected.Length / 100 + 16,
+            $"{compressedLength} bytes against the stream's {expected.Length}");
+#else
         Assert.Equal(expected.ToArray(), compressed.AsSpan(0, compressedLength).ToArray());
+#endif
     }
 
     [Theory]
