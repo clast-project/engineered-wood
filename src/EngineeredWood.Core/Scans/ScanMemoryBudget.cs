@@ -444,10 +444,15 @@ internal sealed class ScanMemoryBudget
                 return;
             _closed = true;
             long left = _memory.UsedLocked;
+            LeftAtClose = left;
             if (left != 0)
                 _memory.AdjustLocked(-left);
         }
     }
+
+    /// <summary>What <see cref="Close"/> found still charged and handed back: for tests that every unit let go of what
+    /// it charged, which <see cref="Used"/> after the scan cannot show, since Close zeroes it either way (#903).</summary>
+    internal long LeftAtClose { get; private set; }
 
     private int QueuedLocked(int unit) => _queued.TryGetValue(unit, out int n) ? n : 0;
 

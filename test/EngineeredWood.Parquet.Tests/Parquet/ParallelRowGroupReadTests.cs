@@ -324,6 +324,92 @@ public class ParallelRowGroupReadTests : IDisposable
         Assert.Equal(0, reader.LastScanBudget!.Used);
     }
 
+    /// <summary>
+    /// #887 / #903 review: a two-pass read reserves its second pass between its passes, so on a budget that binds, the
+    /// units behind the front one wait there, holding their chunks and what their first pass kept. A scan stopped
+    /// early, by cancellation or by its consumer leaving, must let all of it go, whatever each unit was waiting for:
+    /// each unit's own releases must balance what it charged before the scan's close hands back the rest
+    /// (<see cref="EngineeredWood.Scans.ScanMemoryBudget.LeftAtClose"/>). The first pass is answered from <c>k</c>'s dictionary, so it is a bitmap,
+    /// and the second, <c>v</c>, is what the budget cannot hold for every unit at once.
+    /// </summary>
+    [Theory]
+    [InlineData(300_000, false, false, null)]
+    [InlineData(300_000, true, false, null)]
+    [InlineData(600_000, false, false, null)]
+    [InlineData(600_000, true, false, null)]
+    [InlineData(1_200_000, false, false, null)]
+    [InlineData(300_000, false, true, null)]
+    [InlineData(600_000, true, true, null)]
+    // Split groups keeping rows in one batch: each holds its keep-rows decode before the wait, too.
+    [InlineData(300_000, false, false, 5_000)]
+    [InlineData(300_000, true, false, 5_000)]
+    [InlineData(600_000, true, true, 5_000)]
+    public async Task ATwoPassScanStoppedEarly_LeavesNothingHeld_WhereverItsUnitsWaited(
+        long budget, bool cancel, bool shared, int? batchSize)
+    {
+        const int groups = 12, groupRows = 20_000;
+        string path = Path.Combine(_tempDir, "two-pass-stopped.parquet");
+        var arrowSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("k", Int64Type.Default, false))
+            .Field(new Field("v", Int64Type.Default, false))
+            .Build();
+        var random = new Random(903);
+        await using (var output = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(output, ownsFile: false))
+        {
+            for (int g = 0; g < groups; g++)
+            {
+                var keys = new Int64Array.Builder();
+                var values = new Int64Array.Builder();
+                for (int i = 0; i < groupRows; i++)
+                {
+                    keys.Append(i % 100);
+                    // Random.NextInt64 is not on .NET Framework.
+                    values.Append(((long)random.Next() << 32) | (uint)random.Next());
+                }
+                using var batch = new RecordBatch(arrowSchema, [keys.Build(), values.Build()], groupRows);
+                await writer.WriteRowGroupAsync(batch);
+            }
+            await writer.CloseAsync();
+        }
+
+        var parent = shared ? new EngineeredWood.Memory.MemoryBudget(budget) : null;
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(
+            file, ownsFile: false, Options(8, shared ? 1L << 30 : budget) with { MemoryBudget = parent, BatchSize = batchSize })
+        {
+            TwoPassReads = true,
+        };
+        var scan = new ParquetScan { Columns = ["v"], RowFilter = new RowFilter(KeyPredicate(k => k < 5, true)) };
+        using var cts = new CancellationTokenSource();
+        int taken = 0;
+        try
+        {
+            await foreach (var selected in reader.ReadSelectedAsync(scan, cts.Token))
+            {
+                selected.Dispose();
+                // Long enough for the units behind to reach their waits.
+                await Task.Delay(20);
+                if (++taken == 2)
+                {
+                    if (!cancel)
+                        break;
+                    cts.Cancel();
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancel)
+        {
+        }
+
+        Assert.Equal(2, taken);
+        // Close hands back anything still charged, so Used is 0 after any scan: what it found is the test.
+        Assert.Equal(0, reader.LastScanBudget!.LeftAtClose);
+        Assert.Equal(0, reader.LastScanBudget.Used);
+        if (parent is not null)
+            Assert.Equal(0, parent.UsedBytes);
+    }
+
     [Fact]
     public async Task AReadError_SurfacesAtItsRowGroup_AfterEveryBatchBeforeIt()
     {
