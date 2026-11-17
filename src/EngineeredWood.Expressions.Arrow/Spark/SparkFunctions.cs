@@ -536,38 +536,33 @@ internal static class SparkFunctions
             return ReadBoolean(a, index) == ReadBoolean(b, index);
 
         // Exact where both sides have an exact form, so scale differences do not separate equal
-        // values; double only when one side cannot be exact anyway.
+        // values.
         if (SparkWideDecimals.IsExact(left.Data.DataType) && SparkWideDecimals.IsExact(right.Data.DataType))
         {
-            var first = SparkWideDecimals.Read(left, index);
-            var second = SparkWideDecimals.Read(right, index);
+            var exactFirst = SparkWideDecimals.Read(left, index);
+            var exactSecond = SparkWideDecimals.Read(right, index);
 
-            return first is null || second is null
-                ? first is null && second is null
-                : SparkWideDecimals.AreEqual(first.Value, second.Value);
+            return exactFirst is null || exactSecond is null
+                ? exactFirst is null && exactSecond is null
+                : SparkWideDecimals.AreEqual(exactFirst.Value, exactSecond.Value);
         }
 
-        try
-        {
-            return SparkArrays.ReadDecimal(left, index) == SparkArrays.ReadDecimal(right, index);
-        }
-        catch (NotSupportedException)
-        {
-            // Reached when a value has no exact System.Decimal form: a magnitude past decimal's
-            // ceiling near 7.9e28, or a NaN or an infinity. ReadDecimal must keep signalling that
-            // with NotSupportedException for a float or double as well as for a Decimal128, or
-            // it escapes the evaluator instead of landing here.
-            //
-            // Compared with Spark's NaN rule, not IEEE's: `nullif(CAST('NaN' AS DOUBLE),
-            // CAST('NaN' AS DOUBLE))` is NULL, so Spark holds NaN equal to itself here exactly as
-            // `=`, `<=>` and `IN` do, where `==` on two NaNs is false.
-            var first = SparkArrays.ReadDouble(left, index);
-            var second = SparkArrays.ReadDouble(right, index);
+        // What is left has a float or a double on one side (or a `void`, which reads as null),
+        // and Spark compares it as a double: its coercion widens the other side to DOUBLE, a
+        // decimal through BigDecimal.doubleValue, which ReadDouble matches by rounding once.
+        // Not through System.Decimal (#911): `(decimal)double` rounds to 15 significant digits
+        // through .NET 10, which made nullif(0.30000000000000004D, 0.3BD) NULL, and keeps the
+        // binary expansion on .NET 11, which made nullif(0.1D, 0.1BD) 0.1. Spark answers neither.
+        //
+        // Compared with Spark's NaN rule, not IEEE's: `nullif(CAST('NaN' AS DOUBLE),
+        // CAST('NaN' AS DOUBLE))` is NULL, so Spark holds NaN equal to itself here exactly as
+        // `=`, `<=>` and `IN` do, where `==` on two NaNs is false.
+        var first = SparkArrays.ReadDouble(left, index);
+        var second = SparkArrays.ReadDouble(right, index);
 
-            return first is null || second is null
-                ? first is null && second is null
-                : CompareDoubles(first.Value, second.Value) == 0;
-        }
+        return first is null || second is null
+            ? first is null && second is null
+            : CompareDoubles(first.Value, second.Value) == 0;
     }
 
     public static string? ReadString(IArrowArray array, int index)

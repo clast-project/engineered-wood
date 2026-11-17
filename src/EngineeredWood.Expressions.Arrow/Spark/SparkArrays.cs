@@ -47,6 +47,7 @@ internal static class SparkArrays
             _index = index;
             IsNumeric = true;
             FromString = false;
+            IsFloating = array is FloatArray or DoubleArray;
         }
 
         /// <summary>A binary cell, decoded only if something asks for its text.</summary>
@@ -130,6 +131,15 @@ internal static class SparkArrays
         /// mode the fail-closed design exists to avoid.
         /// </remarks>
         public decimal? Exact { get; }
+
+        /// <summary>Whether the source is a float or a double column.</summary>
+        /// <remarks>
+        /// Such a value has no <see cref="Exact"/> form (#911): Spark computes on the double
+        /// itself, truncating it for an integral cast and multiplying it for a timestamp, so a
+        /// cast reads <see cref="AsDouble"/> instead. A float has already been widened to double,
+        /// exactly, as Spark's <c>f.toDouble</c> does.
+        /// </remarks>
+        public bool IsFloating { get; }
 
         /// <summary>Whether the value arrived as text rather than as a number.</summary>
         /// <remarks>
@@ -276,6 +286,14 @@ internal static class SparkArrays
 #endif
     }
 
+    /// <summary>An exact numeric cell as a <see cref="decimal"/>.</summary>
+    /// <remarks>
+    /// Not for a float or a double (#911): Spark computes on the double itself, and the only
+    /// System.Decimal on offer is <c>(decimal)double</c>, which rounds to 15 significant digits
+    /// through .NET 10 and keeps the binary expansion on .NET 11, so neither runtime gives Spark's
+    /// value. Those sources are refused here rather than converted, and every caller branches on
+    /// them first.
+    /// </remarks>
     public static decimal? ReadDecimal(IArrowArray array, int index) => array switch
     {
         NullArray => null,
@@ -283,42 +301,13 @@ internal static class SparkArrays
         Int16Array a => a.IsNull(index) ? null : a.GetValue(index),
         Int32Array a => a.IsNull(index) ? null : a.GetValue(index),
         Int64Array a => a.IsNull(index) ? null : a.GetValue(index),
-        FloatArray a => a.IsNull(index) ? null : ExactDecimal(a.GetValue(index)!.Value, a),
-        DoubleArray a => a.IsNull(index) ? null : ExactDecimal(a.GetValue(index)!.Value, a),
         Decimal128Array a => a.IsNull(index) ? null : ExactDecimal(a, index),
+        FloatArray or DoubleArray => throw new NotSupportedException(
+            $"a {array.Data.DataType.Name} value has no System.Decimal form that matches Spark's; " +
+            "read it as a double"),
         _ => throw new NotSupportedException(
             $"{array.Data.DataType.Name} is not a numeric array"),
     };
-
-    /// <summary>
-    /// A floating-point value as an exact <see cref="decimal"/>, refusing when it has no such form.
-    /// </summary>
-    /// <remarks>
-    /// Refuses with the same exception as <see cref="ExactDecimal(Decimal128Array,int)"/>. A
-    /// checked conversion from a double signals out-of-range with
-    /// <see cref="OverflowException"/>, but callers such as <see cref="SparkFunctions.AreEqual"/>
-    /// catch only <see cref="NotSupportedException"/>, so letting it through would escape the
-    /// evaluator as a bare BCL exception.
-    /// <para>
-    /// Everything <see cref="decimal"/> cannot hold arrives here: a magnitude past its ceiling near
-    /// 7.9228e28, and every NaN and infinity. A caught conversion rather than a range test,
-    /// because the boundary is <see cref="decimal"/>'s own and the conversion already knows it
-    /// exactly; it costs an exception only on values that have no exact form anyway.
-    /// </para>
-    /// </remarks>
-    private static decimal ExactDecimal(double value, IArrowArray array)
-    {
-        try
-        {
-            return (decimal)value;
-        }
-        catch (OverflowException)
-        {
-            throw new NotSupportedException(
-                $"a {array.Data.DataType.Name} value of {value} has no exact System.Decimal form; " +
-                "a caller that can degrade to a double does so, and one needing exactness refuses");
-        }
-    }
 
     /// <summary>
     /// A Decimal128 cell as an exact <see cref="decimal"/>, refusing when it does not fit.
@@ -329,10 +318,8 @@ internal static class SparkArrays
     /// callers that want a <see cref="decimal"/> specifically, where a value past decimal's
     /// ceiling near 7.9e28 has no exact form.
     /// <para>
-    /// Refusing rather than rounding is load-bearing in both directions. It is what lets equality
-    /// fall back to a double comparison when one side is a float and cannot be exact anyway, and
-    /// it is what keeps a cast needing exactness fail-closed — a CHECK constraint that silently
-    /// rounds is worse than one that refuses.
+    /// Refusing rather than rounding is load-bearing: it is what keeps a cast needing exactness
+    /// fail-closed — a CHECK constraint that silently rounds is worse than one that refuses.
     /// </para>
     /// </remarks>
     private static decimal ExactDecimal(Decimal128Array array, int index)
@@ -484,7 +471,13 @@ internal static class SparkArrays
         // Since the value is null past the bound and quietly rounded inside it, Render works from
         // the buffer instead; this serves only the casts that need an exact System.Decimal, and
         // those refuse when it is null.
-        decimal? exact = asDouble.Value is >= -7.9e28 and <= 7.9e28
+        //
+        // A float or double gets none at all (#911). Spark computes on the double itself, and the
+        // only System.Decimal on offer is `(decimal)double`, which rounds to 15 significant
+        // digits through .NET 10 and keeps the binary expansion on .NET 11: neither is Spark's
+        // value. The casts branch on IsFloating before they look for an exact form.
+        decimal? exact = array is not (FloatArray or DoubleArray)
+            && asDouble.Value is >= -7.9e28 and <= 7.9e28
             ? ReadDecimal(array, index)
             : null;
 
