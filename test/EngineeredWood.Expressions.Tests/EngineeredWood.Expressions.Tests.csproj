@@ -32,4 +32,9 @@
     <PackageReference Include="System.Text.Json" VersionOverride="9.0.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Warm-up then best-of-three for the "finishes at once" tests; see test/Shared/Timing.cs. -->
+    <Compile Include="..\Shared\Timing.cs" Link="Shared\Timing.cs" />
+  </ItemGroup>
+
 </Project>

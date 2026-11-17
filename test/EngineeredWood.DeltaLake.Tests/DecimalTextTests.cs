@@ -1,9 +1,9 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using System.Diagnostics;
 using System.Numerics;
 using EngineeredWood.DeltaLake.Schema;
+using EngineeredWood.Tests;
 
 namespace EngineeredWood.DeltaLake.Tests;
 
@@ -30,9 +30,7 @@ public class DecimalTextTests
     [InlineData("1234567890123456789.01234567890123456789e1")]
     public void OutOfRangeValueIsRefusedAtOnce(string text)
     {
-        var watch = Stopwatch.StartNew();
-        Assert.False(DecimalText.TryParse(text, out _, out _));
-        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+        Timing.AssertQuick(() => Assert.False(DecimalText.TryParse(text, out _, out _)));
     }
 
     [Theory]
