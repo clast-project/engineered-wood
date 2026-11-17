@@ -288,4 +288,112 @@ public class ScaledDecimalTests
         }
     }
 #endif
+    /// <summary>
+    /// The digit count from the bit length is exact at every power of ten and either side of it,
+    /// which is where an estimate from a logarithm would be off by one. #902.
+    /// </summary>
+    [Fact]
+    public void DigitCountIsExactAtEveryPowerOfTen()
+    {
+        var wrong = new List<string>();
+        var power = BigInteger.One;
+
+        for (var k = 1; k <= 400; k++)
+        {
+            power *= 10; // 10^k, which has k + 1 digits
+            foreach (var (value, expected) in new[] { (power - 1, k), (power, k + 1), (power + 1, k + 1) })
+            {
+                if (ScaledDecimal.DigitCount(value) != expected)
+                    wrong.Add($"10^{k}{(value < power ? "-1" : value > power ? "+1" : "")}");
+                if (ScaledDecimal.DigitCount(-value) != expected)
+                    wrong.Add($"-(10^{k}{(value < power ? "-1" : value > power ? "+1" : "")})");
+            }
+        }
+
+        // Either side of the ulong boundary, where the count changes method.
+        var top = new BigInteger(ulong.MaxValue);
+        Assert.Equal(20, ScaledDecimal.DigitCount(top));
+        Assert.Equal(20, ScaledDecimal.DigitCount(top + 1));
+        Assert.Equal(1, ScaledDecimal.DigitCount(BigInteger.Zero));
+        Assert.Empty(wrong);
+    }
+
+    /// <summary>
+    /// The digit count's starting estimate never exceeds the true count, even at the bit lengths
+    /// where <c>(bits-1) log10 2</c> falls just short of an integer and a double rounds it up.
+    /// #904 review.
+    /// </summary>
+    /// <remarks>
+    /// Values that large take far too long to build, so this checks the bound itself against
+    /// log10 2 to 60 digits. The listed exponents are the continued-fraction convergents of
+    /// log10 2 that approach an integer from below, the closest calls under int.MaxValue bits;
+    /// 146964308 is the one the review found, which a 1e-9 margin overcounted by one.
+    /// </remarks>
+    [Theory]
+    [InlineData(93)]
+    [InlineData(485)]
+    [InlineData(13301)]
+    [InlineData(42039)]
+    [InlineData(254370)]
+    [InlineData(6107016)]
+    [InlineData(44699994)]
+    [InlineData(146964308)]
+    [InlineData(345060773)]
+    [InlineData(1923400330)]
+    public void DigitCountLowerBoundNeverOvercounts(int exponent)
+    {
+        // 2^exponent has exponent + 1 bits; check it and the bit lengths either side.
+        for (var bits = exponent - 1; bits <= exponent + 3; bits++)
+        {
+            var exact = MinimumDigits(bits);
+            var bound = ScaledDecimal.DigitCountLowerBound(bits);
+
+            Assert.True(bound <= exact, $"{bits} bits: bound {bound} over the true {exact}");
+            Assert.True(bound >= exact - 2, $"{bits} bits: bound {bound} too far under {exact}");
+        }
+    }
+
+    [Fact]
+    public void DigitCountLowerBoundHoldsForEveryBitLengthUpToAHundredThousand()
+    {
+        for (var bits = 1; bits <= 100_000; bits++)
+        {
+            var exact = MinimumDigits(bits);
+            var bound = ScaledDecimal.DigitCountLowerBound(bits);
+            if (bound > exact || bound < exact - 2)
+                Assert.Fail($"{bits} bits: bound {bound}, true {exact}");
+        }
+    }
+
+    /// <summary>The digits of 2^(bits-1), the smallest value with that many bits, from log10 2 to 60 places.</summary>
+    private static int MinimumDigits(int bits)
+    {
+        var log10Of2 = BigInteger.Parse("301029995663981195213738894724493026768189881462108541310427");
+        var scale = BigInteger.Pow(10, 60);
+        return (int)((bits - 1) * log10Of2 / scale) + 1;
+    }
+
+    /// <summary>Counting digits costs about one multiplication of the value's size, not one division per digit.</summary>
+    [Fact]
+    public void DigitCountOfAHugeValueIsQuick()
+    {
+        // Measured against building the value, not against a fixed budget: the count builds one
+        // power of ten about as long as the value, so it costs what the caller already paid, and
+        // what that is depends on the runtime. .NET Framework's BigInteger multiplies by
+        // schoolbook, and a fixed 1 s failed there at 200000 digits in CI (#904). Dividing by ten
+        // once per digit, as before #902, costs hundreds of times the build on every runtime.
+        ScaledDecimal.DigitCount(BigInteger.Pow(10, 100) - 1); // JIT both paths first
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var value = BigInteger.Pow(10, 100_000) - 1;
+        var build = watch.Elapsed;
+
+        watch.Restart();
+        Assert.Equal(100_000, ScaledDecimal.DigitCount(value));
+        var count = watch.Elapsed;
+
+        Assert.True(
+            count < TimeSpan.FromTicks(4 * build.Ticks) + TimeSpan.FromMilliseconds(250),
+            $"counting took {count.TotalMilliseconds:F0} ms, building {build.TotalMilliseconds:F0} ms");
+    }
 }

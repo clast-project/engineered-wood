@@ -75,8 +75,8 @@ internal static class SparkDecimalRounding
         if (!IsExactDecimal(literal) && !IsExactDecimal(bound))
             return false;
 
-        if (!TryDescribe(literal, literalTyping: !setMembership, out var literalDigits, out var literalScale)
-            || !TryDescribe(bound, literalTyping: false, out var boundDigits, out var boundScale))
+        if (!TryDescribeWide(literal, literalTyping: !setMembership, out var literalDigits, out var literalScale)
+            || !TryDescribeWide(bound, literalTyping: false, out var boundDigits, out var boundScale))
         {
             // Not a pair Spark unifies as decimals - a float compares as a double, and anything
             // else is not this rule's business. CompareTo's own exactness flag covers those.
@@ -86,8 +86,11 @@ internal static class SparkDecimalRounding
         // A width of -1 is "declared, and not knowable from the value", which is every decimal
         // that is not a binary comparison's literal. Bounded by the widest a declared
         // decimal(p, scale) can be.
-        var literalWidest = literalDigits >= 0 ? literalDigits : MaxPrecision - literalScale;
-        var boundWidest = boundDigits >= 0 ? boundDigits : MaxPrecision - boundScale;
+        //
+        // All of this is in long: HighPrecisionDecimalOf takes any int scale, and digits minus a
+        // scale near int.MinValue, or a width plus one near int.MaxValue, would wrap (#902).
+        var literalWidest = literalDigits >= 0 ? literalDigits : MaxPrecision - (long)literalScale;
+        var boundWidest = boundDigits >= 0 ? boundDigits : MaxPrecision - (long)boundScale;
 
         // The bound. Only the literal's integral digits can force its scale down, and for a binary
         // comparison those are known exactly.
@@ -112,7 +115,7 @@ internal static class SparkDecimalRounding
         // case where it would be is the one already refused above), so the literal moves by less
         // than half a unit at `boundScale`. If the two values are farther apart than that, every
         // scale the clamp could choose leaves the comparison pointing the same way.
-        return !FartherApartThanHalfAUnit(literal, bound, boundScale);
+        return !FartherApartThanHalfAUnit(literal, bound);
     }
 
     /// <summary>Whether this is one of the two kinds Spark unifies as a decimal.</summary>
@@ -120,30 +123,70 @@ internal static class SparkDecimalRounding
         value.Type is LiteralValue.Kind.Decimal or LiteralValue.Kind.HighPrecisionDecimal;
 
     /// <summary>
-    /// Whether the two differ by more than half a unit at <paramref name="scale"/>, exactly.
+    /// Whether the literal and the bound differ by more than half a unit at the bound's scale,
+    /// exactly. The literal's scale must be greater than the bound's, which <see cref="Rounds"/>
+    /// has established by the time it asks.
     /// </summary>
     /// <remarks>
-    /// Both are lifted to a common scale so the comparison is between integers, and the half is
-    /// cleared by doubling rather than by dividing, which would be the one place a rounding rule
-    /// could round.
+    /// <para>
+    /// Lifting both to the literal's scale would build a power of ten as long as that scale,
+    /// which any caller of <c>HighPrecisionDecimalOf</c> chooses (#902). Instead both go to one
+    /// place past the bound's scale, where half a unit is exactly 5: the bound by a single
+    /// multiplication by ten, and the literal by truncating its extra places toward zero.
+    /// </para>
+    /// <para>
+    /// The truncation cannot change the answer. Its remainder is less than one at the new scale
+    /// and has the literal's sign, and the truncated difference <c>D</c> is an integer there, so
+    /// <c>|D| &gt;= 6</c> is farther apart and <c>|D| &lt;= 4</c> is not, whatever was dropped.
+    /// Only <c>|D| == 5</c> turns on the remainder: farther apart exactly when one was dropped
+    /// and it points away from the bound, the way <c>D</c> already does.
+    /// </para>
+    /// <para>
+    /// The one power left divides away the literal's extra places, and is built only when it is
+    /// shorter than the literal's own unscaled value - otherwise the truncation is zero and needs
+    /// no division - so nothing here is larger than the values themselves.
+    /// </para>
     /// </remarks>
-    private static bool FartherApartThanHalfAUnit(LiteralValue left, LiteralValue right, int scale)
+    private static bool FartherApartThanHalfAUnit(LiteralValue literal, LiteralValue bound)
     {
-        if (!TryUnscaled(left, out var leftUnscaled, out var leftScale)
-            || !TryUnscaled(right, out var rightUnscaled, out var rightScale))
+        if (!TryUnscaled(literal, out var literalUnscaled, out var literalScale)
+            || !TryUnscaled(bound, out var boundUnscaled, out var boundScale))
         {
             return false;
         }
 
-        var common = Math.Max(leftScale, rightScale);
-        var difference = BigInteger.Abs(
-            (leftUnscaled * Power(common - leftScale)) - (rightUnscaled * Power(common - rightScale)));
+        // Places to drop from the literal to reach one past the bound's scale; at least zero
+        // because the literal's scale is past the bound's. In long: two int scales can be
+        // further apart than an int holds.
+        var drop = (long)literalScale - boundScale - 1;
 
-        return 2 * difference > Power(common - scale);
+        BigInteger truncated, remainder;
+        if (drop == 0)
+        {
+            truncated = literalUnscaled;
+            remainder = BigInteger.Zero;
+        }
+        else if (Digits(literalUnscaled) <= drop)
+        {
+            // The literal is smaller than one unit at the new scale, so all of it is dropped.
+            truncated = BigInteger.Zero;
+            remainder = literalUnscaled;
+        }
+        else
+        {
+            // drop < Digits, so the power is shorter than the literal and drop fits an int.
+            // DivRem truncates toward zero and gives the remainder the dividend's sign.
+            truncated = BigInteger.DivRem(literalUnscaled, BigInteger.Pow(10, (int)drop), out remainder);
+        }
+
+        var difference = truncated - (boundUnscaled * 10);
+        var distance = BigInteger.Abs(difference);
+
+        if (distance != 5)
+            return distance > 5;
+
+        return !remainder.IsZero && remainder.Sign == difference.Sign;
     }
-
-    private static BigInteger Power(int exponent) =>
-        exponent <= 0 ? BigInteger.One : BigInteger.Pow(10, exponent);
 
     /// <summary>The value as an unscaled integer and a scale, for whichever exact kind it is.</summary>
     private static bool TryUnscaled(LiteralValue value, out BigInteger unscaled, out int scale)
@@ -207,7 +250,20 @@ internal static class SparkDecimalRounding
     /// Integral digits, or -1 when the value is a decimal whose declared width is not knowable
     /// from the value alone.
     /// </param>
+    /// <remarks>
+    /// An integral digit count past what an int holds - only reachable from a scale near
+    /// <c>int.MinValue</c> - saturates at <c>int.MaxValue</c>. <see cref="Rounds"/> reads the
+    /// exact count instead.
+    /// </remarks>
     internal static bool TryDescribe(LiteralValue value, bool literalTyping, out int digits, out int scale)
+    {
+        var described = TryDescribeWide(value, literalTyping, out var wide, out scale);
+        digits = (int)Math.Min(wide, int.MaxValue);
+        return described;
+    }
+
+    /// <summary><see cref="TryDescribe"/>, with the integral digits in a long so they cannot wrap.</summary>
+    private static bool TryDescribeWide(LiteralValue value, bool literalTyping, out long digits, out int scale)
     {
         digits = 0;
         scale = 0;
@@ -236,7 +292,7 @@ internal static class SparkDecimalRounding
             {
                 var (unscaled, s) = value.AsHighPrecisionDecimal;
                 scale = s;
-                digits = literalTyping ? Math.Max(Digits(unscaled) - s, 0) : -1;
+                digits = literalTyping ? Math.Max(Digits(unscaled) - (long)s, 0) : -1;
                 return true;
             }
 
@@ -263,19 +319,7 @@ internal static class SparkDecimalRounding
     };
 
     /// <summary>How many digits an integer is written with, which is one for zero.</summary>
-    private static int Digits(BigInteger value)
-    {
-        value = BigInteger.Abs(value);
-
-        var digits = 1;
-        while (value >= 10)
-        {
-            value /= 10;
-            digits++;
-        }
-
-        return digits;
-    }
+    private static int Digits(BigInteger value) => ScaledDecimal.DigitCount(value);
 
     /// <summary>A <c>decimal</c>'s declared scale, which its representation carries.</summary>
     private static int DecimalScale(decimal value) => (decimal.GetBits(value)[3] >> 16) & 0xFF;

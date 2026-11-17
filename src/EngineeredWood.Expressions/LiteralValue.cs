@@ -534,8 +534,8 @@ public readonly struct LiteralValue : IEquatable<LiteralValue>, IComparable<Lite
     }
 
     /// <summary>The number of decimal digits in a non-zero value's magnitude.</summary>
-    private static int DigitCount(BigInteger value) =>
-        BigInteger.Abs(value).ToString(System.Globalization.CultureInfo.InvariantCulture).Length;
+    /// <remarks>Not by formatting it, which is quadratic in its length (#902).</remarks>
+    private static int DigitCount(BigInteger value) => ScaledDecimal.DigitCount(value);
 
 #if NET6_0_OR_GREATER
     internal static bool TryAsInstant(LiteralValue v, out DateTimeOffset instant)

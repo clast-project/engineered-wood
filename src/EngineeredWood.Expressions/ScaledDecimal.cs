@@ -288,6 +288,68 @@ internal static class ScaledDecimal
         return quotient;
     }
 
+    /// <summary>How many digits an integer is written with, which is one for zero.</summary>
+    /// <remarks>
+    /// Not by dividing by ten once per digit, which is quadratic in the length and is reached by a
+    /// predicate literal of any size (#902). The bit length pins the count to within one, and a
+    /// single power of ten about as long as the value settles it.
+    /// </remarks>
+    internal static int DigitCount(BigInteger value)
+    {
+        value = BigInteger.Abs(value);
+
+        if (value <= ulong.MaxValue)
+        {
+            var small = (ulong)value;
+            var count = 1;
+            while (small >= 10)
+            {
+                small /= 10;
+                count++;
+            }
+
+            return count;
+        }
+
+        var digits = DigitCountLowerBound(BitLength(value));
+
+        var power = BigInteger.Pow(10, digits);
+        while (value >= power)
+        {
+            power *= 10;
+            digits++;
+        }
+
+        return digits;
+    }
+
+    /// <summary>
+    /// A count of digits no greater than that of any value with this many bits, and at most two
+    /// short of it.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// A value of <c>bits</c> bits is at least <c>2^(bits-1)</c>, so it has at least
+    /// <c>floor((bits-1) log10 2) + 1</c> digits. That product is computed in a double, and it
+    /// must not round up across an integer: an overcount cannot be corrected by the loop in
+    /// <see cref="DigitCount"/>, which only counts up, and one digit too many reorders two
+    /// decimals whose scales are far apart.
+    /// </para>
+    /// <para>
+    /// No margin small enough to keep the bound tight survives every bit length. For
+    /// <c>2^146964308</c> the product is 44240664.9999999969, closer to an integer than the
+    /// double's spacing there, so it rounds to 44240665 and a 1e-9 margin is below what a
+    /// subtraction at that size can resolve (#904 review). So the bound drops the <c>+ 1</c>
+    /// instead. The double's error is far below one at any bit length an int holds, so the
+    /// truncated product is at most <c>floor((bits-1) log10 2)</c>, a digit under the true
+    /// bound, and the counting loop spends one extra multiplication by ten to make it up.
+    /// </para>
+    /// </remarks>
+    internal static int DigitCountLowerBound(int bits) =>
+        bits <= 1 ? 1 : Math.Max(1, (int)((bits - 1) * Log10Of2));
+
+    private const double Log10Of2 = 0.30102999566398119521;
+
     /// <summary>
     /// Bits in a non-negative <see cref="BigInteger"/>. Not <c>GetBitLength</c>, which arrived in
     /// net5.0 and this assembly targets netstandard2.0.

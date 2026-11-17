@@ -709,6 +709,75 @@ public class StatisticsEvaluatorTests
         Assert.Equal(FilterResult.AlwaysTrue, Eval(Expressions.LessThan("d", 4), stats));
     }
 
+    /// <summary>
+    /// A predicate literal's size does not set the cost of the rounding check that runs before
+    /// every exact comparison. #902.
+    /// </summary>
+    /// <remarks>
+    /// <c>HighPrecisionDecimalOf</c> is public and takes any scale. The check counted digits by
+    /// dividing by ten once per digit, and lined the literal and the bound up at the literal's
+    /// scale, so <c>(1, 4_000_000)</c> took 13 s for one row group. Literals Spark could not type
+    /// at all are refused (Unknown) where they could round, and decided exactly where not.
+    /// </remarks>
+    [Theory]
+    [InlineData(10000, 0, FilterResult.Unknown)] // 10^10000: far more integral digits than 38
+    [InlineData(40000, 0, FilterResult.Unknown)]
+    [InlineData(0, 1_000_000, FilterResult.AlwaysFalse)] // 10^-1000000, far below the min
+    [InlineData(0, 4_000_000, FilterResult.AlwaysFalse)]
+    [InlineData(0, int.MaxValue, FilterResult.AlwaysFalse)]
+    [InlineData(0, int.MinValue, FilterResult.Unknown)] // 10^2147483648
+    public void AHugeLiteralIsCheckedForRoundingAtOnce(int exponent, int scale, FilterResult expected)
+    {
+        var stats = new TestStats().With(
+            "d",
+            min: LiteralValue.HighPrecisionDecimalOf(new System.Numerics.BigInteger(125), 2),
+            max: LiteralValue.HighPrecisionDecimalOf(new System.Numerics.BigInteger(975), 2),
+            nullCount: 0);
+        var literal = LiteralValue.HighPrecisionDecimalOf(System.Numerics.BigInteger.Pow(10, exponent), scale);
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var result = Eval(Compare("d", ComparisonOperator.Equal, literal), stats);
+        watch.Stop();
+
+        Assert.Equal(expected, result);
+        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+    }
+
+    /// <summary>
+    /// A literal written with a long tail of zeros is the same value, and is checked as one without
+    /// building a power as long as its scale. #902.
+    /// </summary>
+    [Fact]
+    public void ALiteralWithAHugeScaleButAnOrdinaryValueIsCheckedAtOnce()
+    {
+        var stats = new TestStats().With(
+            "d",
+            min: LiteralValue.HighPrecisionDecimalOf(new System.Numerics.BigInteger(125), 2),
+            max: LiteralValue.HighPrecisionDecimalOf(new System.Numerics.BigInteger(975), 2),
+            nullCount: 0);
+
+        // 5.5 and 1.25, each followed by 20000 zeros, and 1.25 plus a unit in the last of them.
+        var tail = System.Numerics.BigInteger.Pow(10, 20_000);
+        var inside = LiteralValue.HighPrecisionDecimalOf(55 * tail, 20_001);
+        var atMin = LiteralValue.HighPrecisionDecimalOf(125 * tail, 20_002);
+        var justPastMin = LiteralValue.HighPrecisionDecimalOf((125 * tail) + 1, 20_002);
+        var below = LiteralValue.HighPrecisionDecimalOf(5 * tail, 20_001); // 0.5
+
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+
+        // Far from both bounds, so rounding cannot reach them and the answer is exact.
+        Assert.Equal(FilterResult.AlwaysFalse, Eval(Compare("d", ComparisonOperator.LessThan, below), stats));
+        Assert.Equal(FilterResult.Unknown, Eval(Compare("d", ComparisonOperator.Equal, inside), stats));
+        Assert.Equal(FilterResult.AlwaysTrue, Eval(Compare("d", ComparisonOperator.GreaterThan, below), stats));
+
+        // Within half a unit of the min, where rounding could move the literal onto it: refused.
+        Assert.NotEqual(FilterResult.AlwaysFalse, Eval(Compare("d", ComparisonOperator.Equal, atMin), stats));
+        Assert.NotEqual(FilterResult.AlwaysFalse, Eval(Compare("d", ComparisonOperator.Equal, justPastMin), stats));
+
+        watch.Stop();
+        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+    }
+
     private static FilterResult EvalLiterals(LiteralValue a, LiteralValue b) =>
         Eval(
             new ComparisonPredicate(
