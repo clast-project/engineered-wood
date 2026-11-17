@@ -327,9 +327,11 @@ prune on these bounds. Gaps:
 
 - *A FIXED_LEN_BYTE_ARRAY decimal leaf is probed but untested on a real
   file.* EW cannot write one with values: the Arrow shredder fails on a
-  `Decimal16` value, and a `Decimal16` shredding schema is written as
-  `DECIMAL(38,0)` whatever precision and scale it was given. The probe's
-  bytes are checked against the statistics decoder instead.
+  `Decimal16` value
+  ([apache/arrow-dotnet#498](https://github.com/apache/arrow-dotnet/issues/498)),
+  and takes the column's scale from its values, so a leaf with none is
+  written as `DECIMAL(38,0)` whatever the shredding schema declared. The
+  probe's bytes are checked against the statistics decoder instead.
 - *Row-level `variant_get` (#681) refuses some casts.* DML predicates and
   CHECK constraints on a variant path are evaluated row by row, but an
   object or array cast to `string`, a `timestamp_ntz` or nested target, and

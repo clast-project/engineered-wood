@@ -661,9 +661,10 @@ public class VariantPathPruningTests : IDisposable
 
     /// <summary>
     /// A FIXED_LEN_BYTE_ARRAY decimal leaf stores big-endian two's complement at the column's width. EW cannot fill one
-    /// here: the Arrow shredder fails on a Decimal16 value and does not put a narrower one in a 16-byte leaf. So the
-    /// probe's bytes are checked against the decoder that reads the leaf's statistics, on the schema EW writes, whose
-    /// 16-byte leaf is DECIMAL(38,0) whatever the shredding schema asked for.
+    /// here: the Arrow shredder fails on a Decimal16 value (apache/arrow-dotnet#498) and does not put a narrower one in
+    /// a 16-byte leaf. So the probe's bytes are checked against the decoder that reads the leaf's statistics, on the
+    /// schema EW writes. Its 16-byte leaf is DECIMAL(38,0): the shredder takes the scale from the column's values, and
+    /// there are none.
     /// </summary>
     [Theory]
     [InlineData("decimal(10,2)", "15.00", "15")]
