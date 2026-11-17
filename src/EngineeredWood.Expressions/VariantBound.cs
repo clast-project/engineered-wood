@@ -80,8 +80,306 @@ public readonly struct VariantBound
     public static VariantBound String(string value) =>
         new(VariantBoundKind.String, reference: value ?? throw new ArgumentNullException(nameof(value)));
 
-    private bool IsInteger =>
-        Kind is VariantBoundKind.Int8 or VariantBoundKind.Int16 or VariantBoundKind.Int32 or VariantBoundKind.Int64;
+    private bool IsInteger => IsIntegerKind(Kind);
+
+    private static bool IsIntegerKind(VariantBoundKind kind) =>
+        kind is VariantBoundKind.Int8 or VariantBoundKind.Int16 or VariantBoundKind.Int32 or VariantBoundKind.Int64;
+
+    /// <summary>
+    /// The value of an integer, a boolean (0 or 1), a date (days since 1970-01-01), or a timestamp of either
+    /// kind (microseconds since the epoch).
+    /// </summary>
+    public long AsInteger => IsInteger || Kind is VariantBoundKind.Boolean or VariantBoundKind.Date
+        or VariantBoundKind.Timestamp or VariantBoundKind.TimestampNtz
+        ? _integer
+        : throw new InvalidOperationException($"A {Kind} bound has no integer value.");
+
+    /// <summary>The value of a float (held exactly) or a double.</summary>
+    public double AsReal => Kind is VariantBoundKind.Float or VariantBoundKind.Double
+        ? _real
+        : throw new InvalidOperationException($"A {Kind} bound has no floating-point value.");
+
+    /// <summary>The value of a string.</summary>
+    public string AsString => Kind == VariantBoundKind.String
+        ? (string)_ref!
+        : throw new InvalidOperationException($"A {Kind} bound has no string value.");
+
+    /// <summary>The value of a decimal, by its unscaled digits and scale.</summary>
+    public (BigInteger Unscaled, int Scale) AsDecimal => Kind == VariantBoundKind.Decimal
+        ? ((BigInteger)_ref!, _scale)
+        : throw new InvalidOperationException($"A {Kind} bound has no decimal value.");
+
+    /// <summary>
+    /// The inverse of <see cref="ToLiteral"/>: the value a path of Variant type <paramref name="kind"/> must hold
+    /// for <c>variant_get(v, path, <paramref name="targetType"/>)</c> to equal <paramref name="literal"/>.
+    /// </summary>
+    /// <param name="kind">The Variant type the path holds, as a shredded leaf's Parquet type maps to it.</param>
+    /// <param name="scale">For a <see cref="VariantBoundKind.Decimal"/> kind, its scale; otherwise ignored.</param>
+    /// <param name="targetType">A canonical Spark type name (<see cref="VariantGetCall.TargetType"/>).</param>
+    /// <param name="literal">The value the result is compared with for equality.</param>
+    /// <param name="value">
+    /// The one value of the kind that converts to <paramref name="literal"/>, or null when no value of the kind
+    /// does.
+    /// </param>
+    /// <returns>
+    /// False when this cannot say, so the caller must not conclude anything: the pair of kind and type is one
+    /// Spark converts lossily, or <paramref name="literal"/> is not exactly a value of <paramref name="targetType"/>.
+    /// </returns>
+    /// <remarks>
+    /// <para>Three outcomes, not two, because a null <paramref name="value"/> is a claim that no row's result
+    /// equals the literal. That claim holds only for a pair whose every value converts exactly or not at all,
+    /// which are the pairs <see cref="ToLiteral"/> converts: an integer to an integer type or a decimal, a decimal
+    /// to a decimal of at least its scale, a float to <c>float</c> or <c>double</c>, a double to <c>double</c>,
+    /// and the others to their own type. A value that does not convert (an <c>Int64</c> past <c>int</c>) is an
+    /// error in <c>variant_get</c> and NULL in <c>try_variant_get</c>, never equal. Spark converts every other
+    /// pair loosely, measured against Spark 4.0: a string <c>"7"</c> to <c>int</c> 7, a double 1.5 to <c>int</c>
+    /// 1, a decimal 1.25 to <c>decimal(5,1)</c> 1.3, a date to a timestamp. Those decline.</para>
+    /// <para>The literal is first read as a value of <paramref name="targetType"/>, exactly, so the answer does
+    /// not depend on how a comparison of mixed types widens. A literal that is not one (7.5 against
+    /// <c>int</c>, or 1000 against <c>tinyint</c>) declines.</para>
+    /// <para>A NaN against <c>float</c> or <c>double</c> maps to a NaN of the kind; whether a source can be asked
+    /// about it is the caller's concern.</para>
+    /// </remarks>
+    public static bool TryInvert(
+        VariantBoundKind kind, int scale, string targetType, LiteralValue literal, out VariantBound? value)
+    {
+        value = null;
+        if (literal.IsNull)
+            return false;
+
+        switch (targetType)
+        {
+            case "tinyint":
+                return InvertInteger(kind, literal, sbyte.MinValue, sbyte.MaxValue, out value);
+            case "smallint":
+                return InvertInteger(kind, literal, short.MinValue, short.MaxValue, out value);
+            case "int":
+                return InvertInteger(kind, literal, int.MinValue, int.MaxValue, out value);
+            case "bigint":
+                return InvertInteger(kind, literal, long.MinValue, long.MaxValue, out value);
+
+            case "float":
+            {
+                if (kind != VariantBoundKind.Float || !TryAsFloat(literal, out float f))
+                    return false;
+                value = Float(f);
+                return true;
+            }
+
+            case "double":
+            {
+                if (kind is not (VariantBoundKind.Float or VariantBoundKind.Double) || !TryAsDouble(literal, out double d))
+                    return false;
+                if (kind == VariantBoundKind.Double)
+                {
+                    value = Double(d);
+                    return true;
+                }
+                // A float widens to double exactly (Spark 4.0: a float 0.1 reads as 0.10000000149011612), so only a
+                // double that is a float has one. A NaN is a NaN.
+                float narrowed = (float)d;
+                if (double.IsNaN(d) || (double)narrowed == d)
+                    value = Float(narrowed);
+                return true;
+            }
+
+            case "boolean":
+                if (kind != VariantBoundKind.Boolean || literal.Type != LiteralValue.Kind.Boolean)
+                    return false;
+                value = Boolean(literal.AsBoolean);
+                return true;
+
+            case "string":
+                if (kind != VariantBoundKind.String || literal.Type != LiteralValue.Kind.String)
+                    return false;
+                value = String(literal.AsString);
+                return true;
+
+            case "date":
+            {
+                if (kind != VariantBoundKind.Date || !TryAsDays(literal, out int days))
+                    return false;
+                value = Date(days);
+                return true;
+            }
+
+            case "timestamp" or "timestamp_ntz":
+            {
+                var own = targetType == "timestamp" ? VariantBoundKind.Timestamp : VariantBoundKind.TimestampNtz;
+                if (kind != own || !TryAsMicros(literal, out long micros))
+                    return false;
+                value = new VariantBound(own, integer: micros);
+                return true;
+            }
+
+            default:
+                return TryParseDecimalType(targetType, out int precision, out int declared)
+                    && InvertDecimal(kind, scale, precision, declared, literal, out value);
+        }
+    }
+
+    // An integer result of the range [min, max]: the literal must be exactly one, and the kind must be an integer,
+    // whose value is then the literal itself, if the kind can hold it.
+    private static bool InvertInteger(VariantBoundKind kind, LiteralValue literal, long min, long max, out VariantBound? value)
+    {
+        value = null;
+        if (!IsIntegerKind(kind) || !TryAsScaled(literal, out BigInteger unscaled, out int literalScale)
+            || !TryRescale(unscaled, literalScale, 0, out BigInteger integer)
+            || integer < min || integer > max)
+        {
+            return false;
+        }
+
+        if (FitsKind(kind, integer))
+            value = Integer(kind, (long)integer);
+        return true;
+    }
+
+    private static bool InvertDecimal(
+        VariantBoundKind kind, int scale, int precision, int declared, LiteralValue literal, out VariantBound? value)
+    {
+        value = null;
+        // The pairs ToDecimal converts: an integer (scale 0), or a decimal of at most the declared scale. A decimal
+        // of more scale rounds, which Spark does rather than fail.
+        int kindScale;
+        if (IsIntegerKind(kind))
+            kindScale = 0;
+        else if (kind == VariantBoundKind.Decimal && scale >= 0 && scale <= declared)
+            kindScale = scale;
+        else
+            return false;
+
+        if (!TryAsScaled(literal, out BigInteger unscaled, out int literalScale)
+            || !TryRescale(unscaled, literalScale, declared, out BigInteger result)
+            || BigInteger.Abs(result) >= BigInteger.Pow(10, precision))
+        {
+            return false;
+        }
+
+        // Back to the kind's scale: a result with digits below it is no value's conversion.
+        if (!TryRescale(result, declared, kindScale, out BigInteger own))
+            return true;
+        if (kind == VariantBoundKind.Decimal)
+            value = Decimal(own, kindScale);
+        else if (FitsKind(kind, own))
+            value = Integer(kind, (long)own);
+        return true;
+    }
+
+    private static bool FitsKind(VariantBoundKind kind, BigInteger value) => kind switch
+    {
+        VariantBoundKind.Int8 => value >= sbyte.MinValue && value <= sbyte.MaxValue,
+        VariantBoundKind.Int16 => value >= short.MinValue && value <= short.MaxValue,
+        VariantBoundKind.Int32 => value >= int.MinValue && value <= int.MaxValue,
+        VariantBoundKind.Int64 => value >= long.MinValue && value <= long.MaxValue,
+        _ => false,
+    };
+
+    // unscaled × 10^-from as an unscaled value at scale `to`, or false when that would drop a nonzero digit.
+    private static bool TryRescale(BigInteger unscaled, int from, int to, out BigInteger result)
+    {
+        if (to >= from)
+        {
+            result = unscaled * BigInteger.Pow(10, to - from);
+            return true;
+        }
+        result = BigInteger.DivRem(unscaled, BigInteger.Pow(10, from - to), out BigInteger remainder);
+        return remainder.IsZero;
+    }
+
+    // An exact number as unscaled × 10^-scale: an integer, or a decimal. Not a float or double, which are inexact.
+    private static bool TryAsScaled(LiteralValue literal, out BigInteger unscaled, out int scale)
+    {
+        scale = 0;
+        switch (literal.Type)
+        {
+            case LiteralValue.Kind.Int32: unscaled = literal.AsInt32; return true;
+            case LiteralValue.Kind.Int64: unscaled = literal.AsInt64; return true;
+            case LiteralValue.Kind.Decimal:
+            {
+                int[] bits = decimal.GetBits(literal.AsDecimal);
+                scale = (bits[3] >> 16) & 0x7F;
+                var magnitude = (new BigInteger((uint)bits[2]) << 64)
+                    | (new BigInteger((uint)bits[1]) << 32)
+                    | new BigInteger((uint)bits[0]);
+                unscaled = (bits[3] & unchecked((int)0x80000000)) != 0 ? -magnitude : magnitude;
+                return true;
+            }
+            case LiteralValue.Kind.HighPrecisionDecimal:
+                (unscaled, scale) = literal.AsHighPrecisionDecimal;
+                return scale >= 0;
+            default:
+                unscaled = default;
+                return false;
+        }
+    }
+
+    private static bool TryAsDouble(LiteralValue literal, out double value)
+    {
+        switch (literal.Type)
+        {
+            case LiteralValue.Kind.Double: value = literal.AsDouble; return true;
+            case LiteralValue.Kind.Float: value = literal.AsFloat; return true;
+            case LiteralValue.Kind.Int32: value = literal.AsInt32; return true;
+            case LiteralValue.Kind.Int64:
+                value = literal.AsInt64;
+                // Exact only if it converts back. long.MaxValue rounds up to 2^63, which no long holds.
+                return value < 9.2233720368547758E18 && (long)value == literal.AsInt64;
+            default:
+                value = 0;
+                return false;
+        }
+    }
+
+    private static bool TryAsFloat(LiteralValue literal, out float value)
+    {
+        value = 0;
+        if (literal.Type == LiteralValue.Kind.Float)
+        {
+            value = literal.AsFloat;
+            return true;
+        }
+        if (!TryAsDouble(literal, out double d))
+            return false;
+        value = (float)d;
+        return double.IsNaN(d) || (double)value == d;
+    }
+
+    private static bool TryAsDays(LiteralValue literal, out int days)
+    {
+        days = 0;
+        switch (literal.Type)
+        {
+#if NET6_0_OR_GREATER
+            case LiteralValue.Kind.DateOnly:
+                days = literal.AsDateOnly.DayNumber - 719_162; // days from 0001-01-01 to 1970-01-01
+                return true;
+#endif
+            case LiteralValue.Kind.DateTimeOffset:
+            {
+                // ToLiteral's form for a date: UTC midnight. Any other instant is no date.
+                var utc = literal.AsDateTimeOffset.UtcDateTime;
+                if (utc.TimeOfDay != TimeSpan.Zero)
+                    return false;
+                days = (int)(utc - s_epoch).TotalDays;
+                return true;
+            }
+            default:
+                return false;
+        }
+    }
+
+    private static bool TryAsMicros(LiteralValue literal, out long micros)
+    {
+        micros = 0;
+        if (literal.Type != LiteralValue.Kind.DateTimeOffset)
+            return false;
+        long ticks = literal.AsDateTimeOffset.UtcTicks - s_epoch.Ticks;
+        if (ticks % 10 != 0)
+            return false;
+        micros = ticks / 10;
+        return true;
+    }
 
     /// <summary>
     /// This value as a bound on <c>variant_get(v, path, <paramref name="targetType"/>)</c>, or null when it does

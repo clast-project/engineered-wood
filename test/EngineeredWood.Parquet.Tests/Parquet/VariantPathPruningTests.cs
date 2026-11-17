@@ -4,6 +4,7 @@
 using Apache.Arrow;
 using Apache.Arrow.Operations.Shredding;
 using Apache.Arrow.Scalars.Variant;
+using Apache.Arrow.Types;
 using EngineeredWood.Expressions;
 using EngineeredWood.Expressions.Arrow;
 using EngineeredWood.Expressions.Arrow.Spark;
@@ -100,14 +101,16 @@ public class VariantPathPruningTests : IDisposable
             yield return Row(i);
     }
 
-    private async Task<string> WriteAsync(int? pageRows, params RecordBatch[] rowGroups)
-    {
-        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N")[..8] + ".parquet");
-        var options = ParquetWriteOptions.Default with
+    private Task<string> WriteAsync(int? pageRows, params RecordBatch[] rowGroups) =>
+        WriteAsync(ParquetWriteOptions.Default with
         {
             VariantShredSchemas = new Dictionary<string, ShredSchema> { ["v"] = Shape },
             DataPageRowCountLimit = pageRows,
-        };
+        }, rowGroups);
+
+    private async Task<string> WriteAsync(ParquetWriteOptions options, params RecordBatch[] rowGroups)
+    {
+        string path = Path.Combine(_tempDir, Guid.NewGuid().ToString("N")[..8] + ".parquet");
         await using var file = new LocalSequentialFile(path);
         await using var writer = new ParquetFileWriter(file, ownsFile: false, options);
         foreach (var batch in rowGroups)
@@ -127,12 +130,13 @@ public class VariantPathPruningTests : IDisposable
         Batch(Range(200, 250).Append(Stray()).Concat(Range(251, 300))),
         Batch(Enumerable.Range(0, 50).Select(i => i % 2 == 0 ? NoA() : (VariantValue?)null)));
 
-    private static ParquetFileReader Open(string path, out LocalRandomAccessFile file)
+    private static ParquetFileReader Open(string path, out LocalRandomAccessFile file, ParquetReadOptions? options = null)
     {
         file = new LocalRandomAccessFile(path);
         var registry = new ExtensionTypeRegistry();
         registry.Register(VariantExtensionDefinition.Instance);
-        return new ParquetFileReader(file, ownsFile: false, new ParquetReadOptions { ExtensionRegistry = registry });
+        return new ParquetFileReader(file, ownsFile: false,
+            (options ?? new ParquetReadOptions()) with { ExtensionRegistry = registry });
     }
 
     /// <summary>Which rows match, by the row evaluator; null for a row whose evaluation fails.</summary>
@@ -156,13 +160,13 @@ public class VariantPathPruningTests : IDisposable
         return result;
     }
 
-    private static Task<bool[]> CandidatesAsync(string path, string sql) =>
-        CandidatesAsync(path, SparkSqlParser.ParsePredicate(sql));
+    private static Task<bool[]> CandidatesAsync(string path, string sql, ParquetReadOptions? options = null) =>
+        CandidatesAsync(path, SparkSqlParser.ParsePredicate(sql), options);
 
-    private static async Task<bool[]> CandidatesAsync(string path, Predicate predicate)
+    private static async Task<bool[]> CandidatesAsync(string path, Predicate predicate, ParquetReadOptions? options = null)
     {
         string sql = predicate.ToString();
-        using var reader = Open(path, out var file);
+        using var reader = Open(path, out var file, options);
         await using var _ = file;
         var candidates = await reader.GetCandidateRowGroupsAsync(predicate);
         var meta = await reader.ReadMetadataAsync();
@@ -473,5 +477,284 @@ public class VariantPathPruningTests : IDisposable
         }
         return count;
     }
-}
 
+    // ───── Dictionaries and Bloom filters (#772) ─────
+
+    private static readonly ShredSchema MembershipShape = ShredSchema.ForObject(new Dictionary<string, ShredSchema>
+    {
+        ["a"] = ShredSchema.Primitive(ShredType.Int64),
+        ["s"] = ShredSchema.Primitive(ShredType.String),
+    });
+
+    private static VariantValue Object(params (string Key, VariantValue Value)[] fields) =>
+        VariantValue.FromObject(fields.ToDictionary(f => f.Key, f => f.Value));
+
+    /// <summary>
+    /// 1000 rows whose <c>a</c> takes 50 values, 20 apart, starting at <paramref name="offset"/>: few enough
+    /// distinct values that the writer keeps the dictionary, and two offsets give overlapping ranges.
+    /// </summary>
+    private static IEnumerable<VariantValue?> Stepped(int offset) =>
+        Enumerable.Range(0, 1000).Select(i => (VariantValue?)Object(
+            ("a", VariantValue.FromInt64(offset + 20 * (i % 50))),
+            ("s", VariantValue.FromString((i % 10).ToString(System.Globalization.CultureInfo.InvariantCulture)))));
+
+    /// <summary>
+    /// Four row groups whose <c>a</c> ranges all overlap, so statistics prune none for an equality: group 0 holds
+    /// 0, 20, ..., 980; group 1 holds 10, 30, ..., 990; group 2 is group 0's with a stray string in the residual;
+    /// group 3 is group 1's with one value, 2^40, that does not convert to <c>int</c>.
+    /// </summary>
+    private async Task<string> MembershipFileAsync()
+    {
+        string path = await WriteAsync(
+            ParquetWriteOptions.Default with
+            {
+                VariantShredSchemas = new Dictionary<string, ShredSchema> { ["v"] = MembershipShape },
+            },
+            Batch(Stepped(0)),
+            Batch(Stepped(10)),
+            Batch(Stepped(0).Append(Object(("a", VariantValue.FromString("oops"))))),
+            Batch(Stepped(10).Append(Object(("a", VariantValue.FromInt64(1L << 40))))));
+        await AssertEveryChunkAsync(path, "v.typed_value.a.typed_value", m => m.DictionaryPageOffset is not null,
+            "dictionary-encoded");
+        return path;
+    }
+
+    private static async Task AssertEveryChunkAsync(
+        string path, string leaf, Func<EngineeredWood.Parquet.Metadata.ColumnMetaData, bool> test, string what)
+    {
+        using var reader = Open(path, out var file);
+        await using var _ = file;
+        var meta = await reader.ReadMetadataAsync();
+        foreach (var group in meta.RowGroups)
+        {
+            var chunk = group.Columns.Single(c => string.Join(".", c.MetaData!.PathInSchema!) == leaf);
+            Assert.True(test(chunk.MetaData!), $"{leaf} is not {what} in every row group");
+        }
+    }
+
+    private static readonly ParquetReadOptions StatisticsOnly = new() { FilterUseDictionaries = false };
+
+    [Theory]
+    // Groups 0 and 2 hold 500; group 2 is kept for its stray. Groups 1 and 3 do not, and their dictionaries say so.
+    [InlineData("variant_get(v, '$.a', 'bigint') = 500", new[] { true, false, true, false })]
+    [InlineData("variant_get(v, '$.a', 'bigint') <=> 510", new[] { false, true, true, true })]
+    [InlineData("v:a::bigint = 500", new[] { true, false, true, false })]
+    [InlineData("variant_get(v, '$.a', 'bigint') IN (500, 520)", new[] { true, false, true, false })]
+    [InlineData("variant_get(v, '$.a', 'bigint') IN (500, 510)", new[] { true, true, true, true })]
+    [InlineData("variant_get(v, '$.a', 'bigint') = 500 OR variant_get(v, '$.a', 'bigint') = 510", new[] { true, true, true, true })]
+    // An int literal against the Int64 leaf probes 500L.
+    [InlineData("try_variant_get(v, '$.a', 'int') = 500", new[] { true, false, true, false })]
+    // 2^40 in group 3 does not convert to int: variant_get raises there, so the group is kept.
+    [InlineData("variant_get(v, '$.a', 'int') = 500", new[] { true, false, true, true })]
+    // No integer is 500.25: ruled out by type wherever the rules hold, with no source read. Group 3's bounds do not
+    // convert to decimal(10,2), so it is kept.
+    [InlineData("variant_get(v, '$.a', 'decimal(10,2)') = 500.25", new[] { false, false, true, true })]
+    [InlineData("variant_get(v, '$.a', 'decimal(10,2)') = 500.00", new[] { true, false, true, true })]
+    [InlineData("variant_get(v, '$.s', 'string') = '7'", new[] { true, true, true, true })]
+    [InlineData("variant_get(v, '$.s', 'string') = '70'", new[] { false, false, false, false })]
+    public async Task RowGroups_PrunedByTheLeafDictionary(string sql, bool[] expected)
+    {
+        string path = await MembershipFileAsync();
+        Assert.Equal(expected, await CandidatesAsync(path, sql));
+    }
+
+    [Theory]
+    [InlineData("variant_get(v, '$.a', 'bigint') = 500")]
+    [InlineData("variant_get(v, '$.a', 'bigint') IN (500, 520)")]
+    [InlineData("variant_get(v, '$.s', 'string') = '70'")]
+    public async Task RowGroups_StatisticsAlone_KeepThem(string sql)
+    {
+        string path = await MembershipFileAsync();
+        Assert.All(await CandidatesAsync(path, sql, StatisticsOnly), Assert.True);
+    }
+
+    /// <summary>
+    /// Spark converts a string <c>"7"</c> to <c>int</c> 7, so an absent string "7" says nothing for
+    /// <c>try_variant_get(v, '$.s', 'int') = 7</c> on a string leaf: the probe declines, and every group is kept.
+    /// </summary>
+    [Theory]
+    [InlineData("try_variant_get(v, '$.s', 'int') = 7")]
+    [InlineData("try_variant_get(v, '$.s', 'int') = 70")]
+    [InlineData("try_variant_get(v, '$.a', 'double') = 500.5")]
+    public async Task RowGroups_PairSparkConvertsLoosely_AreKept(string sql)
+    {
+        string path = await MembershipFileAsync();
+        Assert.All(await CandidatesAsync(path, sql), Assert.True);
+    }
+
+    [Fact]
+    public async Task RowGroups_PrunedByTheLeafBloomFilter()
+    {
+        const string leaf = "v.typed_value.a.typed_value";
+        // Every value distinct: no dictionary, evens in group 0 and odds in group 1, over the same range.
+        string path = await WriteAsync(
+            ParquetWriteOptions.Default with
+            {
+                VariantShredSchemas = new Dictionary<string, ShredSchema> { ["v"] = MembershipShape },
+                DictionaryEnabled = false,
+                BloomFilterColumns = new HashSet<string> { leaf },
+                BloomFilterFpp = 0.001,
+            },
+            Batch(Enumerable.Range(0, 1000).Select(i => (VariantValue?)Object(("a", VariantValue.FromInt64(2 * i))))),
+            Batch(Enumerable.Range(0, 1000).Select(i => (VariantValue?)Object(("a", VariantValue.FromInt64(2 * i + 1))))));
+        await AssertEveryChunkAsync(path, leaf, m => m.BloomFilterOffset is not null && m.DictionaryPageOffset is null,
+            "Bloom-filtered and plain");
+
+        var bloom = new ParquetReadOptions { FilterUseBloomFilters = true };
+        Assert.Equal(new[] { true, false }, await CandidatesAsync(path, "variant_get(v, '$.a', 'bigint') = 1000", bloom));
+        Assert.Equal(new[] { false, true }, await CandidatesAsync(path, "try_variant_get(v, '$.a', 'int') = 1001", bloom));
+        Assert.Equal(new[] { true, true }, await CandidatesAsync(path, "variant_get(v, '$.a', 'bigint') IN (1000, 1001)", bloom));
+        Assert.Equal(new[] { true, true }, await CandidatesAsync(path, "variant_get(v, '$.a', 'bigint') = 1000"));
+    }
+
+    private static ShredSchema DecimalShape(int precision) => ShredSchema.ForObject(new Dictionary<string, ShredSchema>
+    {
+        ["m"] = ShredSchema.FromArrowType(new Decimal128Type(precision, 1)),
+    });
+
+    /// <summary>
+    /// A decimal leaf, at each width EW's writer fills: <c>decimal(10,2)</c> 1.50 against a <c>DECIMAL(p,1)</c> leaf
+    /// probes the unscaled 15. Group 0 holds the even tenths, group 1 the odd ones. The INT32 leaf is asked through
+    /// its dictionary, the INT64 one through its Bloom filter.
+    /// </summary>
+    [Theory]
+    [InlineData(9, "Int32", false)]
+    [InlineData(18, "Int64", true)]
+    public async Task RowGroups_DecimalLeaf_ProbesTheUnscaledValue(int precision, string physical, bool bloom)
+    {
+        const string leaf = "v.typed_value.m.typed_value";
+        var shape = DecimalShape(precision);
+        VariantValue Tenths(int tenths) => Object(("m", precision <= 9
+            ? VariantValue.FromDecimal4(new decimal(tenths, 0, 0, tenths < 0, 1))
+            : VariantValue.FromDecimal8(new decimal(tenths, 0, 0, tenths < 0, 1))));
+
+        string path = await WriteAsync(
+            ParquetWriteOptions.Default with
+            {
+                VariantShredSchemas = new Dictionary<string, ShredSchema> { ["v"] = shape },
+                BloomFilterColumns = bloom ? new HashSet<string> { leaf } : null,
+                BloomFilterFpp = 0.001,
+            },
+            Batch(Enumerable.Range(0, 1000).Select(i => (VariantValue?)Tenths(2 * (i % 50)))),
+            Batch(Enumerable.Range(0, 1000).Select(i => (VariantValue?)Tenths(2 * (i % 50) + 1))));
+
+        await AssertEveryChunkAsync(path, leaf,
+            m => m.Type.ToString() == physical && (bloom ? m.BloomFilterOffset is not null : m.DictionaryPageOffset is not null),
+            bloom ? $"{physical} with a Bloom filter" : $"{physical} and dictionary-encoded");
+
+        var options = bloom
+            ? new ParquetReadOptions { FilterUseBloomFilters = true, FilterUseDictionaries = false }
+            : new ParquetReadOptions();
+        Assert.Equal(new[] { false, true },
+            await CandidatesAsync(path, "variant_get(v, '$.m', 'decimal(10,2)') = 1.50", options));
+        Assert.Equal(new[] { true, false },
+            await CandidatesAsync(path, "variant_get(v, '$.m', 'decimal(10,1)') = 1.6", options));
+        // 1.55 needs a scale the leaf does not have: no row's result is it.
+        Assert.Equal(new[] { false, false },
+            await CandidatesAsync(path, "variant_get(v, '$.m', 'decimal(10,2)') = 1.55", options));
+        Assert.Equal(new[] { true, true },
+            await CandidatesAsync(path, "variant_get(v, '$.m', 'decimal(10,2)') IN (1.50, 1.60)", options));
+        // Nothing to ask without the source.
+        Assert.Equal(new[] { true, true }, await CandidatesAsync(path, "variant_get(v, '$.m', 'decimal(10,2)') = 1.50",
+            new ParquetReadOptions { FilterUseDictionaries = false }));
+    }
+
+    /// <summary>
+    /// A FIXED_LEN_BYTE_ARRAY decimal leaf stores big-endian two's complement at the column's width. EW cannot fill one
+    /// here: the Arrow shredder fails on a Decimal16 value and does not put a narrower one in a 16-byte leaf. So the
+    /// probe's bytes are checked against the decoder that reads the leaf's statistics, on the schema EW writes, whose
+    /// 16-byte leaf is DECIMAL(38,0) whatever the shredding schema asked for.
+    /// </summary>
+    [Theory]
+    [InlineData("decimal(10,2)", "15.00", "15")]
+    [InlineData("decimal(10,2)", "-15.00", "-15")]
+    [InlineData("decimal(10,1)", "0", "0")]
+    [InlineData("decimal(38,0)", "123456789012345678901234567.0", "123456789012345678901234567")]
+    [InlineData("decimal(38,0)", "-123456789012345678901234567.0", "-123456789012345678901234567")]
+    public async Task FixedLenDecimalLeaf_ProbeBytes_DecodeToTheLiteral(string target, string literal, string unscaled)
+    {
+        string path = await WriteAsync(
+            ParquetWriteOptions.Default with { VariantShredSchemas = new Dictionary<string, ShredSchema> { ["v"] = DecimalShape(30) } },
+            Batch([Object(("m", VariantValue.FromDecimal8(1.5m)))]));
+        using var reader = Open(path, out var file);
+        await using var _ = file;
+        var schema = new EngineeredWood.Parquet.Schema.SchemaDescriptor((await reader.ReadMetadataAsync()).Schema);
+
+        var cmp = (ComparisonPredicate)SparkSqlParser.ParsePredicate($"variant_get(v, '$.m', '{target}') = {literal}");
+        Assert.True(VariantGetCall.TryMatch(cmp.Left, out var call));
+        var resolved = ShreddedVariantPath.Resolve(schema, call);
+        Assert.NotNull(resolved);
+        Assert.Equal("FixedLenByteArray", resolved!.Column.PhysicalType.ToString());
+
+        var value = ((LiteralExpression)cmp.Right).Value;
+        Assert.True(resolved.TryEncodeForProbe(value, out var encodings));
+        byte[] bytes = Assert.Single(encodings);
+        Assert.Equal(resolved.Column.TypeLength, bytes.Length);
+        // Big-endian two's complement of the unscaled value at the leaf's scale.
+        Assert.Equal(System.Numerics.BigInteger.Parse(unscaled, System.Globalization.CultureInfo.InvariantCulture),
+            new System.Numerics.BigInteger(Enumerable.Reverse(bytes).ToArray()));
+
+        // The decoder of the leaf's bounds reads the bytes back to the literal, through the same target type.
+        var decoded = resolved.UpperBound(bytes);
+        Assert.NotNull(decoded);
+        Assert.Equal(0, decoded!.Value.CompareTo(value));
+
+        // 1.5 has a digit below the leaf's scale 0. Where it is a value of the target, no leaf value's result is it;
+        // where it is not (decimal(38,0)), the probe declines rather than answer.
+        bool ofTheTarget = !target.EndsWith(",0)", StringComparison.Ordinal);
+        Assert.Equal(ofTheTarget, resolved.TryEncodeForProbe(LiteralValue.Of(1.5m), out var none));
+        Assert.Empty(none);
+    }
+
+    /// <summary>DuckDB's count of the matching rows of the same file against EW's after dictionary pruning.</summary>
+    [SkippableTheory]
+    [InlineData("variant_get(v, '$.a', 'bigint') = 500", "TRY_CAST(v.a AS BIGINT) = 500")]
+    [InlineData("variant_get(v, '$.a', 'bigint') IN (510, 530)", "TRY_CAST(v.a AS BIGINT) IN (510, 530)")]
+    [InlineData("variant_get(v, '$.s', 'string') = '7'", "TRY_CAST(v.s AS VARCHAR) = '7'")]
+    public async Task Oracle_DuckDbCountsTheSameRows_AfterDictionaryPruning(string spark, string duck)
+    {
+        ExternalParquetReaders.Require();
+        string path = await WriteAsync(
+            ParquetWriteOptions.Default with
+            {
+                VariantShredSchemas = new Dictionary<string, ShredSchema> { ["v"] = MembershipShape },
+            },
+            Batch(Stepped(0)), Batch(Stepped(10)), Batch(Stepped(0)), Batch(Stepped(10)));
+
+        var expected = ExternalParquetReaders.CountWhere("duckdb", path, duck);
+        Skip.If(!expected.Installed, $"DuckDB is not installed: {expected.Error}");
+        Assert.True(expected.Count is not null, $"DuckDB refused {duck}: {expected.Error}");
+        Assert.True(expected.Count > 0);
+
+        Assert.Equal(expected.Count, await CountAfterPruningAsync(path, spark));
+    }
+
+    /// <summary>
+    /// A file DuckDB shredded and wrote: row groups alternate between the even and odd multiples of 10 below 1000,
+    /// so their ranges overlap and only a dictionary tells them apart.
+    /// </summary>
+    [SkippableFact]
+    public async Task Oracle_DuckDbWrittenFile_PrunedByDictionaries()
+    {
+        ExternalParquetReaders.Require();
+        string path = Path.Combine(_tempDir, "duck-dict.parquet");
+        var (written, supported, error) = ExternalParquetReaders.DuckDbWriteVariant(
+            path,
+            "SELECT i AS id, {'a': (i // 2048) % 2 * 10 + (i % 50) * 20}::VARIANT AS v FROM range(8192) t(i) ORDER BY id",
+            orderBy: "id", copyOptions: "ROW_GROUP_SIZE 2048");
+        Skip.IfNot(supported, $"DuckDB cannot write shredded VARIANT here: {error}");
+        Assert.True(written is not null, $"DuckDB failed to write the file: {error}");
+        Assert.Contains("v, typed_value, a, typed_value", written!.Leaves);
+
+        const string sql = "variant_get(v, '$.a', 'bigint') = 500";
+        var expected = ExternalParquetReaders.CountWhere("duckdb", path, "v.a::BIGINT = 500");
+        Assert.True(expected.Count is not null, expected.Error);
+
+        bool[] statisticsOnly = await CandidatesAsync(path, sql, StatisticsOnly);
+        bool[] kept = await CandidatesAsync(path, sql);
+        Assert.True(statisticsOnly.All(k => k), "statistics alone pruned a group: the ranges should overlap");
+        Assert.True(kept.Count(k => !k) > 0, "no row group was pruned by its dictionary");
+
+        Assert.Equal(expected.Count, await CountAfterPruningAsync(path, sql));
+    }
+}

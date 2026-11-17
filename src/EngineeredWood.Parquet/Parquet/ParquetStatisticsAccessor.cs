@@ -97,13 +97,8 @@ public sealed class ParquetStatisticsAccessor
     {
         private Statistics? Stats(RowGroup rg)
         {
-            if (path.Leaf >= rg.Columns.Count)
+            if (path.Leaf >= rg.Columns.Count || !path.ResidualNullThroughout(rg))
                 return null;
-            if (path.Residual is int residual
-                && (residual >= rg.Columns.Count || rg.Columns[residual].MetaData?.Statistics?.NullCount != rg.NumRows))
-            {
-                return null;
-            }
             return rg.Columns[path.Leaf].MetaData?.Statistics;
         }
 
