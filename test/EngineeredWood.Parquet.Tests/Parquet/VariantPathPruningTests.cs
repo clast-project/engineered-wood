@@ -569,6 +569,47 @@ public class VariantPathPruningTests : IDisposable
     }
 
     /// <summary>
+    /// The read-ahead reads a leaf's dictionary only in row groups where a probe would use it (#901 review). In the
+    /// membership file group 2's residual holds a string, and group 3 holds 2^40, which <c>variant_get</c> cannot
+    /// convert to <c>int</c>: statistics leave all four undecided, and the probe refuses groups 2 and 3 before it asks.
+    /// <c>try_variant_get</c> answers NULL for 2^40, so it asks in group 3.
+    /// </summary>
+    [Theory]
+    [InlineData("variant_get(v, '$.a', 'int') = 520", new[] { true, true, false, false })]
+    [InlineData("try_variant_get(v, '$.a', 'int') = 520", new[] { true, true, false, true })]
+    // Either operand asks in group 3, so it is read once for both.
+    [InlineData("variant_get(v, '$.a', 'int') = 520 OR try_variant_get(v, '$.a', 'int') = 540", new[] { true, true, false, true })]
+    public async Task ReadAhead_ReadsTheLeafOnlyWhereAProbeWouldAsk(string sql, bool[] expectedRead)
+    {
+        string path = await MembershipFileAsync();
+        var predicate = SparkSqlParser.ParsePredicate(sql);
+
+        var registry = new ExtensionTypeRegistry();
+        registry.Register(VariantExtensionDefinition.Instance);
+        await using var counting = new RequestCountingFile(new LocalRandomAccessFile(path));
+        using var reader = new ParquetFileReader(counting, ownsFile: false,
+            new ParquetReadOptions { ExtensionRegistry = registry });
+        var meta = await reader.ReadMetadataAsync();
+        var accessor = new ParquetStatisticsAccessor(await reader.GetSchemaAsync());
+        foreach (var group in meta.RowGroups)
+            Assert.Equal(FilterResult.Unknown, StatisticsEvaluator.Evaluate(predicate, group, accessor));
+        counting.RequestRanges.Clear();
+
+        var candidates = await reader.GetCandidateRowGroupsAsync(predicate);
+        Assert.False(candidates[1], "group 1 holds no 520 and should be ruled out by its dictionary");
+
+        var read = new bool[meta.RowGroups.Count];
+        for (int g = 0; g < read.Length; g++)
+        {
+            var leaf = meta.RowGroups[g].Columns
+                .Single(c => string.Join(".", c.MetaData!.PathInSchema!) == "v.typed_value.a.typed_value").MetaData!;
+            long start = leaf.DictionaryPageOffset ?? leaf.DataPageOffset, end = start + leaf.TotalCompressedSize;
+            read[g] = counting.RequestRanges.SelectMany(r => r).Any(r => r.Offset < end && start < r.Offset + r.Length);
+        }
+        Assert.Equal(expectedRead, read);
+    }
+
+    /// <summary>
     /// Spark converts a string <c>"7"</c> to <c>int</c> 7, so an absent string "7" says nothing for
     /// <c>try_variant_get(v, '$.s', 'int') = 7</c> on a string leaf: the probe declines, and every group is kept.
     /// </summary>

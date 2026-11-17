@@ -61,7 +61,7 @@ internal sealed class MembershipPrefetch
     private readonly long _budgetBytes;
     private readonly int? _maxPageUncompressedSize;
     private readonly bool[]? _skipped;
-    private readonly List<(int Index, ColumnDescriptor Descriptor)> _columns;
+    private readonly List<MembershipPredicateEvaluator.MembershipColumn> _columns;
 
     /// <summary>The current window: each covered row group's value sets by column index.</summary>
     private readonly Dictionary<int, Dictionary<int, MembershipPredicateEvaluator.IValueSet?>> _window = new();
@@ -128,8 +128,15 @@ internal sealed class MembershipPrefetch
             var sets = new Dictionary<int, MembershipPredicateEvaluator.IValueSet?>();
             var groupRanges = new List<(int Column, ColumnDescriptor Descriptor, ColumnMetaData Chunk, FileRange Range)>();
             long groupBytes = 0;
-            foreach (var (index, descriptor) in _columns)
+            foreach (var column in _columns)
             {
+                // A variant leaf no operand would ask here (its residual holds values, or a conversion could fail) is
+                // not read: the probe refuses the group before it looks. Left absent rather than null, which would
+                // claim the chunk cannot answer.
+                if (!column.AsksIn(rowGroup))
+                    continue;
+                int index = column.Index;
+                var descriptor = column.Descriptor;
                 var chunk = rowGroup.Columns[index];
                 if (MembershipPredicateEvaluator.TryGetRange(
                         _source, chunk, descriptor, _fileLength, _filePath, out var range))

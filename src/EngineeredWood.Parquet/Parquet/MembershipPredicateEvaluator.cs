@@ -93,11 +93,10 @@ internal static class MembershipPredicateEvaluator
     /// NULL literal, an IN list holding a non-literal (<c>x IN (a, b)</c>), and a literal that cannot
     /// be encoded for the column (an integer against a DECIMAL stored as INT32) are all declined.
     /// </summary>
-    internal static List<(int Index, ColumnDescriptor Descriptor)> MembershipColumns(
-        Predicate predicate, SchemaDescriptor schema)
+    internal static List<MembershipColumn> MembershipColumns(Predicate predicate, SchemaDescriptor schema)
     {
-        var columns = new List<(int, ColumnDescriptor)>();
-        var seen = new HashSet<int>();
+        var columns = new List<MembershipColumn>();
+        var byIndex = new Dictionary<int, MembershipColumn>();
         Collect(predicate);
         return columns;
 
@@ -131,7 +130,7 @@ internal static class MembershipPredicateEvaluator
 
         void Add(Expression operand, IReadOnlyList<LiteralValue> values, bool setMembership)
         {
-            if (!TryResolve(schema, operand, out var target) || seen.Contains(target.Index))
+            if (!TryResolve(schema, operand, out var target))
                 return;
             // A variant leaf whose every value is ruled out by type alone (no encodings) needs no read.
             bool asks = false;
@@ -143,8 +142,15 @@ internal static class MembershipPredicateEvaluator
             }
             if (!asks)
                 return;
-            seen.Add(target.Index);
-            columns.Add((target.Index, target.Descriptor));
+            // Every leaf of the predicate that names the column, so a read-ahead skips a row group only when none
+            // of them would ask there.
+            if (!byIndex.TryGetValue(target.Index, out var column))
+            {
+                column = new MembershipColumn(target.Index, target.Descriptor);
+                byIndex.Add(target.Index, column);
+                columns.Add(column);
+            }
+            column.Targets.Add(target);
         }
     }
 
@@ -253,17 +259,8 @@ internal static class MembershipPredicateEvaluator
         if (chunk.FilePath is not null && ctx.FilePath == ColumnChunkFilePathKind.Refuse)
             return FilterResult.Unknown;
 
-        if (target.Path is { } path)
-        {
-            // The leaf holds every value at the path only where the residual is null throughout; a value of another
-            // type is there, where neither source sees it. And absence of the literal means no row matches only
-            // where no row's conversion fails: variant_get raises on one, and pruning would answer instead. Both
-            // bounds converting rules that out; try_variant_get answers NULL there and needs no such test.
-            if (!path.ResidualNullThroughout(rowGroup))
-                return FilterResult.Unknown;
-            if (target.FailOnError && !path.BoundsConvert(rowGroup))
-                return FilterResult.Unknown;
-        }
+        if (!target.AsksIn(rowGroup))
+            return FilterResult.Unknown;
 
         // Encode before any I/O: a value the source cannot be asked about decides the answer alone.
         var encoded = new List<byte[]>(values.Count);
@@ -655,12 +652,50 @@ internal static class MembershipPredicateEvaluator
     }
 
     /// <summary>
+    /// A column a predicate asks a membership source about, with every operand that names it (<see cref="MembershipColumns"/>).
+    /// </summary>
+    internal sealed class MembershipColumn(int index, ColumnDescriptor descriptor)
+    {
+        public int Index { get; } = index;
+
+        public ColumnDescriptor Descriptor { get; } = descriptor;
+
+        internal List<ProbeTarget> Targets { get; } = new();
+
+        /// <summary>Whether any operand naming the column would ask its source in <paramref name="rowGroup"/>.</summary>
+        public bool AsksIn(RowGroup rowGroup)
+        {
+            foreach (var target in Targets)
+            {
+                if (target.AsksIn(rowGroup))
+                    return true;
+            }
+            return false;
+        }
+    }
+
+    /// <summary>
     /// A resolved membership operand: the leaf column, and for a variant extraction the shredded path and whether
     /// a failed conversion raises (<c>variant_get</c>) rather than answering NULL (<c>try_variant_get</c>).
     /// </summary>
-    private readonly record struct ProbeTarget(
+    internal readonly record struct ProbeTarget(
         int Index, ColumnDescriptor Descriptor, ShreddedVariantPath? Path, bool FailOnError)
     {
+        /// <summary>
+        /// Whether a source may be asked on this operand's behalf in <paramref name="rowGroup"/>: always for a column,
+        /// and for a variant leaf only where it holds every value at the path and no row's conversion fails.
+        /// </summary>
+        /// <remarks>
+        /// The leaf holds every value at the path only where the residual is null throughout; a value of another
+        /// type is there, where neither source sees it. And absence of the literal means no row matches only where
+        /// no row's conversion fails: variant_get raises on one, and pruning would answer instead. Both bounds
+        /// converting rules that out; try_variant_get answers NULL there and needs no such test. The probe and the
+        /// read-ahead both ask this, so neither reads a source the other would not use.
+        /// </remarks>
+        public bool AsksIn(RowGroup rowGroup) =>
+            Path is not { } path
+            || (path.ResidualNullThroughout(rowGroup) && (!FailOnError || path.BoundsConvert(rowGroup)));
+
         /// <summary>
         /// The encodings to probe for <paramref name="value"/>; false when the source cannot be asked. Empty only
         /// for a variant leaf none of whose values converts to <paramref name="value"/>. Whether the value is an
