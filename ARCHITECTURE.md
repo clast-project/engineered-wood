@@ -186,11 +186,11 @@ yields their batches in serial order; `ScanMemoryBudget` reserves budget before 
 |---|---|---|
 | Uncompressed | — | Direct copy |
 | Snappy | Snappier | Pure managed |
-| Gzip, Deflate | System.IO.Compression | Deflate is raw RFC 1951 (ORC's "Zlib") |
+| Gzip, Deflate | System.IO.Compression | Deflate is raw RFC 1951 (ORC's "Zlib"). On net11.0 the span-based `GZipEncoder`/`Decoder` and `DeflateEncoder`/`Decoder`, one per thread; elsewhere the streams, writing straight into the destination |
 | Brotli | System.IO.Compression; BrotliSharpLib on netstandard2.0 | |
 | Lz4 | K4os.Compression.LZ4 | Block codec |
 | Lz4Hadoop | K4os.Compression.LZ4 | Hadoop framing, with frame and raw fallback |
-| Zstd | ZstdSharp.Port | `[ThreadStatic]` compressor/decompressor reuse |
+| Zstd | ZstdSharp.Port; .NET 11's `ZstandardEncoder` | `[ThreadStatic]` reuse. On net11.0, pages of 64 KiB and up compress through the native encoder (byte-identical frames); decompression stays on ZstdSharp, which is faster |
 | Lzo | — | In the enum; not implemented |
 
 Levels are codec-agnostic (`BlockCompressionLevel`) with an optional native override. Each format maps its wire
