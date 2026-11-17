@@ -327,4 +327,121 @@ public class CompressorTests
         var compressed = new byte[maxLen];
         return Compressor.Compress(codec, payload, compressed, level);
     }
+
+    public static IEnumerable<object?[]> ZlibFormatInputs()
+    {
+        foreach (var codec in new[] { CompressionCodec.Gzip, CompressionCodec.Deflate })
+        foreach (var level in new BlockCompressionLevel?[]
+        {
+            null, BlockCompressionLevel.Fastest, BlockCompressionLevel.Optimal, BlockCompressionLevel.SmallestSize,
+        })
+        foreach (int length in new[] { 1, 10_000, 1 << 20 })
+            yield return new object?[] { codec, level, length };
+    }
+
+    /// <summary>
+    /// Mixed input: runs of a repeated phrase (which compress) between stretches of random bytes
+    /// (which don't), so a page exercises both kinds of deflate block.
+    /// </summary>
+    private static byte[] MakeMixedPayload(int length)
+    {
+        var data = MakeRedundantPayload(length);
+        var random = new Random(length);
+        for (int start = 0; start < length; start += 8192)
+        {
+            int n = Math.Min(1024, length - start);
+            var noise = new byte[n];
+            random.NextBytes(noise);
+            noise.CopyTo(data, start);
+        }
+        return data;
+    }
+
+    /// <summary>
+    /// Gzip and Deflate compress straight into the destination rather than into a MemoryStream copied
+    /// out afterwards. The bytes must not change: the same stream type at the same level, fed the same
+    /// input, writes the same output wherever it writes it.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ZlibFormatInputs))]
+    public void GzipAndDeflate_MatchTheStreamWrittenToAMemoryStream(
+        CompressionCodec codec, BlockCompressionLevel? level, int length)
+    {
+        var data = MakeMixedPayload(length);
+
+        var expected = new MemoryStream();
+        var bclLevel = level switch
+        {
+            null or BlockCompressionLevel.Fastest => System.IO.Compression.CompressionLevel.Fastest,
+#if NET
+            BlockCompressionLevel.SmallestSize => System.IO.Compression.CompressionLevel.SmallestSize,
+#endif
+            _ => System.IO.Compression.CompressionLevel.Optimal,
+        };
+        using (Stream reference = codec == CompressionCodec.Gzip
+            ? new System.IO.Compression.GZipStream(expected, bclLevel, leaveOpen: true)
+            : new System.IO.Compression.DeflateStream(expected, bclLevel, leaveOpen: true))
+        {
+            reference.Write(data, 0, data.Length);
+        }
+
+        var compressed = new byte[Compressor.GetMaxCompressedLength(codec, length)];
+        int compressedLength = Compressor.Compress(codec, data, compressed, level);
+
+        Assert.Equal(expected.ToArray(), compressed.AsSpan(0, compressedLength).ToArray());
+    }
+
+    [Theory]
+    [InlineData(CompressionCodec.Gzip)]
+    [InlineData(CompressionCodec.Deflate)]
+    public void GzipAndDeflate_TooShortDestination_ThrowsArgumentException(CompressionCodec codec)
+    {
+        var data = MakeMixedPayload(100_000);
+        var full = new byte[Compressor.GetMaxCompressedLength(codec, data.Length)];
+        int needed = Compressor.Compress(codec, data, full);
+
+        var shortBy1 = new byte[needed - 1];
+        var e = Assert.Throws<ArgumentException>(() => Compressor.Compress(codec, data, shortBy1));
+        Assert.Equal("destination", e.ParamName);
+
+        e = Assert.Throws<ArgumentException>(() => Compressor.Compress(codec, data, Span<byte>.Empty));
+        Assert.Equal("destination", e.ParamName);
+    }
+
+    [Theory]
+    [InlineData(CompressionCodec.Gzip)]
+    [InlineData(CompressionCodec.Deflate)]
+    public void GzipAndDeflate_WriteNothingPastTheirOutput(CompressionCodec codec)
+    {
+        var data = MakeMixedPayload(100_000);
+        var compressed = new byte[Compressor.GetMaxCompressedLength(codec, data.Length)];
+        compressed.AsSpan().Fill(0xA5);
+
+        int compressedLength = Compressor.Compress(codec, data, compressed);
+
+        Assert.True(compressed.Skip(compressedLength).All(b => b == 0xA5),
+            "bytes past the compressed output were overwritten");
+    }
+
+#if NET
+    /// <summary>
+    /// Compressing a 1 MiB page into a MemoryStream allocated about 2 MB, on the large object heap.
+    /// Writing into the destination allocates only the streams themselves.
+    /// </summary>
+    [Theory]
+    [InlineData(CompressionCodec.Gzip)]
+    [InlineData(CompressionCodec.Deflate)]
+    public void GzipAndDeflate_AllocateIndependentlyOfThePageSize(CompressionCodec codec)
+    {
+        var data = MakeMixedPayload(1 << 20);
+        var compressed = new byte[Compressor.GetMaxCompressedLength(codec, data.Length)];
+        Compressor.Compress(codec, data, compressed); // warm up
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        Compressor.Compress(codec, data, compressed);
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(allocated < 16 * 1024, $"allocated {allocated} bytes to compress {data.Length}");
+    }
+#endif
 }
