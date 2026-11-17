@@ -263,8 +263,15 @@ internal static class SparkDoubleText
             index++;
         }
 
-        var written = new StringBuilder(end - index);
-        var fraction = 0;
+        // Significant digits only, and no more than MaxSignificantDigits of them; see there. A
+        // leading zero is not written, though one after the point still moves the exponent, and a
+        // digit past the cap is not written either: one in the integer part moves the exponent the
+        // other way, and any that is not zero leaves a sticky digit behind.
+        var written = new StringBuilder(Math.Min(end - index, MaxSignificantDigits + 1));
+        var fraction = 0L;
+        var dropped = 0L;
+        var sticky = false;
+        var anyDigit = false;
         var seenPoint = false;
 
         for (; index < end; index++)
@@ -273,8 +280,22 @@ internal static class SparkDoubleText
 
             if (c >= '0' && c <= '9')
             {
-                written.Append(c);
-                if (seenPoint) fraction++;
+                anyDigit = true;
+
+                if (written.Length == 0 && c == '0')
+                {
+                    if (seenPoint) fraction++;
+                }
+                else if (written.Length < MaxSignificantDigits)
+                {
+                    written.Append(c);
+                    if (seenPoint) fraction++;
+                }
+                else
+                {
+                    if (!seenPoint) dropped++;
+                    sticky |= c != '0';
+                }
             }
             else if (c == '.' && !seenPoint)
             {
@@ -286,8 +307,16 @@ internal static class SparkDoubleText
             }
         }
 
-        if (written.Length == 0)
+        if (!anyDigit)
             return false;
+
+        // Standing in for everything dropped: it is not zero exactly when the dropped digits were
+        // not, and it sits below every digit kept, which is all the rounding can see of them.
+        if (sticky)
+        {
+            written.Append('1');
+            fraction++;
+        }
 
         var scaled = 0L;
 
@@ -327,11 +356,41 @@ internal static class SparkDoubleText
         if (index != end)
             return false;
 
-        digits = BigInteger.Parse(written.ToString(), NumberStyles.None, CultureInfo.InvariantCulture);
-        exponent = (int)(scaled - fraction);
+        // An all-zero significand writes nothing, and is zero.
+        digits = written.Length == 0
+            ? BigInteger.Zero
+            : BigInteger.Parse(written.ToString(), NumberStyles.None, CultureInfo.InvariantCulture);
+
+        // fraction and dropped are bounded by the text's length, and scaled is clamped, so the sum
+        // is far inside a long; clamped into an int far past anything a double or float can reach.
+        exponent = (int)Math.Max(-int.MaxValue, Math.Min(int.MaxValue, scaled - fraction + dropped));
 
         return true;
     }
+
+    /// <summary>
+    /// The most significant digits <see cref="TryScan"/> keeps, the rest standing behind one
+    /// sticky digit.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Without a cap, every digit was parsed into one <see cref="BigInteger"/> and then counted,
+    /// both quadratic in the length, and text like <c>0.1234…</c> built a power of ten as long as
+    /// it. This is a per-row path on netstandard2.0, so one long numeric string in a column paid
+    /// that on every row (#905).
+    /// </para>
+    /// <para>
+    /// The cap loses nothing. Rounding to a double or a float asks only how the value compares with
+    /// the representable values and the midpoints between them, and each of those is written with
+    /// at most 768 significant digits (fast_float keeps 768 for the same reason; a float needs
+    /// 113). Against any
+    /// number of 800 significant digits or fewer, the value and its stand-in - the first 800 digits
+    /// and, if anything after them was not zero, a 1 beneath them - compare the same way: they
+    /// share the leading digit's position and those 800 digits, and differ only in whether there
+    /// is anything more, which the sticky digit preserves.
+    /// </para>
+    /// </remarks>
+    private const int MaxSignificantDigits = 800;
 
     /// <summary>
     /// The double nearest <c>digits x 10^exponent</c>, with ties to even.
@@ -350,14 +409,14 @@ internal static class SparkDoubleText
         if (exponent > 400)
             return negative ? double.NegativeInfinity : double.PositiveInfinity;
 
-        if (exponent < -400 - DigitCount(digits))
+        if (exponent < -400 - ScaledDecimal.DigitCount(digits))
             return negative ? -0d : 0d;
 
         var numerator = exponent >= 0 ? digits * Powers.Ten(exponent) : digits;
         var denominator = exponent >= 0 ? BigInteger.One : Powers.Ten(-exponent);
 
         // Line the quotient up to 53 bits, then correct — the estimate is off by at most one.
-        var binary = BitLength(numerator) - BitLength(denominator) - 53;
+        var binary = ScaledDecimal.BitLength(numerator) - ScaledDecimal.BitLength(denominator) - 53;
 
         if (binary < MinExponent)
             binary = MinExponent;
@@ -463,47 +522,6 @@ internal static class SparkDoubleText
             bits |= long.MinValue;
 
         return BitConverter.Int64BitsToDouble(bits);
-    }
-
-    /// <summary>How many bits an integer is written with.</summary>
-    /// <remarks>
-    /// By hand because netstandard2.0 has no <c>BigInteger.GetBitLength</c>, and from the byte
-    /// array rather than a logarithm, which would be an estimate exactly where the estimate
-    /// matters.
-    /// </remarks>
-    private static int BitLength(BigInteger value)
-    {
-        var bytes = value.ToByteArray();
-        var index = bytes.Length - 1;
-
-        while (index > 0 && bytes[index] == 0)
-            index--;
-
-        var top = bytes[index];
-        var bits = index * 8;
-
-        while (top != 0)
-        {
-            bits++;
-            top >>= 1;
-        }
-
-        return bits;
-    }
-
-    /// <summary>How many decimal digits an integer is written with.</summary>
-    private static int DigitCount(BigInteger value)
-    {
-        var digits = 1;
-        value = BigInteger.Abs(value);
-
-        while (value >= 10)
-        {
-            value /= 10;
-            digits++;
-        }
-
-        return digits;
     }
 
     /// <summary>The smallest exponent a double can be written at, which is every subnormal's.</summary>
