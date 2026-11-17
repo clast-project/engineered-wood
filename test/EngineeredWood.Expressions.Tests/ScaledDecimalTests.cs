@@ -318,6 +318,61 @@ public class ScaledDecimalTests
         Assert.Empty(wrong);
     }
 
+    /// <summary>
+    /// The digit count's starting estimate never exceeds the true count, even at the bit lengths
+    /// where <c>(bits-1) log10 2</c> falls just short of an integer and a double rounds it up.
+    /// #904 review.
+    /// </summary>
+    /// <remarks>
+    /// Values that large take far too long to build, so this checks the bound itself against
+    /// log10 2 to 60 digits. The listed exponents are the continued-fraction convergents of
+    /// log10 2 that approach an integer from below, the closest calls under int.MaxValue bits;
+    /// 146964308 is the one the review found, which a 1e-9 margin overcounted by one.
+    /// </remarks>
+    [Theory]
+    [InlineData(93)]
+    [InlineData(485)]
+    [InlineData(13301)]
+    [InlineData(42039)]
+    [InlineData(254370)]
+    [InlineData(6107016)]
+    [InlineData(44699994)]
+    [InlineData(146964308)]
+    [InlineData(345060773)]
+    [InlineData(1923400330)]
+    public void DigitCountLowerBoundNeverOvercounts(int exponent)
+    {
+        // 2^exponent has exponent + 1 bits; check it and the bit lengths either side.
+        for (var bits = exponent - 1; bits <= exponent + 3; bits++)
+        {
+            var exact = MinimumDigits(bits);
+            var bound = ScaledDecimal.DigitCountLowerBound(bits);
+
+            Assert.True(bound <= exact, $"{bits} bits: bound {bound} over the true {exact}");
+            Assert.True(bound >= exact - 2, $"{bits} bits: bound {bound} too far under {exact}");
+        }
+    }
+
+    [Fact]
+    public void DigitCountLowerBoundHoldsForEveryBitLengthUpToAHundredThousand()
+    {
+        for (var bits = 1; bits <= 100_000; bits++)
+        {
+            var exact = MinimumDigits(bits);
+            var bound = ScaledDecimal.DigitCountLowerBound(bits);
+            if (bound > exact || bound < exact - 2)
+                Assert.Fail($"{bits} bits: bound {bound}, true {exact}");
+        }
+    }
+
+    /// <summary>The digits of 2^(bits-1), the smallest value with that many bits, from log10 2 to 60 places.</summary>
+    private static int MinimumDigits(int bits)
+    {
+        var log10Of2 = BigInteger.Parse("301029995663981195213738894724493026768189881462108541310427");
+        var scale = BigInteger.Pow(10, 60);
+        return (int)((bits - 1) * log10Of2 / scale) + 1;
+    }
+
     /// <summary>Counting digits costs about one multiplication of the value's size, not one division per digit.</summary>
     [Fact]
     public void DigitCountOfAHugeValueIsQuick()
