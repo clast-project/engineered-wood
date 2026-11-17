@@ -377,10 +377,23 @@ public class ScaledDecimalTests
     [Fact]
     public void DigitCountOfAHugeValueIsQuick()
     {
-        var value = BigInteger.Pow(10, 200_000) - 1;
+        // Measured against building the value, not against a fixed budget: the count builds one
+        // power of ten about as long as the value, so it costs what the caller already paid, and
+        // what that is depends on the runtime. .NET Framework's BigInteger multiplies by
+        // schoolbook, and a fixed 1 s failed there at 200000 digits in CI (#904). Dividing by ten
+        // once per digit, as before #902, costs hundreds of times the build on every runtime.
+        ScaledDecimal.DigitCount(BigInteger.Pow(10, 100) - 1); // JIT both paths first
 
         var watch = System.Diagnostics.Stopwatch.StartNew();
-        Assert.Equal(200_000, ScaledDecimal.DigitCount(value));
-        Assert.True(watch.ElapsedMilliseconds < 1000, $"took {watch.ElapsedMilliseconds} ms");
+        var value = BigInteger.Pow(10, 100_000) - 1;
+        var build = watch.Elapsed;
+
+        watch.Restart();
+        Assert.Equal(100_000, ScaledDecimal.DigitCount(value));
+        var count = watch.Elapsed;
+
+        Assert.True(
+            count < TimeSpan.FromTicks(4 * build.Ticks) + TimeSpan.FromMilliseconds(250),
+            $"counting took {count.TotalMilliseconds:F0} ms, building {build.TotalMilliseconds:F0} ms");
     }
 }
