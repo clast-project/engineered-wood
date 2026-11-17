@@ -827,6 +827,74 @@ public class VariantPathPruningTests : IDisposable
             new ParquetReadOptions { FilterUseDictionaries = false }));
     }
 
+    /// <summary>
+    /// EW before #398 ordered FIXED_LEN_BYTE_ARRAY decimals as unsigned bytes, so a chunk holding -1 and 1 recorded 1 as
+    /// its minimum and -1 as its maximum. Both convert, but the values are not between them, so the guard that no
+    /// conversion fails must not pass (#901 review). Exactness does not enter: an inexact bound is only wider.
+    /// </summary>
+    [Fact]
+    public async Task FixedLenDecimalLeaf_InvertedBounds_DoNotProveTheConversion()
+    {
+        string path = await WriteAsync(
+            ParquetWriteOptions.Default with { VariantShredSchemas = new Dictionary<string, ShredSchema> { ["v"] = DecimalShape(30) } },
+            Batch([Object(("m", VariantValue.FromDecimal8(1.5m)))]));
+        using var reader = Open(path, out var file);
+        await using var _ = file;
+        var schema = new EngineeredWood.Parquet.Schema.SchemaDescriptor((await reader.ReadMetadataAsync()).Schema);
+        var cmp = (ComparisonPredicate)SparkSqlParser.ParsePredicate("variant_get(v, '$.m', 'decimal(10,0)') = 1");
+        Assert.True(VariantGetCall.TryMatch(cmp.Left, out var call));
+        var resolved = ShreddedVariantPath.Resolve(schema, call)!;
+        Assert.Equal(16, resolved.Column.TypeLength);
+
+        byte[] BigEndian(int value)
+        {
+            var bytes = new byte[16];
+            byte fill = value < 0 ? (byte)0xFF : (byte)0;
+            for (int i = 0; i < 16; i++)
+                bytes[i] = fill;
+            bytes[15] = unchecked((byte)value);
+            return bytes;
+        }
+
+        var ordered = new EngineeredWood.Parquet.Metadata.Statistics { MinValue = BigEndian(-1), MaxValue = BigEndian(1) };
+        var inverted = new EngineeredWood.Parquet.Metadata.Statistics { MinValue = BigEndian(1), MaxValue = BigEndian(-1) };
+        var inexact = new EngineeredWood.Parquet.Metadata.Statistics
+        {
+            MinValue = BigEndian(-1), MaxValue = BigEndian(1), IsMinValueExact = false, IsMaxValueExact = false,
+        };
+        Assert.True(resolved.BoundsConvert(ordered));
+        Assert.False(resolved.BoundsConvert(inverted));
+        Assert.True(resolved.BoundsConvert(inexact));
+    }
+
+    /// <summary>
+    /// The row-group null count of a variant result rests on the same guard: a leaf with no nulls says the result has
+    /// none only where every value converts. Group 0's leaf bounds, swapped in memory, no longer say so.
+    /// </summary>
+    [Fact]
+    public async Task RowGroupNullCount_InvertedLeafBounds_IsUnknown()
+    {
+        string path = await MembershipFileAsync();
+        using var reader = Open(path, out var file);
+        await using var _ = file;
+        var meta = await reader.ReadMetadataAsync();
+        var accessor = new ParquetStatisticsAccessor(await reader.GetSchemaAsync());
+        var cmp = (ComparisonPredicate)SparkSqlParser.ParsePredicate("variant_get(v, '$.a', 'int') = 0");
+        Assert.True(VariantGetCall.TryMatch(cmp.Left, out var call));
+        var pathStats = accessor.ForVariantGet(call)!;
+
+        var group = meta.RowGroups[0];
+        var leaf = group.Columns.Single(c => string.Join(".", c.MetaData!.PathInSchema!) == "v.typed_value.a.typed_value").MetaData!;
+        Assert.Equal(0L, pathStats.GetNullCount(group, call.Column.NameParts));
+
+        var stats = leaf.Statistics!;
+        leaf.Statistics = new EngineeredWood.Parquet.Metadata.Statistics
+        {
+            MinValue = stats.MaxValue, MaxValue = stats.MinValue, NullCount = stats.NullCount,
+        };
+        Assert.Null(pathStats.GetNullCount(group, call.Column.NameParts));
+    }
+
     /// <summary>DuckDB's count of the matching rows of the same file against EW's after dictionary pruning.</summary>
     [SkippableTheory]
     [InlineData("variant_get(v, '$.a', 'bigint') = 500", "TRY_CAST(v.a AS BIGINT) = 500")]

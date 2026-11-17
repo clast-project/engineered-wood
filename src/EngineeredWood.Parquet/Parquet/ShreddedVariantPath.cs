@@ -242,16 +242,43 @@ internal sealed class ShreddedVariantPath
             && rowGroup.Columns[residual].MetaData?.Statistics?.NullCount == rowGroup.NumRows);
 
     /// <summary>
-    /// Whether both of the leaf's bounds in <paramref name="rowGroup"/> convert to the target type, which means every
-    /// leaf value between them does: no row's conversion fails there.
+    /// Whether both of the leaf's bounds in <paramref name="rowGroup"/> convert to the target type and describe a range,
+    /// which means every leaf value lies between them and converts: no row's conversion fails there.
     /// </summary>
-    public bool BoundsConvert(RowGroup rowGroup)
+    public bool BoundsConvert(RowGroup rowGroup) =>
+        Leaf < rowGroup.Columns.Count && rowGroup.Columns[Leaf].MetaData?.Statistics is { } stats && BoundsConvert(stats);
+
+    /// <summary>The same, for the leaf's chunk statistics.</summary>
+    public bool BoundsConvert(Statistics stats)
     {
-        if (Leaf >= rowGroup.Columns.Count || rowGroup.Columns[Leaf].MetaData?.Statistics is not { } stats)
-            return false;
         byte[]? max = stats.MaxValue ?? ParquetStatisticsAccessor.FallbackBytes(Column, stats.Max);
         byte[]? min = stats.MinValue ?? ParquetStatisticsAccessor.FallbackBytes(Column, stats.Min);
-        return LowerBound(min, max) is not null && UpperBound(max) is not null;
+        return ConvertedRange(LowerBound(min, max), UpperBound(max));
+    }
+
+    /// <summary>
+    /// Whether two converted bounds describe a range every leaf value lies in: both convert, and the minimum is not
+    /// above the maximum.
+    /// </summary>
+    /// <remarks>
+    /// An inverted pair is the mark of statistics ordered in the wrong type: EW before #398 ordered FIXED_LEN_BYTE_ARRAY
+    /// decimals as unsigned bytes, so a chunk holding -1 and 1 recorded 1 as its minimum and -1 as its maximum. Both
+    /// convert, but the values are not between them, so a value whose conversion fails may be outside. As
+    /// <c>StatisticsEvaluator.IsInverted</c>, only an exact comparison declares a pair inverted. The exactness flags do
+    /// not enter: an inexact bound still bounds every value, and is only wider.
+    /// </remarks>
+    internal static bool ConvertedRange(LiteralValue? lower, LiteralValue? upper)
+    {
+        if (lower is not { } min || upper is not { } max)
+            return false;
+        try
+        {
+            return !(min.CompareTo(max, out bool exact) > 0 && exact);
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
     }
 
     /// <summary>

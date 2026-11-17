@@ -87,8 +87,8 @@ public sealed class ParquetStatisticsAccessor
     /// </summary>
     /// <remarks>
     /// The result's null count is the leaf's: a row whose leaf is null has nothing at the path (the residual is
-    /// null too), and one whose leaf holds a value has a result, provided both bounds convert, which means every
-    /// value between them does. Otherwise only a leaf null in every row says something: the result is NULL there.
+    /// null too), and one whose leaf holds a value has a result, provided both bounds convert and are not inverted,
+    /// which means every value lies between them and converts (<see cref="ShreddedVariantPath.ConvertedRange"/>). Otherwise only a leaf null in every row says something: the result is NULL there.
     /// Its NaN count is the leaf's when the conversion keeps a NaN a NaN, so a float path prunes both ways when the
     /// footer records one.
     /// </remarks>
@@ -113,11 +113,11 @@ public sealed class ParquetStatisticsAccessor
 
         public long? GetNullCount(RowGroup rg, IReadOnlyList<string> column)
         {
-            if (Stats(rg) is not { NullCount: long nulls })
+            if (Stats(rg) is not { NullCount: long nulls } stats)
                 return null;
             if (nulls == rg.NumRows)
                 return nulls;
-            return GetMinValue(rg, column) is not null && GetMaxValue(rg, column) is not null ? nulls : null;
+            return path.BoundsConvert(stats) ? nulls : null;
         }
 
         // The leaf's count only for a NaN-preserving conversion (ShreddedVariantPath.PreservesNaN); otherwise only
