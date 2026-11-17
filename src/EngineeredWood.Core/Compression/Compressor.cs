@@ -1,6 +1,9 @@
 // Copyright (c) clast-project. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+#if !NET6_0_OR_GREATER
+using System.Buffers;
+#endif
 using System.IO.Compression;
 using K4os.Compression.LZ4;
 using Snappier;
@@ -136,22 +139,79 @@ internal static class Compressor
             return EmptyGzipStream.Length;
         }
 
-        var bclLevel = level.HasValue ? MapBclLevel(level.Value) : CompressionLevel.Fastest;
-        using var outputStream = new MemoryStream();
-        using (var gzip = new GZipStream(outputStream, bclLevel, leaveOpen: true))
-        {
-#if NET6_0_OR_GREATER
-            gzip.Write(source);
-#else
-            byte[] array = source.ToArray();
-            gzip.Write(array, 0, array.Length);
-#endif
-        }
-
-        int compressedLength = checked((int)outputStream.Length);
-        outputStream.GetBuffer().AsSpan(0, compressedLength).CopyTo(destination);
-        return compressedLength;
+        return CompressZlibFormat(source, destination, level, gzip: true);
     }
+
+    /// <summary>
+    /// Runs a <see cref="GZipStream"/> or <see cref="DeflateStream"/> straight into
+    /// <paramref name="destination"/>, which the caller sized by <see cref="GetMaxCompressedLength"/>.
+    /// </summary>
+    /// <remarks>
+    /// Compressing into a growing <see cref="MemoryStream"/> and copying the result out allocated about
+    /// twice the input per call: 2 MB for a 1 MiB page, on the large object heap, with Gen2
+    /// collections to match. Writing into the pinned destination allocates only the streams.
+    /// </remarks>
+    private static unsafe int CompressZlibFormat(
+        ReadOnlySpan<byte> source, Span<byte> destination, BlockCompressionLevel? level, bool gzip)
+    {
+        // Non-empty input always produces output, and the pointer a fixed statement gives an empty
+        // span is null, which UnmanagedMemoryStream refuses.
+        if (destination.IsEmpty)
+            throw DestinationTooShort(innerException: null);
+
+        var bclLevel = level.HasValue ? MapBclLevel(level.Value) : CompressionLevel.Fastest;
+        fixed (byte* pointer = destination)
+        {
+            using var output = new UnmanagedMemoryStream(pointer, 0, destination.Length, FileAccess.Write);
+            try
+            {
+                using Stream compressor = gzip
+                    ? new GZipStream(output, bclLevel, leaveOpen: true)
+                    : new DeflateStream(output, bclLevel, leaveOpen: true);
+                WriteAll(compressor, source);
+            }
+            catch (NotSupportedException e)
+            {
+                // UnmanagedMemoryStream refuses to grow past its capacity. That surfaced as
+                // ArgumentException when the result was copied out of a MemoryStream; keep it so.
+                throw DestinationTooShort(e);
+            }
+
+            return checked((int)output.Position);
+        }
+    }
+
+    private static ArgumentException DestinationTooShort(Exception? innerException) =>
+        new("Destination is too short for the compressed output; size it with GetMaxCompressedLength.",
+            "destination", innerException);
+
+    private static void WriteAll(Stream stream, ReadOnlySpan<byte> source)
+    {
+#if NET6_0_OR_GREATER
+        stream.Write(source);
+#else
+        // Stream takes only arrays here: go through a pooled chunk rather than a copy of the whole input.
+        byte[] chunk = ArrayPool<byte>.Shared.Rent(Math.Min(source.Length, WriteChunkSize));
+        try
+        {
+            for (int offset = 0; offset < source.Length;)
+            {
+                int length = Math.Min(chunk.Length, source.Length - offset);
+                source.Slice(offset, length).CopyTo(chunk);
+                stream.Write(chunk, 0, length);
+                offset += length;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(chunk);
+        }
+#endif
+    }
+
+#if !NET6_0_OR_GREATER
+    private const int WriteChunkSize = 64 * 1024;
+#endif
 
     private static int CompressBrotli(
         ReadOnlySpan<byte> source, Span<byte> destination,
@@ -228,21 +288,7 @@ internal static class Compressor
             return EmptyDeflateStream.Length;
         }
 
-        var bclLevel = level.HasValue ? MapBclLevel(level.Value) : CompressionLevel.Fastest;
-        using var outputStream = new MemoryStream();
-        using (var deflate = new DeflateStream(outputStream, bclLevel, leaveOpen: true))
-        {
-#if NET6_0_OR_GREATER
-            deflate.Write(source);
-#else
-            byte[] array = source.ToArray();
-            deflate.Write(array, 0, array.Length);
-#endif
-        }
-
-        int compressedLength = checked((int)outputStream.Length);
-        outputStream.GetBuffer().AsSpan(0, compressedLength).CopyTo(destination);
-        return compressedLength;
+        return CompressZlibFormat(source, destination, level, gzip: false);
     }
 
     private static int CompressZstd(
